@@ -7,13 +7,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hytte::futures_signals::signal::Mutable;
+use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
 use hytte_plugin_proto::{
     AudioAction, Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, HostMsg,
     Manifest, MediaAction, Mount, NiriAction, NowPlaying, Page, PluginMsg, ProvidedDatasource,
-    StateKey, VOCAB, read_frame, wire, write_frame,
+    StateKey, VOCAB, preem as vocab, read_frame, wire, write_frame,
 };
+use hytte_preem as kit;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 
@@ -21,9 +22,10 @@ use super::datasource::DatasourceRouter;
 use super::effects::broker_effect;
 use super::effects::{PageAction, map_page, map_page_for_layout, resolve_open_page};
 use super::listener::{ACCEPT_BACKOFF, accept_backoff, socket_in_use};
+use super::preem_render::{self, Scope};
 use super::pump::{
-    any_sidebar_open, apply_forget, apply_open, tint_in_process_surfaces, to_now_playing,
-    to_upcoming_events,
+    any_sidebar_open, apply_forget, apply_open, request_remap, tint_in_process_surfaces,
+    to_now_playing, to_upcoming_events,
 };
 use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
@@ -210,7 +212,7 @@ fn wire_node_maps_to_ui_node_exhaustively() {
             UiNode::Spacer,
         ],
     };
-    assert_eq!(to_ui_node(&tree), expected);
+    assert_eq!(to_ui_node(&Scope::detached("map"), &tree), expected);
 }
 
 /// The list nodes map field-for-field: `Row`/`ListBox` recurse their
@@ -265,7 +267,7 @@ fn wire_row_listbox_text_map_to_ui() {
             ],
         }],
     };
-    assert_eq!(to_ui_node(&tree), expected);
+    assert_eq!(to_ui_node(&Scope::detached("map"), &tree), expected);
 }
 
 /// The #333 `Expander` maps 1:1: the boxed `header` and the body `children`
@@ -302,7 +304,7 @@ fn wire_expander_maps_to_ui() {
         expanded: true,
         classes: vec!["boxed-list".into()],
     };
-    assert_eq!(to_ui_node(&tree), expected);
+    assert_eq!(to_ui_node(&Scope::detached("map"), &tree), expected);
 }
 
 #[test]
@@ -342,7 +344,7 @@ fn wire_entry_maps_to_ui() {
         placeholder: "type a command…".into(),
         classes: vec!["monospace".into()],
     };
-    assert_eq!(to_ui_node(&tree), expected);
+    assert_eq!(to_ui_node(&Scope::detached("map"), &tree), expected);
 }
 
 /// Every wire `Page` maps to the identically-named `modal::Page` in the
@@ -582,7 +584,7 @@ fn pixels_bad_len_degrades_to_empty_surface() {
         classes: vec!["ts-lcd".into()],
     };
     assert_eq!(
-        to_ui_node(&bad),
+        to_ui_node(&Scope::detached("pixels"), &bad),
         UiNode::Pixels {
             id: Some("lcd".into()),
             width: 0,
@@ -605,7 +607,7 @@ fn pixels_bad_len_degrades_to_empty_surface() {
         classes: vec![],
     };
     assert_eq!(
-        to_ui_node(&good),
+        to_ui_node(&Scope::detached("pixels"), &good),
         UiNode::Pixels {
             id: None,
             width: 1,
@@ -649,7 +651,7 @@ fn pixels_scale_is_clamped_at_the_host_seam() {
         scale,
         classes: vec![],
     };
-    let ui_scale = |n: &wire::Node| match to_ui_node(n) {
+    let ui_scale = |n: &wire::Node| match to_ui_node(&Scope::detached("scale"), n) {
         UiNode::Pixels { scale, .. } => scale,
         other => panic!("expected Pixels, got {other:?}"),
     };
@@ -825,17 +827,31 @@ fn teardown_is_isolated_across_the_three_regions() {
 // ── Host session gating (#305): the SlotVisibility push is opt-in ─────────
 
 /// Read one host→plugin frame, failing (not hanging) if none arrives.
+///
+/// [`HostMsg::Hello`] is skipped: since #883 the host advertises its wire
+/// vocabulary as the first frame after an accepted `Register`, and every test
+/// below builds its fixture from `Manifest::new` (which stamps `vocab_max`), so
+/// they would all see it before the state frame they are actually about. The
+/// advertisement's own *presence and absence* are asserted directly, off raw
+/// `read_frame`, by `a_negotiating_plugin_is_told_the_hosts_vocabulary_first`
+/// and `a_legacy_plugin_is_never_sent_the_vocabulary_advertisement` — so
+/// skipping it here loses no coverage of the send-gate.
 async fn recv<R>(rd: &mut R) -> HostMsg
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        read_frame::<HostMsg, _>(rd),
-    )
-    .await
-    .expect("a host frame within 5s")
-    .expect("decode HostMsg")
+    loop {
+        let msg = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_frame::<HostMsg, _>(rd),
+        )
+        .await
+        .expect("a host frame within 5s")
+        .expect("decode HostMsg");
+        if !matches!(msg, HostMsg::Hello { .. }) {
+            return msg;
+        }
+    }
 }
 
 fn ctx_with(
@@ -2595,6 +2611,9 @@ async fn now_playing_reseed_only_fires_on_the_rising_edge() {
 /// second test ever reads the accent, the two must not run concurrently.
 #[test]
 fn the_accent_reaches_the_shells_own_preem_surfaces() {
+    // Held for the whole test: this one *moves* the process-global the every
+    // preem render reads (see `PREEM_INK_LOCK`).
+    let _ink = preem_ink_lock();
     let lit_pixels = |accent: Option<[u8; 4]>| {
         tint_in_process_surfaces(accent);
         hytte_preem::dot_matrix("8", hytte_preem::DisplayStyle::Vfd)
@@ -2620,5 +2639,995 @@ fn the_accent_reaches_the_shells_own_preem_surfaces() {
         teal.chunks_exact(4)
             .any(|px| px == [0x11, 0x99, 0xaa, 0xff]),
         "a fully-lit dot should carry the accent exactly, not merely something derived from it"
+    );
+}
+
+// ── #883: shell-side preem renderers ─────────────────────────────────────────
+
+/// Serialises every test that renders through `hytte-preem` against the one
+/// that *moves* the kit's accent.
+///
+/// `hytte_preem`'s accent is a process-global `AtomicU32` that **every** widget
+/// reads at render time (`style.rs`'s `palette()`), and the harness runs test
+/// functions concurrently in one process. A parity test compares two renders
+/// taken moments apart; an accent flip landing between them would make them
+/// differ for a reason that has nothing to do with the code under test. Every
+/// preem test below takes this lock, and so does
+/// [`the_accent_reaches_the_shells_own_preem_surfaces`], which is the only test
+/// that writes the global.
+static PREEM_INK_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take [`PREEM_INK_LOCK`], surviving a poisoning by an unrelated test's panic
+/// (the data is `()`, so there is nothing to be inconsistent about).
+fn preem_ink_lock() -> std::sync::MutexGuard<'static, ()> {
+    PREEM_INK_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A `Node::Preem` carrying `widget`, with one CSS class so the mapping's
+/// class passthrough is asserted on every parity case rather than once.
+fn preem_node(id: Option<&str>, widget: vocab::PreemWidget) -> wire::Node {
+    wire::Node::Preem {
+        id: id.map(str::to_owned),
+        classes: vec!["ts-preem".into()],
+        widget: Box::new(widget),
+    }
+}
+
+/// Map `node` through the real host path and take the RGBA8 surface out of it,
+/// asserting the invariants every preem node must satisfy on the way.
+fn mapped_pixels(scope: &Scope, node: &wire::Node) -> (u32, u32, Vec<u8>) {
+    match to_ui_node(scope, node) {
+        UiNode::Pixels {
+            width,
+            height,
+            data,
+            scale,
+            classes,
+            ..
+        } => {
+            assert_eq!(
+                scale, 1,
+                "the kit bakes its own upscale into the buffer, so the host must not scale again",
+            );
+            assert_eq!(
+                classes,
+                vec!["ts-preem".to_owned()],
+                "the preem arm keeps the node's classes, like every other arm",
+            );
+            assert_eq!(
+                data.len(),
+                usize::try_from(width).expect("width fits usize")
+                    * usize::try_from(height).expect("height fits usize")
+                    * 4,
+                "a preem surface must honor the same RGBA8 size invariant as Node::Pixels",
+            );
+            (width, height, data)
+        }
+        other => panic!("a Node::Preem must map to Pixels, got {other:?}"),
+    }
+}
+
+/// A kit frame in the same `(w, h, bytes)` shape [`mapped_pixels`] returns — the
+/// parity oracle's side of every comparison below.
+fn kit_pixels(frame: &kit::Frame) -> (u32, u32, Vec<u8>) {
+    (
+        u32::try_from(frame.width()).expect("kit width fits u32"),
+        u32::try_from(frame.height()).expect("kit height fits u32"),
+        frame.data().to_vec(),
+    )
+}
+
+/// The kit skin a wire [`vocab::StyleName`] names. Spelled out here rather than
+/// imported from the module under test: an oracle that borrows the code's own
+/// resolver agrees with it by construction.
+fn kit_style(style: vocab::StyleName) -> kit::DisplayStyle {
+    match style {
+        vocab::StyleName::Vfd => kit::DisplayStyle::Vfd,
+        vocab::StyleName::Lcd => kit::DisplayStyle::Lcd,
+        vocab::StyleName::Oled => kit::DisplayStyle::Oled,
+        vocab::StyleName::Crt => kit::DisplayStyle::Crt,
+    }
+}
+
+/// Visual parity, `DotMatrix`: the shell's renderer must produce byte-identical
+/// pixels to the kit call a plugin would have made itself — in **every** skin,
+/// which also exercises the by-name `StyleName` → `DisplayStyle` resolution and
+/// (because the node id is reused) the config-change rebuild.
+#[test]
+fn dot_matrix_renders_at_parity_with_the_kit() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("parity-dot-matrix");
+    for style in vocab::StyleName::ALL {
+        let node = preem_node(
+            Some("dm"),
+            vocab::PreemWidget::DotMatrix {
+                config: vocab::DotMatrixConfig {
+                    style: vocab::StyleRef::new(style),
+                },
+                state: vocab::DotMatrixState {
+                    text: "PREEM 42".into(),
+                },
+            },
+        );
+        assert_eq!(
+            mapped_pixels(&scope, &node),
+            kit_pixels(&kit::dot_matrix("PREEM 42", kit_style(style))),
+            "dot-matrix parity in the {} skin",
+            style.name(),
+        );
+    }
+}
+
+/// Visual parity, `SevenSeg`, in every skin.
+#[test]
+fn seven_seg_renders_at_parity_with_the_kit() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("parity-seven-seg");
+    for style in vocab::StyleName::ALL {
+        let node = preem_node(
+            Some("ss"),
+            vocab::PreemWidget::SevenSeg {
+                config: vocab::SevenSegConfig {
+                    style: vocab::StyleRef::new(style),
+                },
+                state: vocab::SevenSegState {
+                    text: "12:34".into(),
+                },
+            },
+        );
+        assert_eq!(
+            mapped_pixels(&scope, &node),
+            kit_pixels(&kit::seven_seg("12:34", kit_style(style))),
+            "seven-segment parity in the {} skin",
+            style.name(),
+        );
+    }
+}
+
+/// Visual parity, `TextBox` — the widget with the most config, so the oracle
+/// spells the whole builder chain out and a mis-ordered or dropped knob shows
+/// up as different bytes.
+#[test]
+fn text_box_renders_at_parity_with_the_kit() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("parity-text-box");
+    let config = vocab::TextBoxConfig {
+        style: vocab::StyleRef::new(vocab::StyleName::Lcd),
+        width: vocab::TextBoxWidth::Cols(12),
+        max_lines: 2,
+        pad: 4,
+        corner: 3,
+        scale: 2,
+        fixed_width: true,
+    };
+    let text = "the quick brown fox jumps";
+    let node = preem_node(
+        Some("tb"),
+        vocab::PreemWidget::TextBox {
+            config,
+            state: vocab::TextBoxState { text: text.into() },
+        },
+    );
+    let oracle = kit::TextBox::styled(kit::DisplayStyle::Lcd)
+        .cols(12)
+        .max_lines(2)
+        .pad(4)
+        .corner(3)
+        .scale(2)
+        .fixed_width(true);
+    assert_eq!(
+        mapped_pixels(&scope, &node),
+        kit_pixels(&oracle.render(text)),
+        "text-box parity across the whole builder chain",
+    );
+
+    // The other width spec is a different kit method, so it gets its own case.
+    let fit = vocab::TextBoxConfig {
+        width: vocab::TextBoxWidth::FitPx(160),
+        ..config
+    };
+    let fit_node = preem_node(
+        Some("tb"),
+        vocab::PreemWidget::TextBox {
+            config: fit,
+            state: vocab::TextBoxState { text: text.into() },
+        },
+    );
+    let fit_oracle = kit::TextBox::styled(kit::DisplayStyle::Lcd)
+        .fit_px(160)
+        .max_lines(2)
+        .pad(4)
+        .corner(3)
+        .scale(2)
+        .fixed_width(true);
+    assert_eq!(
+        mapped_pixels(&scope, &fit_node),
+        kit_pixels(&fit_oracle.render(text)),
+        "text-box parity with a FitPx width",
+    );
+}
+
+/// Visual parity, `LedStrip`, in the three peak configurations the vocabulary
+/// distinguishes: no peak at all, a shell-held one, and the plugin's own
+/// explicit override.
+#[test]
+fn led_strip_renders_at_parity_with_the_kit() {
+    let _ink = preem_ink_lock();
+    let style = vocab::StyleRef::new(vocab::StyleName::Oled);
+    let strip = kit::LedStrip::new(kit::DisplayStyle::Oled).leds(32);
+
+    // 1. No peak-hold and no explicit peak: the kit's "no peak dot" reading.
+    let plain = preem_node(
+        Some("vu"),
+        vocab::PreemWidget::LedStrip {
+            config: vocab::LedStripConfig {
+                style,
+                leds: 32,
+                peak_hold: None,
+            },
+            state: vocab::LedStripState {
+                level: 0.6,
+                peak: None,
+            },
+        },
+    );
+    assert_eq!(
+        mapped_pixels(&Scope::detached("parity-led-plain"), &plain),
+        kit_pixels(&strip.render(0.6, 0.0)),
+        "a strip with neither peak source renders with no peak dot",
+    );
+
+    // 2. Shell-held peak: the level is folded into a `PeakHold` at build time.
+    let held = preem_node(
+        Some("vu"),
+        vocab::PreemWidget::LedStrip {
+            config: vocab::LedStripConfig {
+                style,
+                leds: 32,
+                peak_hold: Some(vocab::PeakHoldConfig { rate: 0.1 }),
+            },
+            state: vocab::LedStripState {
+                level: 0.6,
+                peak: None,
+            },
+        },
+    );
+    let mut oracle_hold = kit::PeakHold::new(0.1);
+    oracle_hold.push(0.6);
+    assert_eq!(
+        mapped_pixels(&Scope::detached("parity-led-held"), &held),
+        kit_pixels(&strip.render(0.6, oracle_hold.value())),
+        "a declared peak-hold rides the level the shell was given",
+    );
+
+    // 3. An explicit peak wins for the render it arrives on.
+    let explicit = preem_node(
+        Some("vu"),
+        vocab::PreemWidget::LedStrip {
+            config: vocab::LedStripConfig {
+                style,
+                leds: 32,
+                peak_hold: Some(vocab::PeakHoldConfig { rate: 0.1 }),
+            },
+            state: vocab::LedStripState {
+                level: 0.6,
+                peak: Some(0.95),
+            },
+        },
+    );
+    assert_eq!(
+        mapped_pixels(&Scope::detached("parity-led-explicit"), &explicit),
+        kit_pixels(&strip.render(0.6, 0.95)),
+        "an explicit peak overrides the held one for that render",
+    );
+}
+
+/// Visual parity, `Marquee`, at rest **and** after one advance — the pair that
+/// proves the shell's dots-per-second integration lands on the same whole-dot
+/// window the kit would have been asked for.
+#[test]
+fn marquee_renders_at_parity_with_the_kit_before_and_after_a_scroll() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("parity-marquee");
+    let text = "SCROLLING MARQUEE TEST";
+    let node = preem_node(
+        Some("mq"),
+        vocab::PreemWidget::Marquee {
+            config: vocab::MarqueeConfig {
+                style: vocab::StyleRef::new(vocab::StyleName::Vfd),
+                window_px: 192,
+                gap_dots: 6,
+                speed_dots_per_sec: 20.0,
+            },
+            state: vocab::MarqueeState { text: text.into() },
+        },
+    );
+    let oracle = kit::Marquee::new(kit::DisplayStyle::Vfd)
+        .window_px(192)
+        .gap_dots(6)
+        .render(text);
+    assert!(
+        oracle.scrolls(),
+        "the fixture must be long enough to scroll, or the advance below proves nothing",
+    );
+
+    assert_eq!(
+        mapped_pixels(&scope, &node),
+        kit_pixels(&oracle.window(0)),
+        "a fresh marquee starts at the left edge",
+    );
+
+    // Half a second at 20 dots/s is exactly ten whole dots — the offset the kit
+    // would have been handed by a plugin stepping one dot per 20 Hz beat.
+    assert!(
+        preem_render::advance_all(0.5),
+        "advancing a scrolling marquee must report that it moved",
+    );
+    assert_eq!(
+        mapped_pixels(&scope, &node),
+        kit_pixels(&oracle.window(10)),
+        "0.5 s at 20 dots/s is a ten-dot window",
+    );
+}
+
+/// Visual parity, `Scope`, at the debut batch and after one identical advance —
+/// the phosphor decay is a per-*call* step in the kit, so this also pins that
+/// one animation tick issues exactly one of them.
+#[test]
+fn scope_renders_at_parity_with_the_kit_before_and_after_a_decay() {
+    let _ink = preem_ink_lock();
+    let scope_key = Scope::detached("parity-scope");
+    let samples: Vec<f32> = (0..64_u8).map(|i| f32::from(i % 9) / 4.0 - 1.0).collect();
+    let node = preem_node(
+        Some("sc"),
+        vocab::PreemWidget::Scope {
+            config: vocab::ScopeConfig {
+                style: vocab::StyleRef::new(vocab::StyleName::Crt),
+                cols: 48,
+                rows: 24,
+                scale: 1,
+                persistence: 184,
+            },
+            state: vocab::ScopeState {
+                samples: samples.clone(),
+            },
+        },
+    );
+    let mut oracle = kit::Scope::with_size(48, 24).scale(1).persistence(184);
+    oracle.advance(&samples);
+    assert_eq!(
+        mapped_pixels(&scope_key, &node),
+        kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
+        "the debut sample batch is stamped before the first frame reaches the screen",
+    );
+
+    // One animation step with nothing new to stamp: the trail decays, exactly
+    // as an empty batch does in the kit.
+    assert!(
+        preem_render::advance_all(preem_render::ANIM_STEP_SECS),
+        "a fading phosphor trail must report that it moved",
+    );
+    oracle.advance(&[]);
+    assert_eq!(
+        mapped_pixels(&scope_key, &node),
+        kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
+        "one animation step is exactly one phosphor decay",
+    );
+}
+
+/// Visual parity, `Gauge`, at the target's arrival and after one advance — the
+/// needle physics is closed-form, so the shell integrating it with the real
+/// frame `dt` must land on the same `f32` the kit would have.
+#[test]
+fn gauge_renders_at_parity_with_the_kit_before_and_after_a_swing() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("parity-gauge");
+    let node = preem_node(
+        Some("gg"),
+        vocab::PreemWidget::Gauge {
+            config: vocab::GaugeConfig {
+                style: vocab::StyleRef::new(vocab::StyleName::Vfd),
+                cols: 64,
+                rows: 40,
+                scale: 1,
+                sweep_deg: 150.0,
+                divisions: 4,
+                subdivisions: 5,
+                range: vocab::GaugeRange {
+                    low: 0.0,
+                    high: 100.0,
+                },
+                frequency_hz: 2.0,
+                damping: 0.5,
+            },
+            state: vocab::GaugeState { target: 75.0 },
+        },
+    );
+    let mut oracle = kit::Gauge::with_size(64, 40)
+        .scale(1)
+        .sweep_deg(150.0)
+        .ticks(4, 5)
+        .range(0.0, 100.0)
+        .frequency(2.0)
+        .damping(0.5);
+    oracle.set_target(75.0);
+    assert_eq!(
+        mapped_pixels(&scope, &node),
+        kit_pixels(&oracle.render(kit::DisplayStyle::Vfd)),
+        "a fresh gauge rests at the low end with its target set",
+    );
+
+    assert!(
+        preem_render::advance_all(preem_render::ANIM_STEP_SECS),
+        "an un-settled needle must report that it moved",
+    );
+    oracle.advance(preem_render::ANIM_STEP_SECS);
+    assert_eq!(
+        mapped_pixels(&scope, &node),
+        kit_pixels(&oracle.render(kit::DisplayStyle::Vfd)),
+        "the shell integrates the needle with the same dt the kit would have",
+    );
+}
+
+/// Visual parity, `FlipBoard`, at the text's arrival and after one advance.
+#[test]
+fn flip_board_renders_at_parity_with_the_kit_before_and_after_a_flip() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("parity-flip-board");
+    let node = preem_node(
+        Some("fb"),
+        vocab::PreemWidget::FlipBoard {
+            config: vocab::FlipBoardConfig {
+                style: vocab::StyleRef::new(vocab::StyleName::Vfd),
+                mechanism: vocab::Mechanism::SplitFlap,
+                cells: 8,
+                glyph_px: 2,
+                scale: 1,
+                // `None` on both means "the mechanism's own default", which the
+                // oracle reproduces by *not* calling the two builder methods.
+                duration_secs: None,
+                stagger_secs: None,
+            },
+            state: vocab::FlipBoardState {
+                text: "12:34:56".into(),
+            },
+        },
+    );
+    let mut oracle = kit::FlipBoard::new(kit::Mechanism::SplitFlap)
+        .cells(8)
+        .glyph_px(2)
+        .scale(1);
+    oracle.set_text("12:34:56");
+    assert_eq!(
+        mapped_pixels(&scope, &node),
+        kit_pixels(&oracle.render(kit::DisplayStyle::Vfd)),
+        "a board that has just been given its text is mid-flip at t=0",
+    );
+
+    assert!(
+        preem_render::advance_all(0.1),
+        "cards still in motion must report that they moved",
+    );
+    oracle.advance(0.1);
+    assert_eq!(
+        mapped_pixels(&scope, &node),
+        kit_pixels(&oracle.render(kit::DisplayStyle::Vfd)),
+        "the shell drives the flip clock with the same dt the kit would have",
+    );
+}
+
+/// Acceptance criterion 1 (#895's B2 handoff): the renderer rasterises the
+/// **clamped** widget, never the raw one.
+///
+/// The config below asks for a 5000-column, 8× upscaled scope — a buffer the
+/// wire caps are there to refuse. The assertion is not merely "it didn't
+/// explode": the surface must be byte-identical to the kit rendering
+/// `PreemWidget::clamped()`'s output, which is what proves the clamp is on the
+/// path rather than merely available.
+#[test]
+fn an_absurd_preem_config_is_clamped_before_the_renderer_sees_it() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("clamp-seam");
+    let raw = vocab::PreemWidget::Scope {
+        config: vocab::ScopeConfig {
+            style: vocab::StyleRef::new(vocab::StyleName::Vfd),
+            cols: 5_000,
+            rows: 40,
+            scale: 8,
+            persistence: 184,
+        },
+        state: vocab::ScopeState {
+            samples: vec![0.5; 128],
+        },
+    };
+    let (width, height, data) = mapped_pixels(&scope, &preem_node(Some("sc"), raw.clone()));
+    assert!(
+        width <= vocab::MAX_BUFFER_DIM && height <= vocab::MAX_BUFFER_DIM,
+        "the rasterised surface must respect the wire's buffer cap, got {width}x{height}",
+    );
+
+    let vocab::PreemWidget::Scope { config, state } = raw.clamped() else {
+        panic!("clamping a Scope yields a Scope");
+    };
+    let mut oracle = kit::Scope::with_size(
+        usize::try_from(config.cols).expect("clamped cols fit usize"),
+        usize::try_from(config.rows).expect("clamped rows fit usize"),
+    )
+    .scale(usize::try_from(config.scale).expect("clamped scale fits usize"))
+    .persistence(config.persistence);
+    oracle.advance(&state.samples);
+    assert_eq!(
+        (width, height, data),
+        kit_pixels(&oracle.render(kit::DisplayStyle::Vfd)),
+        "the renderer must rasterise the clamped widget, not the raw one",
+    );
+}
+
+/// Lifecycle: a **state** change updates the instance in place — the renderer is
+/// built once and the animation it is running is not restarted.
+#[test]
+fn a_state_change_updates_the_instance_in_place() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("lifecycle-state");
+    let config = vocab::GaugeConfig::default();
+    let at = |target: f32| {
+        preem_node(
+            Some("gg"),
+            vocab::PreemWidget::Gauge {
+                config,
+                state: vocab::GaugeState { target },
+            },
+        )
+    };
+
+    let _ = to_ui_node(&scope, &at(0.25));
+    assert_eq!(preem_render::probe(&scope, Some("gg")), Some((1, 1)));
+
+    let _ = to_ui_node(&scope, &at(0.75));
+    assert_eq!(
+        preem_render::probe(&scope, Some("gg")),
+        Some((1, 2)),
+        "a new target must be applied to the SAME renderer — one build, two applies",
+    );
+}
+
+/// Lifecycle: re-mapping an unchanged tree — which is what a second monitor's
+/// reconcile does on every render frame — must not re-apply anything.
+///
+/// Without this, a two-output session would stamp every scope sample batch twice
+/// and decay its phosphor twice per frame, i.e. animate at 2× speed.
+#[test]
+fn re_mapping_an_unchanged_widget_is_a_no_op() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("lifecycle-idempotent");
+    let node = preem_node(
+        Some("dm"),
+        vocab::PreemWidget::DotMatrix {
+            config: vocab::DotMatrixConfig::default(),
+            state: vocab::DotMatrixState {
+                text: "STEADY".into(),
+            },
+        },
+    );
+
+    let first = mapped_pixels(&scope, &node);
+    assert_eq!(preem_render::probe(&scope, Some("dm")), Some((1, 1)));
+
+    let second = mapped_pixels(&scope, &node);
+    assert_eq!(
+        preem_render::probe(&scope, Some("dm")),
+        Some((1, 1)),
+        "a second monitor mapping the same tree must neither rebuild nor re-apply",
+    );
+    assert_eq!(first, second, "and it must produce the same surface");
+}
+
+/// Lifecycle: a **config** change rebuilds the instance, and so does swapping
+/// the widget **kind** under the same node id.
+#[test]
+fn a_config_or_kind_change_rebuilds_the_instance() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("lifecycle-rebuild");
+
+    let dots = |style: vocab::StyleName| {
+        preem_node(
+            Some("w"),
+            vocab::PreemWidget::DotMatrix {
+                config: vocab::DotMatrixConfig {
+                    style: vocab::StyleRef::new(style),
+                },
+                state: vocab::DotMatrixState { text: "A".into() },
+            },
+        )
+    };
+
+    let _ = to_ui_node(&scope, &dots(vocab::StyleName::Vfd));
+    assert_eq!(preem_render::probe(&scope, Some("w")), Some((1, 1)));
+
+    let _ = to_ui_node(&scope, &dots(vocab::StyleName::Crt));
+    assert_eq!(
+        preem_render::probe(&scope, Some("w")),
+        Some((2, 2)),
+        "a config change must rebuild, not update",
+    );
+
+    let _ = to_ui_node(
+        &scope,
+        &preem_node(
+            Some("w"),
+            vocab::PreemWidget::SevenSeg {
+                config: vocab::SevenSegConfig::default(),
+                state: vocab::SevenSegState { text: "1".into() },
+            },
+        ),
+    );
+    assert_eq!(
+        preem_render::probe(&scope, Some("w")),
+        Some((3, 3)),
+        "a kind change under the same node id must rebuild too",
+    );
+}
+
+/// Lifecycle: an instance whose node stops appearing in the tree is dropped at
+/// the end of the mapping pass, and `forget_scope` drops the whole tree's worth
+/// (what a plugin card leaving its region does).
+#[test]
+fn instances_are_swept_when_their_node_leaves_the_tree() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("lifecycle-sweep");
+    let leaf = |id: &str| {
+        preem_node(
+            Some(id),
+            vocab::PreemWidget::DotMatrix {
+                config: vocab::DotMatrixConfig::default(),
+                state: vocab::DotMatrixState { text: id.into() },
+            },
+        )
+    };
+    let row = |children: Vec<wire::Node>| wire::Node::Row {
+        id: Some("row".into()),
+        classes: vec![],
+        children,
+    };
+
+    let _ = to_ui_node(&scope, &row(vec![leaf("a"), leaf("b")]));
+    assert_eq!(preem_render::instance_count(&scope), 2);
+
+    let _ = to_ui_node(&scope, &row(vec![leaf("a")]));
+    assert_eq!(
+        preem_render::instance_count(&scope),
+        1,
+        "the node the plugin stopped rendering releases its renderer",
+    );
+    assert!(preem_render::probe(&scope, Some("a")).is_some());
+    assert!(preem_render::probe(&scope, Some("b")).is_none());
+
+    preem_render::forget_scope(&scope);
+    assert_eq!(
+        preem_render::instance_count(&scope),
+        0,
+        "forgetting a scope drops everything in it",
+    );
+}
+
+/// Lifecycle: a preem node with no `id` is keyed by its ordinal among the
+/// tree's preem nodes, so it still animates across frames — and the ordinal is
+/// reset per mapping pass rather than climbing forever.
+#[test]
+fn an_un_idd_preem_node_is_keyed_by_its_ordinal() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("lifecycle-ordinal");
+    let anon = |text: &str| {
+        preem_node(
+            None,
+            vocab::PreemWidget::DotMatrix {
+                config: vocab::DotMatrixConfig::default(),
+                state: vocab::DotMatrixState { text: text.into() },
+            },
+        )
+    };
+
+    let _ = to_ui_node(&scope, &anon("one"));
+    assert_eq!(preem_render::probe(&scope, None), Some((1, 1)));
+
+    let _ = to_ui_node(&scope, &anon("two"));
+    assert_eq!(
+        preem_render::probe(&scope, None),
+        Some((1, 2)),
+        "the same ordinal slot is reused across passes, so the instance survives",
+    );
+    assert_eq!(
+        preem_render::instance_count(&scope),
+        1,
+        "the ordinal resets per pass instead of minting a new instance each frame",
+    );
+}
+
+/// A widget kind this build cannot render degrades to a nothing-rendered
+/// surface that keeps its id and classes — the same posture the malformed-
+/// `Pixels` seam takes — and recovers in place once it becomes renderable.
+///
+/// `build`'s match is exhaustive over today's vocabulary, so this path is
+/// unreachable as the code stands; the test forces it through the seam that
+/// stands in for a future `PreemWidget` variant this build predates.
+#[test]
+fn an_unrenderable_preem_widget_degrades_to_an_empty_surface() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("unsupported");
+    let node = preem_node(
+        Some("x"),
+        vocab::PreemWidget::DotMatrix {
+            config: vocab::DotMatrixConfig::default(),
+            state: vocab::DotMatrixState { text: "hi".into() },
+        },
+    );
+
+    let degraded = preem_render::with_unsupported_widgets(|| to_ui_node(&scope, &node));
+    assert_eq!(
+        degraded,
+        UiNode::Pixels {
+            id: Some("x".into()),
+            width: 0,
+            height: 0,
+            data: vec![],
+            scale: 1,
+            classes: vec!["ts-preem".into()],
+        },
+        "an unrenderable widget keeps its id and classes so a later frame updates in place",
+    );
+
+    // The instance is kept (so the warn stays latched at one) but rebuilds the
+    // moment the widget becomes renderable again.
+    let (_, _, data) = mapped_pixels(&scope, &node);
+    assert!(
+        !data.is_empty(),
+        "the same node recovers in place once its kind is renderable",
+    );
+}
+
+/// A pure widget never asks the animation clock for anything; a scrolling
+/// marquee does, and stops once its speed is parked.
+///
+/// This is the gate that keeps the 20 Hz timer free for every session that has
+/// no animated preem widget on screen.
+#[test]
+fn only_animated_widgets_keep_the_clock_awake() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("animates");
+    let marquee = |speed: f32| {
+        preem_node(
+            Some("mq"),
+            vocab::PreemWidget::Marquee {
+                config: vocab::MarqueeConfig {
+                    style: vocab::StyleRef::new(vocab::StyleName::Vfd),
+                    window_px: 192,
+                    gap_dots: 6,
+                    speed_dots_per_sec: speed,
+                },
+                state: vocab::MarqueeState {
+                    text: "A LONG SCROLLING MESSAGE".into(),
+                },
+            },
+        )
+    };
+
+    let pure = preem_node(
+        Some("dm"),
+        vocab::PreemWidget::DotMatrix {
+            config: vocab::DotMatrixConfig::default(),
+            state: vocab::DotMatrixState {
+                text: "STATIC".into(),
+            },
+        },
+    );
+    let _ = to_ui_node(&scope, &pure);
+    assert!(
+        !preem_render::any_animating(),
+        "a static dot matrix must not keep the animation clock awake",
+    );
+
+    let _ = to_ui_node(&scope, &marquee(20.0));
+    assert!(
+        preem_render::any_animating(),
+        "a scrolling marquee is what the clock exists for",
+    );
+
+    // `0.0` (and, per the vocabulary, a non-finite value) parks the message.
+    let _ = to_ui_node(&scope, &marquee(0.0));
+    assert!(
+        !preem_render::any_animating(),
+        "a parked speed stops asking for ticks",
+    );
+    assert!(
+        !preem_render::advance_all(1.0),
+        "and advancing a parked marquee reports no movement",
+    );
+}
+
+/// The step-based kit primitives are driven off **elapsed time**, and a stall
+/// can't make one replay the whole gap.
+///
+/// `PeakHold::decay` takes no `dt` — it is one fixed fall per call — so the
+/// shell converts real seconds into whole steps. Three steps' worth of `dt`
+/// must be exactly three decays, and a `dt` worth hundreds must be capped.
+#[test]
+fn step_based_animation_is_anchored_to_elapsed_time_and_capped() {
+    let _ink = preem_ink_lock();
+    let strip = kit::LedStrip::new(kit::DisplayStyle::Vfd).leds(16);
+    let node = preem_node(
+        Some("vu"),
+        vocab::PreemWidget::LedStrip {
+            config: vocab::LedStripConfig {
+                style: vocab::StyleRef::new(vocab::StyleName::Vfd),
+                leds: 16,
+                peak_hold: Some(vocab::PeakHoldConfig { rate: 0.05 }),
+            },
+            state: vocab::LedStripState {
+                level: 1.0,
+                peak: None,
+            },
+        },
+    );
+
+    let three = Scope::detached("steps-three");
+    let _ = to_ui_node(&three, &node);
+    assert!(preem_render::advance_all(
+        preem_render::ANIM_STEP_SECS * 3.0
+    ));
+    let mut oracle = kit::PeakHold::new(0.05);
+    oracle.push(1.0);
+    for _ in 0..3 {
+        oracle.decay();
+    }
+    assert_eq!(
+        mapped_pixels(&three, &node),
+        kit_pixels(&strip.render(1.0, oracle.value())),
+        "three animation steps' worth of dt is exactly three decays",
+    );
+
+    let stalled = Scope::detached("steps-stalled");
+    let _ = to_ui_node(&stalled, &node);
+    // A resume-from-suspend sized `dt`: hundreds of steps' worth.
+    assert!(preem_render::advance_all(30.0));
+    let mut capped = kit::PeakHold::new(0.05);
+    capped.push(1.0);
+    for _ in 0..preem_render::MAX_CATCHUP_STEPS {
+        capped.decay();
+    }
+    assert!(
+        capped.value() > 0.0,
+        "the fixture must not decay to zero at the cap, or the assertion below is vacuous",
+    );
+    assert_eq!(
+        mapped_pixels(&stalled, &node),
+        kit_pixels(&strip.render(1.0, capped.value())),
+        "a stall's worth of dt is capped instead of replayed step by step",
+    );
+}
+
+/// A repaint request must actually wake a mount region's subscribers.
+///
+/// `Mutable`'s write guard only arms its wake-on-drop once something has gone
+/// through `DerefMut`, so a `lock_mut()` that is merely taken and dropped
+/// notifies nobody and the animation would advance invisibly. An empty mailbox
+/// is skipped (there is nothing on screen to repaint).
+#[test]
+fn a_repaint_request_wakes_the_regions_subscribers() {
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+    let mailbox: Mutable<Vec<SlotRender>> = Mutable::new(Vec::new());
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut signal = pin!(mailbox.signal_cloned());
+
+    // Drain the replayed initial value, then confirm the signal is quiet.
+    assert!(matches!(
+        signal.as_mut().poll_change(&mut cx),
+        Poll::Ready(Some(_))
+    ));
+    assert!(matches!(
+        signal.as_mut().poll_change(&mut cx),
+        Poll::Pending
+    ));
+
+    request_remap(&mailbox);
+    assert!(
+        matches!(signal.as_mut().poll_change(&mut cx), Poll::Pending),
+        "an empty mailbox has nothing on screen, so it is not woken",
+    );
+
+    mailbox.lock_mut().push(render_of("p", 0, 1, "chip", &tx));
+    assert!(matches!(
+        signal.as_mut().poll_change(&mut cx),
+        Poll::Ready(Some(_))
+    ));
+    assert!(matches!(
+        signal.as_mut().poll_change(&mut cx),
+        Poll::Pending
+    ));
+
+    request_remap(&mailbox);
+    assert!(
+        matches!(signal.as_mut().poll_change(&mut cx), Poll::Ready(Some(_))),
+        "a repaint request must wake the region even though the trees are unchanged",
+    );
+}
+
+/// Acceptance criterion 2: `HostMsg::Hello` is sent **iff** the manifest
+/// declares `vocab_max`.
+///
+/// A negotiating plugin gets the advertisement as the very first host frame —
+/// which is what lets it emit `Node::Preem` at all.
+#[tokio::test]
+async fn a_negotiating_plugin_is_told_the_hosts_vocabulary_first() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+
+    let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+    let (mut prd, mut pwr) = plugin_end.into_split();
+
+    let mut manifest = Manifest::new("negotiator", Mount::BarCenter);
+    manifest.subscribes.push(StateKey::SlotVisible);
+    assert!(
+        manifest.negotiates_vocab(),
+        "`Manifest::new` stamps `vocab_max`, so this fixture must negotiate",
+    );
+    write_frame(&mut pwr, &PluginMsg::Register { manifest })
+        .await
+        .expect("send Register");
+
+    let first = read_frame::<HostMsg, _>(&mut prd)
+        .await
+        .expect("the host sends a frame");
+    assert!(
+        matches!(first, HostMsg::Hello { vocab } if vocab == VOCAB),
+        "the advertisement must be the FIRST frame after an accepted Register, got {first:?}",
+    );
+}
+
+/// Acceptance criterion 2, the half that matters: a **pre-#882** plugin — one
+/// whose manifest carries no `vocab_max` — must receive **no** `Hello` at all.
+///
+/// Its `rmp-serde` cannot decode the variant, so a `Hello` would fail the
+/// decode, close the session, and let `Restart=on-failure` redial into the #437
+/// crash-loop, on every deployed plugin at once. The fixture is byte-for-byte a
+/// negotiating manifest except for that one field, and it subscribes
+/// `SlotVisible` on a bar mount so the host is guaranteed to send *something* —
+/// making "no Hello" an assertion about the frame that did arrive rather than
+/// about silence.
+#[tokio::test]
+async fn a_legacy_plugin_is_never_sent_the_vocabulary_advertisement() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+
+    let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+    let (mut prd, mut pwr) = plugin_end.into_split();
+
+    let mut manifest = Manifest::new("legacy", Mount::BarCenter);
+    manifest.subscribes.push(StateKey::SlotVisible);
+    // What a binary built before #882 sends: the field simply isn't on the wire.
+    manifest.vocab_max = None;
+    assert!(
+        !manifest.negotiates_vocab(),
+        "the fixture must be a non-negotiating manifest",
+    );
+    write_frame(&mut pwr, &PluginMsg::Register { manifest })
+        .await
+        .expect("send Register");
+
+    let first = read_frame::<HostMsg, _>(&mut prd)
+        .await
+        .expect("the host sends a frame");
+    assert!(
+        matches!(first, HostMsg::SlotVisibility { visible: true }),
+        "a legacy plugin's first frame must be the state it subscribed to, never a Hello — got \
+         {first:?}",
     );
 }

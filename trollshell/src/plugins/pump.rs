@@ -3,13 +3,18 @@
 //! (#288) aggregation fed from `sidebar.rs`. Each `publish_*` writes a
 //! [`super::PluginHandles`] `watch::Sender`; the per-conn tasks in
 //! [`super::session`] subscribe the matching receiver.
+//!
+//! Since #883 this module also owns the **preem animation clock** — the one
+//! timer that advances every shell-side preem renderer and asks the affected
+//! reconcilers to repaint. See [`install_preem_clock`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use hytte::futures_signals::signal::Mutable;
-use hytte::gtk::{self, prelude::*};
+use hytte::gtk::{self, glib, prelude::*};
 use hytte::reactive::registry;
 use hytte::services::calendar::CalendarEvent;
 use hytte::services::mpris::{PlaybackStatus, Player};
@@ -18,7 +23,8 @@ use hytte_plugin_proto::{
     AudioSpectrum, ClockState, MAX_UPCOMING_EVENTS, NowPlaying, UpcomingEvent,
 };
 
-use super::PluginHandles;
+use super::preem_render;
+use super::{PluginHandles, SlotRender};
 
 /// The upcoming-calendar digest window (#484): events starting within the next
 /// 24 h. Paired with the [`MAX_UPCOMING_EVENTS`] cap, this is the "briefing-shaped
@@ -53,6 +59,11 @@ pub(super) fn set_clock(cs: ClockState) {
 /// kit forces alpha opaque on its own (a preem frame is a screen).
 pub(super) fn tint_in_process_surfaces(accent: Option<[u8; 4]>) {
     hytte_preem::set_accent(accent);
+    // The shell's *plugin* preem surfaces (#883) cache their rasterised bytes,
+    // and those were produced under the old ink — drop them so the next mapping
+    // pass re-renders in the new accent. Registry-free, like the call above, so
+    // the same test covers both halves of the re-tint.
+    preem_render::invalidate_cached_frames();
 }
 
 /// Publish the resolved desktop accent to the per-conn accent tasks (#376) and
@@ -67,6 +78,9 @@ pub(super) fn publish_accent(accent: Option<[u8; 4]>) {
             .accent_tx
             .send_replace(accent);
     });
+    // A shell-rendered preem widget has no plugin to wake it: the re-tint only
+    // reaches the screen once its reconciler re-maps the tree (#883).
+    request_preem_repaint();
 }
 
 /// Publish the latest audio spectrum to the per-conn spectrum tasks (#405).
@@ -232,6 +246,106 @@ pub(super) fn to_clock_state(dt: &DateTime<Local>) -> ClockState {
         iso: dt.to_rfc3339(),
         unix: dt.timestamp(),
     }
+}
+
+// ── Preem animation clock (#883) ─────────────────────────────────────────────
+
+/// Install the single GTK-thread timer that animates every shell-side preem
+/// renderer: marquee scroll, phosphor decay, needle physics, flip clocks and
+/// peak-hold fall.
+///
+/// **One clock, not one per widget and not one per monitor.** The renderer
+/// instances are shared across monitors (`preem_render`'s table is keyed by
+/// plugin + tree, not by output), so advancing them from each monitor's
+/// reconcile would run every animation at N× speed. This drives them once with
+/// the *real* elapsed time and then asks the affected reconcilers to re-map.
+///
+/// It idles cheaply. [`preem_render::any_animating`] is a handful of enum
+/// matches, and with no preem widget on screen — the state of every session
+/// until a plugin built on the new SDK dials in — the callback does nothing but
+/// re-stamp its baseline.
+///
+/// ## Visibility gating, and the tradeoff that is *not* gated
+///
+/// The **repaint** is gated on the two visibility signals the host already
+/// keeps: a sidebar region is only re-mapped while some monitor's sidebar is
+/// open (#288's aggregate), and the drawer panel only while a plugin panel is
+/// active. Bar chips have no such signal and are always re-mapped.
+///
+/// The **advance** is deliberately not gated: it is a few floating-point
+/// operations per instance, and skipping it would make a hidden gauge resume
+/// mid-swing rather than settled. What that costs is one 20 Hz timer callback
+/// while an animation is live but off-screen — the CPU-expensive half
+/// (rasterising, and the reconcile pass) is what the gate above actually stops.
+pub(super) fn install_preem_clock() {
+    let last = Cell::new(Instant::now());
+    glib::timeout_add_local(
+        Duration::from_secs_f32(preem_render::ANIM_STEP_SECS),
+        move || {
+            let now = Instant::now();
+            let dt = now.duration_since(last.replace(now)).as_secs_f32();
+            // The `any_animating` probe first, so a session with no animated
+            // preem widget never walks the instance table's mutable half — and
+            // the baseline is re-stamped either way, so the tick that *does*
+            // find work carries one frame's `dt`, not the idle period's.
+            if preem_render::any_animating() && preem_render::advance_all(dt) {
+                request_preem_repaint();
+            }
+            glib::ControlFlow::Continue
+        },
+    );
+}
+
+/// Ask the mount reconcilers to re-map their current trees, which is how an
+/// advanced (or re-tinted) preem renderer reaches the screen.
+///
+/// A render mailbox is a `Mutable<Vec<SlotRender>>` and the regions subscribe to
+/// it, so nudging it re-runs `reconcile_region` over the *same* trees —
+/// `to_ui_node` then rasterises the preem nodes from their advanced instances
+/// while every other node diffs to a no-op. That is the same work a plugin
+/// pushing 20 frames a second already costs today, minus the socket traffic, and
+/// it only happens while something is actually animating.
+///
+/// Empty mailboxes are skipped, and so are the ones nobody can see (see
+/// [`install_preem_clock`]).
+fn request_preem_repaint() {
+    let sidebar_visible = slot_visible_mutable().get();
+    registry::with(|r| {
+        let handles = r
+            .get::<PluginHandles>()
+            .expect("plugins::service() not registered");
+        for mailbox in [&handles.bar_left, &handles.bar_center, &handles.bar_right] {
+            request_remap(mailbox);
+        }
+        if sidebar_visible {
+            for mailbox in [
+                &handles.sidebar_lead,
+                &handles.sidebar_top,
+                &handles.sidebar_bottom,
+            ] {
+                request_remap(mailbox);
+            }
+        }
+        if handles.active_panel_id.lock_ref().is_some() {
+            request_remap(&handles.panels);
+        }
+    });
+}
+
+/// Notify a render mailbox's subscribers without changing its contents.
+///
+/// `Mutable`'s write guard only arms its wake-on-drop once something goes
+/// through `DerefMut`, so the deliberately-inert `as_mut_slice` below is what
+/// turns this into a repaint request rather than a silent no-op. The read probe
+/// runs in its own statement so its guard is released before the write lock is
+/// taken (holding both would deadlock the `RwLock`).
+pub(super) fn request_remap(mailbox: &Mutable<Vec<SlotRender>>) {
+    let empty = mailbox.lock_ref().is_empty();
+    if empty {
+        return;
+    }
+    let mut guard = mailbox.lock_mut();
+    let _ = guard.as_mut_slice();
 }
 
 // ── Slot visibility (#288): OR of every monitor's sidebar open flag ───────────

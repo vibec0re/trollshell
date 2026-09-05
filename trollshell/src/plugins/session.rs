@@ -537,6 +537,35 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     let (out_tx, out_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
     let writer = tokio::spawn(writer_task(wr, out_rx));
 
+    // Vocabulary advertisement (#882/#883): the first frame after an accepted
+    // `Register`, and the thing that makes this shell able to *receive*
+    // `Node::Preem` at all — a plugin emits the typed preem vocabulary only
+    // above the generation the host advertised, and rasterises to `Node::Pixels`
+    // otherwise.
+    //
+    // **Sent if and only if `manifest.negotiates_vocab()`.** This gate is the
+    // whole reason `vocab_max` exists as a separate, `Option` field: a plugin
+    // can only set it if it was built against the proto that also carries
+    // `HostMsg::Hello`, so gating on its presence means a pre-#882 binary never
+    // meets a frame its `rmp-serde` cannot decode. Sending `Hello`
+    // unconditionally is not a cosmetic slip — it is the #437 crash-loop on
+    // every deployed plugin at once: decode failure → session close →
+    // `Restart=on-failure` redial → the host re-sends it.
+    if manifest.negotiates_vocab() {
+        let negotiated = manifest.negotiated_vocab(VOCAB);
+        // `try_send` on a fresh, empty queue: this cannot be full, and a
+        // connection that died between the handshake and here is about to be
+        // reaped by the reader anyway.
+        let _ = out_tx.try_send(HostMsg::Hello { vocab: VOCAB });
+        tracing::debug!(
+            plugin = %plugin_id,
+            host_vocab = VOCAB,
+            plugin_vocab_max = ?manifest.vocab_max,
+            negotiated,
+            "advertised the host wire vocabulary",
+        );
+    }
+
     // Datasource providers (#509): register each datasource this connection serves
     // so the effect broker can route a matching `Effect::DatasourceQuery` (from any
     // requester) to THIS connection's outbound. Gated on BOTH a non-empty `provides`

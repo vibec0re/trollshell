@@ -148,6 +148,7 @@ use tokio::sync::{mpsc, watch};
 mod datasource;
 mod effects;
 mod listener;
+mod preem_render;
 mod pump;
 mod region;
 mod session;
@@ -610,6 +611,13 @@ pub fn install() {
     style_manager.connect_dark_notify(|_| {
         pump::publish_accent(pump::resolve_accent_color());
     });
+
+    // Preem animation clock (#883): the single timer that advances every
+    // shell-side preem renderer (marquee scroll, phosphor decay, needle
+    // physics, flip clocks, peak-hold fall) and asks the affected reconcilers to
+    // re-map. Installed unconditionally — it idles to a couple of enum matches
+    // per tick while no preem widget is on screen.
+    pump::install_preem_clock();
 
     // Audio spectrum pump (#405): project the live `pipewire::audio_spectrum()`
     // (a services `AudioSpectrum`, or `None` while the tap is inactive) onto the

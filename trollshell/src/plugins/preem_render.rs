@@ -1,0 +1,1010 @@
+//! Shell-side preem renderers (#883): the typed [`Node::Preem`](hytte_plugin_proto::wire::Node::Preem)
+//! widgets #882 put on the wire, rasterised **in this process** with
+//! `hytte-preem` — the same kit the Stats drawer's per-core LED panel already
+//! draws with (#857), into the same [`UiNode::Pixels`]/`PixelSurface` machinery
+//! the legacy `Node::Pixels` arm feeds.
+//!
+//! # What this module owns
+//!
+//! Everything the vocabulary deliberately left off the wire. A
+//! [`vocab::PreemWidget`] carries a **config** (rebuild on change) and a
+//! **state** (animate toward the target); it carries no phosphor buffer, no
+//! needle position, no flip clock, no scroll offset and no held peak. Those
+//! live here, in a per-node renderer instance, advanced by one animation clock
+//! (`pump::install_preem_clock`) rather than by every plugin ticking its own
+//! rasterisation over the socket. That is what makes the traffic go quiet: a
+//! marquee scrolling a track title sends one frame when the title changes, not
+//! twenty a second.
+//!
+//! # Instance lifecycle
+//!
+//! Instances live in a GTK-thread-local table keyed by **[`Scope`] + node key**,
+//! and follow the rule the reconciler already uses for widgets:
+//!
+//! - same key, same widget **kind**, same **config** → *update* the existing
+//!   instance's state (the animation continues from where it is);
+//! - a **config** change or a **kind** change → *rebuild* the instance (a new
+//!   scope clears its phosphor, a new gauge rests its needle, a new board
+//!   blanks its cells — exactly what the vocabulary's per-config docs promise);
+//! - a node that stops appearing in the tree → dropped at the end of the
+//!   mapping pass ([`end_pass`]); a whole plugin card leaving → [`forget_scope`].
+//!
+//! ## Why a scope, and what the node key is
+//!
+//! Node ids are namespaced *per plugin*, and a plugin renders two independent
+//! trees (its chip/card and its drawer panel). A bare node id is therefore not
+//! a unique key: two plugins both calling a gauge `"cpu"` would otherwise share
+//! one needle. [`Scope`] is that namespace — the plugin id plus the tree role —
+//! and it is also the unit [`forget_scope`] drops on teardown.
+//!
+//! Within a scope the key is the node's `id` when it has one. A node **without**
+//! an id is keyed by its **ordinal** among the preem nodes of that tree, in
+//! traversal order (the tradeoff React's index keys make): stable while the
+//! tree's preem nodes keep their order, and migrating state between them if the
+//! plugin reorders. Giving an animated widget an id (`preem_id`) is the fix, and
+//! is what the SDK emits.
+//!
+//! ## Idempotence — the multi-monitor requirement
+//!
+//! `to_ui_node` runs **once per monitor** on every render frame (each monitor
+//! has its own region container and reconciler), and again for the drawer
+//! panel. So applying a widget must be idempotent: state is applied only when
+//! the incoming widget differs from the one last applied to that instance.
+//! Without that, a two-monitor session would stamp every scope sample batch
+//! twice and decay its phosphor twice per frame. The rasterised frame is cached
+//! for the same reason — the second monitor's mapping pass re-uses the bytes the
+//! first one produced.
+//!
+//! (The equality that gates this is `PreemWidget`'s derived `PartialEq`, so a
+//! widget carrying a `NaN` reading compares unequal to itself and is re-applied
+//! every pass. Harmless for every widget whose apply is a plain assignment; for
+//! a scope it costs one extra stamp per extra monitor. The kit reads `NaN`
+//! samples as `0.0`, so the picture is unaffected either way.)
+//!
+//! # Clamping
+//!
+//! Every widget reaching this module has already been through
+//! [`PreemWidget::clamp_in_place`](vocab::PreemWidget::clamp_in_place) in
+//! `wire_map`'s Preem arm. That is the wire contract (#895): a ~40-byte config
+//! must never become a multi-GB allocation or a multi-million-segment render.
+//! **Nothing here may re-derive geometry from an unclamped value.**
+//!
+//! # Styles and accents — #885 is not here
+//!
+//! [`vocab::StyleRef`] is resolved to the kit's `DisplayStyle` **by name**, the
+//! same linear scan over `DisplayStyle::ALL` the Stats panel's config parser
+//! uses. Its semantic [`vocab::AccentRole`] is *not* resolved per widget: the
+//! kit exposes one process-global accent (`hytte_preem::set_accent`), which the
+//! shell already drives from `@accent_color` (#862,
+//! `pump::tint_in_process_surfaces`) — so an in-process preem surface is
+//! accent-tinted today, uniformly, exactly as the Stats panel's is. Per-role
+//! resolution (`Success`/`Warning`/`Error`, and `Neutral`'s opt-out) needs a
+//! per-widget ink the kit does not have; that is **#885**, and it is
+//! deliberately out of scope here. The role is carried through the
+//! config-equality check, so a plugin changing it rebuilds the instance and will
+//! pick up #885's resolution the day it lands without touching this file's
+//! lifecycle.
+
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use hytte::ui::Node as UiNode;
+use hytte_plugin_proto::preem as vocab;
+use hytte_preem as kit;
+
+/// The cadence the animation clock runs at, in seconds — and, for the two kit
+/// primitives that step **per call** rather than per elapsed second
+/// (`Scope::advance` and `PeakHold::decay`), the wall-clock length of one of
+/// their steps.
+///
+/// 20 Hz is not arbitrary: it is the rate the kit's own consumers already
+/// animate at (`hytte-plugin-audio-widget`'s `TICK`), and the rate
+/// [`vocab::MarqueeConfig::speed_dots_per_sec`]'s default of `20.0` was derived
+/// from. Anchoring the step-based widgets to elapsed time rather than to timer
+/// callbacks keeps a phosphor trail's fade the same length whether the clock
+/// fired on time or late.
+pub(super) const ANIM_STEP_SECS: f32 = 1.0 / 20.0;
+
+/// Most steps one [`advance_all`] call issues to a step-based widget.
+///
+/// A tick arriving after a long stall (a resume from suspend, or a blocked GTK
+/// thread) carries a `dt` worth hundreds of steps; replaying them all would burn
+/// the stall's length in phosphor decays for no visible benefit. Clamping
+/// catches the trail up to "fully faded" and moves on.
+pub(super) const MAX_CATCHUP_STEPS: u32 = 8;
+
+/// Idle animation steps after which a [`Scope`](vocab::PreemWidget::Scope) with
+/// no new samples stops asking for repaints.
+///
+/// The kit's decay is `(v * retained) >> 8` per step, which reaches zero from a
+/// full-intensity `255` in ~17 steps at the default persistence of `184`, and
+/// faster at lower ones. 64 leaves a wide margin for a persistence just under
+/// the never-fades ceiling while still parking the clock inside a few seconds.
+const SCOPE_SETTLE_STEPS: u32 = 64;
+
+/// Latch for the "this shell can't render that preem widget" warning, so a
+/// plugin that keeps re-rendering an unsupported widget logs once per session
+/// instead of once per node per frame (the #895 pattern — at 20 Hz with eight
+/// nodes that would be 160 identical journal lines a second).
+static UNSUPPORTED_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// The namespace a plugin's preem nodes live in: its id plus which of its two
+/// trees the node came from. See the module docs on why a bare node id is not a
+/// key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct Scope(String);
+
+impl Scope {
+    /// The scope of `plugin_id`'s chip/card tree (the one a mount region
+    /// reconciles). `\u{1}` separates the two halves because it cannot occur in
+    /// a plugin id (`Manifest::id` is a unit-name-shaped string) and so can't be
+    /// spoofed into a collision with the panel scope.
+    pub(super) fn card(plugin_id: &str) -> Self {
+        Self(format!("{plugin_id}\u{1}card"))
+    }
+
+    /// The scope of `plugin_id`'s drawer panel tree (#349 PR2).
+    pub(super) fn panel(plugin_id: &str) -> Self {
+        Self(format!("{plugin_id}\u{1}panel"))
+    }
+
+    /// A scope for a tree with no plugin behind it — what the unit tests hand
+    /// the mapping when the preem instances are beside the point. Test-only
+    /// because every production tree belongs to a plugin: the drawer's blank
+    /// page is the one plugin-less tree, and it is a constant the panel child
+    /// renders straight into the reconciler without mapping at all.
+    #[cfg(test)]
+    pub(super) fn detached(label: &str) -> Self {
+        Self(format!("\u{1}detached\u{1}{label}"))
+    }
+}
+
+// ── the per-node renderer instances ──────────────────────────────────────────
+
+/// A stepping accumulator for the two kit primitives that advance **per call**
+/// with no `dt` of their own. Converts elapsed seconds into whole
+/// [`ANIM_STEP_SECS`] steps, carrying the remainder so a jittery timer doesn't
+/// drift.
+#[derive(Debug, Default)]
+struct Steps {
+    carry: f32,
+}
+
+impl Steps {
+    /// Whole steps owed for `dt` seconds, capped at [`MAX_CATCHUP_STEPS`]; the
+    /// sub-step remainder is carried to the next call. A non-finite or
+    /// non-positive `dt` owes nothing and leaves the carry alone. A `dt` past
+    /// the cap drops its surplus rather than banking it — otherwise one stall
+    /// would keep the widget catching up for as long as the stall lasted.
+    fn owed(&mut self, dt: f32) -> u32 {
+        if !dt.is_finite() || dt <= 0.0 {
+            return 0;
+        }
+        self.carry += dt;
+        let mut steps = 0;
+        while self.carry >= ANIM_STEP_SECS && steps < MAX_CATCHUP_STEPS {
+            self.carry -= ANIM_STEP_SECS;
+            steps += 1;
+        }
+        if self.carry >= ANIM_STEP_SECS {
+            self.carry = 0.0;
+        }
+        steps
+    }
+}
+
+/// One live preem widget's shell-side renderer: the kit objects plus the
+/// animation state the wire deliberately doesn't carry.
+#[derive(Debug)]
+enum Renderer {
+    /// Pure — no instance state; re-rendered from the text on change.
+    DotMatrix {
+        text: String,
+    },
+    /// Pure.
+    SevenSeg {
+        text: String,
+    },
+    /// Pure, but the builder is worth keeping: it *is* the config, pre-parsed
+    /// (and, uniquely in the kit, with the skin's palette already baked in — see
+    /// [`invalidate_cached_frames`]).
+    TextBox {
+        boxed: kit::TextBox,
+        text: String,
+    },
+    LedStrip {
+        strip: kit::LedStrip,
+        level: f32,
+        /// The plugin's own inter-frame peak, when it computes one. Wins for the
+        /// render it arrives on and never disturbs `hold`.
+        explicit_peak: Option<f32>,
+        /// Shell-owned peak-hold, present iff the config declared one.
+        hold: Option<kit::PeakHold>,
+        /// The declared fall rate, kept because the kit exposes no accessor for
+        /// it and [`Renderer::animates`] must know whether the dot can still
+        /// move: a `PeakHold` at rate `0.0` holds forever and must not keep the
+        /// animation clock awake.
+        hold_rate: f32,
+        steps: Steps,
+    },
+    Marquee {
+        strip: kit::MarqueeStrip,
+        text: String,
+        /// Scroll position in **dots**, fractional so a slow speed still moves.
+        offset: f32,
+        speed_dots_per_sec: f32,
+    },
+    Scope {
+        scope: kit::Scope,
+        /// The newest sample batch, stamped by the next animation step rather
+        /// than at apply time — one decay + stamp per step is the kit's model,
+        /// and it keeps a two-monitor mapping pass from double-stamping.
+        pending: Option<Vec<f32>>,
+        /// Steps since the last batch, so a fully-faded trail stops asking for
+        /// repaints. Saturates.
+        idle: u32,
+        /// `256` never fades, so a scope at that persistence is static once its
+        /// pending batch is stamped.
+        fades: bool,
+        steps: Steps,
+    },
+    Gauge {
+        gauge: kit::Gauge,
+    },
+    FlipBoard {
+        board: kit::FlipBoard,
+    },
+}
+
+/// A node's renderer plus the widget it was last built/updated from.
+#[derive(Debug)]
+struct Instance {
+    /// The exact (already clamped) widget last applied. The equality check
+    /// against this is what makes a mapping pass idempotent across monitors, and
+    /// what distinguishes "config changed → rebuild" from "state changed →
+    /// animate".
+    applied: vocab::PreemWidget,
+    /// `None` for a widget kind this build cannot render — see [`build`].
+    renderer: Option<Renderer>,
+    /// The last rasterised frame, re-used until something invalidates it.
+    cached: Option<(u32, u32, Vec<u8>)>,
+    /// How many times the renderer has been *built* (1 on first sight, +1 per
+    /// config/kind change) and how many times a widget has been *applied* to it
+    /// (a build or a state update; a no-op re-map doesn't count).
+    ///
+    /// Bookkeeping for the lifecycle tests: "updated in place" versus "rebuilt"
+    /// is the whole contract of this module, and asserting it through rendered
+    /// pixels would only prove that *something* differs. Two `u32`s per live
+    /// preem node is not a cost worth `cfg`-ing away.
+    builds: u32,
+    applies: u32,
+}
+
+/// One plugin tree's instances, plus the bookkeeping of a mapping pass.
+#[derive(Debug, Default)]
+struct ScopeState {
+    instances: HashMap<String, Instance>,
+    /// Keys the in-flight mapping pass has touched; anything else is dropped
+    /// when the pass ends.
+    touched: HashSet<String>,
+    /// Ordinal of the next un-id'd preem node in the in-flight pass.
+    ordinal: usize,
+}
+
+thread_local! {
+    /// GTK-main-thread-only renderer table. `to_ui_node` runs on the GTK thread
+    /// (from `region.rs`'s reconcile and the drawer panel child) and so does the
+    /// animation clock, so this never crosses a thread — the same discipline as
+    /// `pump`'s slot-visibility map.
+    static STORE: RefCell<HashMap<Scope, ScopeState>> = RefCell::new(HashMap::new());
+}
+
+// ── mapping-pass API (called from `wire_map`) ────────────────────────────────
+
+/// Open a mapping pass for `scope`: reset the un-id'd ordinal counter and the
+/// touched set. Paired with [`end_pass`].
+pub(super) fn begin_pass(scope: &Scope) {
+    STORE.with_borrow_mut(|store| {
+        if let Some(state) = store.get_mut(scope) {
+            state.touched.clear();
+            state.ordinal = 0;
+        }
+    });
+}
+
+/// Close a mapping pass for `scope`, dropping every instance the pass did not
+/// touch — a preem node the plugin stopped rendering releases its phosphor
+/// buffer / needle / board here rather than leaking for the session.
+pub(super) fn end_pass(scope: &Scope) {
+    STORE.with_borrow_mut(|store| {
+        let Some(state) = store.get_mut(scope) else {
+            return;
+        };
+        let ScopeState {
+            instances, touched, ..
+        } = state;
+        instances.retain(|key, _| touched.contains(key));
+        touched.clear();
+        if state.instances.is_empty() {
+            store.remove(scope);
+        }
+    });
+}
+
+/// Drop every instance in `scope` — a plugin's card leaving its region, or its
+/// panel going away. Idempotent.
+pub(super) fn forget_scope(scope: &Scope) {
+    STORE.with_borrow_mut(|store| {
+        store.remove(scope);
+    });
+}
+
+/// Materialize one **already clamped** [`vocab::PreemWidget`] as the
+/// [`UiNode::Pixels`] the reconciler blits into a `PixelSurface`.
+///
+/// Creates the renderer instance on first sight, updates it in place when only
+/// the state moved, and rebuilds it when the config or the kind changed. A
+/// widget kind this build cannot render degrades to a nothing-rendered surface
+/// with a latched warning — `id` and `classes` are kept either way, so CSS
+/// chrome stays and a later valid frame updates the same surface in place (the
+/// posture the malformed-`Pixels` seam takes).
+pub(super) fn map_widget(
+    scope: &Scope,
+    id: Option<&str>,
+    classes: &[String],
+    widget: &vocab::PreemWidget,
+) -> UiNode {
+    let (width, height, data, supported) = STORE.with_borrow_mut(|store| {
+        let state = store.entry(scope.clone()).or_default();
+        let key = if let Some(id) = id {
+            format!("id\u{1}{id}")
+        } else {
+            let ordinal = state.ordinal;
+            state.ordinal += 1;
+            format!("#{ordinal}")
+        };
+        state.touched.insert(key.clone());
+        let instance = state.instances.entry(key).or_insert_with(|| Instance {
+            applied: widget.clone(),
+            // No renderer yet: `apply` sees `None` and builds, which is also
+            // what keeps the freshly-inserted `applied` above from short-
+            // circuiting the very first apply.
+            renderer: None,
+            cached: None,
+            builds: 0,
+            applies: 0,
+        });
+        apply(instance, widget);
+        let supported = instance.renderer.is_some();
+        let (width, height, data) = instance.frame();
+        (width, height, data, supported)
+    });
+
+    if !supported && !UNSUPPORTED_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            node = ?id,
+            kind = widget.kind(),
+            "this shell cannot render that preem widget kind; rendering nothing \
+             (further occurrences are silenced)",
+        );
+    }
+
+    UiNode::Pixels {
+        id: id.map(str::to_owned),
+        width,
+        height,
+        data,
+        // The kit bakes its own upscale into the buffer (`Frame::upscale`, and
+        // every widget's `scale` knob), so the host must not scale again —
+        // exactly what `Frame::into_node` hard-codes for the plugin-side path.
+        scale: 1,
+        classes: classes.to_vec(),
+    }
+}
+
+/// Bring `instance` in line with `widget`: rebuild on a kind/config change,
+/// update state otherwise, and no-op when nothing moved (the multi-monitor
+/// case).
+fn apply(instance: &mut Instance, widget: &vocab::PreemWidget) {
+    if instance.renderer.is_some() && instance.applied == *widget {
+        return;
+    }
+    let rebuild = instance
+        .renderer
+        .as_ref()
+        .is_none_or(|renderer| !renderer.matches_kind(widget))
+        || !same_config(&instance.applied, widget);
+    if rebuild {
+        instance.renderer = build(widget);
+        instance.builds = instance.builds.saturating_add(1);
+    } else if let Some(renderer) = instance.renderer.as_mut() {
+        renderer.update(widget);
+    }
+    instance.applies = instance.applies.saturating_add(1);
+    instance.applied = widget.clone();
+    instance.cached = None;
+}
+
+impl Instance {
+    /// The instance's current frame as `(width, height, RGBA8)`, rasterising it
+    /// only when the cache is cold. `(0, 0, empty)` is the unsupported-widget
+    /// placeholder.
+    fn frame(&mut self) -> (u32, u32, Vec<u8>) {
+        if let Some(cached) = self.cached.as_ref() {
+            return cached.clone();
+        }
+        let style = display_style(self.applied.style());
+        let rendered = self.renderer.as_ref().map_or_else(
+            || (0, 0, Vec::new()),
+            |renderer| {
+                let frame = renderer.render(style);
+                (
+                    u32::try_from(frame.width()).unwrap_or(0),
+                    u32::try_from(frame.height()).unwrap_or(0),
+                    frame.data().to_vec(),
+                )
+            },
+        );
+        self.cached = Some(rendered.clone());
+        rendered
+    }
+}
+
+// ── the animation clock's half ───────────────────────────────────────────────
+
+/// Advance every live renderer by `dt` seconds, returning `true` if any of them
+/// changed and so needs a repaint.
+///
+/// Called once per animation tick from `pump::install_preem_clock`, **not** per
+/// monitor: the instance table is shared across monitors, so advancing it from
+/// each monitor's reconcile would run every animation at N× speed.
+pub(super) fn advance_all(dt: f32) -> bool {
+    STORE.with_borrow_mut(|store| {
+        let mut moved = false;
+        for state in store.values_mut() {
+            for instance in state.instances.values_mut() {
+                if let Some(renderer) = instance.renderer.as_mut()
+                    && renderer.advance(dt)
+                {
+                    instance.cached = None;
+                    moved = true;
+                }
+            }
+        }
+        moved
+    })
+}
+
+/// Whether any live renderer still has something to animate — the cheap
+/// early-out that lets the animation clock stay a no-op while every preem widget
+/// on screen is static (or there are none at all).
+pub(super) fn any_animating() -> bool {
+    STORE.with_borrow(|store| {
+        store.values().any(|state| {
+            state
+                .instances
+                .values()
+                .any(|instance| instance.renderer.as_ref().is_some_and(Renderer::animates))
+        })
+    })
+}
+
+/// Drop every cached frame, so the next mapping pass re-rasterises.
+///
+/// The kit reads the desktop accent from a process-global
+/// (`hytte_preem::set_accent`), which the shell re-publishes on every accent /
+/// color-scheme change (#396/#862). A cached frame was rasterised under the
+/// *old* ink, so without this a shell-rendered preem widget would keep the
+/// previous accent until its state next moved.
+///
+/// `TextBox` is the one kit widget that resolves its palette at **construction**
+/// (`TextBox::styled` bakes bg/ink/notdef into the builder) rather than at
+/// render time, so dropping its cached bytes is not enough — its renderer is
+/// rebuilt. That is free: the text box is pure, so a rebuild loses no animation
+/// state. Every other widget takes its `DisplayStyle` per render and re-tints on
+/// the re-rasterise alone.
+pub(super) fn invalidate_cached_frames() {
+    STORE.with_borrow_mut(|store| {
+        for state in store.values_mut() {
+            for instance in state.instances.values_mut() {
+                instance.cached = None;
+                if matches!(instance.renderer, Some(Renderer::TextBox { .. })) {
+                    instance.renderer = build(&instance.applied);
+                }
+            }
+        }
+    });
+}
+
+// ── config / kind identity ───────────────────────────────────────────────────
+
+/// Whether two widgets are the same kind **and** carry the same config — the
+/// "update in place" predicate. A `false` here rebuilds the renderer, which is
+/// what the vocabulary's per-config docs promise.
+fn same_config(a: &vocab::PreemWidget, b: &vocab::PreemWidget) -> bool {
+    use vocab::PreemWidget as W;
+    match (a, b) {
+        (W::DotMatrix { config: x, .. }, W::DotMatrix { config: y, .. }) => x == y,
+        (W::SevenSeg { config: x, .. }, W::SevenSeg { config: y, .. }) => x == y,
+        (W::TextBox { config: x, .. }, W::TextBox { config: y, .. }) => x == y,
+        (W::LedStrip { config: x, .. }, W::LedStrip { config: y, .. }) => x == y,
+        (W::Marquee { config: x, .. }, W::Marquee { config: y, .. }) => x == y,
+        (W::Scope { config: x, .. }, W::Scope { config: y, .. }) => x == y,
+        (W::Gauge { config: x, .. }, W::Gauge { config: y, .. }) => x == y,
+        (W::FlipBoard { config: x, .. }, W::FlipBoard { config: y, .. }) => x == y,
+        // Different kinds: never the same config, always a rebuild.
+        _ => false,
+    }
+}
+
+/// Resolve a wire [`vocab::StyleRef`] to the kit's `DisplayStyle`, **by name**.
+///
+/// Matching on the lowercase word rather than on the enum shape is the idiom the
+/// shell already uses for its own preem config (`panels::stats`'s
+/// `parse_core_leds_style`), and it means the two enums can drift a variant apart
+/// without a compile error here — a wire style this kit build has no counterpart
+/// for falls back to the kit's own default rather than failing the render.
+///
+/// [`vocab::StyleRef::accent`] is intentionally ignored: see the module docs and
+/// **#885**.
+fn display_style(style: vocab::StyleRef) -> kit::DisplayStyle {
+    let name = style.style.name();
+    kit::DisplayStyle::ALL
+        .into_iter()
+        .find(|candidate| candidate.name() == name)
+        // `DisplayStyle` has no `Default`; `ALL` is the kit's canonical rotation
+        // order and its head is `Vfd`, which is also `StyleName`'s own default —
+        // so an unmatched name lands on the skin an omitted one would have.
+        .unwrap_or(kit::DisplayStyle::ALL[0])
+}
+
+// ── construction / update / advance / render ─────────────────────────────────
+
+/// `u32` → `usize` for a value the wire caps well below either type's range.
+fn dim(value: u32) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+/// Build a renderer for `widget`, or `None` for a kind this build cannot draw.
+///
+/// The match is exhaustive over today's vocabulary, so `None` is unreachable as
+/// this file stands — the return type is the seam that keeps it *representable*
+/// (a future `PreemWidget` variant whose kit widget this build predates), which
+/// is what makes the unknown-widget placeholder in [`map_widget`] a real path
+/// rather than dead code to be deleted. The instance is kept either way, so a
+/// plugin that keeps sending it costs one warn, not one per frame.
+// `unnecessary_wraps` is exactly right about today's body and exactly wrong
+// about the contract: the `Option` *is* the placeholder seam, and collapsing it
+// would delete the unknown-widget path #883 is required to keep (and that
+// `an_unrenderable_preem_widget_degrades_to_an_empty_surface` covers).
+#[allow(clippy::unnecessary_wraps)]
+fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
+    use vocab::PreemWidget as W;
+    #[cfg(test)]
+    if force_unsupported() {
+        return None;
+    }
+    let style = display_style(widget.style());
+    Some(match widget {
+        W::DotMatrix { state, .. } => Renderer::DotMatrix {
+            text: state.text.clone(),
+        },
+        W::SevenSeg { state, .. } => Renderer::SevenSeg {
+            text: state.text.clone(),
+        },
+        W::TextBox { config, state } => Renderer::TextBox {
+            boxed: text_box(*config, style),
+            text: state.text.clone(),
+        },
+        W::LedStrip { config, state } => {
+            let mut hold = config.peak_hold.map(|p| kit::PeakHold::new(p.rate));
+            if let Some(hold) = hold.as_mut() {
+                hold.push(state.level);
+            }
+            Renderer::LedStrip {
+                strip: kit::LedStrip::new(style).leds(dim(config.leds)),
+                level: state.level,
+                explicit_peak: state.peak,
+                hold,
+                hold_rate: config.peak_hold.map_or(0.0, |p| p.rate),
+                steps: Steps::default(),
+            }
+        }
+        W::Marquee { config, state } => Renderer::Marquee {
+            strip: marquee_strip(*config, style, &state.text),
+            text: state.text.clone(),
+            offset: 0.0,
+            speed_dots_per_sec: config.speed_dots_per_sec,
+        },
+        W::Scope { config, state } => {
+            let mut scope = kit::Scope::with_size(dim(config.cols), dim(config.rows))
+                .scale(dim(config.scale))
+                .persistence(config.persistence);
+            // The debut batch is stamped now rather than queued, so the first
+            // frame a plugin sends is on screen before the clock's first tick.
+            scope.advance(&state.samples);
+            Renderer::Scope {
+                scope,
+                pending: None,
+                idle: 0,
+                fades: config.persistence < 256,
+                steps: Steps::default(),
+            }
+        }
+        W::Gauge { config, state } => {
+            let mut gauge = kit::Gauge::with_size(dim(config.cols), dim(config.rows))
+                .scale(dim(config.scale))
+                .sweep_deg(config.sweep_deg)
+                .ticks(dim(config.divisions), dim(config.subdivisions))
+                // `range` before `set_target`: the kit normalizes a target
+                // against the range in force when it is set.
+                .range(config.range.low, config.range.high)
+                .frequency(config.frequency_hz)
+                .damping(config.damping);
+            gauge.set_target(state.target);
+            Renderer::Gauge { gauge }
+        }
+        W::FlipBoard { config, state } => {
+            let mut board = flip_board(*config, style);
+            board.set_text(&state.text);
+            Renderer::FlipBoard { board }
+        }
+    })
+}
+
+/// The kit `TextBox` a [`vocab::TextBoxConfig`] describes. Split out so the
+/// parity tests can build the *same* box the renderer does without re-stating
+/// the builder chain (a duplicated chain is an oracle that agrees with the code
+/// by construction, which is no oracle at all).
+fn text_box(config: vocab::TextBoxConfig, style: kit::DisplayStyle) -> kit::TextBox {
+    let boxed = kit::TextBox::styled(style);
+    let boxed = match config.width {
+        vocab::TextBoxWidth::Cols(cols) => boxed.cols(dim(cols)),
+        vocab::TextBoxWidth::FitPx(px) => boxed.fit_px(dim(px)),
+    };
+    boxed
+        .max_lines(dim(config.max_lines))
+        .pad(dim(config.pad))
+        .corner(dim(config.corner))
+        .scale(dim(config.scale))
+        .fixed_width(config.fixed_width)
+}
+
+/// The kit `MarqueeStrip` a [`vocab::MarqueeConfig`] + message describe.
+fn marquee_strip(
+    config: vocab::MarqueeConfig,
+    style: kit::DisplayStyle,
+    text: &str,
+) -> kit::MarqueeStrip {
+    kit::Marquee::new(style)
+        .window_px(dim(config.window_px))
+        .gap_dots(dim(config.gap_dots))
+        .render(text)
+}
+
+/// The kit `FlipBoard` a [`vocab::FlipBoardConfig`] describes, blank.
+fn flip_board(config: vocab::FlipBoardConfig, style: kit::DisplayStyle) -> kit::FlipBoard {
+    let _ = style; // the board takes its skin at render time, not construction
+    let mechanism = match config.mechanism {
+        vocab::Mechanism::SplitFlap => kit::Mechanism::SplitFlap,
+        vocab::Mechanism::Nixie => kit::Mechanism::Nixie,
+    };
+    let mut board = kit::FlipBoard::new(mechanism)
+        // `cells` rebuilds the row blank, so it must precede the text.
+        .cells(dim(config.cells))
+        .glyph_px(dim(config.glyph_px))
+        .scale(dim(config.scale));
+    if let Some(secs) = config.duration_secs {
+        board = board.duration_secs(secs);
+    }
+    if let Some(secs) = config.stagger_secs {
+        board = board.stagger_secs(secs);
+    }
+    board
+}
+
+impl Renderer {
+    /// Whether this renderer was built for `widget`'s kind. A mismatch means the
+    /// plugin swapped one widget for another under the same node key, which
+    /// rebuilds.
+    fn matches_kind(&self, widget: &vocab::PreemWidget) -> bool {
+        use vocab::PreemWidget as W;
+        matches!(
+            (self, widget),
+            (Self::DotMatrix { .. }, W::DotMatrix { .. })
+                | (Self::SevenSeg { .. }, W::SevenSeg { .. })
+                | (Self::TextBox { .. }, W::TextBox { .. })
+                | (Self::LedStrip { .. }, W::LedStrip { .. })
+                | (Self::Marquee { .. }, W::Marquee { .. })
+                | (Self::Scope { .. }, W::Scope { .. })
+                | (Self::Gauge { .. }, W::Gauge { .. })
+                | (Self::FlipBoard { .. }, W::FlipBoard { .. })
+        )
+    }
+
+    /// Point the renderer at `widget`'s new **state**, keeping the animation it
+    /// is already running. Only ever called after [`same_config`] agreed, so the
+    /// config half of `widget` is the one this renderer was built from.
+    fn update(&mut self, widget: &vocab::PreemWidget) {
+        use vocab::PreemWidget as W;
+        match (self, widget) {
+            (Self::DotMatrix { text }, W::DotMatrix { state, .. }) => {
+                text.clone_from(&state.text);
+            }
+            (Self::SevenSeg { text }, W::SevenSeg { state, .. }) => text.clone_from(&state.text),
+            (Self::TextBox { text, .. }, W::TextBox { state, .. }) => text.clone_from(&state.text),
+            (
+                Self::LedStrip {
+                    level,
+                    explicit_peak,
+                    hold,
+                    ..
+                },
+                W::LedStrip { state, .. },
+            ) => {
+                *level = state.level;
+                // The explicit peak wins for the render it arrives on but never
+                // disturbs the held value — the vocabulary says so in as many
+                // words, so it is deliberately not pushed into `hold`.
+                *explicit_peak = state.peak;
+                if let Some(hold) = hold.as_mut() {
+                    hold.push(state.level);
+                }
+            }
+            (Self::Marquee { strip, text, .. }, W::Marquee { config, state }) => {
+                if *text != state.text {
+                    // A new message re-rasterises the strip; the offset is
+                    // deliberately *not* reset, so a ticker whose text changes
+                    // mid-scroll keeps moving instead of snapping left.
+                    // `window` wraps modulo the new period.
+                    *strip = marquee_strip(*config, display_style(config.style), &state.text);
+                    text.clone_from(&state.text);
+                }
+            }
+            (Self::Scope { pending, idle, .. }, W::Scope { state, .. }) => {
+                *pending = Some(state.samples.clone());
+                *idle = 0;
+            }
+            (Self::Gauge { gauge }, W::Gauge { state, .. }) => gauge.set_target(state.target),
+            (Self::FlipBoard { board }, W::FlipBoard { state, .. }) => board.set_text(&state.text),
+            // Unreachable: `apply` rebuilds on a kind mismatch rather than
+            // calling this. Dropping the update is the harmless outcome if that
+            // ever stops being true.
+            _ => {}
+        }
+    }
+
+    /// Advance the shell-owned animation by `dt` seconds, returning `true` if
+    /// anything moved (so the frame cache must be dropped and a repaint asked
+    /// for).
+    ///
+    /// The two kit primitives that step per *call* rather than per elapsed
+    /// second — `Scope::advance` and `PeakHold::decay` — are driven through a
+    /// [`Steps`] accumulator so their cadence is anchored to wall-clock time.
+    /// The rest take `dt` straight: the needle's spring and the flip board's
+    /// clock are closed-form and frame-rate independent by construction, and the
+    /// marquee's speed is stated in dots *per second*.
+    fn advance(&mut self, dt: f32) -> bool {
+        match self {
+            Self::DotMatrix { .. } | Self::SevenSeg { .. } | Self::TextBox { .. } => false,
+            Self::LedStrip { hold, steps, .. } => {
+                let owed = steps.owed(dt);
+                let Some(hold) = hold.as_mut() else {
+                    return false;
+                };
+                let before = hold.value();
+                for _ in 0..owed {
+                    hold.decay();
+                }
+                changed(before, hold.value())
+            }
+            Self::Marquee {
+                strip,
+                offset,
+                speed_dots_per_sec,
+                ..
+            } => {
+                let period = strip.period();
+                // A message short enough to sit still, or a parked speed — the
+                // vocabulary's documented "`0.0` or non-finite parks".
+                if period == 0 || !speed_dots_per_sec.is_finite() || *speed_dots_per_sec == 0.0 {
+                    return false;
+                }
+                if !dt.is_finite() || dt <= 0.0 {
+                    return false;
+                }
+                let before = dots(*offset, period);
+                #[allow(clippy::cast_precision_loss)]
+                let modulus = period as f32;
+                // `rem_euclid` so a negative speed (the wire permits one: the
+                // cap is on magnitude) scrolls the other way instead of
+                // saturating an unsigned offset at zero.
+                *offset = (*offset + *speed_dots_per_sec * dt).rem_euclid(modulus);
+                before != dots(*offset, period)
+            }
+            Self::Scope {
+                scope,
+                pending,
+                idle,
+                fades,
+                steps,
+            } => {
+                let owed = steps.owed(dt);
+                let mut moved = false;
+                for _ in 0..owed {
+                    let batch = pending.take();
+                    // Nothing pending and nothing left to fade: stop, so a
+                    // settled trace doesn't keep the clock (and the reconcilers)
+                    // awake.
+                    if batch.is_none() && (!*fades || *idle >= SCOPE_SETTLE_STEPS) {
+                        break;
+                    }
+                    // An empty batch flatlines on the axis while the existing
+                    // trail keeps decaying — the kit's documented behaviour, and
+                    // what lets a plugin with nothing to say simply stop.
+                    scope.advance(batch.as_deref().unwrap_or(&[]));
+                    *idle = if batch.is_some() {
+                        0
+                    } else {
+                        idle.saturating_add(1)
+                    };
+                    moved = true;
+                }
+                moved
+            }
+            Self::Gauge { gauge } => {
+                if gauge.is_settled() {
+                    return false;
+                }
+                gauge.advance(dt);
+                true
+            }
+            Self::FlipBoard { board } => {
+                if board.is_settled() {
+                    return false;
+                }
+                board.advance(dt);
+                true
+            }
+        }
+    }
+
+    /// Whether this renderer still has animation left to run. Cheap — the
+    /// animation clock calls it every tick to decide whether to do anything at
+    /// all.
+    fn animates(&self) -> bool {
+        match self {
+            Self::DotMatrix { .. } | Self::SevenSeg { .. } | Self::TextBox { .. } => false,
+            // A peak dot only moves while it is above the floor *and* has a
+            // fall rate: the kit clamps a negative or non-finite rate to `0.0`
+            // ("never falls"), which must not keep the clock awake.
+            Self::LedStrip {
+                hold, hold_rate, ..
+            } => {
+                hold_rate.is_finite()
+                    && *hold_rate > 0.0
+                    && hold.as_ref().is_some_and(|hold| hold.value() > 0.0)
+            }
+            Self::Marquee {
+                strip,
+                speed_dots_per_sec,
+                ..
+            } => strip.scrolls() && speed_dots_per_sec.is_finite() && *speed_dots_per_sec != 0.0,
+            Self::Scope {
+                pending,
+                idle,
+                fades,
+                ..
+            } => pending.is_some() || (*fades && *idle < SCOPE_SETTLE_STEPS),
+            Self::Gauge { gauge } => !gauge.is_settled(),
+            Self::FlipBoard { board } => !board.is_settled(),
+        }
+    }
+
+    /// Rasterise the current frame in `style`.
+    fn render(&self, style: kit::DisplayStyle) -> kit::Frame {
+        match self {
+            Self::DotMatrix { text } => kit::dot_matrix(text, style),
+            Self::SevenSeg { text } => kit::seven_seg(text, style),
+            // The box baked its palette at construction, so it takes no style
+            // here — see `invalidate_cached_frames`.
+            Self::TextBox { boxed, text } => boxed.render(text),
+            Self::LedStrip {
+                strip,
+                level,
+                explicit_peak,
+                hold,
+                ..
+            } => strip.render(*level, peak_for(*explicit_peak, hold.as_ref())),
+            Self::Marquee { strip, offset, .. } => strip.window(dots(*offset, strip.period())),
+            Self::Scope { scope, .. } => scope.render(style),
+            Self::Gauge { gauge } => gauge.render(style),
+            Self::FlipBoard { board } => board.render(style),
+        }
+    }
+}
+
+/// The peak-dot position a strip renders with: the plugin's explicit value when
+/// it sent one, else the shell-held peak, else `0.0` (which the kit reads as "no
+/// peak dot").
+fn peak_for(explicit: Option<f32>, hold: Option<&kit::PeakHold>) -> f32 {
+    explicit
+        .or_else(|| hold.map(kit::PeakHold::value))
+        .unwrap_or(0.0)
+}
+
+/// Exact `f32` inequality — "did this value change at all", which is precisely
+/// the question a repaint gate asks. `float_cmp`'s suggested error margin would
+/// be wrong in both directions here: it would swallow a slow decay's last steps
+/// and report a still frame as moved.
+#[allow(clippy::float_cmp)]
+fn changed(before: f32, after: f32) -> bool {
+    before != after
+}
+
+// ── test seams ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`build`] answer `None` for every widget, so the
+    /// unsupported-widget placeholder — structurally unreachable while `build`'s
+    /// match stays exhaustive over the whole vocabulary — is a *tested* path
+    /// rather than a promise. It stands in for what a future `PreemWidget`
+    /// variant this build predates would do. Thread-local, like the store it
+    /// perturbs, so one test flipping it can't reach another.
+    static FORCE_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn force_unsupported() -> bool {
+    FORCE_UNSUPPORTED.get()
+}
+
+/// Run `body` with [`build`] pretending it doesn't know any widget kind.
+#[cfg(test)]
+pub(super) fn with_unsupported_widgets<T>(body: impl FnOnce() -> T) -> T {
+    FORCE_UNSUPPORTED.set(true);
+    let out = body();
+    FORCE_UNSUPPORTED.set(false);
+    out
+}
+
+/// `(builds, applies)` for the instance `id` keys in `scope`, or `None` if there
+/// is no such instance — the lifecycle tests' window onto "updated in place"
+/// versus "rebuilt". `id: None` probes the first un-id'd preem node's ordinal
+/// slot.
+#[cfg(test)]
+pub(super) fn probe(scope: &Scope, id: Option<&str>) -> Option<(u32, u32)> {
+    let key = match id {
+        Some(id) => format!("id\u{1}{id}"),
+        None => "#0".to_owned(),
+    };
+    STORE.with_borrow(|store| {
+        store
+            .get(scope)
+            .and_then(|state| state.instances.get(&key))
+            .map(|instance| (instance.builds, instance.applies))
+    })
+}
+
+/// How many renderer instances `scope` holds — `0` once the scope itself has
+/// been swept away.
+#[cfg(test)]
+pub(super) fn instance_count(scope: &Scope) -> usize {
+    STORE.with_borrow(|store| store.get(scope).map_or(0, |state| state.instances.len()))
+}
+
+/// A fractional dot offset as the whole-dot index `MarqueeStrip::window` takes.
+/// `period == 0` (a message short enough to sit still) reads as `0`, which the
+/// kit ignores anyway.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn dots(offset: f32, period: usize) -> usize {
+    if period == 0 || !offset.is_finite() || offset <= 0.0 {
+        return 0;
+    }
+    // `offset` is kept in `0.0..period` by `rem_euclid` and `period` is bounded
+    // by the wire's text/gap caps, so the truncating cast is exact and cannot
+    // lose a sign.
+    (offset.floor() as usize) % period
+}

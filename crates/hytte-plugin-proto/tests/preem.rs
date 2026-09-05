@@ -8,7 +8,10 @@
 //!    an equal value, and every config/state struct's `#[serde(default)]`
 //!    container attribute makes a partial map decode to the kit's defaults.
 //! 2. **Wire limits** — [`PreemWidget::clamped`] actually enforces every
-//!    documented cap, including on a char boundary for text.
+//!    documented cap, including on a char boundary for text, and sanitises
+//!    every non-finite float so a clamped widget compares equal to itself
+//!    under the derived `PartialEq` (which is what both ends' render dedup
+//!    rests on — see the `clamp_in_place` docs).
 //! 3. **Encoding stability** — adding [`Node::Preem`] must not have moved any
 //!    *existing* node's bytes. [`existing_node_encodings_are_frozen`] pins two
 //!    of them against hex literals recorded before the variant existed, so an
@@ -18,11 +21,14 @@
 use hytte_plugin_proto::{
     AccentRole, Cls, DotMatrixConfig, DotMatrixState, FlipBoardConfig, FlipBoardState, GaugeConfig,
     GaugeRange, GaugeState, HostMsg, LedStripConfig, LedStripState, MAX_BUFFER_DIM, MAX_CELLS,
-    MAX_GAP_DOTS, MAX_LEDS, MAX_MARQUEE_SPEED_DPS, MAX_RASTER_PIXELS, MAX_SCALE, MAX_SCOPE_SAMPLES,
-    MAX_STRIP_DIM, MAX_TEXT_LEN, Manifest, MarqueeConfig, MarqueeState, Mechanism, Mount, Node,
-    PREEM_VOCAB, PeakHoldConfig, PluginMsg, PreemWidget, ScopeConfig, ScopeState, SevenSegConfig,
-    SevenSegState, StyleName, StyleRef, TextBoxConfig, TextBoxState, TextBoxWidth, VOCAB,
-    VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body, preem, preem_id, preem_styled,
+    MAX_DAMPING, MAX_FLIP_DURATION_SECS, MAX_FLIP_STAGGER_SECS, MAX_FREQUENCY_HZ, MAX_GAP_DOTS,
+    MAX_LEDS, MAX_MARQUEE_SPEED_DPS, MAX_PEAK_HOLD_RATE, MAX_RASTER_PIXELS, MAX_SCALE,
+    MAX_SCOPE_SAMPLES, MAX_STRIP_DIM, MAX_SWEEP_DEG, MAX_TEXT_LEN, MIN_DAMPING,
+    MIN_FLIP_DURATION_SECS, MIN_FREQUENCY_HZ, MIN_SWEEP_DEG, Manifest, MarqueeConfig, MarqueeState,
+    Mechanism, Mount, Node, PREEM_VOCAB, PeakHoldConfig, PluginMsg, PreemWidget, ScopeConfig,
+    ScopeState, SevenSegConfig, SevenSegState, StyleName, StyleRef, TextBoxConfig, TextBoxState,
+    TextBoxWidth, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body, preem,
+    preem_id, preem_styled,
 };
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -1045,6 +1051,556 @@ fn clamping_a_legal_widget_changes_nothing() {
             widget.clone().clamped(),
             widget,
             "{} was mutated by clamped() despite being in range",
+            widget.kind()
+        );
+    }
+}
+
+// ── 2b. non-finite floats ───────────────────────────────────────────────────
+
+/// Every widget kind with **every** `f32` it carries set to `poison`, and every
+/// non-float field left legal — so a failure below can only be about floats.
+///
+/// The three text widgets carry no float at all; they are in the list so the
+/// per-kind loops stay honest about covering all eight rather than quietly
+/// skipping the ones that would be awkward.
+fn widgets_with_every_float_poisoned(poison: f32) -> Vec<PreemWidget> {
+    vec![
+        PreemWidget::DotMatrix {
+            config: DotMatrixConfig::default(),
+            state: DotMatrixState {
+                text: "12:34".into(),
+            },
+        },
+        PreemWidget::SevenSeg {
+            config: SevenSegConfig::default(),
+            state: SevenSegState {
+                text: "88.8".into(),
+            },
+        },
+        PreemWidget::TextBox {
+            config: TextBoxConfig::default(),
+            state: TextBoxState {
+                text: "no floats here".into(),
+            },
+        },
+        PreemWidget::LedStrip {
+            config: LedStripConfig {
+                peak_hold: Some(PeakHoldConfig { rate: poison }),
+                ..LedStripConfig::default()
+            },
+            state: LedStripState {
+                level: poison,
+                peak: Some(poison),
+            },
+        },
+        PreemWidget::Marquee {
+            config: MarqueeConfig {
+                speed_dots_per_sec: poison,
+                ..MarqueeConfig::default()
+            },
+            state: MarqueeState {
+                text: "poisoned".into(),
+            },
+        },
+        PreemWidget::Scope {
+            config: ScopeConfig::default(),
+            state: ScopeState {
+                samples: vec![poison, 0.5, poison, -0.5, poison],
+            },
+        },
+        PreemWidget::Gauge {
+            config: GaugeConfig {
+                sweep_deg: poison,
+                frequency_hz: poison,
+                damping: poison,
+                range: GaugeRange {
+                    low: poison,
+                    high: poison,
+                },
+                ..GaugeConfig::default()
+            },
+            state: GaugeState { target: poison },
+        },
+        PreemWidget::FlipBoard {
+            config: FlipBoardConfig {
+                duration_secs: Some(poison),
+                stagger_secs: Some(poison),
+                ..FlipBoardConfig::default()
+            },
+            state: FlipBoardState {
+                text: "SPANDAU".into(),
+            },
+        },
+    ]
+}
+
+/// Exact float equality by bit pattern — stricter than `==` (which would let a
+/// `-0.0` → `0.0` rewrite pass) and lint-clean, unlike a bare float compare.
+#[track_caller]
+fn assert_bits(got: f32, want: f32, what: &str) {
+    assert_eq!(
+        got.to_bits(),
+        want.to_bits(),
+        "{what}: got {got}, want {want}"
+    );
+}
+
+#[track_caller]
+fn assert_in_range(value: f32, lo: f32, hi: f32, what: &str) {
+    assert!(value.is_finite(), "{what} is not finite: {value}");
+    assert!(
+        value >= lo && value <= hi,
+        "{what} = {value}, want {lo}..={hi}"
+    );
+}
+
+/// Half (a) of the invariant `PreemWidget::clamp_in_place` documents: every
+/// float this widget carries is finite and inside its documented bounds.
+#[track_caller]
+fn assert_every_float_is_sane(widget: &PreemWidget) {
+    match widget {
+        // No floats at all — stated rather than defaulted, so a float added to
+        // one of these later fails here instead of going unchecked.
+        PreemWidget::DotMatrix { .. }
+        | PreemWidget::SevenSeg { .. }
+        | PreemWidget::TextBox { .. } => {}
+        PreemWidget::LedStrip { config, state } => {
+            if let Some(hold) = config.peak_hold {
+                assert_in_range(hold.rate, 0.0, MAX_PEAK_HOLD_RATE, "peak_hold.rate");
+            }
+            assert_in_range(state.level, 0.0, 1.0, "level");
+            if let Some(peak) = state.peak {
+                assert_in_range(peak, 0.0, 1.0, "peak");
+            }
+        }
+        PreemWidget::Marquee { config, .. } => assert_in_range(
+            config.speed_dots_per_sec,
+            -MAX_MARQUEE_SPEED_DPS,
+            MAX_MARQUEE_SPEED_DPS,
+            "speed_dots_per_sec",
+        ),
+        PreemWidget::Scope { state, .. } => {
+            for (i, sample) in state.samples.iter().enumerate() {
+                assert_in_range(*sample, -1.0, 1.0, &format!("samples[{i}]"));
+            }
+        }
+        PreemWidget::Gauge { config, state } => {
+            assert_in_range(config.sweep_deg, MIN_SWEEP_DEG, MAX_SWEEP_DEG, "sweep_deg");
+            assert_in_range(
+                config.frequency_hz,
+                MIN_FREQUENCY_HZ,
+                MAX_FREQUENCY_HZ,
+                "frequency_hz",
+            );
+            assert_in_range(config.damping, MIN_DAMPING, MAX_DAMPING, "damping");
+            let GaugeRange { low, high } = config.range;
+            assert!(low.is_finite() && high.is_finite(), "range {low}..={high}");
+            assert!(high > low, "degenerate range {low}..={high}");
+            assert!(
+                (high - low).is_finite(),
+                "range span overflows: {low}..={high}"
+            );
+            assert_in_range(state.target, low, high, "target");
+        }
+        PreemWidget::FlipBoard { config, .. } => {
+            if let Some(duration) = config.duration_secs {
+                assert_in_range(
+                    duration,
+                    MIN_FLIP_DURATION_SECS,
+                    MAX_FLIP_DURATION_SECS,
+                    "duration_secs",
+                );
+            }
+            if let Some(stagger) = config.stagger_secs {
+                assert_in_range(stagger, 0.0, MAX_FLIP_STAGGER_SECS, "stagger_secs");
+            }
+        }
+    }
+}
+
+/// Every `f32` a widget carries, as bit patterns, in declaration order — for
+/// the identity check below, which wants *exact* comparison rather than `==`.
+fn float_bits(widget: &PreemWidget) -> Vec<u32> {
+    match widget {
+        PreemWidget::DotMatrix { .. }
+        | PreemWidget::SevenSeg { .. }
+        | PreemWidget::TextBox { .. } => Vec::new(),
+        PreemWidget::LedStrip { config, state } => {
+            let mut bits: Vec<u32> = config
+                .peak_hold
+                .iter()
+                .map(|hold| hold.rate.to_bits())
+                .collect();
+            bits.push(state.level.to_bits());
+            bits.extend(state.peak.iter().map(|peak| peak.to_bits()));
+            bits
+        }
+        PreemWidget::Marquee { config, .. } => vec![config.speed_dots_per_sec.to_bits()],
+        PreemWidget::Scope { state, .. } => state.samples.iter().map(|s| s.to_bits()).collect(),
+        PreemWidget::Gauge { config, state } => vec![
+            config.sweep_deg.to_bits(),
+            config.frequency_hz.to_bits(),
+            config.damping.to_bits(),
+            config.range.low.to_bits(),
+            config.range.high.to_bits(),
+            state.target.to_bits(),
+        ],
+        PreemWidget::FlipBoard { config, .. } => config
+            .duration_secs
+            .iter()
+            .chain(config.stagger_secs.iter())
+            .map(|v| v.to_bits())
+            .collect(),
+    }
+}
+
+/// The probe is real: an **unclamped** widget carrying a `NaN` is not equal to
+/// itself, which is exactly the defect the clamp exists to close (a `NaN`
+/// defeats the derived `PartialEq`, so neither end's render dedup ever
+/// short-circuits). Without this, a clamp that silently did nothing could still
+/// pass the equality tests below on a widget that never carried a `NaN`.
+#[test]
+fn an_unclamped_nan_widget_is_not_equal_to_itself() {
+    let float_carrying = ["led-strip", "marquee", "scope", "gauge", "flip-board"];
+    let mut seen = 0;
+    for widget in widgets_with_every_float_poisoned(f32::NAN) {
+        if float_carrying.contains(&widget.kind()) {
+            seen += 1;
+            assert_ne!(
+                widget.clone(),
+                widget,
+                "{} carries no NaN — the poison probe missed a field",
+                widget.kind()
+            );
+        }
+    }
+    assert_eq!(
+        seen,
+        float_carrying.len(),
+        "a float-carrying kind went missing"
+    );
+}
+
+/// Invariant (a): after clamping, every float of every widget kind is finite
+/// and inside its bounds — even when the input carried a `NaN` or an infinity
+/// in *every* float field it has.
+#[test]
+fn poisoned_floats_are_finite_and_in_range_after_clamping() {
+    for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        for widget in widgets_with_every_float_poisoned(poison) {
+            let kind = widget.kind();
+            let clamped = widget.clamped();
+            assert_eq!(kind, clamped.kind(), "clamping changed the variant");
+            assert_every_float_is_sane(&clamped);
+        }
+    }
+}
+
+/// Invariant (b): a clamped widget compares equal to itself, for every kind,
+/// however poisoned the input was. This is the property both ends' render dedup
+/// rests on — the shell's `applied == widget` gate and the SDK's
+/// `view != last_view`.
+#[test]
+fn a_clamped_widget_compares_equal_to_itself() {
+    for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        for widget in widgets_with_every_float_poisoned(poison) {
+            let kind = widget.kind();
+            assert_eq!(
+                widget.clone().clamped(),
+                widget.clamped(),
+                "{kind} does not compare equal to itself after clamping"
+            );
+        }
+    }
+}
+
+/// Clamping is a **fixpoint**: a host that clamps a widget it already clamped
+/// (or an SDK that clamps before the host does) must not see it move, or the
+/// equality gates would fire on the second pass instead of the first.
+#[test]
+fn clamping_is_a_fixpoint_even_on_a_poisoned_widget() {
+    for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        for widget in widgets_with_every_float_poisoned(poison) {
+            let once = widget.clamped();
+            assert_eq!(
+                once.clone().clamped(),
+                once,
+                "{} is not a clamp fixpoint",
+                once.kind()
+            );
+        }
+    }
+}
+
+/// The mapping table on `PreemWidget::clamp_in_place` is contract, so the four
+/// tests below pin every row of it, one widget kind each.
+/// (`speed_dots_per_sec` has its own test above,
+/// `marquee_speed_is_clamped_including_non_finite`, and is the one row that
+/// maps `±inf` to `0.0` rather than to the nearer bound.)
+///
+/// `LedStrip`: level → rest/full/rest, an explicit peak drops to `None`, the
+/// peak-hold rate → never-falls/cap/never-falls.
+#[test]
+fn non_finite_led_strip_readings_map_to_their_documented_replacements() {
+    for (poison, want_level, want_rate) in [
+        (f32::NAN, 0.0_f32, 0.0_f32),
+        (f32::INFINITY, 1.0, MAX_PEAK_HOLD_RATE),
+        (f32::NEG_INFINITY, 0.0, 0.0),
+    ] {
+        let clamped = PreemWidget::LedStrip {
+            config: LedStripConfig {
+                peak_hold: Some(PeakHoldConfig { rate: poison }),
+                ..LedStripConfig::default()
+            },
+            state: LedStripState {
+                level: poison,
+                peak: Some(poison),
+            },
+        }
+        .clamped();
+        let PreemWidget::LedStrip { config, state } = clamped else {
+            panic!("variant changed")
+        };
+        assert_bits(state.level, want_level, "level");
+        assert!(
+            state.peak.is_none(),
+            "a non-finite explicit peak must drop to None, got {:?}",
+            state.peak
+        );
+        assert_bits(
+            config.peak_hold.expect("peak_hold survives").rate,
+            want_rate,
+            "peak_hold.rate",
+        );
+    }
+}
+
+/// `Scope`: each sample independently, `NaN` to the axis and the infinities to
+/// the rails, with the finite ones clamped and untouched respectively.
+#[test]
+fn non_finite_scope_samples_map_to_their_documented_replacements() {
+    let clamped = PreemWidget::Scope {
+        config: ScopeConfig::default(),
+        state: ScopeState {
+            samples: vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 2.0, -2.0, 0.25],
+        },
+    }
+    .clamped();
+    let PreemWidget::Scope { state, .. } = clamped else {
+        panic!("variant changed")
+    };
+    assert_eq!(state.samples.len(), 6, "the batch must not be re-sized");
+    for (got, want) in state
+        .samples
+        .iter()
+        .zip([0.0_f32, 1.0, -1.0, 1.0, -1.0, 0.25])
+    {
+        assert_bits(*got, want, "sample");
+    }
+}
+
+/// `Gauge`: the three spring knobs fall back to their *defaults* on `NaN` and
+/// to the bounds on the infinities; the target follows the sanitised range.
+#[test]
+fn non_finite_gauge_floats_map_to_their_documented_replacements() {
+    for (poison, want_sweep, want_freq, want_damping, want_target) in [
+        (f32::NAN, 150.0_f32, 2.0_f32, 0.5_f32, 0.0_f32),
+        (
+            f32::INFINITY,
+            MAX_SWEEP_DEG,
+            MAX_FREQUENCY_HZ,
+            MAX_DAMPING,
+            1.0,
+        ),
+        (
+            f32::NEG_INFINITY,
+            MIN_SWEEP_DEG,
+            MIN_FREQUENCY_HZ,
+            MIN_DAMPING,
+            0.0,
+        ),
+    ] {
+        let clamped = PreemWidget::Gauge {
+            config: GaugeConfig {
+                sweep_deg: poison,
+                frequency_hz: poison,
+                damping: poison,
+                range: GaugeRange {
+                    low: poison,
+                    high: poison,
+                },
+                ..GaugeConfig::default()
+            },
+            state: GaugeState { target: poison },
+        }
+        .clamped();
+        let PreemWidget::Gauge { config, state } = clamped else {
+            panic!("variant changed")
+        };
+        assert_bits(config.sweep_deg, want_sweep, "sweep_deg");
+        assert_bits(config.frequency_hz, want_freq, "frequency_hz");
+        assert_bits(config.damping, want_damping, "damping");
+        // The poisoned range fell back to the default 0.0..=1.0 scale, and the
+        // target landed at an end of *that*.
+        assert_bits(config.range.low, 0.0, "range.low");
+        assert_bits(config.range.high, 1.0, "range.high");
+        assert_bits(state.target, want_target, "target");
+    }
+
+    // …and against a legal, non-default range the target's replacements are the
+    // ends of that range, not of the default one.
+    let range = GaugeRange {
+        low: -20.0,
+        high: 40.0,
+    };
+    for (poison, want_target) in [
+        (f32::NAN, -20.0_f32),
+        (f32::INFINITY, 40.0),
+        (f32::NEG_INFINITY, -20.0),
+    ] {
+        let clamped = PreemWidget::Gauge {
+            config: GaugeConfig {
+                range,
+                ..GaugeConfig::default()
+            },
+            state: GaugeState { target: poison },
+        }
+        .clamped();
+        let PreemWidget::Gauge { state, .. } = clamped else {
+            panic!("variant changed")
+        };
+        assert_bits(state.target, want_target, "target in a -20..=40 range");
+    }
+}
+
+/// `FlipBoard`: both optional timings drop to `None` on anything non-finite —
+/// `None` is how this field spells "the mechanism's own default" — and finite
+/// values clamp to the kit's bounds.
+#[test]
+fn non_finite_flip_timings_drop_to_none() {
+    for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let clamped = PreemWidget::FlipBoard {
+            config: FlipBoardConfig {
+                duration_secs: Some(poison),
+                stagger_secs: Some(poison),
+                ..FlipBoardConfig::default()
+            },
+            state: FlipBoardState::default(),
+        }
+        .clamped();
+        let PreemWidget::FlipBoard { config, .. } = clamped else {
+            panic!("variant changed")
+        };
+        assert!(
+            config.duration_secs.is_none() && config.stagger_secs.is_none(),
+            "non-finite flip timings must drop to None, got {:?}/{:?}",
+            config.duration_secs,
+            config.stagger_secs
+        );
+    }
+    let clamped = PreemWidget::FlipBoard {
+        config: FlipBoardConfig {
+            duration_secs: Some(100.0),
+            stagger_secs: Some(-1.0),
+            ..FlipBoardConfig::default()
+        },
+        state: FlipBoardState::default(),
+    }
+    .clamped();
+    let PreemWidget::FlipBoard { config, .. } = clamped else {
+        panic!("variant changed")
+    };
+    assert_bits(
+        config.duration_secs.expect("kept"),
+        MAX_FLIP_DURATION_SECS,
+        "duration_secs",
+    );
+    assert_bits(config.stagger_secs.expect("kept"), 0.0, "stagger_secs");
+}
+
+/// A degenerate [`GaugeRange`] — inverted, empty, non-finite, or with a span
+/// that overflows to infinity — is replaced by the default `0.0..=1.0` scale
+/// **as a unit**, because the needle physics divides by the span. A legal range
+/// is left exactly alone.
+#[test]
+fn a_degenerate_gauge_range_falls_back_to_the_default_scale() {
+    for range in [
+        GaugeRange {
+            low: 10.0,
+            high: 5.0,
+        },
+        GaugeRange {
+            low: 3.0,
+            high: 3.0,
+        },
+        GaugeRange {
+            low: f32::NAN,
+            high: 1.0,
+        },
+        GaugeRange {
+            low: 0.0,
+            high: f32::INFINITY,
+        },
+        GaugeRange {
+            low: -f32::MAX,
+            high: f32::MAX,
+        },
+    ] {
+        let clamped = PreemWidget::Gauge {
+            config: GaugeConfig {
+                range,
+                ..GaugeConfig::default()
+            },
+            state: GaugeState { target: 0.5 },
+        }
+        .clamped();
+        let PreemWidget::Gauge { config, state } = clamped else {
+            panic!("variant changed")
+        };
+        assert_bits(config.range.low, 0.0, "range.low");
+        assert_bits(config.range.high, 1.0, "range.high");
+        assert_bits(state.target, 0.5, "an in-range target rides the fallback");
+    }
+
+    let legal = GaugeRange {
+        low: -20.0,
+        high: 40.0,
+    };
+    let clamped = PreemWidget::Gauge {
+        config: GaugeConfig {
+            range: legal,
+            ..GaugeConfig::default()
+        },
+        state: GaugeState { target: 1000.0 },
+    }
+    .clamped();
+    let PreemWidget::Gauge { config, state } = clamped else {
+        panic!("variant changed")
+    };
+    assert_bits(config.range.low, -20.0, "a legal range.low is untouched");
+    assert_bits(config.range.high, 40.0, "a legal range.high is untouched");
+    assert_bits(state.target, 40.0, "an over-range target clamps to the end");
+}
+
+/// The sanitiser must not perturb valid input: every float of every widget in
+/// [`all_widgets`] comes back with the **same bit pattern**. Stricter than the
+/// `==` in `clamping_a_legal_widget_changes_nothing`, which would let a
+/// `-0.0` → `0.0` rewrite through.
+#[test]
+fn clamping_a_legal_widget_is_bit_identical() {
+    for widget in all_widgets() {
+        let clamped = widget.clone().clamped();
+        assert_eq!(
+            float_bits(&clamped),
+            float_bits(&widget),
+            "{} had a float rewritten despite being in range",
+            widget.kind()
+        );
+        assert_eq!(
+            clamped,
+            widget,
+            "{} was mutated by clamped()",
             widget.kind()
         );
     }

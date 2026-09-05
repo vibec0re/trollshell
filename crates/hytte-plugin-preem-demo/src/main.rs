@@ -1,67 +1,87 @@
 //! `hytte-plugin-preem-demo` — the showcase plugin for the SDK's **preem
-//! raster kit** (issue #356; `hytte_plugin::preem`).
+//! display widgets** (issues #356 and #884; `hytte_plugin::display`).
 //!
-//! One sidebar card cycling every kit widget through every skin: a
-//! seven-segment **HH:MM clock**, a **dot-matrix ticker** stepping one char
-//! per second, a **scrolling marquee** stepping a message across a fixed dot
-//! grid one whole dot at a time (#839/#843), and an **8bit textbox**, all
-//! rotating VFD → LCD → OLED → CRT every [`STYLE_SECS`] seconds — the last of
-//! those being the kit's one *pass* rather than a skin, so it puts scanlines
-//! and curved-glass falloff over every widget on the card at once (#397).
-//! Below them a real
-//! **oscilloscope**
-//! ([`Scope`], #556/#397) sweeps the 16-band `AudioSpectrum` push as a
-//! glow-trace waveform over a graticule, with real phosphor decay — a silent
-//! sink flatlines on the axis while the old trail keeps ghosting. Below *that*
-//! a **needle gauge** ([`Gauge`], #397) steps between readings and swings to
-//! each one on a real damped oscillator: the pointer overshoots, bounces once,
-//! and settles, smearing while it moves. Below *that*, two **`HH:MM:SS`
+//! One sidebar card cycling every widget through every skin: a seven-segment
+//! **HH:MM clock**, a **dot-matrix ticker** stepping one char per second, a
+//! **scrolling marquee**, and an **8bit textbox**, all rotating VFD → LCD →
+//! OLED → CRT every [`STYLE_SECS`] seconds — the last of those being the kit's
+//! one *pass* rather than a skin, so it puts scanlines and curved-glass falloff
+//! over every widget on the card at once (#397). Below them a real
+//! **oscilloscope** ([`Scope`], #556/#397) sweeps the 16-band `AudioSpectrum`
+//! push as a glow-trace waveform over a graticule, with real phosphor decay — a
+//! silent sink flatlines on the axis while the old trail keeps ghosting. Below
+//! *that* a **needle gauge** ([`Gauge`], #397) steps between readings and swings
+//! to each one on a real damped oscillator: the pointer overshoots, bounces
+//! once, and settles, smearing while it moves. Below *that*, two **`HH:MM:SS`
 //! boards** ([`FlipBoard`], #397) showing the same clock through the kit's two
 //! change mechanisms: a **split-flap** board whose cards hinge down and ripple
-//! left to right, and a **nixie** readout whose outgoing cathode fades under
-//! the incoming one's strike. Tapping the clock advances the skin immediately.
-//! It doubles as the kit's visual regression harness and the copy-from
-//! reference for plugin authors.
+//! left to right, and a **nixie** readout whose outgoing cathode fades under the
+//! incoming one's strike. Tapping the clock advances the skin immediately.
 //!
-//! # The scope, the gauge and the two boards are the card's stateful widgets
+//! It doubles as the visual regression harness and the copy-from reference for
+//! plugin authors — which since #884 means it is the reference for **one code
+//! path, two hosts**, not just for the raster kit.
 //!
-//! Every other widget is a pure function of the snapshot, but the scope carries
-//! a phosphor buffer across frames, so it lives in the model: each host
-//! heartbeat (the ~1 Hz `Clock` snapshot) [`advance`](Scope::advance)s it one
-//! sweep with the latest bands, and `view` [`render`](Scope::render)s the
-//! current trace. A frame-timer plugin would advance per frame for a fast
-//! sweep; at the demo's 1 Hz heartbeat the lush decay is on full display (you
-//! watch the ghost linger for several seconds).
+//! # The #884 migration: what this card does and does not know
 //!
-//! The gauge carries *physics* rather than pixels — a deflection and a velocity
-//! — and is advanced the same way, by [`GAUGE_SLOWMO_DT`] of needle time per
-//! heartbeat rather than the full second, so a swing plays out over several
-//! renders instead of completing between two of them. Its target steps through
-//! [`GAUGE_STOPS`] every [`GAUGE_HOLD_SECS`], which is a pure function of the
-//! snapshot clock like everything else here.
+//! Every widget here comes from [`hytte_plugin::display`] rather than the raw
+//! kit, so the card ships **typed state nodes** to a shell that speaks the preem
+//! vocabulary and **CPU-rasterised pixels** to one that doesn't — with no branch
+//! anywhere below. There is exactly one rule to see in the code:
+//!
+//! - **State setters** ([`Gauge::set_target`], [`FlipBoard::set_text`],
+//!   [`Scope::push`]) and the `node(…)` calls in `view` are unconditional.
+//! - **`advance(dt)`** is unconditional *too* — the SDK makes it a no-op once
+//!   the host speaks preem, because the shell owns the needle spring, the
+//!   phosphor, the flip clocks and the scroll offset there.
+//!
+//! So against a preem-speaking shell this card allocates no framebuffers and
+//! runs no physics at all, and its animation is smooth at the shell's frame rate
+//! instead of stepping at the host's ~1 Hz heartbeat. Against an older shell it
+//! behaves exactly as it did before.
+//!
+//! # The stateful widgets, and why they are slow-motion in raster mode
+//!
+//! The scope carries a phosphor buffer, the gauge carries a deflection and a
+//! velocity, and the two boards carry per-cell clocks — so they live in the
+//! model and are advanced on the host heartbeat.
+//!
+//! They are advanced by a *fraction* of the elapsed second
+//! ([`GAUGE_SLOWMO_DT`], [`FLIP_SLOWMO_DT`]) rather than the whole of it. That
+//! is a **raster-mode concession**: this card has no frame timer, only the
+//! shell's ~1 Hz `Clock` snapshot, so advancing by the real second would land
+//! every animation between two renders and the mechanism would never be seen.
+//! Those constants therefore have no effect at all once the host speaks preem —
+//! the shell's own pump animates at frame rate — which is exactly the point of
+//! the seam.
+//!
+//! The **marquee is the exception, and the instructive one**: its offset is not
+//! integrated at all but *stated* from the snapshot's unix time
+//! ([`MARQUEE_STEP_DOTS`], via [`Marquee::set_scroll_dots`]), so the raster
+//! scroll keeps the wall-clock phase this card has always had. Integrating it
+//! looked equivalent — the rate matches exactly — but made the pan
+//! session-relative: every reconnect restarting at column 0, and a dropped
+//! heartbeat losing ground the old code caught up. Where a widget's state is a
+//! pure function of the clock, say it; only genuine physics needs a tick.
 //!
 //! # …and the scope alone is the card's **parked** widget (#422)
 //!
 //! Being stateful is also the only reason this card subscribes
-//! [`SlotVisible`](Input::SlotVisible) at all: the scope is the one widget that
-//! parks. While the sidebar is closed no spectrum push arrives (the shell drops
-//! the `PipeWire` tap once nothing on-screen wants it, #565/#583), yet the
-//! 1 Hz heartbeat keeps coming: left
-//! ungated, every tick would re-stamp the *same* frozen bands, saturating the
-//! phosphor into a solid constant waveform that then needs several sweeps to
-//! decay once the card is looked at again. So the heartbeat's sweep is gated on
-//! visibility and the hide edge [`clear`](Scope::clear)s the phosphor — a
-//! reopened card starts from a dark screen and re-derives from the next sweep.
+//! [`SlotVisible`](Input::SlotVisible): the scope is the one widget that parks.
+//! While the sidebar is closed no spectrum push arrives (the shell drops the
+//! `PipeWire` tap once nothing on-screen wants it, #565/#583), yet the 1 Hz
+//! heartbeat keeps coming: left ungated, every tick would re-stamp the *same*
+//! frozen bands, saturating the phosphor into a solid constant waveform that
+//! then needs several sweeps to decay once the card is looked at again. So the
+//! heartbeat's sweep is gated on visibility and the hide edge
+//! [`clear`](Scope::clear)s the phosphor.
 //!
-//! The two [`FlipBoard`]s are stateful in the same way the gauge is — they
-//! carry a clock and a per-cell transition, not pixels — and are driven the
-//! same way: [`set_text`](FlipBoard::set_text) with the current time on each
-//! heartbeat, then advanced by [`FLIP_SLOWMO_DT`] of board time rather than the
-//! full second, so a fold plays out over several renders instead of completing
-//! between two of them. That also means the seconds card is *retargeted while
-//! it is still falling* on most beats, which is exactly the case #397's
-//! retarget rule exists for: the card in flight keeps its clock and lands on
-//! the newest target rather than restarting.
+//! Worth noting for #884: in **state** mode the park is redundant. Re-stating
+//! frozen bands emits an identical state node, which the runtime dedups, so no
+//! frame reaches the shell and nothing saturates; the shell's own decay fades
+//! the trace out honestly. The gate is kept because it is still load-bearing for
+//! the raster path, and because a plugin should not have to reason about which
+//! host it is talking to — which is the whole promise.
 //!
 //! Everything else deliberately keeps running while hidden: the clock, ticker,
 //! marquee, boards, skin rotation **and the gauge** are pure functions of the
@@ -69,40 +89,39 @@
 //! show a *stale time* — the very failure the scope's park exists to avoid. The
 //! gauge is the instructive case: it is stateful like the scope, but its input
 //! is derived rather than pushed, so it is the *input*, not the statefulness,
-//! that decides whether a widget must park. ([`Needle::settle`] is there for a
-//! gauge whose reading really does come from outside.)
-//!
-//! [`Needle::settle`]: hytte_plugin::preem::Needle::settle
+//! that decides whether a widget must park.
 //!
 //! # Shape — The Elm Architecture, purely host-driven
 //!
-//! Like `hytte-plugin-clock-demo`, everything below is the pure TEA core.
-//! There are **no sources and no timers**: the shell's `Clock` subscription
-//! re-snapshots every second, and both the ticker step and the style
-//! rotation are pure functions of the snapshot's unix time (plus a click
-//! offset) — so `view` stays deterministic and unit-testable, and the
-//! runtime's render dedup sees a fresh tree each second without the plugin
-//! owning any cadence (the kit renders frames; it owns no clock).
+//! Like `hytte-plugin-clock-demo`, everything below is the pure TEA core. There
+//! are **no sources and no timers**: the shell's `Clock` subscription
+//! re-snapshots every second, and both the ticker step and the style rotation
+//! are pure functions of the snapshot's unix time (plus a click offset) — so
+//! `view` stays deterministic and unit-testable, and the runtime's render dedup
+//! sees a fresh tree each second without the plugin owning any cadence.
 //!
 //! # Sizing — the #313 lesson
 //!
-//! Every widget is sized via its **buffer dimensions** (a `Pixels` node's
-//! natural size), not shell CSS: the 7seg clock renders 188 px wide, the
-//! 11-char ticker 268 px, the marquee window [`MARQUEE_WINDOW_PX`] wide, the
-//! 22-column ×2 textbox 274 px, the scope's and gauge's defaults 288 px each,
-//! and the two 8-cell boards 260 px — all inside the sidebar card's ~296 px
-//! content width.
+//! Every widget is sized via its **buffer dimensions** (which in state mode
+//! become the config the shell sizes from), not shell CSS: the 7seg clock
+//! renders 188 px wide, the 11-char ticker 268 px, the marquee window
+//! [`MARQUEE_WINDOW_PX`] wide, the 22-column ×2 textbox 274 px, the scope's and
+//! gauge's defaults 288 px each, and the two 8-cell boards 260 px — all inside
+//! the sidebar card's ~296 px content width.
 
-use hytte_plugin::preem::{
-    DisplayStyle, FlipBoard, Gauge, Marquee, Mechanism, Scope, TextBox, dot_matrix, seven_seg,
+use hytte_plugin::display::{
+    DotMatrix, FlipBoard, Gauge, Marquee, Mechanism, Scope, SevenSeg, StyleName, TextBox,
 };
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node, SPECTRUM_BINS, StateKey};
 use hytte_plugin::{CmdSender, Input, Plugin, View};
 
 /// Stable plugin id — the host's mount-slot ownership key.
 const PLUGIN_ID: &str = "preem-demo";
-/// Node ids. The clock button is the click target (cycle the skin); the
-/// `Pixels` ids make each re-render swap its texture in place.
+/// Node ids. The clock button is the click target (cycle the skin); the widget
+/// ids keep the host reconciler on the *same* renderer instance across renders,
+/// which is what preserves the phosphor, the needle's momentum and the flip
+/// clocks in state mode (#882's `preem_id` rule) — and swaps the texture in
+/// place in raster mode.
 const ROOT_ID: &str = "preem-demo-root";
 const CYCLE_BTN: &str = "preem-demo-cycle";
 const SEG_ID: &str = "preem-demo-7seg";
@@ -120,15 +139,15 @@ const STYLE_SECS: i64 = 10;
 /// The `HH:MM` placeholder the readout wears until the first snapshot lands.
 const NO_CLOCK: &str = "--:--";
 /// Cells on each [`FlipBoard`]: `HH:MM:SS`, 260 px wide at the kit's defaults.
-const CLOCK_CELLS: usize = 8;
+const CLOCK_CELLS: u32 = 8;
 /// Seconds of board time each [`FlipBoard`] is advanced per host heartbeat.
 ///
-/// **Slow motion, on purpose**, for the same reason [`GAUGE_SLOWMO_DT`] is: the
-/// card has no frame timer, only the shell's ~1 Hz `Clock` snapshot, so
-/// advancing by the real elapsed second would land every card between two
-/// renders and the mechanism would never be seen. At this rate a fold spans
-/// three or four heartbeats. A frame-timer plugin passes its real elapsed
-/// seconds instead; the kit owns no clock either way.
+/// **Slow motion, on purpose**, and **raster-only**: the card has no frame timer
+/// of its own, so advancing by the real elapsed second would land every card
+/// between two renders and the mechanism would never be seen. At this rate a
+/// fold spans three or four heartbeats. Once the host speaks preem this constant
+/// stops mattering — `advance` is a no-op and the shell's pump runs the fold at
+/// frame rate.
 const FLIP_SLOWMO_DT: f32 = 0.12;
 
 /// The readings the showcase gauge steps between, one every
@@ -140,13 +159,10 @@ const GAUGE_STOPS: [f32; 6] = [10.0, 72.0, 38.0, 90.0, 22.0, 55.0];
 const GAUGE_HOLD_SECS: i64 = 8;
 /// Seconds of needle motion the gauge is advanced per host heartbeat.
 ///
-/// **Slow motion, on purpose.** This card has no frame timer — its only cadence
-/// is the shell's ~1 Hz `Clock` snapshot (see the crate docs) — so advancing by
-/// the real elapsed second would land the needle settled every time and the
-/// physics would never be visible. At this rate the eight heartbeats of a hold
-/// window cover the whole 1.3 s response, so successive renders actually show
-/// the kick, the overshoot, the bounce and the settle. A frame-timer plugin
-/// passes its real elapsed seconds instead; the kit owns no clock either way.
+/// **Slow motion, on purpose**, and **raster-only** — same reasoning as
+/// [`FLIP_SLOWMO_DT`]. At this rate the eight heartbeats of a hold window cover
+/// the whole 1.3 s response, so successive renders actually show the kick, the
+/// overshoot, the bounce and the settle.
 const GAUGE_SLOWMO_DT: f32 = 0.16;
 /// The ticker's marquee message; the view shows a [`TICKER_WINDOW`]-char
 /// window that advances one char per second (wrapping around).
@@ -161,21 +177,41 @@ const TICKER_WINDOW: usize = 11;
 const MARQUEE_MSG: &str = "SCROLLING MARQUEE ~ DOT-MATRIX PIXEL TICKER ~ ";
 /// The marquee window width in pixels — a wide bar-chip ticker that stays
 /// within the ~296 px sidebar card.
-const MARQUEE_WINDOW_PX: usize = 268;
-/// **Virtual pixels** (dots) the marquee pans per host snapshot — the unit the
-/// marquee scrolls in, where a sub-dot step is not expressible (#839). The
-/// shell re-snapshots ~1 Hz, so the demo steps twice a second's worth of dots
-/// once a second (about the pre-#839 pace, now landed on whole grid columns);
-/// a frame-timer plugin would bump the offset a dot per frame for a smooth
-/// scroll (the kit owns no clock).
+const MARQUEE_WINDOW_PX: u32 = 268;
+/// **Virtual pixels** (dots) the marquee pans per wall-clock second in raster
+/// mode — the unit the marquee scrolls in, where a sub-dot step is not
+/// expressible (#839).
+///
+/// Unlike the gauge's and the boards' slow-motion constants, this is **not** an
+/// integration step: the offset is a pure function of the snapshot's unix time
+/// ([`PreemDemo::marquee_offset`]), stated through
+/// [`Marquee::set_scroll_dots`], exactly as this card computed it before #884.
+/// Integrating instead would have made the scroll session-relative — every
+/// reconnect restarting at column 0, and a missed heartbeat slowing the pan
+/// rather than being caught up — a visible change against an old shell, which
+/// this PR promises not to make (#898 review R4).
 const MARQUEE_STEP_DOTS: usize = 2;
+/// The marquee's scroll speed in **dots per second**, as stated on the wire.
+///
+/// State mode only: the shell integrates it against its own frame clock. The
+/// raster arm never reads it — [`MARQUEE_STEP_DOTS`] drives that, off the host
+/// clock — so the card scrolls at 2 dots/s against an old shell (all a 1 Hz
+/// cadence can express) and at this rate, smoothly, against a preem-speaking
+/// one. 20 dots/s is the kit's own default and the rate the audio widget
+/// already scrolls at.
+const MARQUEE_SPEED_DPS: f32 = 20.0;
 /// The textbox wrap width: 22 columns at ×2 scale = 274 px.
-const TEXT_COLS: usize = 22;
+const TEXT_COLS: u32 = 22;
 
 /// The demo's entire state — rebuilt on every (re)connect, re-derived from
 /// the next snapshot.
 // `Eq` is intentionally not derived: `bins` is `[f32; N]`, which is `PartialEq`
 // but not `Eq`. Nothing compares the whole model for equality anyway.
+//
+// `PartialEq` is derived, as it was before #884 — the three wrappers that had
+// dropped it now carry it again (#898 review R3), which is the property this
+// model exists to demonstrate: swapping the raw kit for `display` must not cost
+// a plugin its derives.
 #[derive(Debug, PartialEq)]
 struct PreemDemo {
     /// `"HH:MM"` from the host clock's ISO timestamp (`"--:--"` until the
@@ -189,14 +225,23 @@ struct PreemDemo {
     /// swept by the scope. All-zero until the first push lands (a flat
     /// baseline), so the trace shows even on a silent desktop.
     bins: [f32; SPECTRUM_BINS],
-    /// The oscilloscope (#556): a stateful widget carrying its phosphor buffer
-    /// across frames. Advanced one sweep per host heartbeat with [`Self::bins`]
-    /// **while the card is on-screen**, rendered by `view` in the current skin.
+    /// The seven-segment `HH:MM` clock — pure, so its text is a `view` argument.
+    seg: SevenSeg,
+    /// The dot-matrix ticker — pure, likewise.
+    ticker: DotMatrix,
+    /// The scrolling marquee. Its **offset** is stateful (shell-owned in state
+    /// mode, plugin-owned in raster mode), so the widget lives in the model even
+    /// though its text is a `view` argument.
+    marquee: Marquee,
+    /// The 8bit textbox — pure.
+    textbox: TextBox,
+    /// The oscilloscope (#556): stateful, carrying a phosphor buffer in raster
+    /// mode and a sample batch on the wire in state mode. Swept once per host
+    /// heartbeat with [`Self::bins`] **while the card is on-screen**.
     scope: Scope,
     /// The needle gauge (#397): the card's other stateful widget, and the one
     /// that carries *physics* rather than a pixel buffer. Its target steps
-    /// through [`GAUGE_STOPS`] on the heartbeat and the needle swings to it —
-    /// overshooting and settling — over the following ticks.
+    /// through [`GAUGE_STOPS`] on the heartbeat and the needle swings to it.
     ///
     /// Unlike the scope this deliberately does **not** park (#422): its input is
     /// a pure function of the snapshot, exactly like the clock and the ticker,
@@ -204,9 +249,8 @@ struct PreemDemo {
     /// of replaying a stale swing.
     gauge: Gauge,
     /// The split-flap board (#397): the same `HH:MM:SS` the 7seg shows, on the
-    /// airport-board mechanism. Stateful like the gauge — a clock plus a
-    /// per-cell transition — and, like it, deliberately **not** parked (#422):
-    /// its content is a pure function of the snapshot.
+    /// airport-board mechanism. Stateful like the gauge, and like it deliberately
+    /// **not** parked — its content is a pure function of the snapshot.
     flap: FlipBoard,
     /// The nixie readout (#397): the same clock again, so the card contrasts
     /// the two change mechanisms side by side on identical content.
@@ -229,13 +273,32 @@ fn parse_hhmm(iso: &str) -> Option<&str> {
 
 impl PreemDemo {
     /// The skin currently on display: unix time rotates through
-    /// [`DisplayStyle::ALL`] every [`STYLE_SECS`], and each click on the
-    /// clock advances the rotation by one.
-    fn style(&self) -> DisplayStyle {
+    /// [`StyleName::ALL`] every [`STYLE_SECS`], and each click on the clock
+    /// advances the rotation by one.
+    fn style(&self) -> StyleName {
         let slot = self.unix.div_euclid(STYLE_SECS) + i64::from(self.style_bump);
-        let n = i64::try_from(DisplayStyle::ALL.len()).unwrap_or(1);
+        let n = i64::try_from(StyleName::ALL.len()).unwrap_or(1);
         let idx = usize::try_from(slot.rem_euclid(n)).unwrap_or(0);
-        DisplayStyle::ALL[idx]
+        StyleName::ALL[idx]
+    }
+
+    /// Point every widget at `style`.
+    ///
+    /// On the wire this is a **config** change, so a preem-speaking shell
+    /// rebuilds each renderer instance — which resets the animation it owns.
+    /// That is the vocabulary's rule ("a plugin that jitters a config field
+    /// kills its own animation") and this card breaks it deliberately, once
+    /// every [`STYLE_SECS`], because showing every widget in every skin is the
+    /// whole job. A real plugin picks a skin and leaves it alone.
+    fn restyle(&mut self, style: StyleName) {
+        self.seg.style(style);
+        self.ticker.style(style);
+        self.marquee.style(style);
+        self.textbox.style(style);
+        self.scope.style(style);
+        self.gauge.style(style);
+        self.flap.style(style);
+        self.nixie.style(style);
     }
 
     /// The ticker's visible window, advanced one char per second.
@@ -247,12 +310,14 @@ impl PreemDemo {
     }
 
     /// The marquee's scroll offset, panning [`MARQUEE_STEP_DOTS`] dots per
-    /// second.
-    /// [`MarqueeStrip::window`](hytte_plugin::preem::MarqueeStrip::window) wraps
-    /// this modulo the strip period, so the raw (unbounded) counter is fine.
+    /// second of wall clock — a pure function of the snapshot, like the ticker
+    /// and the skin rotation.
+    ///
+    /// Byte-for-byte the pre-#884 projection, restored in the #898 review
+    /// round: `MarqueeStrip::window` wraps it modulo the strip period, so the
+    /// raw (unbounded) counter is fine, and the bound below only keeps the
+    /// multiply from overflowing.
     fn marquee_offset(&self) -> usize {
-        // Bound the seconds before scaling so the multiply can never overflow;
-        // the window's own modulo makes the absolute value irrelevant.
         let secs = usize::try_from(self.unix.rem_euclid(1_000_000)).unwrap_or(0);
         secs.saturating_mul(MARQUEE_STEP_DOTS)
     }
@@ -290,7 +355,7 @@ impl PreemDemo {
 
     /// The textbox's line — names the current skin so the rotation is
     /// legible in all three widgets at once.
-    fn textbox_line(style: DisplayStyle) -> String {
+    fn textbox_line(style: StyleName) -> String {
         format!(
             "8bit textbox in the {} skin - wraps, clips and never panics",
             style.name()
@@ -308,6 +373,9 @@ impl Plugin for PreemDemo {
     /// input, #405) and `SlotVisible` (the scope's park gate, #422), mounts
     /// `SidebarTop` under the clock demo (`order = 1`; unordered co-mounts sort
     /// as 0 — #303). No capabilities: the demo asks nothing of the shell.
+    ///
+    /// The #884 vocabulary negotiation needs no declaration here:
+    /// `Manifest::new` stamps the `vocab`/`vocab_max` pair for every plugin.
     fn manifest() -> Manifest {
         let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarTop).with_order(1);
         m.subscribes = vec![
@@ -321,21 +389,32 @@ impl Plugin for PreemDemo {
     /// All-ghost placeholders until the first snapshot lands (the runtime
     /// renders this seed immediately, so the card mounts right away).
     fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+        let style = StyleName::ALL[0];
         Self {
             hhmm: NO_CLOCK.to_owned(),
             unix: 0,
             style_bump: 0,
             bins: [0.0; SPECTRUM_BINS],
-            scope: Scope::new(),
-            gauge: Gauge::new().range(0.0, 100.0),
-            flap: FlipBoard::new(Mechanism::SplitFlap).cells(CLOCK_CELLS),
-            nixie: FlipBoard::new(Mechanism::Nixie).cells(CLOCK_CELLS),
+            seg: SevenSeg::new(style),
+            ticker: DotMatrix::new(style),
+            marquee: Marquee::new(style)
+                .window_px(MARQUEE_WINDOW_PX)
+                .speed_dots_per_sec(MARQUEE_SPEED_DPS),
+            textbox: TextBox::new(style).cols(TEXT_COLS).scale(2),
+            scope: Scope::new(style),
+            gauge: Gauge::new(style).range(0.0, 100.0),
+            flap: FlipBoard::new(style, Mechanism::SplitFlap).cells(CLOCK_CELLS),
+            nixie: FlipBoard::new(style, Mechanism::Nixie).cells(CLOCK_CELLS),
             visible: false,
         }
     }
 
-    /// Fold one input into the model. Pure and panic-free over any
-    /// host-sent value; re-rendering is the runtime's problem.
+    /// Fold one input into the model. Pure and panic-free over any host-sent
+    /// value; re-rendering is the runtime's problem.
+    ///
+    /// Note that nothing here branches on which host is on the other end. Every
+    /// `set_*`/`push` states what the widget should show; every `advance` is the
+    /// raster-mode tick the SDK drops once the shell owns the animation.
     fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
         match input {
             // `clock` is optional on the wire (a startup snapshot may
@@ -347,34 +426,41 @@ impl Plugin for PreemDemo {
                     }
                     self.unix = clock.unix;
                 }
-                // The heartbeat is the scope's sweep tick: advance the phosphor
-                // one frame with the latest bands (silence flatlines on the axis
-                // while the old trail decays — the honest ghost). Gated on
-                // visibility (#422): hidden, no fresh bands arrive, so sweeping
-                // would just re-stamp the frozen ones into a saturated trace.
+                let style = self.style();
+                self.restyle(style);
+                // The heartbeat is the scope's sweep tick: state the latest
+                // bands (silence flatlines on the axis while the old trail
+                // decays — the honest ghost). Gated on visibility (#422); see
+                // the crate docs on why that gate is raster-only in effect.
                 if self.visible {
-                    self.scope.advance(&self.bins);
+                    let bins = self.bins;
+                    self.scope.push(&bins);
                 }
                 // The gauge's own heartbeat: dial in the current reading and let
                 // the needle move toward it. Ungated on visibility, unlike the
-                // scope — see the field docs — and advanced in slow motion so
-                // the swing is legible at a 1 Hz cadence (`GAUGE_SLOWMO_DT`).
+                // scope — see the field docs.
                 self.gauge.set_target(self.gauge_target());
                 self.gauge.advance(GAUGE_SLOWMO_DT);
                 // The boards' heartbeat: re-state the clock (unchanged cards
                 // are untouched, so only the seconds card usually moves) and
-                // advance the mechanism in slow motion (`FLIP_SLOWMO_DT`).
-                // Ungated on visibility for the same reason the gauge is.
+                // advance the mechanism. Ungated for the gauge's reason.
                 let face = self.clock_face();
                 self.flap.set_text(&face);
                 self.flap.advance(FLIP_SLOWMO_DT);
                 self.nixie.set_text(&face);
                 self.nixie.advance(FLIP_SLOWMO_DT);
+                // …and the marquee's: state where the strip has panned to.
+                // Absolute, not an increment, so the phase tracks the wall
+                // clock and a clockless snapshot (or a missed heartbeat) leaves
+                // it exactly where the time says it should be.
+                self.marquee.set_scroll_dots(self.marquee_offset());
             }
             // Tapping the clock advances the skin rotation by one.
             Input::Event { node, kind } => {
                 if node == CYCLE_BTN && matches!(kind, EventKind::Click) {
                     self.style_bump = self.style_bump.wrapping_add(1);
+                    let style = self.style();
+                    self.restyle(style);
                 }
             }
             // The audio-spectrum push (#405): store the latest bands; the scope
@@ -414,30 +500,14 @@ impl Plugin for PreemDemo {
     /// One vertical card: the pokeable 7seg clock, the ticker, the scrolling
     /// marquee, the textbox — all wearing the same skin — the audio
     /// oscilloscope, the needle gauge, the split-flap and nixie boards, and a
-    /// dim hint line. Every `Pixels` buffer satisfies the
-    /// host's `len == w * h * 4` invariant by kit construction.
+    /// dim hint line.
+    ///
+    /// Every `node(…)` here is one call that lands as a typed `Node::Preem` or a
+    /// rasterised `Node::Pixels` depending on what the host advertised; a
+    /// `Pixels` buffer satisfies the host's `len == w * h * 4` invariant by kit
+    /// construction either way.
     fn view(&self) -> View {
         let style = self.style();
-        let clock = seven_seg(&self.hhmm, style);
-        let ticker = dot_matrix(&self.ticker_window(), style);
-        let marquee = Marquee::new(style)
-            .window_px(MARQUEE_WINDOW_PX)
-            .render(MARQUEE_MSG)
-            .window(self.marquee_offset());
-        let textbox = TextBox::styled(style)
-            .cols(TEXT_COLS)
-            .scale(2)
-            .render(&Self::textbox_line(style));
-        // The scope carries its phosphor across frames; `advance` already ran on
-        // the heartbeat, so `view` just renders the current trace in this skin.
-        let scope = self.scope.render(style);
-        // Likewise the gauge: `update` already moved the needle, so `view` only
-        // draws where it currently points.
-        let gauge = self.gauge.render(style);
-        // …and the two boards: `update` already set their content and advanced
-        // their clocks, so `view` only draws the moment each is in.
-        let flap = self.flap.render(style);
-        let nixie = self.nixie.render(style);
         Node::Box {
             id: Some(ROOT_ID.to_owned()),
             dir: Dir::Vertical,
@@ -448,15 +518,15 @@ impl Plugin for PreemDemo {
                 Node::Button {
                     id: CYCLE_BTN.to_owned(),
                     classes: vec!["flat".to_owned()],
-                    child: Box::new(clock.into_node(Some(SEG_ID), Vec::new())),
+                    child: Box::new(self.seg.node(SEG_ID, &self.hhmm)),
                 },
-                ticker.into_node(Some(TICKER_ID), Vec::new()),
-                marquee.into_node(Some(MARQUEE_ID), Vec::new()),
-                textbox.into_node(Some(TEXT_ID), Vec::new()),
-                scope.into_node(Some(SCOPE_ID), Vec::new()),
-                gauge.into_node(Some(GAUGE_ID), Vec::new()),
-                flap.into_node(Some(FLAP_ID), Vec::new()),
-                nixie.into_node(Some(NIXIE_ID), Vec::new()),
+                self.ticker.node(TICKER_ID, &self.ticker_window()),
+                self.marquee.node(MARQUEE_ID, MARQUEE_MSG),
+                self.textbox.node(TEXT_ID, &Self::textbox_line(style)),
+                self.scope.node(SCOPE_ID),
+                self.gauge.node(GAUGE_ID),
+                self.flap.node(FLAP_ID),
+                self.nixie.node(NIXIE_ID),
                 Node::Label {
                     id: None,
                     text: "tap the clock to switch skins".to_owned(),
@@ -475,7 +545,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{CYCLE_BTN, PreemDemo, STYLE_SECS, parse_hhmm};
-    use hytte_plugin::preem::{DisplayStyle, Marquee};
+    use hytte_plugin::display::testing::with_render_mode;
+    use hytte_plugin::display::{Marquee, RenderMode, StyleName, display_style};
+    use hytte_plugin::proto::preem::PreemWidget;
     use hytte_plugin::proto::{
         ClockState, EventKind, Node, PluginMsg, StateKey, StateSnapshot, decode, encode,
     };
@@ -528,6 +600,25 @@ mod tests {
         out
     }
 
+    /// Walk a tree and collect every `Preem` node's `(id, widget kind)`.
+    fn preem_of(node: &Node) -> Vec<(String, &'static str)> {
+        let mut out = Vec::new();
+        let mut stack = vec![node];
+        while let Some(n) = stack.pop() {
+            match n {
+                Node::Preem { id, widget, .. } => {
+                    out.push((id.clone().unwrap_or_default(), widget.kind()));
+                }
+                Node::Box { children, .. }
+                | Node::Row { children, .. }
+                | Node::ListBox { children, .. } => stack.extend(children.iter()),
+                Node::Button { child, .. } => stack.push(child),
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// A snapshot updates the readout and the ticker clock.
     #[test]
     fn snapshot_updates_the_model() {
@@ -567,32 +658,32 @@ mod tests {
         });
         assert!(fx.is_empty(), "the demo asks nothing of the shell");
         assert_ne!(m.style(), base, "a tap advances the skin");
-        // One slot per style = a full lap through DisplayStyle::ALL. Off the
+        // One slot per style = a full lap through StyleName::ALL. Off the
         // list's own length, so adding a skin (#397's CRT was the fourth) can
         // never leave this asserting a stale lap.
         let lap = m.style();
-        m.unix += STYLE_SECS * i64::try_from(DisplayStyle::ALL.len()).unwrap();
+        m.unix += STYLE_SECS * i64::try_from(StyleName::ALL.len()).unwrap();
         assert_eq!(m.style(), lap);
     }
 
     /// The rotation reaches **every** skin, the CRT pass included (#397): a
-    /// full lap of slots visits each of `DisplayStyle::ALL` exactly once, so
+    /// full lap of slots visits each of `StyleName::ALL` exactly once, so
     /// there is no per-skin wiring in the demo that could quietly skip one.
     #[test]
     fn the_rotation_visits_every_skin_including_the_crt() {
         let mut m = fresh();
-        let seen: Vec<DisplayStyle> = (0..DisplayStyle::ALL.len())
+        let seen: Vec<StyleName> = (0..StyleName::ALL.len())
             .map(|_| {
                 let style = m.style();
                 m.unix += STYLE_SECS;
                 style
             })
             .collect();
-        for style in DisplayStyle::ALL {
+        for style in StyleName::ALL {
             assert!(seen.contains(&style), "the rotation never shows {style:?}");
         }
         assert!(
-            seen.contains(&DisplayStyle::Crt),
+            seen.contains(&StyleName::Crt),
             "the CRT pass is on the card"
         );
     }
@@ -607,14 +698,16 @@ mod tests {
             kind: EventKind::Click,
         });
         assert!(fx.is_empty());
-        assert_eq!(m.view(), before);
+        assert!(m.view() == before, "the tree is unchanged");
     }
 
-    /// Every `Pixels` buffer in the view honors the host's
-    /// `len == w * h * 4` invariant and the ~296 px sidebar content width
-    /// (the #313 lesson) — across all skins and clock states.
+    /// Against a host that never advertises the preem vocabulary — the default
+    /// for these tests, and every shell before #883 — the card is exactly what
+    /// it was: eight rasterised `Pixels` buffers, each honoring the host's
+    /// `len == w * h * 4` invariant and the ~296 px sidebar content width (the
+    /// #313 lesson), across all skins and clock states.
     #[test]
-    fn every_view_pixels_is_valid_and_fits_the_card() {
+    fn against_an_old_shell_the_card_is_still_eight_pixel_buffers() {
         let mut m = fresh();
         for step in 0..6 {
             let tree = m.view().tree;
@@ -623,6 +716,10 @@ mod tests {
                 bufs.len(),
                 8,
                 "clock + ticker + marquee + textbox + scope + gauge + flap + nixie"
+            );
+            assert!(
+                preem_of(&tree).is_empty(),
+                "no advertisement, no state nodes"
             );
             for (w, h, len) in bufs {
                 assert_eq!(len, (w as usize) * (h as usize) * 4);
@@ -633,13 +730,90 @@ mod tests {
         }
     }
 
+    /// …and against a shell that does advertise it, the *same* card is eight
+    /// typed state nodes instead — same ids, same order, no rasterisation. This
+    /// is the #884 acceptance showcase: one `view()`, two wire shapes.
+    ///
+    /// Drives the SDK's recorded generation directly rather than through a
+    /// session; the session-level negotiation is `hytte-plugin`'s own test.
+    #[test]
+    fn against_a_preem_shell_the_same_card_is_eight_state_nodes() {
+        let mut m = fresh();
+        let _ = m.update(snapshot("2026-07-16T15:49:00+02:00", 1_752_672_540));
+
+        let tree = with_render_mode(RenderMode::State, || m.view().tree);
+
+        assert!(
+            pixels_of(&tree).is_empty(),
+            "a preem-speaking shell gets no rasterised buffers at all"
+        );
+        assert_eq!(
+            preem_of(&tree),
+            vec![
+                // `pixels_of`/`preem_of` walk depth-first off a stack, so the
+                // card's children come back reversed — the assertion is on the
+                // set and the ids, not on paint order.
+                ("preem-demo-nixie".to_owned(), "flip-board"),
+                ("preem-demo-flap".to_owned(), "flip-board"),
+                ("preem-demo-gauge".to_owned(), "gauge"),
+                ("preem-demo-scope".to_owned(), "scope"),
+                ("preem-demo-textbox".to_owned(), "text-box"),
+                ("preem-demo-marquee".to_owned(), "marquee"),
+                ("preem-demo-ticker".to_owned(), "dot-matrix"),
+                ("preem-demo-7seg".to_owned(), "seven-seg"),
+            ],
+            "every widget on the card has a typed node with a stable id",
+        );
+    }
+
+    /// The state nodes carry the readings the card actually derived — a tree of
+    /// eight defaults would satisfy the shape assertion above while showing
+    /// nothing.
+    #[test]
+    fn the_state_nodes_carry_the_card_s_own_readings() {
+        let mut m = fresh();
+        let _ = m.update(snapshot("2026-07-16T15:49:00+02:00", 1_752_672_540));
+        let face = m.clock_face();
+        let target = m.gauge_target();
+
+        let tree = with_render_mode(RenderMode::State, || m.view().tree);
+
+        let mut seen_seg = false;
+        let mut seen_gauge = false;
+        let mut stack = vec![&tree];
+        while let Some(n) = stack.pop() {
+            match n {
+                Node::Preem { widget, .. } => match widget.as_ref() {
+                    PreemWidget::SevenSeg { state, .. } => {
+                        assert_eq!(state.text, "15:49", "the clock's own reading");
+                        seen_seg = true;
+                    }
+                    PreemWidget::Gauge { state, config } => {
+                        assert!((state.target - target).abs() < f32::EPSILON);
+                        assert!((config.range.high - 100.0).abs() < f32::EPSILON);
+                        seen_gauge = true;
+                    }
+                    PreemWidget::FlipBoard { state, config } => {
+                        assert_eq!(state.text, face, "both boards show the clock face");
+                        assert_eq!(config.cells, super::CLOCK_CELLS);
+                    }
+                    _ => {}
+                },
+                Node::Box { children, .. } => stack.extend(children.iter()),
+                Node::Button { child, .. } => stack.push(child),
+                _ => {}
+            }
+        }
+        assert!(seen_seg && seen_gauge, "both widgets were on the card");
+    }
+
     /// The view is a pure function of the model, and each skin renders a
     /// visibly different card.
     #[test]
     fn view_is_deterministic_and_skins_differ() {
         let mut m = fresh();
         let _ = m.update(snapshot("2026-07-16T12:00:00+02:00", 100));
-        assert_eq!(m.view(), m.view(), "view is pure");
+        assert!(m.view() == m.view(), "view is pure");
         let a = m.style();
         let before = m.view();
         let _ = m.update(Input::Event {
@@ -647,7 +821,7 @@ mod tests {
             kind: EventKind::Click,
         });
         assert_ne!(m.style(), a);
-        assert_ne!(m.view(), before, "a new skin renders a new card");
+        assert!(m.view() != before, "a new skin renders a new card");
     }
 
     /// The ticker window advances with the clock and wraps around.
@@ -664,25 +838,64 @@ mod tests {
         assert_eq!(w0.chars().count(), super::TICKER_WINDOW);
     }
 
-    /// The marquee pans forward with the host clock (a live frame timer would
-    /// bump the offset per frame), and the panned pixels actually move.
+    /// The marquee pans forward with the host clock in raster mode, at the same
+    /// 2 dots per second it panned at before #884, on the same **wall-clock
+    /// phase** — the offset is a pure function of `unix`, not a session-relative
+    /// accumulation (#898 review R4) — and the panned pixels actually move.
     #[test]
     fn marquee_pans_with_the_clock() {
         let mut m = fresh();
         let _ = m.update(snapshot("2026-07-16T00:00:03+02:00", 300));
-        let o0 = m.marquee_offset();
+        let o0 = m.marquee.scroll_dots();
         let _ = m.update(snapshot("2026-07-16T00:00:04+02:00", 301));
-        let o1 = m.marquee_offset();
-        assert_eq!(o1 - o0, super::MARQUEE_STEP_DOTS, "one second, one step");
+        let o1 = m.marquee.scroll_dots();
+        assert_eq!(o1 - o0, 2, "one heartbeat, two dots — the pre-#884 pace");
 
-        let strip = Marquee::new(m.style())
-            .window_px(super::MARQUEE_WINDOW_PX)
+        // The phase, not just the rate: a *fresh* model handed the same
+        // snapshot lands on the same column, which is what a reconnect gets and
+        // what an integrating accumulator could not deliver.
+        assert_eq!(o1, 301 * super::MARQUEE_STEP_DOTS, "the pre-#884 offset");
+        let mut reconnected = fresh();
+        let _ = reconnected.update(snapshot("2026-07-16T00:00:04+02:00", 301));
+        assert_eq!(
+            reconnected.marquee.scroll_dots(),
+            o1,
+            "a reconnect resumes the scroll where the clock says, not at 0",
+        );
+
+        // …and a snapshot the host sent without a clock does not pan it (the
+        // offset is stated from `unix`, which did not move).
+        let _ = m.update(Input::Snapshot(StateSnapshot::default()));
+        assert_eq!(m.marquee.scroll_dots(), o1, "a clockless snapshot is inert");
+
+        let strip = hytte_plugin::preem::Marquee::new(display_style(m.style()))
+            .window_px(usize::try_from(super::MARQUEE_WINDOW_PX).unwrap())
             .render(super::MARQUEE_MSG);
         assert!(strip.scrolls(), "the demo message overflows the window");
-        assert_ne!(
-            strip.window(o0),
-            strip.window(o1),
+        assert!(
+            strip.window(o0) != strip.window(o1),
             "the scroll moves pixels"
+        );
+    }
+
+    /// …and in state mode the plugin does not pan at all: the shell owns the
+    /// offset, so the card's marquee node is identical across heartbeats even
+    /// though it is visibly scrolling on screen.
+    #[test]
+    fn the_marquee_stops_panning_once_the_shell_owns_it() {
+        let mut quiet = Marquee::new(StyleName::Vfd).window_px(super::MARQUEE_WINDOW_PX);
+        let before = quiet.node_in(RenderMode::State, "mq", Vec::new(), super::MARQUEE_MSG);
+        for beat in 0..50 {
+            // Both ways a plugin can move a marquee, and neither reaches the
+            // plugin-side offset while the shell owns it.
+            quiet.advance_in(RenderMode::State, 1.0);
+            quiet.set_scroll_dots_in(RenderMode::State, beat * super::MARQUEE_STEP_DOTS);
+        }
+        assert_eq!(quiet.scroll_dots(), 0, "the plugin never ticked");
+        assert_eq!(
+            quiet.node_in(RenderMode::State, "mq", Vec::new(), super::MARQUEE_MSG),
+            before,
+            "so fifty heartbeats put nothing on the wire",
         );
     }
 
@@ -696,7 +909,7 @@ mod tests {
                 "ticker/marquee char {c:?} has a glyph"
             );
         }
-        for style in DisplayStyle::ALL {
+        for style in StyleName::ALL {
             for c in PreemDemo::textbox_line(style).chars() {
                 assert!(
                     hytte_plugin::preem::font::glyph(c).is_some(),
@@ -718,9 +931,8 @@ mod tests {
         loud_bins[8] = 1.0;
         let mut loud = Scope::new();
         loud.advance(&loud_bins);
-        assert_ne!(
-            quiet.render(DisplayStyle::Vfd),
-            loud.render(DisplayStyle::Vfd),
+        assert!(
+            quiet.render(DisplayStyle::Vfd) != loud.render(DisplayStyle::Vfd),
             "a loud band bends the trace"
         );
 
@@ -734,31 +946,31 @@ mod tests {
 
     /// The scope sweeps on the host heartbeat and ghosts honestly when the sink
     /// goes silent: the old trace decays across ticks rather than snapping to
-    /// black or freezing (the #556 phosphor showcase). Compares the scope
-    /// buffer directly so the marquee's own scroll doesn't confound it.
+    /// black or freezing (the #556 phosphor showcase). Compares the scope's own
+    /// node so the marquee's scroll doesn't confound it.
     #[test]
     fn scope_sweeps_on_the_heartbeat_with_a_decay_ghost() {
-        use hytte_plugin::preem::DisplayStyle;
         let mut m = shown();
+        let trace = |m: &PreemDemo| m.scope.node_in(RenderMode::Raster, "sc", Vec::new());
         // A loud band, then the heartbeat draws it.
         let mut loud = [0.0_f32; super::SPECTRUM_BINS];
         loud[2] = 1.0;
         let _ = m.update(spectrum(loud));
         let _ = m.update(snapshot("2026-07-16T00:00:00+02:00", 1));
-        let lit = m.scope.render(DisplayStyle::Vfd);
+        let lit = trace(&m);
         // Silence: the heartbeat keeps sweeping and the loud trail decays.
         let _ = m.update(spectrum([0.0; super::SPECTRUM_BINS]));
         let _ = m.update(snapshot("2026-07-16T00:00:01+02:00", 2));
-        let ghost = m.scope.render(DisplayStyle::Vfd);
-        assert_ne!(ghost, lit, "silence decays the loud trace to a ghost");
+        let ghost = trace(&m);
+        assert!(ghost != lit, "silence decays the loud trace to a ghost");
         let _ = m.update(snapshot("2026-07-16T00:00:02+02:00", 3));
-        let ghost2 = m.scope.render(DisplayStyle::Vfd);
-        assert_ne!(ghost2, ghost, "the ghost keeps fading each heartbeat");
+        assert!(trace(&m) != ghost, "the ghost keeps fading each heartbeat");
     }
 
     /// The gauge steps between readings on the host clock, and the needle
     /// **overshoots** on the way — the #397 showcase, checked here at the card
-    /// level rather than trusted.
+    /// level rather than trusted. (Raster mode: in state mode the shell runs
+    /// this same spring off the emitted target.)
     #[test]
     fn the_gauge_steps_readings_and_overshoots_on_the_way() {
         let mut m = fresh();
@@ -838,7 +1050,7 @@ mod tests {
         let _ = m.update(snapshot("2026-07-16T15:49:01+02:00", 1_752_672_541));
         assert_eq!(m.flap.target(), "15:49:01");
         assert!(!m.flap.is_settled(), "and the next second is mid-flip");
-        assert_ne!(m.view(), landed, "which the card actually shows");
+        assert!(m.view() != landed, "which the card actually shows");
     }
 
     /// The boards deliberately do **not** park (#422), for the gauge's reason:
@@ -874,24 +1086,15 @@ mod tests {
             faces.push(m.clock_face());
         }
         for face in faces {
-            assert_eq!(face.chars().count(), super::CLOCK_CELLS, "{face:?}");
+            assert_eq!(
+                face.chars().count(),
+                usize::try_from(super::CLOCK_CELLS).unwrap(),
+                "{face:?}"
+            );
             for c in face.chars() {
                 assert!(CHARSET.contains(c), "clock-face char {c:?} is on the drum");
             }
         }
-    }
-
-    /// The manifest opts into the clock heartbeat, the audio spectrum, and the
-    /// slot-visibility gate the scope parks on (#422).
-    #[test]
-    fn manifest_subscribes_clock_spectrum_and_visibility() {
-        let m = PreemDemo::manifest();
-        assert!(m.subscribes.contains(&StateKey::Clock));
-        assert!(m.subscribes.contains(&StateKey::AudioSpectrum));
-        assert!(
-            m.subscribes.contains(&StateKey::SlotVisible),
-            "the scope's park gate is opt-in per #305"
-        );
     }
 
     /// A hidden card parks the scope (#422): the heartbeat stops sweeping, so a
@@ -900,23 +1103,19 @@ mod tests {
     /// whenever the sidebar closed.
     #[test]
     fn a_hidden_card_parks_the_scope() {
-        use hytte_plugin::preem::{DisplayStyle, Scope};
-        let dark = Scope::new().render(DisplayStyle::Vfd);
+        let trace = |m: &PreemDemo| m.scope.node_in(RenderMode::Raster, "sc", Vec::new());
+        let dark = trace(&fresh());
 
         let mut m = shown();
         let mut loud = [0.0_f32; super::SPECTRUM_BINS];
         loud[2] = 1.0;
         let _ = m.update(spectrum(loud));
         let _ = m.update(snapshot("2026-07-16T00:00:00+02:00", 1));
-        assert_ne!(m.scope.render(DisplayStyle::Vfd), dark, "a trace is drawn");
+        assert!(trace(&m) != dark, "a trace is drawn");
 
         // Hide: the phosphor is wiped and the bands forgotten.
         let _ = m.update(Input::SlotVisible(false));
-        assert_eq!(
-            m.scope.render(DisplayStyle::Vfd),
-            dark,
-            "hiding wipes the trace"
-        );
+        assert!(trace(&m) == dark, "hiding wipes the trace");
         assert!(m.bins.iter().all(|&b| b <= 0.0), "and forgets the bands");
 
         // Hidden: heartbeats no longer sweep, and a late push (another
@@ -925,26 +1124,20 @@ mod tests {
         for s in 2..8 {
             let _ = m.update(snapshot("2026-07-16T00:00:00+02:00", s));
         }
-        assert_eq!(
-            m.scope.render(DisplayStyle::Vfd),
-            dark,
+        assert!(
+            trace(&m) == dark,
             "a parked scope stays dark across heartbeats"
         );
 
         // Reopen: still dark until real data sweeps again.
         let _ = m.update(Input::SlotVisible(true));
-        assert_eq!(
-            m.scope.render(DisplayStyle::Vfd),
-            dark,
+        assert!(
+            trace(&m) == dark,
             "the reopened card starts from a dark screen"
         );
         let _ = m.update(spectrum(loud));
         let _ = m.update(snapshot("2026-07-16T00:00:09+02:00", 9));
-        assert_ne!(
-            m.scope.render(DisplayStyle::Vfd),
-            dark,
-            "and re-derives from the next sweep"
-        );
+        assert!(trace(&m) != dark, "and re-derives from the next sweep");
     }
 
     /// The rest of the card deliberately does **not** park: the clock, ticker,
@@ -960,9 +1153,28 @@ mod tests {
         assert_eq!(m.unix, 1_752_672_600, "and so does the rotation clock");
     }
 
-    /// The frames built from this plugin's data are valid on the wire.
+    /// The manifest opts into the clock heartbeat, the audio spectrum, and the
+    /// slot-visibility gate the scope parks on (#422).
     #[test]
-    fn register_and_render_frames_round_trip() {
+    fn manifest_subscribes_clock_spectrum_and_visibility() {
+        let m = PreemDemo::manifest();
+        assert!(m.subscribes.contains(&StateKey::Clock));
+        assert!(m.subscribes.contains(&StateKey::AudioSpectrum));
+        assert!(
+            m.subscribes.contains(&StateKey::SlotVisible),
+            "the scope's park gate is opt-in per #305"
+        );
+        assert!(
+            m.negotiates_vocab(),
+            "and `Manifest::new` stamps the #882 negotiation pair for free"
+        );
+    }
+
+    /// The frames built from this plugin's data are valid on the wire — in
+    /// **both** shapes, since the whole point is that the same `view()` produces
+    /// either.
+    #[test]
+    fn register_and_render_frames_round_trip_in_both_modes() {
         let reg = PluginMsg::Register {
             manifest: PreemDemo::manifest(),
         };
@@ -971,13 +1183,15 @@ mod tests {
 
         let mut m = fresh();
         let _ = m.update(snapshot("2026-07-16T15:49:00+02:00", 42));
-        let view = m.view();
-        let render = PluginMsg::Render {
-            tree: view.tree,
-            panel: view.panel,
-            effects: Vec::new(),
-        };
-        let back: PluginMsg = decode(&encode(&render)).expect("render frame decodes");
-        assert_eq!(render, back);
+        for mode in [RenderMode::Raster, RenderMode::State] {
+            let view = with_render_mode(mode, || m.view());
+            let render = PluginMsg::Render {
+                tree: view.tree,
+                panel: view.panel,
+                effects: Vec::new(),
+            };
+            let back: PluginMsg = decode(&encode(&render)).expect("render frame decodes");
+            assert!(render == back, "{mode:?} round-trips");
+        }
     }
 }

@@ -7,7 +7,8 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use hytte_plugin_proto::{
-    HostMsg, LogLevel, PluginMsg, ProtoError, StateKey, read_frame, socket_path, write_frame,
+    HostMsg, LogLevel, PluginMsg, ProtoError, StateKey, VOCAB_UNCONDITIONAL, read_frame,
+    socket_path, write_frame,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
@@ -140,6 +141,25 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Unpin,
 {
+    // The negotiated generation lives in a thread-local (`display::NEGOTIATED`)
+    // read by `view()` on whatever thread this future is polled on, so the
+    // seed, the `Hello` and every render have to share one thread. `run` builds
+    // a current-thread runtime and `block_on`s this, and only the frame reader
+    // is spawned, so today they do. If they ever didn't, the feature would
+    // disable itself in silence — a read on the wrong worker sees the `Cell`'s
+    // default `0` and degrades to `Raster`, fail-safe and total, with every
+    // test still green (#898 review R7).
+    //
+    // That is already impossible, but only *incidentally*: this future holds a
+    // `MsgStream` — `Pin<Box<dyn Stream>>` with no `+ Send` — across its awaits,
+    // so `tokio::spawn` has never accepted it. The `Rc` states the requirement
+    // deliberately instead, so that adding `+ Send` to `MsgStream` for some
+    // unrelated reason cannot quietly re-open the hole. Dropped explicitly at
+    // the end so it is genuinely live across every await rather than something
+    // the generator layout may elide; verified by probe — `tokio::spawn` of
+    // this future names `Rc<()>` as the offending type.
+    let thread_bound = std::rc::Rc::new(());
+
     // Handshake: `Register` MUST be the first frame (else the host drops us),
     // then a greeting through the host log (exercises the `Log` frame path).
     let mut manifest = P::manifest();
@@ -165,7 +185,15 @@ where
     // `display` widget CPU-rasterises exactly as it does today. Re-seeding on
     // every (re)connect is what makes a reconnect to an older shell degrade
     // instead of carrying the previous session's advertisement forward.
-    crate::display::set_negotiated(negotiation.vocab);
+    //
+    // Floored at `VOCAB_UNCONDITIONAL` rather than trusted from the manifest
+    // (#898 review N2): `Manifest`'s fields are `pub`, so a plugin can hand-set
+    // `vocab` above `PREEM_VOCAB`, and seeding from that would put the *seed*
+    // render on the state arm — a `Node::Preem` at a host that has advertised
+    // nothing, which is the #437 decode-fail crash loop this gate exists to
+    // prevent. An older host's `check_vocab` refuses such a plugin anyway, so
+    // this only closes the window against a current one.
+    crate::display::set_negotiated(negotiation.vocab.min(VOCAB_UNCONDITIONAL));
     write_frame(&mut wr, &PluginMsg::Register { manifest }).await?;
     write_frame(
         &mut wr,
@@ -315,7 +343,7 @@ where
                     // here on `display`'s widgets emit `Node::Preem` and stop
                     // rasterising — and stop ticking their own animation, which
                     // the shell now owns.
-                    crate::display::set_negotiated(negotiation.negotiated_vocab(vocab));
+                    crate::display::raise_negotiated(negotiation.negotiated_vocab(vocab));
                     Step::Rerender
                 }
                 Some(Ok(HostMsg::Ping { seq })) => {
@@ -384,6 +412,8 @@ where
     // Stop reading; the caller drops the write half, which half-closes the
     // socket and lets the host reap the connection.
     reader.abort();
+    // Keeps the `!Send` marker live across every await above — see its comment.
+    drop(thread_bound);
     result
 }
 
@@ -1890,11 +1920,18 @@ mod tests {
     }
 
     /// The headline: a host that advertises the preem generation gets typed
-    /// state nodes — and the plugin **stops ticking its own animation**, which
-    /// the wire proves by going silent across two heartbeats that would each
-    /// have produced a fresh buffer in raster mode.
+    /// state nodes, and the wire then goes **silent** across two heartbeats
+    /// that would each have produced a fresh buffer in raster mode.
+    ///
+    /// Named for what it can actually prove (#898 review N5). It looks like a
+    /// guard on `advance` being a no-op, and it is not: defeat all six
+    /// `if mode == Raster` guards and this test still passes, because
+    /// `MarqueeState` carries only the text — a ticking plugin-side offset
+    /// cannot change the emitted node. The guards are covered by
+    /// `display::tests::{an_unchanged_marquee_is_quiet_…, settling_animations_are_quiet_…}`,
+    /// which is where that mutation goes red.
     #[tokio::test]
-    async fn an_advertising_host_gets_state_nodes_and_the_plugin_stops_ticking() {
+    async fn an_advertising_host_gets_state_nodes_and_the_wire_stays_quiet() {
         scroller_session(|mut hrd, mut hwr| async move {
             let seed = eat_handshake(&mut hrd, "scroller-test").await;
             assert!(

@@ -39,16 +39,31 @@
 //!
 //! That is what lets one `update`/`view` pair serve both hosts. It also means a
 //! plugin talking to a preem-speaking shell does **no rasterisation at all** —
-//! no [`Frame`](crate::preem::Frame) is allocated, and no needle/phosphor math
-//! runs — which is the CPU half of the win, next to the wire half.
+//! no [`Frame`](crate::preem::Frame) is allocated *per render*, and no
+//! needle/phosphor math runs — which is the CPU half of the win, next to the
+//! wire half. (Per *session* the stateful wrappers still build and hold their
+//! kit renderer, phosphor buffer included, in either mode: the widget is
+//! constructed before the host has advertised anything, and it has to be ready
+//! if the advertisement never comes.)
 //!
 //! The physics **getters** follow the same rule rather than reporting the
-//! stopped local animation: [`Gauge::value`] is the stated target and
-//! [`Gauge::is_settled`] / [`FlipBoard::is_settled`] are `true` while the host
-//! speaks preem, because there is no local motion left to advance. A plugin
-//! that gates work on "has the needle arrived yet?" therefore keeps working
-//! instead of waiting forever on a tick that is a no-op. Each has an `_in`
-//! twin that states the mode explicitly, for tests.
+//! stopped local animation: [`Gauge::value`] is where the shell will land the
+//! needle, and [`Gauge::is_settled`] / [`FlipBoard::is_settled`] are `true`
+//! while the host speaks preem, because there is no local motion left to
+//! advance. A plugin that gates work on "has the needle arrived yet?" therefore
+//! keeps working instead of waiting forever on a tick that is a no-op. Each has
+//! an `_in` twin that states the mode explicitly, for tests.
+//! [`Marquee::scroll_dots`] is the one that cannot follow — the wire carries no
+//! scroll offset to read back — and its docs say so.
+//!
+//! # Non-finite readings
+//!
+//! Every state setter takes its value through the same rule the kit applies to
+//! it, so `NaN`/`±inf` cannot make the two arms disagree — and, just as
+//! importantly, cannot defeat the runtime's render dedup, which compares
+//! `Node`s and would find a `NaN` unequal to itself forever. See the
+//! `level_reading` / `sample_reading` block below for the per-widget rules and
+//! why each is the kit's output unchanged rather than an improvement on it.
 //!
 //! # Negotiation
 //!
@@ -148,9 +163,23 @@ thread_local! {
 }
 
 /// Record the generation this session negotiated. Called by the session loop at
-/// (re)connect (seeding the unconditional floor) and again on `Hello`.
+/// (re)connect to **seed** the unconditional floor — the one place the value is
+/// allowed to go down, which is what makes a reconnect degrade.
 pub(crate) fn set_negotiated(vocab: u16) {
     NEGOTIATED.with(|v| v.set(vocab));
+}
+
+/// Raise the negotiated generation to `vocab`, never lower it — the `Hello`
+/// path.
+///
+/// Monotonic on purpose (#898 review N1). A second `Hello` carrying a *lower*
+/// generation would otherwise flip a live session back to `Raster` mid-flight,
+/// and the wrappers' plugin-side physics have been standing still since the
+/// upgrade, so the first frames after such a downgrade would jump. No host
+/// sends a second `Hello` today; this makes the SDK's behaviour not depend on
+/// that.
+pub(crate) fn raise_negotiated(vocab: u16) {
+    NEGOTIATED.with(|v| v.set(v.get().max(vocab)));
 }
 
 /// The wire-vocabulary generation this session negotiated with the host — the
@@ -315,6 +344,78 @@ fn lower(
     }
 }
 
+// ── non-finite readings: the kit's own rules, applied one step earlier ───────
+
+// Every kit widget already defends itself against `NaN`/`±inf`, and each does
+// it slightly differently because each has its own idea of "no reading":
+// `Needle::set_target` (`gauge.rs`) **ignores** the value outright, `Scope`'s
+// `sanitize` (`scope.rs`) maps any of the three to `0.0` — the axis — and
+// `lit_count` / `peak_led` / `PeakHold::push` (`led_strip.rs`) clamp `±inf` to
+// the ends of the scale and absorb only `NaN`. The setters below apply the
+// *same* rule, **per widget**, before the value reaches `state`, for two
+// reasons (#898 review R1):
+//
+// 1. **Parity.** The raster arm hands the value straight to the kit, which
+//    sanitises it; the state arm puts it on the wire, where the shell's copy of
+//    the same kit sanitises it later. Sanitising here makes both arms render the
+//    same pixels from the same input — the invariant the
+//    `the_raster_arm_is_byte_identical_*` tests exist to protect, extended to
+//    the one input class those tests cannot otherwise reach. Each rule below is
+//    chosen so the kit's output is **unchanged**, never improved.
+// 2. **Dedup.** `Node` derives `PartialEq` and `NaN != NaN`, so one non-finite
+//    reading in `state` makes the runtime's `view != last_view` true *forever*:
+//    a `Render` every heartbeat until the plugin restarts, the exact inverse of
+//    the "the wire goes quiet" property this module exists for. Dedup happens
+//    plugin-side, so this is the load-bearing place for it whatever the wire
+//    format clamps downstream.
+
+/// A `0.0..=1.0` meter reading: `NaN` read as rest, everything else clamped.
+///
+/// Kit-identical, and note that `NaN` is the *only* special case here — unlike
+/// [`sample_reading`], where the kit lumps all three non-finite values together.
+/// `lit_count`, `peak_led` and `PeakHold::push` each `clamp(0.0, 1.0)` first,
+/// and a clamp passes `±inf` straight through to the ends of the scale
+/// (`f32::INFINITY.clamp(0.0, 1.0) == 1.0`, a **full** strip) while `NaN`
+/// survives it and is then absorbed — by a saturating cast in `lit_count`, an
+/// `is_nan` arm in `peak_led`, a failed `>` in `PeakHold::push` — into the same
+/// answer `0.0` gives. Reading `+inf` as rest, which is what "non-finite means
+/// no reading" would have done, darkens a strip the kit lights fully; the test
+/// `sanitising_a_non_finite_reading_leaves_the_raster_arm_byte_identical`
+/// caught exactly that.
+fn level_reading(level: f32) -> f32 {
+    if level.is_nan() {
+        0.0
+    } else {
+        level.clamp(0.0, 1.0)
+    }
+}
+
+/// A normalized `-1.0..=1.0` sample, with **any** non-finite value read as the
+/// axis — character for character the kit's own `sanitize` (`scope.rs`), which
+/// every sample already passes through inside `Scope::advance`.
+///
+/// Deliberately a different rule from [`level_reading`]'s, because the kit's is
+/// different: the scope rejects `±inf` outright rather than clamping it to the
+/// rails. Mirror each widget, never unify them.
+fn sample_reading(sample: f32) -> f32 {
+    if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Ceiling on the plugin-side scroll accumulator, in dots.
+///
+/// A bound exists only so the `f32` accumulator stays exactly
+/// integer-representable (`f32` is exact to 2^24) and [`offset_dots`]' cast can
+/// never saturate; the strip wraps modulo its own period, so where the ceiling
+/// sits is otherwise arbitrary. 10^7 leaves room for a plugin that states an
+/// absolute offset derived from a wall clock — `preem-demo` uses
+/// `2 × (unix mod 10^6)`, up to ~2×10^6 — without the SDK folding a number the
+/// plugin computed exactly.
+const MAX_OFFSET_DOTS: f32 = 1.0e7;
+
 /// Convert an accumulated dot offset to the kit's `usize` window offset.
 /// Non-finite and negative values park at 0; the strip wraps modulo its own
 /// period, so the absolute magnitude is irrelevant beyond staying in range.
@@ -327,7 +428,16 @@ fn offset_dots(dots: f32) -> usize {
     if !dots.is_finite() || dots <= 0.0 {
         return 0;
     }
-    dots.min(1.0e6) as usize
+    dots.min(MAX_OFFSET_DOTS) as usize
+}
+
+/// The accumulator value for an absolute offset stated in whole dots.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "bounded to MAX_OFFSET_DOTS, well inside f32's exact integer range"
+)]
+fn dots_offset(dots: usize) -> f32 {
+    (dots as f32).min(MAX_OFFSET_DOTS)
 }
 
 /// Advance a wrapping dot accumulator by `speed * dt`, keeping it bounded.
@@ -337,7 +447,7 @@ fn advance_dots(offset: &mut f32, speed: f32, dt: f32) {
     }
     let next = *offset + speed * dt;
     *offset = if next.is_finite() {
-        next.rem_euclid(1.0e6)
+        next.rem_euclid(MAX_OFFSET_DOTS)
     } else {
         0.0
     };
@@ -706,8 +816,34 @@ impl Marquee {
         }
     }
 
+    /// Put the **plugin-side** scroll at an absolute offset in whole dots.
+    ///
+    /// The counterpart of [`advance`](Self::advance) for a plugin whose scroll
+    /// is a pure function of a clock rather than an integration — which is what
+    /// a plugin driven only by the host's ~1 Hz `Clock` snapshot has, and what
+    /// `preem-demo` and `audio-widget` both do. A no-op while the host speaks
+    /// preem, for `advance`'s reason: the shell owns the offset there.
+    pub fn set_scroll_dots(&mut self, dots: usize) {
+        self.set_scroll_dots_in(render_mode(), dots);
+    }
+
+    /// [`set_scroll_dots`](Self::set_scroll_dots) with the mode stated explicitly.
+    pub fn set_scroll_dots_in(&mut self, mode: RenderMode, dots: usize) {
+        if mode == RenderMode::Raster {
+            self.offset = dots_offset(dots);
+        }
+    }
+
     /// The plugin-side scroll offset in whole dots — raster bookkeeping, exposed
     /// for tests and for a plugin that wants to observe its own scroll.
+    ///
+    /// **Stays at whatever it was left at while the host speaks preem** — `0`
+    /// for a plugin that only ever called [`advance`](Self::advance) — because
+    /// there is no plugin-side offset there to observe: the scroll is the
+    /// shell's, integrated on its own frame clock from
+    /// [`speed_dots_per_sec`](Self::speed_dots_per_sec), and the wire carries no
+    /// offset for the plugin to read back. Unlike [`Gauge::value`] this one has
+    /// no honest state-mode answer to substitute (#898 review R6).
     #[must_use]
     pub fn scroll_dots(&self) -> usize {
         offset_dots(self.offset)
@@ -817,12 +953,17 @@ impl LedStrip {
     /// Set the level to light, in `0.0..=1.0`. Always takes effect; also folds
     /// into the plugin-side peak-hold when one is declared and the host does not
     /// speak preem.
+    ///
+    /// The reading is taken through [`level_reading`] — the strip's own rule, so
+    /// a non-finite level reads as rest in **both** modes rather than as a `NaN`
+    /// the raster arm silently absorbs and the state arm ships forever.
     pub fn set_level(&mut self, level: f32) {
         self.set_level_in(render_mode(), level);
     }
 
     /// [`set_level`](Self::set_level) with the mode stated explicitly.
     pub fn set_level_in(&mut self, mode: RenderMode, level: f32) {
+        let level = level_reading(level);
         self.state.level = level;
         if mode == RenderMode::Raster
             && let Some(hold) = self.hold.as_mut()
@@ -834,8 +975,13 @@ impl LedStrip {
     /// Override the peak dot with an explicitly computed value (a true
     /// inter-frame peak the shell's per-render fold cannot see), or `None` to
     /// leave it to the declared [`peak_hold`](Self::peak_hold).
+    ///
+    /// A `NaN` override becomes `Some(0.0)` rather than `None`: `peak_led`
+    /// draws no dot for either, so the rendered strip is unchanged, and keeping
+    /// it a `Some` preserves the "explicit override wins" contract instead of
+    /// silently handing the render back to the declared hold.
     pub fn set_peak(&mut self, peak: Option<f32>) {
-        self.state.peak = peak;
+        self.state.peak = peak.map(level_reading);
     }
 
     /// Decay the **plugin-side** peak-hold one tick. A no-op while the host
@@ -901,7 +1047,10 @@ impl LedStrip {
 /// The phosphor buffer is **shell-owned** in state mode. [`push`](Self::push)
 /// states the batch in both modes; it stamps the plugin-side phosphor only in
 /// raster mode.
-#[derive(Clone, Debug)]
+/// `PartialEq` but not `Eq`, matching the kit's own `Scope` — `ScopeState`
+/// carries a `Vec<f32>`, and `f32` is not `Eq`. Every other bound the kit's
+/// type derives is here (#898 review R3).
+#[derive(Clone, Debug, PartialEq)]
 pub struct Scope {
     config: ScopeConfig,
     state: ScopeState,
@@ -967,6 +1116,11 @@ impl Scope {
 
     /// State a fresh sample batch (a normalized `-1.0..=1.0` signal). Always
     /// recorded; stamps the plugin-side phosphor only in raster mode.
+    ///
+    /// Every sample is taken through [`sample_reading`], the kit's own
+    /// `sanitize` — which `Scope::advance` applies to each one anyway, so the
+    /// rasterised trace is byte-for-byte unchanged, while the batch that goes
+    /// on the wire can no longer carry a `NaN` that compares unequal to itself.
     pub fn push(&mut self, samples: &[f32]) {
         self.push_in(render_mode(), samples);
     }
@@ -974,9 +1128,14 @@ impl Scope {
     /// [`push`](Self::push) with the mode stated explicitly.
     pub fn push_in(&mut self, mode: RenderMode, samples: &[f32]) {
         self.state.samples.clear();
-        self.state.samples.extend_from_slice(samples);
+        self.state
+            .samples
+            .extend(samples.iter().copied().map(sample_reading));
         if mode == RenderMode::Raster {
-            self.kit.advance(samples);
+            // The sanitised batch, not the caller's: identical to the kit (it
+            // re-applies `sanitize` internally, which is idempotent), and it
+            // keeps the two arms reading from the one value.
+            self.kit.advance(&self.state.samples);
         }
     }
 
@@ -986,6 +1145,12 @@ impl Scope {
     /// word for "clear" — but it does not need one: a parked plugin simply stops
     /// pushing batches and the shell's own decay fades the trace out, which is
     /// what real phosphor does anyway.
+    ///
+    /// The one mutator here that is **not** mode-gated, deliberately (#898
+    /// review). Wiping the kit costs nothing while the host speaks preem, and
+    /// leaving it dirty would mean a session that later degraded to raster —
+    /// through a reconnect to an older shell — resumed on a phosphor from
+    /// before the park, which is the stale trace `clear` exists to prevent.
     pub fn clear(&mut self) {
         self.state.samples.clear();
         self.kit.clear();
@@ -1041,7 +1206,9 @@ impl Scope {
 /// wire carries only the target, so a settled gauge sends nothing while it
 /// swings. [`advance`](Self::advance) integrates the same spring plugin-side for
 /// the raster path.
-#[derive(Clone, Debug)]
+/// `PartialEq` like the kit's own `Gauge`, so a plugin model holding one still
+/// derives it (#898 review R3). Not `Eq`: `GaugeState::target` is an `f32`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Gauge {
     config: GaugeConfig,
     state: GaugeState,
@@ -1138,9 +1305,18 @@ impl Gauge {
         self.accent_role(AccentRole::Neutral)
     }
 
-    /// Point the needle at a new reading. Always takes effect — it is the one
-    /// thing the plugin has to say in either mode.
+    /// Point the needle at a new reading. Takes effect in either mode — it is
+    /// the one thing the plugin has to say.
+    ///
+    /// A **non-finite** reading is ignored, exactly as the kit's own
+    /// `Needle::set_target` ignores it (`gauge.rs`). Storing it would leave the
+    /// raster arm on its last real target while the state arm shipped a `NaN`
+    /// that never compares equal to itself — the two arms diverging on one
+    /// input, and render dedup defeated for the rest of the session.
     pub fn set_target(&mut self, value: f32) {
+        if !value.is_finite() {
+            return;
+        }
         self.state.target = value;
         self.kit.set_target(value);
     }
@@ -1164,15 +1340,24 @@ impl Gauge {
         self.kit.settle();
     }
 
-    /// The reading the needle is currently at, in the configured range.
+    /// The reading the needle is currently at, in the configured
+    /// [`range`](Self::range).
     ///
-    /// Plugin-side physics in raster mode. Once the host speaks preem this is
-    /// [`target`](Self::target): [`advance`](Self::advance) is a no-op there, so
-    /// the local needle would otherwise sit frozen wherever the last raster tick
-    /// left it — a value that is neither where the shell is drawing the pointer
-    /// nor where it is heading, and the one number a plugin reading this getter
-    /// would least expect. The shell lands the needle on the target, so that is
-    /// the honest answer.
+    /// Plugin-side physics in raster mode. Once the host speaks preem it is
+    /// where the **shell** will land the pointer: [`advance`](Self::advance) is
+    /// a no-op there, so the local needle would otherwise sit frozen wherever
+    /// the last raster tick left it — a value that is neither where the shell
+    /// draws the pointer nor where it is heading.
+    ///
+    /// That is *not* simply [`target`](Self::target). The shell runs this same
+    /// kit, and `Needle::set_target` folds a target into the dial's travel
+    /// before the needle ever reaches it, so a `0.0..=100.0` gauge told to read
+    /// `500.0` settles at `100.0` — which the raster arm reported all along and
+    /// the state arm did not, until #898's review (R2) caught it. The state arm
+    /// below is `Needle::set_target`'s normalisation followed by
+    /// `Needle::value`, i.e. the kit's own two lines, so the modes cannot drift.
+    /// A degenerate range reproduces whatever the kit would do with it, for the
+    /// same reason.
     #[must_use]
     pub fn value(&self) -> f32 {
         self.value_in(render_mode())
@@ -1183,7 +1368,11 @@ impl Gauge {
     pub fn value_in(&self, mode: RenderMode) -> f32 {
         match mode {
             RenderMode::Raster => self.kit.value(),
-            RenderMode::State => self.state.target,
+            RenderMode::State => {
+                let GaugeRange { low, high } = self.config.range;
+                let span = high - low;
+                low + ((self.state.target - low) / span).clamp(0.0, 1.0) * span
+            }
         }
     }
 
@@ -1270,7 +1459,9 @@ impl Gauge {
 /// The per-cell flip clocks and the left-to-right stagger are **shell-owned** in
 /// state mode: the wire carries the content and nothing else, so a board sends
 /// one frame per change and nothing at all while the cards are in motion.
-#[derive(Clone, Debug)]
+/// `PartialEq` like the kit's own `FlipBoard` (#898 review R3). Not `Eq`:
+/// `FlipBoardConfig`'s `duration_secs`/`stagger_secs` are `Option<f32>`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct FlipBoard {
     config: FlipBoardConfig,
     state: FlipBoardState,
@@ -1698,7 +1889,22 @@ mod tests {
                     .fixed_width(true)
                     .render("wrapped demo copy")
                     .into_node(Some("tb"), no_cls()),
-            "text box",
+            "text box, Cols",
+        );
+        // …and the other `TextBoxWidth` arm. Without it a dropped `fit_px` in
+        // `TextBox::kit()` is invisible: the `Cols` case above never reaches
+        // that branch (#898 review N6).
+        assert!(
+            TextBox::new(StyleName::Oled)
+                .fit_px(120)
+                .max_lines(3)
+                .node_in(raster, "tb", no_cls(), "fit to a pixel budget")
+                == kit::TextBox::styled(DisplayStyle::Oled)
+                    .fit_px(120)
+                    .max_lines(3)
+                    .render("fit to a pixel budget")
+                    .into_node(Some("tb"), no_cls()),
+            "text box, FitPx",
         );
     }
 
@@ -1840,6 +2046,219 @@ mod tests {
                     .into_node(Some("fb"), no_cls()),
             "flip board",
         );
+    }
+
+    // ── non-finite readings ─────────────────────────────────────────────────
+
+    /// The three non-finite values, and a heartbeat count long enough that a
+    /// per-beat frame would be unmistakable.
+    const NON_FINITE: [f32; 3] = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+    const BEATS: usize = 5;
+
+    /// A non-finite reading must not defeat render dedup (#898 review R1).
+    ///
+    /// The runtime ships a frame when `view != last_view`, [`Node`] derives
+    /// `PartialEq`, and `NaN != NaN` — so one `NaN` reaching `state` meant one
+    /// `Render` per heartbeat for the rest of the session, forever, which is
+    /// the exact inverse of the property this module exists for. A plugin gets
+    /// there by ordinary arithmetic: `sum / n` with `n == 0`, a `-inf` dB fold,
+    /// an unread sensor.
+    ///
+    /// Asserted the way the runtime would see it: the node from the first
+    /// heartbeat, then [`BEATS`] more that re-state the same bad reading, all
+    /// compared for equality. Under the old code every one of them differed.
+    #[test]
+    fn a_non_finite_reading_does_not_defeat_dedup_in_state_mode() {
+        let state = RenderMode::State;
+        for bad in NON_FINITE {
+            let mut gauge = Gauge::new(StyleName::Vfd).range(0.0, 100.0);
+            gauge.set_target(bad);
+            let first = gauge.node_in(state, "ga", Vec::new());
+            for beat in 0..BEATS {
+                gauge.set_target(bad);
+                gauge.advance(0.1);
+                assert_eq!(
+                    gauge.node_in(state, "ga", Vec::new()),
+                    first,
+                    "gauge, {bad}, beat {beat}",
+                );
+            }
+
+            let mut led = LedStrip::new(StyleName::Vfd).leds(16).peak_hold(0.02);
+            led.set_level_in(state, bad);
+            led.set_peak(Some(bad));
+            let first = led.node_in(state, "led", Vec::new());
+            for beat in 0..BEATS {
+                led.set_level_in(state, bad);
+                led.set_peak(Some(bad));
+                led.advance_in(state);
+                assert_eq!(
+                    led.node_in(state, "led", Vec::new()),
+                    first,
+                    "led strip, {bad}, beat {beat}",
+                );
+            }
+
+            let batch = [bad, 0.5, bad, -0.25];
+            let mut scope = Scope::new(StyleName::Vfd);
+            scope.push_in(state, &batch);
+            let first = scope.node_in(state, "sc", Vec::new());
+            for beat in 0..BEATS {
+                scope.push_in(state, &batch);
+                assert_eq!(
+                    scope.node_in(state, "sc", Vec::new()),
+                    first,
+                    "scope, {bad}, beat {beat}",
+                );
+            }
+        }
+    }
+
+    /// …and sanitising must not have moved a single pixel: the raster arm fed a
+    /// non-finite reading is still byte-identical to the raw kit fed the same
+    /// one (#898 review R1).
+    ///
+    /// This is the half that makes the fix a *parity* fix rather than a
+    /// behaviour change. Each rule was picked to be the kit's existing answer
+    /// restated: `Needle::set_target` ignores a non-finite target, `lit_count`
+    /// and `peak_led` read one as an unlit strip with no dot (identically to
+    /// `0.0`), and `Scope`'s `sanitize` already maps one to the axis. The
+    /// `the_raster_arm_is_byte_identical_*` tests cannot reach this input class
+    /// because they drive only finite values.
+    #[test]
+    fn sanitising_a_non_finite_reading_leaves_the_raster_arm_byte_identical() {
+        let raster = RenderMode::Raster;
+        let no_cls = Vec::new;
+        for bad in NON_FINITE {
+            // Gauge: a real reading, then a bad one, then a settle — the kit
+            // must have ignored the bad one on both sides.
+            let mut ga = Gauge::with_size(StyleName::Lcd, 120, 60).range(0.0, 100.0);
+            let mut ga_kit = kit::Gauge::with_size(120, 60).range(0.0, 100.0);
+            ga.set_target(42.0);
+            ga_kit.set_target(42.0);
+            ga.set_target(bad);
+            ga_kit.set_target(bad);
+            for _ in 0..BEATS {
+                ga.advance_in(raster, 0.1);
+                ga_kit.advance(0.1);
+            }
+            assert!(
+                ga.node_in(raster, "ga", no_cls())
+                    == ga_kit
+                        .render(DisplayStyle::Lcd)
+                        .into_node(Some("ga"), no_cls()),
+                "gauge, {bad}",
+            );
+
+            // Led strip: the level *and* the explicit peak override.
+            let mut led = LedStrip::new(StyleName::Oled).leds(16).peak_hold(0.02);
+            let mut hold = kit::PeakHold::new(0.02);
+            led.set_level_in(raster, bad);
+            led.advance_in(raster);
+            hold.push(bad);
+            hold.decay();
+            led.set_peak(Some(bad));
+            assert!(
+                led.node_in(raster, "led", no_cls())
+                    == kit::LedStrip::new(DisplayStyle::Oled)
+                        .leds(16)
+                        .render(bad, bad)
+                        .into_node(Some("led"), no_cls()),
+                "led strip, {bad}",
+            );
+
+            // Scope: a batch with bad samples either side of good ones.
+            let batch = [bad, 0.5, bad, -0.25];
+            let mut sc = Scope::with_size(StyleName::Crt, 96, 32);
+            let mut sc_kit = kit::Scope::with_size(96, 32).scale(2);
+            for _ in 0..BEATS {
+                sc.push_in(raster, &batch);
+                sc_kit.advance(&batch);
+            }
+            assert!(
+                sc.node_in(raster, "sc", no_cls())
+                    == sc_kit
+                        .render(DisplayStyle::Crt)
+                        .into_node(Some("sc"), no_cls()),
+                "scope, {bad}",
+            );
+        }
+    }
+
+    /// `Gauge::value()` reports the same reading in both modes (#898 review R2).
+    ///
+    /// The state arm used to return the raw `state.target`, so a `0.0..=100.0`
+    /// gauge told to read `500.0` answered `500` against a preem shell and
+    /// `100` against an old one — from identical plugin code and identical
+    /// input. The shell runs this same kit, and `Needle::set_target` folds a
+    /// target into the dial's travel before the needle reaches it, so `100` was
+    /// right both times.
+    ///
+    /// A tolerance rather than exact equality: the raster arm arrives at full
+    /// scale through the needle's own float arithmetic. It is a thousandth of
+    /// one division, where the bug was five times full scale.
+    #[test]
+    fn the_gauge_reads_the_same_in_both_modes() {
+        for target in [42.0_f32, 500.0, -80.0, 0.0, 100.0] {
+            let mut ga = Gauge::new(StyleName::Vfd).range(0.0, 100.0);
+            ga.set_target(target);
+            ga.settle();
+            let (raster, state) = (
+                ga.value_in(RenderMode::Raster),
+                ga.value_in(RenderMode::State),
+            );
+            assert!(
+                (raster - state).abs() < 1e-3,
+                "target {target}: raster={raster} state={state}",
+            );
+            assert!(
+                (0.0..=100.0).contains(&state),
+                "target {target}: {state} is off the dial",
+            );
+        }
+
+        // A non-finite target is ignored (the kit's rule), so both modes keep
+        // reporting the last real reading rather than one of them going NaN.
+        for bad in NON_FINITE {
+            let mut ga = Gauge::new(StyleName::Vfd).range(0.0, 100.0);
+            ga.set_target(37.0);
+            ga.settle();
+            ga.set_target(bad);
+            for mode in [RenderMode::Raster, RenderMode::State] {
+                let v = ga.value_in(mode);
+                assert!(v.is_finite(), "{mode:?} went non-finite on {bad}");
+                assert!((v - 37.0).abs() < 1e-3, "{mode:?} moved to {v} on {bad}");
+            }
+            assert!(
+                (ga.target() - 37.0).abs() < f32::EPSILON,
+                "…and so did target()"
+            );
+        }
+    }
+
+    /// The three wrappers that had lost it derive `PartialEq` again (#898 review
+    /// R3), so a plugin model holding one still derives its own.
+    ///
+    /// Stated as a use, not a claim: this function would not compile if any of
+    /// the three lacked the bound, and `preem-demo`'s model — which had to drop
+    /// `PartialEq` for exactly this reason — carries it again.
+    #[test]
+    fn the_stateful_wrappers_compare_like_the_kit_types_they_replace() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct Model {
+            scope: Scope,
+            gauge: Gauge,
+            board: FlipBoard,
+        }
+        let model = Model {
+            scope: Scope::new(StyleName::Vfd),
+            gauge: Gauge::new(StyleName::Vfd),
+            board: FlipBoard::new(StyleName::Vfd, Mechanism::Nixie),
+        };
+        let mut moved = model.clone();
+        assert_eq!(moved, model, "a fresh clone compares equal");
+        moved.gauge.set_target(1.0);
+        assert_ne!(moved, model, "…and a stated reading makes it differ");
     }
 
     /// The SDK defaults the semantic role to `Accent` so a state-mode widget

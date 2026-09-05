@@ -47,6 +47,20 @@
 //! The drawer panel stays plain GTK labels: an RFC3339 timestamp and a raw unix
 //! count are text, not a retro readout, and the contrast is the point — the
 //! seam is opt-in per widget, not a mode the plugin enters.
+//!
+//! ## What the raster arm costs, stated (#898 review R5)
+//!
+//! Against a shell that does not speak preem, `view()` rasterises a 188×70
+//! frame — 52,640 bytes — on **every** `Clock` snapshot, i.e. about once a
+//! second, while the `HH:MM` it draws changes once a minute. The runtime's
+//! render dedup then throws 59 of every 60 away, after the allocation, the
+//! rasterise and a 52 KB compare. That is not new (`timer` has always cost
+//! exactly this for its bar readout) and it is not a bug, but it is the honest
+//! price of a pixel chip on a 1 Hz cadence, and it is the *only* mode live
+//! until the shell renderer lands. It is left as it stands deliberately: a
+//! cache keyed on [`clock_face`] would need interior mutability in `view(&self)`
+//! and would make the reference plugin less readable than the thing it
+//! references. In state mode the same chip is a ~40-byte node.
 
 use hytte_plugin::display::{SevenSeg, StyleName};
 use hytte_plugin::proto::{

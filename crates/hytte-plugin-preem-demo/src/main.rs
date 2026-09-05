@@ -47,13 +47,22 @@
 //! model and are advanced on the host heartbeat.
 //!
 //! They are advanced by a *fraction* of the elapsed second
-//! ([`GAUGE_SLOWMO_DT`], [`FLIP_SLOWMO_DT`], [`MARQUEE_SLOWMO_DT`]) rather than
-//! the whole of it. That is a **raster-mode concession**: this card has no frame
-//! timer, only the shell's ~1 Hz `Clock` snapshot, so advancing by the real
-//! second would land every animation between two renders and the mechanism would
-//! never be seen. Those constants therefore have no effect at all once the host
-//! speaks preem — the shell's own pump animates at frame rate — which is exactly
-//! the point of the seam.
+//! ([`GAUGE_SLOWMO_DT`], [`FLIP_SLOWMO_DT`]) rather than the whole of it. That
+//! is a **raster-mode concession**: this card has no frame timer, only the
+//! shell's ~1 Hz `Clock` snapshot, so advancing by the real second would land
+//! every animation between two renders and the mechanism would never be seen.
+//! Those constants therefore have no effect at all once the host speaks preem —
+//! the shell's own pump animates at frame rate — which is exactly the point of
+//! the seam.
+//!
+//! The **marquee is the exception, and the instructive one**: its offset is not
+//! integrated at all but *stated* from the snapshot's unix time
+//! ([`MARQUEE_STEP_DOTS`], via [`Marquee::set_scroll_dots`]), so the raster
+//! scroll keeps the wall-clock phase this card has always had. Integrating it
+//! looked equivalent — the rate matches exactly — but made the pan
+//! session-relative: every reconnect restarting at column 0, and a dropped
+//! heartbeat losing ground the old code caught up. Where a widget's state is a
+//! pure function of the clock, say it; only genuine physics needs a tick.
 //!
 //! # …and the scope alone is the card's **parked** widget (#422)
 //!
@@ -169,19 +178,27 @@ const MARQUEE_MSG: &str = "SCROLLING MARQUEE ~ DOT-MATRIX PIXEL TICKER ~ ";
 /// The marquee window width in pixels — a wide bar-chip ticker that stays
 /// within the ~296 px sidebar card.
 const MARQUEE_WINDOW_PX: u32 = 268;
-/// Seconds of scroll the marquee is advanced per host heartbeat.
+/// **Virtual pixels** (dots) the marquee pans per wall-clock second in raster
+/// mode — the unit the marquee scrolls in, where a sub-dot step is not
+/// expressible (#839).
 ///
-/// **Slow motion, on purpose**, and **raster-only** — the third of the trio with
-/// [`GAUGE_SLOWMO_DT`] and [`FLIP_SLOWMO_DT`]. At the widget's
-/// [`MARQUEE_SPEED_DPS`] this works out to the same 2 dots per heartbeat the
-/// card panned at before #884, which is about as smooth as a 1 Hz cadence gets.
-/// A preem-speaking shell ignores it and scrolls at the full
-/// [`MARQUEE_SPEED_DPS`] on its own frame clock.
-const MARQUEE_SLOWMO_DT: f32 = 0.1;
-/// The marquee's scroll speed in **dots per second** — the one number that
-/// drives both modes (the shell integrates it in state mode; the SDK integrates
-/// it against [`MARQUEE_SLOWMO_DT`] in raster mode). 20 dots/s is the kit's own
-/// default and the rate the audio widget already scrolls at.
+/// Unlike the gauge's and the boards' slow-motion constants, this is **not** an
+/// integration step: the offset is a pure function of the snapshot's unix time
+/// ([`PreemDemo::marquee_offset`]), stated through
+/// [`Marquee::set_scroll_dots`], exactly as this card computed it before #884.
+/// Integrating instead would have made the scroll session-relative — every
+/// reconnect restarting at column 0, and a missed heartbeat slowing the pan
+/// rather than being caught up — a visible change against an old shell, which
+/// this PR promises not to make (#898 review R4).
+const MARQUEE_STEP_DOTS: usize = 2;
+/// The marquee's scroll speed in **dots per second**, as stated on the wire.
+///
+/// State mode only: the shell integrates it against its own frame clock. The
+/// raster arm never reads it — [`MARQUEE_STEP_DOTS`] drives that, off the host
+/// clock — so the card scrolls at 2 dots/s against an old shell (all a 1 Hz
+/// cadence can express) and at this rate, smoothly, against a preem-speaking
+/// one. 20 dots/s is the kit's own default and the rate the audio widget
+/// already scrolls at.
 const MARQUEE_SPEED_DPS: f32 = 20.0;
 /// The textbox wrap width: 22 columns at ×2 scale = 274 px.
 const TEXT_COLS: u32 = 22;
@@ -190,7 +207,12 @@ const TEXT_COLS: u32 = 22;
 /// the next snapshot.
 // `Eq` is intentionally not derived: `bins` is `[f32; N]`, which is `PartialEq`
 // but not `Eq`. Nothing compares the whole model for equality anyway.
-#[derive(Debug)]
+//
+// `PartialEq` is derived, as it was before #884 — the three wrappers that had
+// dropped it now carry it again (#898 review R3), which is the property this
+// model exists to demonstrate: swapping the raw kit for `display` must not cost
+// a plugin its derives.
+#[derive(Debug, PartialEq)]
 struct PreemDemo {
     /// `"HH:MM"` from the host clock's ISO timestamp (`"--:--"` until the
     /// first snapshot lands — all-ghost dashes on the readout).
@@ -285,6 +307,19 @@ impl PreemDemo {
         let len = i64::try_from(chars.len()).unwrap_or(1).max(1);
         let off = usize::try_from(self.unix.rem_euclid(len)).unwrap_or(0);
         chars.iter().cycle().skip(off).take(TICKER_WINDOW).collect()
+    }
+
+    /// The marquee's scroll offset, panning [`MARQUEE_STEP_DOTS`] dots per
+    /// second of wall clock — a pure function of the snapshot, like the ticker
+    /// and the skin rotation.
+    ///
+    /// Byte-for-byte the pre-#884 projection, restored in the #898 review
+    /// round: `MarqueeStrip::window` wraps it modulo the strip period, so the
+    /// raw (unbounded) counter is fine, and the bound below only keeps the
+    /// multiply from overflowing.
+    fn marquee_offset(&self) -> usize {
+        let secs = usize::try_from(self.unix.rem_euclid(1_000_000)).unwrap_or(0);
+        secs.saturating_mul(MARQUEE_STEP_DOTS)
     }
 
     /// Park the scope (#422): forget the last bands and wipe the phosphor, so a
@@ -414,8 +449,11 @@ impl Plugin for PreemDemo {
                 self.flap.advance(FLIP_SLOWMO_DT);
                 self.nixie.set_text(&face);
                 self.nixie.advance(FLIP_SLOWMO_DT);
-                // …and the marquee's: pan the strip along.
-                self.marquee.advance(MARQUEE_SLOWMO_DT);
+                // …and the marquee's: state where the strip has panned to.
+                // Absolute, not an increment, so the phase tracks the wall
+                // clock and a clockless snapshot (or a missed heartbeat) leaves
+                // it exactly where the time says it should be.
+                self.marquee.set_scroll_dots(self.marquee_offset());
             }
             // Tapping the clock advances the skin rotation by one.
             Input::Event { node, kind } => {
@@ -801,8 +839,9 @@ mod tests {
     }
 
     /// The marquee pans forward with the host clock in raster mode, at the same
-    /// 2 dots per heartbeat it panned at before #884 (`MARQUEE_SPEED_DPS` ×
-    /// `MARQUEE_SLOWMO_DT`), and the panned pixels actually move.
+    /// 2 dots per second it panned at before #884, on the same **wall-clock
+    /// phase** — the offset is a pure function of `unix`, not a session-relative
+    /// accumulation (#898 review R4) — and the panned pixels actually move.
     #[test]
     fn marquee_pans_with_the_clock() {
         let mut m = fresh();
@@ -811,6 +850,23 @@ mod tests {
         let _ = m.update(snapshot("2026-07-16T00:00:04+02:00", 301));
         let o1 = m.marquee.scroll_dots();
         assert_eq!(o1 - o0, 2, "one heartbeat, two dots — the pre-#884 pace");
+
+        // The phase, not just the rate: a *fresh* model handed the same
+        // snapshot lands on the same column, which is what a reconnect gets and
+        // what an integrating accumulator could not deliver.
+        assert_eq!(o1, 301 * super::MARQUEE_STEP_DOTS, "the pre-#884 offset");
+        let mut reconnected = fresh();
+        let _ = reconnected.update(snapshot("2026-07-16T00:00:04+02:00", 301));
+        assert_eq!(
+            reconnected.marquee.scroll_dots(),
+            o1,
+            "a reconnect resumes the scroll where the clock says, not at 0",
+        );
+
+        // …and a snapshot the host sent without a clock does not pan it (the
+        // offset is stated from `unix`, which did not move).
+        let _ = m.update(Input::Snapshot(StateSnapshot::default()));
+        assert_eq!(m.marquee.scroll_dots(), o1, "a clockless snapshot is inert");
 
         let strip = hytte_plugin::preem::Marquee::new(display_style(m.style()))
             .window_px(usize::try_from(super::MARQUEE_WINDOW_PX).unwrap())
@@ -829,8 +885,11 @@ mod tests {
     fn the_marquee_stops_panning_once_the_shell_owns_it() {
         let mut quiet = Marquee::new(StyleName::Vfd).window_px(super::MARQUEE_WINDOW_PX);
         let before = quiet.node_in(RenderMode::State, "mq", Vec::new(), super::MARQUEE_MSG);
-        for _ in 0..50 {
-            quiet.advance_in(RenderMode::State, super::MARQUEE_SLOWMO_DT);
+        for beat in 0..50 {
+            // Both ways a plugin can move a marquee, and neither reaches the
+            // plugin-side offset while the shell owns it.
+            quiet.advance_in(RenderMode::State, 1.0);
+            quiet.set_scroll_dots_in(RenderMode::State, beat * super::MARQUEE_STEP_DOTS);
         }
         assert_eq!(quiet.scroll_dots(), 0, "the plugin never ticked");
         assert_eq!(

@@ -24,6 +24,43 @@
 //! `g_return_if_fail`). It does **not** log — the trust boundary that validates
 //! untrusted plugin buffers and warns is the host's `to_ui_node`, upstream.
 //!
+//! # Equality guard — an identical frame costs nothing (#902)
+//!
+//! [`set_pixels`](PixelSurface::set_pixels) is called from the plugin
+//! reconciler on **every** re-map of a `Node::Pixels`, and the shell's preem
+//! animation clock re-maps a whole mailbox whenever anything in it moves — so an
+//! unchanged chip sitting next to an animating one used to rebuild a
+//! [`glib::Bytes`] + [`gdk::MemoryTexture`](gtk::gdk::MemoryTexture) and
+//! `queue_draw` 20× a second for a picture nobody changed.
+//!
+//! The surface therefore keeps the last **accepted** buffer and compares before
+//! it uploads. *Equal* means, exactly:
+//!
+//! - the same `width` **and** the same `height` (compared first, so a reshape
+//!   can never be mistaken for a no-op even when the byte block is identical —
+//!   `2×1` and `1×2` are both 8 bytes), **and**
+//! - the same bytes (`Arc::ptr_eq` short-circuits the shared path below, then a
+//!   full slice compare; a pointer match implies byte equality because the
+//!   buffer is immutable while the surface holds a reference to it).
+//!
+//! On equality `set_pixels` returns without touching GTK at all — no `Bytes`, no
+//! texture, no `queue_draw`. An **inconsistent** buffer (see the contract above)
+//! is never remembered, so it can never compare equal to anything: the cheap
+//! rejection just re-runs.
+//!
+//! The [`set_scale`](PixelSurface::set_scale) hint is guarded separately and has
+//! been since #358 — it only queues a resize when the *effective* scale changes.
+//!
+//! ## Sharing a buffer instead of cloning it
+//!
+//! [`set_pixels_shared`](PixelSurface::set_pixels_shared) takes an
+//! `Arc<[u8]>` rather than a slice. A caller with a frame cache (the shell's
+//! preem renderer, one cache feeding N monitors) can hand the *same* allocation
+//! to every surface instead of a full RGBA clone each: the guard then costs one
+//! pointer compare, and on a real change the `MemoryTexture` adopts the `Arc`
+//! through [`glib::Bytes::from_owned`] with **no copy at all**. The slice
+//! setter still works and still copies exactly once, as before.
+//!
 //! # Sizing — aspect-ratio locked, integer-scalable
 //!
 //! The buffer's pixel dimensions carry an aspect ratio, and the widget honors
@@ -47,6 +84,7 @@ use gtk::graphene;
 use gtk::gsk;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
+use std::sync::Arc;
 
 /// Whether `data_len` is exactly `width * height * 4` (RGBA8), computed in
 /// `u64` so no intermediate product can overflow.
@@ -102,12 +140,61 @@ mod imp {
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
     use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
+
+    /// What a `set_pixels*` call needs from GTK once it has updated the state.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum Invalidate {
+        /// The surface already held exactly this frame: nothing was rebuilt and
+        /// nothing needs repainting (the #902 guard).
+        Nothing,
+        /// New pixels at the same natural size — a cheap repaint.
+        Draw,
+        /// The natural size changed, so layout has to run again.
+        Resize,
+    }
+
+    /// The last **accepted** frame, kept so the next `set_pixels*` call can be
+    /// compared against it (#902).
+    struct Held {
+        width: u32,
+        height: u32,
+        /// The *same* allocation the live `texture` reads (the `glib::Bytes`
+        /// handed to `MemoryTexture::new` is [`glib::Bytes::from_owned`] over
+        /// this very `Arc`), so remembering it costs a refcount, not a copy.
+        data: Arc<[u8]>,
+    }
+
+    impl Held {
+        /// Whether this is the frame being handed in. Dimensions first: a
+        /// reshape must never look like a no-op even when the byte block is
+        /// identical (`2×1` and `1×2` are both 8 bytes).
+        fn is(&self, width: u32, height: u32, data: &[u8]) -> bool {
+            self.width == width && self.height == height && *self.data == *data
+        }
+
+        /// [`Held::is`] for a shared buffer. Same allocation ⇒ same bytes: an
+        /// `Arc<[u8]>` the surface holds a reference to can't be mutated behind
+        /// its back, so the pointer check is a sound short-circuit. The slice
+        /// compare is the fallback for two equal-but-distinct buffers.
+        fn is_shared(&self, width: u32, height: u32, data: &Arc<[u8]>) -> bool {
+            if Arc::ptr_eq(&self.data, data) {
+                return self.width == width && self.height == height;
+            }
+            self.is(width, height, data)
+        }
+    }
 
     #[derive(Default)]
     pub struct PixelSurface {
         /// The current texture, rebuilt whenever the buffer changes. `None`
         /// renders nothing (empty/degraded/invalid buffer).
         texture: RefCell<Option<gtk::gdk::MemoryTexture>>,
+        /// The frame the surface is currently showing, for the #902 guard.
+        /// `None` means it has never held a valid buffer, or the last call was
+        /// inconsistent and cleared it; either way the next call can never
+        /// compare equal.
+        held: RefCell<Option<Held>>,
         /// Natural (unscaled) buffer size in pixels, honored by `measure`.
         nat_width: Cell<i32>,
         nat_height: Cell<i32>,
@@ -115,6 +202,11 @@ mod imp {
         /// `Default`-derived `0` is treated as `1` everywhere (see
         /// [`scaled_nat`]), so a freshly-built surface measures at 1×.
         scale: Cell<u32>,
+        /// Test seam (#902): how many `MemoryTexture`s this surface has built,
+        /// and how many invalidations it has asked GTK for. Compiled out
+        /// entirely outside `cargo test`.
+        #[cfg(all(test, feature = "system-tests"))]
+        counts: Cell<super::Counts>,
     }
 
     #[glib::object_subclass]
@@ -179,38 +271,113 @@ mod imp {
         }
     }
 
+    /// The dimensions as `i32` if this `(width, height, len)` triple describes a
+    /// texture that can actually be built: both axes positive, in range, and
+    /// `len == width * height * 4`. `None` is the "render nothing" backstop.
+    ///
+    /// Checked *before* any allocation, so an inconsistent buffer never costs a
+    /// copy — a misbehaving plugin can't make the reject path expensive.
+    fn buildable(width: u32, height: u32, len: usize) -> Option<(i32, i32)> {
+        match (i32::try_from(width), i32::try_from(height)) {
+            (Ok(w), Ok(h)) if w > 0 && h > 0 && rgba_len_ok(width, height, len) => Some((w, h)),
+            _ => None,
+        }
+    }
+
     impl PixelSurface {
-        /// Swap in a new RGBA8 buffer, or clear to "render nothing" for any
-        /// inconsistent input. Returns whether the natural size changed (so the
-        /// caller can pick `queue_resize` vs `queue_draw`).
-        pub(super) fn set_pixels(&self, width: u32, height: u32, data: &[u8]) -> bool {
+        /// Swap in a new RGBA8 buffer from a slice, copying it exactly once into
+        /// a shared allocation. Returns nothing to do when the surface already
+        /// holds this very frame (#902).
+        pub(super) fn set_pixels(&self, width: u32, height: u32, data: &[u8]) -> Invalidate {
+            let unchanged = self
+                .held
+                .borrow()
+                .as_ref()
+                .is_some_and(|held| held.is(width, height, data));
+            if unchanged {
+                return Invalidate::Nothing;
+            }
+            self.replace(width, height, || Arc::from(data), data.len())
+        }
+
+        /// Swap in a caller-owned shared buffer — no RGBA copy on either the
+        /// guard's fast path (a pointer compare) or the upload (`Bytes` adopts
+        /// the `Arc`).
+        pub(super) fn set_pixels_shared(
+            &self,
+            width: u32,
+            height: u32,
+            data: &Arc<[u8]>,
+        ) -> Invalidate {
+            let unchanged = self
+                .held
+                .borrow()
+                .as_ref()
+                .is_some_and(|held| held.is_shared(width, height, data));
+            if unchanged {
+                return Invalidate::Nothing;
+            }
+            self.replace(width, height, || Arc::clone(data), data.len())
+        }
+
+        /// The shared tail of both setters: validate, then either upload a new
+        /// texture or clear to "render nothing", and report what GTK owes us.
+        ///
+        /// `data` is a thunk so the `Arc` is only materialised once the buffer
+        /// is known to be consistent — the slice setter's single copy happens
+        /// here, and not at all on the reject path.
+        fn replace(
+            &self,
+            width: u32,
+            height: u32,
+            data: impl FnOnce() -> Arc<[u8]>,
+            len: usize,
+        ) -> Invalidate {
             let old_w = self.nat_width.get();
             let old_h = self.nat_height.get();
 
             // Defensive: never build a texture from an inconsistent buffer.
-            let texture = match (i32::try_from(width), i32::try_from(height)) {
-                (Ok(w), Ok(h)) if w > 0 && h > 0 && rgba_len_ok(width, height, data.len()) => {
-                    let bytes = glib::Bytes::from(data);
-                    let stride = crate::cast::u32_to_usize(width) * 4;
-                    self.nat_width.set(w);
-                    self.nat_height.set(h);
-                    Some(gtk::gdk::MemoryTexture::new(
-                        w,
-                        h,
-                        gtk::gdk::MemoryFormat::R8g8b8a8,
-                        &bytes,
-                        stride,
-                    ))
-                }
-                _ => {
-                    // Empty / invalid: render nothing, reserve no space.
-                    self.nat_width.set(0);
-                    self.nat_height.set(0);
-                    None
-                }
+            let texture = if let Some((w, h)) = buildable(width, height, len) {
+                let data = data();
+                // Zero-copy: GBytes takes a reference on the Arc rather than
+                // duplicating the RGBA block, and `held` keeps the same one.
+                let bytes = glib::Bytes::from_owned(Arc::clone(&data));
+                let stride = crate::cast::u32_to_usize(width) * 4;
+                self.nat_width.set(w);
+                self.nat_height.set(h);
+                self.held.replace(Some(Held {
+                    width,
+                    height,
+                    data,
+                }));
+                #[cfg(all(test, feature = "system-tests"))]
+                self.counts.set(self.counts.get().with_build());
+                Some(gtk::gdk::MemoryTexture::new(
+                    w,
+                    h,
+                    gtk::gdk::MemoryFormat::R8g8b8a8,
+                    &bytes,
+                    stride,
+                ))
+            } else {
+                // Empty / invalid: render nothing, reserve no space. Forget the
+                // buffer too — an inconsistent frame was never displayed, so it
+                // must never let a later identical one short-circuit.
+                self.nat_width.set(0);
+                self.nat_height.set(0);
+                self.held.replace(None);
+                None
             };
             self.texture.replace(texture);
-            self.nat_width.get() != old_w || self.nat_height.get() != old_h
+            let invalidate = if self.nat_width.get() == old_w && self.nat_height.get() == old_h {
+                Invalidate::Draw
+            } else {
+                Invalidate::Resize
+            };
+            #[cfg(all(test, feature = "system-tests"))]
+            self.counts
+                .set(self.counts.get().with_invalidation(invalidate));
+            invalidate
         }
 
         /// Set the integer upscale factor. Returns whether the *effective*
@@ -220,6 +387,40 @@ mod imp {
             let old = self.scale.replace(scale);
             old.max(1) != scale.max(1)
         }
+
+        /// Test seam (#902): the running `(builds, draws, resizes)` tally.
+        #[cfg(all(test, feature = "system-tests"))]
+        pub(super) fn counts(&self) -> super::Counts {
+            self.counts.get()
+        }
+    }
+}
+
+/// Test seam (#902): how much work a sequence of `set_pixels*` calls actually
+/// cost. `builds` counts `MemoryTexture` constructions, `draws`/`resizes` the
+/// invalidations queued on GTK — a guarded call increments none of the three.
+#[cfg(all(test, feature = "system-tests"))]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct Counts {
+    builds: u32,
+    draws: u32,
+    resizes: u32,
+}
+
+#[cfg(all(test, feature = "system-tests"))]
+impl Counts {
+    fn with_build(mut self) -> Self {
+        self.builds += 1;
+        self
+    }
+
+    fn with_invalidation(mut self, what: imp::Invalidate) -> Self {
+        match what {
+            imp::Invalidate::Nothing => {}
+            imp::Invalidate::Draw => self.draws += 1,
+            imp::Invalidate::Resize => self.resizes += 1,
+        }
+        self
     }
 }
 
@@ -244,11 +445,45 @@ impl PixelSurface {
     /// inconsistent buffer clears the surface to render nothing. Queues the
     /// minimal invalidation (`queue_resize` only when the natural size changed,
     /// otherwise `queue_draw`), so a same-size data swap is a cheap redraw.
+    ///
+    /// **A frame identical to the one already displayed does nothing at all**
+    /// (#902) — no `Bytes`, no texture, no `queue_draw`. See the
+    /// [module docs](self) for what "identical" means. `data` is copied once
+    /// into a shared
+    /// allocation; a caller that already has one should use
+    /// [`set_pixels_shared`](Self::set_pixels_shared) instead.
     pub fn set_pixels(&self, width: u32, height: u32, data: &[u8]) {
-        if self.imp().set_pixels(width, height, data) {
-            self.queue_resize();
-        } else {
-            self.queue_draw();
+        self.invalidate(self.imp().set_pixels(width, height, data));
+    }
+
+    /// [`set_pixels`](Self::set_pixels) over a buffer the caller already holds
+    /// in an [`Arc`], with the same contract and the same equality guard — but
+    /// **no RGBA copy on any path**: the guard's common case is an
+    /// `Arc::ptr_eq`, and a real change hands the allocation straight to
+    /// `MemoryTexture` via [`glib::Bytes::from_owned`].
+    ///
+    /// This is the setter for a caller with a frame cache feeding several
+    /// surfaces — the shell's preem renderer rasterises once per tick and shows
+    /// the result on every monitor, which is a full RGBA clone per monitor per
+    /// tick through the slice setter and a refcount bump through this one.
+    /// (Adopting it there is a follow-up; the slice path is unchanged and stays
+    /// the default.)
+    ///
+    /// The buffer must be treated as immutable — which an `Arc<[u8]>` the
+    /// surface holds a reference to already is, since `Arc::get_mut` can't
+    /// hand out a `&mut` while this surface is a second owner.
+    pub fn set_pixels_shared(&self, width: u32, height: u32, data: &Arc<[u8]>) {
+        self.invalidate(self.imp().set_pixels_shared(width, height, data));
+    }
+
+    /// Ask GTK for exactly the invalidation the state change earned — and for
+    /// [`Invalidate::Nothing`](imp::Invalidate::Nothing), the #902 guard's
+    /// verdict, ask for none.
+    fn invalidate(&self, what: imp::Invalidate) {
+        match what {
+            imp::Invalidate::Nothing => {}
+            imp::Invalidate::Draw => self.queue_draw(),
+            imp::Invalidate::Resize => self.queue_resize(),
         }
     }
 
@@ -382,8 +617,10 @@ mod tests {
 
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
-    use super::PixelSurface;
+    use super::{Counts, PixelSurface};
     use gtk::prelude::*;
+    use gtk::subclass::prelude::*;
+    use std::sync::Arc;
 
     /// A 2×1 (RGBA8) buffer — an aspect ratio of 2:1 so the height request is a
     /// clean half of the width.
@@ -392,6 +629,20 @@ mod gtk_tests {
         // 2 px wide, 1 px tall = 2*1*4 = 8 bytes.
         s.set_pixels(2, 1, &[0xff; 8]);
         s
+    }
+
+    /// The surface's `(builds, draws, resizes)` tally — the #902 test seam.
+    fn counts(s: &PixelSurface) -> Counts {
+        s.imp().counts()
+    }
+
+    /// A `Counts` literal, so the assertions below read as a budget.
+    fn spent(builds: u32, draws: u32, resizes: u32) -> Counts {
+        Counts {
+            builds,
+            draws,
+            resizes,
+        }
     }
 
     #[gtk::test]
@@ -436,5 +687,136 @@ mod gtk_tests {
         assert_eq!(s.measure(gtk::Orientation::Horizontal, -1).1, 2);
         s.set_scale(0);
         assert_eq!(s.measure(gtk::Orientation::Horizontal, -1).1, 2);
+    }
+
+    // ── the #902 equality guard ─────────────────────────────────────────────
+
+    /// (a) The headline: handing the surface the frame it already displays is
+    /// free — no texture rebuilt, nothing queued on GTK. The animation clock
+    /// re-maps a whole mailbox when anything in it moves, so every static
+    /// `Pixels` chip in that mailbox lands here 20× a second.
+    #[gtk::test]
+    fn an_identical_frame_builds_nothing_and_queues_nothing() {
+        let s = PixelSurface::new();
+        // First frame: one build, and a resize because 0×0 → 2×1.
+        s.set_pixels(2, 1, &[0xff; 8]);
+        assert_eq!(counts(&s), spent(1, 0, 1));
+
+        // A genuinely new frame at the same size: one more build, one draw.
+        s.set_pixels(2, 1, &[0x11; 8]);
+        assert_eq!(counts(&s), spent(2, 1, 1));
+
+        // The same bytes again — twice, to show it is a steady state and not a
+        // one-shot latch.
+        s.set_pixels(2, 1, &[0x11; 8]);
+        s.set_pixels(2, 1, &[0x11; 8]);
+        assert_eq!(
+            counts(&s),
+            spent(2, 1, 1),
+            "an unchanged frame must cost no texture build and no invalidation",
+        );
+        // …and the surface still displays it (the guard is a skip, not a clear).
+        assert_eq!(s.measure(gtk::Orientation::Vertical, 200).1, 100);
+    }
+
+    /// (b) Equal bytes at different dimensions are a different picture: `2×1`
+    /// and `1×2` are both 8 bytes, and confusing them would freeze a reshaping
+    /// widget on its old aspect ratio.
+    #[gtk::test]
+    fn a_reshape_is_never_equal_even_with_identical_bytes() {
+        let s = PixelSurface::new();
+        s.set_pixels(2, 1, &[0xff; 8]);
+        s.set_pixels(1, 2, &[0xff; 8]);
+        assert_eq!(
+            counts(&s).builds,
+            2,
+            "same bytes, transposed dimensions: the texture must be rebuilt",
+        );
+        // Both dimensions really did change, not just the bookkeeping.
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, -1).1, 1);
+        assert_eq!(s.measure(gtk::Orientation::Vertical, 100).1, 200);
+    }
+
+    /// (c) Different bytes at the same size still upload — the guard must not
+    /// swallow a real frame.
+    #[gtk::test]
+    fn different_bytes_at_the_same_size_still_build() {
+        let s = PixelSurface::new();
+        s.set_pixels(2, 1, &[0xff; 8]);
+        s.set_pixels(2, 1, &[0xfe; 8]);
+        assert_eq!(counts(&s), spent(2, 1, 1));
+        // One byte apart is still a different frame.
+        let mut nearly = [0xfe_u8; 8];
+        nearly[7] = 0x00;
+        s.set_pixels(2, 1, &nearly);
+        assert_eq!(counts(&s), spent(3, 2, 1));
+    }
+
+    /// (d) The shared-buffer setter: handing back the *same* `Arc` is a pointer
+    /// compare, and a distinct-but-equal buffer still short-circuits on the byte
+    /// fallback.
+    #[gtk::test]
+    fn a_shared_buffer_handed_back_builds_once() {
+        let s = PixelSurface::new();
+        let frame: Arc<[u8]> = Arc::from([0x22_u8; 8].as_slice());
+        s.set_pixels_shared(2, 1, &frame);
+        s.set_pixels_shared(2, 1, &Arc::clone(&frame));
+        s.set_pixels_shared(2, 1, &frame);
+        assert_eq!(
+            counts(&s),
+            spent(1, 0, 1),
+            "one cached frame shown N times must upload exactly once",
+        );
+
+        // A different allocation with equal bytes: the ptr_eq fast path misses,
+        // the byte compare still catches it.
+        let twin: Arc<[u8]> = Arc::from([0x22_u8; 8].as_slice());
+        assert!(!Arc::ptr_eq(&frame, &twin));
+        s.set_pixels_shared(2, 1, &twin);
+        assert_eq!(counts(&s), spent(1, 0, 1));
+
+        // A real new frame still uploads.
+        s.set_pixels_shared(2, 1, &Arc::from([0x23_u8; 8].as_slice()));
+        assert_eq!(counts(&s), spent(2, 1, 1));
+    }
+
+    /// The two setters share one guard: a shared buffer equal to what the slice
+    /// setter uploaded (and vice versa) is still the same frame, so a caller can
+    /// migrate to `set_pixels_shared` without a spurious re-upload.
+    #[gtk::test]
+    fn the_slice_and_shared_setters_share_the_guard() {
+        let s = PixelSurface::new();
+        s.set_pixels(2, 1, &[0x33; 8]);
+        s.set_pixels_shared(2, 1, &Arc::from([0x33_u8; 8].as_slice()));
+        assert_eq!(counts(&s), spent(1, 0, 1));
+        s.set_pixels(2, 1, &[0x33; 8]);
+        assert_eq!(counts(&s), spent(1, 0, 1));
+    }
+
+    /// An inconsistent buffer is never remembered, so it can never let a later
+    /// identical one short-circuit: the surface must keep rejecting it, and a
+    /// valid frame after it must still upload.
+    #[gtk::test]
+    fn an_invalid_buffer_is_not_remembered() {
+        let s = PixelSurface::new();
+        // len 3 != 2*2*4 — rejected, renders nothing, reserves no space.
+        s.set_pixels(2, 2, &[1, 2, 3]);
+        s.set_pixels(2, 2, &[1, 2, 3]);
+        assert_eq!(counts(&s).builds, 0, "an invalid buffer builds no texture");
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, -1).1, 0);
+
+        // A valid frame after it is a real change and must upload.
+        s.set_pixels(1, 1, &[9, 9, 9, 255]);
+        assert_eq!(counts(&s).builds, 1);
+        assert_eq!(s.measure(gtk::Orientation::Horizontal, -1).1, 1);
+
+        // …and an invalid frame after a valid one clears without remembering.
+        s.set_pixels(1, 1, &[9, 9, 9]);
+        s.set_pixels(1, 1, &[9, 9, 9, 255]);
+        assert_eq!(
+            counts(&s).builds,
+            2,
+            "the cleared surface must rebuild the frame it dropped",
+        );
     }
 }

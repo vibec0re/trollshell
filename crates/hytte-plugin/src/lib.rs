@@ -101,6 +101,25 @@
 //! [`preem::DisplayStyle`] skins. See that module's docs; the
 //! `hytte-plugin-preem-demo` crate is the reference consumer.
 //!
+//! # …and [`display`], the path that doesn't rasterise (#884)
+//!
+//! Reach for [`display`] rather than the raw kit for anything the preem
+//! **state vocabulary** (#882) has a word for. Its wrappers wear the kit's
+//! shape — [`display::Gauge`], [`display::Marquee`], [`display::FlipBoard`], …
+//! — but decide **at render time**, from the generation the host advertised in
+//! [`HostMsg::Hello`](proto::HostMsg::Hello), whether the widget goes out as a
+//! typed [`Node::Preem`](proto::Node::Preem) the shell draws and animates, or
+//! as the CPU-rasterised [`Node::Pixels`](proto::Node::Pixels) it is today.
+//!
+//! One `update`/`view` pair serves both hosts: state setters always take
+//! effect, and `advance(dt)` — the plugin-side animation tick — is a no-op
+//! while the host speaks preem, because the shell owns the needle spring, the
+//! phosphor, the flip clocks and the scroll offset there. Against a host that
+//! never advertises, every widget rasterises exactly as before; version skew
+//! degrades to the status quo, never to a blank chip. Rasterising by hand stays
+//! the escape hatch for drawing the vocabulary has no word for (the pet's face,
+//! caw's speech bubble) — see [`display`]'s docs.
+//!
 //! # Styling
 //!
 //! A plugin's entire style surface is the `classes` field every [`Node`]
@@ -324,6 +343,8 @@ use hytte_plugin_proto::{
 /// `hytte-plugin` alone, and every `hytte_plugin::preem::…` path keeps
 /// resolving to the same items.
 pub use hytte_preem as preem;
+
+pub mod display;
 
 mod runtime;
 

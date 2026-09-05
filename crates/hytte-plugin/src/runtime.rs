@@ -111,7 +111,8 @@ impl Redial {
 /// `update`, or perform a runtime-internal [`Rerender`](Step::Rerender) that
 /// refreshes the view without an `update` — used when the host installs a new
 /// accent (#376), which changes what the `preem` kit paints but is not a TEA
-/// message.
+/// message, and when the host advertises its wire vocabulary (#882/#884), which
+/// changes whether [`display`](crate::display) widgets rasterise or emit state.
 enum Step<M> {
     Update(Input<M>),
     Rerender,
@@ -152,6 +153,19 @@ where
         manifest.subscribes.push(StateKey::Accent);
     }
     let plugin_id = manifest.id.clone();
+    // Kept for the vocabulary negotiation (#884): `Manifest::negotiated_vocab`
+    // is the proto's own arithmetic over `vocab_max` and the host's offer, and
+    // both ends must compute the same number from the same two inputs — so the
+    // negotiation reads the manifest that was actually registered rather than
+    // re-deriving the ceiling by hand. One small clone per session.
+    let negotiation = manifest.clone();
+    // Seed the negotiated generation at the *unconditional* ceiling — what this
+    // plugin may emit with no advertisement at all. A host that never sends
+    // `Hello` leaves it here, which is below `PREEM_VOCAB`, so every
+    // `display` widget CPU-rasterises exactly as it does today. Re-seeding on
+    // every (re)connect is what makes a reconnect to an older shell degrade
+    // instead of carrying the previous session's advertisement forward.
+    crate::display::set_negotiated(negotiation.vocab);
     write_frame(&mut wr, &PluginMsg::Register { manifest }).await?;
     write_frame(
         &mut wr,
@@ -288,20 +302,21 @@ where
                     crate::preem::set_accent(color);
                     Step::Rerender
                 }
-                Some(Ok(HostMsg::Hello { vocab: _ })) => {
-                    // #882: the host's vocabulary advertisement, sent because
-                    // `Manifest::new` declares a `vocab_max`. Runtime plumbing
-                    // like `Accent` — never surfaced to the TEA model.
+                Some(Ok(HostMsg::Hello { vocab })) => {
+                    // #882/#884: the host's vocabulary advertisement, sent
+                    // because `Manifest::new` declares a `vocab_max`. Runtime
+                    // plumbing like `Accent` — never surfaced to the TEA model.
                     //
-                    // Accepted and ignored here on purpose: this SDK has no
-                    // negotiated emit path yet, so there is nothing to gate.
-                    // #884 is where the generation gets held and consulted, so
-                    // `view` can emit `Node::Preem` above `PREEM_VOCAB` and
-                    // CPU-rasterise to `Node::Pixels` below it. Handling the
-                    // frame now (rather than after #884) is what keeps a
-                    // current plugin from dying on an unmatched variant the
-                    // moment a host starts advertising.
-                    continue;
+                    // Record what the two ends agreed on (the proto computes it;
+                    // see `negotiation` above), then fall through to re-render:
+                    // the seed frame already went out under the pre-`Hello`
+                    // floor, so without this the plugin would keep shipping
+                    // `Pixels` until its next `update` happened to fire. From
+                    // here on `display`'s widgets emit `Node::Preem` and stop
+                    // rasterising — and stop ticking their own animation, which
+                    // the shell now owns.
+                    crate::display::set_negotiated(negotiation.negotiated_vocab(vocab));
+                    Step::Rerender
                 }
                 Some(Ok(HostMsg::Ping { seq })) => {
                     // Liveness is runtime plumbing: answer, don't surface.
@@ -458,11 +473,13 @@ mod tests {
         BACKOFF_BASE, BACKOFF_CAP, Backoff, IMMEDIATE_FAILURE, Redial, SKEW_WARN_AFTER,
         reconnect_loop, session,
     };
+    use crate::display::{Marquee, StyleName};
     use crate::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
+    use hytte_plugin_proto::preem::PREEM_VOCAB;
     use hytte_plugin_proto::{
         AudioSpectrum, Capability, ClockState, ConsentDecision, Effect, EffectOutcome, EventKind,
         HostMsg, Manifest, Mount, Node, Page, PluginMsg, SPECTRUM_BINS, StateKey, StateSnapshot,
-        read_frame, write_frame,
+        VOCAB, VOCAB_UNCONDITIONAL, read_frame, write_frame,
     };
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -617,6 +634,55 @@ mod tests {
                 classes: Vec::new(),
             }
             .into()
+        }
+    }
+
+    /// Renders one [`crate::display`] widget, so a session test can observe
+    /// which arm of the #884 negotiation the SDK picked — and, because a
+    /// marquee's scroll is shell-owned in state mode and plugin-owned in raster
+    /// mode, whether the plugin is still ticking its own animation.
+    ///
+    /// Deliberately the *one-code-path* shape a migrated plugin has: `update`
+    /// calls `advance` unconditionally and `view` calls `node` unconditionally.
+    /// Neither branches on the mode; that is the seam under test.
+    struct Scroller {
+        marquee: Marquee,
+        text: String,
+    }
+
+    /// Wide enough that a 64 px window can't hold it, so the strip really
+    /// scrolls (a held message ignores the offset — see `MarqueeStrip::window`)
+    /// and a plugin-side tick is actually observable as a different buffer.
+    const SCROLL_TEXT: &str = "A LONG ENOUGH MESSAGE TO OVERFLOW THE WINDOW AND SCROLL";
+
+    impl Plugin for Scroller {
+        type Msg = std::convert::Infallible;
+        type Cmd = std::convert::Infallible;
+
+        fn manifest() -> Manifest {
+            let mut m = Manifest::new("scroller-test", Mount::BarRight);
+            m.subscribes = vec![StateKey::Clock];
+            m
+        }
+
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+            Self {
+                marquee: Marquee::new(StyleName::Vfd).window_px(64),
+                text: SCROLL_TEXT.to_owned(),
+            }
+        }
+
+        fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
+            if let Input::Snapshot(_) = input {
+                // One second of scroll at the configured speed: 20 dots in
+                // raster mode, nothing at all once the host speaks preem.
+                self.marquee.advance(1.0);
+            }
+            Vec::new()
+        }
+
+        fn view(&self) -> View {
+            self.marquee.node("scroll", &self.text).into()
         }
     }
 
@@ -1741,5 +1807,213 @@ mod tests {
         }
         assert!(!r2.note(quick, true), "a clean shutdown resets the streak");
         assert!(!r2.note(quick, false), "…so the next failure starts over");
+    }
+
+    // ── Vocabulary negotiation, end to end (#884) ───────────────────────────
+
+    /// A node's kind, for assertion messages — `Node::Pixels`'s own `Debug`
+    /// would dump the whole RGBA buffer into the failure output.
+    fn kind_of(node: &Node) -> &'static str {
+        match node {
+            Node::Pixels { .. } => "Pixels",
+            Node::Preem { .. } => "Preem",
+            _ => "some other node kind",
+        }
+    }
+
+    /// Read the next frame, requiring it to be a `Render`, and return its tree.
+    async fn next_render<R: AsyncRead + Unpin>(rd: &mut R) -> Node {
+        match next_plugin_frame(rd).await {
+            PluginMsg::Render { tree, .. } => tree,
+            PluginMsg::Pong { seq } => panic!("expected a Render frame, got Pong {seq}"),
+            PluginMsg::Log { msg, .. } => panic!("expected a Render frame, got Log {msg:?}"),
+            PluginMsg::Register { .. } => panic!("expected a Render frame, got a second Register"),
+        }
+    }
+
+    /// Run one whole `Scroller` session against a host closure.
+    async fn scroller_session<F, Fut>(host: F)
+    where
+        F: FnOnce(tokio::io::ReadHalf<tokio::io::DuplexStream>, tokio::io::WriteHalf<tokio::io::DuplexStream>) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (hrd, hwr) = tokio::io::split(host_end);
+        let (result, ()) = tokio::join!(session::<Scroller, _, _>(prd, pwr), host(hrd, hwr));
+        result.expect("the host shut the session down cleanly");
+    }
+
+    /// The `Register` frame carries the #882 negotiation **pair**, and that
+    /// pairing is what makes the whole thing reachable: `vocab` stays at the
+    /// unconditional generation an old host still accepts, while `vocab_max`
+    /// declares what this plugin could speak if asked — which is also the
+    /// structural #305 opt-in for the host's `Hello`.
+    #[test]
+    fn register_declares_the_negotiation_pair() {
+        let m = Scroller::manifest();
+        assert_eq!(
+            m.vocab, VOCAB_UNCONDITIONAL,
+            "the unconditional ceiling must NOT be the census counter, or an \
+             older host refuses a plugin the negotiation would have made safe",
+        );
+        assert_eq!(m.vocab_max, Some(VOCAB), "…and the negotiated one is VOCAB");
+        assert!(m.negotiates_vocab(), "so the host knows to send Hello");
+        m.check_vocab().expect("an old host's handshake still accepts us");
+
+        // Both ends compute the same number from the same two inputs.
+        assert_eq!(m.negotiated_vocab(VOCAB_UNCONDITIONAL), VOCAB_UNCONDITIONAL);
+        assert_eq!(m.negotiated_vocab(VOCAB), VOCAB);
+        assert!(
+            m.negotiated_vocab(VOCAB) >= PREEM_VOCAB,
+            "a current host reaches the preem generation",
+        );
+        assert!(
+            m.negotiated_vocab(VOCAB_UNCONDITIONAL) < PREEM_VOCAB,
+            "an old one does not",
+        );
+    }
+
+    /// The headline: a host that advertises the preem generation gets typed
+    /// state nodes — and the plugin **stops ticking its own animation**, which
+    /// the wire proves by going silent across two heartbeats that would each
+    /// have produced a fresh buffer in raster mode.
+    #[tokio::test]
+    async fn an_advertising_host_gets_state_nodes_and_the_plugin_stops_ticking() {
+        scroller_session(|mut hrd, mut hwr| async move {
+            let seed = eat_handshake(&mut hrd, "scroller-test").await;
+            assert!(
+                matches!(seed, Node::Pixels { .. }),
+                "the seed render goes out before Hello can arrive, so it must \
+                 rasterise — got {}",
+                kind_of(&seed),
+            );
+
+            // The advertisement. The runtime re-renders on it, so the switch
+            // lands inside the same session rather than waiting for an update.
+            send(&mut hwr, &HostMsg::Hello { vocab: VOCAB }).await;
+            let switched = next_render(&mut hrd).await;
+            assert!(
+                matches!(switched, Node::Preem { .. }),
+                "Hello must switch the session to state nodes — got {}",
+                kind_of(&switched),
+            );
+
+            // Two heartbeats. The view's text never changes and `advance` is a
+            // no-op now, so the state node is identical and nothing is sent.
+            // The Ping is the sync barrier: a Pong arriving before any Render
+            // is the wire staying quiet.
+            send(&mut hwr, &snapshot("10:00")).await;
+            send(&mut hwr, &snapshot("10:01")).await;
+            send(&mut hwr, &HostMsg::Ping { seq: 9 }).await;
+            assert!(
+                matches!(
+                    next_plugin_frame(&mut hrd).await,
+                    PluginMsg::Pong { seq: 9 }
+                ),
+                "a scrolling marquee must send nothing while the shell animates it",
+            );
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        })
+        .await;
+    }
+
+    /// The other half of the compat matrix, and the guard that matters most: a
+    /// host that never advertises must **never** see a `Node::Preem`. The same
+    /// plugin code keeps rasterising and keeps ticking its own scroll, so every
+    /// heartbeat is a fresh buffer — exactly today's behaviour.
+    #[tokio::test]
+    async fn a_host_that_never_says_hello_keeps_getting_pixels() {
+        scroller_session(|mut hrd, mut hwr| async move {
+            let seed = eat_handshake(&mut hrd, "scroller-test").await;
+            assert!(
+                matches!(seed, Node::Pixels { .. }),
+                "no advertisement, no state nodes — got {}",
+                kind_of(&seed),
+            );
+
+            send(&mut hwr, &snapshot("10:00")).await;
+            let first = next_render(&mut hrd).await;
+            assert!(
+                matches!(first, Node::Pixels { .. }),
+                "still no advertisement — got {}",
+                kind_of(&first),
+            );
+            // Compared with `!=` rather than `assert_ne!` throughout: these are
+            // `Node::Pixels`, whose `Debug` would dump the whole RGBA buffer
+            // into a failure message.
+            assert!(first != seed, "and the plugin's own tick moved the scroll");
+
+            send(&mut hwr, &snapshot("10:01")).await;
+            let second = next_render(&mut hrd).await;
+            assert!(
+                matches!(second, Node::Pixels { .. }),
+                "…for every frame of the session — got {}",
+                kind_of(&second),
+            );
+            assert!(second != first, "the plugin keeps owning the animation");
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        })
+        .await;
+    }
+
+    /// A host that negotiates but whose own vocabulary predates the preem
+    /// widgets (`Hello { vocab: 1 }`) is still a raster host. The gate is the
+    /// **negotiated generation**, not the mere presence of an advertisement.
+    #[tokio::test]
+    async fn a_hello_below_the_preem_generation_still_rasterises() {
+        scroller_session(|mut hrd, mut hwr| async move {
+            eat_handshake(&mut hrd, "scroller-test").await;
+
+            // The Rerender this triggers changes nothing (still Pixels, same
+            // offset), so it is deduped — a heartbeat forces the next frame.
+            send(
+                &mut hwr,
+                &HostMsg::Hello {
+                    vocab: VOCAB_UNCONDITIONAL,
+                },
+            )
+            .await;
+            send(&mut hwr, &snapshot("10:00")).await;
+            let node = next_render(&mut hrd).await;
+            assert!(
+                matches!(node, Node::Pixels { .. }),
+                "generation {VOCAB_UNCONDITIONAL} is below PREEM_VOCAB \
+                 {PREEM_VOCAB} — got {}",
+                kind_of(&node),
+            );
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        })
+        .await;
+    }
+
+    /// The generation is re-seeded on every (re)connect, so a reconnect to a
+    /// host that does *not* advertise degrades back to pixels instead of
+    /// inheriting the previous session's advertisement. Both sessions run on
+    /// this one thread, which is precisely the state that could leak.
+    #[tokio::test]
+    async fn a_reconnect_to_a_silent_host_degrades_back_to_pixels() {
+        scroller_session(|mut hrd, mut hwr| async move {
+            eat_handshake(&mut hrd, "scroller-test").await;
+            send(&mut hwr, &HostMsg::Hello { vocab: VOCAB }).await;
+            let switched = next_render(&mut hrd).await;
+            assert!(matches!(switched, Node::Preem { .. }), "session 1 upgraded");
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        })
+        .await;
+
+        scroller_session(|mut hrd, mut hwr| async move {
+            let seed = eat_handshake(&mut hrd, "scroller-test").await;
+            assert!(
+                matches!(seed, Node::Pixels { .. }),
+                "a new session must start from the unconditional floor — got {}",
+                kind_of(&seed),
+            );
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        })
+        .await;
     }
 }

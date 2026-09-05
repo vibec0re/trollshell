@@ -10,11 +10,11 @@
 //! [`vocab::PreemWidget`] carries a **config** (rebuild on change) and a
 //! **state** (animate toward the target); it carries no phosphor buffer, no
 //! needle position, no flip clock, no scroll offset and no held peak. Those
-//! live here, in a per-node renderer instance, advanced by one animation clock
-//! (`pump::install_preem_clock`) rather than by every plugin ticking its own
-//! rasterisation over the socket. That is what makes the traffic go quiet: a
-//! marquee scrolling a track title sends one frame when the title changes, not
-//! twenty a second.
+//! live here, in a per-node renderer instance, advanced from the **GTK frame
+//! clock** of whichever mount is showing them (#897 — `pump::install_animation`)
+//! rather than by every plugin ticking its own rasterisation over the socket.
+//! That is what makes the traffic go quiet: a marquee scrolling a track title
+//! sends one frame when the title changes, not twenty a second.
 //!
 //! # Instance lifecycle
 //!
@@ -191,26 +191,61 @@ use hytte_plugin_proto::preem as vocab;
 use hytte_plugin_proto::wire::MAX_PREEM_NODES_PER_TREE;
 use hytte_preem as kit;
 
-/// The cadence the animation clock runs at, in seconds — and, for the two kit
-/// primitives that step **per call** rather than per elapsed second
-/// (`Scope::advance` and `PeakHold::decay`), the wall-clock length of one of
-/// their steps.
+/// The wall-clock length of one **step**, for the two kit primitives that
+/// advance per call rather than per elapsed second (`Scope::advance` and
+/// `PeakHold::decay`).
 ///
-/// 20 Hz is not arbitrary: it is the rate the kit's own consumers already
-/// animate at (`hytte-plugin-audio-widget`'s `TICK`), and the rate
+/// Since #897 this is **not** a tick cadence: preem animation rides each mount's
+/// GTK frame clock, so ticks arrive at the display's refresh (60 Hz here, 144 on
+/// a fast panel) and [`Steps`] converts the real frame `dt` into whole steps,
+/// carrying the remainder. What the constant still pins is how long one of those
+/// steps *lasts*, and 20 Hz is not arbitrary for that: it is the rate the kit's
+/// own consumers animate at (`hytte-plugin-audio-widget`'s `TICK`), and the rate
 /// [`vocab::MarqueeConfig::speed_dots_per_sec`]'s default of `20.0` was derived
-/// from. Anchoring the step-based widgets to elapsed time rather than to timer
-/// callbacks keeps a phosphor trail's fade the same length whether the clock
-/// fired on time or late.
+/// from. Anchoring the step-based widgets to elapsed time rather than to
+/// callbacks keeps a phosphor trail's fade the same length whether it is being
+/// driven at 60 Hz, at 144 Hz, or by a stalling clock.
 pub(super) const ANIM_STEP_SECS: f32 = 1.0 / 20.0;
 
-/// Most steps one [`advance_all`] call issues to a step-based widget.
+/// Most steps one advance call issues to a step-based widget.
 ///
 /// A tick arriving after a long stall (a resume from suspend, or a blocked GTK
 /// thread) carries a `dt` worth hundreds of steps; replaying them all would burn
 /// the stall's length in phosphor decays for no visible benefit. Clamping
 /// catches the trail up to "fully faded" and moves on.
+///
+/// Since #897 [`advance_scopes`] clamps its own `dt` to [`MAX_TICK_DT_US`] —
+/// *one* step — long before this cap can bite, so in production this is the
+/// accumulator's own backstop rather than the live guard. It still governs
+/// [`advance_all`], which takes a caller-supplied `dt`.
 pub(super) const MAX_CATCHUP_STEPS: u32 = 8;
+
+/// The most animation time one frame-clock tick may advance a scope by, in
+/// microseconds — the stall clamp, and the thing that makes a *park* free of
+/// consequence (#897).
+///
+/// Two events hand a tick an unbounded elapsed time, and both must land on the
+/// same answer:
+///
+/// - a **stall** — a resume from suspend, or a blocked GTK thread — where the
+///   frame clock's `frame_time` simply jumps;
+/// - a **park**, where the mount's tick callback broke because everything had
+///   settled and something re-armed it minutes later. The per-scope baseline
+///   ([`ScopeState::last_advance_us`]) is deliberately *not* reset on re-arm, so
+///   this clamp is what stops the parked interval from being replayed as
+///   elapsed animation. Not resetting is the point: a scope shown by two mounts
+///   must not have its baseline stomped by whichever one happens to arm second.
+///
+/// One step ([`ANIM_STEP_SECS`], asserted in `plugins::tests`) rather than
+/// several: the issue asks for "the first tick after re-arming must not see the
+/// whole parked interval", and a resume that replays eight phosphor decays at
+/// once is a visible lurch where one is not. The cost of the clamp is that
+/// animation runs *slightly slow* through a hitch longer than 50 ms, which is
+/// the ordinary trade every frame loop makes.
+///
+/// A `u16` so the conversion to seconds is `f32::from` — lossless, and clean
+/// under `clippy::cast_precision_loss`, which an `i64 as f32` is not.
+pub(super) const MAX_TICK_DT_US: u16 = 50_000;
 
 /// A phosphor cell's maximum intensity in the kit's persistence buffer
 /// (`hytte-preem/src/scope.rs`: "one intensity (`0..=255`) per logical pixel").
@@ -514,6 +549,29 @@ struct ScopeState {
     touched: HashSet<String>,
     /// Ordinal of the next un-id'd preem node in the in-flight pass.
     ordinal: usize,
+    /// The `GdkFrameClock::frame_time` this scope was last advanced at, in
+    /// microseconds — the baseline [`advance_scopes`] takes its `dt` from.
+    ///
+    /// **Per scope, not per mount**, and that is the whole double-mount rule
+    /// (#897). One `Scope::card` is shared by every monitor's copy of that
+    /// chip, and each of those mounts drives its own frame clock; a `dt`
+    /// measured per mount would advance the shared instances once per mount per
+    /// frame and run every animation at N× speed on a two-monitor desk — the
+    /// same N× hazard the old single timer existed to avoid. Measuring from the
+    /// scope's own last advance instead makes a second mount's tick cost
+    /// whatever real time has passed since the first one's (often a fraction of
+    /// a frame), so the animation runs at 1× no matter how many mounts show it,
+    /// and gets the *union* of their refresh rates rather than the slowest.
+    ///
+    /// `None` until the first tick, which stamps and advances nothing: a scope
+    /// has no meaningful baseline before some frame clock has looked at it, and
+    /// one dropped frame at the start of a motion is invisible. Frame times come
+    /// from `g_get_monotonic_time`, so clocks belonging to different monitors
+    /// are directly comparable.
+    ///
+    /// Deliberately **not** touched by [`advance_all`], which takes an explicit
+    /// `dt` and exists for the tests.
+    last_advance_us: Option<i64>,
 }
 
 /// A one-shot per-tree diagnostic — something wrong with the *shape* of a
@@ -1032,14 +1090,32 @@ impl Instance {
     }
 }
 
-// ── the animation clock's half ───────────────────────────────────────────────
+// ── the frame clock's half (#897) ────────────────────────────────────────────
 
-/// Advance every live renderer by `dt` seconds, returning **which scopes**
-/// changed and so need a repaint.
+/// Advance `scopes`' live renderers up to `frame_time_us` — one mount's
+/// frame-clock tick — returning **which of them** changed and so need a repaint.
 ///
-/// Called once per animation tick from `pump::install_preem_clock`, **not** per
-/// monitor: the instance table is shared across monitors, so advancing it from
-/// each monitor's reconcile would run every animation at N× speed.
+/// This is the production advance path since #897, called from
+/// `pump::install_animation`'s tick callback with the mount's own
+/// `GdkFrameClock::frame_time` and the scopes that mount is currently showing.
+/// [`advance_all`] is its test-only sibling.
+///
+/// ## Where the `dt` comes from, and why it is not the caller's
+///
+/// The caller hands a *timestamp*, not an elapsed time, and each scope takes its
+/// own `dt` from [`ScopeState::last_advance_us`] — see that field for the
+/// double-mount argument in full. In one line: the instance table is keyed by
+/// scope and shared across monitors, so two mounts showing the same chip would
+/// each advance it by a full frame and run it at 2× speed if the `dt` were the
+/// caller's. Measuring per scope makes the second mount's tick worth only the
+/// real time since the first one's, whatever the two clocks' phase.
+///
+/// The `dt` is clamped to [`MAX_TICK_DT_US`], which is what makes a park and a
+/// stall cost the same one step rather than the interval they spanned.
+///
+/// A scope with no entry in the store is skipped: a mount can name a scope whose
+/// instances a mapping pass has since dropped ([`end_pass`] removes an empty
+/// entry), and that is a settled scope, not an error.
 ///
 /// The return type is a scope list rather than a `bool` because the fan-out is
 /// otherwise global: collapsing every instance into one flag made a single
@@ -1055,22 +1131,30 @@ impl Instance {
 /// every plugin's whole tree, re-mapping every wire node, cloning each preem
 /// instance's cached RGBA frame out of the store on the way through
 /// ([`Instance::frame`]), and then the byte compare itself, per surface, per
-/// monitor, 20× a second. Naming the movers lets `pump::request_preem_repaint`
+/// monitor, every frame. Naming the movers lets `pump::request_preem_repaint`
 /// nudge only the mailboxes that actually hold one and skip all of it.
-pub(super) fn advance_all(dt: f32) -> Vec<Scope> {
+pub(super) fn advance_scopes(scopes: &[Scope], frame_time_us: i64) -> Vec<Scope> {
     STORE.with_borrow_mut(|store| {
         let mut moved = Vec::new();
-        for (scope, state) in store.iter_mut() {
-            let mut scope_moved = false;
-            for instance in state.instances.values_mut() {
-                if let Some(renderer) = instance.renderer.as_mut()
-                    && renderer.advance(dt)
-                {
-                    instance.cached = None;
-                    scope_moved = true;
+        for scope in scopes {
+            let Some(state) = store.get_mut(scope) else {
+                continue;
+            };
+            let dt = match state.last_advance_us.replace(frame_time_us) {
+                // `saturating_sub` then clamp: a frame time that went backwards
+                // owes nothing, rather than handing the kit a negative `dt` every
+                // primitive would have to defend against on its own.
+                Some(last) => {
+                    let capped = frame_time_us
+                        .saturating_sub(last)
+                        .clamp(0, i64::from(MAX_TICK_DT_US));
+                    // The clamp above proves the `u16` fits; the fallback keeps
+                    // the conversion total rather than a `panic!` inside a tick.
+                    f32::from(u16::try_from(capped).unwrap_or(MAX_TICK_DT_US)) / 1_000_000.0
                 }
-            }
-            if scope_moved {
+                None => 0.0,
+            };
+            if advance_state(state, dt) {
                 moved.push(scope.clone());
             }
         }
@@ -1078,18 +1162,81 @@ pub(super) fn advance_all(dt: f32) -> Vec<Scope> {
     })
 }
 
-/// Whether any live renderer still has something to animate — the cheap
-/// early-out that lets the animation clock stay a no-op while every preem widget
-/// on screen is static (or there are none at all).
-pub(super) fn any_animating() -> bool {
-    STORE.with_borrow(|store| {
-        store.values().any(|state| {
-            state
-                .instances
-                .values()
-                .any(|instance| instance.renderer.as_ref().is_some_and(Renderer::animates))
-        })
+/// Advance every live renderer by `dt` seconds, returning the scopes that moved.
+///
+/// **Test-only since #897**: production advances per mount through
+/// [`advance_scopes`], which is where the per-scope `dt` and the frame-time
+/// baseline live. This one takes the `dt` straight from its caller and leaves
+/// [`ScopeState::last_advance_us`] alone — exactly what a test wanting "advance
+/// everything by half a second" needs, and exactly what a frame clock must not
+/// do.
+#[cfg(test)]
+pub(super) fn advance_all(dt: f32) -> Vec<Scope> {
+    STORE.with_borrow_mut(|store| {
+        let mut moved = Vec::new();
+        for (scope, state) in store.iter_mut() {
+            if advance_state(state, dt) {
+                moved.push(scope.clone());
+            }
+        }
+        moved
     })
+}
+
+/// Advance one scope's instances by `dt`, dropping the cached frame of each one
+/// that moved; answers whether the scope as a whole needs a repaint.
+///
+/// The shared body of [`advance_scopes`] and [`advance_all`], split out so the
+/// production path and the test path cannot drift on what "moved" means — which
+/// is the property every parity assertion in `plugins::tests` reads through
+/// `advance_all` and every frame on glass reads through `advance_scopes`.
+fn advance_state(state: &mut ScopeState, dt: f32) -> bool {
+    let mut moved = false;
+    for instance in state.instances.values_mut() {
+        if let Some(renderer) = instance.renderer.as_mut()
+            && renderer.advance(dt)
+        {
+            instance.cached = None;
+            moved = true;
+        }
+    }
+    moved
+}
+
+/// Whether any of `scopes`' live renderers still has something to animate — the
+/// predicate one mount's tick callback keeps itself armed on (#897).
+///
+/// Per mount rather than global, so a settled bar region parks its frame clock
+/// while an open drawer's gauge is still swinging. A scope with no entry in the
+/// store contributes nothing: it has no instances, so it has nothing to animate.
+pub(super) fn any_animating_in(scopes: &[Scope]) -> bool {
+    STORE.with_borrow(|store| {
+        scopes
+            .iter()
+            .filter_map(|scope| store.get(scope))
+            .any(state_animates)
+    })
+}
+
+/// Whether any live renderer anywhere still has something to animate.
+///
+/// **Test-only since #897**: no production caller wants the global answer any
+/// more, because nothing drives every scope at once — each mount asks
+/// [`any_animating_in`] about its own. Kept because it is the shape a couple of
+/// dozen assertions in `plugins::tests` are written against ("does a parked
+/// marquee stop asking for ticks"), and narrowing each of them to a scope list
+/// would only restate the scope it already built.
+#[cfg(test)]
+pub(super) fn any_animating() -> bool {
+    STORE.with_borrow(|store| store.values().any(state_animates))
+}
+
+/// Whether one scope's instances have animation left to run.
+fn state_animates(state: &ScopeState) -> bool {
+    state
+        .instances
+        .values()
+        .any(|instance| instance.renderer.as_ref().is_some_and(Renderer::animates))
 }
 
 /// Drop every cached frame **and the memoized role colors**, so the next mapping

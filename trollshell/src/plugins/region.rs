@@ -21,6 +21,7 @@ use hytte_plugin_proto::HostMsg;
 use tokio::sync::mpsc;
 
 use super::preem_render::{self, Scope};
+use super::pump::Animator;
 use super::wire_map::{to_ui_node, to_wire_event};
 use super::{PluginHandles, SlotRender};
 
@@ -200,6 +201,25 @@ fn build_region(
     let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
 
     let cards_for_signal = cards.clone();
+
+    // This region's animation driver (#897): one frame-clock tick callback on
+    // `container`, armed from the mapping pass below and broken by its own tick
+    // once every card here has settled.
+    //
+    // The scopes closure captures the card list and nothing else — in particular
+    // **not** `container`. A strong clone of the mount inside a closure the mount
+    // itself (transitively) owns is the self-pin #909 measured on this very
+    // function, and the tick callback GTK installs on `container` holds this
+    // `Rc<Animator>`. The card roots the list does reach are *children* of the
+    // container, and in GTK4 a parent refs its children and never the reverse,
+    // so nothing here points back up.
+    let animator = Animator::new(move || {
+        cards
+            .borrow()
+            .iter()
+            .map(|card| card.preem_scope.clone())
+            .collect()
+    });
     // Bound with [`hytte::reactive::bind`] rather than a hand-rolled apply-loop,
     // and *that* is what makes the region destroyable (#909 — the twin of the pin
     // #903 fixed on the drawer panel child).
@@ -252,6 +272,16 @@ fn build_region(
     // this teardown path breaks the cross-monitor invariant `gtk_tests` pins.
     hytte::reactive::bind(signal, &container, move |container, renders| {
         reconcile_region(container, &cards_for_signal, &renders, card_class);
+        // **The re-arm point** (#897), and the reason it is here rather than
+        // inside `reconcile_region`: a mapping pass is the only thing that can
+        // give a settled widget somewhere to go, and `reconcile_region` holds
+        // `cards.borrow_mut()` for its whole body while the scopes closure
+        // needs a shared borrow of the same cell. Arming after it returns is
+        // both correct and the only order that does not panic.
+        //
+        // `container` is `bind`'s own closure parameter, not a captured clone —
+        // the contract `nix/lint-bind-pins.py` scans this call site for.
+        animator.ensure_armed(container);
     });
 
     container.upcast()
@@ -493,6 +523,18 @@ fn build_panel_child(
     // below reads and clears the *same* cell the renders write.
     let shown_at_destroy = shown_scope.clone();
 
+    // This drawer child's animation driver (#897): one frame-clock tick callback
+    // on `root`, armed after each render in [`drive_panel_child`]. Its scope set
+    // is at most one — whichever panel is on screen — which is why a closed
+    // drawer costs nothing twice over: the set is empty *and* the widget is
+    // unmapped, so the clock is neither armed nor ticking.
+    //
+    // Captures the shown-scope cell only. A strong `root` here would re-pin
+    // exactly what the `canvas` split above unpinned (#903), and the tick
+    // callback GTK installs on `root` owns this `Rc<Animator>`.
+    let shown_for_scopes = shown_scope.clone();
+    let animator = Animator::new(move || shown_for_scopes.borrow().clone().into_iter().collect());
+
     // Hand-rolled rather than routed through [`hytte::reactive::bind`], which is
     // what [`build_region`] above uses — and this is the one of the two mounts
     // that genuinely cannot. `bind`'s apply closure is called only *while* the
@@ -511,6 +553,7 @@ fn build_panel_child(
         reconciler,
         outbound,
         shown_scope,
+        animator,
     ));
 
     // Teardown: abort the render subscription when the drawer child is destroyed
@@ -579,17 +622,24 @@ async fn drive_panel_child(
     mut reconciler: Reconciler,
     outbound: Rc<RefCell<Option<mpsc::Sender<HostMsg>>>>,
     shown_scope: Rc<RefCell<Option<Scope>>>,
+    animator: Rc<Animator>,
 ) {
     let mut active = std::pin::pin!(active);
     while let Some(slot) = std::future::poll_fn(|cx| active.as_mut().poll_change(cx)).await {
-        if root.upgrade().is_none() {
+        let Some(mounted) = root.upgrade() else {
             // The mount is gone and nobody aborted us: release the panel scope
             // that was on screen and stop, rather than parking on this signal for
             // the session holding the reconciler, the canvas and the outbound.
             forget_previous_panel_scope(&shown_scope, None);
             break;
-        }
+        };
         render_active_panel(&mut reconciler, &outbound, &shown_scope, slot.as_ref());
+        // **The re-arm point** for this mount (#897): the render above is the
+        // panel's whole mapping pass, so it is the only place a settled panel
+        // can be given something to animate — a plugin going active, or a state
+        // change on the one already showing. `mounted` is the upgrade this loop
+        // already performs; the animator holds no widget of its own.
+        animator.ensure_armed(&mounted);
     }
 }
 
@@ -844,13 +894,19 @@ pub(super) fn clear_region_if_owned(
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use super::{
-        MountedCard, Scope, SlotRender, build_panel_child, build_region, drive_panel_child,
-        forget_previous_panel_scope, preem_render, reconcile_region, render_active_panel,
+        Animator, MountedCard, Scope, SlotRender, build_panel_child, build_region,
+        drive_panel_child, forget_previous_panel_scope, preem_render, reconcile_region,
+        render_active_panel,
     };
-    // The #921 releaser lives in `pump` (beside the animation clock whose
-    // `any_animating` predicate a leaked scope corrupts), but the mounts it has
+    // The #921 releaser lives in `pump` (beside the animation driver whose
+    // "still animating" predicate a leaked scope corrupts), but the mounts it has
     // to outlive are built here — so its production-shaped coverage is here too.
-    use crate::plugins::pump::{drive_scope_releaser, live_plugin_ids_signal};
+    // The #897 animation probes are there for the same reason, read here because
+    // the mounts that arm them are these.
+    use crate::plugins::pump::{
+        animation_arms, drive_scope_releaser, live_animators, live_plugin_ids_signal,
+        reset_animation_probes,
+    };
     use hytte::adw;
     use hytte::futures_signals::signal::Mutable;
     use hytte::gtk::{self, glib, prelude::*};
@@ -965,6 +1021,139 @@ mod gtk_tests {
             "a card leaving its region must release the tree's renderer instances, \
              not park them for the session",
         );
+    }
+
+    /// A tree of one **animating** preem node, at `speed` dots per second — `0.0`
+    /// parks the message, which is the vocabulary's own way of spelling
+    /// "settled" without changing the widget kind.
+    fn marquee_tree(speed: f32) -> wire::Node {
+        wire::Node::Preem {
+            id: Some("mq".to_owned()),
+            classes: vec![],
+            widget: Box::new(vocab::PreemWidget::Marquee {
+                config: vocab::MarqueeConfig {
+                    style: vocab::StyleRef::new(vocab::StyleName::Vfd),
+                    window_px: 192,
+                    gap_dots: 6,
+                    speed_dots_per_sec: speed,
+                },
+                state: vocab::MarqueeState {
+                    text: "A LONG SCROLLING MESSAGE".into(),
+                },
+            }),
+        }
+    }
+
+    /// [`render_of`], but the card tree is a marquee at `speed` — so the mount
+    /// has something to animate (or, at `0.0`, deliberately does not).
+    fn marquee_render_of(plugin_id: &str, tx: &mpsc::Sender<HostMsg>, speed: f32) -> SlotRender {
+        SlotRender {
+            tree: marquee_tree(speed),
+            ..render_of(plugin_id, tx)
+        }
+    }
+
+    /// A **real mount** arms one frame-clock tick callback when it has something
+    /// to animate, breaks it when everything settles, and arms a *new* one when
+    /// a later mapping pass brings motion back (#897).
+    ///
+    /// The whole arm → park → re-arm cycle, driven through the production
+    /// `build_region` — its `bind`, its `reconcile_region`, its `Animator` — and
+    /// not a replica of it. The arm *count* is what tells the two failure modes
+    /// apart: a mount that never disarms and a mount that correctly re-armed
+    /// both end up animating, and only the count says which.
+    ///
+    /// The tick itself is driven by calling `Animator::tick` at chosen frame
+    /// times rather than by waiting on a real `GdkFrameClock`: an unrealized
+    /// window in a headless `#[gtk::test]` has no clock ticking, and a test that
+    /// waited on wall-clock frames would be a flake. What that leaves untested
+    /// here is the one line GTK owns — `add_tick_callback` delivering the tick —
+    /// which is the on-glass half of #897's acceptance.
+    ///
+    /// **Deletion check (a):** dropping `animator.ensure_armed(container)` from
+    /// `build_region`'s bind closure turns the *first* assertion red (`left: 0,
+    /// right: 1`) — nothing ever arms, and every preem animation in the shell is
+    /// frozen. **(b):** removing the `self.armed.set(false)` from
+    /// `Animator::tick` leaves the mount believing it is still armed, so the
+    /// re-arm is skipped and the last assertion reads `left: 1, right: 2` — the
+    /// silently-dead mount a mutation to the break edge alone would otherwise
+    /// leave green.
+    #[gtk::test]
+    fn a_mount_arms_parks_and_re_arms_its_frame_clock() {
+        adw::init().expect("libadwaita init");
+        reset_animation_probes();
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let renders = Mutable::new(vec![marquee_render_of("anim-mount", &tx, 20.0)]);
+
+        let _window = mount_region(&renders);
+        pump();
+
+        assert_eq!(
+            animation_arms(),
+            1,
+            "a mount holding a scrolling marquee must arm exactly one tick callback from its \
+             mapping pass — this is the only place an instance can start animating, and a \
+             mount that never arms freezes every preem animation for the session",
+        );
+        let animators = live_animators();
+        assert_eq!(animators.len(), 1, "one mount, one animation driver");
+        let animator = &animators[0];
+        assert!(animator.is_armed(), "…and it must believe it is armed");
+
+        // The mount's very first tick has no baseline to measure from: it stamps
+        // one, advances nothing, and still asks for the next frame.
+        let baseline = animator.tick(1_000_000);
+        assert!(
+            baseline.moved.is_empty(),
+            "the first tick of a scope only stamps its frame-time baseline",
+        );
+        assert!(
+            baseline.keep_going,
+            "…and must not read 'settled' just because it moved nothing, or every animation \
+             would park on its own first frame",
+        );
+
+        // A tick while it is still scrolling: it moves the card's scope (so the
+        // mount's scopes closure really does reach `MountedCard::preem_scope`)
+        // and asks for another frame.
+        let running = animator.tick(1_000_000 + i64::from(preem_render::MAX_TICK_DT_US));
+        assert_eq!(
+            running.moved,
+            vec![Scope::card("anim-mount")],
+            "the tick must advance the card this mount is showing, by name",
+        );
+        assert!(running.keep_going, "…and ask for the next frame");
+
+        // The plugin parks the message: same widget kind, nothing left to scroll.
+        renders.set(vec![marquee_render_of("anim-mount", &tx, 0.0)]);
+        pump();
+        assert_eq!(
+            animation_arms(),
+            1,
+            "a mapping pass over an already-armed mount must not stack a second callback",
+        );
+
+        let settled = animator.tick(2_000_000);
+        assert!(
+            !settled.keep_going,
+            "a settled mount must break its callback"
+        );
+        assert!(
+            !animator.is_armed(),
+            "…and record that it did, or the mapping pass that could revive it will see an \
+             armed mount and skip the re-arm",
+        );
+
+        // Motion comes back.
+        renders.set(vec![marquee_render_of("anim-mount", &tx, 20.0)]);
+        pump();
+        assert_eq!(
+            animation_arms(),
+            2,
+            "the mapping pass must arm a *new* callback for the revived marquee — the parked \
+             one is gone, and nothing else in the shell can start it again",
+        );
+        assert!(animator.is_armed(), "…and the mount knows it");
     }
 
     /// A mount **region** must be freeable — nothing [`build_region`] spawns may
@@ -1460,6 +1649,10 @@ mod gtk_tests {
                 reconciler,
                 outbound,
                 shown,
+                // Never reached: the weak leg breaks before the render, so this
+                // loop arms nothing. An empty scope set would refuse to arm in
+                // any case.
+                Animator::new(Vec::new),
             )
             .await;
             finished_in_task.set(true);

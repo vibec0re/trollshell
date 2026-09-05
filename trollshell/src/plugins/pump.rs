@@ -4,13 +4,14 @@
 //! [`super::PluginHandles`] `watch::Sender`; the per-conn tasks in
 //! [`super::session`] subscribe the matching receiver.
 //!
-//! Since #883 this module also owns the **preem animation clock** — the one
-//! timer that advances every shell-side preem renderer and asks the affected
-//! reconcilers to repaint. See [`install_preem_clock`].
+//! Since #883 this module also owns the **preem animation driver** — since #897
+//! one GTK frame-clock tick callback per *mount*, which advances the preem
+//! renderers that mount is showing and asks the affected reconcilers to repaint.
+//! See [`Animator`].
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::rc::Rc;
 
 use chrono::{DateTime, Local};
 use hytte::futures_signals::map_ref;
@@ -251,73 +252,220 @@ pub(super) fn to_clock_state(dt: &DateTime<Local>) -> ClockState {
     }
 }
 
-// ── Preem animation clock (#883) ─────────────────────────────────────────────
+// ── Preem animation, on the frame clock (#883, #897) ─────────────────────────
 
-/// Install the single GTK-thread timer that animates every shell-side preem
-/// renderer: marquee scroll, phosphor decay, needle physics, flip clocks and
-/// peak-hold fall.
+/// What one tick of a mount's animation decided: the scopes that moved (so the
+/// caller can nudge the mailboxes holding them) and whether the tick callback
+/// should stay armed.
 ///
-/// **One clock, not one per widget and not one per monitor.** The renderer
-/// instances are shared across monitors (`preem_render`'s table is keyed by
-/// plugin + tree, not by output), so advancing them from each monitor's
-/// reconcile would run every animation at N× speed. This drives them once with
-/// the *real* elapsed time and then asks the affected reconcilers to re-map.
+/// A plain struct rather than a `glib::ControlFlow` so the decision is
+/// **GTK-free** and testable without a main loop — which is the whole reason
+/// #897 could be built at all, given #883 shipped its timer untested for exactly
+/// the opposite reason.
+pub(super) struct Tick {
+    /// The scopes whose renderers advanced this frame — [`request_preem_repaint`]'s input.
+    pub(super) moved: Vec<Scope>,
+    /// Whether anything in this mount still has animation left to run.
+    pub(super) keep_going: bool,
+}
+
+/// One mount's tick, with no GTK and no registry in sight: advance `scopes` to
+/// `frame_time_us` and answer whether to stay armed.
 ///
-/// Its per-tick *work* idles to nothing (the wakeup itself does not — see "The
-/// standing cost" below). [`preem_render::any_animating`] is a handful of enum
-/// matches, and with no preem widget on screen — the state of every session
-/// until a plugin built on the new SDK dials in — the callback does nothing but
-/// re-stamp its baseline.
+/// Split out of [`Animator::tick`] so `plugins::tests` can drive the *decision*
+/// — the dt clamp, the double-mount rule, the settle → break edge, the
+/// state-change → animate-again edge — hermetically, with no display and no
+/// `PluginHandles` registered. The effect the decision authorises
+/// ([`request_preem_repaint`]) needs both, and stays outside.
+pub(super) fn tick_decision(scopes: &[Scope], frame_time_us: i64) -> Tick {
+    let moved = preem_render::advance_scopes(scopes, frame_time_us);
+    Tick {
+        moved,
+        // Asked *after* the advance, so the tick that settles the last widget is
+        // also the one that breaks: a settled renderer's `animates()` is already
+        // false by the time this reads it, and nothing is left to re-check.
+        keep_going: preem_render::any_animating_in(scopes),
+    }
+}
+
+/// The animation driver for one **mount** — a mount region's container box, or a
+/// drawer panel child (#897).
 ///
-/// ## Visibility gating, and the tradeoff that is *not* gated
+/// ## One tick callback per mount, not per instance
 ///
-/// The **repaint** is gated twice over. First on *which scopes moved*: only a
-/// mailbox actually holding an advanced plugin's render is nudged, so one
-/// animating widget no longer re-uploads a texture for every other plugin's
-/// chips (see [`request_preem_repaint`]). Then on the two visibility signals the
-/// host already keeps: a sidebar region only while some monitor's sidebar is
-/// open (#288's aggregate), the drawer panel only while that plugin's panel is
-/// the active one. Bar chips have no visibility signal and rely on the scope
-/// gate alone.
+/// A `gtk::Widget` tick callback runs at its surface's refresh rate while the
+/// widget is mapped, is not called at all while it is not, and stops the frame
+/// clock's `begin_updating` when it returns `Break`. That is three properties
+/// this wants and a timer cannot have: animation phase-locked to compositor
+/// frames instead of beating against them at a fixed 20 Hz; a closed drawer, a
+/// hidden sidebar and an unplugged output costing exactly nothing; and a park
+/// with no timer to break out of.
 ///
-/// The **advance** is deliberately not gated: it is a few floating-point
-/// operations per instance, and skipping it would make a hidden gauge resume
-/// mid-swing rather than settled. What that costs is one 20 Hz timer callback
-/// while an animation is live but off-screen — the CPU-expensive half
-/// (rasterising, and the reconcile pass) is what the gate above actually stops.
+/// It is per mount rather than per renderer instance for two reasons. Every
+/// instance in a mount repaints *together* anyway — the repaint unit is the
+/// render mailbox, and [`request_preem_repaint`] nudges a whole region — so N
+/// callbacks would decide N times what one decides once. And the shell has no
+/// handle from a preem node back to its `PixelSurface`: `hytte-ui`'s
+/// `reconcile_single` is the only place the concrete surface is touched
+/// (`update_in_place` downcasts and calls `set_pixels`), and it keeps no node
+/// id → widget map. Per-instance registration would need a new `hytte-ui` API
+/// for no gain.
 ///
-/// ## The standing cost, stated plainly
+/// ## What is *not* gated any more, and what that changes
 ///
-/// The timer is armed once here and never breaks, so **every** session pays 20
-/// timer wakeups a second — including one with no plugins installed at all,
-/// where the callback finds an empty instance table and returns. The work per
-/// wakeup is negligible; the wakeup itself is not free on battery, and calling
-/// that "idles cheaply" would only be true of the CPU half.
+/// The old timer advanced every instance in the process and let the repaint
+/// fan-out do the gating, so an animating widget in a hidden sidebar kept
+/// running and was *settled* when the sidebar reopened. Now an unmapped mount
+/// does not tick, so its widgets resume where they were rather than where they
+/// would have got to. That is the trade #897 asks for in as many words — "a
+/// hidden drawer's instances cost nothing because an unmapped widget has no
+/// ticking clock" — and it resumes smoothly rather than jumping, because
+/// `preem_render::MAX_TICK_DT_US` clamps the first tick back to one step.
 ///
-/// Parking it is possible and cheap — break out of the timer when
-/// [`preem_render::any_animating`] goes false and re-arm from the mapping pass,
-/// which is the only place an instance can *start* animating — and is
-/// deliberately left out of this PR: the timer's arm/break behaviour is the one
-/// part of this module no hermetic test can observe (there is no GTK main loop
-/// under `cargo test`), so getting it wrong would freeze every preem animation
-/// with CI still green. It belongs in a follow-up that can be verified on glass.
-pub(super) fn install_preem_clock() {
-    let last = Cell::new(Instant::now());
-    glib::timeout_add_local(
-        Duration::from_secs_f32(preem_render::ANIM_STEP_SECS),
-        move || {
-            let now = Instant::now();
-            let dt = now.duration_since(last.replace(now)).as_secs_f32();
-            // The `any_animating` probe first, so a session with no animated
-            // preem widget never walks the instance table's mutable half — and
-            // the baseline is re-stamped either way, so the tick that *does*
-            // find work carries one frame's `dt`, not the idle period's.
-            if preem_render::any_animating() {
-                request_preem_repaint(&preem_render::advance_all(dt));
+/// The repaint side keeps every gate it had: the per-scope targeting in
+/// [`request_preem_repaint`], the sidebar-visibility aggregate (#288), and the
+/// active-panel check.
+///
+/// ## Ownership
+///
+/// The tick closure captures an `Rc<Animator>` and **no widget**: GTK hands the
+/// widget back as the closure's first argument, and this one does not even need
+/// it. The `scopes` closure must reach only *down* the tree (a region's card
+/// list, a panel child's shown-scope cell) — capturing the mount itself would
+/// pin it against its own teardown, the defect #903/#909 fixed on both mounts
+/// and `nix/lint-bind-pins.py` guards on the `bind` side.
+///
+/// The returned `TickCallbackId` is deliberately dropped. `gtk4::TickCallbackId`
+/// has no `Drop` (it exists only so a caller can `remove()` early), the callback
+/// is removed by the `Break` this driver returns when it settles, and by GTK
+/// itself when the widget is disposed. Keeping the id would mean an
+/// `Rc<RefCell<Option<_>>>` whose only reader is the code that already knows,
+/// from [`armed`](Self::armed), whether a callback is out there.
+pub(super) struct Animator {
+    /// The scopes this mount is showing *now* — re-read every tick and every
+    /// arm, never cached, because a region's card list and a panel child's
+    /// selection both change under it.
+    scopes: Box<dyn Fn() -> Vec<Scope>>,
+    /// Whether a tick callback is currently installed. Cleared by the tick that
+    /// returns `Break`, so the next mapping pass sees "not armed" and re-arms.
+    armed: Cell<bool>,
+}
+
+impl Animator {
+    /// A driver for the mount whose current scopes are `scopes()`.
+    ///
+    /// Constructing one arms nothing: a mount with nothing animating must cost
+    /// no frame-clock wakeups at all, which is the park. [`ensure_armed`] from
+    /// the mapping pass is the only thing that starts a callback.
+    ///
+    /// [`ensure_armed`]: Self::ensure_armed
+    pub(super) fn new(scopes: impl Fn() -> Vec<Scope> + 'static) -> Rc<Self> {
+        let animator = Rc::new(Self {
+            scopes: Box::new(scopes),
+            armed: Cell::new(false),
+        });
+        #[cfg(all(test, feature = "system-tests"))]
+        ANIMATORS.with_borrow_mut(|live| live.push(Rc::downgrade(&animator)));
+        animator
+    }
+
+    /// Arm a tick callback on `widget` if this mount has something to animate
+    /// and none is armed. Idempotent, and cheap enough to call from every
+    /// mapping pass — which is exactly where it *is* called.
+    ///
+    /// **The mapping pass is the only re-arm point**, because it is the only
+    /// place an instance can start animating: a new instance, or a state change
+    /// that gives a settled widget somewhere to go (`preem_render::map_widget`
+    /// applies state there). Every path that can start motion — a plugin's
+    /// render, a card joining a region, a panel going active — runs one.
+    pub(super) fn ensure_armed(self: &Rc<Self>, widget: &impl IsA<gtk::Widget>) {
+        if self.armed.get() {
+            return;
+        }
+        if !preem_render::any_animating_in(&(self.scopes)()) {
+            return;
+        }
+        self.armed.set(true);
+        #[cfg(all(test, feature = "system-tests"))]
+        ARMS.with(|arms| arms.set(arms.get() + 1));
+        let driver = Rc::clone(self);
+        // Dropped on purpose — see the type docs. `_id` rather than `_` so the
+        // callback is not removed before it is ever installed.
+        let _id = widget.as_ref().add_tick_callback(move |_widget, clock| {
+            let tick = driver.tick(clock.frame_time());
+            if !tick.moved.is_empty() {
+                request_preem_repaint(&tick.moved);
             }
-            glib::ControlFlow::Continue
-        },
-    );
+            if tick.keep_going {
+                glib::ControlFlow::Continue
+            } else {
+                glib::ControlFlow::Break
+            }
+        });
+    }
+
+    /// One tick of this mount's animation at `frame_time_us`, plus the arm
+    /// bookkeeping: a tick that finds nothing left to animate clears
+    /// [`armed`](Self::armed) on its way to telling the caller to `Break`.
+    ///
+    /// Separate from the closure in [`ensure_armed`] so `gtk_tests` can drive
+    /// the real driver — its scopes, its arm flag, its break edge — at chosen
+    /// frame times, instead of waiting on a real frame clock to fire inside a
+    /// `#[gtk::test]`.
+    pub(super) fn tick(&self, frame_time_us: i64) -> Tick {
+        let tick = tick_decision(&(self.scopes)(), frame_time_us);
+        if !tick.keep_going {
+            self.armed.set(false);
+        }
+        tick
+    }
+
+    /// Whether a tick callback is installed right now — the parked/awake bit
+    /// `gtk_tests` asserts on.
+    #[cfg(all(test, feature = "system-tests"))]
+    pub(super) fn is_armed(&self) -> bool {
+        self.armed.get()
+    }
+}
+
+#[cfg(all(test, feature = "system-tests"))]
+thread_local! {
+    /// How many tick callbacks [`Animator::ensure_armed`] has actually
+    /// installed, process-wide on the GTK thread.
+    ///
+    /// The seam that makes "it re-armed" and "it never disarmed" tell apart:
+    /// both leave a mount animating, and only the count says which happened.
+    /// A counter rather than a captured callback because the thing under test is
+    /// how *often* a callback is created, and `#[gtk::test]` shares one thread
+    /// across the whole suite (`gtk::test_synced`), so a test resets it first.
+    static ARMS: Cell<u32> = const { Cell::new(0) };
+
+    /// Every [`Animator`] built on this thread, weakly — so a test can reach the
+    /// driver a real `build_region` / `build_panel_child` created inside itself
+    /// and drive its ticks, rather than asserting against a replica of it.
+    static ANIMATORS: RefCell<Vec<std::rc::Weak<Animator>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Forget every recorded arm and every recorded [`Animator`] — a `#[gtk::test]`
+/// preamble, since `gtk::test_synced` runs the whole suite on one thread and
+/// these are thread-locals.
+#[cfg(all(test, feature = "system-tests"))]
+pub(super) fn reset_animation_probes() {
+    ARMS.with(|arms| arms.set(0));
+    ANIMATORS.with_borrow_mut(Vec::clear);
+}
+
+/// How many tick callbacks have been armed since [`reset_animation_probes`].
+#[cfg(all(test, feature = "system-tests"))]
+pub(super) fn animation_arms() -> u32 {
+    ARMS.with(Cell::get)
+}
+
+/// The [`Animator`]s built since [`reset_animation_probes`] that are still
+/// alive — a mount torn down in the meantime drops out rather than lingering.
+#[cfg(all(test, feature = "system-tests"))]
+pub(super) fn live_animators() -> Vec<Rc<Animator>> {
+    ANIMATORS.with_borrow(|live| live.iter().filter_map(std::rc::Weak::upgrade).collect())
 }
 
 // ── Monitor-independent preem scope release (#921) ───────────────────────────
@@ -421,11 +569,12 @@ fn mailbox_ids(mailbox: &Mutable<Vec<SlotRender>>) -> impl Signal<Item = Vec<Str
 /// self-pin (#909) — a stranded-but-still-subscribed region released the scope
 /// by accident; unpinning the region is what exposed it.
 ///
-/// It matters beyond the memory: a leaked *animating* scope keeps
-/// [`preem_render::any_animating`] true forever, so the 20 Hz
-/// [`install_preem_clock`] tick keeps walking the instance table with nothing on
-/// screen — and that predicate is exactly what #897's frame-clock parking is
-/// built on.
+/// It matters beyond the memory: a leaked *animating* scope answers "still
+/// animating" forever, and since #897 that predicate
+/// ([`preem_render::any_animating_in`]) is what decides whether a mount's frame
+/// clock parks. A leak in a scope a mount still names would keep that mount
+/// requesting frames with nothing on screen to show for them — the standing
+/// wakeup #897 exists to remove.
 ///
 /// ## Why it is a hand-written apply-loop and not `hytte::reactive::bind`
 ///
@@ -486,9 +635,9 @@ pub(super) async fn drive_scope_releaser(live: impl Signal<Item = HashSet<String
 }
 
 /// Subscribe [`drive_scope_releaser`] to the production mailboxes. Called once
-/// from [`super::install`], on the GTK main thread — next to
-/// [`install_preem_clock`], whose `any_animating` gate is the thing a leaked
-/// animating scope corrupts.
+/// from [`super::install`], on the GTK main thread — the same install path the
+/// preem animation used to arm its timer from, and the `animates` predicate a
+/// leaked animating scope corrupts is still the one [`Animator`] parks on.
 ///
 /// The authoritative "plugin left" site is the connection teardown in
 /// `session.rs:815-824`, which runs on a **tokio** task — `preem_render`'s
@@ -562,11 +711,12 @@ pub(super) fn install_scope_releaser() {
 /// targeting is the guard that stops the call from happening at all: without
 /// it, nudging every bar mailbox because *something somewhere* animated would
 /// still walk and compare a full frame for every `Pixels` node of every plugin
-/// chip on every monitor at 20 Hz, legacy self-rasterising plugins included —
-/// cheaper than an unconditional re-upload, but not free at the wire's buffer
-/// cap and instance count.
+/// chip on every monitor, every frame, legacy self-rasterising plugins included
+/// — cheaper than an unconditional re-upload, but not free at the wire's buffer
+/// cap and instance count. Since #897 that fan-out runs at the display's refresh
+/// rather than at 20 Hz, so the targeting matters *more*, not less.
 ///
-/// [`preem_render::advance_all`] therefore names the scopes that moved, and a
+/// [`preem_render::advance_scopes`] therefore names the scopes that moved, and a
 /// mailbox is nudged only when it actually carries one of their plugins.
 /// Visibility still gates on top of that: a sidebar region only while some
 /// monitor's sidebar is open (#288's aggregate), the panel mailbox only when the
@@ -623,7 +773,7 @@ fn request_preem_repaint(moved: &[Scope]) {
 /// A skin change re-tints *every* shell-rendered preem surface at once
 /// ([`tint_in_process_surfaces`] drops all the cached frames), so there is no
 /// subset to narrow to and the per-scope targeting above would only cost a
-/// comparison. Rare (an accent or color-scheme change), unlike the 20 Hz clock.
+/// comparison. Rare (an accent or color-scheme change), unlike an animation tick.
 fn request_preem_repaint_all() {
     let sidebar_visible = slot_visible_mutable().get();
     registry::with(|r| {

@@ -2934,6 +2934,7 @@ fn text_box_renders_at_parity_with_the_kit() {
         corner: 3,
         scale: 2,
         fixed_width: true,
+        notdef: None,
     };
     let text = "the quick brown fox jumps";
     let node = preem_node(
@@ -5342,6 +5343,180 @@ fn a_pinned_text_box_survives_a_theme_change_though_it_bakes_at_construction() {
         "a pinned TextBox must draw its pinned color",
     );
     assert_eq!(teal, rose, "…and survive a theme change byte-identically");
+}
+
+// ── #885's palette widening: field + notdef (#884's two speech bubbles) ──────
+
+/// A pinned **field** floods the ground the widget draws on, and — like a pinned
+/// ink — is deliberately excluded from the live re-tint.
+///
+/// The ground is where most of a widget's pixels are, so this is the pin that
+/// actually made `pet`'s and `caw`'s bubbles migratable: #912's ink-only
+/// override would have left both boxes standing on the skin's own field.
+///
+/// The two pins are **independent**, and the middle assertion says so out loud:
+/// a widget that pins only its field still re-tints its *ink* with the desktop,
+/// so it is not byte-frozen. Only when both slots are spoken for — here by
+/// `Neutral`, which is the ink saying "not even the accent" — is the whole
+/// widget still. Getting that wrong in the obvious direction (asserting the
+/// field-only widget is frozen) is what this test caught while it was written.
+///
+/// The unpinned control is what keeps the flooding claim from being vacuous.
+///
+/// **Deletion check:** making `pins_for` drop `StyleRef::field` (returning
+/// `field: None`) leaves the rest of the shell suite green and turns "a pinned
+/// field must flood the widget's ground" red.
+#[test]
+fn a_pinned_field_floods_the_ground_and_survives_a_theme_change() {
+    let _ink = preem_ink_lock();
+    let lilac = [0x3a, 0x22, 0x50, 0xff];
+    let scope = Scope::detached("885-field");
+    let vfd = vocab::StyleRef::new(vocab::StyleName::Vfd);
+    let pinned = ink_probe("field", vfd.with_field(lilac));
+    let plain = ink_probe("plain", vfd);
+    let still = ink_probe(
+        "still",
+        vfd.with_field(lilac)
+            .with_accent(vocab::AccentRole::Neutral),
+    );
+
+    tint_in_process_surfaces(Some([0x11, 0x99, 0xaa, 0xff]));
+    let pinned_teal = mapped_pixels(&scope, &pinned);
+    let plain_teal = mapped_pixels(&scope, &plain);
+    let still_teal = mapped_pixels(&scope, &still);
+
+    tint_in_process_surfaces(Some([0xdd, 0x22, 0x66, 0xff]));
+    let pinned_rose = mapped_pixels(&scope, &pinned);
+    let still_rose = mapped_pixels(&scope, &still);
+
+    tint_in_process_surfaces(None);
+    preem_render::forget_scope(&scope);
+
+    let floods = |px: &(u32, u32, Vec<u8>)| px.2.chunks_exact(4).any(|c| c == lilac);
+    assert!(
+        floods(&pinned_teal),
+        "a pinned field must flood the widget's ground, exactly, not something derived from it",
+    );
+    assert!(
+        !floods(&plain_teal),
+        "…and the same widget without the pin must not, or the check above is vacuous",
+    );
+    assert!(
+        floods(&pinned_rose),
+        "the ground is excluded from the re-tint — the accent moved and the field did not",
+    );
+    assert_ne!(
+        pinned_teal, pinned_rose,
+        "…while its *ink* still follows the desktop: the two pins are independent",
+    );
+    assert_eq!(
+        still_teal, still_rose,
+        "and with both slots spoken for the whole widget is byte-identical across the change",
+    );
+}
+
+/// The whole point of the widening, end to end on the state path: a `TextBox`
+/// carrying all three pins renders **byte-identically** to the kit call `pet`
+/// made before it migrated (`TextBox::new().…​.colors(field, ink, notdef)`).
+///
+/// This is the shell's half of #884's compat promise. The plugin's half — that
+/// its *raster* arm still produces those same bytes against an old shell — is
+/// pinned in `hytte-plugin-pet` and `hytte-plugin-caw`; together they say the
+/// bubbles look the same on both shells and on both arms.
+///
+/// The config is `pet`'s real one, down to the emoji: an uncovered char is the
+/// only input that reaches the `notdef` slot, which is the color the palette
+/// scope structurally *cannot* carry (no kit palette has one) and so the one a
+/// wrong wiring drops silently.
+///
+/// **Deletion check:** making `text_box` ignore `config.notdef` leaves the rest
+/// of the shell suite green and turns the oracle comparison red; so does making
+/// `pins_for` drop the field. The three "…must move pixels" controls below say
+/// which pin each failure is about.
+#[test]
+fn a_fully_pinned_text_box_reproduces_the_plugins_own_palette() {
+    let _ink = preem_ink_lock();
+    let field = [0x3a, 0x22, 0x50, 0xff];
+    let ink = [0xf0, 0xe0, 0xf8, 0xff];
+    let notdef = [0x6c, 0x4e, 0x86, 0xff];
+    let text = "mrrp 💕";
+    let scope = Scope::detached("885-palette");
+
+    let config = |field, ink, notdef| vocab::TextBoxConfig {
+        style: {
+            let base = vocab::StyleRef::new(vocab::StyleName::Lcd);
+            let base = match field {
+                Some(f) => base.with_field(f),
+                None => base,
+            };
+            match ink {
+                Some(i) => base.with_ink(i),
+                None => base,
+            }
+        },
+        width: vocab::TextBoxWidth::FitPx(126),
+        max_lines: 3,
+        pad: 3,
+        corner: 2,
+        scale: 2,
+        fixed_width: true,
+        notdef,
+    };
+    let node = |id: &'static str, config| {
+        preem_node(
+            Some(id),
+            vocab::PreemWidget::TextBox {
+                config,
+                state: vocab::TextBoxState { text: text.into() },
+            },
+        )
+    };
+
+    // An accent is installed throughout: a pin that quietly fell through to the
+    // session tint would then differ from the oracle rather than coincide with it.
+    tint_in_process_surfaces(Some([0x11, 0x99, 0xaa, 0xff]));
+    let all = mapped_pixels(
+        &scope,
+        &node("all", config(Some(field), Some(ink), Some(notdef))),
+    );
+    let no_field = mapped_pixels(&scope, &node("nf", config(None, Some(ink), Some(notdef))));
+    let no_ink = mapped_pixels(&scope, &node("ni", config(Some(field), None, Some(notdef))));
+    let no_notdef = mapped_pixels(&scope, &node("nn", config(Some(field), Some(ink), None)));
+
+    // …and it survives the theme moving, like every pin.
+    tint_in_process_surfaces(Some([0xdd, 0x22, 0x66, 0xff]));
+    let all_again = mapped_pixels(
+        &scope,
+        &node("all", config(Some(field), Some(ink), Some(notdef))),
+    );
+    tint_in_process_surfaces(None);
+    preem_render::forget_scope(&scope);
+
+    // The oracle is the pre-#884 kit call, written out rather than derived from
+    // `text_box`: an oracle built from the code under test agrees by construction.
+    let oracle = kit::TextBox::new()
+        .fit_px(126)
+        .max_lines(3)
+        .pad(3)
+        .corner(2)
+        .scale(2)
+        .fixed_width(true)
+        .colors(field, ink, notdef);
+    assert_eq!(
+        all,
+        kit_pixels(&oracle.render(text)),
+        "a fully pinned TextBox must reproduce the plugin's own `colors()` bytes",
+    );
+    assert_eq!(
+        all, all_again,
+        "…and survive a theme change byte-identically"
+    );
+    assert_ne!(all, no_field, "the field pin must move pixels");
+    assert_ne!(all, no_ink, "the ink pin must move pixels");
+    assert_ne!(
+        all, no_notdef,
+        "the notdef pin must move pixels — the emoji is what reaches it",
+    );
 }
 
 /// The memoized role colors are dropped when the theme moves — which is what

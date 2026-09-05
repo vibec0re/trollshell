@@ -666,21 +666,24 @@ session.
   2. **Motion, not steps.** Open `hytte-plugin-preem-demo`'s card: the
      marquee scroll, needle swing and phosphor decay should run at the
      shell's own frame rate, not step once per the plugin's old ~1 Hz
-     heartbeat. Judge this knowing the clock has a known, deliberately
-     unfixed cost meanwhile — it never parks when nothing is animating
-     (#897 tracks that follow-up) — so idle battery drain is expected today,
-     not a new regression.
+     heartbeat. **Superseded by #897/#926 below**, which replaced this
+     20 Hz timer with the display's own frame clock — the motion should now
+     read smooth rather than merely faster, and the idle drain this entry
+     used to warn about ("it never parks when nothing is animating") is
+     gone. Judge #883's own contribution here only against a shell that
+     predates #926.
   3. **Two real outputs, not one thread mapping the same tree twice.** With
      two monitors attached and an animating preem widget on screen, confirm
      it neither runs at double speed nor decays its phosphor twice as fast —
      each output gets its own reconciler and frame clock, the case a
      hermetic idempotence test cannot cover.
-  4. **The timer arm itself under load**, not just the functions it calls —
-     there is no GTK main loop under `cargo test`, so `install_preem_clock`'s
-     `dt` measurement and repaint request are never exercised by CI. With
-     several plugin panels animating at once, motion should stay smooth
-     rather than the step drifting into visible jitter, and resuming from a
-     stall (e.g. suspend) should catch up smoothly rather than snapping.
+  4. **The clock's arm under load**, not just the functions it calls — there
+     is no GTK main loop under `cargo test`, so the `dt` measurement and the
+     repaint request are only ever exercised on glass. With several plugin
+     panels animating at once, motion should stay smooth rather than the step
+     drifting into visible jitter, and resuming from a stall (e.g. suspend)
+     should catch up smoothly rather than snapping. #897/#926 moved this onto
+     each mount's frame clock; the arm/park half of it is checked there.
 - [ ] **(#884/#898)** The SDK's display seam, against a shell carrying #896:
   1. Start (or restart) `hytte-plugin-preem-demo` and
      `hytte-plugin-bar-clock-demo`. The card's eight widgets and the bar
@@ -870,6 +873,46 @@ session.
      uncovered glyph falls back to the box. `pet` and `caw` both pin
      `notdef` fully opaque, so this alpha difference has no visible
      effect on the bundled plugins as shipped.
+
+- [ ] **(#897/#926 — lands with that PR, open at the time of writing)** Preem
+      animation now rides each **mount's GTK frame clock** instead of one
+      process-wide 20 Hz timer that was armed at startup and never broke. CI
+      cannot see any of this: there is no compositor delivering frames under
+      `cargo test`, so the hermetic tests drive the decision the tick makes
+      and one `#[gtk::test]` drives a real `GdkFrameClock` under `xvfb` — but
+      the shell's actual mounts, on real outputs, are only observable here.
+  1. **No periodic wakeup when everything is settled.** With every preem
+     widget at rest — or, better, with no preem plugin running at all —
+     `strace -c -e clock_nanosleep,ppoll -p "$(pgrep -x trollshell)"` over
+     ~10 s should show no 20 Hz drumbeat from this path. Before #926 that
+     was 200 wakeups in the window regardless of what was on screen, on
+     every session including one with no plugins installed.
+  2. **A marquee text change (or a gauge value change) resumes without a
+     hitch.** The single most important item: the mount had parked, and only
+     the mapping pass can re-arm it. A wrong re-arm point freezes every
+     preem animation in the shell **silently, with CI green** — that is the
+     exact failure mode #897's body calls out. Watch `preem-demo`'s card go
+     still and then move again on its next state change.
+  3. **Smooth at the panel's refresh.** A gauge sweep should no longer read
+     steppy and a marquee faster than 20 dots/s should no longer skip dots
+     — the whole point of Annika's "isn't 20 Hz a bit rough?".
+  4. **A closed drawer, and a closed sidebar, cost nothing.** Open a plugin
+     panel with something animating, close the drawer, and confirm the
+     wakeups stop (same `strace`); reopen and confirm it resumes rather than
+     jumping ahead by the whole closed interval. Then repeat with a
+     **sidebar** card — the harder case, because the sidebar is a layer
+     surface presented once for the process lifetime and "closing" it only
+     flips a `GtkRevealer`, which GTK does **not** treat as a reason to stop
+     ticking. The review round measured the first cut of this PR still
+     ticking at full refresh there.
+  5. **Two monitors, one chip.** With the same plugin chip on both bars, its
+     animation must run at normal speed, not double — the renderer instances
+     are shared across outputs while the frame clocks are not.
+  6. **A slow or throttled clock keeps the right speed.** Load the shell up
+     (several animating panels at once, or a compositor throttling an
+     occluded surface) and confirm a marquee still crosses at its stated
+     dots/second rather than visibly slowing. The `dt` clamp is the resume
+     cap, not a per-frame cap, precisely so this cannot drift.
 
 ## Screen recording
 

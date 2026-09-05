@@ -293,13 +293,45 @@ pub(super) fn tick_decision(scopes: &[Scope], frame_time_us: i64) -> Tick {
 ///
 /// ## One tick callback per mount, not per instance
 ///
-/// A `gtk::Widget` tick callback runs at its surface's refresh rate while the
-/// widget is mapped, is not called at all while it is not, and stops the frame
-/// clock's `begin_updating` when it returns `Break`. That is three properties
-/// this wants and a timer cannot have: animation phase-locked to compositor
-/// frames instead of beating against them at a fixed 20 Hz; a closed drawer, a
-/// hidden sidebar and an unplugged output costing exactly nothing; and a park
-/// with no timer to break out of.
+/// A `gtk::Widget` tick callback runs at its surface's refresh rate and stops
+/// the frame clock's `begin_updating` when it returns `Break`. That is two
+/// properties this wants and a timer cannot have: animation phase-locked to
+/// compositor frames instead of beating against them at a fixed 20 Hz, and a
+/// park with no timer to break out of.
+///
+/// ## Visibility is *this* code's job, not GTK's
+///
+/// GTK gates tick-callback delivery on **realized**, not on mapped:
+/// `gtk_widget_add_tick_callback` calls `gdk_frame_clock_begin_updating` under
+/// `if (priv->realized …)`, `gtk_widget_real_unrealize` is what disconnects, and
+/// `gtk_widget_unmap` touches neither — nor does `gtk_widget_set_child_visible`,
+/// which is all a `GtkRevealer` does to its child.
+///
+/// The first cut of #897 assumed the opposite and the #926 review measured the
+/// cost. The sidebar is a layer surface presented **once for the process
+/// lifetime** (`overlays/sidebar.rs` — the toggle goes through the revealer,
+/// never through `set_visible`/`present`), so a "closed" sidebar's region is
+/// `mapped = false, realized = true` and kept ticking at the full display
+/// refresh: measured 30 deliveries per 500 ms either way. A marquee's
+/// `Renderer::animates` is config-driven and so **never settles**, which means
+/// one scrolling card in a closed sidebar cost 60–144 wakeups a second per
+/// monitor against #883's 20 process-wide — a regression in one of the exact
+/// cases this issue exists to fix.
+///
+/// So the mapped check is written out here, in the tick closure, on the widget
+/// GTK hands back. Three of the four hiding mechanisms then stop for the right
+/// reason and the fourth stops for GTK's:
+///
+/// | hidden how | what GTK does | ticks? |
+/// |---|---|---|
+/// | drawer closed (`modal.rs` hides the **toplevel**) | unmap, no unrealize | no — the `is_mapped` break |
+/// | sidebar closed (a `GtkRevealer`'s `child_visible`) | unmap only | no — the `is_mapped` break |
+/// | region empty (`set_visible(false)`) | unmap only | no — and its scope set is empty anyway |
+/// | output unplugged (window destroyed) | `destroy_tick_callbacks` | no — GTK removes the callback |
+///
+/// The break is paired with a `connect_map` re-arm on each mount (`region.rs`),
+/// because nothing else re-arms a mount on becoming visible: a sidebar opening
+/// is not by itself a mapping pass.
 ///
 /// It is per mount rather than per renderer instance for two reasons. Every
 /// instance in a mount repaints *together* anyway — the repaint unit is the
@@ -311,20 +343,25 @@ pub(super) fn tick_decision(scopes: &[Scope], frame_time_us: i64) -> Tick {
 /// id → widget map. Per-instance registration would need a new `hytte-ui` API
 /// for no gain.
 ///
-/// ## What is *not* gated any more, and what that changes
+/// ## What that changes about hidden widgets
 ///
 /// The old timer advanced every instance in the process and let the repaint
 /// fan-out do the gating, so an animating widget in a hidden sidebar kept
-/// running and was *settled* when the sidebar reopened. Now an unmapped mount
-/// does not tick, so its widgets resume where they were rather than where they
-/// would have got to. That is the trade #897 asks for in as many words — "a
-/// hidden drawer's instances cost nothing because an unmapped widget has no
-/// ticking clock" — and it resumes smoothly rather than jumping, because
-/// `preem_render::MAX_TICK_DT_US` clamps the first tick back to one step.
+/// running and was *settled* when the sidebar reopened. Now a hidden mount does
+/// not tick, so its widgets resume where they were rather than where they would
+/// have got to. That is the trade #897 asks for in as many words — "a hidden
+/// drawer's instances cost nothing because an unmapped widget has no ticking
+/// clock" — and the resume is a bounded hop rather than the whole hidden
+/// interval, because `preem_render::MAX_TICK_DT_US` caps the first tick back at
+/// eight steps.
 ///
 /// The repaint side keeps every gate it had: the per-scope targeting in
 /// [`request_preem_repaint`], the sidebar-visibility aggregate (#288), and the
-/// active-panel check.
+/// active-panel check. What it does **not** have is any dedup across mounts: a
+/// `Gauge` or `FlipBoard` advanced by two mounts in one frame fans out twice, so
+/// two monitors showing one animating gauge cost two mailbox nudges per frame,
+/// not one. That is the cost #897 signed up for, bounded by #896's per-scope
+/// targeting, #907's `set_pixels` compare and eventually #893's GL backend.
 ///
 /// ## Ownership
 ///
@@ -347,8 +384,18 @@ pub(super) struct Animator {
     /// selection both change under it.
     scopes: Box<dyn Fn() -> Vec<Scope>>,
     /// Whether a tick callback is currently installed. Cleared by the tick that
-    /// returns `Break`, so the next mapping pass sees "not armed" and re-arms.
+    /// returns `Break` — settled, or unmapped — so the next mapping pass (or
+    /// `map`) sees "not armed" and re-arms.
     armed: Cell<bool>,
+    /// How many times GTK has actually delivered a tick to this mount.
+    ///
+    /// The only way to observe the *real* `GdkFrameClock` half of this design,
+    /// which is otherwise the one line no hermetic test can reach. Counted at
+    /// the very top of the closure, before the mapped gate, so "hidden but still
+    /// ticking" — the #926 review's M-1 — is visible as a number rather than
+    /// inferred from an animation that happens not to have moved.
+    #[cfg(all(test, feature = "system-tests"))]
+    ticks: Cell<u32>,
 }
 
 impl Animator {
@@ -363,6 +410,8 @@ impl Animator {
         let animator = Rc::new(Self {
             scopes: Box::new(scopes),
             armed: Cell::new(false),
+            #[cfg(all(test, feature = "system-tests"))]
+            ticks: Cell::new(0),
         });
         #[cfg(all(test, feature = "system-tests"))]
         ANIMATORS.with_borrow_mut(|live| live.push(Rc::downgrade(&animator)));
@@ -373,11 +422,17 @@ impl Animator {
     /// and none is armed. Idempotent, and cheap enough to call from every
     /// mapping pass — which is exactly where it *is* called.
     ///
-    /// **The mapping pass is the only re-arm point**, because it is the only
-    /// place an instance can start animating: a new instance, or a state change
-    /// that gives a settled widget somewhere to go (`preem_render::map_widget`
-    /// applies state there). Every path that can start motion — a plugin's
-    /// render, a card joining a region, a panel going active — runs one.
+    /// There are **two** re-arm points, and both are needed:
+    ///
+    /// - the **mapping pass**, because it is the only place an instance can
+    ///   start animating — a new instance, or a state change that gives a
+    ///   settled widget somewhere to go (`preem_render::map_widget` applies
+    ///   state there). Every path that can start motion runs one: a plugin's
+    ///   render, a card joining a region, a panel going active, even the accent
+    ///   re-tint's blanket nudge;
+    /// - **`map`**, because the tick below breaks on an unmapped mount and a
+    ///   sidebar opening is not by itself a mapping pass. Without it, a mount
+    ///   that went quiet while hidden would stay quiet after it reappeared.
     pub(super) fn ensure_armed(self: &Rc<Self>, widget: &impl IsA<gtk::Widget>) {
         if self.armed.get() {
             return;
@@ -391,7 +446,16 @@ impl Animator {
         let driver = Rc::clone(self);
         // Dropped on purpose — see the type docs. `_id` rather than `_` so the
         // callback is not removed before it is ever installed.
-        let _id = widget.as_ref().add_tick_callback(move |_widget, clock| {
+        let _id = widget.as_ref().add_tick_callback(move |widget, clock| {
+            #[cfg(all(test, feature = "system-tests"))]
+            driver.ticks.set(driver.ticks.get() + 1);
+            // The visibility gate GTK does not apply for us — see the type docs.
+            // `widget` is the one GTK hands back, never a captured clone, so
+            // this reads the live mapped state without pinning the mount.
+            if !widget.is_mapped() {
+                driver.armed.set(false);
+                return glib::ControlFlow::Break;
+            }
             let tick = driver.tick(clock.frame_time());
             if !tick.moved.is_empty() {
                 request_preem_repaint(&tick.moved);
@@ -401,6 +465,19 @@ impl Animator {
             } else {
                 glib::ControlFlow::Break
             }
+        });
+    }
+
+    /// Arm from `widget`'s `map` signal as well as from the mapping pass, and
+    /// answer the `SignalHandlerId` to nobody — the handler lives as long as the
+    /// widget, which is exactly its useful life.
+    ///
+    /// Captures the driver and **no widget**: the handler is given its own
+    /// widget back, the same contract the tick closure keeps.
+    pub(super) fn arm_on_map(self: &Rc<Self>, widget: &impl IsA<gtk::Widget>) {
+        let driver = Rc::clone(self);
+        widget.as_ref().connect_map(move |widget| {
+            driver.ensure_armed(widget);
         });
     }
 
@@ -425,6 +502,18 @@ impl Animator {
     #[cfg(all(test, feature = "system-tests"))]
     pub(super) fn is_armed(&self) -> bool {
         self.armed.get()
+    }
+
+    /// Ticks GTK has delivered since the last [`reset_ticks`](Self::reset_ticks).
+    #[cfg(all(test, feature = "system-tests"))]
+    pub(super) fn ticks(&self) -> u32 {
+        self.ticks.get()
+    }
+
+    /// Start a fresh counting window for [`ticks`](Self::ticks).
+    #[cfg(all(test, feature = "system-tests"))]
+    pub(super) fn reset_ticks(&self) {
+        self.ticks.set(0);
     }
 }
 

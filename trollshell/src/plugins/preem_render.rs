@@ -214,38 +214,70 @@ pub(super) const ANIM_STEP_SECS: f32 = 1.0 / 20.0;
 /// the stall's length in phosphor decays for no visible benefit. Clamping
 /// catches the trail up to "fully faded" and moves on.
 ///
-/// Since #897 [`advance_scopes`] clamps its own `dt` to [`MAX_TICK_DT_US`] —
-/// *one* step — long before this cap can bite, so in production this is the
-/// accumulator's own backstop rather than the live guard. It still governs
-/// [`advance_all`], which takes a caller-supplied `dt`.
+/// [`advance_scopes`] clamps its own `dt` to exactly this many steps' worth
+/// ([`MAX_TICK_DT_US`]), so on the production path this is the live guard for a
+/// resume from suspend — not, as the first cut of #897 had it, a constant made
+/// unreachable by a tighter clamp upstream.
 pub(super) const MAX_CATCHUP_STEPS: u32 = 8;
 
 /// The most animation time one frame-clock tick may advance a scope by, in
 /// microseconds — the stall clamp, and the thing that makes a *park* free of
 /// consequence (#897).
 ///
-/// Two events hand a tick an unbounded elapsed time, and both must land on the
-/// same answer:
+/// Two events hand a tick an unbounded elapsed time, and both land on the same
+/// answer:
 ///
 /// - a **stall** — a resume from suspend, or a blocked GTK thread — where the
 ///   frame clock's `frame_time` simply jumps;
-/// - a **park**, where the mount's tick callback broke because everything had
-///   settled and something re-armed it minutes later. The per-scope baseline
+/// - a **park**, where the mount's tick callback broke (settled, or unmapped)
+///   and something re-armed it minutes later. The per-scope baseline
 ///   ([`ScopeState::last_advance_us`]) is deliberately *not* reset on re-arm, so
 ///   this clamp is what stops the parked interval from being replayed as
 ///   elapsed animation. Not resetting is the point: a scope shown by two mounts
-///   must not have its baseline stomped by whichever one happens to arm second.
+///   must not have its baseline stomped by whichever one happens to arm second,
+///   and a scope another mount kept advancing while this one was parked has a
+///   fresh baseline already.
 ///
-/// One step ([`ANIM_STEP_SECS`], asserted in `plugins::tests`) rather than
-/// several: the issue asks for "the first tick after re-arming must not see the
-/// whole parked interval", and a resume that replays eight phosphor decays at
-/// once is a visible lurch where one is not. The cost of the clamp is that
-/// animation runs *slightly slow* through a hitch longer than 50 ms, which is
-/// the ordinary trade every frame loop makes.
+/// **[`ANIM_STEP_SECS`] × [`MAX_CATCHUP_STEPS`], not one step** (both agreements
+/// asserted in `plugins::tests`). The first cut of #897 clamped at one step, and
+/// the #926 review measured what that costs: the clamp does not only bound
+/// *catch-up*, it truncates **every** frame interval longer than itself, so any
+/// sustained clock below 20 Hz runs animation slow with no diagnostic — probe
+/// P5 measured a 15 Hz clock advancing a 20 dots/s marquee 15 dots in a second
+/// rather than 20, a silent 25 % rate error. That is a live hazard rather than a
+/// corner, because #897's own cost note says the shell rasterises on the CPU per
+/// tick per animating widget: enough widgets push the frame clock below 20 Hz,
+/// which then makes phosphor fade length, needle settle time and marquee speed
+/// all drift together.
 ///
-/// A `u16` so the conversion to seconds is `f32::from` — lossless, and clean
-/// under `clippy::cast_precision_loss`, which an `i64 as f32` is not.
-pub(super) const MAX_TICK_DT_US: u16 = 50_000;
+/// At 400 ms a 15 Hz clock (66.7 ms), and even a compositor throttling to 10 Hz,
+/// passes through **unclamped and rate-exact**, while a park or a suspend still
+/// resumes with at most the 8 steps #897's body asked to keep. The cost is that
+/// a resume is a hop of up to 8 steps rather than 1 — the issue explicitly
+/// allows either ("clamp **or** reset `last_tick` on re-arm"), and #883 behaved
+/// the same way.
+///
+/// An `i64` of microseconds, converted through [`micros_to_secs`] rather than a
+/// cast: 400 000 does not fit the `u16` the one-step version converted through.
+/// Spelled as a literal, with `the_tick_dt_clamp_is_the_resume_cap` pinning it
+/// against the two constants it is derived from.
+pub(super) const MAX_TICK_DT_US: i64 = 400_000;
+
+/// `micros` as seconds, for a value already known to be within
+/// `0..=MAX_TICK_DT_US`.
+///
+/// Split at the millisecond so both halves fit a `u16` and convert through
+/// `f32::from` — **exact**, and clean under `clippy::cast_precision_loss`, which
+/// a direct `i64 as f32` (or `u32 as f32`) trips regardless of how small the
+/// range actually is. Values outside the range are clamped rather than
+/// truncated, so the conversion is total: this runs inside a tick callback,
+/// where a `panic!` would take the shell's main loop with it.
+fn micros_to_secs(micros: i64) -> f32 {
+    let clamped = micros.clamp(0, MAX_TICK_DT_US);
+    let millis = u16::try_from(clamped / 1_000).unwrap_or(u16::MAX);
+    let rest = u16::try_from(clamped % 1_000).unwrap_or(0);
+    f32::from(millis) / 1_000.0 + f32::from(rest) / 1_000_000.0
+}
 
 /// A phosphor cell's maximum intensity in the kit's persistence buffer
 /// (`hytte-preem/src/scope.rs`: "one intensity (`0..=255`) per logical pixel").
@@ -1111,7 +1143,10 @@ impl Instance {
 /// real time since the first one's, whatever the two clocks' phase.
 ///
 /// The `dt` is clamped to [`MAX_TICK_DT_US`], which is what makes a park and a
-/// stall cost the same one step rather than the interval they spanned.
+/// stall cost the same bounded catch-up rather than the interval they spanned —
+/// and, at eight steps rather than one, leaves every frame interval a real
+/// compositor can produce (down to 2.5 Hz) passing through **rate-exact**. See
+/// that constant for why the tighter clamp was wrong.
 ///
 /// A scope with no entry in the store is skipped: a mount can name a scope whose
 /// instances a mapping pass has since dropped ([`end_pass`] removes an empty
@@ -1141,17 +1176,11 @@ pub(super) fn advance_scopes(scopes: &[Scope], frame_time_us: i64) -> Vec<Scope>
                 continue;
             };
             let dt = match state.last_advance_us.replace(frame_time_us) {
-                // `saturating_sub` then clamp: a frame time that went backwards
-                // owes nothing, rather than handing the kit a negative `dt` every
-                // primitive would have to defend against on its own.
-                Some(last) => {
-                    let capped = frame_time_us
-                        .saturating_sub(last)
-                        .clamp(0, i64::from(MAX_TICK_DT_US));
-                    // The clamp above proves the `u16` fits; the fallback keeps
-                    // the conversion total rather than a `panic!` inside a tick.
-                    f32::from(u16::try_from(capped).unwrap_or(MAX_TICK_DT_US)) / 1_000_000.0
-                }
+                // `saturating_sub`, then the clamp inside `micros_to_secs`: a
+                // frame time that went backwards owes nothing, rather than
+                // handing the kit a negative `dt` every primitive would have to
+                // defend against on its own.
+                Some(last) => micros_to_secs(frame_time_us.saturating_sub(last)),
                 None => 0.0,
             };
             if advance_state(state, dt) {
@@ -1959,15 +1988,26 @@ impl Renderer {
                 }
                 moved
             }
+            // The two seconds-based primitives are the only ones whose "did it
+            // move" answer is not derived from a before/after comparison
+            // (`LedStrip`, `Marquee`) or from a step count (`Scope`), so they are
+            // the only ones that needed the `dt` guard spelled out. The kit
+            // early-returns on a `dt` that cannot move anything
+            // (`hytte-preem/src/gauge.rs`, `split_flap.rs`), so without this they
+            // reported motion for a `dt` of zero — dropping the cached frame and
+            // fanning a repaint out for a byte-identical frame on **every
+            // scope's first tick** (the `None` baseline branch of
+            // [`advance_scopes`]) and on every duplicate `frame_time` two
+            // in-phase mounts hand it. Found by the #926 review, probes P2/P4.
             Self::Gauge { gauge } => {
-                if gauge.is_settled() {
+                if gauge.is_settled() || !advances(dt) {
                     return false;
                 }
                 gauge.advance(dt);
                 true
             }
             Self::FlipBoard { board } => {
-                if board.is_settled() {
+                if board.is_settled() || !advances(dt) {
                     return false;
                 }
                 board.advance(dt);
@@ -2036,6 +2076,16 @@ impl Renderer {
             Self::FlipBoard { board } => board.render(style),
         }
     }
+}
+
+/// Whether `dt` can move anything at all.
+///
+/// The guard [`Steps::owed`] already applies to the step-based primitives,
+/// hoisted so the two that take real seconds (`Gauge`, `FlipBoard`) answer the
+/// same way instead of each rolling its own — or, as they did until the #926
+/// review, none at all.
+fn advances(dt: f32) -> bool {
+    dt.is_finite() && dt > 0.0
 }
 
 /// The peak-dot position a strip renders with: the plugin's explicit value when

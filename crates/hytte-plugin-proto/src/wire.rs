@@ -440,15 +440,21 @@ pub enum Node {
     /// The type stays `Option` for wire compatibility (the field is optional in
     /// every other variant and a hand-rolled client can omit it), so the host
     /// degrades rather than refusing: an anonymous preem node is keyed by its
-    /// **ordinal among the un-id'd preem nodes** of that tree, the host logs one
-    /// warning per plugin session, and the node still renders. That fallback is
-    /// only stable while those nodes keep their order *and* their count —
+    /// **ordinal among the un-id'd preem nodes** of that tree, and the node
+    /// still renders. That fallback is only stable while those nodes keep their
+    /// order *and* their count —
     /// inserting or removing an anonymous sibling shifts every later one down a
     /// slot, and because interchangeable widgets have identical configs by
     /// construction the host cannot tell the difference and updates the survivor
     /// in place: the third gauge renders the second's needle, a phosphor history
     /// moves onto another signal, a variable-length row of per-core meters
     /// glitches on every insert.
+    ///
+    /// The host says so in its log — but only **once per plugin tree for the
+    /// life of the shell process**, deliberately, so a node that appears and
+    /// disappears cannot turn the diagnostic into a per-frame stream. It is not
+    /// once per plugin *session*: a plugin restarted under the same id will not
+    /// produce a second line. Check the journal from the top of the shell's run.
     ///
     /// The Rust SDK's `display` wrappers stamp the id from the widget key they
     /// already take (`display::gauge::node("cpu")`), so a plugin built on them
@@ -479,8 +485,8 @@ pub enum Node {
     Preem {
         /// The reconciliation key — **required in practice**, `Option` only for
         /// wire shape. See the variant docs: without it the host falls back to
-        /// an ordinal key, warns once per session, and animation state moves
-        /// between siblings on any insert or removal.
+        /// an ordinal key, warns once per tree per shell run, and animation
+        /// state moves between siblings on any insert or removal.
         id: Option<NodeId>,
         classes: Vec<Cls>,
         widget: Box<PreemWidget>,

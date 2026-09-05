@@ -316,9 +316,9 @@ fn map_node(scope: &Scope, node: &wire::Node) -> UiNode {
 
             // `id` is the reconciliation key for the renderer instance (and
             // #900 makes it the contract, not an optimisation), but a missing
-            // one is handled *there*, not here: `map_widget` warns once per
-            // scope and falls back to a positional key, so a hand-rolled plugin
-            // degrades rather than losing the widget.
+            // one is handled *there*, not here: `map_widget` falls back to a
+            // positional key and warns at most once per tree per shell run, so
+            // a hand-rolled plugin degrades rather than losing the widget.
             preem_render::map_widget(scope, id.as_deref(), classes, &widget)
         }
     }

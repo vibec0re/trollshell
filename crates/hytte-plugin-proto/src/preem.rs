@@ -1698,6 +1698,16 @@ fn sane_range(range: GaugeRange) -> GaugeRange {
 /// phosphor / needle / flip clocks onto a different node (#900). This one-liner
 /// is fine for a lone static readout in a fixed tree and wrong for anything
 /// else; the [`Node::Preem`](crate::wire::Node::Preem) docs spell out why.
+///
+/// # Docs, not `#[deprecated]` — on purpose
+///
+/// #900 makes the `id` a contract, and a `#[deprecated]` here would be the only
+/// place a Rust compiler could say so at build time. It is deliberately not
+/// taken: this constructor stays correct for the fixed-tree case above, the
+/// attribute would fire on that legitimate use too, and it buys a hand-rolled
+/// client in another language exactly nothing — which is the client the fallback
+/// exists for. The enforcement is where it can see the whole tree: the host,
+/// once, in the journal.
 #[must_use]
 pub fn preem(widget: PreemWidget) -> crate::wire::Node {
     crate::wire::Node::Preem {

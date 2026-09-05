@@ -2796,8 +2796,6 @@ fn mapped_pixels(scope: &Scope, node: &wire::Node) -> (u32, u32, Vec<u8>) {
     }
 }
 
-/// A kit frame in the same `(w, h, bytes)` shape [`mapped_pixels`] returns — the
-/// parity oracle's side of every comparison below.
 /// A horizontal row of **same-config** gauges — the interchangeable-sibling
 /// shape #900 is about, where nothing but the node key can tell two widgets
 /// apart. `None` for an id spells the anonymous fallback.
@@ -2844,6 +2842,8 @@ fn mapped_row_pixels(scope: &Scope, node: &wire::Node) -> Vec<(u32, u32, Vec<u8>
     }
 }
 
+/// A kit frame in the same `(w, h, bytes)` shape [`mapped_pixels`] returns — the
+/// parity oracle's side of every comparison below.
 fn kit_pixels(frame: &kit::Frame) -> (u32, u32, Vec<u8>) {
     (
         u32::try_from(frame.width()).expect("kit width fits u32"),
@@ -3637,7 +3637,7 @@ fn the_anonymous_preem_warning_is_once_per_scope_not_once_per_frame() {
     );
 
     // A plugin's two trees are two scopes, and each deserves to hear about its
-    // own: the latch lives on the `ScopeState`, not on a process-wide atomic.
+    // own: the latch is keyed by `Scope`, not by a process-wide flag.
     let panel = Scope::detached("anon-warn-panel");
     let _ = to_ui_node(&panel, &anon);
     assert_eq!(
@@ -3658,6 +3658,83 @@ fn the_anonymous_preem_warning_is_once_per_scope_not_once_per_frame() {
     preem_render::forget_scope(&card);
     preem_render::forget_scope(&panel);
     preem_render::forget_scope(&id_d);
+}
+
+/// The warning survives a frame in which the plugin renders **no preem node at
+/// all** — and survives an explicit scope teardown.
+///
+/// A `ScopeState` is not a plugin session, and this is the regression that
+/// proves the latch does not live on one. `end_pass` drops the whole entry the
+/// moment a mapping pass leaves the scope with zero instances, and
+/// `forget_scope` runs on a drawer *close* as well as on a plugin leaving
+/// (`region.rs`'s `forget_previous_panel_scope` — its own rustdoc says so). With
+/// the latch on the `ScopeState`, both re-armed it:
+///
+/// - a **conditionally-rendered** preem node (a gauge shown only while something
+///   runs) warned again on every appearance — worst case one line every other
+///   render, ~10 a second at a 20 Hz plugin, which is precisely the stream the
+///   latch exists to prevent;
+/// - a **drawer panel** holding an anonymous node warned once per drawer *open*,
+///   deterministically, with no toggling at all.
+///
+/// So the contract is at most once per plugin tree for the shell's run. See
+/// `preem_render`'s `WARNED`.
+#[test]
+fn the_anonymous_preem_warning_survives_an_emptied_scope() {
+    let _ink = preem_ink_lock();
+    let base = preem_render::anonymous_warnings();
+    let scope = Scope::detached("anon-warn-emptied");
+    let anon = preem_node(
+        None,
+        vocab::PreemWidget::DotMatrix {
+            config: vocab::DotMatrixConfig::default(),
+            state: vocab::DotMatrixState {
+                text: "BLINK".into(),
+            },
+        },
+    );
+    // A frame of the same tree carrying no preem node at all — what a plugin
+    // renders while its gauge has nothing to show.
+    let nothing = wire::Node::Label {
+        id: None,
+        text: "idle".into(),
+        classes: vec![],
+    };
+
+    let _ = to_ui_node(&scope, &anon);
+    assert_eq!(
+        preem_render::anonymous_warnings() - base,
+        1,
+        "the node's first appearance warns",
+    );
+
+    let _ = to_ui_node(&scope, &nothing);
+    assert_eq!(
+        preem_render::instance_count(&scope),
+        0,
+        "the blank frame must really empty the scope, or this test proves nothing",
+    );
+
+    // Present → absent → present → absent → present: still one line.
+    let _ = to_ui_node(&scope, &anon);
+    let _ = to_ui_node(&scope, &nothing);
+    let _ = to_ui_node(&scope, &anon);
+    assert_eq!(
+        preem_render::anonymous_warnings() - base,
+        1,
+        "three appearances across two preem-less frames are ONE warning, not one per appearance",
+    );
+
+    // And an explicit teardown — a card leaving its region, or the drawer
+    // closing on a panel — does not re-arm it either.
+    preem_render::forget_scope(&scope);
+    let _ = to_ui_node(&scope, &anon);
+    assert_eq!(
+        preem_render::anonymous_warnings() - base,
+        1,
+        "nor does forget_scope, which fires on a drawer close and not only on a plugin leaving",
+    );
+    preem_render::forget_scope(&scope);
 }
 
 /// A widget kind this build cannot render degrades to a nothing-rendered
@@ -4177,10 +4254,19 @@ fn the_phosphor_settle_bound_follows_the_configured_persistence() {
     // independent notion rather than the code under test grading its own work
     // (#906 R8: `faded != lit` only proved the trail had *moved*, which a trail
     // frozen half-way down also satisfies).
+    //
+    // Geometry read off the same `ScopeConfig::default()` the fixture builds
+    // from, never spelled out: a hardcoded `144 × 48 @ 2` would silently become
+    // a size mismatch the day those defaults move, and this assertion would then
+    // fail reading like a phosphor regression.
     let all_off = {
-        let mut off = kit::Scope::with_size(144, 48).scale(2).persistence(255);
+        let defaults = vocab::ScopeConfig::default();
+        let dim = |value: u32| usize::try_from(value).expect("a wire-capped dimension fits usize");
+        let mut off = kit::Scope::with_size(dim(defaults.cols), dim(defaults.rows))
+            .scale(dim(defaults.scale))
+            .persistence(255);
         off.advance(&[]);
-        kit_pixels(&off.render(kit_style(vocab::StyleName::Vfd)))
+        kit_pixels(&off.render(kit_style(defaults.style.style)))
     };
 
     // 1. A long phosphor must fade all the way to black rather than freezing.

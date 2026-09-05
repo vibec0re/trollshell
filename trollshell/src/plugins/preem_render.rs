@@ -48,9 +48,11 @@
 //! An anonymous node is a **fallback, not a supported shape**. It is keyed by
 //! its **ordinal among the un-id'd preem nodes** of that tree, in traversal
 //! order (the tradeoff React's index keys make), and [`map_widget`] logs one
-//! `warn` per scope the first time it sees one. It falls back rather than
-//! refusing to draw so a hand-rolled (non-Rust-SDK) plugin degrades to the
-//! pre-#900 behaviour instead of losing the widget.
+//! `warn` the first time it sees one — **at most once per plugin tree for the
+//! shell's run**, latched in [`WARNED`] rather than on the [`ScopeState`], which
+//! a single preem-less frame destroys. It falls back rather than refusing to
+//! draw so a hand-rolled (non-Rust-SDK) plugin degrades to the pre-#900
+//! behaviour instead of losing the widget.
 //!
 //! What that fallback costs, and why the warning exists: the ordinal is stable
 //! only while those nodes keep their order and their count. **Insert or remove
@@ -222,11 +224,12 @@ static UNSUPPORTED_WARNED: AtomicBool = AtomicBool::new(false);
 /// How many "preem node without an id" warnings [`map_widget`] has emitted
 /// (#900).
 ///
-/// The assertion seam for "warns **once per scope**, not once per frame". This
-/// crate has no `tracing` subscriber harness — nothing in `plugins/tests.rs`
-/// installs a collector — so the tests count the emissions at the emitting call
-/// site rather than capturing the event; the counter is bumped inside the one
-/// `if` that logs, immediately beside the `warn!`, so the two cannot drift.
+/// The assertion seam for "warns **at most once per plugin tree**, not once per
+/// frame and not once per appearance". This crate has no `tracing` subscriber
+/// harness — nothing in `plugins/tests.rs` installs a collector — so the tests
+/// count the emissions at the emitting call site rather than capturing the
+/// event; the counter is bumped inside the one `if` that logs, immediately
+/// beside the `warn!`, so the two cannot drift.
 ///
 /// Process-global, so a test reads it as a **delta** around the operation under
 /// test (every preem test already serialises on the ink lock).
@@ -442,19 +445,31 @@ struct ScopeState {
     touched: HashSet<String>,
     /// Ordinal of the next un-id'd preem node in the in-flight pass.
     ordinal: usize,
-    /// Latch for the "preem node without an id" warning (#900), so a plugin
-    /// rendering an anonymous preem node logs **once for this scope** rather
-    /// than once per node per frame — at 20 Hz with four anonymous nodes that
-    /// would be eighty identical journal lines a second (the [`UNSUPPORTED_WARNED`]
-    /// pattern, per-scope rather than per-process because the message names the
-    /// plugin and every plugin deserves to hear about its own tree).
+}
+
+/// A one-shot per-tree diagnostic — something wrong with a plugin's node
+/// *keying* that the host works around, tells the journal about once, and then
+/// stops mentioning.
+///
+/// The latch is keyed by `(Scope, Warned)` rather than being a `bool` field on
+/// [`ScopeState`], for two reasons. It has to **outlive** `ScopeState` (see
+/// [`WARNED`]); and #918 — two preem nodes in one tree claiming the same `id` —
+/// is the next diagnostic of exactly this shape, so it wants a second key here
+/// rather than a second table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Warned {
+    /// A preem node arrived with no `id` (#900): keyed by ordinal, so its
+    /// animation state moves to a sibling on any insert or removal.
+    NoId,
+    /// Two preem nodes in one tree claimed the same `id` (#918), collapsing
+    /// onto one renderer instance — two targets fighting one needle.
     ///
-    /// Deliberately **not** reset by [`begin_pass`]: a pass is a frame, and this
-    /// must outlive frames. It dies with the [`ScopeState`], i.e. when the
-    /// plugin's tree stops holding any preem node at all ([`end_pass`]) or the
-    /// card/panel goes away ([`forget_scope`]) — which is the "once per plugin
-    /// session" the policy asks for.
-    anonymous_warned: bool,
+    /// **Reserved.** Emitting it is #918's work; the variant is here so that
+    /// lands as a `warn_once(scope, Warned::DuplicateId)` call rather than a
+    /// parallel latch. `state.touched.insert(key)` in [`map_widget`] already
+    /// returns `false` on exactly the collision it has to detect.
+    #[allow(dead_code, reason = "#918 is the caller; the latch is built for it")]
+    DuplicateId,
 }
 
 thread_local! {
@@ -463,6 +478,41 @@ thread_local! {
     /// animation clock, so this never crosses a thread — the same discipline as
     /// `pump`'s slot-visibility map.
     static STORE: RefCell<HashMap<Scope, ScopeState>> = RefCell::new(HashMap::new());
+
+    /// Which [`Warned`] diagnostics each tree has already been told about.
+    ///
+    /// **Deliberately outlives [`ScopeState`], and is never cleared.** A latch
+    /// living on the `ScopeState` would be re-armed constantly, because a
+    /// `ScopeState` is not a plugin session — [`end_pass`] drops the whole entry
+    /// the moment a pass leaves the scope with zero instances, and
+    /// [`forget_scope`] drops it on a drawer *close*
+    /// (`region.rs`'s `forget_previous_panel_scope`), not only on a plugin
+    /// leaving. Both are ordinary frames. A conditionally-rendered preem node
+    /// would then re-warn on **every appearance** — a plugin toggling one at 20
+    /// renders a second means ~10 journal lines a second, the exact noise the
+    /// latch exists to prevent — and a panel would warn once per drawer open.
+    ///
+    /// So the contract is **at most once per shell run, per plugin tree**, not
+    /// "once per plugin session": there is no clean GTK-thread hook for a
+    /// session ending (`session.rs`'s teardown runs on a tokio task, and this
+    /// table is main-thread-local), and every GTK-side teardown that *is*
+    /// reachable fires on frames that are not session ends. A plugin restarted
+    /// under the same id therefore does not get a second line — which is the
+    /// quiet end of the trade, and stated as such in the wire docs so a plugin
+    /// author knows to check the journal from the top of the shell's run.
+    ///
+    /// Growth is one entry per `(plugin id, tree, diagnostic)` that ever
+    /// tripped: a short `String` and two discriminants, bounded in practice by
+    /// the plugin roster. A plugin reconnecting under a *fresh* id each time
+    /// would accumulate entries, but a process that can do that already runs
+    /// code as this user.
+    static WARNED: RefCell<HashSet<(Scope, Warned)>> = RefCell::new(HashSet::new());
+}
+
+/// Claim the one-shot `what` diagnostic for `scope`: `true` the first time it is
+/// asked for, `false` for the rest of the shell's run. See [`WARNED`].
+fn warn_once(scope: &Scope, what: Warned) -> bool {
+    WARNED.with_borrow_mut(|warned| warned.insert((scope.clone(), what)))
 }
 
 // ── mapping-pass API (called from `wire_map`) ────────────────────────────────
@@ -499,6 +549,11 @@ pub(super) fn end_pass(scope: &Scope) {
 
 /// Drop every instance in `scope` — a plugin's card leaving its region, or its
 /// panel going away. Idempotent.
+///
+/// Drops **renderer state only**. The one-shot diagnostics in [`WARNED`] survive
+/// on purpose: this fires on a drawer *close* as well as on a plugin leaving
+/// (`region.rs`'s `forget_previous_panel_scope`), so clearing them here would
+/// re-warn once per drawer open.
 pub(super) fn forget_scope(scope: &Scope) {
     STORE.with_borrow_mut(|store| {
         store.remove(scope);
@@ -515,33 +570,38 @@ pub(super) fn forget_scope(scope: &Scope) {
 /// chrome stays and a later valid frame updates the same surface in place (the
 /// posture the malformed-`Pixels` seam takes).
 ///
-/// **A node with no `id` warns once per scope and falls back to an ordinal key**
-/// (#900) — see the module docs for what that costs. The fallback is deliberate:
-/// `id` is required by contract, but refusing to draw would only make a
-/// hand-rolled client harder to write, so the node renders and the journal says
-/// why it may misbehave.
+/// **A node with no `id` falls back to an ordinal key and warns** (#900) — see
+/// the module docs for what that costs. The fallback is deliberate: `id` is
+/// required by contract, but refusing to draw would only make a hand-rolled
+/// client harder to write, so the node renders and the journal says why it may
+/// misbehave. The warning is latched in [`WARNED`], which is **not** per pass and
+/// **not** per [`ScopeState`]: at most once per plugin tree for the shell's run.
 ///
 /// **Two preem nodes in one tree sharing an explicit `id` silently collapse onto
 /// one renderer instance**, applying both widgets to it every pass — two targets
 /// fighting one needle. The reconciler's own node keying has the same shape, so
-/// this is not a new hazard, but it is undiagnosed: warning once per session on a
-/// key already touched in this pass is the follow-up.
+/// this is not a new hazard, but it is undiagnosed: tracked as **#918**, which
+/// reuses this latch ([`Warned::DuplicateId`]) on the `false` that
+/// `state.touched.insert(key)` already returns for a key twice in one pass.
 pub(super) fn map_widget(
     scope: &Scope,
     id: Option<&str>,
     classes: &[String],
     widget: &vocab::PreemWidget,
 ) -> UiNode {
-    let (width, height, data, supported, warn_anonymous) = STORE.with_borrow_mut(|store| {
+    let (width, height, data, supported, anonymous_key) = STORE.with_borrow_mut(|store| {
         let state = store.entry(scope.clone()).or_default();
-        let mut warn_anonymous = false;
+        // `None` for an id'd node; for an anonymous one, the ordinal key just
+        // minted — the only handle that node has, and so what the warning names.
+        let mut anonymous_key = None;
         let key = if let Some(id) = id {
             format!("id\u{1}{id}")
         } else {
-            warn_anonymous = !std::mem::replace(&mut state.anonymous_warned, true);
             let ordinal = state.ordinal;
             state.ordinal += 1;
-            format!("#{ordinal}")
+            let ordinal_key = format!("#{ordinal}");
+            anonymous_key = Some(ordinal_key.clone());
+            ordinal_key
         };
         state.touched.insert(key.clone());
         let instance = state.instances.entry(key).or_insert_with(|| Instance {
@@ -557,21 +617,33 @@ pub(super) fn map_widget(
         apply(instance, widget);
         let supported = instance.renderer.is_some();
         let (width, height, data) = instance.frame();
-        (width, height, data, supported, warn_anonymous)
+        (width, height, data, supported, anonymous_key)
     });
 
     // Outside the `STORE` borrow: a `tracing` subscriber is arbitrary code, and
-    // the table is thread-local and re-entered by every mapping pass.
-    if warn_anonymous {
+    // the table is thread-local and re-entered by every mapping pass. The latch
+    // ([`WARNED`]) is a second thread-local for the same reason it is a separate
+    // table — it must outlive the `ScopeState` this borrow just touched.
+    if let Some(key) = anonymous_key
+        && warn_once(scope, Warned::NoId)
+    {
         #[cfg(test)]
         ANONYMOUS_WARNINGS.fetch_add(1, Ordering::Relaxed);
+        // `key` is the ordinal slot this node landed in — the only handle it
+        // has, since it declined to name itself. It is `#0` in practice (the
+        // first un-id'd node of a pass is the one that trips the latch); the
+        // count of anonymous nodes in the tree would be the more useful number
+        // but is not known until `end_pass` closes, and is not worth deferring
+        // the whole diagnostic for.
         tracing::warn!(
             plugin = scope.plugin_id(),
             tree = ?scope.role(),
+            node = %key,
             kind = widget.kind(),
             "preem node without an id — animation state cannot be tracked across reorders; \
              the node falls back to a positional key and may inherit a sibling's phosphor, \
-             needle or flip clocks (further occurrences in this tree are silenced)",
+             needle or flip clocks (further occurrences in this tree are silenced for the \
+             rest of this shell run)",
         );
     }
 

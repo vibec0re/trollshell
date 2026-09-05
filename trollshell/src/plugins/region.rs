@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use hytte::futures_signals::map_ref;
-use hytte::futures_signals::signal::{Mutable, Signal, SignalExt};
+use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, glib, prelude::*};
 use hytte::reactive::registry;
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode, NodeId, Reconciler};
@@ -200,39 +200,68 @@ fn build_region(
     let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
 
     let cards_for_signal = cards.clone();
-    let container_for_signal = container.clone();
-    let handle = glib::MainContext::default().spawn_local(signal.for_each(move |renders| {
-        reconcile_region(
-            &container_for_signal,
-            &cards_for_signal,
-            &renders,
-            card_class,
-        );
-        std::future::ready(())
-    }));
+    // The render subscription holds this container **weakly**, and that is what
+    // makes the region destroyable (#909 — the twin of the pin #903 fixed on the
+    // drawer panel child).
+    //
+    // Held strongly (`container.clone()` moved into the closure, which is what
+    // shipped before), the task owns the container and the only thing that
+    // aborts the task is the container's own `destroy` handler below. The
+    // container can then never reach refcount zero, `destroy` never fires, and a
+    // hot-plug strands one fully-live region per monitor per mount — still
+    // reconciling plugin cards into a detached widget tree on every render, for
+    // the session. Measured before this change: after the surface was destroyed,
+    // the container still upgraded from a `glib::WeakRef` **and** still mounted a
+    // renderer instance for a plugin id it had never seen.
+    //
+    // This is the shape `hytte-reactive`'s `bind` has always had
+    // (`crates/hytte-reactive/src/bind.rs:16-30`): the weak upgrade is the
+    // *guarantee* — the loop `break`s the first time the widget is gone, which
+    // covers a widget freed without emitting `destroy` — and the eager
+    // `handle.abort()` below only trims the residual between the destroy and the
+    // next emission. Written as a `while let` over `poll_change` rather than
+    // `for_each` for exactly that reason: `for_each` cannot `break`.
+    //
+    // #903's inner-`canvas` split is **not** needed here, because the strong refs
+    // this closure does hold already point *down* the tree, not back at the
+    // container. `Reconciler` keeps a strong clone of the box it was built over
+    // (`crates/hytte-ui/src/widget_tree.rs:355`), but [`reconcile_region`] builds
+    // one per card over that card's own `root` — a *child* of this container —
+    // and in GTK4 a parent refs its children, never the reverse. So the cards and
+    // their reconcilers are freed with the subscription, and none of them can
+    // hold the container up. Splitting an inner canvas out here would buy nothing
+    // and cost a level: [`reconcile_region`] also `set_visible`s the *outer*
+    // container (the empty-region hide, which has to stay on the widget the
+    // parent bar group lays out) and the row's inter-chip `spacing` lives on it
+    // too, so the weak handle would still be required.
+    let container_weak = container.downgrade();
+    let handle = glib::MainContext::default().spawn_local(async move {
+        let mut signal = std::pin::pin!(signal);
+        while let Some(renders) = std::future::poll_fn(|cx| signal.as_mut().poll_change(cx)).await {
+            let Some(container) = container_weak.upgrade() else {
+                // The surface is gone. Nothing to release: a card's scope
+                // (`Scope::card(plugin_id)`) is shared by every monitor's copy of
+                // that card, so forgetting it here would drop the renderer
+                // instances a surviving monitor is still painting. It is
+                // [`reconcile_region`]'s retain loop that releases a card scope,
+                // driven by the shared render list every live region observes.
+                break;
+            };
+            reconcile_region(&container, &cards_for_signal, &renders, card_class);
+        }
+    });
 
-    // Best-effort teardown: abort the render subscription when the region widget
-    // is destroyed (a sidebar rebuild on hot-plug), so it stops rendering into a
-    // detached container and drops its captured handles.
+    // Teardown: abort the render subscription the moment the region widget is
+    // destroyed (a bar rebuild or a sidebar `close_all` on hot-plug), so it stops
+    // rendering into a detached container and drops its captured handles —
+    // cards, reconcilers and all — immediately rather than lingering until the
+    // next emission wakes it to break on the dead weak ref.
     //
-    // **This handler does not currently fire**, for the same reason the drawer
-    // panel child's did not before #903: the subscription above owns
-    // `container_for_signal` — a strong clone of this very container — plus every
-    // `MountedCard`'s `root` and `Reconciler`, and the only thing that aborts it
-    // is this destroy handler. The container therefore pins itself, and a
-    // hot-plug strands one live region per monitor per mount.
-    //
-    // It is left as-is deliberately, because the *consequence* differs from the
-    // panel's and is not a preem-scope leak. A card's scope
-    // (`Scope::card(plugin_id)`) is shared by every monitor's copy of that card,
-    // and it is released by [`reconcile_region`]'s retain loop when the plugin
-    // leaves the render list — a global event every stranded region observes too.
-    // So a stranded region re-does work rather than holding a scope nothing can
-    // free. Unpinning it needs the same inner-canvas split the panel child got,
-    // but `container` is also the widget [`reconcile_region`] inserts, reorders,
-    // removes and `set_visible`s cards on, and `.ts-plugin-region` carries the
-    // bar row's inter-chip spacing — so it is a wider change than #903's, and it
-    // belongs to its own issue rather than riding this one.
+    // Captures no widget, only the `JoinHandle`, matching the contract
+    // `hytte-reactive`'s `abort_on_destroy` spells out
+    // (`crates/hytte-reactive/src/bind.rs:49-56`). A strong clone here would
+    // re-pin precisely what the weak handle above unpins — which is the bug this
+    // handler silently had until #909.
     container.connect_destroy(move |_| handle.abort());
 
     container.upcast()
@@ -364,8 +393,11 @@ fn empty_panel() -> UiNode {
     }
 }
 
-/// The per-monitor plugin drawer child (#349 PR2): a single reconciler-backed
-/// `gtk::Box` whose content is the **active** plugin's `panel` tree. One instance
+/// The per-monitor plugin drawer child (#349 PR2): a `.ts-plugin-panel` root
+/// `gtk::Box` over an inner `.ts-plugin-canvas` box — *two* boxes, since #903 —
+/// whose content is the **active** plugin's `panel` tree. The reconciler mounts
+/// into the inner one so the root stays freeable; see [`build_panel_child`] for
+/// why that level of indirection is load-bearing. One instance
 /// lives in each monitor's drawer stack under the fixed `PLUGIN_STACK_CHILD`
 /// name (see `modal.rs`); all mirror the same active panel — exactly how sidebar
 /// plugin cards mirror onto every monitor's sidebar region. When no plugin is
@@ -423,7 +455,17 @@ fn build_panel_child(
     // tree through a *descendant* selector (`assets/trollshell/style.css:570`),
     // never a child one. The box is plain (vertical, spacing 0, no margins) and
     // propagates its child's expand flags, so it adds no geometry either.
+    //
+    // It carries a class of its own so the seam is *addressable* — a future
+    // `.ts-plugin-panel > …` rule would otherwise silently miss the plugin tree
+    // (#909's third nit). Nothing styles `.ts-plugin-canvas` today, and nothing
+    // in either stylesheet can start matching because of it: the sheet has no
+    // `[class*=…]` selector, and every child-combinator rule that touches the
+    // `.ts-plugin-*` family is rooted at a widget *inside* the plugin tree
+    // (`.ts-plugin-card scale > trough` and its two variants,
+    // `assets/trollshell/style.css:542`/`:549`/`:557`), never at the panel root.
     let canvas = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    canvas.add_css_class("ts-plugin-canvas");
     root.append(&canvas);
 
     // The active connection's outbound, swapped on each render so panel events
@@ -461,10 +503,26 @@ fn build_panel_child(
     // below reads and clears the *same* cell the renders write.
     let shown_at_destroy = shown_scope.clone();
 
-    let handle = glib::MainContext::default().spawn_local(active.for_each(move |slot| {
-        render_active_panel(&mut reconciler, &outbound, &shown_scope, slot.as_ref());
-        std::future::ready(())
-    }));
+    // Holds `root` **weakly**, the same shape [`build_region`] above now has and
+    // the one `hytte-reactive`'s `bind` has always had
+    // (`crates/hytte-reactive/src/bind.rs:16-30`): the weak upgrade is the
+    // *guarantee* and the `destroy`-driven abort below only trims the residual.
+    // The `canvas` split is what lets `root` be freed at all; this is what makes
+    // the subscription notice, and release the panel scope, on the one path the
+    // abort cannot cover — a widget freed without emitting `destroy`. Unreachable
+    // in GTK4 (dispose always emits it), which is why the abort carries the
+    // common case; both legs are cheap and neither is load-bearing alone.
+    let root_weak = root.downgrade();
+    let handle = glib::MainContext::default().spawn_local(async move {
+        let mut active = std::pin::pin!(active);
+        while let Some(slot) = std::future::poll_fn(|cx| active.as_mut().poll_change(cx)).await {
+            if root_weak.upgrade().is_none() {
+                forget_previous_panel_scope(&shown_scope, None);
+                break;
+            }
+            render_active_panel(&mut reconciler, &outbound, &shown_scope, slot.as_ref());
+        }
+    });
 
     // Teardown: abort the render subscription when the drawer child is destroyed
     // (a per-monitor drawer rebuild on hot-plug), and release the panel scope it
@@ -483,7 +541,10 @@ fn build_panel_child(
     // Captures no widget — only the `JoinHandle` and an `Rc` of the scope cell —
     // matching the contract `hytte-reactive`'s `abort_on_destroy` spells out
     // (`crates/hytte-reactive/src/bind.rs:49-56`). A strong widget clone here
-    // would re-pin precisely what the `canvas` split above unpins.
+    // would re-pin precisely what the `canvas` split above unpins. It is the
+    // *eager* leg of that contract; the weak upgrade in the loop above is the
+    // guarantee, and it releases the same scope on the path this handler cannot
+    // see (#909's first nit).
     //
     // No sibling-monitor hazard. `active_panel_id` is one global selection, and
     // the only two things that destroy a drawer window are `modal::close_all`
@@ -507,7 +568,7 @@ fn build_panel_child(
 ///
 /// Extracted from [`plugin_panel_slot`]'s subscription closure so the preem
 /// scope lifecycle it drives is reachable from a test — a `Reconciler` and two
-/// `Rc`s are constructible; a `spawn_local`'d `for_each` over a `map_ref!` of
+/// `Rc`s are constructible; a `spawn_local`'d apply-loop over a `map_ref!` of
 /// two registry-backed signals is not. `gtk_tests` at the bottom of this file is
 /// what that buys.
 fn render_active_panel(
@@ -623,8 +684,8 @@ pub(super) fn clear_region_if_owned(
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use super::{
-        MountedCard, Scope, SlotRender, build_panel_child, forget_previous_panel_scope,
-        preem_render, reconcile_region, render_active_panel,
+        MountedCard, Scope, SlotRender, build_panel_child, build_region,
+        forget_previous_panel_scope, preem_render, reconcile_region, render_active_panel,
     };
     use hytte::adw;
     use hytte::futures_signals::signal::Mutable;
@@ -657,6 +718,28 @@ mod gtk_tests {
         let window = gtk::Window::new();
         window.set_child(Some(&child));
         drop(child);
+        window
+    }
+
+    /// Mount a real bar-chip region on `renders`, inside a window, dropping every
+    /// *local* strong reference to the region container.
+    ///
+    /// That ownership mirrors production exactly: `main.rs`'s `build_bar` passes
+    /// `plugins::bar_left_slot()` straight into the bar group as a temporary
+    /// (`main.rs:412-416`), and `overlays::sidebar::build_card` does the same with
+    /// `card.append(&crate::plugins::sidebar_lead_slot())` (`sidebar.rs:452`), so
+    /// the surface's widget tree holds the only reference. A test that kept a
+    /// handle would keep the container alive and never see its `connect_destroy`
+    /// run at all.
+    fn mount_region(renders: &Mutable<Vec<SlotRender>>) -> gtk::Window {
+        let region = build_region(
+            renders.signal_cloned(),
+            gtk::Orientation::Horizontal,
+            "ts-plugin-chip",
+        );
+        let window = gtk::Window::new();
+        window.set_child(Some(&region));
+        drop(region);
         window
     }
 
@@ -718,6 +801,179 @@ mod gtk_tests {
             "a card leaving its region must release the tree's renderer instances, \
              not park them for the session",
         );
+    }
+
+    /// A mount **region** must be freeable — nothing [`build_region`] spawns may
+    /// hold the container it renders into alive (#909, the twin of #903's pin on
+    /// the drawer panel child).
+    ///
+    /// **Deletion check:** capturing `container.clone()` in the render
+    /// subscription instead of `container.downgrade()` turns both assertions red
+    /// at once — the container stays upgradeable, its `connect_destroy` never
+    /// fires, and the stranded region goes on reconciling a plugin it never had
+    /// into a detached widget tree, building renderer instances for it. That is
+    /// the state `main` shipped: one live region per monitor per mount per
+    /// hot-plug.
+    #[gtk::test]
+    fn a_destroyed_region_is_freed_and_stops_rendering() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let renders = Mutable::new(vec![render_of("region-stranded", &tx)]);
+
+        let region = build_region(
+            renders.signal_cloned(),
+            gtk::Orientation::Horizontal,
+            "ts-plugin-chip",
+        );
+        let region_weak = region.downgrade();
+        let window = gtk::Window::new();
+        window.set_child(Some(&region));
+        // The bar group / sidebar card holds the only reference in production, so
+        // the test must too — see [`mount_region`].
+        drop(region);
+        pump();
+        assert_eq!(
+            preem_render::instance_count(&Scope::card("region-stranded")),
+            1,
+            "the mounted chip must have a live renderer instance before teardown",
+        );
+
+        window.destroy();
+        drop(window);
+        pump();
+
+        assert!(
+            region_weak.upgrade().is_none(),
+            "the region container must be freed with its surface: a subscription \
+             holding a strong clone of the very container whose `destroy` handler \
+             is supposed to abort it pins the container against its own teardown, \
+             so hot-plug strands one live region per monitor per mount forever",
+        );
+
+        // A stranded region would still be subscribed, and would mount this
+        // brand-new plugin's card — reconciler, widgets and renderer instances —
+        // into a detached widget tree nobody can see.
+        renders.set(vec![render_of("region-newcomer", &tx)]);
+        pump();
+        assert_eq!(
+            preem_render::instance_count(&Scope::card("region-newcomer")),
+            0,
+            "a destroyed region must stop rendering: an orphan still building \
+             renderer instances is what keeps their kit buffers resident and \
+             `any_animating()` true (#897)",
+        );
+    }
+
+    /// The **sidebar's** teardown path frees its plugin regions too — through
+    /// the deeper production chain the bare-window tests above skip, and in
+    /// `overlays::sidebar::close_all`'s real order.
+    ///
+    /// `close_all` (`overlays/sidebar.rs:744-773`) destroys the toplevel while
+    /// `SidebarPanel` still holds its own `revealer` clone (`sidebar.rs:118-133`
+    /// — note it holds **no** reference to the `card` box the regions live in),
+    /// and only the end of the drain loop drops that record. So the region's
+    /// `destroy` fires one refcount step *after* `window.destroy()` returns, not
+    /// during it. This models that nesting and that order.
+    ///
+    /// **Deletion check:** the same one as
+    /// [`a_destroyed_region_is_freed_and_stops_rendering`] — re-pinning the
+    /// subscription with `container.clone()` turns it red.
+    #[gtk::test]
+    fn a_destroyed_sidebar_surface_frees_its_plugin_regions() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let renders = Mutable::new(vec![render_of("region-sidebar", &tx)]);
+
+        // window → revealer → AdwClamp → card → region: `sidebar::install`'s
+        // nesting (`sidebar.rs:290-303`), with the region appended into the card
+        // as a temporary exactly as `build_card` does (`sidebar.rs:452`).
+        let region = build_region(
+            renders.signal_cloned(),
+            gtk::Orientation::Vertical,
+            "ts-plugin-card",
+        );
+        let region_weak = region.downgrade();
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        card.append(&region);
+        drop(region);
+        let clamp = adw::Clamp::builder().child(&card).build();
+        drop(card);
+        let revealer = gtk::Revealer::new();
+        revealer.set_child(Some(&clamp));
+        drop(clamp);
+        let window = gtk::Window::new();
+        window.set_child(Some(&revealer));
+        pump();
+
+        // `close_all`'s order: destroy the toplevel first, with the panel record
+        // (here: the local `revealer`) still holding its clone…
+        window.destroy();
+        drop(window);
+        pump();
+        // …then let the drained record drop.
+        drop(revealer);
+        pump();
+
+        assert!(
+            region_weak.upgrade().is_none(),
+            "a hot-unplugged sidebar must free the plugin regions inside its \
+             card: nothing on the sidebar's own teardown path holds them (its \
+             two subscriptions and its settle timer are aborted/cancelled \
+             explicitly, `sidebar.rs:754`/`:758`/`:768-770`), so the only thing \
+             that can strand them is the region pinning itself (#909)",
+        );
+    }
+
+    /// A card's preem scope is **cross-monitor** — `Scope::card(plugin_id)` is
+    /// shared by every monitor's copy of that card — so releasing it is
+    /// [`reconcile_region`]'s retain loop's job, driven by the shared render
+    /// list, and *not* the region's teardown's. Destroying one monitor's region
+    /// must therefore neither drop a scope a surviving monitor is still showing,
+    /// nor stop the surviving region from releasing it when the plugin leaves.
+    ///
+    /// This is the invariant #909's fix is built on rather than a regression
+    /// guard for it: it is green on `main` too. **Deletion check:** adding a
+    /// `preem_render::forget_scope` for each mounted card to [`build_region`]'s
+    /// destroy handler turns the mid-test assertion red (`left: 0, right: 1`) —
+    /// which is exactly why that release is not part of the fix.
+    #[gtk::test]
+    fn a_destroyed_regions_card_scope_is_released_by_a_surviving_region() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let renders = Mutable::new(vec![render_of("region-shared", &tx)]);
+        let scope = Scope::card("region-shared");
+
+        // Two monitors' regions, mirroring the one shared mailbox.
+        let hot_unplugged = mount_region(&renders);
+        let survivor = mount_region(&renders);
+        pump();
+        assert_eq!(
+            preem_render::instance_count(&scope),
+            1,
+            "both monitors' copies of a card share one renderer instance",
+        );
+
+        hot_unplugged.destroy();
+        drop(hot_unplugged);
+        pump();
+        assert_eq!(
+            preem_render::instance_count(&scope),
+            1,
+            "one monitor's region going away must not drop the renderer instances \
+             the surviving monitor's copy of the same card is still painting",
+        );
+
+        // The plugin disconnects: the shared render list empties, and the
+        // surviving region's retain loop is what releases the scope.
+        renders.set(Vec::new());
+        pump();
+        assert_eq!(
+            preem_render::instance_count(&scope),
+            0,
+            "a card leaving the shared render list must still release its \
+             renderer instances through the surviving region's retain loop",
+        );
+        drop(survivor);
     }
 
     /// Switching the drawer to another plugin's panel — and closing the drawer —

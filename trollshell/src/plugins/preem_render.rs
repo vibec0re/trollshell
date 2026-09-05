@@ -81,26 +81,49 @@
 //! must never become a multi-GB allocation or a multi-million-segment render.
 //! **Nothing here may re-derive geometry from an unclamped value.**
 //!
-//! # Styles and accents — #885 is not here
+//! # Styles, roles and the live re-tint (#885)
 //!
-//! [`vocab::StyleRef`] is resolved to the kit's `DisplayStyle` **by name**, the
-//! same linear scan over `DisplayStyle::ALL` the Stats panel's config parser
-//! uses. Its semantic [`vocab::AccentRole`] is *not* resolved per widget: the
-//! kit exposes one process-global accent (`hytte_preem::set_accent`), which the
-//! shell already drives from `@accent_color` (#862,
-//! `pump::tint_in_process_surfaces`) — so an in-process preem surface is
-//! accent-tinted today, uniformly, exactly as the Stats panel's is. Per-role
-//! resolution (`Success`/`Warning`/`Error`, and `Neutral`'s opt-out) needs a
-//! per-widget ink the kit does not have; that is **#885**, and it is
-//! deliberately out of scope here. The role is carried through the
-//! config-equality check, so a plugin changing it rebuilds the instance and will
-//! pick up #885's resolution the day it lands without touching this file's
-//! lifecycle.
+//! A [`vocab::StyleRef`] is three things, and this module resolves all three.
+//!
+//! The **skin** goes to the kit's `DisplayStyle` by name ([`display_style`]),
+//! the same linear scan over `DisplayStyle::ALL` the Stats panel's config parser
+//! uses. That is #397's payoff: one skin implementation, shell-side, serving
+//! every plugin's widgets.
+//!
+//! The **[`vocab::AccentRole`]** and the optional pinned
+//! [`ink`](vocab::StyleRef::ink) become one `kit::Ink` ([`ink_for`]), scoped
+//! around the rasterisation with `hytte_preem::with_ink`. That is the piece the
+//! kit did not have before #885: `hytte_preem::set_accent` is a *process*
+//! global, which is exactly right in a plugin (one process, one plugin, one
+//! session tint) and not enough in a shell, which rasterises many plugins'
+//! widgets — each with its own role — in this one process.
+//!
+//! `Success`/`Warning`/`Error` resolve against the live theme ([`role_inks`],
+//! `@success_color` and friends, memoized until the theme moves); `Accent` and a
+//! role-less `StyleRef` take the session accent the shell already installs
+//! (#862, `pump::tint_in_process_surfaces`), so a frame that says nothing looks
+//! exactly as it did before this existed; `Neutral` refuses even that and takes
+//! the skin's own ink.
+//!
+//! # …and what makes it *live* (#396)
+//!
+//! Nothing here is baked into an instance. Every rasterisation resolves the ink
+//! afresh, so a desktop accent or color-scheme change only has to drop the
+//! cached frames — which is what [`invalidate_cached_frames`] already does on
+//! the accent path, and where the memoized role colors are dropped too. The next
+//! mapping pass re-renders every widget in the new theme with no plugin
+//! involvement and no wire traffic.
+//!
+//! The one deliberate exception is a **pinned** ink: a `StyleRef` carrying an
+//! explicit color re-rasterises like everything else and produces byte-identical
+//! pixels, because the color it was pinned to did not change. That is what
+//! pinning means, and the wire docs say so.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use hytte::gtk::{self, prelude::*};
 use hytte::ui::Node as UiNode;
 use hytte_plugin_proto::preem as vocab;
 use hytte_preem as kit;
@@ -548,10 +571,15 @@ impl Instance {
             return cached.clone();
         }
         let style = display_style(self.applied.style());
+        // The ink is resolved here, per rasterisation, never baked into the
+        // instance — which is what makes a theme change a cache drop rather than
+        // a rebuild (#396). A pinned ink resolves to the same color every time,
+        // so a pinned widget re-rasterises to identical bytes.
+        let ink = ink_for(self.applied.style());
         let rendered = self.renderer.as_ref().map_or_else(
             || (0, 0, Vec::new()),
             |renderer| {
-                let frame = renderer.render(style);
+                let frame = kit::with_ink(ink, || renderer.render(style));
                 // Both dimensions or neither: a lone `unwrap_or(0)` could pair a
                 // zero dimension with a non-empty buffer and break the
                 // `len == w * h * 4` invariant every `Node::Pixels` consumer
@@ -624,13 +652,21 @@ pub(super) fn any_animating() -> bool {
     })
 }
 
-/// Drop every cached frame, so the next mapping pass re-rasterises.
+/// Drop every cached frame **and the memoized role colors**, so the next mapping
+/// pass re-rasterises against the theme as it now stands.
 ///
 /// The kit reads the desktop accent from a process-global
 /// (`hytte_preem::set_accent`), which the shell re-publishes on every accent /
 /// color-scheme change (#396/#862). A cached frame was rasterised under the
 /// *old* ink, so without this a shell-rendered preem widget would keep the
 /// previous accent until its state next moved.
+///
+/// Since #885 the same call is the theme seam for the semantic roles: a color
+/// scheme flip moves `@success_color` and friends exactly as it can move
+/// `@accent_color`, so [`role_inks`]'s memo is dropped here rather than kept for
+/// the session. A **pinned** ink is the deliberate exception on the way out —
+/// the frames are dropped like everyone's, and the re-render reproduces them
+/// byte for byte, because the color that widget asked for did not change.
 ///
 /// `TextBox` is the one kit widget that resolves its palette at **construction**
 /// (`TextBox::styled` bakes bg/ink/notdef into the builder) rather than at
@@ -639,6 +675,7 @@ pub(super) fn any_animating() -> bool {
 /// state. Every other widget takes its `DisplayStyle` per render and re-tints on
 /// the re-rasterise alone.
 pub(super) fn invalidate_cached_frames() {
+    ROLE_INKS.set(None);
     STORE.with_borrow_mut(|store| {
         for state in store.values_mut() {
             for instance in state.instances.values_mut() {
@@ -810,8 +847,8 @@ fn config_eq(a: &vocab::PreemWidget, b: &vocab::PreemWidget) -> bool {
 /// without a compile error here — a wire style this kit build has no counterpart
 /// for falls back to the kit's own default rather than failing the render.
 ///
-/// [`vocab::StyleRef::accent`] is intentionally ignored: see the module docs and
-/// **#885**.
+/// [`vocab::StyleRef::accent`] and [`vocab::StyleRef::ink`] are the *other* half
+/// of a style reference and resolve through [`ink_for`].
 fn display_style(style: vocab::StyleRef) -> kit::DisplayStyle {
     let name = style.style.name();
     kit::DisplayStyle::ALL
@@ -821,6 +858,138 @@ fn display_style(style: vocab::StyleRef) -> kit::DisplayStyle {
         // order and its head is `Vfd`, which is also `StyleName`'s own default —
         // so an unmatched name lands on the skin an omitted one would have.
         .unwrap_or(kit::DisplayStyle::ALL[0])
+}
+
+// ── semantic ink roles (#885) ────────────────────────────────────────────────
+
+/// The three theme colors a [`vocab::AccentRole`] can name that the session
+/// accent does not already cover.
+///
+/// `Accent` is deliberately absent: the shell installs `@accent_color` into the
+/// kit's process global on every change (`pump::tint_in_process_surfaces`), so
+/// "the accent" is what `kit::Ink::Default` already means. Resolving it a second
+/// time here would be a second source of truth for one color.
+///
+/// A `None` field is a color this theme does not define (or a lookup made before
+/// the display's CSS providers were up); the role then degrades to the session
+/// accent rather than to something invented locally.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct RoleInks {
+    pub(super) success: Option<kit::Rgba>,
+    pub(super) warning: Option<kit::Rgba>,
+    pub(super) error: Option<kit::Rgba>,
+}
+
+impl RoleInks {
+    /// The ink for one role, or `None` for a role this struct does not carry.
+    fn get(self, role: vocab::AccentRole) -> Option<kit::Rgba> {
+        match role {
+            vocab::AccentRole::Success => self.success,
+            vocab::AccentRole::Warning => self.warning,
+            vocab::AccentRole::Error => self.error,
+            vocab::AccentRole::Accent | vocab::AccentRole::Neutral => None,
+        }
+    }
+}
+
+thread_local! {
+    /// The resolved role colors, memoized until the theme moves.
+    ///
+    /// Resolution is a GTK named-color lookup, and a mapping pass rasterises
+    /// many widgets — so doing it per render would build a throwaway widget per
+    /// frame for a value that changes when the user picks a new accent. Dropped
+    /// by [`invalidate_cached_frames`], which is *already* the shell's
+    /// "the theme moved" seam, so the memo can never outlive the frames it
+    /// tinted.
+    static ROLE_INKS: RefCell<Option<RoleInks>> = const { RefCell::new(None) };
+}
+
+/// The role colors for this render, resolving them from the theme on first use
+/// since the last invalidation.
+fn role_inks() -> RoleInks {
+    ROLE_INKS.with_borrow_mut(|memo| *memo.get_or_insert_with(resolve_role_inks))
+}
+
+/// Resolve `@success_color` / `@warning_color` / `@error_color` off the live
+/// theme, the same way `pump::resolve_accent_color` resolves `@accent_color`:
+/// libadwaita registers them as display-scope named colors, so a throwaway
+/// unrealized widget resolves them.
+///
+/// Deliberately separate from `pump`'s accent resolver rather than a
+/// generalization of it: that one materializes the *wire* accent for
+/// out-of-process plugins and writes the kit's global, while these three are
+/// shell-only and exist purely to ink a role. The style-context lookup is
+/// deprecated in GTK4 and libadwaita's typed getters need `v1_6`, so this
+/// carries the same scoped `allow` and the same reasoning as `pump`'s.
+///
+/// Returns every color unset when GTK is not up — the hermetic `cargo test`
+/// case, where a widget probe would panic. A role then falls back to the session
+/// accent, which is what an unthemed session renders anyway.
+fn resolve_role_inks() -> RoleInks {
+    if !gtk::is_initialized_main_thread() {
+        return RoleInks::default();
+    }
+    let probe = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let lookup = |name: &str| {
+        #[allow(deprecated)]
+        let rgba = probe.style_context().lookup_color(name)?;
+        // Clamped then scaled into `0..=255` and rounded, so the cast is exact
+        // — the same conversion (and the same reasoning) as `pump`'s
+        // `rgba_to_bytes`. Alpha is forced opaque: a preem frame is a screen.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let chan = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        Some([
+            chan(rgba.red()),
+            chan(rgba.green()),
+            chan(rgba.blue()),
+            0xff,
+        ])
+    };
+    RoleInks {
+        success: lookup("success_color"),
+        warning: lookup("warning_color"),
+        error: lookup("error_color"),
+    }
+}
+
+/// Install role colors explicitly, bypassing the theme lookup — the seam the
+/// role tests resolve against, since the hermetic test binary has no GTK display
+/// and every role would otherwise degrade to the session accent (and so prove
+/// nothing about resolution).
+#[cfg(test)]
+pub(super) fn set_role_inks(inks: RoleInks) {
+    ROLE_INKS.set(Some(inks));
+}
+
+/// The kit ink a widget's style reference asks for.
+///
+/// The precedence *is* the design settled on #885:
+///
+/// 1. a pinned [`ink`](vocab::StyleRef::ink) wins outright, and by winning opts
+///    the widget out of the live re-tint — it renders this exact color while the
+///    desktop changes around it;
+/// 2. `Success`/`Warning`/`Error` resolve against the live theme, falling back to
+///    the session accent when the theme does not define one;
+/// 3. `Neutral` takes the skin's own ink, refusing even the accent;
+/// 4. `Accent` — and a `StyleRef` that names no role at all — take the session
+///    accent, which is `kit::Ink::Default`: exactly what every preem widget
+///    rendered before roles were resolved at all, so an old frame is unmoved.
+fn ink_for(style: vocab::StyleRef) -> kit::Ink {
+    if let Some(ink) = style.ink {
+        return kit::Ink::Fixed(ink);
+    }
+    match style.accent {
+        Some(vocab::AccentRole::Neutral) => kit::Ink::Base,
+        // Named before the memo, not through it: [`RoleInks`] deliberately does
+        // not carry the accent, so resolving one for `Accent` would build a
+        // throwaway probe widget and do three `lookup_color`s on the first
+        // render after every theme change — in a session where nothing asks for
+        // a status role at all — only to throw the answer away.
+        Some(vocab::AccentRole::Accent) | None => kit::Ink::Default,
+        Some(role) => role_inks()
+            .get(role)
+            .map_or(kit::Ink::Default, kit::Ink::Fixed),
+    }
 }
 
 // ── construction / update / advance / render ─────────────────────────────────
@@ -850,7 +1019,13 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
         return None;
     }
     let style = display_style(widget.style());
-    Some(match widget {
+    // The whole build runs inside the widget's ink scope, because `TextBox` is
+    // the one kit widget that resolves its palette at *construction* — see
+    // `invalidate_cached_frames`. Every other arm resolves at render time and is
+    // unaffected by the scope being open here, so scoping the build wholesale
+    // costs nothing and cannot miss a future widget that bakes.
+    let ink = ink_for(widget.style());
+    Some(kit::with_ink(ink, || match widget {
         W::DotMatrix { state, .. } => Renderer::DotMatrix {
             text: state.text.clone(),
         },
@@ -915,7 +1090,7 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
             board.set_text(&state.text);
             Renderer::FlipBoard { board }
         }
-    })
+    }))
 }
 
 /// The kit `TextBox` a [`vocab::TextBoxConfig`] describes. Split out so the
@@ -1023,7 +1198,13 @@ impl Renderer {
                     // deliberately *not* reset, so a ticker whose text changes
                     // mid-scroll keeps moving instead of snapping left.
                     // `window` wraps modulo the new period.
-                    *strip = marquee_strip(*config, display_style(config.style), &state.text);
+                    // Scoped like `build`'s: the strip bakes the skin's field and
+                    // ghost, and while today it re-resolves the *ink* per
+                    // `window()` call, that is the kit's business and not a
+                    // contract this call site should depend on.
+                    *strip = kit::with_ink(ink_for(config.style), || {
+                        marquee_strip(*config, display_style(config.style), &state.text)
+                    });
                     text.clone_from(&state.text);
                 }
             }

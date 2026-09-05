@@ -507,6 +507,195 @@ fn style_accessor_covers_every_variant() {
     }
 }
 
+// ── the explicit ink pin (#885) ─────────────────────────────────────────────
+
+/// Pin `ink` into a widget's style reference, whatever variant it is — the
+/// mutable twin of [`PreemWidget::style`], which is read-only.
+fn pin_ink(widget: &mut PreemWidget, ink: hytte_plugin_proto::preem::Rgba) {
+    let style = match widget {
+        PreemWidget::DotMatrix { config, .. } => &mut config.style,
+        PreemWidget::SevenSeg { config, .. } => &mut config.style,
+        PreemWidget::TextBox { config, .. } => &mut config.style,
+        PreemWidget::LedStrip { config, .. } => &mut config.style,
+        PreemWidget::Marquee { config, .. } => &mut config.style,
+        PreemWidget::Scope { config, .. } => &mut config.style,
+        PreemWidget::Gauge { config, .. } => &mut config.style,
+        PreemWidget::FlipBoard { config, .. } => &mut config.style,
+    };
+    style.ink = Some(ink);
+}
+
+/// A frame written by a peer that predates [`StyleRef::ink`] — the field simply
+/// absent from the map — decodes with no pin, and so renders exactly as it did
+/// before the field existed.
+///
+/// This is half of the compatible-addition claim (#895's vocabulary is
+/// *unbumped* by this change): the wire is a named-field map
+/// (`rmp_serde::to_vec_named`), so an unknown key is skippable and a missing one
+/// falls to `#[serde(default)]`.
+///
+/// **Falsified** by giving `ink` a `#[serde(default = …)]` that returns a color:
+/// the decode then invents a pin nobody asked for and both assertions go red.
+///
+/// Worth knowing which mutation *doesn't* falsify it, since it is the obvious
+/// guess: dropping the container's `#[serde(default)]` leaves this green,
+/// because serde's `missing_field` helper can already produce `None` for an
+/// `Option` field on its own. The absent-key guarantee for `ink` therefore rests
+/// on the field being an `Option` at all — not on the container attribute, which
+/// is what carries the *other* keys.
+#[test]
+fn a_style_ref_written_before_the_ink_field_decodes_unpinned() {
+    for (pre, want) in [
+        (
+            PreInkStyleRef {
+                style: StyleName::Lcd,
+                accent: Some(AccentRole::Warning),
+            },
+            StyleRef::new(StyleName::Lcd).with_accent(AccentRole::Warning),
+        ),
+        (
+            PreInkStyleRef {
+                style: StyleName::Vfd,
+                accent: None,
+            },
+            StyleRef::new(StyleName::Vfd),
+        ),
+    ] {
+        let bytes = rmp_serde::to_vec_named(&pre).expect("the pre-#885 shape encodes");
+        let back = decode_body::<StyleRef>(&bytes).expect("a pre-#885 style ref still decodes");
+        assert_eq!(back, want);
+        assert_eq!(back.ink, None, "an absent key is not a pin");
+    }
+}
+
+/// The other half: a style reference with **no** pin encodes to exactly the
+/// bytes the pre-#885 shape does, so a plugin built against the old proto and a
+/// shell built against the new one (or the reverse) exchange identical frames.
+///
+/// The repo's byte-pinned `plugin_render_preem_v1` golden fixture is the
+/// belt-and-braces version of this claim — it is committed to git and was **not**
+/// regenerated for this change.
+///
+/// **Falsified** by dropping `skip_serializing_if` from `StyleRef::ink`: the
+/// unpinned form starts writing an explicit `ink: nil` and both assertions go
+/// red.
+#[test]
+fn an_unpinned_style_ref_is_byte_identical_to_the_pre_change_form() {
+    let cases = [
+        (
+            StyleRef::new(StyleName::Lcd).with_accent(AccentRole::Warning),
+            PreInkStyleRef {
+                style: StyleName::Lcd,
+                accent: Some(AccentRole::Warning),
+            },
+        ),
+        (
+            StyleRef::new(StyleName::Vfd),
+            PreInkStyleRef {
+                style: StyleName::Vfd,
+                accent: None,
+            },
+        ),
+    ];
+    for (now, before) in cases {
+        assert_eq!(
+            encode_body(&now),
+            rmp_serde::to_vec_named(&before).expect("the pre-#885 shape encodes"),
+            "an unpinned {now:?} must not add a byte to the wire"
+        );
+    }
+
+    // …and the same claim where it actually matters: inside a whole widget, the
+    // key must not appear at all.
+    //
+    // Matched as the encoded *key* (`0xa3` = MessagePack fixstr of length 3,
+    // then `ink`) rather than as the substring "ink" anywhere in the frame: a
+    // widget whose state text happened to contain "PINK" or "thinking" would
+    // trip a loose scan. It could only ever false-*fail*, never false-pass, but
+    // a test that a future fixture can break for the wrong reason is worth four
+    // more bytes of precision.
+    let ink_key: &[u8] = b"\xa3ink";
+    let carries_key =
+        |widget: &PreemWidget| encode(widget).windows(ink_key.len()).any(|w| w == ink_key);
+    for widget in all_widgets() {
+        assert!(
+            !carries_key(&widget),
+            "{}'s unpinned encoding must not carry an `ink` key",
+            widget.kind()
+        );
+        // The positive control: an anchored needle that never matches anything
+        // would satisfy the assertion above for the wrong reason. Pin the same
+        // widget and the key must appear.
+        let mut pinned = widget.clone();
+        pin_ink(&mut pinned, [0x11, 0x22, 0x33, 0xff]);
+        assert!(
+            carries_key(&pinned),
+            "{}'s pinned encoding must carry exactly that key, or the absence check above is blind",
+            widget.kind()
+        );
+    }
+}
+
+/// A pin does travel, survives the codec, and reaches the far side as the exact
+/// color that was set — the claim the shell's "this widget is excluded from the
+/// re-tint" behavior rests on.
+#[test]
+fn a_pinned_ink_travels_on_the_wire() {
+    let violet = [0x9b, 0x59, 0xb6, 0xff];
+    for widget in all_widgets() {
+        let mut pinned = widget.clone();
+        pin_ink(&mut pinned, violet);
+        assert_ne!(pinned, widget, "pinning changed the widget");
+
+        let back = decode::<PreemWidget>(&encode(&pinned)).expect("a pinned widget decodes");
+        assert_eq!(back, pinned, "{} did not round-trip pinned", widget.kind());
+        assert_eq!(
+            back.style().ink,
+            Some(violet),
+            "{} lost its pinned ink",
+            widget.kind()
+        );
+    }
+}
+
+/// [`PreemWidget::clamped`] has nothing to enforce on a pin: four `u8`s are four
+/// `u8`s, every bit pattern is a color, and there is no non-finite case to fold.
+/// So the pin survives clamping byte for byte, and reflexivity — the property
+/// #899 exists to protect — still holds with one present.
+///
+/// Includes the two values a sanitiser would be tempted to "fix": fully
+/// transparent, and pure black.
+///
+/// **Falsified** by having `clamp_in_place` clear or normalize `style.ink`: the
+/// "clamping is not allowed to touch a pin" assertion goes red.
+#[test]
+fn clamping_leaves_a_pinned_ink_untouched_and_stays_reflexive() {
+    for ink in [
+        [0x9b, 0x59, 0xb6, 0xff],
+        [0x00, 0x00, 0x00, 0x00],
+        [0x00, 0x00, 0x00, 0xff],
+        [0xff, 0xff, 0xff, 0xff],
+    ] {
+        for widget in all_widgets() {
+            let mut pinned = widget.clone();
+            pin_ink(&mut pinned, ink);
+            let clamped = pinned.clone().clamped();
+            assert_eq!(
+                clamped.style().ink,
+                Some(ink),
+                "{}: clamping is not allowed to touch a pin",
+                widget.kind()
+            );
+            assert_eq!(
+                clamped,
+                pinned.clamped(),
+                "{}: clamped(w) == clamped(w) with a pin present",
+                widget.kind()
+            );
+        }
+    }
+}
+
 // ── 2. wire limits ──────────────────────────────────────────────────────────
 
 /// The text cap is enforced, and enforced on a **char boundary**: a naive
@@ -1910,6 +2099,17 @@ fn hello_round_trips_and_drives_the_decision() {
 
 #[derive(serde::Serialize)]
 struct Empty {}
+
+/// A [`StyleRef`] as it was encoded **before** #885: the skin, an optional
+/// semantic role, and no `ink` key in the map at all. The field list and the
+/// `skip_serializing_if` are a deliberate copy of the shipped struct's, so this
+/// is the *old* encoder rather than a paraphrase of it.
+#[derive(Debug, serde::Serialize)]
+struct PreInkStyleRef {
+    style: StyleName,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accent: Option<AccentRole>,
+}
 
 #[derive(serde::Serialize)]
 struct OnlyText {

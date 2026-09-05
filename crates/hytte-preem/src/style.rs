@@ -57,6 +57,83 @@ fn accent() -> Option<Rgba> {
     unpack_accent(ACCENT.load(Ordering::Relaxed))
 }
 
+// ── per-render ink (#885) ────────────────────────────────────────────────────
+
+/// Which ink a render should use, for a host that decides **per render** rather
+/// than per process.
+///
+/// [`set_accent`] answers the question once for the whole process, which is
+/// exactly right inside a plugin — one process hosts one plugin, and every
+/// widget in it wants the same session tint. A *shell* drawing the kit is the
+/// other case: it renders many plugins' widgets in one process, each of which
+/// asked for its own semantic role, and one of which may have pinned an explicit
+/// color (`hytte_plugin_proto::preem::StyleRef`). [`with_ink`] is that
+/// per-render answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Ink {
+    /// The session default: the [`set_accent`] accent if one is installed,
+    /// otherwise the skin's own ink. Exactly what a render outside [`with_ink`]
+    /// gets, so a caller with nothing to say can name it.
+    #[default]
+    Default,
+    /// The skin's own hard-coded ink, **ignoring** any installed accent — the
+    /// way to hold one widget still while the desktop re-tints around it.
+    Base,
+    /// This exact color, ignoring any installed accent. Forced opaque on the way
+    /// in, like the accent: a kit widget is a screen, and its ink is what a lit
+    /// pixel reaches.
+    Fixed(Rgba),
+}
+
+thread_local! {
+    /// The ink [`with_ink`] is currently scoping, for **this thread**.
+    ///
+    /// Thread-local and scoped rather than global and sticky, which is the
+    /// difference that matters against [`ACCENT`]: a host renders one widget at
+    /// a time on its UI thread, so "the ink for the render in progress" is a
+    /// well-defined per-thread value, while "the ink for the process" is not
+    /// once more than one widget is in play. A thread that never calls
+    /// [`with_ink`] — every plugin, and the kit's own tests — sees
+    /// [`Ink::Default`] and behaves exactly as it did before this existed.
+    static SCOPED_INK: std::cell::Cell<Ink> = const { std::cell::Cell::new(Ink::Default) };
+}
+
+/// Restores the enclosing [`SCOPED_INK`] on the way out — including on an
+/// unwind, which is why this is a guard and not a pair of `set` calls around the
+/// closure.
+struct InkGuard(Ink);
+
+impl Drop for InkGuard {
+    fn drop(&mut self) {
+        SCOPED_INK.set(self.0);
+    }
+}
+
+/// Render `body` with `ink` as the lit ink of every kit widget it draws,
+/// restoring the previous scope afterwards.
+///
+/// Host-facing, like [`set_accent`]: a plugin author never calls it (the kit
+/// widget entry points take a [`DisplayStyle`] and nothing else, deliberately —
+/// see the module docs). A **shell** calls it once around each widget's
+/// rasterisation to resolve that widget's own semantic role or pinned color.
+///
+/// Only the lit **ink** moves. The field, the ghost, the bloom and the CRT pass
+/// are the panel's physical character and stay per-skin, exactly as they do
+/// under [`set_accent`].
+///
+/// Nesting is well-defined (the inner scope wins for its duration, the outer one
+/// resumes), and the scope is per-thread, so a background thread rasterising in
+/// parallel is unaffected by — and does not disturb — this one.
+pub fn with_ink<T>(ink: Ink, body: impl FnOnce() -> T) -> T {
+    let _guard = InkGuard(SCOPED_INK.replace(ink));
+    body()
+}
+
+/// The ink scope in force on this thread.
+fn scoped_ink() -> Ink {
+    SCOPED_INK.get()
+}
+
 /// The retro display skin a kit widget renders in. Palettes + post-passes
 /// over one shared renderer per widget (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -109,17 +186,34 @@ impl DisplayStyle {
     /// per-style palette (no regression). An explicit plugin palette
     /// ([`TextBox::colors`](super::TextBox::colors), a hand-built
     /// [`Frame`]) never routes through here, so it always wins.
+    ///
+    /// A host that decides the ink **per render** rather than per session
+    /// ([`with_ink`], #885) overrides the accent for the duration of that
+    /// render — the same one field, and the same
+    /// everything-else-stays-per-skin rule.
     pub(crate) fn palette(self) -> Palette {
-        self.palette_with_accent(accent())
+        self.palette_with(scoped_ink(), accent())
     }
 
-    /// [`palette`](Self::palette) with the accent passed explicitly — split out
-    /// so the default-vs-override resolution is unit-testable without the
-    /// process-global.
-    fn palette_with_accent(self, accent: Option<Rgba>) -> Palette {
+    /// [`palette`](Self::palette) with **both** of its inputs passed explicitly:
+    /// the per-render scope ([`with_ink`]) and the process accent
+    /// ([`set_accent`]) — split out so the resolution is unit-testable without
+    /// touching either global.
+    ///
+    /// The precedence is the whole rule, in one place: an explicit per-render
+    /// ink beats the session accent, which beats the skin's own — and
+    /// [`Ink::Base`] is how a render says "not even the accent". Only
+    /// [`Palette::ink`] is ever touched.
+    fn palette_with(self, ink: Ink, accent: Option<Rgba>) -> Palette {
         let mut palette = self.base_palette();
-        if let Some(ink) = accent {
-            palette.ink = ink;
+        match ink {
+            Ink::Default => {
+                if let Some(accent) = accent {
+                    palette.ink = accent;
+                }
+            }
+            Ink::Base => {}
+            Ink::Fixed([r, g, b, _]) => palette.ink = [r, g, b, 0xff],
         }
         palette
     }
@@ -658,7 +752,7 @@ fn box_blur(src: &[u16], w: usize, h: usize, r: usize) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bloom, DisplayStyle, Emission, Frame, mix};
+    use super::{Bloom, DisplayStyle, Emission, Frame, Ink, mix, scoped_ink, with_ink};
 
     #[test]
     fn mix_hits_both_endpoints_exactly() {
@@ -740,19 +834,19 @@ mod tests {
     /// #376: with no host accent, every style keeps its hard-coded ink (no
     /// regression); with an accent, every style's **ink** becomes it while
     /// `bg`/`ghost`/`bloom` stay the per-style panel character. Uses the
-    /// explicit-accent seam so it never touches the process-global.
+    /// explicit seam so it never touches the process-global.
     #[test]
     fn accent_tints_ink_but_leaves_the_panel_character() {
         let accent = [0x9b, 0x59, 0xb6, 0xff];
         for style in DisplayStyle::ALL {
-            let base = style.palette_with_accent(None);
+            let base = style.palette_with(Ink::Default, None);
             assert_eq!(
                 base.ink,
                 style.base_palette().ink,
                 "{style:?}: no accent keeps the hard-coded ink"
             );
 
-            let tinted = style.palette_with_accent(Some(accent));
+            let tinted = style.palette_with(Ink::Default, Some(accent));
             assert_eq!(tinted.ink, accent, "{style:?}: accent becomes the ink");
             assert_eq!(tinted.bg, base.bg, "{style:?}: field is per-style");
             assert_eq!(tinted.ghost, base.ghost, "{style:?}: ghost is per-style");
@@ -780,6 +874,131 @@ mod tests {
         assert_eq!(
             unpack_accent(pack_accent(Some([0, 0, 0, 0xff]))),
             Some([0, 0, 0, 0xff])
+        );
+    }
+
+    // ── per-render ink (#885) ────────────────────────────────────────────────
+
+    /// The precedence rule, stated once over every skin: a per-render
+    /// [`Ink::Fixed`] beats the session accent, [`Ink::Base`] refuses even the
+    /// accent, and [`Ink::Default`] is the accent — i.e. exactly what a render
+    /// outside a scope has always got. Pure seam (`palette_with`), so it never
+    /// touches the process-global or the thread-local.
+    ///
+    /// **Falsified** by collapsing `Ink::Base` into `Ink::Default` in
+    /// `palette_with`: `Base ignores the accent` goes red.
+    #[test]
+    fn a_per_render_ink_beats_the_accent_and_base_beats_both() {
+        let accent = [0x9b, 0x59, 0xb6, 0xff];
+        let pinned = [0x1a, 0xc0, 0x77, 0xff];
+        for style in DisplayStyle::ALL {
+            let base = style.base_palette().ink;
+            assert_eq!(
+                style.palette_with(Ink::Default, Some(accent)).ink,
+                accent,
+                "{style:?}: no scope is the accent"
+            );
+            assert_eq!(
+                style.palette_with(Ink::Default, None).ink,
+                base,
+                "{style:?}: no scope and no accent is the skin's own ink"
+            );
+            assert_eq!(
+                style.palette_with(Ink::Base, Some(accent)).ink,
+                base,
+                "{style:?}: Base ignores the accent"
+            );
+            assert_eq!(
+                style.palette_with(Ink::Fixed(pinned), Some(accent)).ink,
+                pinned,
+                "{style:?}: a pinned ink beats the accent"
+            );
+            assert_eq!(
+                style.palette_with(Ink::Fixed(pinned), None).ink,
+                pinned,
+                "{style:?}: …and stands in for one that was never installed"
+            );
+        }
+    }
+
+    /// A per-render ink moves **only** the ink — the field, the ghost, the bloom
+    /// and the CRT pass are the panel's physical character, so a pinned widget
+    /// still reads as the same device. Alpha is forced opaque, like the accent's.
+    ///
+    /// **Falsified** by also assigning `palette.bg` in the `Ink::Fixed` arm: the
+    /// "field is per-skin" assertion goes red.
+    #[test]
+    fn a_per_render_ink_moves_the_ink_and_nothing_else() {
+        for style in DisplayStyle::ALL {
+            let base = style.palette_with(Ink::Default, None);
+            let pinned = style.palette_with(Ink::Fixed([0x12, 0x34, 0x56, 0x00]), None);
+            assert_eq!(
+                pinned.ink,
+                [0x12, 0x34, 0x56, 0xff],
+                "{style:?}: a translucent pin still draws opaque"
+            );
+            assert_eq!(pinned.bg, base.bg, "{style:?}: field is per-skin");
+            assert_eq!(pinned.ghost, base.ghost, "{style:?}: ghost is per-skin");
+            assert_eq!(
+                pinned.bloom.is_some(),
+                base.bloom.is_some(),
+                "{style:?}: bloom is per-skin"
+            );
+            assert_eq!(
+                pinned.mask.is_some(),
+                base.mask.is_some(),
+                "{style:?}: the CRT pass is per-skin"
+            );
+        }
+    }
+
+    /// [`with_ink`] is a *scope*: it applies to the renders inside it, nests,
+    /// and leaves nothing behind. Uses the thread-local directly rather than the
+    /// process accent, so it is safe against every other test in this binary.
+    ///
+    /// **Falsified** by dropping the `InkGuard` restore (`with_ink` setting the
+    /// cell and returning): the post-scope assertion goes red.
+    #[test]
+    fn with_ink_scopes_and_nests_and_restores() {
+        let outer = [0x11, 0x22, 0x33, 0xff];
+        let inner = [0x44, 0x55, 0x66, 0xff];
+        assert_eq!(scoped_ink(), Ink::Default, "no scope by default");
+
+        let (seen_outer, seen_inner) = with_ink(Ink::Fixed(outer), || {
+            let seen_outer = DisplayStyle::Vfd.palette().ink;
+            let seen_inner = with_ink(Ink::Fixed(inner), || DisplayStyle::Vfd.palette().ink);
+            assert_eq!(
+                DisplayStyle::Vfd.palette().ink,
+                outer,
+                "the outer scope resumes when the inner one ends"
+            );
+            (seen_outer, seen_inner)
+        });
+
+        assert_eq!(seen_outer, outer, "a render inside the scope uses its ink");
+        assert_eq!(seen_inner, inner, "the inner scope wins while it is open");
+        assert_eq!(
+            scoped_ink(),
+            Ink::Default,
+            "the scope is gone once `with_ink` returns"
+        );
+    }
+
+    /// The end-to-end claim the shell rests on: two renders of the *same* widget
+    /// under two different pinned inks produce different pixels, and the pinned
+    /// one carries that exact color on a fully-lit dot — the same shape as
+    /// `the_accent_reaches_the_shells_own_preem_surfaces` in the shell, but here
+    /// with no process-global involved.
+    #[test]
+    fn two_pinned_inks_render_differently() {
+        let teal = [0x11, 0x99, 0xaa, 0xff];
+        let rose = [0xdd, 0x22, 0x66, 0xff];
+        let lit = |ink| with_ink(Ink::Fixed(ink), || dot_matrix("8", DisplayStyle::Oled));
+        let (t, r) = (lit(teal), lit(rose));
+        assert_ne!(t, r, "two pinned inks must not render the same");
+        assert!(
+            t.data().chunks_exact(4).any(|px| px == teal),
+            "a fully-lit dot carries the pinned ink exactly, not something derived from it"
         );
     }
 

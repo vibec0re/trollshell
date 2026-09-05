@@ -48,10 +48,17 @@
 //! # Style is a *reference*, not colors
 //!
 //! [`StyleRef`] carries the [`StyleName`] (`vfd`/`lcd`/`oled`/`crt`) plus an
-//! optional **semantic** [`AccentRole`]. It never carries resolved RGBA. The
-//! shell resolves both against the live desktop theme, which is the whole
-//! payoff: a `@accent_color` change re-tints every preem widget on screen with
-//! zero plugin involvement and zero frames on the wire.
+//! optional **semantic** [`AccentRole`]. The shell resolves both against the
+//! live desktop theme, which is the whole payoff: a `@accent_color` change
+//! re-tints every preem widget on screen with zero plugin involvement and zero
+//! frames on the wire.
+//!
+//! There is exactly one way to put a resolved color on the wire —
+//! [`StyleRef::ink`], the explicit pin — and taking it costs precisely that
+//! payoff: a pinned widget keeps its ink while the desktop re-tints around it.
+//! It is ink-only (the skin still owns field, ghost, bloom and the CRT pass) and
+//! it is the exception, for a color that *is* the meaning and that no role
+//! names.
 //!
 //! # Compat contract
 //!
@@ -422,6 +429,22 @@ impl StyleName {
     }
 }
 
+/// An explicit ink color, `[r, g, b, a]` — the same byte quad
+/// [`HostMsg::Accent`](crate::msg::HostMsg::Accent) already carries, and the
+/// same layout [`Node::Pixels`](crate::wire::Node::Pixels) uses per pixel, so it
+/// crosses the SDK/kit boundary unconverted (`hytte_preem::Rgba` **is** this
+/// type).
+///
+/// Deliberately `u8` channels rather than floats: there is nothing to sanitise
+/// — every bit pattern is a valid color, so
+/// [`PreemWidget::clamp_in_place`] has no rule to apply to it and
+/// `clamped(w) == clamped(w)` stays reflexive with one in the widget. (The alpha
+/// byte travels for symmetry with `HostMsg::Accent`; a preem frame is a
+/// *screen*, so the kit draws ink opaque either way.)
+///
+/// Reaching for one is the exception, not the path — see [`StyleRef::ink`].
+pub type Rgba = [u8; 4];
+
 /// A **semantic** ink role, resolved shell-side against the live theme.
 ///
 /// This is what replaces a plugin reaching for RGBA (the kit's `TextBox::colors`
@@ -429,8 +452,11 @@ impl StyleName {
 /// that looks like in the current accent and color scheme, so a re-tint costs no
 /// wire traffic and no plugin rebuild.
 ///
-/// `None` on [`StyleRef::accent`] — the default — means the style's own
-/// hard-coded ink, i.e. exactly today's look.
+/// `None` on [`StyleRef::accent`] — the default — leaves the ink to the host:
+/// the session accent when it has resolved one, otherwise the skin's own
+/// hard-coded ink. That is what an accent-tinted host renders for a widget that
+/// says nothing, so a frame omitting the key looks exactly as it did before this
+/// field existed. [`Neutral`](Self::Neutral) is the *explicit* opt-out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AccentRole {
     /// The desktop accent (libadwaita's `@accent_color`) — the same tint the
@@ -449,26 +475,68 @@ pub enum AccentRole {
     Neutral,
 }
 
-/// How a preem widget asks to be skinned: a [`StyleName`] plus an optional
-/// semantic [`AccentRole`]. Never resolved colors — see the module docs.
+/// How a preem widget asks to be skinned: a [`StyleName`], a semantic
+/// [`AccentRole`], and — the escape hatch — an explicit [`ink`](Self::ink).
+///
+/// The first two are the path (#885): the shell resolves the role against the
+/// live theme on every render, so changing the desktop accent re-tints every
+/// widget on screen with no wire traffic and no plugin restart. The third pins
+/// one widget's ink and **opts it out of that**.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StyleRef {
     /// The display skin.
     pub style: StyleName,
-    /// The semantic ink role, or `None` for the skin's own hard-coded ink
-    /// (the default, and what a frame that omits the key decodes to).
+    /// The semantic ink role, or `None` to leave the ink to the host — see
+    /// [`AccentRole`] for what each resolves to, and what a frame that omits the
+    /// key decodes to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accent: Option<AccentRole>,
+    /// An explicit ink, overriding whatever [`accent`](Self::accent) would have
+    /// resolved to. `None` — the default, and what a frame omitting the key
+    /// decodes to — leaves the role in charge.
+    ///
+    /// # This is the discouraged path, and it costs the live re-tint
+    ///
+    /// A pinned widget is **deliberately excluded from re-tinting**: it keeps
+    /// this exact ink while the desktop accent changes around it, because that
+    /// is what pinning means. Reach for it when the color *is* the meaning and
+    /// no role names it (a brand color, a plugin's own signature tint); reach
+    /// for [`AccentRole`] for everything else, including anything that means
+    /// "good", "warn" or "broken".
+    ///
+    /// # Ink only
+    ///
+    /// It replaces the accent-tinted part — the lit ink — and nothing else. The
+    /// skin still supplies the field, the ghost, the bloom and the CRT pass, so
+    /// a pinned widget still reads as the same device. (Widening this to a whole
+    /// palette override is a deliberate non-goal here; the skin *is* the
+    /// vocabulary for the panel's physical character.)
+    ///
+    /// # Pin a color that does not move
+    ///
+    /// This lives in the **config**, so the module's config rule applies to it
+    /// like any other field: *changing* it rebuilds the shell's renderer, and a
+    /// rebuild loses the animation state that renderer owned — a needle back at
+    /// rest, a cleared phosphor, a blanked flip board, a marquee snapped to
+    /// offset 0. A steady pin costs nothing (an unchanged config is compared,
+    /// not rebuilt), but driving one from a reading — `ink(RED)` above a
+    /// threshold — resets the animation on every crossing. That case wants an
+    /// [`AccentRole`], which has the same problem and the same answer: state it
+    /// once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ink: Option<Rgba>,
 }
 
 impl StyleRef {
-    /// A style reference with no accent role — the skin's own ink.
+    /// A style reference with no accent role and no pinned ink — the host's
+    /// default ink for the skin.
     #[must_use]
     pub fn new(style: StyleName) -> Self {
         Self {
             style,
             accent: None,
+            ink: None,
         }
     }
 
@@ -477,6 +545,14 @@ impl StyleRef {
     #[must_use]
     pub fn with_accent(mut self, accent: AccentRole) -> Self {
         self.accent = Some(accent);
+        self
+    }
+
+    /// The same skin with an explicit ink pinned, opting the widget out of the
+    /// live re-tint — see [`ink`](Self::ink) before reaching for it.
+    #[must_use]
+    pub fn with_ink(mut self, ink: Rgba) -> Self {
+        self.ink = Some(ink);
         self
     }
 }
@@ -550,7 +626,9 @@ impl Default for TextBoxWidth {
 ///
 /// Mirrors the kit's `TextBox` builder, minus its `colors()` escape hatch: an
 /// explicit RGBA palette becomes a semantic [`StyleRef::accent`] here, so a live
-/// re-tint reaches this widget like every other. Defaults match the kit's.
+/// re-tint reaches this widget like every other — or, where a color really is
+/// the meaning, a one-color pin through [`StyleRef::ink`]. Defaults match the
+/// kit's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TextBoxConfig {
@@ -1192,6 +1270,12 @@ impl PreemWidget {
     /// mid-codepoint), sample batches truncate, and counts/dimensions clamp into
     /// range — so a bad frame renders a sane widget instead of dropping the
     /// session.
+    ///
+    /// [`StyleRef`] is the one config field with nothing to enforce: a
+    /// [`StyleName`] and an [`AccentRole`] are closed enums, and an
+    /// [`ink`](StyleRef::ink) is four `u8`s where every bit pattern is already a
+    /// color. It passes through untouched, and cannot make `clamped(w)` differ
+    /// from `clamped(w)`.
     ///
     /// It also **sanitises every float**, config and state alike: after this
     /// runs, every `f32` a renderer can reach is finite and inside its

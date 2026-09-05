@@ -110,7 +110,8 @@
 //! the sidebar card's ~296 px content width.
 
 use hytte_plugin::display::{
-    DotMatrix, FlipBoard, Gauge, Marquee, Mechanism, Scope, SevenSeg, StyleName, TextBox,
+    AccentRole, DotMatrix, FlipBoard, Gauge, Marquee, Mechanism, Scope, SevenSeg, StyleName,
+    TextBox,
 };
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node, SPECTRUM_BINS, StateKey};
 use hytte_plugin::{CmdSender, Input, Plugin, View};
@@ -132,6 +133,20 @@ const SCOPE_ID: &str = "preem-demo-scope";
 const GAUGE_ID: &str = "preem-demo-gauge";
 const FLAP_ID: &str = "preem-demo-flap";
 const NIXIE_ID: &str = "preem-demo-nixie";
+const ROLE_ID: &str = "preem-demo-role";
+const PIN_ID: &str = "preem-demo-pin";
+
+/// The pinned widget's ink (#885) — a color no theme resolves to, so "did it
+/// re-tint?" is answerable on glass at a glance rather than by pixel-peeping.
+///
+/// Deliberately loud: the whole point of the pair below is that changing the
+/// desktop accent moves one of them and not the other.
+const PIN_INK: [u8; 4] = [0xff, 0x2d, 0x95, 0xff];
+
+/// What the two ink probes read. Four cells each, so the pair fits the ~296 px
+/// card side by side.
+const ROLE_TEXT: &str = "ROLE";
+const PIN_TEXT: &str = "PIN.";
 
 /// Seconds each skin holds before the rotation advances.
 const STYLE_SECS: i64 = 10;
@@ -255,6 +270,16 @@ struct PreemDemo {
     /// The nixie readout (#397): the same clock again, so the card contrasts
     /// the two change mechanisms side by side on identical content.
     nixie: FlipBoard,
+    /// The **role-tinted** half of the #885 ink pair: a dot matrix asking for
+    /// [`AccentRole::Success`], so the shell resolves it against the live theme
+    /// and it re-tints the moment the desktop accent or color scheme moves — no
+    /// restart, no frame on the wire.
+    role: DotMatrix,
+    /// The **pinned** half: the same widget with an explicit
+    /// [`PIN_INK`](crate::PIN_INK), which is deliberately excluded from that
+    /// re-tint. Side by side with `role` these two *are* the demo of #885: change
+    /// the accent with the card open and exactly one of them moves.
+    pin: DotMatrix,
     /// Whether the sidebar (and so this card) is currently shown — the
     /// [`SlotVisible`](Input::SlotVisible) gate for the scope's sweep (#422).
     /// Seeded `false`; the host sends the real value at register.
@@ -299,6 +324,8 @@ impl PreemDemo {
         self.gauge.style(style);
         self.flap.style(style);
         self.nixie.style(style);
+        self.role.style(style);
+        self.pin.style(style);
     }
 
     /// The ticker's visible window, advanced one char per second.
@@ -405,6 +432,8 @@ impl Plugin for PreemDemo {
             gauge: Gauge::new(style).range(0.0, 100.0),
             flap: FlipBoard::new(style, Mechanism::SplitFlap).cells(CLOCK_CELLS),
             nixie: FlipBoard::new(style, Mechanism::Nixie).cells(CLOCK_CELLS),
+            role: DotMatrix::new(style).accent_role(AccentRole::Success),
+            pin: DotMatrix::new(style).ink(PIN_INK),
             visible: false,
         }
     }
@@ -498,7 +527,7 @@ impl Plugin for PreemDemo {
     }
 
     /// One vertical card: the pokeable 7seg clock, the ticker, the scrolling
-    /// marquee, the textbox — all wearing the same skin — the audio
+    /// marquee, the textbox — all wearing the same skin — the ink pair, the audio
     /// oscilloscope, the needle gauge, the split-flap and nixie boards, and a
     /// dim hint line.
     ///
@@ -527,6 +556,21 @@ impl Plugin for PreemDemo {
                 self.gauge.node(GAUGE_ID),
                 self.flap.node(FLAP_ID),
                 self.nixie.node(NIXIE_ID),
+                // #885, on glass: same widget, same skin, two ink sources. The
+                // left one names a semantic role and follows the theme; the
+                // right one pins `PIN_INK` and does not. Change the desktop
+                // accent with this card open and exactly one of them moves.
+                Node::Box {
+                    id: None,
+                    dir: Dir::Horizontal,
+                    spacing: 8,
+                    scroll: false,
+                    classes: Vec::new(),
+                    children: vec![
+                        self.role.node(ROLE_ID, ROLE_TEXT),
+                        self.pin.node(PIN_ID, PIN_TEXT),
+                    ],
+                },
                 Node::Label {
                     id: None,
                     text: "tap the clock to switch skins".to_owned(),
@@ -703,19 +747,19 @@ mod tests {
 
     /// Against a host that never advertises the preem vocabulary — the default
     /// for these tests, and every shell before #883 — the card is exactly what
-    /// it was: eight rasterised `Pixels` buffers, each honoring the host's
-    /// `len == w * h * 4` invariant and the ~296 px sidebar content width (the
-    /// #313 lesson), across all skins and clock states.
+    /// it was: one rasterised `Pixels` buffer per widget, each honoring the
+    /// host's `len == w * h * 4` invariant and the ~296 px sidebar content width
+    /// (the #313 lesson), across all skins and clock states.
     #[test]
-    fn against_an_old_shell_the_card_is_still_eight_pixel_buffers() {
+    fn against_an_old_shell_the_card_is_still_pixel_buffers() {
         let mut m = fresh();
         for step in 0..6 {
             let tree = m.view().tree;
             let bufs = pixels_of(&tree);
             assert_eq!(
                 bufs.len(),
-                8,
-                "clock + ticker + marquee + textbox + scope + gauge + flap + nixie"
+                10,
+                "clock + ticker + marquee + textbox + scope + gauge + flap + nixie + the ink pair"
             );
             assert!(
                 preem_of(&tree).is_empty(),
@@ -730,14 +774,16 @@ mod tests {
         }
     }
 
-    /// …and against a shell that does advertise it, the *same* card is eight
-    /// typed state nodes instead — same ids, same order, no rasterisation. This
-    /// is the #884 acceptance showcase: one `view()`, two wire shapes.
+    /// …and against a shell that does advertise it, the *same* card is typed
+    /// state nodes instead — same ids, same order, no rasterisation. This is the
+    /// #884 acceptance showcase: one `view()`, two wire shapes. The #885 ink pair
+    /// rides it unchanged: a pinned ink is a *state* node like any other, since
+    /// what travels is still a style reference and not a rendered pixel.
     ///
     /// Drives the SDK's recorded generation directly rather than through a
     /// session; the session-level negotiation is `hytte-plugin`'s own test.
     #[test]
-    fn against_a_preem_shell_the_same_card_is_eight_state_nodes() {
+    fn against_a_preem_shell_the_same_card_is_state_nodes() {
         let mut m = fresh();
         let _ = m.update(snapshot("2026-07-16T15:49:00+02:00", 1_752_672_540));
 
@@ -752,7 +798,11 @@ mod tests {
             vec![
                 // `pixels_of`/`preem_of` walk depth-first off a stack, so the
                 // card's children come back reversed — the assertion is on the
-                // set and the ids, not on paint order.
+                // set and the ids, not on paint order. The ink pair is the last
+                // row and so comes back first, its own two children reversed
+                // with it.
+                ("preem-demo-pin".to_owned(), "dot-matrix"),
+                ("preem-demo-role".to_owned(), "dot-matrix"),
                 ("preem-demo-nixie".to_owned(), "flip-board"),
                 ("preem-demo-flap".to_owned(), "flip-board"),
                 ("preem-demo-gauge".to_owned(), "gauge"),

@@ -600,7 +600,7 @@ pub fn install() {
     // re-resolve as an accent change). `publish_accent` just re-sends on the
     // existing `watch::Sender`; the per-conn accent tasks (and the SDK on the
     // plugin side) already treat a second `Accent` frame as latest-wins, so
-    // nothing else changes. Both signals fire on the GTK main thread, same as
+    // nothing else changes. All three signals fire on the GTK main thread, same as
     // this `install()` call, so no thread hop is needed. `connect_notify_local`
     // (rather than a typed `connect_accent_color_notify`) sidesteps the same
     // v1_6-feature gap `resolve_accent_color` already works around.
@@ -609,6 +609,16 @@ pub fn install() {
         pump::publish_accent(pump::resolve_accent_color());
     });
     style_manager.connect_dark_notify(|_| {
+        pump::publish_accent(pump::resolve_accent_color());
+    });
+    // …and high contrast, which since #885 is not just about the accent:
+    // `publish_accent` also drops the shell's memoized semantic role colors
+    // (`@success_color`/`@warning_color`/`@error_color`, `preem_render`), and
+    // libadwaita's HC stylesheet redefines exactly those. Without this the memo
+    // outlives the stylesheet that produced it, so a status widget keeps the
+    // pre-HC green for the rest of the session — a *sticky* miss rather than the
+    // one-frame kind, which is what makes it worth a third listener.
+    style_manager.connect_notify_local(Some("high-contrast"), |_, _| {
         pump::publish_accent(pump::resolve_accent_color());
     });
 

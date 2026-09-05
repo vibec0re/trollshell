@@ -20,6 +20,7 @@
 //! data, never a widget), so this runs as a plain hermetic `#[test]`, not a
 //! `#[gtk::test]`.
 
+use std::future::Future;
 use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
@@ -210,4 +211,152 @@ fn an_animating_plugin_does_not_wake_a_static_bar_left_subscriber() {
 
     preem_render::forget_scope(&resident_scope);
     preem_render::forget_scope(&mover_scope);
+}
+
+// ── #921: the monitor-independent scope releaser ─────────────────────────────
+
+/// Drive `releaser` one step and assert it is still parked on its signal.
+///
+/// The releaser never completes (it is a `while let` over a `Mutable`-backed
+/// signal that lives as long as the mailboxes), so `Pending` is the only
+/// correct answer — a `Ready` here would mean the loop broke, which in
+/// production is the whole subscription going away.
+fn step(releaser: &mut std::pin::Pin<&mut impl Future<Output = ()>>) {
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        releaser.as_mut().poll(&mut cx).is_pending(),
+        "the scope releaser must stay subscribed for the process lifetime",
+    );
+}
+
+/// A plugin leaving **every** render mailbox releases *both* of its preem
+/// scopes, with no region, no drawer child and no widget of any kind involved
+/// (#921).
+///
+/// This is the mechanism the production wiring rests on, isolated from GTK: the
+/// releaser's only input is the union of the seven mailboxes' plugin ids, and
+/// its only output is a `forget_scope` per departed id. `region::gtk_tests`'
+/// `a_plugin_leaving_with_no_live_region_still_releases_its_card_scope` covers
+/// the same fix in its production shape (a real region mounted, then destroyed,
+/// then the plugin exiting); this one covers the part that shape cannot show —
+/// that the departure is read off *all seven* mailboxes, so the id has to leave
+/// the panel list as well as its region before anything is forgotten, which is
+/// exactly the order `session.rs:812-824`'s teardown writes them in.
+///
+/// **Deletion check:** dropping the `forget_scope` loop from
+/// [`drive_scope_releaser`] turns the **final** card assertion red with
+/// `left: 1, right: 0`. Narrowing the union to the six region mailboxes turns
+/// the **middle** one red instead, with `left: 0, right: 1` — the scopes would
+/// be released while the plugin is still in the panel list.
+#[test]
+fn a_departing_plugin_releases_both_its_scopes_with_no_region_alive() {
+    let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+    let card = Scope::card("t921-leaver");
+    let panel = Scope::panel("t921-leaver");
+
+    // The renderer instances a real chip mount and a real drawer child would
+    // have built, mapped the same way they map them.
+    let _ = to_ui_node(&card, &marquee_node("chip"));
+    let _ = to_ui_node(&panel, &marquee_node("panel"));
+    assert_eq!(preem_render::instance_count(&card), 1);
+    assert_eq!(preem_render::instance_count(&panel), 1);
+
+    // The seven mailboxes, with this plugin in one region (`bar_left`) and in
+    // the shared panel list — where a chip with a drawer panel really sits.
+    let mailboxes: [Mutable<Vec<SlotRender>>; RENDER_MAILBOXES] = [
+        Mutable::new(Vec::new()),
+        Mutable::new(Vec::new()),
+        Mutable::new(Vec::new()),
+        Mutable::new(vec![slot("t921-leaver", marquee_node("chip"), &tx)]),
+        Mutable::new(Vec::new()),
+        Mutable::new(Vec::new()),
+        Mutable::new(vec![slot("t921-leaver", marquee_node("panel"), &tx)]),
+    ];
+    let bar_left = mailboxes[3].clone();
+    let panels = mailboxes[6].clone();
+
+    let mut releaser = pin!(drive_scope_releaser(live_plugin_ids_signal(mailboxes)));
+    // The first emission only seeds "who is here"; nothing has left yet.
+    step(&mut releaser);
+    assert_eq!(preem_render::instance_count(&card), 1);
+
+    // Teardown's order (`session.rs:812-824`): the six regions first…
+    bar_left.set(Vec::new());
+    step(&mut releaser);
+    assert_eq!(
+        preem_render::instance_count(&card),
+        1,
+        "a plugin still in the panel list has not left the host yet",
+    );
+    assert_eq!(preem_render::instance_count(&panel), 1);
+
+    // …then the panel list. Now the id is in no mailbox at all.
+    panels.set(Vec::new());
+    step(&mut releaser);
+    assert_eq!(
+        preem_render::instance_count(&card),
+        0,
+        "a departed plugin's card scope must be released with no region alive \
+         to run a retain loop (#921)",
+    );
+    assert_eq!(
+        preem_render::instance_count(&panel),
+        0,
+        "…and its panel scope too — both of a plugin's trees go when it does",
+    );
+}
+
+/// The repaint nudges the animation clock fires at up to 20 Hz must **not**
+/// reach the releaser's body (#921).
+///
+/// `request_remap` deliberately re-emits a mailbox whose contents are unchanged
+/// — that is how an advanced preem renderer reaches the screen. The releaser
+/// rides those same mailboxes, so without the membership projection and the
+/// `dedupe_cloned` in [`live_plugin_ids_signal`] it would rebuild a set and
+/// diff it 20 times a second forever, deep-cloning every plugin's `wire::Node`
+/// tree on the way.
+///
+/// **Deletion check:** removing `.dedupe_cloned()` turns the second assertion
+/// red — the nudge propagates and the combined signal yields a set that is
+/// equal to the previous one.
+#[test]
+fn a_repaint_nudge_does_not_wake_the_scope_releaser() {
+    let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+    let bar_left = Mutable::new(vec![slot("t921-steady", marquee_node("chip"), &tx)]);
+    let mailboxes: [Mutable<Vec<SlotRender>>; RENDER_MAILBOXES] = [
+        Mutable::new(Vec::new()),
+        Mutable::new(Vec::new()),
+        Mutable::new(Vec::new()),
+        bar_left.clone(),
+        Mutable::new(Vec::new()),
+        Mutable::new(Vec::new()),
+        Mutable::new(Vec::new()),
+    ];
+
+    let mut live = pin!(live_plugin_ids_signal(mailboxes));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        matches!(live.as_mut().poll_change(&mut cx), Poll::Ready(Some(_))),
+        "the first poll must yield the live set",
+    );
+
+    // The animation clock's nudge: same contents, re-emitted.
+    request_remap(&bar_left);
+    assert!(
+        matches!(live.as_mut().poll_change(&mut cx), Poll::Pending),
+        "a repaint nudge changes no membership, so it must not reach the \
+         releaser — it fires up to 20 times a second",
+    );
+
+    // A real join still does.
+    bar_left.set(vec![
+        slot("t921-steady", marquee_node("chip"), &tx),
+        slot("t921-newcomer", marquee_node("chip"), &tx),
+    ]);
+    assert!(
+        matches!(live.as_mut().poll_change(&mut cx), Poll::Ready(Some(_))),
+        "a plugin actually joining must reach the releaser",
+    );
+
+    preem_render::forget_scope(&Scope::card("t921-steady"));
 }

@@ -629,6 +629,23 @@ pub fn install() {
     // per tick while no preem widget is on screen.
     pump::install_preem_clock();
 
+    // Monitor-independent preem scope release (#921): forget a departed
+    // plugin's renderer instances from a subscriber to the render mailboxes
+    // themselves, rather than from a region's retain loop or a drawer child's
+    // teardown — both of which are per-monitor widgets, while a scope
+    // (`Scope::card` / `Scope::panel`, keyed without a connector) is not. With
+    // every output unplugged there is no region left to observe the leave, so
+    // before this the plugin's instances stayed resident for the session, and
+    // an animating one kept `any_animating()` — the predicate the clock above
+    // gates on, and #897's parking rests on — true forever.
+    //
+    // Wired here, beside the clock, because this is the one install path that
+    // runs regardless of how many monitors exist (or whether any do). Not
+    // `hytte::reactive::bind`: every `bind*` scopes its subscription to a
+    // widget's life, which is precisely the monitor-shaped lifetime being fixed
+    // — see [`pump::drive_scope_releaser`] for the full argument.
+    pump::install_scope_releaser();
+
     // Audio spectrum pump (#405): project the live `pipewire::audio_spectrum()`
     // (a services `AudioSpectrum`, or `None` while the tap is inactive) onto the
     // GTK-free wire `AudioSpectrum` and publish it on the watch channel the

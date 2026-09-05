@@ -12,11 +12,43 @@
 //!   `elapsed/total` off the [`NowPlaying`] digest's timing fields (#840),
 //! - a **16-band spectrum scope** (`spectrum::scope_tile`, mirroring the
 //!   preem-demo's tile),
-//! - the **LED peak/level strip** ([`hytte_plugin::preem::LedStrip`], the kit
+//! - the **LED peak/level strip** ([`hytte_plugin::display::LedStrip`], the kit
 //!   widget this issue adds): a row of discrete LEDs lighting with the overall
 //!   level, topped by a peak-hold dot that floats and decays, and
 //! - the **transport row** (#840): chunky prev / play-pause / next buttons that
 //!   drive the host's *active* player.
+//!
+//! # Three of the four displays speak preem state now (#884)
+//!
+//! The marquee, the time readout and the LED strip go through
+//! [`hytte_plugin::display`] rather than calling the raster kit by hand: against
+//! a shell that advertises the preem vocabulary in `HostMsg::Hello` each ships
+//! as a typed `Node::Preem` the shell draws and animates; against one that
+//! doesn't each CPU-rasterises to exactly the `Node::Pixels` it produced before,
+//! byte for byte (pinned by the tests below). Nothing in `view` branches on
+//! which host is on the other end.
+//!
+//! The **scroll offset moves shell-side**: the wire carries the banner text and
+//! a speed in dots per second, never a position, so a marquee showing an
+//! unchanged title sends *one* frame when the title changes instead of ~43 a
+//! second forever. [`MARQUEE_SPEED_DPS`] is the same rate
+//! [`MARQUEE_STEP`]-per-[`TICK`] gives plugin-side, so the two hosts scroll at
+//! one visual rate from one number (`the_two_scroll_rates_agree` pins it).
+//!
+//! The **meters' ballistics stay plugin-side**, and that is deliberate rather
+//! than an omission. Both LED values are attack-on-push / release-on-tick
+//! envelopes over the raw audio, and the wire has one number for the level: a
+//! *level* envelope has no wire form at all, and the strip's declarable
+//! [`peak_hold`](hytte_plugin::display::LedStrip::peak_hold) folds the level it
+//! is *given*, which here is already the fast-released bar value rather than the
+//! raw peak the dot follows. Declaring it would therefore change what the dot
+//! holds. So the card keeps both [`PeakHold`]s and states the two resulting
+//! numbers, which is byte-exact against an old shell and still replaces a
+//! ~25 KB RGBA buffer per frame with two floats against a new one.
+//!
+//! The **spectrum scope stays on the escape hatch**: `spectrum::scope_tile` is a
+//! hand-drawn 16-band bar tile, not the kit's glow-trace `Scope`, and the
+//! vocabulary has no word for it — exactly what `Frame::into_node` is for.
 //!
 //! # Transport — zero new protocol (#840)
 //!
@@ -87,12 +119,10 @@
 
 mod spectrum;
 
-use std::cell::RefCell;
 use std::time::Duration;
 
-use hytte_plugin::preem::{
-    DisplayStyle, Frame, LedStrip, Marquee, MarqueeStrip, PeakHold, dot_matrix,
-};
+use hytte_plugin::display::{DotMatrix, LedStrip, Marquee, StyleName};
+use hytte_plugin::preem::PeakHold;
 use hytte_plugin::proto::{
     Capability, Dir, Effect, EventKind, Manifest, MediaAction, Mount, Node, NowPlaying,
     SPECTRUM_BINS, StateKey,
@@ -102,8 +132,9 @@ use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View, tick_
 /// Stable plugin id — the host's mount-slot ownership key and audit-log subject.
 const PLUGIN_ID: &str = "audio-widget";
 
-// Node ids. The `Pixels` ids make each re-render swap its texture in place
-// instead of rebuilding the widget.
+// Node ids. Each display's id keys the host reconciler onto the *same* renderer
+// across renders — swapping a texture in place in raster mode, and (#882's
+// `preem_id` rule) keeping the shell-owned scroll continuous in state mode.
 const ROOT_ID: &str = "audio-widget-root";
 const MARQUEE_ID: &str = "audio-widget-marquee";
 const READOUT_ID: &str = "audio-widget-readout";
@@ -126,15 +157,18 @@ const ICON_NEXT: &str = "media-skip-forward-symbolic";
 
 /// The skin every widget wears. VFD (cyan glow on near-black) reads like a hi-fi
 /// display; its lit ink is accent-tinted by the SDK (#376) so the card matches
-/// the desktop out of the box.
-const STYLE: DisplayStyle = DisplayStyle::Vfd;
+/// the desktop out of the box. A wire [`StyleName`] since #884 — the skin
+/// travels to a preem-speaking shell as a *name*, never as resolved colors,
+/// which is what lets the shell re-tint every display live (#396).
+const STYLE: StyleName = StyleName::Vfd;
 
 /// The frame cadence: ~20 Hz, matching the spectrum push rate for a smooth
 /// animation without outrunning the data.
 const TICK: Duration = Duration::from_millis(50);
 
 /// The marquee window width in px — a wide ticker inside the ~296 px card.
-const MARQUEE_WINDOW_PX: usize = 268;
+/// A `u32` since #884: it is a wire config field now, not a kit builder arg.
+const MARQUEE_WINDOW_PX: u32 = 268;
 /// **Virtual pixels** (dots) the marquee pans per frame tick — one, the
 /// smallest step the display has: ≈20 dots/s at the 20 Hz [`TICK`], which
 /// reads as a classic ticker. The unit is the dot, not the buffer pixel
@@ -142,6 +176,16 @@ const MARQUEE_WINDOW_PX: usize = 268;
 /// keeps the text stepping grid-column to grid-column instead of smearing
 /// across dot positions the way the pre-#839 3-px step did.
 const MARQUEE_STEP: usize = 1;
+
+/// The **same** scroll rate stated for a shell that owns the offset (#884), in
+/// dots per second: [`MARQUEE_STEP`] dot per [`TICK`] is 1/0.05 s = 20 dots/s.
+///
+/// Two hosts, one visual rate from one number — the plugin integrates it via
+/// [`AudioWidget::marquee_offset`] when it owns the offset, and the shell
+/// integrates it on its own frame clock when it does.
+/// `the_two_scroll_rates_agree` pins the arithmetic so a change to either
+/// constant can't quietly desync them.
+const MARQUEE_SPEED_DPS: f32 = 20.0;
 
 /// Per-tick release (fall) rates, in level units — the meters' ballistics.
 /// The spectrum bars fall in ~1 s, the LED bar in ~0.4 s (a snappy VU release),
@@ -178,53 +222,6 @@ const MAX_TIME: &str = "99:59";
 enum Msg {
     /// One frame elapsed — advance the marquee and release the meters.
     Tick,
-}
-
-/// The rasterized marquee strip, cached by the exact text it was drawn from.
-///
-/// The preem [`Marquee`] API is render-**once**, then [`window`](MarqueeStrip::window)
-/// per frame (`crates/hytte-preem/src/marquee.rs`): `render` rasterizes the
-/// message into its font-space bitmap and paints the window's fixed ghost matrix
-/// once, while `window` only clones that backdrop and lights the dots the offset
-/// selects. But the SDK calls [`view`](AudioWidget::view)
-/// on every input — ~43×/s while visible (the 20 Hz tick + ~23 Hz spectrum
-/// push) — for marquee text that changes only when the track or the idle/active
-/// state flips (#560). So the strip is rasterized once per distinct text and
-/// merely windowed each frame.
-#[derive(Debug, Default)]
-struct MarqueeCache {
-    /// The cached `(text, strip)`: the strip rasterized from that exact text.
-    /// `None` before the first [`frame`](Self::frame).
-    entry: Option<(String, MarqueeStrip)>,
-    /// How many times the strip has been (re)rasterized — a test hook (see
-    /// `the_marquee_strip_is_cached`) proving the strip re-renders **iff** the
-    /// text changed. Not logical state, so it's `#[cfg(test)]`-only and never
-    /// rides in the shipped widget.
-    #[cfg(test)]
-    renders: u64,
-}
-
-impl MarqueeCache {
-    /// The `MARQUEE_WINDOW_PX`-wide marquee frame for `text` at scroll `offset`.
-    /// Re-rasterizes the strip only when `text` differs from the last render;
-    /// otherwise it just slides the window over the cached strip.
-    fn frame(&mut self, text: &str, offset: usize) -> Frame {
-        if self.entry.as_ref().is_none_or(|(t, _)| t.as_str() != text) {
-            let strip = Marquee::new(STYLE)
-                .window_px(MARQUEE_WINDOW_PX)
-                .render(text);
-            self.entry = Some((text.to_owned(), strip));
-            #[cfg(test)]
-            {
-                self.renders += 1;
-            }
-        }
-        self.entry
-            .as_ref()
-            .expect("populated above")
-            .1
-            .window(offset)
-    }
 }
 
 /// A microsecond duration as `MM:SS` (#840).
@@ -297,15 +294,26 @@ struct AudioWidget {
     /// marquee scrolls `title — artist` while `playing`, and falls back to the
     /// decorative banner otherwise (see [`AudioWidget::marquee_text`]).
     now_playing: NowPlaying,
-    /// The rasterized-marquee cache (#560). `RefCell` because [`view`](Self::view)
-    /// takes `&self` yet refills the cache lazily.
-    marquee_cache: RefCell<MarqueeCache>,
+    /// The scrolling ticker (#884). Holds the skin, the window and the scroll
+    /// *rate*; its plugin-side offset is re-stated from [`Self::frame`] on every
+    /// tick and is a no-op once the shell owns the scroll.
+    marquee: Marquee,
+    /// The `elapsed/total` time line (#884). Config only — a dot-matrix strip is
+    /// pure, so its whole state is the text handed to `node`.
+    readout: DotMatrix,
+    /// The LED peak/level strip (#884). Config only: no
+    /// [`peak_hold`](LedStrip::peak_hold) is declared, because both meters are
+    /// plugin-side envelopes (see the crate docs), so `view` clones this and
+    /// states the two numbers the model already holds.
+    leds: LedStrip,
 }
 
-// `PartialEq` is hand-written (not derived) to exclude `marquee_cache`: it's a
-// pure derived-render cache, so two models with equal logical state must compare
-// equal regardless of what either has cached — otherwise a stale/differing cache
-// could leak into the SDK's `view() != last_view` dedup or model equality.
+// `PartialEq` is hand-written (not derived) to exclude the three display
+// widgets: `readout` and `leds` are immutable config, and `marquee` carries only
+// the raster-side scroll offset, which is a pure function of `frame` (already
+// compared). Two models with equal logical state must compare equal regardless,
+// so no derived render state can leak into the SDK's `view() != last_view` dedup
+// or into model equality — the same rule the pre-#884 marquee cache followed.
 // (`Eq` stays underived: `bins` is `[f32; N]`, `PartialEq` but not `Eq`.)
 impl PartialEq for AudioWidget {
     fn eq(&self, other: &Self) -> bool {
@@ -347,8 +355,16 @@ impl AudioWidget {
     }
 
     /// One frame: advance the scroll and release every meter toward rest.
+    ///
+    /// The scroll is *stated*, not integrated (#884): this card's offset is a
+    /// pure function of its frame counter, which is exactly the case
+    /// [`Marquee::set_scroll_dots`] exists for. It is a no-op while the host
+    /// speaks preem — the shell integrates [`MARQUEE_SPEED_DPS`] on its own
+    /// frame clock there — so it is safe (and correct) to call unconditionally.
     fn tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
+        let dots = self.marquee_offset();
+        self.marquee.set_scroll_dots(dots);
         for b in &mut self.bins {
             *b = (*b - BIN_RELEASE).max(0.0);
         }
@@ -409,10 +425,9 @@ impl AudioWidget {
         }
     }
 
-    /// The marquee scroll offset, in whole dots.
-    /// [`MarqueeStrip::window`](hytte_plugin::preem::MarqueeStrip::window)
-    /// wraps it modulo the strip period, so the raw counter is fine; bound it
-    /// before the multiply so the product can never overflow.
+    /// The marquee scroll offset, in whole dots. The strip wraps it modulo its
+    /// own period, so the raw counter is fine; bound it before the multiply so
+    /// the product can never overflow.
     fn marquee_offset(&self) -> usize {
         let n = usize::try_from(self.frame % 1_000_000).unwrap_or(0);
         n.saturating_mul(MARQUEE_STEP)
@@ -458,7 +473,11 @@ impl Plugin for AudioWidget {
             level: PeakHold::new(LEVEL_RELEASE),
             peak: PeakHold::new(PEAK_RELEASE),
             now_playing: NowPlaying::default(),
-            marquee_cache: RefCell::default(),
+            marquee: Marquee::new(STYLE)
+                .window_px(MARQUEE_WINDOW_PX)
+                .speed_dots_per_sec(MARQUEE_SPEED_DPS),
+            readout: DotMatrix::new(STYLE),
+            leds: LedStrip::new(STYLE),
         }
     }
 
@@ -539,25 +558,25 @@ impl Plugin for AudioWidget {
 
     /// One vertical card: the dot-matrix marquee, the time readout, the spectrum
     /// scope and the LED peak/level strip — all in the VFD skin — over the
-    /// transport row. Every `Pixels` buffer satisfies the host's
-    /// `len == w * h * 4` invariant by kit construction, and every widget fits
-    /// the ~296 px sidebar content width. No `.card`/`.ts-plugin-*` class — the
-    /// host's region wrapper supplies the card chrome.
+    /// transport row. Every widget fits the ~296 px sidebar content width, and
+    /// no `.card`/`.ts-plugin-*` class rides here — the host's region wrapper
+    /// supplies the card chrome.
+    ///
+    /// Three of the four displays lower through the #884 seam, landing as typed
+    /// `Node::Preem` or rasterised `Node::Pixels` depending on what the host
+    /// advertised, with no branch here; the spectrum tile is hand-drawn and
+    /// stays on `Frame::into_node`. In raster mode every buffer satisfies the
+    /// host's `len == w * h * 4` invariant by kit construction.
     fn view(&self) -> View {
-        // Render the marquee strip once per distinct text, then window it per
-        // frame (#560) — see [`MarqueeCache`]. `borrow_mut` is uncontended: the
-        // runtime never calls `view` reentrantly.
-        let marquee = self
-            .marquee_cache
-            .borrow_mut()
-            .frame(&self.marquee_text(), self.marquee_offset());
-        // Deliberately *not* cached the way the marquee is (#560): `dot_matrix`
-        // rasterizes one short fixed-width line with no font-space bitmap behind
-        // it, so it costs a fraction of the scope tile and the LED strip this
-        // same `view` already re-renders unconditionally every frame.
-        let readout = dot_matrix(&self.readout_text(), STYLE);
+        // The LED strip is a pure projection of the two meters the model already
+        // holds, so `view` clones the configured strip and states them. Neither
+        // setter animates anything: with no `peak_hold` declared the strip owns
+        // no plugin-side physics, and the explicit peak is the true inter-frame
+        // dot the slow-release `PeakHold` computed.
+        let mut leds = self.leds.clone();
+        leds.set_level(self.level.value());
+        leds.set_peak(Some(self.peak.value()));
         let scope = spectrum::scope_tile(&self.bins);
-        let leds = LedStrip::new(STYLE).render(self.level.value(), self.peak.value());
         // Spacer-flanked so the three buttons centre under the displays whatever
         // the card's width — `Node::Box` (not `Node::Row`) for the `spacing`
         // field, which is what keeps the circular buttons from butting together.
@@ -582,10 +601,10 @@ impl Plugin for AudioWidget {
             scroll: false,
             classes: Vec::new(),
             children: vec![
-                marquee.into_node(Some(MARQUEE_ID), Vec::new()),
-                readout.into_node(Some(READOUT_ID), Vec::new()),
+                self.marquee.node(MARQUEE_ID, &self.marquee_text()),
+                self.readout.node(READOUT_ID, &self.readout_text()),
                 scope.into_node(Some(SCOPE_ID), Vec::new()),
-                leds.into_node(Some(LEDS_ID), Vec::new()),
+                leds.node(LEDS_ID),
                 transport,
             ],
         }
@@ -600,15 +619,39 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVE_MSG, AudioWidget, ICON_PAUSE, ICON_PLAY, IDLE_MSG, MARQUEE_STEP, MAX_TIME, Msg,
-        NEXT_ID, PLAY_ID, PLUGIN_ID, PREV_ID, UNKNOWN_TIME, mmss, transport_action,
+        ACTIVE_MSG, AudioWidget, ICON_PAUSE, ICON_PLAY, IDLE_MSG, LEDS_ID, MARQUEE_ID,
+        MARQUEE_SPEED_DPS, MARQUEE_STEP, MARQUEE_WINDOW_PX, MAX_TIME, Msg, NEXT_ID, PLAY_ID,
+        PLUGIN_ID, PREV_ID, READOUT_ID, TICK, UNKNOWN_TIME, mmss, transport_action,
     };
-    use hytte_plugin::preem::font;
+    use hytte_plugin::display::{RenderMode, StyleName, testing::with_render_mode};
+    // Aliased rather than imported by name: the raster-parity tests below build
+    // the *kit* `Marquee`/`LedStrip` by hand, and the model holds the *display*
+    // wrappers of the same names — `kit::` keeps which is which unmissable.
+    use hytte_plugin::preem::{self as kit, DisplayStyle, font};
+    use hytte_plugin::proto::preem::PreemWidget;
     use hytte_plugin::proto::{
         AudioSpectrum, Effect, EventKind, MediaAction, Mount, Node, PluginMsg, SPECTRUM_BINS,
         StateKey, decode, encode,
     };
     use hytte_plugin::{Input, Plugin};
+
+    /// The kit window width the raster arm builds, as the kit's `usize`.
+    fn window_px() -> usize {
+        usize::try_from(MARQUEE_WINDOW_PX).expect("the window fits a usize")
+    }
+
+    /// Unwrap one migrated display's typed widget, checking the reconciler's key
+    /// and that a preem-speaking host got no pixels for it (#884).
+    fn preem<'a>(node: &'a Node, want_id: &str) -> &'a PreemWidget {
+        match node {
+            Node::Preem { id, widget, .. } => {
+                assert_eq!(id.as_deref(), Some(want_id), "the reconciler's key");
+                widget.as_ref()
+            }
+            Node::Pixels { .. } => panic!("a preem-speaking host must not get pixels"),
+            other => panic!("expected Node::Preem, got {other:?}"),
+        }
+    }
 
     /// One second in microseconds — the unit `NowPlaying`'s timing fields carry.
     const SEC: u64 = 1_000_000;
@@ -806,8 +849,8 @@ mod tests {
         assert!(m.active(), "a loud push reads as playing");
         assert_eq!(m.marquee_text(), ACTIVE_MSG);
         // The active banner overflows the window (scrolls); a step moves pixels.
-        let strip = hytte_plugin::preem::Marquee::new(super::STYLE)
-            .window_px(super::MARQUEE_WINDOW_PX)
+        let strip = kit::Marquee::new(DisplayStyle::Vfd)
+            .window_px(window_px())
             .render(ACTIVE_MSG);
         assert!(strip.scrolls(), "the active banner scrolls");
     }
@@ -1021,77 +1064,189 @@ mod tests {
         assert_eq!(m.marquee_offset() - o0, MARQUEE_STEP, "one tick, one step");
     }
 
-    /// The marquee strip is rasterized **once per distinct text** and merely
-    /// windowed per frame (#560): identical text over repeated `view()`s
-    /// re-renders nothing, advancing the scroll offset re-renders nothing, and a
-    /// text change (idle banner → active banner) re-rasterizes exactly once. The
-    /// rasterization count is read off the widget's own cache — no SDK hook.
+    /// The plugin's own scroll cadence and the rate it *states* for a
+    /// shell-owned scroll are the same number (#884): [`MARQUEE_STEP`] dot per
+    /// [`TICK`] is [`MARQUEE_SPEED_DPS`] dots per second, so the ticker moves at
+    /// one visual rate whichever host is on the other end.
+    ///
+    /// Pinned because the two live in different constants and nothing else would
+    /// notice them drifting apart — the raster arm never reads the speed, and
+    /// the state arm never reads the step.
     #[test]
-    fn the_marquee_strip_is_cached() {
+    fn the_two_scroll_rates_agree() {
+        // In `f64` off integer sources, so the check itself carries no cast.
+        let stated_per_tick = f64::from(MARQUEE_SPEED_DPS) * TICK.as_secs_f64();
+        let step = u32::try_from(MARQUEE_STEP).expect("a small whole-dot step");
+        assert!(
+            (stated_per_tick - f64::from(step)).abs() < 1e-6,
+            "the plugin steps {step} dot(s) per tick but tells the shell \
+             {MARQUEE_SPEED_DPS} dots/s, which is {stated_per_tick} per tick",
+        );
+    }
+
+    /// The migration's compat promise (#884): against a shell that does **not**
+    /// advertise the preem vocabulary, the three migrated displays must reach
+    /// the host as the exact same pixels the hand-written kit calls produced
+    /// before the seam existed — byte for byte, at a **fixed advance sequence**,
+    /// since the marquee's offset and the meters' ballistics are both time-driven.
+    ///
+    /// The sequence below is the card's real one: become visible, take a loud
+    /// push (which attacks both meters and flips the banner to `ACTIVE_MSG`),
+    /// then three frame ticks, which release the meters and walk the scroll
+    /// three dots. Nothing here would hold if the config translation were even
+    /// one field off.
+    #[test]
+    fn against_an_old_shell_the_three_displays_are_rasterised_kit_widgets() {
         let mut m = shown();
-        assert_eq!(m.marquee_text(), IDLE_MSG, "silent at rest");
-
-        // First view rasterizes the idle banner.
-        let _ = m.view();
-        assert_eq!(
-            m.marquee_cache.borrow().renders,
-            1,
-            "the first view rasterizes the strip"
-        );
-
-        // Same text over more views (offset unchanged) → no re-rasterization.
-        let _ = m.view();
-        let _ = m.view();
-        assert_eq!(
-            m.marquee_cache.borrow().renders,
-            1,
-            "identical text reuses the cached strip"
-        );
-
-        // A tick advances the scroll offset but not the text — still windowing,
-        // never re-rasterizing.
-        tick(&mut m);
-        assert_eq!(m.marquee_text(), IDLE_MSG, "still silent, same text");
-        let _ = m.view();
-        assert_eq!(
-            m.marquee_cache.borrow().renders,
-            1,
-            "advancing the window offset does not re-rasterize"
-        );
-
-        // A loud push flips the banner idle → active: exactly one re-rasterization.
+        let _ = m.update(timed_track(
+            "Chrome Rain",
+            "Choom",
+            true,
+            83 * SEC,
+            214 * SEC,
+        ));
         let _ = m.update(spectrum(0.9, 0, 0.9));
-        assert_eq!(m.marquee_text(), ACTIVE_MSG, "a loud push reads as playing");
-        let _ = m.view();
+        for _ in 0..3 {
+            tick(&mut m);
+        }
+
+        let tree = with_render_mode(RenderMode::Raster, || m.view().tree);
+        let Node::Box { children, .. } = &tree else {
+            panic!("the card root is a Box")
+        };
+
+        // The kit calls this card wrote by hand before #884, verbatim.
+        let marquee = kit::Marquee::new(DisplayStyle::Vfd)
+            .window_px(window_px())
+            .render(&m.marquee_text())
+            .window(m.marquee_offset())
+            .into_node(Some(MARQUEE_ID), vec![]);
+        let readout = kit::dot_matrix(&m.readout_text(), DisplayStyle::Vfd)
+            .into_node(Some(READOUT_ID), vec![]);
+        let leds = kit::LedStrip::new(DisplayStyle::Vfd)
+            .render(m.level.value(), m.peak.value())
+            .into_node(Some(LEDS_ID), vec![]);
+
+        // `==` rather than `assert_eq!`: these carry a `Node::Pixels`, whose
+        // `Debug` would dump the whole RGBA buffer into the failure output.
+        assert!(
+            children[0] == marquee,
+            "the raster marquee must match the kit"
+        );
+        assert!(
+            children[1] == readout,
+            "the raster readout must match the kit"
+        );
+        assert!(
+            children[3] == leds,
+            "the raster LED strip must match the kit"
+        );
+        // …and the hand-drawn spectrum tile is untouched by the migration.
+        assert!(
+            children[2]
+                == super::spectrum::scope_tile(&m.bins).into_node(Some(super::SCOPE_ID), vec![]),
+            "the scope tile stays on the escape hatch",
+        );
+    }
+
+    /// …and against a shell that advertises the vocabulary, the *same* `view`
+    /// ships typed state nodes for those three — same ids, same readings, the
+    /// skin as a name, the scroll rate stated rather than a position, and no
+    /// pixels except the hand-drawn scope tile (#884).
+    #[test]
+    fn against_a_preem_shell_the_three_displays_are_state_nodes() {
+        let mut m = shown();
+        let _ = m.update(timed_track(
+            "Chrome Rain",
+            "Choom",
+            true,
+            83 * SEC,
+            214 * SEC,
+        ));
+        let _ = m.update(spectrum(0.9, 0, 0.9));
+        tick(&mut m);
+
+        let tree = with_render_mode(RenderMode::State, || m.view().tree);
+        let Node::Box { children, .. } = &tree else {
+            panic!("the card root is a Box")
+        };
+
+        match preem(&children[0], MARQUEE_ID) {
+            PreemWidget::Marquee { config, state } => {
+                assert_eq!(state.text, m.marquee_text(), "the banner the shell scrolls");
+                assert_eq!(config.window_px, MARQUEE_WINDOW_PX);
+                assert!(
+                    (config.speed_dots_per_sec - MARQUEE_SPEED_DPS).abs() < 1e-6,
+                    "the wire carries a rate, and the shell owns the offset",
+                );
+                assert_eq!(config.style.style, StyleName::Vfd);
+            }
+            other => panic!("expected a marquee, got {other:?}"),
+        }
+        match preem(&children[1], READOUT_ID) {
+            PreemWidget::DotMatrix { config, state } => {
+                assert_eq!(state.text, m.readout_text(), "elapsed/total");
+                assert_eq!(config.style.style, StyleName::Vfd);
+            }
+            other => panic!("expected a dot-matrix strip, got {other:?}"),
+        }
+        match preem(&children[3], LEDS_ID) {
+            PreemWidget::LedStrip { config, state } => {
+                assert!((state.level - m.level.value()).abs() < 1e-6, "the bar");
+                assert_eq!(state.peak, Some(m.peak.value()), "the explicit dot");
+                assert!(
+                    config.peak_hold.is_none(),
+                    "no shell-owned fall: both envelopes are the plugin's own",
+                );
+                assert_eq!(config.style.style, StyleName::Vfd);
+            }
+            other => panic!("expected an LED strip, got {other:?}"),
+        }
+        // The spectrum tile has no vocabulary word and stays pixels in both modes.
+        assert!(
+            matches!(children[2], Node::Pixels { .. }),
+            "the hand-drawn scope tile is the escape hatch",
+        );
+    }
+
+    /// The scroll the shell will own and the scroll the plugin runs are the same
+    /// walk: after N ticks the marquee draws the window the raw counter selects,
+    /// and a state-mode session never moves the plugin-side offset at all
+    /// (`set_scroll_dots` is a no-op there) — so a reconnect to an old shell
+    /// re-derives it from `frame` on the very next tick rather than resuming
+    /// from a stale position.
+    #[test]
+    fn the_scroll_offset_is_raster_only_and_tracks_the_frame_counter() {
+        let mut m = shown();
+        with_render_mode(RenderMode::State, || {
+            for _ in 0..5 {
+                tick(&mut m);
+            }
+        });
+        assert_eq!(m.marquee_offset(), 5, "the model still counts frames");
         assert_eq!(
-            m.marquee_cache.borrow().renders,
-            2,
-            "a text change re-rasterizes the strip once"
+            m.marquee.scroll_dots(),
+            0,
+            "but the shell owns the scroll, so nothing moved plugin-side",
         );
 
-        // The active banner scrolls; ticking advances the offset and windows the
-        // same strip — still no re-rasterization.
+        // One raster tick re-states it from the counter — no drift carried over.
         tick(&mut m);
-        assert_eq!(
-            m.marquee_text(),
-            ACTIVE_MSG,
-            "the peak lingers, still active"
-        );
-        let _ = m.view();
-        assert_eq!(
-            m.marquee_cache.borrow().renders,
-            2,
-            "scrolling the active banner windows the cached strip"
-        );
+        assert_eq!(m.marquee.scroll_dots(), m.marquee_offset());
+        assert_eq!(m.marquee.scroll_dots(), 6);
     }
 
     /// Every `Pixels` buffer honors the host's `len == w*h*4` seam and the ~296 px
     /// sidebar content width — across silent and loud states.
+    ///
+    /// Raster mode explicitly (#884): against a preem-speaking host three of the
+    /// four displays carry no buffer at all, and this is the arm where the
+    /// invariant has to hold.
     #[test]
     fn every_view_pixels_is_valid_and_fits_the_card() {
         let mut m = shown();
         for _ in 0..4 {
-            let bufs = pixels_of(&m.view().tree);
+            let bufs = with_render_mode(RenderMode::Raster, || pixels_of(&m.view().tree));
             assert_eq!(bufs.len(), 4, "marquee + readout + scope + LED strip");
             for (w, h, len) in bufs {
                 assert_eq!(len, (w as usize) * (h as usize) * 4);

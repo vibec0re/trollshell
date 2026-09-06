@@ -32,11 +32,20 @@
 //! `lcd` its hot pink sits on the olive field and will look washed out, which is
 //! the pin contract on glass rather than a regression. `ROLE` resolves a
 //! *semantic role*, and since #939 the shell offers that resolved color to the
-//! skin before pinning it (`DisplayStyle::admit_ink`): on `lcd` it comes back
-//! darkened far enough to clear WCAG AA against the olive field, and on the
-//! `AsGiven` skins (`vfd`/`oled`/`crt`) it comes back verbatim. So `ROLE` and
-//! `PIN.` differ on purpose — a role is the *shell's* answer and the skin gets
-//! a say in it; a pin is the author's and the skin does not.
+//! skin before pinning it — since #940 through `DisplayStyle::admit_role_ink`,
+//! which holds **WCAG AA on every skin**: darkened toward the ink on `lcd`,
+//! lightened toward the phosphor on `vfd`/`oled`/`crt`, and passed through
+//! byte-for-byte wherever the theme color was already legible (libadwaita's
+//! whole dark trio, on all three dark panels). Rotate under a **light** desktop
+//! theme to see the half that moved: the light `@error_color` used to land on a
+//! phosphor at 3.1–3.3:1 and now clears 4.5:1.
+//!
+//! The **accent** is deliberately not that: it still lands verbatim on
+//! `vfd`/`oled`/`crt` (`DisplayStyle::admit_ink`, the per-skin `AccentPolicy`),
+//! because a phosphor's identity is its accent while a status role is a signal
+//! that has to be read. So `ROLE` and `PIN.` differ on purpose — a role is the
+//! *shell's* answer and the skin gets a say in it; a pin is the author's and the
+//! skin does not.
 //!
 //! It doubles as the visual regression harness and the copy-from reference for
 //! plugin authors — which since #884 means it is the reference for **one code

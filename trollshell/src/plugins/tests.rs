@@ -6029,31 +6029,43 @@ fn resolved_ink(style: vocab::StyleRef) -> kit::Rgba {
     }
 }
 
-/// **#935, the property.** Every libadwaita status color, on every skin, is what
-/// that skin admits — which on the reflective `Lcd` means it clears WCAG AA
-/// against the field it is actually painted on, and on the three dark panels
-/// means it arrives untouched.
+/// **#935's property, widened to #940's.** Every libadwaita status color, on
+/// **every** skin, clears WCAG AA against the field it is actually painted on.
 ///
-/// The claim is deliberately *not* "AA everywhere". `AccentPolicy::AsGiven` on
-/// `Vfd`/`Oled`/`Crt` is #933's settled design and says so in its own rustdoc —
-/// and measured, the light-theme trio lands at 3.15–3.95:1 on those fields, so a
-/// blanket AA assertion would have to override the skins to pass. What the shell
-/// owes is that it *asks*: the three concrete assertions below are the outcome,
-/// and the equality against [`kit::DisplayStyle::admit_ink`] is the anti-drift
-/// one (the shell must route through the kit's seam, not re-implement a ramp
-/// beside it — #933's `the_public_seam_answers_what_the_render_path_does` is the
-/// mirror of it on the kit side).
+/// #939 could only claim that for the `Lcd`: it asked the skin through
+/// [`kit::DisplayStyle::admit_ink`], which runs the per-skin `AccentPolicy`, and
+/// that policy is `AsGiven` on `Vfd`/`Oled`/`Crt` — so the light-theme trio was
+/// arriving there verbatim at **3.15–3.95:1**, nine of the eighteen
+/// role×dark-skin pairs below the bar. #940 chose option B: the shell asks
+/// through [`kit::DisplayStyle::admit_role_ink`] instead, the seam that holds AA
+/// on all four skins because a status role is a *signal*, not the desktop's
+/// identity.
+///
+/// Three claims, and the split between them is the design:
+///
+/// 1. **AA everywhere**, for all six colors on all four skins — the acceptance
+///    #935 asked for.
+/// 2. The equality against the kit seam is the **anti-drift** one: the shell
+///    must route through the kit, not re-implement a ramp beside it (#933's
+///    `the_public_seam_answers_what_the_render_path_does` is its mirror on the
+///    kit side).
+/// 3. The **accent** seam is asserted unmoved on the dark three in the same
+///    loop, on the same colors: `admit_ink` still hands them back verbatim. That
+///    is what "accent as given, roles to legible" means as an inequality, and it
+///    is the half a mutation that routed everything through one seam would
+///    break.
 ///
 /// Resolution rather than pixels because three of the four skins bloom or mask
 /// their lit layer, which would make a "find the fully-lit pixel" assertion a
 /// claim about the post-passes. The rendered half is
-/// [`a_role_renders_exactly_like_its_pin_on_the_dark_skins_and_never_on_the_lcd`]
+/// [`a_role_renders_like_its_pin_exactly_where_the_theme_color_was_already_legible`]
 /// and [`the_admitted_role_inks_on_the_lcd_are_pinned_to_their_bytes`].
 ///
-/// **Deletion check:** restoring the pre-#935 arm (`.map_or(Ink::Default,
-/// Ink::Fixed)` — the role color pinned unadmitted) turns this red at the seam
-/// equality, `[100, 236, 165, 255]` against `[45, 71, 48, 255]`; the `Lcd` AA
-/// assertion is the next one behind it, at 1.06–2.87:1. Hard-coding
+/// **Deletion check:** reverting the role arm to `admit_ink` (#939's call) turns
+/// this red on the light trio at `vfd`/`oled`/`crt`, `[0, 124, 61, 255]` at
+/// 3.745:1 where AA was owed. Restoring the pre-#935 arm (`.map_or(Ink::Default,
+/// Ink::Fixed)` — the role color pinned unadmitted) reds the seam equality on
+/// the `Lcd`, `[100, 236, 165, 255]` against `[45, 71, 48, 255]`. Hard-coding
 /// `DisplayStyle::Lcd` instead of `display_style(style)` reds the same equality
 /// from the other side, on `vfd`.
 #[test]
@@ -6078,8 +6090,8 @@ fn every_status_role_color_is_admitted_by_the_skin_it_renders_on() {
 
             assert_eq!(
                 resolved,
-                skin.admit_ink(color, None),
-                "{label} on {}: the shell must hand the color to the skin's own seam",
+                skin.admit_role_ink(color, None),
+                "{label} on {}: the shell must hand the color to the skin's own role seam",
                 skin.name(),
             );
             assert!(
@@ -6088,17 +6100,19 @@ fn every_status_role_color_is_admitted_by_the_skin_it_renders_on() {
                  ({raw:.3}:1 became {got:.3}:1)",
                 skin.name(),
             );
-            if skin == kit::DisplayStyle::Lcd {
-                assert!(
-                    got >= kit::AA_TEXT,
-                    "{label} on the lcd field: {color:?} read at {raw:.3}:1 and the skin \
-                     handed back {resolved:?} at {got:.3}:1, still below AA — this is #935",
-                );
-            } else {
+            assert!(
+                got >= kit::AA_TEXT,
+                "{label} on the {} field: {color:?} read at {raw:.3}:1 and the skin \
+                 handed back {resolved:?} at {got:.3}:1, still below AA — this is #940",
+                skin.name(),
+            );
+
+            if skin != kit::DisplayStyle::Lcd {
                 assert_eq!(
-                    resolved,
+                    skin.admit_ink(color, None),
                     color,
-                    "{label} on {}: a dark panel is `AsGiven`, so the role color is verbatim",
+                    "{label} on {}: …while the *accent* seam is untouched — a dark panel is \
+                     still `AsGiven`, which is what #940 option B deliberately kept",
                     skin.name(),
                 );
             }
@@ -6119,11 +6133,11 @@ fn every_status_role_color_is_admitted_by_the_skin_it_renders_on() {
 /// *light* pinned ground the role still has to be darkened, and to a different
 /// stop than the skin's own field would have chosen.
 ///
-/// **Deletion check:** passing `None` instead of `style.field` to `admit_ink`
-/// turns the lilac assertion red — `[45, 71, 48, 255]` where the role color
-/// belonged, which is 1.348:1 on that ground — and reds **only** this test out
-/// of the module's 121, so it is an alarm on its own wire rather than a second
-/// bell on the admission itself.
+/// **Deletion check:** passing `None` instead of `style.field` to
+/// `admit_role_ink` turns the lilac assertion red — `[45, 71, 48, 255]` where
+/// the role color belonged, which is 1.348:1 on that ground — and reds **only**
+/// this test out of the module's 121, so it is an alarm on its own wire rather
+/// than a second bell on the admission itself.
 #[test]
 fn a_pinned_field_moves_the_ground_a_role_is_admitted_against() {
     let _ink = preem_ink_lock();
@@ -6273,27 +6287,39 @@ fn an_explicit_ink_pin_is_never_admitted_even_where_the_lcd_cannot_carry_it() {
     );
 }
 
-/// **The dark skins do not move.** A role-tinted render is byte-identical to the
-/// same color arriving as an explicit pin on `Vfd`/`Oled`/`Crt` — which is what
-/// `AccentPolicy::AsGiven` means — and is *not* on the `Lcd`, which is #935.
+/// **A role renders exactly like its pin iff the theme color was already
+/// legible on that skin's field** — the rendered half of #940, and now one rule
+/// for all four skins instead of a per-skin table.
 ///
-/// Comparing against the pin rather than against a recorded baseline is what
-/// makes this non-vacuous without a golden: the pin path provably never touches
-/// the admission ([`an_explicit_ink_pin_is_never_admitted_even_where_the_lcd_cannot_carry_it`]),
+/// Before #940 the split was by *skin*: `AsGiven` meant a role on
+/// `Vfd`/`Oled`/`Crt` was never touched, whatever it was, and every role on the
+/// `Lcd` was. Option B replaces that with a split by *measurement* — a color
+/// that clears `AA_TEXT` on the ground it will be drawn on is stop 0 of the ramp
+/// and comes back byte-for-byte; one that does not is tinted. That partitions
+/// exactly this table's 24 pairs into the 9 that pass through (libadwaita's dark
+/// trio, on the three dark panels) and the 15 that move (everything on the
+/// `Lcd`, plus the light trio everywhere).
+///
+/// The predicate is computed from the color, not written out as a list, which is
+/// what makes it a rule rather than a recording. Comparing against the *pin*
+/// rather than against a recorded baseline is what makes it non-vacuous without
+/// a golden: the pin path provably never touches the admission
+/// ([`an_explicit_ink_pin_is_never_admitted_even_where_the_lcd_cannot_carry_it`]),
 /// so an equal frame is a frame the admission left alone, all the way through
 /// bloom, ghost and the CRT mask.
 ///
-/// **Deletion check:** giving the dark skins `TintToLegible` is a kit-side
-/// change this file cannot make; the shell-side mutation that reds it is
-/// asking the *wrong* skin — hard-coding `DisplayStyle::Lcd` in `ink_for`
-/// instead of `display_style(style)` — which reds it at "dark `@success_color`
-/// on vfd: `AsGiven` means not one byte moves". The pre-#935 arm reds it from
-/// the other direction, at the `Lcd` inequality.
+/// **Deletion check:** reverting the role arm to `admit_ink` reds the light
+/// trio's three dark-skin rows — the frames come back equal where the rule says
+/// they must differ. Asking the *wrong* skin (hard-coding `DisplayStyle::Lcd` in
+/// `ink_for` instead of `display_style(style)`) reds "dark `@success_color` on
+/// vfd", which the rule says is a passthrough. The pre-#935 arm reds every
+/// tinted row at once.
 #[test]
-fn a_role_renders_exactly_like_its_pin_on_the_dark_skins_and_never_on_the_lcd() {
+fn a_role_renders_like_its_pin_exactly_where_the_theme_color_was_already_legible() {
     let _ink = preem_ink_lock();
     let _roles = role_ink_reset();
-    let scope = Scope::detached("935-dark-parity");
+    let scope = Scope::detached("940-role-parity");
+    let (mut same, mut moved) = (0_u32, 0_u32);
 
     for (index, (label, role, color)) in LIBADWAITA_ROLES.into_iter().enumerate() {
         for (name, skin) in vocab::StyleName::ALL
@@ -6315,22 +6341,38 @@ fn a_role_renders_exactly_like_its_pin_on_the_dark_skins_and_never_on_the_lcd() 
                     vocab::StyleRef::new(name).with_ink(color),
                 ),
             );
-            if skin == kit::DisplayStyle::Lcd {
-                assert_ne!(
-                    by_role, by_pin,
-                    "{label} on the lcd: the role is admitted and the pin is not, \
-                     so the two frames must differ",
-                );
-            } else {
+            let legible = kit::contrast_ratio(color, skin.field()) >= kit::AA_TEXT;
+            if legible {
+                same += 1;
                 assert_eq!(
                     by_role,
                     by_pin,
-                    "{label} on {}: `AsGiven` means not one byte moves",
+                    "{label} on {}: it already read at {:.3}:1, so the skin has nothing to \
+                     admit and not one byte may move",
                     skin.name(),
+                    kit::contrast_ratio(color, skin.field()),
+                );
+            } else {
+                moved += 1;
+                assert_ne!(
+                    by_role,
+                    by_pin,
+                    "{label} on {}: it read at {:.3}:1, below AA, so the role is admitted \
+                     and the pin is not — the two frames must differ",
+                    skin.name(),
+                    kit::contrast_ratio(color, skin.field()),
                 );
             }
         }
     }
+
+    // Neither branch may be vacuous: the point of the rule is that both happen,
+    // and #940's whole change is that `moved` grew from 6 to 15.
+    assert_eq!(
+        (same, moved),
+        (9, 15),
+        "9 of the 24 role×skin pairs are passthroughs and 15 are tinted",
+    );
 
     preem_render::forget_scope(&scope);
 }

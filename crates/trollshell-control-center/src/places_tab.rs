@@ -397,7 +397,14 @@ impl Editor {
         page.add(&self.list_group(index, ListField::Lines, None));
         page.add(&self.list_group(index, ListField::Directions, None));
 
-        let header = adw::HeaderBar::new();
+        // The shared no-window-controls header bar (#944, `plugins_tab`'s
+        // `tab_header_bar`): this page is pushed into the tab's own
+        // `AdwNavigationView`, itself mounted inside `crate::build_window`'s
+        // `AdwApplicationWindow`, which already draws the window's real
+        // controls in its own header bar. `adw::HeaderBar::new()` here would
+        // draw a second `GtkWindowControls` cluster — the #943 shape,
+        // reused rather than duplicated.
+        let header = crate::plugins_tab::tab_header_bar();
         let delete = gtk::Button::builder()
             .icon_name("user-trash-symbolic")
             .tooltip_text("Delete this place")
@@ -1052,5 +1059,160 @@ mod tests {
         assert_eq!(as_usize(f64::NAN), 0);
         assert_eq!(as_u32(f64::NEG_INFINITY), 0);
         assert_eq!(as_usize(f64::INFINITY), 4096);
+    }
+}
+
+/// The window-controls-duplication regression for the Places tab's pushed
+/// detail page (#944, `#943`'s residual #2) — the same shape as
+/// `plugins_tab`'s `the_tab_draws_no_window_controls`, needing the same
+/// `system-tests` gate for the same reason (geometry/mapped-state assertions
+/// need a real display).
+///
+/// Drives [`Editor`] directly with one fabricated place rather than going
+/// through [`build_page`]: that function calls
+/// [`hytte_config::places::load_places`], which reads (and, on a missing
+/// file, *writes*) the real `$HOME/.config/trollshell/places.toml` — a test
+/// process must never touch a user's actual config file. `Editor::open` is
+/// exactly the method under test (it builds the pushed page, header bar and
+/// all), and it only ever reads `self.base`, so seeding that directly is
+/// enough.
+#[cfg(all(test, feature = "system-tests"))]
+mod gtk_tests {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use adw::prelude::*;
+    use gtk::glib;
+    use hytte_config::places::Place;
+
+    use super::Editor;
+
+    /// Run the GTK main loop until it has nothing left to dispatch, so a
+    /// queued push/allocation actually happens.
+    fn pump() {
+        while glib::MainContext::default().iteration(false) {}
+    }
+
+    /// Build the Places tab's `Editor` around one fabricated place, with no
+    /// file I/O and no `Control` call — see the module doc above for why this
+    /// doesn't call [`super::build_page`].
+    fn build_editor() -> (adw::ToastOverlay, Editor) {
+        let nav = adw::NavigationView::new();
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_child(Some(&nav));
+
+        let list = adw::PreferencesGroup::new();
+        let editor = Editor {
+            base: Rc::new(RefCell::new(vec![Place::new("Home", 52.4556, 13.5085)])),
+            nav: nav.clone(),
+            list: list.clone(),
+            rows: Rc::new(RefCell::new(Vec::new())),
+            resolved: Rc::new(RefCell::new(None)),
+            status_row: adw::ActionRow::builder().title("Current place").build(),
+            auto_switch: adw::SwitchRow::builder()
+                .title("Automatic location")
+                .build(),
+            toasts: toasts.clone(),
+            syncing: Rc::new(Cell::new(false)),
+        };
+        editor.rebuild();
+
+        let page = adw::PreferencesPage::new();
+        page.add(&list);
+        nav.add(&adw::NavigationPage::new(&page, "Places"));
+
+        (toasts, editor)
+    }
+
+    /// Every `GtkWindowControls` under `root`, at any depth — the same walk
+    /// `plugins_tab`'s test of the same name uses. Kept file-local rather than
+    /// shared: it's a few lines of private tree-walking and each test module
+    /// already owns its own fixtures (`build_editor` above vs. `build_tab`
+    /// over there).
+    fn window_controls_under(root: &gtk::Widget) -> Vec<gtk::WindowControls> {
+        let mut found = Vec::new();
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            if let Ok(controls) = widget.clone().downcast::<gtk::WindowControls>() {
+                found.push(controls);
+            }
+            found.extend(window_controls_under(&widget));
+            child = widget.next_sibling();
+        }
+        found
+    }
+
+    /// Mounted the way `crate::build_window` mounts every tab: inside an
+    /// `AdwApplicationWindow` at the real 760 × 560 default, under an
+    /// `AdwToolbarView` whose top bar is the app's own header bar (with a view
+    /// switcher, standing in for the real one's three tabs). That context is
+    /// the entire bug (#943/#944): a second `AdwHeaderBar` left on its
+    /// defaults draws its own `GtkWindowControls` inside a window that
+    /// already has one from the app's own header.
+    ///
+    /// The root "Places" list page carries no header bar of its own at all
+    /// (see the module doc), so only the **pushed** per-place detail page can
+    /// be the offender — hence `editor.open(0)` before the assertions.
+    ///
+    /// Falsified by reverting `Editor::detail`'s header back to
+    /// `adw::HeaderBar::new()`: depending on the harness' virtual display,
+    /// that failure can show up as "mapped at 0 px" rather than a visibly
+    /// wide cluster (#944's own probe found exactly that), which is why this
+    /// asserts presence-and-mapped rather than width — same reasoning
+    /// `plugins_tab`'s sibling test documents.
+    #[gtk::test]
+    fn the_tab_draws_no_window_controls() {
+        adw::init().expect("libadwaita init");
+        let (bin, editor) = build_editor();
+
+        let stack = adw::ViewStack::new();
+        stack.add_titled_with_icon(&bin, Some("places"), "Places", "mark-location-symbolic");
+        let switcher = adw::ViewSwitcher::builder()
+            .stack(&stack)
+            .policy(adw::ViewSwitcherPolicy::Wide)
+            .build();
+        let header = adw::HeaderBar::builder().title_widget(&switcher).build();
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&stack));
+        let window = adw::ApplicationWindow::builder()
+            .title("trollshell Control Center")
+            .default_width(760)
+            .default_height(560)
+            .content(&toolbar)
+            .build();
+        window.present();
+        pump();
+
+        // Push the one place's detail page — after the window is already up,
+        // matching how a real click would arrive once the app is on screen.
+        editor.open(0);
+        pump();
+
+        let app_controls: Vec<gtk::WindowControls> = window_controls_under(header.upcast_ref())
+            .into_iter()
+            .filter(gtk::prelude::WidgetExt::is_mapped)
+            .collect();
+        assert!(
+            !app_controls.is_empty(),
+            "the window's own header bar must keep its controls — without them this test cannot \
+             tell 'no controls in the tab' from 'no controls anywhere'"
+        );
+
+        let stray: Vec<gtk::WindowControls> = window_controls_under(bin.upcast_ref())
+            .into_iter()
+            .filter(gtk::prelude::WidgetExt::is_mapped)
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "the Places tab's pushed detail page draws {} mapped GtkWindowControls of its own \
+             (first is {}px wide) — a second close/minimise/maximise cluster inside the window",
+            stray.len(),
+            stray.first().map_or(0, gtk::prelude::WidgetExt::width)
+        );
+
+        window.set_content(None::<&gtk::Widget>);
+        window.destroy();
+        pump();
     }
 }

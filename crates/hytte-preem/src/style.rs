@@ -786,6 +786,119 @@ pub(crate) struct Bloom {
     pub strength: u16,
 }
 
+// ── the palette as plain data (#893 stage B) ────────────────────────────────
+
+/// A resolved [`Palette`] as **plain, public data** — every number a renderer
+/// outside this crate needs to reproduce what the kit's composite does.
+///
+/// [`Palette`] itself is `pub(crate)` and stays that way: it is the kit's own
+/// internal currency, and widening it would make every field a compatibility
+/// promise. What #893's GPU renderer needs is narrower and honest as a
+/// snapshot — the ink and field it composites toward, plus the two post-pass
+/// parameter sets — so it gets a copy, taken at one instant, through
+/// [`palette_snapshot`].
+///
+/// **Additive only.** Nothing in the kit reads this type; no render path
+/// changed to produce it. It is a projection of [`Palette`] and the tests
+/// beside it assert that projection is byte-exact, so the two cannot drift
+/// without going red.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaletteSnapshot {
+    /// The screen field every widget floods first ([`Palette::bg`]).
+    pub bg: Rgba,
+    /// Lit ink at full intensity; partial intensity mixes toward it
+    /// ([`Palette::ink`]).
+    pub ink: Rgba,
+    /// Unlit elements, painted flat; `None` skips the ghost pass (the OLED
+    /// case). Carried for completeness — the `Scope` has no ghost pass, but a
+    /// second GL widget will.
+    pub ghost: Option<Rgba>,
+    /// The post-pass halo, `None` for glow-free skins (the LCD case).
+    pub bloom: Option<BloomSnapshot>,
+    /// The CRT screen-space attenuation, `None` for every other skin.
+    pub mask: Option<MaskSnapshot>,
+}
+
+/// [`Bloom`] as plain data: a `radius` box blur of the lit layer, scaled by
+/// `strength`/256 and max-combined under the original intensities.
+///
+/// The blur is **separable and truncating** — a horizontal pass then a vertical
+/// one, each dividing by a constant `2 * radius + 1` window *even where the
+/// window clips at an edge*. A renderer reproducing it has to do both passes
+/// with the same integer truncation; a single 2-D pass, or a float divide,
+/// gives different bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BloomSnapshot {
+    /// Box-blur radius in emission pixels; the window is `2 * radius + 1`.
+    pub radius: usize,
+    /// Halo strength in 256ths, applied to the blurred grid before the max.
+    pub strength: u16,
+}
+
+/// [`Mask`] as plain data: the CRT pass's scanline comb and vignette.
+///
+/// Both are pure functions of `(x, y, width, height)` and these four numbers —
+/// no state, no clock — which is exactly what makes them reproducible in a
+/// fragment shader. See [`Mask`] for what each one means and why it is the
+/// value it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaskSnapshot {
+    /// Scanline comb pitch, in emission rows.
+    pub pitch: usize,
+    /// Comb phase: a row is dimmed when `y % pitch == phase`.
+    pub phase: usize,
+    /// Light kept on a comb row, in 256ths.
+    pub scanline_keep: u32,
+    /// Light kept at the screen's extreme corner, in 256ths.
+    pub corner_keep: u32,
+}
+
+/// The palette `style` would render with **right now**, as plain data.
+///
+/// Resolved **through [`DisplayStyle::palette`]**, deliberately and not by
+/// reimplementing the precedence: the `with_pins` scope beats the [`set_accent`]
+/// session accent beats the skin's own ink, the pinned field is chosen before
+/// the ink policy is evaluated against it, and the ghost/bloom/mask stay the
+/// skin's. All of that is one rule with one implementation, and this returns
+/// what that implementation answered — so a host that resolves a semantic role
+/// or an author's pin gets the same colors on the GPU that the CPU kit would
+/// have drawn.
+///
+/// Call it **inside** the same `with_pins` scope the render would have run in;
+/// outside one it answers for [`Pins::default`] plus the session accent, which
+/// is what a plugin's own render sees.
+///
+/// ```
+/// use hytte_preem::{DisplayStyle, Ink, Pins, palette_snapshot, with_pins};
+///
+/// let pinned = with_pins(
+///     Pins { ink: Ink::Fixed([0xff, 0x00, 0x00, 0xff]), field: None },
+///     || palette_snapshot(DisplayStyle::Vfd),
+/// );
+/// assert_eq!(pinned.ink, [0xff, 0x00, 0x00, 0xff]);
+/// // …and the panel's own character is untouched by the pin.
+/// assert_eq!(pinned.bg, palette_snapshot(DisplayStyle::Vfd).bg);
+/// ```
+#[must_use]
+pub fn palette_snapshot(style: DisplayStyle) -> PaletteSnapshot {
+    let palette = style.palette();
+    PaletteSnapshot {
+        bg: palette.bg,
+        ink: palette.ink,
+        ghost: palette.ghost,
+        bloom: palette.bloom.map(|bloom| BloomSnapshot {
+            radius: bloom.radius,
+            strength: bloom.strength,
+        }),
+        mask: palette.mask.map(|mask| MaskSnapshot {
+            pitch: mask.pitch,
+            phase: mask.phase,
+            scanline_keep: mask.scanline_keep,
+            corner_keep: mask.corner_keep,
+        }),
+    }
+}
+
 // ── The CRT pass (#397) ──────────────────────────────────────────────────────
 
 /// Fixed-point one for a mask factor, in 256ths — the same convention
@@ -1231,8 +1344,83 @@ fn box_blur(src: &[u16], w: usize, h: usize, r: usize) -> Vec<u16> {
 mod tests {
     use super::{
         BLACK, Bloom, DisplayStyle, Emission, Frame, Ink, Pins, WHITE, admit, contrast, mix,
-        scoped_pins, with_ink, with_pins,
+        palette_snapshot, scoped_pins, with_ink, with_pins,
     };
+
+    // ── the plain-data palette snapshot (#893 stage B) ──────────────────────
+
+    /// The snapshot is a **projection** of the palette the CPU kit renders
+    /// with, byte for byte, on every skin and through every pin arm.
+    ///
+    /// This is the whole contract, and it is worth an exhaustive comparison
+    /// rather than a spot check: #893's GPU renderer composites toward
+    /// `snapshot.ink` over `snapshot.bg` while the CPU kit composites toward
+    /// `palette().ink` over `palette().bg`, so any drift between the two shows
+    /// up as a colour difference in a parity harness measured in ΔE — which is
+    /// a much worse way to find out than a failing equality here.
+    ///
+    /// Both sides are read in the **same** pin scope at the same instant, so
+    /// the process-wide accent (an atomic other tests may be moving in
+    /// parallel) cannot make this flaky: whatever it is, both calls see it.
+    ///
+    /// **Falsified** by swapping `bg` and `ink` in `palette_snapshot`, or by
+    /// dropping any of the four `map`ped fields.
+    #[test]
+    fn the_snapshot_is_the_palette_the_kit_renders_with() {
+        let pins = [
+            Pins::default(),
+            Pins::from(Ink::Base),
+            Pins::from(Ink::Fixed([0x12, 0x34, 0x56, 0xff])),
+            Pins {
+                ink: Ink::Default,
+                field: Some([0x2a, 0x1e, 0x3c, 0xff]),
+            },
+            Pins {
+                ink: Ink::Fixed([0xff, 0xa5, 0x00, 0xff]),
+                field: Some([0x08, 0x08, 0x08, 0xff]),
+            },
+        ];
+        for style in DisplayStyle::ALL {
+            for scope in pins {
+                let (snapshot, palette) =
+                    with_pins(scope, || (palette_snapshot(style), style.palette()));
+                assert_eq!(snapshot.bg, palette.bg, "{style:?} {scope:?}: field");
+                assert_eq!(snapshot.ink, palette.ink, "{style:?} {scope:?}: ink");
+                assert_eq!(snapshot.ghost, palette.ghost, "{style:?} {scope:?}: ghost");
+                assert_eq!(
+                    snapshot.bloom.map(|b| (b.radius, b.strength)),
+                    palette.bloom.map(|b| (b.radius, b.strength)),
+                    "{style:?} {scope:?}: bloom"
+                );
+                assert_eq!(
+                    snapshot
+                        .mask
+                        .map(|m| (m.pitch, m.phase, m.scanline_keep, m.corner_keep)),
+                    palette
+                        .mask
+                        .map(|m| (m.pitch, m.phase, m.scanline_keep, m.corner_keep)),
+                    "{style:?} {scope:?}: mask"
+                );
+            }
+        }
+    }
+
+    /// The snapshot carries the per-skin post-pass presence the palette does —
+    /// the LCD glows not at all, the CRT is the only masked skin, and only the
+    /// OLED has no ghost. A GPU renderer branches on exactly these three
+    /// `Option`s, so a snapshot that flattened one of them to `Some(zero)`
+    /// would silently run a pass the CPU kit skips.
+    #[test]
+    fn the_snapshot_keeps_the_per_skin_post_passes() {
+        let vfd = palette_snapshot(DisplayStyle::Vfd);
+        let lcd = palette_snapshot(DisplayStyle::Lcd);
+        let oled = palette_snapshot(DisplayStyle::Oled);
+        let crt = palette_snapshot(DisplayStyle::Crt);
+        assert!(vfd.bloom.is_some() && vfd.ghost.is_some() && vfd.mask.is_none());
+        assert!(lcd.bloom.is_none() && lcd.ghost.is_some() && lcd.mask.is_none());
+        assert!(oled.bloom.is_some() && oled.ghost.is_none() && oled.mask.is_none());
+        assert!(crt.bloom.is_some() && crt.ghost.is_none() && crt.mask.is_some());
+    }
 
     #[test]
     fn mix_hits_both_endpoints_exactly() {

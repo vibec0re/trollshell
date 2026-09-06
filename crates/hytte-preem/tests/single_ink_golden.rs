@@ -187,68 +187,115 @@ fn gauge_single_ink_bytes_are_unchanged() {
     );
 }
 
+/// A gauge settled at 30 %, retargeted to 80 %, then advanced six frames at
+/// 60 Hz — the one state [`gauge_midswing_single_ink_bytes_are_unchanged`]
+/// asserts on and renders. A shared helper so the assertions and the digests
+/// `check` verifies always describe the same construction; building it twice,
+/// by hand, in two places is exactly how a guard drifts from what it guards.
+fn midswing() -> Gauge {
+    let mut gauge = Gauge::new();
+    gauge.set_target(0.30);
+    gauge.settle();
+    gauge.set_target(0.80);
+    for _ in 0..6 {
+        gauge.advance(1.0 / 60.0);
+    }
+    gauge
+}
+
 /// The **default 144×64 needle gauge**, mid-swing: settled at 30 %, retargeted
-/// to 80 %, then advanced by exactly one 60 Hz frame (`1.0 / 60.0` s).
+/// to 80 %, then advanced by six steps of `1.0 / 60.0` s (0.1 s of wall clock)
+/// — see [`midswing`].
 ///
 /// Added by #937. The row above pins the needle **settled** — [`Needle::advance`]
 /// has not run since the last [`Needle::settle`], so its velocity is `0.0` and
-/// [`trail_fraction`]'s `back` term (`fraction - velocity * back`) collapses to
-/// the current fraction at every sample; the four [`TRAIL_T`] blades stack
-/// exactly on the live blade and the max-combine in [`Gauge::render`] erases
+/// `trail_fraction`'s `back` term (`fraction - velocity * back`) collapses to
+/// the current fraction at every sample; the four `TRAIL_T` blades stack
+/// exactly on the live blade and the max-combine in `Gauge::render` erases
 /// the motion blur completely (documented in `render`'s own comment on why a
 /// settled needle's blur "vanishes exactly"). A `TRAIL_T` retune, a change to
 /// `TRAIL_SPAN_SECS`'s subdivision, or any other tweak to the blur fan is
 /// therefore **invisible** to that row — it renders the one code path
 /// (`velocity == 0.0`) where the trail loop runs but paints nothing.
 ///
-/// This row closes that gap: after one frame of real motion the needle carries
-/// nonzero velocity, so each of the four trail samples lands at a distinct
-/// fraction behind the live blade and the blur is actually on the buffer. A
-/// change to `TRAIL_T`'s weights, its length, or `TRAIL_SPAN_SECS` moves this
-/// digest; the settled row above is untouched by definition, since velocity is
-/// still `0.0` there regardless of what the trail path does with it. A change
-/// to the **static** face geometry (`MIN_TICK_SPACING`, `MAJOR_HW`, the arc,
-/// the ticks, the hub, …) moves both rows, because both render the same 144×64
-/// face under a lit needle.
+/// This row closes that gap by advancing until the needle is actually
+/// smearing. **Six** steps rather than one: a reviewed sweep of 1–12 steps
+/// found trail coverage (the pixel difference between this render and a
+/// `set_target(fraction); settle()` render at the same fraction, i.e. the
+/// smear alone with the needle-moved delta subtracted out) peaks at six —
+/// 1.8×–2.4× a single step's trail pixels, across all four skins — at 54 % of
+/// the 30→80 swing, nowhere near the 80 % target and still well short of
+/// [`Needle::is_settled`]. A change to `TRAIL_T`'s weights, its length, or
+/// `TRAIL_SPAN_SECS` moves this digest; the settled row above is untouched by
+/// definition, since velocity is still `0.0` there regardless of what the
+/// trail path does with it. A change to the **static** face geometry
+/// (`MIN_TICK_SPACING`, `MAJOR_HW`, the arc, the ticks, the hub, …) moves both
+/// rows, because both render the same 144×64 face under a lit needle.
 ///
-/// The four values were captured by running this test against `origin/main` at
-/// `d1a2d57`, i.e. before this row existed — a plain run against the branch's
-/// own base, since the row is new here rather than guarding a prior change.
+/// Two things worth knowing before touching this row on a red:
+///
+/// - **It also pins the spring**, not just the trail. Six steps of the
+///   underdamped solver in [`Needle::advance`] exercise [`DEFAULT_FREQ_HZ`]
+///   and [`DEFAULT_DAMPING`] in a way the settled row cannot ([`Needle::settle`]
+///   snaps straight past the solver) — retuning either constant moves this
+///   digest too. A red here is therefore not automatically a blur regression;
+///   check what actually changed in `gauge.rs` before assuming a blur-taste
+///   PR is the culprit.
+/// - **It is the suite's first byte-exact pin on libm.** The underdamped
+///   branch evaluates `(-decay * dt).exp()` and `(damped * dt).sin_cos()`,
+///   neither of which `std` guarantees is correctly rounded, so — unlike every
+///   other row in this file, which only ever reaches `sin`/`cos` at a constant
+///   angle — this digest is sensitive to the platform libm. A toolchain/glibc
+///   bump that reddens *only* this row with an otherwise clean diff is that,
+///   not a kit bug; the fix is to recapture with fresh provenance (see below),
+///   never to loosen the pin.
+///
+/// The step count is a **test fixture**, not the shell's frame step: the shell
+/// hands the kit a real, µs-quantised `dt` —
+/// `micros_to_secs(frame_time_us.saturating_sub(last))`, clamped at
+/// `MAX_TICK_DT_US` (400 000 µs) in `trollshell/src/plugins/preem_render.rs`
+/// — and an exact `1.0 / 60.0` never arrives except by coincidence. A kit
+/// golden fixes `dt` by construction, which is the point; six repeats of that
+/// fixture is not a claim about any real frame pacing.
+///
+/// The four values were captured by running this test against `origin/main`
+/// at `d1a2d57` (this branch's own base — the row is new here, not guarding a
+/// prior change, so a plain run against the base is the capture).
 ///
 /// [`Needle::advance`]: hytte_preem::Needle::advance
 /// [`Needle::settle`]: hytte_preem::Needle::settle
+/// [`Needle::is_settled`]: hytte_preem::Needle::is_settled
+/// [`DEFAULT_FREQ_HZ`]: hytte_preem::DEFAULT_FREQ_HZ
+/// [`DEFAULT_DAMPING`]: hytte_preem::DEFAULT_DAMPING
 #[test]
 fn gauge_midswing_single_ink_bytes_are_unchanged() {
-    let mut probe = Gauge::new();
-    probe.set_target(0.30);
-    probe.settle();
-    probe.set_target(0.80);
-    probe.advance(1.0 / 60.0);
-    assert!(
-        !probe.is_settled(),
-        "the probe settled within one frame — pick a state that is actually mid-swing"
-    );
+    let probe = midswing();
+    // `is_settled()` is NOT the load-bearing guard here: it also reads false
+    // at `advance(0.0)` (position 0.30 is still short of target 0.80), so on
+    // its own it cannot catch a fixture that stopped actually moving.
+    // Velocity is what the trail path reads (`trail_fraction`'s `back` term),
+    // so it is the assertion this fixture actually depends on — and it is
+    // NaN-safe the same way `is_settled` is: `NaN > 0.0` is false (this assert
+    // fires), and `is_settled`'s `<=` pair is false on `NaN` too (the assert
+    // below still fires).
     assert!(
         probe.needle().velocity().abs() > 0.0,
         "zero velocity would collapse the trail onto the live blade — see this test's doc comment"
+    );
+    assert!(
+        !probe.is_settled(),
+        "the probe settled within six frames — pick a state that is actually mid-swing"
     );
 
     check(
         "gauge midswing",
         [
-            0x9e38_425b_6403_800a,
-            0xd271_62a7_df95_ec32,
-            0x4faa_9cb1_a7cd_b84a,
-            0x50b3_fbdf_55ef_de92,
+            0xfbd7_93ed_c5f6_7e52,
+            0x4738_7fc9_ee7d_8daa,
+            0x34bc_7708_4385_c52a,
+            0xea17_1d1d_fa2e_f3a2,
         ],
-        |style| {
-            let mut gauge = Gauge::new();
-            gauge.set_target(0.30);
-            gauge.settle();
-            gauge.set_target(0.80);
-            gauge.advance(1.0 / 60.0);
-            gauge.render(style)
-        },
+        |style| midswing().render(style),
     );
 }
 

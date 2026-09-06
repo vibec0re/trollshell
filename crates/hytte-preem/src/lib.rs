@@ -121,6 +121,7 @@
 pub mod font;
 
 mod color_map;
+mod contrast;
 mod dot_matrix;
 mod frame;
 mod gauge;

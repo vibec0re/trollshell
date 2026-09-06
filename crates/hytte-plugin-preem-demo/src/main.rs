@@ -18,6 +18,12 @@
 //! left to right, and a **nixie** readout whose outgoing cathode fades under the
 //! incoming one's strike. Tapping the clock advances the skin immediately.
 //!
+//! That rotation is also where #928's per-skin contrast policy is checked on
+//! glass: under a **light** desktop accent the LCD slot must read as dark ink on
+//! its greenish field — the kit darkens an accent it cannot carry there, while
+//! VFD, OLED and CRT still take it verbatim. No code here changed for it; the
+//! cycle already visits every skin, which is the point of visiting every skin.
+//!
 //! It doubles as the visual regression harness and the copy-from reference for
 //! plugin authors — which since #884 means it is the reference for **one code
 //! path, two hosts**, not just for the raster kit.

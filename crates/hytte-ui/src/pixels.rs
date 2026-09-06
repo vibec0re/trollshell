@@ -80,6 +80,12 @@
 //! through [`glib::Bytes::from_owned`] with **no copy at all**. The slice
 //! setter still works and still copies exactly once, as before.
 //!
+//! Since #911 this is the path the reconciler takes:
+//! [`Node::Pixels`](crate::widget_tree::Node::Pixels)`::data` is an
+//! `Arc<[u8]>`, so a frame mapped onto a second monitor — or re-mapped
+//! unchanged because a sibling animated — reaches the surface as the very same
+//! allocation and is settled without reading a byte of it.
+//!
 //! The pointer compare holds only for as long as the caller hands back *the same
 //! `Arc`* — that is the static-chip-shown-on-N-monitors case it is for. A cache
 //! that rebuilds its buffer and wraps it in a fresh `Arc` every tick falls
@@ -210,22 +216,11 @@ mod imp {
     }
 
     impl Frame {
-        /// Whether this is the frame being handed in. Dimensions first: a
-        /// reshape must never look like a no-op even when the byte block is
-        /// identical (`2×1` and `1×2` are both 8 bytes).
-        fn is(&self, width: u32, height: u32, data: &[u8]) -> bool {
-            self.width == width && self.height == height && *self.data == *data
-        }
-
-        /// [`Frame::is`] for a shared buffer. Same allocation ⇒ same bytes: an
-        /// `Arc<[u8]>` the surface holds a reference to can't be mutated behind
-        /// its back, so the pointer check is a sound short-circuit. The slice
-        /// compare is the fallback for two equal-but-distinct buffers.
-        fn is_shared(&self, width: u32, height: u32, data: &Arc<[u8]>) -> bool {
-            if Arc::ptr_eq(&self.data, data) {
-                return self.width == width && self.height == height;
-            }
-            self.is(width, height, data)
+        /// Whether this frame has these dimensions — the half of the guard that
+        /// is checked first, so a reshape can never look like a no-op even when
+        /// the byte block is identical (`2×1` and `1×2` are both 8 bytes).
+        fn shaped(&self, width: u32, height: u32) -> bool {
+            self.width == width && self.height == height
         }
     }
 
@@ -248,6 +243,12 @@ mod imp {
         /// entirely outside `cargo test`.
         #[cfg(all(test, feature = "system-tests"))]
         counts: Cell<super::Counts>,
+        /// Test seam (#911): bytes the equality guard has handed to a real
+        /// slice comparison — the work the `Arc::ptr_eq` fast path skips.
+        /// Kept out of [`super::Counts`] so the #902 budget assertions keep
+        /// reading as `(builds, draws, resizes)`.
+        #[cfg(all(test, feature = "system-tests"))]
+        compared: Cell<usize>,
     }
 
     #[glib::object_subclass]
@@ -335,7 +336,7 @@ mod imp {
             let Some(dims) = buildable(width, height, data.len()) else {
                 return self.render_nothing();
             };
-            if self.shows(|frame| frame.is(width, height, data)) {
+            if self.shows_slice(width, height, data) {
                 return Invalidate::Nothing;
             }
             self.upload(width, height, dims, Arc::from(data))
@@ -353,7 +354,7 @@ mod imp {
             let Some(dims) = buildable(width, height, data.len()) else {
                 return self.render_nothing();
             };
-            if self.shows(|frame| frame.is_shared(width, height, data)) {
+            if self.shows_shared(width, height, data) {
                 return Invalidate::Nothing;
             }
             self.upload(width, height, dims, Arc::clone(data))
@@ -367,6 +368,49 @@ mod imp {
                 Shown::Frame(frame) => is_it(frame),
                 Shown::Never | Shown::Nothing => false,
             }
+        }
+
+        /// Whether the surface already displays exactly this slice buffer:
+        /// the dimensions, then the bytes.
+        fn shows_slice(&self, width: u32, height: u32, data: &[u8]) -> bool {
+            self.shows(|frame| frame.shaped(width, height) && self.same_bytes(frame, data))
+        }
+
+        /// [`Self::shows_slice`] for a shared buffer. Same allocation ⇒ same
+        /// bytes: an `Arc<[u8]>` the surface holds a reference to can't be
+        /// mutated behind its back, so the pointer check is a sound
+        /// short-circuit — and it is what makes one cached frame shown on N
+        /// surfaces cost N pointer compares instead of N full buffer scans
+        /// (#911). The byte compare is the fallback for two equal-but-distinct
+        /// buffers.
+        fn shows_shared(&self, width: u32, height: u32, data: &Arc<[u8]>) -> bool {
+            self.shows(|frame| {
+                frame.shaped(width, height)
+                    && (Arc::ptr_eq(&frame.data, data) || self.same_bytes(frame, data))
+            })
+        }
+
+        /// The guard's slow path — the full byte compare, and the only place
+        /// either setter reads the held buffer.
+        ///
+        /// Both guards funnel through here so the test seam below is a count of
+        /// *real* comparisons: the `Arc::ptr_eq` short-circuit is otherwise
+        /// invisible (it agrees with the compare on every answer, and differs
+        /// only in what it had to read), and an invisible fast path is one no
+        /// test can pin.
+        ///
+        /// `&self` is the tally's, so it is genuinely unused in the production
+        /// build — the `allow` is scoped to exactly that build rather than
+        /// blanket, so a future real use of `self` here is still linted.
+        #[cfg_attr(
+            not(all(test, feature = "system-tests")),
+            allow(clippy::unused_self, reason = "the byte-compare tally is test-only")
+        )]
+        fn same_bytes(&self, frame: &Frame, data: &[u8]) -> bool {
+            #[cfg(all(test, feature = "system-tests"))]
+            self.compared
+                .set(self.compared.get().saturating_add(frame.data.len()));
+            *frame.data == *data
         }
 
         /// Build the texture for an already-validated buffer and adopt it.
@@ -446,6 +490,12 @@ mod imp {
         pub(super) fn counts(&self) -> super::Counts {
             self.counts.get()
         }
+
+        /// Test seam (#911): the running tally of bytes compared.
+        #[cfg(all(test, feature = "system-tests"))]
+        pub(super) fn compared(&self) -> usize {
+            self.compared.get()
+        }
     }
 }
 
@@ -455,9 +505,11 @@ mod imp {
 #[cfg(all(test, feature = "system-tests"))]
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(crate) struct Counts {
-    builds: u32,
-    draws: u32,
-    resizes: u32,
+    /// `MemoryTexture` constructions. `pub(crate)` so the reconciler's own GTK
+    /// tests can read it, not just this module's (#911).
+    pub(crate) builds: u32,
+    pub(crate) draws: u32,
+    pub(crate) resizes: u32,
 }
 
 #[cfg(all(test, feature = "system-tests"))]
@@ -519,9 +571,10 @@ impl PixelSurface {
     /// This is the setter for a caller with a frame cache feeding several
     /// surfaces — the shell's preem renderer rasterises once per tick and shows
     /// the result on every monitor, which is a full RGBA clone per monitor per
-    /// tick through the slice setter and a refcount bump through this one.
-    /// (Adopting it there is a follow-up; the slice path is unchanged and stays
-    /// the default.)
+    /// tick through the slice setter and a refcount bump through this one. It
+    /// is what the reconciler calls for every
+    /// [`Node::Pixels`](crate::widget_tree::Node::Pixels) since #911; the slice
+    /// setter stays for a caller that only has a borrowed buffer.
     ///
     /// The `Arc::ptr_eq` fast path only fires while the caller hands back *the
     /// same* `Arc` — the static-chip-on-N-monitors case. A cache that rebuilds
@@ -557,6 +610,22 @@ impl PixelSurface {
         if self.imp().set_scale(scale) {
             self.queue_resize();
         }
+    }
+
+    /// Test seam (#902): this surface's `(builds, draws, resizes)` tally.
+    /// Crate-visible so the reconciler's own GTK tests can assert what a
+    /// `Node::Pixels` re-render cost, not just what a direct setter call did.
+    #[cfg(all(test, feature = "system-tests"))]
+    pub(crate) fn counts(&self) -> Counts {
+        self.imp().counts()
+    }
+
+    /// Test seam (#911): bytes this surface's equality guard has actually
+    /// compared. `0` across a re-render means the `Arc::ptr_eq` fast path
+    /// settled it — i.e. the caller really did hand back the same allocation.
+    #[cfg(all(test, feature = "system-tests"))]
+    pub(crate) fn bytes_compared(&self) -> usize {
+        self.imp().compared()
     }
 }
 
@@ -693,6 +762,11 @@ mod gtk_tests {
     /// The surface's `(builds, draws, resizes)` tally — the #902 test seam.
     fn counts(s: &PixelSurface) -> Counts {
         s.imp().counts()
+    }
+
+    /// Bytes the surface's guard has actually compared — the #911 test seam.
+    fn compared(s: &PixelSurface) -> usize {
+        s.imp().compared()
     }
 
     /// A `Counts` literal, so the assertions below read as a budget.
@@ -837,6 +911,96 @@ mod gtk_tests {
         // A real new frame still uploads.
         s.set_pixels_shared(2, 1, &Arc::from([0x23_u8; 8].as_slice()));
         assert_eq!(counts(&s), spent(2, 1, 1));
+    }
+
+    /// **#911, the headline.** One cached frame shown on two surfaces for N
+    /// ticks — the shell's preem renderer with two monitors attached — is
+    /// settled without reading a single byte of the buffer, because every
+    /// surface is handed the *same* allocation and `Arc::ptr_eq` decides it.
+    ///
+    /// The second half is the control: the identical sequence through the slice
+    /// setter (what the reconciler called before #911) reaches the same verdict
+    /// by scanning the whole buffer on every repeat — `(ticks - 1) × len` bytes
+    /// per surface, on top of the RGBA clone per monitor per tick the caller
+    /// had to make to get here at all.
+    #[gtk::test]
+    fn one_shared_frame_on_two_surfaces_compares_no_bytes() {
+        const TICKS: usize = 20;
+        // 64×16 RGBA8 = 4 KiB, the size of a bar-sized preem chip.
+        let frame: Arc<[u8]> = Arc::from([0x44_u8; 4096].as_slice());
+
+        let shared = [PixelSurface::new(), PixelSurface::new()];
+        for _ in 0..TICKS {
+            for s in &shared {
+                s.set_pixels_shared(64, 16, &frame);
+            }
+        }
+        for s in &shared {
+            assert_eq!(
+                counts(s),
+                spent(1, 0, 1),
+                "one frame is uploaded once per surface, however many ticks show it",
+            );
+            assert_eq!(
+                compared(s),
+                0,
+                "the same Arc must be settled by the pointer compare, not by a buffer scan",
+            );
+        }
+
+        let sliced = [PixelSurface::new(), PixelSurface::new()];
+        for _ in 0..TICKS {
+            for s in &sliced {
+                s.set_pixels(64, 16, &frame);
+            }
+        }
+        for s in &sliced {
+            assert_eq!(
+                counts(s),
+                spent(1, 0, 1),
+                "same verdict through the slice setter…"
+            );
+            assert_eq!(
+                compared(s),
+                (TICKS - 1) * frame.len(),
+                "…reached by scanning the whole buffer on every repeat — 76 KiB per surface \
+                 for 20 ticks of a picture nobody changed",
+            );
+        }
+    }
+
+    /// The pointer path is a fast path, not a different answer: a frame that
+    /// really did change still uploads, and still uploads exactly once per
+    /// distinct frame however many surfaces show it.
+    ///
+    /// This is the animating half of #911. A cache that rebuilds its buffer
+    /// every tick hands out a *fresh* `Arc`, so `Arc::ptr_eq` misses and the
+    /// guard falls through to the byte compare it always did — what the sharing
+    /// buys there is the copy, not the compare (the upload adopts the caller's
+    /// allocation; see `set_pixels_shared`).
+    #[gtk::test]
+    fn a_changing_shared_frame_uploads_once_per_distinct_frame() {
+        const TICKS: u8 = 6;
+        let surfaces = [PixelSurface::new(), PixelSurface::new()];
+        for tick in 0..TICKS {
+            let frame: Arc<[u8]> = Arc::from([tick; 4096].as_slice());
+            for s in &surfaces {
+                s.set_pixels_shared(64, 16, &frame);
+            }
+        }
+        for s in &surfaces {
+            assert_eq!(
+                counts(s).builds,
+                u32::from(TICKS),
+                "every distinct frame is a real upload — the guard must not swallow one",
+            );
+            // The first call has nothing to compare against (`Shown::Never`).
+            assert_eq!(
+                compared(s),
+                usize::from(TICKS - 1) * 4096,
+                "a fresh Arc per tick falls through to the byte compare, as documented",
+            );
+        }
     }
 
     /// The two setters share one guard: a shared buffer equal to what the slice

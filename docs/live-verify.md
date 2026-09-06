@@ -1532,8 +1532,18 @@ session.
       both catch up within ~2 s without the selection jumping or a pushed page
       popping. Finally, `systemctl --user stop trollshell` with the tab open:
       the list must drop to a single non-selectable "Unavailable" row and the
-      detail pane to its empty state, with no panic. **No version column** —
-      that half of #887 is held pending the source decision on the issue.
+      detail pane to its empty state, with no panic — and then
+      `systemctl --user start trollshell` again: within ~2 s the same plugin
+      must be selected again, with its detail page still pushed if you had
+      drilled in, rather than the list settling on whichever plugin sorts
+      first (the review round's parked selection; the unit test drives the
+      placeholder directly, a real timeout is what a human can confirm).
+      Also worth an eye on every one of these steps: the tab must show
+      **exactly one** set of window buttons — the app's own, top right.
+      Switching between Plugins, Places and AI Keys must not make a second
+      close/minimise/maximise cluster appear or disappear. **No version
+      column** — that half of #887 is held pending the source decision on the
+      issue.
 - [ ] **(#601/#836)** The control-center's **footer** reports the running
       _shell's_ revision, not its own. The companion app is a separate binary
       with its **own** `TROLLSHELL_REV` baked in by `nix/control-center.nix`,

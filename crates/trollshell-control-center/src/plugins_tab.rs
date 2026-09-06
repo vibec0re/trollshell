@@ -39,6 +39,12 @@
 //! never on a page for a unit that no longer exists. With no plugins at all,
 //! [`clear_selection`] drops to the detail pane's empty state.
 //!
+//! A **failed** poll is not a membership change and must not be read as one: it
+//! parks the selection ([`ParkedSelection`]) while the "unavailable"
+//! placeholder is up, and the next good poll puts both the selection and a
+//! pushed page back. Without that, one 3 s timeout on a 2 s cadence would
+//! quietly move the user to whichever plugin happens to be first.
+//!
 //! # `AdwBreakpointBin`, on contract (#856)
 //!
 //! #856 recorded what using that widget *off* contract costs: it warns once per
@@ -182,6 +188,25 @@ struct PluginDetail {
     conn_badge: gtk::Image,
 }
 
+/// A selection set aside while the shell is unreachable, so a transient failure
+/// doesn't retarget the user's drill-down (#943 review).
+///
+/// `list_plugins` runs with `RetryPolicy::Never` and a 3 s timeout on a 2 s
+/// cadence, so **one** slow reply is enough to take the `Err` arm and show the
+/// "Unavailable" placeholder. That placeholder has to drop the selection — the
+/// rows it belonged to are gone — but the *id* is cheap to keep, and the next
+/// good poll almost always brings the same plugin set back. Without this, the
+/// rebuild after the placeholder sees no previous selection, takes the
+/// first-load arm and silently moves the user to the first plugin in the list.
+struct ParkedSelection {
+    /// The plugin that was selected when the poll failed.
+    id: String,
+    /// Whether its detail page was pushed (i.e. the tab was collapsed and the
+    /// user had drilled in) at that moment, so the restore can put the
+    /// navigation back where it was and not merely the highlight.
+    pushed: bool,
+}
+
 /// What the sidebar list is currently showing, so a poll only rebuilds on a
 /// real transition (list ⇄ empty ⇄ unavailable) and otherwise updates in place.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -212,6 +237,9 @@ struct PluginsState {
     snapshot: Rc<RefCell<HashMap<String, PluginSnapshot>>>,
     /// The selected plugin's id, or `None` for the empty state.
     selected: Rc<RefCell<Option<String>>>,
+    /// The selection held over an "unavailable" placeholder — see
+    /// [`ParkedSelection`]. `None` whenever the tab is showing real rows.
+    parked: Rc<RefCell<Option<ParkedSelection>>>,
     /// What's currently shown, gating rebuild vs. in-place update.
     view: Rc<Cell<PluginsView>>,
     /// Guard so programmatically setting the detail switch from a fetched state
@@ -221,6 +249,107 @@ struct PluginsState {
     /// or the `row-selected(None)` that removing rows emits — doesn't run the
     /// user-driven selection path and, with it, disturb navigation.
     selecting: Rc<Cell<bool>>,
+}
+
+/// [`PluginsState`] with its widget handles held **weakly** — what the
+/// tab's own handlers capture, and the reason they don't leak the tab (#943
+/// review).
+///
+/// GTK owns a signal handler for as long as it owns the widget it is connected
+/// to, so a handler that captures a strong `PluginsState` closes a cycle:
+/// `list` → its `row-selected` handler → `PluginsState` → `list`. Nothing
+/// breaks it, and the whole tab tree — both panes, every row — outlives the
+/// window it was built for. That is the same defect
+/// `crates/hytte-reactive/src/bind.rs` avoids by holding its widget through a
+/// [`glib::WeakRef`] and handing it back to the closure (`nix/lint-bind-pins.py`
+/// exists to keep call sites honest about it); this is that convention applied
+/// to a state struct rather than a single widget.
+///
+/// The `Rc` cells are cloned strongly on purpose: none of them refers to an
+/// **ancestor** of a widget with a handler on it (`by_id` and `rows` hold the
+/// list's own children, and a GTK child does not hold a reference to its
+/// parent), so they close no cycle, and holding them strongly is what lets a
+/// handler that fires during teardown still see coherent bookkeeping.
+#[derive(Clone)]
+struct WeakPluginsState {
+    split: glib::WeakRef<adw::NavigationSplitView>,
+    list: glib::WeakRef<gtk::ListBox>,
+    detail: WeakPluginDetail,
+    rows: Rc<RefCell<Vec<gtk::Widget>>>,
+    by_id: Rc<RefCell<HashMap<String, PluginRow>>>,
+    snapshot: Rc<RefCell<HashMap<String, PluginSnapshot>>>,
+    selected: Rc<RefCell<Option<String>>>,
+    parked: Rc<RefCell<Option<ParkedSelection>>>,
+    view: Rc<Cell<PluginsView>>,
+    syncing: Rc<Cell<bool>>,
+    selecting: Rc<Cell<bool>>,
+}
+
+/// [`PluginDetail`]'s widgets, weakly — see [`WeakPluginsState`].
+#[derive(Clone)]
+struct WeakPluginDetail {
+    page: glib::WeakRef<adw::NavigationPage>,
+    stack: glib::WeakRef<gtk::Stack>,
+    switch: glib::WeakRef<adw::SwitchRow>,
+    unit_row: glib::WeakRef<adw::ActionRow>,
+    conn_row: glib::WeakRef<adw::ActionRow>,
+    conn_badge: glib::WeakRef<gtk::Image>,
+}
+
+impl PluginsState {
+    /// The handler-side view of this state.
+    fn downgrade(&self) -> WeakPluginsState {
+        WeakPluginsState {
+            split: self.split.downgrade(),
+            list: self.list.downgrade(),
+            detail: WeakPluginDetail {
+                page: self.detail.page.downgrade(),
+                stack: self.detail.stack.downgrade(),
+                switch: self.detail.switch.downgrade(),
+                unit_row: self.detail.unit_row.downgrade(),
+                conn_row: self.detail.conn_row.downgrade(),
+                conn_badge: self.detail.conn_badge.downgrade(),
+            },
+            rows: self.rows.clone(),
+            by_id: self.by_id.clone(),
+            snapshot: self.snapshot.clone(),
+            selected: self.selected.clone(),
+            parked: self.parked.clone(),
+            view: self.view.clone(),
+            syncing: self.syncing.clone(),
+            selecting: self.selecting.clone(),
+        }
+    }
+}
+
+impl WeakPluginsState {
+    /// Rebuild the strong state for the duration of one callback, or `None`
+    /// once the tab has been dropped — in which case there is nothing to
+    /// update and the handler returns. All-or-nothing on purpose: the widgets
+    /// live and die as one tree, so a partial upgrade would mean a torn tab,
+    /// not a case worth handling.
+    fn upgrade(&self) -> Option<PluginsState> {
+        Some(PluginsState {
+            split: self.split.upgrade()?,
+            list: self.list.upgrade()?,
+            detail: PluginDetail {
+                page: self.detail.page.upgrade()?,
+                stack: self.detail.stack.upgrade()?,
+                switch: self.detail.switch.upgrade()?,
+                unit_row: self.detail.unit_row.upgrade()?,
+                conn_row: self.detail.conn_row.upgrade()?,
+                conn_badge: self.detail.conn_badge.upgrade()?,
+            },
+            rows: self.rows.clone(),
+            by_id: self.by_id.clone(),
+            snapshot: self.snapshot.clone(),
+            selected: self.selected.clone(),
+            parked: self.parked.clone(),
+            view: self.view.clone(),
+            syncing: self.syncing.clone(),
+            selecting: self.selecting.clone(),
+        })
+    }
 }
 
 /// Build the real **Plugins** tab: an adaptive drill-down over the
@@ -282,7 +411,7 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
         .build();
 
     let sidebar_toolbar = adw::ToolbarView::new();
-    sidebar_toolbar.add_top_bar(&adw::HeaderBar::new());
+    sidebar_toolbar.add_top_bar(&tab_header_bar());
     sidebar_toolbar.set_content(Some(&list_scroller));
     let sidebar_page = adw::NavigationPage::new(&sidebar_toolbar, "Plugins");
 
@@ -321,6 +450,7 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
         by_id: Rc::new(RefCell::new(HashMap::new())),
         snapshot: Rc::new(RefCell::new(HashMap::new())),
         selected: Rc::new(RefCell::new(None)),
+        parked: Rc::new(RefCell::new(None)),
         view: Rc::new(Cell::new(PluginsView::Uninit)),
         syncing: Rc::new(Cell::new(false)),
         selecting: Rc::new(Cell::new(false)),
@@ -333,11 +463,37 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
     (bin, state)
 }
 
+/// A header bar for one of the tab's two `AdwToolbarView`s, with the window
+/// controls off.
+///
+/// `AdwHeaderBar` defaults `show-start-title-buttons` /
+/// `show-end-title-buttons` to `true`, which is right for a header bar that is
+/// the window's own. These two are not: the tab is mounted *inside*
+/// `crate::build_window`'s `AdwApplicationWindow`, which already has its header
+/// bar (with the view switcher) at the top. Left on the defaults, the sidebar
+/// and content header bars each draw a second, live `GtkWindowControls` cluster
+/// — hit-testable close/minimise/maximise buttons that appear and disappear as
+/// the user switches tabs, since Places and AI Keys have no header bar of their
+/// own. `the_tab_draws_no_window_controls` pins it.
+fn tab_header_bar() -> adw::HeaderBar {
+    adw::HeaderBar::builder()
+        .show_start_title_buttons(false)
+        .show_end_title_buttons(false)
+        .build()
+}
+
 /// Build the detail pane once: an empty state and the per-plugin controls, in a
 /// stack under a header bar that grows a back button when collapsed.
 fn build_detail() -> PluginDetail {
     // The empty state carries what the old `AdwPreferencesGroup` description
-    // said, because this is where someone who has just opened the tab lands.
+    // said, because it is the only place that blurb still has. It is *not*
+    // where a fresh tab lands: `apply_plugins` settles the sidebar on the
+    // first plugin on the first load, so with any plugin installed this page
+    // is reachable only in the two no-rows-to-drill-into states — no plugins
+    // installed, or the shell unreachable (`set_placeholder` → both go through
+    // `clear_selection`) — and when the selected plugin vanishes from the
+    // snapshot. That is exactly when a plugins-are-units explainer is worth
+    // reading, so it stays.
     // No `<id>` in the text: `AdwStatusPage`'s description is a plain label,
     // so an escaped `&lt;id&gt;` would render literally — the ellipsis says
     // the same thing with no markup exposure either way.
@@ -381,7 +537,7 @@ fn build_detail() -> PluginDetail {
     // No explicit back button: inside a collapsed `AdwNavigationSplitView` the
     // header bar is in a navigation stack with the sidebar beneath it, and
     // `AdwHeaderBar` grows the back button itself.
-    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.add_top_bar(&tab_header_bar());
     toolbar.set_content(Some(&stack));
 
     let page = adw::NavigationPage::new(&toolbar, "Plugin");
@@ -398,10 +554,17 @@ fn build_detail() -> PluginDetail {
 /// Wire the two halves of drill-down: `row-selected` retargets the detail pane
 /// (which is all a wide layout needs, and is also what keyboard arrows drive),
 /// `row-activated` additionally shows the content — a push, when collapsed.
+///
+/// Both closures capture the **weak** state ([`WeakPluginsState`]) and upgrade
+/// per callback: these handlers are owned by the very list they would otherwise
+/// hold, and the strong version of that is a cycle the tab never escapes.
 fn connect_selection(state: &PluginsState) {
     {
-        let state = state.clone();
-        state.list.clone().connect_row_selected(move |_, row| {
+        let weak = state.downgrade();
+        state.list.connect_row_selected(move |_, row| {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
             // A programmatic selection: restoring one after a rebuild, or the
             // `None` that removing the selected row emits. Neither is the user
             // navigating, so neither may touch the detail or the stack.
@@ -414,8 +577,11 @@ fn connect_selection(state: &PluginsState) {
         });
     }
     {
-        let state = state.clone();
-        state.list.clone().connect_row_activated(move |_, row| {
+        let weak = state.downgrade();
+        state.list.connect_row_activated(move |_, row| {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
             let Some(id) = id_for_row(&state, row) else {
                 return;
             };
@@ -430,29 +596,32 @@ fn connect_selection(state: &PluginsState) {
 
 /// Wire the relocated on/off control. One switch serves every plugin, so it
 /// reads the selected id at fire time rather than capturing one.
+///
+/// Weakly, for [`connect_selection`]'s reason: the switch is inside the tab the
+/// state holds. The strong clone the async completion takes is a *bounded*
+/// hold (one `Control` round trip plus the 1.2 s settle poll), not an
+/// ownership edge — and it wants the tab alive to refresh it.
 fn connect_switch(state: &PluginsState) {
-    let state = state.clone();
-    state
-        .detail
-        .switch
-        .clone()
-        .connect_active_notify(move |sw| {
-            if state.syncing.get() {
-                return;
+    let weak = state.downgrade();
+    state.detail.switch.connect_active_notify(move |sw| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        if state.syncing.get() {
+            return;
+        }
+        let selected = state.selected.borrow().clone();
+        let Some(id) = selected else {
+            return;
+        };
+        let want_on = sw.is_active();
+        spawn_on_runtime(set_plugin_state(id, want_on), move |res| {
+            if let Err(err) = res {
+                tracing::info!(%err, "plugin start/stop failed");
             }
-            let selected = state.selected.borrow().clone();
-            let Some(id) = selected else {
-                return;
-            };
-            let want_on = sw.is_active();
-            let state = state.clone();
-            spawn_on_runtime(set_plugin_state(id, want_on), move |res| {
-                if let Err(err) = res {
-                    tracing::info!(%err, "plugin start/stop failed");
-                }
-                refresh_plugins_soon(&state);
-            });
+            refresh_plugins_soon(&state);
         });
+    });
 }
 
 /// Which plugin a sidebar row belongs to.
@@ -564,7 +733,18 @@ fn apply_plugins(
 
     // Structural change (or first load): rebuild the rows, then put the
     // selection back on the same plugin if it survived.
+    //
+    // `parked` is the selection an "unavailable" placeholder set aside (#943
+    // review); `take` it either way, because once real rows are back it has
+    // either been restored or been proven gone. A live `selected` wins over it
+    // — that path never lost its page, so it has nothing to restore.
+    let parked = state.parked.take();
     let previously = state.selected.borrow().clone();
+    let (wanted, restore_push) = match (previously, parked) {
+        (Some(id), _) => (Some(id), false),
+        (None, Some(parked)) => (Some(parked.id), parked.pushed),
+        (None, None) => (None, false),
+    };
     clear_rows(state);
     for (id, active_state, enabled) in units {
         let prow = build_plugin_row(id, active_state, *enabled, rt.get(id));
@@ -581,10 +761,18 @@ fn apply_plugins(
     }
     state.view.set(PluginsView::List);
 
-    match previously {
+    match wanted {
         // The plugin survived: put the selection back exactly where it was,
         // silently, so a pushed detail page stays pushed.
-        Some(id) if state.by_id.borrow().contains_key(&id) => select_silently(state, &id),
+        Some(id) if state.by_id.borrow().contains_key(&id) => {
+            select_silently(state, &id);
+            // Restoring across a placeholder: the page was popped when the
+            // rows went away, so put it back — the user drilled in, and a
+            // failed poll is not them navigating out.
+            if restore_push {
+                state.split.set_show_content(true);
+            }
+        }
         // Either the selected plugin is gone, or this is the first load.
         //
         // Pop first: the user asked to see *that* plugin, and leaving a pushed
@@ -593,11 +781,15 @@ fn apply_plugins(
         // plugin, so a wide layout shows a detail pane rather than an empty one
         // beside a full list.
         //
-        // That second half is also what `GtkListBox` does on its own: appending
-        // into an empty single-selection list selects the new row, which fires
-        // `row-selected` outside any guard. Doing it here explicitly makes it a
-        // decision with a reason rather than a side effect that happens to look
-        // right, and pins the behaviour to this code instead of to GTK's.
+        // That second half is entirely this code's doing. `GtkListBox` in
+        // `Single` mode does **not** auto-select an appended row — that is
+        // `Browse` mode — so without the explicit `select_silently` below a
+        // rebuild would leave the list with nothing selected beside a full set
+        // of rows. It is the *silent* variant because `apply_plugins` owns the
+        // selection here: it sets `selected` itself and calls `refresh_detail`
+        // once at the end, so letting the `row-selected` handler run would
+        // re-enter that path mid-rebuild and, worse, make a poll look like the
+        // user navigating.
         _ => {
             state.split.set_show_content(false);
             if let Some((first, ..)) = units.first() {
@@ -725,10 +917,29 @@ fn clear_rows(state: &PluginsState) {
 /// unavailable), rebuilding only on a *transition* into `view` so a steady poll
 /// doesn't flicker it. There is nothing to drill into, so the row is neither
 /// activatable nor selectable and the detail pane drops to its empty state.
+///
+/// Entering [`PluginsView::Unavailable`] *parks* the selection first (see
+/// [`ParkedSelection`]): an unreachable shell says nothing about which plugins
+/// exist, so the id is kept for [`apply_plugins`] to restore. Entering
+/// [`PluginsView::Empty`] is the opposite — the shell answered, and it answered
+/// "no plugins" — so any parked selection is dropped there.
 fn set_placeholder(state: &PluginsState, view: PluginsView, title: &str, subtitle: &str) {
     if state.view.get() == view {
         return;
     }
+    // Before `clear_selection` below wipes it. A repeated failure re-enters
+    // with the same `view` and returns above, so the first failure's park is
+    // never overwritten with the `None` it left behind.
+    let park = if view == PluginsView::Unavailable {
+        let selected = state.selected.borrow().clone();
+        selected.map(|id| ParkedSelection {
+            id,
+            pushed: state.split.shows_content(),
+        })
+    } else {
+        None
+    };
+    *state.parked.borrow_mut() = park;
     clear_rows(state);
     state.snapshot.borrow_mut().clear();
     clear_selection(state);
@@ -838,6 +1049,13 @@ fn refresh_plugins_soon(state: &PluginsState) {
 /// the socket is the case the two disagree on, and the one worth spotting from
 /// the list — hence "Not connected" rather than a second "Running".
 ///
+/// A unit that is still *coming up* (`activating` / `reloading`) is not that
+/// case: it has not had a chance to dial the socket yet, so reporting it with
+/// the same word as a plugin that crashed after start would flag a
+/// disagreement that does not exist. It gets "Starting…" instead — the same
+/// word [`plugin_subtitle`] uses for the unit, because here the two genuinely
+/// do agree.
+///
 /// Deliberately `&'static str`: a column is only a column if the values are
 /// short and drawn from a closed set. The full sentence — mount region, dropped
 /// effects, how long since the last frame — is the detail page's job.
@@ -846,6 +1064,10 @@ fn status_cell(active_state: &str, rt: Option<&PluginRuntime>) -> &'static str {
         Some(rt) if rt.rendering => "Rendering",
         Some(_) => "Connected",
         None => match active_state {
+            // Still coming up — no connection yet is expected, not a
+            // disagreement. Before the `is_running` arm, which would otherwise
+            // swallow both of these.
+            "activating" | "reloading" => "Starting…",
             _ if is_running(active_state) => "Not connected",
             "failed" => "Failed",
             "deactivating" => "Stopping…",
@@ -1164,12 +1386,18 @@ mod tests {
     /// The case the column exists for: the unit says one thing and the host
     /// says another. A `Running · enabled` subtitle beside a `Not connected`
     /// status is the whole diagnostic.
+    ///
+    /// A unit that is merely *starting* is not that case (#943 review): it has
+    /// not had a chance to connect, so it must not wear the same word as a
+    /// plugin that crashed after start.
     #[test]
     fn status_cell_separates_a_running_unit_from_a_live_plugin() {
         assert_eq!(status_cell("active", None), "Not connected");
-        assert_eq!(status_cell("activating", None), "Not connected");
-        assert_eq!(status_cell("reloading", None), "Not connected");
         assert_eq!(plugin_subtitle("active", true), "Running · enabled");
+        assert_eq!(status_cell("activating", None), "Starting…");
+        assert_eq!(status_cell("reloading", None), "Starting…");
+        // …and the two columns agree on a starting unit, which is the point.
+        assert_eq!(plugin_subtitle("activating", true), "Starting… · enabled");
     }
 
     #[test]
@@ -1287,6 +1515,40 @@ mod gtk_tests {
         window.set_child(None::<&gtk::Widget>);
         window.destroy();
         pump();
+    }
+
+    /// One failed poll: what [`super::refresh_plugins`]' `Err` arm does when
+    /// `ListPlugins` times out or the shell isn't there. Same call, same
+    /// strings — the tab cannot tell this apart from the real thing, which is
+    /// the point.
+    fn poll_failed(state: &PluginsState) {
+        super::set_placeholder(
+            state,
+            super::PluginsView::Unavailable,
+            "Unavailable",
+            "Is trollshell running?",
+        );
+        pump();
+    }
+
+    /// Every `GtkWindowControls` under `root`, at any depth.
+    ///
+    /// Walked by hand (`first_child`/`next_sibling`) rather than by any public
+    /// "find a descendant" API, because there isn't one: header-bar internals
+    /// are private widgetry, and the question — *does this subtree draw window
+    /// buttons?* — is about what GTK built underneath, not about anything the
+    /// tab named.
+    fn window_controls_under(root: &gtk::Widget) -> Vec<gtk::WindowControls> {
+        let mut found = Vec::new();
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            if let Ok(controls) = widget.clone().downcast::<gtk::WindowControls>() {
+                found.push(controls);
+            }
+            found.extend(window_controls_under(&widget));
+            child = widget.next_sibling();
+        }
+        found
     }
 
     /// What a click on a row does: select it, then activate it.
@@ -1587,8 +1849,270 @@ mod gtk_tests {
             state.split.shows_content(),
             "restoring a selection must not pop the page the user pushed"
         );
+        // The other half of the rebuild: the plugin that *appeared* got a row.
+        // Without this the test passes under a `same_plugin_set → true`
+        // mutation, which skips the rebuild entirely — the selection survives
+        // for the wrong reason and `pet` never reaches the list (#943 review).
+        assert!(
+            state.by_id.borrow().contains_key("pet"),
+            "a plugin that appeared must get a row"
+        );
 
         dismiss(&window);
+    }
+
+    /// A poll that *fails* is not a poll that says the plugin set changed.
+    ///
+    /// `list_plugins` runs `RetryPolicy::Never` with a 3 s timeout on a 2 s
+    /// cadence, so one slow reply shows the "unavailable" placeholder. That
+    /// placeholder legitimately drops the selection — its rows are gone — but
+    /// the next good poll must put the user back where they were, page and
+    /// all, instead of taking the first-load arm and silently selecting the
+    /// first plugin in the list (#943 review).
+    ///
+    /// Falsified by deleting the `parked` restore in `apply_plugins` (the
+    /// `(None, Some(parked))` arm): the selection comes back as `clock` and
+    /// the page stays popped.
+    #[gtk::test]
+    fn a_transient_poll_failure_keeps_the_selection() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply(&state, &["clock", "departures"]);
+        let window = present(&bin, 420);
+        click(&state, "departures");
+        assert!(state.split.shows_content());
+
+        poll_failed(&state);
+        // The placeholder itself is unchanged: no rows, no selection, popped.
+        assert_eq!(state.selected.borrow().as_deref(), None);
+        assert!(!state.split.shows_content());
+
+        // …and the very next good poll returns the same plugins.
+        apply(&state, &["clock", "departures"]);
+
+        assert_eq!(
+            state.selected.borrow().as_deref(),
+            Some("departures"),
+            "a failed poll must not retarget the selection"
+        );
+        assert!(
+            state.split.shows_content(),
+            "the page the user pushed must come back with it"
+        );
+        assert_eq!(
+            state.split.content().expect("a content page").title(),
+            "departures"
+        );
+        let row = state
+            .by_id
+            .borrow()
+            .get("departures")
+            .map(|prow| prow.row.clone())
+            .expect("a row for departures");
+        assert_eq!(
+            state.list.selected_row().as_ref(),
+            Some(row.upcast_ref::<gtk::ListBoxRow>()),
+            "the restored selection must be highlighted too"
+        );
+        assert!(
+            state.parked.borrow().is_none(),
+            "a restored selection must not stay parked"
+        );
+
+        dismiss(&window);
+    }
+
+    /// The other side of the same coin: the failure was real *and* the plugin
+    /// really did go away while the shell was down. Then the parked selection
+    /// is stale, and the pre-existing pop-then-settle-on-the-first semantics
+    /// apply unchanged.
+    #[gtk::test]
+    fn a_failure_that_hid_a_removed_plugin_still_pops_back() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply(&state, &["clock", "departures"]);
+        let window = present(&bin, 420);
+        click(&state, "departures");
+
+        poll_failed(&state);
+        apply(&state, &["clock"]);
+
+        assert!(
+            !state.split.shows_content(),
+            "a plugin that is genuinely gone must not have its page restored"
+        );
+        assert_eq!(
+            state.selected.borrow().as_deref(),
+            Some("clock"),
+            "the sidebar settles on the surviving plugin"
+        );
+        assert_ne!(
+            state.split.content().expect("a content page").title(),
+            "departures"
+        );
+        assert!(
+            state.parked.borrow().is_none(),
+            "the park is spent either way"
+        );
+
+        dismiss(&window);
+    }
+
+    /// The tab must not draw a second set of window buttons.
+    ///
+    /// Mounted the way `crate::build_window` mounts it — inside an
+    /// `AdwApplicationWindow` at its real 760 × 560 default, under a
+    /// `AdwToolbarView` whose top bar is the app's own header bar with the view
+    /// switcher — because that context is the entire bug: two `AdwHeaderBar`s
+    /// on libadwaita's defaults draw their own `GtkWindowControls` inside a
+    /// window that already has a header bar of its own.
+    ///
+    /// The positive half matters as much as the negative one: the app's header
+    /// bar *does* have mapped controls here, so a walk that simply found
+    /// nothing would fail rather than pass vacuously.
+    ///
+    /// Falsified by dropping `show_start_title_buttons(false)` /
+    /// `show_end_title_buttons(false)` from `tab_header_bar`.
+    #[gtk::test]
+    fn the_tab_draws_no_window_controls() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply(&state, &["clock", "departures"]);
+
+        // `crate::build_window`'s shape, minus the tabs the tab under test
+        // doesn't need.
+        let stack = adw::ViewStack::new();
+        stack.add_titled_with_icon(
+            &bin,
+            Some("plugins"),
+            "Plugins",
+            "application-x-addon-symbolic",
+        );
+        let switcher = adw::ViewSwitcher::builder()
+            .stack(&stack)
+            .policy(adw::ViewSwitcherPolicy::Wide)
+            .build();
+        let header = adw::HeaderBar::builder().title_widget(&switcher).build();
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&stack));
+        let window = adw::ApplicationWindow::builder()
+            .title("trollshell Control Center")
+            .default_width(760)
+            .default_height(560)
+            .content(&toolbar)
+            .build();
+        window.present();
+        pump();
+
+        let app_controls: Vec<gtk::WindowControls> = window_controls_under(header.upcast_ref())
+            .into_iter()
+            .filter(gtk::prelude::WidgetExt::is_mapped)
+            .collect();
+        assert!(
+            !app_controls.is_empty(),
+            "the window's own header bar must keep its controls — without them this \
+             test cannot tell 'no controls in the tab' from 'no controls anywhere'"
+        );
+
+        let stray: Vec<gtk::WindowControls> = window_controls_under(bin.upcast_ref())
+            .into_iter()
+            .filter(gtk::prelude::WidgetExt::is_mapped)
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "the tab draws {} mapped GtkWindowControls of its own (first is {}px wide) — \
+             a second close/minimise/maximise cluster inside the window",
+            stray.len(),
+            stray.first().map_or(0, gtk::prelude::WidgetExt::width)
+        );
+
+        // The one start-side button the content header *should* grow when
+        // collapsed and pushed: the navigation back button, which is
+        // `show-back-button`'s business and not the title buttons'.
+        state.split.set_collapsed(true);
+        pump();
+        click(&state, "departures");
+        let back = has_mapped_back_button(&state.split.content().expect("a content page"));
+        assert!(
+            back,
+            "turning the title buttons off must not cost the collapsed back button"
+        );
+
+        window.set_content(None::<&gtk::Widget>);
+        window.destroy();
+        pump();
+    }
+
+    /// Whether `page`'s subtree has a mapped `go-previous-symbolic` button —
+    /// what `AdwHeaderBar` grows inside a navigation stack.
+    fn has_mapped_back_button(page: &adw::NavigationPage) -> bool {
+        fn walk(root: &gtk::Widget) -> bool {
+            let mut child = root.first_child();
+            while let Some(widget) = child {
+                if let Ok(button) = widget.clone().downcast::<gtk::Button>()
+                    && button.icon_name().as_deref() == Some("go-previous-symbolic")
+                    && button.is_mapped()
+                {
+                    return true;
+                }
+                if walk(&widget) {
+                    return true;
+                }
+                child = widget.next_sibling();
+            }
+            false
+        }
+        walk(page.upcast_ref())
+    }
+
+    /// Dropping the tab must free it.
+    ///
+    /// The tab's own handlers are owned by widgets *inside* the tab, so a
+    /// handler that captured a strong `PluginsState` would close a cycle
+    /// (`list` → handler → state → `list`) that nothing breaks: every
+    /// control-center window would leave its whole Plugins tree behind, and
+    /// `crate::build_window`'s close handler — which only stops the timers —
+    /// cannot help. Hence the weak captures, and hence this test: drop every
+    /// strong handle, pump the main loop, and the `ListBox` must be gone.
+    ///
+    /// Falsified by capturing `state.clone()` in `connect_selection` /
+    /// `connect_switch` instead of `state.downgrade()`: the weak refs still
+    /// upgrade afterwards.
+    #[gtk::test]
+    fn dropping_the_tab_frees_the_widget_tree() {
+        adw::init().expect("libadwaita init");
+        let (list, switch, split) = {
+            let (bin, state) = build_tab();
+            apply(&state, &["clock", "departures"]);
+            let window = present(&bin, 640);
+            // Through the handlers, so the closures have actually run.
+            click(&state, "departures");
+
+            let weak = (
+                state.list.downgrade(),
+                state.detail.switch.downgrade(),
+                state.split.downgrade(),
+            );
+            dismiss(&window);
+            weak
+            // `bin` and `state` — the only strong handles a caller holds —
+            // drop here.
+        };
+        pump();
+
+        assert!(
+            list.upgrade().is_none(),
+            "the plugin list outlived the tab: a handler is holding the state that holds it"
+        );
+        assert!(
+            switch.upgrade().is_none(),
+            "the detail switch outlived the tab"
+        );
+        assert!(
+            split.upgrade().is_none(),
+            "the split view outlived the tab — the whole tree with it"
+        );
     }
 
     /// The #856 contract, asserted rather than hoped for.

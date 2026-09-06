@@ -434,9 +434,12 @@ fn wire_defaults_match_the_documented_kit_values() {
             style: StyleRef::default(),
             window_px: 192,
             gap_dots: 6,
-            speed_dots_per_sec: 20.0,
+            speed_dots_per_sec: 12.0,
         },
-        "marquee.rs:80-84 + the audio widget's ≈20 dots/s (main.rs:134-144)"
+        "marquee.rs:80-84 for window_px/gap_dots; speed_dots_per_sec has no kit \
+         default (#882 invented the field) — 12.0 is the #929 taste call, down \
+         from the audio widget's own ≈20 dots/s (main.rs:134-144), which the \
+         widget still sets explicitly and does not follow this default"
     );
     assert_eq!(
         ScopeConfig::default(),
@@ -482,6 +485,28 @@ fn wire_defaults_match_the_documented_kit_values() {
         "split_flap.rs:135-144 (duration/stagger are None = the mechanism's own)"
     );
     assert_eq!(StyleRef::default(), StyleRef::new(StyleName::Vfd));
+}
+
+/// Pins [`MarqueeConfig::default`]'s scroll speed to the #929 taste call — 20
+/// dots/s read as too fast once #926 put the marquee on the display's real
+/// refresh instead of a choppy 20 Hz timer, and Annika's live-verify on #881
+/// asked for slower. If this ever needs to move again, name the new number on
+/// its own issue rather than editing the constant quietly.
+///
+/// `clippy::float_cmp` is about "are these two computed quantities close
+/// enough"; this is the opposite and narrower — the default is a literal
+/// constant, not the result of any arithmetic, so bit-for-bit sameness is
+/// exactly what's being pinned.
+#[test]
+#[allow(clippy::float_cmp)]
+fn the_marquee_default_speed_is_twelve_dots_per_second_per_issue_929() {
+    assert_eq!(
+        MarqueeConfig::default().speed_dots_per_sec,
+        12.0,
+        "MarqueeConfig::default().speed_dots_per_sec drifted from the #929 taste \
+         call (12.0 dots/s) — if 12 is wrong, name the new number on a fresh \
+         issue instead of editing this constant quietly"
+    );
 }
 
 /// The name mappings mirror the kit's `DisplayStyle::name` / `Mechanism::name`,

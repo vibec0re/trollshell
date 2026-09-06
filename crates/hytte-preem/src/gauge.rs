@@ -476,7 +476,7 @@ const NEEDLE_T: u16 = 255;
 const HUB_T: u16 = 235;
 /// The motion-blur blades, oldest last. Length sets [`TRAIL_SPAN_SECS`]'s
 /// subdivision.
-const TRAIL_T: &[u16] = &[104, 50];
+const TRAIL_T: &[u16] = &[150, 104, 66, 34];
 
 // ── #930 sharpness knobs (scratch scaffold) ──────────────────────────────────
 // The three dials the "too blurry" candidates move, all gauge-local so the
@@ -484,7 +484,7 @@ const TRAIL_T: &[u16] = &[104, 50];
 // At `1` / `256` / the `FEATHER` above, the render is byte-identical to the
 // tree before this commit.
 /// Divisor applied to the skin palette's bloom radius before the gauge blooms.
-const BLOOM_RADIUS_DIV: usize = 2;
+const BLOOM_RADIUS_DIV: usize = 1;
 /// Multiplier, in 256ths, applied to the skin palette's bloom strength.
 const BLOOM_STRENGTH_NUM: u32 = 256;
 

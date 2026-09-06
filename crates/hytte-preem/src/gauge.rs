@@ -1319,6 +1319,23 @@ mod tests {
     /// A 60 Hz frame, the tick rate the physics tests read in.
     const FRAME: f32 = 1.0 / 60.0;
 
+    /// Fewest blade pixels `the_needle_reaches_both_stops_on_a_small_dial` will
+    /// average an angle out of.
+    ///
+    /// Its annulus is an unweighted mean, so a shape whose annulus collapses
+    /// asserts a 2° bound on a sample where **one pixel is worth more than
+    /// that** — and then passes or fails on cancellation, blaming the needle for
+    /// whatever face tuning moved a pixel in or out. `32×64` was in that loop
+    /// with 4 to 6 samples and did exactly that.
+    ///
+    /// `8` because the sparsest shape the loop should carry is `40×40` on
+    /// `Lcd`, which yields **11** — the review that found this suggested 16,
+    /// which would have rejected that arm along with the bad one. The floor is
+    /// the coarse guard; the leave-one-out bound beside it is the sharp one, and
+    /// it is what actually rejects `32×64` (6.42° for one pixel, against a 2°
+    /// tolerance).
+    const MIN_BLADE_SAMPLES: usize = 8;
+
     /// Run a needle for `secs` at `dt`, returning every deflection sampled.
     fn trajectory(needle: &mut Needle, secs: f32, dt: f32) -> Vec<f32> {
         let mut out = vec![needle.fraction()];
@@ -2485,32 +2502,58 @@ mod tests {
     /// clear at all, and two faint tick pixels sitting at 0° join an average of
     /// twenty-six blade pixels sitting at −75°.
     ///
-    /// Measured, low stop, `scale(1)`, with the naive annulus and with this one:
+    /// Measured at the low stop, `scale(1)`, over the three flat skins — the
+    /// high stop is the mirror image to the last digit. Ranges, not one skin's
+    /// number, because *which* skin is the outlier is the whole finding:
     ///
-    /// | face | skin | naive | furniture excluded |
+    /// | face | naive annulus | furniture excluded | samples |
     /// |---|---|---|---|
-    /// | 48×48 | Lcd | **+5.51°** | +0.32° |
-    /// | 48×48 | Vfd / Oled | +2.82° | −0.23° |
-    /// | 64×64 | any flat | −0.15° | −0.22° |
-    /// | 32×64 | Lcd | **+53.59°** | −0.98° |
-    /// | 144×64 | any flat | −0.09° | −0.12° |
+    /// | 48×48 | **+2.82° … +5.51°** (Lcd worst) | −0.23° … +0.32° | 22 … 35 |
+    /// | 64×64 | −0.12° … −0.29° (Vfd worst) | −0.14° … −0.32° | 34 … 59 |
+    /// | 40×40 | **+14.97° … +23.07°** (Lcd worst) | +0.02° … +0.37° | 11 … 19 |
+    /// | 144×64 | −0.09° … +0.01° | −0.12° … +0.02° | 69 … 147 |
     ///
     /// So the needle was never short: the metric was reading the dial's own
     /// centre mark. The bloomed skins hid it, because their halo multiplies the
     /// blade's pixel count and dilutes the two tick pixels — which is exactly
     /// why rendering one skin was not enough. `Lcd` has no bloom at all and is
-    /// the skin that showed it.
+    /// both the sparsest sample and the worst error at every shape here.
     ///
-    /// The slack is **2°**, tightened from the 3° this test shipped with: the
-    /// worst measurement above is 0.98°, at the extreme 32×64 aspect, and the
-    /// two tuned sizes are inside 0.4°. `Crt` is left out for
+    /// # The estimator has to be able to carry the bound it asserts
+    ///
+    /// This is an **unweighted mean of a pixel set**, so its precision comes
+    /// from the sample count, never from the pixel pitch — one pixel at the
+    /// 48×48 annulus subtends 4.23° at the outer bound and 7.64° at the inner,
+    /// both far past the 2° asserted here. A shape whose annulus collapses to a
+    /// handful of pixels therefore passes by cancellation rather than by
+    /// precision, and then any face-tuning change that admits or drops one pixel
+    /// fails **blaming the needle** — the exact misattribution this test was
+    /// rewritten to remove. `32×64` was in this loop and was that shape: 4 to 6
+    /// samples, where leaving one out moves the mean 6.0–6.4°, three times the
+    /// tolerance. `MIN_MAJOR_LEN` 3.0 → 3.3 and `MID_LEN_BONUS` 1.35 → 1.30 both
+    /// turned it red, at 12.8° and 2.5°, without touching the needle at all.
+    ///
+    /// So the extreme aspect in the loop is **40×40** — which still shows the
+    /// old metric 23° out, on 11 to 19 samples that can carry the claim — and
+    /// two guards make a future addition fail as the *metric* failure it is
+    /// rather than as a needle bug:
+    ///
+    /// - [`MIN_BLADE_SAMPLES`]: the annulus did not collapse.
+    /// - a **leave-one-out** bound: no single pixel may move the mean by as much
+    ///   as the whole tolerance. 0.24–0.54° at 48×48 and 64×64, 1.07–1.13° at
+    ///   40×40, against `32×64`'s 6.42°.
+    ///
+    /// The slack is **2°**, tightened from the 3° this test shipped with. It is
+    /// twice the worst measurement and nothing more principled than that — see
+    /// the pitch numbers above for why no pixel-geometry derivation is
+    /// available. `Crt` is left out for
     /// `a_small_square_dial_is_centred_and_fits_its_buffer`'s reason — its comb
     /// and vignette tint every pixel on the glass, so "not field" stops meaning
     /// "ink" — though it measures identically to `Vfd` today.
     #[test]
     fn the_needle_reaches_both_stops_on_a_small_dial() {
         let slack = 2.0_f32.to_radians();
-        for (cols, rows) in [(48usize, 48usize), (64, 64), (32, 64)] {
+        for (cols, rows) in [(48usize, 48usize), (64, 64), (40, 40)] {
             for style in [DisplayStyle::Vfd, DisplayStyle::Lcd, DisplayStyle::Oled] {
                 let mut gauge = Gauge::with_size(cols, rows).scale(1);
                 let dial = gauge.dial();
@@ -2534,7 +2577,7 @@ mod tests {
                     gauge.settle();
                     let frame = gauge.render(style);
                     let bg = style.palette().bg;
-                    let (mut sum, mut count) = (0.0_f32, 0usize);
+                    let mut angles: Vec<f32> = Vec::new();
                     for y in 0..frame.height() {
                         for x in 0..frame.width() {
                             let px =
@@ -2545,16 +2588,19 @@ mod tests {
                             let (run, rise) = (fx(x) - dial.pivot.0, fx(y) - dial.pivot.1);
                             let radius = run.hypot(rise);
                             if radius >= inner && radius <= outer {
-                                sum += run.atan2(-rise);
-                                count += 1;
+                                angles.push(run.atan2(-rise));
                             }
                         }
                     }
+                    let count = angles.len();
                     assert!(
-                        count > 0,
-                        "{cols}×{rows} {}: the blade lit something at {fraction}",
+                        count >= MIN_BLADE_SAMPLES,
+                        "{cols}×{rows} {}: only {count} px between the hub and the furniture — \
+                         too few blade pixels to average an angle out of, whatever the needle \
+                         is doing",
                         style.name()
                     );
+                    let sum: f32 = angles.iter().sum();
                     let got = sum / fx(count);
                     let want = dial.angle(fraction);
                     assert!(
@@ -2564,6 +2610,21 @@ mod tests {
                         style.name(),
                         got.to_degrees(),
                         want.to_degrees()
+                    );
+                    // …and the reading is an average, not a coincidence: no one
+                    // pixel may be worth the whole tolerance.
+                    let worst = angles
+                        .iter()
+                        .map(|a| ((sum - a) / fx(count - 1) - got).abs())
+                        .fold(0.0_f32, f32::max);
+                    assert!(
+                        worst < slack,
+                        "{cols}×{rows} {} at {fraction}: dropping one of {count} px moves the \
+                         mean {:.2}°, which is the whole {:.2}° tolerance — this arm is \
+                         measuring a handful of pixels, not a needle",
+                        style.name(),
+                        worst.to_degrees(),
+                        slack.to_degrees()
                     );
                 }
             }
@@ -2594,6 +2655,15 @@ mod tests {
     /// placement change. `96×48` and `64×32` are seated because their *height*
     /// binds, so centring was never on the table for them; they are in the list
     /// so a later change to which axis wins is caught here.
+    ///
+    /// The clearance is asserted **twice**: once against the budget's own terms,
+    /// and once against the rendered frame — a centred face lights nothing in
+    /// its first or last row, at five readings on three skins. The first form
+    /// reduces algebraically to `margin >= 0`, the production predicate, and is
+    /// saved from being an oracle-agrees-by-construction only by deriving
+    /// `halo` independently; the second is what would still catch a
+    /// [`bloom_cap`] that under-states the real halo, and what survives a
+    /// refactor of [`Gauge::dial`].
     #[test]
     fn a_centred_face_leaves_room_for_its_own_halo() {
         let mut centred_seen = 0usize;
@@ -2638,6 +2708,45 @@ mod tests {
                 "{cols}×{rows} is centred with only {bottom:.2} px below its hub, and its \
                  halo is {halo}"
             );
+
+            // …and the same invariant read off the **frame** rather than off the
+            // budget's own arithmetic. The two asserts above reduce
+            // algebraically to `margin >= 0` — the production predicate — with
+            // only the independently-derived `halo` keeping them from being an
+            // oracle that agrees by construction, so this is the form that
+            // survives a refactor of `dial()`: a centred face lights nothing in
+            // its first or last row, at any reading, on any flat skin.
+            //
+            // Asserted for centred faces only. A **seated** face is allowed to
+            // reach its edges and the shipped default does — 18 lit pixels in
+            // row 0 at mid-scale — which is the current look, predates #931 and
+            // is #930's territory, not this test's.
+            for style in [DisplayStyle::Vfd, DisplayStyle::Lcd, DisplayStyle::Oled] {
+                for reading in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+                    let mut gauge = Gauge::with_size(cols, rows).scale(1);
+                    gauge.set_target(reading);
+                    gauge.settle();
+                    let frame = gauge.render(style);
+                    let bg = style.palette().bg;
+                    let last = frame.height() - 1;
+                    for edge in [0, last] {
+                        let lit = (0..frame.width())
+                            .filter(|&x| {
+                                frame
+                                    .get(i32::try_from(x).unwrap(), i32::try_from(edge).unwrap())
+                                    .is_some_and(|p| p[..4] != bg[..])
+                            })
+                            .count();
+                        assert_eq!(
+                            lit,
+                            0,
+                            "{cols}×{rows} {} at {reading} is centred, but row {edge} carries \
+                             {lit} lit px — the halo is being cut off",
+                            style.name()
+                        );
+                    }
+                }
+            }
         }
         assert!(centred_seen >= 8, "the sweep exercises the centred branch");
         for (cols, rows) in [(48usize, 48usize), (64, 64)] {

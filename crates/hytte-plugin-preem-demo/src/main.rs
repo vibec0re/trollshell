@@ -121,7 +121,8 @@
 //! become the config the shell sizes from), not shell CSS: the 7seg clock
 //! renders 188 px wide, the 11-char ticker 268 px, the marquee window
 //! [`MARQUEE_WINDOW_PX`] wide, the 22-column ×2 textbox 274 px, the scope's and
-//! gauge's defaults 288 px each, the two 8-cell boards 260 px, and the
+//! gauge's defaults 288 px each, the #931 square-dial row 128 + 96 px plus an
+//! 8 px gap = 232 px, the two 8-cell boards 260 px, and the
 //! `ROLE`/`PIN.`/`FLD` palette row 100 + 100 + 76 px plus two 8 px gaps = 292 px
 //! — all inside the sidebar card's ~296 px content width.
 
@@ -147,6 +148,8 @@ const MARQUEE_ID: &str = "preem-demo-marquee";
 const TEXT_ID: &str = "preem-demo-textbox";
 const SCOPE_ID: &str = "preem-demo-scope";
 const GAUGE_ID: &str = "preem-demo-gauge";
+const GAUGE_64_ID: &str = "preem-demo-gauge-64";
+const GAUGE_48_ID: &str = "preem-demo-gauge-48";
 const FLAP_ID: &str = "preem-demo-flap";
 const NIXIE_ID: &str = "preem-demo-nixie";
 const ROLE_ID: &str = "preem-demo-role";
@@ -207,6 +210,17 @@ const GAUGE_HOLD_SECS: i64 = 8;
 /// the whole 1.3 s response, so successive renders actually show the kick, the
 /// overshoot, the bounce and the settle.
 const GAUGE_SLOWMO_DT: f32 = 0.16;
+/// The larger of the two **square** dials (#931), in logical pixels a side —
+/// 128 px at the kit's ×2.
+const SMALL_DIAL_PX: u32 = 64;
+/// The smaller one: 96 px on screen, and the size at which the kit drops the
+/// counterweight and thins the needle to a hairline.
+///
+/// The two sit beside the 288 px default in one horizontal row —
+/// `128 + 8 + 96 = 232 px`, inside the sidebar card's ~296 px (the #313 lesson)
+/// — because "is a 48 px dial legible" is a question only a human looking at
+/// three dials showing the same reading can answer.
+const TINY_DIAL_PX: u32 = 48;
 /// The ticker's marquee message; the view shows a [`TICKER_WINDOW`]-char
 /// window that advances one char per second (wrapping around).
 const TICKER: &str = "PREEM RASTER KIT ~ VFD / LCD / OLED / CRT ~ 7SEG DOT 8BIT ~ ";
@@ -291,6 +305,18 @@ struct PreemDemo {
     /// so keeping it live means a reopened card reads the current value instead
     /// of replaying a stale swing.
     gauge: Gauge,
+    /// The **64×64** square dial (#931), reading the same value as
+    /// [`gauge`](Self::gauge) so the on-glass comparison is one glance: same
+    /// skin, same needle, same physics, a quarter of the pixels. At this size
+    /// the kit's face centres itself in the buffer, halves its subdivisions and
+    /// tightens its halo, but still carries a counterweight.
+    gauge_64: Gauge,
+    /// The **48×48** square dial (#931) — the small end. Everything
+    /// [`gauge_64`](Self::gauge_64) does, plus the counterweight dropped and the
+    /// needle thinned to a hairline: the smallest face the kit claims is
+    /// legible, and the reason it is here is that "legible" is a judgement no
+    /// test makes.
+    gauge_48: Gauge,
     /// The split-flap board (#397): the same `HH:MM:SS` the 7seg shows, on the
     /// airport-board mechanism. Stateful like the gauge, and like it deliberately
     /// **not** parked — its content is a pure function of the snapshot.
@@ -358,6 +384,8 @@ impl PreemDemo {
         self.textbox.style(style);
         self.scope.style(style);
         self.gauge.style(style);
+        self.gauge_64.style(style);
+        self.gauge_48.style(style);
         self.flap.style(style);
         self.nixie.style(style);
         self.role.style(style);
@@ -467,6 +495,8 @@ impl Plugin for PreemDemo {
             textbox: TextBox::new(style).cols(TEXT_COLS).scale(2),
             scope: Scope::new(style),
             gauge: Gauge::new(style).range(0.0, 100.0),
+            gauge_64: Gauge::new(style).size(SMALL_DIAL_PX).range(0.0, 100.0),
+            gauge_48: Gauge::new(style).size(TINY_DIAL_PX).range(0.0, 100.0),
             flap: FlipBoard::new(style, Mechanism::SplitFlap).cells(CLOCK_CELLS),
             nixie: FlipBoard::new(style, Mechanism::Nixie).cells(CLOCK_CELLS),
             role: DotMatrix::new(style).accent_role(AccentRole::Success),
@@ -506,8 +536,11 @@ impl Plugin for PreemDemo {
                 // The gauge's own heartbeat: dial in the current reading and let
                 // the needle move toward it. Ungated on visibility, unlike the
                 // scope — see the field docs.
-                self.gauge.set_target(self.gauge_target());
-                self.gauge.advance(GAUGE_SLOWMO_DT);
+                let reading = self.gauge_target();
+                for dial in [&mut self.gauge, &mut self.gauge_64, &mut self.gauge_48] {
+                    dial.set_target(reading);
+                    dial.advance(GAUGE_SLOWMO_DT);
+                }
                 // The boards' heartbeat: re-state the clock (unchanged cards
                 // are untouched, so only the seconds card usually moves) and
                 // advance the mechanism. Ungated for the gauge's reason.
@@ -592,6 +625,22 @@ impl Plugin for PreemDemo {
                 self.textbox.node(TEXT_ID, &Self::textbox_line(style)),
                 self.scope.node(SCOPE_ID),
                 self.gauge.node(GAUGE_ID),
+                // #931, on glass: the same needle at three sizes, reading the
+                // same value. The default above is the 288 px panel meter; these
+                // two are the square dials, and the whole point of putting them
+                // here is that whether 48 px is still *readable* is a judgement
+                // no assertion makes.
+                Node::Box {
+                    id: None,
+                    dir: Dir::Horizontal,
+                    spacing: 8,
+                    scroll: false,
+                    classes: Vec::new(),
+                    children: vec![
+                        self.gauge_64.node(GAUGE_64_ID),
+                        self.gauge_48.node(GAUGE_48_ID),
+                    ],
+                },
                 self.flap.node(FLAP_ID),
                 self.nixie.node(NIXIE_ID),
                 // #885, on glass: same widget, same skin, three palette sources.
@@ -801,9 +850,9 @@ mod tests {
             let bufs = pixels_of(&tree);
             assert_eq!(
                 bufs.len(),
-                11,
-                "clock + ticker + marquee + textbox + scope + gauge + flap + nixie \
-                 + the ROLE/PIN./FLD palette row"
+                13,
+                "clock + ticker + marquee + textbox + scope + gauge + the two square \
+                 dials + flap + nixie + the ROLE/PIN./FLD palette row"
             );
             assert!(
                 preem_of(&tree).is_empty(),
@@ -850,6 +899,9 @@ mod tests {
                 ("preem-demo-role".to_owned(), "dot-matrix"),
                 ("preem-demo-nixie".to_owned(), "flip-board"),
                 ("preem-demo-flap".to_owned(), "flip-board"),
+                // …and the #931 square-dial row, reversed with it.
+                ("preem-demo-gauge-48".to_owned(), "gauge"),
+                ("preem-demo-gauge-64".to_owned(), "gauge"),
                 ("preem-demo-gauge".to_owned(), "gauge"),
                 ("preem-demo-scope".to_owned(), "scope"),
                 ("preem-demo-textbox".to_owned(), "text-box"),

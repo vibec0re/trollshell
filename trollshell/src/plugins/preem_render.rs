@@ -1746,6 +1746,13 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
             }
         }
         W::Gauge { config, state } => {
+            // `cols`/`rows` are the whole of the gauge's size story, small
+            // square dials included (#931): the kit's `dial()` resolves a
+            // centred face, its subdivision count, its needle width and its
+            // bloom cap from the buffer alone, so a 48×48 gauge needs nothing
+            // here beyond the two dimensions a 144×64 one already sent. A
+            // config change rebuilds this instance (`same_config`), which is
+            // what re-resolves the face when a plugin re-sizes its dial.
             let mut gauge = kit::Gauge::with_size(dim(config.cols), dim(config.rows))
                 .scale(dim(config.scale))
                 .sweep_deg(config.sweep_deg)

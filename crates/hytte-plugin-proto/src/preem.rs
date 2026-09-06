@@ -1067,9 +1067,24 @@ pub struct GaugeConfig {
     pub style: StyleRef,
     /// Logical buffer width in columns (pre-upscale). Default `144`, clamped to
     /// `1..=`[`MAX_BUFFER_DIM`].
+    ///
+    /// Together with [`rows`](Self::rows) this is the **whole** size story a
+    /// gauge has — there is deliberately no separate small-dial or `size` field
+    /// (#931). The kit's face resolves its own proportions from the buffer it is
+    /// handed (`crates/hytte-preem/src/gauge.rs`'s `dial`), so a *square*
+    /// `cols == rows` already means "small dial" everywhere the kit is used:
+    /// the arc then fits by width rather than by height, so the face is
+    /// **centred** in the rows it has instead of sitting on the bottom edge,
+    /// and as the resolved arc radius shrinks it draws fewer subdivisions, a
+    /// thinner needle, no counterweight and a proportionally tighter halo. The
+    /// two sizes #931 tuned are `48` and `64` (96 and 128 px at the default ×2).
+    ///
+    /// A second spelling of the same thing on the wire would be a second source
+    /// of truth for the shell to reconcile; the SDK's `Gauge::size(edge)` is the
+    /// convenience, and it sets exactly these two fields.
     pub cols: u32,
     /// Logical buffer height in rows (pre-upscale). Default `64`, clamped to
-    /// `1..=`[`MAX_BUFFER_DIM`].
+    /// `1..=`[`MAX_BUFFER_DIM`]. See [`cols`](Self::cols) on square dials.
     pub rows: u32,
     /// Integer upscale baked into the output. Default `2`, clamped to
     /// `1..=`[`MAX_SCALE`] and pulled lower whenever `cols`/`rows` would

@@ -3511,6 +3511,63 @@ fn a_config_or_kind_change_rebuilds_the_instance() {
     );
 }
 
+/// Lifecycle, the #931 case: **re-sizing a gauge rebuilds its instance**, and
+/// the rebuilt one is the square face the new size asks for.
+///
+/// The general "a config change rebuilds" rule above already covers the
+/// mechanism, so what this pins is the *consequence* — that the shell's gauge
+/// really is sized from `cols`/`rows` on every rebuild rather than from a
+/// dimension latched at first build. A gauge that kept its original buffer
+/// would keep rendering 288×128 here and the surface would be the wrong shape
+/// on screen with nothing in CI to say so.
+///
+/// Both dimensions are asserted, because a square dial is not merely a smaller
+/// wide one: at 48×48 the kit centres the face, drops to two subdivisions,
+/// drops the counterweight and caps the bloom, and every one of those follows
+/// from the buffer these two fields carry.
+#[test]
+fn a_gauge_resize_rebuilds_the_instance_at_the_new_size() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("gauge-resize");
+
+    let dial = |cols: u32, rows: u32| {
+        preem_node(
+            Some("g"),
+            vocab::PreemWidget::Gauge {
+                config: vocab::GaugeConfig {
+                    cols,
+                    rows,
+                    ..vocab::GaugeConfig::default()
+                },
+                state: vocab::GaugeState { target: 0.5 },
+            },
+        )
+    };
+    let pixels = |node: &UiNode| match node {
+        UiNode::Pixels { width, height, .. } => (*width, *height),
+        other => panic!("a gauge maps to a Pixels node, got {other:?}"),
+    };
+
+    let wide = to_ui_node(&scope, &dial(144, 64));
+    assert_eq!(preem_render::probe(&scope, Some("g")), Some((1, 1)));
+    assert_eq!(pixels(&wide), (288, 128), "the default face, at ×2");
+
+    let small = to_ui_node(&scope, &dial(48, 48));
+    assert_eq!(
+        preem_render::probe(&scope, Some("g")),
+        Some((2, 2)),
+        "a size change is a config change, so it rebuilds rather than updating",
+    );
+    assert_eq!(pixels(&small), (96, 96), "…at the square size it asked for");
+
+    // And back again: nothing latches.
+    let wide_again = to_ui_node(&scope, &dial(144, 64));
+    assert_eq!(preem_render::probe(&scope, Some("g")), Some((3, 3)));
+    assert_eq!(pixels(&wide_again), (288, 128));
+
+    preem_render::forget_scope(&scope);
+}
+
 /// Lifecycle: an instance whose node stops appearing in the tree is dropped at
 /// the end of the mapping pass, and `forget_scope` drops the whole tree's worth
 /// (what a plugin card leaving its region does).

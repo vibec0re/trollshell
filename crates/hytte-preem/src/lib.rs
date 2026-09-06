@@ -121,6 +121,7 @@
 pub mod font;
 
 mod color_map;
+mod contrast;
 mod dot_matrix;
 mod frame;
 mod gauge;
@@ -157,6 +158,17 @@ pub use textbox::TextBox;
 /// wins). It was `pub(crate)` while the kit lived inside the SDK — the caller
 /// is simply on the far side of a crate boundary now.
 pub use style::set_accent;
+
+/// The WCAG contrast ratio between two colors (#928): `1.0` when they are
+/// equally luminous, `21.0` for black against white, symmetric.
+///
+/// Host-facing, and the reason it is public: a host that resolves colors of its
+/// own — a shell mapping semantic roles onto the live theme — needs to ask
+/// whether one of them can be read on a skin before it pins it, and
+/// [`AA_TEXT`] is the bar the kit itself holds its own inks to. Pair it with
+/// [`DisplayStyle::field`] for the skin's ground and
+/// [`DisplayStyle::admit_ink`] for the skin's own answer.
+pub use contrast::{AA_TEXT, ratio as contrast_ratio};
 
 /// Scope one render to an explicit palette (#885) — host-facing like
 /// [`set_accent`], and the *per-render* answer where that one is the

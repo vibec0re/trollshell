@@ -18,6 +18,21 @@
 //! left to right, and a **nixie** readout whose outgoing cathode fades under the
 //! incoming one's strike. Tapping the clock advances the skin immediately.
 //!
+//! That rotation is also where #928's per-skin contrast policy is checked on
+//! glass: under a **light** desktop accent the LCD slot must read as dark ink on
+//! its greenish field — the kit darkens an accent it cannot carry there, while
+//! VFD, OLED and CRT still take it verbatim. No code here changed for it; the
+//! cycle already visits every skin, which is the point of visiting every skin.
+//!
+//! Two cells on the card are deliberately *not* that. `FLD` pins its own dark
+//! lilac ground and leaves its ink on the accent path, so on `lcd` it keeps a
+//! light accent verbatim — the skin resolves against the ground a widget
+//! actually floods, and on that ground a light accent was already legible.
+//! `PIN.` pins its ink outright and so is excluded from the policy entirely; on
+//! `lcd` its hot pink sits on the olive field and will look washed out, which is
+//! the pin contract on glass rather than a regression. `ROLE` resolves a
+//! *semantic role*, which also reaches the kit as a pin — see #928's follow-up.
+//!
 //! It doubles as the visual regression harness and the copy-from reference for
 //! plugin authors — which since #884 means it is the reference for **one code
 //! path, two hosts**, not just for the raster kit.

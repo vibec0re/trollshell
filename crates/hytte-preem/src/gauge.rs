@@ -508,6 +508,57 @@ const MIN_TICK_SPACING: f32 = 5.9;
 /// halo exactly as it is.
 const BLOOM_ARC_DIV: f32 = 16.0;
 
+/// Divisor the gauge applies to its skin's bloom radius before blooming
+/// (#930) — the face wears **half** the halo the skin asks for.
+///
+/// Taste, settled by looking at renders rather than by argument. The kit bakes
+/// chunkiness into the *logical* buffer and upscales last, so at the default
+/// `scale = 2` a skin's radius is a doubled halo on the glass: `Vfd`'s `2`
+/// draws 4 output px of spill around a pointer whose solid core is 2 output px
+/// near the tip, which reads as blur, not as glow.
+///
+/// Measured on the default 144×64 face at `scale = 2`, halving takes `Vfd`'s
+/// blade from **28 lit output px to 20** across the row through it, and the
+/// whole frame from 6248 lit px to 5380 at rest (−14 %) / 7268 to 5972 settled
+/// at 80 % (−18 %); `Crt` goes 32 → 28 and 6948 → 6104. The lit **core** is
+/// untouched in both — the bloom max-combines under the lit layer, so it can
+/// only ever add shoulder, and this only ever takes shoulder away.
+///
+/// [`usize::div_ceil`], so the divisor can never reach `0` and silently switch
+/// a skin's bloom off: `Vfd` 2 → 1, `Crt` 3 → 2, `Oled` 1 → **1**. Two of the
+/// four skins therefore render **byte-identical** under this constant — `Oled`
+/// because its radius is already the floor, and `Lcd` because it carries
+/// `bloom: None` and never blooms at all. If a dial on the green skin ever
+/// reads as too soft, this is not the knob (it is [`FEATHER`]).
+///
+/// Gauge-local like [`BLOOM_ARC_DIV`]: [`Gauge::render`] copies the palette per
+/// frame, so the [`Scope`](super::Scope) standing next to a gauge keeps the
+/// skin's halo exactly as the skin defines it.
+///
+/// # Composing with the cap
+///
+/// This and [`BLOOM_ARC_DIV`]'s cap are two different statements about the same
+/// number, and they **do not commute**: halve-then-cap is
+/// `min(⌈r / 2⌉, cap)`, cap-then-halve is `⌈min(r, cap) / 2⌉`. Swept over 361
+/// buffer shapes × all four skins they agree everywhere but one cell: **`Crt`
+/// (radius `3`) on a cap-`2` face** — an arc radius in `[32, 48)`, which is
+/// `72×72`, `96×48`, `96×96` and the `100×62` #931 measured, among others —
+/// where halve-then-cap keeps `2` and cap-then-halve gives `1`. No other skin
+/// can diverge: `Vfd`'s `2` and `Oled`'s `1` both halve to `1`, which is
+/// [`bloom_cap`]'s own floor, and `Lcd` never blooms.
+///
+/// [`bloom_radius`] takes `min(cap, halved)`, the halve-then-cap form, in one
+/// place, and that is deliberate rather than incidental: the cap is a
+/// **ceiling on what a face may spend**, not an input to a taste knob. Halving
+/// a ceiling takes the halo under what *either* rule asks for on its own. In
+/// the divergent cell the cap has already done the halving's work — `Crt` asks
+/// for more than that face can afford, and gets cut to the budget — so there
+/// is nothing left for #930 to take, and the gauge stays where #931 put it.
+///
+/// Pinned by `the_bloom_takes_the_tighter_of_the_cap_and_the_halved_ask`, which
+/// enumerates the divergent set rather than asserting the orders agree.
+const BLOOM_RADIUS_DIV: usize = 2;
+
 /// How far a lit edge ramps from full intensity to nothing, perpendicular to
 /// the shape, in logical pixels.
 ///
@@ -813,13 +864,14 @@ impl Gauge {
     pub fn render(&self, style: DisplayStyle) -> Frame {
         let dial = self.dial();
         let mut palette = style.palette();
-        // A smaller dial gets a proportionally tighter halo (#931): the bloom
-        // runs at logical resolution and the upscale is the last thing `render`
-        // does, so an uncapped radius is a fixed pixel count that swallows a
-        // small face's needle. Local to this frame — the skin's own palette,
-        // and every other kit widget wearing it, is untouched.
+        // The halo this face actually spends: half the radius the skin asks for
+        // (#930), ceilinged by what a dial this size can afford (#931). The two
+        // rules compose in `bloom_radius` and nowhere else — see
+        // `BLOOM_RADIUS_DIV` for why in that order. Local to this frame — the
+        // skin's own palette, and every other kit widget wearing it, is
+        // untouched.
         if let Some(bloom) = palette.bloom.as_mut() {
-            bloom.radius = bloom.radius.min(bloom_cap(dial.radius));
+            bloom.radius = bloom_radius(bloom.radius, dial.radius);
         }
         let mut frame = Frame::filled(self.cols, self.rows, palette.bg);
 
@@ -1271,6 +1323,24 @@ fn bloom_cap(radius: f32) -> usize {
     }
     // Same clamp-then-cast contract as [`tick_budget`].
     cap.clamp(1.0, f32::from(u16::MAX)).floor() as usize
+}
+
+/// The bloom radius the gauge actually spends, in logical pixels: the radius
+/// its skin asks for, halved ([`BLOOM_RADIUS_DIV`], #930), then ceilinged by
+/// what a face with this arc radius may afford ([`bloom_cap`], #931).
+///
+/// **The one place** those two rules meet. They do not commute; see
+/// [`BLOOM_RADIUS_DIV`]'s "Composing with the cap" for the divergent cell and
+/// why this order is the principled one.
+///
+/// [`Gauge::dial`] deliberately reserves its halo margin against
+/// [`bloom_cap`] alone and not against this: the reservation only has to be an
+/// upper bound, and re-deriving the placement from a taste knob would move
+/// every centred face's geometry — #930 is a blur change, not a layout one.
+fn bloom_radius(skin_radius: usize, arc_radius: f32) -> usize {
+    skin_radius
+        .div_ceil(BLOOM_RADIUS_DIV)
+        .min(bloom_cap(arc_radius))
 }
 
 /// The pixel range covering `[low, high]` on one axis, clipped to `0..dim`.
@@ -2786,6 +2856,12 @@ mod tests {
         // faces still carry), measured along the row through the blade's
         // mid-span. Uncapped, `Vfd`'s radius-2 halo would add 4 logical px to
         // this; the cap holds it to 2.
+        //
+        // #930's halving is *inert* at this size and this measurement is
+        // unchanged by it: a 48×48 face caps at 1, and `Vfd`'s halved 2 is also
+        // 1, so `bloom_radius` returns what the bare cap already returned. The
+        // taste knob is pinned separately, on a face large enough for it to
+        // bite, in `the_bloom_takes_the_tighter_of_the_cap_and_the_halved_ask`.
         let mut gauge = Gauge::with_size(48, 48).scale(1);
         gauge.set_target(0.8);
         gauge.settle();
@@ -2807,6 +2883,119 @@ mod tests {
             lit <= 10,
             "a 48×48 Vfd blade lights {lit} px across its own row — the cap is what holds \
              that under the 12 px an uncapped halo draws"
+        );
+    }
+
+    /// The two rules that narrow a gauge's halo — #931's proportional cap and
+    /// #930's taste halving — compose in **one** place ([`bloom_radius`]) and
+    /// in one order: `min(cap, halved)`.
+    ///
+    /// They do **not** commute, so this pins the divergent set by enumerating
+    /// it rather than by asserting an order-independence that is not true. Over
+    /// 361 buffer shapes × every skin that blooms, the only cell where
+    /// cap-then-halve gives a different answer is `Crt` on a cap-`2` face, and
+    /// there the shipped rule keeps the `2` the cap had already cut it to.
+    /// [`BLOOM_RADIUS_DIV`]'s "Composing with the cap" is the argument for why
+    /// that is the wanted answer; this is the pin that stops the next taste
+    /// round having to re-derive it.
+    ///
+    /// The rule is written out here rather than called, so the assertion is not
+    /// [`bloom_radius`] agreeing with itself, and the last block is the
+    /// observable half — a constant nobody can see from outside the crate is
+    /// not a taste change. It measures the way #930 measured the blur: the lit
+    /// cross-section straight through the settled blade.
+    #[test]
+    fn the_bloom_takes_the_tighter_of_the_cap_and_the_halved_ask() {
+        let mut swept = 0usize;
+        let mut divergences = 0usize;
+        for cols in (16..=160).step_by(8) {
+            for rows in (16..=160).step_by(8) {
+                let dial = Gauge::with_size(cols, rows).dial();
+                let cap = super::bloom_cap(dial.radius);
+                for style in DisplayStyle::ALL {
+                    let Some(bloom) = style.palette().bloom else {
+                        continue;
+                    };
+                    swept += 1;
+                    let shipped = super::bloom_radius(bloom.radius, dial.radius);
+                    let halved = bloom.radius.div_ceil(super::BLOOM_RADIUS_DIV);
+                    assert_eq!(
+                        shipped,
+                        halved.min(cap),
+                        "{cols}×{rows} {}: the rule is min(cap {cap}, halved {halved})",
+                        style.name()
+                    );
+                    assert!(
+                        (1..=cap).contains(&shipped) && shipped <= bloom.radius,
+                        "{cols}×{rows} {}: {shipped} must stay inside 1..={cap} and never \
+                         exceed the skin's own {} — a radius of 0 is the bloom switched off, \
+                         which is a different change from narrowing it",
+                        style.name(),
+                        bloom.radius
+                    );
+
+                    // The other order, and the enumeration of where it lands
+                    // somewhere else.
+                    let other = bloom.radius.min(cap).div_ceil(super::BLOOM_RADIUS_DIV);
+                    if other != shipped {
+                        divergences += 1;
+                        assert!(
+                            matches!(style, DisplayStyle::Crt)
+                                && cap == 2
+                                && shipped == 2
+                                && other == 1,
+                            "{cols}×{rows} {}: an order divergence outside the documented set \
+                             (cap {cap}, skin asks {}, min(cap, halved) {shipped}, \
+                             cap-then-halve {other}) — see BLOOM_RADIUS_DIV",
+                            style.name(),
+                            bloom.radius
+                        );
+                    }
+                }
+            }
+        }
+        assert!(swept > 1_000, "the sweep is not vacuous: {swept} cells");
+        assert!(
+            divergences > 0,
+            "the sweep found no order divergence at all — BLOOM_RADIUS_DIV, a skin's radius \
+             or bloom_cap's bands have moved, and BLOOM_RADIUS_DIV's doc now describes a case \
+             that cannot happen. Re-derive the divergent set before editing this assertion: \
+             it is the only thing standing between the next taste round and the sketch that \
+             said these two orders agree"
+        );
+
+        // The two faces that doc names, by hand rather than by sweep.
+        for (cols, rows) in [(96usize, 96usize), (100, 62)] {
+            let radius = Gauge::with_size(cols, rows).dial().radius;
+            assert_eq!(
+                super::bloom_cap(radius),
+                2,
+                "{cols}×{rows} (arc radius {radius:.2}) is a cap-2 face"
+            );
+            assert_eq!(
+                super::bloom_radius(3, radius),
+                2,
+                "{cols}×{rows}: Crt keeps the 2 the cap already cut it to — halving a ceiling \
+                 would take it to 1"
+            );
+        }
+
+        // …and the halving is visible in the pixels, not only in the
+        // arithmetic. The default 144×64 face settled at 80 %, along the output
+        // row through the blade: **20** lit px at the shipped divisor, **28**
+        // with the skin's unhalved radius.
+        let mut gauge = Gauge::new();
+        gauge.set_target(0.80);
+        gauge.settle();
+        let frame = gauge.render(DisplayStyle::Vfd);
+        let bg = DisplayStyle::Vfd.palette().bg;
+        let lit = (141_i32..200)
+            .filter(|&x| frame.get(x, 80).is_some_and(|p| p[..4] != bg[..]))
+            .count();
+        assert!(
+            lit <= 24,
+            "the default Vfd blade lights {lit} px across its own row — 20 at the halved \
+             radius and 28 unhalved, so 24 and up is the halving gone"
         );
     }
 }

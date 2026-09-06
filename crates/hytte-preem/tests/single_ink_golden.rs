@@ -33,7 +33,7 @@
 //! cannot accidentally reach past a boundary to reconstruct the expected
 //! bytes.
 
-use hytte_preem::{DisplayStyle, Frame, LedStrip, Marquee, TextBox, dot_matrix, seven_seg};
+use hytte_preem::{DisplayStyle, Frame, Gauge, LedStrip, Marquee, TextBox, dot_matrix, seven_seg};
 
 /// FNV-1a over the frame's RGBA bytes plus its dimensions, so a buffer that
 /// changed *shape* fails as loudly as one that changed *colour*.
@@ -146,6 +146,43 @@ fn marquee_single_ink_bytes_are_unchanged() {
                 .window_px(120)
                 .render("blinken lichten")
                 .window(7)
+        },
+    );
+}
+
+/// The **default 144×64 needle gauge**, settled at 30 % of full scale.
+///
+/// Added by #931, which taught the face a set of small-dial rules — a centred
+/// pivot when the arc fits by width, a subdivision floor, a counterweight
+/// minimum, tick-length floors and a bloom cap proportional to the arc — every
+/// one of which is a threshold the default face sits clear of. That claim is
+/// exactly what a golden can settle and an argument cannot, and until #931 the
+/// kit's most geometry-heavy widget was the one widget with no byte pin at all.
+///
+/// The four values were captured **before** any of #931's changes, by running
+/// this test against `origin/main` at `d629f90`; they were then re-run against
+/// the finished branch unchanged. So unlike the rows above they are not from
+/// `5e50ad7`, but they are from a tree that predates the change they guard,
+/// which is the property that matters.
+///
+/// Settled at a reading rather than at rest so the frame carries the whole
+/// path: the flat face, the lit value arc, the tapered blade, the counterweight
+/// and the hub, bloomed and composited.
+#[test]
+fn gauge_single_ink_bytes_are_unchanged() {
+    check(
+        "gauge",
+        [
+            0xf28f_82e8_52ac_2312,
+            0x471c_d528_d5fa_3612,
+            0x3500_9832_2b70_3bea,
+            0xf257_45aa_ec57_3372,
+        ],
+        |style| {
+            let mut gauge = Gauge::new();
+            gauge.set_target(0.30);
+            gauge.settle();
+            gauge.render(style)
         },
     );
 }

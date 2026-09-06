@@ -1174,6 +1174,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hytte-gl"
+version = "0.1.0"
+dependencies = [
+ "gl",
+ "libloading",
+ "tracing",
+]
+
+[[package]]
 name = "hytte-plugin"
 version = "0.1.0"
 dependencies = [

@@ -8,6 +8,7 @@ members = [
   "crates/hytte-bus",
   "crates/hytte-config",
   "crates/hytte-ecal",
+  "crates/hytte-gl",
   "crates/hytte-ai-providers",
   "crates/hytte-claude-bridge",
   "crates/hytte-plugin-proto",
@@ -50,10 +51,11 @@ repository = "https://git.hannig.cc/choom/trollshell"
 # the code actually requires rather than rewriting call sites across 5 crates.
 rust-version = "1.91"
 
-# hytte-ecal hand-mirrors this table (crates/hytte-ecal/Cargo.toml) instead of
-# `[lints] workspace = true`, because it needs `unsafe_code = "allow"` and
-# Cargo's workspace-lints inheritance is all-or-nothing (no per-lint override).
-# Keep the two in sync when editing this table.
+# hytte-ecal and hytte-gl hand-mirror this table (crates/hytte-ecal/Cargo.toml,
+# crates/hytte-gl/Cargo.toml) instead of `[lints] workspace = true`, because
+# they need `unsafe_code = "allow"` and Cargo's workspace-lints inheritance is
+# all-or-nothing (no per-lint override). Keep all three in sync when editing
+# this table.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

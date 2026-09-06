@@ -197,10 +197,11 @@ fn marquee_single_ink_bytes_are_unchanged() {
 /// path: the flat face, the lit value arc, the tapered blade, the counterweight
 /// and the hub, bloomed and composited.
 ///
-/// **Recaptured by #930** (`BLOOM_RADIUS_DIV: 1 → 2` in `gauge.rs`, the gauge
-/// halving its skin's bloom radius) — see this file's header, "Recaptured by
-/// #930", for the provenance and for why exactly two of the four values below
-/// moved.
+/// **Recaptured by #930** (`BLOOM_RADIUS_DIV` introduced at `2` in `gauge.rs`
+/// — effectively `1 → 2`: the skin radius was previously used as-is — the
+/// gauge halving its skin's bloom radius) — see this file's header,
+/// "Recaptured by #930", for the provenance and for why exactly two of the
+/// four values below moved.
 #[test]
 fn gauge_single_ink_bytes_are_unchanged() {
     check(

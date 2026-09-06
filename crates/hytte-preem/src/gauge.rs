@@ -522,12 +522,16 @@ const BLOOM_ARC_DIV: f32 = 16.0;
 /// whole frame from 6248 lit px to 5380 at rest (−14 %) / 7268 to 5972 settled
 /// at 80 % (−18 %); `Crt` goes 32 → 28 and 6948 → 6104. The lit **core** is
 /// untouched in both — the bloom max-combines under the lit layer, so it can
-/// only ever add shoulder, and this only ever takes shoulder away.
+/// only ever add shoulder, and halving it dims the halo's shoulder; a handful
+/// of near-black pixels beside thin elements gain 1–2/255 as the blur
+/// concentrates, imperceptible. Fully-saturated ink is unchanged.
 ///
-/// [`usize::div_ceil`], so the divisor can never reach `0` and silently switch
-/// a skin's bloom off: `Vfd` 2 → 1, `Crt` 3 → 2, `Oled` 1 → **1**. Two of the
-/// four skins therefore render **byte-identical** under this constant — `Oled`
-/// because its radius is already the floor, and `Lcd` because it carries
+/// [`usize::div_ceil`], so the halved radius can never reach `0` — a floor
+/// would take Oled's radius-1 bloom to `0`, and `Emission::bloom` treats
+/// radius `0` as *no bloom*, switching the skin's glow off silently. `Vfd` 2
+/// → 1, `Crt` 3 → 2, `Oled` 1 → **1**. Two of the four skins therefore render
+/// **byte-identical** under this constant — `Oled` because its radius is
+/// already the floor, and `Lcd` because it carries
 /// `bloom: None` and never blooms at all. If a dial on the green skin ever
 /// reads as too soft, this is not the knob (it is [`FEATHER`]).
 ///

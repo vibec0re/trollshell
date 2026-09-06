@@ -652,10 +652,12 @@ audio feed, not the raster.
      from): the pointer should read as a drawn needle with a glow, not as a
      lit smudge. Its lit cross-section on the default 144×64 face at ×2 is 20
      output px, down from 28.
-  2. **The core is not dimmer or thinner.** The bloom only ever adds shoulder,
-     so halving it must take _only_ shoulder: the bright centre of the blade,
-     the hub and the value arc should be exactly as bright and exactly as wide
-     as before. A needle that got fainter is a different bug.
+  2. **The core is not dimmer or thinner.** Halving the bloom dims the halo's
+     shoulder; a handful of near-black pixels beside thin elements gain
+     1–2/255 as the blur concentrates, imperceptible. Fully-saturated ink —
+     the bright centre of the blade, the hub and the value arc — should be
+     exactly as bright and exactly as wide as before. A needle that got
+     fainter is a different bug.
   3. **CRT keeps a visibly broader halo than VFD** (radius 3 → 2 there, so it
      is narrowed too but stays the widest of the four). If VFD and CRT now
      read the same, the per-skin spread has collapsed.

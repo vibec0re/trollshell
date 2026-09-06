@@ -1702,8 +1702,10 @@ pub(super) fn set_role_inks(inks: RoleInks) {
 /// beside it. Since #940 that admission runs on all four skins rather than on
 /// the `Lcd` alone, and it is still one scan: the ramp stops at the **first**
 /// stop that clears the bar, so an already-legible color (libadwaita's whole
-/// dark trio, on every dark panel) costs one `contrast::ratio` and returns at
-/// stop 0.
+/// dark trio, on every dark panel) costs **two** `contrast::ratio` calls — the
+/// pole probe, then stop 0 — and returns the color it was handed. The
+/// light-theme trio on a dark panel costs 8–31; the `Lcd`'s worst case, 56, is
+/// exactly what #939 already shipped, so the ceiling did not move.
 ///
 /// The reason not to memoize is what the key would have to be. [`role_inks`]
 /// caches the three *theme* colors, so [`invalidate_cached_frames`]'s

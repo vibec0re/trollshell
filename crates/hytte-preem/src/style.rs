@@ -308,7 +308,9 @@ const WHITE: Rgba = [0xff, 0xff, 0xff, 0xff];
 ///
 /// **Total and deterministic.** Against a skin's *own* field a legible answer
 /// always exists — the ramp's last stop is `toward` itself, each skin's own ink,
-/// which its own palette reads at 6.85:1 — so the scan succeeds and the fallback
+/// which its own palette reads at **at least 6.85:1** (that figure is the
+/// [`Lcd`](DisplayStyle::Lcd)'s, the tightest of the four; `Vfd` reads 15.771:1,
+/// `Oled` 18.391:1 and `Crt` 15.516:1) — so the scan succeeds and the fallback
 /// is unreachable. Against a field a **host pinned**, it is reachable and real:
 /// a dark accent on a dark substituted ground cannot be helped by darkening it
 /// further, because darkening is the only tool the skin has. So the fallback is
@@ -529,7 +531,22 @@ impl DisplayStyle {
     /// [`contrast_ratio`](crate::contrast_ratio) and
     /// [`field`](Self::field) to decide whether asking is even necessary.
     ///
-    /// Nothing in the kit calls this — it is a seam, not a step.
+    /// Nothing in the kit calls this — it is a seam, not a step: the render path
+    /// reaches the same policy through the private
+    /// [`admit_ink_against`](Self::admit_ink_against), which
+    /// [`palette_with`](Self::palette_with) calls directly.
+    ///
+    /// **Since #940 nothing in the workspace calls it either.** #939's single
+    /// call site was `preem_render::ink_for`'s role arm, and #940 moved that to
+    /// [`admit_role_ink`](Self::admit_role_ink); what is left is two assertions
+    /// (`the_public_seam_answers_what_the_render_path_does` and
+    /// `a_role_is_admitted_where_an_accent_is_taken_as_given`, which hold it
+    /// against `palette_with` so it cannot rot) and whatever **out-of-tree
+    /// host** asks the question. That is the caller set the signature is kept
+    /// stable for — not an in-tree accent caller, of which there are none. It is
+    /// still the documented answer to "what would this skin do with an accent?",
+    /// and it is still the honest place to send one; it is simply not on any
+    /// path this repository executes.
     #[must_use]
     pub fn admit_ink(self, ink: Rgba, field: Option<Rgba>) -> Rgba {
         let [r, g, b, _] = self.admit_ink_against(ink, field.unwrap_or(self.base_palette().bg));
@@ -569,6 +586,32 @@ impl DisplayStyle {
     /// green exactly as #939 left it. Nothing is ever made *less* legible than
     /// it arrived, which is [`admit`]'s own guarantee.
     ///
+    /// # What the bar is measured on
+    ///
+    /// The **flat palette pair** — this ink against that ground — which is the
+    /// scope [`contrast`] states and the only thing a color-resolution seam can
+    /// answer. It is *not* a claim about every pixel of the finished frame: a
+    /// skin's post-passes run after the palette is chosen, and one of them
+    /// takes light away. The [`Mask`] the `Crt` carries keeps `150/256` of the
+    /// lit layer on one scanline row in four and `115/256` at the far corner,
+    /// so on the
+    /// [`Crt`](Self::Crt) an ink admitted to exactly 4.5:1 reads about
+    /// **2.2:1 on a comb row** (≈1.75:1 in the corner) — measured, for the
+    /// light-theme trio, `#0a8a44` 4.565 → 2.229, `#85791c` 4.582 → 2.239,
+    /// `#95733b` 4.625 → 2.236. The bloom (radius 3, strength 190) puts some of
+    /// that back around a stroke, and a comb row is the worst row rather than
+    /// the average one, but the direction is real.
+    ///
+    /// This is newly *reachable* rather than new: the `Crt`'s own ink is
+    /// 15.516:1 flat and still 5.561:1 on a comb row, chosen with the headroom
+    /// to survive its own mask, and until #940 nothing on that skin was ever
+    /// tinted **to** the bar (its [`AccentPolicy`] is
+    /// [`AsGiven`](AccentPolicy::AsGiven)). Raising the constant here would be
+    /// the wrong lever — it would move every skin to fix one, and the ramp would
+    /// keep walking toward the same green. If the `Crt` needs more, it needs
+    /// #940's option **C**: role inks the skin owns, chosen with the mask in
+    /// view (#397).
+    ///
     /// Nothing in the kit calls this either — a role is a host's vocabulary, and
     /// the kit has none.
     #[must_use]
@@ -583,12 +626,21 @@ impl DisplayStyle {
     ///
     /// **The skin's own ink, whenever it can be read there.** That is the common
     /// case and the only one a skin has an opinion about: against a skin's *own*
-    /// field its own ink reads at ≈6.85:1, so the pole is the skin's ink on
-    /// every unpinned widget — the phosphors' pale cyan / white-blue / P31 green
-    /// and the LCD's dark olive. Tinting toward it is what makes an admitted
-    /// role still look like the panel it is on, and it is what makes the
-    /// direction fall out of the skin instead of out of a hard-coded
-    /// "lighten"/"darken".
+    /// field its own ink reads at **at least 6.85:1** — `Lcd` 6.847:1, and the
+    /// three dark panels with more than twice that headroom (`Vfd` 15.771:1,
+    /// `Oled` 18.391:1, `Crt` 15.516:1) — so the pole is the skin's ink on
+    /// every unpinned widget, on all four. Those are the phosphors' pale cyan /
+    /// white-blue / P31 green and the LCD's dark olive. Tinting toward one is
+    /// what makes an admitted role still look like the panel it is on, and it is
+    /// what makes the direction fall out of the skin instead of out of a
+    /// hard-coded "lighten"/"darken".
+    ///
+    /// **The tie-break is `WHITE`.** The second branch compares the two extremes
+    /// with `>=`, so an exact tie takes white. It is deterministic and
+    /// immaterial — a tie means both sides read 4.5826:1, comfortably over the
+    /// bar, and the closest 8-bit ground to the crossover, `#a833ff`, separates
+    /// them by 1.6e-4 — but which side wins should not have to be read off the
+    /// operator.
     ///
     /// It also makes the `Lcd` role path **byte-identical** to the one #933/#939
     /// already ship: the Lcd's pole here is the same `#23281a` its
@@ -1808,7 +1860,9 @@ mod tests {
     ///
     /// 1. **On the skin's own field the bar is unconditional.** Every accent
     ///    clears AA, because the ramp ends on the skin's own ink and that ink
-    ///    reads on that field at 6.85:1. This is #928.
+    ///    reads on that field at **at least 6.85:1** — the `Lcd`'s number, and
+    ///    the tightest of the four (the dark panels read 15.5–18.4:1). This is
+    ///    #928.
     /// 2. **On a ground the host pinned, the skin promises only that it will
     ///    not make things worse** — the admitted ink is never less legible than
     ///    the raw accent would have been. It *cannot* promise AA there: its only

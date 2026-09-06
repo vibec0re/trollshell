@@ -8,6 +8,21 @@
 //! field and vanish (Annika's live verify on #881: *"lcd background skin
 //! (greenish) has light tinted foreground so it's not readable"*).
 //!
+//! # The pair is the scope, and the post-passes are outside it
+//!
+//! A ratio here is about the **palette**, measured before a single pixel is
+//! stamped. The passes that run after — the bloom, the ghost, and above all
+//! [`Mask::CRT`](super::style::Mask) — move the light that actually lands, and
+//! this module never sees them. The mask is the one that takes light *away*:
+//! `150/256` on one scanline row in four and `115/256` at the far corner, so a
+//! `Crt` ink admitted to exactly [`AA_TEXT`] reads around **2.2:1 on a comb
+//! row**. Every skin's own ink is chosen with enough headroom to survive its
+//! own passes (the `Crt`'s is 15.516:1 flat, 5.561:1 on a comb row); an ink
+//! admitted to the bar has none. #940's
+//! [`admit_role_ink`](super::style::DisplayStyle::admit_role_ink) carries the
+//! numbers and the reasoning — it is the first thing in the kit that tints a
+//! phosphor skin's ink *to* the bar rather than leaving it as given.
+//!
 //! [`ratio`] is the whole module's surface.
 //! [`DisplayStyle`](super::style::DisplayStyle)'s per-skin accent policy is its
 //! consumer inside the kit; it is re-exported from the crate root

@@ -5915,6 +5915,426 @@ fn a_pinned_text_box_survives_a_theme_change_though_it_bakes_at_construction() {
     assert_eq!(teal, rose, "…and survive a theme change byte-identically");
 }
 
+// ── #935: a resolved role is offered to the skin, an author's pin is not ─────
+
+/// libadwaita's six status colors — `@success_color`, `@warning_color` and
+/// `@error_color` under each scheme, as the installed 1.9.3 resolves them
+/// (the table on #935).
+///
+/// Hard-coded for the same reason `set_role_inks` exists at all: the hermetic
+/// test binary has no display, so `resolve_role_inks` returns every color unset
+/// and each role would — correctly, by its documented fallback — degrade to the
+/// session accent, proving nothing about admission.
+const LIBADWAITA_ROLES: [(&str, vocab::AccentRole, kit::Rgba); 6] = [
+    (
+        "dark @success_color",
+        vocab::AccentRole::Success,
+        [0x64, 0xec, 0xa5, 0xff],
+    ),
+    (
+        "dark @warning_color",
+        vocab::AccentRole::Warning,
+        [0xff, 0xc1, 0x3f, 0xff],
+    ),
+    (
+        "dark @error_color",
+        vocab::AccentRole::Error,
+        [0xff, 0x87, 0x7b, 0xff],
+    ),
+    (
+        "light @success_color",
+        vocab::AccentRole::Success,
+        [0x00, 0x7c, 0x3d, 0xff],
+    ),
+    (
+        "light @warning_color",
+        vocab::AccentRole::Warning,
+        [0x90, 0x54, 0x00, 0xff],
+    ),
+    (
+        "light @error_color",
+        vocab::AccentRole::Error,
+        [0xc3, 0x00, 0x00, 0xff],
+    ),
+];
+
+/// What each of [`LIBADWAITA_ROLES`] becomes on the `Lcd`, byte for byte, in the
+/// same order — the ramp's answer against the skin's own olive field.
+///
+/// Pinned rather than recomputed on purpose: **the stop count changes what the
+/// user sees**, and every other assertion here compares against `AA_TEXT` or
+/// against the seam and so follows the kit anywhere it goes. This one does not
+/// (the kit's own `an_accented_lcd_render_is_pinned_to_its_bytes` makes the same
+/// argument for the accent path). Per-platform, like every admitted ink: the
+/// ramp is integer-exact but the stop *selection* runs through `f32::powf`.
+const LCD_ADMITTED_ROLE_INKS: [kit::Rgba; 6] = [
+    [0x2d, 0x47, 0x30, 0xff],
+    [0x49, 0x42, 0x20, 0xff],
+    [0x53, 0x3d, 0x2f, 0xff],
+    [0x14, 0x4c, 0x29, 0xff],
+    [0x58, 0x3d, 0x0d, 0xff],
+    [0x87, 0x0f, 0x0a, 0xff],
+];
+
+/// Drops the memoized role colors (and the kit accent) when it falls out of
+/// scope — see [`role_ink_reset`].
+struct RoleInkReset;
+
+impl Drop for RoleInkReset {
+    fn drop(&mut self) {
+        // `tint_in_process_surfaces(None)` is the shell's own theme-moved seam:
+        // it clears the kit accent *and* calls `invalidate_cached_frames`,
+        // which does the `ROLE_INKS.set(None)`. Resetting through it rather
+        // than through `set_role_inks(default)` means the teardown cannot
+        // reach a state the shell itself has no path to.
+        tint_in_process_surfaces(None);
+    }
+}
+
+/// Clear the role memo now, and again when the test ends.
+///
+/// `ROLE_INKS` is a `thread_local!`, so the default harness hands every test a
+/// fresh cell and the module is green either way — including under
+/// `--test-threads=1`, where all 121 share one. This is hygiene the file already
+/// keeps (`a_status_role_resolves_to_the_theme_color_not_the_accent` ends on a
+/// `tint_in_process_surfaces(None)`), made order-proof: a guard restores on the
+/// unwind out of a failed assertion, where a trailing call would not, so one red
+/// test cannot cascade into the next one on the same thread.
+fn role_ink_reset() -> RoleInkReset {
+    tint_in_process_surfaces(None);
+    RoleInkReset
+}
+
+/// Install exactly one role color, leaving the other two unset — so a case names
+/// a single `(role, color)` pair and no second color can leak into it.
+fn inject_role_ink(role: vocab::AccentRole, ink: kit::Rgba) {
+    let mut inks = preem_render::RoleInks::default();
+    match role {
+        vocab::AccentRole::Success => inks.success = Some(ink),
+        vocab::AccentRole::Warning => inks.warning = Some(ink),
+        vocab::AccentRole::Error => inks.error = Some(ink),
+        vocab::AccentRole::Accent | vocab::AccentRole::Neutral => {
+            unreachable!("only the three status roles carry a theme color")
+        }
+    }
+    preem_render::set_role_inks(inks);
+}
+
+/// The color a `StyleRef` resolves its ink to through the render path, or a
+/// panic naming the variant that came back instead.
+fn resolved_ink(style: vocab::StyleRef) -> kit::Rgba {
+    match preem_render::resolved_pins(style).ink {
+        kit::Ink::Fixed(rgba) => rgba,
+        other => panic!("a resolved role must arrive as a pinned color, got {other:?}"),
+    }
+}
+
+/// **#935, the property.** Every libadwaita status color, on every skin, is what
+/// that skin admits — which on the reflective `Lcd` means it clears WCAG AA
+/// against the field it is actually painted on, and on the three dark panels
+/// means it arrives untouched.
+///
+/// The claim is deliberately *not* "AA everywhere". `AccentPolicy::AsGiven` on
+/// `Vfd`/`Oled`/`Crt` is #933's settled design and says so in its own rustdoc —
+/// and measured, the light-theme trio lands at 3.15–3.95:1 on those fields, so a
+/// blanket AA assertion would have to override the skins to pass. What the shell
+/// owes is that it *asks*: the three concrete assertions below are the outcome,
+/// and the equality against [`kit::DisplayStyle::admit_ink`] is the anti-drift
+/// one (the shell must route through the kit's seam, not re-implement a ramp
+/// beside it — #933's `the_public_seam_answers_what_the_render_path_does` is the
+/// mirror of it on the kit side).
+///
+/// Resolution rather than pixels because three of the four skins bloom or mask
+/// their lit layer, which would make a "find the fully-lit pixel" assertion a
+/// claim about the post-passes. The rendered half is
+/// [`a_role_renders_exactly_like_its_pin_on_the_dark_skins_and_never_on_the_lcd`]
+/// and [`the_admitted_role_inks_on_the_lcd_are_pinned_to_their_bytes`].
+///
+/// **Deletion check:** restoring the pre-#935 arm (`.map_or(Ink::Default,
+/// Ink::Fixed)` — the role color pinned unadmitted) turns this red at the seam
+/// equality, `[100, 236, 165, 255]` against `[45, 71, 48, 255]`; the `Lcd` AA
+/// assertion is the next one behind it, at 1.06–2.87:1. Hard-coding
+/// `DisplayStyle::Lcd` instead of `display_style(style)` reds the same equality
+/// from the other side, on `vfd`.
+#[test]
+fn every_status_role_color_is_admitted_by_the_skin_it_renders_on() {
+    let _ink = preem_ink_lock();
+    let _roles = role_ink_reset();
+
+    for (label, role, color) in LIBADWAITA_ROLES {
+        for (name, skin) in vocab::StyleName::ALL
+            .into_iter()
+            .zip(kit::DisplayStyle::ALL)
+        {
+            assert_eq!(
+                name.name(),
+                skin.name(),
+                "the wire's style order is the kit's — the zip above depends on it",
+            );
+            inject_role_ink(role, color);
+            let resolved = resolved_ink(vocab::StyleRef::new(name).with_accent(role));
+            let raw = kit::contrast_ratio(color, skin.field());
+            let got = kit::contrast_ratio(resolved, skin.field());
+
+            assert_eq!(
+                resolved,
+                skin.admit_ink(color, None),
+                "{label} on {}: the shell must hand the color to the skin's own seam",
+                skin.name(),
+            );
+            assert!(
+                got >= raw,
+                "{label} on {}: admission may not make a color harder to read \
+                 ({raw:.3}:1 became {got:.3}:1)",
+                skin.name(),
+            );
+            if skin == kit::DisplayStyle::Lcd {
+                assert!(
+                    got >= kit::AA_TEXT,
+                    "{label} on the lcd field: {color:?} read at {raw:.3}:1 and the skin \
+                     handed back {resolved:?} at {got:.3}:1, still below AA — this is #935",
+                );
+            } else {
+                assert_eq!(
+                    resolved,
+                    color,
+                    "{label} on {}: a dark panel is `AsGiven`, so the role color is verbatim",
+                    skin.name(),
+                );
+            }
+        }
+    }
+}
+
+/// The admission measures against the ground the widget will **actually flood** —
+/// the widget's own [`field`](vocab::StyleRef::field) pin when it has one, the
+/// skin's otherwise. The same rule, and the same reason, as `palette_with`'s
+/// ordering for the accent (#933's HIGH-1).
+///
+/// Both directions are asserted, because they fail differently. On `preem-demo`'s
+/// dark lilac `FLD` ground the dark `@success_color` already reads at 9.24:1, so
+/// the skin must pass it through — resolving against the olive field instead
+/// would darken it to `#2d4730` and drop it onto the lilac at **1.35:1**, making
+/// a widget strictly worse than it was before roles were admitted at all. On a
+/// *light* pinned ground the role still has to be darkened, and to a different
+/// stop than the skin's own field would have chosen.
+///
+/// **Deletion check:** passing `None` instead of `style.field` to `admit_ink`
+/// turns the lilac assertion red — `[45, 71, 48, 255]` where the role color
+/// belonged, which is 1.348:1 on that ground — and reds **only** this test out
+/// of the module's 121, so it is an alarm on its own wire rather than a second
+/// bell on the admission itself.
+#[test]
+fn a_pinned_field_moves_the_ground_a_role_is_admitted_against() {
+    let _ink = preem_ink_lock();
+    let _roles = role_ink_reset();
+    let success = [0x64, 0xec, 0xa5, 0xff];
+    inject_role_ink(vocab::AccentRole::Success, success);
+    let lcd = vocab::StyleRef::new(vocab::StyleName::Lcd).with_accent(vocab::AccentRole::Success);
+
+    // `preem-demo`'s `FLD` cell pins exactly this ground and leaves its ink on
+    // the theme (`main.rs`'s `FIELD_PIN`).
+    let lilac = [0x3a, 0x22, 0x50, 0xff];
+    let on_lilac = resolved_ink(lcd.with_field(lilac));
+    assert_eq!(
+        on_lilac, success,
+        "the role already reads on a dark pinned ground, so the skin has nothing to admit",
+    );
+    assert!(
+        kit::contrast_ratio(on_lilac, lilac) >= kit::AA_TEXT,
+        "…and it is legible there, which is what makes the passthrough right",
+    );
+
+    // #928's mirror: a host that pins a *light* ground reopens the same bug
+    // through a second door, so the ink still has to be darkened — just to a
+    // different stop than the olive field asks for.
+    let paper = [0xf5, 0xf5, 0xf5, 0xff];
+    let on_paper = resolved_ink(lcd.with_field(paper));
+    assert_eq!(
+        on_paper,
+        [0x3f, 0x7b, 0x55, 0xff],
+        "a light pinned ground gets its own admitted ink, not the skin field's",
+    );
+    assert!(
+        kit::contrast_ratio(on_paper, paper) >= kit::AA_TEXT,
+        "…and that ink clears AA on the ground it is drawn on",
+    );
+    assert_ne!(
+        on_paper,
+        resolved_ink(lcd),
+        "…and it is a different stop from the one the skin's own field selects, \
+         or this test cannot see the ground at all",
+    );
+}
+
+/// The six admitted `Lcd` inks, byte for byte, and one of them all the way
+/// through the real render path.
+///
+/// The literal quads pin the ramp: `ADMIT_STOPS` is what decides how far along
+/// the accent → skin-ink line the answer sits, and every ratio-shaped assertion
+/// in this file would follow it silently to a coarser ramp. The render half is
+/// what ties the resolution to a pixel — `Lcd` is the kit's one skin with no
+/// bloom and no mask, so a fully-lit dot *is* the ink, which is why the byte
+/// probe lives on this skin and not on `Vfd`.
+///
+/// **Deletion check:** the pre-#935 arm turns every quad red (the raw theme
+/// color comes back), and the rendered assertion red at the raw `#64eca5` being
+/// on screen.
+#[test]
+fn the_admitted_role_inks_on_the_lcd_are_pinned_to_their_bytes() {
+    let _ink = preem_ink_lock();
+    let _roles = role_ink_reset();
+    let lcd = kit::DisplayStyle::Lcd;
+
+    for ((label, role, color), admitted) in LIBADWAITA_ROLES.into_iter().zip(LCD_ADMITTED_ROLE_INKS)
+    {
+        inject_role_ink(role, color);
+        let resolved = resolved_ink(vocab::StyleRef::new(vocab::StyleName::Lcd).with_accent(role));
+        assert_eq!(resolved, admitted, "{label}: the admitted ink moved");
+        assert!(
+            kit::contrast_ratio(admitted, lcd.field()) >= kit::AA_TEXT,
+            "{label}: …and the pinned byte is the legible one",
+        );
+    }
+
+    // The same resolution, rasterised: the admitted ink reaches a lit pixel and
+    // the raw theme color reaches none.
+    let (label, role, color) = LIBADWAITA_ROLES[0];
+    let admitted = LCD_ADMITTED_ROLE_INKS[0];
+    inject_role_ink(role, color);
+    let scope = Scope::detached("935-lcd-bytes");
+    let pixels = mapped_pixels(
+        &scope,
+        &ink_probe(
+            "role",
+            vocab::StyleRef::new(vocab::StyleName::Lcd).with_accent(role),
+        ),
+    );
+    preem_render::forget_scope(&scope);
+
+    assert!(
+        pixels.2.chunks_exact(4).any(|px| px == admitted),
+        "{label}: a fully-lit lcd dot must carry the admitted ink",
+    );
+    assert!(
+        !pixels.2.chunks_exact(4).any(|px| px == color),
+        "{label}: …and the raw theme color must reach no pixel at all — it is the invisible one",
+    );
+}
+
+/// **The #912 contract, unmoved.** An author's explicit `ink` pin is returned
+/// verbatim even when the skin would never have admitted that color — pins win
+/// unconditionally, and #935 narrows that to *stated* colors only.
+///
+/// The pin used is the very color the role path darkens two tests up, so the two
+/// halves of the distinction are measured against one another rather than
+/// against different inputs, and the pin is asserted to be illegible so the
+/// claim is about a color the skin really would have rejected.
+///
+/// **Deletion check:** admitting in the `Some(ink)` early-return arm turns this
+/// red at "a pinned ink is a stated color and wins outright", `[45, 71, 48,
+/// 255]` for `[100, 236, 165, 255]` — and reds #912's
+/// `a_pinned_text_box_survives_a_theme_change_though_it_bakes_at_construction`
+/// beside it, which is the same contract on the widget that bakes.
+#[test]
+fn an_explicit_ink_pin_is_never_admitted_even_where_the_lcd_cannot_carry_it() {
+    let _ink = preem_ink_lock();
+    let _roles = role_ink_reset();
+    let illegible = [0x64, 0xec, 0xa5, 0xff];
+    let lcd = kit::DisplayStyle::Lcd;
+
+    assert!(
+        kit::contrast_ratio(illegible, lcd.field()) < kit::AA_TEXT,
+        "the pin has to be a color the skin would have refused, or this proves nothing",
+    );
+
+    let pinned = vocab::StyleRef::new(vocab::StyleName::Lcd).with_ink(illegible);
+    assert_eq!(
+        resolved_ink(pinned),
+        illegible,
+        "a pinned ink is a stated color and wins outright — legible or not",
+    );
+
+    inject_role_ink(vocab::AccentRole::Success, illegible);
+    assert_ne!(
+        resolved_ink(
+            vocab::StyleRef::new(vocab::StyleName::Lcd).with_accent(vocab::AccentRole::Success)
+        ),
+        illegible,
+        "…while the same color arriving as a *role* is the shell's answer, and is admitted",
+    );
+
+    let scope = Scope::detached("935-pin-verbatim");
+    let pixels = mapped_pixels(&scope, &ink_probe("pin", pinned));
+    preem_render::forget_scope(&scope);
+    assert!(
+        pixels.2.chunks_exact(4).any(|px| px == illegible),
+        "…and the pinned color reaches the glass exactly as pinned",
+    );
+}
+
+/// **The dark skins do not move.** A role-tinted render is byte-identical to the
+/// same color arriving as an explicit pin on `Vfd`/`Oled`/`Crt` — which is what
+/// `AccentPolicy::AsGiven` means — and is *not* on the `Lcd`, which is #935.
+///
+/// Comparing against the pin rather than against a recorded baseline is what
+/// makes this non-vacuous without a golden: the pin path provably never touches
+/// the admission ([`an_explicit_ink_pin_is_never_admitted_even_where_the_lcd_cannot_carry_it`]),
+/// so an equal frame is a frame the admission left alone, all the way through
+/// bloom, ghost and the CRT mask.
+///
+/// **Deletion check:** giving the dark skins `TintToLegible` is a kit-side
+/// change this file cannot make; the shell-side mutation that reds it is
+/// asking the *wrong* skin — hard-coding `DisplayStyle::Lcd` in `ink_for`
+/// instead of `display_style(style)` — which reds it at "dark `@success_color`
+/// on vfd: `AsGiven` means not one byte moves". The pre-#935 arm reds it from
+/// the other direction, at the `Lcd` inequality.
+#[test]
+fn a_role_renders_exactly_like_its_pin_on_the_dark_skins_and_never_on_the_lcd() {
+    let _ink = preem_ink_lock();
+    let _roles = role_ink_reset();
+    let scope = Scope::detached("935-dark-parity");
+
+    for (index, (label, role, color)) in LIBADWAITA_ROLES.into_iter().enumerate() {
+        for (name, skin) in vocab::StyleName::ALL
+            .into_iter()
+            .zip(kit::DisplayStyle::ALL)
+        {
+            inject_role_ink(role, color);
+            let by_role = mapped_pixels(
+                &scope,
+                &ink_probe(
+                    &format!("role-{index}-{}", skin.name()),
+                    vocab::StyleRef::new(name).with_accent(role),
+                ),
+            );
+            let by_pin = mapped_pixels(
+                &scope,
+                &ink_probe(
+                    &format!("pin-{index}-{}", skin.name()),
+                    vocab::StyleRef::new(name).with_ink(color),
+                ),
+            );
+            if skin == kit::DisplayStyle::Lcd {
+                assert_ne!(
+                    by_role, by_pin,
+                    "{label} on the lcd: the role is admitted and the pin is not, \
+                     so the two frames must differ",
+                );
+            } else {
+                assert_eq!(
+                    by_role,
+                    by_pin,
+                    "{label} on {}: `AsGiven` means not one byte moves",
+                    skin.name(),
+                );
+            }
+        }
+    }
+
+    preem_render::forget_scope(&scope);
+}
+
 // ── #885's palette widening: field + notdef (#884's two speech bubbles) ──────
 
 /// A pinned **field** floods the ground the widget draws on, and — like a pinned

@@ -170,6 +170,13 @@
 //! exactly as it did before this existed; `Neutral` refuses even that and takes
 //! the skin's own ink.
 //!
+//! A theme color resolved for a role is then **offered to the skin** before it
+//! is pinned (`DisplayStyle::admit_ink`, #935): it is the shell's answer rather
+//! than the author's, so the skin still owns what an ink it did not choose looks
+//! like on its field — which is what keeps the status trio readable on the
+//! reflective `Lcd`. An author's explicit `ink` pin is *not* offered; see
+//! [`ink_for`] for the whole of that distinction.
+//!
 //! # …and what makes it *live* (#396)
 //!
 //! Nothing here is baked into an instance. Every rasterisation resolves the
@@ -1630,6 +1637,53 @@ pub(super) fn set_role_inks(inks: RoleInks) {
 /// 4. `Accent` — and a `StyleRef` that names no role at all — take the session
 ///    accent, which is `kit::Ink::Default`: exactly what every preem widget
 ///    rendered before roles were resolved at all, so an old frame is unmoved.
+///
+/// # A resolved role is *asked about*, a pinned ink is not (#935)
+///
+/// Arms 1 and 2 both end at [`kit::Ink::Fixed`], and the kit cannot tell them
+/// apart — so it treats both as stated on purpose and takes them verbatim, which
+/// is right for a pin and wrong for a role. `Fixed` bypasses the skin's
+/// [`AccentPolicy`][policy], and on the reflective `Lcd` — the one skin whose
+/// field is *lighter* than its ink — libadwaita's dark-theme status colors then
+/// landed at 1.06–1.48:1 against `#a9b47e`, which is invisible.
+///
+/// The fix is entirely on this side of the wire, because a role color is the
+/// shell's answer, not the author's: it is run through
+/// [`kit::DisplayStyle::admit_ink`] — #933's seam, the same ramp the accent path
+/// takes inside the kit — *before* it becomes a pin. So the skin still decides
+/// what an ink it did not choose looks like, and pins stay unconditional (they
+/// return above, never reaching this match).
+///
+/// The ground it is admitted against is the **effective** one: the widget's own
+/// [`field`](vocab::StyleRef::field) pin when it has one, the skin's otherwise.
+/// This mirrors `palette_with`'s ordering for the accent, and for the same
+/// reason — an ink chosen against a ground the widget never floods is a
+/// guarantee about a pixel that does not exist.
+///
+/// `Neutral` and `Accent` are deliberately untouched: the first *is* the skin's
+/// own ink, and the second reaches the kit as [`kit::Ink::Default`], which the
+/// skin already admits for itself.
+///
+/// **Admitted at use, not memoized** — and the invalidation, not the cost, is
+/// the load-bearing half of that.
+///
+/// The cost is genuinely small: a memo would save a scan over a 65-stop integer
+/// ramp (~43 stops in practice for the six role colors) that the *accent* path
+/// has already paid, unmemoized, on every `Lcd` rasterisation since #928 — and
+/// pays twice per marquee render. A role widget now pays exactly one admission
+/// per rasterisation, the same or fewer than the default path beside it, and
+/// none at all on the three `AsGiven` skins.
+///
+/// The reason not to memoize is what the key would have to be. [`role_inks`]
+/// caches the three *theme* colors, so [`invalidate_cached_frames`]'s
+/// `ROLE_INKS.set(None)` — a theme-moved seam — is the whole of its
+/// invalidation. An admitted ink is keyed `(role color, skin, effective field)`,
+/// and **skin and field come from the widget, not the theme**: such a memo would
+/// also have to drop on every config change, widening the invalidation surface
+/// rather than leaving it where #912 put it. Deriving at use keeps one cell with
+/// one reason to be dropped, and no derived value that can go stale behind it.
+///
+/// [policy]: kit::DisplayStyle::admit_ink
 fn ink_for(style: vocab::StyleRef) -> kit::Ink {
     if let Some(ink) = style.ink {
         return kit::Ink::Fixed(ink);
@@ -1642,9 +1696,9 @@ fn ink_for(style: vocab::StyleRef) -> kit::Ink {
         // render after every theme change — in a session where nothing asks for
         // a status role at all — only to throw the answer away.
         Some(vocab::AccentRole::Accent) | None => kit::Ink::Default,
-        Some(role) => role_inks()
-            .get(role)
-            .map_or(kit::Ink::Default, kit::Ink::Fixed),
+        Some(role) => role_inks().get(role).map_or(kit::Ink::Default, |ink| {
+            kit::Ink::Fixed(display_style(style).admit_ink(ink, style.field))
+        }),
     }
 }
 
@@ -1663,6 +1717,19 @@ fn pins_for(style: vocab::StyleRef) -> kit::Pins {
         ink: ink_for(style),
         field: style.field,
     }
+}
+
+/// The pins one style reference resolves to — the render path's own
+/// [`pins_for`], reachable from the test module.
+///
+/// The role tests assert over every skin, and three of the four bloom or mask
+/// their lit layer, so hunting a fully-lit pixel out of a rendered frame would
+/// make the assertion about the post-passes rather than about the resolution.
+/// The rendered claims stay rendered (see the byte pin and the dark-skin
+/// parity test); this is for the ones that are about *what the shell decided*.
+#[cfg(test)]
+pub(super) fn resolved_pins(style: vocab::StyleRef) -> kit::Pins {
+    pins_for(style)
 }
 
 // ── construction / update / advance / render ─────────────────────────────────

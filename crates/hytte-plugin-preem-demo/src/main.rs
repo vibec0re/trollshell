@@ -31,7 +31,12 @@
 //! `PIN.` pins its ink outright and so is excluded from the policy entirely; on
 //! `lcd` its hot pink sits on the olive field and will look washed out, which is
 //! the pin contract on glass rather than a regression. `ROLE` resolves a
-//! *semantic role*, which also reaches the kit as a pin — see #928's follow-up.
+//! *semantic role*, and since #939 the shell offers that resolved color to the
+//! skin before pinning it (`DisplayStyle::admit_ink`): on `lcd` it comes back
+//! darkened far enough to clear WCAG AA against the olive field, and on the
+//! `AsGiven` skins (`vfd`/`oled`/`crt`) it comes back verbatim. So `ROLE` and
+//! `PIN.` differ on purpose — a role is the *shell's* answer and the skin gets
+//! a say in it; a pin is the author's and the skin does not.
 //!
 //! It doubles as the visual regression harness and the copy-from reference for
 //! plugin authors — which since #884 means it is the reference for **one code

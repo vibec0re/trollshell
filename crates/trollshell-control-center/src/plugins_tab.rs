@@ -223,6 +223,13 @@ struct PluginDetail {
 /// good poll almost always brings the same plugin set back. Without this, the
 /// rebuild after the placeholder sees no previous selection, takes the
 /// first-load arm and silently moves the user to the first plugin in the list.
+///
+/// Carries any live [`PendingToggle`] for the same reason (#945 review,
+/// finding 3): an "unavailable" placeholder is exactly the kind of transient
+/// failure the selection itself is parked against, and dropping the intent
+/// along with the rows would re-expose the very bounce #944 fixed the moment
+/// the poll recovers — a stale poll inside [`PENDING_TOGGLE_TIMEOUT`] would
+/// snap the just-restored switch back to whatever it read before the outage.
 struct ParkedSelection {
     /// The plugin that was selected when the poll failed.
     id: String,
@@ -230,6 +237,10 @@ struct ParkedSelection {
     /// user had drilled in) at that moment, so the restore can put the
     /// navigation back where it was and not merely the highlight.
     pushed: bool,
+    /// The intent that was pending for [`id`](Self::id), if any, moved here
+    /// wholesale — including its original `since` — so the timeout keeps
+    /// counting from when the user actually toggled, not from the restore.
+    pending: Option<PendingToggle>,
 }
 
 /// A user-initiated toggle the poll hasn't confirmed yet (#944).
@@ -678,18 +689,58 @@ fn connect_switch(state: &PluginsState) {
         // gives up. `syncing` above is what keeps this arm from firing at all
         // for `refresh_detail`'s own programmatic `set_active`, so every
         // intent recorded here really did come from the user.
+        //
+        // `since` is captured here, not re-read from `state.pending` in the
+        // completion below, because the switch can be flipped again before
+        // this round trip lands — `on_toggle_result` needs to tell "this
+        // call's own intent" from "a newer one" apart, and a timestamp taken
+        // at record time is what makes that comparison exact.
+        let since = Instant::now();
         *state.pending.borrow_mut() = Some(PendingToggle {
             plugin_id: id.clone(),
             wanted: want_on,
-            since: Instant::now(),
+            since,
         });
         spawn_on_runtime(set_plugin_state(id, want_on), move |res| {
-            if let Err(err) = res {
-                tracing::info!(%err, "plugin start/stop failed");
-            }
-            refresh_plugins_soon(&state);
+            on_toggle_result(&state, since, res);
         });
     });
+}
+
+/// The completion half of the round trip [`connect_switch`] starts (#945
+/// review, finding 1): a failed `StartPlugin`/`StopPlugin` already knows —
+/// at the call's own `RetryPolicy::Never` timeout, well inside
+/// [`PENDING_TOGGLE_TIMEOUT`] — that the transition it recorded an intent for
+/// never happened, so it must clear that intent rather than let
+/// [`resolve_pending`] keep answering `wanted` for the full 10s window on a
+/// switch that is never coming back on its own.
+///
+/// Guarded on identity: `since` is the timestamp *this* call's intent was
+/// recorded with, captured by `connect_switch` before the round trip started.
+/// If the user flipped the switch again while this call was in flight,
+/// `state.pending` now holds a newer intent with a different `since` — a
+/// later toggle the user asked for after this one — and this completion must
+/// not clobber it.
+///
+/// Split out of the `connect_switch` closure so it can be driven directly in
+/// tests with a fabricated `res`, with no session bus needed — see
+/// `gtk_tests`' `a_failed_toggle_clears_its_own_intent` and
+/// `a_failed_toggles_completion_does_not_clobber_a_newer_intent`.
+fn on_toggle_result(state: &PluginsState, since: Instant, res: Result<(), hytte_bus::BusError>) {
+    if let Err(err) = res {
+        tracing::info!(%err, "plugin start/stop failed");
+        let still_this_intent = state
+            .pending
+            .borrow()
+            .as_ref()
+            .is_some_and(|intent| intent.since == since);
+        if still_this_intent {
+            state.pending.borrow_mut().take();
+        }
+    }
+    // Either way: an immediate re-poll snaps the switch to the truth as soon
+    // as the shell has it, on success or on failure.
+    refresh_plugins_soon(state);
 }
 
 /// Which plugin a sidebar row belongs to.
@@ -808,10 +859,22 @@ fn apply_plugins(
     // — that path never lost its page, so it has nothing to restore.
     let parked = state.parked.take();
     let previously = state.selected.borrow().clone();
-    let (wanted, restore_push) = match (previously, parked) {
-        (Some(id), _) => (Some(id), false),
-        (None, Some(parked)) => (Some(parked.id), parked.pushed),
-        (None, None) => (None, false),
+    let (wanted, restore_push, restore_pending) = match (previously, parked) {
+        (Some(id), _) => (Some(id), false, None),
+        (None, Some(parked)) => {
+            let ParkedSelection {
+                id,
+                pushed,
+                pending,
+            } = parked;
+            // Belt-and-braces identity check (#945 review, finding 3): a
+            // parked intent is always recorded for the same plugin it's
+            // parked alongside (see `ParkedSelection`'s doc), but restoring
+            // it under any other id would silently steer the wrong switch.
+            let pending = pending.filter(|intent| intent.plugin_id == id);
+            (Some(id), pushed, pending)
+        }
+        (None, None) => (None, false, None),
     };
     clear_rows(state);
     for (id, active_state, enabled) in units {
@@ -839,6 +902,13 @@ fn apply_plugins(
             // failed poll is not them navigating out.
             if restore_push {
                 state.split.set_show_content(true);
+            }
+            // And the intent that was live when the placeholder parked the
+            // selection, if any — with its original `since` untouched, so the
+            // timeout keeps counting from the real toggle rather than from
+            // this restore (#945 review, finding 3).
+            if let Some(pending) = restore_pending {
+                *state.pending.borrow_mut() = Some(pending);
             }
         }
         // Either the selected plugin is gone, or this is the first load.
@@ -968,6 +1038,14 @@ fn show_empty_detail(state: &PluginsState) {
 fn refresh_detail(state: &PluginsState) {
     let selected = state.selected.borrow().clone();
     let Some(id) = selected else {
+        // Nothing shown ⇒ no plugin's intent is "for" the detail pane — the
+        // same rule `clear_selection` applies (#944), reached here too
+        // because deselecting (a ctrl-click in `Single` mode) drives
+        // `connect_row_selected(None)` straight into this arm without going
+        // through `clear_selection` (#945 review, finding 2). Left unhandled,
+        // the intent would silently steer whichever plugin gets selected
+        // next.
+        state.pending.borrow_mut().take();
         show_empty_detail(state);
         return;
     };
@@ -1042,14 +1120,19 @@ fn set_placeholder(state: &PluginsState, view: PluginsView, title: &str, subtitl
     if state.view.get() == view {
         return;
     }
-    // Before `clear_selection` below wipes it. A repeated failure re-enters
-    // with the same `view` and returns above, so the first failure's park is
-    // never overwritten with the `None` it left behind.
+    // Before `clear_selection` below wipes both of them. A repeated failure
+    // re-enters with the same `view` and returns above, so the first
+    // failure's park is never overwritten with the `None` it left behind.
     let park = if view == PluginsView::Unavailable {
         let selected = state.selected.borrow().clone();
         selected.map(|id| ParkedSelection {
-            id,
             pushed: state.split.shows_content(),
+            // Take, not clone: an intent is "for" exactly one home at a time
+            // (the live pane, or the park), same as `clear_selection`'s own
+            // `take()`. `clear_selection` below sees `None` and is a no-op on
+            // `pending`.
+            pending: state.pending.borrow_mut().take(),
+            id,
         })
     } else {
         None
@@ -1581,7 +1664,7 @@ mod gtk_tests {
 
     use super::{
         BIN_MIN_WIDTH_PX, COLLAPSE_WIDTH_PX, PENDING_TOGGLE_TIMEOUT, PendingToggle, PluginRuntime,
-        PluginsState, apply_plugins, build_tab,
+        PluginsState, apply_plugins, build_tab, on_toggle_result, refresh_detail,
     };
 
     /// Run the GTK main loop until it has nothing left to dispatch, so a queued
@@ -2421,7 +2504,10 @@ mod gtk_tests {
             wanted: true,
             since: Instant::now()
                 .checked_sub(PENDING_TOGGLE_TIMEOUT + Duration::from_millis(50))
-                .expect("test process has been up for over 10s"),
+                // `Instant` is `CLOCK_MONOTONIC`, anchored to boot, not to
+                // process start — the precondition is "the machine has been
+                // up for over 10s", trivially true anywhere this test runs.
+                .expect("machine has been up for over 10s"),
         });
 
         // Still stale — the unit never actually started — but the intent has
@@ -2468,6 +2554,212 @@ mod gtk_tests {
             "the newly shown plugin's switch must read its own real state, unclouded by the \
              dropped intent"
         );
+
+        dismiss(&window);
+    }
+
+    // ── #945 review fixes ────────────────────────────────────────────────────
+
+    /// Finding 1: a failed `StartPlugin`/`StopPlugin` already knows — at its
+    /// own `RetryPolicy::Never` timeout, well inside `PENDING_TOGGLE_TIMEOUT`
+    /// — that the transition it recorded an intent for never happened, and
+    /// must clear that intent rather than leave `resolve_pending` answering
+    /// `wanted` for the full 10s window.
+    ///
+    /// Drives `on_toggle_result` directly (the completion half of
+    /// `connect_switch`, with the D-Bus round trip removed) rather than a real
+    /// `Control` call, for the reason the module doc above gives.
+    ///
+    /// Falsified by removing the `state.pending.borrow_mut().take()` call from
+    /// `on_toggle_result`'s `Err` arm: the intent survives, and the next
+    /// (correctly stale) poll still shows the user's wish instead of the
+    /// truth.
+    #[gtk::test]
+    fn a_failed_toggle_clears_its_own_intent() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "inactive");
+        let window = present(&bin, 640);
+
+        let since = Instant::now();
+        *state.pending.borrow_mut() = Some(PendingToggle {
+            plugin_id: "clock".to_owned(),
+            wanted: true,
+            since,
+        });
+
+        on_toggle_result(
+            &state,
+            since,
+            Err(hytte_bus::BusError::Permanent {
+                reason: "no such unit".to_owned(),
+                dbus_name: None,
+            }),
+        );
+
+        assert!(
+            state.pending.borrow().is_none(),
+            "a failed toggle must clear the intent it recorded"
+        );
+
+        // The next poll — still reporting the pre-toggle state, since the
+        // toggle never actually happened — must now be read as the truth
+        // rather than bounced off a lingering intent.
+        apply_state(&state, &["clock"], "inactive");
+        assert!(
+            !state.detail.switch.is_active(),
+            "with the intent cleared, the switch must show the real (unchanged) state"
+        );
+
+        dismiss(&window);
+    }
+
+    /// Finding 1's identity guard: a second toggle recorded while the first
+    /// call is still in flight must survive that first call's (failed)
+    /// completion — the two are different intents (different `since`), and a
+    /// completion only owns the one it started with.
+    ///
+    /// Falsified by dropping the `since` comparison in `on_toggle_result` (an
+    /// unconditional `state.pending.borrow_mut().take()` on `Err`): intent B
+    /// would be clobbered by intent A's late, irrelevant failure.
+    #[gtk::test]
+    fn a_failed_toggles_completion_does_not_clobber_a_newer_intent() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "inactive");
+        let window = present(&bin, 640);
+
+        // Intent A: the user's first click.
+        let since_a = Instant::now();
+        *state.pending.borrow_mut() = Some(PendingToggle {
+            plugin_id: "clock".to_owned(),
+            wanted: true,
+            since: since_a,
+        });
+
+        // Intent B: the user flips the switch again before A's round trip
+        // returns — a later `since`, replacing A in `state.pending` exactly
+        // as a real second flip would (`connect_switch` always overwrites).
+        let since_b = Instant::now();
+        *state.pending.borrow_mut() = Some(PendingToggle {
+            plugin_id: "clock".to_owned(),
+            wanted: false,
+            since: since_b,
+        });
+
+        // A's call finally completes — and fails.
+        on_toggle_result(
+            &state,
+            since_a,
+            Err(hytte_bus::BusError::Permanent {
+                reason: "timed out".to_owned(),
+                dbus_name: None,
+            }),
+        );
+
+        let pending = state.pending.borrow();
+        let intent = pending
+            .as_ref()
+            .expect("intent B must survive intent A's completion");
+        assert_eq!(
+            intent.since, since_b,
+            "the surviving intent must be B, not wiped by A's stale completion"
+        );
+        assert!(
+            !intent.wanted,
+            "the surviving intent must still be B's wish"
+        );
+        drop(pending);
+
+        dismiss(&window);
+    }
+
+    /// Finding 2: deselecting must drop the intent too — the same "nothing
+    /// shown ⇒ no intent belongs to the pane" rule `clear_selection` applies.
+    /// Reached here because a ctrl-click deselect (`Single`-mode `GtkListBox`
+    /// allows it) drives `connect_row_selected(None)` straight into
+    /// `refresh_detail`'s early-return arm, outside `clear_selection`.
+    ///
+    /// Falsified by removing the `state.pending.borrow_mut().take()` call
+    /// from that arm.
+    #[gtk::test]
+    fn deselecting_drops_the_pending_intent() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "inactive");
+        let window = present(&bin, 640);
+        click(&state, "clock");
+
+        *state.pending.borrow_mut() = Some(PendingToggle {
+            plugin_id: "clock".to_owned(),
+            wanted: true,
+            since: Instant::now(),
+        });
+
+        // The ctrl-click deselect path: `connect_selection`'s `row-selected`
+        // handler just sets `selected` and calls `refresh_detail` — no
+        // `clear_selection` in between.
+        *state.selected.borrow_mut() = None;
+        refresh_detail(&state);
+
+        assert!(
+            state.pending.borrow().is_none(),
+            "deselecting must drop the pending intent along with the selection"
+        );
+
+        dismiss(&window);
+    }
+
+    /// Finding 3: an "unavailable" placeholder must park a live intent
+    /// alongside the selection it already parks, not drop it — a poll failure
+    /// inside `PENDING_TOGGLE_TIMEOUT` must not re-expose the very bounce
+    /// #944 fixed the moment the selection is restored. The restored intent
+    /// must also keep counting from its original `since`, not the restore.
+    ///
+    /// Falsified by not carrying `pending` through `ParkedSelection` (or by
+    /// restamping `since` on restore).
+    #[gtk::test]
+    fn an_unavailable_poll_parks_the_intent_with_the_selection() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "inactive");
+        let window = present(&bin, 640);
+        click(&state, "clock");
+
+        let since = Instant::now();
+        *state.pending.borrow_mut() = Some(PendingToggle {
+            plugin_id: "clock".to_owned(),
+            wanted: true,
+            since,
+        });
+
+        // One failed poll: the shell went briefly unreachable.
+        poll_failed(&state);
+        assert!(
+            state.selected.borrow().is_none(),
+            "sanity: the placeholder drops the live selection"
+        );
+
+        // The next good poll brings the same plugin back.
+        apply_state(&state, &["clock"], "inactive");
+
+        assert_eq!(state.selected.borrow().as_deref(), Some("clock"));
+        assert!(
+            state.detail.switch.is_active(),
+            "the restored selection must still show the user's wanted state, not the poll \
+             that never agreed with it"
+        );
+        let restored = state.pending.borrow();
+        let intent = restored
+            .as_ref()
+            .expect("the intent must be restored alongside the selection");
+        assert_eq!(intent.plugin_id, "clock");
+        assert_eq!(
+            intent.since, since,
+            "the restored intent must keep counting from its original `since`, not reset the \
+             timeout"
+        );
+        drop(restored);
 
         dismiss(&window);
     }

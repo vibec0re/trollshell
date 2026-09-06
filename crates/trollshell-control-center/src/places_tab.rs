@@ -1155,11 +1155,11 @@ mod gtk_tests {
     /// be the offender — hence `editor.open(0)` before the assertions.
     ///
     /// Falsified by reverting `Editor::detail`'s header back to
-    /// `adw::HeaderBar::new()`: depending on the harness' virtual display,
-    /// that failure can show up as "mapped at 0 px" rather than a visibly
-    /// wide cluster (#944's own probe found exactly that), which is why this
-    /// asserts presence-and-mapped rather than width — same reasoning
-    /// `plugins_tab`'s sibling test documents.
+    /// `adw::HeaderBar::new()`: the mutation reports a duplicate
+    /// `GtkWindowControls` cluster **108 px** wide, not 0 — this asserts
+    /// presence-and-mapped rather than width regardless, because presence is
+    /// the stronger claim (a narrower or differently-sized duplicate is still
+    /// a duplicate) — same reasoning `plugins_tab`'s sibling test documents.
     #[gtk::test]
     fn the_tab_draws_no_window_controls() {
         adw::init().expect("libadwaita init");
@@ -1211,8 +1211,43 @@ mod gtk_tests {
             stray.first().map_or(0, gtk::prelude::WidgetExt::width)
         );
 
+        // The one start-side control the pushed page's header bar *should*
+        // grow despite `show_start_title_buttons(false)`: the navigation back
+        // button, `AdwNavigationView`'s own business and not the title
+        // buttons' — the same pairing `plugins_tab`'s sibling test pins
+        // (#945 review, finding 4).
+        let back = has_mapped_back_button(&editor.nav.visible_page().expect("a pushed page"));
+        assert!(
+            back,
+            "turning the title buttons off must not cost the pushed page's back button"
+        );
+
         window.set_content(None::<&gtk::Widget>);
         window.destroy();
         pump();
+    }
+
+    /// Whether `page`'s subtree has a mapped `go-previous-symbolic` button —
+    /// what `AdwHeaderBar` grows inside a navigation stack. The same walk
+    /// `plugins_tab`'s test of the same name uses; kept file-local for the
+    /// reason `window_controls_under` above is.
+    fn has_mapped_back_button(page: &adw::NavigationPage) -> bool {
+        fn walk(root: &gtk::Widget) -> bool {
+            let mut child = root.first_child();
+            while let Some(widget) = child {
+                if let Ok(button) = widget.clone().downcast::<gtk::Button>()
+                    && button.icon_name().as_deref() == Some("go-previous-symbolic")
+                    && button.is_mapped()
+                {
+                    return true;
+                }
+                if walk(&widget) {
+                    return true;
+                }
+                child = widget.next_sibling();
+            }
+            false
+        }
+        walk(page.upcast_ref())
     }
 }

@@ -1,0 +1,47 @@
+[package]
+name = "hytte-gl"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The workspace's OpenGL island: safe RAII wrappers over the `gl` crate's unsafe entry points (programs, textures, FBOs, draws) for hytte's GtkGLArea renderer."
+
+[dependencies]
+# Already in `Cargo.lock` — `gdk4 0.11.2` depends on it — so this crate adds
+# **no** new resolved package (#893 stage B, the spec's `hytte-gl` row). The
+# bindings are generated against the desktop GL registry; this crate calls only
+# functions in the GL 4.x / GLES 3.2 intersection, because GDK negotiates a
+# GLES context here (#886: `GLAPI(GLES) version=3.2 legacy=false`). See the
+# `loader` module for how the pointers are resolved.
+gl = "0.14.0"
+# Also already in `Cargo.lock` (via `clang-sys`, the bindgen consumer). Used to
+# `dlopen` libepoxy by soname, which GTK has already loaded — see `loader`.
+libloading = "0.8.9"
+tracing.workspace = true
+
+# This crate can't use `[lints] workspace = true` — it is the workspace's
+# **second** `unsafe_code` island (after `hytte-ecal`), and workspace-lints
+# inheritance is all-or-nothing (no per-lint override), so the umbrella below is
+# hand-mirrored from the root `[workspace.lints]` (see the tripwire comment
+# there) with `unsafe_code` flipped. Keep the `rust`/`clippy` tables' shared
+# entries (`all`, `pedantic`, `disallowed_methods`, `module_name_repetitions`,
+# `missing_errors_doc`, `missing_panics_doc`) in sync with root when either
+# changes.
+[lints.rust]
+# Every OpenGL entry point the `gl` crate exposes is an `unsafe fn`; issuing a
+# draw call is therefore impossible under the workspace's global `forbid`. This
+# crate is the one place that lifts it, and it exists for exactly that reason:
+# the unsafety is confined to the safe RAII wrappers in this crate, and every
+# downstream crate (`hytte-ui`, `trollshell`) stays `forbid`. See
+# `docs/superpowers/specs/2026-09-06-preem-gl-renderer-design.md`, "The hard
+# problem: GL draw calls under `unsafe_code = forbid`".
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+disallowed_methods = "deny"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

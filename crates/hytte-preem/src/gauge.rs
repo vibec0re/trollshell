@@ -486,7 +486,7 @@ const TRAIL_T: &[u16] = &[150, 104, 66, 34];
 /// Divisor applied to the skin palette's bloom radius before the gauge blooms.
 const BLOOM_RADIUS_DIV: usize = 1;
 /// Multiplier, in 256ths, applied to the skin palette's bloom strength.
-const BLOOM_STRENGTH_NUM: u32 = 256;
+const BLOOM_STRENGTH_NUM: u32 = 154;
 
 /// How far back in time the needle's motion blur reaches, in seconds — a ~50 ms
 /// shutter. Sampling the smear in *time* rather than in past frames is what

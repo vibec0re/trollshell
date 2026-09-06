@@ -874,13 +874,13 @@ session.
      `notdef` fully opaque, so this alpha difference has no visible
      effect on the bundled plugins as shipped.
 
-- [ ] **(#897/#926 — lands with that PR, open at the time of writing)** Preem
-      animation now rides each **mount's GTK frame clock** instead of one
-      process-wide 20 Hz timer that was armed at startup and never broke. CI
-      cannot see any of this: there is no compositor delivering frames under
-      `cargo test`, so the hermetic tests drive the decision the tick makes
-      and one `#[gtk::test]` drives a real `GdkFrameClock` under `xvfb` — but
-      the shell's actual mounts, on real outputs, are only observable here.
+- [ ] **(#897/#926)** Merged as `4cde9bb`. Preem animation now rides each
+      **mount's GTK frame clock** instead of one process-wide 20 Hz timer
+      that was armed at startup and never broke. CI cannot see any of this:
+      there is no compositor delivering frames under `cargo test`, so the
+      hermetic tests drive the decision the tick makes and one
+      `#[gtk::test]` drives a real `GdkFrameClock` under `xvfb` — but the
+      shell's actual mounts, on real outputs, are only observable here.
   1. **No periodic wakeup when everything is settled.** With every preem
      widget at rest — or, better, with no preem plugin running at all —
      `strace -c -e clock_nanosleep,ppoll -p "$(pgrep -x trollshell)"` over
@@ -913,6 +913,16 @@ session.
      occluded surface) and confirm a marquee still crosses at its stated
      dots/second rather than visibly slowing. The `dt` clamp is the resume
      cap, not a per-frame cap, precisely so this cannot drift.
+- [ ] **(#911/#927)** Merged as `bfe7275`. Preem frames now travel to every
+      monitor's texture as one shared `Arc<[u8]>` instead of a fresh copy
+      per output. On a two-output Niri session, mirror an animating preem
+      widget (the preem-demo plugin's marquee, or `caw`) on both outputs and
+      watch `perf top -p "$(pgrep -x trollshell)"`: the RGBA fan-out
+      (`__memmove_avx_unaligned_erms` climbing with the number of outputs
+      showing the widget) should be gone from the profile — one
+      rasterisation per tick remains. Nothing should look different on
+      screen — same picture, same pixels; this PR moves ownership only,
+      never a byte of content.
 
 ## Screen recording
 

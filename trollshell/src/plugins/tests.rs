@@ -5116,13 +5116,13 @@ fn the_phosphor_settle_bound_follows_the_configured_persistence() {
 /// advanced plugin's render.
 ///
 /// A blanket nudge re-runs `reconcile_region` over every plugin's whole tree —
-/// every wire node re-mapped, every preem instance's cached RGBA frame cloned
+/// every wire node re-mapped, every preem instance's cached frame `Arc`-cloned
 /// out of the store — for every plugin, on every monitor, 20× a second, legacy
 /// self-rasterising plugins included. Since #907 the *upload* at the end of that
-/// is no longer part of the bill: `hytte-ui`'s `PixelSurface::set_pixels` keeps
-/// the last accepted buffer and returns without touching GTK when the frame is
-/// identical. This narrowing is the second guard, and it is the one that skips
-/// the walk rather than paying for it and discarding the result.
+/// is no longer part of the bill: `hytte-ui`'s `PixelSurface::set_pixels_shared`
+/// keeps the last accepted buffer and returns without touching GTK when the
+/// frame is identical. This narrowing is the second guard, and it is the one
+/// that skips the walk rather than paying for it and discarding the result.
 #[test]
 fn a_repaint_request_skips_mailboxes_holding_no_mover() {
     use std::pin::pin;

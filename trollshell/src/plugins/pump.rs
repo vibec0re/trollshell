@@ -339,7 +339,7 @@ pub(super) fn tick_decision(scopes: &[Scope], frame_time_us: i64) -> Tick {
 /// callbacks would decide N times what one decides once. And the shell has no
 /// handle from a preem node back to its `PixelSurface`: `hytte-ui`'s
 /// `reconcile_single` is the only place the concrete surface is touched
-/// (`update_in_place` downcasts and calls `set_pixels`), and it keeps no node
+/// (`update_in_place` downcasts and calls `set_pixels_shared`), and it keeps no node
 /// id → widget map. Per-instance registration would need a new `hytte-ui` API
 /// for no gain.
 ///
@@ -361,7 +361,8 @@ pub(super) fn tick_decision(scopes: &[Scope], frame_time_us: i64) -> Tick {
 /// `Gauge` or `FlipBoard` advanced by two mounts in one frame fans out twice, so
 /// two monitors showing one animating gauge cost two mailbox nudges per frame,
 /// not one. That is the cost #897 signed up for, bounded by #896's per-scope
-/// targeting, #907's `set_pixels` compare and eventually #893's GL backend.
+/// targeting, #907's `set_pixels_shared` compare and eventually #893's GL
+/// backend.
 ///
 /// ## Ownership
 ///
@@ -792,18 +793,21 @@ pub(super) fn install_scope_releaser() {
 /// A nudge is not free downstream, and it is not free for the *other* plugins in
 /// the region either. `Reconciler::render` has no descriptor-equality
 /// short-circuit, so every `Pixels` node in a re-mapped mailbox reaches
-/// `hytte-ui`'s `PixelSurface::set_pixels` on every nudge. Since #907
-/// `set_pixels` itself compares against the last accepted frame and skips the
-/// `glib::Bytes` + `gdk::MemoryTexture` + `queue_draw` when the bytes are
-/// unchanged, but that guard is per-surface and per-call — it does not stop the
-/// call from happening, only its GTK cost when nothing moved. This per-scope
-/// targeting is the guard that stops the call from happening at all: without
-/// it, nudging every bar mailbox because *something somewhere* animated would
-/// still walk and compare a full frame for every `Pixels` node of every plugin
-/// chip on every monitor, every frame, legacy self-rasterising plugins included
-/// — cheaper than an unconditional re-upload, but not free at the wire's buffer
-/// cap and instance count. Since #897 that fan-out runs at the display's refresh
-/// rather than at 20 Hz, so the targeting matters *more*, not less.
+/// `hytte-ui`'s `PixelSurface::set_pixels_shared` on every nudge. Since #907
+/// the setter compares against the last accepted frame and skips the
+/// `glib::Bytes` + `gdk::MemoryTexture` + `queue_draw` when the frame is
+/// unchanged; since #927 that compare is an `Arc::ptr_eq` for a shared preem
+/// frame rather than a byte-for-byte scan, but the guard is still per-surface
+/// and per-call — it does not stop the call from happening, only its GTK cost
+/// when nothing moved. This per-scope targeting is the guard that stops the
+/// call from happening at all: without it, nudging every bar mailbox because
+/// *something somewhere* animated would still walk every `Pixels` node of
+/// every plugin chip on every monitor, every frame, legacy self-rasterising
+/// plugins included, and run the setter's compare on each — a pointer check
+/// for a shared preem frame now rather than a full byte scan, but still a
+/// call and a comparison that this targeting skips entirely. Since #897 that
+/// fan-out runs at the display's refresh rather than at 20 Hz, so the
+/// targeting matters *more*, not less.
 ///
 /// [`preem_render::advance_scopes`] therefore names the scopes that moved, and a
 /// mailbox is nudged only when it actually carries one of their plugins.

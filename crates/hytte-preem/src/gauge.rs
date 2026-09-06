@@ -484,7 +484,7 @@ const TRAIL_T: &[u16] = &[150, 104, 66, 34];
 // At `1` / `256` / the `FEATHER` above, the render is byte-identical to the
 // tree before this commit.
 /// Divisor applied to the skin palette's bloom radius before the gauge blooms.
-const BLOOM_RADIUS_DIV: usize = 1;
+const BLOOM_RADIUS_DIV: usize = 2;
 /// Multiplier, in 256ths, applied to the skin palette's bloom strength.
 const BLOOM_STRENGTH_NUM: u32 = 256;
 

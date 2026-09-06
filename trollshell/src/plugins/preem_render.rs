@@ -121,7 +121,10 @@
 //! Without that, a two-monitor session would stamp every scope sample batch
 //! twice and decay its phosphor twice per frame. The rasterised frame is cached
 //! for the same reason — the second monitor's mapping pass re-uses the bytes the
-//! first one produced.
+//! first one produced, and since #911 it re-uses the *allocation*: the cache
+//! holds an `Arc<[u8]>` and every monitor's [`UiNode::Pixels`] carries a handle
+//! on it, so one frame is rasterised once, copied never, and settled on each
+//! surface by an `Arc::ptr_eq` when nothing moved.
 //!
 //! The equality that gates this is [`same_widget`], **not** `PreemWidget`'s
 //! derived `PartialEq`. The derived one is not reflexive over a `NaN`, and a
@@ -183,6 +186,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hytte::gtk::{self, prelude::*};
@@ -559,7 +563,12 @@ struct Instance {
     /// `None` for a widget kind this build cannot render — see [`build`].
     renderer: Option<Renderer>,
     /// The last rasterised frame, re-used until something invalidates it.
-    cached: Option<(u32, u32, Vec<u8>)>,
+    ///
+    /// Shared, not owned (#911): every monitor's mapping pass takes a *handle*
+    /// on this one allocation and hands it to that monitor's `PixelSurface`, so
+    /// a frame costs one rasterisation and one buffer however many screens show
+    /// it — see [`Instance::frame`].
+    cached: Option<(u32, u32, Arc<[u8]>)>,
     /// How many times the renderer has been *built* (1 on first sight, +1 per
     /// config/kind change) and how many times a widget has been *applied* to it
     /// (a build or a state update; a no-op re-map doesn't count).
@@ -810,8 +819,9 @@ pub(super) fn forget_scope(scope: &Scope) {
 /// by every mapping pass).
 struct Mapped {
     /// The instance's `(width, height, RGBA8)`; `(0, 0, empty)` for the
-    /// placeholder an over-cap or unrenderable node degrades to.
-    frame: (u32, u32, Vec<u8>),
+    /// placeholder an over-cap or unrenderable node degrades to. The buffer is
+    /// a handle on the instance's cached frame, never a copy of it (#911).
+    frame: (u32, u32, Arc<[u8]>),
     /// The widget kind is one this build cannot render — [`build`] returned
     /// `None`. Latched process-wide, not per tree.
     unsupported: bool,
@@ -919,7 +929,7 @@ pub(super) fn map_widget(
         // its in-cap siblings.
         if !state.instances.contains_key(&key) && state.touched.len() >= MAX_PREEM_NODES_PER_TREE {
             return Mapped {
-                frame: (0, 0, Vec::new()),
+                frame: (0, 0, nothing()),
                 unsupported: false,
                 anonymous_key,
                 duplicate_of: None,
@@ -1088,9 +1098,17 @@ impl Instance {
     /// The instance's current frame as `(width, height, RGBA8)`, rasterising it
     /// only when the cache is cold. `(0, 0, empty)` is the unsupported-widget
     /// placeholder.
-    fn frame(&mut self) -> (u32, u32, Vec<u8>) {
-        if let Some(cached) = self.cached.as_ref() {
-            return cached.clone();
+    ///
+    /// **A warm cache costs a refcount, not a copy** (#911). This runs once per
+    /// monitor per mapping pass — the instance table is keyed by scope and
+    /// shared across mounts — so returning an owned `Vec` here was a full RGBA
+    /// clone per screen per tick, and a second one for every unchanged chip a
+    /// blanket repaint walked past. The `Arc` travels all the way into
+    /// `hytte_ui`'s `PixelSurface`, which adopts it for the texture upload and
+    /// settles an unchanged frame with an `Arc::ptr_eq` (#907).
+    fn frame(&mut self) -> (u32, u32, Arc<[u8]>) {
+        if let Some((width, height, data)) = self.cached.as_ref() {
+            return (*width, *height, Arc::clone(data));
         }
         let style = display_style(self.applied.style());
         // The palette is resolved here, per rasterisation, never baked into the
@@ -1099,7 +1117,7 @@ impl Instance {
         // pinned widget re-rasterises to identical bytes.
         let pins = pins_for(self.applied.style());
         let rendered = self.renderer.as_ref().map_or_else(
-            || (0, 0, Vec::new()),
+            || (0, 0, nothing()),
             |renderer| {
                 let frame = kit::with_pins(pins, || renderer.render(style));
                 // Both dimensions or neither: a lone `unwrap_or(0)` could pair a
@@ -1112,14 +1130,33 @@ impl Instance {
                     u32::try_from(frame.height()),
                     u32::try_from(frame.data().len()),
                 ) {
-                    (Ok(width), Ok(height), Ok(_)) => (width, height, frame.data().to_vec()),
-                    _ => (0, 0, Vec::new()),
+                    // One copy out of the kit's frame, exactly what `to_vec`
+                    // was — an `Arc<[u8]>` carries its refcount inline ahead of
+                    // the bytes, so it can never adopt a `Vec`'s allocation and
+                    // there is nothing to be saved by going through one.
+                    (Ok(width), Ok(height), Ok(_)) => (width, height, Arc::from(frame.data())),
+                    _ => (0, 0, nothing()),
                 }
             },
         );
+        // A tuple clone of two `u32`s and a refcount — the cache and the caller
+        // share the one buffer.
         self.cached = Some(rendered.clone());
         rendered
     }
+}
+
+/// The empty RGBA buffer every "renders nothing" placeholder shares — this
+/// module's over-cap and unrenderable-kind degradations, and
+/// [`wire_map`](super::wire_map)'s malformed-buffer one.
+///
+/// `Vec::new()` was free; `Arc::from(&[][..])` is not — it still allocates the
+/// refcount header — and a placeholder is built per degraded node per mapping
+/// pass per monitor. One process-wide empty buffer keeps that a refcount bump,
+/// and makes every placeholder pointer-identical into the bargain.
+pub(super) fn nothing() -> Arc<[u8]> {
+    static NOTHING: std::sync::OnceLock<Arc<[u8]>> = std::sync::OnceLock::new();
+    Arc::clone(NOTHING.get_or_init(|| Arc::from(&[][..])))
 }
 
 // ── the frame clock's half (#897) ────────────────────────────────────────────
@@ -1159,15 +1196,16 @@ impl Instance {
 ///
 /// **This is the second guard, not the only one.** Since #907 the surface holds
 /// the last accepted buffer and compares before it uploads (`hytte-ui`'s
-/// `PixelSurface::set_pixels`), so a blanket nudge no longer costs a
+/// `PixelSurface::set_pixels_shared`), so a blanket nudge no longer costs a
 /// `glib::Bytes` + `gdk::MemoryTexture` + `queue_draw` per unchanged
-/// `Node::Pixels` node it walks past. What a blanket nudge still costs is
-/// everything *upstream* of that compare — re-running `reconcile_region` over
-/// every plugin's whole tree, re-mapping every wire node, cloning each preem
-/// instance's cached RGBA frame out of the store on the way through
-/// ([`Instance::frame`]), and then the byte compare itself, per surface, per
-/// monitor, every frame. Naming the movers lets `pump::request_preem_repaint`
-/// nudge only the mailboxes that actually hold one and skip all of it.
+/// `Node::Pixels` node it walks past — and since #911 an unchanged frame
+/// reaches that surface as the *same* `Arc`, so the compare is a pointer
+/// compare and no RGBA block is copied out of the store on the way. What a
+/// blanket nudge still costs is everything upstream of that: re-running
+/// `reconcile_region` over every plugin's whole tree and re-mapping every wire
+/// node, per monitor, every frame. Naming the movers lets
+/// `pump::request_preem_repaint` nudge only the mailboxes that actually hold
+/// one and skip all of it.
 pub(super) fn advance_scopes(scopes: &[Scope], frame_time_us: i64) -> Vec<Scope> {
     STORE.with_borrow_mut(|store| {
         let mut moved = Vec::new();

@@ -55,6 +55,7 @@ use gtk::prelude::*;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Stable, plugin-meaningful node identity. Doubles as the diff key and the
@@ -207,6 +208,18 @@ pub enum Node {
     /// [`Node::Label`]'s `text`). An inconsistent buffer renders nothing (the
     /// widget is panic-safe); the upstream host validates and warns, and also
     /// clamps an absurd `scale` before it reaches this node.
+    ///
+    /// `data` is an [`Arc<[u8]>`](std::sync::Arc) rather than a `Vec<u8>`
+    /// (#911) because one buffer is routinely shown on **several** surfaces:
+    /// the shell rasterises a preem widget once per tick and maps the result
+    /// once per monitor, and the host's own re-map is per monitor too. Sharing
+    /// the allocation makes that fan-out a refcount instead of a full RGBA
+    /// clone per monitor, and lets the reconciler hand it to
+    /// [`PixelSurface::set_pixels_shared`](crate::pixels::PixelSurface::set_pixels_shared),
+    /// whose guard is then an `Arc::ptr_eq` and whose upload adopts the
+    /// allocation with no copy at all. A producer that owns its bytes converts
+    /// once at the boundary (`Arc::from(&bytes[..])` — the same single copy a
+    /// `Vec` clone was).
     Pixels {
         /// Optional diff/reorder key (see [`NodeId`]).
         id: Option<NodeId>,
@@ -215,7 +228,9 @@ pub enum Node {
         /// Buffer height in pixels.
         height: u32,
         /// Row-major RGBA8 pixels, `width * height * 4` bytes (mutable prop).
-        data: Vec<u8>,
+        /// Shared: cloning this node, or mapping one frame onto a second
+        /// monitor, costs a refcount rather than a copy.
+        data: Arc<[u8]>,
         /// Integer upscale hint (`0` means `1`); natural size becomes
         /// `width*scale` × `height*scale` (mutable prop).
         scale: u32,
@@ -796,7 +811,9 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             ..
         } => {
             let surface = crate::pixels::PixelSurface::new();
-            surface.set_pixels(*width, *height, data);
+            // Shared, not copied: the same `Arc` is what the node's other
+            // mountings (one per monitor) hand their own surfaces (#911).
+            surface.set_pixels_shared(*width, *height, data);
             surface.set_scale(*scale);
             apply_classes(&surface, classes);
             (surface.upcast(), Vec::new())
@@ -1113,7 +1130,13 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             // `data` and `scale` are mutable props: swap the texture / natural
             // size in place (no rebuild; `set_scale` only queues a resize on a
             // real change).
-            surface.set_pixels(*width, *height, data);
+            //
+            // The shared setter (#911): a re-map that carries the *same* `Arc`
+            // — a static preem chip re-mapped because a sibling animated, or
+            // the second monitor's pass over one frame — is settled by an
+            // `Arc::ptr_eq` without reading a byte, and a frame that really did
+            // change is uploaded without a copy.
+            surface.set_pixels_shared(*width, *height, data);
             surface.set_scale(*scale);
             reconcile_classes(surface, &retained.desc.classes, classes);
         }
@@ -1940,6 +1963,7 @@ mod gtk_tests {
     use gtk::prelude::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     fn root() -> gtk::Box {
         gtk::Box::new(gtk::Orientation::Horizontal, 0)
@@ -2165,13 +2189,20 @@ mod gtk_tests {
         );
     }
 
-    fn pix(id: Option<&str>, width: u32, height: u32, data: Vec<u8>) -> Node {
+    fn pix(id: Option<&str>, width: u32, height: u32, data: &[u8]) -> Node {
+        pix_shared(id, width, height, Arc::from(data), 1)
+    }
+
+    /// [`pix`] over a buffer the caller keeps a handle on, so a test can hand
+    /// the *same* allocation to two renders (or two reconcilers) the way the
+    /// shell's frame cache hands one frame to every monitor (#911).
+    fn pix_shared(id: Option<&str>, width: u32, height: u32, data: Arc<[u8]>, scale: u32) -> Node {
         Node::Pixels {
             id: id.map(ToOwned::to_owned),
             width,
             height,
             data,
-            scale: 1,
+            scale,
             classes: vec![],
         }
     }
@@ -2181,7 +2212,7 @@ mod gtk_tests {
         let root = root();
         let mut rec = Reconciler::new(&root, |_, _| {});
         // 1×1 opaque red.
-        rec.render(&pix(Some("lcd"), 1, 1, vec![255, 0, 0, 255]));
+        rec.render(&pix(Some("lcd"), 1, 1, &[255, 0, 0, 255]));
         let w = root.first_child().expect("pixel surface mounted");
         assert!(
             w.downcast_ref::<crate::pixels::PixelSurface>().is_some(),
@@ -2193,11 +2224,11 @@ mod gtk_tests {
     fn pixels_update_reuses_widget_on_same_id() {
         let root = root();
         let mut rec = Reconciler::new(&root, |_, _| {});
-        rec.render(&pix(Some("lcd"), 1, 1, vec![255, 0, 0, 255]));
+        rec.render(&pix(Some("lcd"), 1, 1, &[255, 0, 0, 255]));
         let before = root.first_child().unwrap();
 
         // Same id, new bytes: mutable-prop update, widget identity preserved.
-        rec.render(&pix(Some("lcd"), 1, 1, vec![0, 255, 0, 255]));
+        rec.render(&pix(Some("lcd"), 1, 1, &[0, 255, 0, 255]));
         let after = root.first_child().unwrap();
         assert_eq!(before, after, "same-id Pixels reuses the surface in place");
     }
@@ -2398,11 +2429,80 @@ mod gtk_tests {
         assert_eq!(e.placeholder_text().as_deref().unwrap_or(""), "");
     }
 
+    /// **#911.** The reconciler hands a `Node::Pixels` buffer to its surface
+    /// *shared*, so a re-render carrying the same allocation — one monitor's
+    /// static chip re-mapped because a sibling animated, once per frame the
+    /// clock delivers — is settled by an `Arc::ptr_eq` inside the surface: no
+    /// texture rebuilt,
+    /// no invalidation queued, and not one byte of the buffer read.
+    ///
+    /// The byte-compare tally is what makes this a test of *this* line rather
+    /// than of the #902 guard: the slice setter reaches the identical
+    /// `(builds, draws, resizes)` verdict, just by scanning 4 KiB to get there
+    /// on every one of those re-renders.
+    #[gtk::test]
+    fn pixels_re_render_of_one_shared_buffer_reads_no_bytes() {
+        // Two containers up front: one per "monitor", bound before `root` is
+        // shadowed by the first of them.
+        let (root, other_root) = (root(), root());
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        // 64×16 RGBA8 = 4 KiB, a bar-sized preem chip.
+        let frame: Arc<[u8]> = Arc::from([0xab_u8; 4096].as_slice());
+        for _ in 0..10 {
+            rec.render(&pix_shared(Some("lcd"), 64, 16, Arc::clone(&frame), 1));
+        }
+        let surface = root
+            .first_child()
+            .unwrap()
+            .downcast::<crate::pixels::PixelSurface>()
+            .unwrap();
+        assert_eq!(
+            surface.counts().builds,
+            1,
+            "ten renders of one buffer must upload exactly one texture",
+        );
+        assert_eq!(
+            surface.bytes_compared(),
+            0,
+            "the reconciler must pass the buffer through shared — a byte compare here means \
+             it copied or fell back to the slice setter",
+        );
+
+        // The multi-monitor shape: a second reconciler over its own container
+        // is handed the very same allocation and uploads it once, without a
+        // copy and without a scan.
+        let mut other = Reconciler::new(&other_root, |_, _| {});
+        for _ in 0..10 {
+            other.render(&pix_shared(Some("lcd"), 64, 16, Arc::clone(&frame), 1));
+        }
+        let second = other_root
+            .first_child()
+            .unwrap()
+            .downcast::<crate::pixels::PixelSurface>()
+            .unwrap();
+        assert_eq!(second.counts().builds, 1);
+        assert_eq!(
+            second.bytes_compared(),
+            0,
+            "a second monitor's surface pays a pointer compare per tick, not a buffer scan",
+        );
+
+        // …and a frame that really did change still gets through.
+        rec.render(&pix_shared(
+            Some("lcd"),
+            64,
+            16,
+            Arc::from([0xcd_u8; 4096].as_slice()),
+            1,
+        ));
+        assert_eq!(surface.counts().builds, 2, "a new frame must still upload");
+    }
+
     #[gtk::test]
     fn pixels_scale_is_a_mutable_prop() {
         let root = root();
         let mut rec = Reconciler::new(&root, |_, _| {});
-        rec.render(&pix(Some("lcd"), 1, 1, vec![255, 0, 0, 255]));
+        rec.render(&pix(Some("lcd"), 1, 1, &[255, 0, 0, 255]));
         let surface = root
             .first_child()
             .unwrap()
@@ -2412,14 +2512,13 @@ mod gtk_tests {
 
         // Same id, new scale: mutable-prop update — the widget is reused and
         // its natural request grows to buffer × scale.
-        rec.render(&Node::Pixels {
-            id: Some("lcd".into()),
-            width: 1,
-            height: 1,
-            data: vec![255, 0, 0, 255],
-            scale: 4,
-            classes: vec![],
-        });
+        rec.render(&pix_shared(
+            Some("lcd"),
+            1,
+            1,
+            Arc::from([255, 0, 0, 255].as_slice()),
+            4,
+        ));
         assert_eq!(
             root.first_child().unwrap(),
             surface.clone().upcast::<gtk::Widget>(),
@@ -2434,14 +2533,14 @@ mod gtk_tests {
         let mut rec = Reconciler::new(&root, |_, _| {});
         // data.len() (3) != 2*2*4: the widget must degrade to rendering nothing
         // rather than hand MemoryTexture::new an under-sized buffer.
-        rec.render(&pix(Some("lcd"), 2, 2, vec![1, 2, 3]));
+        rec.render(&pix(Some("lcd"), 2, 2, &[1, 2, 3]));
         let w = root
             .first_child()
             .unwrap()
             .downcast::<crate::pixels::PixelSurface>()
             .unwrap();
         // A subsequent valid frame still renders in place (kind/id unchanged).
-        rec.render(&pix(Some("lcd"), 1, 1, vec![9, 9, 9, 255]));
+        rec.render(&pix(Some("lcd"), 1, 1, &[9, 9, 9, 255]));
         assert_eq!(root.first_child().unwrap(), w.upcast::<gtk::Widget>());
     }
 

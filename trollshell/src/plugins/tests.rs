@@ -167,7 +167,7 @@ fn wire_node_maps_to_ui_node_exhaustively() {
                 id: Some("px".into()),
                 width: 1,
                 height: 1,
-                data: vec![10, 20, 30, 255],
+                data: Arc::from([10, 20, 30, 255].as_slice()),
                 scale: 2,
                 classes: vec!["ts-lcd".into()],
             },
@@ -589,7 +589,7 @@ fn pixels_bad_len_degrades_to_empty_surface() {
             id: Some("lcd".into()),
             width: 0,
             height: 0,
-            data: vec![],
+            data: Arc::from(&[][..]),
             // The degraded (empty) surface renders nothing; scale is inert
             // there, so it normalizes to 1.
             scale: 1,
@@ -612,7 +612,7 @@ fn pixels_bad_len_degrades_to_empty_surface() {
             id: None,
             width: 1,
             height: 2,
-            data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            data: Arc::from([1, 2, 3, 4, 5, 6, 7, 8].as_slice()),
             scale: 1,
             classes: vec![],
         },
@@ -2764,7 +2764,19 @@ fn preem_node(id: Option<&str>, widget: vocab::PreemWidget) -> wire::Node {
 
 /// Map `node` through the real host path and take the RGBA8 surface out of it,
 /// asserting the invariants every preem node must satisfy on the way.
+///
+/// Returns owned bytes so the parity assertions below read against a kit frame
+/// unchanged; [`mapped_frame`] is the one that keeps the shared buffer's
+/// identity, which is what the #911 sharing tests are about.
 fn mapped_pixels(scope: &Scope, node: &wire::Node) -> (u32, u32, Vec<u8>) {
+    let (width, height, data) = mapped_frame(scope, node);
+    (width, height, data.to_vec())
+}
+
+/// [`mapped_pixels`] without flattening the buffer: the `Arc<[u8]>` the host
+/// actually handed out, so a test can ask whether two mapping passes shared one
+/// allocation (#911).
+fn mapped_frame(scope: &Scope, node: &wire::Node) -> (u32, u32, Arc<[u8]>) {
     match to_ui_node(scope, node) {
         UiNode::Pixels {
             width,
@@ -2834,7 +2846,7 @@ fn mapped_row_pixels(scope: &Scope, node: &wire::Node) -> Vec<(u32, u32, Vec<u8>
                     height,
                     data,
                     ..
-                } => (width, height, data),
+                } => (width, height, data.to_vec()),
                 other => panic!("a preem child must map to Pixels, got {other:?}"),
             })
             .collect(),
@@ -3356,6 +3368,101 @@ fn re_mapping_an_unchanged_widget_is_a_no_op() {
         "a second monitor mapping the same tree must neither rebuild nor re-apply",
     );
     assert_eq!(first, second, "and it must produce the same surface");
+}
+
+/// **#911.** The second monitor's mapping pass takes a *handle* on the frame the
+/// first one rasterised, never a copy of it.
+///
+/// The instance table is keyed by scope and shared across mounts, so a
+/// two-output session maps every preem node twice per frame, and a blanket
+/// repaint maps every *unchanged* node again on top of that. Returning owned
+/// bytes from [`preem_render::Instance::frame`] made each of those a full RGBA
+/// clone out of the store — which the reconciler then copied a second time into
+/// the surface's texture. Now `UiNode::Pixels.data` is an `Arc<[u8]>`: the extra
+/// pass costs a refcount, and `PixelSurface::set_pixels_shared` settles it with
+/// an `Arc::ptr_eq` (#907) instead of scanning the buffer.
+///
+/// Pointer identity is the assertion because it is the one thing a byte-for-byte
+/// copy cannot fake — `assert_eq!` on the bytes passes either way, which is
+/// exactly why the test above it could not catch this.
+#[test]
+fn every_monitors_pass_shares_one_frame_allocation() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("shared-frame-911");
+    let node = preem_node(
+        Some("dm"),
+        vocab::PreemWidget::DotMatrix {
+            config: vocab::DotMatrixConfig::default(),
+            state: vocab::DotMatrixState {
+                text: "SHARED".into(),
+            },
+        },
+    );
+
+    let (width, height, first) = mapped_frame(&scope, &node);
+    let (again_w, again_h, second) = mapped_frame(&scope, &node);
+    assert!(
+        !first.is_empty(),
+        "the fixture must really rasterise something, or the sharing claim is vacuous",
+    );
+    assert_eq!(
+        (width, height),
+        (again_w, again_h),
+        "both monitors map one frame",
+    );
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "two monitors mapping one frame must share one buffer, not hold two copies of it",
+    );
+    // Three monitors, a drawer, a blanket repaint — every further pass is the
+    // same allocation until something invalidates the cache.
+    let (_, _, third) = mapped_frame(&scope, &node);
+    assert!(Arc::ptr_eq(&first, &third));
+    assert_eq!(
+        Arc::strong_count(&first),
+        4,
+        "the cache's own handle plus one per pass — no copy anywhere on the path",
+    );
+
+    preem_render::forget_scope(&scope);
+}
+
+/// The other half of #911: a frame that really did change is a **new**
+/// allocation, so the surface's pointer compare correctly misses it and the new
+/// pixels reach the screen. A shared buffer that outlived its content would be
+/// a frozen widget.
+#[test]
+fn a_moved_frame_is_a_new_allocation() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("moved-frame-911");
+    let node = preem_node(
+        Some("mq"),
+        vocab::PreemWidget::Marquee {
+            config: vocab::MarqueeConfig {
+                style: vocab::StyleRef::new(vocab::StyleName::Vfd),
+                window_px: 192,
+                gap_dots: 6,
+                speed_dots_per_sec: 20.0,
+            },
+            state: vocab::MarqueeState {
+                text: "A LONG SCROLLING MESSAGE".into(),
+            },
+        },
+    );
+
+    let (_, _, before) = mapped_frame(&scope, &node);
+    assert!(advanced(0.5), "the marquee must actually have moved");
+    let (_, _, after) = mapped_frame(&scope, &node);
+    assert!(
+        !Arc::ptr_eq(&before, &after),
+        "a tick that moved the widget must produce a new buffer, not mutate the shared one",
+    );
+    assert_ne!(*before, *after, "…and it must really be different pixels");
+    // The pre-tick handle is still valid — the surfaces still holding it see
+    // the frame they were given, not a half-written one.
+    assert_eq!(before.len(), after.len());
+
+    preem_render::forget_scope(&scope);
 }
 
 /// Lifecycle: a **config** change rebuilds the instance, and so does swapping
@@ -4428,7 +4535,7 @@ fn an_unrenderable_preem_widget_degrades_to_an_empty_surface() {
             id: Some("x".into()),
             width: 0,
             height: 0,
-            data: vec![],
+            data: Arc::from(&[][..]),
             scale: 1,
             classes: vec!["ts-preem".into()],
         },

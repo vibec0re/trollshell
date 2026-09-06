@@ -5,6 +5,7 @@
 //! exhaustively so adding a variant to either side is a compile error here.
 
 use std::cell::Cell;
+use std::sync::Arc;
 
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
 use hytte_plugin_proto::wire::{self, MAX_NODES_PER_TREE, MAX_TREE_DEPTH};
@@ -258,8 +259,17 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             // with `tracing`); the `hytte_ui` widget stays a silent panic-safe
             // backstop, and decode stays permissive so one bad node can't drop
             // the whole connection.
+            // `Arc::from(&data[..])` and not `Arc::from(data.clone())`: both end
+            // in one copy of the RGBA block (an `Arc<[u8]>` stores its refcount
+            // inline ahead of the bytes, so it can never adopt a `Vec`'s
+            // allocation), but the second would pay for a `Vec` on the way
+            // through. This is exactly the single copy the `data.clone()` here
+            // always was — plugin-side pixels arrive owned from MessagePack and
+            // this mapping is per monitor, so there is no shared cache upstream
+            // to hand a handle on (#911). Downstream of here the buffer is
+            // shared like every other `Pixels` node's.
             let (width, height, data) = if pixels_len_ok(*width, *height, data.len()) {
-                (*width, *height, data.clone())
+                (*width, *height, Arc::from(&data[..]))
             } else {
                 tracing::warn!(
                     node = ?id,
@@ -268,7 +278,7 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
                     data_len = data.len(),
                     "plugin Pixels buffer size != width*height*4; rendering nothing"
                 );
-                (0, 0, Vec::new())
+                (0, 0, preem_render::nothing())
             };
             // Same seam for the `scale` hint (#358): an absurd upscale is
             // clamped (with a warn) rather than honored, so a malformed plugin

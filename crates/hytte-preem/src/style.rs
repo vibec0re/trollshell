@@ -1936,15 +1936,17 @@ mod tests {
     /// render path does — over every skin, the whole accent sweep and both
     /// field regimes.
     ///
-    /// The seam exists for the status-role follow-up: `preem_render::ink_for`
-    /// resolves `Success`/`Warning`/`Error` to theme colors and pins them as
-    /// [`Ink::Fixed`], which the policy deliberately never touches, so a host
-    /// that wants the skin's opinion has to ask for it. Review measured what is
-    /// at stake — all twelve libadwaita role colors fail AA on the LCD field,
-    /// the dark-theme six at 1.03–1.48:1 — and noted that the shell could not
-    /// even ask, because `contrast`, `Palette` and `base_palette` are all
-    /// private. This is that door, and this test is what stops it drifting away
-    /// from the render path it is supposed to mirror.
+    /// The seam was opened for the status-role follow-up, and **#939 walked
+    /// through it**: `preem_render::ink_for` resolves `Success`/`Warning`/
+    /// `Error` to theme colors and now runs each through
+    /// [`admit_ink`](DisplayStyle::admit_ink) before pinning the answer as
+    /// [`Ink::Fixed`] — because a role color is the *host's* answer, while a
+    /// pin is the author's and the policy deliberately never touches it. Review
+    /// measured what was at stake — all twelve libadwaita role colors fail AA
+    /// on the LCD field, the dark-theme six at 1.03–1.48:1 — and noted that the
+    /// shell could not even ask, because `contrast`, `Palette` and
+    /// `base_palette` are all private. This is that door, and this test is what
+    /// stops it drifting away from the render path it now shares.
     ///
     /// **Falsified** by giving `admit_ink` its own copy of the policy match
     /// (rather than sharing `admit_ink_against`) and flipping one arm.
@@ -2047,12 +2049,17 @@ mod tests {
     /// the consequence on glass belongs to whoever wrote the pin.
     ///
     /// It has to be this way. The kit cannot tell an author's `.ink(…)` from a
-    /// color a host resolved for a semantic role — the shell hands both over as
-    /// [`Ink::Fixed`] (`preem_render::ink_for`) — so a policy reaching into
-    /// `Fixed` would silently rewrite deliberate palettes, #884's two speech
-    /// bubbles among them, which pin their ink *and* their field precisely so
-    /// the skin stops having an opinion. Guarding a stated color is the worse
-    /// of the two failures.
+    /// color a host resolved for a semantic role — both arrive as
+    /// [`Ink::Fixed`] — so a policy reaching into `Fixed` would silently
+    /// rewrite deliberate palettes, #884's two speech bubbles among them, which
+    /// pin their ink *and* their field precisely so the skin stops having an
+    /// opinion. Guarding a stated color is the worse of the two failures.
+    ///
+    /// The host resolves the ambiguity on its own side, which is the only side
+    /// that can: since #939 `preem_render::ink_for` sends a *role*-resolved
+    /// color through [`admit_ink`](DisplayStyle::admit_ink) before pinning it,
+    /// and leaves an author's `.ink(…)` alone. Both still reach here as
+    /// `Fixed`; one of them has already been asked about.
     ///
     /// **Falsified** by routing `Ink::Fixed` through `admit` on the LCD: the
     /// white pin comes back darkened and the equality goes red.

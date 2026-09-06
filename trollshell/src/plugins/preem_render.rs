@@ -1664,14 +1664,24 @@ pub(super) fn set_role_inks(inks: RoleInks) {
 /// own ink, and the second reaches the kit as [`kit::Ink::Default`], which the
 /// skin already admits for itself.
 ///
-/// **Admitted at use, not memoized.** [`role_inks`] caches the three *theme*
-/// colors; the admission is per `(role color, skin, effective field)` and so
-/// would need a memo key three wide for a scan over a 65-stop integer ramp that
-/// the accent path already pays, unmemoized, on every `Lcd` rasterisation. Doing
-/// it here also keeps the invalidation story exactly as #912 left it — the memo
-/// holds only what the theme said, so [`invalidate_cached_frames`]'s
-/// `ROLE_INKS.set(None)` remains the whole of it and no derived value can go
-/// stale behind it.
+/// **Admitted at use, not memoized** — and the invalidation, not the cost, is
+/// the load-bearing half of that.
+///
+/// The cost is genuinely small: a memo would save a scan over a 65-stop integer
+/// ramp (~43 stops in practice for the six role colors) that the *accent* path
+/// has already paid, unmemoized, on every `Lcd` rasterisation since #928 — and
+/// pays twice per marquee render. A role widget now pays exactly one admission
+/// per rasterisation, the same or fewer than the default path beside it, and
+/// none at all on the three `AsGiven` skins.
+///
+/// The reason not to memoize is what the key would have to be. [`role_inks`]
+/// caches the three *theme* colors, so [`invalidate_cached_frames`]'s
+/// `ROLE_INKS.set(None)` — a theme-moved seam — is the whole of its
+/// invalidation. An admitted ink is keyed `(role color, skin, effective field)`,
+/// and **skin and field come from the widget, not the theme**: such a memo would
+/// also have to drop on every config change, widening the invalidation surface
+/// rather than leaving it where #912 put it. Deriving at use keeps one cell with
+/// one reason to be dropped, and no derived value that can go stale behind it.
 ///
 /// [policy]: kit::DisplayStyle::admit_ink
 fn ink_for(style: vocab::StyleRef) -> kit::Ink {

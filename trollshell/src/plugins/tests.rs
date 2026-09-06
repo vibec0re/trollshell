@@ -5976,6 +5976,35 @@ const LCD_ADMITTED_ROLE_INKS: [kit::Rgba; 6] = [
     [0x87, 0x0f, 0x0a, 0xff],
 ];
 
+/// Drops the memoized role colors (and the kit accent) when it falls out of
+/// scope — see [`role_ink_reset`].
+struct RoleInkReset;
+
+impl Drop for RoleInkReset {
+    fn drop(&mut self) {
+        // `tint_in_process_surfaces(None)` is the shell's own theme-moved seam:
+        // it clears the kit accent *and* calls `invalidate_cached_frames`,
+        // which does the `ROLE_INKS.set(None)`. Resetting through it rather
+        // than through `set_role_inks(default)` means the teardown cannot
+        // reach a state the shell itself has no path to.
+        tint_in_process_surfaces(None);
+    }
+}
+
+/// Clear the role memo now, and again when the test ends.
+///
+/// `ROLE_INKS` is a `thread_local!`, so the default harness hands every test a
+/// fresh cell and the module is green either way — including under
+/// `--test-threads=1`, where all 121 share one. This is hygiene the file already
+/// keeps (`a_status_role_resolves_to_the_theme_color_not_the_accent` ends on a
+/// `tint_in_process_surfaces(None)`), made order-proof: a guard restores on the
+/// unwind out of a failed assertion, where a trailing call would not, so one red
+/// test cannot cascade into the next one on the same thread.
+fn role_ink_reset() -> RoleInkReset {
+    tint_in_process_surfaces(None);
+    RoleInkReset
+}
+
 /// Install exactly one role color, leaving the other two unset — so a case names
 /// a single `(role, color)` pair and no second color can leak into it.
 fn inject_role_ink(role: vocab::AccentRole, ink: kit::Rgba) {
@@ -6030,7 +6059,7 @@ fn resolved_ink(style: vocab::StyleRef) -> kit::Rgba {
 #[test]
 fn every_status_role_color_is_admitted_by_the_skin_it_renders_on() {
     let _ink = preem_ink_lock();
-    tint_in_process_surfaces(None);
+    let _roles = role_ink_reset();
 
     for (label, role, color) in LIBADWAITA_ROLES {
         for (name, skin) in vocab::StyleName::ALL
@@ -6098,7 +6127,7 @@ fn every_status_role_color_is_admitted_by_the_skin_it_renders_on() {
 #[test]
 fn a_pinned_field_moves_the_ground_a_role_is_admitted_against() {
     let _ink = preem_ink_lock();
-    tint_in_process_surfaces(None);
+    let _roles = role_ink_reset();
     let success = [0x64, 0xec, 0xa5, 0xff];
     inject_role_ink(vocab::AccentRole::Success, success);
     let lcd = vocab::StyleRef::new(vocab::StyleName::Lcd).with_accent(vocab::AccentRole::Success);
@@ -6154,7 +6183,7 @@ fn a_pinned_field_moves_the_ground_a_role_is_admitted_against() {
 #[test]
 fn the_admitted_role_inks_on_the_lcd_are_pinned_to_their_bytes() {
     let _ink = preem_ink_lock();
-    tint_in_process_surfaces(None);
+    let _roles = role_ink_reset();
     let lcd = kit::DisplayStyle::Lcd;
 
     for ((label, role, color), admitted) in LIBADWAITA_ROLES.into_iter().zip(LCD_ADMITTED_ROLE_INKS)
@@ -6210,7 +6239,7 @@ fn the_admitted_role_inks_on_the_lcd_are_pinned_to_their_bytes() {
 #[test]
 fn an_explicit_ink_pin_is_never_admitted_even_where_the_lcd_cannot_carry_it() {
     let _ink = preem_ink_lock();
-    tint_in_process_surfaces(None);
+    let _roles = role_ink_reset();
     let illegible = [0x64, 0xec, 0xa5, 0xff];
     let lcd = kit::DisplayStyle::Lcd;
 
@@ -6263,7 +6292,7 @@ fn an_explicit_ink_pin_is_never_admitted_even_where_the_lcd_cannot_carry_it() {
 #[test]
 fn a_role_renders_exactly_like_its_pin_on_the_dark_skins_and_never_on_the_lcd() {
     let _ink = preem_ink_lock();
-    tint_in_process_surfaces(None);
+    let _roles = role_ink_reset();
     let scope = Scope::detached("935-dark-parity");
 
     for (index, (label, role, color)) in LIBADWAITA_ROLES.into_iter().enumerate() {

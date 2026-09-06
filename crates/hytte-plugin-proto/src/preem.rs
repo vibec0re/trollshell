@@ -919,8 +919,11 @@ pub struct MarqueeConfig {
     /// generalizes that: the shell's pump integrates it against real elapsed
     /// time, so the scroll runs at the same visual speed whatever the frame
     /// rate, and a plugin no longer owns a timer to keep it moving. Default
-    /// `20.0`, matching the rate the kit's own consumers already scroll at.
-    /// `0.0` parks the message, and so does **any** non-finite value,
+    /// `12.0` — with #926 riding the display's real refresh instead of a
+    /// choppy 20 Hz timer, the original `20.0` taste (matching the audio
+    /// widget's own rate) read as too fast on glass; #929 is Annika's live-verify
+    /// call, one character width every ~2 s. `0.0` parks the message, and so
+    /// does **any** non-finite value,
     /// infinities included. This is the one float in the vocabulary with **no
     /// kit behaviour to match** — the kit's `Marquee` has no speed at all
     /// (`MarqueeStrip::window(offset)` is caller-driven), so #882 invented the
@@ -936,7 +939,7 @@ impl Default for MarqueeConfig {
             style: StyleRef::default(),
             window_px: 192,
             gap_dots: 6,
-            speed_dots_per_sec: 20.0,
+            speed_dots_per_sec: 12.0,
         }
     }
 }

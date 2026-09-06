@@ -23,6 +23,23 @@ workspace issues GL draw calls, how a GPU frame reaches the reconciler without a
 readback, and what #893's trust boundary is now that robustness turned out to be
 unreachable.
 
+## Decisions (Annika, 2026-09-06)
+
+Annika answered all six open questions below on [#893](https://github.com/vibec0re/trollshell/issues/893#issuecomment-5562069487). Recorded here as decisions, not questions:
+
+1. **GL by default, not opt-in.** `TROLLSHELL_PREEM_RENDERER` flips from an
+   opt-in switch to a **kill switch**: `=cpu` forces the CPU kit. CPU remains
+   the per-instance fallback on context-creation failure.
+2. **`hytte-gl`** ships as the workspace's second `unsafe_code = "allow"`
+   island, on the `hytte-ecal` precedent.
+3. **Per-monitor phosphor divergence: accepted.** Each monitor's GLArea owns
+   its own trail, as the CPU instance table already does per scope.
+4. **Parity ceiling stands:** mean 2 / p99 8 / max 32 per channel.
+5. **#893's caps stand:** 16 KiB source, 4096 IR expressions, no unbounded
+   loops.
+6. **Dialect fallback: drop to `#version 310 es`** if naga cannot parse
+   `320 es`, rather than take a heavier validator.
+
 ## What stage A settled (quoting only the numbers the #893 verdict quotes)
 
 | phase                          | avg   | p50   | p95       | max     | jank | frames |
@@ -134,12 +151,14 @@ document (it converges within `settle_steps` — 17 at the default persistence);
 
 **When the CPU arm is used.** "No CPU fallback" was Annika's call about the
 _shader widget_, which has no CPU implementation. Kit widgets do, and it is the
-reference, so falling back is free and strictly better than a blank chip. CPU is
-used when (1) `TROLLSHELL_PREEM_RENDERER=cpu` — the PR 1 default, so main cannot
-regress the bar before the acceptance run, with the flip to `gl` its own one-line
-PR; (2) the kind has no GL arm (everything but `Scope` in PR 1); or (3)
-`GLArea::error()` is set after realize or `context()` is `None` — per instance,
-warned once, no process-wide probe.
+reference, so falling back is free and strictly better than a blank chip. **GL
+is on by default** (Decisions #1); CPU is used when (1)
+`TROLLSHELL_PREEM_RENDERER=cpu` — the kill switch, forcing CPU regardless of GL
+availability; (2) the kind has no GL arm (everything but `Scope` in PR 1); or
+(3) `GLArea::error()` is set after realize or `context()` is `None` — per
+instance, warned once, no process-wide probe. (3) is what makes GL-by-default
+safe on hardware PR 1 never saw: a context-creation failure falls back to CPU
+per instance rather than blanking the chip.
 
 ## State → uniforms
 
@@ -242,10 +261,12 @@ GTK's wrapper).
 
 ## Perf budget and acceptance
 
+- **GL is on by default; `TROLLSHELL_PREEM_RENDERER=cpu` must restore today's
+  frames byte-exactly** (Decisions #1) — the CPU goldens are the proof.
 - `--areas 8`, layer-shell, on glass: **jank 0**, and p95 within **0.5 ms** of
   the idle baseline (16.67 ms). The gl-x3 layer number to beat is 16.77.
 - The real bar, preem-demo's scope on two monitors: no new jank versus the CPU
-  arm, A/B'd with the same env var.
+  arm, A/B'd via the kill switch.
 - GL was _cheaper_ than the Cairo path it replaces in the window run (p95 19.00
   vs 20.82, jank 2 vs 3) in a **debug** build, so that is conservative in GL's
   favour.
@@ -279,19 +300,10 @@ No change to `hytte-plugin-proto`, `hytte-plugin`, any plugin, or `pump.rs`.
 - **Route 3**, the out-of-process shader host. Named, not built.
 - **Fractional-scale snapping.** Unprovable on this hardware.
 
-## Open questions for Annika
+## Resolved — see Decisions
 
-1. PR 1 opt-in (`TROLLSHELL_PREEM_RENDERER=gl`, default CPU) with a default flip
-   after your `--areas 8` run — or GL on by default immediately? _(rec: opt-in)_
-2. `hytte-gl` as the workspace's second `unsafe_code = "allow"` crate, modelled
-   on `hytte-ecal`? _(rec: yes — zero new lock entries)_
-3. Per-monitor phosphor divergence: accept, or clear-on-map? _(rec: accept)_
-4. Parity ceiling mean 2 / p99 8 / max 32 per channel — right ballpark?
-   _(rec: yes, tighten to observed + margin after PR 1)_
-5. #893's caps — 16 KiB source, 4096 IR expressions, no unbounded loops?
-6. If naga cannot parse `#version 320 es`, drop the plugin-facing dialect to
-   `310 es` (a 3.2 context accepts it) or take a heavier validator?
-   _(rec: `310 es`)_
+The six open questions this section used to ask are answered — see
+[Decisions (Annika, 2026-09-06)](#decisions-annika-2026-09-06) above.
 
 ## References
 

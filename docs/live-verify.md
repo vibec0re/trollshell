@@ -643,6 +643,33 @@ audio feed, not the raster.
      static widget (the 7seg clock between minutes). The scanlines must be
      perfectly frozen — they must not creep, shimmer, or breathe between
      frames. Only the scope's own phosphor trail decays over time.
+- [ ] **(#930)** **The gauge's halo, halved.** The gauge now wears half the
+      bloom radius its skin asks for (`BLOOM_RADIUS_DIV` in
+      `crates/hytte-preem/src/gauge.rs`) — a taste change picked off renders,
+      so eyes on glass is the only verification there is. Watch the needle
+      gauge on the preem-demo card through a full skin rotation:
+  1. **VFD is the one to judge** (the default, and where the complaint came
+     from): the pointer should read as a drawn needle with a glow, not as a
+     lit smudge. Its lit cross-section on the default 144×64 face at ×2 is 20
+     output px, down from 28.
+  2. **The core is not dimmer or thinner.** Halving the bloom dims the halo's
+     shoulder; a handful of near-black pixels beside thin elements gain
+     1–2/255 as the blur concentrates, imperceptible. Fully-saturated ink —
+     the bright centre of the blade, the hub and the value arc — should be
+     exactly as bright and exactly as wide as before. A needle that got
+     fainter is a different bug.
+  3. **CRT keeps a visibly broader halo than VFD** (radius 3 → 2 there, so it
+     is narrowed too but stays the widest of the four). If VFD and CRT now
+     read the same, the per-skin spread has collapsed.
+  4. **LCD and OLED are pixel-identical** — LCD never blooms, and OLED's radius
+     was already at the floor. Any visible change on those two skins is not
+     this PR; it is a change to the shared composite path.
+  5. **The scope beside it is untouched.** The change is gauge-local (the
+     palette is copied per frame), so the scope's phosphor halo on the same
+     card, in the same skin, must keep exactly the spread it had. Judge them
+     side by side on VFD — that contrast is the point of the change.
+  6. **Small dials are unaffected.** A square 48/64 gauge was already at #931's
+     proportional cap, so nothing there should move.
 
 ## Preem state over the wire
 

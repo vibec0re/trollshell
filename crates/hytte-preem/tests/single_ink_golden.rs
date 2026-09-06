@@ -32,6 +32,34 @@
 //! crate's public API only, so it stays honest about what a consumer sees and
 //! cannot accidentally reach past a boundary to reconstruct the expected
 //! bytes.
+//!
+//! # Recaptured by #930
+//!
+//! The **two gauge rows** ([`gauge_single_ink_bytes_are_unchanged`] and
+//! [`gauge_midswing_single_ink_bytes_are_unchanged`]) no longer hold the
+//! values their own doc comments describe capturing. They were recaptured on
+//! branch `fix/930-gauge-bloom-b`, based on `origin/main` at `1755239`, by
+//! running this file with `gauge.rs`'s `BLOOM_RADIUS_DIV` at its shipped `2` —
+//! the taste change #930 settled: **the gauge wears half the bloom radius its
+//! skin asks for**, ceilinged by #931's proportional `bloom_cap`. Nothing else
+//! moved with it: `FEATHER` is still `1.15`, `TRAIL_T` still
+//! `[150, 104, 66, 34]`, `TRAIL_SPAN_SECS` still `0.05`, `BLOOM_ARC_DIV` still
+//! `16.0`, and no skin palette in `style.rs` was touched. Every non-gauge row
+//! in this file is untouched, which is itself the check that #930 stayed
+//! inside the gauge.
+//!
+//! **Two of the four values in each gauge row are byte-identical to the
+//! pre-#930 capture, and that identity is the regression check worth stating.**
+//! `Lcd` (index 1) carries `bloom: None` and never blooms at all; `Oled`
+//! (index 2) asks for radius `1`, which `div_ceil(2)` leaves at `1`. Only
+//! `Vfd` (2 → 1) and `Crt` (3 → 2) may move under #930, and exactly those two
+//! did, in both rows. A future diff that reddens the `Lcd` or `Oled` cell of a
+//! gauge row is therefore *not* a bloom-taste change — it is a change to the
+//! shared composite path this file exists to catch.
+//!
+//! Recapturing rather than loosening is deliberate. The value of a golden is
+//! that a deliberate taste change arrives as a reviewed diff of hashes with a
+//! commit named beside it, not as a widened tolerance.
 
 use hytte_preem::{DisplayStyle, Frame, Gauge, LedStrip, Marquee, TextBox, dot_matrix, seven_seg};
 
@@ -168,15 +196,21 @@ fn marquee_single_ink_bytes_are_unchanged() {
 /// Settled at a reading rather than at rest so the frame carries the whole
 /// path: the flat face, the lit value arc, the tapered blade, the counterweight
 /// and the hub, bloomed and composited.
+///
+/// **Recaptured by #930** (`BLOOM_RADIUS_DIV` introduced at `2` in `gauge.rs`
+/// — effectively `1 → 2`: the skin radius was previously used as-is — the
+/// gauge halving its skin's bloom radius) — see this file's header,
+/// "Recaptured by #930", for the provenance and for why exactly two of the
+/// four values below moved.
 #[test]
 fn gauge_single_ink_bytes_are_unchanged() {
     check(
         "gauge",
         [
-            0xf28f_82e8_52ac_2312,
+            0x5f60_bb60_9dc3_2a3a,
             0x471c_d528_d5fa_3612,
             0x3500_9832_2b70_3bea,
-            0xf257_45aa_ec57_3372,
+            0xfebf_540b_f11e_adca,
         ],
         |style| {
             let mut gauge = Gauge::new();
@@ -260,7 +294,8 @@ fn midswing() -> Gauge {
 ///
 /// The four values were captured by running this test against `origin/main`
 /// at `d1a2d57` (this branch's own base — the row is new here, not guarding a
-/// prior change, so a plain run against the base is the capture).
+/// prior change, so a plain run against the base is the capture), and
+/// **recaptured by #930** — see this file's header, "Recaptured by #930".
 ///
 /// [`Needle::advance`]: hytte_preem::Needle::advance
 /// [`Needle::settle`]: hytte_preem::Needle::settle
@@ -290,10 +325,10 @@ fn gauge_midswing_single_ink_bytes_are_unchanged() {
     check(
         "gauge midswing",
         [
-            0xfbd7_93ed_c5f6_7e52,
+            0x30fb_485c_3616_b2da,
             0x4738_7fc9_ee7d_8daa,
             0x34bc_7708_4385_c52a,
-            0xea17_1d1d_fa2e_f3a2,
+            0x3701_e7d1_5db7_bd3a,
         ],
         |style| midswing().render(style),
     );

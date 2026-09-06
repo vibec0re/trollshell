@@ -1538,6 +1538,39 @@ session.
       and preamble all survive. The editor must also work with the shell
       **stopped**, since it writes the file directly rather than asking the
       shell to.
+- [ ] **(#887)** Plugins tab **adaptive drill-down**. Open the control-center
+      at its default 760 px width: the tab is a two-pane split — plugin list on
+      the left, the selected plugin's detail on the right — and each row carries
+      a status word (`Rendering` / `Connected` / `Not connected` / `Stopped` /
+      `Failed`) beside the existing `Running · enabled` subtitle. Now **drag the
+      window narrower, across ~520 px**: the detail pane must disappear, leaving
+      the list alone; tapping a row pushes its page (titled with the plugin id),
+      and the header's back arrow returns. Widen again and both panes come back
+      with the selection intact. The parts the tests can't reach: the two
+      resize directions on a real compositor (tests present a fixed-size window
+      each time), the swipe-back gesture, and the **journal** — the
+      control-center's own `journalctl --user` output, grepped for `exceeds`,
+      must stay empty while the window sits collapsed, which is the #856 contract
+      (`AdwBreakpointBin` warns once per allocation when a child's minimum
+      exceeds the bin's width, and #856 records that the warning is suppressed
+      in tests, so only a long-lived window proves it). Then **start and stop a
+      plugin from the detail page** — the switch moved there from the row — and
+      confirm the list's status column and the detail's `Host connection` row
+      both catch up within ~2 s without the selection jumping or a pushed page
+      popping. Finally, `systemctl --user stop trollshell` with the tab open:
+      the list must drop to a single non-selectable "Unavailable" row and the
+      detail pane to its empty state, with no panic — and then
+      `systemctl --user start trollshell` again: within ~2 s the same plugin
+      must be selected again, with its detail page still pushed if you had
+      drilled in, rather than the list settling on whichever plugin sorts
+      first (the review round's parked selection; the unit test drives the
+      placeholder directly, a real timeout is what a human can confirm).
+      Also worth an eye on every one of these steps: the tab must show
+      **exactly one** set of window buttons — the app's own, top right.
+      Switching between Plugins, Places and AI Keys must not make a second
+      close/minimise/maximise cluster appear or disappear. **No version
+      column** — that half of #887 is held pending the source decision on the
+      issue.
 - [ ] **(#601/#836)** The control-center's **footer** reports the running
       _shell's_ revision, not its own. The companion app is a separate binary
       with its **own** `TROLLSHELL_REV` baked in by `nix/control-center.nix`,

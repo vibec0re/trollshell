@@ -10,6 +10,19 @@ description = "External (out-of-shell) settings & management companion app for t
 [lints]
 workspace = true
 
+[features]
+# Opt-in test bucket: the tests that need a real display server (GTK). Off by
+# default so `cargo test` stays hermetic. Mirrors hytte-bus / hytte-reactive /
+# hytte-services / hytte-ui / trollshell — this crate had no such bucket until
+# #887 needed one for the Plugins tab's adaptive layout, which is geometry and
+# navigation state and so cannot be asserted without a display.
+#
+# `nix flake check`'s `system-tests` derivation runs
+# `xvfb-run -a cargo test --workspace --locked --features system-tests`, and its
+# `clippy` derivation passes `--features system-tests` too, so declaring the
+# feature here is all it takes for both to pick this crate's gated module up.
+system-tests = []
+
 [[bin]]
 name = "trollshell-control-center"
 path = "src/main.rs"

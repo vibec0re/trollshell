@@ -1548,6 +1548,44 @@ impl Gauge {
         })
     }
 
+    /// A **square** dial of `edge` logical pixels a side (pre-upscale) — the
+    /// small-gauge shorthand for `cols == rows` (#931).
+    ///
+    /// The kit's face resolves its own legibility from the buffer it is given:
+    /// a square dial fits its arc by width, so it is **centred** in the height
+    /// it has instead of sitting on the bottom edge, and below a threshold it
+    /// draws fewer subdivisions, a thinner needle, no counterweight and a
+    /// proportionally tighter halo. Nothing extra travels on the wire for any
+    /// of that — [`GaugeConfig::cols`]/[`rows`](GaugeConfig::rows) already say
+    /// everything the shell needs, and the shell builds the same kit face from
+    /// them that this does.
+    ///
+    /// `48` and `64` are the two sizes #931 tuned for; at ×2 they render 96 and
+    /// 128 px square, so a row of both plus a gap fits a sidebar card beside
+    /// the 288 px default.
+    ///
+    /// ```
+    /// use hytte_plugin::display::{Gauge, StyleName};
+    ///
+    /// let small = Gauge::new(StyleName::Vfd).size(48).range(0.0, 100.0);
+    /// assert_eq!(small.frame_size(), (96, 96));
+    /// ```
+    #[must_use]
+    pub fn size(mut self, edge: u32) -> Self {
+        self.config.cols = edge;
+        self.config.rows = edge;
+        self.rebuild();
+        self
+    }
+
+    /// The rendered frame's `(width, height)` in pixels — the logical buffer
+    /// times [`scale`](Self::scale). What the raster arm produces, and what the
+    /// shell sizes the state arm's surface to.
+    #[must_use]
+    pub fn frame_size(&self) -> (usize, usize) {
+        (self.kit.width(), self.kit.height())
+    }
+
     /// The value scale the caller reads in.
     #[must_use]
     pub fn range(mut self, low: f32, high: f32) -> Self {
@@ -2387,6 +2425,34 @@ mod tests {
             "gauge",
         );
 
+        // — the same claim on a **small square** dial (#931). Worth its own
+        //   arm rather than a size swap above: the 48 px face takes the kit's
+        //   small-dial rules (a centred pivot, two subdivisions, no
+        //   counterweight, a capped bloom) and every one of them is resolved
+        //   from the buffer the config carries, so if `.size(48)` did not reach
+        //   the kit exactly as `with_size(48, 48)` does, these two frames would
+        //   differ in far more than their dimensions —
+        let mut small = Gauge::new(StyleName::Vfd).size(48).range(0.0, 100.0);
+        let mut small_kit = kit::Gauge::with_size(48, 48).range(0.0, 100.0);
+        small.set_target(42.0);
+        small_kit.set_target(42.0);
+        for _ in 0..3 {
+            small.advance_in(raster, 0.1);
+            small_kit.advance(0.1);
+        }
+        assert_eq!(
+            small.frame_size(),
+            (96, 96),
+            "48 logical px at the ×2 default"
+        );
+        assert!(
+            small.node_in(raster, "sm", no_cls())
+                == small_kit
+                    .render(DisplayStyle::Vfd)
+                    .into_node(Some("sm"), no_cls()),
+            "48×48 gauge",
+        );
+
         // — the flip board: per-cell clocks mid-fold, so the stagger and the
         //   duration have to survive the translation too —
         let mut fb = FlipBoard::new(StyleName::Oled, Mechanism::SplitFlap)
@@ -2417,6 +2483,40 @@ mod tests {
                     .render(DisplayStyle::Oled)
                     .into_node(Some("fb"), no_cls()),
             "flip board",
+        );
+    }
+
+    /// [`Gauge::size`] is a square [`Gauge::with_size`] and nothing more (#931):
+    /// it moves **both** buffer dimensions, and it moves them on the *config*,
+    /// so the state arm carries the small dial to the shell instead of the
+    /// raster arm quietly being the only one that shrank.
+    ///
+    /// The state-arm half is the load-bearing one. The raster arm is checked
+    /// against the kit in
+    /// [`the_raster_arm_is_byte_identical_for_the_physics_widgets`]; if `size`
+    /// touched only `self.kit` that test would still pass, and a plugin on a
+    /// preem-speaking host would get the 144×64 default back.
+    #[test]
+    fn size_squares_the_gauge_on_both_arms() {
+        let state = RenderMode::State;
+        let gauge = Gauge::new(StyleName::Vfd).size(48);
+        assert_eq!(gauge.frame_size(), (96, 96));
+        match gauge.node_in(state, "ga", Vec::new()) {
+            Node::Preem { widget, .. } => match *widget {
+                PreemWidget::Gauge { config, .. } => {
+                    assert_eq!((config.cols, config.rows), (48, 48), "square on the wire");
+                    assert_eq!(config.scale, 2, "and it does not disturb the scale");
+                }
+                other => panic!("expected a gauge, got {other:?}"),
+            },
+            other => panic!("expected a preem node, got {other:?}"),
+        }
+        // The default is untouched, and `size` is the only thing that squares
+        // it: an explicit `with_size` still says what it says.
+        assert_eq!(Gauge::new(StyleName::Vfd).frame_size(), (288, 128));
+        assert_eq!(
+            Gauge::with_size(StyleName::Vfd, 120, 60).frame_size(),
+            (240, 120)
         );
     }
 

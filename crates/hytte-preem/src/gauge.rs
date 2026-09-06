@@ -448,7 +448,7 @@ const MID_LEN_BONUS: f32 = 1.35;
 /// Every shape on the face — arc, tick, blade, hub — gets its coverage from the
 /// same distance ramp, so nothing on the dial looks hand-drawn next to anything
 /// else.
-const FEATHER: f32 = 1.15;
+const FEATHER: f32 = 0.7;
 
 /// The dial's mechanical stops: how far past each end of the scale the needle
 /// is allowed to travel. A real meter's pointer bangs its stop on a full-scale
@@ -476,7 +476,7 @@ const NEEDLE_T: u16 = 255;
 const HUB_T: u16 = 235;
 /// The motion-blur blades, oldest last. Length sets [`TRAIL_SPAN_SECS`]'s
 /// subdivision.
-const TRAIL_T: &[u16] = &[150, 104, 66, 34];
+const TRAIL_T: &[u16] = &[104, 50];
 
 // ── #930 sharpness knobs (scratch scaffold) ──────────────────────────────────
 // The three dials the "too blurry" candidates move, all gauge-local so the
@@ -484,9 +484,9 @@ const TRAIL_T: &[u16] = &[150, 104, 66, 34];
 // At `1` / `256` / the `FEATHER` above, the render is byte-identical to the
 // tree before this commit.
 /// Divisor applied to the skin palette's bloom radius before the gauge blooms.
-const BLOOM_RADIUS_DIV: usize = 1;
+const BLOOM_RADIUS_DIV: usize = 2;
 /// Multiplier, in 256ths, applied to the skin palette's bloom strength.
-const BLOOM_STRENGTH_NUM: u32 = 256;
+const BLOOM_STRENGTH_NUM: u32 = 154;
 
 /// How far back in time the needle's motion blur reaches, in seconds — a ~50 ms
 /// shutter. Sampling the smear in *time* rather than in past frames is what

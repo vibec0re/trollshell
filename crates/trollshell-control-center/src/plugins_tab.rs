@@ -726,6 +726,20 @@ fn connect_switch(state: &PluginsState) {
 /// tests with a fabricated `res`, with no session bus needed — see
 /// `gtk_tests`' `a_failed_toggle_clears_its_own_intent` and
 /// `a_failed_toggles_completion_does_not_clobber_a_newer_intent`.
+///
+/// #945 re-check: the intent isn't always in `state.pending` by the time this
+/// runs. `set_placeholder` moves it wholesale into `state.parked`'s
+/// [`ParkedSelection::pending`] the moment a poll failure parks the selection
+/// (`:1134`), and a correlated outage — `ListPlugins` and `StartPlugin` hit
+/// the same `Control` endpoint, so one dead shell fails both — typically parks
+/// it before this completion arrives. The identity guard above then finds
+/// `state.pending == None`, clears nothing, and the definitively failed
+/// intent would otherwise be restored with the selection on the next good
+/// poll (the switch lies again until [`PENDING_TOGGLE_TIMEOUT`]). So this also
+/// checks the park for the same `since` and drops the intent there — leaving
+/// the parked selection itself alone, same as `set_placeholder`'s own
+/// `take()`. The two homes are mutually exclusive (an intent lives in exactly
+/// one), so at most one of the two clears ever fires.
 fn on_toggle_result(state: &PluginsState, since: Instant, res: Result<(), hytte_bus::BusError>) {
     if let Err(err) = res {
         tracing::info!(%err, "plugin start/stop failed");
@@ -736,6 +750,15 @@ fn on_toggle_result(state: &PluginsState, since: Instant, res: Result<(), hytte_
             .is_some_and(|intent| intent.since == since);
         if still_this_intent {
             state.pending.borrow_mut().take();
+        }
+        let still_parked_intent = state
+            .parked
+            .borrow()
+            .as_ref()
+            .and_then(|parked| parked.pending.as_ref())
+            .is_some_and(|intent| intent.since == since);
+        if still_parked_intent && let Some(parked) = state.parked.borrow_mut().as_mut() {
+            parked.pending = None;
         }
     }
     // Either way: an immediate re-poll snaps the switch to the truth as soon
@@ -2760,6 +2783,149 @@ mod gtk_tests {
              timeout"
         );
         drop(restored);
+
+        dismiss(&window);
+    }
+
+    /// #945 re-check's new finding: a poll failure can park the live intent
+    /// (`set_placeholder` moves it into `ParkedSelection::pending`, proven by
+    /// [`an_unavailable_poll_parks_the_intent_with_the_selection`] above)
+    /// *before* the toggle's own completion arrives — the common case, since
+    /// `ListPlugins` and `StartPlugin` hit the same `Control` endpoint and one
+    /// dead shell fails both. `on_toggle_result`'s identity guard on
+    /// `state.pending` alone finds nothing to clear in that ordering, so the
+    /// definitively failed intent would otherwise be restored with the
+    /// selection on the next good poll — the switch lying again until
+    /// `PENDING_TOGGLE_TIMEOUT`.
+    ///
+    /// Falsified by removing the park-inspection clause from
+    /// `on_toggle_result`'s `Err` arm: `pending` stays `Some` in the park,
+    /// gets restored, and the switch shows the wanted (active) state instead
+    /// of the poll's truth (inactive).
+    #[gtk::test]
+    fn a_failed_toggle_also_clears_an_already_parked_intent() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "inactive");
+        let window = present(&bin, 640);
+        click(&state, "clock");
+
+        let since = Instant::now();
+        *state.pending.borrow_mut() = Some(PendingToggle {
+            plugin_id: "clock".to_owned(),
+            wanted: true,
+            since,
+        });
+
+        // The poll fails first and parks the live intent along with the
+        // selection — `state.pending` is now `None`.
+        poll_failed(&state);
+        assert!(
+            state.pending.borrow().is_none(),
+            "sanity: the placeholder moves the intent into the park"
+        );
+
+        // The toggle's own `StartPlugin` completion lands after the park,
+        // and it failed too — the same dead shell.
+        on_toggle_result(
+            &state,
+            since,
+            Err(hytte_bus::BusError::Permanent {
+                reason: "no such unit".to_owned(),
+                dbus_name: None,
+            }),
+        );
+
+        // The next good poll restores the selection. Applied directly
+        // (skipping `apply_state`'s trailing `pump()`) rather than a real
+        // `refresh_plugins_soon`-driven poll: `on_toggle_result` above just
+        // fired one of its own (a real, doomed `spawn_on_runtime` call, since
+        // there is no live `Control` endpoint in this test), and pumping the
+        // loop here would risk that background attempt's `Err` completing
+        // mid-assertion and re-parking the very selection this test is
+        // checking — a timing hazard orthogonal to the fix under test.
+        let units = vec![("clock".to_owned(), "inactive".to_owned(), true)];
+        apply_plugins(&state, &units, &HashMap::new());
+        assert_eq!(state.selected.borrow().as_deref(), Some("clock"));
+        assert!(
+            state.pending.borrow().is_none(),
+            "the failed intent must not be restored alongside the selection"
+        );
+        assert!(
+            !state.detail.switch.is_active(),
+            "with the intent dropped, the switch must show the poll's truth (inactive), not \
+             the wanted state"
+        );
+
+        dismiss(&window);
+    }
+
+    /// Mirror of [`a_failed_toggles_completion_does_not_clobber_a_newer_intent`]
+    /// for the parked home: a parked intent recorded under a *different*
+    /// `since` than the completion names must survive that completion — the
+    /// same identity guard, applied to `state.parked`'s carried intent rather
+    /// than `state.pending`.
+    ///
+    /// Falsified by dropping the `since` comparison in the park-inspection
+    /// clause (an unconditional clear of `parked.pending` on `Err`): B would
+    /// be clobbered by A's late, irrelevant failure.
+    #[gtk::test]
+    fn a_failed_toggles_completion_does_not_clobber_a_newer_parked_intent() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+        apply_state(&state, &["clock"], "inactive");
+        let window = present(&bin, 640);
+        click(&state, "clock");
+
+        // Intent A: the user's first click, then a poll failure parks it.
+        let since_a = Instant::now();
+        *state.pending.borrow_mut() = Some(PendingToggle {
+            plugin_id: "clock".to_owned(),
+            wanted: true,
+            since: since_a,
+        });
+        poll_failed(&state);
+
+        // Intent B replaces A in the park directly, standing in for a second
+        // toggle cycle while parked — what matters here is only that the
+        // park ends up holding a `since` different from A's.
+        let since_b = Instant::now();
+        {
+            let mut parked = state.parked.borrow_mut();
+            let slot = parked
+                .as_mut()
+                .expect("sanity: the placeholder must have parked a selection");
+            slot.pending = Some(PendingToggle {
+                plugin_id: "clock".to_owned(),
+                wanted: false,
+                since: since_b,
+            });
+        }
+
+        // A's call finally completes — and fails. It must not touch B.
+        on_toggle_result(
+            &state,
+            since_a,
+            Err(hytte_bus::BusError::Permanent {
+                reason: "timed out".to_owned(),
+                dbus_name: None,
+            }),
+        );
+
+        let parked = state.parked.borrow();
+        let intent = parked
+            .as_ref()
+            .and_then(|p| p.pending.as_ref())
+            .expect("intent B must survive intent A's stale completion");
+        assert_eq!(
+            intent.since, since_b,
+            "the surviving parked intent must be B, not wiped by A's stale completion"
+        );
+        assert!(
+            !intent.wanted,
+            "the surviving parked intent must still be B's wish"
+        );
+        drop(parked);
 
         dismiss(&window);
     }

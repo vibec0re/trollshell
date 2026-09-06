@@ -8,11 +8,13 @@
 //! field and vanish (Annika's live verify on #881: *"lcd background skin
 //! (greenish) has light tinted foreground so it's not readable"*).
 //!
-//! [`ratio`] is the whole module's surface, and
+//! [`ratio`] is the whole module's surface.
 //! [`DisplayStyle`](super::style::DisplayStyle)'s per-skin accent policy is its
-//! only consumer. Pure `std`, no state, symmetric in its arguments, and alpha
-//! is ignored because a kit palette is opaque by construction (a screen, not a
-//! sprite).
+//! consumer inside the kit; it is re-exported from the crate root
+//! (`contrast_ratio`, `AA_TEXT`) so a **host** resolving colors of its own can
+//! ask the same question before pinning one. Pure `std`, no state, symmetric in
+//! its arguments, and alpha is ignored because a kit palette is opaque by
+//! construction (a screen, not a sprite).
 
 use super::frame::Rgba;
 
@@ -24,7 +26,7 @@ use super::frame::Rgba;
 /// bar (7:1) would leave the LCD almost no room to carry an accent's hue at
 /// all. 4.5 is both the right rule for the content and the one that keeps a
 /// tint visible.
-pub(crate) const AA_TEXT: f32 = 4.5;
+pub const AA_TEXT: f32 = 4.5;
 
 /// One sRGB channel byte → linear light, per IEC 61966-2-1 — the transfer
 /// function WCAG's relative luminance is defined over.
@@ -48,7 +50,8 @@ fn luminance(color: Rgba) -> f32 {
 /// luminous, `21.0` for black against white. Symmetric — the ordering of the
 /// arguments never changes the answer, so a caller need not know which side is
 /// the ink.
-pub(crate) fn ratio(a: Rgba, b: Rgba) -> f32 {
+#[must_use]
+pub fn ratio(a: Rgba, b: Rgba) -> f32 {
     let (a, b) = (luminance(a), luminance(b));
     let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
     (hi + 0.05) / (lo + 0.05)
@@ -112,6 +115,48 @@ mod tests {
         let clear = [0x9b, 0x59, 0xb6, 0x00];
         let field = [0xa9, 0xb4, 0x7e, 0xff];
         assert!((ratio(opaque, field) - ratio(clear, field)).abs() < 1.0e-6);
+    }
+
+    /// [`AA_TEXT`] is **4.5**, the number WCAG 2.2 SC 1.4.3 states for body
+    /// text, and this is the assertion that says so.
+    ///
+    /// It looks tautological and is not. Every other test here compares a
+    /// measured ratio *against* `AA_TEXT`, so all of them follow the constant
+    /// wherever it is moved: review demonstrated `4.5 → 4.0` running the whole
+    /// suite green while changing every admitted ink on glass. A constant that
+    /// decides what users see needs one assertion that is about its **value**
+    /// rather than about its use — the same reason
+    /// [`the_luminance_weights_are_the_published_ones`] exists beside a stack
+    /// of tests that all use the weights.
+    ///
+    /// The reference pair is `WebAIM`'s published boundary, reproduced here so
+    /// the threshold is anchored to the standard and not to this file: `#777777`
+    /// on white fails AA (4.478:1) and `#767676`, one byte lighter, passes
+    /// (4.542:1). Move `AA_TEXT` in either direction by more than ~0.05 and one
+    /// of the two lands on the wrong side.
+    ///
+    /// **Falsified** by `AA_TEXT = 4.0` or `= 5.0`: the equality goes red, and
+    /// so does whichever boundary assertion the new value crosses.
+    #[test]
+    fn the_aa_threshold_is_the_published_one() {
+        assert!(
+            (AA_TEXT - 4.5).abs() < f32::EPSILON,
+            "WCAG 2.2 SC 1.4.3 body text is 4.5:1, not {AA_TEXT}"
+        );
+
+        let on_white = |c: [u8; 4]| ratio(c, WHITE);
+        let fails = [0x77, 0x77, 0x77, 0xff];
+        let passes = [0x76, 0x76, 0x76, 0xff];
+        assert!(
+            on_white(fails) < AA_TEXT,
+            "#777777 on white is WebAIM's failing side: {}",
+            on_white(fails)
+        );
+        assert!(
+            on_white(passes) >= AA_TEXT,
+            "#767676 on white is WebAIM's passing side: {}",
+            on_white(passes)
+        );
     }
 
     /// Each of the three primaries at full strength is its own weight — pure

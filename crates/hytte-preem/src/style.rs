@@ -240,8 +240,8 @@ enum AccentPolicy {
     TintToLegible,
 }
 
-/// How many stops [`admit`] tries along the accent → skin-ink ramp, inclusive
-/// of both ends.
+/// How many equal **intervals** [`admit`] divides the accent → skin-ink ramp
+/// into; it therefore tries `ADMIT_STOPS + 1` stops, both endpoints included.
 ///
 /// 65 stops put the mix within `255 / 64 ≈ 4` units of the ideal on each
 /// channel — well under a visible step — and cost ~65 luminance evaluations
@@ -249,17 +249,40 @@ enum AccentPolicy {
 /// [`palette`](DisplayStyle::palette) is resolved once per widget per frame,
 /// never per pixel, so this is noise either way; the coarser ramp is simply the
 /// honest amount of work for the precision anyone can see.
+///
+/// **Changing this changes pixels**, so it is pinned by
+/// `an_accented_lcd_render_is_pinned_to_its_bytes` rather than left to taste:
+/// review measured `64 → 16` running fully green while moving every admitted
+/// ink on glass.
 const ADMIT_STOPS: u16 = 64;
+
+// The stop index is scaled by 255 in `admit`; keep that inside `u16` rather
+// than discovering the wrap in release. (`257 * 255 = 65535`, the last value
+// that fits.)
+const _: () = assert!(
+    ADMIT_STOPS <= 257,
+    "ADMIT_STOPS * 255 must fit in the u16 `mix` takes"
+);
 
 /// Mix `accent` toward `toward` until it clears `min_ratio` against `field`,
 /// and return the first stop that does — forced opaque, like every other
 /// palette slot.
 ///
-/// **Total and deterministic.** The ramp's last stop is `toward` itself (each
-/// skin's own ink, which its own palette already reads against its own field),
-/// so a legible answer always exists; `unwrap_or` is the unreachable arm that
-/// keeps the function total anyway, and it degrades to the strongest thing the
-/// skin has rather than to the accent.
+/// **Total and deterministic.** Against a skin's *own* field a legible answer
+/// always exists — the ramp's last stop is `toward` itself, each skin's own ink,
+/// which its own palette reads at 6.85:1 — so the scan succeeds and the fallback
+/// is unreachable. Against a field a **host pinned**, it is reachable and real:
+/// a dark accent on a dark substituted ground cannot be helped by darkening it
+/// further, because darkening is the only tool the skin has. So the fallback is
+/// the **most legible stop on the ramp**, not the last one.
+///
+/// That choice is what makes the one property that holds on *every* ground
+/// true: the admitted ink is never less legible than the raw accent would have
+/// been. Stop 0 *is* the accent, so the maximum is taken over a set containing
+/// it. Returning `toward` blindly broke exactly that — a black accent on
+/// `preem-demo`'s pinned lilac went 1.52:1 → 1.10:1, the skin making a widget
+/// worse in the name of helping it, which is the shape of the whole bug this
+/// module exists to fix.
 ///
 /// The scan is **linear, not a bisection**, and that is load-bearing. Luminance
 /// along the ramp is monotonic — every channel moves monotonically, and both
@@ -269,11 +292,33 @@ const ADMIT_STOPS: u16 = 64;
 /// LCD's field does exactly that (white is lighter than the field, the skin's
 /// ink is far darker), so a bisection would probe into the dip and conclude
 /// there is no answer. 65 stops is cheap enough that the honest scan wins.
+///
+/// **On determinism, precisely.** The ramp itself is bit-exact: [`mix`] is
+/// integer-only, so every candidate on it is the same quad on every machine.
+/// What picks *which* candidate is [`contrast::ratio`], and that runs through
+/// `f32::powf`, which is not bit-reproducible across libm builds. So the ramp
+/// is deterministic and the **selection** is deterministic per platform — and
+/// since the selection is what becomes the pixel, a byte pin of an admitted ink
+/// is a per-platform pin. Nothing is at risk today (both raster arms run on one
+/// machine, and no golden crosses machines), but the distinction is the kind
+/// that gets misquoted later.
 fn admit(accent: Rgba, toward: Rgba, field: Rgba, min_ratio: f32) -> Rgba {
-    let [r, g, b, _] = (0..=ADMIT_STOPS)
-        .map(|stop| mix(accent, toward, stop * 255 / ADMIT_STOPS))
-        .find(|candidate| contrast::ratio(*candidate, field) >= min_ratio)
-        .unwrap_or(toward);
+    let mut best = toward;
+    let mut best_ratio = f32::NEG_INFINITY;
+    for stop in 0..=ADMIT_STOPS {
+        let t = u32::from(stop) * 255 / u32::from(ADMIT_STOPS);
+        let candidate = mix(accent, toward, u16::try_from(t).unwrap_or(255));
+        let ratio = contrast::ratio(candidate, field);
+        if ratio >= min_ratio {
+            best = candidate;
+            break;
+        }
+        if ratio > best_ratio {
+            best = candidate;
+            best_ratio = ratio;
+        }
+    }
+    let [r, g, b, _] = best;
     [r, g, b, 0xff]
 }
 
@@ -364,42 +409,99 @@ impl DisplayStyle {
     ///
     /// The one thing precedence does **not** settle is what the accent looks
     /// like once it arrives, and that is the skin's ([`AccentPolicy`], #928).
-    /// The policy is evaluated against the skin's **own** field, before the
-    /// field pin below is applied — deliberately, and for two reasons. First it
-    /// keeps the two pins orthogonal, exactly as the paragraph above promises:
-    /// the resolved ink is a function of `(skin, pins.ink, accent)` and a field
-    /// pin cannot move it. Second, a skin's contrast policy is a statement
-    /// about the panel it ships, and a host that replaced the ground has left
-    /// that panel behind — the ground is now the host's, and so is the job of
-    /// keeping an ink on it (which is why #884's two speech bubbles pin both
-    /// slots together). The consequence worth knowing: pinning a *dark* field
-    /// on the LCD while leaving the ink to the desktop still darkens the
-    /// accent, because the skin is answering for its own olive field. Pin the
-    /// ink too, or name [`Ink::Base`].
+    ///
+    /// The policy is evaluated against the **effective** field — the pinned one
+    /// when there is a pin, the skin's own otherwise — which is why the field
+    /// arm below runs *first*. The ink a skin admits is the ink that has to be
+    /// read on the ground the widget will actually flood, and nothing else is
+    /// defensible: an ink chosen against a ground the widget never draws is a
+    /// guarantee about a pixel that does not exist.
+    ///
+    /// That costs one word of the orthogonality above — the resolved ink is a
+    /// function of `(skin, pins.ink, accent, pins.field)`, not of the first
+    /// three — and review measured what the other ordering costs instead.
+    /// `preem-demo`'s `FLD` cell pins a dark lilac ground and leaves its ink on
+    /// the accent path *by design*; resolving against the skin's own olive
+    /// field darkened its ink to near-black and then dropped it onto that dark
+    /// ground, taking a white accent from 13.8:1 to **1.36:1**. Answering for a
+    /// panel the host replaced made one widget strictly worse than it was
+    /// before the skin had a policy at all.
+    ///
+    /// Handing the whole duty back instead — `AsGiven` whenever a field is
+    /// pinned — fixes that case and reopens #928 itself for the mirror of it: a
+    /// host pinning a *light* ground would get the raw light accent on it, the
+    /// original bug through a second door. Measuring against what is actually
+    /// there covers both, and leaves a pinned-dark-field widget byte-identical
+    /// to its pre-#928 self whenever its accent was already legible (which is
+    /// what `FLD` and #884's bubbles are).
     fn palette_with(self, pins: Pins, accent: Option<Rgba>) -> Palette {
         let mut palette = self.base_palette();
+        // First, so the ink policy below sees the ground the widget will flood.
+        if let Some([r, g, b, _]) = pins.field {
+            palette.bg = [r, g, b, 0xff];
+        }
         match pins.ink {
+            // Forced opaque here rather than per arm: a palette slot is opaque
+            // by construction, and both arms feed the same slot. Unreachable
+            // through the public path — `pack_accent` already stores the accent
+            // opaque — but the two arms may not disagree about a byte.
             Ink::Default => {
-                if let Some(accent) = accent {
-                    palette.ink = match self.accent_policy() {
-                        AccentPolicy::AsGiven => accent,
-                        // Measured against `palette.bg` while it is still the
-                        // **skin's own** field: the `pins.field` arm below has
-                        // not run yet, and that ordering is the design, not an
-                        // accident — see the rustdoc above.
-                        AccentPolicy::TintToLegible => {
-                            admit(accent, palette.ink, palette.bg, contrast::AA_TEXT)
-                        }
-                    };
+                if let Some([r, g, b, _]) = accent {
+                    palette.ink = self.admit_ink_against([r, g, b, 0xff], palette.bg);
                 }
             }
             Ink::Base => {}
             Ink::Fixed([r, g, b, _]) => palette.ink = [r, g, b, 0xff],
         }
-        if let Some([r, g, b, _]) = pins.field {
-            palette.bg = [r, g, b, 0xff];
-        }
         palette
+    }
+
+    /// The skin's [`AccentPolicy`] applied to one ink against one ground — the
+    /// single place the policy is *executed*, shared by [`palette_with`] and
+    /// the public [`admit_ink`](Self::admit_ink) seam so the two cannot drift.
+    fn admit_ink_against(self, ink: Rgba, field: Rgba) -> Rgba {
+        match self.accent_policy() {
+            AccentPolicy::AsGiven => ink,
+            AccentPolicy::TintToLegible => {
+                admit(ink, self.base_palette().ink, field, contrast::AA_TEXT)
+            }
+        }
+    }
+
+    /// **The seam for host-resolved colors** (#928 → the status-role follow-up).
+    ///
+    /// Answers "what would this skin do with `ink`?" without rendering
+    /// anything: the skin's own ink back on a dark panel, a darkened tint on the
+    /// reflective [`Lcd`](Self::Lcd). `field` is the ground the ink will be
+    /// drawn on — `None` for the skin's own, `Some(rgba)` to match a pin the
+    /// host is also passing through [`Pins::field`].
+    ///
+    /// A host resolving a *semantic role* to a theme color reaches the kit as
+    /// [`Ink::Fixed`], which is deliberately unconditional (an author's pin and
+    /// a resolved role are the same variant, and guarding a stated color is the
+    /// worse failure — see [`AccentPolicy`]). So a host that wants the skin's
+    /// opinion has to ask for it, and this is the question: run the role color
+    /// through here, then pin the answer. Pair it with
+    /// [`contrast_ratio`](crate::contrast_ratio) and
+    /// [`field`](Self::field) to decide whether asking is even necessary.
+    ///
+    /// Nothing in the kit calls this — it is a seam, not a step.
+    #[must_use]
+    pub fn admit_ink(self, ink: Rgba, field: Option<Rgba>) -> Rgba {
+        let [r, g, b, _] = self.admit_ink_against(ink, field.unwrap_or(self.base_palette().bg));
+        [r, g, b, 0xff]
+    }
+
+    /// This skin's own field — the opaque ground its widgets flood before they
+    /// draw anything, before any [`Pins::field`] pin.
+    ///
+    /// Exported for the same reason as [`admit_ink`](Self::admit_ink): a host
+    /// asking whether a color it resolved is legible on a skin needs the other
+    /// half of the pair, and hard-coding `a9b47e` on the far side of the crate
+    /// boundary would be the wrong way to get it.
+    #[must_use]
+    pub fn field(self) -> Rgba {
+        self.base_palette().bg
     }
 
     /// What this skin does with an ink it did not choose — see
@@ -1230,6 +1332,16 @@ mod tests {
     /// "a pinned field becomes the ground" assertion goes red), and — the other
     /// direction — by having that arm also assign `palette.ink`, which turns
     /// "the ink is untouched by a field pin" red.
+    ///
+    /// Since #928 the ink assertion is **per family**, and the change is the
+    /// point rather than a concession. On a dark-panel skin the ink is still
+    /// untouched by a field pin. On the `Lcd` it is not, because the skin
+    /// resolves its accent against the ground the widget will actually flood —
+    /// and the fixed configuration below (`field = #3a2250`, accent `#9b59b6`)
+    /// is exactly `preem-demo`'s `FLD` cell, the shipped consumer review found
+    /// this test was standing next to without measuring. The old assertion
+    /// pinned the *ordering* and said nothing about whether the resulting ink
+    /// could be seen on the pinned ground; the sweep below is that assertion.
     #[test]
     fn a_per_render_field_moves_the_ground_and_nothing_else() {
         let field = [0x3a, 0x22, 0x50, 0x00];
@@ -1252,10 +1364,25 @@ mod tests {
                 pinned.bg, base.bg,
                 "{style:?}: …and it actually moved, or the assertion above is vacuous"
             );
-            assert_eq!(
-                pinned.ink, base.ink,
-                "{style:?}: the ink is untouched by a field pin"
-            );
+            match style {
+                // This accent is already legible on this ground (2.95:1 is
+                // below AA, but the ramp cannot beat it here), so the skin
+                // hands it straight back — the pre-#928 byte.
+                DisplayStyle::Lcd => assert!(
+                    contrast::ratio(pinned.ink, pinned.bg) >= contrast::ratio(accent, pinned.bg),
+                    "Lcd: the ink must not read worse on the ground it is actually \
+                     drawn on than the accent did, got {:.3}:1 for ink {:?} against \
+                     the accent's {:.3}:1 on pinned field {:?}",
+                    contrast::ratio(pinned.ink, pinned.bg),
+                    pinned.ink,
+                    contrast::ratio(accent, pinned.bg),
+                    pinned.bg
+                ),
+                DisplayStyle::Vfd | DisplayStyle::Oled | DisplayStyle::Crt => assert_eq!(
+                    pinned.ink, base.ink,
+                    "{style:?}: a dark panel's ink is untouched by a field pin"
+                ),
+            }
             assert_eq!(pinned.ghost, base.ghost, "{style:?}: ghost is per-skin");
             assert_eq!(
                 pinned.bloom.is_some(),
@@ -1267,6 +1394,37 @@ mod tests {
                 base.mask.is_some(),
                 "{style:?}: the CRT pass is per-skin"
             );
+        }
+
+        // `preem-demo`'s `FLD` cell over the whole sweep, which is the shape
+        // review's probe used: a dark lilac ground pinned, the ink left on the
+        // accent path by design. Every accent must be readable on *that*, and
+        // the light ones — the accents #928 is about — must be readable while
+        // still being what the desktop asked for, because they already clear
+        // the bar on a dark ground and the ramp's first stop returns them.
+        let fld = Pins {
+            ink: Ink::Default,
+            field: Some([0x3a, 0x22, 0x50, 0xff]),
+        };
+        for accent in accent_sweep() {
+            let p = DisplayStyle::Lcd.palette_with(fld, Some(accent));
+            let ratio = contrast::ratio(p.ink, p.bg);
+            let raw = contrast::ratio(accent, [0x3a, 0x22, 0x50, 0xff]);
+            assert!(
+                ratio >= raw || ratio >= contrast::AA_TEXT,
+                "FLD: accent {accent:?} read at {raw:.3}:1 and became ink {:?} on the \
+                 pinned ground {:?} at {ratio:.3}:1 — never worse than the accent",
+                p.ink,
+                p.bg
+            );
+            if raw >= contrast::AA_TEXT {
+                assert_eq!(
+                    p.ink,
+                    [accent[0], accent[1], accent[2], 0xff],
+                    "FLD: an accent already legible on the pinned ground is passed \
+                     through untouched — this is the pre-#928 byte"
+                );
+            }
         }
     }
 
@@ -1510,31 +1668,132 @@ mod tests {
     }
 
     /// **#928's guarantee.** On the LCD an unpinned ink clears WCAG AA (4.5:1)
-    /// against the LCD's field for *any* accent a desktop can hand it.
+    /// against **the ground it is drawn on** — for any accent a desktop can hand
+    /// it, and under any field pin a host can put beneath it.
     ///
     /// A property over a sweep rather than a table of expected bytes, because
     /// the claim is about every color and not about the six that happen to be
     /// interesting: a policy that special-cased white would pass a table and
     /// fail here on the random tail.
     ///
-    /// **Falsified** by reverting the `Ink::Default` arm to `palette.ink =
-    /// accent` — `main`'s accent-replaces-ink behaviour, i.e. the bug: red on
-    /// the first sweep entry, white, at 2.21:1.
+    /// The field axis is the half review added, and adding it turned the
+    /// guarantee from one claim into **two**, which is the honest shape:
+    ///
+    /// 1. **On the skin's own field the bar is unconditional.** Every accent
+    ///    clears AA, because the ramp ends on the skin's own ink and that ink
+    ///    reads on that field at 6.85:1. This is #928.
+    /// 2. **On a ground the host pinned, the skin promises only that it will
+    ///    not make things worse** — the admitted ink is never less legible than
+    ///    the raw accent would have been. It *cannot* promise AA there: its only
+    ///    tool is a mix toward its own ink, an ink chosen for its own field, and
+    ///    darkening cannot rescue a dark accent from a dark substituted ground.
+    ///    A host that replaces the ground owns the pair; pin the ink too.
+    ///
+    /// Claim 2 is not a weakening, it is the thing HIGH-1 violated: resolving
+    /// against the skin's field and then painting onto the pinned one took
+    /// `preem-demo`'s `FLD` cell from 13.8:1 to 1.36:1 under a white accent.
+    /// The three grounds below are the three regimes — no pin (the skin's
+    /// olive), a **dark** pin (`FLD`'s lilac), and a **light** pin, which is
+    /// #928's own bug arriving through a second door and is why the fix
+    /// measures against the effective ground rather than handing the duty back
+    /// whenever a field is pinned.
+    ///
+    /// **Falsified** three ways: reverting the `Ink::Default` arm to
+    /// `palette.ink = accent` (the original bug) reds claim 1 on white at
+    /// 2.21:1; resolving the ink *before* the field arm (the pre-review
+    /// ordering) reds claim 2 on the dark ground at ≈1.36:1; and `admit`
+    /// falling back to `toward` rather than to the ramp's most legible stop
+    /// reds claim 2 for a black accent on the dark ground, 1.52:1 → 1.10:1.
     #[test]
     fn the_lcd_admits_no_accent_it_cannot_carry() {
         let style = DisplayStyle::Lcd;
-        let field = style.base_palette().bg;
-        for accent in accent_sweep() {
-            let p = style.palette_with(Pins::default(), Some(accent));
-            let ratio = contrast::ratio(p.ink, p.bg);
+        let grounds = [
+            (None, style.base_palette().bg),
+            // `preem-demo`'s FIELD_PIN (main.rs:162), ink left on the accent path.
+            (Some([0x3a, 0x22, 0x50, 0xff]), [0x3a, 0x22, 0x50, 0xff]),
+            // The mirror of #928: a light ground a host pinned itself.
+            (Some([0xf2, 0xf0, 0xe6, 0xff]), [0xf2, 0xf0, 0xe6, 0xff]),
+        ];
+        for (pin, ground) in grounds {
+            for accent in accent_sweep() {
+                let p = style.palette_with(
+                    Pins {
+                        ink: Ink::Default,
+                        field: pin,
+                    },
+                    Some(accent),
+                );
+                let ratio = contrast::ratio(p.ink, p.bg);
+                assert_eq!(
+                    p.bg, ground,
+                    "{accent:?}: the ground is the pin, or the skin's"
+                );
+                assert_eq!(p.ink[3], 0xff, "{accent:?}: an admitted ink is opaque");
+
+                // Claim 2, on every ground including the skin's own.
+                let raw = contrast::ratio(accent, ground);
+                assert!(
+                    ratio >= raw || ratio >= contrast::AA_TEXT,
+                    "ground {ground:?}: accent {accent:?} read at {raw:.3}:1 and the skin \
+                     handed back {:?} at {ratio:.3}:1 — the policy may never make an ink \
+                     less legible than the accent it was given",
+                    p.ink
+                );
+
+                // Claim 1, on the skin's own field only.
+                if pin.is_none() {
+                    assert!(
+                        ratio >= contrast::AA_TEXT,
+                        "own field: accent {accent:?} became ink {:?} at {ratio:.3}:1, below AA",
+                        p.ink
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The bytes of an accented LCD render, pinned.** Both numbers that decide
+    /// what a user sees — [`contrast::AA_TEXT`] and [`ADMIT_STOPS`](super::ADMIT_STOPS)
+    /// — are otherwise held by nothing at all.
+    ///
+    /// Review demonstrated the hole with two mutations that ran the entire
+    /// suite **green** while moving every admitted ink on glass: `AA_TEXT`
+    /// `4.5 → 4.0` and `ADMIT_STOPS` `64 → 16`. Every #928 assertion until now
+    /// compares a measured ratio *against* `AA_TEXT`, so all of them follow the
+    /// constant wherever it goes, and `tests/single_ink_golden.rs` installs no
+    /// accent, so its digests never reach the tint path at all.
+    ///
+    /// So this pins literal quads. The PR argued that pinning bytes would pin
+    /// the ramp's stop count; that is precisely the point — the stop count
+    /// changes what the user sees, and a change to it should be a deliberate
+    /// act with a golden to update, not a silent one.
+    ///
+    /// Per-platform, and knowingly so: `mix` is bit-exact everywhere, but the
+    /// stop *selection* runs through `f32::powf` (see [`admit`](super::admit)).
+    /// If this ever fails on a new machine with the code unchanged, that is the
+    /// libm difference and not a regression — the ratio assertions beside each
+    /// quad are the part that must hold everywhere.
+    ///
+    /// **Falsified** by `AA_TEXT = 4.0` (white → `464a3e`) and by
+    /// `ADMIT_STOPS = 16` (crimson → `741f29`), the two mutations that were
+    /// green before it existed.
+    #[test]
+    fn an_accented_lcd_render_is_pinned_to_its_bytes() {
+        let style = DisplayStyle::Lcd;
+        for (accent, want) in [
+            ([0xff, 0xff, 0xff, 0xff], [0x3f, 0x43, 0x37, 0xff]),
+            ([0xd0, 0xd0, 0xd0, 0xff], [0x3e, 0x42, 0x37, 0xff]),
+            ([0xdc, 0x14, 0x3c, 0xff], [0x7d, 0x1e, 0x2b, 0xff]),
+            ([0x00, 0x00, 0xff, 0xff], [0x05, 0x05, 0xe0, 0xff]),
+            ([0x11, 0x99, 0xaa, 0xff], [0x1e, 0x48, 0x43, 0xff]),
+        ] {
+            let got = style.palette_with(Pins::default(), Some(accent)).ink;
+            assert_eq!(got, want, "accent {accent:?}: the admitted ink moved");
+            let ratio = contrast::ratio(got, style.field());
             assert!(
-                ratio >= contrast::AA_TEXT,
-                "accent {accent:?} became ink {:?} on field {:?} at {ratio:.2}:1, below AA",
-                p.ink,
-                p.bg
+                (contrast::AA_TEXT..5.0).contains(&ratio),
+                "…and it is the *first* legible stop, not an over-shot one: {ratio:.3}:1"
             );
-            assert_eq!(p.bg, field, "{accent:?}: the field itself never moves");
-            assert_eq!(p.ink[3], 0xff, "{accent:?}: an admitted ink is opaque");
         }
     }
 
@@ -1547,11 +1806,26 @@ mod tests {
     /// (or it would be illegible) and not the skin's own ink (or the tint would
     /// be gone).
     ///
-    /// The hue claim is stated as channel *ordering*, not as bytes: a mix
-    /// toward a fixed target preserves the sign of every channel difference, so
-    /// a blue-dominant accent stays blue-dominant no matter how many stops the
-    /// ramp has. Pinning the bytes would pin [`ADMIT_STOPS`](super::ADMIT_STOPS),
-    /// which is an implementation detail this test has no business owning.
+    /// **How far the hue survives, stated honestly.** An earlier revision of
+    /// this rustdoc claimed that "a mix toward a fixed target preserves the sign
+    /// of every channel difference, so a blue-dominant accent stays
+    /// blue-dominant". The premise is true and the conclusion does not follow:
+    /// the target `#23281a` is itself **green-dominant**, so a stop far enough
+    /// along flips the ordering. Review measured it over a 79,507-accent grid —
+    /// **11.9%** flip, the widest being `#c0c0fc`, whose blue leads green by
+    /// 60/255 and which still lands on the green-dominant `#3e4241`.
+    ///
+    /// What is true, and what this test now pins:
+    ///
+    /// * **Saturated** accents keep their hue — pure blue lands on `#0505e0`,
+    ///   crimson on `#7d1e2b`. The assertion below runs only on accents whose
+    ///   dominant channel leads by a stated margin, and the margin is a real
+    ///   one (`0x60`) rather than the 255 the earlier version used, which no
+    ///   mix could have flipped.
+    /// * **Pale** accents converge: white, light grey and pastel yellow all
+    ///   land within a few units of one another near the skin's own ink, so
+    ///   policy (b)'s advantage over (a) is real for saturated accents and close
+    ///   to nil for pale ones. Asserted below rather than left as a caveat.
     ///
     /// **Falsified** by policy (a) — an `Lcd` arm returning `palette.ink`
     /// unchanged for every accent: "the tint survived" goes red on all four.
@@ -1581,22 +1855,69 @@ mod tests {
             }
         }
 
-        // The dominant channel is the hue's signature, and it survives.
+        // The dominant channel is the hue's signature, and it survives — for a
+        // *saturated* accent. `margin` is the lead the dominant channel has over
+        // the runner-up; the accents below all clear 0x60, which is the regime
+        // review's grid found intact, and `#c0c0fc` (lead 0x3c) is included as
+        // the documented counterexample rather than swept under the claim.
         let dominant = |c: Rgba| {
             (0..3)
                 .max_by_key(|&i| c[i])
                 .expect("three channels is not an empty range")
         };
+        let margin = |c: Rgba| {
+            let mut ch = [c[0], c[1], c[2]];
+            ch.sort_unstable();
+            ch[2] - ch[1]
+        };
         for accent in [
-            [0x00, 0x00, 0xff, 0xff],
-            [0xdc, 0x14, 0x3c, 0xff],
-            [0x00, 0xff, 0x00, 0xff],
+            [0x00, 0x00, 0xff, 0xff], // lead 255
+            [0xdc, 0x14, 0x3c, 0xff], // lead 0xa0
+            [0x00, 0xff, 0x00, 0xff], // lead 255
+            [0x35, 0x84, 0xe4, 0xff], // GNOME's default blue, lead 0x60
         ] {
+            assert!(
+                margin(accent) >= 0x60,
+                "{accent:?} is not in the saturated regime this claim covers"
+            );
             let ink = style.palette_with(Pins::default(), Some(accent)).ink;
             assert_eq!(
                 dominant(ink),
                 dominant(accent),
-                "{accent:?} became {ink:?}: the dominant channel is the hue"
+                "{accent:?} became {ink:?}: a saturated accent keeps its dominant channel"
+            );
+        }
+
+        // The counterexample, asserted so the narrowed claim is measured rather
+        // than merely narrowed: a weakly-dominant accent *does* flip, because
+        // the target is green-dominant.
+        let weak = [0xc0, 0xc0, 0xfc, 0xff];
+        let flipped = style.palette_with(Pins::default(), Some(weak)).ink;
+        assert!(
+            margin(weak) < 0x60 && dominant(flipped) != dominant(weak),
+            "the documented flip must be real: {weak:?} → {flipped:?}"
+        );
+
+        // Pale accents converge on one colour near the skin's ink — (b)'s gain
+        // over (a) is a saturated-accent gain, and this is the honest bound on
+        // it.
+        let pale: Vec<Rgba> = [
+            [0xff, 0xff, 0xff, 0xff],
+            [0xd0, 0xd0, 0xd0, 0xff],
+            [0xf7, 0xe6, 0x9c, 0xff],
+        ]
+        .into_iter()
+        .map(|a| style.palette_with(Pins::default(), Some(a)).ink)
+        .collect();
+        for ink in &pale {
+            let spread = (0..3)
+                .map(|c| u16::from(ink[c].abs_diff(pale[0][c])))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                spread <= 0x10,
+                "pale accents converge: {ink:?} is {spread} from {:?}",
+                pale[0]
             );
         }
 
@@ -1607,6 +1928,67 @@ mod tests {
             style.palette_with(Pins::default(), Some(black)).ink,
             black,
             "a dark accent already clears the bar and passes straight through"
+        );
+    }
+
+    /// The public seam ([`DisplayStyle::admit_ink`], [`DisplayStyle::field`],
+    /// [`contrast_ratio`](crate::contrast_ratio)) answers **exactly** what the
+    /// render path does — over every skin, the whole accent sweep and both
+    /// field regimes.
+    ///
+    /// The seam exists for the status-role follow-up: `preem_render::ink_for`
+    /// resolves `Success`/`Warning`/`Error` to theme colors and pins them as
+    /// [`Ink::Fixed`], which the policy deliberately never touches, so a host
+    /// that wants the skin's opinion has to ask for it. Review measured what is
+    /// at stake — all twelve libadwaita role colors fail AA on the LCD field,
+    /// the dark-theme six at 1.03–1.48:1 — and noted that the shell could not
+    /// even ask, because `contrast`, `Palette` and `base_palette` are all
+    /// private. This is that door, and this test is what stops it drifting away
+    /// from the render path it is supposed to mirror.
+    ///
+    /// **Falsified** by giving `admit_ink` its own copy of the policy match
+    /// (rather than sharing `admit_ink_against`) and flipping one arm.
+    #[test]
+    fn the_public_seam_answers_what_the_render_path_does() {
+        for style in DisplayStyle::ALL {
+            assert_eq!(
+                style.field(),
+                style.base_palette().bg,
+                "{style:?}: the seam's field is the skin's own ground"
+            );
+            for field in [None, Some([0x3a, 0x22, 0x50, 0xff])] {
+                for ink in accent_sweep() {
+                    let via_seam = style.admit_ink(ink, field);
+                    let via_render = style
+                        .palette_with(
+                            Pins {
+                                ink: Ink::Default,
+                                field,
+                            },
+                            Some(ink),
+                        )
+                        .ink;
+                    assert_eq!(
+                        via_seam, via_render,
+                        "{style:?} ink {ink:?} field {field:?}: the seam and the render path \
+                         must not drift"
+                    );
+                }
+            }
+        }
+
+        // And the question the follow-up actually asks, end to end: is a
+        // resolved role color legible on this skin, and if not, what does the
+        // skin offer instead?
+        let role = [0x64, 0xec, 0xa5, 0xff]; // libadwaita dark @success_color
+        let lcd = DisplayStyle::Lcd;
+        assert!(
+            crate::contrast_ratio(role, lcd.field()) < crate::AA_TEXT,
+            "the premise review measured: dark-theme success is illegible on the LCD field"
+        );
+        assert!(
+            crate::contrast_ratio(lcd.admit_ink(role, None), lcd.field()) >= crate::AA_TEXT,
+            "…and the seam hands back something that is not"
         );
     }
 
@@ -1696,40 +2078,96 @@ mod tests {
         );
     }
 
-    /// [`admit`](super::admit) is **total**: when nothing on the ramp clears the
-    /// bar it returns the target rather than looping, panicking, or handing back
-    /// the illegible accent.
+    /// [`admit`](super::admit) is **total**, and when nothing on the ramp clears
+    /// the bar it degrades to the ramp's **most legible stop** — never to a
+    /// worse ink than the accent it was handed.
     ///
-    /// Unreachable through `palette_with` — every skin's own ink clears its own
-    /// field, which is what makes the LCD guarantee unconditional — so it is
-    /// asserted directly, on a field chosen to defeat the whole ramp. Mid grey
-    /// (`0x81`, relative luminance ≈ 0.22) sits *between* white and the LCD's
-    /// ink, so both endpoints fail (≈3.89:1 each) and the ratio only dips
-    /// further in between, where the ramp crosses the field's own luminance.
-    /// That dip is also why the scan is linear rather than a bisection.
+    /// Unreachable against a skin's *own* field (every skin's ink clears its own
+    /// field, which is what makes claim 1 of the guarantee unconditional), and
+    /// entirely reachable against a **pinned** ground, which is why the choice
+    /// of fallback is behaviour rather than defensive padding.
     ///
-    /// **Falsified** by `unwrap_or(accent)`: the fallback returns white, the
-    /// least legible thing on the ramp, instead of the strongest ink the skin
-    /// has.
+    /// **Where the maximum lives, and why one ground is not enough.** Luminance
+    /// along the ramp is monotonic, so the contrast ratio against a fixed
+    /// ground is a *V*: it falls to 1.0 where the ramp crosses that ground's
+    /// own luminance and rises again after. The maximum over the ramp is
+    /// therefore always at an **endpoint** — the accent or the skin's ink — and
+    /// "the most legible stop" is exactly `max(accent, toward)`. Which of the
+    /// two wins depends on the ground, so a single ground can only ever catch
+    /// one of the two ways the fallback can be wrong.
+    ///
+    /// That is not hypothetical: an earlier revision of this test had only the
+    /// `0x81` ground and its rustdoc claimed both mutations. Measured, the
+    /// always-the-accent mutation ran it **green** — on `0x81` the accent *is*
+    /// the right answer, so the test could not tell a correct fallback from one
+    /// that had stopped choosing. Hence three grounds, the first two a matched
+    /// pair straddling the crossover (the ground whose luminance makes the two
+    /// endpoints tie, ≈0.220 — between `0x81` and `0x85`):
+    ///
+    /// * **`0x81` grey**: both endpoints fail and the **accent** wins,
+    ///   3.8957:1 to 3.8784:1 — by a hair, but the direction is what matters.
+    ///   Catches a fallback that always returns the target.
+    /// * **`0x89` grey**: both endpoints still fail and the **skin's ink** wins,
+    ///   4.3191:1 to 3.4982:1. Catches a fallback that always returns the
+    ///   accent, which `0x81` cannot.
+    /// * **`preem-demo`'s pinned lilac under a black accent**, which is where
+    ///   the earlier `unwrap_or(toward)` actually bit: black reads on that
+    ///   ground at 1.52:1 and the skin's near-black ink at 1.10:1, so falling
+    ///   back to the target made a real widget measurably worse.
+    ///
+    /// **Falsified** both ways: always-the-target reds on `0x81` and on the
+    /// lilac; always-the-accent reds on `0x89`.
     #[test]
-    fn admit_falls_back_to_the_target_when_the_ramp_cannot_clear_the_bar() {
-        let accent = [0xff, 0xff, 0xff, 0xff];
+    fn admit_degrades_to_the_most_legible_stop_never_to_a_worse_one() {
         let toward = DisplayStyle::Lcd.base_palette().ink;
-        let hopeless = [0x81, 0x81, 0x81, 0xff];
+        let white = [0xff, 0xff, 0xff, 0xff];
+
+        // Grounds 1 and 2: the matched pair either side of the crossover.
+        for hopeless in [[0x81, 0x81, 0x81, 0xff], [0x89, 0x89, 0x89, 0xff]] {
+            let (by_accent, by_ink) = (
+                contrast::ratio(white, hopeless),
+                contrast::ratio(toward, hopeless),
+            );
+            assert!(
+                by_accent < contrast::AA_TEXT && by_ink < contrast::AA_TEXT,
+                "the premise: neither endpoint of the ramp clears {hopeless:?}"
+            );
+            let got = contrast::ratio(admit(white, toward, hopeless, contrast::AA_TEXT), hopeless);
+            assert!(
+                got >= by_accent,
+                "{hopeless:?}: the fallback must not be worse than the accent, \
+                 {got:.4}:1 against {by_accent:.4}:1"
+            );
+            assert!(
+                got >= by_ink,
+                "{hopeless:?}: …nor worse than the skin's own ink, \
+                 {got:.4}:1 against {by_ink:.4}:1"
+            );
+        }
+
+        // …and the pair really does straddle: each ground is won by a different
+        // endpoint, or the two cases above are one case written twice.
+        let (lo, hi) = ([0x81, 0x81, 0x81, 0xff], [0x89, 0x89, 0x89, 0xff]);
         assert!(
-            contrast::ratio(accent, hopeless) < contrast::AA_TEXT
-                && contrast::ratio(toward, hopeless) < contrast::AA_TEXT,
-            "the premise: neither endpoint of the ramp clears this field"
+            contrast::ratio(white, lo) > contrast::ratio(toward, lo)
+                && contrast::ratio(toward, hi) > contrast::ratio(white, hi),
+            "the two grounds must be won by different endpoints"
         );
-        assert_eq!(
-            admit(accent, toward, hopeless, contrast::AA_TEXT),
-            toward,
-            "a ramp with no legible stop degrades to the skin's own ink"
+
+        // Ground 3: the regression the old fallback caused, pinned as a case.
+        let lilac = [0x3a, 0x22, 0x50, 0xff];
+        let black = [0x00, 0x00, 0x00, 0xff];
+        let admitted = admit(black, toward, lilac, contrast::AA_TEXT);
+        assert!(
+            contrast::ratio(admitted, lilac) >= contrast::ratio(black, lilac),
+            "a black accent on the pinned lilac must not be darkened toward the skin's \
+             ink: got {:.3}:1 where the accent itself read {:.3}:1",
+            contrast::ratio(admitted, lilac),
+            contrast::ratio(black, lilac)
         );
 
         // The ramp's last stop *is* the target — the reason the fallback is
-        // unreachable in practice. Asserted through a field the target clears
-        // and the accent does not.
+        // unreachable against a skin's own field.
         let field = DisplayStyle::Lcd.base_palette().bg;
         assert_eq!(
             admit(toward, toward, field, contrast::AA_TEXT),

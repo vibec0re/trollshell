@@ -476,7 +476,17 @@ const NEEDLE_T: u16 = 255;
 const HUB_T: u16 = 235;
 /// The motion-blur blades, oldest last. Length sets [`TRAIL_SPAN_SECS`]'s
 /// subdivision.
-const TRAIL_T: [u16; 4] = [150, 104, 66, 34];
+const TRAIL_T: &[u16] = &[150, 104, 66, 34];
+
+// ── #930 sharpness knobs (scratch scaffold) ──────────────────────────────────
+// The three dials the "too blurry" candidates move, all gauge-local so the
+// scope's phosphor and every other kit widget keep the skin's halo untouched.
+// At `1` / `256` / the `FEATHER` above, the render is byte-identical to the
+// tree before this commit.
+/// Divisor applied to the skin palette's bloom radius before the gauge blooms.
+const BLOOM_RADIUS_DIV: usize = 1;
+/// Multiplier, in 256ths, applied to the skin palette's bloom strength.
+const BLOOM_STRENGTH_NUM: u32 = 256;
 
 /// How far back in time the needle's motion blur reaches, in seconds — a ~50 ms
 /// shutter. Sampling the smear in *time* rather than in past frames is what
@@ -722,7 +732,15 @@ impl Gauge {
     /// the host's `len == w * h * 4` invariant.
     #[must_use]
     pub fn render(&self, style: DisplayStyle) -> Frame {
-        let palette = style.palette();
+        let mut palette = style.palette();
+        // #930: the gauge tightens the skin's halo before it blooms — the
+        // needle is a *pointer*, not a phosphor trace, so it wants less spill
+        // than the scope does off the same palette.
+        if let Some(bloom) = palette.bloom.as_mut() {
+            bloom.radius = bloom.radius.div_ceil(BLOOM_RADIUS_DIV);
+            bloom.strength =
+                u16::try_from(u32::from(bloom.strength) * BLOOM_STRENGTH_NUM / 256).unwrap_or(255);
+        }
         let dial = self.dial();
         let mut frame = Frame::filled(self.cols, self.rows, palette.bg);
 

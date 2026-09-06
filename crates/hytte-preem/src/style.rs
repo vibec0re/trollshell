@@ -222,6 +222,27 @@ fn scoped_pins() -> Pins {
 /// kit cannot tell an author's deliberate pin from a color the host resolved
 /// for it — both arrive as the same variant — and silently darkening a pin
 /// would be the worse failure of the two.
+///
+/// # Status roles are not in this table (#940)
+///
+/// A **status role** — success, warning, error — goes through
+/// [`admit_role_ink`](DisplayStyle::admit_role_ink) instead, which tints to
+/// legible on *every* skin and has no per-skin variant to choose. That is not
+/// an oversight in the table; it is the distinction the table is drawn around.
+///
+/// The accent is the desktop's **identity**, and a phosphor skin's identity is
+/// its accent — which is why three of the four take it as given, and why #940
+/// deliberately left that untouched. A role is a **signal**: the whole content
+/// of "error" is that the reader sees it, and a warning nobody can read has
+/// failed at the one thing it is for. So the answer to "what does this skin do
+/// with a color it did not choose?" splits on *what the color is for*, and only
+/// the identity half is a matter of skin taste.
+///
+/// Measured, that split is the nine pairs #940 was filed over: libadwaita's
+/// light-theme trio (`#007c3d` / `#905400` / `#c30000`) lands at 3.15–3.95:1 on
+/// `Vfd`, `Oled` and `Crt`, below AA on every one of them, while the dark-theme
+/// trio is already fine there — so the role path moves exactly the colors that
+/// could not be read and passes the rest through.
 enum AccentPolicy {
     /// Take the accent verbatim, at every luminance. The dark-panel skins:
     /// [`Vfd`](DisplayStyle::Vfd), [`Oled`](DisplayStyle::Oled) and
@@ -264,13 +285,32 @@ const _: () = assert!(
     "ADMIT_STOPS * 255 must fit in the u16 `mix` takes"
 );
 
+/// The two ends of the sRGB cube — the poles
+/// [`DisplayStyle::role_pole`](DisplayStyle::role_pole) falls back on when a
+/// skin's own ink cannot carry a role on the ground it is actually drawn on
+/// (#940).
+///
+/// They are the only pair with a *proof* behind them, and the proof is what
+/// makes the role path total. Against a ground of relative luminance `L`, white
+/// reads at `1.05 / (L + 0.05)` and black at `(L + 0.05) / 0.05`; the two are
+/// equal where `(L + 0.05)² = 0.0525`, i.e. `L ≈ 0.179`, and that crossover is
+/// the worst ground there is — both sides read **4.58:1** there, above
+/// [`contrast::AA_TEXT`]. So for *every* ground, at least one of these two
+/// clears AA, and a ramp ending on the better of them always has a legible stop
+/// to land on. No skin ink can promise that against a ground a host pinned.
+const BLACK: Rgba = [0x00, 0x00, 0x00, 0xff];
+/// White — see [`BLACK`].
+const WHITE: Rgba = [0xff, 0xff, 0xff, 0xff];
+
 /// Mix `accent` toward `toward` until it clears `min_ratio` against `field`,
 /// and return the first stop that does — forced opaque, like every other
 /// palette slot.
 ///
 /// **Total and deterministic.** Against a skin's *own* field a legible answer
 /// always exists — the ramp's last stop is `toward` itself, each skin's own ink,
-/// which its own palette reads at 6.85:1 — so the scan succeeds and the fallback
+/// which its own palette reads at **at least 6.85:1** (that figure is the
+/// [`Lcd`](DisplayStyle::Lcd)'s, the tightest of the four; `Vfd` reads 15.771:1,
+/// `Oled` 18.391:1 and `Crt` 15.516:1) — so the scan succeeds and the fallback
 /// is unreachable. Against a field a **host pinned**, it is reachable and real:
 /// a dark accent on a dark substituted ground cannot be helped by darkening it
 /// further, because darkening is the only tool the skin has. So the fallback is
@@ -468,28 +508,167 @@ impl DisplayStyle {
         }
     }
 
-    /// **The seam for host-resolved colors** (#928 → the status-role follow-up).
+    /// **The seam for a host-resolved *accent*** (#928) — the desktop's own
+    /// color, offered to the skin without rendering anything.
     ///
-    /// Answers "what would this skin do with `ink`?" without rendering
-    /// anything: the skin's own ink back on a dark panel, a darkened tint on the
-    /// reflective [`Lcd`](Self::Lcd). `field` is the ground the ink will be
-    /// drawn on — `None` for the skin's own, `Some(rgba)` to match a pin the
-    /// host is also passing through [`Pins::field`].
+    /// Answers "what would this skin do with `ink` as its accent?": back
+    /// verbatim on a dark panel, a darkened tint on the reflective
+    /// [`Lcd`](Self::Lcd). `field` is the ground the ink will be drawn on —
+    /// `None` for the skin's own, `Some(rgba)` to match a pin the host is also
+    /// passing through [`Pins::field`].
     ///
-    /// A host resolving a *semantic role* to a theme color reaches the kit as
-    /// [`Ink::Fixed`], which is deliberately unconditional (an author's pin and
-    /// a resolved role are the same variant, and guarding a stated color is the
-    /// worse failure — see [`AccentPolicy`]). So a host that wants the skin's
-    /// opinion has to ask for it, and this is the question: run the role color
-    /// through here, then pin the answer. Pair it with
+    /// This is the accent question and *only* the accent question — it runs the
+    /// skin's [`AccentPolicy`], which is about identity. A host resolving a
+    /// **status role** asks
+    /// [`admit_role_ink`](Self::admit_role_ink) instead, which is about
+    /// legibility and holds on every skin; the two seams are the two halves of
+    /// that distinction, and #940 is why they are two.
+    ///
+    /// Either way the host has to *ask*, because both a role color and an
+    /// author's `.ink(…)` reach the kit as [`Ink::Fixed`], which is deliberately
+    /// unconditional (guarding a stated color is the worse failure — see
+    /// [`AccentPolicy`]). Pair either seam with
     /// [`contrast_ratio`](crate::contrast_ratio) and
     /// [`field`](Self::field) to decide whether asking is even necessary.
     ///
-    /// Nothing in the kit calls this — it is a seam, not a step.
+    /// Nothing in the kit calls this — it is a seam, not a step: the render path
+    /// reaches the same policy through the private
+    /// [`admit_ink_against`](Self::admit_ink_against), which
+    /// [`palette_with`](Self::palette_with) calls directly.
+    ///
+    /// **Since #940 nothing in the workspace calls it either.** #939's single
+    /// call site was `preem_render::ink_for`'s role arm, and #940 moved that to
+    /// [`admit_role_ink`](Self::admit_role_ink); what is left is two assertions
+    /// (`the_public_seam_answers_what_the_render_path_does` and
+    /// `a_role_is_admitted_where_an_accent_is_taken_as_given`, which hold it
+    /// against `palette_with` so it cannot rot) and whatever **out-of-tree
+    /// host** asks the question. That is the caller set the signature is kept
+    /// stable for — not an in-tree accent caller, of which there are none. It is
+    /// still the documented answer to "what would this skin do with an accent?",
+    /// and it is still the honest place to send one; it is simply not on any
+    /// path this repository executes.
     #[must_use]
     pub fn admit_ink(self, ink: Rgba, field: Option<Rgba>) -> Rgba {
         let [r, g, b, _] = self.admit_ink_against(ink, field.unwrap_or(self.base_palette().bg));
         [r, g, b, 0xff]
+    }
+
+    /// **The seam for a host-resolved *status role*** (#940) — success, warning
+    /// or error, tinted until it can be **read** on the ground this widget will
+    /// actually flood, on every skin.
+    ///
+    /// Same shape and same ramp as [`admit_ink`](Self::admit_ink) — `field` is
+    /// `None` for the skin's own ground, `Some(rgba)` to match a
+    /// [`Pins::field`] pin — and a different question, which is the whole point
+    /// of the second entry. The accent seam runs the skin's
+    /// [`AccentPolicy`] and so returns three of the four skins' answer
+    /// unchanged, because a phosphor's identity *is* its accent. A role has no
+    /// identity to protect: a warning that cannot be read is a failed warning,
+    /// on a VFD exactly as on an LCD. So this one holds
+    /// [`contrast::AA_TEXT`] everywhere, and there is no per-skin variant to
+    /// pick.
+    ///
+    /// **Direction is read off the ground, never hard-coded.** The ramp ends at
+    /// [`role_pole`](Self::role_pole), which is the skin's own ink whenever that
+    /// ink can be read on this ground — light on the three dark panels, dark on
+    /// the [`Lcd`](Self::Lcd) — so "tint to legible" *is* "lighten" on a
+    /// phosphor and "darken" on the reflective skin without either word
+    /// appearing in the code. Tinting toward the skin's own ink is also what
+    /// keeps the result looking like the skin it is on, which is the half of
+    /// #940's option B that is about taste rather than about the bar.
+    ///
+    /// **Total.** Every ground has a legible pole (see [`BLACK`]), and the
+    /// ramp's last stop is that pole, so the scan in [`admit`] always finds a
+    /// stop — the answer is `≥ 4.5:1` against `field`, unconditionally. An ink
+    /// that already clears the bar is stop 0 and comes back **byte-identical**:
+    /// libadwaita's dark-theme trio passes straight through on all three dark
+    /// panels, and `preem-demo`'s pinned lilac ground keeps its 9.238:1 success
+    /// green exactly as #939 left it. Nothing is ever made *less* legible than
+    /// it arrived, which is [`admit`]'s own guarantee.
+    ///
+    /// # What the bar is measured on
+    ///
+    /// The **flat palette pair** — this ink against that ground — which is the
+    /// scope [`contrast`] states and the only thing a color-resolution seam can
+    /// answer. It is *not* a claim about every pixel of the finished frame: a
+    /// skin's post-passes run after the palette is chosen, and one of them
+    /// takes light away. The [`Mask`] the `Crt` carries keeps `150/256` of the
+    /// lit layer on one scanline row in four and `115/256` at the far corner,
+    /// so on the
+    /// [`Crt`](Self::Crt) an ink admitted to exactly 4.5:1 reads about
+    /// **2.2:1 on a comb row** (≈1.75:1 in the corner) — measured, for the
+    /// light-theme trio, `#0a8a44` 4.565 → 2.229, `#85791c` 4.582 → 2.239,
+    /// `#95733b` 4.625 → 2.236. The bloom (radius 3, strength 190) puts some of
+    /// that back around a stroke, and a comb row is the worst row rather than
+    /// the average one, but the direction is real.
+    ///
+    /// This is newly *reachable* rather than new: the `Crt`'s own ink is
+    /// 15.516:1 flat and still 5.561:1 on a comb row, chosen with the headroom
+    /// to survive its own mask, and until #940 nothing on that skin was ever
+    /// tinted **to** the bar (its [`AccentPolicy`] is
+    /// [`AsGiven`](AccentPolicy::AsGiven)). Raising the constant here would be
+    /// the wrong lever — it would move every skin to fix one, and the ramp would
+    /// keep walking toward the same green. If the `Crt` needs more, it needs
+    /// #940's option **C**: role inks the skin owns, chosen with the mask in
+    /// view (#397).
+    ///
+    /// Nothing in the kit calls this either — a role is a host's vocabulary, and
+    /// the kit has none.
+    #[must_use]
+    pub fn admit_role_ink(self, ink: Rgba, field: Option<Rgba>) -> Rgba {
+        let field = field.unwrap_or(self.base_palette().bg);
+        let [r, g, b, _] = admit(ink, self.role_pole(field), field, contrast::AA_TEXT);
+        [r, g, b, 0xff]
+    }
+
+    /// The end of the ramp [`admit_role_ink`](Self::admit_role_ink) tints a role
+    /// toward, chosen against the ground the widget will actually flood.
+    ///
+    /// **The skin's own ink, whenever it can be read there.** That is the common
+    /// case and the only one a skin has an opinion about: against a skin's *own*
+    /// field its own ink reads at **at least 6.85:1** — `Lcd` 6.847:1, and the
+    /// three dark panels with more than twice that headroom (`Vfd` 15.771:1,
+    /// `Oled` 18.391:1, `Crt` 15.516:1) — so the pole is the skin's ink on
+    /// every unpinned widget, on all four. Those are the phosphors' pale cyan /
+    /// white-blue / P31 green and the LCD's dark olive. Tinting toward one is
+    /// what makes an admitted role still look like the panel it is on, and it is
+    /// what makes the direction fall out of the skin instead of out of a
+    /// hard-coded "lighten"/"darken".
+    ///
+    /// **The tie-break is `WHITE`.** The second branch compares the two extremes
+    /// with `>=`, so an exact tie takes white. It is deterministic and
+    /// immaterial — a tie means both sides read 4.5826:1, comfortably over the
+    /// bar, and the closest 8-bit ground to the crossover, `#a833ff`, separates
+    /// them by 1.6e-4 — but which side wins should not have to be read off the
+    /// operator.
+    ///
+    /// It also makes the `Lcd` role path **byte-identical** to the one #933/#939
+    /// already ship: the Lcd's pole here is the same `#23281a` its
+    /// [`AccentPolicy::TintToLegible`] arm ramps toward, so no pixel that was
+    /// already legible moves.
+    ///
+    /// **The better of [`BLACK`] and [`WHITE`] otherwise** — reachable only when
+    /// a host has pinned a ground the skin's ink cannot be read on, which is
+    /// exactly where the skin has run out of its own material. A pinned white
+    /// page under `Vfd` is the case: pale cyan on white is 1.16:1, so ramping
+    /// toward it could only ever hand back the most-legible stop, and #940 asked
+    /// for a bar, not a shrug. The two poles are the pair with a proof that one
+    /// of them always clears AA (see [`BLACK`]), which is what makes
+    /// `admit_role_ink` total rather than best-effort.
+    ///
+    /// The predicate is the bar itself, not a luminance comparison against the
+    /// ground: "is the skin's ink readable here?" is the question actually being
+    /// asked, and a mid-luminance ground can be *lighter* than an ink that still
+    /// reads on it perfectly well.
+    fn role_pole(self, field: Rgba) -> Rgba {
+        let ink = self.base_palette().ink;
+        if contrast::ratio(ink, field) >= contrast::AA_TEXT {
+            ink
+        } else if contrast::ratio(WHITE, field) >= contrast::ratio(BLACK, field) {
+            WHITE
+        } else {
+            BLACK
+        }
     }
 
     /// This skin's own field — the opaque ground its widgets flood before they
@@ -1051,8 +1230,8 @@ fn box_blur(src: &[u16], w: usize, h: usize, r: usize) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Bloom, DisplayStyle, Emission, Frame, Ink, Pins, admit, contrast, mix, scoped_pins,
-        with_ink, with_pins,
+        BLACK, Bloom, DisplayStyle, Emission, Frame, Ink, Pins, WHITE, admit, contrast, mix,
+        scoped_pins, with_ink, with_pins,
     };
 
     #[test]
@@ -1681,7 +1860,9 @@ mod tests {
     ///
     /// 1. **On the skin's own field the bar is unconditional.** Every accent
     ///    clears AA, because the ramp ends on the skin's own ink and that ink
-    ///    reads on that field at 6.85:1. This is #928.
+    ///    reads on that field at **at least 6.85:1** — the `Lcd`'s number, and
+    ///    the tightest of the four (the dark panels read 15.5–18.4:1). This is
+    ///    #928.
     /// 2. **On a ground the host pinned, the skin promises only that it will
     ///    not make things worse** — the admitted ink is never less legible than
     ///    the raw accent would have been. It *cannot* promise AA there: its only
@@ -1938,10 +2119,12 @@ mod tests {
     ///
     /// The seam was opened for the status-role follow-up, and **#939 walked
     /// through it**: `preem_render::ink_for` resolves `Success`/`Warning`/
-    /// `Error` to theme colors and now runs each through
-    /// [`admit_ink`](DisplayStyle::admit_ink) before pinning the answer as
-    /// [`Ink::Fixed`] — because a role color is the *host's* answer, while a
-    /// pin is the author's and the policy deliberately never touches it. Review
+    /// `Error` to theme colors and runs each through the kit before pinning the
+    /// answer as [`Ink::Fixed`] — because a role color is the *host's* answer,
+    /// while a pin is the author's and the policy deliberately never touches it.
+    /// (#940 moved that call to
+    /// [`admit_role_ink`](DisplayStyle::admit_role_ink); this test is still
+    /// about the accent seam, which is the one `palette_with` runs.) Review
     /// measured what was at stake — all twelve libadwaita role colors fail AA
     /// on the LCD field, the dark-theme six at 1.03–1.48:1 — and noted that the
     /// shell could not even ask, because `contrast`, `Palette` and
@@ -2057,9 +2240,10 @@ mod tests {
     ///
     /// The host resolves the ambiguity on its own side, which is the only side
     /// that can: since #939 `preem_render::ink_for` sends a *role*-resolved
-    /// color through [`admit_ink`](DisplayStyle::admit_ink) before pinning it,
-    /// and leaves an author's `.ink(…)` alone. Both still reach here as
-    /// `Fixed`; one of them has already been asked about.
+    /// color through the kit before pinning it — since #940 through
+    /// [`admit_role_ink`](DisplayStyle::admit_role_ink) — and leaves an author's
+    /// `.ink(…)` alone. Both still reach here as `Fixed`; one of them has
+    /// already been asked about.
     ///
     /// **Falsified** by routing `Ink::Fixed` through `admit` on the LCD: the
     /// white pin comes back darkened and the equality goes red.
@@ -2180,6 +2364,310 @@ mod tests {
             admit(toward, toward, field, contrast::AA_TEXT),
             toward,
             "an accent already equal to the skin's ink is returned as itself"
+        );
+    }
+
+    // ── Status roles: legible on every skin (#940 option B) ──────────────────
+
+    /// libadwaita 1.9.3's six status colors — `@success_color`,
+    /// `@warning_color`, `@error_color` under each scheme.
+    ///
+    /// The kit has no role vocabulary and never resolves these itself; they are
+    /// here because they are the *measured* input #940 is about, and a property
+    /// stated over a synthetic sweep alone could not say that the nine failing
+    /// pairs are these nine. The shell keeps the same table
+    /// (`plugins::tests::LIBADWAITA_ROLES`) for its half of the seam.
+    const ROLE_COLORS: [(&str, super::Rgba); 6] = [
+        ("dark @success_color", [0x64, 0xec, 0xa5, 0xff]),
+        ("dark @warning_color", [0xff, 0xc1, 0x3f, 0xff]),
+        ("dark @error_color", [0xff, 0x87, 0x7b, 0xff]),
+        ("light @success_color", [0x00, 0x7c, 0x3d, 0xff]),
+        ("light @warning_color", [0x90, 0x54, 0x00, 0xff]),
+        ("light @error_color", [0xc3, 0x00, 0x00, 0xff]),
+    ];
+
+    /// The grounds a role is admitted against: the skin's own (`None`) and the
+    /// two shapes of host pin that pull the answer in opposite directions.
+    ///
+    /// `None` is the case every unpinned widget takes. The dark lilac is
+    /// `preem-demo`'s `FLD` cell, the pin #933 measured a real regression on.
+    /// The near-white page is its **mirror**, and it is the only one of the
+    /// three that reaches [`role_pole`](DisplayStyle::role_pole)'s second
+    /// branch on the phosphor skins: their own inks are pale, so on paper they
+    /// cannot be the pole and the ramp has to end somewhere else.
+    const ROLE_GROUNDS: [Option<super::Rgba>; 3] = [
+        None,
+        Some([0x3a, 0x22, 0x50, 0xff]),
+        Some([0xf5, 0xf5, 0xf5, 0xff]),
+    ];
+
+    /// Relative luminance, ordered rather than measured: the contrast ratio
+    /// against black is strictly monotone in luminance, so it orders two colors
+    /// exactly as luminance does without reaching into `contrast`'s private
+    /// half.
+    fn lightness(color: super::Rgba) -> f32 {
+        contrast::ratio(color, BLACK)
+    }
+
+    /// **#940's property.** A status role admitted by *any* skin, against *any*
+    /// of the grounds a host can put it on, clears
+    /// [`AA_TEXT`](contrast::AA_TEXT) — and is never less legible than the color
+    /// that arrived.
+    ///
+    /// This is the claim #935's acceptance asked for and #939 could only make on
+    /// the `Lcd`: the accent seam runs the per-skin
+    /// [`AccentPolicy`](super::AccentPolicy), which is `AsGiven` on the three
+    /// dark panels, so the light-theme trio was landing there at 3.15–3.95:1 —
+    /// nine of eighteen role×dark-skin pairs below the bar. `admit_role_ink`
+    /// asks a different question, and it has one answer on every skin.
+    ///
+    /// The **totality** is not a lucky sweep: every ground has a legible pole
+    /// (`every_ground_has_a_pole_that_clears_the_bar`), the ramp's last stop
+    /// *is* that pole, so [`admit`] always finds a clearing stop and the
+    /// most-legible fallback is unreachable through this seam. The sweep is what
+    /// says the implementation actually has that shape.
+    ///
+    /// **Falsified** by delegating `admit_role_ink` to `admit_ink` (M1): the
+    /// light trio reds on `Vfd`, `Oled` and `Crt` at 3.148–3.950:1. Also by
+    /// dropping `role_pole`'s second branch and always using the skin's ink
+    /// (M4'): the paper ground reds on the phosphors, at ~1.16:1.
+    #[test]
+    fn every_status_role_is_legible_on_every_skin_and_every_ground() {
+        for style in DisplayStyle::ALL {
+            for ground in ROLE_GROUNDS {
+                let field = ground.unwrap_or(style.field());
+                for (label, color) in ROLE_COLORS {
+                    let admitted = style.admit_role_ink(color, ground);
+                    let (raw, got) = (
+                        contrast::ratio(color, field),
+                        contrast::ratio(admitted, field),
+                    );
+                    assert!(
+                        got >= contrast::AA_TEXT,
+                        "{label} on {} over {field:?}: {color:?} read at {raw:.3}:1 and the \
+                         skin handed back {admitted:?} at {got:.3}:1 — still below AA",
+                        style.name(),
+                    );
+                    assert!(
+                        got >= raw,
+                        "{label} on {} over {field:?}: admission may not make a color harder \
+                         to read ({raw:.3}:1 became {got:.3}:1)",
+                        style.name(),
+                    );
+                    assert_eq!(admitted[3], 0xff, "a palette slot is opaque");
+                }
+            }
+        }
+    }
+
+    /// **Direction is read off the skin, not written into the code.** The one
+    /// light-theme trio is tinted *lighter* on the three dark panels and
+    /// *darker* on the reflective `Lcd` — same call, same colors, opposite
+    /// directions — because [`role_pole`](DisplayStyle::role_pole) ends the ramp
+    /// on the skin's own ink and that ink is pale on a phosphor and near-black
+    /// on the LCD.
+    ///
+    /// The trio is the right probe precisely because it fails on all four skins
+    /// (`3.15–3.95:1` on the dark three, `2.41–2.87:1` on the `Lcd`), so every
+    /// skin has to *move* it and the direction is observable everywhere. The
+    /// dark trio would prove nothing here: it passes through on three skins.
+    ///
+    /// **Falsified** by hard-coding the pole to a dark color — `BLACK`, or
+    /// `Lcd`'s own ink — (M2): the phosphor assertions red with a result darker
+    /// than the input.
+    #[test]
+    fn a_role_is_tinted_toward_the_pole_the_skin_can_be_read_against() {
+        for (label, color) in ROLE_COLORS.into_iter().skip(3) {
+            for style in DisplayStyle::ALL {
+                assert!(
+                    contrast::ratio(color, style.field()) < contrast::AA_TEXT,
+                    "{label} must be illegible on {} to begin with, or this test cannot see \
+                     a direction",
+                    style.name(),
+                );
+                let admitted = style.admit_role_ink(color, None);
+                if style == DisplayStyle::Lcd {
+                    assert!(
+                        lightness(admitted) < lightness(color),
+                        "{label} on the lcd must be *darkened* toward its olive ink: \
+                         {color:?} → {admitted:?}",
+                    );
+                } else {
+                    assert!(
+                        lightness(admitted) > lightness(color),
+                        "{label} on {} must be *lightened* toward the phosphor: \
+                         {color:?} → {admitted:?}",
+                        style.name(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The two seams answer different questions, and the accent one did not
+    /// move.** On the dark panels an accent is still taken verbatim at every
+    /// luminance while a *role* of the very same color is tinted — which is the
+    /// whole of #940 option B, stated as an inequality on one input.
+    ///
+    /// The accent half is the byte-for-byte guarantee the golden rows and
+    /// [`the_dark_skins_take_every_accent_verbatim_exactly_as_before`] hold;
+    /// this restates it beside the role answer so the *pair* cannot drift into
+    /// each other. The `Lcd` is asserted the other way round: there the two
+    /// seams agree, and they agree byte for byte — see
+    /// [`the_lcd_role_answer_is_the_accent_ramps_answer_byte_for_byte`].
+    ///
+    /// **Falsified** by routing the accent path through the role entry (M3):
+    /// the "an accent is still verbatim" equality reds on the light trio, as do
+    /// the `single_ink_golden` digests and the accent sweep.
+    #[test]
+    fn a_role_is_admitted_where_an_accent_is_taken_as_given() {
+        for (label, color) in ROLE_COLORS.into_iter().skip(3) {
+            for style in [DisplayStyle::Vfd, DisplayStyle::Oled, DisplayStyle::Crt] {
+                assert_eq!(
+                    style.admit_ink(color, None),
+                    color,
+                    "{label} on {}: an accent is still taken as given",
+                    style.name(),
+                );
+                assert_ne!(
+                    style.admit_role_ink(color, None),
+                    color,
+                    "{label} on {}: …and the same color as a *role* is not",
+                    style.name(),
+                );
+            }
+        }
+    }
+
+    /// **Nothing on the `Lcd` moved.** Its role answer is bit-for-bit the answer
+    /// #933/#939 already ship through the accent ramp, for every one of the six
+    /// theme colors and on a pinned ground too — because the pole
+    /// [`role_pole`](DisplayStyle::role_pole) picks there *is* the ink
+    /// [`AccentPolicy::TintToLegible`](super::AccentPolicy::TintToLegible) ramps
+    /// toward.
+    ///
+    /// That is what lets the shell's `LCD_ADMITTED_ROLE_INKS` byte pin stay
+    /// exactly as #939 recorded it: option B adds a behaviour on the three dark
+    /// skins and changes none on the fourth.
+    ///
+    /// **Falsified** by giving `role_pole` a different pole on the `Lcd` —
+    /// `BLACK` (M4'') — the six equalities red and the shell's pinned bytes red
+    /// beside them.
+    #[test]
+    fn the_lcd_role_answer_is_the_accent_ramps_answer_byte_for_byte() {
+        let lcd = DisplayStyle::Lcd;
+        for ground in [None, Some([0xf5, 0xf5, 0xf5, 0xff])] {
+            for (label, color) in ROLE_COLORS {
+                assert_eq!(
+                    lcd.admit_role_ink(color, ground),
+                    lcd.admit_ink(color, ground),
+                    "{label} over {ground:?}: the lcd's role answer is its accent answer",
+                );
+            }
+        }
+        // The pin the shell records, from this side of the boundary.
+        assert_eq!(
+            lcd.admit_role_ink([0x64, 0xec, 0xa5, 0xff], None),
+            [0x2d, 0x47, 0x30, 0xff],
+            "the ramp's stop for dark @success_color on the olive field",
+        );
+    }
+
+    /// **An already-legible role is a passthrough**, byte for byte — the ramp's
+    /// stop 0 *is* the color it was handed, so a skin that has nothing to fix
+    /// returns exactly what arrived.
+    ///
+    /// Two cases, because they are legible for different reasons. libadwaita's
+    /// **dark** trio is legible on all three dark panels by construction (a
+    /// bright status color on a black tube), and would be the thing a blunt
+    /// "always tint" implementation broke. `preem-demo`'s **pinned lilac
+    /// ground** is the case #939 measured at 9.238:1: the widget replaced the
+    /// skin's field, and answering against the skin's own field instead would
+    /// darken a perfectly readable green to 1.35:1 on the ground it is actually
+    /// drawn on.
+    ///
+    /// **Falsified** by starting [`admit`]'s scan at stop 1 instead of stop 0,
+    /// so the color it was handed is never itself a candidate: every
+    /// passthrough here comes back tinted.
+    #[test]
+    fn an_already_legible_role_is_returned_unchanged() {
+        for (label, color) in ROLE_COLORS.into_iter().take(3) {
+            for style in [DisplayStyle::Vfd, DisplayStyle::Oled, DisplayStyle::Crt] {
+                assert!(
+                    contrast::ratio(color, style.field()) >= contrast::AA_TEXT,
+                    "{label} is the premise: already legible on {}",
+                    style.name(),
+                );
+                assert_eq!(
+                    style.admit_role_ink(color, None),
+                    color,
+                    "{label} on {}: nothing to admit, nothing to change",
+                    style.name(),
+                );
+            }
+        }
+
+        let lilac = [0x3a, 0x22, 0x50, 0xff];
+        let success = [0x64, 0xec, 0xa5, 0xff];
+        assert!(
+            contrast::ratio(success, lilac) >= contrast::AA_TEXT,
+            "the `FLD` premise: 9.238:1 on the ground the widget floods",
+        );
+        assert_eq!(
+            DisplayStyle::Lcd.admit_role_ink(success, Some(lilac)),
+            success,
+            "a role that already reads on a *pinned* ground is passed through",
+        );
+    }
+
+    /// **Every ground has a pole that clears the bar** — the proof
+    /// [`BLACK`]'s rustdoc states, run as a sweep, and the reason
+    /// `admit_role_ink` is total rather than best-effort.
+    ///
+    /// Two claims. First, the pair itself: for any color, the better of black
+    /// and white against it reads at ≥ 4.5:1 — the worst ground is the
+    /// crossover at relative luminance ≈0.179, where both read 4.58:1, and the
+    /// sweep's measured minimum is asserted to be in that neighbourhood so the
+    /// bound is not vacuous. Second, that [`role_pole`](DisplayStyle::role_pole)
+    /// *returns* such a pole on every skin and every ground — the skin's own ink
+    /// where that reads, one of the two extremes where it does not.
+    ///
+    /// The step of 17 walks all four corners and both diagonals of the sRGB cube
+    /// at 16 levels per channel (4096 grounds × 4 skins), which is dense enough
+    /// to straddle the crossover from both sides.
+    ///
+    /// **Falsified** by picking the *worse* of the two extremes (`<` for `>=`):
+    /// the pole assertion reds at ~1.1:1 on the first near-black ground.
+    #[test]
+    fn every_ground_has_a_pole_that_clears_the_bar() {
+        let mut worst = f32::INFINITY;
+        for r in (0..=0xff_u8).step_by(17) {
+            for g in (0..=0xff_u8).step_by(17) {
+                for b in (0..=0xff_u8).step_by(17) {
+                    let ground = [r, g, b, 0xff];
+                    let best = contrast::ratio(WHITE, ground).max(contrast::ratio(BLACK, ground));
+                    assert!(
+                        best >= contrast::AA_TEXT,
+                        "{ground:?}: the better of black and white reads at {best:.4}:1",
+                    );
+                    worst = worst.min(best);
+
+                    for style in DisplayStyle::ALL {
+                        let pole = style.role_pole(ground);
+                        assert!(
+                            contrast::ratio(pole, ground) >= contrast::AA_TEXT,
+                            "{}: the pole {pole:?} must be readable on {ground:?}, or the \
+                             ramp has no legible stop to end on",
+                            style.name(),
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            (4.58..4.60).contains(&worst),
+            "…and the bound is tight: the crossover ground reads {worst:.4}:1, not far above \
+             the 4.5 bar",
         );
     }
 

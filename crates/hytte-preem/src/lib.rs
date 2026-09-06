@@ -166,8 +166,11 @@ pub use style::set_accent;
 /// own — a shell mapping semantic roles onto the live theme — needs to ask
 /// whether one of them can be read on a skin before it pins it, and
 /// [`AA_TEXT`] is the bar the kit itself holds its own inks to. Pair it with
-/// [`DisplayStyle::field`] for the skin's ground and
-/// [`DisplayStyle::admit_ink`] for the skin's own answer.
+/// [`DisplayStyle::field`] for the skin's ground and, for the skin's own answer,
+/// with [`DisplayStyle::admit_ink`] when the color is the desktop **accent** or
+/// [`DisplayStyle::admit_role_ink`] when it is a **status role** — the second
+/// holds `AA_TEXT` on every skin, where the first defers to the skin's taste
+/// (#940).
 pub use contrast::{AA_TEXT, ratio as contrast_ratio};
 
 /// Scope one render to an explicit palette (#885) — host-facing like

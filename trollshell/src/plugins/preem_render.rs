@@ -171,11 +171,17 @@
 //! the skin's own ink.
 //!
 //! A theme color resolved for a role is then **offered to the skin** before it
-//! is pinned (`DisplayStyle::admit_ink`, #935): it is the shell's answer rather
-//! than the author's, so the skin still owns what an ink it did not choose looks
-//! like on its field — which is what keeps the status trio readable on the
-//! reflective `Lcd`. An author's explicit `ink` pin is *not* offered; see
-//! [`ink_for`] for the whole of that distinction.
+//! is pinned (`DisplayStyle::admit_role_ink`, #935 → #940): it is the shell's
+//! answer rather than the author's, so the skin still owns what an ink it did
+//! not choose looks like on its field. Since #940 that seam is the *role* one
+//! rather than the accent one, so the status trio clears WCAG AA on **all four**
+//! skins — darkened toward the ink on the reflective `Lcd`, lightened toward the
+//! phosphor on `Vfd`/`Oled`/`Crt`, where libadwaita's light-theme trio was
+//! sitting at 3.15–3.95:1. The accent is untouched by that and still lands
+//! verbatim on the dark three: a phosphor's identity is its accent, while a
+//! warning is a signal that has to be read. An author's explicit `ink` pin is
+//! *not* offered through either seam; see [`ink_for`] for the whole of that
+//! distinction.
 //!
 //! # …and what makes it *live* (#396)
 //!
@@ -1642,17 +1648,39 @@ pub(super) fn set_role_inks(inks: RoleInks) {
 ///
 /// Arms 1 and 2 both end at [`kit::Ink::Fixed`], and the kit cannot tell them
 /// apart — so it treats both as stated on purpose and takes them verbatim, which
-/// is right for a pin and wrong for a role. `Fixed` bypasses the skin's
-/// [`AccentPolicy`][policy], and on the reflective `Lcd` — the one skin whose
-/// field is *lighter* than its ink — libadwaita's dark-theme status colors then
-/// landed at 1.06–1.48:1 against `#a9b47e`, which is invisible.
+/// is right for a pin and wrong for a role. `Fixed` bypasses the skin's contrast
+/// policy, and on the reflective `Lcd` — the one skin whose field is *lighter*
+/// than its ink — libadwaita's dark-theme status colors then landed at
+/// 1.06–1.48:1 against `#a9b47e`, which is invisible.
 ///
 /// The fix is entirely on this side of the wire, because a role color is the
-/// shell's answer, not the author's: it is run through
-/// [`kit::DisplayStyle::admit_ink`] — #933's seam, the same ramp the accent path
-/// takes inside the kit — *before* it becomes a pin. So the skin still decides
-/// what an ink it did not choose looks like, and pins stay unconditional (they
-/// return above, never reaching this match).
+/// shell's answer, not the author's: it is run through the kit's role seam
+/// *before* it becomes a pin. So the skin still decides what an ink it did not
+/// choose looks like, and pins stay unconditional (they return above, never
+/// reaching this match).
+///
+/// # …and the seam it is asked *through* is the role one (#940)
+///
+/// #939 asked with [`kit::DisplayStyle::admit_ink`], which runs the skin's
+/// `AccentPolicy` — and that policy is `AsGiven` on `Vfd`/`Oled`/`Crt`, so the
+/// three dark panels took a role color verbatim. Measured, libadwaita's
+/// **light-theme** trio (`#007c3d` / `#905400` / `#c30000`) then sat at
+/// 3.15–3.95:1 on those fields: nine of the eighteen role×dark-skin pairs below
+/// AA, which is the gap #935's acceptance had asked to close and #940 chose
+/// option **B** to close.
+///
+/// So the call is [`kit::DisplayStyle::admit_role_ink`][policy] instead — the
+/// same ramp, aimed at the skin's *legible* pole rather than gated on the
+/// accent policy, and therefore ≥ 4.5:1 on all four skins. It lightens toward
+/// the phosphor on the dark panels and darkens toward the olive ink on the
+/// `Lcd`, from the ground rather than from a hard-coded direction, and passes an
+/// already-legible color through byte-for-byte.
+///
+/// What did **not** change is the accent: `Accent` and a role-less `StyleRef`
+/// still reach the kit as [`kit::Ink::Default`] and still get the skin's
+/// `AccentPolicy` answer, verbatim on the dark three. A phosphor's identity is
+/// its accent; a warning is a signal that has to be read. Two questions, two
+/// seams.
 ///
 /// The ground it is admitted against is the **effective** one: the widget's own
 /// [`field`](vocab::StyleRef::field) pin when it has one, the skin's otherwise.
@@ -1668,11 +1696,16 @@ pub(super) fn set_role_inks(inks: RoleInks) {
 /// the load-bearing half of that.
 ///
 /// The cost is genuinely small: a memo would save a scan over a 65-stop integer
-/// ramp (~43 stops in practice for the six role colors) that the *accent* path
-/// has already paid, unmemoized, on every `Lcd` rasterisation since #928 — and
-/// pays twice per marquee render. A role widget now pays exactly one admission
-/// per rasterisation, the same or fewer than the default path beside it, and
-/// none at all on the three `AsGiven` skins.
+/// ramp that the *accent* path has already paid, unmemoized, on every `Lcd`
+/// rasterisation since #928 — and pays twice per marquee render. A role widget
+/// pays exactly one admission per rasterisation, the same as the default path
+/// beside it. Since #940 that admission runs on all four skins rather than on
+/// the `Lcd` alone, and it is still one scan: the ramp stops at the **first**
+/// stop that clears the bar, so an already-legible color (libadwaita's whole
+/// dark trio, on every dark panel) costs **two** `contrast::ratio` calls — the
+/// pole probe, then stop 0 — and returns the color it was handed. The
+/// light-theme trio on a dark panel costs 8–31; the `Lcd`'s worst case, 56, is
+/// exactly what #939 already shipped, so the ceiling did not move.
 ///
 /// The reason not to memoize is what the key would have to be. [`role_inks`]
 /// caches the three *theme* colors, so [`invalidate_cached_frames`]'s
@@ -1683,7 +1716,7 @@ pub(super) fn set_role_inks(inks: RoleInks) {
 /// rather than leaving it where #912 put it. Deriving at use keeps one cell with
 /// one reason to be dropped, and no derived value that can go stale behind it.
 ///
-/// [policy]: kit::DisplayStyle::admit_ink
+/// [policy]: kit::DisplayStyle::admit_role_ink
 fn ink_for(style: vocab::StyleRef) -> kit::Ink {
     if let Some(ink) = style.ink {
         return kit::Ink::Fixed(ink);
@@ -1697,7 +1730,7 @@ fn ink_for(style: vocab::StyleRef) -> kit::Ink {
         // a status role at all — only to throw the answer away.
         Some(vocab::AccentRole::Accent) | None => kit::Ink::Default,
         Some(role) => role_inks().get(role).map_or(kit::Ink::Default, |ink| {
-            kit::Ink::Fixed(display_style(style).admit_ink(ink, style.field))
+            kit::Ink::Fixed(display_style(style).admit_role_ink(ink, style.field))
         }),
     }
 }

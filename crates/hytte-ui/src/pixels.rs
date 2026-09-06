@@ -31,7 +31,8 @@
 //! animation clock re-maps a whole mailbox whenever anything in it moves — so an
 //! unchanged chip sitting next to an animating one used to rebuild a
 //! [`glib::Bytes`] + [`gdk::MemoryTexture`](gtk::gdk::MemoryTexture) and
-//! `queue_draw` 20× a second for a picture nobody changed.
+//! `queue_draw` on every re-map of the mount — per frame-clock tick while
+//! animating — for a picture nobody changed.
 //!
 //! The surface therefore keeps the last **accepted** buffer and compares before
 //! it uploads. *Equal* means, exactly:
@@ -827,7 +828,8 @@ mod gtk_tests {
     /// (a) The headline: handing the surface the frame it already displays is
     /// free — no texture rebuilt, nothing queued on GTK. The animation clock
     /// re-maps a whole mailbox when anything in it moves, so every static
-    /// `Pixels` chip in that mailbox lands here 20× a second.
+    /// `Pixels` chip in that mailbox lands here on every re-map — per
+    /// frame-clock tick while animating.
     #[gtk::test]
     fn an_identical_frame_builds_nothing_and_queues_nothing() {
         let s = PixelSurface::new();

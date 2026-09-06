@@ -205,8 +205,9 @@ use hytte_preem as kit;
 /// carrying the remainder. What the constant still pins is how long one of those
 /// steps *lasts*, and 20 Hz is not arbitrary for that: it is the rate the kit's
 /// own consumers animate at (`hytte-plugin-audio-widget`'s `TICK`), and the rate
-/// [`vocab::MarqueeConfig::speed_dots_per_sec`]'s default of `20.0` was derived
-/// from. Anchoring the step-based widgets to elapsed time rather than to
+/// [`vocab::MarqueeConfig::speed_dots_per_sec`]'s default was derived from —
+/// `12.0` dots/s — #929, PR #932. Anchoring the
+/// step-based widgets to elapsed time rather than to
 /// callbacks keeps a phosphor trail's fade the same length whether it is being
 /// driven at 60 Hz, at 144 Hz, or by a stalling clock.
 pub(super) const ANIM_STEP_SECS: f32 = 1.0 / 20.0;

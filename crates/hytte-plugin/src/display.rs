@@ -1579,8 +1579,16 @@ impl Gauge {
     }
 
     /// The rendered frame's `(width, height)` in pixels — the logical buffer
-    /// times [`scale`](Self::scale). What the raster arm produces, and what the
-    /// shell sizes the state arm's surface to.
+    /// times [`scale`](Self::scale), **as requested**.
+    ///
+    /// This is what the raster arm produces. It is *not* a promise about the
+    /// state arm: the shell re-derives the size from the **sanitised** config
+    /// (`PreemWidget::clamp_in_place` clamps `cols`/`rows` into
+    /// `1..=MAX_BUFFER_DIM` and then pulls `scale` down to keep the product
+    /// inside it), so a gauge asking for more than the vocabulary allows reports
+    /// its request here and is drawn at the cap there. Every size worth putting
+    /// on a card — the 288 px default, the #931 squares — is far inside the cap
+    /// and the two agree.
     #[must_use]
     pub fn frame_size(&self) -> (usize, usize) {
         (self.kit.width(), self.kit.height())

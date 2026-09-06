@@ -462,8 +462,13 @@ const MAJOR_LEN_FRAC: f32 = 0.15;
 const MINOR_LEN_FRAC: f32 = 0.075;
 /// Shortest major (and mid) tick, in logical pixels (#931) — under it the mark
 /// is shorter than the [`FEATHER`] ramp on either end of it and reads as a
-/// smudge on the arc rather than as a division boundary. Inert at the default
-/// (7.6 px) and at 64×64 (4.3 px).
+/// smudge on the arc rather than as a division boundary.
+///
+/// Inert at **all three** tuned faces — the default's major is 7.6 px, 64×64's
+/// is 4.3 and even 48×48's is 3.11 — so it first fires around a 40×40 buffer.
+/// [`MIN_MINOR_LEN`] is the floor that bites at 48; this one is its argument
+/// carried to the longer mark, and it is here so a face small enough to need
+/// both keeps the two lengths apart.
 const MIN_MAJOR_LEN: f32 = 3.0;
 /// Shortest minor tick, in logical pixels (#931) — the [`MIN_MAJOR_LEN`]
 /// argument, one notch down, so a subdivision stays visibly shorter than the
@@ -583,6 +588,18 @@ struct Dial {
     major_len: f32,
     /// Minor tick length, inward from the scale arc.
     minor_len: f32,
+    /// Whether the face was **centred** in its buffer rather than seated on the
+    /// rows [`BASE_FRAC`] reserves (#931). True exactly when the arc fits by
+    /// width *and* the buffer can hold the halo at both ends — see
+    /// [`Gauge::dial`].
+    ///
+    /// Test-only: the renderer needs the resolved `pivot`, never the branch that
+    /// produced it. It is carried on the [`Dial`] rather than recomputed in
+    /// `a_centred_face_leaves_room_for_its_own_halo` because a test that
+    /// re-derives the predicate is an oracle that agrees with the code by
+    /// construction.
+    #[cfg(test)]
+    centred: bool,
     /// Minor ticks per major division **as the face can actually draw them**:
     /// the configured count, pulled down until adjacent ticks clear
     /// [`MIN_TICK_SPACING`]. Resolved here rather than in
@@ -962,6 +979,17 @@ impl Gauge {
     /// above, the counterweight or the bare hub below) has equal margins. The
     /// radius is unchanged by the move — it was already the width's answer, and
     /// moving the pivot up only ever grows the height's.
+    ///
+    /// The budget counts the **halo** [`render`](Self::render) adds afterwards
+    /// ([`bloom_cap`] logical px at each end), because a face centred on its ink
+    /// alone can still have its glow cut off at the top — and asymmetrically, on
+    /// the side the centring moved toward. Adding the same amount at both ends
+    /// leaves the pivot exactly where it was on every face with room to spare,
+    /// so this costs the tuned sizes nothing. Where the buffer *cannot* hold
+    /// both halos — a near-square face like `105×64`, whose arc fits by width by
+    /// a hair — centring would buy nothing and cost a row of glow, so the face
+    /// stays **seated**: precisely what it did before #931, which is the one
+    /// placement guaranteed not to be a regression.
     fn dial(&self) -> Dial {
         let cols = fx(self.cols);
         let rows = fx(self.rows);
@@ -977,8 +1005,9 @@ impl Gauge {
         let by_height = seated_y - EDGE;
         let by_width = (pivot_x - EDGE) / half.sin().max(f32::EPSILON);
         let radius = by_height.min(by_width).max(MIN_RADIUS);
-        // Width binds ⇒ there is height to spare ⇒ centre the face in it.
-        let centred = by_width < by_height;
+        // Width binds ⇒ there is height to spare ⇒ the face *may* be centred in
+        // it. Whether it actually is depends on the halo fitting too, below.
+        let spare_height = by_width < by_height;
 
         let blade = (radius * BLADE_FRAC).clamp(BLADE_RANGE.0, BLADE_RANGE.1);
         let hub = (radius * HUB_FRAC).max(MIN_HUB);
@@ -986,24 +1015,32 @@ impl Gauge {
         // reserved for it; on a centred one the centring below is what reserves
         // the room, so the fraction stands. Either way a stub too short to read
         // as one is dropped.
-        let stub = if centred {
+        let stub = if spare_height {
             radius * TAIL_FRAC
         } else {
             (radius * TAIL_FRAC).min((base - FEATHER - 0.5).max(0.0))
         };
         let tail = if stub < MIN_TAIL { 0.0 } else { stub };
-        let pivot_y = if centred {
-            // The face's vertical extent about the pivot: the *value* arc's
-            // outer edge above (it is the wider of the two bands the scale
-            // carries), and whichever of the counterweight or the bare hub
-            // reaches lowest below.
-            let above = radius + ARC_HW + VALUE_HW_BONUS + FEATHER;
-            let below = if tail > 0.0 {
-                tail + blade * TAIL_FLARE + FEATHER
+        // The face's vertical extent about the pivot: the *value* arc's outer
+        // edge above (it is the wider of the two bands the scale carries), and
+        // whichever of the counterweight or the bare hub reaches lowest below —
+        // each widened by the halo `render` will lay over it.
+        let glow = fx(bloom_cap(radius));
+        let above = radius + ARC_HW + VALUE_HW_BONUS + FEATHER + glow;
+        let below = glow
+            + FEATHER
+            + if tail > 0.0 {
+                tail + blade * TAIL_FLARE
             } else {
-                hub + FEATHER
+                hub
             };
-            let margin = ((rows - 1.0 - above - below) / 2.0).max(0.0);
+        let margin = (rows - 1.0 - above - below) / 2.0;
+        // Centre only when the whole drawn face — halo included — fits. When it
+        // does not, stay seated: that is the pre-#931 placement, so it cannot be
+        // a regression, and centring a face whose glow is clipped either way
+        // would only move which end loses it.
+        let centred = spare_height && margin >= 0.0;
+        let pivot_y = if centred {
             (margin + above).clamp(0.0, (rows - 1.0).max(0.0))
         } else {
             seated_y
@@ -1024,6 +1061,8 @@ impl Gauge {
             subdivisions: self
                 .subdivisions
                 .min(tick_budget(radius * 2.0 * half, self.divisions)),
+            #[cfg(test)]
+            centred,
         }
     }
 }
@@ -1270,9 +1309,10 @@ fn trail_fraction(fraction: f32, velocity: f32, back: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLADE_TIP, DEFAULT_DAMPING, DEFAULT_FREQ_HZ, DisplayStyle, FEATHER, Gauge, Grid,
-        MAX_DAMPING, MAX_FREQ_HZ, MIN_DAMPING, MIN_FREQ_HZ, Needle, OVERTRAVEL, Tick, coverage, fx,
-        on_dial, polar, shade, span, trail_fraction,
+        ARC_HW, BLADE_TIP, DEFAULT_DAMPING, DEFAULT_FREQ_HZ, DisplayStyle, FEATHER, Gauge, Grid,
+        MAJOR_HW, MAX_DAMPING, MAX_FREQ_HZ, MID_LEN_BONUS, MIN_DAMPING, MIN_FREQ_HZ, Needle,
+        OVERTRAVEL, Tick, VALUE_HW_BONUS, coverage, fx, on_dial, polar, shade, span,
+        trail_fraction,
     };
     use std::f32::consts::PI;
 
@@ -2429,53 +2469,191 @@ mod tests {
         );
     }
 
-    /// The needle still reaches both mechanical stops on a small dial: at `0.0`
-    /// and `1.0` it lands on the ends of the sweep the face draws, within 3° —
-    /// the wide face's `the_needle_points_where_the_reading_says` bound, held on
-    /// a quarter of the pixels.
+    /// The needle reaches both mechanical stops on a small dial: at `0.0` and
+    /// `1.0` it lands on the ends of the sweep the face draws, on **every flat
+    /// skin** and at three buffer shapes.
+    ///
+    /// # The annulus has to exclude the face's furniture
+    ///
+    /// The obvious probe — average the angle of every lit pixel in an annulus
+    /// around the blade — is only honest if the annulus really does contain the
+    /// blade and nothing else. `tip * 0.45 .. tip * 0.90` does *not*: the mid
+    /// tick at 12 o'clock is drawn `major_len * MID_LEN_BONUS` inward from the
+    /// arc and then rounded off by a `MAJOR_HW + FEATHER` end cap, and that cap
+    /// is a **fixed pixel cost** while the gap it has to clear is a fraction of
+    /// the radius. On the default face it clears by 3.9 px; at 48×48 it does not
+    /// clear at all, and two faint tick pixels sitting at 0° join an average of
+    /// twenty-six blade pixels sitting at −75°.
+    ///
+    /// Measured, low stop, `scale(1)`, with the naive annulus and with this one:
+    ///
+    /// | face | skin | naive | furniture excluded |
+    /// |---|---|---|---|
+    /// | 48×48 | Lcd | **+5.51°** | +0.32° |
+    /// | 48×48 | Vfd / Oled | +2.82° | −0.23° |
+    /// | 64×64 | any flat | −0.15° | −0.22° |
+    /// | 32×64 | Lcd | **+53.59°** | −0.98° |
+    /// | 144×64 | any flat | −0.09° | −0.12° |
+    ///
+    /// So the needle was never short: the metric was reading the dial's own
+    /// centre mark. The bloomed skins hid it, because their halo multiplies the
+    /// blade's pixel count and dilutes the two tick pixels — which is exactly
+    /// why rendering one skin was not enough. `Lcd` has no bloom at all and is
+    /// the skin that showed it.
+    ///
+    /// The slack is **2°**, tightened from the 3° this test shipped with: the
+    /// worst measurement above is 0.98°, at the extreme 32×64 aspect, and the
+    /// two tuned sizes are inside 0.4°. `Crt` is left out for
+    /// `a_small_square_dial_is_centred_and_fits_its_buffer`'s reason — its comb
+    /// and vignette tint every pixel on the glass, so "not field" stops meaning
+    /// "ink" — though it measures identically to `Vfd` today.
     #[test]
     fn the_needle_reaches_both_stops_on_a_small_dial() {
-        let slack = 3.0_f32.to_radians();
-        for edge in [48usize, 64] {
-            let mut gauge = Gauge::with_size(edge, edge).scale(1);
-            let dial = gauge.dial();
-            for fraction in [0.0_f32, 1.0] {
-                gauge.set_target(fraction);
-                gauge.settle();
-                let frame = gauge.render(DisplayStyle::Oled);
-                let bg = DisplayStyle::Oled.palette().bg;
-                // Average the angle of every lit pixel in the blade's own
-                // annulus — outside the hub, inside the tick marks.
-                let (inner, outer) = (dial.tip * 0.45, dial.tip * 0.90);
-                let (mut sum, mut count) = (0.0_f32, 0usize);
-                for y in 0..frame.height() {
-                    for x in 0..frame.width() {
-                        let px = frame.get(i32::try_from(x).unwrap(), i32::try_from(y).unwrap());
-                        if px.is_none_or(|p| p[..4] == bg[..]) {
-                            continue;
-                        }
-                        let (run, rise) = (fx(x) - dial.pivot.0, fx(y) - dial.pivot.1);
-                        let radius = run.hypot(rise);
-                        if radius >= inner && radius <= outer {
-                            sum += run.atan2(-rise);
-                            count += 1;
+        let slack = 2.0_f32.to_radians();
+        for (cols, rows) in [(48usize, 48usize), (64, 64), (32, 64)] {
+            for style in [DisplayStyle::Vfd, DisplayStyle::Lcd, DisplayStyle::Oled] {
+                let mut gauge = Gauge::with_size(cols, rows).scale(1);
+                let dial = gauge.dial();
+                // Outside the hub, and strictly inside the innermost ink the
+                // *face* can reach: the mid tick's end cap, widened by the halo.
+                let inner = dial.tip * 0.45;
+                let outer = (dial.tip * 0.90).min(
+                    dial.radius
+                        - dial.major_len * MID_LEN_BONUS
+                        - MAJOR_HW
+                        - FEATHER
+                        - fx(super::bloom_cap(dial.radius)),
+                );
+                assert!(
+                    outer > inner,
+                    "{cols}×{rows}: no room between the hub ({inner:.2}) and the furniture \
+                     ({outer:.2}) to measure the blade in"
+                );
+                for fraction in [0.0_f32, 1.0] {
+                    gauge.set_target(fraction);
+                    gauge.settle();
+                    let frame = gauge.render(style);
+                    let bg = style.palette().bg;
+                    let (mut sum, mut count) = (0.0_f32, 0usize);
+                    for y in 0..frame.height() {
+                        for x in 0..frame.width() {
+                            let px =
+                                frame.get(i32::try_from(x).unwrap(), i32::try_from(y).unwrap());
+                            if px.is_none_or(|p| p[..4] == bg[..]) {
+                                continue;
+                            }
+                            let (run, rise) = (fx(x) - dial.pivot.0, fx(y) - dial.pivot.1);
+                            let radius = run.hypot(rise);
+                            if radius >= inner && radius <= outer {
+                                sum += run.atan2(-rise);
+                                count += 1;
+                            }
                         }
                     }
+                    assert!(
+                        count > 0,
+                        "{cols}×{rows} {}: the blade lit something at {fraction}",
+                        style.name()
+                    );
+                    let got = sum / fx(count);
+                    let want = dial.angle(fraction);
+                    assert!(
+                        (got - want).abs() < slack,
+                        "{cols}×{rows} {} at {fraction}: the needle points {:.2}°, the sweep \
+                         end is {:.2}° ({count} px sampled)",
+                        style.name(),
+                        got.to_degrees(),
+                        want.to_degrees()
+                    );
                 }
-                assert!(
-                    count > 0,
-                    "{edge}×{edge}: the blade lit something at {fraction}"
-                );
-                let got = sum / fx(count);
-                let want = dial.angle(fraction);
-                assert!(
-                    (got - want).abs() < slack,
-                    "{edge}×{edge} at {fraction}: the needle points {:.1}°, the sweep end is \
-                     {:.1}°",
-                    got.to_degrees(),
-                    want.to_degrees()
-                );
             }
+        }
+    }
+
+    /// A **centred** face leaves room for its own halo at both ends (#931).
+    ///
+    /// `render` blooms the lit layer *after* `dial()` has placed the pivot, so a
+    /// budget counting only the ink can centre a face and then have its glow cut
+    /// off — and cut off asymmetrically, on the side the centring moved toward.
+    /// It does not show at 48×48 or 64×64, which have ten px of margin against a
+    /// one px halo; it shows on a **near-square** face like `105×64`, where the
+    /// arc fits by width by a hair and the ink budget leaves 0.40 px against a
+    /// halo of 3.
+    ///
+    /// The invariant, checked across fourteen buffer shapes: **a face is centred
+    /// only when the halo fits at both ends**, and otherwise it stays seated —
+    /// the pre-#931 placement, which cannot be a regression. The two tuned sizes
+    /// are asserted to still be centred, so the fallback cannot quietly swallow
+    /// them.
+    ///
+    /// Verified against `origin/main` by digesting every render at eleven buffer
+    /// shapes × four skins × three readings: `105×64` and `110×66` come back
+    /// **byte-identical** to the pre-#931 tree, and `100×62` differs on `Crt`
+    /// alone — that one is the proportional halo cap doing its documented job
+    /// (arc radius 47.6 ⇒ cap 2, and `Crt` is the only skin asking for 3), not a
+    /// placement change. `96×48` and `64×32` are seated because their *height*
+    /// binds, so centring was never on the table for them; they are in the list
+    /// so a later change to which axis wins is caught here.
+    #[test]
+    fn a_centred_face_leaves_room_for_its_own_halo() {
+        let mut centred_seen = 0usize;
+        for (cols, rows) in [
+            (144usize, 64usize),
+            (110, 66),
+            (105, 64),
+            (100, 62),
+            (96, 96),
+            (96, 48),
+            (72, 72),
+            (64, 64),
+            (64, 32),
+            (48, 64),
+            (48, 48),
+            (48, 32),
+            (32, 64),
+            (24, 24),
+        ] {
+            let dial = Gauge::with_size(cols, rows).dial();
+            let halo = fx(super::bloom_cap(dial.radius));
+            let ink_above = dial.radius + ARC_HW + VALUE_HW_BONUS + FEATHER;
+            let ink_below = FEATHER
+                + if dial.tail > 0.0 {
+                    dial.tail + dial.blade * super::TAIL_FLARE
+                } else {
+                    dial.hub
+                };
+            if !dial.centred {
+                continue;
+            }
+            centred_seen += 1;
+            let top = dial.pivot.1 - ink_above;
+            let bottom = (fx(rows) - 1.0) - (dial.pivot.1 + ink_below);
+            assert!(
+                top >= halo - 1.0e-4,
+                "{cols}×{rows} is centred with only {top:.2} px above its arc, and its halo \
+                 is {halo}"
+            );
+            assert!(
+                bottom >= halo - 1.0e-4,
+                "{cols}×{rows} is centred with only {bottom:.2} px below its hub, and its \
+                 halo is {halo}"
+            );
+        }
+        assert!(centred_seen >= 8, "the sweep exercises the centred branch");
+        for (cols, rows) in [(48usize, 48usize), (64, 64)] {
+            assert!(
+                Gauge::with_size(cols, rows).dial().centred,
+                "{cols}×{rows} is a tuned size and must still centre"
+            );
+        }
+        // …and the four aspects whose renders were digested against `origin/main`
+        // all stay seated: the two near-square ones because the halo does not
+        // fit, the two wide ones because their height binds in the first place.
+        for (cols, rows) in [(105usize, 64usize), (100, 62), (96, 48), (64, 32)] {
+            assert!(
+                !Gauge::with_size(cols, rows).dial().centred,
+                "{cols}×{rows} must keep the seated placement it had before #931"
+            );
         }
     }
 
@@ -2519,7 +2697,7 @@ mod tests {
         assert!(
             lit <= 10,
             "a 48×48 Vfd blade lights {lit} px across its own row — the cap is what holds \
-             that under the uncapped halo's 12"
+             that under the 12 px an uncapped halo draws"
         );
     }
 }

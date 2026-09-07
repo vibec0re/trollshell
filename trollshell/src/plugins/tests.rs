@@ -77,6 +77,11 @@ fn accept_error_never_terminates_the_loop() {
 /// The `wire`→`hytte_ui` mapping is exhaustive over every node variant
 /// (incl. `Box { scroll }` and nesting) and produces a field-for-field
 /// mirror.
+///
+/// The tree deliberately sets a **non-`None` `tooltip`** (#957) on the root
+/// `Box` and on both leaf kinds that declare one: an optional field is exactly
+/// the kind a mapping arm forgets, and `None` everywhere would let a dropped
+/// `tooltip: tooltip.clone()` pass unnoticed.
 #[test]
 #[allow(clippy::too_many_lines)] // one big paired tree literal; splitting hurts readability
 fn wire_node_maps_to_ui_node_exhaustively() {
@@ -91,13 +96,13 @@ fn wire_node_maps_to_ui_node_exhaustively() {
                 id: None,
                 text: "hi".into(),
                 classes: vec!["ts-l".into()],
-                tooltip: None,
+                tooltip: Some("a greeting".into()),
             },
             wire::Node::Icon {
                 id: Some("i".into()),
                 name: "battery-symbolic".into(),
                 classes: vec![],
-                tooltip: None,
+                tooltip: Some("87%, 3h left".into()),
             },
             wire::Node::Pixels {
                 id: Some("px".into()),
@@ -149,7 +154,9 @@ fn wire_node_maps_to_ui_node_exhaustively() {
             },
             wire::Node::Spacer,
         ],
-        tooltip: None,
+        // Carried across the mapping, not dropped (#957) — set on the root
+        // box and on the two leaf kinds that declare the field.
+        tooltip: Some("the whole card".into()),
     };
     let expected = UiNode::Box {
         id: Some("root".into()),
@@ -162,13 +169,13 @@ fn wire_node_maps_to_ui_node_exhaustively() {
                 id: None,
                 text: "hi".into(),
                 classes: vec!["ts-l".into()],
-                tooltip: None,
+                tooltip: Some("a greeting".into()),
             },
             UiNode::Icon {
                 id: Some("i".into()),
                 name: "battery-symbolic".into(),
                 classes: vec![],
-                tooltip: None,
+                tooltip: Some("87%, 3h left".into()),
             },
             UiNode::Pixels {
                 id: Some("px".into()),
@@ -220,7 +227,7 @@ fn wire_node_maps_to_ui_node_exhaustively() {
             },
             UiNode::Spacer,
         ],
-        tooltip: None,
+        tooltip: Some("the whole card".into()),
     };
     assert_eq!(to_ui_node(&Scope::detached("map"), &tree), expected);
 }

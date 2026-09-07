@@ -177,9 +177,9 @@
 //!             id: Some("lamp".into()),
 //!             classes: vec![],
 //!             children: vec![
-//!                 Node::Label { id: None, text: "Lamp".into(), classes: vec![] },
+//!                 Node::Label { id: None, text: "Lamp".into(), classes: vec![], tooltip: None },
 //!                 Node::Spacer,
-//!                 Node::Label { id: None, text: "On".into(), classes: vec!["dim-label".into()] },
+//!                 Node::Label { id: None, text: "On".into(), classes: vec!["dim-label".into()], tooltip: None },
 //!             ],
 //!         },
 //!         // …one Row per device…
@@ -202,7 +202,7 @@
 //! Node::Expander {
 //!     id: format!("room:{}", room.id),
 //!     header: Box::new(Node::Label {
-//!         id: None, text: room.name.clone(), classes: vec!["heading".into()],
+//!         id: None, text: room.name.clone(), classes: vec!["heading".into()], tooltip: None,
 //!     }),
 //!     children: room.devices.iter().map(device_row).collect(),
 //!     expanded: room.open,
@@ -320,15 +320,39 @@
 //!             id: None,
 //!             text: "Living Room".into(),
 //!             classes: vec!["heading".into()],
+//!             tooltip: None,
 //!         },
 //!         Node::Label {
 //!             id: None,
 //!             text: "21°C".into(),
 //!             classes: vec!["numeric".into(), "dim-label".into()],
+//!             tooltip: Some("Measured 4 minutes ago".into()),
 //!         },
 //!     ],
+//!     tooltip: None,
 //! }
 //! ```
+//!
+//! # Tooltips
+//!
+//! [`Node::Box`], [`Node::Label`] and [`Node::Icon`] carry an optional
+//! `tooltip: Option<String>`, which the host applies with
+//! `gtk::Widget::set_tooltip_text` (#957). It is the one place a plugin can put
+//! words that don't fit on screen, and a **bar chip is where it earns its keep**:
+//! a chip is a handful of 16px glyphs, and the claude-bridge chip's `sub 18/0`
+//! was legible only to someone who had read its source. Hang one string on the
+//! chip's **root box** and hovering anywhere on the pill answers the question —
+//! no drawer panel, no extra capability, no new node.
+//!
+//! It is **plain text, not Pango markup**: the host calls `set_tooltip_text`, so
+//! `<b>` arrives as four literal characters. It is a mutable prop like `text` —
+//! a same-id re-render retitles in place, and re-rendering it as `None` clears
+//! the hover rather than leaving the last string armed — and it is *not* part of
+//! a node's identity, so changing it never rebuilds the widget.
+//!
+//! Set `tooltip: None` when you have nothing to say; it costs no wire bytes
+//! (`skip_serializing_if`), and an older host that predates the field skips the
+//! key rather than failing the frame, so using it is safe against any shell.
 
 use std::time::Duration;
 

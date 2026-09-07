@@ -59,6 +59,7 @@ const CLAUDE_ICON: &str = "claude-symbolic";
 fn the_bundled_claude_glyph_resolves_through_the_icon_theme() {
     let display = gdk::Display::default().expect("a display (run under xvfb-run)");
     let theme = gtk::IconTheme::for_display(&display);
+    let search_before = theme.search_path();
 
     assert!(
         !theme.has_icon(CLAUDE_ICON),
@@ -90,9 +91,15 @@ fn the_bundled_claude_glyph_resolves_through_the_icon_theme() {
         path.ends_with("claude-symbolic.svg"),
         "resolved to {path:?}, not the bundled SVG"
     );
+    // Canonicalized on both sides: the dev-fallback data dir is
+    // `<manifest>/../assets/trollshell`, and `Path::starts_with` is purely
+    // lexical — it would not see through that `..` even though GTK hands back
+    // the normalized path.
+    let icons_dir = std::fs::canonicalize(assets::icons_dir()).expect("the bundled icon dir");
+    let resolved = std::fs::canonicalize(&path).expect("the resolved icon file");
     assert!(
-        path.starts_with(assets::icons_dir()),
-        "resolved to {path:?}, outside the shell's own icon dir"
+        resolved.starts_with(&icons_dir),
+        "resolved to {resolved:?}, outside the shell's own icon dir {icons_dir:?}"
     );
 
     // The `-symbolic` suffix is not decoration: it is what puts the glyph on
@@ -105,17 +112,27 @@ fn the_bundled_claude_glyph_resolves_through_the_icon_theme() {
         "the bundled glyph must recolour with the theme"
     );
 
-    // The path is **appended**, so a bundled file can never shadow an Adwaita
-    // icon of the same name — the chip's other glyphs must keep resolving.
-    for adwaita in [
-        "emblem-ok-symbolic",
-        "dialog-warning-symbolic",
-        "dialog-password-symbolic",
-        "content-loading-symbolic",
-    ] {
-        assert!(
-            theme.has_icon(adwaita),
-            "{adwaita} (a claude-bridge chip glyph) must still resolve"
-        );
-    }
+    // The directory is **appended**, never set: every entry the theme already
+    // searched stays ahead of it, so a bundled file can never shadow an Adwaita
+    // name (the chip's other three glyphs are Adwaita symbolics). Asserted on
+    // the search path itself rather than by looking up an Adwaita name, which
+    // would depend on the icon themes installed in whatever sandbox this runs
+    // in — the very fragility `main.rs`'s forced theme name works around.
+    let search_after = theme.search_path();
+    assert_eq!(
+        search_after.len(),
+        search_before.len() + 1,
+        "exactly one entry added, and the existing path is not replaced"
+    );
+    assert_eq!(
+        search_after[..search_before.len()],
+        search_before[..],
+        "…the entries the theme already had keep their order, and their priority"
+    );
+    let appended = search_after.last().expect("the appended entry");
+    assert_eq!(
+        std::fs::canonicalize(appended).ok(),
+        Some(icons_dir),
+        "the appended entry is the shell's bundled icon dir, and it is last"
+    );
 }

@@ -134,6 +134,7 @@ impl Plugin for ClockDemo {
                     id: Some(TIME_ID.to_owned()),
                     text: self.iso.clone(),
                     classes: vec!["ts-clock".to_owned()],
+                    tooltip: None,
                 },
                 Node::Button {
                     id: CLOCK_BTN.to_owned(),
@@ -142,9 +143,11 @@ impl Plugin for ClockDemo {
                         id: None,
                         text: "Power menu".to_owned(),
                         classes: Vec::new(),
+                        tooltip: None,
                     }),
                 },
             ],
+            tooltip: None,
         }
         .into()
     }
@@ -199,6 +202,7 @@ mod tests {
                     id: Some("clock-demo-time".to_owned()),
                     text: "2026-07-11T15:49:00+02:00".to_owned(),
                     classes: vec!["ts-clock".to_owned()],
+                    tooltip: None,
                 },
                 Node::Button {
                     id: "clock-demo-btn".to_owned(),
@@ -207,9 +211,11 @@ mod tests {
                         id: None,
                         text: "Power menu".to_owned(),
                         classes: vec![],
+                        tooltip: None,
                     }),
                 },
             ],
+            tooltip: None,
         };
         assert_eq!(model.view().tree, expected);
     }

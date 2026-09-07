@@ -274,6 +274,7 @@ impl Infobroker {
             id: None,
             name: icon_name.to_owned(),
             classes: Vec::new(),
+            tooltip: None,
         }];
         if !badge.is_empty() {
             chip_children.push(label(&badge, &["numeric", badge_class]));
@@ -294,6 +295,7 @@ impl Infobroker {
                     children: chip_children,
                 }),
             }],
+            tooltip: None,
         }
     }
 
@@ -326,6 +328,7 @@ impl Infobroker {
                     label("Info broker", &["title-4"]),
                     muted_text("Hidden while the session is locked."),
                 ],
+                tooltip: None,
             };
         }
         // The topic sections, in order. Pending knocks lead when present (the
@@ -414,6 +417,7 @@ impl Infobroker {
             scroll: true,
             classes: Vec::new(),
             children,
+            tooltip: None,
         }
     }
 }
@@ -425,6 +429,7 @@ fn label(text: &str, classes: &[&str]) -> Node {
         id: None,
         text: text.to_owned(),
         classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+        tooltip: None,
     }
 }
 
@@ -461,6 +466,7 @@ fn section(title: &str, body: Node) -> Node {
         scroll: false,
         classes: Vec::new(),
         children: vec![label(title, &["heading"]), body],
+        tooltip: None,
     }
 }
 
@@ -488,6 +494,7 @@ fn action_row(title: &str, subtitle: &str, trailing: Option<Node>) -> Node {
             label(title, &["heading"]),
             label(subtitle, &["dim-label", "caption"]),
         ],
+        tooltip: None,
     };
     let mut children = vec![stack];
     if let Some(t) = trailing {
@@ -572,6 +579,7 @@ fn audit_row(a: &AuditView, now_unix: i64) -> Node {
             label(a.outcome.label(), &[outcome_class, "caption-heading"]),
             label(&format!("{} · {}", a.agent, a.resource), &[]),
         ],
+        tooltip: None,
     };
     Node::Row {
         id: None,

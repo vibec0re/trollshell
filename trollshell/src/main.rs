@@ -204,6 +204,14 @@ fn main() -> hytte::ui::Result<()> {
                 s.set_gtk_icon_theme_name(Some("Adwaita"));
             }
 
+            // …and teach that theme where the shell's *own* bundled icons live,
+            // so they resolve by name and not only by file path (#957). The
+            // native chips load theirs with `Image::from_file`; a widget plugin
+            // can't — `Node::Icon` names an icon, it never ships pixels — so
+            // this is what lets the claude-bridge chip paint `claude-symbolic`.
+            // Appended after the theme, so a bundled name can't shadow Adwaita.
+            assets::install_icon_search_path();
+
             // Inject the CSS base `font-size` from Rust so every CSS `em`
             // rides the same scale factor as `scale::scale()` — one knob
             // rescales the whole shell, CSS text and Rust-set sizes together

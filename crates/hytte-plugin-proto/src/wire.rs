@@ -118,10 +118,50 @@ fn pixels_scale_default() -> u32 {
 ///
 /// Appending a variant here ⇒ **bump [`VOCAB`](crate::VOCAB)** (#437): a plugin
 /// renders these, so the counter is how an older host refuses one it can't decode.
+///
+/// # Tooltips
+///
+/// [`Box`](Node::Box), [`Label`](Node::Label) and [`Icon`](Node::Icon) each carry
+/// an optional `tooltip: Option<String>`, which the host maps straight onto
+/// `gtk::Widget::set_tooltip_text` (#957). It is the vocabulary's only
+/// self-explanation primitive: a bar chip is a handful of glyphs with nowhere to
+/// say what they mean, and a plugin that is deliberately panel-less (the
+/// claude-bridge chip, #866) has no other surface to put the legend on.
+///
+/// - It is a **mutable prop**: a same-id re-render with a different string
+///   retitles the widget in place, and a re-render dropping it back to `None`
+///   **clears** the tooltip rather than leaving the last one stuck.
+/// - It is **plain text**, not Pango markup — the host calls `set_tooltip_text`,
+///   so `<b>` arrives as four literal characters. (A plugin's tree is untrusted
+///   input; `set_tooltip_markup` would hand it a parser.)
+/// - It is **not** part of a node's identity: only `kind` and `id` decide reuse,
+///   so changing a tooltip never rebuilds a widget.
+/// - Three variants, not all sixteen, because these are the ones a chip is made
+///   of. Extending the set later is the same additive move as this one was.
+///
+/// **Additive, so [`PROTO_VERSION`](crate::PROTO_VERSION) and
+/// [`VOCAB`](crate::VOCAB) both stay put** — the crate root's compat rules put an
+/// optional field on the same-version side ("Adding an **optional field** to a
+/// struct (carry `#[serde(default)]`, and `#[serde(skip_serializing_if = …)]`
+/// where it should stay off the wire)"), and the [`VOCAB`](crate::VOCAB) rule is
+/// scoped to *appending a wire variant*, which this is not. Both directions hold
+/// concretely: a pre-#957 frame carries no `tooltip` key and `#[serde(default)]`
+/// decodes it to `None`, and a new frame's key is skipped by an older host's
+/// decoder (named-map encoding, no `deny_unknown_fields`) — so a new plugin
+/// against an old shell renders exactly as it did before, with no tooltip,
+/// instead of breaking the session. There is no #437 crash-loop hazard here
+/// because an unknown *field* is skipped where an unknown *variant* would fail
+/// the whole decode. Pinned by `tests/proto.rs` in both directions, and by the
+/// `tests/fixtures/plugin_render_v1.hex` golden bytes, which did not move: the
+/// `skip_serializing_if` keeps a `None` tooltip off the wire entirely.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Node {
     /// A `gtk::Box`. `id` (optional) keys the node for diffing/reordering;
     /// `scroll` independently makes it a scroll event target.
+    ///
+    /// A `Box` is the usual place to hang a [`tooltip`](Node#tooltips): a chip's
+    /// root box covers the whole pill, so one string explains every glyph inside
+    /// it without the plugin having to guess which child the pointer is over.
     Box {
         id: Option<NodeId>,
         dir: Dir,
@@ -129,6 +169,11 @@ pub enum Node {
         scroll: bool,
         classes: Vec<Cls>,
         children: Vec<Node>,
+        /// Hover text for the whole box, or `None` for no tooltip. See the
+        /// [tooltip section](Node#tooltips) on this enum for the semantics and
+        /// the compat argument.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tooltip: Option<String>,
     },
     /// A horizontal list **row** — a semantic sibling of [`Box`](Node::Box) for
     /// list-y cards (planned additive in the spec's node vocab, #199). Children
@@ -153,6 +198,10 @@ pub enum Node {
         id: Option<NodeId>,
         text: String,
         classes: Vec<Cls>,
+        /// Hover text, or `None` for no tooltip. See the
+        /// [tooltip section](Node#tooltips) on this enum.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tooltip: Option<String>,
     },
     /// A **wrapping** `gtk::Label`. Where [`Label`](Node::Label) is a single-line
     /// tag whose natural width forces its container wider (the pet's 320 px
@@ -186,10 +235,21 @@ pub enum Node {
         classes: Vec<Cls>,
     },
     /// A `gtk::Image` set from a themed icon `name` (name only — never pixels).
+    ///
+    /// The name is resolved against the host's `GtkIconTheme`, so it must be one
+    /// the *shell* can find: an Adwaita symbolic (`emblem-ok-symbolic`, …) or one
+    /// of the shell's own bundled icons, whose directory the shell puts on the
+    /// theme's search path (`claude-symbolic`, `cpu`, `memory`, …). An
+    /// unresolvable name renders as `image-missing`.
     Icon {
         id: Option<NodeId>,
         name: String,
         classes: Vec<Cls>,
+        /// Hover text, or `None` for no tooltip — the load-bearing case for an
+        /// icon, which otherwise carries no words at all. See the
+        /// [tooltip section](Node#tooltips) on this enum.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tooltip: Option<String>,
     },
     /// A raster image: a `width`×`height` block of **RGBA8** pixels.
     ///

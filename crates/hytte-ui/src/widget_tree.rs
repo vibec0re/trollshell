@@ -114,6 +114,20 @@ pub enum EventKind {
 ///
 /// `classes` are applied verbatim as GTK CSS classes (`add_css_class`); the
 /// plugin is expected to use the existing `ts-*` / `hytte-*` token contract.
+///
+/// # Tooltips
+///
+/// [`Box`](Node::Box), [`Label`](Node::Label) and [`Icon`](Node::Icon) carry an
+/// optional `tooltip`, applied with `gtk::Widget::set_tooltip_text` (#957) —
+/// **plain text, never markup**: a plugin tree is untrusted input, and
+/// `set_tooltip_markup` would hand it a parser.
+///
+/// It is a **mutable prop**, reconciled centrally rather than per variant (see
+/// [`node_tooltip`] and its two call sites in [`build_node`]/[`update_in_place`]),
+/// so build and update cannot drift: a changed string retitles in place, and a
+/// drop back to `None` **clears** the tooltip instead of leaving a stale one
+/// stuck on the widget. It is not part of a node's identity — [`reusable`] keys
+/// on kind and id only — so a tooltip change never rebuilds a widget.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node {
     /// A `gtk::Box`. `id` (optional) keys the node for diffing/reordering;
@@ -133,6 +147,9 @@ pub enum Node {
         classes: Vec<String>,
         /// Child nodes, diffed by key/position.
         children: Vec<Node>,
+        /// Hover text (`set_tooltip_text`), `None` for none — see
+        /// [the tooltip section](Node#tooltips).
+        tooltip: Option<String>,
     },
     /// A list **row** — a horizontal `gtk::Box` sibling of [`Node::Box`] for
     /// list-y cards. Children are diffed exactly like a `Box`'s.
@@ -163,6 +180,9 @@ pub enum Node {
         text: String,
         /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
+        /// Hover text (`set_tooltip_text`), `None` for none — see
+        /// [the tooltip section](Node#tooltips).
+        tooltip: Option<String>,
     },
     /// A **wrapping** `gtk::Label` (word/char wrap): unlike [`Node::Label`] its
     /// natural width doesn't force its container wider — the fix for the pet's
@@ -195,6 +215,9 @@ pub enum Node {
         name: String,
         /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
+        /// Hover text (`set_tooltip_text`), `None` for none — see
+        /// [the tooltip section](Node#tooltips).
+        tooltip: Option<String>,
     },
     /// A raster image: a `width`×`height` block of **RGBA8** pixels
     /// (`data`, row-major, 4 bytes/pixel `[R, G, B, A]`, non-premultiplied,
@@ -530,6 +553,11 @@ struct NodeDesc {
     id: Option<NodeId>,
     kind: NodeKind,
     classes: Vec<String>,
+    /// The tooltip as last applied (`None` = none was set). Retained so
+    /// [`update_in_place`] can tell a real change from a re-render echoing the
+    /// same string, and — the case a "set it every frame" shortcut would get
+    /// wrong — so a drop back to `None` actually **clears** it.
+    tooltip: Option<String>,
 }
 
 impl NodeDesc {
@@ -779,6 +807,9 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             scroll,
             classes,
             children,
+            // Bound centrally after this match, together with `Label`'s and
+            // `Icon`'s — see the `apply_tooltip` call below.
+            tooltip: _,
         } => {
             let boxw = gtk::Box::new(orientation(*dir), *spacing);
             apply_classes(&boxw, classes);
@@ -1037,6 +1068,12 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
         }
     };
 
+    // Applied here, once, rather than in the three arms that carry the field
+    // (#957): the arms differ in widget *type*, not in how a tooltip is set, and
+    // a central call is what keeps this from drifting away from the matching
+    // `reconcile_tooltip` in `update_in_place`.
+    apply_tooltip(&widget, node_tooltip(node));
+
     RetainedNode {
         widget,
         desc: desc_of(node),
@@ -1098,6 +1135,8 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             scroll,
             classes,
             children,
+            // Reconciled centrally after this match — see `reconcile_tooltip`.
+            tooltip: _,
         } => {
             let boxw = downcast::<gtk::Box>(&retained.widget);
             boxw.set_orientation(orientation(*dir));
@@ -1356,6 +1395,16 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             reconcile_classes(entry, &retained.desc.classes, classes);
         }
     }
+
+    // The tooltip is a mutable prop on every kind that carries one, and the
+    // reconcile is kind-independent — so it lives here, next to the snapshot
+    // refresh it reads, rather than repeated in three arms (#957). Must run
+    // *before* the refresh below, which overwrites the `prev` it compares to.
+    reconcile_tooltip(
+        &retained.widget,
+        retained.desc.tooltip.as_deref(),
+        node_tooltip(new),
+    );
 
     // Refresh the snapshot so the *next* diff compares against current state.
     retained.desc = desc_of(new);
@@ -1764,6 +1813,41 @@ fn node_classes(node: &Node) -> &[String] {
     }
 }
 
+/// A node's hover text, for the three variants that carry one (#957); `None`
+/// both for "this kind has no tooltip field" and for "this node set none" —
+/// the two are indistinguishable to the widget, which either has a tooltip or
+/// doesn't.
+///
+/// Deliberately shaped like [`node_classes`]: one accessor consulted by
+/// [`build_node`] and [`update_in_place`] alike, so a fourth variant growing a
+/// tooltip is a one-line change here rather than two per-arm edits that can
+/// drift apart.
+fn node_tooltip(node: &Node) -> Option<&str> {
+    match node {
+        Node::Box { tooltip, .. } | Node::Label { tooltip, .. } | Node::Icon { tooltip, .. } => {
+            tooltip.as_deref()
+        }
+        _ => None,
+    }
+}
+
+/// Apply a node's tooltip to its realized widget. `None` clears it: GTK's
+/// `set_tooltip_text(None)` removes the tooltip and unsets `has-tooltip`, which
+/// is what makes a plugin dropping the field actually take the hover text away.
+fn apply_tooltip(widget: &gtk::Widget, tooltip: Option<&str>) {
+    widget.set_tooltip_text(tooltip);
+}
+
+/// Reconcile a reused widget's tooltip against the one it was last rendered
+/// with. Skipping the unchanged case keeps a per-second chip re-render from
+/// emitting a `notify::tooltip-text` (and a `has-tooltip` churn) every tick,
+/// exactly as [`reconcile_classes`] does for CSS classes.
+fn reconcile_tooltip(widget: &gtk::Widget, prev: Option<&str>, new: Option<&str>) {
+    if prev != new {
+        apply_tooltip(widget, new);
+    }
+}
+
 fn child_key(node: &Node) -> ChildKey {
     ChildKey {
         id: node_id(node).map(ToOwned::to_owned),
@@ -1776,6 +1860,7 @@ fn desc_of(node: &Node) -> NodeDesc {
         id: node_id(node).map(ToOwned::to_owned),
         kind: node_kind(node),
         classes: node_classes(node).to_vec(),
+        tooltip: node_tooltip(node).map(ToOwned::to_owned),
     }
 }
 
@@ -2151,6 +2236,7 @@ mod gtk_tests {
             id: id.map(ToOwned::to_owned),
             text: text.to_owned(),
             classes: vec![],
+            tooltip: None,
         }
     }
 
@@ -2170,6 +2256,7 @@ mod gtk_tests {
             scroll: false,
             classes: vec![],
             children,
+            tooltip: None,
         }
     }
 
@@ -2271,6 +2358,7 @@ mod gtk_tests {
             id: None,
             text: "t".into(),
             classes: vec!["one".into()],
+            tooltip: None,
         });
         let w1 = root.first_child().unwrap();
         assert!(w1.has_css_class("one"));
@@ -2279,6 +2367,7 @@ mod gtk_tests {
             id: None,
             text: "t".into(),
             classes: vec!["two".into()],
+            tooltip: None,
         });
         let w2 = root.first_child().unwrap();
         assert_eq!(w1, w2, "reused via positional match");
@@ -2723,6 +2812,7 @@ mod gtk_tests {
                 scroll,
                 classes: vec![],
                 children: vec![],
+                tooltip: None,
             }
         }
 
@@ -3051,6 +3141,7 @@ mod gtk_tests {
             scroll: false,
             classes: vec![],
             children: vec![lbl(None, "a"), Node::Spacer, lbl(None, "b")],
+            tooltip: None,
         };
         rec.render(&vbox);
         let inner = root.first_child().unwrap();
@@ -3540,5 +3631,128 @@ mod gtk_tests {
             48,
             "…and the new height",
         );
+    }
+
+    // ── Tooltips (#957) ─────────────────────────────────────────────────────
+    //
+    // The claude-bridge chip's `sub 18/0` was unreadable to the person running
+    // it, and the chip is deliberately panel-less, so the vocabulary grew an
+    // optional `tooltip` instead. Three properties matter and each is falsifiable
+    // by deleting exactly one line of the reconciler:
+    //
+    //   build   → `apply_tooltip(&widget, node_tooltip(node))` in `build_node`
+    //   change  → the `reconcile_tooltip(…)` call in `update_in_place`
+    //   clear   → the same call, whose `None` arm is the one a "set it when
+    //             `Some`" shortcut would silently skip
+    //
+    // A reused widget is the interesting case throughout: the tooltip is not
+    // part of a node's identity, so a change must move onto the *same* widget.
+
+    /// A label carrying a tooltip.
+    fn lbl_tip(id: Option<&str>, text: &str, tooltip: Option<&str>) -> Node {
+        Node::Label {
+            id: id.map(ToOwned::to_owned),
+            text: text.to_owned(),
+            classes: vec![],
+            tooltip: tooltip.map(ToOwned::to_owned),
+        }
+    }
+
+    /// The realized widget for the single child of the mounted root box.
+    fn only_child(root: &gtk::Box) -> gtk::Widget {
+        root.first_child()
+            .expect("the box mounted")
+            .first_child()
+            .expect("its child mounted")
+    }
+
+    #[gtk::test]
+    fn a_tooltip_is_applied_on_build() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&hbox(vec![lbl_tip(Some("a"), "x", Some("what x means"))]));
+
+        let label = only_child(&root);
+        assert_eq!(label.tooltip_text().as_deref(), Some("what x means"));
+        assert!(label.has_tooltip(), "GTK arms the hover for it");
+    }
+
+    /// Every variant that declares the field actually gets it — including the
+    /// two that matter for a bar chip: the root `Box` (one hover for the whole
+    /// pill) and an `Icon` (a glyph with no words of its own).
+    #[gtk::test]
+    fn every_tooltip_carrying_variant_applies_it_on_build() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&Node::Box {
+            id: Some("chip".to_owned()),
+            dir: Dir::Horizontal,
+            spacing: 0,
+            scroll: false,
+            classes: vec![],
+            children: vec![Node::Icon {
+                id: Some("glyph".to_owned()),
+                name: "emblem-ok-symbolic".to_owned(),
+                classes: vec![],
+                tooltip: Some("the icon's own".to_owned()),
+            }],
+            tooltip: Some("the whole pill".to_owned()),
+        });
+
+        let boxw = root.first_child().expect("the box mounted");
+        assert_eq!(boxw.tooltip_text().as_deref(), Some("the whole pill"));
+        let icon = boxw.first_child().expect("the icon mounted");
+        assert!(icon.is::<gtk::Image>(), "an Icon is a gtk::Image");
+        assert_eq!(icon.tooltip_text().as_deref(), Some("the icon's own"));
+    }
+
+    /// A same-id re-render with a *different* string retitles the widget in
+    /// place. The `assert_eq!(after, before)` is load-bearing: if the tooltip
+    /// ever became part of the node's identity, this would pass by rebuilding,
+    /// and the reconciler would be throwing widgets away on every count change.
+    #[gtk::test]
+    fn a_changed_tooltip_is_applied_to_the_reused_widget() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&hbox(vec![lbl_tip(Some("a"), "x", Some("18 served"))]));
+        let before = only_child(&root);
+        assert_eq!(before.tooltip_text().as_deref(), Some("18 served"));
+
+        rec.render(&hbox(vec![lbl_tip(Some("a"), "x", Some("19 served"))]));
+        let after = only_child(&root);
+
+        assert_eq!(after, before, "the widget is reused, not rebuilt");
+        assert_eq!(after.tooltip_text().as_deref(), Some("19 served"));
+    }
+
+    /// …and a re-render that drops the tooltip **clears** it. This is the
+    /// property a "only set it when `Some`" reconciler gets wrong: the stale
+    /// hover text stays armed on the widget for ever, explaining a state the
+    /// plugin has left.
+    #[gtk::test]
+    fn a_tooltip_dropped_to_none_is_cleared() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&hbox(vec![lbl_tip(Some("a"), "x", Some("stale"))]));
+        let before = only_child(&root);
+        assert_eq!(before.tooltip_text().as_deref(), Some("stale"));
+
+        rec.render(&hbox(vec![lbl_tip(Some("a"), "x", None)]));
+        let after = only_child(&root);
+
+        assert_eq!(after, before, "the widget is reused, not rebuilt");
+        assert_eq!(after.tooltip_text(), None, "the stale hover is gone");
+        assert!(!after.has_tooltip(), "…and GTK no longer arms one");
+    }
+
+    /// A node that never carried a tooltip never grows one — the central
+    /// `apply_tooltip` must not, say, stringify the node into the hover.
+    #[gtk::test]
+    fn a_node_without_a_tooltip_has_none() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&hbox(vec![lbl(Some("a"), "x")]));
+        assert_eq!(only_child(&root).tooltip_text(), None);
+        assert_eq!(root.first_child().unwrap().tooltip_text(), None);
     }
 }

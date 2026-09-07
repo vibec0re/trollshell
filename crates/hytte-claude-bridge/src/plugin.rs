@@ -28,12 +28,15 @@
 //!
 //! # What the chip says
 //!
-//! A health glyph, the mode, an optional key glyph, and coarse counts:
+//! The Claude glyph, a health glyph, the mode, an optional key glyph, and coarse
+//! counts:
 //!
 //! ```text
-//! [✓] api [🔑] 12/1
+//! [✳] [✓] api [🔑] 12/1
 //! ```
 //!
+//! - the **Claude glyph** ([`CLAUDE_ICON`]) leads, so the pill is identifiable as
+//!   *this* daemon's before anyone parses the rest (#957, Annika's ask);
 //! - the **glyph** is the last request's outcome (nothing served yet / 2xx / not);
 //! - the **mode** is `sub` / `rep` / `api` — which backend is answering;
 //! - the **key glyph** appears only when the bridge holds an outbound credential
@@ -42,6 +45,22 @@
 //!   itself never reaches this module — [`crate::status::Startup::keyed`] is a
 //!   boolean;
 //! - the **counts** are `<2xx>/<not-2xx>`, hidden until something has been served.
+//!
+//! # And what the hover says
+//!
+//! All of it, in words — [`tooltip`] on the root box:
+//!
+//! ```text
+//! Claude bridge · subscription · 18 served, 0 failed
+//! ```
+//!
+//! This is the #957 fix. Mara ran the chip for weeks reading `sub 18/0` without
+//! knowing what it meant, and she was right to: every part of it is an
+//! abbreviation whose key lived only in this module doc. The chip is
+//! deliberately panel-less (see below), so there was nowhere on the shell to put
+//! the legend — which is why #957 grew `tooltip` on the node vocabulary
+//! ([`Node::Box`]/[`Label`](Node::Label)/[`Icon`](Node::Icon)) rather than giving
+//! this one chip a drawer.
 //!
 //! # No panel, no capabilities
 //!
@@ -65,6 +84,19 @@ const PLUGIN_ID: &str = "claude-bridge";
 
 /// The chip's root node id (the only id it assigns: nothing here is clickable).
 const ROOT_ID: &str = "claude-bridge-root";
+
+/// The Claude glyph the chip leads with (#957): the eight-spoked asterisk `✳`
+/// the `claude` CLI prompts with — a generic dingbat, deliberately **not**
+/// Anthropic's wordmark or logo.
+///
+/// Unlike every other icon this plugin names, it is not an Adwaita symbolic: it
+/// ships with the *shell*, as `assets/trollshell/icons/claude-symbolic.svg`, and
+/// resolves because the shell puts that directory on its `GtkIconTheme` search
+/// path (`trollshell::assets::install_icon_search_path`). A host that hasn't
+/// done so — or a plugin run against some other shell — renders `image-missing`
+/// here and loses nothing else: the health glyph, mode and counts are
+/// independent nodes.
+const CLAUDE_ICON: &str = "claude-symbolic";
 
 /// How often the chip re-reads [`crate::status`].
 ///
@@ -142,10 +174,23 @@ fn health_icon(last: Last) -> &'static str {
 /// has to answer: `sub` rides the subscription, `rep` re-prompts a fresh
 /// `claude` per turn, `api` spends metered credits.
 fn mode_label(mode: Mode) -> &'static str {
+    mode_words(mode).0
+}
+
+/// The same backend, spelled out for the tooltip — which has room for words the
+/// chip does not.
+fn mode_name(mode: Mode) -> &'static str {
+    mode_words(mode).1
+}
+
+/// The chip's two renderings of a backend, `(short, spelled out)`, from **one**
+/// match so they cannot drift: a new [`Mode`] variant gets both or neither, and
+/// the tooltip can never explain a different mode than the label prints.
+fn mode_words(mode: Mode) -> (&'static str, &'static str) {
     match mode {
-        Mode::Subscription => "sub",
-        Mode::Reprompt => "rep",
-        Mode::Api => "api",
+        Mode::Subscription => ("sub", "subscription"),
+        Mode::Reprompt => ("rep", "re-prompt"),
+        Mode::Api => ("api", "API key"),
     }
 }
 
@@ -178,12 +223,39 @@ fn capped(n: u64) -> String {
     }
 }
 
+/// The whole chip in one sentence, for the hover (#957).
+///
+/// The chip itself is four glyphs wide and, being deliberately panel-less
+/// (#866), has nowhere else to explain them — `sub 18/0` was legible only to
+/// someone who had read this module. So the tooltip spells out every part the
+/// chip abbreviates: the backend by name, and the counts as words.
+///
+/// The counts are the **raw** numbers, not [`counts_label`]'s `999+`-saturated
+/// ones: the cap exists to stop the chip widening on the bar, and a tooltip has
+/// no width to defend.
+fn tooltip(status: &Status) -> String {
+    let Some(startup) = status.startup else {
+        // Same honesty as the `…` label: no mode has been settled yet, so name
+        // none.
+        return "Claude bridge · starting up".to_owned();
+    };
+    let traffic = if status.ok == 0 && status.errors == 0 {
+        "nothing served yet".to_owned()
+    } else {
+        format!("{} served, {} failed", status.ok, status.errors)
+    };
+    format!("Claude bridge · {} · {traffic}", mode_name(startup.mode))
+}
+
 /// A plain label node.
 fn label(text: &str, classes: &[&str]) -> Node {
     Node::Label {
         id: None,
         text: text.to_owned(),
         classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+        // The whole pill's hover lives on the root box (see `chip`); a tooltip
+        // here would only shadow it for the pointer's exact position.
+        tooltip: None,
     }
 }
 
@@ -193,6 +265,7 @@ fn icon(name: &str, classes: &[&str]) -> Node {
         id: None,
         name: name.to_owned(),
         classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+        tooltip: None,
     }
 }
 
@@ -204,7 +277,9 @@ fn icon(name: &str, classes: &[&str]) -> Node {
 /// a mode for that window would be a lie the chip is specifically there to
 /// prevent.
 fn chip(status: &Status) -> Node {
-    let mut children = vec![icon(health_icon(status.last), &[])];
+    // Annika's ask on #957: lead with the Claude glyph, so the pill reads as
+    // "the Claude thing" before anyone tries to parse `sub 18/0`.
+    let mut children = vec![icon(CLAUDE_ICON, &[]), icon(health_icon(status.last), &[])];
     match status.startup {
         None => children.push(label("…", &["dim-label"])),
         Some(startup) => {
@@ -226,6 +301,9 @@ fn chip(status: &Status) -> Node {
         scroll: false,
         classes: Vec::new(),
         children,
+        // On the root, so hovering anywhere on the pill answers the question —
+        // the glyphs are 16px wide and nobody should have to find the right one.
+        tooltip: Some(tooltip(status)),
     }
 }
 
@@ -247,7 +325,10 @@ pub fn run() -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{BridgeChip, Tick, capped, chip, counts_label, health_icon, mode_label};
+    use super::{
+        BridgeChip, CLAUDE_ICON, Tick, capped, chip, counts_label, health_icon, mode_label,
+        mode_name, tooltip,
+    };
     use crate::Mode;
     use crate::status::{Last, Startup, Status};
     use hytte_plugin::proto::{Manifest, Mount, Node, PluginMsg, decode, encode};
@@ -272,6 +353,14 @@ mod tests {
                 children.iter().flat_map(texts).collect()
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// The hover text on the tree's root box — the chip's one tooltip (#957).
+    fn root_tooltip(node: &Node) -> Option<&str> {
+        match node {
+            Node::Box { tooltip, .. } => tooltip.as_deref(),
+            _ => None,
         }
     }
 
@@ -311,7 +400,10 @@ mod tests {
     #[test]
     fn a_fresh_subscription_bridge_shows_no_key_and_no_counts() {
         let tree = chip(&status(Mode::Subscription, false, 0, 0, Last::None));
-        assert_eq!(texts(&tree), vec!["content-loading-symbolic", "sub"]);
+        assert_eq!(
+            texts(&tree),
+            vec![CLAUDE_ICON, "content-loading-symbolic", "sub"]
+        );
     }
 
     /// An `api`-mode bridge holding a key: the key glyph is present, and the
@@ -322,6 +414,7 @@ mod tests {
         assert_eq!(
             texts(&tree),
             vec![
+                CLAUDE_ICON,
                 "emblem-ok-symbolic",
                 "api",
                 "dialog-password-symbolic",
@@ -354,7 +447,114 @@ mod tests {
             errors: 0,
             last: Last::None,
         });
-        assert_eq!(texts(&tree), vec!["content-loading-symbolic", "…"]);
+        assert_eq!(
+            texts(&tree),
+            vec![CLAUDE_ICON, "content-loading-symbolic", "…"]
+        );
+    }
+
+    /// The Claude glyph leads in **every** state — including the two the chip
+    /// treats specially (nothing published yet; nothing served yet). Annika's
+    /// ask on #957 was that the pill be identifiable at a glance, which it isn't
+    /// if the identity only shows up once the daemon has settled.
+    #[test]
+    fn the_claude_glyph_always_leads_the_chip() {
+        let mut boards = vec![Status {
+            startup: None,
+            ok: 0,
+            errors: 0,
+            last: Last::None,
+        }];
+        for mode in [Mode::Subscription, Mode::Reprompt, Mode::Api] {
+            for keyed in [false, true] {
+                for last in [Last::None, Last::Ok, Last::Error] {
+                    boards.push(status(mode, keyed, 7, 2, last));
+                }
+            }
+        }
+        for board in &boards {
+            let tree = chip(board);
+            assert_eq!(
+                texts(&tree).first().map(String::as_str),
+                Some(CLAUDE_ICON),
+                "{board:?} must still lead with the Claude glyph"
+            );
+        }
+    }
+
+    /// The #957 fix itself: hovering the pill spells out everything it
+    /// abbreviates. Mode by name, counts as words, on the **root** box so any
+    /// pixel of the chip answers.
+    #[test]
+    fn the_root_box_carries_the_spelled_out_tooltip() {
+        let tree = chip(&status(Mode::Subscription, false, 18, 0, Last::Ok));
+        assert_eq!(
+            root_tooltip(&tree),
+            Some("Claude bridge · subscription · 18 served, 0 failed"),
+            "this is literally Mara's `sub 18/0`, in words"
+        );
+    }
+
+    /// Before anything is served the tooltip says so, rather than printing the
+    /// `0 served, 0 failed` the chip itself deliberately refuses to render.
+    #[test]
+    fn the_tooltip_says_nothing_served_yet_before_the_first_request() {
+        assert_eq!(
+            tooltip(&status(Mode::Api, true, 0, 0, Last::None)),
+            "Claude bridge · API key · nothing served yet"
+        );
+    }
+
+    /// …and before `main` publishes the startup facts it names no mode at all —
+    /// the same honesty as the `…` label.
+    #[test]
+    fn the_tooltip_names_no_mode_before_the_backend_is_settled() {
+        let board = Status {
+            startup: None,
+            ok: 0,
+            errors: 0,
+            last: Last::None,
+        };
+        assert_eq!(tooltip(&board), "Claude bridge · starting up");
+        assert_eq!(root_tooltip(&chip(&board)).unwrap(), tooltip(&board));
+    }
+
+    /// One source of truth: the tooltip's spelled-out mode and the chip's
+    /// three-letter one come from the same match, so they can never describe
+    /// different backends. Every mode gets a distinct, non-empty long name.
+    #[test]
+    fn the_tooltip_names_the_backend_the_label_abbreviates() {
+        let modes = [Mode::Subscription, Mode::Reprompt, Mode::Api];
+        let names = modes.map(mode_name);
+        assert_eq!(names, ["subscription", "re-prompt", "API key"]);
+        let mut sorted = names;
+        sorted.sort_unstable();
+        sorted
+            .windows(2)
+            .for_each(|w| assert_ne!(w[0], w[1], "names must not collide"));
+        for (mode, name) in modes.into_iter().zip(names) {
+            let board = status(mode, false, 1, 0, Last::Ok);
+            let hover = tooltip(&board);
+            assert!(hover.contains(name), "{hover:?} must name {name}");
+            // …and the chip is still printing the short form of that same mode.
+            assert_eq!(texts(&chip(&board))[2], mode_label(mode));
+        }
+    }
+
+    /// The chip saturates at `999+` to keep its width; the tooltip has no width
+    /// to defend, so it reports the real numbers.
+    #[test]
+    fn the_tooltip_reports_the_uncapped_counts() {
+        let hover = tooltip(&status(Mode::Reprompt, false, 86_400, 12_345, Last::Error));
+        assert_eq!(
+            hover,
+            "Claude bridge · re-prompt · 86400 served, 12345 failed"
+        );
+        assert_eq!(
+            counts_label(86_400, 12_345),
+            "999+/999+",
+            "the chip still caps"
+        );
     }
 
     #[test]

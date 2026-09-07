@@ -665,6 +665,7 @@ mod tests {
                 id: Some("echo-lbl".to_owned()),
                 text: self.iso.clone(),
                 classes: Vec::new(),
+                tooltip: None,
             }
             .into()
         }
@@ -701,6 +702,7 @@ mod tests {
                 id: None,
                 text: if self.visible { "visible" } else { "hidden" }.to_owned(),
                 classes: Vec::new(),
+                tooltip: None,
             }
             .into()
         }
@@ -789,6 +791,7 @@ mod tests {
                 id: None,
                 text: self.count.to_string(),
                 classes: Vec::new(),
+                tooltip: None,
             }
             .into()
         }
@@ -858,6 +861,7 @@ mod tests {
                 id: None,
                 text: self.count.to_string(),
                 classes: Vec::new(),
+                tooltip: None,
             }
             .into()
         }
@@ -895,11 +899,13 @@ mod tests {
                 id: Some("paneled-chip".to_owned()),
                 text: "chip".to_owned(),
                 classes: Vec::new(),
+                tooltip: None,
             })
             .panel(Node::Label {
                 id: Some("paneled-panel".to_owned()),
                 text: if self.open { "open" } else { "closed" }.to_owned(),
                 classes: Vec::new(),
+                tooltip: None,
             })
         }
     }
@@ -982,6 +988,7 @@ mod tests {
                 id: Some("cmd-lbl".to_owned()),
                 text: self.last.clone(),
                 classes: Vec::new(),
+                tooltip: None,
             }
             .into()
         }
@@ -1020,6 +1027,7 @@ mod tests {
                 id: None,
                 text: format!("{:.2}", self.peak),
                 classes: Vec::new(),
+                tooltip: None,
             }
             .into()
         }
@@ -1122,6 +1130,7 @@ mod tests {
                     id: Some("echo-lbl".to_owned()),
                     text: "seed".to_owned(),
                     classes: Vec::new(),
+                    tooltip: None,
                 }
             );
             // Host goes away without Shutdown: both halves dropped → EOF.

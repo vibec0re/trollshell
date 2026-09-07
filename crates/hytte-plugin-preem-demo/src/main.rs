@@ -654,6 +654,7 @@ impl Plugin for PreemDemo {
                         self.gauge_64.node(GAUGE_64_ID),
                         self.gauge_48.node(GAUGE_48_ID),
                     ],
+                    tooltip: None,
                 },
                 self.flap.node(FLAP_ID),
                 self.nixie.node(NIXIE_ID),
@@ -676,13 +677,16 @@ impl Plugin for PreemDemo {
                         self.pin.node(PIN_ID, PIN_TEXT),
                         self.field_pin.node(FIELD_ID, FIELD_TEXT),
                     ],
+                    tooltip: None,
                 },
                 Node::Label {
                     id: None,
                     text: "tap the clock to switch skins".to_owned(),
                     classes: vec!["dim-label".to_owned()],
+                    tooltip: None,
                 },
             ],
+            tooltip: None,
         }
         .into()
     }

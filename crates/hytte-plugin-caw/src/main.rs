@@ -452,6 +452,7 @@ impl Plugin for Caw {
             scroll: false,
             classes: vec!["caw-root".to_owned()],
             children,
+            tooltip: None,
         }
         .into()
     }

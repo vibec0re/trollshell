@@ -198,6 +198,7 @@ fn expander_tree() -> Node {
             id: None,
             text: "Living Room".into(),
             classes: vec!["heading".into()],
+            tooltip: None,
         }),
         children: vec![Node::Row {
             id: Some("lamp".into()),
@@ -206,6 +207,7 @@ fn expander_tree() -> Node {
                 id: None,
                 text: "Lamp".into(),
                 classes: vec![],
+                tooltip: None,
             }],
         }],
         expanded: true,
@@ -227,6 +229,7 @@ fn node_tree() -> Node {
                 id: None,
                 text: "hi".into(),
                 classes: vec![],
+                tooltip: None,
             },
             Node::Text {
                 id: Some("dest".into()),
@@ -239,6 +242,7 @@ fn node_tree() -> Node {
                 id: Some("ico".into()),
                 name: "weather-clear-symbolic".into(),
                 classes: vec!["ts-icon".into()],
+                tooltip: None,
             },
             Node::Pixels {
                 id: Some("lcd".into()),
@@ -255,6 +259,7 @@ fn node_tree() -> Node {
                     id: None,
                     text: "Go".into(),
                     classes: vec![],
+                    tooltip: None,
                 }),
             },
             Node::Progress {
@@ -289,6 +294,7 @@ fn node_tree() -> Node {
                 classes: vec!["monospace".into()],
             },
         ],
+        tooltip: None,
     }
 }
 
@@ -298,6 +304,7 @@ fn panel_tree() -> Node {
         id: Some("panel-lbl".into()),
         text: "panel body".into(),
         classes: vec![],
+        tooltip: None,
     }
 }
 
@@ -659,6 +666,7 @@ fn preem_tree() -> Node {
                 },
             }),
         ],
+        tooltip: None,
     }
 }
 

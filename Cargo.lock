@@ -2882,6 +2882,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "hytte",
+ "hytte-gl",
  "hytte-plugin-proto",
  "hytte-preem",
  "oo7",

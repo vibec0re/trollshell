@@ -585,6 +585,10 @@ mod imp {
                 abandon_gl("the GL entry points could not be resolved");
                 return;
             };
+            // Before anything is written: the phosphor recurrence is exact only
+            // if an 8-bit fixed-point store is exact, and dithering is enabled
+            // by default in both GL and GLES. See `hytte_gl::disable_dither`.
+            hgl::disable_dither(&gl);
 
             if !self.ensure_resources(&gl, &pipeline, state.grid) {
                 return;

@@ -32,6 +32,13 @@ let
   #   - assets/hytte-ui/style.css — hytte-ui's DEFAULT_STYLESHEET fallback
   #     (crates/hytte-ui/src/app.rs) include_str!'s this one file at compile
   #     time, so it must be present even though the rest of `assets/` isn't.
+  #   - *.glsl — the preem GL renderer's shaders (#893 stage B), which
+  #     `trollshell/src/plugins/preem_gl/program.rs` include_str!'s. They are
+  #     deliberately under `src/` rather than `assets/` (the design spec says
+  #     so) because they are compiled into the binary, not loaded at runtime —
+  #     but crane's filter is by *extension*, so `src/` does not save them and
+  #     without this clause every `nix build` fails on a missing file while
+  #     `cargo build` passes locally (the #480/#446 trap, from the other side).
   # No OTHER stylesheets/icons are kept: everything else in `assets/` is
   # loaded from disk at runtime — the binary resolves them via the
   # makeWrapper env (TROLLSHELL_DATA_DIR / HYTTE_UI_DATA_DIR → the `assets`
@@ -47,7 +54,10 @@ let
       path: type:
       (craneLib.filterCargoSources path type)
       || (lib.hasInfix "/tests/fixtures/" path)
-      || (lib.hasSuffix "assets/hytte-ui/style.css" path);
+      || (lib.hasSuffix "assets/hytte-ui/style.css" path)
+      || (lib.hasSuffix ".glsl" path)
+      || (lib.hasSuffix ".vert" path)
+      || (lib.hasSuffix ".frag" path);
   };
 
   # Standalone assets derivation: depends ONLY on the asset files, so editing a

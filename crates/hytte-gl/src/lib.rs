@@ -752,6 +752,25 @@ pub fn set_blend(_gl: &Gl, blend: Blend) {
     }
 }
 
+/// Turn **dithering** off for this context.
+///
+/// `GL_DITHER` is one of the two capabilities GL and GLES enable by *default*,
+/// and it is the one thing that can break the exactness argument
+/// [`Format::R8`] rests on: a driver that actually dithers an 8-bit
+/// fixed-point write may perturb the stored value by one LSB, and a phosphor
+/// decayed by `(v * retained) >> 8` cannot survive that — the error compounds
+/// every step rather than washing out.
+///
+/// Every mainstream desktop driver no-ops dithering at 8 bits per channel, so
+/// this has never been observed to matter. It is here because "never observed"
+/// is not the same as "cannot happen", and the alternative is a bit-exactness
+/// claim whose last step is a driver's discretion. One enum-only call, made
+/// once per render alongside the rest of the fixed-function setup.
+pub fn disable_dither(_gl: &Gl) {
+    // SAFETY: a context is current and the call takes only an enum constant.
+    unsafe { gl::Disable(gl::DITHER) };
+}
+
 /// Set the viewport, refusing an extent that does not fit `GLsizei`.
 pub fn viewport(_gl: &Gl, x: i32, y: i32, width: u32, height: u32) {
     let w = GLsizei::try_from(width).unwrap_or(0);

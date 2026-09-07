@@ -3163,6 +3163,399 @@ fn scope_renders_at_parity_with_the_kit_before_and_after_a_decay() {
     );
 }
 
+// ── the GL arm (#893 stage B) ────────────────────────────────────────────────
+//
+// **CI has no OpenGL.** `nix flake check`'s system-tests bucket runs
+// `xvfb-run` in a sandbox with no `/dev/dri` and no mesa in the closure, so
+// nothing here draws a pixel: what these hold is everything up to the draw —
+// which arm a `Scope` takes, what node it emits, the uniforms in it, and the
+// animation state machine that decides when the frame clock parks. The pixels,
+// the parity delta and the `--areas 8` budget are live-verify
+// (`docs/live-verify.md`).
+
+/// Map `node` and take the GL surface out of it, asserting the invariants every
+/// `Node::GlSurface` must satisfy — the mirror of [`mapped_frame`] for the GPU
+/// arm.
+fn mapped_gl(
+    scope: &Scope,
+    node: &wire::Node,
+) -> (u32, u32, Arc<hytte::ui::gl_surface::GlUniforms>) {
+    match to_ui_node(scope, node) {
+        UiNode::GlSurface {
+            width,
+            height,
+            program,
+            state,
+            classes,
+            ..
+        } => {
+            assert_eq!(
+                program,
+                super::preem_gl::SCOPE,
+                "a preem Scope names the registered scope pipeline",
+            );
+            assert_eq!(
+                classes,
+                vec!["ts-preem".to_owned()],
+                "the GL arm keeps the node's classes, like every other arm",
+            );
+            (width, height, state)
+        }
+        other => panic!("the GL arm must map to a GlSurface node, got {other:?}"),
+    }
+}
+
+/// A `Scope` widget at a known geometry, for the tests below.
+fn gl_scope_widget(samples: Vec<f32>) -> vocab::PreemWidget {
+    vocab::PreemWidget::Scope {
+        config: vocab::ScopeConfig {
+            style: vocab::StyleRef::new(vocab::StyleName::Crt),
+            cols: 48,
+            rows: 24,
+            scale: 2,
+            persistence: 184,
+        },
+        state: vocab::ScopeState { samples },
+    }
+}
+
+/// **The kill switch restores today's bytes exactly.**
+///
+/// GL is the default (#893, Annika's call), so this is the contract that keeps
+/// `TROLLSHELL_PREEM_RENDERER=cpu` a real escape hatch rather than a
+/// nearly-the-same second renderer: under the CPU arm the host emits a
+/// `Node::Pixels` whose buffer is byte-identical to the kit's own frame — the
+/// same assertion `scope_renders_at_parity_with_the_kit_before_and_after_a_decay`
+/// makes, restated here as the *switch's* promise and with the node kind
+/// pinned too.
+///
+/// The whole preem test suite runs on the CPU arm by default (see
+/// `preem_gl`'s `TEST_ARM`), precisely so every byte-parity assertion in this
+/// file keeps measuring the kit rather than a shader CI cannot run.
+#[test]
+fn the_cpu_arm_still_emits_the_kits_own_bytes_as_a_pixels_node() {
+    let _ink = preem_ink_lock();
+    let key = Scope::detached("kill-switch-cpu");
+    let samples: Vec<f32> = (0..64_u8).map(|i| f32::from(i % 9) / 4.0 - 1.0).collect();
+    let node = preem_node(Some("sc"), gl_scope_widget(samples.clone()));
+
+    assert!(
+        matches!(to_ui_node(&key, &node), UiNode::Pixels { .. }),
+        "with the kill switch on, a Scope is a raster surface",
+    );
+    let mut oracle = kit::Scope::with_size(48, 24).scale(2).persistence(184);
+    oracle.advance(&samples);
+    assert_eq!(
+        mapped_pixels(&key, &node),
+        kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
+        "the CPU arm is the kit, byte for byte",
+    );
+}
+
+/// The GL arm emits a `GlSurface` node the CPU arm would have sized
+/// **identically** — `cols * scale` × `rows * scale`, exactly what
+/// `Frame::upscale` produces — so flipping the kill switch changes no layout.
+///
+/// That is not cosmetic: the two nodes are different `NodeKind`s under the same
+/// id, so a flip rebuilds the widget, and a rebuild that also resized would
+/// reflow the whole card.
+#[test]
+fn the_gl_arm_emits_a_gl_surface_the_cpu_arm_would_have_sized_identically() {
+    let _ink = preem_ink_lock();
+    let samples: Vec<f32> = vec![0.0, 0.5, -0.5, 1.0];
+    let node = preem_node(Some("sc"), gl_scope_widget(samples.clone()));
+
+    let cpu = Scope::detached("gl-size-cpu");
+    let (cpu_w, cpu_h, _) = mapped_pixels(&cpu, &node);
+
+    super::preem_gl::with_gl_arm(|| {
+        let gl = Scope::detached("gl-size-gl");
+        let (gl_w, gl_h, uniforms) = mapped_gl(&gl, &node);
+        assert_eq!(
+            (gl_w, gl_h),
+            (cpu_w, cpu_h),
+            "same natural size on both arms"
+        );
+        assert_eq!((gl_w, gl_h), (96, 48), "cols * scale by rows * scale");
+        assert_eq!(
+            uniforms.grid,
+            (48, 24),
+            "the shader's offscreen passes run at the pre-upscale grid",
+        );
+        assert_eq!(
+            uniforms.step_seq, 1,
+            "the debut batch is stamped as step 0, so the counter starts at 1",
+        );
+        assert!(
+            uniforms
+                .data
+                .as_ref()
+                .is_some_and(|held| held.as_ref() == samples.as_slice()),
+            "the batch travels as the data strip",
+        );
+    });
+}
+
+/// **`animates()` is the same expression on both arms**, so #926's frame-clock
+/// park and unpark behave identically and `pump.rs` needed no change at all.
+///
+/// Driven through the whole settle sequence rather than spot-checked: a scope
+/// animates while a batch is pending, keeps animating while the trail fades,
+/// and goes quiet after exactly `scope_settle_steps(persistence)` idle steps.
+/// The two arms are stepped in lockstep and compared at every step, so a
+/// divergence anywhere in the sequence — not just at the ends — fails.
+///
+/// **Falsified** by changing either arm's `animates()` expression, or by
+/// dropping the `idle` bookkeeping from `ScopeGl`'s `advance`.
+#[test]
+fn both_scope_arms_animate_and_park_in_lockstep() {
+    let _ink = preem_ink_lock();
+    let node = preem_node(Some("sc"), gl_scope_widget(vec![0.0, 1.0, -1.0]));
+    let cpu = Scope::detached("park-cpu");
+    let gl = Scope::detached("park-gl");
+
+    let _ = to_ui_node(&cpu, &node);
+    super::preem_gl::with_gl_arm(|| {
+        let _ = to_ui_node(&gl, &node);
+    });
+
+    // `persistence: 184` settles in 17 steps; walk past that so the parked tail
+    // is compared too.
+    for step in 0..40 {
+        let cpu_animates = preem_render::any_animating_in(std::slice::from_ref(&cpu));
+        let gl_animates = preem_render::any_animating_in(std::slice::from_ref(&gl));
+        assert_eq!(
+            cpu_animates, gl_animates,
+            "step {step}: the two arms disagree about whether the scope animates",
+        );
+        let moved = preem_render::advance_all(preem_render::ANIM_STEP_SECS);
+        assert_eq!(
+            moved.contains(&cpu),
+            moved.contains(&gl),
+            "step {step}: the two arms disagree about whether the scope moved",
+        );
+    }
+    assert!(
+        !preem_render::any_animating_in(std::slice::from_ref(&gl)),
+        "a fully faded GL trail stops asking for repaints",
+    );
+}
+
+/// `step_seq` is **monotonic** and advances one per animation step — the
+/// idempotence key the surface replays against. A mapping pass on its own
+/// advances nothing (that is the multi-monitor rule), and a repeat pass hands
+/// back the *same* `Arc`, which is what makes `GlSurface::set_state`'s guard a
+/// pointer compare.
+#[test]
+fn step_seq_advances_once_per_step_and_never_on_a_mapping_pass() {
+    let _ink = preem_ink_lock();
+    super::preem_gl::with_gl_arm(|| {
+        let key = Scope::detached("step-seq");
+        let node = preem_node(Some("sc"), gl_scope_widget(vec![0.25, -0.25]));
+
+        let (_, _, first) = mapped_gl(&key, &node);
+        assert_eq!(first.step_seq, 1, "the debut batch is one step");
+
+        // The second monitor's pass over the same wire frame: no advance, and
+        // the very same allocation.
+        let (_, _, again) = mapped_gl(&key, &node);
+        assert_eq!(again.step_seq, 1, "a mapping pass advances nothing");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "a re-map shares the cached uniforms, so the surface settles on a pointer compare",
+        );
+
+        let mut previous = 1;
+        for step in 0..5 {
+            assert!(advanced(preem_render::ANIM_STEP_SECS), "step {step} moved");
+            let (_, _, now) = mapped_gl(&key, &node);
+            assert_eq!(
+                now.step_seq,
+                previous + 1,
+                "step {step}: one animation step is one step_seq",
+            );
+            previous = now.step_seq;
+        }
+    });
+}
+
+/// One tick carrying a long stall advances at most `MAX_CATCHUP_STEPS` — the
+/// same clamp the CPU arm takes, and the reason a resume from suspend costs a
+/// bounded hop rather than the interval it spanned.
+///
+/// The GL arm has a *second* clamp downstream (`hytte-ui`'s
+/// `MAX_STEPS_PER_RENDER`, for a surface that was unmapped while its state kept
+/// running); this is the upstream one, which is the live guard on the
+/// production path.
+#[test]
+fn a_stalled_tick_advances_the_gl_arm_by_exactly_the_catch_up_clamp() {
+    let _ink = preem_ink_lock();
+    super::preem_gl::with_gl_arm(|| {
+        let key = Scope::detached("catch-up");
+        // A fading persistence with a 17-step settle, so none of the eight
+        // steps the clamp allows is cut short by the trail going quiet — the
+        // clamp is the only thing that bounds this, which is the point.
+        let node = preem_node(Some("sc"), gl_scope_widget(vec![0.5, -0.5]));
+        let (_, _, debut) = mapped_gl(&key, &node);
+        assert_eq!(debut.step_seq, 1, "the debut batch");
+
+        // Ten seconds of `dt` in one tick — two hundred steps' worth, which is
+        // the shape of a resume from suspend.
+        assert!(advanced(10.0), "a stalled tick still advances the trail");
+        let (_, _, after) = mapped_gl(&key, &node);
+        assert_eq!(
+            after.step_seq,
+            1 + u64::from(preem_render::MAX_CATCHUP_STEPS),
+            "a stalled tick replays the clamp, never the stall's length",
+        );
+    });
+}
+
+/// The same clamp holds the **CPU** arm, so a stall costs the two arms the same
+/// amount of animation. Stated as a comparison rather than a second constant:
+/// the two arms diverging here would make a kill-switch flip change how a
+/// resume from suspend looks.
+#[test]
+fn both_scope_arms_take_the_same_catch_up_clamp() {
+    let _ink = preem_ink_lock();
+    let node = preem_node(Some("sc"), gl_scope_widget(vec![0.5, -0.5]));
+    let cpu = Scope::detached("catch-up-cpu");
+    let gl = Scope::detached("catch-up-gl");
+    let _ = to_ui_node(&cpu, &node);
+    super::preem_gl::with_gl_arm(|| {
+        let _ = to_ui_node(&gl, &node);
+    });
+
+    let moved = preem_render::advance_all(10.0);
+    assert!(moved.contains(&cpu) && moved.contains(&gl));
+    // The CPU arm has no counter to read, so the shared property is asserted
+    // through the one both arms expose: how much of the trail is left. Eight
+    // steps of `184/256` decay from a full-intensity beam, and the two arms
+    // agree about *that* because they run the same loop.
+    let (_, _, gl_state) = super::preem_gl::with_gl_arm(|| mapped_gl(&gl, &node));
+    assert_eq!(
+        gl_state.step_seq,
+        1 + u64::from(preem_render::MAX_CATCHUP_STEPS),
+    );
+    let mut oracle = kit::Scope::with_size(48, 24).scale(2).persistence(184);
+    oracle.advance(&[0.5, -0.5]);
+    for _ in 0..preem_render::MAX_CATCHUP_STEPS {
+        oracle.advance(&[]);
+    }
+    assert_eq!(
+        mapped_pixels(&cpu, &node),
+        kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
+        "the CPU arm replayed the same eight steps the GL arm counted",
+    );
+}
+
+/// **A failed GL context drops the instance to the CPU kit** — per the spec's
+/// third fallback case, and the reason falling back is free for a kit widget:
+/// it *has* a CPU implementation, and that implementation is the reference the
+/// GL arm is measured against, so a blank chip would be strictly worse.
+///
+/// Driven through `hytte-ui`'s `abandon_gl`, which is the seam a host tests
+/// this through without a display server — "a GL-less display" is not something
+/// a hermetic test can arrange, but "behave as if the context had failed" is
+/// one call. The latch is thread-local and never cleared, so this test's own
+/// thread is the blast radius.
+///
+/// **Falsified** by dropping the `gl_lost` clause from `apply`: the instance
+/// keeps its `ScopeGl` renderer, `to_ui_node` keeps emitting a `GlSurface`
+/// node that can never draw, and the chip stays blank for the session.
+#[test]
+fn a_failed_gl_context_rebuilds_the_scope_onto_the_cpu_kit() {
+    let _ink = preem_ink_lock();
+    super::preem_gl::with_gl_arm(|| {
+        let key = Scope::detached("context-lost");
+        let samples: Vec<f32> = vec![0.0, 0.75, -0.75];
+        let node = preem_node(Some("sc"), gl_scope_widget(samples.clone()));
+
+        assert!(
+            matches!(to_ui_node(&key, &node), UiNode::GlSurface { .. }),
+            "the GL arm is chosen while a context is still possible",
+        );
+        let before = preem_render::probe(&key, Some("sc")).expect("the instance exists");
+
+        hytte::ui::gl_surface::abandon_gl("no GL in this test");
+
+        assert!(
+            matches!(to_ui_node(&key, &node), UiNode::Pixels { .. }),
+            "a lost context drops the scope to the raster arm",
+        );
+        let after = preem_render::probe(&key, Some("sc")).expect("the instance survives");
+        assert_eq!(
+            after.0,
+            before.0 + 1,
+            "the fallback is a rebuild, not a silent no-op",
+        );
+
+        // …and the raster it produces is the kit's, from a fresh phosphor —
+        // the GL arm never drew a trail there is anything to inherit.
+        let mut oracle = kit::Scope::with_size(48, 24).scale(2).persistence(184);
+        oracle.advance(&samples);
+        assert_eq!(
+            mapped_pixels(&key, &node),
+            kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
+            "the fallback is the kit, byte for byte",
+        );
+    });
+}
+
+/// An accent change re-tints a GL scope through the **uniforms**, with no
+/// renderer rebuild — the same live-re-tint contract (#396/#862) the CPU arm
+/// has, reached by the same `invalidate_cached_frames` call.
+///
+/// `ScopeGl` resolves its palette at mapping time exactly as the CPU `Scope`
+/// does, so it needs no entry in `invalidate_cached_frames`' `TextBox`
+/// special case — this is what says so.
+///
+/// **Falsified** by baking the palette into `Renderer::ScopeGl` at build time:
+/// the ink would not move, and the rebuild count would have to.
+#[test]
+fn an_accent_change_re_tints_a_gl_scope_without_rebuilding_it() {
+    let _ink = preem_ink_lock();
+    super::preem_gl::with_gl_arm(|| {
+        let key = Scope::detached("gl-accent");
+        // A role-less style takes the session accent, which is what moves here.
+        let node = preem_node(
+            Some("sc"),
+            vocab::PreemWidget::Scope {
+                config: vocab::ScopeConfig {
+                    style: vocab::StyleRef::default(),
+                    cols: 16,
+                    rows: 8,
+                    scale: 1,
+                    persistence: 184,
+                },
+                state: vocab::ScopeState { samples: vec![0.5] },
+            },
+        );
+
+        tint_in_process_surfaces(Some([0x00, 0xff, 0x00, 0xff]));
+        let (_, _, green) = mapped_gl(&key, &node);
+        let builds = preem_render::probe(&key, Some("sc"))
+            .expect("the instance exists")
+            .0;
+
+        tint_in_process_surfaces(Some([0xff, 0x00, 0xff, 0xff]));
+        let (_, _, magenta) = mapped_gl(&key, &node);
+
+        assert_ne!(
+            green.values, magenta.values,
+            "the accent reaches the shader as a uniform",
+        );
+        assert_eq!(
+            preem_render::probe(&key, Some("sc"))
+                .expect("the instance exists")
+                .0,
+            builds,
+            "a re-tint is a cache drop, never a renderer rebuild",
+        );
+        tint_in_process_surfaces(None);
+    });
+}
+
 /// Visual parity, `Gauge`, at the target's arrival and after one advance — the
 /// needle physics is closed-form, so the shell integrating it with the real
 /// frame `dt` must land on the same `f32` the kit would have.

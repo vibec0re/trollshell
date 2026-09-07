@@ -71,6 +71,12 @@ tracing-subscriber = { workspace = true, default-features = true, features = [
 ] }
 
 [dev-dependencies]
+# The `preem_gl_diff` parity harness (#893 stage B) reads the GLArea's
+# framebuffer back to compare it with the CPU kit — a full pipeline stall,
+# which is exactly why the *shell* never does it and why this is a
+# dev-dependency: the binary reaches GL only through `hytte-ui`'s `GlSurface`,
+# and links no GL crate of its own.
+hytte-gl = { path = "../crates/hytte-gl" }
 # Host-side plugin-session tests (#305): `#[tokio::test]` needs `macros`, and the
 # "no visibility frame arrives" assertions need `time` (`tokio::time::timeout`).
 # `test-util` drives the paused-clock handshake-timeout test (#435). net/rt/sync

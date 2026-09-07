@@ -114,12 +114,27 @@ Beyond the package build's `doCheck`, the flake's `checks` output
   script's header documents the deliberate carve-out (capturing a _different_
   widget is correct) and why it paren/brace-matches instead of using a regex —
   read it before changing it.
+- `glsl` (#893 stage B): the same shape for the preem GL renderer's shaders —
+  `nix/lint-glsl.py` assembles each `trollshell/src/plugins/preem_gl/*.{vert,frag}`
+  the way `Program::compile` does (the `GLSL_HEADER` const is read out of
+  `crates/hytte-ui/src/gl_surface.rs`, the blur's `BLUR_DIR` splice out of
+  `program.rs`'s `concat!`) and runs `glslangValidator` over it. Nothing else in
+  the tree looks inside those files — they are `include_str!`'d `&'static str`s
+  until a driver compiles them, and no check here has one — so without this a
+  typo'd identifier ships green and surfaces as a blank chip on glass. The
+  design spec named **naga** for this row; measured, naga 26's GLSL frontend
+  rejects the whole ES profile (`#version 300/310/320 es` all
+  `InvalidVersion` + `InvalidProfile("es")`), so this is `glslang` instead —
+  which costs zero `Cargo.lock` entries, since it is invoked as a binary at
+  build time rather than linked into the shell. Run it by hand with
+  `nix shell nixpkgs#python3 nixpkgs#glslang --command python3 nix/lint-glsl.py`
+  (both are in the devShell too).
 
 ### Lint — strict, treat as the gate
 
 The workspace lint config (`Cargo.toml`) is deliberately severe; a violation fails `cargo check`, not just clippy:
 
-- `unsafe_code = "forbid"` workspace-wide. **Only `hytte-ecal`** overrides this (it's pure FFI; unsafety is confined to safe wrappers in its `lib.rs`).
+- `unsafe_code = "forbid"` workspace-wide. **Only `hytte-ecal` and `hytte-gl`** override this — the two islands (FFI to libecal; OpenGL entry points), each confining its unsafety to safe wrappers and each hand-mirroring the root lints table because workspace-lints inheritance is all-or-nothing. Keep the three tables in sync.
 - clippy `all` **and** `pedantic` at `deny`. Code must be pedantic-clean.
 - `disallowed_methods`: `zbus::Connection::session`/`::system` are **banned** (see `clippy.toml`). All D-Bus access goes through the `hytte-bus` primitives, never a raw zbus connection.
 
@@ -180,7 +195,8 @@ hytte-ui          → App/AppBuilder (wraps adw::Application), Bar, LayerWindow,
 hytte-bus         → shared D-Bus layer: call / property / proxy / signals / own_name builders over pooled session+system connections
 hytte-services    → the service modules (clients to daemons)
 hytte-config      → GTK-free leaf (serde/serde_ignored/toml/toml_edit/tracing only): the `places.toml` schema + validation + its format-preserving `toml_edit` writer, plus the atomic `~/.config/trollshell/*` write helper (ex `hytte-services::config_file`, aliased back as `pub(crate) use hytte_config::file as config_file` so in-crate call sites still read `config_file::…`). Consumed by BOTH `hytte-services` and `trollshell-control-center` — the first crate the shell's service layer and the companion app share, which is exactly why it exists: `places.toml` has two editors (#640/#703, the file stays hand-editable) and they must agree byte for byte rather than each carrying its own serialisation path. Since #868 it also holds the **config layering** #866 settled: `xdg` (the `XDG_CONFIG_DIRS` base → `XDG_CONFIG_HOME` overlay search path, plus the `XDG_STATE_HOME` path so state never shares a directory with config), `merge` (the four rules — scalars overlay-wins-when-present with `_unset` spelling the null TOML lacks, tables deep-merge, arrays **replace**, and unknown keys warn via `serde_ignored` rather than fail), `subsystem` (declare a type + a name + a documented `DEFAULT_TOML`, inherit the reader/validator/format-preserving writer) and `state`. `places` predates all of it and goes through none of it — `crates/hytte-config/tests/places_byte_identical.rs` pins its bytes against a recording taken from `origin/main` before the layering existed, so a change that moves the two editors apart fails there
-hytte-ecal        → hand-written FFI to evolution-data-server (libecal); the ONLY crate allowed `unsafe`
+hytte-ecal        → hand-written FFI to evolution-data-server (libecal); one of TWO crates allowed `unsafe`
+hytte-gl          → the **second `unsafe` island** (#893 stage B), on the `hytte-ecal` precedent: `Cargo.toml` hand-mirrors the root lints table with `unsafe_code = "allow"` because workspace-lints inheritance is all-or-nothing. It exists because the workspace `forbid`s unsafe and *every* raw-GL binding marks each entry point `unsafe fn`, so nothing could issue a draw call — which is why stage A's `gl_probe` deliberately measures GTK's integration cost without touching GL. GTK-free and tiny: one safe RAII type per GL object (program with the driver's info log handed back, immutable-storage texture, FBO, VAO), plus blend/viewport/clear and two attribute-less draws. Adds **no** resolved package — `gl 0.14.0` is already in `Cargo.lock` via `gdk4`, `libloading` via `clang-sys` — and resolves its entry points through libepoxy by soname, which GTK already has mapped and whose `gl*` symbols are per-context dispatch stubs (so one process-wide `gl::load_with` serves every `GdkGLContext`). Consumed by `hytte-ui`'s `gl_surface` only; `trollshell` reaches GL through that widget and links this crate only as a dev-dependency, for the `preem_gl_diff` parity harness
 hytte-ai-providers → shared OpenAI-compatible chat client + provider config + key-file loader, used by plugins that talk to an LLM (e.g. hytte-plugin-pet)
 hytte             → umbrella: re-exports {bus, reactive, services, ui} + a `prelude`
 trollshell        → the binary; depends on `hytte` — plus, since #857, `hytte-preem` directly: the Stats drawer's per-core LED panel rasterises the kit in-process into a `hytte::ui::PixelSurface`. That is the kit, NOT the plugin SDK; the shell still never links `hytte-plugin`
@@ -216,7 +232,7 @@ Source layout (each module has a consistent shape — match it when adding):
 - `assets.rs` — resolves bundled asset paths via `TROLLSHELL_DATA_DIR` (runtime env → compile-time env baked by Nix → `CARGO_MANIFEST_DIR` dev fallback). Asset sources live in the top-level `assets/` dir mirroring the runtime `share/` layout: `assets/trollshell/{style.css,icons/}` and `assets/hytte-ui/style.css`.
 - `commands.rs` — `gio::ActionEntry`s registered on the `adw::Application` (`org.gtk.Actions`) so niri keybinds can drive drawer/power-menu/sidebar actions that are otherwise mouse-only (#219).
 - `control.rs` — the `mov.vibec0re.trollshell.Control` D-Bus endpoint that `trollshell-control-center` (and future tabs) bind to; transport only, no UI (#390).
-- `plugins/` — the out-of-process widget-plugin **host transport** (a module dir since #443, not a single file — `mod.rs` plus `listener.rs`/`session.rs`/`effects.rs`/`pump.rs`/etc.): the per-user socket listener, the GTK-side clock pump, and the effect broker (#35).
+- `plugins/` — the out-of-process widget-plugin **host transport** (a module dir since #443, not a single file — `mod.rs` plus `listener.rs`/`session.rs`/`effects.rs`/`pump.rs`/etc.): the per-user socket listener, the GTK-side clock pump, and the effect broker (#35). Since #893 stage B it also holds `preem_gl/` — the GPU arm of `preem_render`: the `Scope` shader pipeline, its `*.glsl` (under `src/`, `include_str!`'d, with a matching clause in `nix/package.nix`'s crane filter — the filter is by extension, so `src/` alone does not save them), the pure state→uniform mapping, and the `TROLLSHELL_PREEM_RENDERER=cpu` kill switch. GL is the **default**; the CPU kit is the fallback for a failed context or a kind with no GL arm.
 - `plugin_launcher.rs` — the declarative plugin **launcher** (#419): reads the nix-written `trollshell/plugins.json` (XDG config, rendered from `programs.trollshell.plugins`) and launches each enabled plugin as a transient `trollshell-plugin-<id>` user unit via `systemd-run --user`; the control-center Plugins tab's start/stop (#348) routes through it, and its `extra_env` spawn hook is where #392's key injection rides. Hand-installed static units under `etc/` keep working (legacy fallback).
 - `revision.rs` — resolves the build's git revision via `TROLLSHELL_REV` (runtime env → compile-time env → `"dev"` fallback), the same three-tier shape as `assets.rs` (#601). The nix side injects it **only** through the cheap wrapper slices' `preFixup` (`nix/package.nix`, `nix/control-center.nix`) — never as a compile-time env, which would rehash the single `workspace` crane compile on every commit. Surfaced over D-Bus as `Control.Revision`; whether it also gets a UI surface is still open.
 - `scale.rs` — font-relative pixel scaling (`scale()`) for the handful of Rust-set sizes CSS `em` can't reach (#135).

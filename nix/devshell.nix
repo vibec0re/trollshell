@@ -35,6 +35,12 @@ pkgs.mkShell {
     # just makes the devShell able to run the same commands locally (#684).
     dbus
     xvfb-run
+
+    # The reference GLSL ES compiler, for the `glsl` flake check
+    # (`nix/lint-glsl.py`, #893 stage B). Same reason as the two above: CI's
+    # check supplies it in `nativeBuildInputs`, and listing it here lets the
+    # identical `python3 nix/lint-glsl.py` run from the devShell.
+    glslang
   ];
 
   # Fixed (non-prepending) values live as env attrs; only the two vars that

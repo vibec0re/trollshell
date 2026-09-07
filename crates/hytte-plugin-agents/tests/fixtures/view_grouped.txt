@@ -15,6 +15,7 @@ View {
                     "dim-label",
                     "ts-agents-group",
                 ],
+                tooltip: None,
             },
             Box {
                 id: None,
@@ -37,6 +38,7 @@ View {
                                 classes: [
                                     "ts-agent-runtime",
                                 ],
+                                tooltip: None,
                             },
                             Button {
                                 id: "chat:nixos-choom",
@@ -48,6 +50,7 @@ View {
                                     id: None,
                                     text: "nixos-choom",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Spacer,
@@ -58,6 +61,7 @@ View {
                                     "ts-agent-badge",
                                     "ts-agent-upd",
                                 ],
+                                tooltip: None,
                             },
                             Icon {
                                 id: None,
@@ -66,6 +70,7 @@ View {
                                     "ts-agent-state",
                                     "dim-label",
                                 ],
+                                tooltip: None,
                             },
                         ],
                     },
@@ -95,6 +100,7 @@ View {
                                     id: None,
                                     name: "media-playback-start-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Button {
@@ -107,11 +113,13 @@ View {
                                     id: None,
                                     name: "document-edit-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                         ],
                     },
                 ],
+                tooltip: None,
             },
             Label {
                 id: None,
@@ -121,6 +129,7 @@ View {
                     "dim-label",
                     "ts-agents-group",
                 ],
+                tooltip: None,
             },
             Box {
                 id: None,
@@ -143,6 +152,7 @@ View {
                                 classes: [
                                     "ts-agent-runtime",
                                 ],
+                                tooltip: None,
                             },
                             Button {
                                 id: "chat:trollshell-choom",
@@ -154,6 +164,7 @@ View {
                                     id: None,
                                     text: "choom",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Spacer,
@@ -164,6 +175,7 @@ View {
                                     "ts-agent-state",
                                     "accent",
                                 ],
+                                tooltip: None,
                             },
                         ],
                     },
@@ -193,6 +205,7 @@ View {
                                     id: None,
                                     name: "media-playback-pause-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Button {
@@ -205,11 +218,13 @@ View {
                                     id: None,
                                     name: "document-edit-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                         ],
                     },
                 ],
+                tooltip: None,
             },
             Label {
                 id: None,
@@ -219,6 +234,7 @@ View {
                     "dim-label",
                     "ts-agents-group",
                 ],
+                tooltip: None,
             },
             Box {
                 id: None,
@@ -241,6 +257,7 @@ View {
                                 classes: [
                                     "ts-agent-runtime",
                                 ],
+                                tooltip: None,
                             },
                             Button {
                                 id: "chat:stray",
@@ -252,6 +269,7 @@ View {
                                     id: None,
                                     text: "stray",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Spacer,
@@ -262,6 +280,7 @@ View {
                                     "ts-agent-state",
                                     "dim-label",
                                 ],
+                                tooltip: None,
                             },
                         ],
                     },
@@ -291,6 +310,7 @@ View {
                                     id: None,
                                     name: "media-playback-pause-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Button {
@@ -303,11 +323,13 @@ View {
                                     id: None,
                                     name: "document-edit-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                         ],
                     },
                 ],
+                tooltip: None,
             },
         ],
     },
@@ -329,6 +351,7 @@ View {
                     classes: [
                         "heading",
                     ],
+                    tooltip: None,
                 },
                 Row {
                     id: None,
@@ -342,6 +365,7 @@ View {
                             classes: [
                                 "dim-label",
                             ],
+                            tooltip: None,
                         },
                         Spacer,
                         Text {
@@ -367,6 +391,7 @@ View {
                             classes: [
                                 "dim-label",
                             ],
+                            tooltip: None,
                         },
                         Spacer,
                         Text {
@@ -392,6 +417,7 @@ View {
                             classes: [
                                 "dim-label",
                             ],
+                            tooltip: None,
                         },
                         Spacer,
                         Text {
@@ -406,6 +432,7 @@ View {
                     ],
                 },
             ],
+            tooltip: None,
         },
     ),
 }

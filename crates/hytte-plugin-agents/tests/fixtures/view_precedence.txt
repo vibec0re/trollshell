@@ -28,6 +28,7 @@ View {
                                 classes: [
                                     "ts-agent-runtime",
                                 ],
+                                tooltip: None,
                             },
                             Button {
                                 id: "chat:wedged",
@@ -39,6 +40,7 @@ View {
                                     id: None,
                                     text: "wedged",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Spacer,
@@ -49,6 +51,7 @@ View {
                                     "ts-agent-state",
                                     "error",
                                 ],
+                                tooltip: None,
                             },
                         ],
                     },
@@ -78,6 +81,7 @@ View {
                                     id: None,
                                     name: "media-playback-start-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Button {
@@ -90,11 +94,13 @@ View {
                                     id: None,
                                     name: "document-edit-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                         ],
                     },
                 ],
+                tooltip: None,
             },
             Box {
                 id: None,
@@ -117,6 +123,7 @@ View {
                                 classes: [
                                     "ts-agent-runtime",
                                 ],
+                                tooltip: None,
                             },
                             Button {
                                 id: "chat:locked-out",
@@ -128,6 +135,7 @@ View {
                                     id: None,
                                     text: "locked-out",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Spacer,
@@ -138,6 +146,7 @@ View {
                                     "ts-agent-state",
                                     "warning",
                                 ],
+                                tooltip: None,
                             },
                         ],
                     },
@@ -167,6 +176,7 @@ View {
                                     id: None,
                                     name: "media-playback-start-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Button {
@@ -179,11 +189,13 @@ View {
                                     id: None,
                                     name: "document-edit-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                         ],
                     },
                 ],
+                tooltip: None,
             },
             Box {
                 id: None,
@@ -206,6 +218,7 @@ View {
                                 classes: [
                                     "ts-agent-runtime",
                                 ],
+                                tooltip: None,
                             },
                             Button {
                                 id: "chat:parked",
@@ -217,6 +230,7 @@ View {
                                     id: None,
                                     text: "parked",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Spacer,
@@ -227,6 +241,7 @@ View {
                                     "ts-agent-state",
                                     "dim-label",
                                 ],
+                                tooltip: None,
                             },
                         ],
                     },
@@ -256,6 +271,7 @@ View {
                                     id: None,
                                     name: "media-playback-start-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Button {
@@ -268,11 +284,13 @@ View {
                                     id: None,
                                     name: "document-edit-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                         ],
                     },
                 ],
+                tooltip: None,
             },
             Box {
                 id: None,
@@ -295,6 +313,7 @@ View {
                                 classes: [
                                     "ts-agent-runtime",
                                 ],
+                                tooltip: None,
                             },
                             Button {
                                 id: "chat:off",
@@ -306,6 +325,7 @@ View {
                                     id: None,
                                     text: "off",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Spacer,
@@ -316,6 +336,7 @@ View {
                                     "ts-agent-badge",
                                     "ts-agent-upd",
                                 ],
+                                tooltip: None,
                             },
                             Icon {
                                 id: None,
@@ -324,6 +345,7 @@ View {
                                     "ts-agent-state",
                                     "dim-label",
                                 ],
+                                tooltip: None,
                             },
                         ],
                     },
@@ -353,6 +375,7 @@ View {
                                     id: None,
                                     name: "media-playback-pause-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Button {
@@ -365,11 +388,13 @@ View {
                                     id: None,
                                     name: "document-edit-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                         ],
                     },
                 ],
+                tooltip: None,
             },
             Box {
                 id: None,
@@ -392,6 +417,7 @@ View {
                                 classes: [
                                     "ts-agent-runtime",
                                 ],
+                                tooltip: None,
                             },
                             Button {
                                 id: "chat:busy",
@@ -403,6 +429,7 @@ View {
                                     id: None,
                                     text: "busy",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Spacer,
@@ -413,6 +440,7 @@ View {
                                     "ts-agent-state",
                                     "accent",
                                 ],
+                                tooltip: None,
                             },
                         ],
                     },
@@ -442,6 +470,7 @@ View {
                                     id: None,
                                     name: "media-playback-pause-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                             Button {
@@ -454,11 +483,13 @@ View {
                                     id: None,
                                     name: "document-edit-symbolic",
                                     classes: [],
+                                    tooltip: None,
                                 },
                             },
                         ],
                     },
                 ],
+                tooltip: None,
             },
         ],
     },
@@ -480,6 +511,7 @@ View {
                     classes: [
                         "heading",
                     ],
+                    tooltip: None,
                 },
                 Row {
                     id: None,
@@ -493,6 +525,7 @@ View {
                             classes: [
                                 "dim-label",
                             ],
+                            tooltip: None,
                         },
                         Spacer,
                         Text {
@@ -518,6 +551,7 @@ View {
                             classes: [
                                 "dim-label",
                             ],
+                            tooltip: None,
                         },
                         Spacer,
                         Text {
@@ -543,6 +577,7 @@ View {
                             classes: [
                                 "dim-label",
                             ],
+                            tooltip: None,
                         },
                         Spacer,
                         Text {
@@ -557,6 +592,7 @@ View {
                     ],
                 },
             ],
+            tooltip: None,
         },
     ),
 }

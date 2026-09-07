@@ -30,6 +30,7 @@ View {
                                     "ts-agent-state",
                                     "error",
                                 ],
+                                tooltip: None,
                             },
                             Label {
                                 id: None,
@@ -37,6 +38,7 @@ View {
                                 classes: [
                                     "heading",
                                 ],
+                                tooltip: None,
                             },
                         ],
                     },
@@ -58,6 +60,7 @@ View {
                         ],
                     },
                 ],
+                tooltip: None,
             },
         ],
     },
@@ -79,6 +82,7 @@ View {
                     classes: [
                         "heading",
                     ],
+                    tooltip: None,
                 },
                 Row {
                     id: None,
@@ -92,6 +96,7 @@ View {
                             classes: [
                                 "dim-label",
                             ],
+                            tooltip: None,
                         },
                         Spacer,
                         Text {
@@ -117,6 +122,7 @@ View {
                             classes: [
                                 "dim-label",
                             ],
+                            tooltip: None,
                         },
                         Spacer,
                         Text {
@@ -142,6 +148,7 @@ View {
                             classes: [
                                 "dim-label",
                             ],
+                            tooltip: None,
                         },
                         Spacer,
                         Text {
@@ -156,6 +163,7 @@ View {
                     ],
                 },
             ],
+            tooltip: None,
         },
     ),
 }

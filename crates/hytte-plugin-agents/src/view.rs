@@ -46,6 +46,7 @@ fn label(text: impl Into<String>, classes: &[&str]) -> Node {
     Node::Label {
         id: None,
         text: text.into(),
+        tooltip: None,
         classes: classes.iter().map(|c| (*c).to_owned()).collect(),
     }
 }
@@ -64,6 +65,7 @@ fn icon(name: impl Into<String>, classes: &[&str]) -> Node {
     Node::Icon {
         id: None,
         name: name.into(),
+        tooltip: None,
         classes: classes.iter().map(|c| (*c).to_owned()).collect(),
     }
 }
@@ -90,6 +92,7 @@ fn column(classes: &[&str], children: Vec<Node>) -> Node {
         dir: Dir::Vertical,
         spacing: 2,
         scroll: false,
+        tooltip: None,
         classes: classes.iter().map(|c| (*c).to_owned()).collect(),
         children,
     }
@@ -412,6 +415,7 @@ pub fn panel(
         dir: Dir::Vertical,
         spacing: 4,
         scroll: true,
+        tooltip: None,
         classes: vec!["ts-agents-panel".to_owned()],
         children,
     }

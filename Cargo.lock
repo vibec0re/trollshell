@@ -1198,6 +1198,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hytte-plugin-agents"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hytte-config",
+ "hytte-plugin",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hytte-plugin-audio-widget"
 version = "0.1.0"
 dependencies = [

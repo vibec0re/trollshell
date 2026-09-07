@@ -1,0 +1,161 @@
+View {
+    tree: ListBox {
+        id: Some(
+            "agents-root",
+        ),
+        classes: [
+            "ts-agents-list",
+        ],
+        children: [
+            Box {
+                id: None,
+                dir: Vertical,
+                spacing: 2,
+                scroll: false,
+                classes: [
+                    "ts-agent-row",
+                    "ts-agents-notice",
+                ],
+                children: [
+                    Row {
+                        id: None,
+                        classes: [
+                            "ts-agent-head",
+                        ],
+                        children: [
+                            Icon {
+                                id: None,
+                                name: "content-loading-symbolic",
+                                classes: [
+                                    "ts-agent-state",
+                                    "dim-label",
+                                ],
+                            },
+                            Label {
+                                id: None,
+                                text: "hive",
+                                classes: [
+                                    "heading",
+                                ],
+                            },
+                        ],
+                    },
+                    Row {
+                        id: None,
+                        classes: [
+                            "ts-agent-foot",
+                        ],
+                        children: [
+                            Text {
+                                id: None,
+                                text: "connecting…",
+                                max_width_chars: None,
+                                ellipsize: true,
+                                classes: [
+                                    "dim-label",
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        ],
+    },
+    panel: Some(
+        Box {
+            id: Some(
+                "agents-panel",
+            ),
+            dir: Vertical,
+            spacing: 4,
+            scroll: true,
+            classes: [
+                "ts-agents-panel",
+            ],
+            children: [
+                Label {
+                    id: None,
+                    text: "hive",
+                    classes: [
+                        "heading",
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "state",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "connecting…",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "socket",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "/run/hyperhive/host.sock",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "last poll",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "never",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+    ),
+}

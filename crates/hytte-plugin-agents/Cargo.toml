@@ -1,0 +1,65 @@
+[package]
+name = "hytte-plugin-agents"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "hyperhive agents as trollshell sidebar rows: a typed mirror of the host.sock wire, one row per agent with live status and a pause button (issue #947, phase P1)"
+
+[lints]
+workspace = true
+
+[lib]
+name = "hytte_plugin_agents"
+path = "src/lib.rs"
+
+# The plugin binary. `main` is one line — the whole transport lives in the SDK.
+[[bin]]
+name = "hytte-plugin-agents"
+path = "src/main.rs"
+
+[dependencies]
+# The plugin runtime SDK; re-exports the proto vocabulary, `tokio` and
+# `tokio_stream` (including `wrappers::UnboundedReceiverStream`).
+hytte-plugin = { path = "../hytte-plugin" }
+# `agents.toml` rides the #868 config layering (spec §9): a `Subsystem` impl
+# buys the XDG search path, the four merge rules, unknown-key warnings and the
+# format-preserving writer from a `NAME` + a `DEFAULT_TOML`. GTK-free leaf
+# (serde / serde_ignored / toml / toml_edit / tracing), so a plugin may link it
+# — the same argument that let `trollshell-control-center` link it in #640.
+hytte-config = { path = "../hytte-config" }
+serde.workspace = true
+# `host.sock` speaks JSON lines: one object per request, one per response.
+serde_json.workspace = true
+# The poll task's interval + command-lane `select!` loop, the unix socket, and
+# the per-request timeout. `net` for `UnixStream`, `io-util` for the buffered
+# line read/write, `rt` for `spawn`, `macros` for `select!`.
+tokio = { workspace = true, default-features = false, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "sync",
+  "time",
+] }
+# `status_set_at` is RFC 3339 UTC on the wire; parsed at render time into the
+# panel's age label.
+chrono.workspace = true
+tracing.workspace = true
+# One subscriber in `main`, so `hytte-config`'s unknown-key warnings and this
+# crate's own diagnostics actually reach the journal instead of being dropped
+# by the no-subscriber no-op. Same pair `hytte-claude-bridge` resolves, so it
+# adds no `Cargo.lock` entry.
+tracing-subscriber = { workspace = true, default-features = true, features = [
+  "env-filter",
+] }
+
+[dev-dependencies]
+# The fake `host.sock`: a real `UnixListener` in a `TempDir`, speaking the
+# recorded JSON lines under `tests/fixtures/`.
+tempfile.workspace = true
+# `test-util` for `#[tokio::test(start_paused = true)]`: the request-timeout
+# test asserts a 5 s budget, and paused virtual time makes that assertion
+# instant rather than a five-second stall in every `cargo test` run.
+tokio = { workspace = true, features = ["test-util"] }

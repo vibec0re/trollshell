@@ -1,0 +1,751 @@
+View {
+    tree: ListBox {
+        id: Some(
+            "agents-root",
+        ),
+        classes: [
+            "ts-agents-list",
+        ],
+        children: [
+            Box {
+                id: None,
+                dir: Vertical,
+                spacing: 2,
+                scroll: false,
+                classes: [
+                    "ts-agent-row",
+                ],
+                children: [
+                    Row {
+                        id: None,
+                        classes: [
+                            "ts-agent-head",
+                        ],
+                        children: [
+                            Icon {
+                                id: None,
+                                name: "system-run-symbolic",
+                                classes: [
+                                    "ts-agent-runtime",
+                                ],
+                            },
+                            Button {
+                                id: "chat:trollshell-choom",
+                                classes: [
+                                    "flat",
+                                    "ts-agent-name",
+                                ],
+                                child: Label {
+                                    id: None,
+                                    text: "trollshell-choom",
+                                    classes: [],
+                                },
+                            },
+                            Spacer,
+                            Icon {
+                                id: None,
+                                name: "media-playback-start-symbolic",
+                                classes: [
+                                    "ts-agent-state",
+                                    "accent",
+                                ],
+                            },
+                        ],
+                    },
+                    Row {
+                        id: None,
+                        classes: [
+                            "ts-agent-foot",
+                        ],
+                        children: [
+                            Text {
+                                id: None,
+                                text: "reviewing PR #947",
+                                max_width_chars: None,
+                                ellipsize: true,
+                                classes: [
+                                    "dim-label",
+                                ],
+                            },
+                            Spacer,
+                            Button {
+                                id: "pause:trollshell-choom",
+                                classes: [
+                                    "flat",
+                                    "ts-agent-pause",
+                                ],
+                                child: Icon {
+                                    id: None,
+                                    name: "media-playback-pause-symbolic",
+                                    classes: [],
+                                },
+                            },
+                            Button {
+                                id: "edit:trollshell-choom",
+                                classes: [
+                                    "flat",
+                                    "ts-agent-edit",
+                                ],
+                                child: Icon {
+                                    id: None,
+                                    name: "document-edit-symbolic",
+                                    classes: [],
+                                },
+                            },
+                        ],
+                    },
+                ],
+            },
+            Box {
+                id: None,
+                dir: Vertical,
+                spacing: 2,
+                scroll: false,
+                classes: [
+                    "ts-agent-row",
+                ],
+                children: [
+                    Row {
+                        id: None,
+                        classes: [
+                            "ts-agent-head",
+                        ],
+                        children: [
+                            Icon {
+                                id: None,
+                                name: "system-run-symbolic",
+                                classes: [
+                                    "ts-agent-runtime",
+                                ],
+                            },
+                            Button {
+                                id: "chat:nixos-choom",
+                                classes: [
+                                    "flat",
+                                    "ts-agent-name",
+                                ],
+                                child: Label {
+                                    id: None,
+                                    text: "nixos-choom",
+                                    classes: [],
+                                },
+                            },
+                            Spacer,
+                            Icon {
+                                id: None,
+                                name: "software-update-available-symbolic",
+                                classes: [
+                                    "ts-agent-badge",
+                                    "ts-agent-upd",
+                                ],
+                            },
+                            Icon {
+                                id: None,
+                                name: "media-playback-pause-symbolic",
+                                classes: [
+                                    "ts-agent-state",
+                                    "dim-label",
+                                ],
+                            },
+                        ],
+                    },
+                    Row {
+                        id: None,
+                        classes: [
+                            "ts-agent-foot",
+                        ],
+                        children: [
+                            Text {
+                                id: None,
+                                text: "paused",
+                                max_width_chars: None,
+                                ellipsize: true,
+                                classes: [
+                                    "dim-label",
+                                ],
+                            },
+                            Spacer,
+                            Button {
+                                id: "pause:nixos-choom",
+                                classes: [
+                                    "flat",
+                                    "ts-agent-pause",
+                                ],
+                                child: Icon {
+                                    id: None,
+                                    name: "media-playback-start-symbolic",
+                                    classes: [],
+                                },
+                            },
+                            Button {
+                                id: "edit:nixos-choom",
+                                classes: [
+                                    "flat",
+                                    "ts-agent-edit",
+                                ],
+                                child: Icon {
+                                    id: None,
+                                    name: "document-edit-symbolic",
+                                    classes: [],
+                                },
+                            },
+                        ],
+                    },
+                ],
+            },
+            Box {
+                id: None,
+                dir: Vertical,
+                spacing: 2,
+                scroll: false,
+                classes: [
+                    "ts-agent-row",
+                ],
+                children: [
+                    Row {
+                        id: None,
+                        classes: [
+                            "ts-agent-head",
+                        ],
+                        children: [
+                            Icon {
+                                id: None,
+                                name: "system-run-symbolic",
+                                classes: [
+                                    "ts-agent-runtime",
+                                ],
+                            },
+                            Button {
+                                id: "chat:stray",
+                                classes: [
+                                    "flat",
+                                    "ts-agent-name",
+                                ],
+                                child: Label {
+                                    id: None,
+                                    text: "stray",
+                                    classes: [],
+                                },
+                            },
+                            Spacer,
+                            Icon {
+                                id: None,
+                                name: "media-playback-stop-symbolic",
+                                classes: [
+                                    "ts-agent-state",
+                                    "dim-label",
+                                ],
+                            },
+                        ],
+                    },
+                    Row {
+                        id: None,
+                        classes: [
+                            "ts-agent-foot",
+                        ],
+                        children: [
+                            Text {
+                                id: None,
+                                text: "stopped",
+                                max_width_chars: None,
+                                ellipsize: true,
+                                classes: [
+                                    "dim-label",
+                                ],
+                            },
+                            Spacer,
+                            Button {
+                                id: "pause:stray",
+                                classes: [
+                                    "flat",
+                                    "ts-agent-pause",
+                                ],
+                                child: Icon {
+                                    id: None,
+                                    name: "media-playback-pause-symbolic",
+                                    classes: [],
+                                },
+                            },
+                            Button {
+                                id: "edit:stray",
+                                classes: [
+                                    "flat",
+                                    "ts-agent-edit",
+                                ],
+                                child: Icon {
+                                    id: None,
+                                    name: "document-edit-symbolic",
+                                    classes: [],
+                                },
+                            },
+                        ],
+                    },
+                ],
+            },
+        ],
+    },
+    panel: Some(
+        Box {
+            id: Some(
+                "agents-panel",
+            ),
+            dir: Vertical,
+            spacing: 4,
+            scroll: true,
+            classes: [
+                "ts-agents-panel",
+            ],
+            children: [
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agents-panel-head",
+                    ],
+                    children: [
+                        Icon {
+                            id: None,
+                            name: "system-run-symbolic",
+                            classes: [
+                                "ts-agent-runtime",
+                            ],
+                        },
+                        Label {
+                            id: None,
+                            text: "trollshell-choom",
+                            classes: [
+                                "title-4",
+                            ],
+                        },
+                        Spacer,
+                        Icon {
+                            id: None,
+                            name: "media-playback-start-symbolic",
+                            classes: [
+                                "ts-agent-state",
+                                "accent",
+                            ],
+                        },
+                    ],
+                },
+                Text {
+                    id: None,
+                    text: "reviewing PR #947",
+                    max_width_chars: None,
+                    ellipsize: false,
+                    classes: [
+                        "dim-label",
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "status set",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "10m ago",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+                Label {
+                    id: None,
+                    text: "flags",
+                    classes: [
+                        "heading",
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "running",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "yes",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "failed",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "no",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "paused",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "no",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "needs login",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "no",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "needs update",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "no",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "deployed sha",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "1bfaf24abcde",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "parent",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "— (root)",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "model",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "claude-opus-4-6",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "agent page",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "https://hive.local/agent/trollshell-choom/",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agents-panel-actions",
+                    ],
+                    children: [
+                        Button {
+                            id: "start:trollshell-choom",
+                            classes: [
+                                "flat",
+                            ],
+                            child: Label {
+                                id: None,
+                                text: "start",
+                                classes: [],
+                            },
+                        },
+                        Button {
+                            id: "stop:trollshell-choom",
+                            classes: [
+                                "flat",
+                            ],
+                            child: Label {
+                                id: None,
+                                text: "stop",
+                                classes: [],
+                            },
+                        },
+                        Spacer,
+                        Button {
+                            id: "agents-back",
+                            classes: [
+                                "flat",
+                            ],
+                            child: Label {
+                                id: None,
+                                text: "all agents",
+                                classes: [],
+                            },
+                        },
+                    ],
+                },
+                Separator {
+                    classes: [],
+                },
+                Label {
+                    id: None,
+                    text: "hive",
+                    classes: [
+                        "heading",
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "state",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "up — 3 agent(s)",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "socket",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "/run/hyperhive/host.sock",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "last poll",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "just now",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+                Row {
+                    id: None,
+                    classes: [
+                        "ts-agent-detail",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "dashboard",
+                            classes: [
+                                "dim-label",
+                            ],
+                        },
+                        Spacer,
+                        Text {
+                            id: None,
+                            text: "https://hive.local/",
+                            max_width_chars: None,
+                            ellipsize: true,
+                            classes: [
+                                "numeric",
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+    ),
+}

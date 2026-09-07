@@ -1,0 +1,1 @@
+{"version":1,"ok":true,"agent_statuses":[{"name":"good","running":true,"failed":false,"needs_update":false,"needs_login":false,"pending_reminders":0,"paused":false},{"name":"../etc/passwd","running":true,"failed":false,"needs_update":false,"needs_login":false,"pending_reminders":0,"paused":false}]}

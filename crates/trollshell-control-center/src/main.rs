@@ -8,8 +8,9 @@
 //! `mov.vibec0re.trollshell.Control` session-bus endpoint (see the shell's
 //! `control.rs`).
 //!
-//! An `adw::ViewStack` of tabs plus a banner that reports whether the shell
-//! answered `Ping`/`Version`. The **Places** tab ([`places_tab`], #640/#703) is
+//! An `adw::ViewStack` of tabs plus a banner that appears only when the shell
+//! did *not* answer `Ping`/`Version` (#959) — a connected session shows no
+//! banner at all. The **Places** tab ([`places_tab`], #640/#703) is
 //! a full editor for `~/.config/trollshell/places.toml` — the named places that
 //! drive departures, Wi-Fi-fingerprint place detection and walk time — plus the
 //! session-only weather-location override this tab used to be (#391). It is the
@@ -131,9 +132,11 @@ fn build_window(app: &adw::Application) {
         .revealed(true)
         .build();
 
-    // The revision footer (#601): the running shell's build git revision,
-    // fetched over `Control.Revision` — see `check_shell_revision` for why this
-    // must never resolve the companion app's own compiled-in `TROLLSHELL_REV`.
+    // The revision footer (#601, extended by #959 to also carry the shell's
+    // `Version`): the running shell's build git revision plus its reported
+    // version, fetched over `Control.Revision`/`Control.Version` — see
+    // `check_shell_revision` for why this must never resolve the companion
+    // app's own compiled-in `TROLLSHELL_REV`.
     let (footer, revision_label) = build_revision_footer();
 
     let toolbar = adw::ToolbarView::new();
@@ -195,27 +198,39 @@ fn build_revision_footer() -> (gtk::Box, gtk::Label) {
     (bar, label)
 }
 
-/// Format the footer label's text from a `Control.Revision` call outcome.
+/// Format the footer label's text from a `Control.Version`/`Control.Revision`
+/// call outcome, each `None` exactly when that call failed.
 ///
-/// Pure so the shell-not-running fallback and the `"dev"` passthrough are
-/// unit-tested without a live D-Bus call — see the `revision_footer_tests`
-/// module below. `revision` is `None` exactly when the call failed (the shell
-/// isn't running or didn't answer in time); a `"dev"` value — `revision.rs`'s
-/// documented fallback for an unstamped local build — is rendered as-is rather
-/// than special-cased, per #601: a developer seeing `dev` is correct
-/// information, not a state to hide.
-fn format_revision_footer(revision: Option<&str>) -> String {
-    match revision {
-        Some(rev) => format!("Shell revision: {rev}"),
-        None => "Shell revision: unavailable (trollshell not running)".to_owned(),
+/// Pure so the shell-not-running fallback, the `"dev"` passthrough and the
+/// partial-availability cases are unit-tested without a live D-Bus call — see
+/// the `revision_footer_tests` module below. Four shapes, in order of how
+/// informative they are:
+///
+/// - both present: `"trollshell {version} · revision {revision}"` — a `"dev"`
+///   or `-dirty`-suffixed revision (`revision.rs`'s documented fallback /
+///   marker) is rendered as-is rather than special-cased, per #601: a
+///   developer seeing either is correct information, not a state to hide.
+/// - only one present: render that one (`"trollshell {version} · revision
+///   unknown"` / `"revision {revision}"`) rather than discarding it because
+///   its sibling call happened to fail.
+/// - neither present: the shell isn't running (or didn't answer in time) —
+///   the pre-#959 fallback text, kept byte-for-byte so `docs/live-verify.md`'s
+///   #601/#836 entry still matches.
+fn format_revision_footer(version: Option<&str>, revision: Option<&str>) -> String {
+    match (version, revision) {
+        (None, None) => "Shell revision: unavailable (trollshell not running)".to_owned(),
+        (Some(version), Some(revision)) => format!("trollshell {version} · revision {revision}"),
+        (Some(version), None) => format!("trollshell {version} · revision unknown"),
+        (None, Some(revision)) => format!("revision {revision}"),
     }
 }
 
-/// Probe `Control.Revision` on the shared tokio runtime and set the footer
-/// label from the result. Mirrors [`check_shell_connection`]'s shape (spawn on
-/// the runtime, deliver back over [`spawn_on_runtime`]'s oneshot).
+/// Probe `Control.Version` and `Control.Revision` on the shared tokio runtime
+/// and set the footer label from the combined result. Mirrors
+/// [`check_shell_connection`]'s shape (spawn on the runtime, deliver back over
+/// [`spawn_on_runtime`]'s oneshot).
 ///
-/// # Why this calls `Control.Revision` and not a local resolver
+/// # Why this calls `Control.Version`/`Control.Revision` and not a local resolver
 ///
 /// `trollshell-control-center` is a separate binary from the shell, wrapped by
 /// its own nix slice (`nix/control-center.nix`) with its **own**
@@ -228,12 +243,30 @@ fn format_revision_footer(revision: Option<&str>) -> String {
 /// (four bug reports — #375, #566, #375 again, #810 — turned on "which commit
 /// is the running shell", not "which commit is the control center"). So this
 /// crate has no `revision` module of its own; the only source of truth is the
-/// D-Bus round trip below.
+/// D-Bus round trip below. The same reasoning applies to `Version` (#959):
+/// the banner already round-trips it per-connection-check, so the footer
+/// reuses that same source rather than a compiled-in `CARGO_PKG_VERSION`.
 fn check_shell_revision(label: &gtk::Label) {
     let label = label.clone();
-    spawn_on_runtime(revision(), move |res| {
-        label.set_text(&format_revision_footer(res.ok().as_deref()));
-    });
+    spawn_on_runtime(
+        async {
+            let version = version().await;
+            let revision = revision().await;
+            (version, revision)
+        },
+        move |(version, revision)| {
+            label.set_text(&format_revision_footer(
+                version.ok().as_deref(),
+                revision.ok().as_deref(),
+            ));
+        },
+    );
+}
+
+/// `Version` → the running shell's reported version (#959; the same call
+/// [`probe_shell`] uses for the banner).
+async fn version() -> Result<String, hytte_bus::BusError> {
+    control_call("Version").await
 }
 
 /// `Revision` → the running shell's build git revision (#601). See
@@ -414,6 +447,12 @@ async fn clear_ai_key(slot: String) -> Result<(), hytte_bus::BusError> {
 /// Probe the running shell's control endpoint on the shared tokio runtime, then
 /// update `banner` back on the GTK main thread with the result. Never blocks the
 /// UI and never panics when the shell is absent.
+///
+/// #959: the banner only carries information when the shell is *not*
+/// reachable — a successful probe hides it (`set_revealed(false)`) rather than
+/// leaving a permanent "Connected to trollshell …" notice up for the entire
+/// session. A later poll that succeeds again (there isn't one today, but
+/// nothing here assumes there won't be) would hide it again the same way.
 fn check_shell_connection(banner: &adw::Banner) {
     let (tx, rx) = tokio::sync::oneshot::channel();
 
@@ -429,24 +468,62 @@ fn check_shell_connection(banner: &adw::Banner) {
 
     let banner = banner.clone();
     glib::spawn_future_local(async move {
-        match rx.await {
-            Ok(Ok((pong, version))) => {
-                banner.set_title(&format!(
-                    "Connected to trollshell {version} (Ping → {pong})"
-                ));
-            }
-            Ok(Err(err)) => {
-                tracing::info!(%err, "trollshell control endpoint unreachable");
-                banner.set_title("trollshell is not running — start the shell to manage it");
+        let message = match rx.await {
+            Ok(probe) => {
+                if let Err(err) = &probe {
+                    tracing::info!(%err, "trollshell control endpoint unreachable");
+                }
+                format_banner_message(&probe)
             }
             Err(_) => {
                 // Sender dropped without sending (task cancelled) — unreachable
                 // in practice, but degrade to the disconnected message.
-                banner.set_title("Could not reach trollshell");
+                Some("Could not reach trollshell".to_owned())
             }
+        };
+        match message {
+            Some(text) => {
+                banner.set_title(&text);
+                banner.set_revealed(true);
+            }
+            None => banner.set_revealed(false),
         }
-        banner.set_revealed(true);
     });
+}
+
+/// Format the connection banner's text from a [`probe_shell`] outcome. `None`
+/// means "hide the banner" (the shell answered); `Some` carries the text to
+/// show.
+///
+/// Pure so the three cases are unit-tested without a live D-Bus call — see
+/// the `banner_message_tests` module below. Distinguishes the shell simply
+/// not running (`ServiceUnknown` — nothing owns `CONTROL_NAME`, see
+/// [`is_shell_not_running`]) from any other bus failure, which gets a literal
+/// `Connection error: {err}` rather than being folded into the same "not
+/// running" text — per #959, only a state the bus layer actually reports.
+fn format_banner_message(probe: &Result<(String, String), hytte_bus::BusError>) -> Option<String> {
+    match probe {
+        Ok(_) => None,
+        Err(err) if is_shell_not_running(err) => {
+            Some("trollshell is not running — start the shell to manage it".to_owned())
+        }
+        Err(err) => Some(format!("Connection error: {err}")),
+    }
+}
+
+/// True when `err` is the D-Bus daemon's reply for "nothing owns this bus
+/// name" (`org.freedesktop.DBus.Error.ServiceUnknown`) — i.e. the shell
+/// process isn't running, as distinct from a real connection problem (a
+/// transient bus hiccup, `AccessDenied`, a misbehaving `Control` endpoint's own
+/// method failure). Confirmed empirically against a real `dbus-daemon`: a call
+/// to a destination with no owner surfaces as exactly this
+/// `BusError::Permanent` shape, not `Transient`.
+fn is_shell_not_running(err: &hytte_bus::BusError) -> bool {
+    matches!(
+        err,
+        hytte_bus::BusError::Permanent { dbus_name, .. }
+            if dbus_name.as_deref() == Some("org.freedesktop.DBus.Error.ServiceUnknown")
+    )
 }
 
 /// Call `Ping` then `Version` on the shell's control interface. Returns the
@@ -538,7 +615,10 @@ pub(crate) async fn set_auto_location(auto: bool) -> Result<(), hytte_bus::BusEr
 mod tests {
     use tracing_subscriber::filter::LevelFilter;
 
-    use super::{DEFAULT_LOG_LEVEL, build_env_filter, format_revision_footer};
+    use super::{
+        DEFAULT_LOG_LEVEL, build_env_filter, format_banner_message, format_revision_footer,
+        is_shell_not_running,
+    };
 
     // #780: with `RUST_LOG` unset, the effective filter must default to
     // `DEFAULT_LOG_LEVEL` (currently `INFO`), not `tracing-subscriber`'s own
@@ -575,21 +655,21 @@ mod tests {
         assert_eq!(filter.max_level_hint(), Some(LevelFilter::TRACE));
     }
 
-    // ── Revision footer (#601) ────────────────────────────────────────────
+    // ── Revision footer (#601, extended by #959 to add Version) ───────────
 
     #[test]
-    fn footer_renders_a_known_revision() {
+    fn footer_renders_version_and_revision() {
         assert_eq!(
-            format_revision_footer(Some("34e3d96")),
-            "Shell revision: 34e3d96"
+            format_revision_footer(Some("0.1.0"), Some("34e3d96")),
+            "trollshell 0.1.0 · revision 34e3d96"
         );
     }
 
     #[test]
     fn footer_renders_a_dirty_tree_hash_unmodified() {
         assert_eq!(
-            format_revision_footer(Some("34e3d96-dirty")),
-            "Shell revision: 34e3d96-dirty"
+            format_revision_footer(Some("0.1.0"), Some("34e3d96-dirty")),
+            "trollshell 0.1.0 · revision 34e3d96-dirty"
         );
     }
 
@@ -599,25 +679,118 @@ mod tests {
     // deployed shell is itself the useful signal ("this wasn't built by nix").
     #[test]
     fn footer_renders_the_dev_fallback_honestly() {
-        assert_eq!(format_revision_footer(Some("dev")), "Shell revision: dev");
+        assert_eq!(
+            format_revision_footer(Some("0.1.0"), Some("dev")),
+            "trollshell 0.1.0 · revision dev"
+        );
     }
 
+    // A revision value that is literally the string "unknown" (not to be
+    // confused with the `revision: None` case below, which synthesizes that
+    // same word) must still pass through unmodified.
     #[test]
     fn footer_renders_unknown_passthrough() {
         assert_eq!(
-            format_revision_footer(Some("unknown")),
-            "Shell revision: unknown"
+            format_revision_footer(Some("0.1.0"), Some("unknown")),
+            "trollshell 0.1.0 · revision unknown"
         );
     }
 
-    // The shell-not-running case: `None` (the `Control.Revision` call failed)
-    // must render an honest "unavailable" state, not a blank label or a
-    // leftover stale value from a previous connection.
+    // #959: `Version` succeeded but `Revision` didn't (or vice versa) — render
+    // what's available rather than discarding it because its sibling call
+    // failed.
+    #[test]
+    fn footer_renders_version_only() {
+        assert_eq!(
+            format_revision_footer(Some("0.1.0"), None),
+            "trollshell 0.1.0 · revision unknown"
+        );
+    }
+
+    #[test]
+    fn footer_renders_revision_only() {
+        assert_eq!(
+            format_revision_footer(None, Some("34e3d96")),
+            "revision 34e3d96"
+        );
+    }
+
+    // The shell-not-running case: both calls failed, so both are `None`. Must
+    // render an honest "unavailable" state, not a blank label or a leftover
+    // stale value from a previous connection — and must match
+    // `docs/live-verify.md`'s #601/#836 entry byte-for-byte, since #959
+    // deliberately kept this string unchanged.
     #[test]
     fn footer_falls_back_when_shell_is_not_running() {
         assert_eq!(
-            format_revision_footer(None),
+            format_revision_footer(None, None),
             "Shell revision: unavailable (trollshell not running)"
         );
+    }
+
+    // ── Connection banner (#959) ────────────────────────────────────────────
+
+    #[test]
+    fn banner_hides_on_a_successful_probe() {
+        let probe: Result<(String, String), hytte_bus::BusError> =
+            Ok(("pong".to_owned(), "0.1.0".to_owned()));
+        assert_eq!(format_banner_message(&probe), None);
+    }
+
+    #[test]
+    fn banner_shows_not_running_for_service_unknown() {
+        let probe: Result<(String, String), hytte_bus::BusError> =
+            Err(hytte_bus::BusError::Permanent {
+                reason: "The name mov.vibec0re.trollshell.Control was not provided by any \
+                         .service files"
+                    .to_owned(),
+                dbus_name: Some("org.freedesktop.DBus.Error.ServiceUnknown".to_owned()),
+            });
+        assert_eq!(
+            format_banner_message(&probe).as_deref(),
+            Some("trollshell is not running — start the shell to manage it")
+        );
+    }
+
+    // A permanent bus failure that is NOT the shell simply being absent (e.g.
+    // `AccessDenied`, or a `Control` method itself failing) must not be folded
+    // into the "not running" text — it gets its own, honest message instead.
+    #[test]
+    fn banner_shows_a_distinct_message_for_other_bus_errors() {
+        let probe: Result<(String, String), hytte_bus::BusError> =
+            Err(hytte_bus::BusError::Permanent {
+                reason: "not authorised".to_owned(),
+                dbus_name: Some("org.freedesktop.DBus.Error.AccessDenied".to_owned()),
+            });
+        let message = format_banner_message(&probe).expect("must show a message");
+        assert!(
+            message.starts_with("Connection error:"),
+            "expected a distinct connection-error message, got {message:?}"
+        );
+        assert!(
+            !message.contains("not running"),
+            "must not be folded into the not-running text: {message:?}"
+        );
+    }
+
+    #[test]
+    fn is_shell_not_running_is_true_only_for_service_unknown() {
+        let service_unknown = hytte_bus::BusError::Permanent {
+            reason: "unused".to_owned(),
+            dbus_name: Some("org.freedesktop.DBus.Error.ServiceUnknown".to_owned()),
+        };
+        assert!(is_shell_not_running(&service_unknown));
+
+        let access_denied = hytte_bus::BusError::Permanent {
+            reason: "unused".to_owned(),
+            dbus_name: Some("org.freedesktop.DBus.Error.AccessDenied".to_owned()),
+        };
+        assert!(!is_shell_not_running(&access_denied));
+
+        let no_name = hytte_bus::BusError::Permanent {
+            reason: "unused".to_owned(),
+            dbus_name: None,
+        };
+        assert!(!is_shell_not_running(&no_name));
     }
 }

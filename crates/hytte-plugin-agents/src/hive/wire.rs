@@ -8,10 +8,10 @@
 //! | in-tree type      | mirrors                                                            |
 //! | ----------------- | ------------------------------------------------------------------ |
 //! | [`Request`]       | `HostRequest`, `hive-host-sock/src/lib.rs:117-119`                  |
-//! | [`Scope`]         | `LifecycleScope`, `hive-host-sock/src/lib.rs:468-485`               |
-//! | [`Response`]      | `HostResponse`, `hive-host-sock/src/lib.rs:521-569`                 |
+//! | [`Scope`]         | `LifecycleScope`, `hive-host-sock/src/lib.rs:484-501`               |
+//! | [`Response`]      | `HostResponse`, `hive-host-sock/src/lib.rs:546-604`                 |
 //! | [`AgentStatusRow`]| `hive_sh4re::container::AgentStatusRow`, `hive-sh4re/src/container.rs:34-96` |
-//! | [`HiveUrls`]      | `HiveUrls`, `hive-host-sock/src/lib.rs:503-518`                     |
+//! | [`HiveUrls`]      | `HiveUrls`, `hive-host-sock/src/lib.rs:519-534`                     |
 //!
 //! # The three rules the mirror follows
 //!
@@ -38,7 +38,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The wire-schema version this build speaks, mirroring hyperhive's
-/// `HOST_SOCK_VERSION` (`hive-host-sock/src/lib.rs:526`, currently `1`).
+/// `HOST_SOCK_VERSION` (`hive-host-sock/src/lib.rs:543`, currently `1`).
 ///
 /// Bumped hive-side **only** for a breaking change — "removing, renaming, or
 /// retyping an existing field"; adding a new optional field is not breaking
@@ -70,7 +70,7 @@ pub struct VersionMismatch {
 ///   this build reads — every mirrored field is `#[serde(default)]`, so an
 ///   absent one decodes to its default and renders as "unknown", never as a
 ///   wrong value. `0` is the pre-version daemon (hyperhive's own
-///   `#[serde(default)]` on the field, `hive-host-sock/src/lib.rs:532-540`)
+///   `#[serde(default)]` on the field, `hive-host-sock/src/lib.rs:547-556`)
 ///   and lands in the same bucket.
 /// - `theirs > ours` is **refused**. A newer daemon may have retyped a field
 ///   this build reads, and a mis-read status flag is worse than no status at
@@ -107,7 +107,7 @@ pub enum Request {
     /// List managed containers (`hive-host-sock/src/lib.rs:190`).
     List,
     /// The roster view: one [`AgentStatusRow`] per managed agent
-    /// (`hive-host-sock/src/lib.rs:207`). **This is P1's data path.**
+    /// (`hive-host-sock/src/lib.rs:208`). **This is P1's data path.**
     AgentStatus,
     /// Turn the connection into a live push feed of agent-status changes —
     /// hyperhive#4064, **landed** (`hive-host-sock/src/lib.rs:209-224`). The
@@ -127,7 +127,7 @@ pub enum Request {
     /// go away; it becomes the reconciler behind the stream.
     SubscribeAgentStatus,
     /// Park (or un-park) one agent's turn loop
-    /// (`hive-host-sock/src/lib.rs:160-166`). "A single marker write …
+    /// (`hive-host-sock/src/lib.rs:152-164`). "A single marker write …
     /// applies immediately and works on a stopped container too", and it is
     /// idempotent both ways, so a double-click is harmless.
     SetPaused {
@@ -136,12 +136,12 @@ pub enum Request {
         /// `true` pauses, `false` resumes.
         paused: bool,
     },
-    /// Start containers, scoped (`hive-host-sock/src/lib.rs:270-273`).
+    /// Start containers, scoped (`hive-host-sock/src/lib.rs:291-294`).
     Start {
         /// Always a single agent — see [`Scope`].
         scope: Scope,
     },
-    /// Stop containers, scoped (`hive-host-sock/src/lib.rs:262-267`).
+    /// Stop containers, scoped (`hive-host-sock/src/lib.rs:282-287`).
     Stop {
         /// Always a single agent — see [`Scope`].
         scope: Scope,
@@ -149,13 +149,13 @@ pub enum Request {
         graceful: bool,
     },
     /// Stop and start one container without rebuilding config
-    /// (`hive-host-sock/src/lib.rs:144`).
+    /// (`hive-host-sock/src/lib.rs:151`).
     Restart {
         /// The agent, echoed from the hive's own [`AgentStatusRow::name`].
         name: String,
     },
     /// This hive's domain plus its browser-facing URLs
-    /// (`hive-host-sock/src/lib.rs:220`).
+    /// (`hive-host-sock/src/lib.rs:232`).
     Urls,
 }
 
@@ -163,7 +163,7 @@ pub enum Request {
 ///
 /// This is spec §11's rule one, enforced by the type rather than by a
 /// convention. Hyperhive's `LifecycleScope::is_everything` treats an all-false
-/// scope as *everything* (`hive-host-sock/src/lib.rs:487-495`), so a `Start`
+/// scope as *everything* (`hive-host-sock/src/lib.rs:503-511`), so a `Start`
 /// with a defaulted scope starts the entire hive — agents, CI, forge, gateway
 /// and matrix.
 ///
@@ -172,7 +172,7 @@ pub enum Request {
 /// - The mirror carries **only** `agent_names`. There is no `agents` / `ci` /
 ///   `forge` / `gateway` / `matrix` field to set, so "everything" cannot be
 ///   spelled. The omitted keys are `#[serde(default)]` on the hive's own
-///   struct (`hive-host-sock/src/lib.rs:466-484`), so they arrive as `false`.
+///   struct (`hive-host-sock/src/lib.rs:485-500`), so they arrive as `false`.
 /// - There is **no `Default` impl** and no all-false constructor.
 ///   [`Scope::agent`] is the only way to build one and it always fills
 ///   `agent_names` with exactly one non-empty name.
@@ -207,7 +207,7 @@ impl Scope {
 
 /// A response on the host admin socket — one JSON object per line.
 ///
-/// Mirrors `HostResponse` (`hive-host-sock/src/lib.rs:521-569`); only the
+/// Mirrors `HostResponse` (`hive-host-sock/src/lib.rs:546-604`); only the
 /// fields the rows and the panel render are carried (mirror rule 2).
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Response {
@@ -234,7 +234,7 @@ pub struct Response {
 
 /// This hive's canonical domain plus the browser-facing dashboard root.
 ///
-/// Mirrors `HiveUrls` (`hive-host-sock/src/lib.rs:503-518`); `forge` and
+/// Mirrors `HiveUrls` (`hive-host-sock/src/lib.rs:519-534`); `forge` and
 /// `matrix` are swarm surfaces the plugin never reads (spec §3), so they are
 /// not mirrored.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -379,7 +379,7 @@ mod tests {
     /// constructor, so this walks every lifecycle frame the crate can build
     /// and asserts the serialized `agent_names` is present and non-empty —
     /// the property that stops a defaulted scope from meaning "the whole
-    /// hive" (`hive-host-sock/src/lib.rs:487-495`).
+    /// hive" (`hive-host-sock/src/lib.rs:503-511`).
     ///
     /// Falsification: give `Scope` a `Default` (or an `everything()`
     /// constructor) and add it to this table, and the assertion below fails.

@@ -18,22 +18,41 @@ hand —
 
 | shape               | source                                                            |
 | ------------------- | ----------------------------------------------------------------- |
-| `HostResponse`      | `hive-host-sock/src/lib.rs:521-569` (+ its `Default`, `:591-612`) |
-| `HOST_SOCK_VERSION` | `hive-host-sock/src/lib.rs:526`                                   |
+| `HostResponse`      | `hive-host-sock/src/lib.rs:546-604` (+ its `Default`, `:612-629`) |
+| `HOST_SOCK_VERSION` | `hive-host-sock/src/lib.rs:543`                                   |
 | `AgentStatusRow`    | `hive-sh4re/src/container.rs:34-96`                               |
-| `HiveUrls`          | `hive-host-sock/src/lib.rs:503-518`                               |
+| `HiveUrls`          | `hive-host-sock/src/lib.rs:519-534`                               |
 
-That is weaker than a recording in exactly one way, and it is worth naming: a
-hand-derived fixture can agree with a _misreading_ of the source, where a
-recording cannot. It is stronger than the alternative the spec warns about ("a
-hand-written fixture would only prove the mirror agrees with itself") because
-these are written against the daemon's struct definitions, not against
-`crates/hytte-plugin-agents/src/hive/wire.rs` — the mirror was written first
-and the fixtures were derived independently from hyperhive.
+### The gap that leaves was measured, and it is closed
 
-**Re-record on Annika's machine when #949 lands.** The live-verify entry
-(`docs/live-verify.md`) carries that as a checklist item. A recording that
-differs from these files is a finding, not a formatting nit.
+The obvious weakness of a hand-derived fixture is that it can agree with a
+_misreading_ of the source, where a recording cannot. That was checked, and it
+did not happen. The PR's adversarial review built a throwaway crate holding
+**verbatim copies** of hyperhive `origin/main` (`ded23b71`)'s own
+`hive-types`, `hive-sh4re::container` and `hive-host-sock` — four documented
+substitutions, all in cross-crate `use`s plus one field the plugin never reads
+— and put this directory through them:
+
+- all 10 fixtures **decode** through hyperhive's real `HostResponse`;
+- 8 of them **decode → re-serialize with hyperhive's own `Serialize` →
+  compare → byte-identical**: `agent_status_grouped`,
+  `agent_status_precedence`, `agent_status_empty`, `agent_status_bad_name`,
+  `agent_status_v99`, `list`, `urls`, `error`;
+- all 8 pinned request lines from `wire.rs` deserialize into the **correct**
+  `HostRequest` variant, and the plugin's `Start` / `Stop` scope reads `false`
+  through hyperhive's own `LifecycleScope::is_everything()` — while `{}` and
+  `{"agent_names":[]}` read `true`, so the §11 footgun is real and the mirror
+  dodges it.
+
+A byte-identical round trip through the real writer pins every field **name**,
+every field **order**, and every `skip_serializing_if`. What it cannot pin is a
+field `hive-c0re` _populates_ differently from what its struct implies — a much
+smaller surface than "these were written by hand".
+
+**Re-record on Annika's machine anyway when #949 lands.** The live-verify entry
+(`docs/live-verify.md`) carries that as a checklist item; it is now
+belt-and-braces rather than the only evidence. A recording that differs from
+these files is still a finding, not a formatting nit.
 
 ## The files
 

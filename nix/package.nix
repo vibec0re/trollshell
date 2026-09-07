@@ -79,6 +79,16 @@ let
     cp -r ${../assets/trollshell/icons} $out/share/trollshell/icons
     cp ${../assets/trollshell/style.css} $out/share/trollshell/style.css
     cp ${../assets/hytte-ui/style.css} $out/share/hytte-ui/style.css
+
+    # The claude-bridge chip names this glyph through the *icon theme* rather
+    # than loading it by path (#957) — it is an out-of-process plugin, and
+    # `Node::Icon` carries a name, never pixels. A rename or a deletion would
+    # therefore surface as `image-missing` on the bar with nothing red anywhere,
+    # and no Rust test can catch it: the crane source filter above strips
+    # `assets/`, so `checks.system-tests` never sees this directory. Assert it
+    # here, where the file is actually shipped — this derivation is trivial, so
+    # the check costs nothing and couples nothing to the Rust compile.
+    test -f $out/share/trollshell/icons/claude-symbolic.svg
   '';
 
   # Pulled out of commonArgs so the dev shell can reuse the exact same deps via

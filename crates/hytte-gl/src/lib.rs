@@ -318,9 +318,10 @@ impl Program {
         terminated.push('\0');
         // SAFETY: `self.id` is a live program and the pointer is to a
         // nul-terminated buffer that outlives the call.
-        let location =
-            unsafe { gl::GetUniformLocation(self.id, terminated.as_ptr().cast::<i8>()) };
-        self.locations.borrow_mut().insert(name.to_owned(), location);
+        let location = unsafe { gl::GetUniformLocation(self.id, terminated.as_ptr().cast::<i8>()) };
+        self.locations
+            .borrow_mut()
+            .insert(name.to_owned(), location);
         location
     }
 }
@@ -404,10 +405,7 @@ fn program_info_log(id: GLuint) -> String {
 ///
 /// `fill` is handed `(buffer, capacity, written)` exactly as GL wants them, and
 /// promises to write at most `capacity` bytes at `buffer`.
-fn read_info_log(
-    length: GLint,
-    fill: impl FnOnce(*mut i8, GLsizei, *mut GLsizei),
-) -> String {
+fn read_info_log(length: GLint, fill: impl FnOnce(*mut i8, GLsizei, *mut GLsizei)) -> String {
     let capacity = usize::try_from(length).unwrap_or(0);
     if capacity == 0 {
         return String::new();
@@ -499,8 +497,16 @@ impl Texture {
             gl::GenTextures(1, &raw mut id);
             gl::BindTexture(gl::TEXTURE_2D, id);
             gl::TexStorage2D(gl::TEXTURE_2D, 1, internal, w, h);
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST.cast_signed());
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST.cast_signed());
+            gl::TexParameteri(
+                gl::TEXTURE_2D,
+                gl::TEXTURE_MIN_FILTER,
+                gl::NEAREST.cast_signed(),
+            );
+            gl::TexParameteri(
+                gl::TEXTURE_2D,
+                gl::TEXTURE_MAG_FILTER,
+                gl::NEAREST.cast_signed(),
+            );
             gl::TexParameteri(
                 gl::TEXTURE_2D,
                 gl::TEXTURE_WRAP_S,
@@ -536,7 +542,11 @@ impl Texture {
     /// same defensive posture `PixelSurface` takes with an inconsistent RGBA
     /// buffer.
     pub fn upload_f32(&self, _gl: &Gl, values: &[f32]) {
-        debug_assert_eq!(self.format, Format::R32f, "upload_f32 wants an R32F texture");
+        debug_assert_eq!(
+            self.format,
+            Format::R32f,
+            "upload_f32 wants an R32F texture"
+        );
         let wanted = (self.width as usize) * (self.height as usize);
         let mut staged;
         let data = if values.len() == wanted {

@@ -4,6 +4,35 @@
 //! draws with (#857), into the same [`UiNode::Pixels`]/`PixelSurface` machinery
 //! the legacy `Node::Pixels` arm feeds.
 //!
+//! # …and one of them on the GPU (#893 stage B)
+//!
+//! Since #893, a [`Scope`](vocab::PreemWidget::Scope) does **not** take that
+//! path by default. It takes [`Renderer::ScopeGl`], which emits a
+//! [`UiNode::GlSurface`] carrying the state a shader rasterises from — the
+//! uniforms, the sample batch, and a monotonic step count — instead of a
+//! rasterised buffer. The frame never leaves the GPU: rendering into an FBO and
+//! reading it back into an `Arc<[u8]>` would have reused every line of the
+//! machinery below and cost a pipeline stall per chip per frame, which is
+//! exactly the cost #863 set out to remove. `Scope` went first because it is
+//! the one kit widget with an inter-frame accumulation buffer, and a ping-pong
+//! FBO gets the phosphor decay and the bloom for free.
+//!
+//! **What did *not* change is the point.** `ScopeGl` carries the same
+//! `pending`/`idle`/`fades`/`settle_steps`/`steps` fields as the CPU arm, runs
+//! them through the same [`scope_steps`] loop, and answers
+//! [`animates`](Renderer::animates) with the same expression — so #926's frame
+//! clock parks and unparks identically and `pump.rs` needed no change at all.
+//! Everything in this module's contract below — the instance lifecycle, the
+//! keying, the caps, the idempotence rule, the live re-tint — applies to both
+//! arms unchanged; the GL arm caches an `Arc<GlUniforms>` where the CPU arm
+//! caches an `Arc<[u8]>`, and both settle a re-map on an `Arc::ptr_eq`.
+//!
+//! The CPU arm is still the reference and is still gated byte-exactly. It is
+//! taken when `TROLLSHELL_PREEM_RENDERER=cpu` is set (the kill switch — read
+//! once at the first build), when the widget kind has no GL arm (everything but
+//! `Scope` today), or when a GL context could not be created. See
+//! [`preem_gl`](super::preem_gl) for all three.
+//!
 //! # What this module owns
 //!
 //! Everything the vocabulary deliberately left off the wire. A
@@ -204,9 +233,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use hytte::gtk::{self, prelude::*};
 use hytte::ui::Node as UiNode;
+use hytte::ui::gl_surface::{GlProgram, GlUniforms};
 use hytte_plugin_proto::preem as vocab;
 use hytte_plugin_proto::wire::MAX_PREEM_NODES_PER_TREE;
 use hytte_preem as kit;
+
+use super::preem_gl::{self, Arm};
 
 /// The wall-clock length of one **step**, for the two kit primitives that
 /// advance per call rather than per elapsed second (`Scope::advance` and
@@ -558,12 +590,87 @@ enum Renderer {
         settle_steps: u32,
         steps: Steps,
     },
+    /// The **GPU** arm of [`Scope`](Self::Scope) (#893 stage B) — the default
+    /// since Annika's call on #893, with `TROLLSHELL_PREEM_RENDERER=cpu` as the
+    /// kill switch and [`preem_gl::arm`] as the decision.
+    ///
+    /// The animation bookkeeping is **verbatim** from the CPU arm — the same
+    /// `pending`/`idle`/`fades`/`settle_steps`/`steps` fields, advanced by the
+    /// same loop with the same break condition, and [`animates`](Self::animates)
+    /// answers with the *same expression*. That is what let #926's frame-clock
+    /// park and unpark, and `pump.rs` entirely, go untouched by this change.
+    ///
+    /// What is gone is the `kit::Scope`: no `Vec<u16>` phosphor, no per-step
+    /// decay pass, no polyline stamping and no `box_blur`. That is #863's
+    /// retirement rather than an optimisation of it. `scope_settle_steps` stays
+    /// as the CPU integer replay of the kit's recurrence — nothing ever reads
+    /// back from the GPU to ask whether a trail is still fading, and the
+    /// clamped `u32` arithmetic that answers it is cheaper than the question.
+    ScopeGl {
+        /// The already-clamped config the uniforms are rebuilt from every
+        /// mapping pass. Kept because there is no kit object to read it out of.
+        config: vocab::ScopeConfig,
+        /// The batch the shader stamps, shared so the node's dedup is a
+        /// pointer compare across monitors (#911's rule, for uniforms).
+        samples: Arc<[f32]>,
+        /// The absolute step index `samples` is stamped on, or `None` before
+        /// any batch has been consumed. Reaches the shader as a distance back
+        /// from the newest step — see `preem_gl::scope_surface`.
+        ///
+        /// **One batch per render, not one per step.** There is a single
+        /// `samples`/`batch_step` slot, so if two animation steps carrying
+        /// *different* batches elapse between two renders, only the newer one
+        /// is on the wire and the older step flatlines on the axis in the
+        /// shader instead of stamping what it stamped on the CPU. Unreachable
+        /// while renders keep up with the 20 Hz step rate — `queue_render`
+        /// rides the same frame clock the tick does, so a step and a render
+        /// alternate — but it is the mechanism behind
+        /// `hytte_ui::gl_surface::fresh_last_drawn`: a surface replaying steps
+        /// whose batches have scrolled out of this slot is exactly the case
+        /// that made a hot-plugged monitor flash a bright axis band.
+        batch_step: Option<u64>,
+        /// Total animation steps since this renderer was built. Monotonic, and
+        /// the surface's idempotence key: it replays exactly the steps it has
+        /// not drawn yet, and zero on a repeat render.
+        step_seq: u64,
+        // ── verbatim from `Renderer::Scope` ──────────────────────────────────
+        /// The newest sample batch, stamped by the next animation step.
+        pending: Option<Vec<f32>>,
+        /// Steps since the last batch; saturates.
+        idle: u32,
+        /// `256` never fades.
+        fades: bool,
+        /// Idle steps this trail needs to reach black.
+        settle_steps: u32,
+        steps: Steps,
+    },
     Gauge {
         gauge: kit::Gauge,
     },
     FlipBoard {
         board: kit::FlipBoard,
     },
+}
+
+/// What an instance last produced, cached so a second monitor's mapping pass
+/// costs a refcount rather than a rasterisation (#911) — and, for the GL arm,
+/// so the surface's `Arc::ptr_eq` guard actually fires.
+///
+/// Two shapes because the two arms hand the reconciler different things: the
+/// CPU arm hands it **pixels**, the GL arm hands it the **state a shader
+/// rasterises from**. See `hytte_ui::gl_surface` for why the GL frame never
+/// comes back across the bus as bytes.
+#[derive(Clone, Debug)]
+enum Cached {
+    /// `(width, height, RGBA8)` for a [`UiNode::Pixels`].
+    Pixels(u32, u32, Arc<[u8]>),
+    /// `(program, width, height, uniforms)` for a [`UiNode::GlSurface`].
+    ///
+    /// The program travels with the payload rather than being re-derived at
+    /// the node, so a second GL kind (a gauge, after #930/#931 settles) adds an
+    /// arm here instead of an `if` in `map_widget` that the compiler cannot
+    /// check.
+    Gl(GlProgram, u32, u32, Arc<GlUniforms>),
 }
 
 /// A node's renderer plus the widget it was last built/updated from.
@@ -576,13 +683,15 @@ struct Instance {
     applied: vocab::PreemWidget,
     /// `None` for a widget kind this build cannot render — see [`build`].
     renderer: Option<Renderer>,
-    /// The last rasterised frame, re-used until something invalidates it.
+    /// The last produced surface, re-used until something invalidates it.
     ///
     /// Shared, not owned (#911): every monitor's mapping pass takes a *handle*
-    /// on this one allocation and hands it to that monitor's `PixelSurface`, so
-    /// a frame costs one rasterisation and one buffer however many screens show
-    /// it — see [`Instance::frame`].
-    cached: Option<(u32, u32, Arc<[u8]>)>,
+    /// on this one allocation and hands it to that monitor's widget, so a frame
+    /// costs one rasterisation and one buffer however many screens show it —
+    /// see [`Instance::surface`]. The GL arm shares its `Arc<GlUniforms>` for
+    /// exactly the same reason and to exactly the same effect: `GlSurface`'s
+    /// dedup short-circuits on an `Arc::ptr_eq` just as `PixelSurface`'s does.
+    cached: Option<Cached>,
     /// How many times the renderer has been *built* (1 on first sight, +1 per
     /// config/kind change) and how many times a widget has been *applied* to it
     /// (a build or a state update; a no-op re-map doesn't count).
@@ -832,10 +941,11 @@ pub(super) fn forget_scope(scope: &Scope) {
 /// subscriber is arbitrary code, and this table is thread-local and re-entered
 /// by every mapping pass).
 struct Mapped {
-    /// The instance's `(width, height, RGBA8)`; `(0, 0, empty)` for the
-    /// placeholder an over-cap or unrenderable node degrades to. The buffer is
-    /// a handle on the instance's cached frame, never a copy of it (#911).
-    frame: (u32, u32, Arc<[u8]>),
+    /// The instance's surface — rasterised pixels, or the GL arm's uniform bag.
+    /// `Cached::Pixels(0, 0, empty)` for the placeholder an over-cap or
+    /// unrenderable node degrades to. The payload is a handle on the instance's
+    /// cache, never a copy of it (#911).
+    surface: Cached,
     /// The widget kind is one this build cannot render — [`build`] returned
     /// `None`. Latched process-wide, not per tree.
     unsupported: bool,
@@ -943,7 +1053,11 @@ pub(super) fn map_widget(
         // its in-cap siblings.
         if !state.instances.contains_key(&key) && state.touched.len() >= MAX_PREEM_NODES_PER_TREE {
             return Mapped {
-                frame: (0, 0, nothing()),
+                // Always the raster placeholder, on either arm: an over-cap
+                // node has no renderer at all, so there is nothing to draw with
+                // and an empty `PixelSurface` is the cheapest way to say so
+                // while keeping the node's id and classes.
+                surface: Cached::Pixels(0, 0, nothing()),
                 unsupported: false,
                 anonymous_key,
                 duplicate_of: None,
@@ -984,7 +1098,7 @@ pub(super) fn map_widget(
         apply(instance, widget);
         let unsupported = instance.renderer.is_none();
         Mapped {
-            frame: instance.frame(),
+            surface: instance.surface(),
             unsupported,
             anonymous_key,
             duplicate_of,
@@ -992,18 +1106,33 @@ pub(super) fn map_widget(
         }
     });
     report(scope, id, widget, &mapped);
-    let (width, height, data) = mapped.frame;
 
-    UiNode::Pixels {
-        id: id.map(str::to_owned),
-        width,
-        height,
-        data,
-        // The kit bakes its own upscale into the buffer (`Frame::upscale`, and
-        // every widget's `scale` knob), so the host must not scale again —
-        // exactly what `Frame::into_node` hard-codes for the plugin-side path.
-        scale: 1,
-        classes: classes.to_vec(),
+    match mapped.surface {
+        Cached::Pixels(width, height, data) => UiNode::Pixels {
+            id: id.map(str::to_owned),
+            width,
+            height,
+            data,
+            // The kit bakes its own upscale into the buffer (`Frame::upscale`,
+            // and every widget's `scale` knob), so the host must not scale
+            // again — exactly what `Frame::into_node` hard-codes for the
+            // plugin-side path.
+            scale: 1,
+            classes: classes.to_vec(),
+        },
+        // The GL arm's node carries **state**, not pixels: `width`/`height` are
+        // the same `cols * scale` × `rows * scale` the CPU arm's buffer would
+        // have been, so the two measure identically and a kill-switch flip
+        // changes no layout — but the frame is rasterised in a shader against
+        // the phosphor the surface owns, and never crosses back.
+        Cached::Gl(program, width, height, state) => UiNode::GlSurface {
+            id: id.map(str::to_owned),
+            width,
+            height,
+            program,
+            state,
+            classes: classes.to_vec(),
+        },
     }
 }
 
@@ -1086,16 +1215,29 @@ fn report(scope: &Scope, id: Option<&str>, widget: &vocab::PreemWidget, mapped: 
 /// update state otherwise, and no-op when nothing moved (the multi-monitor
 /// case).
 fn apply(instance: &mut Instance, widget: &vocab::PreemWidget) {
+    // **The CPU fallback** (#893). A `ScopeGl` whose `GtkGLArea` could not get
+    // a context can never draw anything, so it is rebuilt onto the kit — which
+    // `build` does on its own, because `preem_gl::arm()` consults the same
+    // latch. Checked here rather than in the short-circuit below because a
+    // failed context does not change the *widget*: without this the
+    // `same_widget` early return would keep a dead renderer forever on a scope
+    // whose plugin has gone quiet.
+    //
+    // The phosphor restarts from black. That is the honest outcome: the GL arm
+    // never drew a trail to inherit.
+    let gl_lost =
+        matches!(instance.renderer, Some(Renderer::ScopeGl { .. })) && preem_gl::arm() == Arm::Cpu;
     // `same_widget`, not `==`: derived `PartialEq` is not reflexive over a
     // non-finite float, and a short-circuit that never fires is a permanent
     // 20 Hz loop rather than a missed optimisation. See `sanitize_in_place`.
-    if instance.renderer.is_some() && same_widget(&instance.applied, widget) {
+    if !gl_lost && instance.renderer.is_some() && same_widget(&instance.applied, widget) {
         return;
     }
-    let rebuild = instance
-        .renderer
-        .as_ref()
-        .is_none_or(|renderer| !renderer.matches_kind(widget))
+    let rebuild = gl_lost
+        || instance
+            .renderer
+            .as_ref()
+            .is_none_or(|renderer| !renderer.matches_kind(widget))
         || !same_config(&instance.applied, widget);
     if rebuild {
         instance.renderer = build(widget);
@@ -1109,9 +1251,9 @@ fn apply(instance: &mut Instance, widget: &vocab::PreemWidget) {
 }
 
 impl Instance {
-    /// The instance's current frame as `(width, height, RGBA8)`, rasterising it
-    /// only when the cache is cold. `(0, 0, empty)` is the unsupported-widget
-    /// placeholder.
+    /// The instance's current surface — rasterised pixels for a CPU arm, a
+    /// uniform bag for the GL one — produced only when the cache is cold.
+    /// `Cached::Pixels(0, 0, empty)` is the unsupported-widget placeholder.
     ///
     /// **A warm cache costs a refcount, not a copy** (#911). This runs once per
     /// monitor per mapping pass — the instance table is keyed by scope and
@@ -1119,44 +1261,67 @@ impl Instance {
     /// clone per screen per tick, and a second one for every unchanged chip a
     /// blanket repaint walked past. The `Arc` travels all the way into
     /// `hytte_ui`'s `PixelSurface`, which adopts it for the texture upload and
-    /// settles an unchanged frame with an `Arc::ptr_eq` (#907).
-    fn frame(&mut self) -> (u32, u32, Arc<[u8]>) {
-        if let Some((width, height, data)) = self.cached.as_ref() {
-            return (*width, *height, Arc::clone(data));
+    /// settles an unchanged frame with an `Arc::ptr_eq` (#907). The GL arm is
+    /// the same argument with a different payload: the second monitor's
+    /// `GlSurface` gets the very same `Arc<GlUniforms>` and settles on the same
+    /// pointer compare, queueing no render at all.
+    fn surface(&mut self) -> Cached {
+        if let Some(cached) = self.cached.as_ref() {
+            return cached.clone();
         }
         let style = display_style(self.applied.style());
         // The palette is resolved here, per rasterisation, never baked into the
         // instance — which is what makes a theme change a cache drop rather than
         // a rebuild (#396). A pin resolves to the same colors every time, so a
         // pinned widget re-rasterises to identical bytes.
+        //
+        // The GL arm resolves it through the *same* scope, into
+        // `hytte_preem::palette_snapshot` rather than into a rasterisation, so
+        // the accent / role / pin precedence is the kit's one implementation on
+        // both arms and an accent change is a cache drop on both.
         let pins = pins_for(self.applied.style());
-        let rendered = self.renderer.as_ref().map_or_else(
-            || (0, 0, nothing()),
-            |renderer| {
-                let frame = kit::with_pins(pins, || renderer.render(style));
-                // Both dimensions or neither: a lone `unwrap_or(0)` could pair a
-                // zero dimension with a non-empty buffer and break the
-                // `len == w * h * 4` invariant every `Node::Pixels` consumer
-                // (and `mapped_pixels`) relies on. The wire caps put this far
-                // out of reach; the seam is here so it cannot be reached at all.
-                match (
-                    u32::try_from(frame.width()),
-                    u32::try_from(frame.height()),
-                    u32::try_from(frame.data().len()),
-                ) {
-                    // One copy out of the kit's frame, exactly what `to_vec`
-                    // was — an `Arc<[u8]>` carries its refcount inline ahead of
-                    // the bytes, so it can never adopt a `Vec`'s allocation and
-                    // there is nothing to be saved by going through one.
-                    (Ok(width), Ok(height), Ok(_)) => (width, height, Arc::from(frame.data())),
-                    _ => (0, 0, nothing()),
+        let produced = match self.renderer.as_ref() {
+            None => Cached::Pixels(0, 0, nothing()),
+            Some(renderer) => kit::with_pins(pins, || {
+                if let Some((program, surface)) = renderer.gl_surface(style) {
+                    return Cached::Gl(
+                        program,
+                        surface.width,
+                        surface.height,
+                        Arc::new(surface.uniforms),
+                    );
                 }
-            },
-        );
-        // A tuple clone of two `u32`s and a refcount — the cache and the caller
-        // share the one buffer.
-        self.cached = Some(rendered.clone());
-        rendered
+                renderer
+                    .render(style)
+                    .map_or(Cached::Pixels(0, 0, nothing()), |frame| {
+                        // Both dimensions or neither: a lone `unwrap_or(0)`
+                        // could pair a zero dimension with a non-empty buffer
+                        // and break the `len == w * h * 4` invariant every
+                        // `Node::Pixels` consumer (and `mapped_pixels`) relies
+                        // on. The wire caps put this far out of reach; the seam
+                        // is here so it cannot be reached at all.
+                        match (
+                            u32::try_from(frame.width()),
+                            u32::try_from(frame.height()),
+                            u32::try_from(frame.data().len()),
+                        ) {
+                            // One copy out of the kit's frame, exactly what
+                            // `to_vec` was — an `Arc<[u8]>` carries its refcount
+                            // inline ahead of the bytes, so it can never adopt a
+                            // `Vec`'s allocation and there is nothing to be
+                            // saved by going through one.
+                            (Ok(width), Ok(height), Ok(_)) => {
+                                Cached::Pixels(width, height, Arc::from(frame.data()))
+                            }
+                            _ => Cached::Pixels(0, 0, nothing()),
+                        }
+                    })
+            }),
+        };
+        // A clone of two `u32`s and a refcount — the cache and the caller share
+        // the one allocation.
+        self.cached = Some(produced.clone());
+        produced
     }
 }
 
@@ -1318,6 +1483,40 @@ fn state_animates(state: &ScopeState) -> bool {
         .instances
         .values()
         .any(|instance| instance.renderer.as_ref().is_some_and(Renderer::animates))
+}
+
+/// Rebuild every `ScopeGl` instance onto the CPU kit, now — the GL
+/// context-failure path (#893).
+///
+/// [`apply`]'s `gl_lost` already does this on the next mapping pass, which is
+/// enough for an *animating* scope because a pass is coming. A settled one gets
+/// no pass at all: `persistence: 256` is the kit's own legal
+/// infinite-persistence value, `build` then gives the renderer `fades: false`,
+/// [`Renderer::animates`] is `false` from birth, #926's clock parks, and the
+/// chip would stay blank until a plugin frame that may never arrive. So the
+/// rebuild happens here instead, exactly as [`invalidate_cached_frames`]
+/// rebuilds a `TextBox`, and for the same reason it is free: the fallback
+/// restarts the phosphor from black either way. Swapping the on-screen node for
+/// the `Pixels` one is the other half, and is `preem_gl`'s hook's job.
+///
+/// **Ordering, load-bearing:** `build` resolves the arm through
+/// `preem_gl::arm()`, which consults `hytte_ui::gl_surface::gl_abandoned()`.
+/// That latch is set *before* the failure handler is invoked
+/// (`gl_surface::abandon_gl`), which is the only reason this mints a
+/// `Renderer::Scope` rather than another `ScopeGl`. Reverse those two
+/// statements and this function silently becomes a no-op.
+pub(super) fn rebuild_gl_renderers_on_cpu() {
+    STORE.with_borrow_mut(|store| {
+        for state in store.values_mut() {
+            for instance in state.instances.values_mut() {
+                if matches!(instance.renderer, Some(Renderer::ScopeGl { .. })) {
+                    instance.renderer = build(&instance.applied);
+                    instance.builds = instance.builds.saturating_add(1);
+                    instance.cached = None;
+                }
+            }
+        }
+    });
 }
 
 /// Drop every cached frame **and the memoized role colors**, so the next mapping
@@ -1830,6 +2029,28 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
             speed_dots_per_sec: config.speed_dots_per_sec,
         },
         W::Scope { config, state } => {
+            // GL by default, the CPU kit under the kill switch or once a
+            // context has failed — `preem_gl::arm` is the whole decision, and
+            // it is consulted per *build* so an instance rebuilt after a
+            // context failure lands on the CPU arm (see `apply`).
+            if preem_gl::arm() == Arm::Gl {
+                return Renderer::ScopeGl {
+                    config: *config,
+                    // The debut batch is stamped now rather than queued —
+                    // `step_seq: 1` with the batch at step `0` — so the first
+                    // frame a plugin sends is on screen before the clock's
+                    // first tick, exactly as the CPU arm's eager
+                    // `scope.advance(&state.samples)` below arranges.
+                    samples: Arc::from(&state.samples[..]),
+                    batch_step: Some(0),
+                    step_seq: 1,
+                    pending: None,
+                    idle: 0,
+                    fades: config.persistence < KIT_MAX_PERSISTENCE,
+                    settle_steps: scope_settle_steps(config.persistence),
+                    steps: Steps::default(),
+                };
+            }
             let mut scope = kit::Scope::with_size(dim(config.cols), dim(config.rows))
                 .scale(dim(config.scale))
                 .persistence(config.persistence);
@@ -1949,6 +2170,11 @@ impl Renderer {
                 | (Self::LedStrip { .. }, W::LedStrip { .. })
                 | (Self::Marquee { .. }, W::Marquee { .. })
                 | (Self::Scope { .. }, W::Scope { .. })
+                // Both `Scope` arms answer for the same wire kind: which one an
+                // instance holds is the host's choice (`preem_gl::arm`), not
+                // the plugin's, so a kind mismatch here would rebuild every
+                // frame rather than never.
+                | (Self::ScopeGl { .. }, W::Scope { .. })
                 | (Self::Gauge { .. }, W::Gauge { .. })
                 | (Self::FlipBoard { .. }, W::FlipBoard { .. })
         )
@@ -2011,7 +2237,14 @@ impl Renderer {
                     text.clone_from(&state.text);
                 }
             }
-            (Self::Scope { pending, idle, .. }, W::Scope { state, .. }) => {
+            (Self::Scope { pending, idle, .. }, W::Scope { state, .. })
+            // The GL arm queues a batch exactly as the CPU arm does — the
+            // stamping happens in `advance`, one batch per step, so a
+            // two-monitor mapping pass cannot double-stamp either of them.
+            // **This arm is the one `update`'s `_ => {}` catch-all would have
+            // swallowed**: without it a GL scope would queue nothing, never
+            // animate, and show its debut batch for ever.
+            | (Self::ScopeGl { pending, idle, .. }, W::Scope { state, .. }) => {
                 *pending = Some(state.samples.clone());
                 *idle = 0;
             }
@@ -2110,30 +2343,60 @@ impl Renderer {
                 fades,
                 settle_steps,
                 steps,
-            } => {
-                let owed = steps.owed(dt);
-                let mut moved = false;
-                for _ in 0..owed {
-                    let batch = pending.take();
-                    // Nothing pending and nothing left to fade: stop, so a
-                    // settled trace doesn't keep the clock (and the reconcilers)
-                    // awake.
-                    if batch.is_none() && (!*fades || *idle >= *settle_steps) {
-                        break;
+            } => scope_steps(
+                ScopeClock {
+                    steps,
+                    pending,
+                    idle,
+                    fades: *fades,
+                    settle_steps: *settle_steps,
+                },
+                dt,
+                // An empty batch flatlines on the axis while the existing trail
+                // keeps decaying — the kit's documented behaviour, and what
+                // lets a plugin with nothing to say simply stop.
+                |batch| scope.advance(batch.unwrap_or(&[])),
+            ),
+            // **The same loop with the kit call replaced by bookkeeping** — and
+            // literally so since it moved into [`scope_steps`], which is what
+            // makes "the two arms agree about *when* a scope advances"
+            // structural rather than a comment. That agreement is what let
+            // #926's clock park and `pump.rs` go untouched by this change.
+            //
+            // What the CPU arm spends on a `Vec<u16>` decay and a polyline
+            // stamp, this spends on incrementing a counter: the decay and the
+            // stamp happen in the shader, once per step the surface has not
+            // drawn yet. `batch_step` records *which* step consumes the batch,
+            // because the kit stamps a batch on the first step of an advance
+            // and flatlines on the axis for the rest — and the shader has to
+            // reproduce that, not stamp the same batch eight times.
+            Self::ScopeGl {
+                pending,
+                idle,
+                fades,
+                settle_steps,
+                steps,
+                samples,
+                batch_step,
+                step_seq,
+                ..
+            } => scope_steps(
+                ScopeClock {
+                    steps,
+                    pending,
+                    idle,
+                    fades: *fades,
+                    settle_steps: *settle_steps,
+                },
+                dt,
+                |batch| {
+                    if let Some(batch) = batch {
+                        *samples = Arc::from(batch);
+                        *batch_step = Some(*step_seq);
                     }
-                    // An empty batch flatlines on the axis while the existing
-                    // trail keeps decaying — the kit's documented behaviour, and
-                    // what lets a plugin with nothing to say simply stop.
-                    scope.advance(batch.as_deref().unwrap_or(&[]));
-                    *idle = if batch.is_some() {
-                        0
-                    } else {
-                        idle.saturating_add(1)
-                    };
-                    moved = true;
-                }
-                moved
-            }
+                    *step_seq = step_seq.saturating_add(1);
+                },
+            ),
             // The two seconds-based primitives are the only ones whose "did it
             // move" answer is not derived from a before/after comparison
             // (`LedStrip`, `Marquee`) or from a step count (`Scope`), so they are
@@ -2189,7 +2452,19 @@ impl Renderer {
                 speed_dots_per_sec,
                 ..
             } => strip.scrolls() && speed_dots_per_sec.is_finite() && *speed_dots_per_sec != 0.0,
+            // **The same expression on both arms**, and that is the property
+            // #926's frame clock rests on: whether a scope keeps its mount's
+            // tick callback armed must not depend on which renderer drew it, or
+            // a kill-switch flip would change when the shell parks. Asserted in
+            // `plugins::tests`.
             Self::Scope {
+                pending,
+                idle,
+                fades,
+                settle_steps,
+                ..
+            }
+            | Self::ScopeGl {
                 pending,
                 idle,
                 fades,
@@ -2201,9 +2476,16 @@ impl Renderer {
         }
     }
 
-    /// Rasterise the current frame in `style`.
-    fn render(&self, style: kit::DisplayStyle) -> kit::Frame {
-        match self {
+    /// Rasterise the current frame in `style`, or `None` for a renderer that
+    /// does not rasterise at all.
+    ///
+    /// The `Option` is the GL seam and nothing else: [`Self::ScopeGl`] draws in
+    /// a shader from uniforms, so there is no CPU frame to hand back and
+    /// inventing an empty one would make a GL scope render as a blank chip
+    /// rather than fail loudly. [`Instance::surface`] asks
+    /// [`gl_surface`](Self::gl_surface) first and only falls through to here.
+    fn render(&self, style: kit::DisplayStyle) -> Option<kit::Frame> {
+        Some(match self {
             Self::DotMatrix { text } => kit::dot_matrix(text, style),
             Self::SevenSeg { text } => kit::seven_seg(text, style),
             // The box baked its palette at construction, so it takes no style
@@ -2218,10 +2500,99 @@ impl Renderer {
             } => strip.render(*level, peak_for(*explicit_peak, hold.as_ref())),
             Self::Marquee { strip, offset, .. } => strip.window(dots(*offset, strip.period())),
             Self::Scope { scope, .. } => scope.render(style),
+            Self::ScopeGl { .. } => return None,
             Self::Gauge { gauge } => gauge.render(style),
             Self::FlipBoard { board } => board.render(style),
+        })
+    }
+
+    /// The program and node payload for a renderer that draws on the GPU, or
+    /// `None` for every CPU arm.
+    ///
+    /// **Call it inside this widget's `with_pins` scope** — see
+    /// [`Instance::surface`], the only caller. The palette is resolved *here*,
+    /// through `hytte_preem::palette_snapshot`, so the accent / role / pin
+    /// precedence stays the kit's single implementation across both arms: the
+    /// GL arm reads the very palette the CPU arm would have composited toward
+    /// rather than re-deriving one. Resolving it inside the `Some` arm also
+    /// keeps a CPU rasterisation from paying for a snapshot it never reads.
+    ///
+    /// The `_ => None` catch-all is deliberate and safe in a way this module's
+    /// other catch-alls are not: the question is "does this renderer draw on
+    /// the GPU", and the honest answer for an arm that does not is `None`. A
+    /// new GPU arm that forgot to answer here would render nothing at all —
+    /// loudly — rather than render subtly wrongly.
+    fn gl_surface(&self, style: kit::DisplayStyle) -> Option<(GlProgram, preem_gl::ScopeSurface)> {
+        match self {
+            Self::ScopeGl {
+                config,
+                samples,
+                batch_step,
+                step_seq,
+                ..
+            } => Some((
+                preem_gl::SCOPE,
+                preem_gl::scope_surface(
+                    *config,
+                    samples,
+                    *batch_step,
+                    *step_seq,
+                    &kit::palette_snapshot(style),
+                ),
+            )),
+            _ => None,
         }
     }
+}
+
+/// The step-budget state a `Scope` carries, whichever arm draws it — borrowed
+/// as one bundle so [`scope_steps`] can own the loop.
+struct ScopeClock<'a> {
+    steps: &'a mut Steps,
+    pending: &'a mut Option<Vec<f32>>,
+    idle: &'a mut u32,
+    fades: bool,
+    settle_steps: u32,
+}
+
+/// Advance a `Scope`'s step budget by `dt`, calling `stamp` once per step with
+/// that step's batch (`None` for an idle step), and answering "did anything
+/// move".
+///
+/// **Shared by both `Scope` arms on purpose.** The step count, the break
+/// condition and the `idle` accounting are exactly what
+/// [`Renderer::animates`] then reads, so the CPU and GPU arms agreeing about
+/// *when* a scope advances is what keeps #926's frame-clock park identical
+/// across a kill-switch flip — and a duplicated loop is precisely the thing
+/// that would drift. The arms differ only in what a step *does*: the CPU one
+/// stamps into a `kit::Scope`, the GL one records which step the batch belongs
+/// to and bumps a counter the shader replays against.
+fn scope_steps(clock: ScopeClock<'_>, dt: f32, mut stamp: impl FnMut(Option<&[f32]>)) -> bool {
+    let ScopeClock {
+        steps,
+        pending,
+        idle,
+        fades,
+        settle_steps,
+    } = clock;
+    let owed = steps.owed(dt);
+    let mut moved = false;
+    for _ in 0..owed {
+        let batch = pending.take();
+        // Nothing pending and nothing left to fade: stop, so a settled trace
+        // doesn't keep the clock (and the reconcilers) awake.
+        if batch.is_none() && (!fades || *idle >= settle_steps) {
+            break;
+        }
+        *idle = if batch.is_some() {
+            0
+        } else {
+            idle.saturating_add(1)
+        };
+        stamp(batch.as_deref());
+        moved = true;
+    }
+    moved
 }
 
 /// Whether `dt` can move anything at all.

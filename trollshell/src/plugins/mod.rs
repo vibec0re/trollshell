@@ -148,6 +148,7 @@ use tokio::sync::{mpsc, watch};
 mod datasource;
 mod effects;
 mod listener;
+mod preem_gl;
 mod preem_render;
 mod pump;
 mod region;
@@ -578,6 +579,12 @@ pub fn service() -> PluginsService {
 /// mount per-monitor via [`sidebar_lead_slot`] / [`sidebar_top_slot`] /
 /// [`sidebar_bottom_slot`].
 pub fn install() {
+    // The GPU arm of the preem renderer (#893 stage B): register the `Scope`
+    // shader pipeline with `hytte-ui` and install the context-failure hook that
+    // drops every GL scope back to the CPU kit. Before anything can reconcile a
+    // plugin tree, and free — no GL is touched until a surface realizes.
+    preem_gl::install();
+
     // Clock state pump: project the live `clock::now()` into a GTK-free wire
     // `ClockState` and publish it on the watch channel the per-conn snapshot
     // tasks subscribe to. `clock::now()` replays its current value on subscribe,

@@ -182,3 +182,20 @@ pub use contrast::{AA_TEXT, ratio as contrast_ratio};
 /// [`with_pins`] names the ink and, optionally, the field; [`with_ink`] is the
 /// one-slot form, kept because most callers pin exactly one color.
 pub use style::{Ink, Pins, with_ink, with_pins};
+
+/// Read the palette a skin would render with **right now**, as plain data
+/// (#893 stage B) — host-facing, and additive: no kit render path produces or
+/// consumes it.
+///
+/// The kit's own `Palette` is crate-private and stays that way. This is the
+/// narrow projection of it a renderer *outside* this crate needs — the ink and
+/// field a composite mixes between, plus the bloom and CRT-mask parameters —
+/// resolved through the same `palette()` every widget draws with, so the
+/// [`with_pins`] / [`set_accent`] precedence is reused rather than
+/// reimplemented on the far side of the boundary.
+///
+/// It exists for the GPU arm of the shell's preem renderer, which composites a
+/// `Scope`'s phosphor toward these colors in a fragment shader instead of in
+/// [`Emission::composite`](self)'s loop, and must agree with the CPU kit byte
+/// for byte to stay inside the parity ceiling.
+pub use style::{BloomSnapshot, MaskSnapshot, PaletteSnapshot, palette_snapshot};

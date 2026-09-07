@@ -376,6 +376,45 @@
             touch $out
           '';
 
+          # The preem GL renderer's shaders, compiled in the dialect the shell
+          # compiles them in (#893 stage B). Same posture and same reasons as
+          # `bind-pins` above: a source-level defect no compile in this flake
+          # can see, checked by a script rather than a test, with no
+          # cargoArtifacts so it goes red in seconds.
+          #
+          # Nothing else looks inside those files. They are `include_str!`'d
+          # `&'static str`s until a *driver* compiles them, and no check here
+          # has one — `system-tests` runs `xvfb-run` in a sandbox with no
+          # `/dev/dri` and no mesa in the closure. So without this a typo'd
+          # identifier ships green and surfaces as a blank chip on glass.
+          #
+          # The design spec's CI table named **naga** for this row. Measured, it
+          # cannot do the job: naga 26's GLSL frontend rejects the entire ES
+          # profile — `#version 300/310/320 es` each come back
+          # `InvalidVersion(N)` + `InvalidProfile("es")`, so the spec's own
+          # fallback (decision 6, "drop to 310 es") does not reach either — and
+          # at `#version 450` it stops on `NotImplemented("variable
+          # qualifier")` for the `flat in` / `precision` declarations these
+          # shaders are written with. The spec preferred naga because glslang is
+          # C++ FFI that would have to live in the `hytte-gl` unsafe island: a
+          # real objection to *linking* a validator in for #893's untrusted
+          # plugin shaders, and none at all to running the binary at build time.
+          # So this is glslang, it validates the real `#version 320 es`, and it
+          # adds zero `Cargo.lock` entries.
+          glsl =
+            pkgs.runCommand "trollshell-glsl-check"
+              {
+                nativeBuildInputs = [
+                  pkgs.python3
+                  pkgs.glslang
+                ];
+              }
+              ''
+                cd ${self}
+                python3 nix/lint-glsl.py
+                touch $out
+              '';
+
           # Run the `system-tests` cargo-feature bucket (#232): the
           # whole-file-`#![cfg(feature = "system-tests")]` integration tests
           # in hytte-bus/hytte-reactive/hytte-ui, plus the `#[cfg(all(test,

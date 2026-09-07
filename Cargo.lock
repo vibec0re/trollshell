@@ -1174,6 +1174,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hytte-gl"
+version = "0.1.0"
+dependencies = [
+ "gl",
+ "libloading",
+ "tracing",
+]
+
+[[package]]
 name = "hytte-plugin"
 version = "0.1.0"
 dependencies = [
@@ -1369,6 +1378,7 @@ dependencies = [
  "gio",
  "gtk4",
  "gtk4-layer-shell",
+ "hytte-gl",
  "hytte-reactive",
  "libadwaita",
  "tracing",
@@ -2872,6 +2882,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "hytte",
+ "hytte-gl",
  "hytte-plugin-proto",
  "hytte-preem",
  "oo7",

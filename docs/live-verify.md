@@ -950,6 +950,60 @@ session.
       rasterisation per tick remains. Nothing should look different on
       screen — same picture, same pixels; this PR moves ownership only,
       never a byte of content.
+- [ ] **(#893 stage B / #886 / #863)** **`Scope` renders on a `GtkGLArea`, and
+      it is on by default.** Nothing in this entry can be gated in CI:
+      `nix flake check`'s system-tests bucket runs `xvfb-run` in a sandbox with
+      no `/dev/dri` and no mesa in the closure, so the shell's GL path never
+      executes there. What CI _does_ hold is the arm selection, the uniform
+      table, the animation state machine and the reconciler's node handling —
+      everything up to the draw call. The draw is yours.
+  1. **GL is the default, and the picture is right.** Start the shell with no
+     `TROLLSHELL_PREEM_RENDERER` set and open `hytte-plugin-preem-demo`'s card.
+     The scope must look like the scope did: same graticule, same beam, same
+     phosphor trail length, same skin colours. A gamma-shifted or washed-out
+     trace means the `GtkGLArea` framebuffer is being treated as linear where
+     `PixelSurface`'s texture was sRGB — the one colour-space question this
+     design could not settle from the sources.
+     `journalctl --user -u trollshell | grep -i 'GlSurface\|GL context'` should
+     be silent; a line there names the fallback that fired.
+  2. **The kill switch restores today's frames.** Restart with
+     `TROLLSHELL_PREEM_RENDERER=cpu` and confirm the scope still draws — and
+     draws the _same_ picture. That identity is byte-checked in CI
+     (`the_cpu_arm_still_emits_the_kits_own_bytes_as_a_pixels_node`, plus every
+     existing `*_renders_at_parity_with_the_kit` test, which all run on the CPU
+     arm by default). What only glass can confirm is that the switch is
+     actually _read_: the variable is consumed once at the first `Scope` build,
+     so it has to be in the unit's environment, not just your shell's.
+  3. **A bar's worth of scopes.**
+     `cargo run -p hytte-ui --example gl_probe -- --layer --areas 8` (stage A's
+     probe, on layer-shell): **jank 0**, and p95 within 0.5 ms of the 16.67 ms
+     idle baseline. The number to beat is stage A's `gl-x3` layer result,
+     16.77 ms. `--areas 3` was all stage A measured, so this is the
+     extrapolation being checked rather than re-confirmed.
+  4. **The parity numbers.** `cargo run -p trollshell --example preem_gl_diff`
+     prints a per-channel mean / p99 / max against the CPU kit for each skin at
+     three points in the fade, plus a per-column peak-row structural check. The
+     proposed ceiling is **mean ≤ 2 / p99 ≤ 8 / max ≤ 32** of 255 (#893,
+     Annika's answer 4). Paste the transcript on #893; if the span-quad design
+     holds, the observed numbers should be far tighter and the ceiling tightens
+     to observed + margin.
+  5. **CPU and GL side by side.** Two shells cannot share the session, so do it
+     in sequence on the same preem-demo card and compare screenshots — or put a
+     GL scope next to a CPU-only kit widget (the gauge, which has no GL arm in
+     this PR) and check the skin reads as one device: same field, same ink,
+     same bloom character.
+  6. **Two monitors.** A scope on both outputs accumulates its phosphor twice,
+     once per `GtkGLArea` — accepted and documented (#893, answer 3). Fed the
+     same batches they stay visually equivalent; a monitor that was unmapped
+     and remaps resumes from its own trail and converges within the settle
+     window (17 steps at the default persistence). What must _not_ happen is
+     the animation running at double speed: the renderer instances are shared
+     across outputs even though the surfaces are not.
+  7. **The fallback, if you can provoke it.** Force a context failure (a
+     session with no GL, or a stack that refuses `LIBGL_ALWAYS_SOFTWARE`) and
+     confirm the scope falls back to the CPU kit with one journal line rather
+     than showing a blank chip. The phosphor restarts from black, which is the
+     honest outcome — the GL arm never drew a trail to inherit.
 
 ## Screen recording
 

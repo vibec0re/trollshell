@@ -54,13 +54,14 @@ Recorded from the #947 / #950 / #951 / #952 threads as decisions, not questions:
 7. **tmux is up for discussion** (#951). Section 7 presents the four options with a
    recommendation; it does not decide.
 
-### 2.1 Amendments from the hive side (2026-09-07, 09:22Z–11:33Z)
+### 2.1 Amendments from the hive side (2026-09-07, 09:22Z–12:22Z)
 
 The first draft of this spec (07:51Z) predated @kaesaecracker (Mara, a hyperhive
-dev) and @the-sword-above joining the threads between 09:22Z and 11:33Z. Their
-input moved seven things. Annika's seven decisions above are **unchanged**; these
-constrain how they are met, and retract two things the first draft got wrong (a
-forge-less hive profile, and the reason behind section 10's recommendation).
+dev) and @the-sword-above joining the threads. Their input moved eight things.
+Annika's seven decisions above are **unchanged**; these constrain how they are met,
+and retract three things earlier drafts got wrong: a forge-less hive profile (a),
+the reason behind section 10's recommendation (a), and the claim that the swarm
+control plane waits on Mara's hardware (h).
 
 - **a. A hive is never standalone.** Mara, [#947 09:22Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5568440406):
   "a hive itself can only be deployed as part of a swarm and agent-agent comms go
@@ -123,6 +124,17 @@ forge-less hive profile, and the reason behind section 10's recommendation).
   | hyperhive#4038 | a schema / `version` field on `HostResponse`                         | zero version or schema field exists on that struct today                                                                                                                                                             |
   | hyperhive#4039 | a polkit rule granting `hive-admin` the action `choom` triggers      | `machinectl shell <name>@h-<name>` triggers **exactly one** action, `org.freedesktop.machine1.shell`; `login` and `host-shell` are different verbs `choom` never calls. hyperhive has zero `security.polkit.*` today |
 
+- **h. The swarm control plane is _local_, not Mara's.** Mara,
+  [#947 12:21Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5570553019):
+  "'the swarm control plane once her central node exists' — my central node would
+  not be annis central node." An earlier draft had option (ii) of the lifetime-ops
+  fork blocked on her pending hardware; it never was. `singleHostSwarm` asserts
+  `deploy.swarm-controller.enable`
+  (`nix/host-modules/local-defaults.nix:36,131`), so Annika's laptop runs its own
+  controller on loopback and the fork is a live choice today. Section 5.7 is
+  rewritten against the controller's actual routes, and finds two gaps the thread
+  did not surface — it cannot express `paused`, and its row is a different shape.
+
 ## 3. Goals and non-goals
 
 **Goals**
@@ -154,9 +166,14 @@ forge-less hive profile, and the reason behind section 10's recommendation).
   desktop lists, starts, stops, pauses and attaches.
 - **No `hivectl` in the status or control loop.** It appears once, as the attach
   argv (amendment c).
-- No in-shell VTE. A terminal is an external emulator, launched detached; the
-  canonical non-goals already exclude the shell owning a PTY in spirit
-  (`docs/superpowers/specs/2026-04-24-hytte-trollshell-design.md:23-28`).
+- No in-shell VTE. A terminal is an external emulator, launched detached. The
+  canonical design does not name terminals in its non-goals — the closest line is
+  "Lockscreen, OSD, or compositor in `hytte`"
+  (`docs/superpowers/specs/2026-04-24-hytte-trollshell-design.md:28`), which is
+  about scope, not PTYs — so this is a **new** non-goal, stated here rather than
+  inherited: a VTE would add a GTK dependency and make the shell the owner of a
+  PTY it would then have to keep alive across its own restarts, which is exactly
+  what decision 4 rules out.
 - No remote hive. The transport is the local unix socket only; the gateway
   HTTP + SSE path is a later phase of #948.
 - No editing hive config from the desktop. The v1 Agents tab is read-only; a write
@@ -175,10 +192,19 @@ forge-less hive profile, and the reason behind section 10's recommendation).
   always part of a swarm (amendment a). This is the plugin's entire world.
 - **swarm** — the layer above: forge, matrix, the controller, NATS, approvals, and
   increasingly the lifetime control plane (amendment d). The desktop reads none of
-  it. On Annika's laptop the swarm and the hive are the same box, via
+  it **today**. On Annika's laptop the swarm and the hive are the same box, via
   `services.hyperhive.deploy.singleHostSwarm`
   (`nix/host-modules/local-defaults.nix:26`), and the forge and matrix exist for the
   agents rather than for her — project work stays on GitHub with a token.
+- **the (swarm) controller** — `swarm-controller`, the swarm's HTTP control plane.
+  `singleHostSwarm` asserts it on
+  (`deploy.swarm-controller.enable`, `nix/host-modules/local-defaults.nix:36,131`),
+  so on Annika's laptop it is a **local** service on loopback, not Mara's
+  infrastructure. That is why section 5.7's option (ii) is a live choice rather
+  than a blocked one.
+- **`trollshell-choom`** — the working name, from Annika's mock on #947, for an
+  agent that maintains trollshell from a cage. It is the spec's running example of
+  a row; whether it is actually the **first** agent to exist is open question 6.
 - **session** — Claude Code's on-disk session under
   `~/.claude/projects/<cwd-slug>/<uuid>.jsonl`, resumed **by title**. The hive's
   harness keys every turn on one constant title, `hive-session` by default,
@@ -217,14 +243,27 @@ field on responses. It also names what the desktop will **never** need —
 is what keeps a local override cheap while lifetime ops move (amendment d, section
 5.7). This spec does not re-derive that list; it implements it.
 
-One in-tree module, `hive::wire`, mirroring only what the rows need:
+One in-tree module, `hive::wire`, mirroring only what the rows need — and covering
+**every** verb and field a later section relies on, so nothing in sections 6, 7, 9
+or 10 reaches for something this table does not carry:
 
-| in-tree type     | mirrors                                                                       | fields used                                                                                        |
-| ---------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `Request`        | `HostRequest` (`hive-host-sock/src/lib.rs:117-119`, `#[serde(tag = "cmd")]`)  | `List`, `AgentStatus`, `SetPaused { name, paused }`, `Start { scope }`, `Stop { scope, graceful }` |
-| `Scope`          | `LifecycleScope` (`hive-host-sock/src/lib.rs:468-485`)                        | `agent_names` only — see section 11                                                                |
-| `Response`       | `HostResponse` (`hive-host-sock/src/lib.rs:521-569`)                          | `ok`, `error`, `agents`, `agent_statuses`                                                          |
-| `AgentStatusRow` | `hive_sh4re::container::AgentStatusRow` (`hive-sh4re/src/container.rs:33-66`) | `name`, `running`, `failed`, `needs_update`, `needs_login`, `paused`, `parent`                     |
+| in-tree type     | mirrors                                                                       | fields used                                                                                                                    | used by                                                                                          |
+| ---------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `Request`        | `HostRequest` (`hive-host-sock/src/lib.rs:117-119`, `#[serde(tag = "cmd")]`)  | `List`, `AgentStatus`, `SetPaused { name, paused }`, `Start { scope }`, `Stop { scope, graceful }`, `Restart { name }`, `Urls` | the rows and the panel; `Urls` backs the `web:<name>` button                                     |
+| `Scope`          | `LifecycleScope` (`hive-host-sock/src/lib.rs:468-485`)                        | `agent_names` only — see section 11                                                                                            | the panel's per-agent start / stop                                                               |
+| `Response`       | `HostResponse` (`hive-host-sock/src/lib.rs:521-569`)                          | `ok`, `error`, `agents`, `agent_statuses`, `urls`                                                                              | every request                                                                                    |
+| `AgentStatusRow` | `hive_sh4re::container::AgentStatusRow` (`hive-sh4re/src/container.rs:33-66`) | `name`, `running`, `failed`, `needs_update`, `needs_login`, `paused`, `parent`, `deployed_sha`                                 | section 6.2's precedence; `parent` and `deployed_sha` are panel- and tab-only (sections 6.4, 10) |
+| `HiveUrls`       | `HiveUrls` (`hive-host-sock/src/lib.rs:503-518`)                              | `home` (and `domain` as the fallback)                                                                                          | the agent-page URL, **derived** — see below                                                      |
+
+**One derivation, stated so nobody assumes otherwise:** `HiveUrls` carries
+`domain` / `home` / `forge` / `matrix` and **no per-agent URL**
+(`hive-host-sock/src/lib.rs:503-518`). The `web:<name>` button therefore builds
+`<home>agent/<name>/` client-side from `home`, and renders disabled when `home` is
+`None` (the hive says so when the dashboard is not reachable from a browser). A
+per-agent URL on `HiveUrls` would remove the guess; it is small enough to ask for
+if the web terminal survives the section 7 decision, and is deliberately **not**
+filed yet — the three hyperhive issues that are filed were each scoped to
+something already settled.
 
 Rules for the mirror:
 
@@ -324,19 +363,71 @@ Mara flagged that permissions, agent create/destroy and secret management are
 moving from the hive to the swarm control plane, "though there could be a back
 channel for local cli control if you need it"
 ([#947 09:22Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5568440406)).
-That makes the transport a real fork, and it is **not this spec's to settle** — it
-is Annika's and Mara's:
+That makes the transport a real fork, and it is **not this spec's to settle**.
 
-| option                                                                      | for                                                                                                                                                                                                                                      | against                                                                                                             |
-| --------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| **(i) `host.sock` now; Mara keeps a local override for the seven verbs** ⭐ | Annika's "local hive first, swarm later" points straight here. Buildable today. The frozen list is tiny — `List` / `AgentStatus` / `Start` / `Stop` / `SetPaused` / `Restart` / `Urls`, and none of them is a lifetime op that is moving | it is a promise Mara has to keep: a local override maintained past the control-plane migration                      |
-| **(ii) integrate the swarm control plane for lifetime + status**            | future-proof; nothing to keep behind                                                                                                                                                                                                     | it is precisely the part that is in motion, and it needs Mara's central compute node, which she says is **pending** |
+**Correction (12:21Z).** An earlier draft of this section said option (ii) waited
+on Mara's central compute node. It does not, and she said so:
+"'the swarm control plane once her central node exists' — my central node would
+not be annis central node"
+([#947 12:21Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5570553019)).
+Under `singleHostSwarm` Annika's laptop runs **its own** swarm controller —
+`deploy.swarm-controller.enable` is one of the toggles the mode asserts
+(`nix/host-modules/local-defaults.nix:36,131`) — so the control plane is local,
+on loopback, and buildable today. Section 4's vocabulary said as much a page
+earlier; this section had simply not caught up.
 
-**Recommended: (i), with (ii) as the migration** — the local extras (a `choom`
-session, the agent web terminal) sit on top either way, so (ii) is a transport swap
-behind `hive::wire`, not a rewrite. **Marked OPEN**: Mara has not said whether the
-override is a burden, and that answer decides it. Asked on
-[#947 09:36Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5568628973).
+What the local controller serves today (`swarm-controller/src/main.rs`):
+
+| route                                    | verb  | line | what it is                                                   |
+| ---------------------------------------- | ----- | ---- | ------------------------------------------------------------ |
+| `/api/agents`                            | `GET` | 552  | every agent the swarm holds an identity for                  |
+| `/api/agents/status`                     | `GET` | 913  | a row per agent — the controller's **own** `AgentStatusRow`  |
+| `/api/hives/{hive}/agents/{agent}/state` | `PUT` | 789  | **the write**: declare an agent's wanted state               |
+| `/api/hives/{hive}/wanted`               | `GET` | 830  | read the declaration back; the published value is the record |
+
+So the honest table is:
+
+| option                                       | for                                                                                                                                              | against                                                                                                                    |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| **(i) `host.sock`, the seven verbs**         | exists, stable-ish, and already carries every flag the row renders. Annika's "local hive first" points here. Buildable now against a fake socket | asks Mara to keep a small local override alive past the migration — a promise, and she has not said whether it is a burden |
+| **(ii) the local controller's HTTP surface** | where lifetime ops are actually going; loopback, no new hive promise, no dependency on anyone's hardware                                         | no promise of stability either — it is the part "currently moving". And two concrete gaps today, below                     |
+
+Two gaps make (ii) more than a transport swap, both read out of the code rather
+than the thread:
+
+- **It cannot express pause.** The declaration vocabulary is a **closed** enum of
+  `Up` / `Offline` (`swarm-queue-client/src/wanted.rs:87-94`), and a value the
+  build does not know fails the _whole_ document by design — the test that pins
+  that rule uses `"paused"` as its example of an invalid state
+  (`swarm-queue-client/src/wanted.rs:228-231`). Pause is the one write v1 does
+  (section 6.3) and the mandatory first step of attach (section 7), so (ii) needs
+  a third state before it can drive the row.
+- **Its row is a different shape.** The controller's `AgentStatusRow`
+  (`swarm-controller/src/agent_status.rs:32-68`) is a _reported-snapshot_ view —
+  `hive`, `freshness`, `last_seen_unix`, `age_seconds`, an opaque `snapshot`,
+  `config_pr`, `wanted` — with no `paused`, `failed`, `needs_login`,
+  `needs_update`, `parent` or `deployed_sha`. Section 6.2's precedence table maps
+  none of it. It does carry the agent's status text inside `snapshot`, which is
+  the very thing hyperhive#4037 asks the hive socket for — so on that one field
+  (ii) is **ahead** of (i) today.
+
+**Recommendation, conditional:** if Mara answers "controller, now", **(ii)**
+becomes the recommendation and #948's frozen list moves from socket verbs to
+controller routes (with a pinned `version`, the hyperhive#4038 shape). Absent that
+answer, **(i)** — it is the only one that can render and drive the row as
+specified today. Either way the local extras (a `choom` session, the agent web
+terminal) sit on top, so the loser is a transport swap behind `hive::wire`, not a
+rewrite.
+
+**Marked OPEN.** Two questions decide it, both Mara's, both posted on
+[#947 12:22Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5570564007)
+and unanswered:
+
+1. Is that controller API the control plane she means, and is
+   `PUT /api/hives/{hive}/agents/{agent}/state` the write path for start / stop /
+   pause — given `AgentState` has no `paused` today?
+2. Would she rather the desktop code against it **now** and absorb its churn, than
+   keep the `host.sock` override alive?
 
 ## 6. The rows
 
@@ -418,12 +509,12 @@ principle, section 3).
 Four, not three: Mara's two terminals are different tools for different moments
 (amendment e), so the row offers both rather than picking one.
 
-| gesture            | button id       | v1 behaviour                                                                                                                                                                                                            |
-| ------------------ | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| click the name     | `attach:<name>` | attach — the direct `choom` session, "for when you want to use claude code directly". Section 7; a detached `RunCommand`, needs #953 and hyperhive#4039                                                                 |
-| click the terminal | `web:<name>`    | open the agent web terminal — Mara's "check on the agents and maybe send them a msg as they do dev work without my direct attention". `Urls` → `/agent/<name>/`, handed to the browser. Needs nothing new from the hive |
-| click pause        | `pause:<name>`  | `SetPaused { name, paused: !paused }` (`hive-host-sock/src/lib.rs:160`); optimistic flip, reconciled by the next poll                                                                                                   |
-| click edit         | `edit:<name>`   | show the agent's config flake and its dispatch target (section 9), read-only, plus the links. **Real editing waits for #952.**                                                                                          |
+| gesture            | button id       | v1 behaviour                                                                                                                                                                                                                                                                                                                                       |
+| ------------------ | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| click the name     | `attach:<name>` | attach — the direct `choom` session, "for when you want to use claude code directly". Section 7; a detached `RunCommand`, needs #953 and hyperhive#4039                                                                                                                                                                                            |
+| click the terminal | `web:<name>`    | open the agent web terminal — Mara's "check on the agents and maybe send them a msg as they do dev work without my direct attention". `Urls` → `home`, from which the plugin builds `<home>agent/<name>/` (section 5.2: `HiveUrls` has no per-agent field), handed to the browser. Disabled when `home` is `None`. Needs nothing new from the hive |
+| click pause        | `pause:<name>`  | `SetPaused { name, paused: !paused }` (`hive-host-sock/src/lib.rs:160`); optimistic flip, reconciled by the next poll                                                                                                                                                                                                                              |
+| click edit         | `edit:<name>`   | show the agent's config flake and its dispatch target (section 9), read-only, plus the links. **Real editing waits for #952.**                                                                                                                                                                                                                     |
 
 Pause is the one write v1 does, and it is the safest one in the vocabulary: the
 hive's own docs describe it as "a single marker write … applies immediately and
@@ -736,7 +827,7 @@ is enough for every one of them.
 | P0    | this spec                                                                                                                                                                                                                                   | Annika's veto                                                                                                         |
 | P1    | #953 (detached `RunCommand` — the detached path must bypass the awaited `cmd.output()`, not merely re-parent) + `hytte-plugin-agents`: wire mirror, rows, pause, panel, the `web:<name>` button                                             | nothing in-tree; dev against a fake socket. Live-verify needs a hive, i.e. **#949**'s `singleHostSwarm` on the laptop |
 | P2    | control-center **Agents** tab, read-only, adaptive drill-down                                                                                                                                                                               | P1                                                                                                                    |
-| P3    | attach: the `choom` session as the primary click                                                                                                                                                                                            | **hyperhive#4039** (filed). #950 only if option 1 or 4 is chosen instead                                              |
+| P3    | attach, per whichever section 7 option wins (rec. option 2). The `web:<name>` button ships in P1 either way                                                                                                                                 | option 2 → **hyperhive#4039** (filed); option 1 or 4 → **#950** as well; option 3 → nothing, it is already in P1      |
 | P4    | edit — narrowed by amendment f: the in-container fields already live in the agent's config flake, so this is a **config-flake editor**, not a hive change; the host-level remainder (mounts, caps) waits on **#952** and on open question 8 | **#952** for the host-level half only                                                                                 |
 | later | remote hive: #948's gateway HTTP + SSE transport; `Subscribe { kinds }` replacing the poll; the swarm control plane if section 5.7 resolves to (ii); extraction; other runtimes                                                             | **#948**, section 5.7, and decision 6's "once this all stable"                                                        |
 
@@ -752,11 +843,11 @@ join Mara's swarm (no — amendment b) and whether the hive needs a forge-less p
 
 1. **Attach mechanism** — section 7's four options for the primary click: tmux, pause + `claude --resume`, the per-agent web page, or a harness-owned PTY? (Recommendation: option 2; option 3 ships alongside regardless.)
 2. **#953 now or later** — still unanswered on #947; P1 cannot ship without it.
-3. **The lifetime-ops fork** (section 5.7, needs Mara as much as Annika) — `host.sock` now with a local override for the seven verbs, or integrate the swarm control plane once Mara's central node exists? Recommendation: the override, with the control plane as the migration.
+3. **The lifetime-ops fork** (section 5.7 — Mara's call, not Annika's) — `host.sock`'s seven verbs, which asks her to keep a local override alive, or the **local** swarm controller's HTTP surface, which is where lifetime ops are going but cannot express `paused` today? If she answers "controller, now", that becomes the recommendation; otherwise `host.sock`. Both questions posted on [#947 12:22Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5570564007), unanswered.
 4. **Edit surface** — the plugin's own panel (the #487 groove) or a control-center tab, once editing is real? Both eventually, but which first?
 5. **Plugin name** — `agents`, `hive`, or `choom`? It becomes the crate name, the unit name (`trollshell-plugin-<id>`) and the `plugins.<id>` key, so it is awkward to change later.
 6. **Is `trollshell-choom` the first agent?** (Which hive is settled: Annika's own all-local swarm on the laptop.)
-7. **Auto-unpause** — should attach pause the loop automatically, or refuse to attach while the loop runs and make the operator pause first?
+7. **Unpause after attach: automatic or manual?** Auto-_pause_ is not open — section 7 settles it for option 2 (pause-first, always; never refuse-to-attach). What is open is the other end: does the plugin unpause by itself when the terminal exits — which needs #953 to surface the transient unit's exit without re-parenting the child — or is v1 honest and manual, unpaused by the row's own pause button with the row reading `paused · attached` until then?
 8. **Is there anything you need in the cage that a `git clone` cannot bring in?** Mara's question, relayed on #952: if not, mounts leave the requirement entirely and P4 shrinks to the config flake.
 9. **Notify policy** — toast on `needs_login` and `failed` only, or also on a harness status the config marks "waiting for you", once hyperhive#4037 puts the text on the row?
 
@@ -771,6 +862,12 @@ join Mara's swarm (no — amendment b) and whether the hive needs a forge-less p
   `hive-c0re/src/server.rs:367-388`.
 - The all-local deployment mode: `services.hyperhive.deploy.singleHostSwarm`,
   `nix/host-modules/local-defaults.nix:26`; the laptop checklist lives on #949.
+  It asserts the local swarm controller on at `local-defaults.nix:36,131`.
+- The local swarm controller (section 5.7 option ii): routes at
+  `swarm-controller/src/main.rs:552,789,830,913`; its own row shape at
+  `swarm-controller/src/agent_status.rs:32-68`; the closed `Up` / `Offline`
+  declaration vocabulary — and the test that uses `"paused"` as its invalid
+  example — at `swarm-queue-client/src/wanted.rs:87-94,228-231`.
 - Attach today: `docs/tools/hivectl.md:213-268`.
 - Session identity: `docs/turn-loop/claude-invocation.md:4-9,72-87`.
 - Event push: `hive-c0re/src/dashboard_events.rs:13-15`,

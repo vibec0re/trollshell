@@ -8,9 +8,10 @@
 ## 1. Summary
 
 A sidebar plugin renders one row per hyperhive agent —
-`(icon) name (status-icon)` over `status (pause) (term) (edit)` — and a click
-opens a terminal attached to that agent's Claude Code session. The hive is the
-backend; trollshell is a client.
+`(icon) name (status-icon)` over `status (pause) (edit)`, grouped by multi-repo
+project — and a click opens that agent's **chat surface in its own window**. The
+hive is the backend; trollshell is a client. A terminal into the cage is the
+secondary action, not the primary one (section 7).
 
 The plugin is `hytte-plugin-agents`, an **in-tree** plugin binary in the
 `hytte-plugin-infobroker` / `hytte-claude-bridge` two-hats shape. It speaks
@@ -33,7 +34,9 @@ agent on screen.
 
 ## 2. Decisions (Annika, 2026-09-07)
 
-Recorded from the #947 / #950 / #951 / #952 threads as decisions, not questions:
+Recorded from the #947 / #950 / #951 / #952 threads as decisions, not questions.
+Decisions 8–11 arrived in the evening, after the hive-side amendments in 2.1, and
+they are the ones that fixed the shape of section 7:
 
 1. **hyperhive first.** "I think I'd like to have this hyperhive first if possible.
    Why reinvent wheel." No podman cage; the earlier podman recommendation is
@@ -51,17 +54,64 @@ Recorded from the #947 / #950 / #951 / #952 threads as decisions, not questions:
 6. **Placement A: in-tree.** "We keep the plugin and integration close to our chest,
    choom. At least for now. Maybe once this all stable we can extract and move to
    either hyperhive project or dedicated project."
-7. **tmux is up for discussion** (#951). Section 7 presents the four options with a
-   recommendation; it does not decide.
+7. **tmux is up for discussion** (#951) — **superseded by decision 9**: an
+   interactive terminal turned out not to be the requirement at all.
+8. **The use case, in her words** ([#947 17:14Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573834527)):
 
-### 2.1 Amendments from the hive side (2026-09-07, 09:22Z–15:27Z)
+   > - Project structure: `/home/annika/<multi-repo-workspace>/<project-repos, usually in git, managed in github / gitlab forge>`
+   > - Want able to start choom in a container and manage via sidebar plugin.
+   > - Maybe grouped by `<multi-repo-project>`
+   > - Haz right now up to 8 Chooms in one `<multi-repo-project>`, all manually spawned in tmux 😭
+   > - Fine if they run in same container - as long as projects distinct - so claudes can communicate.
+   > - We can e.g. use some hytte datasource plugin to trigger agent run: Eg: received gitlab email (hytte-plugin-inbox-imap) -> matches criteria -> "/idd" -> stdin(relevant choom)
+
+   Mapped onto hyperhive's unit (Mara's model, #952), which is what
+   decision 9 confirms fits:
+   - **a choom = one hive agent** — its own container, its own config repo on
+     the local forge, cloning the project repo. Not a tmux pane.
+   - **"up to 8 Chooms in one project" = 8 agents**, grouped in the sidebar by
+     the multi-repo workspace their project repo sits under (section 6.1).
+     "so claudes can communicate" is the **broker**, not a shared shell — which
+     is better, because it survives a restart and is addressable by name.
+   - **triggers** — the IMAP → `/idd` idea is a broker `send` to the right
+     agent, not stdin (section 6.6).
+   - **`viberoot` stays her own dev cage** (`nixos/containers/viberoot.nix` in
+     her nixos repo — an ephemeral container with `~/viberoot` bind-mounted and
+     `claude-code` + `tmux` inside). Hive agents get their own containers; this
+     spec does not touch it.
+
+9. **A local forge is fine, and the terminal is not the point.**
+   [#947 17:21Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573896006):
+   "oooh ok the config repos! Then ok local forge fine <3 … I'm not too invested
+   in the terminal as chat client for agent soooo I mean custom gtk client I'm
+   also game - as long as runs out of trollshell process". That settles section 7
+   on **the agent's chat surface, in its own process** — not a terminal — and it
+   is why the tmux fork briefly opened at 17:17Z was withdrawn at 17:23Z. The
+   forge it accepts runs in its own persistent `hive-forge` nixos-container on
+   the hive host (`nix/host-modules/hive-forge/default.nix:107-110,634-636`:
+   `ephemeral = false`, state under
+   `/var/lib/nixos-containers/hive-forge/var/lib/forgejo/`), so the all-local
+   laptop mode is her `viberoot`-style containers plus one more.
+10. **Notifications with options.**
+    [#947 17:24Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573917144):
+    "hyperhive integration in trollshell will be ultra preem!! Typ notify user
+    with options and stuff." Section 6.5 is that: hive approvals raised as an
+    interactive consent prompt on the desktop.
+11. **Feature parity is a hard constraint on the chat surface.**
+    [#947 17:25Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573926876):
+    "well the gtk chat client would pretty much need to fully support the current
+    hyperhive webui features ❤️". This is what rules a native GTK
+    reimplementation out of v1 — see section 7.
+
+### 2.1 Amendments from the hive side (2026-09-07, 09:22Z–17:26Z)
 
 The first draft of this spec (07:51Z) predated @kaesaecracker (Mara, a hyperhive
-dev) and @the-sword-above joining the threads. Their input moved nine things.
-Annika's seven decisions above are **unchanged**; these constrain how they are met,
-and retract four things earlier drafts got wrong: a forge-less hive profile (a),
-the reason behind section 10's recommendation (a), the claim that the swarm control
-plane waits on Mara's hardware (h), and the claim that it cannot express pause (i).
+dev) and @the-sword-above joining the threads. Their input moved ten things.
+Annika's decisions 1–7 above are **unchanged** and 8–11 came later; these constrain
+how all of them are met, and retract five things earlier drafts got wrong: a
+forge-less hive profile (a), the reason behind section 10's recommendation (a), the
+claim that the swarm control plane waits on Mara's hardware (h), the claim that it
+cannot express pause (i), and a proposal to abandon hyperhive for tmux (j).
 
 - **a. A hive is never standalone.** Mara, [#947 09:22Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5568440406):
   "a hive itself can only be deployed as part of a swarm and agent-agent comms go
@@ -145,6 +195,21 @@ plane waits on Mara's hardware (h), and the claim that it cannot express pause (
   [#947 15:16Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5572677568):
   "swarm-queue-client is the swarm-hive com, not the host.sock". It was a category
   error, not a gap — see section 5.7.
+- **j. A tmux backend was proposed and withdrawn inside ten minutes.** When
+  Annika's use case landed at 17:14Z it read as "eight interactive chooms per
+  project, in one container, on my own workspace dirs" — which fits hyperhive's
+  unit badly (8 config repos, a mount #952 does not have, a tty agent kind #950
+  does not have, and multi-agent-per-container the hive does not do), so at
+  [17:17Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573859194)
+  I proposed dropping the hive for tmux inside her existing `viberoot` container.
+  Her 17:21Z reply ("ok the config repos! Then ok local forge fine … not too
+  invested in the terminal as chat client") removed the premise — the interactive
+  terminal was never the requirement — and the proposal was
+  [withdrawn at 17:23Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573911134).
+  **hyperhive stays; nothing in sections 5, 5.7 or 9 changed.** Recorded because
+  the reasoning is worth keeping: if she ever does want N interactive chooms
+  sharing one cage, that is a different product than this spec, and the tmux path
+  is where it starts.
 
 ## 3. Goals and non-goals
 
@@ -251,32 +316,41 @@ Mara's request ([#948 09:24Z](https://github.com/vibec0re/trollshell/issues/948#
 seven verbs (`List`, `AgentStatus`, `Start`, `Stop`, `SetPaused`, `Restart`,
 `Urls`), one row shape, one new push (`Subscribe { kinds }`), plus a `version`
 field on responses. It also names what the desktop will **never** need —
-`Spawn`, `RequestSpawn`, `Destroy`, `Approve` / `Deny` / `Pending`, `Matrix*`,
-`Forge*`, `Gateway*`, `Quota*`, `SetResourceLimits`, `SetParent`, `Rebuild` — which
-is what keeps a local override cheap while lifetime ops move (amendment d, section
-5.7). This spec does not re-derive that list; it implements it.
+`Spawn`, `RequestSpawn`, `Destroy`, `Matrix*`, `Forge*`, `Gateway*`, `Quota*`,
+`SetResourceLimits`, `SetParent`, `Rebuild` — which is what keeps a local override
+cheap while lifetime ops move (amendment d, section 5.7). This spec does not
+re-derive that list; it implements it.
+
+**One addition to relay to #948**, from Annika's decision 10 (notify with
+options): `Pending` / `Approve { id }` / `Deny { id }` were on that comment's
+"never needed" line, and they are needed after all — section 6.5 turns hive
+approvals into a desktop consent prompt. Ten verbs, not seven. Nothing else on
+the list moves.
 
 One in-tree module, `hive::wire`, mirroring only what the rows need — and covering
 **every** verb and field a later section relies on, so nothing in sections 6, 7, 9
 or 10 reaches for something this table does not carry:
 
-| in-tree type     | mirrors                                                                                                  | fields used                                                                                                                                        | used by                                                                                                              |
-| ---------------- | -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `Request`        | `HostRequest` (`hive-host-sock/src/lib.rs:117-119`, `#[serde(tag = "cmd")]`)                             | `List`, `AgentStatus`, `SetPaused { name, paused }`, `Start { scope }`, `Stop { scope, graceful }`, `Restart { name }`, `Urls`                     | the rows and the panel; `Urls` backs the `web:<name>` button                                                         |
-| `Scope`          | `LifecycleScope` (`hive-host-sock/src/lib.rs:468-485`)                                                   | `agent_names` only — see section 11                                                                                                                | the panel's per-agent start / stop                                                                                   |
-| `Response`       | `HostResponse` (`hive-host-sock/src/lib.rs:521-569`)                                                     | `ok`, `error`, `agents`, `agent_statuses`, `urls`                                                                                                  | every request                                                                                                        |
-| `AgentStatusRow` | `hive_sh4re::container::AgentStatusRow` (`hive-sh4re/src/container.rs:34-86` on hyperhive `origin/main`) | `name`, `running`, `failed`, `needs_update`, `needs_login`, `paused`, `parent`, `deployed_sha`, **`status_text`**, `status_set_at`, `active_model` | section 6.2's precedence and its status line; `parent` and `deployed_sha` are panel- and tab-only (sections 6.4, 10) |
-| `HiveUrls`       | `HiveUrls` (`hive-host-sock/src/lib.rs:503-518`)                                                         | `home` (and `domain` as the fallback)                                                                                                              | the agent-page URL, **derived** — see below                                                                          |
+| in-tree type     | mirrors                                                                                                  | fields used                                                                                                                                                                | used by                                                                                                              |
+| ---------------- | -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `Request`        | `HostRequest` (`hive-host-sock/src/lib.rs:117-119`, `#[serde(tag = "cmd")]`)                             | `List`, `AgentStatus`, `SetPaused { name, paused }`, `Start { scope }`, `Stop { scope, graceful }`, `Restart { name }`, `Urls`, `Pending`, `Approve { id }`, `Deny { id }` | the rows and the panel; `Urls` backs the chat companion's URL; the last three back the approval prompt (section 6.5) |
+| `Scope`          | `LifecycleScope` (`hive-host-sock/src/lib.rs:468-485`)                                                   | `agent_names` only — see section 11                                                                                                                                        | the panel's per-agent start / stop                                                                                   |
+| `Response`       | `HostResponse` (`hive-host-sock/src/lib.rs:521-569`)                                                     | `ok`, `error`, `agents`, `agent_statuses`, `urls`, `approvals`                                                                                                             | every request                                                                                                        |
+| `AgentStatusRow` | `hive_sh4re::container::AgentStatusRow` (`hive-sh4re/src/container.rs:34-86` on hyperhive `origin/main`) | `name`, `running`, `failed`, `needs_update`, `needs_login`, `paused`, `parent`, `deployed_sha`, **`status_text`**, `status_set_at`, `active_model`                         | section 6.2's precedence and its status line; `parent` and `deployed_sha` are panel- and tab-only (sections 6.4, 10) |
+| `Approval`       | `hive_sh4re::approvals::Approval` (`hive-sh4re/src/approvals.rs:14-34`)                                  | `id`, `agent`, `kind`, `requested_at`, and the free-text description                                                                                                       | section 6.5's prompt strings                                                                                         |
+| `HiveUrls`       | `HiveUrls` (`hive-host-sock/src/lib.rs:503-518`)                                                         | `home` (and `domain` as the fallback)                                                                                                                                      | the agent-page URL, **derived** — see below                                                                          |
 
 **One derivation, stated so nobody assumes otherwise:** `HiveUrls` carries
 `domain` / `home` / `forge` / `matrix` and **no per-agent URL**
-(`hive-host-sock/src/lib.rs:503-518`). The `web:<name>` button therefore builds
-`<home>agent/<name>/` client-side from `home`, and renders disabled when `home` is
-`None` (the hive says so when the dashboard is not reachable from a browser). A
-per-agent URL on `HiveUrls` would remove the guess; it is small enough to ask for
-if the web terminal survives the section 7 decision, and is deliberately **not**
-filed yet — the three hyperhive issues that are filed were each scoped to
-something already settled.
+(`hive-host-sock/src/lib.rs:503-518`). The plugin therefore builds
+`<home>agent/<name>/` client-side from `home`, hands that to the chat companion,
+and greys the row's primary click when `home` is `None` (the hive says so when the
+dashboard is not reachable from a browser). **This matters more after decision 9
+than it did before** — the derived URL is now the primary interaction, not a
+secondary button — so a per-agent URL field on `HiveUrls` is worth asking the hive
+for once section 7.1 is confirmed. It is deliberately **not** filed yet: the three
+hyperhive issues that are filed were each scoped to something already settled, and
+this one waits on Annika's one word.
 
 Rules for the mirror:
 
@@ -422,7 +496,7 @@ ListBox { classes: ["ts-agents-list"], children: [
   Box { dir: Vertical, spacing: 2, classes: ["ts-agent-row"], children: [
     Row { classes: ["ts-agent-head"], children: [
       Icon   { name: "<runtime icon>", classes: ["ts-agent-runtime"] },
-      Button { id: "attach:<name>", classes: ["flat", "ts-agent-name"],
+      Button { id: "chat:<name>", classes: ["flat", "ts-agent-name"],
                child: Label { text: "<display name>" } },
       Spacer,
       Icon   { name: "<status icon>", classes: ["ts-agent-state", "<state class>"] },
@@ -432,15 +506,19 @@ ListBox { classes: ["ts-agents-list"], children: [
       Spacer,
       Button { id: "pause:<name>", classes: ["flat"],
                child: Icon { name: "media-playback-pause-symbolic" } },
-      Button { id: "web:<name>", classes: ["flat"],
-               child: Icon { name: "utilities-terminal-symbolic" } },
       Button { id: "edit:<name>", classes: ["flat"],
                child: Icon { name: "document-edit-symbolic" } },
     ]},
   ]},
-  … one per agent
+  … one per agent, under a Label group header per project (section 6.3)
 ]}
 ```
+
+The `choom:<name>` secondary action (section 7.3) is a **context-menu** entry, not
+a fourth button — the row is two lines and already carries three targets. The
+vocabulary has no context-menu node today, so v1 renders it as a fourth `Button`
+in the panel (section 6.4) rather than on the row, and a real per-row menu waits
+for a vocabulary addition nobody has asked for yet.
 
 Every node in that tree already exists in the vocabulary — `Box` (`wire.rs:125`),
 `Row` (`wire.rs:137`), `ListBox` (`wire.rs:146`), `Label` (`wire.rs:152`), `Text`
@@ -490,18 +568,25 @@ the row does not show it, for the same reason.
 
 ### 6.3 The four interactions
 
-Four, not three: Mara's two terminals are different tools for different moments
-(amendment e), so the row offers both rather than picking one.
+The primary click opens the chat surface (decision 9, section 7); the terminal
+demotes to a context-menu entry. Mara's two surfaces both survive (amendment e) —
+they just swapped places once Annika said the terminal was not the point.
 
-| gesture            | button id       | v1 behaviour                                                                                                                                                                                                                                                                                                                                       |
-| ------------------ | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| click the name     | `attach:<name>` | attach — the direct `choom` session, "for when you want to use claude code directly". Section 7; a detached `RunCommand`, needs #953 and hyperhive#4039                                                                                                                                                                                            |
-| click the terminal | `web:<name>`    | open the agent web terminal — Mara's "check on the agents and maybe send them a msg as they do dev work without my direct attention". `Urls` → `home`, from which the plugin builds `<home>agent/<name>/` (section 5.2: `HiveUrls` has no per-agent field), handed to the browser. Disabled when `home` is `None`. Needs nothing new from the hive |
-| click pause        | `pause:<name>`  | `SetPaused { name, paused: !paused }` (`hive-host-sock/src/lib.rs:160`); optimistic flip, reconciled by the next poll                                                                                                                                                                                                                              |
-| click edit         | `edit:<name>`   | show the agent's config flake and its dispatch target (section 9), read-only, plus the links. **Real editing waits for #952.**                                                                                                                                                                                                                     |
+| gesture        | button id      | v1 behaviour                                                                                                                                                          |
+| -------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| click the name | `chat:<name>`  | **primary** — open the agent's chat surface in its own window (section 7). A detached `RunCommand` launching the companion binary; needs #953. Never pauses the loop. |
+| click pause    | `pause:<name>` | `SetPaused { name, paused: !paused }` (`hive-host-sock/src/lib.rs:160`); optimistic flip, reconciled by the next poll                                                 |
+| click edit     | `edit:<name>`  | show the agent's config flake and its dispatch target (section 9), read-only, plus the links. **Real editing waits for #952.**                                        |
+| context menu   | `choom:<name>` | **secondary** — pause, then `choom --resume` in a terminal (section 7.3). A context-menu entry, not a button: it is the rare path                                     |
 
-Pause is the one write v1 does, and it is the safest one in the vocabulary: the
-hive's own docs describe it as "a single marker write … applies immediately and
+Grouping (decision 8): rows are grouped by **multi-repo project** — the workspace
+directory the agent's project repo sits under — with the group name as a header
+row. An agent whose project is unknown falls into an "ungrouped" group rather than
+being hidden. With one project the header is suppressed and the list looks exactly
+as it does today.
+
+Pause is the one write the rows do, and it is the safest one in the vocabulary:
+the hive's own docs describe it as "a single marker write … applies immediately and
 works on a stopped container too" (`hive-host-sock/src/lib.rs:152-158`). It is
 idempotent both ways, so a double-click is harmless.
 
@@ -519,57 +604,177 @@ control-center surface. Contents, for the selected agent:
 - start / stop buttons, scoped to that one agent (section 11's rule);
 - a link row: the agent page URL, the config repo path.
 
-## 7. Attach — the #950 decision table
+### 6.5 Approvals — "notify user with options and stuff"
 
-Four options. **Nothing here is decided** — Annika reopened tmux on #951 ("tmux
-should be up for discussion").
+Annika, [#947 17:24Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573917144):
+"hyperhive integration in trollshell will be ultra preem!! Typ notify user with
+options and stuff." The hive already has exactly one thing shaped like that: the
+approval queue. An agent proposing a config change parks an approval, and today
+the only way to answer it is `hivectl` or the dashboard.
 
-One framing correction from amendment e: options 2 and 3 are **not alternatives**.
-Mara uses both, for different moments — "the direct choom session in the container:
-this is for when you want to use claude code directly" versus the agent web
-terminal, "a claude-code-like web ui with a message history and ability to send
-messages, see todos, interrupt the turn and all that jazz … i mostly use the web
-thing to check on the agents and maybe send them a msg as they do dev work without
-my direct attention" ([#947 09:22Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5568440406)).
-The row therefore carries both buttons (section 6.3). What is actually being
-decided below is **which one the primary click — the agent's name — does**, and
-whether 1 or 4 is wanted at all.
+The desktop already has the matching primitive — #487 phase 1b's interactive
+consent prompt. So the two are wired together with **no new vocabulary on either
+side**:
 
-| option                                                  | needs from the hive                                                                             | root?                             | survives shell restart | sees the loop's transcript       | remote-capable               |
-| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | --------------------------------- | ---------------------- | -------------------------------- | ---------------------------- |
-| **1. tmux in the cage**                                 | a `tty` agent kind + a supervised tmux session (#950, new; nothing in the hive uses tmux today) | yes, unless hyperhive#4039        | yes (in the cage)      | no — a second, parallel `claude` | no                           |
-| **2. pause + `claude --resume <title>` via `choom`** ⭐ | **hyperhive#4039 only**, and it is filed; `choom --resume` already ships                        | **no**, once hyperhive#4039 lands | yes (own terminal)     | **yes** — same session file      | via `ssh`                    |
-| **3. the per-agent web page** (kept regardless)         | nothing — it exists today                                                                       | no                                | yes (a browser)        | rendered stream, not a tty       | **yes**, through the gateway |
-| **4. a harness-owned PTY on `web.sock`**                | the real attach primitive (#951 option 2, largest change)                                       | no                                | yes                    | yes                              | yes                          |
+```text
+poll  Pending                              (hive-host-sock/src/lib.rs:228-229)
+  → for each new approval id, the plugin emits
+    Effect::RequestConsent { request_id, agent, datasource, scope, detail }
+                                           (crates/hytte-plugin-proto/src/effect.rs:135-141)
+  → the shell raises the prompt on the focused output, four choices
+  → HostMsg::ConsentDecision comes back keyed by the same request_id
+                                           (crates/hytte-plugin-proto/src/msg.rs:122-124)
+  → the plugin sends Approve { id }  or  Deny { id }
+                                           (hive-host-sock/src/lib.rs:230-233)
+```
 
-**Recommended default for the primary click: option 2** — recommended, not decided.
-Option 3 ships alongside it either way.
+The prompt's strings come from the `Approval` itself — `agent`, `kind`,
+`requested_at` and the free-text description
+(`hive-sh4re/src/approvals.rs:14-34`) — so the host learns no hive domain, which
+is the rule `RequestConsent` was designed around.
 
-Why it is the cheapest thing that satisfies decisions 4 and 5:
+**One mapping decision, and it is deliberately lossy.** `ConsentDecision` has four
+variants — `AllowOnce`, `AllowSession`, `AllowAlways`, `Deny`
+(`crates/hytte-plugin-proto/src/effect.rs:242-251`) — but a hive approval is a
+one-shot on a specific id. So **every `Allow*` maps to `Approve { id }` for that
+one id**, and the plugin persists **no standing grant**. "Approve every future
+config PR from this agent" is not something a consent prompt should be able to
+grant, and the `Deny` timeout (60 s → deny) is the right default for an approval
+too: an unanswered prompt leaves the approval pending, which is what it already
+was.
 
-- `hivectl agent <name> choom` already does the interactive-claude-in-the-cage
-  shape, and already takes `--resume <value>`, which passes straight through to
-  `claude --resume` (`docs/tools/hivectl.md:213-245`). Nothing is invented.
-- The harness's session title is constant and knowable — `hive-session`, or
-  `HIVE_SESSION_TITLE` (`docs/turn-loop/claude-invocation.md:72-77`) — so
-  `choom --resume hive-session` lands the operator in **the agent's own
-  transcript**, and the loop's next turn sees what the human did.
-- `choom` already reproduces the harness's environment: the agent user, the state
-  dir as cwd, and `--settings` / `--mcp-config` / `--system-prompt-file`
-  (`docs/tools/hivectl.md:247-268`).
-- The one blocker is now filed and endorsed. Mara,
-  [#947 09:35Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5568616265):
-  "the polkit rules should probably go into hyperhive proper, no?" —
-  **hyperhive#4039**, scoped by @the-sword-above to the single action
-  `machinectl shell` actually triggers (`org.freedesktop.machine1.shell`; `login`
-  and `host-shell` are different verbs `choom` never calls). With it, option 2
-  needs nothing further from the hive.
-- It needs no tmux, no PTY, no new socket verb, and no in-shell terminal.
+An approval that disappears from `Pending` between the prompt and the answer (the
+operator used `hivectl`, or another prompt won) is dropped with a debug line, not
+an error — the same idempotence the pause button has.
 
-The one hazard, stated plainly: because the title is constant, resuming it **does**
-collide with the live harness — precisely the case the hive's own note excludes for
-a _blank_ choom ("it won't carry our title",
-`docs/turn-loop/claude-invocation.md:83-84`). So option 2 is **pause-first, always**:
+### 6.6 Triggers — a datasource plugin waking an agent
+
+Decision 8's last line: "received gitlab email (hytte-plugin-inbox-imap) → matches
+criteria → `/idd` → stdin(relevant choom)". The shape is right; the delivery is
+not stdin. A hive agent has no stdin an outsider can reach, and it does not need
+one: the harness already wakes on **inbox messages through the broker**, which is
+the same path a sibling agent uses to talk to it, and messages queue unacked while
+an agent is paused rather than being lost.
+
+So a trigger is: a datasource plugin (the #487 groove — its own binary, its own
+socket, no shell change) matches an event and sends `/idd` to the named agent as a
+broker message. The desktop's side of that is one plugin and no new shell surface.
+
+**Deliberately not specified here:** which verb sends it. Sending into an agent's
+inbox from outside the hive is not something this spec has verified a route for —
+`POST /send` on the agent's own web socket is one candidate (section 7.2), a
+`host.sock` verb would be another and does not exist today. That is a phase-4
+question and belongs on #948 when it is actually wanted, not a guess in this
+document.
+
+## 7. Attach — DECIDED: the agent's own chat surface, out of process
+
+**The question #950 asked is answered, and it was the wrong question.** It offered
+four ways to open a _terminal_. Annika, [#947 17:21Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573896006):
+
+> thing is I'm not too invested in the terminal as chat client for agent soooo
+> I mean custom gtk client I'm also game - as long as runs out of trollshell process
+
+So the primary click opens the agent's **chat surface**, in its **own process**,
+and a terminal is the secondary action. That is #950's option 3 — the per-agent
+web UI — promoted from "kept alongside" to the answer. tmux (option 1) and a
+harness-owned PTY (option 4) are **considered and dropped**: both exist to give a
+better terminal, and a terminal is not what she wants. They stay only as a note
+here in case a future use case revives them.
+
+Consequences, in order:
+
+- **hyperhive#4039 (the `machinectl shell` polkit rule) is no longer on the
+  critical path.** It gates only the secondary action, so P1 and P3 no longer wait
+  on it. It is still worth landing — the secondary action is real.
+- `terminal = ["alacritty", "-e"]` stays in `agents.toml`, for that secondary
+  action alone.
+- The pause-before-attach dance (below) applies only to the `choom` path. The chat
+  surface is designed to be used **while the loop runs** — that is the whole point
+  of it — so the primary click never touches `SetPaused`.
+
+### 7.1 The v1 shape — PROPOSED, awaiting one word
+
+Annika added one hard constraint at
+[#947 17:25Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573926876):
+
+> well the gtk chat client would pretty much need to fully support the current
+> hyperhive webui features ❤️
+
+That rules out a native GTK reimplementation for v1. The agent page already has
+message history with tool-call rendering, the composer, interrupt, the inbox and
+todos flyouts, model and effort pickers, ctx and cost badges, login flow, and a
+stats page (`docs/web-ui/agent.md`) — and it keeps moving. Reimplementing that in
+GTK widgets is a parity treadmill from day one, and it would be trollshell's job
+to keep up with hyperhive's frontend forever.
+
+**Proposed instead** ([#947 17:26Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573931084)),
+and it satisfies "runs out of trollshell process" exactly:
+
+> a small companion binary (control-center shape) that is a libadwaita window
+> **embedding the agent's own web page** — WebKitGTK `WebView` pointed at
+> `/agent/<name>/` on the local gateway, the swarm CA trusted programmatically so
+> there is no click-through.
+
+| property        | what it gives                                                                                                                         |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| own process     | the `trollshell-control-center` shape: a separate windowed GTK4/libadwaita binary, launched **detached** per #953                     |
+| own window      | its own title and app-id, so niri window rules can place and size it                                                                  |
+| feature parity  | free and permanent — it _is_ the web UI, so decision 11 is met by construction                                                        |
+| dependency cost | WebKitGTK is heavy, and it lands **only in the companion**. The shell never links it, exactly as it never links GTK's web stack today |
+| the CA          | the swarm CA is trusted programmatically in the WebView rather than clicked through (Mara's browser workflow, #949)                   |
+
+**This is proposed, not decided** — it needs one word from Annika (_WebView?_).
+The alternative she might still prefer is native widgets, at the parity cost above;
+if she says so, section 7.2's endpoint notes are where that work would start.
+
+Native pieces can replace parts of the embedded page later, one at a time, if a
+reason appears — a keyboard shortcut the web UI cannot bind, a notification the
+window should raise. That is an option the WebView keeps open; it is not a plan.
+
+### 7.2 If a native piece is ever wanted — the API it would speak
+
+Kept as a **note, not a plan.** The agent's HTTP surface is reachable without the
+gateway: `hivectl agent <name> watch` already dials
+`/run/hive-agent/<name>/web.sock` directly and speaks bare HTTP/1.1 for the SSE
+stream (`docs/tools/hivectl.md:276-285`), which is the precedent an external
+client would follow. The socket is `0666` inside a `0751` per-agent dir owned by
+the agent's container uid (`docs/networking/gateway.md:107-109`).
+
+Endpoints a native client would need, all verified in `docs/web-ui/agent.md`:
+
+| purpose            | endpoint                                       | line |
+| ------------------ | ---------------------------------------------- | ---- |
+| history on load    | `GET /events/history` (replay buffer)          | 190  |
+| live tail          | `GET /events/stream` (SSE)                     | 191  |
+| send a message     | `POST /send`                                   | 281  |
+| interrupt the turn | `POST /api/cancel` (SIGINT the in-flight turn) | 284  |
+| cold-load snapshot | `GET /api/state`                               | 331  |
+| todos flyout       | `GET /api/todos`, `POST /api/todos/mark-done`  | 340  |
+| model / effort     | `POST /api/model`, `POST /api/effort`          | 291  |
+
+**One pointer I could not verify:** an earlier draft of #950 cited `/api/op-send`
+as the prompt endpoint. It does not appear anywhere in `docs/web-ui/agent.md`;
+the send endpoint is `POST /send` (`:281`). Treat the earlier reference as wrong.
+
+### 7.3 The secondary action — `choom` in a terminal
+
+Unchanged from the previous draft, and demoted to a context-menu entry on the row:
+for the rare "drive Claude Code myself" moment.
+
+`hivectl agent <name> choom` already runs an interactive claude in the cage and
+already takes `--resume <value>`, passed through to `claude --resume`
+(`docs/tools/hivectl.md:213-245`). The harness's session title is a knowable
+constant — `hive-session`, or `HIVE_SESSION_TITLE`
+(`docs/turn-loop/claude-invocation.md:72-77`) — so `choom --resume hive-session`
+lands the operator in the agent's own transcript, and `choom` reproduces the
+harness's environment: the agent user, the state dir as cwd, and `--settings` /
+`--mcp-config` / `--system-prompt-file` (`docs/tools/hivectl.md:247-268`).
+
+Because the title is constant, resuming it **does** collide with a running turn —
+the case the hive's own note excludes for a _blank_ choom ("it won't carry our
+title", `docs/turn-loop/claude-invocation.md:83-84`). So this path is
+**pause-first, always**:
 
 ```text
 SetPaused { name, paused: true }   →  wait one poll for paused == true
@@ -579,22 +784,20 @@ on EffectResult (launch ok)        →  the row shows "paused · attached"
 on terminal exit                   →  SetPaused { name, paused: false }
 ```
 
-Option 3 needs no pause at all — the web terminal is designed to be used while the
-loop runs, which is half of why Mara reaches for it — so the `web:<name>` button
-never touches `SetPaused`.
-
 Unpause-on-exit is the piece #953 must not lose. A detached launch reports launch
 success only, not exit status (#953's own proposal), so v1 unpauses on the
-operator's next click of the pause button and the row makes that state obvious. If
-#953 can cheaply surface "the transient unit stopped" without re-parenting the
-child, the plugin unpauses automatically; if not, manual unpause is the honest v1
-and the row says so.
+operator's next click of the pause button and the row makes that state obvious —
+open question 5.
 
-The terminal is a config key — an argv prefix, defaulting to Annika's emulator:
+### 7.4 Considered and dropped
 
-```toml
-terminal = ["alacritty", "-e"]
-```
+**tmux in the cage** (#950 option 1) and **a harness-owned PTY on `web.sock`**
+(#950 option 3's heavier sibling) both existed to make the _terminal_ better.
+Decision 9 removed the terminal from the primary path, so both drop out: tmux
+needs a `tty` agent kind the hive does not have and would run a second `claude`
+nobody drives, and the PTY is the largest hive change of the four for a surface
+the web UI already provides. Neither is refuted — they are simply answering a
+question that is no longer being asked.
 
 ## 8. Status source
 
@@ -634,14 +837,27 @@ cannot change in a free-form way."
 # ~/.config/trollshell/agents.toml
 socket = "/run/hyperhive/host.sock"   # override only
 poll_seconds = 5
-terminal = ["alacritty", "-e"]
-attach = "choom-resume"               # section 7; "web" and "choom-blank" also valid
+terminal = ["alacritty", "-e"]        # the section 7.3 secondary action only
 session_title = "hive-session"        # matches HIVE_SESSION_TITLE on the hive
 
 [display.trollshell-choom]
 label = "choom"
 icon = "starred-symbolic"
+project = "viberoot"                  # the group header this row sits under
+
+# The chat companion's own prefs live here too, so one file is the whole
+# desktop-side surface and the companion works while the shell is down —
+# the same rule the Places tab follows for places.toml.
+[chat]
+width = 1100
+height = 800
+last_agent = "trollshell-choom"       # reopened by default when launched bare
 ```
+
+The `attach = "choom-resume"` key from the previous draft is **gone**: section 7
+settles which surface the primary click opens, so a config key choosing between
+them would only let the file contradict the spec. What stays configurable is the
+terminal for the secondary action.
 
 That is the **whole** trollshell column. Nothing from the other two rows is
 duplicated here — the desktop reads them and never keeps a second copy that can
@@ -677,7 +893,7 @@ The `agents` subsystem rides `hytte-config`
 (`crates/hytte-config/src/merge.rs:34-48`), unknown-key warnings rather than
 failures, and the format-preserving writer — all from a `NAME` and a `DEFAULT_TOML`.
 
-## 10. Control-center Agents tab (phase 2)
+## 10. Control-center Agents tab (phase 4)
 
 Same shape as the Plugins tab after #887/#943: an `AdwBreakpointBin` over an
 `AdwNavigationSplitView` — split panes wide, push navigation narrow, one widget tree
@@ -710,7 +926,7 @@ if #952 ever needs it. Not decided; it is downstream of #952 and of open questio
 ## 11. Trust boundary
 
 The socket is full hive control — "spawn / kill / destroy / deploy"
-(`nix/host-modules/hive-c0re/options.nix:429-431`). Four rules follow.
+(`nix/host-modules/hive-c0re/options.nix:429-431`). Five rules follow.
 
 **One: the scope footgun.** `LifecycleScope::is_everything` treats an all-false scope
 as **everything** (`hive-host-sock/src/lib.rs:487-495`), so a `Start {}` with a
@@ -733,7 +949,19 @@ no `sh -c`, no shell metacharacter path, and no plugin-supplied program name out
 the configured terminal prefix. The effect broker already audits every `RunCommand`
 by kind (`trollshell/src/plugins/effects.rs:514`).
 
-**Three: no secrets cross the plugin.** It holds no token, declares no secret slot,
+**Three: the approval prompt needs `Capability::Consent`, and grants nothing
+standing.** Section 6.5's flow means the plugin declares `Capability::Consent`
+(`crates/hytte-plugin-proto/src/manifest.rs:133`) on top of `RunCommand`, `Notify`
+and `OpenPage` — and that capability is also the #305 gate for receiving the
+`ConsentDecision` push at all, so declaring it is not optional decoration. Two
+constraints on how it is used: the plugin **never persists a grant** (every
+`Allow*` is one `Approve { id }`, section 6.5), and the prompt's strings are
+echoed from the hive's own `Approval` record rather than composed from anything
+the plugin invents — a prompt that misdescribes what it is approving is the one
+way this surface could do real harm. The 60 s timeout resolving to `Deny` leaves
+the approval **pending**, never denied on the hive.
+
+**Four: no secrets cross the plugin.** It holds no token, declares no secret slot,
 and reads no credential. Its entire authority is the desktop user's `hive-admin`
 membership — group membership only, since the socket is always group-owned
 (amendment c): `adminUsers` (`nix/host-modules/hive-c0re/options.nix:419-432`)
@@ -742,7 +970,7 @@ populates the group, and the socket's `0660 root:hive-admin` mode
 no polkit, no `sudo` anywhere in this plugin. A user outside the group gets
 `EACCES` and the "no hive" row — the correct unprivileged outcome, not a bug.
 
-**Four: the laptop rule — keep the gateway off the network.** This one is about
+**Five: the laptop rule — keep the gateway off the network.** This one is about
 the hive's deployment, not the plugin, but it is the security fact that changed
 today. Mara, [#949 11:03Z](https://github.com/vibec0re/trollshell/issues/949#issuecomment-5569648120):
 "the hive dashboard still is not behind auth. dont open it to the network. a full
@@ -751,9 +979,13 @@ running on the host network." On a machine that roams between networks, an
 all-local swarm therefore wants the gateway bound to loopback or firewalled on
 `:80`/`:443` until that sweep lands. **Nothing on the trollshell side needs those
 ports open**: the plugin reaches `host.sock` and `127.0.0.1` and nothing else, and
-the agent web terminal (section 7 option 3) is a loopback URL. The browser trusting
-the swarm CA is a separate, benign matter — Mara: "i just click through the invalid
-cert warning"; `security.pki.certificateFiles` is the tidy version.
+the chat companion (section 7.1) points at the **same loopback gateway** — which is
+why closing `:80`/`:443` to the network costs the desktop nothing at all. The
+swarm CA is the one place the companion differs from a browser: rather than
+Mara's "i just click through the invalid cert warning", it trusts the CA
+programmatically in the WebView, so there is no click-through to train the
+operator out of. `security.pki.certificateFiles` remains the host-wide tidy
+version.
 
 **An aside #953 should fold in.** The problem is worse than #953's body states. A
 `RunCommand` child is not merely in the shell's cgroup: `execute_command` awaits it
@@ -768,21 +1000,25 @@ merely re-parent the child.
 Everything below is hermetic and rides the existing gates (`cargo test`,
 `nix flake check`, `cargo clippy --workspace --all-targets --features system-tests`).
 
-| check                                                                                     | where                                           |
-| ----------------------------------------------------------------------------------------- | ----------------------------------------------- |
-| `Request` serializes to the exact `{"cmd":"agent_status"}` line shape, per verb           | `hive::wire` unit test                          |
-| recorded real `HostResponse` JSON lines decode into the mirror (fixture files)            | `hive::wire` fixture test                       |
-| a response carrying **unknown** fields still decodes (forward drift)                      | `hive::wire` fixture test                       |
-| every `Start` / `Stop` frame the plugin can emit has a non-empty `agent_names` (rule 1)   | `hive::wire` unit test                          |
-| flags → (icon, text, class) for all 32 flag combinations, precedence pinned               | plugin unit test                                |
-| `View` render-tree goldens: unreachable, empty hive, running, paused, failed, needs-login | plugin golden test                              |
-| a click on `pause:<name>` emits exactly one `SetPaused` with the flipped bool             | plugin reducer test                             |
-| the attach argv is the fixed shape, and a rejected name never reaches it                  | plugin reducer test                             |
-| a click on `web:<name>` emits **no** `SetPaused` — the web terminal never pauses the loop | plugin reducer test                             |
-| `Notify` fires on the flag **edge**, not the level (two identical polls → one toast)      | plugin reducer test                             |
-| an absent / refused / permission-denied socket parks and re-polls, never exits            | fake-socket integration test (`system-tests`)   |
-| the detached `RunCommand` argv is `systemd-run`-wrapped and never awaited                 | #953, `trollshell/src/plugins/effects.rs` tests |
-| a detached child outlives the effect broker being dropped                                 | #953, `system-tests`                            |
+| check                                                                                                        | where                                           |
+| ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------- |
+| `Request` serializes to the exact `{"cmd":"agent_status"}` line shape, per verb                              | `hive::wire` unit test                          |
+| recorded real `HostResponse` JSON lines decode into the mirror (fixture files)                               | `hive::wire` fixture test                       |
+| a response carrying **unknown** fields still decodes (forward drift)                                         | `hive::wire` fixture test                       |
+| every `Start` / `Stop` frame the plugin can emit has a non-empty `agent_names` (rule 1)                      | `hive::wire` unit test                          |
+| flags → (icon, text, class) for all 32 flag combinations, precedence pinned                                  | plugin unit test                                |
+| `View` render-tree goldens: unreachable, empty hive, running, paused, failed, needs-login                    | plugin golden test                              |
+| a click on `pause:<name>` emits exactly one `SetPaused` with the flipped bool                                | plugin reducer test                             |
+| the `choom` argv is the fixed shape, and a rejected name never reaches it                                    | plugin reducer test                             |
+| a click on `chat:<name>` emits **no** `SetPaused` — the chat surface never pauses the loop                   | plugin reducer test                             |
+| a new `Pending` row raises exactly one `RequestConsent`, and a repeat poll of the same id raises none        | plugin reducer test                             |
+| every `ConsentDecision::Allow*` maps to `Approve { id }` and persists no grant; `Deny` maps to `Deny { id }` | plugin reducer test                             |
+| an approval that vanishes from `Pending` before the decision arrives is dropped, not errored                 | plugin reducer test                             |
+| rows group by project, and an agent with no known project lands in "ungrouped" rather than vanishing         | `View` golden test                              |
+| `Notify` fires on the flag **edge**, not the level (two identical polls → one toast)                         | plugin reducer test                             |
+| an absent / refused / permission-denied socket parks and re-polls, never exits                               | fake-socket integration test (`system-tests`)   |
+| the detached `RunCommand` argv is `systemd-run`-wrapped and never awaited                                    | #953, `trollshell/src/plugins/effects.rs` tests |
+| a detached child outlives the effect broker being dropped                                                    | #953, `system-tests`                            |
 
 The fixtures are the drift detector until hyperhive#4038 lands. They are **recorded
 from a live hive**, checked in verbatim, and a hive-side wire change fails them —
@@ -799,42 +1035,58 @@ settle these, and all of them need a hive, i.e. `singleHostSwarm` deployed (#949
 the rows render legibly in the sidebar at her scale; the pause button actually parks
 a live agent; `hivectl … choom --resume hive-session` lands in the agent's own
 transcript and the loop's next turn sees it; the launched Alacritty survives
-`systemctl --user restart trollshell`; the `web:<name>` button opens the agent page
-on loopback with the swarm CA warning clicked through; a `needs_login` flip raises
-exactly one toast; and the desktop user's `hive-admin` membership alone (no `sudo`)
-is enough for every one of them.
+`systemctl --user restart trollshell`; the chat companion opens the agent page on
+loopback **with no certificate warning** (the CA trusted programmatically, section
+7.1) and survives a shell restart the same way; a `needs_login` flip raises exactly
+one toast; a real `Pending` approval raises the consent prompt with strings that
+correctly describe what is being approved, and answering it actually resolves the
+approval hive-side; and the desktop user's `hive-admin` membership alone (no
+`sudo`) is enough for every one of them.
 
 ## 13. Phases
 
-| phase | what                                                                                                                                                                                                                                        | blocked on                                                                                                                                                                                                                                 |
-| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| P0    | this spec                                                                                                                                                                                                                                   | Annika's veto                                                                                                                                                                                                                              |
-| P1    | #953 (detached `RunCommand` — the detached path must bypass the awaited `cmd.output()`, not merely re-parent) + `hytte-plugin-agents`: wire mirror, rows, pause, panel, the `web:<name>` button                                             | nothing. The transport is settled (`host.sock`, section 5.7) and the status text has landed (hyperhive#4037), so P1 is dev-against-a-fake-socket today; only **live-verify** needs a hive, i.e. **#949**'s `singleHostSwarm` on the laptop |
-| P2    | control-center **Agents** tab, read-only, adaptive drill-down                                                                                                                                                                               | P1                                                                                                                                                                                                                                         |
-| P3    | attach, per whichever section 7 option wins (rec. option 2). The `web:<name>` button ships in P1 either way                                                                                                                                 | option 2 → **hyperhive#4039** (filed); option 1 or 4 → **#950** as well; option 3 → nothing, it is already in P1                                                                                                                           |
-| P4    | edit — narrowed by amendment f: the in-container fields already live in the agent's config flake, so this is a **config-flake editor**, not a hive change; the host-level remainder (mounts, caps) waits on **#952** and on open question 8 | **#952** for the host-level half only                                                                                                                                                                                                      |
-| later | the swarm-controller migration, "at some point" (section 5.7); remote hive over #948's gateway HTTP + SSE; `Subscribe { kinds }` replacing the poll; extraction; other runtimes                                                             | **#948**, Mara's "at some point", and decision 6's "once this all stable"                                                                                                                                                                  |
+| phase | what                                                                                                                                                                                                                                                                                                      | blocked on                                                                                                                                                                                                                                 |
+| ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| P0    | this spec                                                                                                                                                                                                                                                                                                 | Annika's veto, plus one word on section 7.1 (**WebView?**)                                                                                                                                                                                 |
+| P1    | #953 (detached `RunCommand` — the detached path must bypass the awaited `cmd.output()`, not merely re-parent) + `hytte-plugin-agents`: wire mirror, rows grouped by project, pause, panel                                                                                                                 | nothing. The transport is settled (`host.sock`, section 5.7) and the status text has landed (hyperhive#4037), so P1 is dev-against-a-fake-socket today; only **live-verify** needs a hive, i.e. **#949**'s `singleHostSwarm` on the laptop |
+| P2    | **the chat companion** (section 7.1) — the out-of-process window the primary click opens. Moved ahead of the Agents tab because it is the interaction Annika actually asked for; the tab is a settings surface                                                                                            | section 7.1's one word, and #953 for the detached launch                                                                                                                                                                                   |
+| P3    | **approvals** (section 6.5) — poll `Pending`, raise the consent prompt, route `Approve` / `Deny` back                                                                                                                                                                                                     | P1. Deliberately **not** in P1: the row must be trustworthy before it is allowed to raise a modal that approves a config change, and the consent prompt is the one surface here that can do harm if it misdescribes what it is asking      |
+| P4    | control-center **Agents** tab, read-only, adaptive drill-down                                                                                                                                                                                                                                             | P1                                                                                                                                                                                                                                         |
+| P5    | edit — narrowed by amendment f: the in-container fields already live in the agent's config flake, so this is a **config-flake editor**, not a hive change; the host-level remainder (mounts, caps) waits on **#952** and on open question 6                                                               | **#952** for the host-level half only                                                                                                                                                                                                      |
+| later | triggers (section 6.6 — a datasource plugin sending `/idd` through the broker; the send route is unspecified on purpose); the swarm-controller migration, "at some point" (section 5.7); remote hive over #948's gateway HTTP + SSE; `Subscribe { kinds }` replacing the poll; extraction; other runtimes | **#948**, Mara's "at some point", and decision 6's "once this all stable"                                                                                                                                                                  |
 
-P1 is buildable **today** against a fake socket, and that is the point of the fixture
-suite: the plugin can be finished, tested and reviewed before a hive exists on the
-laptop. It just cannot be _live-verified_ until #949.
+The `choom` secondary action (section 7.3) rides along with P2, since it is one
+more entry in the same window's context menu — and it is the only thing in this
+plan that wants **hyperhive#4039**, which is why nothing above blocks on it.
+
+P1 is buildable **today** against a fake socket, and that is the point of the
+fixture suite: the plugin can be finished, tested and reviewed before a hive exists
+on the laptop. It just cannot be _live-verified_ until #949.
 
 ## 14. Open questions
 
-Numbered for reply, and **all eight are Annika's** — the hive side is done. Three
+Numbered for reply, and **all seven are Annika's** — the hive side is done. Four
 that earlier drafts listed are answered and gone: whether to join Mara's swarm (no
-— amendment b), whether the hive needs a forge-less profile (no — amendment a), and
-the lifetime-ops transport (`host.sock` now, controller later — amendment i,
-section 5.7).
+— amendment b), whether the hive needs a forge-less profile (no — amendment a), the
+lifetime-ops transport (`host.sock` now, controller later — amendment i), and the
+attach mechanism (the chat surface, decision 9 — section 7).
 
-1. **Attach mechanism** — section 7's four options for the primary click: tmux, pause + `claude --resume`, the per-agent web page, or a harness-owned PTY? (Recommendation: option 2; option 3 ships alongside regardless.)
+1. **Section 7.1: WebView?** The one word this spec is waiting on. An embedded
+   `WebView` on the agent's own page gives decision 11's feature parity for free
+   and forever; native GTK widgets give a nicer window and a parity treadmill. If
+   the answer is "native", section 7.2 is where that work starts and P2 grows by a
+   lot.
 2. **#953 now or later** — still unanswered on #947; P1 cannot ship without it.
-3. **Edit surface** — the plugin's own panel (the #487 groove) or a control-center tab, once editing is real? Both eventually, but which first?
-4. **Plugin name** — `agents`, `hive`, or `choom`? It becomes the crate name, the unit name (`trollshell-plugin-<id>`) and the `plugins.<id>` key, so it is awkward to change later.
-5. **Is `trollshell-choom` the first agent?** (Which hive is settled: Annika's own all-local swarm on the laptop.)
-6. **Unpause after attach: automatic or manual?** Auto-_pause_ is not open — section 7 settles it for option 2 (pause-first, always; never refuse-to-attach). What is open is the other end: does the plugin unpause by itself when the terminal exits — which needs #953 to surface the transient unit's exit without re-parenting the child — or is v1 honest and manual, unpaused by the row's own pause button with the row reading `paused · attached` until then?
-7. **Is there anything you need in the cage that a `git clone` cannot bring in?** Mara's question, relayed on #952: if not, mounts leave the requirement entirely and P4 shrinks to the config flake.
-8. **Notify policy** — toast on `needs_login` and `failed` only, or also on a `status_text` the config marks "waiting for you", now that the text is on the row?
+3. **Plugin name** — `agents`, `hive`, or `choom`? It becomes the crate name, the unit name (`trollshell-plugin-<id>`) and the `plugins.<id>` key, so it is awkward to change later. The companion binary needs a name too (`trollshell-agent-chat`?).
+4. **Is `trollshell-choom` the first agent?** (Which hive is settled: Annika's own all-local swarm on the laptop.)
+5. **Unpause after the `choom` path: automatic or manual?** Auto-_pause_ is not open — section 7.3 settles it. What is open is the other end: does the plugin unpause by itself when the terminal exits — which needs #953 to surface the transient unit's exit without re-parenting the child — or is v1 honest and manual, unpaused by the row's own pause button with the row reading `paused · attached` until then?
+6. **Is there anything you need in the cage that a `git clone` cannot bring in?** Mara's question, relayed on #952: if not, mounts leave the requirement entirely and P5 shrinks to the config flake.
+7. **Notify policy** — toast on `needs_login` and `failed` only, or also on a `status_text` the config marks "waiting for you", now that the text is on the row? (Distinct from section 6.5's approval prompt, which is a modal with buttons, not a toast.)
+
+**Marked later, not asked now:** whether the chat companion should also reach
+agents on a _remote_ hive through the gateway. It would — the URL is the only
+thing that changes — but the remote-hive phase is behind #948's HTTP transport
+and there is no reason to decide it before then.
 
 ## 15. References
 

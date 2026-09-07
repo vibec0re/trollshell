@@ -2,7 +2,7 @@
 //!
 //! `tests/reducer.rs` covers the model and `tests/fake_socket.rs` covers one
 //! round trip; neither ever executes [`poll_task_with`]. That left four
-//! load-bearing behaviours untested — and a mechanism with no test that goes
+//! load-bearing behaviours (five, with the refusal send) untested — and a mechanism with no test that goes
 //! red when it is deleted is exactly what spec §12 forbids:
 //!
 //! | mechanism | what it buys | test here |
@@ -11,6 +11,7 @@
 //! | the seed poll before the loop | a card that is not "connecting…" until the sidebar is first opened | [`the_seed_poll_runs_before_any_visibility_edge`] |
 //! | `ConfigSource::changed` | `agents.toml` live-reload — the `places` behaviour §9 promises | [`an_agents_toml_edit_is_picked_up_on_the_next_poll`] |
 //! | `*urls_done = true` | one `Urls` round trip per session, not one per poll | [`urls_is_fetched_once_per_session_not_once_per_poll`] |
+//! | the `Msg::WriteRefused` send | a refused write reaching the operator at all | [`a_refused_write_reaches_the_reducer_and_still_re_polls`] |
 //!
 //! Every one of these uses `#[tokio::test(start_paused = true)]`: the cadence
 //! is the thing under test, so the virtual clock is what makes "ten cadences
@@ -22,6 +23,7 @@ use std::time::Duration;
 
 use hytte_plugin::cmd_channel;
 use hytte_plugin_agents::config::AgentsConfig;
+use hytte_plugin_agents::hive::wire::Request;
 use hytte_plugin_agents::poll::{Cmd, ConfigSource, Msg, poll_task_with};
 use tokio::sync::mpsc;
 
@@ -252,6 +254,74 @@ async fn an_agents_toml_edit_is_picked_up_on_the_next_poll() {
 
     assert_eq!(reloaded.label_for("trollshell-choom"), "choom");
     assert_eq!(reloaded.project_for("trollshell-choom"), Some("viberoot"));
+    task.abort();
+}
+
+/// **A refused write reaches the reducer.** The hive answers `ok: false` to a
+/// `set_paused`; the task must turn that into a `Msg::WriteRefused` carrying
+/// the daemon's own words, and must still re-poll so the row un-sticks.
+///
+/// `reducer.rs` covers the other half — `Msg::WriteRefused` → exactly one
+/// `Effect::Notify` — by feeding the message directly, which means it does
+/// **not** cover the send. Measured: deleting the `msg_tx.send` in `poll.rs`
+/// leaves the whole suite green without this test.
+///
+/// Falsification: delete that send and this fails on `recv_soon`'s deadline.
+#[tokio::test(start_paused = true)]
+async fn a_refused_write_reaches_the_reducer_and_still_re_polls() {
+    let hive = FakeHive::serve(replies(&[
+        ("agent_status", &fixture("agent_status_grouped.json")),
+        ("set_paused", &fixture("error.json")),
+    ]));
+    let (tx, rx) = cmd_channel();
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(poll_task_with(
+        rx,
+        msg_tx,
+        cfg_for(&hive),
+        ConfigSource::over(Vec::new()),
+    ));
+
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "the seed config").await,
+        Msg::Config(_)
+    ));
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "a poll answer").await,
+        Msg::Status(Ok(_))
+    ));
+    settle().await;
+
+    tx.send(Cmd::Send(Request::SetPaused {
+        name: "trollshell-choom".to_owned(),
+        paused: true,
+    }))
+    .expect("the lane is open");
+
+    match recv_soon(&mut msg_rx, "the refusal").await {
+        Msg::WriteRefused { request, reason } => {
+            assert_eq!(
+                request,
+                Request::SetPaused {
+                    name: "trollshell-choom".to_owned(),
+                    paused: true,
+                },
+                "the refusal must carry the frame that was refused"
+            );
+            assert!(
+                reason.contains("ghost"),
+                "the hive's own words, not a stand-in: {reason}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    // …and the roster is re-read regardless, which is what un-sticks the row's
+    // optimistic flip.
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "the reconciling poll").await,
+        Msg::Status(Ok(_))
+    ));
     task.abort();
 }
 

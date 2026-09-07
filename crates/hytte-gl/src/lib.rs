@@ -192,7 +192,18 @@ impl Gl {
         Ok(Self(PhantomData))
     }
 
-    /// Whether GL reported an error since the last check, draining the queue.
+    /// The first GL error pending, **draining the whole queue**.
+    ///
+    /// `glGetError` pops *one* entry: GL keeps a queue and returns
+    /// `GL_NO_ERROR` only once it is empty. A single call therefore leaves any
+    /// further errors to be picked up by the *next* caller and attributed to
+    /// whatever it was doing — which is exactly the misattribution a harness
+    /// calls this to avoid. So it loops until the queue is clear and hands back
+    /// the first code it saw.
+    ///
+    /// The loop is bounded because a lost or misbehaving context can report an
+    /// error forever; hitting the bound returns the first code like any other
+    /// non-empty queue, rather than hanging.
     ///
     /// A debugging seam, not a control-flow one: the render path is written so
     /// that a GL error cannot change what is drawn, and polling `glGetError`
@@ -200,10 +211,20 @@ impl Gl {
     /// harness calls it; the shell does not.
     #[must_use]
     pub fn take_error(&self) -> Option<u32> {
-        // SAFETY: a context is current (the `&self` token) and `glGetError`
-        // takes no arguments and cannot fail.
-        let code = unsafe { gl::GetError() };
-        (code != gl::NO_ERROR).then_some(code)
+        /// Enough to clear any queue a conforming driver keeps, and a bound on
+        /// one that never returns `GL_NO_ERROR`.
+        const MAX_DRAIN: usize = 64;
+        let mut first = None;
+        for _ in 0..MAX_DRAIN {
+            // SAFETY: a context is current (the `&self` token) and `glGetError`
+            // takes no arguments and cannot fail.
+            let code = unsafe { gl::GetError() };
+            if code == gl::NO_ERROR {
+                break;
+            }
+            first.get_or_insert(code);
+        }
+        first
     }
 }
 

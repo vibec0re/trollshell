@@ -309,8 +309,9 @@ pub fn register(program: GlProgram, pipeline: GlPipeline) {
 /// reason the first time any surface cannot get a GL context, and never again.
 ///
 /// The hook is where a host decides what a failure *means*, which this crate
-/// cannot: `trollshell` uses it to latch its own flag, warn once, and drop
-/// every `Scope` renderer to the CPU kit on the next mapping pass.
+/// cannot: `trollshell` uses it to rebuild every GL `Scope` renderer onto the
+/// CPU kit there and then, and to ask for one re-map — because a settled
+/// widget's parked clock never delivers a mapping pass to do it on.
 pub fn set_context_failure_handler(handler: impl Fn(&str) + 'static) {
     ON_CONTEXT_FAILURE.with_borrow_mut(|slot| *slot = Some(Box::new(handler)));
 }
@@ -328,6 +329,14 @@ pub fn gl_abandoned() -> bool {
 /// because it is also the seam a host tests its own CPU fallback through: a
 /// display server with no GL is not something a hermetic test can arrange, but
 /// "behave as if the context had failed" is exactly one call.
+///
+/// **The latch is set before the hook runs, and that ordering is load-bearing
+/// — do not reverse it.** A host's handler will typically rebuild whatever it
+/// had on GL, and it decides what to rebuild *onto* by asking
+/// [`gl_abandoned`]. If the flag were only set afterwards, every one of those
+/// rebuilds would resolve back to GL and the handler would silently accomplish
+/// nothing. `trollshell`'s `preem_render::rebuild_gl_renderers_on_cpu` is
+/// exactly that shape.
 pub fn abandon_gl(reason: &str) {
     let first = ABANDONED.with_borrow_mut(|slot| {
         if slot.is_some() {
@@ -1055,8 +1064,20 @@ mod tests {
     /// hot-plugged monitor, because the renderer instance is shared across
     /// mounts and the surface is not.
     ///
-    /// **Falsified** by restoring `self.last_drawn.set(0)` in
-    /// `ensure_resources`, which is what this replaced.
+    /// **Falsified** by neutering [`fresh_last_drawn`] itself — to `0`, or to
+    /// any expression that ignores its argument.
+    ///
+    /// **What this does *not* cover, stated rather than implied:** the one call
+    /// site, `imp::GlSurface::ensure_resources`. Restoring
+    /// `self.last_drawn.set(0)` there leaves this test green — verified, and
+    /// green with zero warnings for a variant that keeps every binding used
+    /// (`set(fresh_last_drawn(step_seq.min(1)))` is the same bug and lints
+    /// clean). That line lives in `mod imp` behind a live `GdkGLContext` and
+    /// there is no hermetic way to reach it, so it is uncovered — the same
+    /// honest gap as the parity harness's exit status. An earlier version of
+    /// this comment claimed the call-site mutation as the falsification, which
+    /// was simply false; in a tree where these claims are the review currency,
+    /// a wrong one costs more than a missing one.
     #[test]
     fn a_fresh_surface_does_not_replay_an_absence_it_has_no_trail_for() {
         assert_eq!(steps_owed(fresh_last_drawn(9_000), 9_000), (1, false));

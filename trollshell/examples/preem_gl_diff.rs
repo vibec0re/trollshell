@@ -322,8 +322,11 @@ fn measure(area: &GlSurface, case: &Case) -> bool {
     );
     // Drain anything the pipeline left queued *before* the readback, so a GL
     // error reported below is attributable to the read and not to a draw three
-    // passes ago. The shell never does this — `glGetError` is a
-    // synchronisation point on some drivers — but a harness that stalls the
+    // passes ago. `take_error` empties the whole queue, which is what makes
+    // that attribution true — `glGetError` pops one entry, so a single call
+    // would leave a second pending error to surface below as a readback
+    // failure. The shell never does any of this (`glGetError` is a
+    // synchronisation point on some drivers), but a harness that stalls the
     // pipeline anyway can afford the honesty.
     if let Some(code) = gl.take_error() {
         println!("INFO {label}: a GL error was pending before the readback ({code:#x})");
@@ -364,18 +367,20 @@ fn measure(area: &GlSurface, case: &Case) -> bool {
         );
     }
 
+    // `for_capture` rather than a struct literal: the beam tolerance is
+    // `parity::peak_row_tolerance`'s to compute, and it is the number that
+    // decides `FAIL(beam)` in a transcript pasted on #893. Written out here it
+    // drifted — it carried a stray device-scale factor, which made the verdict
+    // depend on the monitor the harness ran on.
     let stats = parity::compare(
         &raw,
         reference.data(),
-        parity::Layout {
+        parity::Layout::for_capture(
             alloc,
-            reference: (reference.width(), reference.height()),
-            device_scale: scale,
-            // The kit's beam is `2 * GLOW_SPAN + 1` grid rows tall, so a peak
-            // that moved less than that is rounding rather than a structural
-            // difference. Expressed in *reference* pixels, hence the upscale.
-            peak_row_tolerance: (scale as usize) * (SCALE as usize),
-        },
+            (reference.width(), reference.height()),
+            scale,
+            SCALE as usize,
+        ),
     );
     let verdict = stats.verdict();
     println!(

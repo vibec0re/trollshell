@@ -40,6 +40,34 @@ pub(crate) const CEILING_MAX: f64 = 32.0;
 /// Channel names, for the transcript.
 pub(crate) const CHANNELS: [&str; 3] = ["R", "G", "B"];
 
+/// How far a column's brightest row may move, in **grid** rows, before it counts
+/// as a structural difference rather than a rounding one.
+///
+/// **One**, and the reason is the kit's kernel rather than its span. `GLOW` is a
+/// bright `CORE` with strictly dimmer steps either side (`hytte-preem`'s
+/// `scope.rs`: 255 / 130 / 45), so the brightest row of a beam is always its
+/// core row — the two glow rows on each side can never *be* the peak, and the
+/// beam being five rows tall does not widen the peak's legitimate travel by one
+/// row. What can legitimately move it is the single disagreement this harness
+/// exists to bound: `round()` at an exact `.5`, which lands a column one row
+/// either way. Two rows would already be a beam drawn somewhere else.
+pub(crate) const PEAK_ROW_TOLERANCE_GRID_ROWS: usize = 1;
+
+/// [`PEAK_ROW_TOLERANCE_GRID_ROWS`] converted into the units the comparison
+/// actually runs in: **reference-frame pixels**, which are the kit's grid rows
+/// times its own `scale`.
+///
+/// There is deliberately **no device-scale term**. Both peak rows come out of
+/// `compare`, which walks `0..ref_h` and whose `gl_at` has already divided the
+/// device scale back out — so both are reference rows, and multiplying the
+/// tolerance by the device scale again would make `FAIL(beam)` depend on which
+/// monitor the harness was run on (2 px on a 1× screen, 4 px on a 2× one, same
+/// pixels and same pipeline). That is what this function exists to make
+/// unsayable at the call site.
+pub(crate) fn peak_row_tolerance(upscale: usize) -> usize {
+    PEAK_ROW_TOLERANCE_GRID_ROWS * upscale.max(1)
+}
+
 /// One channel's absolute-difference distribution.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct ChannelStats {
@@ -71,8 +99,9 @@ pub(crate) enum Verdict {
     UndrawnFramebuffer,
     /// At least one channel is outside mean/p99/max.
     OverCeiling,
-    /// The beam's peak row moved by more than the glow's own height in at
-    /// least one column — a structural difference, not a rounding one.
+    /// A column's brightest row moved further than
+    /// [`peak_row_tolerance`] — a beam drawn somewhere else, not a rounding
+    /// disagreement.
     BeamMoved,
 }
 
@@ -101,9 +130,9 @@ pub(crate) struct Stats {
     /// How many **pixels** were compared — not bytes, and not
     /// channel-samples. A 96×48 frame is 4608 of these.
     pub(crate) pixels: usize,
-    /// Columns whose brightest row moved further than the beam's own glow is
-    /// tall. Zero is the only acceptable answer, and it is **in** the verdict:
-    /// a trace drawn in the wrong place with the right colours can sit well
+    /// Columns whose brightest row moved further than [`peak_row_tolerance`].
+    /// Zero is the only acceptable answer, and it is **in** the verdict: a
+    /// trace drawn in the wrong place with the right colours can sit well
     /// inside a per-channel mean.
     pub(crate) peak_row_mismatches: u32,
     /// Every pixel of the GL readback carries the same colour.
@@ -165,10 +194,37 @@ pub(crate) struct Layout {
     pub(crate) reference: (usize, usize),
     /// The framebuffer's integer device-scale multiplier.
     pub(crate) device_scale: u32,
-    /// How many reference pixels the beam's peak row may move before it counts
-    /// as a structural difference — the kit's glow is `2 * GLOW_SPAN + 1` rows
-    /// tall in *grid* rows, so this is that times the upscale.
+    /// How many **reference-frame pixels** a column's brightest row may move
+    /// before it counts as a structural difference — see
+    /// [`peak_row_tolerance`], which is what [`Layout::for_capture`] fills this
+    /// with and the only thing that should.
     pub(crate) peak_row_tolerance: usize,
+}
+
+impl Layout {
+    /// The layout for one capture: a `GtkGLArea` readback at `alloc` device
+    /// pixels, against a kit frame of `reference` pixels rendered at `upscale`.
+    ///
+    /// A constructor rather than a struct literal so [`peak_row_tolerance`] is
+    /// the *only* way the beam tolerance gets set. It was a hand-written
+    /// expression at the call site before, and it drifted: it carried a stray
+    /// device-scale factor (making the verdict depend on the reviewer's
+    /// monitor) while two comments described a different number again. The
+    /// tests below drive this function, not a literal, which is what would have
+    /// caught that.
+    pub(crate) fn for_capture(
+        alloc: (u32, u32),
+        reference: (usize, usize),
+        device_scale: u32,
+        upscale: usize,
+    ) -> Self {
+        Self {
+            alloc,
+            reference,
+            device_scale,
+            peak_row_tolerance: peak_row_tolerance(upscale),
+        }
+    }
 }
 
 /// Compare a GL framebuffer readback against the kit's frame.
@@ -265,6 +321,7 @@ fn distribution(deltas: &mut [u8]) -> ChannelStats {
 mod tests {
     use super::{
         CEILING_MAX, CEILING_MEAN, ChannelStats, Layout, Stats, Verdict, compare, distribution,
+        peak_row_tolerance,
     };
 
     /// A `w`×`h` top-down RGBA8 frame from a per-pixel colour function.
@@ -431,6 +488,91 @@ mod tests {
         let gl = flipped(w, h, trace(11));
         let stats = compare(&gl, &cpu, layout(w, h));
         assert_eq!(stats.peak_row_mismatches, 0, "one row is inside tolerance");
+    }
+
+    /// **The beam tolerance is computed, not written down at the call site.**
+    ///
+    /// This is the test that was missing, and its absence is exactly why the
+    /// harness shipped a tolerance neither of its two comments described: every
+    /// other test here passes `peak_row_tolerance` as a literal it chose
+    /// itself, so the expression that produces the real one had no witness at
+    /// all. This one goes through [`Layout::for_capture`], the same path the
+    /// verdict uses.
+    ///
+    /// **Falsified** by putting the device scale back into
+    /// [`peak_row_tolerance`] (`* device_scale`), or by changing
+    /// [`PEAK_ROW_TOLERANCE_GRID_ROWS`].
+    #[test]
+    fn the_beam_tolerance_is_one_grid_row_and_ignores_the_device_scale() {
+        // One grid row, in reference pixels — so it tracks the kit's upscale.
+        assert_eq!(
+            peak_row_tolerance(1),
+            1,
+            "a 1x kit frame: one row is one px"
+        );
+        assert_eq!(peak_row_tolerance(2), 2, "the harness's own SCALE");
+        assert_eq!(peak_row_tolerance(3), 3);
+        assert_eq!(
+            peak_row_tolerance(0),
+            1,
+            "a nonsense upscale still allows one"
+        );
+
+        // **The verdict must not depend on the monitor.** Both peak rows come
+        // out of `compare` in reference-frame space — `gl_at` has already
+        // divided the device scale out — so a second device-scale factor here
+        // would make the same pixels pass on one screen and fail on another.
+        let at = |device_scale| {
+            Layout::for_capture((96, 48), (48, 24), device_scale, 2).peak_row_tolerance
+        };
+        assert_eq!(at(1), at(2), "1x and 2x agree");
+        assert_eq!(at(1), at(3), "…and 3x");
+        assert_eq!(at(1), peak_row_tolerance(2), "…on the computed value");
+    }
+
+    /// The tolerance is a real boundary, driven end to end through
+    /// [`Layout::for_capture`]: a beam that moved by exactly it is rounding, one
+    /// row further is a beam somewhere else.
+    ///
+    /// **Falsified** by widening [`PEAK_ROW_TOLERANCE_GRID_ROWS`] to `2`, which
+    /// makes the second half pass.
+    #[test]
+    fn a_beam_exactly_on_the_tolerance_passes_and_one_row_further_does_not() {
+        const UPSCALE: usize = 2;
+        // Tall enough that the two rows a moved trace disagrees on stay under
+        // the 99th percentile — the point here is the *structural* check, so
+        // the ceiling must not fire first and mask it.
+        let (w, h) = (16, 256);
+        let dim = |row: usize| {
+            move |_x: usize, y: usize| {
+                if y == row { [30, 30, 30] } else { [0, 0, 0] }
+            }
+        };
+        let layout = Layout::for_capture(
+            (u32::try_from(w).expect("w"), u32::try_from(h).expect("h")),
+            (w, h),
+            1,
+            UPSCALE,
+        );
+        let tolerance = layout.peak_row_tolerance;
+        assert_eq!(
+            tolerance, UPSCALE,
+            "the premise: one grid row at this upscale"
+        );
+
+        let cpu = frame(w, h, dim(20));
+        // Exactly on the boundary: still rounding.
+        let inside = compare(&flipped(w, h, dim(20 + tolerance)), &cpu, layout);
+        assert_eq!(inside.peak_row_mismatches, 0);
+        assert_eq!(inside.verdict(), Verdict::Pass);
+        // One reference row further: structural.
+        let outside = compare(&flipped(w, h, dim(20 + tolerance + 1)), &cpu, layout);
+        assert_eq!(
+            outside.peak_row_mismatches,
+            u32::try_from(w).expect("w"),
+            "every column"
+        );
+        assert_eq!(outside.verdict(), Verdict::BeamMoved);
     }
 
     /// The device scale point-samples the readback back down, so a 2× capture

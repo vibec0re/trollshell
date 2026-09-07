@@ -256,6 +256,26 @@ impl Effect {
     /// to the systemd user manager as a transient unit, never awaits it, and
     /// reports only whether the *launch* succeeded; the program outlives a shell
     /// restart. For a terminal, an editor, a companion window.
+    ///
+    /// # On a shell older than #953, this silently degrades
+    ///
+    /// `detached` is an additive field, not a new variant, so a pre-#953 host
+    /// does not reject the frame — it skips the key it doesn't know and runs the
+    /// command in the **attached** mode. The program is then a child of the
+    /// shell in the shell's cgroup, is **killed after 10 s** by the attached
+    /// mode's timeout, and the plugin gets `ok: false` with no output — which is
+    /// indistinguishable from a program that simply failed.
+    ///
+    /// That is the deliberate price of not bumping
+    /// [`VOCAB`](crate::VOCAB): a bump would make an older shell refuse *every*
+    /// plugin rebuilt on this SDK at the handshake, including plugins that never
+    /// launch anything, which is strictly worse than one effect degrading. A
+    /// [`HostMsg::Hello`](crate::msg::HostMsg::Hello) negotiation cannot rescue
+    /// it either — an old host advertises nothing, and the vocabulary counter
+    /// correctly did not move. If a plugin must tell the two apart, the
+    /// distinguishing signal is [`EffectOutcome::output`]: a #953 host always
+    /// returns a non-empty `output` naming the unit or pid on a successful
+    /// launch.
     #[must_use]
     pub fn launch(id: u64, argv: Vec<String>) -> Self {
         Effect::RunCommand {

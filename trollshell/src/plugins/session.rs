@@ -273,6 +273,9 @@ fn throttle_effects(
                 plugin_id,
                 &effect,
                 super::effects::AuditDecision::DroppedRateCap,
+                // A dropped effect never reaches a launch, so there is no unit
+                // to name (#953 M1).
+                None,
             );
         }
     }
@@ -419,6 +422,9 @@ pub(super) fn enforce_capabilities(
                     plugin_id,
                     effect,
                     super::effects::AuditDecision::DroppedUngranted,
+                    // A dropped effect never reaches a launch, so there is no
+                    // unit to name (#953 M1).
+                    None,
                 );
                 false
             }

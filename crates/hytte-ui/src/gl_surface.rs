@@ -249,6 +249,10 @@ pub struct GlUniforms {
     /// Named scalar/vector uniforms, applied to **every** pass. A name a pass's
     /// program does not declare resolves to location `-1`, which GL ignores —
     /// so one bag can feed passes that each use a subset of it.
+    ///
+    /// The surface adds five of its own on top, which a bag must not shadow:
+    /// `u_grid`, `u_viewport`, `u_data_len`, `u_step_back`, and the `u_tex0…`
+    /// samplers.
     pub values: Vec<(&'static str, GlValue)>,
     /// The 1-D `R32F` data strip, uploaded as `u_data_len` texels. `None`
     /// binds a 1×1 zero texture and sets `u_data_len` to `0`.
@@ -596,10 +600,13 @@ mod imp {
             if reset {
                 resources.clear_accumulator(&gl);
             }
-            for _ in 0..steps {
+            // The steps replayed are always the **newest** `steps` of them, so
+            // a surface that fell far enough behind to hit the clamp catches up
+            // on what is current rather than on ancient history.
+            for back in (0..steps).rev() {
                 for (slot, pass) in pipeline.step.iter().enumerate() {
                     let program = resources.step_programs.get(slot).copied();
-                    resources.run(&gl, pass, program, &state, self.obj().as_ref(), true);
+                    resources.run(&gl, pass, program, &state, self.obj().as_ref(), true, back);
                 }
                 resources.front = 1 - resources.front;
             }
@@ -607,7 +614,7 @@ mod imp {
 
             for (slot, pass) in pipeline.frame.iter().enumerate() {
                 let program = resources.frame_programs.get(slot).copied();
-                resources.run(&gl, pass, program, &state, self.obj().as_ref(), false);
+                resources.run(&gl, pass, program, &state, self.obj().as_ref(), false, 0);
             }
         }
 
@@ -740,6 +747,15 @@ mod imp {
         /// `step_programs`/`frame_programs`; `None` (a pipeline that grew a
         /// pass since these resources were built) draws nothing rather than
         /// running a neighbouring pass's shader.
+        ///
+        /// `step_back` is how many steps before the newest this pass is
+        /// replaying — `0` for the last one, and `0` for every frame pass. It
+        /// reaches the shader as `u_step_back` so a pipeline whose per-step
+        /// input differs between steps (a sample batch stamped once and then
+        /// decayed, say) can tell them apart. Counted **backwards** so it never
+        /// grows: an absolute step index would outrun the `int` a uniform
+        /// carries after a few years of continuous animation.
+        #[allow(clippy::too_many_arguments)]
         fn run(
             &self,
             gl: &hgl::Gl,
@@ -748,6 +764,7 @@ mod imp {
             state: &GlUniforms,
             area: &super::GlSurface,
             stepping: bool,
+            step_back: u64,
         ) {
             let Some(program) = program.and_then(|slot| self.programs.get(slot)) else {
                 return;
@@ -825,6 +842,11 @@ mod imp {
                 ],
             );
             program.set_int(gl, "u_data_len", i32::try_from(self.data_len).unwrap_or(0));
+            program.set_int(
+                gl,
+                "u_step_back",
+                i32::try_from(step_back).unwrap_or(i32::MAX),
+            );
             for (name, value) in &state.values {
                 match *value {
                     GlValue::Int(v) => program.set_int(gl, name, v),

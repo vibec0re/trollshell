@@ -553,11 +553,21 @@ struct NodeDesc {
     id: Option<NodeId>,
     kind: NodeKind,
     classes: Vec<String>,
-    /// The tooltip as last applied (`None` = none was set). Retained so
-    /// [`update_in_place`] can tell a real change from a re-render merely
-    /// echoing the same string — a chip re-rendering every few seconds would
-    /// otherwise churn `notify::tooltip-text` on every tick, exactly as
-    /// `classes` would without this snapshot.
+    /// The tooltip as last applied (`None` = none was set).
+    ///
+    /// Retained because [`reconcile_tooltip`] needs the **previous** value to
+    /// know whether the widget currently has a tooltip to take away: `new` alone
+    /// cannot distinguish "this node never had one" from "this node had one and
+    /// dropped it". That is the whole job — and it is exactly what mutating
+    /// [`desc_of`] to store `tooltip: None` falsifies, turning
+    /// `a_tooltip_dropped_to_none_is_cleared` red and nothing else.
+    ///
+    /// Note this is **not** the `classes` situation, despite the parallel shape:
+    /// that snapshot is load-bearing for *removals* (GTK has no "set the class
+    /// list" call, so the old list is the only way to know what to unset), and
+    /// it is not here about suppressing churn — `gtk_widget_set_tooltip_text`
+    /// already dedups by value, so re-setting the same string emits no
+    /// `notify::tooltip-text`.
     tooltip: Option<String>,
 }
 
@@ -1840,9 +1850,15 @@ fn apply_tooltip(widget: &gtk::Widget, tooltip: Option<&str>) {
 }
 
 /// Reconcile a reused widget's tooltip against the one it was last rendered
-/// with. Skipping the unchanged case keeps a per-second chip re-render from
-/// emitting a `notify::tooltip-text` (and a `has-tooltip` churn) every tick,
-/// exactly as [`reconcile_classes`] does for CSS classes.
+/// with.
+///
+/// The `prev` argument is what makes the **clearing** case correct — see
+/// [`NodeDesc::tooltip`]. The `prev != new` guard itself buys nothing at
+/// runtime: `gtk_widget_set_tooltip_text` already dedups by value, so calling it
+/// with an unchanged string emits no `notify::tooltip-text` either way. It is
+/// kept for shape (one seam, mirroring [`reconcile_classes`]) and because
+/// skipping a no-op call is free; do **not** read it as the thing preventing
+/// per-tick churn.
 fn reconcile_tooltip(widget: &gtk::Widget, prev: Option<&str>, new: Option<&str>) {
     if prev != new {
         apply_tooltip(widget, new);
@@ -3708,9 +3724,15 @@ mod gtk_tests {
     }
 
     /// A same-id re-render with a *different* string retitles the widget in
-    /// place. The `assert_eq!(after, before)` is load-bearing: if the tooltip
-    /// ever became part of the node's identity, this would pass by rebuilding,
-    /// and the reconciler would be throwing widgets away on every count change.
+    /// place.
+    ///
+    /// The `assert_eq!(after, before)` here guards the **`plan_diff` half** of
+    /// reuse only — this label is a `Box` child, so it is keyed by
+    /// [`child_key`], and putting the tooltip into [`ChildKey`] doesn't even
+    /// compile (the `plan_diff` unit tests construct `ChildKey` literals). The
+    /// other half, [`reusable`], is a *different* gate on a *different* set of
+    /// nodes, and it is the one the claude-bridge chip actually takes — see
+    /// [`a_changed_root_tooltip_reuses_the_root_widget`], which is what pins it.
     #[gtk::test]
     fn a_changed_tooltip_is_applied_to_the_reused_widget() {
         let root = root();
@@ -3744,6 +3766,43 @@ mod gtk_tests {
         assert_eq!(after, before, "the widget is reused, not rebuilt");
         assert_eq!(after.tooltip_text(), None, "the stale hover is gone");
         assert!(!after.has_tooltip(), "…and GTK no longer arms one");
+    }
+
+    /// **The invariant the shipping consumer actually depends on.** [`reusable`]
+    /// — not [`child_key`]/`plan_diff` — is what decides whether the **root**
+    /// node (and a `Button`/`Revealer` child, or an `Expander` header) is
+    /// updated or torn down, and the root is the only node the claude-bridge
+    /// chip hangs a tooltip on, with a string that changes on every count tick.
+    ///
+    /// Every other tooltip test in this module puts its node *inside* an
+    /// `hbox`, so all of them exercise the `plan_diff` gate and none can see
+    /// [`reusable`] at all — adding `tooltip` to that gate leaves the whole
+    /// suite green while the chip rebuilds its entire subtree every 5 s. This
+    /// test is what closes that.
+    #[gtk::test]
+    fn a_changed_root_tooltip_reuses_the_root_widget() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        let chip = |tip: &str| Node::Box {
+            id: Some("chip".to_owned()),
+            dir: Dir::Horizontal,
+            spacing: 0,
+            scroll: false,
+            classes: vec![],
+            children: vec![lbl(None, "sub")],
+            tooltip: Some(tip.to_owned()),
+        };
+
+        rec.render(&chip("Claude bridge · subscription · 18 served, 0 failed"));
+        let before = root.first_child().expect("the chip mounted");
+        rec.render(&chip("Claude bridge · subscription · 19 served, 0 failed"));
+        let after = root.first_child().expect("the chip is still mounted");
+
+        assert_eq!(after, before, "the ROOT widget is reused, not rebuilt");
+        assert_eq!(
+            after.tooltip_text().as_deref(),
+            Some("Claude bridge · subscription · 19 served, 0 failed")
+        );
     }
 
     /// A node that never carried a tooltip never grows one — the central

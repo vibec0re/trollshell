@@ -670,6 +670,44 @@ fn preem_tree() -> Node {
     }
 }
 
+/// A chip-shaped tree whose `Box`, `Icon` and `Label` all carry a **set**
+/// `tooltip` (#957) — the shape the claude-bridge chip actually renders.
+///
+/// Pinned separately from [`node_tree`] for exactly the reason [`preem_tree`]
+/// is: keeping the pre-#957 render fixture byte-identical is itself part of the
+/// evidence that an optional field moved no existing encoding — which means the
+/// *set* case needs bytes of its own, or the only thing this suite ever commits
+/// about `tooltip` is its **absence**. Every one of #957's 135 mechanical edits
+/// wrote `tooltip: None`, and `skip_serializing_if` then keeps the key off the
+/// wire entirely, so without this fixture a `rmp-serde`/`serde` upgrade that
+/// shifted how a `Some(String)` encodes inside a struct variant would sail
+/// through green while already-deployed plugin binaries broke — the precise gap
+/// this file's header says it exists to close.
+fn tooltip_tree() -> Node {
+    Node::Box {
+        id: Some("chip".into()),
+        dir: Dir::Horizontal,
+        spacing: 4,
+        scroll: false,
+        classes: vec!["ts-chip".into()],
+        children: vec![
+            Node::Icon {
+                id: Some("glyph".into()),
+                name: "claude-symbolic".into(),
+                classes: vec![],
+                tooltip: Some("the icon's own".into()),
+            },
+            Node::Label {
+                id: Some("mode".into()),
+                text: "sub".into(),
+                classes: vec![],
+                tooltip: Some("subscription".into()),
+            },
+        ],
+        tooltip: Some("Claude bridge · subscription · 18 served, 0 failed".into()),
+    }
+}
+
 fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
     vec![
         ("manifest_full_v1", Box::new(full_manifest())),
@@ -691,6 +729,14 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
             "plugin_render_preem_v1",
             Box::new(PluginMsg::Render {
                 tree: preem_tree(),
+                panel: None,
+                effects: vec![],
+            }),
+        ),
+        (
+            "plugin_render_tooltip_v1",
+            Box::new(PluginMsg::Render {
+                tree: tooltip_tree(),
                 panel: None,
                 effects: vec![],
             }),

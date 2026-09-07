@@ -10,7 +10,7 @@
 //! | [`Request`]       | `HostRequest`, `hive-host-sock/src/lib.rs:117-119`                  |
 //! | [`Scope`]         | `LifecycleScope`, `hive-host-sock/src/lib.rs:468-485`               |
 //! | [`Response`]      | `HostResponse`, `hive-host-sock/src/lib.rs:521-569`                 |
-//! | [`AgentStatusRow`]| `hive_sh4re::container::AgentStatusRow`, `hive-sh4re/src/container.rs:34-86` |
+//! | [`AgentStatusRow`]| `hive_sh4re::container::AgentStatusRow`, `hive-sh4re/src/container.rs:34-96` |
 //! | [`HiveUrls`]      | `HiveUrls`, `hive-host-sock/src/lib.rs:503-518`                     |
 //!
 //! # The three rules the mirror follows
@@ -251,7 +251,7 @@ pub struct HiveUrls {
 /// One agent's row in an `AgentStatus` result.
 ///
 /// Mirrors `hive_sh4re::container::AgentStatusRow`
-/// (`hive-sh4re/src/container.rs:34-86` on hyperhive `origin/main`). The flags
+/// (`hive-sh4re/src/container.rs:34-96` on hyperhive `origin/main`). The flags
 /// are explicitly orthogonal, not a state machine (`:26-30` on that file) —
 /// [`crate::model::Status::of`] is what collapses them to one rendered state
 /// by strict precedence.

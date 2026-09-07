@@ -292,6 +292,7 @@ fn vbox(spacing: i32, children: Vec<Node>) -> Node {
         scroll: false,
         classes: Vec::new(),
         children,
+        tooltip: None,
     }
 }
 
@@ -305,6 +306,7 @@ fn spaced_row(left: Node, right: Node) -> Node {
         scroll: false,
         classes: Vec::new(),
         children: vec![left, Node::Spacer, right],
+        tooltip: None,
     }
 }
 
@@ -313,6 +315,7 @@ fn heading() -> Node {
         id: None,
         text: HEADING.to_owned(),
         classes: vec!["heading".to_owned()],
+        tooltip: None,
     }
 }
 
@@ -321,6 +324,7 @@ fn dim_caption(text: &str) -> Node {
         id: None,
         text: text.to_owned(),
         classes: vec!["dim-label".to_owned()],
+        tooltip: None,
     }
 }
 
@@ -332,6 +336,7 @@ fn numeric(id: &str, text: String, extra: &[&str]) -> Node {
         id: Some(id.to_owned()),
         text,
         classes,
+        tooltip: None,
     }
 }
 
@@ -358,6 +363,7 @@ fn error_line(msg: &str) -> Node {
                 id: None,
                 name: "dialog-warning-symbolic".to_owned(),
                 classes: vec!["error".to_owned()],
+                tooltip: None,
             },
             Node::Text {
                 id: None,
@@ -367,6 +373,7 @@ fn error_line(msg: &str) -> Node {
                 classes: vec!["dim-label".to_owned()],
             },
         ],
+        tooltip: None,
     }
 }
 
@@ -439,6 +446,7 @@ fn panel(budget: Option<f64>, window_label: &str, state: &DataState) -> Node {
         scroll: false,
         classes: Vec::new(),
         children,
+        tooltip: None,
     }
 }
 

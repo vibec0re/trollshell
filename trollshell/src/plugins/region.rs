@@ -425,6 +425,7 @@ fn empty_panel() -> UiNode {
         scroll: false,
         classes: Vec::new(),
         children: Vec::new(),
+        tooltip: None,
     }
 }
 

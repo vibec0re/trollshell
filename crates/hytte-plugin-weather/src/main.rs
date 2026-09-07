@@ -335,6 +335,7 @@ fn loading_content() -> Node {
             id: None,
             text: LOADING_TEXT.to_owned(),
             classes: vec!["ts-weather-condition".to_owned()],
+            tooltip: None,
         }],
     )
 }
@@ -354,6 +355,7 @@ fn error_content(msg: &str) -> Node {
                 id: None,
                 name: "dialog-warning-symbolic".to_owned(),
                 classes: Vec::new(),
+                tooltip: None,
             },
             Node::Text {
                 id: None,
@@ -363,6 +365,7 @@ fn error_content(msg: &str) -> Node {
                 classes: Vec::new(),
             },
         ],
+        tooltip: None,
     }
 }
 
@@ -380,9 +383,11 @@ fn resolved_content(s: &Snapshot) -> Node {
                 id: Some(ICON_ID.to_owned()),
                 name: s.condition.icon.to_owned(),
                 classes: vec!["ts-weather-icon".to_owned()],
+                tooltip: None,
             },
             label(TEMP_ID, format!("{:.0}°", s.temp_c), "ts-weather-temp"),
         ],
+        tooltip: None,
     };
     let left = vbox(
         0,
@@ -417,6 +422,7 @@ fn resolved_content(s: &Snapshot) -> Node {
         scroll: false,
         classes: vec!["ts-weather-columns".to_owned()],
         children: vec![left, details],
+        tooltip: None,
     };
     vbox(
         0,
@@ -445,10 +451,12 @@ fn detail_row(name: &str, value_id: &str, value: String) -> Node {
                 id: None,
                 text: name.to_owned(),
                 classes: vec!["ts-weather-detail-label".to_owned()],
+                tooltip: None,
             },
             Node::Spacer,
             label(value_id, value, "ts-weather-detail-value"),
         ],
+        tooltip: None,
     }
 }
 
@@ -461,6 +469,7 @@ fn vbox(spacing: i32, classes: Vec<String>, children: Vec<Node>) -> Node {
         scroll: false,
         classes,
         children,
+        tooltip: None,
     }
 }
 
@@ -470,6 +479,7 @@ fn label(id: &str, text: String, class: &str) -> Node {
         id: Some(id.to_owned()),
         text,
         classes: vec![class.to_owned()],
+        tooltip: None,
     }
 }
 

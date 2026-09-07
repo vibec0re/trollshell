@@ -270,6 +270,7 @@ fn transport_button(id: &str, icon: &str, primary: bool) -> Node {
             id: None,
             name: icon.to_owned(),
             classes: Vec::new(),
+            tooltip: None,
         }),
     }
 }
@@ -593,6 +594,7 @@ impl Plugin for AudioWidget {
                 transport_button(NEXT_ID, ICON_NEXT, false),
                 Node::Spacer,
             ],
+            tooltip: None,
         };
         Node::Box {
             id: Some(ROOT_ID.to_owned()),
@@ -607,6 +609,7 @@ impl Plugin for AudioWidget {
                 leds.node(LEDS_ID),
                 transport,
             ],
+            tooltip: None,
         }
         .into()
     }

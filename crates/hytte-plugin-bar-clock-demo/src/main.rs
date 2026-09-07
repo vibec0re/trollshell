@@ -236,6 +236,7 @@ impl Plugin for BarClock {
                 classes: Vec::new(),
                 child: Box::new(self.seg.node(TIME_ID, &clock_face(&self.iso))),
             }],
+            tooltip: None,
         };
         View::new(chip).panel(Node::Box {
             id: Some("bar-clock-demo-panel".to_owned()),
@@ -248,13 +249,16 @@ impl Plugin for BarClock {
                     id: Some(PANEL_ISO_ID.to_owned()),
                     text: self.iso.clone(),
                     classes: vec!["title-2".to_owned()],
+                    tooltip: None,
                 },
                 Node::Label {
                     id: Some(PANEL_UNIX_ID.to_owned()),
                     text: format!("unix: {}", self.unix),
                     classes: vec!["dim-label".to_owned()],
+                    tooltip: None,
                 },
             ],
+            tooltip: None,
         })
     }
 }
@@ -353,6 +357,7 @@ mod tests {
                     seven_seg("15:49", DisplayStyle::Vfd).into_node(Some(TIME_ID), vec![]),
                 ),
             }],
+            tooltip: None,
         };
         // `==` rather than `assert_eq!`: the operands carry a `Node::Pixels`,
         // whose own `Debug` would dump the whole RGBA buffer into the failure
@@ -437,13 +442,16 @@ mod tests {
                     id: Some("bar-clock-demo-panel-iso".to_owned()),
                     text: "2026-07-11T15:49:00+02:00".to_owned(),
                     classes: vec!["title-2".to_owned()],
+                    tooltip: None,
                 },
                 Node::Label {
                     id: Some("bar-clock-demo-panel-unix".to_owned()),
                     text: "unix: 1752241740".to_owned(),
                     classes: vec!["dim-label".to_owned()],
+                    tooltip: None,
                 },
             ],
+            tooltip: None,
         };
         // The panel is plain GTK either way — the seam is per widget, not a
         // mode the plugin enters — so pin it in *both* render modes.

@@ -268,6 +268,7 @@ fn button(id: &str, label: &str) -> Node {
             id: None,
             text: label.to_owned(),
             classes: Vec::new(),
+            tooltip: None,
         }),
     }
 }
@@ -355,6 +356,7 @@ impl Plugin for Timer {
                 classes: vec!["flat".to_owned()],
                 child: Box::new(self.seg.node(SEG_ID, &self.mmss())),
             }],
+            tooltip: None,
         };
         let readout = self.seg.node(PANEL_SEG_ID, &self.mmss());
         let entry = Node::Entry {
@@ -387,6 +389,7 @@ impl Plugin for Timer {
             scroll: false,
             classes: Vec::new(),
             children: vec![readout, entry, presets, controls],
+            tooltip: None,
         })
     }
 }

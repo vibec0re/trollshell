@@ -319,6 +319,7 @@ impl Plugin for Pet {
                 id: None,
                 text: kao.to_owned(),
                 classes: vec!["pet-kao".to_owned()],
+                tooltip: None,
             }
         } else {
             // `Frame::into_node` bakes the wire fields (width/height/len and the
@@ -342,6 +343,7 @@ impl Plugin for Pet {
                     id: None,
                     text: line.clone(),
                     classes: vec!["pet-bubble".to_owned()],
+                    tooltip: None,
                 }
             } else {
                 font::bubble_node(line, "pet-bubble", vec!["pet-bubble".to_owned()])

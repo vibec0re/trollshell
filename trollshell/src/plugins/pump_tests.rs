@@ -85,6 +85,7 @@ fn static_node(id: &str) -> wire::Node {
         id: Some(id.to_owned()),
         text: "static".into(),
         classes: vec![],
+        tooltip: None,
     }
 }
 

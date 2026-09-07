@@ -222,6 +222,7 @@ impl Plugin for Terminal {
                     classes: vec!["monospace".to_owned(), "ts-terminal-input".to_owned()],
                 },
             ],
+            tooltip: None,
         }
         .into()
     }

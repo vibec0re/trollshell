@@ -39,6 +39,7 @@ fn sample_tree() -> Node {
                 id: None,
                 text: "hi".into(),
                 classes: vec![],
+                tooltip: None,
             },
             Node::ListBox {
                 id: Some("list".into()),
@@ -71,6 +72,7 @@ fn sample_tree() -> Node {
                 id: Some("ico".into()),
                 name: "weather-clear-symbolic".into(),
                 classes: vec!["ts-icon".into()],
+                tooltip: None,
             },
             Node::Pixels {
                 id: Some("lcd".into()),
@@ -87,6 +89,7 @@ fn sample_tree() -> Node {
                     id: None,
                     text: "Go".into(),
                     classes: vec![],
+                    tooltip: None,
                 }),
             },
             Node::Progress {
@@ -118,6 +121,7 @@ fn sample_tree() -> Node {
                 classes: vec!["monospace".into()],
             },
         ],
+        tooltip: None,
     }
 }
 
@@ -282,6 +286,7 @@ fn expander_round_trips() {
                 id: None,
                 text: "Living Room".into(),
                 classes: vec!["heading".into()],
+                tooltip: None,
             }),
             children: vec![Node::Row {
                 id: Some("lamp".into()),
@@ -290,6 +295,7 @@ fn expander_round_trips() {
                     id: None,
                     text: "Lamp".into(),
                     classes: vec![],
+                    tooltip: None,
                 }],
             }],
             expanded,
@@ -372,6 +378,143 @@ fn text_without_ellipsize_decodes_old_frame_compat() {
             classes: vec!["ts-dest".into()],
         },
         "absent ellipsize (and max_width_chars) default",
+    );
+}
+
+// ── `tooltip` on Box / Label / Icon (#957) ───────────────────────────────────
+//
+// An **optional field**, not a new variant, so by the crate root's compat rules
+// it keeps both `PROTO_VERSION` and `VOCAB`. These four tests are the concrete
+// evidence for that claim, in both directions.
+
+#[test]
+fn tooltip_round_trips_on_every_variant_that_carries_it() {
+    for tooltip in [None, Some("Claude bridge · subscription".to_owned())] {
+        let nodes = [
+            Node::Box {
+                id: Some("chip".into()),
+                dir: Dir::Horizontal,
+                spacing: 4,
+                scroll: false,
+                classes: vec![],
+                children: vec![],
+                tooltip: tooltip.clone(),
+            },
+            Node::Label {
+                id: None,
+                text: "sub".into(),
+                classes: vec![],
+                tooltip: tooltip.clone(),
+            },
+            Node::Icon {
+                id: None,
+                name: "claude-symbolic".into(),
+                classes: vec![],
+                tooltip: tooltip.clone(),
+            },
+        ];
+        for node in nodes {
+            let back: Node = decode(&encode(&node)).expect("decode tooltip node");
+            assert_eq!(node, back, "tooltip={tooltip:?} round-trips");
+        }
+    }
+}
+
+#[test]
+fn a_none_tooltip_never_reaches_the_wire() {
+    // `skip_serializing_if = "Option::is_none"` is what keeps every already-
+    // committed golden fixture byte-identical across #957: a tree that sets no
+    // tooltip encodes exactly as it did before the field existed. Losing the
+    // attribute would silently move `tests/fixtures/plugin_render_v1.hex`.
+    let node = Node::Label {
+        id: None,
+        text: "sub".into(),
+        classes: vec![],
+        tooltip: None,
+    };
+    assert!(
+        !contains(&encode_body(&node), b"tooltip"),
+        "an unset tooltip costs no bytes"
+    );
+    let node = Node::Label {
+        id: None,
+        text: "sub".into(),
+        classes: vec![],
+        tooltip: Some("Claude bridge".into()),
+    };
+    assert!(
+        contains(&encode_body(&node), b"tooltip"),
+        "…but a set one is named on the wire (named-map encoding)"
+    );
+}
+
+#[test]
+fn a_pre_tooltip_frame_still_decodes() {
+    // Backward: a plugin built before #957 emits `{"Label": { id, text, classes }}`
+    // with no `tooltip` key at all. `#[serde(default)]` must accept it as
+    // "no tooltip" rather than failing the frame — this is what keeps every
+    // already-deployed plugin binary rendering against a new shell.
+    #[derive(serde::Serialize)]
+    enum NodeOld {
+        Label {
+            id: Option<String>,
+            text: String,
+            classes: Vec<String>,
+        },
+    }
+
+    let body = encode_body(&NodeOld::Label {
+        id: Some("mode".into()),
+        text: "sub".into(),
+        classes: vec!["dim-label".into()],
+    });
+    assert!(!contains(&body, b"tooltip"), "an old frame carries no key");
+    let decoded: Node = decode_body(&body).expect("decode pre-#957 Label frame");
+    assert_eq!(
+        decoded,
+        Node::Label {
+            id: Some("mode".into()),
+            text: "sub".into(),
+            classes: vec!["dim-label".into()],
+            tooltip: None,
+        },
+        "an absent tooltip defaults to none",
+    );
+}
+
+#[test]
+fn an_older_host_skips_a_tooltip_it_has_never_heard_of() {
+    // Forward — the direction that matters for #437. A plugin rebuilt on the new
+    // SDK sets a tooltip and talks to a shell that predates the field. Because
+    // the encoding is a name-keyed map with no `deny_unknown_fields`, the old
+    // decoder *skips* the key and renders the chip exactly as it did before,
+    // rather than failing the whole frame. That is why this is an additive
+    // change and needs no `VOCAB` bump: an unknown **field** is skipped where an
+    // unknown **variant** would kill the decode and crash-loop the session.
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    enum NodeOld {
+        Label {
+            id: Option<String>,
+            text: String,
+            classes: Vec<String>,
+        },
+    }
+
+    let body = encode_body(&Node::Label {
+        id: Some("mode".into()),
+        text: "sub".into(),
+        classes: vec![],
+        tooltip: Some("Claude bridge · subscription · 18 served, 0 failed".into()),
+    });
+    assert!(contains(&body, b"tooltip"), "the new frame does carry it");
+    let old: NodeOld = decode_body(&body).expect("a pre-#957 host still decodes the frame");
+    assert_eq!(
+        old,
+        NodeOld::Label {
+            id: Some("mode".into()),
+            text: "sub".into(),
+            classes: vec![],
+        },
     );
 }
 
@@ -861,6 +1004,7 @@ fn render_with_panel_round_trips() {
             id: Some("panel-lbl".into()),
             text: "panel body".into(),
             classes: vec![],
+            tooltip: None,
         }),
         effects: vec![Effect::OpenPage(Page::PluginSelf)],
     };
@@ -1458,6 +1602,7 @@ fn containers_burying(inner: Node) -> Vec<(&'static str, Node)> {
                 scroll: false,
                 classes: vec![],
                 children: vec![inner.clone()],
+                tooltip: None,
             },
         ),
         (
@@ -1538,6 +1683,7 @@ fn tree_with_every_float_poisoned(poison: f64) -> Node {
             id: None,
             text: "hi".into(),
             classes: vec![],
+            tooltip: None,
         },
         Node::Text {
             id: None,
@@ -1550,6 +1696,7 @@ fn tree_with_every_float_poisoned(poison: f64) -> Node {
             id: None,
             name: "weather-clear-symbolic".into(),
             classes: vec![],
+            tooltip: None,
         },
         Node::Pixels {
             id: None,
@@ -1575,6 +1722,7 @@ fn tree_with_every_float_poisoned(poison: f64) -> Node {
         scroll: false,
         classes: vec![],
         children,
+        tooltip: None,
     }
 }
 
@@ -2052,6 +2200,7 @@ fn a_poisoned_node_round_trips_unsanitised_and_the_clamp_fixes_it_after_decode()
             poisoned_progress("prog", f64::NAN),
             poisoned_slider("slide", f64::INFINITY),
         ],
+        tooltip: None,
     };
     let frame = PluginMsg::Render {
         tree,

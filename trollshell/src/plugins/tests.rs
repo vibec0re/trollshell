@@ -77,6 +77,11 @@ fn accept_error_never_terminates_the_loop() {
 /// The `wire`→`hytte_ui` mapping is exhaustive over every node variant
 /// (incl. `Box { scroll }` and nesting) and produces a field-for-field
 /// mirror.
+///
+/// The tree deliberately sets a **non-`None` `tooltip`** (#957) on the root
+/// `Box` and on both leaf kinds that declare one: an optional field is exactly
+/// the kind a mapping arm forgets, and `None` everywhere would let a dropped
+/// `tooltip: tooltip.clone()` pass unnoticed.
 #[test]
 #[allow(clippy::too_many_lines)] // one big paired tree literal; splitting hurts readability
 fn wire_node_maps_to_ui_node_exhaustively() {
@@ -91,11 +96,13 @@ fn wire_node_maps_to_ui_node_exhaustively() {
                 id: None,
                 text: "hi".into(),
                 classes: vec!["ts-l".into()],
+                tooltip: Some("a greeting".into()),
             },
             wire::Node::Icon {
                 id: Some("i".into()),
                 name: "battery-symbolic".into(),
                 classes: vec![],
+                tooltip: Some("87%, 3h left".into()),
             },
             wire::Node::Pixels {
                 id: Some("px".into()),
@@ -112,6 +119,7 @@ fn wire_node_maps_to_ui_node_exhaustively() {
                     id: None,
                     text: "go".into(),
                     classes: vec![],
+                    tooltip: None,
                 }),
             },
             wire::Node::Progress {
@@ -142,9 +150,13 @@ fn wire_node_maps_to_ui_node_exhaustively() {
                 scroll: false,
                 classes: vec![],
                 children: vec![],
+                tooltip: None,
             },
             wire::Node::Spacer,
         ],
+        // Carried across the mapping, not dropped (#957) — set on the root
+        // box and on the two leaf kinds that declare the field.
+        tooltip: Some("the whole card".into()),
     };
     let expected = UiNode::Box {
         id: Some("root".into()),
@@ -157,11 +169,13 @@ fn wire_node_maps_to_ui_node_exhaustively() {
                 id: None,
                 text: "hi".into(),
                 classes: vec!["ts-l".into()],
+                tooltip: Some("a greeting".into()),
             },
             UiNode::Icon {
                 id: Some("i".into()),
                 name: "battery-symbolic".into(),
                 classes: vec![],
+                tooltip: Some("87%, 3h left".into()),
             },
             UiNode::Pixels {
                 id: Some("px".into()),
@@ -178,6 +192,7 @@ fn wire_node_maps_to_ui_node_exhaustively() {
                     id: None,
                     text: "go".into(),
                     classes: vec![],
+                    tooltip: None,
                 }),
             },
             UiNode::Progress {
@@ -208,9 +223,11 @@ fn wire_node_maps_to_ui_node_exhaustively() {
                 scroll: false,
                 classes: vec![],
                 children: vec![],
+                tooltip: None,
             },
             UiNode::Spacer,
         ],
+        tooltip: Some("the whole card".into()),
     };
     assert_eq!(to_ui_node(&Scope::detached("map"), &tree), expected);
 }
@@ -240,6 +257,7 @@ fn wire_row_listbox_text_map_to_ui() {
                     id: None,
                     text: "12:30".into(),
                     classes: vec!["ts-time".into()],
+                    tooltip: None,
                 },
             ],
         }],
@@ -263,6 +281,7 @@ fn wire_row_listbox_text_map_to_ui() {
                     id: None,
                     text: "12:30".into(),
                     classes: vec!["ts-time".into()],
+                    tooltip: None,
                 },
             ],
         }],
@@ -280,11 +299,13 @@ fn wire_expander_maps_to_ui() {
             id: None,
             text: "Living Room".into(),
             classes: vec!["heading".into()],
+            tooltip: None,
         }),
         children: vec![wire::Node::Label {
             id: Some("d".into()),
             text: "Lamp".into(),
             classes: vec![],
+            tooltip: None,
         }],
         expanded: true,
         classes: vec!["boxed-list".into()],
@@ -295,11 +316,13 @@ fn wire_expander_maps_to_ui() {
             id: None,
             text: "Living Room".into(),
             classes: vec!["heading".into()],
+            tooltip: None,
         }),
         children: vec![UiNode::Label {
             id: Some("d".into()),
             text: "Lamp".into(),
             classes: vec![],
+            tooltip: None,
         }],
         expanded: true,
         classes: vec!["boxed-list".into()],
@@ -453,6 +476,7 @@ fn render_of(
             id: None,
             text: text.to_owned(),
             classes: vec![],
+            tooltip: None,
         },
         panel: None,
         outbound: tx.clone(),
@@ -474,6 +498,7 @@ fn render_with_panel(
             id: Some("panel".into()),
             text: panel.to_owned(),
             classes: vec![],
+            tooltip: None,
         }),
         ..render_of(plugin_id, order, generation, chip, tx)
     }
@@ -1031,6 +1056,7 @@ async fn bar_mount_render_reaches_bar_region() {
                 id: Some("t".into()),
                 text: "chip".into(),
                 classes: vec![],
+                tooltip: None,
             },
             // A panel-less render: the chip lands in its bar region, and the
             // dedicated panels mailbox (#349 PR2) must stay empty.
@@ -1107,11 +1133,13 @@ async fn panel_render_populates_panels_mailbox() {
                 id: Some("chip".into()),
                 text: "chip".into(),
                 classes: vec![],
+                tooltip: None,
             },
             panel: Some(wire::Node::Label {
                 id: Some("panel".into()),
                 text: "panel body".into(),
                 classes: vec![],
+                tooltip: None,
             }),
             effects: vec![],
         },
@@ -1147,6 +1175,7 @@ async fn panel_render_populates_panels_mailbox() {
                 id: Some("chip".into()),
                 text: "chip2".into(),
                 classes: vec![],
+                tooltip: None,
             },
             panel: None,
             effects: vec![],
@@ -1692,6 +1721,7 @@ async fn duplicate_id_connection_is_rejected_end_to_end() {
                 id: Some("t".into()),
                 text: "A".into(),
                 classes: vec![],
+                tooltip: None,
             },
             panel: None,
             effects: vec![],
@@ -1832,6 +1862,7 @@ async fn newer_vocab_register_is_rejected_and_equal_vocab_is_accepted() {
                 id: Some("t".into()),
                 text: "chip".into(),
                 classes: vec![],
+                tooltip: None,
             },
             panel: None,
             effects: vec![],
@@ -1882,6 +1913,7 @@ async fn ungranted_effect_never_reaches_the_broker() {
                 id: Some("t".into()),
                 text: "hi".into(),
                 classes: vec![],
+                tooltip: None,
             },
             panel: None,
             effects: vec![Effect::OpenPage(Page::PowerMenu)],
@@ -1922,6 +1954,7 @@ async fn granted_effect_reaches_the_broker() {
                 id: Some("t".into()),
                 text: "hi".into(),
                 classes: vec![],
+                tooltip: None,
             },
             panel: None,
             effects: vec![Effect::OpenPage(Page::PowerMenu)],
@@ -2283,6 +2316,7 @@ async fn provider_manifest_registers_a_routable_datasource() {
                 id: Some("t".into()),
                 text: "board".into(),
                 classes: vec![],
+                tooltip: None,
             },
             panel: None,
             effects: vec![],
@@ -2339,6 +2373,7 @@ async fn provides_without_capability_is_not_registered() {
                 id: Some("t".into()),
                 text: "board".into(),
                 classes: vec![],
+                tooltip: None,
             },
             panel: None,
             effects: vec![],
@@ -2830,6 +2865,7 @@ fn gauge_row<'a>(gauges: impl IntoIterator<Item = (Option<&'a str>, f32)>) -> wi
                 )
             })
             .collect(),
+        tooltip: None,
     }
 }
 
@@ -4432,6 +4468,7 @@ fn the_anonymous_preem_warning_survives_an_emptied_scope() {
         id: None,
         text: "idle".into(),
         classes: vec![],
+        tooltip: None,
     };
 
     let _ = to_ui_node(&scope, &anon);
@@ -4488,8 +4525,10 @@ fn label_tree(children: usize) -> wire::Node {
                 id: Some(format!("n{i}")),
                 text: String::new(),
                 classes: vec![],
+                tooltip: None,
             })
             .collect(),
+        tooltip: None,
     }
 }
 
@@ -4809,6 +4848,7 @@ fn box_chain(depth: usize) -> wire::Node {
         scroll: false,
         classes: vec![],
         children,
+        tooltip: None,
     };
     let mut node = level(depth - 1, vec![]);
     for id in (0..depth - 1).rev() {
@@ -4824,6 +4864,7 @@ fn button_chain(depth: usize) -> wire::Node {
         id: Some("leaf".into()),
         text: String::new(),
         classes: vec![],
+        tooltip: None,
     };
     for id in (0..depth).rev() {
         node = wire::Node::Button {
@@ -5055,6 +5096,7 @@ fn a_tree_of_distinct_preem_ids_never_warns() {
                 },
             ),
         ],
+        tooltip: None,
     };
 
     let _ = to_ui_node(&card, &mixed);

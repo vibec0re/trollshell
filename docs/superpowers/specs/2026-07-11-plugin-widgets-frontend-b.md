@@ -164,6 +164,17 @@ enum EventKind { Click, Scroll { dx: f64, dy: f64 } }   // v1; matches the recon
   > arrive as a validated buffer the host paints, never as cairo/snapshot
   > calls the host executes on the plugin's behalf.
 
+  > **Predicted and now shipped (2026-09-07).** The "richer props" half of that
+  > last sentence came true as written: `tooltip: Option<String>` landed on
+  > `Box`/`Label`/`Icon` (#957), mapped to `set_tooltip_text` in the reconciler.
+  > The trigger was not a list-y plugin but the opposite — the claude-bridge
+  > chip (#866), which is deliberately panel-less and so had _nowhere_ to
+  > explain its `sub 18/0` readout. Additive by the crate root's own compat
+  > rules (an optional `serde(default)` + `skip_serializing_if` field), so
+  > `PROTO_VERSION` **and** `VOCAB` both stayed put and every golden fixture
+  > stayed byte-identical. `ellipsize` had already shipped on `Node::Text`
+  > (#297); of the three props named here only `margins` is still unbuilt.
+
 ## Message envelope
 
 ```rust

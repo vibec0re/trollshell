@@ -699,6 +699,7 @@ fn row_node(r: &Row, now_unix: i64, armed: Option<&str>) -> Node {
                 "ts-line-badge".to_owned(),
                 format!("ts-line-{}", safe_line(&r.line)),
             ],
+            tooltip: None,
         },
         // Destination — wrapping `Text` (capped at 22 chars) so a long name
         // wraps within the sidebar rather than forcing it wider.
@@ -723,6 +724,7 @@ fn row_node(r: &Row, now_unix: i64, armed: Option<&str>) -> Node {
             id: None,
             text: format!("{token} · {}", r.hhmm),
             classes: vec!["ts-departure-time".to_owned()],
+            tooltip: None,
         },
     ];
     if let Some(text) = delay_string(r.delay_minutes) {
@@ -730,6 +732,7 @@ fn row_node(r: &Row, now_unix: i64, armed: Option<&str>) -> Node {
             id: None,
             text,
             classes: vec!["ts-departure-delay".to_owned()],
+            tooltip: None,
         });
     }
 

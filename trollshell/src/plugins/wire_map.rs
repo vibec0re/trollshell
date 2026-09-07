@@ -184,6 +184,7 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             scroll,
             classes,
             children,
+            tooltip,
         } => UiNode::Box {
             id: id.clone(),
             dir: to_ui_dir(*dir),
@@ -194,6 +195,7 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
                 .iter()
                 .filter_map(|child| map_node(walk, child))
                 .collect(),
+            tooltip: tooltip.clone(),
         },
         wire::Node::Row {
             id,
@@ -219,10 +221,16 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
                 .filter_map(|child| map_node(walk, child))
                 .collect(),
         },
-        wire::Node::Label { id, text, classes } => UiNode::Label {
+        wire::Node::Label {
+            id,
+            text,
+            classes,
+            tooltip,
+        } => UiNode::Label {
             id: id.clone(),
             text: text.clone(),
             classes: classes.clone(),
+            tooltip: tooltip.clone(),
         },
         wire::Node::Text {
             id,
@@ -237,10 +245,16 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             ellipsize: *ellipsize,
             classes: classes.clone(),
         },
-        wire::Node::Icon { id, name, classes } => UiNode::Icon {
+        wire::Node::Icon {
+            id,
+            name,
+            classes,
+            tooltip,
+        } => UiNode::Icon {
             id: id.clone(),
             name: name.clone(),
             classes: classes.clone(),
+            tooltip: tooltip.clone(),
         },
         wire::Node::Pixels {
             id,

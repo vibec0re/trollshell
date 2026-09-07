@@ -205,10 +205,12 @@ fn render_frame_mixing_preem_and_legacy_nodes_round_trips() {
                     id: None,
                     text: "now playing".into(),
                     classes: vec![],
+                    tooltip: None,
                 },
                 preem_id("marquee", all_widgets()[4].clone()),
                 preem(all_widgets()[3].clone()),
             ],
+            tooltip: None,
         },
         panel: None,
         effects: vec![],
@@ -389,6 +391,7 @@ fn a_pre_882_decoder_rejects_the_new_variants_cleanly() {
         id: None,
         text: "hi".into(),
         classes: vec![],
+        tooltip: None,
     });
     rmp_serde::from_slice::<LegacyNode>(&label).expect("the legacy mirror still decodes a Label");
 }
@@ -2295,6 +2298,7 @@ fn existing_node_encodings_are_frozen() {
                 id: None,
                 text: "hi".into(),
                 classes: vec![],
+                tooltip: None,
             },
         ),
         (
@@ -2341,6 +2345,7 @@ fn print_frozen_node_hex() {
             id: None,
             text: "hi".into(),
             classes: vec![],
+            tooltip: None,
         }))
     );
     println!(

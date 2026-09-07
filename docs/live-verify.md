@@ -1638,6 +1638,23 @@ session.
       rather than silently falling back to the companion's own hash. A `dev`
       value is rendered as-is on purpose — an unstamped local build is correct
       information, not a state to hide.
+- [ ] **(#959)** Control-center **connection banner** shows only when it
+      carries information, and the **footer** now reports version alongside
+      revision. With the shell running, launch (or reload) the control-center:
+      the top banner must **not** appear at all — no "Connected to trollshell
+      …" notice sitting for the whole session. Stop the shell
+      (`systemctl --user stop trollshell`) while the window is open, or
+      launch the control-center with the shell already down: the banner must
+      appear reading "trollshell is not running — start the shell to manage
+      it". Start it again (`systemctl --user start trollshell`) and relaunch
+      the control-center: the banner is gone once more. The footer should now
+      show both version and revision — e.g.
+      `trollshell 0.1.0 · revision 34e3d96` — rather than the bare revision
+      line it used to show (a `-dirty`/`dev` revision still passes through
+      honestly, per the #601/#836 entry above). With the shell stopped it
+      still falls back to exactly
+      `Shell revision: unavailable (trollshell not running)` (kept
+      byte-for-byte — nothing else needed updating for the change).
 
 ## Documentation site (GitHub Pages)
 

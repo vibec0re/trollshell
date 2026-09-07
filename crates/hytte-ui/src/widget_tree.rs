@@ -554,9 +554,10 @@ struct NodeDesc {
     kind: NodeKind,
     classes: Vec<String>,
     /// The tooltip as last applied (`None` = none was set). Retained so
-    /// [`update_in_place`] can tell a real change from a re-render echoing the
-    /// same string, and — the case a "set it every frame" shortcut would get
-    /// wrong — so a drop back to `None` actually **clears** it.
+    /// [`update_in_place`] can tell a real change from a re-render merely
+    /// echoing the same string — a chip re-rendering every few seconds would
+    /// otherwise churn `notify::tooltip-text` on every tick, exactly as
+    /// `classes` would without this snapshot.
     tooltip: Option<String>,
 }
 

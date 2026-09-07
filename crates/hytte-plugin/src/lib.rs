@@ -487,10 +487,19 @@ pub enum Input<M> {
     /// The outcome of a brokered
     /// [`Effect::RunCommand`](proto::Effect::RunCommand), keyed by the
     /// command's `id`.
+    ///
+    /// Both spawn modes reply here, but they mean different things (#953). For
+    /// an attached `RunCommand` ([`Effect::run_command`](proto::Effect::run_command))
+    /// this is the program's own exit status plus its captured stdout. For a
+    /// detached launch ([`Effect::launch`](proto::Effect::launch)) it arrives
+    /// **immediately** and reports only whether the *launch* succeeded — the
+    /// host hands the program to the systemd user manager and never waits for
+    /// it, so there is no exit status to report.
     EffectResult {
         /// The `id` the plugin chose on the originating `RunCommand`.
         id: u64,
-        /// Whether it succeeded, and any captured output.
+        /// Whether it succeeded, and any captured output — or, for a detached
+        /// launch, whether it started and what it was named.
         outcome: EffectOutcome,
     },
     /// The plugin's mount surface became visible (`true`) or hidden (`false`) —

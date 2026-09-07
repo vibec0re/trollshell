@@ -100,9 +100,16 @@ pub enum StateKey {
 }
 
 /// A shell capability a plugin requests in its manifest. The host auto-grants
-/// from the manifest and audit-logs every brokered effect with the plugin id;
-/// [`RunCommand`](Capability::RunCommand) is a separately granted, higher-trust
-/// cap. Each gates the matching [`Effect`](crate::effect::Effect).
+/// from the manifest and audit-logs every brokered effect with the plugin id.
+/// Each gates the matching [`Effect`](crate::effect::Effect).
+///
+/// [`RunCommand`](Capability::RunCommand) is the **highest-trust** cap here —
+/// but "separately granted" is aspirational, not enforced: the host grants every
+/// capability a manifest declares, this one included
+/// (`trollshell/src/plugins/session.rs`'s registration path; see the #893 trust
+/// boundary, which settles that the same-user socket *is* the boundary). Its
+/// real weight is that both spawn modes — attached and detached (#953) — ride
+/// it, and the audit log records which.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Capability {
     /// Open drawer pages ([`Effect::OpenPage`](crate::effect::Effect::OpenPage)).
@@ -114,6 +121,13 @@ pub enum Capability {
     /// Audio control ([`Effect::Audio`](crate::effect::Effect::Audio)).
     Audio,
     /// Spawn commands ([`Effect::RunCommand`](crate::effect::Effect::RunCommand)).
+    ///
+    /// Gates **both** spawn modes (#953): the attached one, which runs to
+    /// completion under a host timeout and returns the exit status, and the
+    /// detached one (`detached: true`), which hands the program to the systemd
+    /// user manager so it outlives the shell. One cap for both — a plugin that
+    /// may run an arbitrary `argv` can already launch a detacher itself, so a
+    /// second cap would name a boundary that isn't there.
     RunCommand,
     /// Raise a transient OSD nudge ([`Effect::RaiseOsd`](crate::effect::Effect::RaiseOsd)).
     RaiseOsd,

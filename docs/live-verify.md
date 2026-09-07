@@ -109,6 +109,45 @@ range above is a floor, not a ceiling.
       `ok: false` (no hang), with a warn in `RUST_LOG=trollshell=info`.
       `~/.local/state/trollshell/effects-audit.log` accrues one line per
       brokered/dropped effect and rotates to `.log.1` past the 256 KiB cap.
+- [ ] **(#953)** The **detached** spawn mode (`Effect::RunCommand` with
+      `detached: true`, i.e. `Effect::launch(...)`): click a sidebar/panel row
+      on a plugin that launches a terminal that way → the terminal opens, and
+      `systemctl --user list-units 'trollshell-launch-*'` shows a
+      `trollshell-launch-<plugin>-<id>-<pid>-<seq>.service` transient **service**
+      unit (not a scope) for it, under `trollshell-launch.slice`. Then
+      `systemctl --user restart trollshell.service` → **the terminal survives**
+      (the attached mode's child would die with the shell, and would already have
+      been killed at 10 s). The plugin's `EffectResult` arrives **immediately**,
+      with `ok: true` and `output` naming the unit — never the program's exit
+      status, which the host deliberately never learns.
+  - [ ] **Repeat ids (#953 M2).** Launch once, then — with the first terminal
+        still open — restart the plugin (control-center Plugins tab stop/start,
+        which resets its effect-id counter) and launch again. **Both terminals
+        open**: the host, not the plugin, owns the unit name's uniqueness. Kill
+        one by hand → `--collect` releases its unit.
+  - [ ] **Cleanup (#953 L6).** `systemctl --user stop trollshell-launch.slice`
+        closes every launched program at once; nothing else in the session goes
+        with it.
+  - [ ] **Audit (#953 M1).** `~/.local/state/trollshell/effects-audit.log` shows
+        `effect=RunCommand(detached) decision=allowed id=<n>
+unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
+        attached mode's `effect=RunCommand … id=<n>` with no unit, and the
+        `unit=` is what lets you reconcile the log against
+        `systemctl --user list-units 'trollshell-launch-*'`.
+  - [ ] **Environment (#953 L5).** The launched terminal finds the display, and
+        a launched program that speaks niri IPC finds `$NIRI_SOCKET`.
+        Production leans on the session's
+        `systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP`
+        (`etc/niri/session.kdl`) — that is the load-bearing mechanism; the host
+        additionally forwards its own `WAYLAND_DISPLAY`/`NIRI_SOCKET`/`DISPLAY`/
+        `XDG_RUNTIME_DIR` with `--setenv=`, which is what makes a hand-started
+        `cargo run -p trollshell` inside a nested compositor launch onto the
+        _nested_ one rather than the outer session.
+  - [ ] **Old shell, new plugin (#953 L2).** A plugin built against this SDK,
+        run against a **pre-#953** shell, silently degrades: the shell doesn't
+        know `detached`, runs the terminal attached, and kills it at 10 s with
+        `ok: false`. Nothing warns — that is the accepted price of not bumping
+        `VOCAB` (a bump would make the old shell refuse the plugin outright).
 - [ ] **(#553)** Generic `Datasource` capability: `hytte-plugin-departures` /
       `hytte-plugin-weather` now answer `get departures` / `get weather`
       routed **through the running provider plugins** over the host protocol

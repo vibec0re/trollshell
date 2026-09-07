@@ -136,6 +136,7 @@ fn sample_effects() -> Vec<Effect> {
         Effect::RunCommand {
             id: 7,
             argv: vec!["vibectl".into(), "status".into()],
+            detached: false,
         },
         Effect::RaiseOsd {
             title: "Leave now".into(),
@@ -2230,4 +2231,83 @@ fn a_poisoned_node_round_trips_unsanitised_and_the_clamp_fixes_it_after_decode()
     );
     // …and the clamp, applied after decode, is what makes it harmless.
     assert_node_floats_are_sane(&decoded.clamped());
+}
+
+// ── RunCommand detached spawn mode (#953) ────────────────────────────────────
+
+#[test]
+fn run_command_detached_is_additive_and_off_the_wire_when_false() {
+    // The attached form must serialize to the *exact same bytes* it did before
+    // #953 existed: `detached` carries `skip_serializing_if`, so a `false` never
+    // reaches the wire. That is what keeps `tests/fixtures/plugin_render_v1.hex`
+    // byte-identical across this change — the golden suite is the second half of
+    // the proof, and it only stays green because of the assertion below.
+    #[derive(serde::Serialize)]
+    enum EffectOld {
+        RunCommand { id: u64, argv: Vec<String> },
+    }
+
+    let old = EffectOld::RunCommand {
+        id: 7,
+        argv: vec!["vibectl".into(), "status".into()],
+    };
+    let new = Effect::run_command(7, vec!["vibectl".into(), "status".into()]);
+    assert_eq!(
+        encode_body(&new),
+        encode_body(&old),
+        "a non-detached RunCommand must encode exactly like a pre-#953 one",
+    );
+    assert!(
+        !contains(&encode_body(&new), b"detached"),
+        "detached: false must not appear on the wire",
+    );
+
+    // And an old frame — one with no `detached` key at all — still decodes,
+    // defaulting to the attached mode (the pre-#953 behaviour).
+    let decoded: Effect = decode_body(&encode_body(&old)).expect("decode pre-#953 RunCommand");
+    assert_eq!(
+        decoded,
+        Effect::RunCommand {
+            id: 7,
+            argv: vec!["vibectl".into(), "status".into()],
+            detached: false,
+        },
+    );
+}
+
+#[test]
+fn run_command_detached_round_trips_and_is_name_tagged() {
+    // The detached form *does* put the key on the wire (that is the whole
+    // point), stays name-tagged, and round-trips.
+    let effect = Effect::launch(11, vec!["foot".into(), "-e".into(), "claude".into()]);
+    assert_eq!(
+        effect,
+        Effect::RunCommand {
+            id: 11,
+            argv: vec!["foot".into(), "-e".into(), "claude".into()],
+            detached: true,
+        },
+        "Effect::launch is the detached constructor",
+    );
+    let body = encode_body(&effect);
+    assert!(
+        contains(&body, b"RunCommand"),
+        "externally tagged by variant name",
+    );
+    assert!(
+        contains(&body, b"detached"),
+        "detached: true is carried on the wire",
+    );
+    let decoded: Effect = decode_body(&body).expect("decode detached RunCommand");
+    assert_eq!(decoded, effect);
+
+    // The `EffectResult` reply shape is unchanged — a detached launch reuses it,
+    // with `ok` meaning "the launch succeeded" (see the proto docs).
+    round_trip_host(&HostMsg::EffectResult {
+        id: 11,
+        outcome: EffectOutcome {
+            ok: true,
+            output: Some("launched unit trollshell-launch-caw-11.service".into()),
+        },
+    });
 }

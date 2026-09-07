@@ -35,7 +35,7 @@ agent on screen.
 ## 2. Decisions (Annika, 2026-09-07)
 
 Recorded from the #947 / #950 / #951 / #952 threads as decisions, not questions.
-Decisions 8–11 arrived in the evening, after the hive-side amendments in 2.1, and
+Decisions 8–12 arrived in the evening, after the hive-side amendments in 2.1, and
 they are the ones that fixed the shape of section 7:
 
 1. **hyperhive first.** "I think I'd like to have this hyperhive first if possible.
@@ -102,8 +102,15 @@ they are the ones that fixed the shape of section 7:
     "well the gtk chat client would pretty much need to fully support the current
     hyperhive webui features ❤️". This is what rules a native GTK
     reimplementation out of v1 — see section 7.
+12. **The companion embeds a WebView, on WebKitGTK.**
+    [#947 17:31Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573975653):
+    "Ok :) preem thx choom <3 then let's do it like this 💯" — answering the
+    WebView proposal, and her own Servo question one comment earlier. v1 is
+    `webkitgtk_6_0`; Servo is a documented re-check, not a someday, and the engine
+    sits behind a build feature so trying it costs nothing elsewhere. Section 7.1
+    carries the reasoning and the pointers.
 
-### 2.1 Amendments from the hive side (2026-09-07, 09:22Z–17:26Z)
+### 2.1 Amendments from the hive side (2026-09-07, 09:22Z–17:34Z)
 
 The first draft of this spec (07:51Z) predated @kaesaecracker (Mara, a hyperhive
 dev) and @the-sword-above joining the threads. Their input moved ten things.
@@ -282,7 +289,7 @@ cannot express pause (i), and a proposal to abandon hyperhive for tmux (j).
   section 5.7 says why.
 - **`trollshell-choom`** — the working name, from Annika's mock on #947, for an
   agent that maintains trollshell from a cage. It is the spec's running example of
-  a row; whether it is actually the **first** agent to exist is open question 6.
+  a row; whether it is actually the **first** agent to exist is open question 3.
 - **session** — Claude Code's on-disk session under
   `~/.claude/projects/<cwd-slug>/<uuid>.jsonl`, resumed **by title**. The hive's
   harness keys every turn on one constant title, `hive-session` by default,
@@ -347,10 +354,10 @@ or 10 reaches for something this table does not carry:
 and greys the row's primary click when `home` is `None` (the hive says so when the
 dashboard is not reachable from a browser). **This matters more after decision 9
 than it did before** — the derived URL is now the primary interaction, not a
-secondary button — so a per-agent URL field on `HiveUrls` is worth asking the hive
-for once section 7.1 is confirmed. It is deliberately **not** filed yet: the three
-hyperhive issues that are filed were each scoped to something already settled, and
-this one waits on Annika's one word.
+secondary button. With section 7.1 decided, this is now **an ask to file**: a
+per-agent page URL on `HiveUrls` (or on the `AgentStatus` row) so the desktop stops
+guessing a path scheme it does not own. It is scoped, non-breaking and settled,
+which is the bar the other three hyperhive issues met.
 
 Rules for the mirror:
 
@@ -693,7 +700,7 @@ Consequences, in order:
   surface is designed to be used **while the loop runs** — that is the whole point
   of it — so the primary click never touches `SetPaused`.
 
-### 7.1 The v1 shape — PROPOSED, awaiting one word
+### 7.1 The v1 shape — DECIDED: an embedded WebView, WebKitGTK
 
 Annika added one hard constraint at
 [#947 17:25Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573926876):
@@ -708,7 +715,7 @@ stats page (`docs/web-ui/agent.md`) — and it keeps moving. Reimplementing that
 GTK widgets is a parity treadmill from day one, and it would be trollshell's job
 to keep up with hyperhive's frontend forever.
 
-**Proposed instead** ([#947 17:26Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573931084)),
+**So instead** ([#947 17:26Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573931084)),
 and it satisfies "runs out of trollshell process" exactly:
 
 > a small companion binary (control-center shape) that is a libadwaita window
@@ -716,17 +723,38 @@ and it satisfies "runs out of trollshell process" exactly:
 > `/agent/<name>/` on the local gateway, the swarm CA trusted programmatically so
 > there is no click-through.
 
-| property        | what it gives                                                                                                                         |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| own process     | the `trollshell-control-center` shape: a separate windowed GTK4/libadwaita binary, launched **detached** per #953                     |
-| own window      | its own title and app-id, so niri window rules can place and size it                                                                  |
-| feature parity  | free and permanent — it _is_ the web UI, so decision 11 is met by construction                                                        |
-| dependency cost | WebKitGTK is heavy, and it lands **only in the companion**. The shell never links it, exactly as it never links GTK's web stack today |
-| the CA          | the swarm CA is trusted programmatically in the WebView rather than clicked through (Mara's browser workflow, #949)                   |
+| property        | what it gives                                                                                                                                   |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| own process     | the `trollshell-control-center` shape: a separate windowed GTK4/libadwaita binary, launched **detached** per #953                               |
+| own window      | its own title and app-id, so niri window rules can place and size it                                                                            |
+| feature parity  | free and permanent — it _is_ the web UI, so decision 11 is met by construction                                                                  |
+| dependency cost | WebKitGTK is heavy, and it lands **only in the companion**. The shell never links it, exactly as it never links GTK's web stack today           |
+| engine          | `webkitgtk_6_0` via the `webkit6` gtk-rs crate 0.6.1, behind a **build feature** so a second engine can be tried without touching anything else |
+| the CA          | the swarm CA is trusted programmatically in the WebView rather than clicked through (Mara's browser workflow, #949)                             |
 
-**This is proposed, not decided** — it needs one word from Annika (_WebView?_).
-The alternative she might still prefer is native widgets, at the parity cost above;
-if she says so, section 7.2's endpoint notes are where that work would start.
+**Decided.** Annika, [#947 17:31Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573975653):
+"Ok :) preem thx choom <3 then let's do it like this 💯".
+
+**Engine for v1: WebKitGTK** — `webkitgtk_6_0` in nixpkgs, driven through the
+`webkit6` gtk-rs crate 0.6.1 (2026-03): a versioned GTK4 `WebView` widget with no
+coverage questions about the agent page.
+
+**Servo is a re-check, not a someday.** Annika asked
+([#947 17:28Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573946212)):
+"is servo ready for this?" — the answer, with pointers, is on
+[#947 17:34Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573996643):
+`servo` 0.5.0 is a normal crate on crates.io with a `WebView` API modelled on
+WebKitGTK's, but **embedding is the unfinished part** (the "improve the embedding
+API" tracking issue servo/servo#27579 has been open since 2020; the only real GTK4
+integration, `servo-gtk`, runs Servo in a **subprocess** by re-executing your
+binary rather than in-process into a `GtkGLArea`, and its author's own verdict was
+"not yet ready for production"; Verso, the project built to be the embeddable
+WebView, was archived 2025-10), and **CSS Grid is the known web-platform gap**
+(servo/servo#34479). Re-evaluate in **6–12 months** — the day a maintained crate
+offers true in-process `GtkGLArea` rendering with input wired up, or #27579 closes
+with a documented contract. The companion therefore keeps its engine behind a
+**build feature**, so Servo can be tried without touching the plugin, the row, or
+anything else in this spec.
 
 Native pieces can replace parts of the embedded page later, one at a time, if a
 reason appears — a keyboard shortcut the web UI cannot bind, a notification the
@@ -787,7 +815,7 @@ on terminal exit                   →  SetPaused { name, paused: false }
 Unpause-on-exit is the piece #953 must not lose. A detached launch reports launch
 success only, not exit status (#953's own proposal), so v1 unpauses on the
 operator's next click of the pause button and the row makes that state obvious —
-open question 5.
+open question 4.
 
 ### 7.4 Considered and dropped
 
@@ -872,7 +900,7 @@ desktop consumes it as-is. The notes/knowledge mount is redundant for the same
 reason — "the swarm level forge has a knowledge repo agents get a local copy of
 (and can contributen via prs to)". What is left of "mounts" is only what a clone
 cannot carry — a large local dataset, a hardware device — and **Annika has not
-named one**, which is open question 8.
+named one**, which is open question 5.
 
 Mara's own reason for withholding mounts is worth recording, because it outlives
 this spec: "until now i did not add this on purpose. i really need the use case
@@ -921,7 +949,7 @@ a), so "the desktop profile has no forge" — the previous argument for
 
 Recommended: **the config-flake path for in-container fields**, which is most of
 Annika's original list, with `SetAgentOptions` reserved for the host-level remainder
-if #952 ever needs it. Not decided; it is downstream of #952 and of open question 8.
+if #952 ever needs it. Not decided; it is downstream of #952 and of open question 5.
 
 ## 11. Trust boundary
 
@@ -1047,12 +1075,12 @@ approval hive-side; and the desktop user's `hive-admin` membership alone (no
 
 | phase | what                                                                                                                                                                                                                                                                                                      | blocked on                                                                                                                                                                                                                                 |
 | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| P0    | this spec                                                                                                                                                                                                                                                                                                 | Annika's veto, plus one word on section 7.1 (**WebView?**)                                                                                                                                                                                 |
+| P0    | this spec                                                                                                                                                                                                                                                                                                 | Annika's veto                                                                                                                                                                                                                              |
 | P1    | #953 (detached `RunCommand` — the detached path must bypass the awaited `cmd.output()`, not merely re-parent) + `hytte-plugin-agents`: wire mirror, rows grouped by project, pause, panel                                                                                                                 | nothing. The transport is settled (`host.sock`, section 5.7) and the status text has landed (hyperhive#4037), so P1 is dev-against-a-fake-socket today; only **live-verify** needs a hive, i.e. **#949**'s `singleHostSwarm` on the laptop |
-| P2    | **the chat companion** (section 7.1) — the out-of-process window the primary click opens. Moved ahead of the Agents tab because it is the interaction Annika actually asked for; the tab is a settings surface                                                                                            | section 7.1's one word, and #953 for the detached launch                                                                                                                                                                                   |
+| P2    | **the chat companion** (section 7.1) — the out-of-process window the primary click opens. Moved ahead of the Agents tab because it is the interaction Annika actually asked for; the tab is a settings surface                                                                                            | **#953** for the detached launch. Engine and shape are settled (section 7.1)                                                                                                                                                               |
 | P3    | **approvals** (section 6.5) — poll `Pending`, raise the consent prompt, route `Approve` / `Deny` back                                                                                                                                                                                                     | P1. Deliberately **not** in P1: the row must be trustworthy before it is allowed to raise a modal that approves a config change, and the consent prompt is the one surface here that can do harm if it misdescribes what it is asking      |
 | P4    | control-center **Agents** tab, read-only, adaptive drill-down                                                                                                                                                                                                                                             | P1                                                                                                                                                                                                                                         |
-| P5    | edit — narrowed by amendment f: the in-container fields already live in the agent's config flake, so this is a **config-flake editor**, not a hive change; the host-level remainder (mounts, caps) waits on **#952** and on open question 6                                                               | **#952** for the host-level half only                                                                                                                                                                                                      |
+| P5    | edit — narrowed by amendment f: the in-container fields already live in the agent's config flake, so this is a **config-flake editor**, not a hive change; the host-level remainder (mounts, caps) waits on **#952** and on open question 5                                                               | **#952** for the host-level half only                                                                                                                                                                                                      |
 | later | triggers (section 6.6 — a datasource plugin sending `/idd` through the broker; the send route is unspecified on purpose); the swarm-controller migration, "at some point" (section 5.7); remote hive over #948's gateway HTTP + SSE; `Subscribe { kinds }` replacing the poll; extraction; other runtimes | **#948**, Mara's "at some point", and decision 6's "once this all stable"                                                                                                                                                                  |
 
 The `choom` secondary action (section 7.3) rides along with P2, since it is one
@@ -1065,23 +1093,19 @@ on the laptop. It just cannot be _live-verified_ until #949.
 
 ## 14. Open questions
 
-Numbered for reply, and **all seven are Annika's** — the hive side is done. Four
-that earlier drafts listed are answered and gone: whether to join Mara's swarm (no
-— amendment b), whether the hive needs a forge-less profile (no — amendment a), the
-lifetime-ops transport (`host.sock` now, controller later — amendment i), and the
-attach mechanism (the chat surface, decision 9 — section 7).
+Numbered for reply, and **all six are Annika's** — the hive side is done. Five that
+earlier drafts listed are answered and gone: whether to join Mara's swarm (no —
+amendment b), whether the hive needs a forge-less profile (no — amendment a), the
+lifetime-ops transport (`host.sock` now, controller later — amendment i), the
+attach mechanism (the chat surface, decision 9), and the engine behind it
+(WebKitGTK — section 7.1, "let's do it like this 💯").
 
-1. **Section 7.1: WebView?** The one word this spec is waiting on. An embedded
-   `WebView` on the agent's own page gives decision 11's feature parity for free
-   and forever; native GTK widgets give a nicer window and a parity treadmill. If
-   the answer is "native", section 7.2 is where that work starts and P2 grows by a
-   lot.
-2. **#953 now or later** — still unanswered on #947; P1 cannot ship without it.
-3. **Plugin name** — `agents`, `hive`, or `choom`? It becomes the crate name, the unit name (`trollshell-plugin-<id>`) and the `plugins.<id>` key, so it is awkward to change later. The companion binary needs a name too (`trollshell-agent-chat`?).
-4. **Is `trollshell-choom` the first agent?** (Which hive is settled: Annika's own all-local swarm on the laptop.)
-5. **Unpause after the `choom` path: automatic or manual?** Auto-_pause_ is not open — section 7.3 settles it. What is open is the other end: does the plugin unpause by itself when the terminal exits — which needs #953 to surface the transient unit's exit without re-parenting the child — or is v1 honest and manual, unpaused by the row's own pause button with the row reading `paused · attached` until then?
-6. **Is there anything you need in the cage that a `git clone` cannot bring in?** Mara's question, relayed on #952: if not, mounts leave the requirement entirely and P5 shrinks to the config flake.
-7. **Notify policy** — toast on `needs_login` and `failed` only, or also on a `status_text` the config marks "waiting for you", now that the text is on the row? (Distinct from section 6.5's approval prompt, which is a modal with buttons, not a toast.)
+1. **#953 now or later** — still unanswered on #947; P1 cannot ship without it.
+2. **Plugin name** — `agents`, `hive`, or `choom`? It becomes the crate name, the unit name (`trollshell-plugin-<id>`) and the `plugins.<id>` key, so it is awkward to change later. The companion binary needs a name too (`trollshell-agent-chat`?).
+3. **Is `trollshell-choom` the first agent?** (Which hive is settled: Annika's own all-local swarm on the laptop.)
+4. **Unpause after the `choom` path: automatic or manual?** Auto-_pause_ is not open — section 7.3 settles it. What is open is the other end: does the plugin unpause by itself when the terminal exits — which needs #953 to surface the transient unit's exit without re-parenting the child — or is v1 honest and manual, unpaused by the row's own pause button with the row reading `paused · attached` until then?
+5. **Is there anything you need in the cage that a `git clone` cannot bring in?** Mara's question, relayed on #952: if not, mounts leave the requirement entirely and P5 shrinks to the config flake.
+6. **Notify policy** — toast on `needs_login` and `failed` only, or also on a `status_text` the config marks "waiting for you", now that the text is on the row? (Distinct from section 6.5's approval prompt, which is a modal with buttons, not a toast.)
 
 **Marked later, not asked now:** whether the chat companion should also reach
 agents on a _remote_ hive through the gateway. It would — the URL is the only
@@ -1092,6 +1116,12 @@ and there is no reason to decide it before then.
 
 - hyperhive checkout: `/home/annika/viberoot/hyperhive` (every hive pointer above);
   the same content is rendered at `https://hyperhive.darkest.space/docs/`.
+- The chat companion's engine (section 7.1): `webkitgtk_6_0` in nixpkgs, the
+  `webkit6` gtk-rs crate 0.6.1. Servo's state as of mid-2026, with links, is on
+  [#947 17:34Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5573996643)
+  — `servo` 0.5.0 on crates.io, embedding-API tracking issue servo/servo#27579
+  (open since 2020), CSS Grid gap servo/servo#34479, `servo-gtk`'s subprocess
+  approach, Verso archived 2025-10.
 - Host socket protocol: `hive-host-sock/src/lib.rs`, `hive-host-sock/README.md`.
   The frozen subset the desktop needs is enumerated on
   [#948 09:24Z](https://github.com/vibec0re/trollshell/issues/948#issuecomment-5568468371).

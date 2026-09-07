@@ -137,7 +137,14 @@ forge-less hive profile, and the reason behind section 10's recommendation).
 **Non-goals (v1)**
 
 - No podman cage, and no second cage backend of any kind.
-- No second runtime — no Pi, no OpenCode. Claude Code only.
+- No second runtime — no Pi, no OpenCode. Claude Code only. Recorded so nobody
+  re-derives it: the hive side of this is smaller than #950's body implies. Mara,
+  [#947 09:22Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5568440406):
+  "you can already use openrouter to redirect claude code to a different provider.
+  if need be, support for eg opencode can be added, i just never added it bc i dont
+  have any inference except the claude subscription so i cannot test it." A second
+  runtime is a hive feature waiting on a use case, not a redesign — and still out
+  of v1.
 - **No swarm-level surface.** Forge, matrix, the controller, NATS and approvals are
   swarm concerns; the plugin is scoped to **one hive** (amendment a/c) and reads
   none of them. It talks to `host.sock` and `127.0.0.1`, full stop.
@@ -575,6 +582,15 @@ reason — "the swarm level forge has a knowledge repo agents get a local copy o
 (and can contributen via prs to)". What is left of "mounts" is only what a clone
 cannot carry — a large local dataset, a hardware device — and **Annika has not
 named one**, which is open question 8.
+
+Mara's own reason for withholding mounts is worth recording, because it outlives
+this spec: "until now i did not add this on purpose. i really need the use case
+here so i can think about where/how it belongs in hyperhive … having those mounts
+would also prevent you from migrating an agent to a different hive"
+([#947 09:22Z](https://github.com/vibec0re/trollshell/issues/947#issuecomment-5568440406)).
+A mount pins an agent to one host; a clone does not. She also names the escape
+hatch that exists today — "use a network fs and agent config to mount it in the
+container" — which is the config-flake row of the table above, not a hive change.
 
 The roster is the hive's, not the file's: `[display.<name>]` sections only decorate
 agents the hive reports. A section naming an unknown agent is inert and warned, not

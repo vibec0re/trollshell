@@ -237,7 +237,7 @@ independently by PR #954's builder and an adversarial reviewer's standalone
 crate — so decision 6's "drop to `310 es`" never reaches the objection, and
 route 1 never had a working validator to enforce its caps with. Second, Annika
 settled the boundary on
-[#893](https://github.com/vibec0re/trollshell/issues/893#issuecomment-5562069487)
+[#893](https://github.com/vibec0re/trollshell/issues/893#issuecomment-5568936135)
 (2026-09-07T10:02Z): _"hmm ok if this adds nothing then let's not overcomplicate
 things ❤️"_, declining a provenance check (`SO_PEERCRED` → cgroup → unit name,
 first proposed under the name "route 0") as re-deriving what the socket's file

@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use hytte::services::{mpris, niri, notifications, pipewire};
+use hytte::services::{mpris, niri, notifications, pipewire, systemd};
 use hytte_plugin_proto::{
     AudioAction, Effect, EffectOutcome, HostMsg, MediaAction, NiriAction, Page,
 };
@@ -22,9 +22,10 @@ use super::datasource::DatasourceRouter;
 /// (→ MPRIS transport on the active player), [`Effect::Audio`] (→ the default
 /// sink's volume/mute), [`Effect::RaiseOsd`] (→ the transient OSD nudge, #236),
 /// [`Effect::Notify`] (→ a local notification toast, #406), [`Effect::RunCommand`]
-/// (→ a spawned `argv`, its outcome routed back as [`HostMsg::EffectResult`], #510),
-/// [`Effect::RequestConsent`] (→ the interactive consent overlay, #487) and the two
-/// datasource legs (#509).
+/// (→ a spawned `argv`, its outcome routed back as [`HostMsg::EffectResult`], #510 —
+/// or, with `detached: true`, a program handed to the systemd user manager so it
+/// outlives the shell, #953), [`Effect::RequestConsent`] (→ the interactive consent
+/// overlay, #487) and the two datasource legs (#509).
 ///
 /// The match is **exhaustive over the effect vocabulary** — there is no catch-all
 /// (#648). The three compositor/media/audio variants were declared, cap-gated and
@@ -148,14 +149,25 @@ pub(super) fn broker_effect(
                 outbound.clone(),
             );
         }
-        Effect::RunCommand { id, argv } => {
+        Effect::RunCommand { id, argv, detached } => {
             // #510: spawn the granted `argv` on the tokio runtime and route the
             // outcome back to THIS plugin as `HostMsg::EffectResult` keyed by
             // `id`. Reaching here means the plugin holds `Capability::RunCommand`
-            // (`enforce_capabilities` drops it otherwise) — a separately granted,
-            // higher-trust cap, so the host runs exactly what the manifest allows.
-            tracing::info!(plugin = %plugin_id, id = *id, argc = argv.len(), "plugin effect: RunCommand");
-            run_command(plugin_id, *id, argv.clone(), outbound.clone());
+            // (`enforce_capabilities` drops it otherwise) — the highest-trust cap
+            // in the vocabulary, so the host runs exactly what the manifest allows.
+            //
+            // #953 splits it in two. The attached mode is #510's: run to
+            // completion under `RUN_COMMAND_TIMEOUT`, `kill_on_drop`, exit status
+            // back. The detached mode bypasses *both* — no `output()`, no
+            // timeout, no kill — and hands the program to the systemd user
+            // manager so it outlives a `trollshell.service` restart.
+            if *detached {
+                tracing::info!(plugin = %plugin_id, id = *id, argc = argv.len(), "plugin effect: RunCommand (detached launch)");
+                launch_detached(plugin_id, *id, argv.clone(), outbound.clone());
+            } else {
+                tracing::info!(plugin = %plugin_id, id = *id, argc = argv.len(), "plugin effect: RunCommand");
+                run_command(plugin_id, *id, argv.clone(), outbound.clone());
+            }
         }
         Effect::DatasourceQuery {
             request_id,
@@ -384,7 +396,7 @@ fn run_command(plugin_id: &str, id: u64, argv: Vec<String>, outbound: mpsc::Send
 
 /// Run one `argv` to completion (bounded by [`RUN_COMMAND_TIMEOUT`]) and map it
 /// onto an [`EffectOutcome`]. stdin is `/dev/null`; stdout/stderr are captured.
-async fn execute_command(plugin_id: &str, id: u64, argv: &[String]) -> EffectOutcome {
+pub(super) async fn execute_command(plugin_id: &str, id: u64, argv: &[String]) -> EffectOutcome {
     let Some((program, tail)) = argv.split_first() else {
         tracing::warn!(plugin = %plugin_id, id, "RunCommand with empty argv; nothing to spawn");
         return EffectOutcome {
@@ -450,6 +462,298 @@ fn command_outcome(success: bool, stdout: &[u8]) -> EffectOutcome {
     }
 }
 
+// ── Detached launch (#953) ───────────────────────────────────────────────────
+//
+// `Effect::RunCommand { detached: true }` is the "launch a terminal that keeps
+// running" mode (#947). It shares `Capability::RunCommand` with the attached
+// mode above but shares *none* of its machinery, because every piece of that
+// machinery is a reason the program would die:
+//
+// - `execute_command` awaits `cmd.output()`, so the effect task is alive for as
+//   long as the program is;
+// - `RUN_COMMAND_TIMEOUT` kills anything still running after 10 s;
+// - `kill_on_drop(true)` kills it if the task is ever dropped;
+// - and the child is a child of *this* process, so it sits in
+//   `trollshell.service`'s cgroup and `KillMode=control-group` takes it down on
+//   every shell restart.
+//
+// The detached path therefore does not "re-parent an otherwise identical
+// spawn": it never calls `output()`/`wait()`, has no program timeout, sets no
+// `kill_on_drop`, and asks the **systemd user manager** to own the process.
+//
+// ## Why a transient *service*, not `--scope`
+//
+// `systemd-run --user --scope` looks like the lighter option, but with `--scope`
+// systemd-run "runs the command by systemd-run itself as parent process"
+// (systemd-run(1)) — it stays in the foreground for the program's whole life.
+// Awaiting its exit status would be awaiting the program, which is exactly the
+// thing #953 says to bypass, and not awaiting it would mean the host learns
+// nothing about whether the launch worked. A transient *service*
+// (`--unit=<name>`, no `--scope`) has neither problem: `systemd-run` returns as
+// soon as the manager has taken the start job, so its exit status is a launch
+// verdict and nothing else, and the program's parent is `systemd --user` — a
+// different process tree *and* a different cgroup from `trollshell.service`.
+// It is also the exact groove `plugin_launcher.rs` already runs plugins in, and
+// it gives the program a name in `systemctl --user`, which is what #953 asked
+// for.
+
+/// Bounds the `systemd-run` **launch call** — the short D-Bus round-trip that
+/// asks the user manager to start the transient unit — and *nothing else*
+/// (#953). It is emphatically not [`RUN_COMMAND_TIMEOUT`]'s sibling: the
+/// launched program is never timed out, because outliving the shell is the
+/// point. Killing a wedged `systemd-run` is safe precisely because the unit it
+/// already asked for belongs to the manager, not to the helper.
+const LAUNCH_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a detached launch actually started (#953), so the host can say which of
+/// the two paths ran rather than reporting a bare boolean.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum LaunchReport {
+    /// The normal path: `systemd-run --user` started this transient unit, owned
+    /// by the systemd user manager. Survives a `trollshell.service` restart.
+    Unit(String),
+    /// The fallback path: no `systemd-run` to call (no systemd user manager —
+    /// a test sandbox, a non-systemd session), so the program was spawned
+    /// directly into **its own process group**. It still isn't awaited, killed
+    /// or timed out, but it is a child of this process, so it only survives what
+    /// an orphaned child survives.
+    Process(u32),
+}
+
+/// The transient unit name for one detached launch (#953):
+/// `trollshell-launch-<plugin>-<id>.service`. `plugin_id` is guarded by
+/// [`systemd::is_valid_plugin_id`] before it reaches here (see
+/// [`start_detached`]) and `id` is a `u64`, so the result is always a legal unit
+/// name. Pure.
+///
+/// The effect `id` is in the name because it is already the plugin's per-request
+/// correlation token for [`HostMsg::EffectResult`] — reusing a live one would
+/// mis-route the reply too, so "ids of outstanding requests are distinct" is a
+/// rule the plugin already had to keep. `--collect` frees the name the moment
+/// the program exits, so an id is reusable across launches.
+pub(super) fn launch_unit_name(plugin_id: &str, id: u64) -> String {
+    format!("trollshell-launch-{plugin_id}-{id}.service")
+}
+
+/// The full `systemd-run` argv for one detached launch (#953), sans the
+/// `systemd-run` program itself. Pure, so the exact invocation is pinned by a
+/// unit test rather than only observable on a live session.
+///
+/// - `--user`: the session manager, so the unit lands in the user's own tree.
+/// - `--quiet`: no "Running as unit …" chatter on stderr.
+/// - `--collect`: release the unit even when the program ends failed, so a name
+///   is never wedged waiting for a `reset-failed` (same reason
+///   `plugin_launcher::systemd_run_args` passes it).
+/// - `--unit=`: the [`launch_unit_name`] above — #953 wants the program to
+///   *show up in `systemctl --user` with a name*.
+/// - `--description=`: a human line in `systemctl --user status`.
+/// - `--`: terminates option parsing before the plugin-supplied argv, so an
+///   `argv[0]` of `--now` can't be read as a `systemd-run` flag.
+///
+/// Deliberately **not** passed: no `Restart=` (a launched terminal that exits
+/// has finished, it is not a supervised service — unlike a plugin), and no
+/// `PartOf=` (the program is the user's, launched on their behalf; binding its
+/// lifetime to a target would be host policy invented out of nothing, and the
+/// user manager already stops everything at logout).
+///
+/// Also not passed: any `--setenv=`. The transient unit inherits the **user
+/// manager's** environment, into which the niri session has already imported
+/// `WAYLAND_DISPLAY` / `XDG_CURRENT_DESKTOP` (`etc/niri/session.kdl`'s
+/// `systemctl --user import-environment` spawn-at-startup) — so a launched GUI
+/// program finds the display exactly the way a launcher-started app does.
+/// Copying the *shell's* environment in instead would hand the program whatever
+/// `trollshell.service` happens to carry, which is not the same thing.
+pub(super) fn launch_argv(plugin_id: &str, id: u64, argv: &[String]) -> Vec<String> {
+    let mut out = vec![
+        "--user".to_owned(),
+        "--quiet".to_owned(),
+        "--collect".to_owned(),
+        format!("--unit={}", launch_unit_name(plugin_id, id)),
+        format!("--description=trollshell plugin launch: {plugin_id} #{id}"),
+        "--".to_owned(),
+    ];
+    out.extend(argv.iter().cloned());
+    out
+}
+
+/// Why a `systemd-run` launch didn't happen (#953). The distinction is
+/// load-bearing: [`Absent`](LaunchFailure::Absent) means the helper never ran,
+/// so falling back to a direct spawn starts the program exactly once;
+/// [`Refused`](LaunchFailure::Refused) means it ran and said no (a taken unit
+/// name, no reachable user manager, a bad property), and retrying by another
+/// route could start a **second** copy — so a refusal is reported, never
+/// worked around.
+enum LaunchFailure {
+    Absent(std::io::Error),
+    Refused(String),
+}
+
+/// Ask the systemd user manager to start `argv` as the transient unit (#953).
+/// Returns as soon as the manager has taken the start job — the program's own
+/// lifetime is never observed here.
+async fn systemd_run_launch(
+    plugin_id: &str,
+    id: u64,
+    argv: &[String],
+) -> Result<(), LaunchFailure> {
+    let mut cmd = tokio::process::Command::new("systemd-run");
+    cmd.args(launch_argv(plugin_id, id, argv))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Safe *here*, unlike on the launched program: this only bounds the
+        // short-lived `systemd-run` helper. The transient unit it has already
+        // asked for is the manager's, and is untouched by the helper dying.
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(LAUNCH_CALL_TIMEOUT, cmd.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return Err(LaunchFailure::Absent(e)),
+        Err(_) => {
+            return Err(LaunchFailure::Refused(format!(
+                "systemd-run --user did not answer within {}s",
+                LAUNCH_CALL_TIMEOUT.as_secs(),
+            )));
+        }
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(LaunchFailure::Refused(format!(
+        "systemd-run --user failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim(),
+    )))
+}
+
+/// Spawn `argv` directly, detached, when there is no `systemd-run` to call
+/// (#953) — a test sandbox or a non-systemd session.
+///
+/// [`process_group(0)`](tokio::process::Command::process_group) puts the child
+/// in a **new process group**, so a signal delivered to the shell's group (a
+/// `Ctrl-C` in a `cargo run` terminal, say) doesn't reach it. That is the whole
+/// detachment `unsafe`-free code can buy: `setsid`/double-fork would need
+/// `pre_exec`, and `unsafe_code = "forbid"` is workspace policy. Without a user
+/// manager there is no cgroup to escape either, so this is not a lesser version
+/// of the systemd path so much as the best available answer where that path
+/// doesn't exist — [`LaunchReport::Process`] says so to the plugin.
+///
+/// The handle is **dropped, never awaited**: no `output()`, no `wait()`, no
+/// timeout, and `kill_on_drop` left at its default `false` so dropping it
+/// cannot kill the program. Tokio's orphan reaper still collects the exit
+/// status on `SIGCHLD`, so nothing ever waits on the child and no zombie
+/// accumulates either.
+fn spawn_detached(argv: &[String]) -> Result<u32, String> {
+    let Some((program, tail)) = argv.split_first() else {
+        return Err("empty argv; nothing to launch".to_owned());
+    };
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(tail)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("spawning {program}: {e}"))?;
+    let pid = child.id().ok_or_else(|| {
+        format!("spawning {program}: the child was reaped before its pid was read")
+    })?;
+    drop(child);
+    Ok(pid)
+}
+
+/// Start one detached launch and report what it produced (#953). Tries the
+/// systemd user manager first and falls back to [`spawn_detached`] only when
+/// `systemd-run` **could not be run at all** — a refusal from a `systemd-run`
+/// that did run is returned as-is, since retrying by another route risks a
+/// second copy of the program (see [`LaunchFailure`]).
+pub(super) async fn start_detached(
+    plugin_id: &str,
+    id: u64,
+    argv: &[String],
+) -> Result<LaunchReport, String> {
+    if argv.is_empty() {
+        return Err("empty argv; nothing to launch".to_owned());
+    }
+    // The plugin id is spliced into a unit name, so it has to clear the same
+    // charset guard the declarative launcher applies to ids read from
+    // `plugins.json` (#419). A manifest id is plugin-supplied, so an id that
+    // can't be a unit-name segment takes the direct-spawn path rather than
+    // smuggling a crafted `--unit=` argument past `systemd-run`.
+    if !systemd::is_valid_plugin_id(plugin_id) {
+        tracing::warn!(
+            plugin = %plugin_id, id,
+            "detached launch from a plugin id that is not unit-name safe; spawning directly",
+        );
+        return spawn_detached(argv).map(LaunchReport::Process);
+    }
+    match systemd_run_launch(plugin_id, id, argv).await {
+        Ok(()) => Ok(LaunchReport::Unit(launch_unit_name(plugin_id, id))),
+        Err(LaunchFailure::Absent(e)) => {
+            tracing::warn!(
+                plugin = %plugin_id, id, error = %e,
+                "systemd-run --user unavailable; spawning the detached program directly",
+            );
+            spawn_detached(argv).map(LaunchReport::Process)
+        }
+        Err(LaunchFailure::Refused(msg)) => Err(msg),
+    }
+}
+
+/// Map a detached launch's report onto the wire [`EffectOutcome`] (#953). Pure
+/// (no process handle), so the reply a plugin sees is unit-testable.
+///
+/// `ok` is a **launch** verdict, not an exit status — the host never learns the
+/// program's exit status, and the proto documents that split. `output` names
+/// what was started so the human (and the plugin's own log line) can find it:
+/// the unit for `systemctl --user status`, or the pid on the fallback path.
+pub(super) fn launch_outcome(report: &Result<LaunchReport, String>) -> EffectOutcome {
+    let (ok, text) = match report {
+        Ok(LaunchReport::Unit(unit)) => (true, format!("launched unit {unit}")),
+        Ok(LaunchReport::Process(pid)) => (
+            true,
+            format!("launched pid {pid} (no systemd-run; detached process group)"),
+        ),
+        Err(e) => (false, format!("launch failed: {e}")),
+    };
+    EffectOutcome {
+        ok,
+        output: Some(truncate_on_char_boundary(&text, RUN_COMMAND_MAX_OUTPUT)),
+    }
+}
+
+/// Launch a plugin-requested `argv` **independently of the shell** and route the
+/// launch verdict back as [`HostMsg::EffectResult`] keyed by `id` (#953).
+/// Capability-gated upstream like [`run_command`]; the broker stays on the GTK
+/// main thread, so the launch is offloaded to the runtime. The spawned task
+/// finishes as soon as the launch verdict is known — it does not live as long as
+/// the launched program, which is the whole difference from [`run_command`].
+fn launch_detached(plugin_id: &str, id: u64, argv: Vec<String>, outbound: mpsc::Sender<HostMsg>) {
+    let plugin_id = plugin_id.to_owned();
+    hytte::reactive::runtime::handle().spawn(async move {
+        let report = start_detached(&plugin_id, id, &argv).await;
+        match &report {
+            Ok(LaunchReport::Unit(unit)) => {
+                tracing::info!(plugin = %plugin_id, id, unit = %unit, "plugin detached launch started as a transient user unit");
+            }
+            Ok(LaunchReport::Process(pid)) => {
+                tracing::info!(plugin = %plugin_id, id, pid, "plugin detached launch spawned directly (no user manager)");
+            }
+            Err(e) => {
+                tracing::warn!(plugin = %plugin_id, id, error = %e, "plugin detached launch failed");
+            }
+        }
+        let outcome = launch_outcome(&report);
+        if outbound
+            .send(HostMsg::EffectResult { id, outcome })
+            .await
+            .is_err()
+        {
+            tracing::debug!(plugin = %plugin_id, id, "plugin gone before detached launch result; dropped");
+        }
+    });
+}
+
 /// Truncate `s` to at most `max` bytes without splitting a UTF-8 code point.
 fn truncate_on_char_boundary(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -505,12 +809,20 @@ impl AuditDecision {
 /// The short, stable audit name for an effect kind (#510). Exhaustive over the
 /// effect vocabulary so a new variant is a compile error here, mirroring
 /// [`effect_capability`](super::session::effect_capability).
+///
+/// [`Effect::RunCommand`]'s two spawn modes get **two names** (#953). They share
+/// one capability, so [`AuditDecision`] can't tell them apart — but they differ
+/// in exactly the way an audit reader cares about: a `RunCommand(detached)` line
+/// is a program the shell handed to the user manager and will *not* clean up,
+/// so it is the one an after-the-fact review has to reconcile against
+/// `systemctl --user list-units 'trollshell-launch-*'`.
 fn effect_kind(effect: &Effect) -> &'static str {
     match effect {
         Effect::OpenPage(_) => "OpenPage",
         Effect::Niri(_) => "Niri",
         Effect::Media(_) => "Media",
         Effect::Audio(_) => "Audio",
+        Effect::RunCommand { detached: true, .. } => "RunCommand(detached)",
         Effect::RunCommand { .. } => "RunCommand",
         Effect::RaiseOsd { .. } => "RaiseOsd",
         Effect::Notify { .. } => "Notify",
@@ -776,8 +1088,19 @@ mod tests {
             effect_kind(&Effect::RunCommand {
                 id: 1,
                 argv: vec!["true".to_owned()],
+                detached: false,
             }),
             "RunCommand",
+        );
+        // #953: the detached mode is a distinct audit name — same capability,
+        // materially different consequence (a program the shell won't reap).
+        assert_eq!(
+            effect_kind(&Effect::RunCommand {
+                id: 1,
+                argv: vec!["foot".to_owned()],
+                detached: true,
+            }),
+            "RunCommand(detached)",
         );
         assert_eq!(
             effect_kind(&Effect::Notify {

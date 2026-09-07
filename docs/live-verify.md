@@ -109,6 +109,20 @@ range above is a floor, not a ceiling.
       `ok: false` (no hang), with a warn in `RUST_LOG=trollshell=info`.
       `~/.local/state/trollshell/effects-audit.log` accrues one line per
       brokered/dropped effect and rotates to `.log.1` past the 256 KiB cap.
+- [ ] **(#953)** The **detached** spawn mode (`Effect::RunCommand` with
+      `detached: true`, i.e. `Effect::launch(...)`): click a sidebar/panel row
+      on a plugin that launches a terminal that way → the terminal opens, and
+      `systemctl --user list-units 'trollshell-launch-*'` shows a
+      `trollshell-launch-<plugin>-<id>.service` scope-free transient unit for
+      it. Then `systemctl --user restart trollshell.service` → **the terminal
+      survives** (the attached mode's child would die with the shell, and would
+      already have been killed at 10 s). The plugin's `EffectResult` arrives
+      **immediately**, with `ok: true` and `output` naming the unit — never the
+      program's exit status, which the host deliberately never learns. Kill the
+      terminal by hand → `--collect` releases the unit, so launching again with
+      the same effect `id` works rather than hitting "unit already exists". The
+      audit log line reads `effect=RunCommand(detached)`, distinct from the
+      attached mode's `effect=RunCommand`.
 - [ ] **(#553)** Generic `Datasource` capability: `hytte-plugin-departures` /
       `hytte-plugin-weather` now answer `get departures` / `get weather`
       routed **through the running provider plugins** over the host protocol

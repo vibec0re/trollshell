@@ -114,7 +114,10 @@
 //!   (→ the modal drawer, incl. `PluginSelf` → the plugin's own panel, #349 PR2),
 //!   [`Effect::RaiseOsd`] (→ the transient OSD nudge, #236), [`Effect::Notify`]
 //!   (→ a local notification toast through the shell's own daemon, #406),
-//!   [`Effect::RunCommand`] (→ a spawned `argv`, its outcome routed back, #510),
+//!   [`Effect::RunCommand`] (→ a spawned `argv`, its outcome routed back, #510;
+//!   with `detached: true` the program is handed to the systemd user manager as
+//!   a `trollshell-launch-<plugin>-<id>.service` transient unit instead, never
+//!   awaited and never timed out, so it outlives a shell restart — #953),
 //!   [`Effect::RequestConsent`] (→ the consent overlay, #487), the two datasource
 //!   legs (#509), and, since #648, [`Effect::Niri`] / [`Effect::Media`] /
 //!   [`Effect::Audio`] (→ niri IPC / MPRIS transport on the active player /

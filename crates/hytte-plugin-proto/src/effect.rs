@@ -88,9 +88,59 @@ pub enum Effect {
     /// An audio action (cap: [`Audio`](crate::manifest::Capability::Audio)).
     Audio(AudioAction),
     /// Spawn a command (cap: [`RunCommand`](crate::manifest::Capability::RunCommand),
-    /// a separately granted, higher-trust capability). `id` correlates the
+    /// the highest-trust capability in the vocabulary). `id` correlates the
     /// resulting [`HostMsg::EffectResult`](crate::msg::HostMsg::EffectResult).
-    RunCommand { id: u64, argv: Vec<String> },
+    ///
+    /// # Two spawn modes (#953)
+    ///
+    /// `detached` picks between them; both are gated on the *same*
+    /// [`RunCommand`](crate::manifest::Capability::RunCommand) capability,
+    /// because a plugin that may run an arbitrary `argv` at all can already
+    /// launch a detacher of its own — a second capability would be paperwork,
+    /// not a boundary.
+    ///
+    /// - **`detached: false` (the default) — run and report.** The host runs
+    ///   the command *to completion* under a bound (10 s today), captures
+    ///   stdout, and returns the program's exit status in
+    ///   [`EffectOutcome`]. The child lives and dies with the shell: it is in
+    ///   the shell's own cgroup, and the host kills it if the bound expires or
+    ///   the connection drops. Right for a short query whose answer the plugin
+    ///   wants back.
+    /// - **`detached: true` — launch and forget.** The host hands the program
+    ///   to the systemd **user manager** as a transient unit
+    ///   (`systemd-run --user --unit=trollshell-launch-<plugin>-<id>`), so it is
+    ///   *not* in the shell's cgroup, is never awaited, and has no timeout: it
+    ///   outlives a `trollshell.service` restart. [`EffectOutcome::ok`] then
+    ///   reports **whether the launch succeeded**, never the program's exit
+    ///   status (which the host never learns), and [`EffectOutcome::output`]
+    ///   names the unit (or, with no user manager, the pid). Right for a
+    ///   terminal, an editor, a companion window — anything meant to keep
+    ///   running while the user works.
+    ///
+    /// Use [`Effect::run_command`] / [`Effect::launch`] rather than a struct
+    /// literal, so a later field addition stays source-compatible.
+    ///
+    /// Additive on the wire: `detached` is a `#[serde(default)]` field, so a
+    /// frame built before #953 decodes to `false` — the pre-#953 behaviour. It
+    /// also carries `skip_serializing_if`, so a non-detached `RunCommand`
+    /// serializes to the *exact same bytes* it did before the field existed
+    /// (which is what keeps `tests/fixtures/plugin_render_v1.hex` unchanged).
+    /// That diverges from [`Node::Text`](crate::wire::Node::Text)'s `ellipsize`,
+    /// which pays a couple of bytes rather than name a predicate; here the
+    /// byte-identity is itself the compat evidence, and `std::ops::Not::not`
+    /// supplies the `&bool` predicate serde needs without a helper `fn`.
+    /// An **older host** that predates the field skips the unknown key and runs
+    /// the command in the attached mode — the launched program then dies with
+    /// the shell (the status quo), which is a degradation, never a decode
+    /// failure, so no [`VOCAB`](crate::VOCAB) bump is involved.
+    RunCommand {
+        id: u64,
+        argv: Vec<String>,
+        /// Launch independently of the shell instead of running to completion.
+        /// See the variant docs for the two modes.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        detached: bool,
+    },
     /// Raise a transient on-screen-display nudge (cap:
     /// [`RaiseOsd`](crate::manifest::Capability::RaiseOsd)). A **generic,
     /// reusable** surface: the *plugin* computes the display strings and the host
@@ -184,6 +234,38 @@ pub enum Effect {
     },
 }
 
+impl Effect {
+    /// Run `argv` to completion and route its exit status + stdout back as an
+    /// [`EffectOutcome`] — the attached mode ([`Effect::RunCommand`] with
+    /// `detached: false`). The host bounds it with a timeout and the child dies
+    /// with the shell.
+    ///
+    /// Prefer this over a struct literal: a later optional field then stays
+    /// source-compatible for out-of-tree plugins.
+    #[must_use]
+    pub fn run_command(id: u64, argv: Vec<String>) -> Self {
+        Effect::RunCommand {
+            id,
+            argv,
+            detached: false,
+        }
+    }
+
+    /// Launch `argv` **independently of the shell** — the detached mode
+    /// ([`Effect::RunCommand`] with `detached: true`, #953). The host hands it
+    /// to the systemd user manager as a transient unit, never awaits it, and
+    /// reports only whether the *launch* succeeded; the program outlives a shell
+    /// restart. For a terminal, an editor, a companion window.
+    #[must_use]
+    pub fn launch(id: u64, argv: Vec<String>) -> Self {
+        Effect::RunCommand {
+            id,
+            argv,
+            detached: true,
+        }
+    }
+}
+
 /// The outcome of a datasource query (#509). Travels twice: from a provider back
 /// to the host in [`Effect::DatasourceResult`], and from the host on to the
 /// requester in [`HostMsg::DatasourceResult`](crate::msg::HostMsg::DatasourceResult).
@@ -251,10 +333,20 @@ pub enum ConsentDecision {
 }
 
 /// The outcome of a brokered [`Effect::RunCommand`], returned to the plugin.
+///
+/// Both fields mean something different in the two spawn modes (#953) — see the
+/// [`RunCommand`](Effect::RunCommand) docs:
+///
+/// | | attached (`detached: false`) | detached (`detached: true`) |
+/// |---|---|---|
+/// | [`ok`](EffectOutcome::ok) | the program exited `0` | the **launch** succeeded (the exit status is never learned) |
+/// | [`output`](EffectOutcome::output) | captured stdout | the transient unit name, or the pid on the no-user-manager fallback |
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectOutcome {
-    /// Whether the command exited successfully.
+    /// Whether the command exited successfully — or, for a detached launch,
+    /// whether the *launch* succeeded.
     pub ok: bool,
-    /// Captured stdout (host may truncate), if any.
+    /// Captured stdout (host may truncate), if any — or, for a detached launch,
+    /// what was started (unit name / pid) or why it couldn't be.
     pub output: Option<String>,
 }

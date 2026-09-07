@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
 use hytte_plugin_proto::{
-    AudioAction, Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, HostMsg,
-    Manifest, MediaAction, Mount, NiriAction, NowPlaying, Page, PluginMsg, ProvidedDatasource,
-    StateKey, VOCAB, preem as vocab, read_frame, wire, write_frame,
+    AudioAction, Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, EffectOutcome,
+    HostMsg, Manifest, MediaAction, Mount, NiriAction, NowPlaying, Page, PluginMsg,
+    ProvidedDatasource, StateKey, VOCAB, preem as vocab, read_frame, wire, write_frame,
 };
 use hytte_preem as kit;
 use tokio::net::UnixStream;
@@ -20,7 +20,10 @@ use tokio::sync::{mpsc, watch};
 
 use super::datasource::DatasourceRouter;
 use super::effects::broker_effect;
-use super::effects::{PageAction, map_page, map_page_for_layout, resolve_open_page};
+use super::effects::{
+    LaunchReport, PageAction, execute_command, launch_argv, launch_outcome, launch_unit_name,
+    map_page, map_page_for_layout, resolve_open_page,
+};
 use super::listener::{ACCEPT_BACKOFF, accept_backoff, socket_in_use};
 use super::preem_render::{self, Scope};
 use super::pump::{
@@ -1457,6 +1460,18 @@ fn effect_capability_maps_each_effect() {
         effect_capability(&Effect::RunCommand {
             id: 0,
             argv: vec![],
+            detached: false,
+        }),
+        Capability::RunCommand,
+    );
+    // #953: the detached spawn mode rides the *same* capability — a plugin that
+    // may run an arbitrary argv can already launch a detacher of its own, so a
+    // second cap would name a boundary that isn't there.
+    assert_eq!(
+        effect_capability(&Effect::RunCommand {
+            id: 0,
+            argv: vec![],
+            detached: true,
         }),
         Capability::RunCommand,
     );
@@ -7356,4 +7371,218 @@ fn a_theme_change_drops_the_memoized_role_colors() {
         !second.2.chunks_exact(4).any(|px| px == green),
         "the memo must be dropped on a theme change, so the stale role color cannot survive it",
     );
+}
+
+// ── Detached RunCommand launch (#953) ────────────────────────────────────────
+
+/// #953: the detached spawn mode wraps the granted argv in a `systemd-run
+/// --user` transient **service** unit.
+///
+/// The two negative assertions carry the design decision. `--scope` is the
+/// obvious-looking alternative and is wrong here: with it, systemd-run "runs the
+/// command by systemd-run itself as parent process" (systemd-run(1)), staying in
+/// the foreground for the program's whole life — so reading its exit status
+/// would be reading the program's, which is precisely the awaited `output()`
+/// #953's correction says to bypass. `--wait` would do the same to a service
+/// unit. Without either, systemd-run returns as soon as the manager has taken
+/// the start job, so its status is a *launch* verdict and the program is a child
+/// of `systemd --user`, in neither `trollshell.service`'s process tree nor its
+/// cgroup.
+#[test]
+fn detached_launch_wraps_the_argv_in_a_systemd_run_service_unit() {
+    let argv = vec!["foot".to_owned(), "-e".to_owned(), "claude".to_owned()];
+    let run_args = launch_argv("caw", 7, &argv);
+    let expected: Vec<String> = [
+        "--user",
+        "--quiet",
+        "--collect",
+        "--unit=trollshell-launch-caw-7.service",
+        "--description=trollshell plugin launch: caw #7",
+        "--",
+        "foot",
+        "-e",
+        "claude",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    assert_eq!(run_args, expected, "the exact systemd-run invocation");
+    assert!(
+        !run_args.iter().any(|a| a == "--scope"),
+        "--scope would keep systemd-run in the foreground as the program's parent",
+    );
+    assert!(
+        !run_args.iter().any(|a| a == "--wait"),
+        "--wait would make the launch call await the program's exit",
+    );
+    assert_eq!(
+        launch_unit_name("caw", 7),
+        "trollshell-launch-caw-7.service",
+        "#953 wants the program named in `systemctl --user`",
+    );
+}
+
+/// `--` must terminate systemd-run's option parsing before the plugin-supplied
+/// argv, so a program name that looks like a flag is passed through as the
+/// program rather than eaten as a `systemd-run` option.
+#[test]
+fn detached_launch_argv_is_separated_from_systemd_run_options() {
+    let requested = vec!["--scope".to_owned(), "--wait".to_owned()];
+    let run_args = launch_argv("hostile", 1, &requested);
+    let sep = run_args
+        .iter()
+        .position(|a| a == "--")
+        .expect("the argv is separated by --");
+    assert_eq!(
+        &run_args[sep + 1..],
+        &["--scope".to_owned(), "--wait".to_owned()],
+        "everything after -- is the plugin's argv, never a systemd-run option",
+    );
+    assert!(
+        run_args[..sep]
+            .iter()
+            .all(|a| a != "--scope" && a != "--wait"),
+        "and nothing before -- was contributed by the plugin",
+    );
+}
+
+/// #953: for a detached launch, [`EffectOutcome::ok`] is a **launch** verdict —
+/// the host never learns the program's exit status, because it never waits for
+/// it. `output` names what was started so a human can find it again.
+#[test]
+fn detached_launch_outcome_reports_the_launch_never_an_exit_status() {
+    assert_eq!(
+        launch_outcome(&Ok(LaunchReport::Unit(
+            "trollshell-launch-caw-7.service".to_owned()
+        ))),
+        EffectOutcome {
+            ok: true,
+            output: Some("launched unit trollshell-launch-caw-7.service".to_owned()),
+        },
+    );
+    // The fallback path says so, rather than pretending it got a unit.
+    let fallback = launch_outcome(&Ok(LaunchReport::Process(4242)));
+    assert!(fallback.ok);
+    let text = fallback.output.expect("the fallback names the pid");
+    assert!(text.contains("pid 4242"), "{text}");
+    assert!(text.contains("no systemd-run"), "{text}");
+    // A refused launch is the only `ok: false` there is here.
+    let failed = launch_outcome(&Err("systemd-run --user failed (exit status: 1)".to_owned()));
+    assert!(!failed.ok);
+    assert!(
+        failed
+            .output
+            .expect("a failure explains itself")
+            .contains("systemd-run --user failed"),
+    );
+}
+
+/// #953 regression guard for the *other* mode: the attached `RunCommand` still
+/// runs the program to completion and routes its **exit status** back, which is
+/// the behaviour the detached mode had to be added beside rather than replace.
+/// (`command_outcome_maps_success_and_stdout` and
+/// `command_outcome_truncates_long_output` in `effects.rs` pin the stdout
+/// mapping; this pins that a real child is still awaited.)
+#[tokio::test]
+async fn attached_run_command_still_awaits_the_program_and_routes_its_exit_status() {
+    let ok = execute_command("t", 1, &["true".to_owned()]).await;
+    assert!(ok.ok, "a zero exit is reported as ok");
+    let bad = execute_command("t", 2, &["false".to_owned()]).await;
+    assert!(!bad.ok, "a non-zero exit is reported as not-ok");
+    let missing = execute_command("t", 3, &["trollshell-no-such-binary-953".to_owned()]).await;
+    assert!(!missing.ok, "a spawn failure is reported, never a hang");
+    let empty = execute_command("t", 4, &[]).await;
+    assert!(!empty.ok, "an empty argv is reported, never a panic");
+}
+
+/// #953, the behavioural half: a detached launch of a **30 s** program returns a
+/// launch verdict essentially immediately — nowhere near the attached mode's
+/// 10 s `RUN_COMMAND_TIMEOUT` — and the program is still running afterwards.
+///
+/// Gated to `system-tests` because it starts a real process (and, where a user
+/// manager answers, a real transient unit). Both launch paths are legitimate
+/// outcomes and the test says which one ran; only a launch that fails outright
+/// (no user manager *and* no spawnable program) skips.
+///
+/// This is the test the falsification deletes into: making the detached path
+/// await the program — `--scope`/`--wait` on the systemd path, `child.wait()`
+/// instead of `drop(child)` on the fallback — turns the elapsed assertion red.
+#[cfg(feature = "system-tests")]
+#[tokio::test]
+async fn detached_launch_returns_at_once_and_the_program_outlives_the_call() {
+    use super::effects::start_detached;
+
+    /// `true` while `pid` is a live (non-zombie) process. A `/proc/<pid>`
+    /// existence check alone would pass for a zombie, which is exactly what an
+    /// exited-but-unreaped child looks like.
+    fn alive(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // "<pid> (<comm>) <state> …" — comm can contain spaces and parens, so
+        // split at the LAST ')'.
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_owned))
+            .is_some_and(|state| state != "Z")
+    }
+
+    let argv = vec!["sleep".to_owned(), "30".to_owned()];
+    let started = Instant::now();
+    let report = start_detached("ts-detached-953", 953, &argv).await;
+    let elapsed = started.elapsed();
+
+    let report = match report {
+        Ok(report) => report,
+        // `start_detached` already falls back to a direct spawn when there is no
+        // `systemd-run` to call, so the *only* "not available here" shape left is
+        // a `systemd-run` that ran and found no user manager on the other end.
+        // Every other refusal is a real failure and must fail the test — a skip
+        // condition wide enough to swallow them would make this test unable to
+        // go red, which is exactly what the falsification checks.
+        Err(e) if e.contains("Failed to connect to bus") => {
+            eprintln!("skipping: no systemd user manager on this host ({e})");
+            return;
+        }
+        Err(e) => panic!("detached launch failed: {e}"),
+    };
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "a detached launch must not await the program (it sleeps 30s); took {elapsed:?}",
+    );
+
+    // Give the program a beat to actually be running, then check liveness and
+    // clean up. Cleanup happens *before* the assertion so a failure can't leak
+    // a 30 s process or a transient unit.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    match &report {
+        LaunchReport::Unit(unit) => {
+            eprintln!("detached launch took the systemd-run path: {unit}");
+            let state = tokio::process::Command::new("systemctl")
+                .args(["--user", "is-active", unit])
+                .output()
+                .await
+                .expect("systemctl --user is-active");
+            let state = String::from_utf8_lossy(&state.stdout).trim().to_owned();
+            let _ = tokio::process::Command::new("systemctl")
+                .args(["--user", "stop", unit])
+                .output()
+                .await;
+            assert_eq!(
+                state, "active",
+                "the launched program must still be running after the effect returned",
+            );
+        }
+        LaunchReport::Process(pid) => {
+            eprintln!("detached launch took the direct-spawn fallback: pid {pid}");
+            let still_running = alive(*pid);
+            let _ = tokio::process::Command::new("kill")
+                .arg(pid.to_string())
+                .output()
+                .await;
+            assert!(
+                still_running,
+                "the launched program must still be running after the effect returned",
+            );
+        }
+    }
 }

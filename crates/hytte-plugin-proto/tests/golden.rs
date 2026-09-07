@@ -316,6 +316,7 @@ fn effect_table() -> Vec<Effect> {
         Effect::RunCommand {
             id: 7,
             argv: vec!["vibectl".into(), "status".into()],
+            detached: false,
         },
         Effect::RaiseOsd {
             title: "Leave now".into(),

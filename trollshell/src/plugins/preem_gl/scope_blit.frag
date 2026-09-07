@@ -53,8 +53,17 @@ ivec4 mix_kit(ivec4 a, ivec4 b, int t) {
 
 // `centered`: the pixel centre's normalized coordinate in COORD_ONE units,
 // about -COORD_ONE at the near face and +COORD_ONE at the far one. Doubled
-// internally so an odd extent gets a true middle pixel. Integer division
-// truncates toward zero in GLSL exactly as it does in Rust.
+// internally so an odd extent gets a true middle pixel.
+//
+// This is the pipeline's **one signed integer division**, and it is the one
+// place the GLSL ES spec does not back us up: §5.9 states the negative-operand
+// rule only for `%` ("results are undefined if one or both operands are
+// negative") and says nothing about `/`'s rounding direction, so a driver that
+// floors rather than truncates here is not non-conforming. In practice every
+// driver truncates toward zero, as Rust does. The blast radius if one did not
+// is ≤1 in COORD_ONE units, which is ≤~0.5 in 256ths of `radial` — a whisker
+// inside the parity ceiling, which is why this is a note and not a rewrite.
+// `glslangValidator` cannot catch it; only the harness on glass would.
 int centred(int i, int n) {
     if (n == 0) {
         return 0;

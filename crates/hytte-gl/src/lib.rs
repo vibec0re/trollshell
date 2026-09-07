@@ -739,23 +739,49 @@ pub fn set_blend(_gl: &Gl, blend: Blend) {
     }
 }
 
-/// Turn **dithering** off for this context.
+/// Put the fixed-function state this crate depends on into a known position.
 ///
-/// `GL_DITHER` is one of the two capabilities GL and GLES enable by *default*,
-/// and it is the one thing that can break the exactness argument
-/// [`Format::R8`] rests on: a driver that actually dithers an 8-bit
-/// fixed-point write may perturb the stored value by one LSB, and a phosphor
-/// decayed by `(v * retained) >> 8` cannot survive that — the error compounds
-/// every step rather than washing out.
+/// **Everything a pass writes goes through these**, and GTK owns the same
+/// context: it renders its own scene into the `GtkGLArea`'s FBO with whatever
+/// state its renderer wants, and nothing promises what is left set when a
+/// `render` handler is entered. Each of the four below is a defect that would
+/// be invisible in code review and obvious only on glass, so they are set once
+/// per render rather than assumed:
 ///
-/// Every mainstream desktop driver no-ops dithering at 8 bits per channel, so
-/// this has never been observed to matter. It is here because "never observed"
-/// is not the same as "cannot happen", and the alternative is a bit-exactness
-/// claim whose last step is a driver's discretion. One enum-only call, made
-/// once per render alongside the rest of the fixed-function setup.
-pub fn disable_dither(_gl: &Gl) {
-    // SAFETY: a context is current and the call takes only an enum constant.
-    unsafe { gl::Disable(gl::DITHER) };
+/// * **`GL_DITHER`** — enabled by default in both GL and GLES, and the one
+///   thing that can break the exactness argument [`Format::R8`] rests on: a
+///   driver that actually dithers an 8-bit fixed-point write may perturb the
+///   stored value by one LSB, and a phosphor decayed by `(v * retained) >> 8`
+///   cannot survive that — the error compounds every step rather than washing
+///   out. Every mainstream desktop driver no-ops dithering at 8 bits per
+///   channel, which is not the same as "cannot happen".
+/// * **`GL_SCISSOR_TEST`** — a live scissor rect would silently clip an
+///   offscreen pass to whatever region GTK last drew. It was only ever off here
+///   as a side effect of [`clear`] disabling it, which made the *ordering* of
+///   the first clear load-bearing and written down nowhere.
+/// * **`glColorMask`** — a masked-off channel writes nothing, so a phosphor
+///   pass would read back its own previous contents and a blit would drop a
+///   colour. Never set by this crate before, i.e. inherited.
+/// * **`GL_DEPTH_TEST`/`GL_STENCIL_TEST`** — the surface asks for neither
+///   buffer, but an *enabled* test against an absent buffer is a driver's
+///   choice, not a no-op by definition.
+///
+/// `GL_FRAMEBUFFER_SRGB` is deliberately **not** here: it is not core GLES
+/// (only `EXT_sRGB_write_control`), and the surface pins a GLES context, so
+/// there is nothing portable to pin. Whether GTK hands us a linear or an sRGB
+/// framebuffer is the one colour-space question this design could not settle
+/// from the sources, and it is a live-verify item (`docs/live-verify.md`,
+/// "#893 stage B" item 1) rather than something this call could fix.
+pub fn reset_fixed_function_state(_gl: &Gl) {
+    // SAFETY: a context is current and every call takes only enum constants or
+    // plain scalars — none dereferences a pointer or names an object id.
+    unsafe {
+        gl::Disable(gl::DITHER);
+        gl::Disable(gl::SCISSOR_TEST);
+        gl::Disable(gl::DEPTH_TEST);
+        gl::Disable(gl::STENCIL_TEST);
+        gl::ColorMask(gl::TRUE, gl::TRUE, gl::TRUE, gl::TRUE);
+    }
 }
 
 /// Set the viewport, refusing an extent that does not fit `GLsizei`.
@@ -768,8 +794,16 @@ pub fn viewport(_gl: &Gl, x: i32, y: i32, width: u32, height: u32) {
 }
 
 /// Clear the bound framebuffer's colour to `rgba`.
+///
+/// The scissor is disabled here **as well as** in
+/// [`reset_fixed_function_state`], and that repetition is deliberate: a clear
+/// is the one operation whose whole contract is "the entire target, whatever
+/// was there", so it must not depend on a caller having reset the state first.
+/// Before that function existed this call was the *only* place the scissor was
+/// touched, which made "`Resources::build` clears before the first pass" a
+/// load-bearing ordering that nothing wrote down.
 pub fn clear(_gl: &Gl, rgba: [f32; 4]) {
-    // SAFETY: a context is current; both calls take only scalars.
+    // SAFETY: a context is current; every call takes only scalars or enums.
     unsafe {
         gl::Disable(gl::SCISSOR_TEST);
         gl::ClearColor(rgba[0], rgba[1], rgba[2], rgba[3]);

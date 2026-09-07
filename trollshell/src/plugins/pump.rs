@@ -861,6 +861,26 @@ fn request_preem_repaint(moved: &[Scope]) {
     });
 }
 
+/// [`request_preem_repaint_all`], deferred and guarded — the *failure* path.
+///
+/// Two differences from the accent path, both forced by where this is called
+/// from (`preem_gl`'s context-failure hook):
+///
+/// * **Guarded**, because a context can fail before or without a live host —
+///   and in a hermetic test, where there are no mailboxes to re-map and the
+///   `expect` below would be a panic rather than a diagnosis.
+/// * **Deferred to idle**, because the caller is inside a `GtkGLArea`
+///   `realize`/`render` handler. Re-mapping a widget tree from there would
+///   reconcile widgets — creating and destroying them — in the middle of GTK
+///   rendering one.
+pub(super) fn request_preem_repaint_all_when_live() {
+    let live = registry::with(|r| r.get::<PluginHandles>().is_some());
+    if !live {
+        return;
+    }
+    glib::idle_add_local_once(request_preem_repaint_all);
+}
+
 /// Re-map every mount mailbox, whoever is in it — the accent path.
 ///
 /// A skin change re-tints *every* shell-rendered preem surface at once

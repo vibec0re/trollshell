@@ -21,10 +21,15 @@
 //! and `hytte-ui` does not (and must not) depend on `hytte-preem`, so a harness
 //! there would need its own copy of both halves — and a harness that agrees
 //! with itself by construction measures nothing. Here it pulls in the shell's
-//! own `preem_gl::program` with `#[path]`, so what it measures is the code that
-//! ships. Examples are not built by `nix build` (crane runs `cargo build
-//! --workspace`, which skips them) and `postInstall` copies a hardcoded binary
-//! list, so this reaches no closure.
+//! own `preem_gl::program` and `preem_gl::parity` with `#[path]`, so what it
+//! measures — and the arithmetic it measures with — is the code that ships.
+//!
+//! It reaches no closure, but **not** because `nix build` skips examples: the
+//! workspace derivation sets `doCheck = true` and `cargo test --workspace`
+//! builds every example, which is exactly how `nix/package.nix` harvests the
+//! `probe`/`wifi_probe` binaries out of `target/release/examples/`. What keeps
+//! this one out is that it is not in `postInstall`'s hardcoded copy list and
+//! has no `[[example]]` entry asking to be installed.
 //!
 //! # What it measures, and what it cannot
 //!
@@ -45,6 +50,13 @@
 //!   multiple of the grid. The harness sizes the area to the natural size to
 //!   avoid it; a mismatch here means the window manager overrode the size
 //!   request, and the harness says so.
+//!
+//! The statistic is **per channel** and the verdict takes the worst of the
+//! three — #893's answer 4 states the ceiling per channel, and one lumped
+//! R+G+B population divides a single-channel drift by three. It also folds in
+//! the per-column peak-row check and a guard against reporting numbers against
+//! an **undrawn** framebuffer; see `preem_gl::parity` for all three and their
+//! tests.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -58,6 +70,13 @@ use hytte_preem as kit;
 // why this is a `#[path]` include and not a second copy.
 #[path = "../src/plugins/preem_gl/program.rs"]
 mod program;
+// The delta statistics and the verdict. Also a `#[path]` include, and for a
+// second reason on top of the first: `cargo test` does not run `#[test]`s
+// inside an example (examples default to `test = false`), so the arithmetic
+// that decides #893's ceiling lives in the shell's tree — `#[cfg(test)]`-
+// mounted there — where `cargo test -p trollshell --lib` actually runs it.
+#[path = "../src/plugins/preem_gl/parity.rs"]
+mod parity;
 
 /// Logical grid the cases run at. Small enough to keep the whole comparison on
 /// screen at 1× and wide enough that the graticule's 12-column pitch repeats.
@@ -68,10 +87,14 @@ const SCALE: u32 = 2;
 /// Phosphor persistence — the kit's default, a ~17-step settle.
 const PERSISTENCE: u16 = 184;
 
-/// The spec's proposed ceiling, per channel, in 255ths.
-const CEILING_MEAN: f64 = 2.0;
-const CEILING_P99: f64 = 8.0;
-const CEILING_MAX: f64 = 32.0;
+/// Whether any case failed, for [`main`]'s exit status.
+///
+/// A process-global rather than a value threaded out of `activate`, because
+/// there is nowhere to thread it *to*: `GApplication::run` returns the
+/// application's own status, which nothing here sets, and the `activate`
+/// callback returns `()`. `Relaxed` is enough — it is written on the GTK main
+/// thread and read after `run` returns on the same thread.
+static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn main() -> glib::ExitCode {
     let skins = match parse_skins(&std::env::args().skip(1).collect::<Vec<_>>()) {
@@ -85,14 +108,27 @@ fn main() -> glib::ExitCode {
     println!("=== preem_gl_diff — #893 stage B parity harness ===");
     println!(
         "grid {COLS}x{ROWS} scale {SCALE} persistence {PERSISTENCE}; \
-         ceiling mean {CEILING_MEAN} / p99 {CEILING_P99} / max {CEILING_MAX} per channel"
+         ceiling mean {} / p99 {} / max {} per channel",
+        parity::CEILING_MEAN,
+        parity::CEILING_P99,
+        parity::CEILING_MAX,
     );
 
     let app = gtk::Application::builder()
         .application_id("mov.vibec0re.trollshell.preem-gl-diff")
         .build();
     app.connect_activate(move |app| activate(app, &skins));
-    app.run_with_args::<&str>(&[])
+    let status = app.run_with_args::<&str>(&[]);
+    // **The verdict is ours, not `GApplication`'s.** `run_with_args` returns the
+    // application's exit status, which nothing in this program sets, so a
+    // ceiling breach, a missing context, a GL error and a short readback all
+    // came back `0` before this. The transcript goes on #893 to settle the
+    // ceiling; a harness that always exits clean cannot be scripted, cannot be
+    // trusted at a glance, and would let a red run be pasted as a green one.
+    if FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return glib::ExitCode::FAILURE;
+    }
+    status
 }
 
 /// `--skins vfd,lcd,oled,crt` (default: all four).
@@ -188,9 +224,17 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle]) {
             if next >= cases.len() {
                 println!("-- summary --");
                 if failures.get() == 0 {
-                    println!("PASS every case is inside the proposed ceiling");
+                    println!(
+                        "PASS all {} case(s) inside the proposed ceiling on every channel",
+                        cases.len()
+                    );
                 } else {
-                    println!("FAIL {} case(s) outside the ceiling", failures.get());
+                    println!(
+                        "FAIL {} of {} case(s) — see the per-case verdict above",
+                        failures.get(),
+                        cases.len()
+                    );
+                    FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 println!("=== preem_gl_diff done — paste this into issue #893 ===");
                 app.quit();
@@ -250,21 +294,22 @@ fn drive(area: &GlSurface, case: &Case) {
     );
 }
 
-/// Read the GL frame back, build the CPU reference, and print the deltas.
-/// Returns whether the case is inside the ceiling.
+/// Read the GL frame back, build the CPU reference, and print the per-channel
+/// deltas. Returns whether the case passed — see [`parity::Verdict`] for the
+/// four ways it can fail.
 fn measure(area: &GlSurface, case: &Case) -> bool {
     let label = format!("{}.idle{}", case.style.name(), case.idle_steps);
     if let Some(error) = area.error() {
-        println!("FAIL {label}: no GL context — {error}");
+        println!("FAIL(context) {label}: no GL context — {error}");
         return false;
     }
     let Some(context) = area.context() else {
-        println!("FAIL {label}: the area never realized");
+        println!("FAIL(context) {label}: the area never realized");
         return false;
     };
     context.make_current();
     let Ok(gl) = hytte_gl::Gl::current() else {
-        println!("FAIL {label}: the GL entry points could not be resolved");
+        println!("FAIL(context) {label}: the GL entry points could not be resolved");
         return false;
     };
     // Back to GTK's own framebuffer — a `GtkGLArea` does not render into 0 —
@@ -285,11 +330,17 @@ fn measure(area: &GlSurface, case: &Case) -> bool {
     }
     let raw = hytte_gl::read_rgba8(&gl, alloc.0, alloc.1);
     if let Some(code) = gl.take_error() {
-        println!("FAIL {label}: the framebuffer readback raised GL error {code:#x}");
+        println!("FAIL(gl) {label}: the framebuffer readback raised GL error {code:#x}");
         return false;
     }
-    if raw.len() != (alloc.0 as usize) * (alloc.1 as usize) * 4 {
-        println!("FAIL {label}: readback returned {} bytes", raw.len());
+    let wanted = (alloc.0 as usize) * (alloc.1 as usize) * 4;
+    if raw.len() != wanted || wanted == 0 {
+        println!(
+            "FAIL(readback) {label}: got {} bytes for a {}x{} framebuffer, wanted {wanted} bytes",
+            raw.len(),
+            alloc.0,
+            alloc.1,
+        );
         return false;
     }
 
@@ -313,105 +364,42 @@ fn measure(area: &GlSurface, case: &Case) -> bool {
         );
     }
 
-    let stats = compare(&raw, alloc, &reference, scale);
-    let verdict =
-        if stats.mean <= CEILING_MEAN && stats.p99 <= CEILING_P99 && stats.max <= CEILING_MAX {
-            "PASS"
-        } else {
-            "FAIL"
-        };
-    println!(
-        "{verdict} {label}: mean {:.3} p99 {:.0} max {:.0} of 255 over {} px; \
-         peak-row mismatches {}/{COLS}",
-        stats.mean, stats.p99, stats.max, stats.pixels, stats.peak_row_mismatches
+    let stats = parity::compare(
+        &raw,
+        reference.data(),
+        parity::Layout {
+            alloc,
+            reference: (reference.width(), reference.height()),
+            device_scale: scale,
+            // The kit's beam is `2 * GLOW_SPAN + 1` grid rows tall, so a peak
+            // that moved less than that is rounding rather than a structural
+            // difference. Expressed in *reference* pixels, hence the upscale.
+            peak_row_tolerance: (scale as usize) * (SCALE as usize),
+        },
     );
-    verdict == "PASS"
-}
-
-/// Per-channel absolute-difference statistics plus the structural check.
-struct Stats {
-    mean: f64,
-    p99: f64,
-    max: f64,
-    pixels: usize,
-    peak_row_mismatches: u32,
-}
-
-/// Compare the GL readback against the kit's frame.
-///
-/// `raw` is GL-order (bottom-up) RGBA8 at `alloc` pixels; `reference` is the
-/// kit's top-down RGBA8 at the natural size. `device_scale` is the integer
-/// framebuffer multiplier, so a capture on a scaled output is point-sampled
-/// back down rather than compared against a different-sized reference.
-fn compare(raw: &[u8], alloc: (u32, u32), reference: &kit::Frame, device_scale: u32) -> Stats {
-    let ref_w = reference.width();
-    let ref_h = reference.height();
-    let mut deltas: Vec<u8> = Vec::with_capacity(ref_w * ref_h * 3);
-    let mut peak_row_mismatches = 0_u32;
-
-    let gl_at = |x: usize, y: usize| -> [u8; 3] {
-        // Bottom-up, and point-sampled through the device scale.
-        let sx = x * device_scale as usize;
-        let sy = y * device_scale as usize;
-        let flipped = (alloc.1 as usize).saturating_sub(1).saturating_sub(sy);
-        let i = (flipped * alloc.0 as usize + sx) * 4;
-        raw.get(i..i + 3)
-            .map_or([0, 0, 0], |px| [px[0], px[1], px[2]])
-    };
-    let ref_at = |x: usize, y: usize| -> [u8; 3] {
-        let i = (y * ref_w + x) * 4;
-        reference
-            .data()
-            .get(i..i + 3)
-            .map_or([0, 0, 0], |px| [px[0], px[1], px[2]])
-    };
-    let luma = |px: [u8; 3]| u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2]);
-
-    for x in 0..ref_w {
-        let (mut gl_peak, mut gl_peak_row) = (0, 0);
-        let (mut cpu_peak, mut cpu_peak_row) = (0, 0);
-        for y in 0..ref_h {
-            let (g, c) = (gl_at(x, y), ref_at(x, y));
-            for channel in 0..3 {
-                deltas.push(g[channel].abs_diff(c[channel]));
-            }
-            if luma(g) > gl_peak {
-                gl_peak = luma(g);
-                gl_peak_row = y;
-            }
-            if luma(c) > cpu_peak {
-                cpu_peak = luma(c);
-                cpu_peak_row = y;
-            }
-        }
-        // One logical row of tolerance: the beam's own glow is 5 rows tall, so
-        // a peak that moved further than a row is a real structural difference
-        // and not a rounding one.
-        if gl_peak_row.abs_diff(cpu_peak_row) > device_scale as usize * SCALE as usize {
-            peak_row_mismatches += 1;
-        }
+    let verdict = stats.verdict();
+    println!(
+        "{} {label}: worst channel mean {:.3} p99 {:.0} max {:.0} of 255 \
+         over {} px; peak-row mismatches {}/{COLS}",
+        verdict.label(),
+        stats.worst_mean(),
+        stats.worst_p99(),
+        stats.worst_max(),
+        stats.pixels,
+        stats.peak_row_mismatches,
+    );
+    for (channel, name) in stats.channels.iter().zip(parity::CHANNELS) {
+        println!(
+            "      {name}: mean {:.3} p99 {:.0} max {:.0} of 255{}",
+            channel.mean,
+            channel.p99,
+            channel.max,
+            if channel.inside_ceiling() {
+                ""
+            } else {
+                "   <-- outside the ceiling"
+            },
+        );
     }
-
-    let pixels = deltas.len();
-    let sum: u64 = deltas.iter().map(|d| u64::from(*d)).sum();
-    #[allow(clippy::cast_precision_loss)]
-    let mean = if pixels == 0 {
-        0.0
-    } else {
-        sum as f64 / pixels as f64
-    };
-    deltas.sort_unstable();
-    #[allow(clippy::cast_precision_loss)]
-    let p99 = deltas
-        .get(pixels.saturating_mul(99) / 100)
-        .or_else(|| deltas.last())
-        .map_or(0.0, |d| f64::from(*d));
-    let max = deltas.last().map_or(0.0, |d| f64::from(*d));
-    Stats {
-        mean,
-        p99,
-        max,
-        pixels,
-        peak_row_mismatches,
-    }
+    verdict.is_pass()
 }

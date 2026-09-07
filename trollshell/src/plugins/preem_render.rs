@@ -616,6 +616,18 @@ enum Renderer {
         /// The absolute step index `samples` is stamped on, or `None` before
         /// any batch has been consumed. Reaches the shader as a distance back
         /// from the newest step — see `preem_gl::scope_surface`.
+        ///
+        /// **One batch per render, not one per step.** There is a single
+        /// `samples`/`batch_step` slot, so if two animation steps carrying
+        /// *different* batches elapse between two renders, only the newer one
+        /// is on the wire and the older step flatlines on the axis in the
+        /// shader instead of stamping what it stamped on the CPU. Unreachable
+        /// while renders keep up with the 20 Hz step rate — `queue_render`
+        /// rides the same frame clock the tick does, so a step and a render
+        /// alternate — but it is the mechanism behind
+        /// `hytte_ui::gl_surface::fresh_last_drawn`: a surface replaying steps
+        /// whose batches have scrolled out of this slot is exactly the case
+        /// that made a hot-plugged monitor flash a bright axis band.
         batch_step: Option<u64>,
         /// Total animation steps since this renderer was built. Monotonic, and
         /// the surface's idempotence key: it replays exactly the steps it has
@@ -1496,6 +1508,42 @@ fn state_animates(state: &ScopeState) -> bool {
 /// rebuilt. That is free: the text box is pure, so a rebuild loses no animation
 /// state. Every other widget takes its `DisplayStyle` per render and re-tints on
 /// the re-rasterise alone.
+/// Rebuild every `ScopeGl` instance onto the CPU kit, now — the GL
+/// context-failure path (#893).
+///
+/// [`apply`] already drops a `ScopeGl` to the kit on its next pass (`gl_lost`),
+/// and for an *animating* scope that is enough: the frame clock is unparked, so
+/// a pass is coming. **For a settled one it is not.** A plugin may legally
+/// declare `persistence: 256` — the kit's own infinite-persistence value — and
+/// `build` then gives the renderer `fades: false`, `pending: None`, which makes
+/// [`Renderer::animates`] `false` immediately. #926's clock parks, nothing
+/// re-maps, `apply` is never re-entered, and the chip stays **blank** until the
+/// plugin happens to send another frame — which a settled widget, by
+/// definition, may never do.
+///
+/// So the rebuild happens here rather than being waited for, exactly as
+/// [`invalidate_cached_frames`] rebuilds a `TextBox`. It is free in the same
+/// way: the fallback restarts the phosphor from black either way, because the
+/// GL arm never drew a trail there was anything to inherit.
+///
+/// This is only half the fix — the instance now holds a CPU renderer, but the
+/// *widget* on screen is still a `GlSurface` node until something re-maps the
+/// tree. `preem_gl`'s hook asks `pump` for that repaint; this half is the one a
+/// hermetic test can witness.
+pub(super) fn rebuild_gl_renderers_on_cpu() {
+    STORE.with_borrow_mut(|store| {
+        for state in store.values_mut() {
+            for instance in state.instances.values_mut() {
+                if matches!(instance.renderer, Some(Renderer::ScopeGl { .. })) {
+                    instance.renderer = build(&instance.applied);
+                    instance.builds = instance.builds.saturating_add(1);
+                    instance.cached = None;
+                }
+            }
+        }
+    });
+}
+
 pub(super) fn invalidate_cached_frames() {
     ROLE_INKS.set(None);
     STORE.with_borrow_mut(|store| {

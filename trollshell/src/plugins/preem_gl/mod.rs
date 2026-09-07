@@ -39,6 +39,17 @@
 
 mod program;
 
+/// The parity harness's arithmetic — see the module docs there.
+///
+/// Mounted **only under `cfg(test)`**, and that is the whole point of it being
+/// a module rather than lines in `examples/preem_gl_diff.rs`: `cargo test` does
+/// not run `#[test]`s inside an example (examples default to `test = false`),
+/// so the statistic that decides #893's ceiling would have been guarded by
+/// tests that compile and never execute. The harness `#[path]`-includes this
+/// same file; the shell links none of it.
+#[cfg(test)]
+mod parity;
+
 pub(super) use program::{SCOPE, SCOPE_PIPELINE, ScopeSurface, scope_surface};
 
 /// The kill switch. `cpu` forces the CPU kit; unset or anything else is GL.
@@ -128,18 +139,28 @@ pub(super) fn install() {
     hytte::ui::gl_surface::register(SCOPE, SCOPE_PIPELINE);
     hytte::ui::gl_surface::set_context_failure_handler(|_reason| {
         // `hytte-ui` has already logged the reason once. What is left for the
-        // host is to make the fallback take effect promptly: dropping the
-        // cached frames means the next mapping pass re-runs `apply`, which
-        // rebuilds every `ScopeGl` instance onto the CPU kit (see
-        // `preem_render::apply`).
+        // host is to make the fallback actually reach the screen, and that is
+        // two things, because **waiting for the animation clock does not
+        // work**: a plugin may declare `persistence: 256`, the kit's own
+        // infinite-persistence value, and such a scope answers `animates()`
+        // with `false` from the moment it is built. #926's clock parks it, no
+        // mapping pass is coming, and `apply`'s `gl_lost` rebuild — which is
+        // what handles the animating case — is never re-entered. The chip would
+        // stay blank until the plugin sent another frame, which a settled
+        // widget may never do.
         //
-        // No repaint is *forced* from here. `pump`'s fan-out is private to that
-        // module and this change deliberately leaves `pump.rs` untouched — and
-        // it costs nothing: a scope that just failed to get a context is,
-        // almost by definition, still animating (it was built because something
-        // was moving), so the next frame-clock tick re-maps it anyway. A
-        // settled one has nothing on screen to correct.
+        // 1. Rebuild every `ScopeGl` instance onto the kit right now, the way
+        //    `invalidate_cached_frames` rebuilds a `TextBox`. Also drops the
+        //    caches, so a *non*-GL widget re-renders too.
+        super::preem_render::rebuild_gl_renderers_on_cpu();
         super::preem_render::invalidate_cached_frames();
+        // 2. Ask for one full re-map, so the reconciler swaps the on-screen
+        //    `GlSurface` node for the `Pixels` one the rebuilt instance now
+        //    produces. Guarded (a context can fail with no live host) and
+        //    deferred to idle (we are inside a `GtkGLArea` realize/render
+        //    handler, and reconciling a widget tree from there would create and
+        //    destroy widgets mid-render).
+        super::pump::request_preem_repaint_all_when_live();
     });
 }
 

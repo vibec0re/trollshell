@@ -3458,4 +3458,87 @@ mod gtk_tests {
             "echoed value suppressed during the active drag; thumb stays where the user put it",
         );
     }
+
+    /// **`build_node` and `update_in_place` are the only two sites that move a
+    /// `Node::GlSurface`'s props into the widget, and neither had coverage.**
+    ///
+    /// Deleting `surface.set_state(…)` from *either* arm left the whole
+    /// `--features system-tests` suite green: the three reconciler tests that
+    /// name `GlSurface` all go through `node_kind` / `node_id` / `node_classes`,
+    /// the shallow accessors, and never look at what reached the widget. A GL
+    /// chip mounted with no program, no uniforms and a 0×0 natural size — or
+    /// one that never receives a new state, never resizes and never re-renders
+    /// — shipped clean.
+    ///
+    /// This needs **no GL context**: `set_state` only writes the natural size
+    /// and the dedup cell, and only `render` calls GL, so a surface reconciled
+    /// into an unmapped `gtk::Box` never realizes. The size `measure()` reports
+    /// is a hermetic witness that the props arrived.
+    ///
+    /// **Falsified** on both arms — replace either `surface.set_state(…)` with
+    /// `let _ = (program, width, height, state);` and this goes red, on the
+    /// build assertion and the update assertion respectively.
+    #[gtk::test]
+    fn a_gl_surface_node_applies_its_props_on_build_and_on_update() {
+        fn gl(width: u32, height: u32) -> Node {
+            Node::GlSurface {
+                id: Some("scope".to_owned()),
+                width,
+                height,
+                program: crate::gl_surface::GlProgram("preem.scope"),
+                state: Arc::new(crate::gl_surface::GlUniforms {
+                    grid: (width, height),
+                    ..Default::default()
+                }),
+                classes: vec![],
+            }
+        }
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+
+        // `build_node`: the node's natural size reaches the widget.
+        rec.render(&hbox(vec![gl(288, 96)]));
+        let first = root
+            .first_child()
+            .expect("the box mounted")
+            .first_child()
+            .expect("the surface mounted");
+        let surface = first
+            .downcast_ref::<crate::gl_surface::GlSurface>()
+            .expect("a GlSurface, not some other widget");
+        assert_eq!(
+            first.measure(gtk::Orientation::Horizontal, -1).1,
+            288,
+            "build_node moved the node's width into the widget",
+        );
+        assert_eq!(
+            first.measure(gtk::Orientation::Vertical, 288).1,
+            96,
+            "…and its height, aspect-locked for the width offered",
+        );
+        assert!(
+            !surface.has_error(),
+            "an unmapped surface never realized, so it has no context error",
+        );
+
+        // `update_in_place`: a same-id re-render keeps the widget and moves the
+        // new props, rather than leaving the surface on its first frame for ever.
+        rec.render(&hbox(vec![gl(144, 48)]));
+        let same = root
+            .first_child()
+            .expect("the box survived")
+            .first_child()
+            .expect("the surface survived");
+        assert_eq!(same, first, "the widget is reused, not rebuilt");
+        assert_eq!(
+            same.measure(gtk::Orientation::Horizontal, -1).1,
+            144,
+            "update_in_place moved the new width in",
+        );
+        assert_eq!(
+            same.measure(gtk::Orientation::Vertical, 144).1,
+            48,
+            "…and the new height",
+        );
+    }
 }

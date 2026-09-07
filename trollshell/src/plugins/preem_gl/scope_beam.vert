@@ -69,9 +69,20 @@ float sample_at(int x, int width) {
 //
 // `floor(x + 0.5)` rather than `round(x)`: GLSL leaves the direction of a
 // halfway case implementation-defined, while Rust's `f32::round` is
-// away-from-zero. The argument here is non-negative by construction (the
-// amplitude never exceeds the centre), so `floor(x + 0.5)` *is* away-from-zero
-// — and it removes the one place the two ends could legitimately disagree.
+// away-from-zero. This spelling pins the direction, which removes the one place
+// the two ends could legitimately disagree.
+//
+// **Non-negativity is not why the two agree**, though an earlier version of
+// this comment said so. `floor(x + 0.5)` differs from `f32::round` at exactly
+// one non-negative `f32` — `0.49999997`, where `x + 0.5` rounds *up* to `1.0`
+// in the addition and floors to 1 while `round` gives 0 (brute-forced over
+// every bit pattern in `[0, 4096]`: one mismatch, that one). What makes it
+// unreachable *here* is the argument's range, not its sign: with
+// `amplitude = max(centre - GLOW_SPAN, 0)` the value is either exactly
+// `centre ∈ {0, 0.5, 1, 1.5, 2}` (when `rows <= 5` and the amplitude is zero)
+// or at least `2` (`centre - amplitude == 2` exactly). Nothing lands near
+// `0.49999997`. Do not carry "non-negative, therefore equivalent" into another
+// shader — #893's shader widget would inherit a false rule.
 int row_for(float value, int height) {
     if (height == 0) {
         return 0;

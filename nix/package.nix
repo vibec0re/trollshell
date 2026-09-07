@@ -32,16 +32,23 @@ let
   #   - assets/hytte-ui/style.css — hytte-ui's DEFAULT_STYLESHEET fallback
   #     (crates/hytte-ui/src/app.rs) include_str!'s this one file at compile
   #     time, so it must be present even though the rest of `assets/` isn't.
-  #   - *.vert / *.frag / *.glsl — the preem GL renderer's shaders (#893 stage
-  #     B), which `trollshell/src/plugins/preem_gl/program.rs` include_str!'s.
-  #     Today's files are all `.vert`/`.frag` (the extension names the stage,
-  #     for glslangValidator and for a reader); `.glsl` is kept too so a shared
-  #     include added later does not repeat this debugging session. They are
-  #     deliberately under `src/` rather than `assets/` (the design spec says
-  #     so) because they are compiled into the binary, not loaded at runtime —
-  #     but crane's filter is by *extension*, so `src/` does not save them and
-  #     without this clause every `nix build` fails on a missing file while
-  #     `cargo build` passes locally (the #480/#446 trap, from the other side).
+  #   - *.vert / *.frag — the preem GL renderer's shaders (#893 stage B), which
+  #     `trollshell/src/plugins/preem_gl/program.rs` include_str!'s. The
+  #     extension names the stage, for glslangValidator and for a reader. They
+  #     are deliberately under `src/` rather than `assets/` (the design spec
+  #     says so) because they are compiled into the binary, not loaded at
+  #     runtime — but crane's filter is by *extension*, so `src/` does not save
+  #     them and without this clause every `nix build` fails on a missing file
+  #     while `cargo build` passes locally (the #480/#446 trap, from the other
+  #     side).
+  #
+  #     This list and `nix/lint-glsl.py`'s STAGES table must agree, or one of
+  #     the two silently stops covering a file the other ships. `.glsl` used to
+  #     be kept here speculatively and was *not* in that table, so the first
+  #     `.glsl` file added would have shipped uncompiled — or, once the lint
+  #     learned to see subdirectories, turned the check red with exit 2. A
+  #     shared body added later goes in both places, with a decision about
+  #     which stage(s) to compile it under.
   # No OTHER stylesheets/icons are kept: everything else in `assets/` is
   # loaded from disk at runtime — the binary resolves them via the
   # makeWrapper env (TROLLSHELL_DATA_DIR / HYTTE_UI_DATA_DIR → the `assets`
@@ -58,7 +65,6 @@ let
       (craneLib.filterCargoSources path type)
       || (lib.hasInfix "/tests/fixtures/" path)
       || (lib.hasSuffix "assets/hytte-ui/style.css" path)
-      || (lib.hasSuffix ".glsl" path)
       || (lib.hasSuffix ".vert" path)
       || (lib.hasSuffix ".frag" path);
   };

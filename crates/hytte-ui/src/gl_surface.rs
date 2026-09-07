@@ -89,13 +89,17 @@ use gtk::subclass::prelude::*;
 
 /// Most step passes one `render` will replay, however far behind it is.
 ///
-/// The host already bounds catch-up on its own side (`trollshell`'s
-/// `MAX_CATCHUP_STEPS` = 8 per frame-clock tick), so on the production path
-/// this is unreachable. It is the guard for the case the host cannot bound: a
-/// surface that was unmapped for a minute while its state kept advancing, and
-/// then remaps. Replaying that honestly would burn the whole absence in decay
-/// passes for a trail that is fully faded either way, so it catches up as far
-/// as this and skips the rest — the same trade `Steps::owed` makes upstream.
+/// The host bounds catch-up on its own side (`trollshell`'s
+/// `MAX_CATCHUP_STEPS` = 8 per frame-clock tick), but that bound is per *tick*
+/// while `last_drawn` is per *surface*, so it does not carry: a surface that
+/// was unmapped for a minute while its state kept advancing comes back owing
+/// the whole absence. Replaying that honestly would burn it in decay passes for
+/// a trail that is fully faded either way, so it catches up as far as this and
+/// skips the rest — the same trade `Steps::owed` makes upstream.
+///
+/// A **freshly built** accumulator is the other half of that story and is not
+/// this constant's job: it has no trail to catch up to at all, and starts level
+/// with the state instead. See [`fresh_last_drawn`].
 const MAX_STEPS_PER_RENDER: u64 = 64;
 
 /// Sampler uniform names, by input index. A fixed table rather than a
@@ -109,9 +113,15 @@ const SAMPLER_NAMES: [&str; 4] = ["u_tex0", "u_tex1", "u_tex2", "u_tex3"];
 /// [`GlSurface::new`]), which makes the dialect a decision rather than a
 /// negotiation outcome — GDK negotiated GLES 3.2 on the reference hardware
 /// anyway (#886), but "anyway" is not a contract a shader can be written
-/// against. The `precision` defaults are required: ES gives fragment shaders
-/// no default `float`/`int` precision, and every integer recurrence in a
-/// pipeline here needs `highp` to be exact.
+/// against.
+///
+/// The `precision` defaults are **required, not defensive**. ES gives a
+/// fragment shader no default `float` precision at all (it is a compile error
+/// to use one without declaring it) and defaults `int` to `mediump`, which is
+/// only guaranteed ±32767 — and the `Scope`'s CRT mask alone squares a
+/// ±1024 coordinate, reaching ~10⁶. Without `precision highp int` the mask
+/// arithmetic is free to wrap on a conforming driver, silently, on exactly the
+/// integer recurrences the bit-exactness argument rests on.
 const GLSL_HEADER: &str =
     "#version 320 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;";
 
@@ -366,6 +376,29 @@ fn steps_owed(last_drawn: u64, step_seq: u64) -> (u64, bool) {
     ((step_seq - last_drawn).min(MAX_STEPS_PER_RENDER), false)
 }
 
+/// What `last_drawn` starts at for a surface whose accumulator has just been
+/// created (or recreated for a new grid): **level with the newest step**, so
+/// the first render replays exactly one.
+///
+/// Not zero, and that is the whole point. A [`GlPipeline`]'s step passes are
+/// replayed to reconstruct a *trail*, and a freshly-cleared accumulator has no
+/// trail to reconstruct — but the host's state does not restart with the
+/// surface. The renderer instance is shared across mounts while the surface is
+/// per monitor, so a monitor hot-plug hands a brand-new surface a `step_seq`
+/// that has been running for as long as the shell has. Starting at zero made
+/// the first render replay [`MAX_STEPS_PER_RENDER`] steps against an empty
+/// buffer, and a step pass whose per-step input has already scrolled out of the
+/// state does not draw *nothing* — the `Scope`'s beam flatlines on the axis and
+/// stamps it at full intensity — so the new monitor's chip opened with a bright
+/// band across the centre, sixty-three times over, that the CPU arm never draws.
+///
+/// One step, because the newest one is the only one whose input the state still
+/// carries. `step_seq == 0` (a state that has never advanced) stays at zero and
+/// replays nothing.
+fn fresh_last_drawn(step_seq: u64) -> u64 {
+    step_seq.saturating_sub(1)
+}
+
 /// The largest buffer-aspect rect that fits `alloc`, centered — the letterbox
 /// backstop, and the same rule
 /// [`PixelSurface`](crate::PixelSurface)'s `fit_rect` applies, so a GL chip and
@@ -399,7 +432,8 @@ fn fit_rect(alloc_w: i32, alloc_h: i32, buf_w: u32, buf_h: u32) -> (i32, i32, u3
 mod imp {
     use super::{
         GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline, GlProgram, GlTarget, GlUniforms,
-        GlValue, PROGRAMS, SAMPLER_NAMES, abandon_gl, fit_rect, gdk, glib, steps_owed,
+        GlValue, PROGRAMS, SAMPLER_NAMES, abandon_gl, fit_rect, fresh_last_drawn, gdk, glib,
+        steps_owed,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
@@ -585,12 +619,15 @@ mod imp {
                 abandon_gl("the GL entry points could not be resolved");
                 return;
             };
-            // Before anything is written: the phosphor recurrence is exact only
-            // if an 8-bit fixed-point store is exact, and dithering is enabled
-            // by default in both GL and GLES. See `hytte_gl::disable_dither`.
-            hgl::disable_dither(&gl);
+            // Before anything is written. GTK renders its own scene into this
+            // same context and nothing promises what it leaves set, so dither,
+            // scissor, colour mask and the depth/stencil tests are put into a
+            // known position rather than inherited — see
+            // `hytte_gl::reset_fixed_function_state` for what each one would
+            // cost us. Five enum-only calls per render.
+            hgl::reset_fixed_function_state(&gl);
 
-            if !self.ensure_resources(&gl, &pipeline, state.grid) {
+            if !self.ensure_resources(&gl, &pipeline, state.grid, state.step_seq) {
                 return;
             }
             let mut held = self.resources.borrow_mut();
@@ -624,18 +661,25 @@ mod imp {
 
         /// Build or re-size the GL objects; `false` means the surface cannot
         /// draw and the caller should give up for this frame.
-        fn ensure_resources(&self, gl: &hgl::Gl, pipeline: &GlPipeline, grid: (u32, u32)) -> bool {
+        fn ensure_resources(
+            &self,
+            gl: &hgl::Gl,
+            pipeline: &GlPipeline,
+            grid: (u32, u32),
+            step_seq: u64,
+        ) -> bool {
             if let Some(resources) = self.resources.borrow().as_ref()
                 && resources.grid == grid
             {
                 return true;
             }
             // A grid change means new textures, which means a cleared
-            // accumulator — so the step count restarts with it.
+            // accumulator — so the step count restarts with it, at
+            // `fresh_last_drawn` rather than at zero. See there.
             match Resources::build(gl, pipeline, grid) {
                 Ok(resources) => {
                     self.resources.replace(Some(resources));
-                    self.last_drawn.set(0);
+                    self.last_drawn.set(fresh_last_drawn(step_seq));
                     true
                 }
                 Err(error) => {
@@ -962,8 +1006,8 @@ impl Default for GlSurface {
 #[cfg(test)]
 mod tests {
     use super::{
-        GlProgram, GlUniforms, GlValue, MAX_STEPS_PER_RENDER, abandon_gl, fit_rect, gl_abandoned,
-        steps_owed,
+        GlProgram, GlUniforms, GlValue, MAX_STEPS_PER_RENDER, abandon_gl, fit_rect,
+        fresh_last_drawn, gl_abandoned, steps_owed,
     };
     use std::sync::Arc;
 
@@ -1001,6 +1045,33 @@ mod tests {
             (MAX_STEPS_PER_RENDER, false),
             "catch-up is clamped, not replayed"
         );
+    }
+
+    /// A surface built against a long-running state replays **one** step, not
+    /// sixty-four. The accumulator it was just handed is black, so there is no
+    /// trail to catch up *to*, and every replayed step past the newest one
+    /// would stamp a flatline the CPU arm never drew — a bright axis band on a
+    /// hot-plugged monitor, because the renderer instance is shared across
+    /// mounts and the surface is not.
+    ///
+    /// **Falsified** by restoring `self.last_drawn.set(0)` in
+    /// `ensure_resources`, which is what this replaced.
+    #[test]
+    fn a_fresh_surface_does_not_replay_an_absence_it_has_no_trail_for() {
+        assert_eq!(steps_owed(fresh_last_drawn(9_000), 9_000), (1, false));
+        assert_eq!(
+            steps_owed(fresh_last_drawn(1), 1),
+            (1, false),
+            "the debut batch is the one step there is",
+        );
+        assert_eq!(
+            steps_owed(fresh_last_drawn(0), 0),
+            (0, false),
+            "a state that never advanced replays nothing",
+        );
+        // What it replaced, for contrast: the whole clamp against a black
+        // buffer, every step of it stamping a flatline.
+        assert_eq!(steps_owed(0, 9_000), (MAX_STEPS_PER_RENDER, false));
     }
 
     /// A `step_seq` that went backwards means the host rebuilt the state (a

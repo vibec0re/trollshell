@@ -42,8 +42,24 @@ Exactly what the shell compiles, assembled the same way:
     would be checking a source that never ships;
   * every other body is compiled as-is, at the stage its extension names.
 
-It refuses to pass vacuously: a missing header, a missing shader directory, or
-implausibly few shaders is exit 2, not a green tick.
+It refuses to pass vacuously, and every one of those guards is exit **2** (a
+broken check) rather than exit 1 (a broken shader): a missing header, a missing
+shader directory, an unknown extension, a subdirectory it does not know how to
+compile, fewer shaders than `MIN_SHADERS`, fewer compilations than
+`MIN_COMPILATIONS`, or no spliced body at all. Deleting `scope_decay.frag` —
+the file carrying the whole phosphor recurrence — used to be green.
+
+WHAT IT DOES NOT CHECK
+----------------------
+Each stage is compiled **alone**, so the vertex↔fragment varying interface is
+not validated: `fullscreen.vert`'s `out vec2 v_uv` against `scope_blur.frag`'s
+`in vec2 v_uv` would still link at runtime with a mismatched type or a missing
+declaration on one side. Linking the pairs here would mean teaching this script
+the pipeline's pass table, which lives in `program.rs` as Rust — the same
+information `GlPipeline` already carries and `GlSurface` already links for real
+on glass. Uniform-name drift against the bag *is* covered, from the other side:
+`the_mapping_fills_every_uniform_the_shaders_read` parses these same files and
+asserts both directions.
 
 RUNNING IT BY HAND
 ------------------
@@ -65,14 +81,31 @@ SHADER_DIR = Path("trollshell/src/plugins/preem_gl")
 HEADER_SOURCE = Path("crates/hytte-ui/src/gl_surface.rs")
 PROGRAM_SOURCE = SHADER_DIR / "program.rs"
 
-# A tree with fewer than this many shaders is a rename or a bad root, not a
-# tidy-up: fail loudly rather than report "0 problems" over nothing.
-MIN_SHADERS = 5
+# The floors. These are the **current** counts, not counts-with-headroom, and
+# the difference is the point: a lint that tolerates one missing file cannot
+# tell a deletion from a tidy-up. Adding a shader means bumping the number in
+# the same commit, which is a two-second edit and a real review signal;
+# `lint-bind-pins.py` sizes its floor with slack because it counts call sites
+# across three trees, which is a different problem.
+#
+# `scope_decay.frag` carries the whole `(v * retained) >> 8` phosphor
+# recurrence, and with a floor of five against six files its deletion was
+# green.
+MIN_SHADERS = 6
+# Compilations, not files: `scope_blur.frag` is one body compiled twice. A
+# splice that stops being found (a moved `include_str!` path, a `concat!` this
+# script's parser stops recognising) drops this to 6 — today that shows up as a
+# compile failure only because the body happens not to build without its
+# splice, which is luck rather than a guard.
+MIN_COMPILATIONS = 7
+# Distinct bodies that must be spliced rather than compiled as written.
+MIN_SPLICED_BODIES = 1
 
-# `glslangValidator` names the stage by extension, but only for the ones it
-# knows; ours are the two obvious ones and it infers both. Listed anyway so an
-# unknown extension appearing in the directory is an error rather than a file
-# quietly skipped.
+# `glslangValidator` names the stage by extension. `.glsl` is deliberately
+# **absent**: it names no stage, so this script could not compile one, and
+# `nix/package.nix`'s crane filter does not keep it either — the two files agree
+# on exactly this set. A shared body added later needs an entry in both, plus a
+# decision about which stage(s) to compile it under.
 STAGES = {".vert": "vert", ".frag": "frag"}
 
 
@@ -185,16 +218,33 @@ def main() -> int:
     header = read_header()
     splices = read_splices()
 
+    # **Recursive.** `iterdir()` missed anything one directory down, and a
+    # directory has no `.suffix` and is not `is_file()`, so a subdirectory fell
+    # out of the comprehension *without* reaching the unknown-extension guard
+    # below. The crane filter is `lib.hasSuffix ".frag"` on the full path, so
+    # directory position is irrelevant to *it* — a broken shader in
+    # `preem_gl/shaders/` would ship and this check would never see it, which is
+    # precisely the trap it exists to close.
     shaders = sorted(
         path
-        for path in SHADER_DIR.iterdir()
-        if path.suffix in STAGES or (path.is_file() and path.suffix not in {".rs"})
+        for path in SHADER_DIR.rglob("*")
+        if path.is_file() and path.suffix not in {".rs"}
     )
     unknown = [path for path in shaders if path.suffix not in STAGES]
     if unknown:
-        fail(f"unknown shader extension(s): {', '.join(str(p) for p in unknown)}")
+        fail(
+            "unknown shader extension(s), so this check does not know which stage to "
+            f"compile them as: {', '.join(str(p) for p in unknown)}"
+        )
     if len(shaders) < MIN_SHADERS:
         fail(f"only {len(shaders)} shader(s) under {SHADER_DIR}; expected ≥ {MIN_SHADERS}")
+    spliced = sum(1 for path in shaders if splices.get(path.name))
+    if spliced < MIN_SPLICED_BODIES:
+        fail(
+            f"{spliced} spliced shader bodies, expected ≥ {MIN_SPLICED_BODIES} — the "
+            f"`concat!` scan of {PROGRAM_SOURCE} found nothing, so a body that only "
+            "compiles with its prefix would be compiled as written"
+        )
 
     failures = 0
     compiled = 0
@@ -227,6 +277,11 @@ def main() -> int:
                         print(f"        {line}")
 
     print(f"lint-glsl: {compiled} shader compilation(s), {failures} failed")
+    if compiled < MIN_COMPILATIONS:
+        fail(
+            f"only {compiled} compilation(s), expected ≥ {MIN_COMPILATIONS} — a shader "
+            "or a splice went missing, so this run checked less than it should have"
+        )
     return 1 if failures else 0
 
 

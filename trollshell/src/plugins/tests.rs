@@ -3568,6 +3568,91 @@ fn a_failed_gl_context_rebuilds_the_scope_onto_the_cpu_kit() {
     });
 }
 
+/// **A scope that was never going to animate again still falls back.**
+///
+/// The animating case is covered above; this is the one the failure hook's
+/// original comment asserted away ("a settled one has nothing on screen to
+/// correct", which is backwards — a settled *GL* scope whose context failed has
+/// nothing on screen at all, and that is exactly what the fallback exists for).
+///
+/// `persistence: 256` is the kit's own infinite-persistence value, legal on the
+/// wire, and it makes `fades` false: the renderer answers `animates()` with
+/// `false` from the moment it is built, #926's clock parks, and no mapping pass
+/// is ever coming on its own. So `apply`'s `gl_lost` rebuild — which handles
+/// the animating case — is never re-entered, and the chip would stay blank
+/// until the plugin sent another frame, which a settled widget may never do.
+///
+/// **Falsified** by dropping the `rebuild_gl_renderers_on_cpu()` call from
+/// `preem_gl::install`'s hook: the instance keeps its `ScopeGl` renderer with
+/// no rebuild, and the `builds` assertion goes red.
+#[test]
+fn a_settled_gl_scope_falls_back_without_waiting_for_a_frame_that_never_comes() {
+    let _ink = preem_ink_lock();
+    // The hook under test, installed the way `plugins::install` installs it.
+    super::preem_gl::install();
+    super::preem_gl::with_gl_arm(|| {
+        let key = Scope::detached("context-lost-settled");
+        let samples: Vec<f32> = vec![0.0, 0.6, -0.6];
+        let node = preem_node(
+            Some("sc"),
+            vocab::PreemWidget::Scope {
+                config: vocab::ScopeConfig {
+                    style: vocab::StyleRef::new(vocab::StyleName::Crt),
+                    cols: 48,
+                    rows: 24,
+                    scale: 2,
+                    // The kit's ceiling: an infinite-persistence phosphor.
+                    persistence: 256,
+                },
+                state: vocab::ScopeState {
+                    samples: samples.clone(),
+                },
+            },
+        );
+
+        assert!(
+            matches!(to_ui_node(&key, &node), UiNode::GlSurface { .. }),
+            "the GL arm is chosen while a context is still possible",
+        );
+        // The premise, and the reason the animating path cannot save this one.
+        assert!(
+            !preem_render::any_animating_in(std::slice::from_ref(&key)),
+            "an infinite-persistence scope never animates, so nothing will \
+             re-map it on its own",
+        );
+        let before = preem_render::probe(&key, Some("sc")).expect("the instance exists");
+
+        hytte::ui::gl_surface::abandon_gl("no GL in this test");
+
+        // The hook rebuilt it **without** a mapping pass — that is the half a
+        // parked clock would otherwise have withheld for ever.
+        let after = preem_render::probe(&key, Some("sc")).expect("the instance survives");
+        assert_eq!(
+            after.0,
+            before.0 + 1,
+            "the failure hook rebuilt the renderer itself, not the next re-map",
+        );
+        assert_eq!(
+            after.1, before.1,
+            "…and did it without an apply, so no widget state was touched",
+        );
+
+        // …and what it now produces is the kit's own frame, from a fresh
+        // phosphor: the GL arm never drew a trail there was anything to inherit.
+        assert!(
+            matches!(to_ui_node(&key, &node), UiNode::Pixels { .. }),
+            "a lost context drops even a settled scope to the raster arm",
+        );
+        let mut oracle = kit::Scope::with_size(48, 24).scale(2).persistence(256);
+        oracle.advance(&samples);
+        assert_eq!(
+            mapped_pixels(&key, &node),
+            kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
+            "the fallback is the kit, byte for byte",
+        );
+    });
+}
+
 /// An accent change re-tints a GL scope through the **uniforms**, with no
 /// renderer rebuild — the same live-re-tint contract (#396/#862) the CPU arm
 /// has, reached by the same `invalidate_cached_frames` call.

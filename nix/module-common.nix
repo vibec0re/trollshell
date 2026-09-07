@@ -780,6 +780,16 @@ self:
             package = trollshell.packages.''${system}.hytte-plugin-pet;
             env.PET_NAME = "nisse";
           };
+
+          # The hyperhive agents sidebar (#947). `package` is REQUIRED and
+          # has no default — this option is an attrsOf submodule, so there is
+          # no `programs.trollshell.plugins.agents.enable` to find in the
+          # rendered docs until you write the entry yourself. Writing it is
+          # what turns the plugin on.
+          agents = {
+            package = trollshell.packages.''${system}.hytte-plugin-agents;
+            env.RUST_LOG = "hytte_plugin_agents=debug";
+          };
         }
       '';
       description = ''
@@ -830,13 +840,28 @@ self:
         `hytte-plugin-<id>`). Their per-plugin runtime knobs go through
         `env` / `secrets` above.
 
-        None of them is declared here by default — an entry exists only when
-        you write one, so every bundled plugin including `agents` is off
-        until you opt in. `agents` (#947) additionally reads
-        `~/.config/trollshell/agents.toml` for its socket path, poll cadence
-        and per-agent display/grouping overrides; it takes no `env` and no
-        `secrets`, and reaching the hive is the desktop user's `hive-admin`
-        group membership, nothing this module grants.
+        **There is no per-plugin `enable` option to find.** This option is an
+        `attrsOf` submodule, so `programs.trollshell.plugins.<id>` does not
+        exist in the rendered option docs until you write the attr — there is
+        nothing to grep for, and `package` is mandatory with no default.
+        Enabling a bundled plugin *is* writing its entry:
+
+            programs.trollshell.plugins.agents = {
+              package = trollshell.packages.''${system}.hytte-plugin-agents;
+            };
+
+        (The `enable` field inside a submodule defaults to `true`, and exists
+        to turn a declared entry off again without deleting it.)
+
+        `agents` (#947) is worth two extra notes. It reads
+        `~/.config/trollshell/agents.toml` — socket path, poll cadence,
+        per-agent display and grouping — and takes no `env` beyond `RUST_LOG`
+        and no `secrets` at all. Reaching the hive is the desktop user's
+        membership of the `hive-admin` group
+        (`services.hyperhive.adminUsers`) against hyperhive's
+        `0660 root:hive-admin` socket: no root, no polkit, nothing this module
+        grants. Outside that group the card renders one "no hive — permission
+        denied" row, which is the correct unprivileged outcome.
       '';
     };
 

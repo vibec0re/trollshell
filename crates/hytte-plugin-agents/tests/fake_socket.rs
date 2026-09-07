@@ -353,6 +353,34 @@ async fn a_hung_daemon_times_out_on_its_stated_budget() {
     task.abort();
 }
 
+/// The budget's **value**, pinned — because the `elapsed` bounds above cannot
+/// pin it.
+///
+/// Worth spelling out, because it is a trap: those bounds are stated
+/// *relative to `REQUEST_TIMEOUT`*, so they move with the constant. Measured —
+/// widening `REQUEST_TIMEOUT` from 5 s to 60 s leaves
+/// `a_hung_daemon_times_out_on_its_stated_budget` **green**, because 60 s is
+/// still "its stated budget". That test proves the client honours whatever
+/// budget it declares; this one proves which budget that is.
+///
+/// The number matters against the poll cadence: long enough that a slow but
+/// healthy round trip is not cut off, short enough that a wedged daemon costs
+/// a couple of cadences rather than freezing the last-good roster on screen.
+/// Changing it should be a deliberate edit with a new number here.
+///
+/// It also converts an absurd widening into an instant red: at ten years the
+/// hung-daemon test does not fail, it *hangs* — tokio's timer wheel cannot
+/// step a decade in one auto-advance — whereas this fails before any timer
+/// runs.
+#[test]
+fn the_request_budget_is_five_seconds() {
+    assert_eq!(
+        REQUEST_TIMEOUT,
+        std::time::Duration::from_secs(5),
+        "the round-trip budget moved; update this and say why in the commit"
+    );
+}
+
 /// `EACCES` on a socket that exists and is listening — the one connect branch
 /// `docs/plugin-env.md` and the live-verify list both lean on, and the one
 /// most likely to be met in the wild (a `hive-admin` member whose shell

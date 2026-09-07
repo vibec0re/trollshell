@@ -47,6 +47,23 @@ async fn settle() {
     }
 }
 
+/// `msg_rx.recv()` with a deadline — **never a bare `.await`**.
+///
+/// A test that waits forever for a message a deleted mechanism no longer
+/// sends does not go red, it hangs: on CI that is a job timeout with no
+/// failing test name, and locally it is a reviewer's lunch break. That is the
+/// same defect the review caught in the request-timeout test, and it applies
+/// to every wait in this file — deleting the seed poll, measured, starves
+/// three of these tests at once. Under `start_paused` the virtual clock
+/// auto-advances whenever every task is idle, so a genuinely stuck loop trips
+/// this in milliseconds of wall time.
+async fn recv_soon(rx: &mut mpsc::UnboundedReceiver<Msg>, what: &str) -> Msg {
+    tokio::time::timeout(Duration::from_mins(1), rx.recv())
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+        .unwrap_or_else(|| panic!("the poll task dropped its sender before {what}"))
+}
+
 /// **§5.4's parking.** While the sidebar is hidden the loop makes no round
 /// trips at all; opening it polls immediately and resumes the cadence.
 ///
@@ -72,8 +89,14 @@ async fn the_poll_parks_while_the_sidebar_is_closed_and_wakes_on_open() {
         ConfigSource::over(Vec::new()),
     ));
 
-    assert!(matches!(msg_rx.recv().await, Some(Msg::Config(_))));
-    assert!(matches!(msg_rx.recv().await, Some(Msg::Status(Ok(_)))));
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "the seed config").await,
+        Msg::Config(_)
+    ));
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "a poll answer").await,
+        Msg::Status(Ok(_))
+    ));
     // Settle before the baseline: a successful poll is followed by the
     // one-shot `Urls` fetch, which lands *after* the `Msg::Status` this just
     // received. Counting before it completes would credit it to the park.
@@ -94,7 +117,10 @@ async fn the_poll_parks_while_the_sidebar_is_closed_and_wakes_on_open() {
 
     // Open: an immediate poll…
     tx.send(Cmd::SetVisible(true)).expect("the lane is open");
-    assert!(matches!(msg_rx.recv().await, Some(Msg::Status(Ok(_)))));
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "a poll answer").await,
+        Msg::Status(Ok(_))
+    ));
     settle().await;
     let after_open = hive.seen().len();
     assert!(after_open > after_seed, "opening polls immediately");
@@ -132,8 +158,10 @@ async fn the_poll_parks_while_the_sidebar_is_closed_and_wakes_on_open() {
 /// happens to be, usually closed, so without this the parking above would
 /// mean the plugin never talks to the hive until someone opens the sidebar.
 ///
-/// Falsification: delete the `poll_once` call before the loop in `poll.rs` and
-/// the `Msg::Status` assertion below hangs, then fails on the outer timeout.
+/// Falsification: delete the `poll_once` call before the loop in `poll.rs`
+/// and this fails — **named and fast**, on `recv_soon`'s deadline rather than
+/// by hanging. (Measured: it also reds the parking and reload tests, since a
+/// missing seed starves their first `Msg::Status` too.)
 #[tokio::test(start_paused = true)]
 async fn the_seed_poll_runs_before_any_visibility_edge() {
     let hive = FakeHive::serve(replies(&[(
@@ -149,15 +177,13 @@ async fn the_seed_poll_runs_before_any_visibility_edge() {
         ConfigSource::over(Vec::new()),
     ));
 
-    assert!(matches!(msg_rx.recv().await, Some(Msg::Config(_))));
-    // No `SetVisible` was ever sent, so this can only be the seed poll. The
-    // outer timeout is what turns a deleted seed into a fast, named red rather
-    // than a hang.
-    let status = tokio::time::timeout(Duration::from_secs(30), msg_rx.recv())
-        .await
-        .expect("the seed poll must run with the sidebar closed");
-    match status {
-        Some(Msg::Status(Ok(rows))) => assert_eq!(rows.len(), 3),
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "the seed config").await,
+        Msg::Config(_)
+    ));
+    // No `SetVisible` was ever sent, so this can only be the seed poll.
+    match recv_soon(&mut msg_rx, "the seed poll, with the sidebar closed").await {
+        Msg::Status(Ok(rows)) => assert_eq!(rows.len(), 3),
         other => panic!("expected a seeded roster, got {other:?}"),
     }
     assert_eq!(hive.seen(), vec![r#"{"cmd":"agent_status"}"#.to_owned()]);
@@ -189,15 +215,21 @@ async fn an_agents_toml_edit_is_picked_up_on_the_next_poll() {
     ));
 
     // The seed config is the one that was injected.
-    match msg_rx.recv().await {
-        Some(Msg::Config(cfg)) => assert!(cfg.display.is_empty()),
+    match recv_soon(&mut msg_rx, "the seed config").await {
+        Msg::Config(cfg) => assert!(cfg.display.is_empty()),
         other => panic!("expected the seed config, got {other:?}"),
     }
-    assert!(matches!(msg_rx.recv().await, Some(Msg::Status(Ok(_)))));
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "a poll answer").await,
+        Msg::Status(Ok(_))
+    ));
 
     // The operator edits the file while the sidebar is open.
     tx.send(Cmd::SetVisible(true)).expect("the lane is open");
-    assert!(matches!(msg_rx.recv().await, Some(Msg::Status(Ok(_)))));
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "a poll answer").await,
+        Msg::Status(Ok(_))
+    ));
     std::fs::write(
         &layer,
         "[display.trollshell-choom]\nlabel = \"choom\"\nproject = \"viberoot\"\n",
@@ -244,7 +276,10 @@ async fn urls_is_fetched_once_per_session_not_once_per_poll() {
         ConfigSource::over(Vec::new()),
     ));
 
-    assert!(matches!(msg_rx.recv().await, Some(Msg::Config(_))));
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "the seed config").await,
+        Msg::Config(_)
+    ));
     tx.send(Cmd::SetVisible(true)).expect("the lane is open");
 
     // Several cadences worth of polls.

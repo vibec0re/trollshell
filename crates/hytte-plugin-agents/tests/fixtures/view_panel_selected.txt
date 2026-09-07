@@ -51,7 +51,9 @@ View {
                                     "ts-agent-state",
                                     "accent",
                                 ],
-                                tooltip: None,
+                                tooltip: Some(
+                                    "running",
+                                ),
                             },
                         ],
                     },
@@ -146,7 +148,9 @@ View {
                                     "ts-agent-badge",
                                     "ts-agent-upd",
                                 ],
-                                tooltip: None,
+                                tooltip: Some(
+                                    "config commit pending — a rebuild would change this agent's locked rev",
+                                ),
                             },
                             Icon {
                                 id: None,
@@ -155,7 +159,9 @@ View {
                                     "ts-agent-state",
                                     "dim-label",
                                 ],
-                                tooltip: None,
+                                tooltip: Some(
+                                    "paused",
+                                ),
                             },
                         ],
                     },
@@ -250,7 +256,9 @@ View {
                                     "ts-agent-state",
                                     "dim-label",
                                 ],
-                                tooltip: None,
+                                tooltip: Some(
+                                    "stopped",
+                                ),
                             },
                         ],
                     },

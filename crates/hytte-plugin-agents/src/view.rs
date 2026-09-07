@@ -70,6 +70,17 @@ fn icon(name: impl Into<String>, classes: &[&str]) -> Node {
     }
 }
 
+/// An icon whose meaning is not obvious from the glyph, so it carries hover
+/// text (#957's `tooltip`, `crates/hytte-plugin-proto/src/wire.rs:244-252`).
+fn icon_titled(name: impl Into<String>, hover: impl Into<String>, classes: &[&str]) -> Node {
+    Node::Icon {
+        id: None,
+        name: name.into(),
+        tooltip: Some(hover.into()),
+        classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+    }
+}
+
 fn button(id: impl Into<String>, classes: &[&str], child: Node) -> Node {
     Node::Button {
         id: id.into(),
@@ -130,12 +141,21 @@ fn agent_row(agent: &Agent, cfg: &AgentsConfig) -> Node {
         Node::Spacer,
     ];
     if agent.needs_update() {
-        head.push(icon(
+        // Spec §6.2's badge row says "(tooltip only)" for its text, and until
+        // #958 the vocabulary had no tooltip to put it in. It does now.
+        head.push(icon_titled(
             UPDATE_BADGE_ICON,
+            "config commit pending — a rebuild would change this agent's locked rev",
             &["ts-agent-badge", UPDATE_BADGE_CLASS],
         ));
     }
-    head.push(icon(status.icon(), &["ts-agent-state", status.class()]));
+    // The state glyph is the row's only unlabelled signal — the second line
+    // carries the harness's text, not the state's word, whenever one exists.
+    head.push(icon_titled(
+        status.icon(),
+        status.text(),
+        &["ts-agent-state", status.class()],
+    ));
 
     // Paused shows the resume glyph: the button's icon is what it will DO,
     // which is the only reading that stays honest through the optimistic flip.
@@ -457,6 +477,72 @@ mod tests {
     /// The id prefixes are the reducer's parsing contract; a colon terminator
     /// is what makes `strip_prefix` unambiguous against a name whitelist that
     /// excludes `:`.
+    /// Spec §6.2's badge is "(tooltip only)" — the glyph alone does not say
+    /// what `needs_update` means, and the row has no room for the words. Now
+    /// that #958 put a tooltip in the vocabulary, the badge and the state
+    /// glyph both carry one.
+    ///
+    /// Falsification: swap `icon_titled` back to `icon` for either and the
+    /// matching assertion goes red.
+    #[test]
+    fn the_unlabelled_glyphs_carry_hover_text() {
+        use crate::config::AgentsConfig;
+        use crate::hive::wire::AgentStatusRow;
+        use crate::model::{Agent, AgentName, Hive};
+        use hytte_plugin::proto::Node;
+
+        /// Every `Icon` in the tree, as `(name, tooltip)`.
+        fn icons(node: &Node, out: &mut Vec<(String, Option<String>)>) {
+            match node {
+                Node::Icon { name, tooltip, .. } => out.push((name.clone(), tooltip.clone())),
+                Node::Box { children, .. }
+                | Node::Row { children, .. }
+                | Node::ListBox { children, .. } => {
+                    for c in children {
+                        icons(c, out);
+                    }
+                }
+                Node::Button { child, .. } => icons(child, out),
+                _ => {}
+            }
+        }
+
+        let agent = Agent {
+            name: AgentName::parse("busy").expect("legal"),
+            row: AgentStatusRow {
+                name: "busy".to_owned(),
+                running: true,
+                needs_update: true,
+                ..AgentStatusRow::default()
+            },
+            pending_paused: None,
+        };
+        let tree = super::card(
+            &Hive::Up {
+                agents: vec![agent],
+            },
+            &AgentsConfig::default(),
+        );
+
+        let mut found = Vec::new();
+        icons(&tree, &mut found);
+
+        let badge = found
+            .iter()
+            .find(|(n, _)| n == crate::model::UPDATE_BADGE_ICON)
+            .expect("the update badge renders");
+        assert!(
+            badge.1.as_deref().is_some_and(|t| t.contains("rebuild")),
+            "the badge's meaning lives in its tooltip: {badge:?}"
+        );
+
+        let state = found
+            .iter()
+            .find(|(n, _)| n == "media-playback-start-symbolic")
+            .expect("the running state glyph renders");
+        assert_eq!(state.1.as_deref(), Some("running"));
+    }
+
     #[test]
     fn every_button_prefix_ends_in_a_colon() {
         for prefix in [ids::CHAT, ids::PAUSE, ids::EDIT, ids::START, ids::STOP] {

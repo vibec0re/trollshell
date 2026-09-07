@@ -390,6 +390,65 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       newer wire vocabulary … update the shell" warn, instead of crash-looping
       silently.
 
+## Agents (hyperhive)
+
+Everything here needs a **hive on the laptop** — i.e. #949's
+`services.hyperhive.deploy.singleHostSwarm` deployed — plus the desktop user in
+`services.hyperhive.adminUsers`. Nothing in CI can reach any of it: P1 is
+tested end to end against a fake `host.sock`
+(`crates/hytte-plugin-agents/tests/fake_socket.rs`), which proves the wire and
+the reducer but cannot prove the hive agrees.
+
+- [ ] **(#947 P1)** The rows render legibly. Enable the plugin
+      (`programs.trollshell.plugins.agents.package = trollshell.packages.${system}.hytte-plugin-agents;`),
+      open the sidebar, and confirm one two-line card per agent: leading icon ·
+      name · state icon over status text · pause · edit. At Annika's font scale
+      the second line should ellipsize rather than widen the sidebar.
+- [ ] **(#947 P1)** The status line is the harness's own text. Have an agent
+      call its `set_status` tool and confirm the row's second line changes to
+      that string within one poll (2 s by default) — not "running". A stopped
+      or paused agent must show its state word instead, never a stale text from
+      before the stop.
+- [ ] **(#947 P1)** **Pause actually parks a live agent.** Click pause on a
+      running agent; the row should flip immediately (optimistic) and stay
+      paused after the next poll. Confirm hive-side that the harness pause
+      marker exists (`hivectl list-agents` shows it paused) and that the agent
+      drives no further turns. Click again to resume and confirm both ends
+      agree. A refused write must un-stick the row within one poll rather than
+      leaving it claiming a pause that never happened.
+- [ ] **(#947 P1)** Grouping. Give two agents different
+      `[display.<name>].project` values in `~/.config/trollshell/agents.toml`
+      and confirm two group headers appear; collapse them to one project and
+      confirm the header disappears entirely; leave one agent unlabelled and
+      confirm it lands under `ungrouped` rather than vanishing. The file should
+      be picked up on the next poll with no restart.
+- [ ] **(#947 P1)** **A `needs_login` flip raises exactly one toast.** Expire
+      an agent's claude session (or otherwise drive it into `needs_login`) with
+      the sidebar **open** and confirm one notification, then confirm no
+      further toasts while it stays in that state. Same for a `failed` unit.
+      Note the known limitation to check against your taste: the poll parks
+      while the sidebar is closed (spec §5.4), so no toast fires from a closed
+      sidebar — if that is wrong, say so on #947 and it is a one-line change.
+- [ ] **(#947 P1)** The panel. Click an agent's name or edit button and confirm
+      the drawer shows that agent's flags, `deployed_sha`, parent, model, the
+      agent page URL the hive reports, the socket path in use, and a last-poll
+      age that advances. Start/stop from the panel must affect **only** that
+      agent — check `hivectl list-agents` before and after that nothing else
+      moved (the §11 rule-one footgun: an unscoped frame would have started the
+      whole hive, CI can only prove the bytes).
+- [ ] **(#947 P1)** No hive, no crash. Stop `hive-c0re` and confirm the card
+      shows one "no hive" row with a reason, keeps its cadence, and recovers on
+      its own when the daemon comes back — without restarting the plugin.
+      Then remove the user from `hive-admin` (or test as another user) and
+      confirm the row says permission, not "not running".
+- [ ] **(#947 P1)** **Re-record the wire fixtures.** The fixtures under
+      `crates/hytte-plugin-agents/tests/fixtures/*.json` were derived by hand
+      from hyperhive's struct definitions, not recorded from a live daemon
+      (spec §12 asks for a recording; there was no hive to record from). With a
+      hive up, capture real `AgentStatus` / `List` / `Urls` answers and diff
+      them against the committed files. **A difference is a finding, not a
+      formatting nit** — see that directory's `README.md`.
+
 ## Plugins & launcher
 
 - [ ] **(#489)** Plugins now launch via `systemd-run --user` transient units

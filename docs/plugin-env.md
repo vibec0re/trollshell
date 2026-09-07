@@ -97,7 +97,24 @@ anyone else's. Check these on a fresh install:
 
 ## Bundled plugins
 
-Sections below follow `bundledPluginNames`' order in `flake.nix` (13 total).
+Sections below follow `bundledPluginNames`' order in `flake.nix` (14 total).
+
+### agents (`hytte-plugin-agents`)
+
+No environment-variable knobs. The whole desktop-side surface is
+`~/.config/trollshell/agents.toml` (issue #947, spec §9): the hive's
+`host.sock` path, the poll cadence, and per-agent display overrides
+(`label` / `icon` / `project`, the last being the sidebar group header). It
+rides `hytte-config`'s layered `Subsystem`, so it merges
+`XDG_CONFIG_DIRS` → `XDG_CONFIG_HOME`, warns on an unknown key rather than
+failing, and is re-read on the next poll after an edit.
+
+It declares **no secret slot and reads no credential**: reaching the hive is
+the desktop user's `hive-admin` group membership
+(`services.hyperhive.adminUsers`) against a `0660 root:hive-admin` socket —
+no root, no polkit, no `sudo`. A user outside the group gets `EACCES` and the
+plugin renders a single "no hive — permission denied" row, which is the
+correct unprivileged outcome rather than a bug.
 
 ### audio-widget (`hytte-plugin-audio-widget`)
 

@@ -275,7 +275,19 @@ fn measure(area: &GlSurface, case: &Case) -> bool {
         u32::try_from(area.width().max(0)).unwrap_or(0) * scale,
         u32::try_from(area.height().max(0)).unwrap_or(0) * scale,
     );
+    // Drain anything the pipeline left queued *before* the readback, so a GL
+    // error reported below is attributable to the read and not to a draw three
+    // passes ago. The shell never does this — `glGetError` is a
+    // synchronisation point on some drivers — but a harness that stalls the
+    // pipeline anyway can afford the honesty.
+    if let Some(code) = gl.take_error() {
+        println!("INFO {label}: a GL error was pending before the readback ({code:#x})");
+    }
     let raw = hytte_gl::read_rgba8(&gl, alloc.0, alloc.1);
+    if let Some(code) = gl.take_error() {
+        println!("FAIL {label}: the framebuffer readback raised GL error {code:#x}");
+        return false;
+    }
     if raw.len() != (alloc.0 as usize) * (alloc.1 as usize) * 4 {
         println!("FAIL {label}: readback returned {} bytes", raw.len());
         return false;

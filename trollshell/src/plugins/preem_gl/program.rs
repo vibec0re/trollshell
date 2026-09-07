@@ -12,12 +12,14 @@
 //!
 //! # Where the GLSL lives, and why it is not under `assets/`
 //!
-//! `*.glsl` beside this file, `include_str!`'d. Not under the top-level
+//! `*.vert` / `*.frag` beside this file, `include_str!`'d — the extension names
+//! the stage, for `glslangValidator` and for a reader. Not under the top-level
 //! `assets/`, which crane's source filter strips (#480/#446) — a compile-time
 //! `include_str!` of anything under there passes `cargo build` locally and
-//! fails every `nix build`. The nix filter does have to learn `.glsl` (it keeps
-//! only `.rs`/`.toml`/`.lock` by default); `nix/package.nix` carries that
-//! clause.
+//! fails every `nix build`. The nix filter does still have to learn those
+//! suffixes (it keeps only `.rs`/`.toml`/`.lock` by default), because it
+//! filters by *extension* and not by directory; `nix/package.nix` carries that
+//! clause, and `nix/lint-glsl.py` compiles what it keeps.
 //!
 //! # The pipeline
 //!

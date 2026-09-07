@@ -3341,6 +3341,72 @@ fn both_scope_arms_animate_and_park_in_lockstep() {
     );
 }
 
+/// **A second wire frame re-arms a parked GL scope.**
+///
+/// This is the arm the design spec singled out as the PR's review checklist:
+/// `Renderer::update` ends in a `_ => {}` catch-all, so a missing `ScopeGl`
+/// pattern there is not a compile error — it is a scope that queues nothing,
+/// never wakes up, and shows its debut batch for the rest of the session.
+///
+/// It needed its own test, and the discovery is worth writing down: deleting
+/// that arm left **every other GL test on this branch green**, including the
+/// one whose name says it walks the animation state machine. The reason is that
+/// the others map one wire frame and then only advance the clock — and
+/// `apply`'s `same_widget` short-circuit means `update` is never reached on a
+/// re-map of an unchanged frame. Only a *different* batch goes through it, and
+/// only after the trail has parked is the difference observable.
+///
+/// **Falsified** by dropping `Self::ScopeGl` from `Renderer::update`'s `Scope`
+/// arm: the scope stays parked and the assertion below goes red.
+#[test]
+fn a_new_batch_re_arms_a_parked_gl_scope() {
+    let _ink = preem_ink_lock();
+    super::preem_gl::with_gl_arm(|| {
+        let key = Scope::detached("gl-requeue");
+        let node = preem_node(Some("sc"), gl_scope_widget(vec![0.5, -0.5]));
+        let (_, _, debut) = mapped_gl(&key, &node);
+        assert_eq!(debut.step_seq, 1, "the debut batch");
+
+        // Past the 17-step settle at persistence 184, so the trail is black and
+        // the renderer has stopped asking for repaints.
+        for _ in 0..40 {
+            let _ = preem_render::advance_all(preem_render::ANIM_STEP_SECS);
+        }
+        assert!(
+            !preem_render::any_animating_in(std::slice::from_ref(&key)),
+            "the premise: a faded trail parks",
+        );
+        let (_, _, parked) = mapped_gl(&key, &node);
+
+        // A *different* batch — the only thing that reaches `Renderer::update`.
+        let second = vec![-0.25f32, 0.75, 0.25];
+        let next = preem_node(Some("sc"), gl_scope_widget(second.clone()));
+        let _ = mapped_gl(&key, &next);
+        assert!(
+            preem_render::any_animating_in(std::slice::from_ref(&key)),
+            "a new batch wakes the scope back up",
+        );
+
+        assert!(
+            advanced(preem_render::ANIM_STEP_SECS),
+            "the queued batch is stamped by the next step",
+        );
+        let (_, _, after) = mapped_gl(&key, &next);
+        assert_eq!(
+            after.step_seq,
+            parked.step_seq + 1,
+            "one step ran, and the counter did not restart",
+        );
+        assert!(
+            after
+                .data
+                .as_ref()
+                .is_some_and(|held| held.as_ref() == second.as_slice()),
+            "the new batch reaches the shader as the data strip",
+        );
+    });
+}
+
 /// `step_seq` is **monotonic** and advances one per animation step — the
 /// idempotence key the surface replays against. A mapping pass on its own
 /// advances nothing (that is the multi-monitor rule), and a repeat pass hands
@@ -3510,8 +3576,17 @@ fn a_failed_gl_context_rebuilds_the_scope_onto_the_cpu_kit() {
 /// does, so it needs no entry in `invalidate_cached_frames`' `TextBox`
 /// special case — this is what says so.
 ///
-/// **Falsified** by baking the palette into `Renderer::ScopeGl` at build time:
-/// the ink would not move, and the rebuild count would have to.
+/// **Falsified** two ways, one per assertion. Baking the palette into
+/// `Renderer::ScopeGl` at build time stops the ink moving; adding `ScopeGl` to
+/// `invalidate_cached_frames`' `TextBox` rebuild branch resets `step_seq` to
+/// `1` and wipes the trail.
+///
+/// The `step_seq` assertion is load-bearing and the rebuild **counter alone is
+/// not**: `invalidate_cached_frames` assigns `instance.renderer` directly and
+/// never touches `instance.builds`, so a rebuild taken on that path is
+/// completely invisible to `probe`. A mutation run against an earlier version
+/// of this test — which checked only the counter — stayed green with the
+/// rebuild added, which is exactly the failure it was written to catch.
 #[test]
 fn an_accent_change_re_tints_a_gl_scope_without_rebuilding_it() {
     let _ink = preem_ink_lock();
@@ -3533,7 +3608,14 @@ fn an_accent_change_re_tints_a_gl_scope_without_rebuilding_it() {
         );
 
         tint_in_process_surfaces(Some([0x00, 0xff, 0x00, 0xff]));
+        let (_, _, debut) = mapped_gl(&key, &node);
+        // Run the trail on, so `step_seq` is somewhere a rebuild could not
+        // land on by accident: a fresh `ScopeGl` starts at exactly 1.
+        for _ in 0..3 {
+            assert!(advanced(preem_render::ANIM_STEP_SECS));
+        }
         let (_, _, green) = mapped_gl(&key, &node);
+        assert_eq!(green.step_seq, debut.step_seq + 3, "three steps ran");
         let builds = preem_render::probe(&key, Some("sc"))
             .expect("the instance exists")
             .0;
@@ -3544,6 +3626,14 @@ fn an_accent_change_re_tints_a_gl_scope_without_rebuilding_it() {
         assert_ne!(
             green.values, magenta.values,
             "the accent reaches the shader as a uniform",
+        );
+        // The observable consequence of a rebuild, and the reason this is the
+        // assertion rather than the counter: a rebuilt `ScopeGl` restarts its
+        // step count, which restarts the phosphor — a visible trail reset every
+        // time the desktop accent moves.
+        assert_eq!(
+            magenta.step_seq, green.step_seq,
+            "a re-tint keeps the animation state; a rebuild would restart it",
         );
         assert_eq!(
             preem_render::probe(&key, Some("sc"))

@@ -658,29 +658,16 @@ impl Drop for Framebuffer {
     }
 }
 
-/// Bind framebuffer `id` — in practice the one `GtkGLArea` was rendering into,
-/// captured with [`current_draw_framebuffer`] before the offscreen passes.
-///
-/// **GTK does not render into framebuffer 0.** A `GtkGLArea` renders into its
-/// own FBO so GSK can import the result as a texture, so restoring "the default
-/// framebuffer" by binding `0` paints into nothing at all. That is the single
-/// most expensive mistake available on this path, which is why the capture and
-/// the restore are both named here rather than left to the caller's memory.
-pub fn bind_framebuffer(_gl: &Gl, id: u32) {
-    // SAFETY: a context is current. `id` came from `GL_FRAMEBUFFER_BINDING` in
-    // this same context, so it names a live FBO (or 0, which is always legal).
-    unsafe { gl::BindFramebuffer(gl::FRAMEBUFFER, id) };
-}
-
-/// The framebuffer currently bound for drawing — see [`bind_framebuffer`].
-#[must_use]
-pub fn current_draw_framebuffer(_gl: &Gl) -> u32 {
-    let mut id: GLint = 0;
-    // SAFETY: a context is current; `FRAMEBUFFER_BINDING` writes exactly one
-    // `GLint` through a pointer to a live local.
-    unsafe { gl::GetIntegerv(gl::FRAMEBUFFER_BINDING, &raw mut id) };
-    u32::try_from(id).unwrap_or(0)
-}
+// Deliberately absent: a `bind_framebuffer` / `current_draw_framebuffer` pair
+// for getting back to what `GtkGLArea` was rendering into after the offscreen
+// passes. **GTK does not render into framebuffer 0** — a `GtkGLArea` renders
+// into its own FBO so GSK can import the result as a texture, so restoring "the
+// default framebuffer" by binding `0` paints into nothing at all, which is the
+// single most expensive mistake available on this path. The way back is
+// `gtk_gl_area_attach_buffers`, which is GTK's own documented answer and needs
+// no capture; `hytte-ui`'s `gl_surface` calls it, with that hazard written down
+// at the call site. A capture/restore pair here would be a second, worse answer
+// to a question GTK has already answered.
 
 // ── vertex arrays and draws ─────────────────────────────────────────────────
 

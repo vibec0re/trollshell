@@ -32,8 +32,11 @@ let
   #   - assets/hytte-ui/style.css — hytte-ui's DEFAULT_STYLESHEET fallback
   #     (crates/hytte-ui/src/app.rs) include_str!'s this one file at compile
   #     time, so it must be present even though the rest of `assets/` isn't.
-  #   - *.glsl — the preem GL renderer's shaders (#893 stage B), which
-  #     `trollshell/src/plugins/preem_gl/program.rs` include_str!'s. They are
+  #   - *.vert / *.frag / *.glsl — the preem GL renderer's shaders (#893 stage
+  #     B), which `trollshell/src/plugins/preem_gl/program.rs` include_str!'s.
+  #     Today's files are all `.vert`/`.frag` (the extension names the stage,
+  #     for glslangValidator and for a reader); `.glsl` is kept too so a shared
+  #     include added later does not repeat this debugging session. They are
   #     deliberately under `src/` rather than `assets/` (the design spec says
   #     so) because they are compiled into the binary, not loaded at runtime —
   #     but crane's filter is by *extension*, so `src/` does not save them and

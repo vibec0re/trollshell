@@ -51,8 +51,9 @@
 //! [`gl_abandoned`], and calls the host's
 //! [`set_context_failure_handler`] hook exactly once. The host — which is the
 //! only party that knows whether a CPU implementation exists — decides what to
-//! do about it; `trollshell`'s preem renderer drops the instance to the CPU kit
-//! on the next mapping pass.
+//! do about it; `trollshell`'s preem renderer rebuilds every GL scope onto the
+//! CPU kit inside the hook and asks for one re-map, rather than waiting for a
+//! mapping pass that a settled widget's parked clock may never deliver.
 //!
 //! The latch is process-wide (thread-local on the GTK thread) once the *first*
 //! failure is observed, which is one word narrower than the spec's "per

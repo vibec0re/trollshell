@@ -225,7 +225,7 @@ fn capped(n: u64) -> String {
 
 /// The whole chip in one sentence, for the hover (#957).
 ///
-/// The chip itself is four glyphs wide and, being deliberately panel-less
+/// The chip is a handful of 16px glyphs and, being deliberately panel-less
 /// (#866), has nowhere else to explain them — `sub 18/0` was legible only to
 /// someone who had read this module. So the tooltip spells out every part the
 /// chip abbreviates: the backend by name, and the counts as words.

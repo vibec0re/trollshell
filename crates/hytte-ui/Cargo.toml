@@ -21,5 +21,10 @@ futures-signals.workspace = true
 gio = { version = "0.22.5", default-features = false }
 gtk = { workspace = true, features = ["v4_14"] }
 gtk4-layer-shell = "0.8.0"
+# The workspace's OpenGL island (#893 stage B). `hytte-ui` stays `forbid(unsafe_code)`
+# — every GL call the `GlSurface` widget makes goes through hytte-gl's safe
+# RAII wrappers. No new resolved package: hytte-gl's own deps (`gl`,
+# `libloading`) were already in `Cargo.lock`.
+hytte-gl = { path = "../hytte-gl" }
 hytte-reactive = { path = "../hytte-reactive" }
 tracing = "0.1.44"

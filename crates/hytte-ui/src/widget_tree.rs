@@ -237,6 +237,48 @@ pub enum Node {
         /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
     },
+    /// A **GPU** surface: a [`crate::gl_surface::GlSurface`] running the
+    /// host-registered shader pipeline named by `program`, over the plain-data
+    /// uniforms in `state` (#893 stage B).
+    ///
+    /// The GPU sibling of [`Node::Pixels`], and the difference is where the
+    /// pixels live. `Pixels` carries a rasterised RGBA8 buffer; this carries
+    /// the **state** a shader rasterises from, and the frame never leaves the
+    /// GPU. Rendering into an FBO and reading it back into an `Arc<[u8]>` would
+    /// have reused the `Pixels` machinery and cost a pipeline stall per chip
+    /// per frame, which is the whole thing #863 set out to remove.
+    ///
+    /// `width`/`height` are the **logical** natural size in pixels — for a
+    /// preem widget, `cols * scale` by `rows * scale` — measured exactly as
+    /// `Pixels` measures, with `state.grid` carrying the pre-upscale grid the
+    /// offscreen passes run at. GTK allocates the framebuffer at that size
+    /// times the integer `scale_factor` and the surface point-samples into it,
+    /// which is `Pixels`' nearest-neighbour rule moved into a fragment shader.
+    ///
+    /// `program` and `state` are **mutable props**: a same-id re-render points
+    /// the existing surface at the new state in place, and a state equal to the
+    /// one already held costs nothing at all — the `Arc` is compared by pointer
+    /// first, which is the case a frame mapped onto a second monitor hits.
+    ///
+    /// `state.step_seq` is what makes the draw idempotent; see the
+    /// [`gl_surface`](crate::gl_surface) module docs, which is also where the
+    /// CPU-fallback contract for a failed context lives.
+    GlSurface {
+        /// Optional diff/reorder key (see [`NodeId`]).
+        id: Option<NodeId>,
+        /// Natural width in logical pixels.
+        width: u32,
+        /// Natural height in logical pixels.
+        height: u32,
+        /// Which registered pipeline draws it (mutable prop).
+        program: crate::gl_surface::GlProgram,
+        /// The uniforms, data strip, grid and step count (mutable prop).
+        /// Shared, so mapping one frame onto a second monitor costs a refcount
+        /// and settles on an `Arc::ptr_eq`.
+        state: Arc<crate::gl_surface::GlUniforms>,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
+        classes: Vec<String>,
+    },
     /// A `gtk::Button`. `id` is **required** — it is the click event target.
     Button {
         /// **Required** diff key and [`EventKind::Click`] target.
@@ -510,6 +552,7 @@ enum NodeKind {
     Text,
     Icon,
     Pixels,
+    GlSurface,
     Button,
     Progress,
     Slider,
@@ -815,6 +858,21 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             // mountings (one per monitor) hand their own surfaces (#911).
             surface.set_pixels_shared(*width, *height, data);
             surface.set_scale(*scale);
+            apply_classes(&surface, classes);
+            (surface.upcast(), Vec::new())
+        }
+        Node::GlSurface {
+            width,
+            height,
+            program,
+            state,
+            classes,
+            ..
+        } => {
+            let surface = crate::gl_surface::GlSurface::new();
+            // Shared, not copied — the same `Arc` every monitor's mounting of
+            // this node hands its own surface, exactly as the `Pixels` arm does.
+            surface.set_state(*program, *width, *height, state);
             apply_classes(&surface, classes);
             (surface.upcast(), Vec::new())
         }
@@ -1138,6 +1196,24 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             // change is uploaded without a copy.
             surface.set_pixels_shared(*width, *height, data);
             surface.set_scale(*scale);
+            reconcile_classes(surface, &retained.desc.classes, classes);
+        }
+        Node::GlSurface {
+            width,
+            height,
+            program,
+            state,
+            classes,
+            ..
+        } => {
+            let surface = downcast::<crate::gl_surface::GlSurface>(&retained.widget);
+            // `program` and `state` are mutable props: point the existing
+            // surface at the new state in place. The guard is inside
+            // `set_state` and its fast path is an `Arc::ptr_eq`, so a re-map
+            // that carries the *same* state — a static GL chip re-mapped
+            // because a sibling animated, or the second monitor's pass over one
+            // frame — queues no render at all.
+            surface.set_state(*program, *width, *height, state);
             reconcile_classes(surface, &retained.desc.classes, classes);
         }
         Node::Button { classes, child, .. } => {
@@ -1629,6 +1705,7 @@ fn node_kind(node: &Node) -> NodeKind {
         Node::Text { .. } => NodeKind::Text,
         Node::Icon { .. } => NodeKind::Icon,
         Node::Pixels { .. } => NodeKind::Pixels,
+        Node::GlSurface { .. } => NodeKind::GlSurface,
         Node::Button { .. } => NodeKind::Button,
         Node::Progress { .. } => NodeKind::Progress,
         Node::Slider { .. } => NodeKind::Slider,
@@ -1649,6 +1726,7 @@ fn node_id(node: &Node) -> Option<&str> {
         | Node::Text { id, .. }
         | Node::Icon { id, .. }
         | Node::Pixels { id, .. }
+        | Node::GlSurface { id, .. }
         | Node::Progress { id, .. }
         | Node::Revealer { id, .. } => id.as_deref(),
         // `Button`, `Slider`, `Expander`, and `Entry` all require an id — it is
@@ -1671,6 +1749,7 @@ fn node_classes(node: &Node) -> &[String] {
         | Node::Text { classes, .. }
         | Node::Icon { classes, .. }
         | Node::Pixels { classes, .. }
+        | Node::GlSurface { classes, .. }
         | Node::Button { classes, .. }
         | Node::Progress { classes, .. }
         | Node::Slider { classes, .. }
@@ -1704,7 +1783,12 @@ fn desc_of(node: &Node) -> NodeDesc {
 
 #[cfg(test)]
 mod diff_tests {
-    use super::{ChildKey, DiffPlan, NodeKind, SlotOp, plan_diff};
+    use super::{
+        ChildKey, DiffPlan, Node, NodeKind, SlotOp, child_key, node_classes, node_id, node_kind,
+        plan_diff,
+    };
+    use crate::gl_surface::{GlProgram, GlUniforms};
+    use std::sync::Arc;
 
     fn key(id: Option<&str>, kind: NodeKind) -> ChildKey {
         ChildKey {
@@ -1859,6 +1943,89 @@ mod diff_tests {
         let plan = plan_diff(&prev, &next);
         assert_eq!(plan.ops, vec![SlotOp::Create]);
         assert_eq!(plan.removals, vec![0]);
+    }
+
+    // ── Node::GlSurface (#893 stage B) ──────────────────────────────────────
+
+    /// A `GlSurface` node reports its own kind and carries its id and classes
+    /// through the three shallow accessors every diff pass reads — the sites a
+    /// new `Node` variant is silently *missed* at, because `node_id` and
+    /// `node_classes` both end in a catch-all-ish `or`-pattern arm that
+    /// compiles perfectly well without the new variant listed.
+    ///
+    /// **Falsified** by dropping `Node::GlSurface` from `node_id`'s or
+    /// `node_classes`' arm: the node would land in `Separator | Spacer`'s
+    /// "no id, no classes" bucket, every GL chip in a tree would key as
+    /// `(None, GlSurface)`, and they would swap widgets — and phosphor trails
+    /// — on any insert.
+    #[test]
+    fn a_gl_surface_node_carries_its_kind_id_and_classes() {
+        let node = Node::GlSurface {
+            id: Some("scope".to_owned()),
+            width: 288,
+            height: 96,
+            program: GlProgram("preem.scope"),
+            state: Arc::new(GlUniforms::default()),
+            classes: vec!["ts-preem".to_owned()],
+        };
+        assert_eq!(node_kind(&node), NodeKind::GlSurface);
+        assert_eq!(node_id(&node), Some("scope"));
+        assert_eq!(node_classes(&node), ["ts-preem".to_owned()]);
+        assert_eq!(child_key(&node), key(Some("scope"), NodeKind::GlSurface));
+    }
+
+    /// A `GlSurface` is its **own kind**, so an id reused across the
+    /// `Pixels` ⇄ `GlSurface` boundary rebuilds instead of reusing the widget.
+    ///
+    /// This is the arm that matters for the kill switch: with
+    /// `TROLLSHELL_PREEM_RENDERER=cpu` the shell emits `Pixels` for a `Scope`
+    /// and without it a `GlSurface`, under the *same node id*. If both mapped
+    /// to one `NodeKind`, `update_in_place` would downcast a `PixelSurface` to
+    /// a `GlSurface` and hit the `downcast` expect — the "kind invariant"
+    /// panic — on the first frame after a flip.
+    ///
+    /// **Falsified** by mapping `Node::GlSurface` to `NodeKind::Pixels`.
+    #[test]
+    fn a_gl_surface_never_reuses_a_pixels_widget() {
+        let prev = vec![key(Some("scope"), NodeKind::Pixels)];
+        let next = vec![key(Some("scope"), NodeKind::GlSurface)];
+        let plan = plan_diff(&prev, &next);
+        assert_eq!(plan.ops, vec![SlotOp::Create]);
+        assert_eq!(plan.removals, vec![0], "the raster surface is torn down");
+
+        // …and back the other way, which is the kill switch being turned on.
+        let back = plan_diff(&next, &prev);
+        assert_eq!(back.ops, vec![SlotOp::Create]);
+        assert_eq!(back.removals, vec![0]);
+    }
+
+    /// A same-id `GlSurface` re-render reuses its widget in place — the whole
+    /// point of the node, since a rebuilt surface would drop its phosphor
+    /// textures and its `last_drawn` step count on every frame.
+    #[test]
+    fn a_same_id_gl_surface_reuses_in_place() {
+        let prev = vec![key(Some("scope"), NodeKind::GlSurface)];
+        let next = prev.clone();
+        let plan = plan_diff(&prev, &next);
+        assert_eq!(plan.ops, vec![SlotOp::Reuse(0)]);
+        assert!(plan.removals.is_empty());
+    }
+
+    /// GL surfaces reorder and insert like every other keyed child — the
+    /// generic path, asserted here because a chip losing its accumulator to a
+    /// sibling's insert is a *visible* regression (a phosphor trail jumping
+    /// widgets) rather than a layout one.
+    #[test]
+    fn gl_surfaces_reorder_without_rebuilding() {
+        let gl = |id| key(Some(id), NodeKind::GlSurface);
+        let prev = vec![gl("a"), gl("b"), gl("c")];
+        let next = vec![gl("c"), gl("a"), gl("b")];
+        let plan = plan_diff(&prev, &next);
+        assert_eq!(
+            plan.ops,
+            vec![SlotOp::Reuse(2), SlotOp::Reuse(0), SlotOp::Reuse(1)]
+        );
+        assert!(plan.removals.is_empty());
     }
 
     #[test]

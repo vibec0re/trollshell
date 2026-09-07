@@ -5,6 +5,7 @@ mod app;
 mod bar;
 pub(crate) mod cast;
 mod error;
+pub mod gl_surface;
 mod layer_window;
 mod monitor;
 pub mod multi_sparkline;
@@ -16,6 +17,11 @@ pub mod widget_tree;
 pub use app::{App, AppBuilder};
 pub use bar::{Bar, BarHandle, Edge};
 pub use error::{Error, Result};
+// The GPU counterpart to `PixelSurface` (#893 stage B): a `GtkGLArea` running a
+// host-registered shader pipeline for `Node::GlSurface`. The pipeline
+// vocabulary and the registry live in the module; only the widget and the
+// uniform bag are hoisted here, because those are what a shell names.
+pub use gl_surface::{GlProgram, GlSurface, GlUniforms, GlValue};
 pub use layer_window::{Anchor, LayerWindowBuilder, Margin, layer_window, on_surface_ready};
 pub use monitor::Monitor;
 pub use multi_sparkline::MultiSparkline;

@@ -20,8 +20,10 @@ buffer — a `Vec<u16>` phosphor decayed with `(v * retained) >> 8` every step
 
 This spec settles three things nothing upstream did: how a `forbid(unsafe_code)`
 workspace issues GL draw calls, how a GPU frame reaches the reconciler without a
-readback, and what #893's trust boundary is now that robustness turned out to be
-unreachable.
+readback, and what #893's trust boundary is. On that third point: this spec
+originally chose a runtime validator; amended 2026-09-07, the settled boundary
+is the plugin socket's own same-user file permissions instead — see "Trust
+boundary for #893" below.
 
 ## Decisions (Annika, 2026-09-06)
 
@@ -36,9 +38,13 @@ Annika answered all six open questions below on [#893](https://github.com/vibec0
    its own trail, as the CPU instance table already does per scope.
 4. **Parity ceiling stands:** mean 2 / p99 8 / max 32 per channel.
 5. **#893's caps stand:** 16 KiB source, 4096 IR expressions, no unbounded
-   loops.
+   loops. _Superseded 2026-09-07 — naga cannot parse the shipped shaders at
+   all, so there was no validator to enforce the IR/loop caps with; the
+   source-size cap stands on its own. See "Trust boundary for #893" below._
 6. **Dialect fallback: drop to `#version 310 es`** if naga cannot parse
-   `320 es`, rather than take a heavier validator.
+   `320 es`, rather than take a heavier validator. _Superseded 2026-09-07 —
+   moot: naga rejects `300/310/320 es` alike, so tree-owned shaders are gated
+   in CI by `glslangValidator` instead (`nix/lint-glsl.py`)._
 
 ## What stage A settled (quoting only the numbers the #893 verdict quotes)
 
@@ -202,12 +208,12 @@ a bounded per-channel delta against the same goldens, per the #893 verdict.
 in a nix sandbox with no `/dev/dri` and no mesa in the closure. So CI checks what
 it can, all pure-CPU:
 
-| check                                                                                       | where                                        |
-| ------------------------------------------------------------------------------------------- | -------------------------------------------- |
-| the shipped GLSL parses and validates as `#version 320 es` under **naga**                   | `cargo test` in `trollshell`                 |
-| `(ScopeConfig, ScopeState, step_seq)` → `GlUniforms` against a golden uniform table         | `preem_render` unit test                     |
-| the state machine: `animates()`, `settle_steps`, `step_seq` monotonicity, catch-up clamping | `preem_render` unit test                     |
-| `plan_diff` / `NodeKind` for `GlSurface`                                                    | `widget_tree.rs`, headless, existing pattern |
+| check                                                                                                                                           | where                                                 |
+| ----------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| the shipped GLSL (tree-owned only; plugin-supplied shaders have no CI gate, per the settled trust boundary) compiles under **glslangValidator** | `nix flake check`'s `glsl` check (`nix/lint-glsl.py`) |
+| `(ScopeConfig, ScopeState, step_seq)` → `GlUniforms` against a golden uniform table                                                             | `preem_render` unit test                              |
+| the state machine: `animates()`, `settle_steps`, `step_seq` monotonicity, catch-up clamping                                                     | `preem_render` unit test                              |
+| `plan_diff` / `NodeKind` for `GlSurface`                                                                                                        | `widget_tree.rs`, headless, existing pattern          |
 
 **Live-verify only:** the actual pixels, the parity delta, `--areas 8`. The
 parity harness is a new `hytte-ui` example (`preem_gl_diff`) — examples ship
@@ -221,32 +227,65 @@ the span-quad design above holds the observed numbers should be far tighter (onl
 `round()` at exact .5 boundaries can differ); PR 1 records what it measured and
 the ceiling tightens to observed + margin.
 
-## Trust boundary for #893 — route 1, validation only
+## Trust boundary for #893 — route 0: the socket is the boundary
 
-Chosen, not forced: the NVIDIA stack advertises every robustness extension, but
-`gdk.robust_context_api: absent` means GDK requests none of them and
-`GtkGLArea` exposes no knob, so routes 2 and 4 are expensive rather than moot.
+**Amended 2026-09-07**, superseding route 1 below. Two things settled it.
+First: naga cannot parse GLSL ES at all — `#version 300/310/320 es` all fail
+`ParseErrors { errors: [InvalidVersion(_), InvalidProfile("es")] }` under both
+naga 26.0.0 (what `Cargo.lock` resolves) and 29.0.4, measured twice
+independently by PR #954's builder and an adversarial reviewer's standalone
+crate — so decision 6's "drop to `310 es`" never reaches the objection, and
+route 1 never had a working validator to enforce its caps with. Second, Annika
+settled the boundary on
+[#893](https://github.com/vibec0re/trollshell/issues/893#issuecomment-5568936135)
+(2026-09-07T10:02Z): _"hmm ok if this adds nothing then let's not overcomplicate
+things ❤️"_, declining a provenance check (`SO_PEERCRED` → cgroup → unit name,
+first proposed under the name "route 0") as re-deriving what the socket's file
+mode already guarantees. Tree-owned shaders (#954, on main) are gated in CI by
+`glslangValidator` instead — a flake check (`nix/lint-glsl.py`), zero
+`Cargo.lock` cost; see the `glsl` bullet in this repo's `CLAUDE.md` CI section.
 
-- **Validator: naga** (`front::glsl`). Safe Rust; `glslang`/`shaderc` are C++ FFI
-  that would have to live in the unsafe island and drag a large build closure.
-  Lock delta ≈ 15 new entries — paid by #893, **not** by stage B PR 1.
-- **Caps:** source ≤ 16 KiB; after parse, reject > 4096 IR expressions, any loop
-  whose trip count is not a compile-time constant, and any sampler the shell did
-  not bind. These are heuristics, deliberately: they bound the _ordinary_ mistake,
-  not an adversary.
-- **Compile error → the broken-widget placeholder** plus one warning. Note
-  `Warned::slot` (`preem_render.rs:679-690`) is at its 8-diagnostic `u8` ceiling;
-  a new diagnostic needs a slot.
-- **Blast radius, plainly: the whole shell.** One share group per display, no
-  `LOSE_CONTEXT_ON_RESET`, so a GPU reset takes every preem context down with no
-  notification and GTK will not recover on its own. Realistic worst case is a
-  shell restart; whether the Vulkan compositor survives a GL-channel reset on the
-  same device is unknown and untested.
-- **Upgrade path: route 3** (out-of-process shader host, own context and share
-  group, frames back as dmabuf) — reached if a hang is ever observed on glass,
-  not before.
-- **Dialect: `#version 320 es`.** GDK negotiated `GLAPI(GLES) version=3.2` even
-  with `allowed=GLAPI(GL | GLES)`.
+- **The boundary is the socket itself.** It lives under `$XDG_RUNTIME_DIR`
+  (already user-only); the host sets its directory to `0700` and the socket
+  file to `0600` (`trollshell/src/plugins/listener.rs:73,101`;
+  `hytte-plugin-proto/src/topology.rs:4-23` calls it "same-user-only by
+  spec"). Another user or a sandboxed app cannot reach it. A same-uid process
+  can — and no provenance check could stop that one either: it can
+  `systemd-run --user --unit=trollshell-plugin-<id>` itself, or read a token
+  out of `/proc`.
+- **Enforced: whoever can reach the socket is a trusted plugin, for now.**
+  `Capability::Shader` (added by the shader-widget PR) is an ordinary manifest
+  capability, auto-granted and audit-logged exactly like the rest — the host
+  already grants every capability a manifest declares
+  (`trollshell/src/plugins/session.rs:515`); `manifest.rs:104`'s "`RunCommand`
+  is a separately granted, higher-trust cap" sentence is aspirational, not
+  enforced. Also enforced: a 16 KiB source-size cap, kept because it's free;
+  compile error → the broken-widget placeholder plus one warning (a new
+  `Warned` diagnostic slot, `preem_render.rs:791-799`).
+- **Deliberately not enforced:** no runtime validator (naga cannot read the
+  shader — there is nothing to validate with); no 4096-IR-expression or
+  unbounded-loop cap (both were naga-only enforcement and are dropped rather
+  than pretended); no provenance check; no
+  `TROLLSHELL_PLUGIN_ALLOW_UNAUTHENTICATED` flag — there is nothing to
+  bypass. A runaway or malicious shader gets exactly the trust the native
+  code the plugin already runs gets.
+- **Blast radius, plainly: the whole shell.** The NVIDIA stack advertises
+  every robustness extension, but `gdk.robust_context_api: absent` means GDK
+  requests none of them and `GtkGLArea` exposes no knob. One share group per
+  display, no `LOSE_CONTEXT_ON_RESET`, so a GPU reset takes every preem
+  context down with no notification and GTK will not recover on its own.
+  Realistic worst case is a shell restart; whether the Vulkan compositor
+  survives a GL-channel reset on the same device is unknown and untested.
+- **Upgrade path: route 3** (out-of-process shader host, own context and
+  share group, frames back as dmabuf) — reached if a plugin is ever not
+  trusted, not before.
+- **Dialect: `#version 320 es`.** GDK negotiated `GLAPI(GLES) version=3.2`
+  even with `allowed=GLAPI(GL | GLES)`.
+
+_Superseded: route 1 named naga as a runtime validator with caps (16 KiB
+source, 4096 IR expressions, no unbounded loops) — see Decisions #5/#6 above.
+It never had a working validator to enforce with; kept here for the record
+only, not as guidance._
 
 ## Fractional scale
 
@@ -294,8 +333,8 @@ No change to `hytte-plugin-proto`, `hytte-plugin`, any plugin, or `pump.rs`.
   `DotMatrix`, `LedStrip`, `SevenSeg`, `FlipBoard`, `TextBox`. One per PR, after
   `Scope` proves the seam.
 - **The shader widget itself (#893).** This spec settles its trust boundary and
-  dialect; the widget, its wire vocabulary addition and the naga dependency are
-  its own PR.
+  dialect; the widget and its wire vocabulary addition are their own PR. No
+  validator dependency rides along — see "Trust boundary for #893" above.
 - **Skins (#885/#397)** beyond what `palette_snapshot` carries.
 - **Route 3**, the out-of-process shader host. Named, not built.
 - **Fractional-scale snapping.** Unprovable on this hardware.

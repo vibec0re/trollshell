@@ -247,7 +247,9 @@ fn the_primary_click_opens_the_panel_and_never_pauses_the_loop() {
         "the chat surface is used while the loop RUNS — it must not pause it"
     );
     assert_eq!(
-        m.selected.as_ref().map(|n| n.as_str()),
+        m.selected
+            .as_ref()
+            .map(hytte_plugin_agents::model::AgentName::as_str),
         Some("trollshell-choom")
     );
 }
@@ -261,7 +263,12 @@ fn the_edit_click_opens_the_panel_and_sends_no_frame() {
     let fx = m.update(click("edit:stray"));
     assert_eq!(fx, vec![Effect::OpenPage(Page::PluginSelf)]);
     assert!(lines(&mut rx).is_empty());
-    assert_eq!(m.selected.as_ref().map(|n| n.as_str()), Some("stray"));
+    assert_eq!(
+        m.selected
+            .as_ref()
+            .map(hytte_plugin_agents::model::AgentName::as_str),
+        Some("stray")
+    );
 
     m.update(click("agents-back"));
     assert_eq!(m.selected, None);

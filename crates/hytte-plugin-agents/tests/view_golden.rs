@@ -72,7 +72,6 @@ fn seed(now_unix: i64) -> Agents {
             unix: now_unix,
             iso: "2026-09-07T12:45:00Z".to_owned(),
         }),
-        ..hytte_plugin::proto::StateSnapshot::default()
     }));
     m
 }

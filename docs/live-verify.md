@@ -415,7 +415,12 @@ the reducer but cannot prove the hive agrees.
       marker exists (`hivectl list-agents` shows it paused) and that the agent
       drives no further turns. Click again to resume and confirm both ends
       agree. A refused write must un-stick the row within one poll rather than
-      leaving it claiming a pause that never happened.
+      leaving it claiming a pause that never happened — **and must say why**:
+      drive a refusal on purpose (stop `hive-c0re` between the click and the
+      write, or click an agent the hive has since destroyed) and confirm
+      exactly one toast reading `hive refused: pause <label>` with the hive's
+      own message as the body. Without it the button just flips and snaps back,
+      which reads as broken rather than refused.
 - [ ] **(#947 P1)** Grouping. Give two agents different
       `[display.<name>].project` values in `~/.config/trollshell/agents.toml`
       and confirm two group headers appear; collapse them to one project and

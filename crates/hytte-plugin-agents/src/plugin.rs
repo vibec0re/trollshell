@@ -99,6 +99,16 @@ impl Agents {
                 self.hive = Hive::Incompatible(mismatch);
                 Vec::new()
             }
+            // A hive that answered — with `ok: false`, or with a line this
+            // build cannot parse — is up, and saying so as "unreachable"
+            // sends the operator to `systemctl` for a problem that is not
+            // there.
+            Err(e @ (HiveError::Refused { .. } | HiveError::Protocol { .. })) => {
+                self.hive = Hive::Error {
+                    reason: e.to_string(),
+                };
+                Vec::new()
+            }
             Err(e) => {
                 self.hive = Hive::Unreachable {
                     reason: e.to_string(),
@@ -184,6 +194,44 @@ impl Agents {
             agent.pending_paused = Some(want);
         }
         let _ = self.cmd_tx.send(Cmd::Send(req));
+    }
+
+    /// How a refused frame reads in a toast: the verb plus the agent's
+    /// **display label**, so it matches the row the operator just clicked.
+    ///
+    /// Phrased here rather than in the poll task for the same reason the
+    /// alarm toasts are: `update` is where this plugin's human-facing strings
+    /// live, and it is the only place that holds the config the labels come
+    /// from.
+    fn describe(&self, request: &Request) -> String {
+        match request {
+            Request::SetPaused { name, paused } => {
+                let verb = if *paused { "pause" } else { "resume" };
+                format!("{verb} {}", self.cfg.label_for(name))
+            }
+            Request::Start { scope } => {
+                format!("start {}", self.scope_label(scope))
+            }
+            Request::Stop { scope, .. } => {
+                format!("stop {}", self.scope_label(scope))
+            }
+            Request::Restart { name } => format!("restart {}", self.cfg.label_for(name)),
+            // The read verbs never travel as a `Cmd::Send`, so this arm is
+            // unreachable in practice; a generic phrasing beats a panic.
+            Request::List
+            | Request::AgentStatus
+            | Request::SubscribeAgentStatus
+            | Request::Urls => "the request".to_owned(),
+        }
+    }
+
+    /// A scope names exactly one agent by construction (spec §11 rule one),
+    /// so this reads the first — and says so rather than indexing blindly.
+    fn scope_label(&self, scope: &Scope) -> String {
+        scope.agent_names().first().map_or_else(
+            || "the hive".to_owned(),
+            |n| self.cfg.label_for(n).to_owned(),
+        )
     }
 
     /// Select an agent and open this plugin's own panel.
@@ -304,6 +352,14 @@ impl Plugin for Agents {
             Input::App(Msg::Urls(urls)) => {
                 self.urls = Some(*urls);
                 Vec::new()
+            }
+            // Exactly one toast per refusal. The row un-sticks on the next
+            // poll regardless; this is what says why it did.
+            Input::App(Msg::WriteRefused { request, reason }) => {
+                vec![Effect::Notify {
+                    summary: format!("hive refused: {}", self.describe(&request)),
+                    body: reason,
+                }]
             }
             Input::App(Msg::Status(result)) => self.fold_status(result),
             Input::Event {

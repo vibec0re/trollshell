@@ -179,6 +179,15 @@ pub fn card(hive: &Hive, cfg: &AgentsConfig) -> Node {
             reason,
             "dim-label",
         )],
+        // Reachable, and saying no — a different problem from "no hive", so a
+        // different head and a different icon (spec §5.3 covers only the
+        // unreachable case; this is its reachable sibling).
+        Hive::Error { reason } => vec![notice(
+            "dialog-error-symbolic",
+            "hive error",
+            reason,
+            "error",
+        )],
         Hive::Incompatible(mismatch) => vec![notice(
             "dialog-warning-symbolic",
             "hive protocol mismatch",
@@ -281,6 +290,7 @@ fn hive_section(hive: &Hive, ctx: PanelContext<'_>) -> Vec<Node> {
     let reachability = match hive {
         Hive::Connecting => "connecting…".to_owned(),
         Hive::Unreachable { reason } => format!("unreachable — {reason}"),
+        Hive::Error { reason } => format!("reachable, but refused — {reason}"),
         Hive::Incompatible(m) => {
             format!(
                 "refused — hive protocol v{}, plugin speaks v{}",

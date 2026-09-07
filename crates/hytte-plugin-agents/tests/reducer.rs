@@ -13,7 +13,7 @@ use hytte_plugin::proto::{Effect, EventKind, Page};
 use hytte_plugin::{CmdReceiver, Input, Plugin, cmd_channel};
 use hytte_plugin_agents::Agents;
 use hytte_plugin_agents::hive::client::HiveError;
-use hytte_plugin_agents::hive::wire::{AgentStatusRow, Response, VersionMismatch};
+use hytte_plugin_agents::hive::wire::{AgentStatusRow, Request, Response, Scope, VersionMismatch};
 use hytte_plugin_agents::model::{Hive, Status};
 use hytte_plugin_agents::poll::{Cmd, Msg};
 
@@ -110,6 +110,65 @@ fn a_version_mismatch_gets_its_own_state() {
             theirs: 99,
             ours: 1
         })
+    );
+}
+
+/// A hive that **answered** — with `ok: false`, or with a line this build
+/// cannot parse — is up, and must not be labelled unreachable. The two send
+/// the operator to different places: one is a `systemctl` problem, the other
+/// is not.
+///
+/// Falsification: fold `Refused`/`Protocol` back into the `Err(e)` catch-all
+/// and the first two assertions go red.
+#[test]
+fn a_reachable_hive_that_refuses_is_not_labelled_unreachable() {
+    let (mut m, _rx) = model();
+
+    m.update(Input::App(Msg::Status(Err(HiveError::Refused {
+        reason: "agent \"ghost\" is not managed by this hive".to_owned(),
+    }))));
+    assert_eq!(
+        m.hive,
+        Hive::Error {
+            reason: "agent \"ghost\" is not managed by this hive".to_owned()
+        }
+    );
+
+    m.update(Input::App(Msg::Status(Err(HiveError::Protocol {
+        reason: "unparseable answer: expected value".to_owned(),
+    }))));
+    assert!(
+        matches!(m.hive, Hive::Error { .. }),
+        "an unusable answer is still a reachable hive: {:?}",
+        m.hive
+    );
+
+    // …and the genuinely unreachable case keeps its own state.
+    m.update(Input::App(Msg::Status(Err(HiveError::Unreachable {
+        reason: "no socket — hive-c0re is not running".to_owned(),
+    }))));
+    assert!(matches!(m.hive, Hive::Unreachable { .. }), "{:?}", m.hive);
+}
+
+/// A row whose name hyperhive's own `Ident` would refuse never becomes a row —
+/// every button on it would address the daemon with a name it rejects at
+/// deserialize time, so the row would render live controls that cannot work.
+///
+/// Falsification: widen `AgentName::parse` back to spec §11.2's
+/// `[A-Za-z0-9_-]` and this goes red.
+#[test]
+fn a_row_named_outside_hyperhives_ident_charset_is_dropped() {
+    let (mut m, _rx) = model();
+    m.update(status(vec![
+        row("good-agent", false, false),
+        row("Agent_9", false, false),
+        row("SHOUTING", false, false),
+    ]));
+    let names: Vec<&str> = m.hive.agents().iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["good-agent"],
+        "only names hyperhive's Ident accepts may render"
     );
 }
 
@@ -409,6 +468,102 @@ fn toml_config(body: &str) -> hytte_plugin_agents::config::AgentsConfig {
     )])
     .expect("the test config assembles")
     .config
+}
+
+// ── a refused write ──────────────────────────────────────────────────────────
+
+/// A write the hive refused raises **exactly one** toast, naming what was
+/// attempted and carrying the daemon's own reason.
+///
+/// Without it the operator sees a pause button that flips, snaps back on the
+/// next poll, and explains nothing — which on the two failures most likely in
+/// practice (a permission problem, or `agent "…" is not managed`) reads as a
+/// broken button rather than as a refusal.
+///
+/// Falsification: drop the `Msg::WriteRefused` send from `poll.rs`'s `Err`
+/// arm, or the `Input::App(Msg::WriteRefused)` arm from `update`, and this
+/// goes red.
+#[test]
+fn a_refused_write_raises_exactly_one_explaining_toast() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+
+    let fx = m.update(Input::App(Msg::WriteRefused {
+        request: Request::SetPaused {
+            name: "trollshell-choom".to_owned(),
+            paused: true,
+        },
+        reason: "agent \"trollshell-choom\" is not managed by this hive".to_owned(),
+    }));
+    assert_eq!(fx.len(), 1, "one refusal, one toast");
+    match &fx[0] {
+        Effect::Notify { summary, body } => {
+            assert!(summary.contains("refused"), "{summary}");
+            assert!(
+                summary.contains("pause"),
+                "the toast must name the attempt: {summary}"
+            );
+            assert!(summary.contains("trollshell-choom"), "{summary}");
+            assert!(
+                body.contains("not managed"),
+                "the hive's own words carry the why: {body}"
+            );
+        }
+        other => panic!("expected Notify, got {other:?}"),
+    }
+}
+
+/// The toast phrases each verb the way the row does — including `resume` for
+/// an un-pause, and the configured **display label** rather than the hive's
+/// raw name, so it matches the row the operator just clicked.
+#[test]
+fn the_refusal_toast_phrases_the_verb_and_uses_the_display_label() {
+    let (mut m, _rx) = model();
+    m.update(Input::App(Msg::Config(Box::new(toml_config(
+        "[display.trollshell-choom]\nlabel = \"choom\"\n",
+    )))));
+    m.update(status(roster("agent_status_grouped.json")));
+
+    let cases = [
+        (
+            Request::SetPaused {
+                name: "trollshell-choom".to_owned(),
+                paused: false,
+            },
+            "resume choom",
+        ),
+        (
+            Request::Start {
+                scope: Scope::agent("trollshell-choom"),
+            },
+            "start choom",
+        ),
+        (
+            Request::Stop {
+                scope: Scope::agent("trollshell-choom"),
+                graceful: true,
+            },
+            "stop choom",
+        ),
+        (
+            Request::Restart {
+                name: "trollshell-choom".to_owned(),
+            },
+            "restart choom",
+        ),
+    ];
+    for (request, want) in cases {
+        let fx = m.update(Input::App(Msg::WriteRefused {
+            request,
+            reason: "nope".to_owned(),
+        }));
+        match &fx[0] {
+            Effect::Notify { summary, .. } => {
+                assert!(summary.contains(want), "expected {want:?} in {summary:?}");
+            }
+            other => panic!("expected Notify, got {other:?}"),
+        }
+    }
 }
 
 // ── visibility ───────────────────────────────────────────────────────────────

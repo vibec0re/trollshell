@@ -16,12 +16,22 @@ use crate::hive::wire::{AgentStatusRow, VersionMismatch};
 /// it reaches anything that concatenates it — the button ids the row builds
 /// (`pause:<name>`), the request frames, and in P2 the `RunCommand` argv.
 ///
-/// The whitelist the spec names is `[A-Za-z0-9_-]+`. The hive's own `Ident` is
-/// *stricter* (`[a-z0-9-]`, 63 bytes max — `hive-types/src/lib.rs:96-107`), so
-/// nothing this accepts can surprise it; the extra breadth only means a hive
-/// that widens its own charset does not silently drop rows here. The 63-byte
-/// cap is kept because it is the hive's own (`Ident::MAX_LEN`) and it stops an
-/// unbounded wire string from becoming an unbounded node id.
+/// **The charset is hyperhive's own `Ident`, not spec §11.2's.** The spec
+/// names `[A-Za-z0-9_-]+`; `Ident::parse` accepts only `[a-z0-9-]`, 1..=63
+/// bytes (`hive-types/src/lib.rs:95-110`). The looser one is not merely
+/// redundant, it is *wrong in a way that only shows up as a failed write*:
+/// `SetPaused`/`Restart` type their `name` as `Ident`, so a name this
+/// accepted but `Ident` does not — `Agent_9`, `AGENT`, `snake_case` — would
+/// be rendered as a row with live buttons whose every click the daemon
+/// refuses at deserialize time. Matching the source of truth means a row that
+/// renders is a row that can be driven.
+///
+/// The same charset is what spec §11.2 makes the guard on P2's `choom` argv,
+/// so tightening it now is also the cheapest time to do it. Note for that
+/// phase: `[a-z0-9-]` still admits a **leading hyphen** (`--rm` is a legal
+/// `Ident`), which is an argv concern shared with upstream rather than
+/// something this type can fix — an argv builder must pass `--` or an
+/// explicit `--agent=<name>`, never bare interpolation.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AgentName(String);
 
@@ -29,16 +39,18 @@ impl AgentName {
     /// The hive's own cap (`Ident::MAX_LEN`, `hive-types/src/lib.rs:87`).
     pub const MAX_LEN: usize = 63;
 
-    /// Validate a name off the wire. `None` rejects it — the caller drops the
-    /// row and logs, rather than rendering something it cannot address.
+    /// Validate a name off the wire, by hyperhive's own `Ident` rule. `None`
+    /// rejects it — the caller drops the row and logs, rather than rendering
+    /// something the daemon would refuse to be addressed by.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         if s.is_empty() || s.len() > Self::MAX_LEN {
             return None;
         }
+        // `Ident::parse`'s exact predicate, `hive-types/src/lib.rs:105-107`.
         if !s
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         {
             return None;
         }
@@ -218,6 +230,19 @@ pub enum Hive {
     /// land here (spec §5.3, "no socket, no crash").
     Unreachable {
         /// The row's second line.
+        reason: String,
+    },
+    /// The hive is **up and talking**, but its answer was unusable: an
+    /// `ok: false` carrying the daemon's own error, or a line this build
+    /// could not parse.
+    ///
+    /// Kept apart from [`Hive::Unreachable`] because the two send the
+    /// operator to different places — "hive-c0re is not running" is a
+    /// `systemctl` problem, `agent "ghost" is not managed by this hive` is
+    /// not — and a status surface that mislabels which one it is has failed
+    /// at the one job it has.
+    Error {
+        /// The daemon's own message, or the parse failure.
         reason: String,
     },
     /// The daemon speaks a wire version this build refuses to guess at
@@ -513,16 +538,42 @@ mod tests {
         assert_eq!(a.status(), Status::Running);
     }
 
+    /// The whitelist is hyperhive's `Ident`, byte for byte — including the
+    /// three shapes spec §11.2's looser `[A-Za-z0-9_-]` would have admitted
+    /// and the daemon then refuses at deserialize time.
+    ///
+    /// Falsification: widen the predicate back to `is_ascii_alphanumeric() ||
+    /// b'-' || b'_'` and the three `refused_by_ident` assertions go red.
     #[test]
-    fn names_off_the_wire_are_whitelisted() {
-        assert!(AgentName::parse("trollshell-choom").is_some());
-        assert!(AgentName::parse("Agent_9").is_some());
-        assert!(AgentName::parse("").is_none());
-        assert!(AgentName::parse("../etc/passwd").is_none());
-        assert!(AgentName::parse("has space").is_none());
-        assert!(AgentName::parse("colon:in:name").is_none());
-        assert!(AgentName::parse(&"a".repeat(AgentName::MAX_LEN)).is_some());
-        assert!(AgentName::parse(&"a".repeat(AgentName::MAX_LEN + 1)).is_none());
+    fn names_off_the_wire_match_hyperhives_ident_exactly() {
+        for ok in [
+            "trollshell-choom",
+            "a",
+            "agent-9",
+            "9",
+            "-leading-hyphen", // legal Ident; a P2 argv concern, not this type's
+            &"a".repeat(AgentName::MAX_LEN),
+        ] {
+            assert!(AgentName::parse(ok).is_some(), "should accept {ok:?}");
+        }
+        // Rejected by `Ident` and therefore by us — the §11.2 gap this closes.
+        for refused_by_ident in ["Agent_9", "AGENT", "snake_case_agent"] {
+            assert!(
+                AgentName::parse(refused_by_ident).is_none(),
+                "hyperhive's Ident refuses {refused_by_ident:?}, so must we"
+            );
+        }
+        for bad in [
+            "",
+            "../etc/passwd",
+            "has space",
+            "colon:in:name",
+            "dot.separated",
+            "naïve",
+            &"a".repeat(AgentName::MAX_LEN + 1),
+        ] {
+            assert!(AgentName::parse(bad).is_none(), "should reject {bad:?}");
+        }
     }
 
     fn cfg_with_projects(pairs: &[(&str, &str)]) -> AgentsConfig {

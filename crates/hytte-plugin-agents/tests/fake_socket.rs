@@ -19,125 +19,15 @@
 //! `cargo test -p hytte-plugin-agents` is hermetic.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use hytte_plugin_agents::hive::client::{HiveError, request};
+use hytte_plugin_agents::hive::client::{HiveError, REQUEST_TIMEOUT, request};
 use hytte_plugin_agents::hive::wire::{HOST_SOCK_VERSION, Request, Scope, VersionMismatch};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixListener;
 
-// ── fixtures ─────────────────────────────────────────────────────────────────
-
-fn fixture(name: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("missing fixture {} ({e})", path.display()))
-        .trim()
-        .to_owned()
-}
-
-// ── the fake hive ────────────────────────────────────────────────────────────
-
-/// A `host.sock` stand-in. Records every request line it is sent, and answers
-/// each from a `cmd` → reply table.
-struct FakeHive {
-    /// Kept alive so the socket's directory outlives the listener.
-    _dir: tempfile::TempDir,
-    path: PathBuf,
-    seen: Arc<Mutex<Vec<String>>>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for FakeHive {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-impl FakeHive {
-    /// Bind at `<tmp>/host.sock` and serve `replies`, keyed by the request's
-    /// `cmd` tag. A `cmd` with no entry gets a bare success.
-    fn serve(replies: HashMap<&'static str, String>) -> Self {
-        let dir = tempfile::tempdir().expect("a tempdir");
-        let path = dir.path().join("host.sock");
-        let listener = UnixListener::bind(&path).expect("bind the fake host.sock");
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let task = tokio::spawn(accept_loop(listener, replies, Arc::clone(&seen)));
-        Self {
-            _dir: dir,
-            path,
-            seen,
-            task,
-        }
-    }
-
-    /// The socket path a client dials.
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Every request line the fake has been sent, in order.
-    fn seen(&self) -> Vec<String> {
-        self.seen
-            .lock()
-            .expect("the recorder is never poisoned")
-            .clone()
-    }
-}
-
-async fn accept_loop(
-    listener: UnixListener,
-    replies: HashMap<&'static str, String>,
-    seen: Arc<Mutex<Vec<String>>>,
-) {
-    loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            return;
-        };
-        // One request/response per connection, exactly like the real daemon
-        // (and exactly what the client's one-connection-per-request model
-        // expects).
-        serve_one(stream, &replies, &seen).await;
-    }
-}
-
-async fn serve_one(
-    stream: UnixStream,
-    replies: &HashMap<&'static str, String>,
-    seen: &Arc<Mutex<Vec<String>>>,
-) {
-    let (read, mut write) = stream.into_split();
-    let mut reader = BufReader::new(read);
-    let mut line = String::new();
-    if reader.read_line(&mut line).await.is_err() {
-        return;
-    }
-    let line = line.trim().to_owned();
-    let cmd = serde_json::from_str::<serde_json::Value>(&line)
-        .ok()
-        .and_then(|v| v.get("cmd").and_then(|c| c.as_str()).map(str::to_owned))
-        .unwrap_or_default();
-    seen.lock()
-        .expect("the recorder is never poisoned")
-        .push(line);
-
-    let reply = replies
-        .get(cmd.as_str())
-        .cloned()
-        .unwrap_or_else(|| r#"{"version":1,"ok":true}"#.to_owned());
-    let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
-    let _ = write.flush().await;
-}
-
-fn replies(pairs: &[(&'static str, &str)]) -> HashMap<&'static str, String> {
-    pairs
-        .iter()
-        .map(|(cmd, body)| (*cmd, (*body).to_owned()))
-        .collect()
-}
+mod fake;
+use fake::{FakeHive, accept_loop, fixture, replies};
 
 // ── the tests ────────────────────────────────────────────────────────────────
 
@@ -407,12 +297,26 @@ async fn a_dead_socket_file_blames_the_service_not_the_group() {
 }
 
 /// A daemon that accepts and then hangs must not wedge the poll loop: the
-/// round trip is bounded by `REQUEST_TIMEOUT`.
+/// round trip is bounded by `REQUEST_TIMEOUT`, and **by that budget**, not
+/// merely "eventually".
 ///
-/// Falsification: drop the `tokio::time::timeout` wrapper in
-/// `client::request` and this test hangs instead of passing.
+/// Two things here are deliberate, and the earlier version of this test had
+/// neither:
+///
+/// - The **outer** `tokio::time::timeout` is what makes deleting the client's
+///   own timeout a *fast, named* red instead of a hang. A hang is not a red:
+///   on CI it is a job timeout with no failing test name, and locally it is a
+///   reviewer's lunch break.
+/// - The **`elapsed` bounds** are what pin the budget. Under
+///   `start_paused = true` the virtual clock auto-advances to whatever
+///   deadline exists, so a test that only asserts "an error came back" passes
+///   on a ten-year timeout just as happily as on five seconds.
+///
+/// Falsification: remove the `tokio::time::timeout` in `client::request` and
+/// this fails, named, in hundredths of a second; widen `REQUEST_TIMEOUT` and
+/// the `elapsed` assertion fails instead.
 #[tokio::test(start_paused = true)]
-async fn a_hung_daemon_times_out_instead_of_wedging_the_poll() {
+async fn a_hung_daemon_times_out_on_its_stated_budget() {
     let dir = tempfile::tempdir().expect("a tempdir");
     let path = dir.path().join("host.sock");
     let listener = UnixListener::bind(&path).expect("bind");
@@ -425,12 +329,64 @@ async fn a_hung_daemon_times_out_instead_of_wedging_the_poll() {
         }
     });
 
-    let err = request(&path, &Request::AgentStatus)
+    let start = tokio::time::Instant::now();
+    let err = tokio::time::timeout(REQUEST_TIMEOUT * 4, request(&path, &Request::AgentStatus))
         .await
+        .expect("the client must bound its own round trip, not rely on its caller")
         .expect_err("a hung daemon must time out");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= REQUEST_TIMEOUT && elapsed < REQUEST_TIMEOUT * 2,
+        "the budget must be REQUEST_TIMEOUT, not merely 'eventually': {elapsed:?}"
+    );
+
     match &err {
-        HiveError::Unreachable { reason } => assert!(reason.contains("did not answer"), "{reason}"),
+        HiveError::Unreachable { reason } => {
+            assert!(reason.contains("did not answer"), "{reason}");
+            assert!(
+                reason.contains(&REQUEST_TIMEOUT.as_secs().to_string()),
+                "the row should name the budget it gave up on: {reason}"
+            );
+        }
         other => panic!("expected Unreachable, got {other:?}"),
+    }
+    task.abort();
+}
+
+/// `EACCES` on a socket that exists and is listening — the one connect branch
+/// `docs/plugin-env.md` and the live-verify list both lean on, and the one
+/// most likely to be met in the wild (a `hive-admin` member whose shell
+/// predates the group grant). Exercised against a **real** `UnixStream::connect`
+/// rather than only through `connect_reason`'s unit test, because the mapping
+/// only matters if this is the `ErrorKind` the kernel actually produces.
+///
+/// Skipped, not failed, when the test user can open a mode-0000 file anyway —
+/// `root` and `CAP_DAC_OVERRIDE` bypass the permission bits, and a sandbox
+/// that runs tests as root would otherwise fail this for a reason that has
+/// nothing to do with the code.
+#[tokio::test]
+async fn a_permission_denied_socket_names_the_group_not_the_daemon() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().expect("a tempdir");
+    let path = dir.path().join("host.sock");
+    let listener = UnixListener::bind(&path).expect("bind");
+    let task = tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod the socket");
+
+    match request(&path, &Request::AgentStatus).await {
+        Err(HiveError::Unreachable { reason }) => {
+            assert!(
+                reason.contains("hive-admin"),
+                "EACCES must name the group, not the daemon: {reason}"
+            );
+            assert!(!reason.contains("not running"), "{reason}");
+        }
+        // Root ignores the mode bits; that is the environment, not a bug.
+        Ok(_) => eprintln!("skipped: this user can connect to a 0000 socket (root?)"),
+        Err(other) => panic!("expected Unreachable(EACCES), got {other:?}"),
     }
     task.abort();
 }

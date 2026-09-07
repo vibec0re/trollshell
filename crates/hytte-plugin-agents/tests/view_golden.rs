@@ -91,6 +91,15 @@ fn scenarios() -> Vec<(&'static str, Agents)> {
             }))));
             m
         }),
+        // A hive that is up and saying no — visibly different chrome from
+        // "no hive", which is the whole point of the state existing.
+        ("hive_error", {
+            let mut m = seed(GOLDEN_NOW);
+            m.update(Input::App(Msg::Status(Err(HiveError::Refused {
+                reason: "agent \"ghost\" is not managed by this hive".to_owned(),
+            }))));
+            m
+        }),
         ("incompatible", {
             let mut m = seed(GOLDEN_NOW);
             m.update(Input::App(Msg::Status(Err(HiveError::Version(

@@ -53,8 +53,9 @@ Exactly what the shell compiles, assembled the same way:
 
     The scan really is tree-wide now: repo root, recursive, for both
     `.frag` and `.vert`, minus `target/`, `.git/`, `.claude/`, `.direnv/` and
-    a `result*` build-output symlink (none of which ever carry shader
-    source — see `EXCLUDED_DIR_NAMES`). `nix/package.nix`'s filter is
+    a `result`/`result-<output>` build-output symlink (none of which ever
+    carry shader source — see `EXCLUDED_DIR_NAMES`). `nix/package.nix`'s
+    filter is
     `lib.hasSuffix ".frag"` / `".vert"` on the full path with **no** directory
     constraint at all, so anything narrower than the whole tree agrees with
     that filter by convention rather than by construction — and convention
@@ -145,17 +146,27 @@ PREAMBLE_SOURCE = WIDGET_SHADER_DIR / "shader_surface.rs"
 # `EXCLUDED_DIR_NAMES` is *not* part of matching the filter — the filter has
 # no such list — it exists purely so this scanner does not walk into
 # `target/` (large, and never shader source), `.git/` (ditto, plus binary
-# objects), `.claude/` / `.direnv/` (tool state, already `.gitignore`d), or
-# follow a `result*` symlink left by a previous `nix build` (which resolves
-# into the store — arbitrarily large, and a candidate for a walk cycle if
-# `os.walk` ever *did* follow it, which is why the pruning happens during the
-# walk rather than as a filter on its results; see `find_tree_wide`).
+# objects), `.claude/` / `.direnv/` (tool state, already `.gitignore`d), or a
+# `result`/`result-<output>` symlink left by a previous `nix build` (which
+# resolves into the store — arbitrarily large, and a candidate for a walk
+# cycle if `os.walk` ever *did* follow it, which is why the pruning happens
+# during the walk rather than as a filter on its results; see
+# `find_tree_wide`).
+#
+# The nix-symlink match is deliberately narrow — `name == "result" or
+# name.startswith("result-")`, the exact two shapes `nix build` names its
+# output links (`result`, or `result-<output>` for a multi-output
+# derivation) — **not** a bare `name.startswith("result")`. A prefix match
+# would prune any legitimately-tracked directory that happens to start with
+# those letters (`results/`, `resultset/`, `result_cache/`, …), which is
+# precisely the same *convention*-shaped hole this scan exists to close for
+# `.frag`/`.vert` discovery itself, just relocated into the exclusion list.
 EXCLUDED_DIR_NAMES = {"target", ".git", ".claude", ".direnv"}
 
 
 def _is_excluded_dir(name: str) -> bool:
-    """`target`/`.git`/`.claude`/`.direnv`, or a `result*` nix-build link."""
-    return name in EXCLUDED_DIR_NAMES or name.startswith("result")
+    """`target`/`.git`/`.claude`/`.direnv`, or a `result`/`result-<output>` link."""
+    return name in EXCLUDED_DIR_NAMES or name == "result" or name.startswith("result-")
 
 
 def find_tree_wide(suffix: str) -> list[Path]:

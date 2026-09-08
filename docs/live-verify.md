@@ -1098,14 +1098,17 @@ session.
      version, which is the point of the `glsl` check — build the plugin
      directly with `cargo build -p hytte-plugin-preem-demo` for this.)
   4. **The same source does not recompile.** With the tile running, watch
-     `RUST_LOG=hytte_ui=debug journalctl --user -u trollshell -f`: a shader that
-     keeps sending the same body across thousands of frames must produce no
-     repeated compile activity, and the tile must not flicker as frames arrive.
-     The hermetic half of this is `the_same_source_is_compiled_once` in
-     `crates/hytte-ui/src/shader_surface.rs`; what glass adds is that the
-     reconciler really is reusing the widget rather than rebuilding it (a
-     rebuild would restart `u_time`, visible as the beam jumping back to the
-     left edge on every frame).
+     `RUST_LOG=hytte_ui=debug journalctl --user -u trollshell -f`. Every actual
+     compile emits **one** `compiling a plugin shader` line carrying a
+     `source_key`, so the evidence is countable rather than an absence: across
+     thousands of frames of an unchanged shader there must be exactly **one**,
+     and editing the body and restarting the plugin must produce exactly one
+     more, with a _different_ key. The tile must not flicker as frames arrive,
+     and the beam must not jump back to the left edge — a rebuilt widget
+     restarts `u_time`, which is what that would look like. The hermetic half is
+     `the_same_source_is_compiled_once` in
+     `crates/hytte-ui/src/shader_surface.rs`; glass adds that the reconciler
+     really is reusing the widget.
   5. **The capability really gates it.** Delete
      `m.capabilities = vec![Capability::Shader];` from the demo's `manifest()`,
      rebuild and restart the plugin: the tile must become the same empty
@@ -1118,7 +1121,31 @@ session.
      per display, so a runaway plugin shader is the same trust as the plugin's
      own native code and the realistic worst case is a shell restart. Nothing to
      verify — this is the risk being accepted, with route 3 (an out-of-process
-     shader host) named as the upgrade if a plugin is ever not trusted.
+     shader host) named as the upgrade if a plugin is ever not trusted. The same
+     goes for a **failed** context: the latch is sticky for the process and the
+     shader widget has no CPU arm, so every shader stays a placeholder until the
+     shell restarts (`Refusal::NoGl` says why).
+  7. **Alpha is premultiplied — the one contract clause no test can reach.**
+     Everything else on this page is either gated hermetically or visible in the
+     demo; this is neither, because `spectrum.frag` is opaque. Replace its body
+     temporarily with two lines:
+
+     ```glsl
+     void main() { fragColor = vec4(0.5, 0.0, 0.0, 0.5); }
+     ```
+
+     `cargo build -p hytte-plugin-preem-demo`, restart the plugin, and look at
+     the tile against the card behind it. **Premultiplied is what the contract
+     says**, so this must read as an evenly half-transparent red — the card
+     showing through. If it reads as _full_ red (or as a dark, muddy red), the
+     framebuffer is being treated as straight alpha and the contract wording in
+     `Node::Shader`'s docs, `hytte-ui`'s `shader_surface` module docs and the
+     SDK's `shader` module docs is wrong in the same three places — fix the text,
+     not the shader. Then put `spectrum.frag` back.
+
+     Stated plainly: this was read off GDK's memory format
+     (`GDK_MEMORY_DEFAULT`), not off a screen. It is the claim in this PR with
+     the least evidence behind it.
 
 ## Screen recording
 

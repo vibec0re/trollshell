@@ -130,7 +130,8 @@ Beyond the package build's `doCheck`, the flake's `checks` output
   `nix shell nixpkgs#python3 nixpkgs#glslang --command python3 nix/lint-glsl.py`
   (both are in the devShell too). Since #893 it also compiles the **shader
   widget**'s vertex stage and every plugin-supplied fragment _body_ shipped in
-  the tree (`crates/hytte-plugin-preem-demo/shaders/*.frag`), each with the
+  the tree (`crates/*/shaders/*.frag`, globbed rather than listed so a new
+  plugin's bodies are covered the day they land), each with the
   `SHADER_PREAMBLE` interface declarations spliced in front — read out of
   `crates/hytte-ui/src/shader_surface.rs`, so a change to the published uniform
   contract changes what CI validates in the same commit. A plugin's _runtime_

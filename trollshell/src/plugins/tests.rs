@@ -39,7 +39,7 @@ use super::session::{
     EFFECT_BURST, EffectRateLimiter, IdGuard, OUTBOUND_CAPACITY, REGISTER_TIMEOUT,
     effect_capability, enforce_capabilities, handle_conn, push_gate, state_key_capability,
 };
-use super::shader_map::Grants;
+use super::shader_map::{self, Grants};
 use super::wire_map::{clamp_pixels_scale, pixels_len_ok, to_ui_node, to_wire_event};
 use super::{BrokeredEffect, ListenerCtx, SlotRender};
 
@@ -8075,8 +8075,14 @@ fn a_wire_shader_node_maps_its_fields_across_intact() {
             height,
             state,
             classes,
+            tooltip,
         } => {
             assert_eq!(id.as_deref(), Some("spectrum"));
+            assert_eq!(
+                tooltip.as_deref(),
+                Some("dropped on purpose — the reconciler node carries none"),
+                "…and since #968 review M3 it is carried rather than dropped",
+            );
             assert_eq!((width, height), (144 * 3, 48 * 3), "size × the scale hint");
             assert_eq!(state.scale, 3, "…and the hint itself reaches the shader");
             assert_eq!(&*state.fragment, "void main() { fragColor = u_accent; }");
@@ -8157,6 +8163,77 @@ fn an_ungranted_shader_degrades_without_taking_its_siblings() {
                 other => panic!("the refused node mapped to {other:?}"),
             }
         }
+        other => panic!("mapped to {other:?}"),
+    }
+}
+
+/// **#968 review M1, the invalidation half.** A desktop-accent change rebuilds
+/// a shader node's shared state even though the node's own bytes did not move.
+///
+/// This is the #396 live re-tint reaching the shader arm: the theme bag is
+/// resolved per mapping pass, so a cache keyed on the wire node alone would keep
+/// handing back the *old* accent until the plugin's data happened to change —
+/// which for a static shader is never.
+///
+/// Lives here rather than beside the other `shader_map` tests because it writes
+/// `hytte_preem`'s process-global accent, and [`PREEM_INK_LOCK`] is what stops
+/// that racing every other preem test in this binary.
+///
+/// **Falsified** by dropping `held.values == values` from `shared_state`'s
+/// comparison: the second state is pointer-equal to the first and the assertion
+/// goes red.
+#[test]
+fn an_accent_change_rebuilds_a_shader_nodes_shared_state() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("shader-retint");
+    shader_map::forget_scope(&scope);
+
+    let tree = shader_tree_node();
+    let before = shader_state_of(&scope, &tree);
+
+    // The same write `pump::tint_in_process_surfaces` performs on a theme move.
+    kit::set_accent(Some([0xff, 0x00, 0x99, 0xff]));
+    let after = shader_state_of(&scope, &tree);
+    kit::set_accent(None);
+    let restored = shader_state_of(&scope, &tree);
+
+    assert_ne!(
+        before.values, after.values,
+        "the accent must reach the shader's theme bag at all",
+    );
+    assert!(
+        !std::sync::Arc::ptr_eq(&before, &after),
+        "a re-tint must rebuild the shared state, not reuse the old accent",
+    );
+    assert_eq!(
+        restored.values, before.values,
+        "…and putting the accent back restores the original bag",
+    );
+    shader_map::forget_scope(&scope);
+}
+
+/// A `wire::Node::Shader` for the re-tint test — reads `u_accent`, so the
+/// colour it is drawn in is the thing under test.
+fn shader_tree_node() -> wire::Node {
+    wire::Node::Shader {
+        id: Some("retint".into()),
+        width: 32,
+        height: 32,
+        scale: 1,
+        fragment: "void main() { fragColor = u_accent; }".into(),
+        data: vec![0, 0, 0, 0],
+        format: wire::ShaderData::Rgba8,
+        data_width: 1,
+        data_height: 1,
+        classes: vec![],
+        tooltip: None,
+    }
+}
+
+/// One mapping pass over `tree`, returning the shader state it produced.
+fn shader_state_of(scope: &Scope, tree: &wire::Node) -> std::sync::Arc<hytte::ui::ShaderState> {
+    match to_ui_node(scope, Grants::all(), tree) {
+        UiNode::Shader { state, .. } => state,
         other => panic!("mapped to {other:?}"),
     }
 }

@@ -56,5 +56,9 @@ void main() {
     color = mix(color, u_accent.rgb, cap * 0.9);
     color += u_warning.rgb * beam * 0.22;
 
+    // Premultiplied, as the contract asks — `u_bg.a` is 1.0 on every skin (a
+    // preem panel is a screen), so `rgb * a == rgb` and this is opaque output
+    // that needs no scaling. A shader that genuinely wanted half-transparency
+    // would write `vec4(rgb * a, a)`.
     fragColor = vec4(color * scan, u_bg.a);
 }

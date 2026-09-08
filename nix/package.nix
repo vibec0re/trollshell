@@ -49,6 +49,16 @@ let
   #     learned to see subdirectories, turned the check red with exit 2. A
   #     shared body added later goes in both places, with a decision about
   #     which stage(s) to compile it under.
+  #
+  #     Since #893 there are two more producers, both covered by the same
+  #     extension clause and both scanned by the lint: `hytte-ui`'s shader-widget
+  #     vertex stage (`crates/hytte-ui/src/shader_*.vert`) and every plugin's
+  #     widget fragment *bodies* (`crates/*/shaders/*.frag`, e.g. the preem
+  #     demo's `spectrum.frag`). Those bodies are compiled with `SHADER_PREAMBLE`
+  #     spliced in front, because they do not compile alone. The lint globs that
+  #     directory pattern rather than listing crates (#968 review L5), so a new
+  #     plugin shipping a body through this filter is linted the day it lands
+  #     instead of silently escaping the check.
   # No OTHER stylesheets/icons are kept: everything else in `assets/` is
   # loaded from disk at runtime — the binary resolves them via the
   # makeWrapper env (TROLLSHELL_DATA_DIR / HYTTE_UI_DATA_DIR → the `assets`

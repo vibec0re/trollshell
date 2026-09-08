@@ -122,6 +122,10 @@ impl Walk<'_> {
 /// frame.
 pub(super) fn to_ui_node(scope: &Scope, grants: Grants, node: &wire::Node) -> UiNode {
     preem_render::begin_pass(scope);
+    // The shader arm has its own per-node state cache (#968 review M1) with the
+    // same pass lifecycle: opened here, swept below, so a node that left the
+    // tree does not keep its `Arc<ShaderState>` alive for the shell's lifetime.
+    shader_map::begin_pass(scope);
     let walk = Walk {
         scope,
         grants,
@@ -138,6 +142,7 @@ pub(super) fn to_ui_node(scope: &Scope, grants: Grants, node: &wire::Node) -> Ui
     // the reconciler's cheapest node and keeps the region non-empty.
     let mapped = map_node(&walk, node).unwrap_or(UiNode::Spacer);
     preem_render::end_pass(scope);
+    shader_map::end_pass(scope);
 
     if walk.over_budget.get() && preem_render::warn_once(scope, Warned::NodeCap) {
         tracing::warn!(
@@ -505,7 +510,7 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             data_width,
             data_height,
             classes,
-            tooltip: _,
+            tooltip,
         } => {
             // The second non-1:1 arm, and the only one with an *authorisation*
             // in it: `Capability::Shader` gates the node, the two hygiene caps
@@ -514,12 +519,13 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             // tree. The whole policy — and the reason there is no validator
             // beyond it — lives in `shader_map`.
             //
-            // `tooltip` is deliberately dropped rather than mapped: the
-            // reconciler's `Node::Shader` carries none, because the three
-            // variants #957 gave a tooltip to are the ones a bar chip is made
-            // of, and adding a fourth is that issue's call rather than this
-            // one's. The wire field exists so it can be honoured later without
-            // a `PROTO_VERSION` bump.
+            // `tooltip` rides through to the reconciler's fourth tooltip-
+            // carrying variant (#893, #968 review M3). It was dropped here
+            // first, which made the wire field, the SDK builder method and its
+            // pinned golden bytes a documented no-op — a plugin author reading
+            // the field's own doc had no way to learn it did nothing. A shader
+            // chip is a picture with nowhere else to say what it is, so it is
+            // exactly the kind #957 gave the other three one for.
             shader_map::map_shader(
                 walk.scope,
                 walk.grants,
@@ -533,6 +539,7 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
                     format: *format,
                     data_size: (*data_width, *data_height),
                     classes,
+                    tooltip: tooltip.as_deref(),
                 },
             )
         }

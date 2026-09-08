@@ -136,8 +136,11 @@ fn pixels_scale_default() -> u32 {
 ///   input; `set_tooltip_markup` would hand it a parser.)
 /// - It is **not** part of a node's identity: only `kind` and `id` decide reuse,
 ///   so changing a tooltip never rebuilds a widget.
-/// - Three variants, not all sixteen, because these are the ones a chip is made
-///   of. Extending the set later is the same additive move as this one was.
+/// - **Four** variants, not all seventeen, because these are the ones a chip is
+///   made of: [`Box`](Node::Box), [`Label`](Node::Label), [`Icon`](Node::Icon)
+///   and — since #893 — [`Shader`](Node::Shader), which is a picture with
+///   nowhere else to say what it is. Extending the set again is the same
+///   additive move this one was.
 ///
 /// **Additive, so [`PROTO_VERSION`](crate::PROTO_VERSION) and
 /// [`VOCAB`](crate::VOCAB) both stay put** — the crate root's compat rules put an
@@ -592,7 +595,7 @@ pub enum Node {
     /// | name | type | meaning |
     /// |---|---|---|
     /// | `v_uv` | `in vec2` | `0..1` across the drawn rect, origin bottom-left |
-    /// | `u_time` | `float` | seconds since this surface's first frame |
+    /// | `u_time` | `float` | seconds since this surface's first frame, **wrapping every 3600** |
     /// | `u_resolution` | `vec2` | the drawn rect, in framebuffer pixels |
     /// | `u_scale` | `float` | the node's integer [`scale`](Node::Shader::scale) hint |
     /// | `u_data` | `sampler2D` | the data buffer, **nearest**-filtered, clamped |
@@ -603,14 +606,29 @@ pub enum Node {
     /// | `u_success`, `u_warning`, `u_error` | `vec4` | the status roles, admitted to be legible on the skin's ground (#940) |
     ///
     /// The single output is `out vec4 fragColor`, declared by the preamble and
-    /// **not** by the body. Colours are non-premultiplied straight alpha in
-    /// `0..1`, and the surface composites over what is behind it — an `a` of `0`
-    /// is a transparent pixel, not a black one.
+    /// **not** by the body.
+    ///
+    /// # Colour: write **premultiplied** alpha
+    ///
+    /// `fragColor` is written verbatim into GTK's own framebuffer, which GSK
+    /// imports as `GDK_MEMORY_DEFAULT` — premultiplied. So a half-transparent
+    /// red is `vec4(0.5, 0.0, 0.0, 0.5)`, not `vec4(1.0, 0.0, 0.0, 0.5)`: scale
+    /// the colour by the alpha yourself, as the six theme `vec4`s already are
+    /// (they are opaque, so `rgb * a == rgb`). An `a` of `0` is a transparent
+    /// pixel whatever the `rgb`, and fully-opaque output — what a chip normally
+    /// wants, and what the bundled demo writes — needs no thought at all.
+    ///
+    /// The shell cannot convert for you: it never sees the colour, the shader
+    /// writes it, and a second full-surface pass to premultiply would be a
+    /// texture round trip to undo one multiply. Stated as a contract rather than
+    /// discovered on glass — an earlier draft of these docs said "straight
+    /// (non-premultiplied) alpha", which was the one clause here with neither a
+    /// test nor a live-verify item behind it (#968 review M4).
     ///
     /// Which channel a texel lands in depends on
     /// [`format`](Node::Shader::format) — see [`ShaderData`].
     ///
-    /// # When it repaints
+    /// # When it repaints, and what `u_time` is
     ///
     /// **On state change, and only on state change.** The surface runs no frame
     /// clock of its own: `u_time` is sampled when a render happens, and a render
@@ -619,6 +637,19 @@ pub enum Node {
     /// animates at the rate its plugin pushes data, and a plugin that stops
     /// pushing leaves the last frame up rather than burning a GPU at 60 Hz for
     /// ever. A plugin that wants motion sends data on a timer.
+    ///
+    /// Two properties of that clock, both stated because a shader can see them:
+    ///
+    /// - **It wraps every 3600 s.** `u_time` is an `f32`, whose ulp grows with
+    ///   magnitude — unwrapped seconds lose a quarter-second of resolution after
+    ///   a month of uptime and a full second after three, so a shader animating
+    ///   on it would judder and then freeze on a long-running desktop. Any
+    ///   period that divides 3600 (a second, four seconds, a minute, ten
+    ///   minutes) is continuous across the wrap; one that does not jumps once an
+    ///   hour.
+    /// - **It restarts when the widget is unmapped and remapped**, because the
+    ///   surface's GL objects and its epoch go together and a remap is genuinely
+    ///   a new first frame.
     ///
     /// # Sizing
     ///

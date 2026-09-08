@@ -111,7 +111,16 @@ PREAMBLE_SOURCE = WIDGET_SHADER_DIR / "shader_surface.rs"
 # Directories holding plugin-supplied fragment **bodies** shipped in this tree.
 # Each `.frag` under one of these is compiled as `header + preamble + body`,
 # which is exactly what `ShaderSurface::draw` hands the driver.
-WIDGET_BODY_DIRS = [Path("crates/hytte-plugin-preem-demo/shaders")]
+#
+# **Globbed, not listed** (#968 review L5). `nix/package.nix`'s crane filter is
+# `lib.hasSuffix ".frag"` with no directory constraint, so it ships *every*
+# `.frag` in the tree; a hardcoded one-entry list here meant a second plugin
+# adding `crates/hytte-plugin-foo/shaders/x.frag` would ship **unlinted**, with
+# no floor moving to say so — exactly the "one silently stops covering a file
+# the other ships" hazard `nix/package.nix`'s own comment warns about. The glob
+# and the filter now agree by construction: any crate that puts widget bodies in
+# a `shaders/` directory is covered the day it lands.
+WIDGET_BODY_DIRS = sorted(Path("crates").glob("*/shaders"))
 
 # Floors, on the same "current counts, not counts-with-headroom" rule as
 # MIN_SHADERS above: a lint that tolerates a missing file cannot tell a deletion
@@ -369,6 +378,13 @@ def main() -> int:
         for path in sorted(WIDGET_SHADER_DIR.glob("shader_*.vert")):
             widget_stages += 1
             compile_assembled(f"{path.name} (widget vertex stage)", "", path)
+        if not WIDGET_BODY_DIRS:
+            fail(
+                "no `crates/*/shaders` directory found — wrong root, or every "
+                "plugin's widget bodies moved. The crane filter still ships any "
+                "`.frag` in the tree, so a silent empty scan here is the hazard "
+                "this floor exists to catch"
+            )
         for directory in WIDGET_BODY_DIRS:
             if not directory.is_dir():
                 fail(f"{directory} is missing — wrong root, or a demo's shaders moved")

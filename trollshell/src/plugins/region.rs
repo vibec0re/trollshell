@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 
 use super::preem_render::{self, Scope};
 use super::pump::Animator;
+use super::shader_map;
 use super::wire_map::{to_ui_node, to_wire_event};
 use super::{PluginHandles, SlotRender};
 
@@ -332,6 +333,9 @@ fn reconcile_region(
             // reconcile forgetting the same scope is a harmless no-op, and no
             // monitor still wants it.
             preem_render::forget_scope(&card.preem_scope);
+            // …and its shader states, which live on the same pass lifecycle
+            // (#968 review M1).
+            shader_map::forget_scope(&card.preem_scope);
         }
         keep
     });
@@ -787,6 +791,7 @@ pub(super) fn forget_departed_panel_scope(scope: &Scope) {
         holders.remove(scope);
     });
     preem_render::forget_scope(scope);
+    shader_map::forget_scope(scope);
 }
 
 /// How many drawer panel children are currently holding `scope` — the refcount
@@ -847,6 +852,7 @@ fn forget_previous_panel_scope(shown: &Rc<RefCell<Option<Scope>>>, next: Option<
         && release_panel_scope(&previous)
     {
         preem_render::forget_scope(&previous);
+        shader_map::forget_scope(&previous);
     }
     if let Some(next) = next {
         retain_panel_scope(next);

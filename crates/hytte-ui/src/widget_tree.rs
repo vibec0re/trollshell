@@ -334,11 +334,19 @@ pub enum Node {
         /// Natural height in logical pixels.
         height: u32,
         /// The source, the data buffer and the theme bag (mutable prop).
-        /// Shared, so mapping one frame onto a second monitor costs a refcount
-        /// and settles on an `Arc::ptr_eq`.
+        ///
+        /// **Shared**: mapping one frame onto a second monitor costs a refcount
+        /// and settles on an `Arc::ptr_eq`, both in `set_state`'s dedup and in
+        /// the surface's data-upload guard. That is a property of the
+        /// *producer* — `trollshell`'s `shader_map` caches one `Arc` per node
+        /// per frame — not something this type can enforce; before #968's
+        /// review it was claimed here and not true anywhere.
         state: Arc<crate::shader_surface::ShaderState>,
         /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
+        /// Hover text (mutable prop; `None` clears it) — see
+        /// [`node_tooltip`](Node#tooltips).
+        tooltip: Option<String>,
     },
     /// A `gtk::Button`. `id` is **required** — it is the click event target.
     Button {
@@ -1897,7 +1905,7 @@ fn node_classes(node: &Node) -> &[String] {
     }
 }
 
-/// A node's hover text, for the three variants that carry one (#957); `None`
+/// A node's hover text, for the four variants that carry one (#957, #893); `None`
 /// both for "this kind has no tooltip field" and for "this node set none" —
 /// the two are indistinguishable to the widget, which either has a tooltip or
 /// doesn't.
@@ -1908,9 +1916,14 @@ fn node_classes(node: &Node) -> &[String] {
 /// drift apart.
 fn node_tooltip(node: &Node) -> Option<&str> {
     match node {
-        Node::Box { tooltip, .. } | Node::Label { tooltip, .. } | Node::Icon { tooltip, .. } => {
-            tooltip.as_deref()
-        }
+        Node::Box { tooltip, .. }
+        | Node::Label { tooltip, .. }
+        | Node::Icon { tooltip, .. }
+        // #893's shader widget is the fourth. It earns one for the reason the
+        // first three did: a shader chip is a picture with nowhere to say what
+        // it is, and the wire already carried the field (#968 review M3 — it
+        // was a documented, SDK-exposed, golden-pinned no-op before this arm).
+        | Node::Shader { tooltip, .. } => tooltip.as_deref(),
         _ => None,
     }
 }
@@ -2253,6 +2266,7 @@ mod diff_tests {
             height: 96,
             state: shader_state(),
             classes: vec!["ts-shader".to_owned()],
+            tooltip: None,
         };
         assert_eq!(node_kind(&node), NodeKind::Shader);
         assert_eq!(node_id(&node), Some("spectrum"));
@@ -3886,6 +3900,7 @@ mod gtk_tests {
                     values: vec![],
                 }),
                 classes: vec![],
+                tooltip: None,
             }
         }
         let root = root();
@@ -4009,6 +4024,67 @@ mod gtk_tests {
         let icon = boxw.first_child().expect("the icon mounted");
         assert!(icon.is::<gtk::Image>(), "an Icon is a gtk::Image");
         assert_eq!(icon.tooltip_text().as_deref(), Some("the icon's own"));
+    }
+
+    /// **#968 review M3.** The shader surface is the **fourth** tooltip-carrying
+    /// variant, and it is honoured on build, on change, and on clear — the three
+    /// properties #957 pinned for the other three.
+    ///
+    /// Before this the wire carried a `tooltip`, the SDK shipped a public
+    /// `Shader::tooltip(…)` builder method, a golden fixture pinned its bytes,
+    /// and nothing anywhere read it: a plugin author following the field's own
+    /// doc got silence. A shader chip is a picture with nowhere else to say what
+    /// it is, which is exactly why the other three have one.
+    ///
+    /// **Falsified** by dropping the `Node::Shader` arm from `node_tooltip`: all
+    /// three phases go red, because the central `apply_tooltip` /
+    /// `reconcile_tooltip` plumbing reads through it.
+    #[gtk::test]
+    fn a_shader_tooltip_is_applied_changed_and_cleared() {
+        fn shader(tooltip: Option<&str>) -> Node {
+            Node::Shader {
+                id: Some("spectrum".to_owned()),
+                width: 32,
+                height: 32,
+                state: Arc::new(crate::shader_surface::ShaderState {
+                    fragment: Arc::from("void main() { fragColor = u_fg; }"),
+                    data: Arc::from(&[0u8, 255][..]),
+                    format: crate::shader_surface::ShaderFormat::R8,
+                    data_size: (2, 1),
+                    scale: 1,
+                    values: vec![],
+                }),
+                classes: vec![],
+                tooltip: tooltip.map(ToOwned::to_owned),
+            }
+        }
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+
+        // build
+        rec.render(&hbox(vec![shader(Some("audio spectrum"))]));
+        let surface = only_child(&root);
+        assert!(
+            surface.is::<crate::shader_surface::ShaderSurface>(),
+            "a Shader is a ShaderSurface",
+        );
+        assert_eq!(surface.tooltip_text().as_deref(), Some("audio spectrum"));
+        assert!(surface.has_tooltip(), "GTK arms the hover for it");
+
+        // change, on the *same* widget — a tooltip is not part of a node's
+        // identity, so this must retitle rather than rebuild.
+        rec.render(&hbox(vec![shader(Some("cpu spectrum"))]));
+        let same = only_child(&root);
+        assert_eq!(same, surface, "the surface is reused, not rebuilt");
+        assert_eq!(same.tooltip_text().as_deref(), Some("cpu spectrum"));
+
+        // clear — the arm a "set it when `Some`" shortcut would silently skip,
+        // leaving the last string stuck on the widget for ever.
+        rec.render(&hbox(vec![shader(None)]));
+        let cleared = only_child(&root);
+        assert_eq!(cleared, surface, "still the same surface");
+        assert_eq!(cleared.tooltip_text(), None, "dropping the field clears it");
+        assert!(!cleared.has_tooltip(), "…and disarms the hover");
     }
 
     /// A same-id re-render with a *different* string retitles the widget in

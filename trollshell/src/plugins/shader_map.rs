@@ -36,6 +36,8 @@
 //! a shell restart. The upgrade path, if a plugin is ever *not* trusted, is an
 //! out-of-process shader host ("route 3") — named in the spec, not built.
 
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use hytte::ui::Node as UiNode;
@@ -112,6 +114,9 @@ pub(super) struct ShaderNode<'a> {
     pub(super) data_size: (u32, u32),
     /// CSS classes, kept on the placeholder too.
     pub(super) classes: &'a [String],
+    /// Hover text. Reaches the reconciler on the drawn node; a refused node
+    /// takes the placeholder, which has no tooltip field — see `placeholder`.
+    pub(super) tooltip: Option<&'a str>,
 }
 
 /// Why a shader node will not be drawn.
@@ -152,6 +157,25 @@ pub(super) enum Refusal {
     /// for all targets"). So the node takes the placeholder rather than mounting
     /// a `GtkGLArea` that can never draw — which would also pay for a fresh
     /// failed context per shader node, per monitor, per frame.
+    ///
+    /// # It is **sticky for the process**, and that is a decision (#968 L3)
+    ///
+    /// `hytte_ui::gl_surface`'s `ABANDONED` latch is set once and never cleared
+    /// (`gl_surface.rs`, inherited from #954). For a kit widget a stale latch
+    /// costs a CPU render — the picture is still right. For a shader widget it
+    /// costs **the widget, permanently**: one transient context failure (a
+    /// hot-plug race, a resume, a startup before `/dev/dri` is ready) blanks
+    /// every shader in the session until the shell is restarted.
+    ///
+    /// Kept sticky anyway, for one reason: **there is nothing to re-try on.**
+    /// Clearing the latch needs an event that says a context might now succeed,
+    /// and the only honest candidate is `GdkDisplay`'s own open/close — which
+    /// #954 owns, which no shader-widget test could reach, and which would make
+    /// a failing display re-attempt a context per shader node per frame for
+    /// ever. A blank widget plus a journal line naming the restart is the worse
+    /// experience and the better failure mode. If a transient failure is ever
+    /// actually observed on glass, clearing the latch on `GdkDisplay::opened`
+    /// is the fix, and it belongs next to the latch rather than here.
     NoGl,
 }
 
@@ -269,16 +293,149 @@ pub(super) fn map_shader(scope: &Scope, grants: Grants, node: &ShaderNode<'_>) -
         id: node.id.map(ToOwned::to_owned),
         width: node.width.saturating_mul(scale),
         height: node.height.saturating_mul(scale),
-        state: Arc::new(ShaderState {
-            fragment: Arc::from(node.fragment),
-            data: Arc::from(node.data),
-            format: to_ui_format(node.format),
-            data_size: node.data_size,
-            scale,
-            values: theme_values(),
-        }),
+        state: shared_state(scope, node, scale),
         classes: node.classes.to_vec(),
+        tooltip: node.tooltip.map(ToOwned::to_owned),
     }
+}
+
+/// The [`ShaderState`] for this node — **the same `Arc`** every monitor's
+/// mapping pass gets while the node has not changed.
+///
+/// # Why this cache exists (#968 review M1)
+///
+/// `to_ui_node` runs once per monitor per frame, and without a cache this
+/// allocated a fresh `Arc<ShaderState>`, a fresh `Arc<str>` (copying the source)
+/// and a fresh `Arc<[u8]>` (copying the buffer) every single time. Three
+/// documented properties were therefore false, measured:
+///
+/// 1. [`ShaderSurface`](hytte::ui::ShaderSurface)'s data-upload dedup is an
+///    `Arc::ptr_eq`, so it **could never fire** — the whole data texture went
+///    across the bus on every render, including renders where nothing moved
+///    (an accent re-tint, a resize).
+/// 2. `set_state`'s documented `Arc::ptr_eq` fast path always fell through to
+///    the derived `PartialEq`, comparing the whole fragment *and* the whole
+///    buffer — up to 16 KiB + 4 MiB, per monitor, per frame.
+/// 3. The mapping itself paid that allocation and memcpy per monitor per frame.
+///
+/// At the demo's 64 bytes none of it matters; at the caps it is ~160 MB/s of
+/// memcpy plus as much memcmp on two monitors at 20 Hz. #911 solved exactly this
+/// for `Pixels` by caching the `Arc<[u8]>` per scope; the shader arm did not
+/// inherit it, so it does now.
+///
+/// # What it costs, stated
+///
+/// One value comparison per mapping pass — which **replaces** a memcpy of the
+/// same size plus the memcmp `set_state` was doing anyway, and removes the GPU
+/// upload entirely. Strictly cheaper on every axis, not a trade.
+///
+/// # Anonymous nodes are not cached
+///
+/// There is no key to cache them under: an id is the reconciliation key, and
+/// inventing an ordinal here would hand a node its *neighbour's* state on any
+/// insert — the same hazard `Node::Preem`'s `Warned::NoId` warns about. An
+/// anonymous shader therefore pays the old cost, which is one more reason
+/// [`Node::Shader`](hytte_plugin_proto::wire::Node::Shader)'s own docs recommend
+/// an id.
+fn shared_state(scope: &Scope, node: &ShaderNode<'_>, scale: u32) -> Arc<ShaderState> {
+    let values = theme_values();
+    let Some(id) = node.id else {
+        return Arc::new(build_state(node, scale, values));
+    };
+    TOUCHED.with_borrow_mut(|touched| {
+        touched
+            .entry(scope.clone())
+            .or_default()
+            .insert(id.to_owned());
+    });
+    STATES.with_borrow_mut(|states| {
+        let per_scope = states.entry(scope.clone()).or_default();
+        if let Some(held) = per_scope.get(id)
+            && held.scale == scale
+            && held.format == to_ui_format(node.format)
+            && held.data_size == node.data_size
+            && held.values == values
+            && &*held.fragment == node.fragment
+            && &*held.data == node.data
+        {
+            return Arc::clone(held);
+        }
+        let fresh = Arc::new(build_state(node, scale, values));
+        per_scope.insert(id.to_owned(), Arc::clone(&fresh));
+        fresh
+    })
+}
+
+/// A fresh state, with no cache involved.
+fn build_state(
+    node: &ShaderNode<'_>,
+    scale: u32,
+    values: Vec<(&'static str, GlValue)>,
+) -> ShaderState {
+    ShaderState {
+        fragment: Arc::from(node.fragment),
+        data: Arc::from(node.data),
+        format: to_ui_format(node.format),
+        data_size: node.data_size,
+        scale,
+        values,
+    }
+}
+
+thread_local! {
+    /// The per-scope, per-node-id shared states — see [`shared_state`].
+    ///
+    /// GTK-main-thread-only, like every other table in the mapping path.
+    /// Swept by [`end_pass`], which `wire_map::to_ui_node` calls at the close of
+    /// every mapping pass, and dropped wholesale by [`forget_scope`] when a
+    /// plugin leaves its region — the same lifecycle `preem_render`'s instance
+    /// table has, for the same reason.
+    static STATES: RefCell<HashMap<Scope, HashMap<String, Arc<ShaderState>>>> =
+        RefCell::new(HashMap::new());
+
+    /// The node ids touched by the pass currently in flight, per scope.
+    static TOUCHED: RefCell<HashMap<Scope, HashSet<String>>> = RefCell::new(HashMap::new());
+}
+
+/// Open a mapping pass for `scope`: forget what the previous pass touched.
+pub(super) fn begin_pass(scope: &Scope) {
+    TOUCHED.with_borrow_mut(|touched| {
+        touched.entry(scope.clone()).or_default().clear();
+    });
+}
+
+/// Close a mapping pass for `scope`, dropping the cached state of every shader
+/// node that is no longer in the tree.
+///
+/// Every monitor's pass walks the same tree and touches the same ids, so
+/// sweeping per pass is correct rather than fighting the second monitor — the
+/// same argument `preem_render::end_pass` makes for its instances.
+pub(super) fn end_pass(scope: &Scope) {
+    let touched = TOUCHED.with_borrow(|all| all.get(scope).cloned().unwrap_or_default());
+    STATES.with_borrow_mut(|states| {
+        if let Some(per_scope) = states.get_mut(scope) {
+            per_scope.retain(|id, _| touched.contains(id));
+            if per_scope.is_empty() {
+                states.remove(scope);
+            }
+        }
+    });
+    if touched.is_empty() {
+        TOUCHED.with_borrow_mut(|all| all.remove(scope));
+    }
+}
+
+/// Drop everything cached for `scope` — a plugin left its region, or a drawer
+/// panel closed. Called beside `preem_render::forget_scope`.
+pub(super) fn forget_scope(scope: &Scope) {
+    STATES.with_borrow_mut(|states| states.remove(scope));
+    TOUCHED.with_borrow_mut(|touched| touched.remove(scope));
+}
+
+/// How many shader states `scope` currently holds — `0` once swept.
+#[cfg(test)]
+pub(super) fn cached_states(scope: &Scope) -> usize {
+    STATES.with_borrow(|states| states.get(scope).map_or(0, HashMap::len))
 }
 
 /// The broken-widget placeholder: an empty surface keeping the node's id and
@@ -289,6 +446,12 @@ pub(super) fn map_shader(scope: &Scope, grants: Grants, node: &ShaderNode<'_>) -
 /// empty buffer — the same placeholder `wire_map`'s malformed-`Pixels` arm and
 /// `preem_render`'s over-cap arm already draw, so a degraded node looks the same
 /// whatever degraded it.
+/// The tooltip is deliberately **not** carried onto it: `Node::Pixels` has no
+/// tooltip field (#957 gave one to the three variants a chip is made of, and a
+/// raster buffer was not among them), so a refused shader loses its hover text
+/// along with its picture. Stated rather than silently true — the journal line
+/// is where a refused node explains itself, and that is the surface that
+/// matters here.
 fn placeholder(node: &ShaderNode<'_>) -> UiNode {
     UiNode::Pixels {
         id: node.id.map(ToOwned::to_owned),
@@ -366,8 +529,10 @@ fn warn(scope: &Scope, node: &ShaderNode<'_>, refused: Refusal) {
             node = ?node.id,
             "no OpenGL context in this session, so this plugin's Shader nodes render the \
              broken-widget placeholder — unlike a preem widget there is no CPU arm to fall \
-             back to, by design. hytte-ui has already logged the context failure itself \
-             (further occurrences in this tree are silenced)",
+             back to, by design, and the latch is sticky for the life of this process, so \
+             this needs a shell restart rather than a reconnect. hytte-ui has already \
+             logged the context failure itself (further occurrences in this tree are \
+             silenced)",
         ),
     }
 }
@@ -447,8 +612,9 @@ fn rgba(color: kit::Rgba) -> GlValue {
 #[cfg(test)]
 mod tests {
     use super::{
-        GlAvailability, Grants, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Refusal,
-        ShaderData, ShaderNode, Warned, map_shader, refusal, theme_values,
+        Arc, GlAvailability, Grants, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Refusal,
+        ShaderData, ShaderNode, ShaderState, Warned, begin_pass, cached_states, end_pass,
+        forget_scope, map_shader, refusal, theme_values,
     };
     use crate::plugins::preem_render::{self, Scope};
     use hytte::ui::Node as UiNode;
@@ -465,6 +631,23 @@ mod tests {
             format: ShaderData::R8,
             data_size: (u32::try_from(data.len()).unwrap_or(0), 1),
             classes: &[],
+            tooltip: None,
+        }
+    }
+
+    /// One full mapping pass over `node`, returning the state it produced.
+    ///
+    /// Goes through `begin_pass` / `map_shader` / `end_pass` rather than calling
+    /// `shared_state` directly, so what the sharing tests measure is the path a
+    /// monitor's reconcile actually takes — cache lookup, touch bookkeeping and
+    /// sweep included.
+    fn mapped_state(scope: &Scope, node: &ShaderNode<'_>) -> Arc<ShaderState> {
+        begin_pass(scope);
+        let mapped = map_shader(scope, granted(), node);
+        end_pass(scope);
+        match mapped {
+            UiNode::Shader { state, .. } => state,
+            other => panic!("mapped to {other:?}"),
         }
     }
 
@@ -729,8 +912,10 @@ mod tests {
                 height,
                 state,
                 classes,
+                tooltip,
             } => {
                 assert_eq!(id.as_deref(), Some("spectrum"));
+                assert_eq!(tooltip, None, "this fixture sets none");
                 assert_eq!((width, height), (144 * 3, 48 * 3), "size × scale");
                 assert_eq!(&*state.fragment, "void main() { fragColor = u_accent; }");
                 assert_eq!(&*state.data, &data[..]);
@@ -799,5 +984,257 @@ mod tests {
             );
         }
         assert_eq!(values.len(), 6, "and nothing else");
+    }
+
+    // ── #968 review fixes ────────────────────────────────────────────────────
+
+    /// **M1.** Two mapping passes over an unchanged node hand back **the same
+    /// `Arc`** — which is what makes the sharing claim in `hytte-ui`'s own doc
+    /// comments true, and what lets the surface's `Arc::ptr_eq` guards fire at
+    /// all.
+    ///
+    /// `to_ui_node` runs once per monitor per frame. Before this cache, every
+    /// pass allocated a fresh `Arc<ShaderState>` plus a fresh copy of the source
+    /// *and* the buffer, so the data-texture upload dedup could never fire, the
+    /// `set_state` fast path always fell through to a 16 KiB + 4 MiB memcmp, and
+    /// the mapping paid the memcpy — per monitor, per frame.
+    ///
+    /// **Falsified** by returning `Arc::new(build_state(…))` unconditionally
+    /// from [`shared_state`]: every assertion below except the last goes red.
+    #[test]
+    fn two_mapping_passes_over_an_unchanged_node_share_one_state() {
+        let data = [1u8, 2, 3, 4];
+        let node = ok_node("void main() { fragColor = u_fg; }", &data);
+        let scope = Scope::detached("shader-shared-state");
+        forget_scope(&scope);
+
+        let first = mapped_state(&scope, &node);
+        let second = mapped_state(&scope, &node);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second monitor's pass must not re-allocate the state",
+        );
+        assert!(
+            Arc::ptr_eq(&first.data, &second.data),
+            "…nor the data buffer, which is what the upload dedup compares",
+        );
+        assert!(
+            Arc::ptr_eq(&first.fragment, &second.fragment),
+            "…nor the source, which is what the program cache compares",
+        );
+
+        // A node that really changed gets a new state — the other half of the
+        // rule, and the half a cache that never invalidated would still pass
+        // the first three assertions with.
+        let moved = [9u8, 9, 9, 9];
+        let next = ok_node("void main() { fragColor = u_fg; }", &moved);
+        let third = mapped_state(&scope, &next);
+        assert!(!Arc::ptr_eq(&first, &third), "new data, new state");
+        forget_scope(&scope);
+    }
+
+    /// **M1, the payoff.** Driving `hytte-ui`'s own upload rule with the states
+    /// this module produces: twenty renders of an unchanged node cost **one**
+    /// data-texture upload, not twenty.
+    ///
+    /// This is the counting probe the sharing exists for. It runs
+    /// `needs_upload`'s shipped logic — `Arc::ptr_eq` — against real
+    /// `map_shader` output, so it is red both if the cache stops sharing and if
+    /// the surface stops deduping.
+    ///
+    /// **Falsified** either way: neuter [`shared_state`] (20 uploads) or make
+    /// `hytte_ui`'s `needs_upload` unconditional (20 uploads).
+    #[test]
+    fn an_unchanged_node_uploads_its_data_once_across_many_passes() {
+        let data = [7u8; 64];
+        let node = ok_node("void main() { fragColor = u_bg; }", &data);
+        let scope = Scope::detached("shader-upload-count");
+        forget_scope(&scope);
+
+        // What the surface holds, and how many times it would touch the GPU.
+        let mut held: Option<Arc<[u8]>> = None;
+        let mut uploads = 0_u32;
+        for _ in 0..20 {
+            let state = mapped_state(&scope, &node);
+            if hytte::ui::shader_surface::would_upload(held.as_ref(), &state.data) {
+                uploads += 1;
+                held = Some(Arc::clone(&state.data));
+            }
+        }
+        assert_eq!(uploads, 1, "one upload for twenty passes");
+
+        // …and a real change costs exactly one more.
+        let moved = [8u8; 64];
+        let next = ok_node("void main() { fragColor = u_bg; }", &moved);
+        for _ in 0..5 {
+            let state = mapped_state(&scope, &next);
+            if hytte::ui::shader_surface::would_upload(held.as_ref(), &state.data) {
+                uploads += 1;
+                held = Some(Arc::clone(&state.data));
+            }
+        }
+        assert_eq!(uploads, 2, "one more upload for the change, then quiet");
+        forget_scope(&scope);
+    }
+
+    /// The cache is swept at the pass boundary, so a node that leaves the tree
+    /// does not keep its state — and its buffer — alive for the shell's life.
+    ///
+    /// **Falsified** by dropping the `retain` in [`end_pass`]: the count stays
+    /// at 1 after a pass that touched nothing.
+    #[test]
+    fn a_departed_node_is_swept_at_the_pass_boundary() {
+        let data = [1u8, 2, 3, 4];
+        let node = ok_node("void main() {}", &data);
+        let scope = Scope::detached("shader-sweep");
+        forget_scope(&scope);
+
+        begin_pass(&scope);
+        let _ = map_shader(&scope, granted(), &node);
+        end_pass(&scope);
+        assert_eq!(cached_states(&scope), 1, "the mapped node is cached");
+
+        // A pass in which the node is gone.
+        begin_pass(&scope);
+        end_pass(&scope);
+        assert_eq!(cached_states(&scope), 0, "…and swept when it leaves");
+
+        // `forget_scope` is the other release path (a plugin leaving its
+        // region, a drawer panel closing).
+        begin_pass(&scope);
+        let _ = map_shader(&scope, granted(), &node);
+        end_pass(&scope);
+        assert_eq!(cached_states(&scope), 1);
+        forget_scope(&scope);
+        assert_eq!(cached_states(&scope), 0, "forget_scope drops everything");
+    }
+
+    /// An **anonymous** node is not cached — there is no key to cache it under,
+    /// and inventing an ordinal would hand a node its neighbour's state on any
+    /// insert. Stated as a test so the cost is a decision rather than a
+    /// surprise.
+    #[test]
+    fn an_anonymous_node_is_not_cached() {
+        let data = [1u8, 2, 3, 4];
+        let mut node = ok_node("void main() {}", &data);
+        node.id = None;
+        let scope = Scope::detached("shader-anonymous");
+        forget_scope(&scope);
+
+        let first = mapped_state(&scope, &node);
+        let second = mapped_state(&scope, &node);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "no id, no key, no sharing — and the docs say so",
+        );
+        assert_eq!(cached_states(&scope), 0, "and nothing is retained");
+        forget_scope(&scope);
+    }
+
+    /// **M3.** The tooltip reaches the reconciler node rather than being dropped
+    /// on the floor — it was a wire field, an SDK builder method and a pinned
+    /// golden byte with no effect at all.
+    ///
+    /// **Falsified** by restoring `tooltip: _` in `wire_map`'s arm, or by
+    /// dropping the field from `map_shader`'s `UiNode::Shader`.
+    #[test]
+    fn the_tooltip_reaches_the_reconciler_node() {
+        let data = [1u8, 2, 3, 4];
+        let mut node = ok_node("void main() {}", &data);
+        node.tooltip = Some("audio spectrum");
+        let scope = Scope::detached("shader-tooltip");
+        forget_scope(&scope);
+
+        match map_shader(&scope, granted(), &node) {
+            UiNode::Shader { tooltip, .. } => {
+                assert_eq!(tooltip.as_deref(), Some("audio spectrum"));
+            }
+            other => panic!("mapped to {other:?}"),
+        }
+        forget_scope(&scope);
+    }
+
+    /// **L1.** Every `vec4` the published preamble declares is a colour the
+    /// theme bag actually sets — the drift the two hardcoded name lists cannot
+    /// see between them.
+    ///
+    /// Supplied by the #968 review. Without it, adding `uniform vec4 u_dim;` to
+    /// `SHADER_PREAMBLE` alone stays green in both existing tests *and* compiles
+    /// in the lint, and the uniform silently reaches every shader as `vec4(0)`.
+    ///
+    /// **Falsified** by adding a `vec4` to the preamble without a bag entry, or
+    /// by deleting one from `theme_values`.
+    #[test]
+    fn the_theme_bag_covers_every_vec4_the_preamble_declares() {
+        use hytte::ui::shader_surface::SHADER_PREAMBLE;
+        let declared: Vec<&str> = SHADER_PREAMBLE
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("uniform vec4 "))
+            .filter_map(|l| l.strip_suffix(';'))
+            .collect();
+        let bag: Vec<&str> = theme_values().iter().map(|(n, _)| *n).collect();
+        assert!(
+            !declared.is_empty(),
+            "the parse found nothing — preamble moved?"
+        );
+        for name in &declared {
+            assert!(
+                bag.contains(name),
+                "the preamble declares `{name}` and nothing sets it"
+            );
+        }
+        assert_eq!(bag.len(), declared.len(), "…and the bag sets nothing extra");
+    }
+
+    /// **The latch, counted where it is written.** Five refused frames emit
+    /// **one** `tracing` event.
+    ///
+    /// Supplied by the #968 review, and it closes the gap the PR body documented
+    /// honestly: `a_refused_shader_renders_the_placeholder_and_warns_once`
+    /// counts latches *claimed* (the counter lives inside `warn_once`), so it
+    /// stays green when a call site claims the latch and then logs
+    /// unconditionally. This counts events *emitted*, so it does not.
+    ///
+    /// **Falsified** by replacing `if warn_once(…) { … }` with
+    /// `let _ = warn_once(…); …` — verified red, `left: 5, right: 1`.
+    #[test]
+    fn five_refused_frames_emit_one_event() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        const TARGET: &str = "trollshell::plugins::shader_map";
+        struct Counting(StdArc<AtomicU32>);
+        impl tracing::Subscriber for Counting {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                meta.target().starts_with(TARGET)
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+                tracing::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                if event.metadata().target().starts_with(TARGET) {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            fn enter(&self, _: &tracing::Id) {}
+            fn exit(&self, _: &tracing::Id) {}
+        }
+
+        let data = [0u8; 4];
+        let node = ok_node("void main() {}", &data);
+        let scope = Scope::detached("shader-warn-once-events");
+        let count = StdArc::new(AtomicU32::new(0));
+        tracing::subscriber::with_default(Counting(StdArc::clone(&count)), || {
+            for _ in 0..5 {
+                let _ = map_shader(&scope, Grants::none(), &node);
+            }
+        });
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "five refused frames must write one journal line, not five",
+        );
     }
 }

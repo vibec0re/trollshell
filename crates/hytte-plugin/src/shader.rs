@@ -17,6 +17,11 @@
 //! `u_time`, `u_resolution`, `u_scale`, `u_data`, `u_data_size` and the six
 //! theme colours, and writes `fragColor`.
 //!
+//! Two things worth knowing before the first shader, both on that page in full:
+//! `fragColor` is **premultiplied** (a half-transparent red is
+//! `vec4(0.5, 0.0, 0.0, 0.5)`; opaque output needs no thought), and `u_time`
+//! **wraps hourly**, so animate on a period that divides 3600.
+//!
 //! # A minimal example
 //!
 //! ```
@@ -187,6 +192,11 @@ impl Shader {
 
     /// Hover text (plain, not markup) — see the tooltip section on
     /// [`Node`](crate::proto::Node).
+    ///
+    /// Honoured: the host puts it on the surface with `set_tooltip_text`, on
+    /// build and on change, and a re-render dropping it clears the hover. (It
+    /// was a documented no-op until #968's review caught it — a wire field, this
+    /// method and a pinned golden byte, with nothing reading any of them.)
     #[must_use]
     pub fn tooltip(mut self, tooltip: impl Into<String>) -> Self {
         self.tooltip = Some(tooltip.into());

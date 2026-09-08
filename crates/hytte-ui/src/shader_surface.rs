@@ -44,6 +44,28 @@
 //! is mapped, whether or not anything moved. `u_time` is sampled when a render
 //! happens, so a plugin that wants motion pushes data on a timer and gets both.
 //!
+//! Two things about that clock, both consequences rather than choices, and both
+//! stated because a shader author can see them: it **wraps hourly**
+//! ([`TIME_WRAP_SECS`] — an `f32` of unwrapped seconds loses a quarter-second of
+//! resolution after a month of uptime), and it **restarts on unmap/remap**,
+//! because `origin` is dropped with the GL objects in `unrealize` and a remap is
+//! genuinely a new first frame.
+//!
+//! # Colour: premultiplied, because GTK's is
+//!
+//! The single pass draws under `Blend::Replace`, which is
+//! `glDisable(GL_BLEND)` — the shader's `fragColor` lands verbatim in GTK's own
+//! framebuffer, and GSK imports that texture as `GDK_MEMORY_DEFAULT`, i.e.
+//! **premultiplied**. So the contract asks a plugin for premultiplied output
+//! (`vec4(rgb * a, a)`), and that is a fact about the pipeline rather than a
+//! preference: the shell never sees the colour to convert it, and adding a
+//! second pass to premultiply would cost a full-surface texture round trip to
+//! undo something the author can do in one multiply.
+//!
+//! Unverified here, and stated as such: this sandbox has no GL, so the claim is
+//! read off GDK's memory format rather than off a screenshot.
+//! `docs/live-verify.md` carries the check that settles it.
+//!
 //! # Trust
 //!
 //! The source is untrusted input in the ordinary sense — it comes off the wire —
@@ -208,10 +230,19 @@ struct ProgramCache<P> {
     /// The linked program, its key, and the source it was linked from. The
     /// source is kept so the hash is a fast path rather than the whole answer.
     held: Option<(u64, Arc<str>, P)>,
-    /// The key of a source that failed to build. A repeat of that exact source
-    /// is refused without touching the driver, so a broken shader costs one
-    /// compile and one journal line rather than one of each per frame.
-    failed: Option<u64>,
+    /// The key **and source** of a source that failed to build. A repeat of that
+    /// exact source is refused without touching the driver, so a broken shader
+    /// costs one compile rather than one per frame.
+    ///
+    /// The source rides along for the same reason it does in `held`: a hash is a
+    /// fast path, not the whole answer. Keyed on the hash alone, a *different*
+    /// source that happened to collide with a latched-failed key would be
+    /// refused without ever reaching the driver and without a journal line — a
+    /// silently blank widget for a shader that compiles fine. 64-bit `SipHash`
+    /// over two sources in one widget's lifetime makes that astronomically
+    /// unlikely, which is why it is a one-word guard rather than a redesign, but
+    /// "unlikely" is not what the doc above claims.
+    failed: Option<(u64, Arc<str>)>,
 }
 
 impl<P> Default for ProgramCache<P> {
@@ -230,24 +261,38 @@ impl<P> ProgramCache<P> {
     /// - `Ok(Some(program))` — reused, or freshly built.
     /// - `Ok(None)` — **this exact source already failed**; nothing to draw and
     ///   nothing to say (the caller said it the first time).
-    /// - `Err(error)` — it failed now. The caller logs once and draws nothing;
-    ///   the key is latched, so the next frame takes the `Ok(None)` arm.
+    /// - `Err(Failure { error, key })` — it failed now. The caller logs it
+    ///   against `key` and draws nothing; the source is latched, so the next
+    ///   frame carrying it takes the `Ok(None)` arm.
+    ///
+    /// The `key` in the failure is what makes the caller's journal latch
+    /// **per source** rather than per surface: a plugin that ships a broken
+    /// shader, fixes it, then breaks it differently gets a line for each break.
     fn ensure<E>(
         &mut self,
         fragment: &Arc<str>,
         build: impl FnOnce(&str) -> Result<P, E>,
-    ) -> Result<Option<&P>, E> {
+    ) -> Result<Option<&P>, Failure<E>> {
         let key = source_key(fragment);
-        // The reuse rule. `Arc::ptr_eq` first because the shell's per-instance
-        // state cache hands the same allocation back on a re-map, then the hash,
-        // then the bytes — cheapest test first, and the last one is what makes a
-        // hash collision a slow path rather than a wrong picture.
-        if self.held.as_ref().is_some_and(|(held_key, source, _)| {
+        let same = |held_key: &u64, source: &Arc<str>| {
+            // `Arc::ptr_eq` first because the shell's per-node state cache hands
+            // the same allocation back on a re-map, then the hash, then the
+            // bytes — cheapest test first, and the last one is what makes a hash
+            // collision a slow path rather than a wrong picture.
             *held_key == key && (Arc::ptr_eq(source, fragment) || **source == **fragment)
-        }) {
+        };
+        if self
+            .held
+            .as_ref()
+            .is_some_and(|(held_key, source, _)| same(held_key, source))
+        {
             return Ok(self.held.as_ref().map(|(_, _, program)| program));
         }
-        if self.failed == Some(key) {
+        if self
+            .failed
+            .as_ref()
+            .is_some_and(|(failed_key, source)| same(failed_key, source))
+        {
             return Ok(None);
         }
         // A new source: drop the old program *before* building, so a widget
@@ -260,10 +305,48 @@ impl<P> ProgramCache<P> {
                 Ok(Some(&held.2))
             }
             Err(error) => {
-                self.failed = Some(key);
-                Err(error)
+                self.failed = Some((key, Arc::clone(fragment)));
+                Err(Failure { error, key })
             }
         }
+    }
+}
+
+/// A build failure, carrying the source key it failed under so the caller can
+/// latch its journal line **per source**.
+#[derive(Debug, PartialEq, Eq)]
+struct Failure<E> {
+    /// What the builder said.
+    error: E,
+    /// [`source_key`] of the source that failed.
+    key: u64,
+}
+
+/// A one-shot-per-source journal latch.
+///
+/// A bare `bool` was the bug (#968 review M2): set on the first compile failure
+/// and never cleared, it silenced the *second* distinct broken shader entirely —
+/// the driver was asked, the widget went empty, and nothing was ever logged
+/// again. Since `ProgramCache` retries a **changed** source by design, that
+/// sequence (break, fix, break differently) is inside the contract rather than
+/// exotic, and the diagnostic it swallows is the one the whole
+/// "broken shader → placeholder + one warning" story rests on.
+#[derive(Debug, Default)]
+struct WarnLatch {
+    /// The source key the last line was written for.
+    said: Option<u64>,
+}
+
+impl WarnLatch {
+    /// Whether to write a line for `key`: `true` the first time this key is
+    /// seen, `false` for every repeat of the *same* key, `true` again for a
+    /// different one.
+    fn claim(&mut self, key: u64) -> bool {
+        if self.said == Some(key) {
+            return false;
+        }
+        self.said = Some(key);
+        true
     }
 }
 
@@ -282,8 +365,9 @@ fn first_line(log: &str) -> &str {
 
 mod imp {
     use super::{
-        Arc, Cell, Instant, ProgramCache, RefCell, SHADER_PREAMBLE, SHADER_VERT, ShaderState,
-        abandon_gl, first_line, fit_rect, gdk, glib,
+        Arc, Cell, Failure, Instant, ProgramCache, RefCell, SHADER_PREAMBLE, SHADER_VERT,
+        ShaderState, WarnLatch, abandon_gl, first_line, fit_rect, gdk, glib, source_key,
+        would_upload, wrapped_seconds,
     };
     use crate::gl_surface::{GLSL_HEADER, GlValue};
     use gtk::prelude::*;
@@ -316,10 +400,16 @@ mod imp {
         /// rather than at construction: a widget built during a bar rebuild and
         /// mapped a second later would otherwise open mid-animation.
         origin: Cell<Option<Instant>>,
-        /// One-shot latch for a compile failure, so a broken shader costs one
-        /// journal line per surface and not one per frame. (`ProgramCache`
-        /// already stops the *compile* repeating; this stops the *log*.)
-        warned_compile: Cell<bool>,
+        /// Journal latch for a compile failure, **keyed by source** so a broken
+        /// shader costs one line per distinct broken source rather than one per
+        /// frame — and so a *second*, different broken source is not silently
+        /// swallowed. (`ProgramCache` stops the *compile* repeating; this stops
+        /// the *log*.) See [`WarnLatch`].
+        warned_compile: RefCell<WarnLatch>,
+        /// One-shot latch for "the GL objects could not be allocated at all",
+        /// which is not keyed by anything a plugin controls — its own bool, so
+        /// it cannot mask a compile failure or be masked by one.
+        warned_resources: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -431,7 +521,7 @@ mod imp {
                 match Resources::build(&gl) {
                     Ok(resources) => *held = Some(resources),
                     Err(error) => {
-                        if !self.warned_compile.replace(true) {
+                        if !self.warned_resources.replace(true) {
                             tracing::warn!(
                                 %error,
                                 "a plugin shader surface could not allocate its GL objects; \
@@ -462,6 +552,19 @@ mod imp {
             // put the node's id and classes on screen, so what is left is an
             // empty rect, which is the broken-widget placeholder's own look.
             let program = match programs.ensure(&state.fragment, |body| {
+                // One `debug!` per **actual compile**, carrying the source key
+                // (#968 review L4): `docs/live-verify.md`'s "the same source
+                // does not recompile" check asks an operator to watch
+                // `RUST_LOG=hytte_ui=debug` for repeated compile activity, and
+                // before this there was nothing to see — only failures logged,
+                // so the check observed an absence that was unconditional.
+                // Now a silent log *is* the evidence, and a source that really
+                // did change prints exactly one line with a new hash.
+                tracing::debug!(
+                    source_key = source_key(body),
+                    bytes = body.len(),
+                    "compiling a plugin shader"
+                );
                 hgl::Program::compile(
                     &gl,
                     GLSL_HEADER,
@@ -471,27 +574,38 @@ mod imp {
             }) {
                 Ok(Some(program)) => program,
                 Ok(None) => return,
-                Err(error) => {
+                Err(Failure { error, key }) => {
                     let detail = match &error {
                         hgl::Error::Compile { log, .. } | hgl::Error::Link { log } => {
                             first_line(log).to_owned()
                         }
                         other => other.to_string(),
                     };
-                    if !self.warned_compile.replace(true) {
+                    // Latched by **source**, not by surface: a plugin that
+                    // breaks, fixes, then breaks differently gets a line for
+                    // each break rather than one for the first and silence
+                    // thereafter (#968 review M2).
+                    if self.warned_compile.borrow_mut().claim(key) {
                         tracing::warn!(
                             driver = %detail,
+                            source_key = key,
                             "a plugin's shader did not compile; the widget draws nothing \
-                             (further occurrences on this surface are silenced — run with \
-                             RUST_LOG=hytte_ui=debug for the full driver log)"
+                             (further frames carrying this same source are silenced — run \
+                             with RUST_LOG=hytte_ui=debug for the full driver log)"
                         );
                     }
-                    tracing::debug!(%error, "plugin shader compile failure, in full");
+                    tracing::debug!(%error, source_key = key, "plugin shader compile failure, in full");
                     return;
                 }
             };
 
-            upload_data(&gl, data, data_shape, data_source, &state);
+            // A failed reallocation leaves the *previous* texture bound, whose
+            // grid is no longer the one `state.data_size` describes — so the
+            // frame is skipped rather than drawn with `u_data_size` lying about
+            // what `u_data` holds (#968 review L7). The next frame retries.
+            if !upload_data(&gl, data, data_shape, data_source, &state) {
+                return;
+            }
 
             let Some(viewport) = self.narrow_to_fit_rect(&gl) else {
                 return;
@@ -500,8 +614,12 @@ mod imp {
             self.set_uniforms(&gl, program, &state, viewport);
             data.bind_unit(&gl, 0);
             program.set_int(&gl, "u_data", 0);
-            // Straight alpha over whatever is behind the surface, which is what
-            // the wire contract promises a plugin author.
+            // `Replace` is `glDisable(GL_BLEND)`: the shader's `fragColor` is
+            // written verbatim into GTK's framebuffer, which GSK imports as
+            // **premultiplied**. That is why the contract asks a plugin for
+            // premultiplied output — see the `Node::Shader` docs (#968 review
+            // M4). The blend mode is not the place to fix it: the shell never
+            // sees the colour, the shader writes it.
             hgl::set_blend(&gl, hgl::Blend::Replace);
             vao.bind(&gl);
             hgl::draw_fullscreen(&gl);
@@ -563,12 +681,7 @@ mod imp {
                 self.origin.set(Some(now));
                 now
             });
-            // `as f32` on an `f64` of seconds: a wall-clock duration since this
-            // surface's first frame, so small and positive for any session, and
-            // `f32` is the type the uniform carries anyway.
-            #[allow(clippy::cast_possible_truncation)]
-            let seconds = origin.elapsed().as_secs_f64() as f32;
-            program.set_float(gl, "u_time", seconds);
+            program.set_float(gl, "u_time", wrapped_seconds(origin.elapsed()));
             program.set_vec2(gl, "u_resolution", [f32_of(viewport.0), f32_of(viewport.1)]);
             program.set_float(gl, "u_scale", f32_of(state.scale.max(1)));
             program.set_vec2(
@@ -619,25 +732,39 @@ mod imp {
         data_shape: &mut (u32, u32, super::ShaderFormat),
         data_source: &mut Option<Arc<[u8]>>,
         state: &ShaderState,
-    ) {
+    ) -> bool {
         let (w, h) = (state.data_size.0.max(1), state.data_size.1.max(1));
         let shape = (w, h, state.format);
         if *data_shape != shape {
             let Ok(texture) = hgl::Texture::new(gl, state.format.as_gl(), w, h) else {
-                // Keep the 1×1 fallback bound rather than leaving the unit
-                // unbound: a shader samples something defined either way.
+                // **The frame is skipped, not drawn.** The old texture is still
+                // bound and still holds the *old* grid, while `set_uniforms`
+                // would publish `u_data_size` from the new `state` — one frame
+                // sampled against a size that does not describe what is bound
+                // (#968 review L7). Nothing is left inconsistent: the shape is
+                // not advanced, so the next frame retries the allocation.
+                //
+                // **Uncovered, stated rather than implied.** Reaching this arm
+                // needs `Texture::new` to fail, which needs a live context that
+                // refuses an allocation — CI has no GL at all, so there is no
+                // hermetic way in. The same honest gap #954 recorded for
+                // `fresh_last_drawn`'s call site. What *is* covered is the
+                // decision the caller makes with the `false` (it returns before
+                // `set_uniforms`), by reading, and the rest of this function's
+                // dedup, by `would_upload`'s own test.
                 *data_source = None;
-                return;
+                return false;
             };
             *data = texture;
             *data_shape = shape;
             *data_source = None;
         }
-        if data_source
-            .as_ref()
-            .is_some_and(|held| Arc::ptr_eq(held, &state.data))
-        {
-            return;
+        // The re-upload dedup, and the reason `shader_map` caches its
+        // `Arc<ShaderState>` per node (#968 review M1): with a fresh `Arc` every
+        // mapping pass this could never fire, and the whole data texture went to
+        // the GPU on every render even when the bytes had not moved.
+        if !would_upload(data_source.as_ref(), &state.data) {
+            return true;
         }
         match state.format {
             super::ShaderFormat::R8 | super::ShaderFormat::Rgba8 => {
@@ -657,7 +784,61 @@ mod imp {
             }
         }
         *data_source = Some(Arc::clone(&state.data));
+        true
     }
+}
+
+/// Whether the data texture must be re-uploaded for `incoming`.
+///
+/// **Public as a test seam**, and only for that: `trollshell`'s `shader_map`
+/// drives this exact function over real `map_shader` output to count uploads
+/// hermetically, which is the property #968 review M1 is about and which no
+/// probe written beside it could establish (a parallel copy of a caching rule
+/// agrees with itself by construction). Nothing in a shell calls it.
+///
+/// Identity, not equality: the reconciler's contract is that a node mapped onto
+/// a second monitor, or re-mapped because a sibling moved, hands back the
+/// **same** allocation (`shader_map` caches it per node). So a pointer compare
+/// is the whole test, and a `false` here is a whole data texture that does not
+/// cross the bus.
+///
+/// A free function so the rule is testable without a GL context — CI has none,
+/// and "the same buffer uploads once" is exactly the claim a probe written
+/// beside the real code would agree with by construction.
+#[must_use]
+pub fn would_upload(held: Option<&Arc<[u8]>>, incoming: &Arc<[u8]>) -> bool {
+    !held.is_some_and(|held| Arc::ptr_eq(held, incoming))
+}
+
+/// The period `u_time` wraps on, in seconds. One hour.
+///
+/// **This is a resolution fix, not a taste one** (#968 review L6). `u_time` is
+/// an `f32`, and `f32`'s ulp grows with magnitude: at 2.6e6 s (~30 days of
+/// uptime) it is **0.25 s**, and at ~97 days it is a full second — so a shader
+/// animating on `fract(u_time * 0.25)` would visibly judder, then freeze, on a
+/// shell that had simply been up a while. Unwrapped seconds are a value whose
+/// precision decays with how long the desktop has been running, which is the
+/// worst possible failure mode: invisible in every test and every fresh
+/// session.
+///
+/// An hour keeps the ulp at 0.06 ms — three orders of magnitude finer than a
+/// frame — and is a round number a shader author can build against: any period
+/// that divides 3600 (a second, a minute, four seconds, ten minutes) is
+/// continuous across the wrap. A shader with a period that does *not* divide it
+/// jumps once an hour; that is the documented cost, stated in the contract, and
+/// it is a far smaller one than degrading forever.
+const TIME_WRAP_SECS: f64 = 3600.0;
+
+/// Seconds since this surface's first frame, wrapped to [`TIME_WRAP_SECS`].
+///
+/// Extracted so the wrap is testable: everything else about `u_time` needs a GL
+/// context, and "the value stays precise after a month of uptime" is not
+/// something a running shell tells you until it is far too late.
+#[allow(clippy::cast_possible_truncation)]
+fn wrapped_seconds(elapsed: std::time::Duration) -> f32 {
+    // `rem_euclid` rather than `%` so the result is never negative for any
+    // input, including the zero-length first frame.
+    (elapsed.as_secs_f64().rem_euclid(TIME_WRAP_SECS)) as f32
 }
 
 glib::wrapper! {
@@ -719,7 +900,8 @@ impl Default for ShaderSurface {
 #[cfg(test)]
 mod tests {
     use super::{
-        Arc, ProgramCache, SHADER_PREAMBLE, SHADER_VERT, ShaderFormat, first_line, source_key,
+        Arc, ProgramCache, SHADER_PREAMBLE, SHADER_VERT, ShaderFormat, TIME_WRAP_SECS, WarnLatch,
+        first_line, source_key, would_upload, wrapped_seconds,
     };
 
     /// A counting builder, standing in for `hgl::Program::compile`. The cache is
@@ -937,5 +1119,167 @@ mod tests {
         assert_eq!(first_line("\n\n  padded  \nsecond\n"), "padded");
         assert_eq!(first_line(""), "(no driver diagnostic)");
         assert_eq!(first_line("   \n "), "(no driver diagnostic)");
+    }
+
+    // ── #968 review fixes ────────────────────────────────────────────────────
+
+    /// **M2.** The journal latch is keyed by **source**, so a plugin that ships
+    /// a broken shader, fixes it, then breaks it *differently* gets a line for
+    /// each break.
+    ///
+    /// The bug this replaces was a `Cell<bool>` set on the first failure and
+    /// never cleared: the second distinct broken source was compiled, failed,
+    /// blanked the widget — and logged nothing, ever again. That sequence is
+    /// inside the design's own contract ("a *changed* source recompiles"), and
+    /// the diagnostic it swallowed is the one the whole
+    /// "broken shader → placeholder + one warning" story rests on.
+    ///
+    /// **Falsified** by making [`WarnLatch::claim`] a one-way bool (`if
+    /// self.said.is_some() { return false }`): the third assertion goes red,
+    /// which is exactly the shipped-bug behaviour.
+    #[test]
+    fn the_compile_warning_latch_is_per_source_not_per_surface() {
+        let mut latch = WarnLatch::default();
+        let (a, b, c) = (
+            source_key("broken A"),
+            source_key("fine B"),
+            source_key("broken C"),
+        );
+
+        assert!(latch.claim(a), "the first broken source is reported");
+        for _ in 0..8 {
+            assert!(!latch.claim(a), "…and then goes quiet while it persists");
+        }
+        // A source that compiled never reaches the latch — this stands in for
+        // the fixed shader in between, and shows the latch is not a counter.
+        assert!(latch.claim(b), "a different key is a different line");
+        assert!(
+            latch.claim(c),
+            "a SECOND broken source must be reported, not swallowed",
+        );
+        assert!(!latch.claim(c), "…once");
+        assert!(latch.claim(a), "and the first one again, if it comes back");
+    }
+
+    /// **L2.** A source whose hash collides with a latched-**failed** key is
+    /// still handed to the driver: `failed` closes the collision with a byte
+    /// compare, exactly as `held` does.
+    ///
+    /// Before this, `failed: Option<u64>` refused a colliding source without
+    /// ever compiling it and without a journal line — a silently blank widget
+    /// for a shader that is fine. Astronomically unlikely with 64-bit `SipHash`
+    /// over two sources in one widget's lifetime, which is why it is a one-word
+    /// guard; but the module docs claimed the guard already existed.
+    ///
+    /// The collision is *simulated* rather than found (finding one is the point
+    /// of a cryptographic hash): the cache is put into the exact state a
+    /// collision would produce — a `failed` entry whose key equals the incoming
+    /// key but whose source does not — and the shipped comparison is asked.
+    ///
+    /// **Falsified** by comparing only the key in `ensure`'s `failed` arm: the
+    /// good source comes back `Ok(None)` with `builds == 0`.
+    #[test]
+    fn a_failed_key_collision_still_reaches_the_driver() {
+        let builder = Builder::default();
+        let mut cache: ProgramCache<u32> = ProgramCache::default();
+        let good: Arc<str> = Arc::from("void main() { fragColor = u_fg; }");
+
+        // The state a collision would leave: same key, different source.
+        cache.failed = Some((source_key(&good), Arc::from("a different source")));
+
+        assert_eq!(
+            cache.ensure(&good, |s| builder.build(s)).unwrap().copied(),
+            Some(1),
+            "a source that merely collides with a failed key must still compile",
+        );
+        assert_eq!(builder.builds.get(), 1, "the driver was actually asked");
+    }
+
+    /// **L7.** `would_upload` is identity, not equality: the same allocation
+    /// uploads once however many renders arrive, and a *different* allocation
+    /// with the same bytes uploads again.
+    ///
+    /// The second half is not a wart — it is what makes the rule cheap and
+    /// sound. Comparing 4 MiB per render to avoid an upload would cost more than
+    /// the upload; the reconciler's contract is that an unchanged node hands
+    /// back the same `Arc`, which `shader_map`'s per-node cache now actually
+    /// honours (#968 review M1).
+    ///
+    /// **Falsified** by making `would_upload` return `true` unconditionally: the
+    /// counting probe below rises with every frame.
+    #[test]
+    fn the_same_buffer_uploads_once_however_many_renders_arrive() {
+        let shared: Arc<[u8]> = Arc::from(&[1u8, 2, 3, 4][..]);
+        let mut held: Option<Arc<[u8]>> = None;
+        let mut uploads = 0_u32;
+
+        // Twenty renders of one unchanged frame — two monitors at 10 Hz.
+        for _ in 0..20 {
+            if would_upload(held.as_ref(), &shared) {
+                uploads += 1;
+                held = Some(Arc::clone(&shared));
+            }
+        }
+        assert_eq!(uploads, 1, "one upload for twenty renders");
+
+        // A genuinely new frame uploads.
+        let next: Arc<[u8]> = Arc::from(&[9u8, 9, 9, 9][..]);
+        assert!(would_upload(held.as_ref(), &next));
+
+        // Equal bytes in a distinct allocation upload too, and that is the
+        // documented trade rather than a defect.
+        let equal: Arc<[u8]> = Arc::from(&[1u8, 2, 3, 4][..]);
+        assert!(!Arc::ptr_eq(&shared, &equal));
+        assert!(would_upload(Some(&shared), &equal));
+    }
+
+    /// The wrap period as an `f32`, for the range assertion below. `3600.0` is
+    /// exactly representable, so the cast is lossless — but the lint cannot know
+    /// that from a `const`, and burying an `allow` inside the assertion would
+    /// hide it from a reader.
+    #[allow(clippy::cast_possible_truncation)]
+    fn wrap_secs_f32() -> f32 {
+        TIME_WRAP_SECS as f32
+    }
+
+    /// **L6.** `u_time` wraps hourly, so its `f32` resolution does not decay
+    /// with the shell's uptime.
+    ///
+    /// Unwrapped, `origin.elapsed()` as an `f32` has a 0.25 s ulp after a month
+    /// and a 1 s ulp after three — a shader animating on it would judder, then
+    /// freeze, on a desktop that had simply been left running. That is a defect
+    /// no test and no fresh session can see, which is why the wrap is a constant
+    /// with a test rather than a comment.
+    ///
+    /// **Falsified** by dropping the `rem_euclid`: the month-long case comes
+    /// back 2.6e6 and the resolution assertion goes red.
+    #[test]
+    fn u_time_wraps_hourly_and_keeps_its_resolution() {
+        use std::time::Duration;
+
+        assert!((wrapped_seconds(Duration::ZERO) - 0.0).abs() < f32::EPSILON);
+        assert!((wrapped_seconds(Duration::from_millis(1500)) - 1.5).abs() < 1e-6);
+
+        // One month of uptime: the value stays inside the hour…
+        let month = Duration::from_hours(30 * 24);
+        let t = wrapped_seconds(month);
+        assert!(
+            (0.0..wrap_secs_f32()).contains(&t),
+            "wrapped into the period, got {t}",
+        );
+        // …and a millisecond later is still a *different* number, which is the
+        // whole point. Unwrapped, 2.6e6 s has an ulp of 0.25 s and this fails.
+        let later = wrapped_seconds(month + Duration::from_millis(1));
+        assert_ne!(
+            t.to_bits(),
+            later.to_bits(),
+            "a millisecond must still move u_time after a month of uptime",
+        );
+
+        // Exactly on the boundary the clock restarts, continuously for any
+        // period that divides the wrap — which is what the contract promises.
+        let hour = Duration::from_secs_f64(TIME_WRAP_SECS);
+        assert!(wrapped_seconds(hour).abs() < 1e-3);
+        assert!((wrapped_seconds(hour + Duration::from_millis(250)) - 0.25).abs() < 1e-3);
     }
 }

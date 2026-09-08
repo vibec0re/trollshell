@@ -253,6 +253,15 @@ fn wire_node_maps_to_ui_node_exhaustively() {
 /// wire's `u16` to the reconciler's `i32` — the one arithmetic step in this
 /// otherwise 1:1 file, and the one thing a field-for-field `assert_eq!` on a
 /// zero would not have caught.
+///
+/// Since #961 the `tooltip`s ride along, and two of the three cases here are
+/// deliberate. The `Row`'s and the second `Text`'s are **non-`None`**, so a
+/// dropped `tooltip: tooltip.clone()` in the map fails rather than passing on
+/// `None == None` — the mistake an optional field invites. The *ellipsizing*
+/// `Text`'s stays `None` on **both** sides, which pins that the derived
+/// "an ellipsized text hovers itself" default is the **reconciler's**
+/// (`hytte_ui::widget_tree::node_tooltip`) and not something this map bakes
+/// into the tree it hands over.
 #[test]
 fn wire_row_listbox_text_map_to_ui() {
     let tree = wire::Node::ListBox {
@@ -270,6 +279,15 @@ fn wire_row_listbox_text_map_to_ui() {
                     max_width_chars: Some(20),
                     ellipsize: true,
                     classes: vec!["ts-dest".into()],
+                    tooltip: None,
+                },
+                wire::Node::Text {
+                    id: None,
+                    text: "spor 2".into(),
+                    max_width_chars: None,
+                    ellipsize: false,
+                    classes: vec![],
+                    tooltip: Some("platform 2".into()),
                 },
                 wire::Node::Spacer,
                 wire::Node::Label {
@@ -279,6 +297,7 @@ fn wire_row_listbox_text_map_to_ui() {
                     tooltip: None,
                 },
             ],
+            tooltip: Some("Oslo S → Lillestrøm".into()),
         }],
     };
     let expected = UiNode::ListBox {
@@ -296,6 +315,15 @@ fn wire_row_listbox_text_map_to_ui() {
                     max_width_chars: Some(20),
                     ellipsize: true,
                     classes: vec!["ts-dest".into()],
+                    tooltip: None,
+                },
+                UiNode::Text {
+                    id: None,
+                    text: "spor 2".into(),
+                    max_width_chars: None,
+                    ellipsize: false,
+                    classes: vec![],
+                    tooltip: Some("platform 2".into()),
                 },
                 UiNode::Spacer,
                 UiNode::Label {
@@ -305,6 +333,7 @@ fn wire_row_listbox_text_map_to_ui() {
                     tooltip: None,
                 },
             ],
+            tooltip: Some("Oslo S → Lillestrøm".into()),
         }],
     };
     assert_eq!(
@@ -348,7 +377,8 @@ fn wire_scrolled_maps_to_ui() {
 }
 
 /// The #333 `Expander` maps 1:1: the boxed `header` and the body `children`
-/// recurse, and the `expanded` mutable prop carries across.
+/// recurse, and the `expanded` mutable prop carries across — as does #961's
+/// `tooltip`, set non-`None` here so a dropped clone can't pass.
 #[test]
 fn wire_expander_maps_to_ui() {
     let tree = wire::Node::Expander {
@@ -367,6 +397,7 @@ fn wire_expander_maps_to_ui() {
         }],
         expanded: true,
         classes: vec!["boxed-list".into()],
+        tooltip: Some("3 devices, 1 on".into()),
     };
     let expected = UiNode::Expander {
         id: "room".into(),
@@ -384,6 +415,7 @@ fn wire_expander_maps_to_ui() {
         }],
         expanded: true,
         classes: vec!["boxed-list".into()],
+        tooltip: Some("3 devices, 1 on".into()),
     };
     assert_eq!(
         to_ui_node(&Scope::detached("map"), Grants::none(), &tree),
@@ -4286,6 +4318,7 @@ fn instances_are_swept_when_their_node_leaves_the_tree() {
         id: Some("row".into()),
         classes: vec![],
         children,
+        tooltip: None,
     };
 
     let _ = to_ui_node(&scope, Grants::none(), &row(vec![leaf("a"), leaf("b")]));

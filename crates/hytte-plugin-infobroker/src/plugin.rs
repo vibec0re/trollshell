@@ -294,6 +294,7 @@ impl Infobroker {
                     id: None,
                     classes: Vec::new(),
                     children: chip_children,
+                    tooltip: None,
                 }),
             }],
             tooltip: None,
@@ -443,6 +444,7 @@ fn muted_text(text: &str) -> Node {
         max_width_chars: None,
         ellipsize: false,
         classes: vec!["dim-label".to_owned()],
+        tooltip: None,
     }
 }
 
@@ -508,6 +510,7 @@ fn action_row(title: &str, subtitle: &str, trailing: Option<Node>) -> Node {
         id: None,
         classes: Vec::new(),
         children,
+        tooltip: None,
     }
 }
 
@@ -593,6 +596,7 @@ fn audit_row(a: &AuditView, now_unix: i64) -> Node {
             Node::Spacer,
             label(&ago_label(now_unix, a.at_unix), &["dim-label", "caption"]),
         ],
+        tooltip: None,
     }
 }
 

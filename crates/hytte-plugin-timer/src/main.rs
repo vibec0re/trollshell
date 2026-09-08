@@ -374,6 +374,7 @@ impl Plugin for Timer {
                 button(PRESET_5, "5"),
                 button(PRESET_15, "15"),
             ],
+            tooltip: None,
         };
         let controls = Node::Row {
             spacing: 0,
@@ -383,6 +384,7 @@ impl Plugin for Timer {
                 button(PAUSE_ID, if self.running { "Pause" } else { "Start" }),
                 button(RESET_ID, "Reset"),
             ],
+            tooltip: None,
         };
         View::new(chip).panel(Node::Box {
             id: Some(PANEL_ROOT_ID.to_owned()),

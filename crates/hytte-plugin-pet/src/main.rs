@@ -361,6 +361,7 @@ impl Plugin for Pet {
             id: Some("pet-root".to_owned()),
             classes: vec!["pet-root".to_owned()],
             children,
+            tooltip: None,
         }
         .into()
     }

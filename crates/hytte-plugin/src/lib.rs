@@ -360,14 +360,15 @@
 //!
 //! # Tooltips
 //!
-//! [`Node::Box`], [`Node::Label`] and [`Node::Icon`] carry an optional
-//! `tooltip: Option<String>`, which the host applies with
-//! `gtk::Widget::set_tooltip_text` (#957). It is the one place a plugin can put
-//! words that don't fit on screen, and a **bar chip is where it earns its keep**:
-//! a chip is a handful of 16px glyphs, and the claude-bridge chip's `sub 18/0`
-//! was legible only to someone who had read its source. Hang one string on the
-//! chip's **root box** and hovering anywhere on the pill answers the question —
-//! no drawer panel, no extra capability, no new node.
+//! Seven node kinds carry an optional `tooltip: Option<String>`, which the host
+//! applies with `gtk::Widget::set_tooltip_text` (#957, #893, #961):
+//! [`Node::Box`], [`Node::Label`], [`Node::Icon`], [`Node::Shader`],
+//! [`Node::Row`], [`Node::Text`] and [`Node::Expander`]. It is the one place a
+//! plugin can put words that don't fit on screen, and a **bar chip is where it
+//! earns its keep**: a chip is a handful of 16px glyphs, and the claude-bridge
+//! chip's `sub 18/0` was legible only to someone who had read its source. Hang
+//! one string on the chip's **root box** and hovering anywhere on the pill
+//! answers the question — no drawer panel, no extra capability, no new node.
 //!
 //! It is **plain text, not Pango markup**: the host calls `set_tooltip_text`, so
 //! `<b>` arrives as four literal characters. It is a mutable prop like `text` —
@@ -378,6 +379,26 @@
 //! Set `tooltip: None` when you have nothing to say; it costs no wire bytes
 //! (`skip_serializing_if`), and an older host that predates the field skips the
 //! key rather than failing the frame, so using it is safe against any shell.
+//! [`nodes::row`](crate::nodes::row) defaults it for you —
+//! `nodes::row(children).tooltip("argus · running").build()`.
+//!
+//! ## The list-card three (#961)
+//!
+//! - **[`Node::Row`]** is where a card's legend goes: one string per row, on
+//!   the row. A child with its own tooltip still wins the hover where the
+//!   pointer is over it, so a row tooltip is a fallback rather than a blanket.
+//!   (Before the field, the only way to get hover text on a row was to spell it
+//!   as a horizontal [`Node::Box`] instead.)
+//! - **[`Node::Expander`]**'s lands on the **header button**, not on the whole
+//!   expander — so an expanded body does not inherit the header's legend.
+//! - **[`Node::Text`] has a default.** When `ellipsize` is `true` and you set
+//!   no tooltip, the host uses the node's **full `text`** as the hover, which is
+//!   the only way a reader can see what the `…` cut off. An explicit tooltip
+//!   always wins; a `Text` that does not ellipsize gets none. The host does not
+//!   check whether the label is *actually* truncated (that depends on the
+//!   allocation), so a short ellipsizing string in a wide container hovers
+//!   itself — a legend, not a bug. Set a tooltip, or leave `ellipsize` off,
+//!   where that is unwanted.
 
 use std::time::Duration;
 

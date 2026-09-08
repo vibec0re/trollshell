@@ -14,9 +14,9 @@
 //! - [`golden_bytes_are_pinned`] walks a table of representative messages
 //!   (a `Register` handshake, a `Render` carrying the full [`Node`]
 //!   vocabulary incl. [`Node::Pixels`], a second `Render` carrying every
-//!   [`PreemWidget`] (#882), every [`Effect`] variant, every
-//!   [`StateKey`]/[`Capability`], and the full [`HostMsg`] push set) and
-//!   checks, for each entry, that:
+//!   [`PreemWidget`] (#882), one per tooltip cohort (#957's chip, #961's list
+//!   card), every [`Effect`] variant, every [`StateKey`]/[`Capability`], and
+//!   the full [`HostMsg`] push set) and checks, for each entry, that:
 //!   1. `encode()` of the current Rust value is byte-identical to the
 //!      committed fixture (**encode stability** — catches an encoder change);
 //!   2. decoding the fixture's *committed bytes* reproduces the same value
@@ -188,7 +188,9 @@ fn list_tree() -> Node {
                 max_width_chars: None,
                 ellipsize: false,
                 classes: vec![],
+                tooltip: None,
             }],
+            tooltip: None,
         }],
     }
 }
@@ -213,9 +215,11 @@ fn expander_tree() -> Node {
                 classes: vec![],
                 tooltip: None,
             }],
+            tooltip: None,
         }],
         expanded: true,
         classes: vec!["boxed-list".into()],
+        tooltip: None,
     }
 }
 
@@ -241,6 +245,7 @@ fn node_tree() -> Node {
                 max_width_chars: Some(24),
                 ellipsize: true,
                 classes: vec!["ts-dest".into()],
+                tooltip: None,
             },
             Node::Icon {
                 id: Some("ico".into()),
@@ -713,6 +718,63 @@ fn tooltip_tree() -> Node {
     }
 }
 
+/// The #961 half of the tooltip vocabulary: a `Row` and an `Expander` with a
+/// hover text, and both `Text` shapes — one ellipsizing with **no** explicit
+/// tooltip (the host derives the hover from `text`, which is invisible on the
+/// wire and must stay that way), one with an explicit tooltip that wins.
+///
+/// Its own fixture rather than more nodes in [`tooltip_tree`]: that one's bytes
+/// pin #957, and folding #961's into it would have moved a committed fixture
+/// for a purely additive change — exactly what this suite exists to notice.
+fn tooltip_rows_tree() -> Node {
+    Node::ListBox {
+        id: Some("agents".into()),
+        classes: vec!["boxed-list".into()],
+        dense: true,
+        children: vec![
+            Node::Row {
+                id: Some("argus".into()),
+                classes: vec!["ts-row".into()],
+                spacing: 6,
+                children: vec![
+                    Node::Text {
+                        id: Some("what".into()),
+                        text: "rebasing the agents plugin onto the viewport".into(),
+                        max_width_chars: Some(22),
+                        ellipsize: true,
+                        classes: vec![],
+                        // Deliberately unset: the host uses `text` (#961), so
+                        // the derived hover leaves no trace on the wire.
+                        tooltip: None,
+                    },
+                    Node::Text {
+                        id: Some("when".into()),
+                        text: "4m".into(),
+                        max_width_chars: None,
+                        ellipsize: false,
+                        classes: vec!["dim-label".into()],
+                        tooltip: Some("started 4 minutes ago".into()),
+                    },
+                ],
+                tooltip: Some("argus · running · 3 tool calls".into()),
+            },
+            Node::Expander {
+                id: "hive".into(),
+                header: Box::new(Node::Label {
+                    id: None,
+                    text: "hive".into(),
+                    classes: vec![],
+                    tooltip: None,
+                }),
+                children: vec![],
+                expanded: false,
+                classes: vec![],
+                tooltip: Some("4 agents, 1 failed".into()),
+            },
+        ],
+    }
+}
+
 /// A tree carrying the #893 shader widget in both of the shapes that differ on
 /// the wire: an `R32f` strip with a tooltip and a non-default `scale`, and an
 /// `Rgba8` grid with neither.
@@ -805,6 +867,7 @@ fn vocab_gaps_tree() -> Node {
                         tooltip: None,
                     },
                 ],
+                tooltip: None,
             }],
         }),
     }
@@ -847,6 +910,14 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
             "plugin_render_tooltip_v1",
             Box::new(PluginMsg::Render {
                 tree: tooltip_tree(),
+                panel: None,
+                effects: vec![],
+            }),
+        ),
+        (
+            "plugin_render_tooltip_rows_v1",
+            Box::new(PluginMsg::Render {
+                tree: tooltip_rows_tree(),
                 panel: None,
                 effects: vec![],
             }),

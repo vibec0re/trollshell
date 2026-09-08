@@ -213,6 +213,7 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             classes,
             spacing,
             children,
+            tooltip,
         } => UiNode::Row {
             id: id.clone(),
             classes: classes.clone(),
@@ -224,6 +225,7 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
                 .iter()
                 .filter_map(|child| map_node(walk, child))
                 .collect(),
+            tooltip: tooltip.clone(),
         },
         wire::Node::ListBox {
             id,
@@ -267,12 +269,19 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             max_width_chars,
             ellipsize,
             classes,
+            tooltip,
         } => UiNode::Text {
             id: id.clone(),
             text: text.clone(),
             max_width_chars: *max_width_chars,
             ellipsize: *ellipsize,
             classes: classes.clone(),
+            // Passed through as-is, `None` included: the "an ellipsized `Text`
+            // tooltips itself" default (#961) is the *reconciler's*, derived in
+            // `hytte_ui`'s `node_tooltip` from the same node it renders. Doing
+            // it here would put the derived string in the mapped tree, where
+            // the shell's own producers would have to repeat it.
+            tooltip: tooltip.clone(),
         },
         wire::Node::Icon {
             id,
@@ -454,6 +463,7 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             children,
             expanded,
             classes,
+            tooltip,
         } => UiNode::Expander {
             id: id.clone(),
             header: Box::new(map_node(walk, header)?),
@@ -463,6 +473,7 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
                 .collect(),
             expanded: *expanded,
             classes: classes.clone(),
+            tooltip: tooltip.clone(),
         },
         wire::Node::Entry {
             id,

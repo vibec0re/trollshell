@@ -59,6 +59,7 @@ fn sample_tree() -> Node {
                             max_width_chars: Some(24),
                             ellipsize: true,
                             classes: vec!["ts-dest".into()],
+                            tooltip: None,
                         },
                         Node::Spacer,
                         Node::Text {
@@ -67,8 +68,10 @@ fn sample_tree() -> Node {
                             max_width_chars: None,
                             ellipsize: false,
                             classes: vec![],
+                            tooltip: None,
                         },
                     ],
+                    tooltip: None,
                 }],
             },
             Node::Icon {
@@ -302,9 +305,11 @@ fn expander_round_trips() {
                     classes: vec![],
                     tooltip: None,
                 }],
+                tooltip: None,
             }],
             expanded,
             classes: vec!["boxed-list".into()],
+            tooltip: None,
         };
         let back: Node = decode(&encode(&node)).expect("decode Expander");
         assert_eq!(node, back, "expanded={expanded} round-trips");
@@ -321,6 +326,7 @@ fn expander_is_name_tagged() {
         children: vec![],
         expanded: false,
         classes: vec![],
+        tooltip: None,
     });
     assert!(
         contains(&body, b"Expander"),
@@ -337,6 +343,7 @@ fn text_ellipsize_round_trips() {
             max_width_chars: Some(22),
             ellipsize,
             classes: vec!["ts-dest".into()],
+            tooltip: None,
         };
         let back: Node = decode(&encode(&node)).expect("decode Text");
         assert_eq!(node, back, "ellipsize={ellipsize} round-trips");
@@ -381,16 +388,18 @@ fn text_without_ellipsize_decodes_old_frame_compat() {
             max_width_chars: None,
             ellipsize: false,
             classes: vec!["ts-dest".into()],
+            tooltip: None,
         },
         "absent ellipsize (and max_width_chars) default",
     );
 }
 
-// ── `tooltip` on Box / Label / Icon (#957) ───────────────────────────────────
+// ── `tooltip` on Box / Label / Icon (#957), Row / Text / Expander (#961) ─────
 //
 // An **optional field**, not a new variant, so by the crate root's compat rules
-// it keeps both `PROTO_VERSION` and `VOCAB`. These four tests are the concrete
-// evidence for that claim, in both directions.
+// it keeps both `PROTO_VERSION` and `VOCAB`. These tests are the concrete
+// evidence for that claim, in both directions. (`Shader`, the seventh carrier,
+// has its own round-trip below — its ten fields don't fit this table.)
 
 #[test]
 fn tooltip_round_trips_on_every_variant_that_carries_it() {
@@ -417,12 +426,164 @@ fn tooltip_round_trips_on_every_variant_that_carries_it() {
                 classes: vec![],
                 tooltip: tooltip.clone(),
             },
+            // #961's three.
+            Node::Row {
+                id: Some("argus".into()),
+                classes: vec![],
+                spacing: 6,
+                children: vec![],
+                tooltip: tooltip.clone(),
+            },
+            Node::Text {
+                id: None,
+                text: "a destination too long for the row".into(),
+                max_width_chars: Some(22),
+                ellipsize: true,
+                classes: vec![],
+                tooltip: tooltip.clone(),
+            },
+            Node::Expander {
+                id: "hive".into(),
+                header: std::boxed::Box::new(Node::Spacer),
+                children: vec![],
+                expanded: false,
+                classes: vec![],
+                tooltip: tooltip.clone(),
+            },
         ];
         for node in nodes {
             let back: Node = decode(&encode(&node)).expect("decode tooltip node");
             assert_eq!(node, back, "tooltip={tooltip:?} round-trips");
         }
     }
+}
+
+/// #961's three carry the same `skip_serializing_if`, so a tree that sets none
+/// of them encodes exactly the bytes it did before the fields existed — which
+/// is what leaves every already-committed golden fixture byte-identical.
+///
+/// **Falsified** by dropping `skip_serializing_if` from `Node::Row::tooltip`:
+/// this goes red on the first assertion, and `golden::golden_bytes_are_pinned`
+/// goes red on `plugin_render_v1` (which carries a `Row`).
+#[test]
+fn a_none_tooltip_never_reaches_the_wire_on_the_961_three() {
+    let unset = [
+        Node::Row {
+            id: None,
+            classes: vec![],
+            spacing: 0,
+            children: vec![],
+            tooltip: None,
+        },
+        Node::Text {
+            id: None,
+            text: "spor 2".into(),
+            max_width_chars: None,
+            ellipsize: false,
+            classes: vec![],
+            tooltip: None,
+        },
+        Node::Expander {
+            id: "hive".into(),
+            header: std::boxed::Box::new(Node::Spacer),
+            children: vec![],
+            expanded: false,
+            classes: vec![],
+            tooltip: None,
+        },
+    ];
+    for node in unset {
+        assert!(
+            !contains(&encode_body(&node), b"tooltip"),
+            "an unset tooltip costs no bytes: {node:?}"
+        );
+    }
+
+    let set = Node::Row {
+        id: None,
+        classes: vec![],
+        spacing: 0,
+        children: vec![],
+        tooltip: Some("argus · idle".into()),
+    };
+    assert!(
+        contains(&encode_body(&set), b"tooltip"),
+        "…but a set one is named on the wire (named-map encoding)"
+    );
+}
+
+/// Backward (#961): a plugin built before the field emits a `Row` with no
+/// `tooltip` key. `#[serde(default)]` must read that as "no tooltip" rather
+/// than failing the frame — this is what keeps every already-deployed plugin
+/// binary rendering against a new shell.
+#[test]
+fn a_pre_961_row_frame_still_decodes() {
+    #[derive(serde::Serialize)]
+    enum NodeOld {
+        Row {
+            id: Option<String>,
+            classes: Vec<String>,
+            spacing: u16,
+            children: Vec<Node>,
+        },
+    }
+
+    let body = encode_body(&NodeOld::Row {
+        id: Some("argus".into()),
+        classes: vec!["ts-row".into()],
+        spacing: 6,
+        children: vec![],
+    });
+    assert!(!contains(&body, b"tooltip"), "an old frame carries no key");
+    let decoded: Node = decode_body(&body).expect("decode pre-#961 Row frame");
+    assert_eq!(
+        decoded,
+        Node::Row {
+            id: Some("argus".into()),
+            classes: vec!["ts-row".into()],
+            spacing: 6,
+            children: vec![],
+            tooltip: None,
+        },
+        "an absent tooltip defaults to none",
+    );
+}
+
+/// Forward (#961) — the #437 direction. A plugin rebuilt on the new SDK sets a
+/// row tooltip and talks to a shell that predates the field: the old decoder
+/// skips the unknown **key** and renders the row exactly as before, where an
+/// unknown **variant** would have killed the frame and crash-looped the
+/// session. That is the whole argument for "no `VOCAB` bump".
+#[test]
+fn an_older_host_skips_a_row_tooltip_it_has_never_heard_of() {
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    enum NodeOld {
+        Row {
+            id: Option<String>,
+            classes: Vec<String>,
+            spacing: u16,
+            children: Vec<Node>,
+        },
+    }
+
+    let body = encode_body(&Node::Row {
+        id: Some("argus".into()),
+        classes: vec![],
+        spacing: 6,
+        children: vec![],
+        tooltip: Some("argus · 3 running, 1 failed".into()),
+    });
+    assert!(contains(&body, b"tooltip"), "the new frame does carry it");
+    let old: NodeOld = decode_body(&body).expect("a pre-#961 host still decodes the frame");
+    assert_eq!(
+        old,
+        NodeOld::Row {
+            id: Some("argus".into()),
+            classes: vec![],
+            spacing: 6,
+            children: vec![],
+        },
+    );
 }
 
 #[test]
@@ -536,6 +697,7 @@ fn spaced_row(spacing: u16) -> Node {
         classes: vec!["ts-row".into()],
         spacing,
         children: vec![],
+        tooltip: None,
     }
 }
 
@@ -630,6 +792,7 @@ fn a_pre_966_row_and_list_frame_still_decodes() {
                 classes: vec!["ts-row".into()],
                 spacing: 0,
                 children: vec![],
+                tooltip: None,
             }],
         },
         "absent keys default to the pre-#966 layout",
@@ -1796,6 +1959,7 @@ fn containers_burying(inner: Node) -> Vec<(&'static str, Node)> {
                 id: None,
                 classes: vec![],
                 children: vec![inner.clone()],
+                tooltip: None,
             },
         ),
         (
@@ -1831,6 +1995,7 @@ fn containers_burying(inner: Node) -> Vec<(&'static str, Node)> {
                 children: vec![],
                 expanded: true,
                 classes: vec![],
+                tooltip: None,
             },
         ),
         (
@@ -1841,6 +2006,7 @@ fn containers_burying(inner: Node) -> Vec<(&'static str, Node)> {
                 children: vec![inner],
                 expanded: true,
                 classes: vec![],
+                tooltip: None,
             },
         ),
     ]
@@ -1877,6 +2043,7 @@ fn tree_with_every_float_poisoned(poison: f64) -> Node {
             max_width_chars: None,
             ellipsize: false,
             classes: vec![],
+            tooltip: None,
         },
         Node::Icon {
             id: None,

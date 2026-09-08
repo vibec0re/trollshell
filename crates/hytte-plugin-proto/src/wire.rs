@@ -140,12 +140,12 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 ///
 /// # Tooltips
 ///
-/// [`Box`](Node::Box), [`Label`](Node::Label) and [`Icon`](Node::Icon) each carry
-/// an optional `tooltip: Option<String>`, which the host maps straight onto
-/// `gtk::Widget::set_tooltip_text` (#957). It is the vocabulary's only
-/// self-explanation primitive: a bar chip is a handful of glyphs with nowhere to
-/// say what they mean, and a plugin that is deliberately panel-less (the
-/// claude-bridge chip, #866) has no other surface to put the legend on.
+/// Seven variants carry an optional `tooltip: Option<String>`, which the host
+/// maps straight onto `gtk::Widget::set_tooltip_text` (#957). It is the
+/// vocabulary's only self-explanation primitive: a bar chip is a handful of
+/// glyphs with nowhere to say what they mean, and a plugin that is deliberately
+/// panel-less (the claude-bridge chip, #866) has no other surface to put the
+/// legend on.
 ///
 /// - It is a **mutable prop**: a same-id re-render with a different string
 ///   retitles the widget in place, and a re-render dropping it back to `None`
@@ -155,11 +155,44 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 ///   input; `set_tooltip_markup` would hand it a parser.)
 /// - It is **not** part of a node's identity: only `kind` and `id` decide reuse,
 ///   so changing a tooltip never rebuilds a widget.
-/// - **Four** variants, not all seventeen, because these are the ones a chip is
-///   made of: [`Box`](Node::Box), [`Label`](Node::Label), [`Icon`](Node::Icon)
-///   and — since #893 — [`Shader`](Node::Shader), which is a picture with
-///   nowhere else to say what it is. Extending the set again is the same
-///   additive move this one was.
+/// - **Seven** of the seventeen variants, not all of them — the ones a chip or a
+///   list card is made of: [`Box`](Node::Box), [`Label`](Node::Label),
+///   [`Icon`](Node::Icon) and [`Shader`](Node::Shader) (#893, a picture with
+///   nowhere else to say what it is), then — since #961 — [`Row`](Node::Row),
+///   [`Text`](Node::Text) and [`Expander`](Node::Expander). Extending the set
+///   again is the same additive move each of these was.
+///
+/// ## Where the host arms it (#961)
+///
+/// On the widget the node itself materializes as, with **one** exception:
+/// [`Expander`](Node::Expander) arms it on the **header button**, not on the
+/// outer box that also holds the revealed body. An expander's tooltip explains
+/// the row the pointer clicks; hanging it on the outer box would float that
+/// legend over the expanded body too, including over children that deliberately
+/// carry none of their own. The header is what the pointer is over when it
+/// hovers "the row", and it is already the click target.
+///
+/// GTK resolves a hover against the deepest widget under the pointer and walks
+/// **up** until one answers, so a child's own tooltip always wins over its
+/// container's: a [`Row`](Node::Row) tooltip explains the whole row *except*
+/// wherever a child says something more specific.
+///
+/// ## An ellipsized [`Text`](Node::Text) tooltips itself (#961)
+///
+/// [`Text`](Node::Text) is the one variant with a **default**. When
+/// `ellipsize` is `true` and the node sets no explicit `tooltip`, the host uses
+/// the node's **full `text`** as the hover — which is the whole point of the
+/// property: an ellipsized label truncates with `…` and the reader otherwise
+/// has no way to see the rest. An explicit `tooltip` always wins, and a `Text`
+/// that does not ellipsize gets no tooltip unless it asks for one.
+///
+/// The host does **not** check whether the label is *actually* truncated:
+/// `pango_layout_is_ellipsized` is a function of the allocation, which changes
+/// with every resize, so gating on it would mean a per-label allocation hook
+/// re-deciding the tooltip on every layout pass. The cost of not gating is one
+/// redundant hover on a short string in a wide-enough container, which reads as
+/// a legend rather than as a bug; set `tooltip: Some(…)` — or leave `ellipsize`
+/// off — where even that is unwanted.
 ///
 /// **Additive, so [`PROTO_VERSION`](crate::PROTO_VERSION) and
 /// [`VOCAB`](crate::VOCAB) both stay put** — the crate root's compat rules put an
@@ -277,6 +310,17 @@ pub enum Node {
         #[serde(default, skip_serializing_if = "is_default")]
         spacing: u16,
         children: Vec<Node>,
+        /// Hover text for the whole row, or `None` for no tooltip (#961). See
+        /// the [tooltip section](Node#tooltips) on this enum.
+        ///
+        /// This is what a list card wants: one legend per row, on the row. A
+        /// child that says something more specific still wins the hover, so a
+        /// row tooltip is a fallback rather than a blanket. Before this field
+        /// the only way to get hover text on a row was to spell it as a
+        /// horizontal `Box` instead, which is two spellings of a row in one
+        /// file (#963).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tooltip: Option<String>,
     },
     /// A vertical list **container** stacking its children (typically
     /// [`Row`](Node::Row)s) top-to-bottom — the list-y counterpart to
@@ -447,6 +491,17 @@ pub enum Node {
         #[serde(default)]
         ellipsize: bool,
         classes: Vec<Cls>,
+        /// Hover text, or `None` (#961).
+        ///
+        /// **`None` is not "no tooltip" here.** When `ellipsize` is `true` and
+        /// this is `None`, the host uses the node's full `text` as the hover —
+        /// the truncated-string default, which is the case the property exists
+        /// for. A value set here always wins; when `ellipsize` is `false` and
+        /// this is `None`, the label gets no tooltip at all. See the
+        /// [tooltip section](Node#tooltips) on this enum for why the host does
+        /// not gate the default on *actual* truncation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tooltip: Option<String>,
     },
     /// A `gtk::Image` set from a themed icon `name` (name only — never pixels).
     ///
@@ -642,6 +697,13 @@ pub enum Node {
         children: Vec<Node>,
         expanded: bool,
         classes: Vec<Cls>,
+        /// Hover text for the **header**, or `None` for no tooltip (#961).
+        ///
+        /// Armed on the header button rather than on the whole expander, so an
+        /// expanded body does not inherit the header's legend — see
+        /// [where the host arms it](Node#where-the-host-arms-it-961).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tooltip: Option<String>,
     },
     /// A single-line **text input** — a `gtk::Entry` (#357), the vocabulary
     /// half of the micro-terminal ask. The user types into it; pressing

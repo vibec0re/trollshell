@@ -446,12 +446,17 @@ fn build_revealer() -> gtk::Revealer {
 /// * `propagate_natural_width` carries the child's natural through as well, so
 ///   the pair leaves *both* halves of `natural.max(minimum)` reading the card.
 ///   (Belt and braces on this tree specifically: the clamp above caps the
-///   natural at the baseline anyway, so only the minimum can ever exceed it.)
-/// * `overlay_scrolling` (GTK's default, stated because the width depends on it)
-///   keeps the vertical scrollbar an *indicator* drawn over the content rather
-///   than a widget allocated beside it, so it adds nothing to the measurement
-///   and the open width can't jump by a scrollbar the moment a card grows tall.
-///   `gtk_tests::the_scroller_changes_no_width_measurement` is the guard.
+///   natural at the baseline anyway, so only the minimum can ever exceed it —
+///   flipping this one to `false` was measured too, and no test here moves.)
+/// * `overlay_scrolling` asks for the vertical scrollbar as an *indicator* drawn
+///   over the content rather than a widget allocated beside it — the sidebar has
+///   no room for a gutter, and #965 asked for it so the open width can't jump by
+///   a scrollbar's width the moment a card grows tall. Stated explicitly even
+///   though it is GTK's default, because it is a contract of this surface rather
+///   than a preference. It is **not**, however, what protects the width here:
+///   flipping it to `false` was measured against both width tests (realized and
+///   unrealized, GTK 4.22) and changed nothing, so this line is intent, and
+///   `Never` above is the guard.
 ///
 /// `propagate_natural_height` is the vertical half of the same idea: the
 /// scroller asks for the stack's real height rather than collapsing to
@@ -1214,6 +1219,12 @@ mod gtk_tests {
         let (after_top, after_bottom) =
             (f64::from(after.y()), f64::from(after.y() + after.height()));
         let after_hit = hits_last(ax, ay);
+        // Measured here, on a *realized* tree with a live scrollbar, because
+        // that is the production case: the surface is mapped whenever
+        // `open_width` runs. `the_scroller_changes_no_width_measurement` pins
+        // the same number on unrealized trees, where a scrollbar that only
+        // materializes on realize would go unnoticed.
+        let width_while_scrolling = open_width(&revealer);
 
         window.set_child(None::<&gtk::Widget>);
         window.destroy();
@@ -1246,6 +1257,13 @@ mod gtk_tests {
             "a click at the centre of the scrolled-to last card must land on it \
              (bounds y={after_top}..{after_bottom} in a {viewport} px viewport)"
         );
+        assert_eq!(
+            width_while_scrolling,
+            scale(SIDEBAR_WIDTH),
+            "a mapped, actively scrolling sidebar must still reserve exactly the baseline: a \
+             scrollbar allocated beside the content instead of drawn over it would widen the \
+             exclusive zone the moment a card grew tall (#737/#965)"
+        );
     }
 
     /// The width invariant #965 must not disturb: the measured open width is
@@ -1258,8 +1276,15 @@ mod gtk_tests {
     ///   leak into the horizontal measurement (a non-overlay scrollbar appearing
     ///   only once the content overflows would do exactly that).
     /// * scrolled == unscrolled is the stronger statement, and the one that
-    ///   catches a scrollbar allocated *unconditionally*: it pins the number to
-    ///   what the pre-#965 tree measured rather than merely to itself.
+    ///   would catch a scrollbar allocated *unconditionally* (which the
+    ///   tall-vs-short half cannot see, being equally wrong on both sides): it
+    ///   pins the number to what the pre-#965 tree measured rather than merely
+    ///   to itself.
+    ///
+    /// Both halves are measured on **unrealized** trees, which is what
+    /// `a_tall_card_scrolls_instead_of_hiding_the_cards_below_it`'s closing
+    /// width assertion complements: that one measures a mapped surface with a
+    /// live scrollbar.
     #[gtk::test]
     fn the_scroller_changes_no_width_measurement() {
         adw::init().expect("libadwaita init");
@@ -1346,8 +1371,15 @@ mod gtk_tests {
         let capped = scroller.max_content_height();
 
         // Resize the surface under the scroller — a mode switch, in miniature.
-        window.set_default_size(scale(SIDEBAR_WIDTH), SURFACE_HEIGHT * 2);
-        pump();
+        // Driven by growing a minimum the toplevel has to satisfy rather than by
+        // `set_default_size`, which a mapped window ignores (measured: it left
+        // the surface at its old height, and the assertion below then passed
+        // over a resize that never happened).
+        let grown = SURFACE_HEIGHT * 2;
+        scroller.set_size_request(-1, grown);
+        pump_until(2000, || {
+            window.surface().is_some_and(|s| s.height() >= grown)
+        });
         let second = window.surface().map_or(0, |s| s.height());
         let recapped = scroller.max_content_height();
         window.set_child(None::<&gtk::Widget>);
@@ -1359,13 +1391,17 @@ mod gtk_tests {
             "the cap must be the surface's usable height ({first} px), not a number rebuilt from \
              the monitor size and the bar's thickness"
         );
-        if second != first {
-            assert_eq!(
-                recapped, second,
-                "the surface was reconfigured to {second} px and the cap stayed at {recapped} — \
-                 a kanshi mode switch under an open sidebar would leave it stale"
-            );
-        }
+        assert_ne!(
+            second, first,
+            "test setup: the surface must actually have been reconfigured (still {first} px), or \
+             the live half of the cap goes untested"
+        );
+        assert_eq!(
+            recapped, second,
+            "the surface was reconfigured to {second} px and the cap stayed at {recapped} — a \
+             kanshi mode switch under an open sidebar would leave the viewport capped to the \
+             old output's height"
+        );
     }
 
     /// [`open_width`] measures the revealer's **child**, so it is the same

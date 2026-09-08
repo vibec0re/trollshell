@@ -291,15 +291,26 @@ mod pin_tests {
             !attached.get(),
             "a non-empty stream list must detach the empty-state placeholder"
         );
+        assert!(
+            placeholder.parent().is_none(),
+            "a non-empty stream list must actually remove the placeholder from the ListBox, \
+             not merely flip `attached`"
+        );
+        assert!(
+            rows.borrow().values().all(|r| r.row.parent().is_some()),
+            "each tracked StreamRow must actually be appended to the ListBox"
+        );
     }
 
     /// Falsified by reintroducing the `list_for_bind` strong clone the apply
     /// closure used to capture: with it, `drop(list)` is not the last strong
     /// ref and the weak upgrade still succeeds.
     ///
-    /// The `placeholder` clone the closure *does* keep is the #772 carve-out
-    /// and must not affect this: it is a child of the list, and a GTK child
-    /// holds no reference to its parent.
+    /// The `placeholder` clone the closure *does* keep is the #772 carve-out.
+    /// The test drops its own `placeholder` handle before the list, so the
+    /// widget survives only because the apply closure still holds it — which
+    /// is exactly the point: a live carve-out clone does not keep the bind
+    /// target alive, because a GTK child holds no reference to its parent.
     #[gtk::test]
     fn playback_rows_binding_does_not_pin_list() {
         adw::init().expect("libadwaita init");
@@ -320,6 +331,7 @@ mod pin_tests {
         );
         pump();
 
+        drop(rows);
         drop(placeholder);
         drop(list);
 
@@ -329,5 +341,10 @@ mod pin_tests {
              closure (rather than taking the closure's own `&gtk::ListBox` argument from `bind`) \
              would keep this alive for the life of the binding, defeating #224's WeakRef contract"
         );
+
+        // The binding must release cleanly on the next emission, not panic on
+        // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
+        streams.set(vec![stream(1)]);
+        pump();
     }
 }

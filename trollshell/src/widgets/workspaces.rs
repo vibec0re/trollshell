@@ -423,6 +423,11 @@ mod tests {
             1,
             "the scroll handler's shared list must be updated by the same emission"
         );
+        assert!(
+            map.borrow().values().all(|btn| btn.parent().is_some()),
+            "each tracked pill must actually be parented into the container — the map is \
+             written by the same pass whether or not the container calls ran"
+        );
     }
 
     /// Falsified by reintroducing the `container_for_signal` strong clone the
@@ -441,6 +446,7 @@ mod tests {
         // The pills are children of the container; a GTK child holds no
         // reference to its parent, and the map is what would otherwise
         // outlive the drop below.
+        drop(current);
         drop(map);
         drop(container);
 
@@ -451,5 +457,10 @@ mod tests {
              `bind`) would keep this alive for the life of the binding, defeating #224's WeakRef \
              contract"
         );
+
+        // The binding must release cleanly on the next emission, not panic on
+        // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
+        workspaces.set(vec![ws(2, 2)]);
+        pump();
     }
 }

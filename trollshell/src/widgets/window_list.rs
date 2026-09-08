@@ -433,6 +433,11 @@ mod tests {
             [1],
             "the emitted window must reach the strip as a tracked pill"
         );
+        assert!(
+            map.borrow().values().all(|btn| btn.parent().is_some()),
+            "each tracked pill must actually be parented into the container — the map is \
+             written by the same pass whether or not the container calls ran"
+        );
     }
 
     /// Falsified by reintroducing the `container_for_signal` strong clone the
@@ -459,5 +464,10 @@ mod tests {
              closure (rather than taking the closure's own `&gtk::Box` argument from `bind`) \
              would keep this alive for the life of the binding, defeating #224's WeakRef contract"
         );
+
+        // The binding must release cleanly on the next emission, not panic on
+        // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
+        windows.set(vec![win(2, "b")]);
+        pump();
     }
 }

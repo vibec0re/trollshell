@@ -3001,6 +3001,11 @@ mod pin_tests {
              closure (rather than taking the closure's own `&PixelSurface` argument from `bind`) \
              would keep this alive for the life of the binding, defeating #224's WeakRef contract"
         );
+
+        // The binding must release cleanly on the next emission, not panic on
+        // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
+        cpu.set(CpuLoad::default());
+        pump();
     }
 
     /// Falsified by reintroducing the `expander_for_bind` strong clone the
@@ -3023,6 +3028,11 @@ mod pin_tests {
              from `bind`) would keep this alive for the life of the binding, defeating #224's \
              WeakRef contract"
         );
+
+        // The binding must release cleanly on the next emission, not panic on
+        // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
+        samples.set(Vec::new());
+        pump();
     }
 }
 

@@ -388,14 +388,27 @@ mod pin_tests {
             vec!["eth0"],
             "the emitted NetIo's interfaces must reach the group, minus loopback"
         );
+        let cached = cache.borrow();
+        let row = cached.get("eth0").expect("eth0 cached");
+        assert!(
+            matches!(row.attached, Some(super::Bucket::Active)),
+            "an interface carrying traffic must be laid out into the active bucket"
+        );
+        assert!(
+            row.container.parent().is_some(),
+            "relayout must actually parent the row — `cache` is written before it runs"
+        );
     }
 
     /// Falsified by reintroducing the `iface_group_for_bind` strong clone the
     /// apply closure used to capture: with it, `drop(iface_group)` is not the
     /// last strong ref and the weak upgrade still succeeds.
     ///
-    /// The `idle_expander` clone the closure *does* keep is the #772 carve-out
-    /// and must not affect this — it is a sibling widget, not the bind target.
+    /// The `idle_expander` clone the closure *does* keep is the #772 carve-out.
+    /// The test drops its own `idle_expander` handle before the group, so the
+    /// widget survives only because the apply closure still holds it — which
+    /// is exactly the point: a live carve-out clone of a *sibling* widget does
+    /// not keep the bind target alive.
     #[gtk::test]
     fn iface_rows_binding_does_not_pin_iface_group() {
         adw::init().expect("libadwaita init");
@@ -423,5 +436,12 @@ mod pin_tests {
              `bind`) would keep this alive for the life of the binding, defeating #224's WeakRef \
              contract"
         );
+
+        // The binding must release cleanly on the next emission, not panic on
+        // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
+        net.set(NetIo {
+            interfaces: vec![active("eth1")],
+        });
+        pump();
     }
 }

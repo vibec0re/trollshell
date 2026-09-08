@@ -157,6 +157,12 @@ mod pin_tests {
             2,
             "the emitted PowerProfilesState's two profiles must reach the expander"
         );
+        // `rows_track` is written by the same closure whether or not
+        // `expander.add_row` ran — assert the expander actually took them.
+        assert!(
+            rows_track.borrow().iter().all(|r| r.parent().is_some()),
+            "each tracked profile row must actually be parented into the expander"
+        );
     }
 
     /// Falsified by reintroducing the `expander_for_bind` strong clone the
@@ -172,6 +178,10 @@ mod pin_tests {
         bind_profile_rows(&expander, profiles.signal_cloned(), &rows_track);
         pump();
 
+        // The tracked rows are children of the expander; a GTK child holds no
+        // reference to its parent, but dropping the bookkeeping cell first
+        // keeps every pin test in this PR to one drop order.
+        drop(rows_track);
         drop(expander);
 
         assert!(
@@ -181,5 +191,10 @@ mod pin_tests {
              `bind`) would keep this alive for the life of the binding, defeating #224's WeakRef \
              contract"
         );
+
+        // The binding must release cleanly on the next emission, not panic on
+        // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
+        profiles.set(PowerProfilesState::default());
+        pump();
     }
 }

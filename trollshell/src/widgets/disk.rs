@@ -155,5 +155,10 @@ mod pin_tests {
              closure (rather than taking the closure's own `&gtk::Box` argument from `bind`) \
              would keep this alive for the life of the binding, defeating #224's WeakRef contract"
         );
+
+        // The binding must release cleanly on the next emission, not panic on
+        // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
+        disk.set(two_mounts());
+        pump();
     }
 }

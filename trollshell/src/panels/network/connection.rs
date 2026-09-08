@@ -800,6 +800,11 @@ mod pin_tests {
             vec!["eth0"],
             "the emitted link list must reach the expander, minus loopback"
         );
+        assert!(
+            cache.borrow().values().all(|r| r.action.parent().is_some()),
+            "each cached link's action row must actually be added to the expander — \
+             `cache` alone is written before `add_row` runs"
+        );
     }
 
     /// Falsified by reintroducing the `expander_for_bind` strong clone the
@@ -828,5 +833,10 @@ mod pin_tests {
              `bind`) would keep this alive for the life of the binding, defeating #224's WeakRef \
              contract"
         );
+
+        // The binding must release cleanly on the next emission, not panic on
+        // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
+        links.set(vec![link("eth1")]);
+        pump();
     }
 }

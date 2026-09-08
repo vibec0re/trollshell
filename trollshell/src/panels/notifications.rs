@@ -251,12 +251,34 @@ fn fmt_notif_time(unix_secs: u64) -> String {
 /// alive for its own lifetime and defeats #224's `WeakRef` contract
 /// (`hytte-reactive/src/bind.rs:16-22`).
 ///
-/// The emission driven here is the **empty** one: a non-empty history builds
-/// per-app rows through [`build_history_app_row`], whose mute switch is a
-/// `bind_two_way` on `notifications_mute::muted_apps()` — a service accessor
-/// that `.expect()`s without a registered `Registry`. The empty branch is
-/// still an emission of the same closure into the same widget, which is what
-/// both assertions below are about.
+/// # Why only the empty emission is driven
+///
+/// A `HistoryEntry` is trivially constructible (every field is `pub`), so the
+/// blocker is not the value — it is one line inside the closure's non-empty
+/// arm. [`build_history_app_row`] wires its mute switch with
+/// `bind_two_way(notifications_mute::muted_apps(), …)`, and `muted_apps()` is
+/// `registry::with(|r| r.get::<NotificationsMuteHandles>().expect(…))`, so a
+/// non-empty emission panics with no `Registry` registered.
+///
+/// Registering one is **not** the cheap fix it looks like: the registry is a
+/// `thread_local!`, `#[gtk::test]` funnels every test in this binary onto one
+/// shared worker thread (see `widgets/tray.rs`'s `test_monitor`), and
+/// `Registry::insert` `debug_assert!`s on a duplicate — so a second test doing
+/// the same would abort the binary, and `NotificationsMuteHandles::default()`
+/// reads the real `~/.config/trollshell` mute file on the way in. No test in
+/// this workspace mutates the shared registry today and this is not the place
+/// to start.
+///
+/// So the bucketing, the `prior_expanded` restore and the `current_rows`
+/// insert stay uncovered here, and that is recorded rather than papered over.
+/// The cheap seam if it is worth closing later is to lift the pure
+/// `entries -> (order, buckets)` grouping into its own function and test it
+/// hermetically, with no display server at all; that is a body change this PR
+/// deliberately does not make, because its equivalence argument rests on all
+/// ten apply bodies moving verbatim.
+///
+/// The empty branch is still an emission of the same closure into the same
+/// widget, which is what both assertions below are about.
 #[cfg(all(test, feature = "system-tests"))]
 mod pin_tests {
     use std::cell::RefCell;
@@ -309,6 +331,7 @@ mod pin_tests {
         bind_history_groups(&groups_box, history.signal_cloned(), &current_rows);
         pump();
 
+        drop(current_rows);
         drop(groups_box);
 
         assert!(
@@ -318,5 +341,10 @@ mod pin_tests {
              `bind`) would keep this alive for the life of the binding, defeating #224's WeakRef \
              contract"
         );
+
+        // The binding must release cleanly on the next emission, not panic on
+        // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
+        history.set((Vec::new(), ["Spotify".to_owned()].into_iter().collect()));
+        pump();
     }
 }

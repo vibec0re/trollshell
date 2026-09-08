@@ -736,6 +736,11 @@ mod tests {
             ["a".to_owned()],
             "the emitted item must reach the container as a tracked button"
         );
+        assert!(
+            map.borrow().values().all(|(btn, _)| btn.parent().is_some()),
+            "each tracked button must actually be parented into the container — the map is \
+             written by the same pass whether or not the container calls ran"
+        );
     }
 
     /// Falsified by reintroducing the `container_for_signal` strong clone the
@@ -763,5 +768,10 @@ mod tests {
              closure (rather than taking the closure's own `&gtk::Box` argument from `bind`) \
              would keep this alive for the life of the binding, defeating #224's WeakRef contract"
         );
+
+        // The binding must release cleanly on the next emission, not panic on
+        // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
+        items.set(vec![item("b")]);
+        pump();
     }
 }

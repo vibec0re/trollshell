@@ -885,13 +885,25 @@ mod tests {
     /// entirely (the count drops to 0).
     ///
     /// **What it does not prove, measured rather than assumed:** the *latch* at
-    /// this call site. [`preem_render::warnings`] counts the times `warn_once`
-    /// **claimed** the latch, not the times a line was written, so replacing
-    /// `if warn_once(…) { … }` with `let _ = warn_once(…); …` still reads 1 —
-    /// verified green. That convention ("every call site is
+    /// this call site. [`preem_render::warnings_for`] counts the times
+    /// `warn_once` **claimed** the latch, not the times a line was written, so
+    /// replacing `if warn_once(…) { … }` with `let _ = warn_once(…); …` still
+    /// reads 1 — verified green. That convention ("every call site is
     /// `if warn_once(scope, what) { tracing::warn!(…) }` and nothing else") is
     /// stated on `warn_once` itself and held by inspection here, exactly as it
     /// is for the five diagnostics that predate this one.
+    ///
+    /// Reads [`preem_render::warnings_for`] (this scope only), not
+    /// [`preem_render::warnings`] (every scope, process-wide) — #974: this
+    /// module's tests don't take `tests.rs`'s `PREEM_INK_LOCK`, and
+    /// `five_refused_frames_emit_one_event` below trips the very same
+    /// [`Warned::ShaderDenied`] slot under a different scope, deliberately
+    /// co-scheduled by `cargo test`'s default parallel harness. A global delta
+    /// here would see that unrelated claim land inside this test's
+    /// before/after window on an unlucky run and read 2, not 1 (see the PR
+    /// body for the measured pre-fix failure rate). `warnings_for` is keyed by
+    /// `(Scope, Warned)`, the same pair the latch itself checks, so it cannot
+    /// see that other scope's claim.
     #[test]
     fn a_refused_shader_renders_the_placeholder_and_warns_once() {
         let classes = ["ts-shader".to_owned()];
@@ -900,7 +912,7 @@ mod tests {
         node.classes = &classes;
 
         let scope = Scope::detached("shader-refusal-placeholder");
-        let before = preem_render::warnings(Warned::ShaderDenied);
+        let before = preem_render::warnings_for(&scope, Warned::ShaderDenied);
         for _ in 0..5 {
             let mapped = map_shader(&scope, Grants::none(), &node);
             assert_eq!(
@@ -917,9 +929,64 @@ mod tests {
             );
         }
         assert_eq!(
-            preem_render::warnings(Warned::ShaderDenied) - before,
+            preem_render::warnings_for(&scope, Warned::ShaderDenied) - before,
             1,
             "five refused frames cost one journal line",
+        );
+    }
+
+    /// **Regression guard for #974, deterministic rather than schedule-lucky.**
+    ///
+    /// #971's reviewer saw `a_refused_shader_renders_the_placeholder_and_warns_once`
+    /// fail 1 run in 4 under the full `--workspace --features system-tests`
+    /// bucket: this module has no `PREEM_INK_LOCK` (that lock lives in
+    /// `tests.rs` and only serialises tests in that file), and
+    /// `five_refused_frames_emit_one_event` above trips the very same
+    /// [`Warned::ShaderDenied`] slot under a *different* scope. Whether the two
+    /// collide depends on which OS threads `cargo test`'s harness happens to
+    /// schedule them onto and how their timing overlaps — reproduced 0/10 under
+    /// a narrow `shader_map` filter and 0/5 under the reviewer's own
+    /// `--workspace` shape in this PR's own measurement, which is the flake
+    /// working as advertised rather than the bug being absent.
+    ///
+    /// This test forces the same collision on purpose instead of hoping for it:
+    /// a second real OS thread claims `ShaderDenied` under its own scope, and
+    /// `std::thread::scope` joins it — guaranteeing that claim has already
+    /// happened — before this thread claims its own and reads the delta. That
+    /// makes the pre-fix defect reproducible **on every run**, not 1 in 4.
+    ///
+    /// **Falsified** by reading the process-wide
+    /// [`preem_render::warnings`] instead of the per-scope
+    /// [`preem_render::warnings_for`]: the assertion goes red on every run,
+    /// `left: 2, right: 1` — quoted in the PR, restored after.
+    #[test]
+    fn a_scope_counts_only_its_own_shader_denied_claims_even_when_another_scope_races_it() {
+        let data = [0u8; 4];
+        let node = ok_node("void main() {}", &data);
+
+        let victim = Scope::detached("shader-race-victim");
+        let before = preem_render::warnings_for(&victim, Warned::ShaderDenied);
+
+        // A second OS thread claims the very same `Warned::ShaderDenied` slot
+        // under a different scope. `thread::scope` does not return until every
+        // spawned thread has finished, so by the time this call returns the
+        // other thread's claim is a fact, not a maybe.
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                let attacker = Scope::detached("shader-race-attacker");
+                let attacker_data = [0u8; 4];
+                let attacker_node = ok_node("void main() {}", &attacker_data);
+                let _ = map_shader(&attacker, Grants::none(), &attacker_node);
+            });
+        });
+
+        let _ = map_shader(&victim, Grants::none(), &node);
+
+        assert_eq!(
+            preem_render::warnings_for(&victim, Warned::ShaderDenied) - before,
+            1,
+            "the victim's own single claim only — not the concurrent attacker \
+             scope's claim of the same diagnostic",
         );
     }
 

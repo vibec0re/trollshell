@@ -549,12 +549,18 @@ in
               # manager inherited, which is the whole job.
               ANTHROPIC_API_KEY = "";
               ANTHROPIC_AUTH_TOKEN = "";
+              CLAUDE_CODE_OAUTH_TOKEN = "";
               CLAUDE_CODE_USE_BEDROCK = "";
               CLAUDE_CODE_USE_VERTEX = "";
               CLAUDE_CODE_USE_FOUNDRY = "";
               ANTHROPIC_BASE_URL = "";
               ANTHROPIC_BEDROCK_BASE_URL = "";
               ANTHROPIC_VERTEX_BASE_URL = "";
+              ANTHROPIC_FOUNDRY_BASE_URL = "";
+              ANTHROPIC_FOUNDRY_RESOURCE = "";
+              ANTHROPIC_FOUNDRY_AUTH_TOKEN = "";
+              ANTHROPIC_FOUNDRY_API_KEY = "";
+              ANTHROPIC_CUSTOM_HEADERS = "";
               # Belt-and-braces dummy key. Nothing in the bridge reads it (it is
               # keyless and validates no bearer at all); the copy that actually
               # prevents a leak is the one on the CONSUMING plugin, because

@@ -355,6 +355,26 @@ pub fn save(path: &Path, entries: &[(Key, &str)]) -> std::io::Result<()> {
 /// this runs once per boot from [`load`], and a cache sweep must never be
 /// the reason startup fails. A missing directory (first boot) is not even
 /// worth a warning.
+///
+/// # A second, concurrent instance
+///
+/// This sweep has no liveness check against the pid embedded in a temp
+/// file's own name, so a second bridge booting inside the same few-
+/// microsecond window as a live [`save`]'s `File::create`-to-`rename` gap can
+/// sweep that *other*, still-live instance's own temp file out from under it
+/// — `nix/module-common.nix` already documents running two bridges at once as
+/// a user error (the second fails to bind the port), but nothing stops this
+/// sweep from running before that failure surfaces. Measured, not assumed,
+/// to degrade safely rather than lose data: the live writer's `rename` then
+/// returns `NotFound`, `save`'s error path is already a no-op unlink plus an
+/// `Err`, and `session.rs`'s `persist()` turns that `Err` into a `warn!` and
+/// keeps going — the *previous*, still-whole file is left untouched, and the
+/// retirement stays correct in memory until the next successful write heals
+/// the file. The cost is the #855 symptom (one visibly failed turn) only if
+/// the bridge restarts inside that same narrow window. A `/proc/<pid>`
+/// liveness check on the name's embedded pid would close this outright; not
+/// done here because the window this closes is microseconds wide on a write
+/// that happens about once per context window.
 fn sweep_stale_temp_files(path: &Path) {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {

@@ -357,26 +357,29 @@ so the dummy value is what stops the real cloud key being shipped to a loopback
 port. With no auth, reachability is the authorization boundary — hence the
 loopback bind.
 
-**The billing scrub, carried across, not dropped.** The retired unit's
+**The billing/redirect scrub, carried across, not dropped.** The retired
+unit's
 `UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX`
-existed because any of those four would silently move `claude` off the
+existed because each of those would silently move `claude` off the
 subscription and onto metered API credits (or Bedrock/Vertex), with nothing
 visible in the UI to show for it. A transient `systemd-run` unit has no
-`UnsetEnvironment=`, so the rendered plugin entry now carries those same four
-variables as **empty** `env` values instead — empty is equivalent to unset for
-every consumer here: envguard's `redirects` check treats an empty credential
-the same as an absent one, `load_key_from` falls through an empty
-`ANTHROPIC_API_KEY` to the key file exactly as before, and the launcher appends
-injected secrets _after_ the declared env, so `api` mode's keyring key still
-wins over the empty placeholder.
+`UnsetEnvironment=`, so the rendered plugin entry now carries every variable
+named in `crates/hytte-claude-bridge/src/envguard.rs`'s `REDIRECT_VARS` — a
+strictly larger set than the retired unit's four, grown as more redirect
+paths were found (#994) — as **empty** `env` values instead. Empty is
+equivalent to unset for every consumer here: envguard's `redirects` check
+treats an empty credential the same as an absent one, `load_key_from` falls
+through an empty `ANTHROPIC_API_KEY` to the key file exactly as before, and
+the launcher appends injected secrets _after_ the declared env, so `api`
+mode's keyring key still wins over the empty placeholder.
 
 In the two `claude` modes (`subscription`, `reprompt`) the binary still
-**refuses to start** if it finds `ANTHROPIC_API_KEY` (or the other three) set —
-it can't scrub them itself (`std::env::remove_var` is unsafe under edition 2024
-and this workspace forbids unsafe). **That refusal is the guard doing its
-job, not a bug**: if you hit it, something upstream of the plugin entry (a
-shell profile, an imported systemd user-manager environment) is exporting one
-of the four variables — find and unset it there rather than working around the
+**refuses to start** if it finds any `REDIRECT_VARS` entry set — it can't
+scrub them itself (`std::env::remove_var` is unsafe under edition 2024 and
+this workspace forbids unsafe). **That refusal is the guard doing its job,
+not a bug**: if you hit it, something upstream of the plugin entry (a shell
+profile, an imported systemd user-manager environment) is exporting one of
+those variables — find and unset it there rather than working around the
 refusal. `journalctl --user -u trollshell-plugin-claude-bridge` names the
 offending variable. The refusal is **mode-scoped** (#730): it guards the
 `claude` child, and `api` mode spawns none — see below.

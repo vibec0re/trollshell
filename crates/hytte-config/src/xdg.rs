@@ -129,7 +129,10 @@ impl Env {
         nonempty(self.state_home.as_ref())
             .filter(|dir| is_absolute("XDG_STATE_HOME", dir))
             .map_or_else(
-                || nonempty(self.home.as_ref()).map(|h| PathBuf::from(h).join(".local").join("state")),
+                || {
+                    nonempty(self.home.as_ref())
+                        .map(|h| PathBuf::from(h).join(".local").join("state"))
+                },
                 |dir| Some(PathBuf::from(dir)),
             )
     }

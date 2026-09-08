@@ -1114,9 +1114,15 @@ mod gtk_tests {
     /// skip path: there is no session bus here to answer `Ping`, and this is
     /// about the timer re-firing, not about what a probe returns.
     ///
-    /// Falsified by deleting the `glib::timeout_add_local` in
-    /// `install_shell_probe` (returning a one-shot `timeout_add_local_once`'s
-    /// id, or `ControlFlow::Break`): the tick count stops at 1 and this fails.
+    /// Falsified by making `install_shell_probe`'s closure return
+    /// `glib::ControlFlow::Break` (a one-shot timer, i.e. the pre-#989
+    /// behaviour): the tick count stops at 1 and this fails at the deadline.
+    ///
+    /// The loop drains the context **non-blocking** and sleeps between passes
+    /// rather than calling `iteration(true)`: a broken timer leaves nothing to
+    /// dispatch, and a blocking iteration would then park forever — hanging
+    /// not just this test but every `#[gtk::test]` sharing the main context,
+    /// which is a hang rather than a red line and so no falsification at all.
     #[gtk::test]
     fn the_probe_re_runs_on_its_interval() {
         adw::init().expect("libadwaita init");
@@ -1124,9 +1130,10 @@ mod gtk_tests {
         assert!(ui.claim(), "hold the in-flight slot for the whole test");
 
         let source = install_shell_probe(&ui, Duration::from_millis(5));
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(2);
         while ui.ticks.get() < 3 && Instant::now() < deadline {
-            glib::MainContext::default().iteration(true);
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(1));
         }
         let ticks = ui.ticks.get();
         source.remove();

@@ -9,6 +9,7 @@ use chrono::{DateTime, Local};
 
 use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::map_ref;
+use hytte::futures_signals::signal::Signal;
 use hytte::gtk;
 use hytte::prelude::*;
 use hytte::services::{dnd, notifications, notifications_mute};
@@ -80,61 +81,78 @@ pub fn panel_notifications() -> gtk::Widget {
             (entries.clone(), muted.clone())
         }
     };
-    bind(
-        combined,
-        &groups_box,
-        move |groups_box, (entries, muted)| {
-            // Stash prior expand-state keyed by app_name before teardown.
-            let prior_expanded: HashMap<String, bool> = current_rows
-                .borrow()
-                .iter()
-                .map(|(name, row)| (name.clone(), row.is_expanded()))
-                .collect();
-            current_rows.borrow_mut().clear();
-            while let Some(child) = groups_box.first_child() {
-                groups_box.remove(&child);
-            }
-            if entries.is_empty() {
-                let group = adw::PreferencesGroup::new();
-                let empty = adw::ActionRow::builder().title("No notifications").build();
-                group.add(&empty);
-                groups_box.append(&group);
-                return;
-            }
-            // Group entries by app_name, preserving newest-first ordering by
-            // walking entries (already newest-first) and pushing into per-app
-            // Vec<&HistoryEntry> on first sighting.
-            let mut order: Vec<String> = Vec::new();
-            let mut buckets: HashMap<String, Vec<&notifications::HistoryEntry>> = HashMap::new();
-            for entry in &entries {
-                // freedesktop spec allows empty `app_name`; substitute "Unknown"
-                // so we don't render a blank ExpanderRow or persist "" to the
-                // muted-apps file when the user toggles its switch.
-                let key = if entry.app_name.trim().is_empty() {
-                    "Unknown".to_string()
-                } else {
-                    entry.app_name.clone()
-                };
-                if !buckets.contains_key(&key) {
-                    order.push(key.clone());
-                }
-                buckets.entry(key).or_default().push(entry);
-            }
-            let group = adw::PreferencesGroup::new();
-            for app in &order {
-                let bucket = buckets.get(app).expect("bucket present for tracked app");
-                let row = build_history_app_row(app, bucket, &muted);
-                if prior_expanded.get(app).copied().unwrap_or(false) {
-                    row.set_expanded(true);
-                }
-                group.add(&row);
-                current_rows.borrow_mut().insert(app.clone(), row);
-            }
-            groups_box.append(&group);
-        },
-    );
+    bind_history_groups(&groups_box, combined, &current_rows);
 
     finish_page(&column)
+}
+
+/// Rebuild the per-app history groups inside `groups_box` from `signal`,
+/// tracking the live `adw::ExpanderRow`s in `current_rows` so each row's
+/// expanded state survives the clear+rebuild.
+///
+/// Split out of [`panel_notifications`] so this `bind` call site's `WeakRef`
+/// contract (#224, `hytte-reactive/src/bind.rs:16-22`) can be driven with a
+/// synthetic signal in tests, the same extraction #772 made for
+/// `bind_device_groups`. The builder reads `notifications::history()` and
+/// `notifications_mute::muted_apps()` inline, both of which `.expect()`
+/// without a registered `Registry` (#831).
+fn bind_history_groups<S>(
+    groups_box: &gtk::Box,
+    signal: S,
+    current_rows: &Rc<RefCell<HashMap<String, adw::ExpanderRow>>>,
+) where
+    S: Signal<Item = (Vec<notifications::HistoryEntry>, HashSet<String>)> + 'static,
+{
+    let current_rows = current_rows.clone();
+    bind(signal, groups_box, move |groups_box, (entries, muted)| {
+        // Stash prior expand-state keyed by app_name before teardown.
+        let prior_expanded: HashMap<String, bool> = current_rows
+            .borrow()
+            .iter()
+            .map(|(name, row)| (name.clone(), row.is_expanded()))
+            .collect();
+        current_rows.borrow_mut().clear();
+        while let Some(child) = groups_box.first_child() {
+            groups_box.remove(&child);
+        }
+        if entries.is_empty() {
+            let group = adw::PreferencesGroup::new();
+            let empty = adw::ActionRow::builder().title("No notifications").build();
+            group.add(&empty);
+            groups_box.append(&group);
+            return;
+        }
+        // Group entries by app_name, preserving newest-first ordering by
+        // walking entries (already newest-first) and pushing into per-app
+        // Vec<&HistoryEntry> on first sighting.
+        let mut order: Vec<String> = Vec::new();
+        let mut buckets: HashMap<String, Vec<&notifications::HistoryEntry>> = HashMap::new();
+        for entry in &entries {
+            // freedesktop spec allows empty `app_name`; substitute "Unknown"
+            // so we don't render a blank ExpanderRow or persist "" to the
+            // muted-apps file when the user toggles its switch.
+            let key = if entry.app_name.trim().is_empty() {
+                "Unknown".to_string()
+            } else {
+                entry.app_name.clone()
+            };
+            if !buckets.contains_key(&key) {
+                order.push(key.clone());
+            }
+            buckets.entry(key).or_default().push(entry);
+        }
+        let group = adw::PreferencesGroup::new();
+        for app in &order {
+            let bucket = buckets.get(app).expect("bucket present for tracked app");
+            let row = build_history_app_row(app, bucket, &muted);
+            if prior_expanded.get(app).copied().unwrap_or(false) {
+                row.set_expanded(true);
+            }
+            group.add(&row);
+            current_rows.borrow_mut().insert(app.clone(), row);
+        }
+        groups_box.append(&group);
+    });
 }
 
 /// Build the `AdwExpanderRow` for a single app's history bucket.
@@ -224,4 +242,81 @@ fn fmt_notif_time(unix_secs: u64) -> String {
     let dt =
         DateTime::<Local>::from(std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix_secs));
     dt.format("%H:%M").to_string()
+}
+
+/// #831 regression coverage for this file's widget-pinning `bind` call site,
+/// in the shape `panels/connections.rs` established for #772: the apply
+/// closure must take the `&gtk::Box` `bind` hands it rather than a strong
+/// clone captured from the enclosing scope, or the binding keeps the box
+/// alive for its own lifetime and defeats #224's `WeakRef` contract
+/// (`hytte-reactive/src/bind.rs:16-22`).
+///
+/// The emission driven here is the **empty** one: a non-empty history builds
+/// per-app rows through [`build_history_app_row`], whose mute switch is a
+/// `bind_two_way` on `notifications_mute::muted_apps()` — a service accessor
+/// that `.expect()`s without a registered `Registry`. The empty branch is
+/// still an emission of the same closure into the same widget, which is what
+/// both assertions below are about.
+#[cfg(all(test, feature = "system-tests"))]
+mod pin_tests {
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
+    use std::rc::Rc;
+
+    use hytte::adw::{self, prelude::*};
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk;
+    use hytte::services::notifications::HistoryEntry;
+
+    use super::bind_history_groups;
+
+    type Emission = (Vec<HistoryEntry>, HashSet<String>);
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// Anti-vacuity guard for the pin test below: the binding must actually
+    /// apply, or "the widget died" would prove nothing about the closure.
+    #[gtk::test]
+    fn history_groups_binding_applies_a_value() {
+        adw::init().expect("libadwaita init");
+        let groups_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        let current_rows: Rc<RefCell<HashMap<String, adw::ExpanderRow>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        let history: Mutable<Emission> = Mutable::new((Vec::new(), HashSet::new()));
+        bind_history_groups(&groups_box, history.signal_cloned(), &current_rows);
+        pump();
+
+        assert!(
+            groups_box.first_child().is_some(),
+            "the empty-history emission must reach the box as the \"No notifications\" group"
+        );
+    }
+
+    /// Falsified by reintroducing the `groups_for_signal` strong clone the
+    /// apply closure used to capture: with it, `drop(groups_box)` is not the
+    /// last strong ref and the weak upgrade still succeeds.
+    #[gtk::test]
+    fn history_groups_binding_does_not_pin_groups_box() {
+        adw::init().expect("libadwaita init");
+        let groups_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        let weak = groups_box.downgrade();
+        let current_rows: Rc<RefCell<HashMap<String, adw::ExpanderRow>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        let history: Mutable<Emission> = Mutable::new((Vec::new(), HashSet::new()));
+        bind_history_groups(&groups_box, history.signal_cloned(), &current_rows);
+        pump();
+
+        drop(groups_box);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "bind_history_groups must not pin its groups_box: a strong clone captured by the \
+             apply closure (rather than taking the closure's own `&gtk::Box` argument from \
+             `bind`) would keep this alive for the life of the binding, defeating #224's WeakRef \
+             contract"
+        );
+    }
 }

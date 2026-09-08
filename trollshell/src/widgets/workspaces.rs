@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self, prelude::*};
 use hytte::prelude::*;
 use hytte::services::niri;
@@ -42,14 +43,7 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     // of tearing the whole strip down and rebuilding it (#229).
     let button_map: Rc<RefCell<HashMap<u64, gtk::Button>>> = Rc::new(RefCell::new(HashMap::new()));
 
-    let current_workspaces_for_bind = Rc::clone(&current_workspaces);
-    bind(signal, &container, move |container, workspaces| {
-        current_workspaces_for_bind
-            .borrow_mut()
-            .clone_from(&workspaces);
-
-        update_workspaces(container, &button_map, &workspaces);
-    });
+    bind_workspace_pills(&container, signal, &current_workspaces, &button_map);
 
     // Scroll over the pill strip to cycle the active workspace on this
     // monitor. Steps relative to the *active* workspace on this output —
@@ -81,6 +75,34 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     });
 
     container.upcast()
+}
+
+/// Drive [`update_workspaces`] from `signal` into `container`, keyed against
+/// `button_map`, and keep `current_workspaces` in step so the scroll handler
+/// can find prev/next without re-deriving the per-monitor filter.
+///
+/// Split out of [`widget`] so this `bind` call site's `WeakRef` contract
+/// (#224, `hytte-reactive/src/bind.rs:16-22`) can be driven with a synthetic
+/// signal in tests, the same extraction #772 made for its four sites. The
+/// builder's own signal is a filter over `niri::workspaces()`, which
+/// `.expect()`s without a registered `Registry` (#831).
+fn bind_workspace_pills<S>(
+    container: &gtk::Box,
+    signal: S,
+    current_workspaces: &Rc<RefCell<Vec<niri::Workspace>>>,
+    button_map: &Rc<RefCell<HashMap<u64, gtk::Button>>>,
+) where
+    S: Signal<Item = Vec<niri::Workspace>> + 'static,
+{
+    let current_workspaces_for_bind = Rc::clone(current_workspaces);
+    let button_map = button_map.clone();
+    bind(signal, container, move |container, workspaces| {
+        current_workspaces_for_bind
+            .borrow_mut()
+            .clone_from(&workspaces);
+
+        update_workspaces(container, &button_map, &workspaces);
+    });
 }
 
 /// Keyed-diff update of the workspace pill strip. Mirrors `widgets/tray.rs`'s
@@ -187,6 +209,7 @@ fn create_workspace_button(ws: &niri::Workspace) -> gtk::Button {
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
     use super::update_workspaces;
+    use hytte::futures_signals::signal::Mutable;
     use hytte::gtk::{self, prelude::*};
     use hytte::services::niri;
     use std::cell::{Cell, RefCell};
@@ -354,6 +377,79 @@ mod tests {
             keys(&map),
             [1],
             "the reused pill must still be tracked after a re-entrant pass"
+        );
+    }
+
+    // ── #831: the `bind` call site's WeakRef contract ────────────────────────
+    //
+    // In the shape `panels/connections.rs` established for #772: the apply
+    // closure must take the `&gtk::Box` `bind` hands it rather than a strong
+    // clone captured from the enclosing scope, or the binding keeps the
+    // container alive for its own lifetime and defeats #224's `WeakRef`
+    // contract (`hytte-reactive/src/bind.rs:16-22`). `bind_workspace_pills` is
+    // the seam that makes that reachable at all — `widget()`'s own signal
+    // reads `niri::workspaces()`, which `.expect()`s without a registered
+    // `Registry`.
+
+    /// The scroll handler's shared list, exactly as `widget()` builds it.
+    type WorkspaceList = Rc<RefCell<Vec<niri::Workspace>>>;
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// Anti-vacuity guard for the pin test below: the binding must actually
+    /// apply, or "the widget died" would prove nothing about the closure.
+    #[gtk::test]
+    fn workspace_pills_binding_applies_a_value() {
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let current: WorkspaceList = Rc::new(RefCell::new(Vec::new()));
+        let map: ButtonMap = Rc::new(RefCell::new(HashMap::new()));
+        let workspaces: Mutable<Vec<niri::Workspace>> = Mutable::new(Vec::new());
+        super::bind_workspace_pills(&container, workspaces.signal_cloned(), &current, &map);
+        pump();
+
+        workspaces.set(vec![ws(1, 1)]);
+        pump();
+
+        assert_eq!(
+            keys(&map),
+            [1],
+            "the emitted workspace must reach the strip as a tracked pill"
+        );
+        assert_eq!(
+            current.borrow().len(),
+            1,
+            "the scroll handler's shared list must be updated by the same emission"
+        );
+    }
+
+    /// Falsified by reintroducing the `container_for_signal` strong clone the
+    /// apply closure used to capture: with it, `drop(container)` is not the
+    /// last strong ref and the weak upgrade still succeeds.
+    #[gtk::test]
+    fn workspace_pills_binding_does_not_pin_container() {
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let weak = container.downgrade();
+        let current: WorkspaceList = Rc::new(RefCell::new(Vec::new()));
+        let map: ButtonMap = Rc::new(RefCell::new(HashMap::new()));
+        let workspaces: Mutable<Vec<niri::Workspace>> = Mutable::new(vec![ws(1, 1)]);
+        super::bind_workspace_pills(&container, workspaces.signal_cloned(), &current, &map);
+        pump();
+
+        // The pills are children of the container; a GTK child holds no
+        // reference to its parent, and the map is what would otherwise
+        // outlive the drop below.
+        drop(map);
+        drop(container);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "bind_workspace_pills must not pin its container: a strong clone captured by the \
+             apply closure (rather than taking the closure's own `&gtk::Box` argument from \
+             `bind`) would keep this alive for the life of the binding, defeating #224's WeakRef \
+             contract"
         );
     }
 }

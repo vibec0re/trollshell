@@ -1,4 +1,5 @@
 use hytte::bus::OwnState;
+use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::services::tray::{self, MenuEntry, MenuItem, TrayItem};
@@ -59,12 +60,31 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
     // Rc is fine here — bind() drives the closure via spawn_local.
     let button_map: Rc<RefCell<ButtonMap>> = Rc::new(RefCell::new(HashMap::new()));
 
-    let monitor = monitor.clone();
-    bind(tray::items(), &container, move |container, items| {
-        update_tray(container, &button_map, &items, &monitor);
-    });
+    bind_tray_items(&container, tray::items(), &button_map, monitor.clone());
 
     container.upcast()
+}
+
+/// Diff `signal`'s tray items into `container`, reusing the buttons kept in
+/// `button_map`; `monitor` is the output every item's menu popover opens on.
+///
+/// Split out of [`widget`] so this `bind` call site's `WeakRef` contract
+/// (#224, `hytte-reactive/src/bind.rs:16-22`) can be driven with a synthetic
+/// signal in tests, the same extraction #772 made for its four sites. The
+/// builder reads `tray::items()` inline, which `.expect()`s without a
+/// registered `Registry` (#831).
+fn bind_tray_items<S>(
+    container: &gtk::Box,
+    signal: S,
+    button_map: &Rc<RefCell<ButtonMap>>,
+    monitor: Monitor,
+) where
+    S: Signal<Item = Vec<TrayItem>> + 'static,
+{
+    let button_map = button_map.clone();
+    bind(signal, container, move |container, items| {
+        update_tray(container, &button_map, &items, &monitor);
+    });
 }
 
 /// Keyed-diff update of the tray container.
@@ -458,7 +478,8 @@ fn build_menu_item_widget(
 
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
-    use super::{ButtonMap, update_tray};
+    use super::{ButtonMap, bind_tray_items, update_tray};
+    use hytte::futures_signals::signal::Mutable;
     use hytte::gtk::{self, prelude::*};
     use hytte::prelude::*;
     use hytte::services::tray::{ItemStatus, TrayItem};
@@ -678,6 +699,69 @@ mod tests {
             keys(&map),
             ["a".to_owned()],
             "the reused button must still be tracked after a re-entrant pass"
+        );
+    }
+
+    // ── #831: the `bind` call site's WeakRef contract ────────────────────────
+    //
+    // In the shape `panels/connections.rs` established for #772: the apply
+    // closure must take the `&gtk::Box` `bind` hands it rather than a strong
+    // clone captured from the enclosing scope, or the binding keeps the
+    // container alive for its own lifetime and defeats #224's `WeakRef`
+    // contract (`hytte-reactive/src/bind.rs:16-22`). `bind_tray_items` is the
+    // seam that makes that reachable at all — `widget()` reads `tray::items()`
+    // inline, which `.expect()`s without a registered `Registry`.
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// Anti-vacuity guard for the pin test below: the binding must actually
+    /// apply, or "the widget died" would prove nothing about the closure.
+    #[gtk::test]
+    fn tray_items_binding_applies_a_value() {
+        let monitor = test_monitor();
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let map: SharedMap = Rc::new(RefCell::new(HashMap::new()));
+        let items: Mutable<Vec<TrayItem>> = Mutable::new(Vec::new());
+        bind_tray_items(&container, items.signal_cloned(), &map, monitor);
+        pump();
+
+        items.set(vec![item("a")]);
+        pump();
+
+        assert_eq!(
+            keys(&map),
+            ["a".to_owned()],
+            "the emitted item must reach the container as a tracked button"
+        );
+    }
+
+    /// Falsified by reintroducing the `container_for_signal` strong clone the
+    /// apply closure used to capture: with it, `drop(container)` is not the
+    /// last strong ref and the weak upgrade still succeeds.
+    #[gtk::test]
+    fn tray_items_binding_does_not_pin_container() {
+        let monitor = test_monitor();
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        let weak = container.downgrade();
+        let map: SharedMap = Rc::new(RefCell::new(HashMap::new()));
+        let items: Mutable<Vec<TrayItem>> = Mutable::new(vec![item("a")]);
+        bind_tray_items(&container, items.signal_cloned(), &map, monitor);
+        pump();
+
+        // The item buttons are children of the container; a GTK child holds no
+        // reference to its parent, and the map is what would otherwise outlive
+        // the drop below.
+        drop(map);
+        drop(container);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "bind_tray_items must not pin its container: a strong clone captured by the apply \
+             closure (rather than taking the closure's own `&gtk::Box` argument from `bind`) \
+             would keep this alive for the life of the binding, defeating #224's WeakRef contract"
         );
     }
 }

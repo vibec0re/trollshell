@@ -1277,7 +1277,26 @@ fn build_per_core_leds_row() -> gtk::Box {
     let panel = core_panel_surface();
     row.append(&panel);
 
-    bind(sensors::cpu(), &panel, move |panel, c: CpuLoad| {
+    bind_per_core_leds(&panel, sensors::cpu());
+
+    row
+}
+
+/// Rasterise one LED frame per `signal` emission into `panel`.
+///
+/// Split out of [`build_per_core_leds_row`] so this `bind` call site's
+/// `WeakRef` contract (#224, `hytte-reactive/src/bind.rs:16-22`) can be driven
+/// with a synthetic signal in tests, the same extraction #772 made for its
+/// four sites. The builder reads `sensors::cpu()` inline, which `.expect()`s
+/// without a registered `Registry` (#831). This is the successor of #831's
+/// `cores_row` site in this file: #857 replaced the `gtk::FlowBox` of per-core
+/// `ProgressBar`s with the LED panel, carrying the same untestable inline
+/// accessor across.
+fn bind_per_core_leds<S>(panel: &PixelSurface, signal: S)
+where
+    S: Signal<Item = CpuLoad> + 'static,
+{
+    bind(signal, panel, move |panel, c: CpuLoad| {
         let levels: Vec<f32> = c
             .per_core
             .iter()
@@ -1292,8 +1311,6 @@ fn build_per_core_leds_row() -> gtk::Box {
         );
         panel.set_tooltip_text(Some(&core_panel_tooltip(&c.per_core)));
     });
-
-    row
 }
 
 fn build_live_memory_row() -> adw::ActionRow {
@@ -2907,20 +2924,24 @@ mod reentrancy_tests {
 /// for its own lifetime and defeats #224's `WeakRef` contract
 /// (`hytte-reactive/src/bind.rs:16-22`).
 ///
-/// Only `build_top_apps_expander` is reachable from a test: it takes its
-/// signal as a parameter, so a `Mutable` stands in for the service. The other
-/// site in this file, `build_per_core_bars_row`, reads `sensors::cpu()`
-/// inline and would need a registered `Registry` (or an extraction into a
-/// `bind_*` helper, a production restructure this work does not make), so it
-/// is fixed but uncovered — as are the nine sites in the other ten files.
+/// Both sites are now reachable from a test. `build_top_apps_expander` always
+/// was — it takes its signal as a parameter, so a `Mutable` stands in for the
+/// service. The second one read `sensors::cpu()` inline and needed a
+/// registered `Registry`; #831's residual extracted it into
+/// [`bind_per_core_leds`], the same production restructure #772 made for its
+/// four. (The site #831 originally listed here was `cores_row`, the
+/// `gtk::FlowBox` of per-core `ProgressBar`s; #857 replaced it with the LED
+/// panel, which inherited the inline accessor unchanged.)
 #[cfg(all(test, feature = "system-tests"))]
 mod pin_tests {
     use hytte::adw::{self, prelude::*};
     use hytte::futures_signals::signal::Mutable;
     use hytte::gtk;
     use hytte::services::app_usage::ProcSample;
+    use hytte::services::sensors::CpuLoad;
+    use hytte::ui::PixelSurface;
 
-    use super::build_top_apps_expander;
+    use super::{bind_per_core_leds, build_top_apps_expander};
 
     /// Run the GTK main loop until it has nothing left to dispatch.
     fn pump() {
@@ -2929,6 +2950,57 @@ mod pin_tests {
 
     fn cpu_value(s: &ProcSample) -> String {
         format!("{:.0}%", s.cpu_frac * 100.0)
+    }
+
+    fn four_cores() -> CpuLoad {
+        CpuLoad {
+            overall: 0.5,
+            per_core: vec![0.1, 0.4, 0.8, 1.0],
+        }
+    }
+
+    /// Anti-vacuity guard for the per-core pin test below: the binding must
+    /// actually apply, or "the widget died" would prove nothing about the
+    /// closure. The tooltip is the apply body's last statement, so seeing it
+    /// means the whole rasterise-and-upload path ran.
+    #[gtk::test]
+    fn per_core_leds_binding_applies_a_value() {
+        adw::init().expect("libadwaita init");
+        let panel = PixelSurface::new();
+        let cpu: Mutable<CpuLoad> = Mutable::new(CpuLoad::default());
+        bind_per_core_leds(&panel, cpu.signal_cloned());
+        pump();
+
+        cpu.set(four_cores());
+        pump();
+
+        let tooltip = panel.tooltip_text().map(|t| t.to_string());
+        assert!(
+            tooltip.as_deref().is_some_and(|t| t.starts_with("4 cores")),
+            "the emitted CpuLoad's four cores must reach the panel's tooltip, got {tooltip:?}"
+        );
+    }
+
+    /// Falsified by reintroducing a `panel_for_bind` strong clone in the apply
+    /// closure: with it, `drop(panel)` is not the last strong ref and the weak
+    /// upgrade still succeeds.
+    #[gtk::test]
+    fn per_core_leds_binding_does_not_pin_panel() {
+        adw::init().expect("libadwaita init");
+        let panel = PixelSurface::new();
+        let weak = panel.downgrade();
+        let cpu: Mutable<CpuLoad> = Mutable::new(four_cores());
+        bind_per_core_leds(&panel, cpu.signal_cloned());
+        pump();
+
+        drop(panel);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "bind_per_core_leds must not pin its panel: a strong clone captured by the apply \
+             closure (rather than taking the closure's own `&PixelSurface` argument from `bind`) \
+             would keep this alive for the life of the binding, defeating #224's WeakRef contract"
+        );
     }
 
     /// Falsified by reintroducing the `expander_for_bind` strong clone the
@@ -2957,9 +3029,10 @@ mod pin_tests {
 /// The per-core LED panel's **layout** contract (#857), which is pure GTK
 /// geometry and therefore needs a display server.
 ///
-/// [`build_per_core_leds_row`] itself binds `sensors::cpu()` inline and would
-/// need a registered `Registry` to run (the same limitation `pin_tests`
-/// documents), so these drive its two constructors — [`core_panel_row`] and
+/// [`build_per_core_leds_row`] itself reads `sensors::cpu()` inline and would
+/// need a registered `Registry` to run (its `bind` call is reachable through
+/// [`bind_per_core_leds`], which `pin_tests` drives, but the builder is not),
+/// so these drive its two constructors — [`core_panel_row`] and
 /// [`core_panel_surface`] — directly. That is the point of the split: the
 /// arrangement under test is the arrangement that ships, not a copy of it that
 /// can drift.

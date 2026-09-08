@@ -410,16 +410,28 @@ static UNSUPPORTED_WARNED: AtomicBool = AtomicBool::new(false);
 /// index-out-of-bounds panic in the test that reads it rather than a silently
 /// aliased number.
 ///
-/// **Not safe to read as a delta from a test that does not hold `tests.rs`'s
-/// `PREEM_INK_LOCK`** (#974): the latch this counts ([`WARNED`]) is
+/// **Not safe to read as a delta unless every *claimer* of the same slot —
+/// not just every reader — is serialised on `tests.rs`'s `PREEM_INK_LOCK`**
+/// (#974, review of #991 LOW 3): the latch this counts ([`WARNED`]) is
 /// thread-local, keyed by `(Scope, Warned)`, but this counter sums claims
 /// across *every* scope and *every* thread. Two tests tripping the same
 /// [`Warned`] slot under different scopes on different test-harness threads
 /// each see a fresh, unclaimed latch, so both claim it and both bump this one
 /// shared total — a delta a third test reads around its own operation can then
-/// see 2 instead of 1, depending on scheduling. `shader_map`'s tests are the
-/// one caller outside `tests.rs`'s lock, so they read [`warnings_for`]
-/// instead, which is scoped the same way the latch is.
+/// see 2 instead of 1, depending on scheduling. Holding the lock only while
+/// *reading* does not fix this by itself: the window between the `before` and
+/// `after` reads is what has to stay free of unlocked claims, which is a
+/// property of every call site that can reach `warn_once` for that slot, not
+/// of the two reads. It holds today in `tests.rs` — every one of its 44
+/// reader call sites sits in a fn that takes `preem_ink_lock()`, and every
+/// *unlocked* test in that file that can reach the mapping path builds no tree
+/// that claims slots 0-4 — but it is a fact about the whole file's call
+/// graph, not something the lock enforces by construction; a future unlocked
+/// test that claims one of these slots would make the invariant false again
+/// without touching this counter at all. `shader_map`'s tests are the one
+/// caller outside `tests.rs` entirely, unlocked on both axes, so they read
+/// [`warnings_for`] instead, which is scoped the same way the latch is and so
+/// carries no such precondition.
 #[cfg(test)]
 static WARN_COUNTS: [std::sync::atomic::AtomicU32; 7] = [
     std::sync::atomic::AtomicU32::new(0),
@@ -895,15 +907,23 @@ thread_local! {
     /// itself (#974).
     ///
     /// [`WARN_COUNTS`] sums claims process-wide, which only reads sensibly as a
-    /// delta when nothing else in the process can claim the same [`Warned`]
-    /// slot during the window — true for `tests.rs`, which serialises every
-    /// reader on `PREEM_INK_LOCK`, but not for a caller outside that lock.
-    /// This table exists for that caller: since a `#[test]` fn body runs
+    /// delta when every claimer of the same [`Warned`] slot is kept out of the
+    /// window — true for `tests.rs` today (every claimer there is serialised
+    /// on `PREEM_INK_LOCK`), but not for a caller outside that lock. This
+    /// table exists for that caller: since a `#[test]` fn body runs
     /// start-to-finish on one thread, and this map is thread-local, a test's
     /// own reads can only ever see counts *this thread* claimed — never
     /// another test's scope claiming the same diagnostic concurrently on
     /// another thread. See [`warnings_for`].
-    static WARN_COUNTS_BY_SCOPE: RefCell<HashMap<(Scope, Warned), u32>> =
+    ///
+    /// `HashMap<Scope, HashMap<Warned, u32>>` rather than a
+    /// `HashMap<(Scope, Warned), u32>`, for the same reason [`WARNED`] itself
+    /// is a borrow-first `get_mut`-then-`insert` map rather than an
+    /// entry-API one-liner: a composite-tuple key can only be looked up by
+    /// building an owned tuple, which cloned the `Scope` on every read: on
+    /// the read side too, not only on the claim side `WARNED` already pays
+    /// for. Nested, the outer lookup borrows `scope` directly.
+    static WARN_COUNTS_BY_SCOPE: RefCell<HashMap<Scope, HashMap<Warned, u32>>> =
         RefCell::new(HashMap::new());
 }
 
@@ -933,7 +953,13 @@ pub(super) fn warn_once(scope: &Scope, what: Warned) -> bool {
     if claimed {
         warn_counter(what).fetch_add(1, Ordering::Relaxed);
         WARN_COUNTS_BY_SCOPE.with_borrow_mut(|counts| {
-            *counts.entry((scope.clone(), what)).or_insert(0) += 1;
+            if let Some(per_warned) = counts.get_mut(scope) {
+                *per_warned.entry(what).or_insert(0) += 1;
+            } else {
+                let mut per_warned = HashMap::new();
+                per_warned.insert(what, 1);
+                counts.insert(scope.clone(), per_warned);
+            }
         });
     }
     claimed
@@ -2743,9 +2769,10 @@ pub(super) fn probe(scope: &Scope, id: Option<&str>) -> Option<(u32, u32)> {
 /// a delta across the operation under test.
 ///
 /// Process-wide — see [`WARN_COUNTS`]'s doc for when that stops being safe to
-/// read as a delta. `tests.rs`'s callers hold `PREEM_INK_LOCK` for exactly
-/// this reason; a caller that cannot take that lock wants [`warnings_for`]
-/// instead.
+/// read as a delta (every *claimer* of `what`'s slot, not just every reader,
+/// has to be serialised). `tests.rs`'s call sites hold `PREEM_INK_LOCK`, which
+/// satisfies that today; a caller that cannot take that lock wants
+/// [`warnings_for`] instead.
 #[cfg(test)]
 pub(super) fn warnings(what: Warned) -> u32 {
     warn_counter(what).load(Ordering::Relaxed)
@@ -2761,8 +2788,13 @@ pub(super) fn warnings(what: Warned) -> u32 {
 /// checks, so a test observes only claims its own scope made.
 #[cfg(test)]
 pub(super) fn warnings_for(scope: &Scope, what: Warned) -> u32 {
-    WARN_COUNTS_BY_SCOPE
-        .with_borrow(|counts| counts.get(&(scope.clone(), what)).copied().unwrap_or(0))
+    WARN_COUNTS_BY_SCOPE.with_borrow(|counts| {
+        counts
+            .get(scope)
+            .and_then(|per_warned| per_warned.get(&what))
+            .copied()
+            .unwrap_or(0)
+    })
 }
 
 /// How many "preem node without an id" warnings have been emitted so far

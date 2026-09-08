@@ -895,15 +895,19 @@ mod tests {
     ///
     /// Reads [`preem_render::warnings_for`] (this scope only), not
     /// [`preem_render::warnings`] (every scope, process-wide) — #974: this
-    /// module's tests don't take `tests.rs`'s `PREEM_INK_LOCK`, and
-    /// `five_refused_frames_emit_one_event` below trips the very same
-    /// [`Warned::ShaderDenied`] slot under a different scope, deliberately
-    /// co-scheduled by `cargo test`'s default parallel harness. A global delta
-    /// here would see that unrelated claim land inside this test's
-    /// before/after window on an unlucky run and read 2, not 1 (see the PR
-    /// body for the measured pre-fix failure rate). `warnings_for` is keyed by
-    /// `(Scope, Warned)`, the same pair the latch itself checks, so it cannot
-    /// see that other scope's claim.
+    /// module's tests don't take `tests.rs`'s `PREEM_INK_LOCK`, and at least
+    /// two other tests trip the very same [`Warned::ShaderDenied`] slot under
+    /// a different scope without that lock either —
+    /// `five_refused_frames_emit_one_event` below, and
+    /// `plugins::tests::an_ungranted_shader_degrades_without_taking_its_siblings`
+    /// (`tests.rs:8151`, scope `wire-shader-denied`); `pump_tests.rs:394` also
+    /// maps a shader node, but grants it, so it does not itself claim this
+    /// slot. Any of them can be co-scheduled by `cargo test`'s default
+    /// parallel harness. A global delta here would see an unrelated claim land
+    /// inside this test's before/after window on an unlucky run and read 2,
+    /// not 1 (see the PR body for the measured pre-fix failure rate).
+    /// `warnings_for` is keyed by `(Scope, Warned)`, the same pair the latch
+    /// itself checks, so it cannot see another scope's claim.
     #[test]
     fn a_refused_shader_renders_the_placeholder_and_warns_once() {
         let classes = ["ts-shader".to_owned()];
@@ -940,9 +944,12 @@ mod tests {
     /// #971's reviewer saw `a_refused_shader_renders_the_placeholder_and_warns_once`
     /// fail 1 run in 4 under the full `--workspace --features system-tests`
     /// bucket: this module has no `PREEM_INK_LOCK` (that lock lives in
-    /// `tests.rs` and only serialises tests in that file), and
-    /// `five_refused_frames_emit_one_event` above trips the very same
-    /// [`Warned::ShaderDenied`] slot under a *different* scope. Whether the two
+    /// `tests.rs` and only serialises tests in that file), and at least two
+    /// other tests trip the very same [`Warned::ShaderDenied`] slot under a
+    /// *different* scope without that lock either —
+    /// `five_refused_frames_emit_one_event` below, and
+    /// `plugins::tests::an_ungranted_shader_degrades_without_taking_its_siblings`
+    /// (`tests.rs:8151`, scope `wire-shader-denied`). Whether any of them
     /// collide depends on which OS threads `cargo test`'s harness happens to
     /// schedule them onto and how their timing overlaps — reproduced 0/10 under
     /// a narrow `shader_map` filter and 0/5 under the reviewer's own
@@ -955,38 +962,86 @@ mod tests {
     /// happened — before this thread claims its own and reads the delta. That
     /// makes the pre-fix defect reproducible **on every run**, not 1 in 4.
     ///
+    /// **Claims the latch directly (`warn_once`), not through [`map_shader`]**
+    /// (review of #991, HIGH 1). An earlier draft routed the helper thread
+    /// through `map_shader`, which also emits a `tracing::warn!` on the same
+    /// `Refusal::NoCapability` callsite as `five_refused_frames_emit_one_event`
+    /// below. `tracing-core`'s per-callsite `Interest` cache has a lock-free
+    /// fast path used whenever exactly one `Dispatch` has ever been registered
+    /// for the process (`Rebuilder::JustOne`), which this binary's one
+    /// `with_default` call (in `five_refused_frames_emit_one_event`) always is;
+    /// on that path a subscriber-less thread touching the callsite races the
+    /// registration uninterlocked and can cache `Interest::never()` for the
+    /// *rest of the process*, silencing the other test's counting subscriber.
+    /// Measured: 3/40 hermetic + 4/50 xvfb with the `map_shader`-routed guard,
+    /// 0/40 and 0/40 with this version and with the guard deleted entirely.
+    /// The latch is this guard's actual subject anyway —
+    /// `a_refused_shader_renders_the_placeholder_and_warns_once` above already
+    /// covers `map_shader`'s call into it — so going straight to `warn_once`
+    /// both fixes the collision and narrows the guard to what it claims to
+    /// test.
+    ///
+    /// Both claims are asserted (review of #991, MEDIUM 1): the helper's
+    /// `warn_once` call must itself return `true` (a fresh scope's first
+    /// claim), or a helper that silently claims nothing — a future edit that,
+    /// say, reused an already-claimed scope — would leave this guard green
+    /// with #974's bug still present. `thread::scope` propagates a spawned
+    /// closure's panic at the join, so the helper's `assert!` fails the test
+    /// exactly as the victim's own would.
+    ///
+    /// The trailing `bystander` read (review of #991, LOW 1) pins the other
+    /// half of the claim this guard makes: [`warnings_for`](preem_render::warnings_for)
+    /// is keyed by `(Scope, Warned)`, not just by thread. The victim and the
+    /// attacker differ in *both* thread and scope, so on their own they cannot
+    /// tell a scope-keyed counter apart from a merely-thread-local one; a third
+    /// scope, read from *this* thread, that saw either claim would mean the key
+    /// dropped `Scope` and counted by thread alone.
+    ///
     /// **Falsified** by reading the process-wide
     /// [`preem_render::warnings`] instead of the per-scope
     /// [`preem_render::warnings_for`]: the assertion goes red on every run,
     /// `left: 2, right: 1` — quoted in the PR, restored after.
     #[test]
     fn a_scope_counts_only_its_own_shader_denied_claims_even_when_another_scope_races_it() {
-        let data = [0u8; 4];
-        let node = ok_node("void main() {}", &data);
-
         let victim = Scope::detached("shader-race-victim");
         let before = preem_render::warnings_for(&victim, Warned::ShaderDenied);
 
         // A second OS thread claims the very same `Warned::ShaderDenied` slot
-        // under a different scope. `thread::scope` does not return until every
-        // spawned thread has finished, so by the time this call returns the
-        // other thread's claim is a fact, not a maybe.
+        // under a different scope, directly through `warn_once` — no
+        // `tracing` event, so no shared callsite for it to perturb. `join`s
+        // (via `thread::scope`'s implicit join, which also propagates a
+        // panicked `assert!`) before this thread reads its own delta, so the
+        // other thread's claim is a fact by the time we read `after`, not a
+        // maybe.
         std::thread::scope(|threads| {
             threads.spawn(|| {
                 let attacker = Scope::detached("shader-race-attacker");
-                let attacker_data = [0u8; 4];
-                let attacker_node = ok_node("void main() {}", &attacker_data);
-                let _ = map_shader(&attacker, Grants::none(), &attacker_node);
+                assert!(
+                    preem_render::warn_once(&attacker, Warned::ShaderDenied),
+                    "the attacker's scope is fresh — this must be its first claim",
+                );
             });
         });
 
-        let _ = map_shader(&victim, Grants::none(), &node);
+        assert!(
+            preem_render::warn_once(&victim, Warned::ShaderDenied),
+            "the victim's scope is fresh — this must be its first claim",
+        );
 
         assert_eq!(
             preem_render::warnings_for(&victim, Warned::ShaderDenied) - before,
             1,
             "the victim's own single claim only — not the concurrent attacker \
              scope's claim of the same diagnostic",
+        );
+
+        let bystander = Scope::detached("shader-race-bystander");
+        assert_eq!(
+            preem_render::warnings_for(&bystander, Warned::ShaderDenied),
+            0,
+            "a third scope, read from this same thread, must see neither the \
+             victim's nor the attacker's claim — the key is (Scope, Warned), \
+             not thread alone",
         );
     }
 

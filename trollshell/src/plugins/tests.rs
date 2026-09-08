@@ -1614,16 +1614,35 @@ async fn a_second_take_is_refused_by_the_lock_before_the_probe() {
     accepted.expect("the connection lands on the winner's listener");
 }
 
+/// What one racer got out of [`take_socket`] in
+/// [`racing_takes_never_both_bind_the_socket`]. Named rather than reduced to a
+/// `bool`, because "did not bind" is not the property under test: a loser that
+/// *errored* (its `bind` losing to the winner's with `EADDRINUSE`) also fails
+/// to bind, and that is a pre-fix outcome, not a fixed one. `Bound` carries the
+/// path's inode as the winner saw it.
+#[derive(Debug, PartialEq, Eq)]
+enum RaceOutcome {
+    Bound(u64),
+    Locked,
+    AlreadyLive,
+    Failed(String),
+}
+
 /// #996 regression, in the shape the issue proves it: two instances released
 /// from one barrier, over a **stale** socket file so the liveness probe cannot
-/// save them (it answers "reclaimable" for both). Exactly one binds; the other
-/// is refused by the lock. Before the fix both unlinked and both bound, and
-/// the loser of the bind race owned the path while the winner logged
-/// "plugin host listening" and accepted nothing.
+/// save them (it answers "reclaimable" for both). Exactly one binds and the
+/// other is refused by the **lock** — not by the probe, and not by a losing
+/// `bind`. Before the fix both unlinked and both bound, and the loser of the
+/// bind race owned the path while the winner logged "plugin host listening"
+/// and accepted nothing.
 ///
-/// Repeated, because a race that only fails sometimes must fail here often
-/// enough to be seen. Hermetic: two current-thread runtimes on two OS threads
-/// (the dev-dependency tokio has no `rt-multi-thread`), a scratch dir.
+/// Every assertion here is deterministic *given* the lock (the loser can never
+/// reach the probe), which is what makes the whole set falsifiable: with the
+/// lock removed, the loser lands in `AlreadyLive` or `Failed` depending on how
+/// the two threads interleave, and both are red. Repeated because a race that
+/// resolves differently per run must be sampled. Hermetic: two current-thread
+/// runtimes on two OS threads (the dev-dependency tokio has no
+/// `rt-multi-thread`), a scratch dir.
 #[test]
 fn racing_takes_never_both_bind_the_socket() {
     for round in 0..16 {
@@ -1664,22 +1683,50 @@ fn racing_takes_never_both_bind_the_socket() {
                         .expect("runtime");
                     start.wait();
                     let claim = rt.block_on(take_socket(&path));
-                    let bound = matches!(claim, Ok(SocketClaim::Bound(..)));
+                    let outcome = match &claim {
+                        Ok(SocketClaim::Bound(..)) => RaceOutcome::Bound(
+                            std::fs::metadata(&path)
+                                .expect("the winner's socket exists")
+                                .ino(),
+                        ),
+                        Ok(SocketClaim::Locked) => RaceOutcome::Locked,
+                        Ok(SocketClaim::AlreadyLive) => RaceOutcome::AlreadyLive,
+                        Err(e) => RaceOutcome::Failed(e.to_string()),
+                    };
+                    // Hold the claim (and its lock) past the other racer's turn.
                     settled.wait();
-                    bound
+                    drop(claim);
+                    outcome
                 })
             })
             .collect();
 
-        let outcomes: Vec<bool> = handles
+        let outcomes: Vec<RaceOutcome> = handles
             .into_iter()
             .map(|h| h.join().expect("racer thread joins"))
             .collect();
 
+        let winner_inode = outcomes.iter().find_map(|o| match o {
+            RaceOutcome::Bound(inode) => Some(*inode),
+            _ => None,
+        });
         assert_eq!(
-            outcomes.iter().filter(|bound| **bound).count(),
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, RaceOutcome::Bound(_)))
+                .count(),
             1,
             "round {round}: exactly one racer takes the socket, got {outcomes:?}",
+        );
+        assert!(
+            outcomes.contains(&RaceOutcome::Locked),
+            "round {round}: the loser is refused by the lock — never by the probe, \
+             and never by a losing bind: {outcomes:?}",
+        );
+        assert_eq!(
+            Some(std::fs::metadata(&path).expect("socket exists").ino()),
+            winner_inode,
+            "round {round}: the path still names the winner's socket, not a rebind",
         );
     }
 }

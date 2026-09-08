@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use hytte::adw::{self, prelude::*};
+use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self};
 use hytte::prelude::*;
 use hytte::services::sensors;
@@ -56,9 +57,72 @@ pub(super) fn build_traffic_groups() -> (adw::PreferencesGroup, adw::Preferences
     // keys changes (hot-plug, VPN tunnels coming/going) and which bucket a
     // row sits in (active ↔ idle).
     let cache: Rc<RefCell<HashMap<String, IfaceRow>>> = Rc::new(RefCell::new(HashMap::new()));
+    bind_iface_rows(&iface_group, &idle_expander, sensors::network(), &cache);
+
+    // ── Totals + TCP group ─────────────────────────────────────────────────
+    let totals_group = adw::PreferencesGroup::new();
+
+    // Totals row: sum across non-loopback interfaces.
+    let totals_row = adw::ActionRow::builder().title("Total").build();
+    bind(
+        sensors::network().map(|net| {
+            let (rx, tx) = net
+                .interfaces
+                .iter()
+                .filter(|i| i.name != "lo")
+                .fold((0u64, 0u64), |(rx, tx), i| {
+                    (rx + i.rx_bytes_total, tx + i.tx_bytes_total)
+                });
+            format!("\u{2193} {} \u{2191} {}", fmt_bytes(rx), fmt_bytes(tx))
+        }),
+        &totals_row,
+        |row, text| row.set_subtitle(&text),
+    );
+    totals_group.add(&totals_row);
+
+    let tcp_row = adw::ActionRow::builder().title("TCP").build();
+    bind(
+        sensors::net_connections().map(|c| {
+            format!(
+                "{} established, {} listening",
+                c.established_total(),
+                c.tcp_listen + c.tcp6_listen,
+            )
+        }),
+        &tcp_row,
+        |row, text| row.set_subtitle(&text),
+    );
+    totals_group.add(&tcp_row);
+
+    (iface_group, totals_group)
+}
+
+/// Diff `signal`'s per-interface rates into the two activity buckets:
+/// `iface_group` holds the active rows inline, `idle_expander` collapses the
+/// idle ones. Rows persist in `cache` so a `Sparkline` keeps its history
+/// across bucket moves.
+///
+/// Split out of [`build_traffic_groups`] so this `bind` call site's `WeakRef`
+/// contract (#224, `hytte-reactive/src/bind.rs:16-22`) can be driven with a
+/// synthetic signal in tests, the same extraction #772 made for
+/// `bind_device_groups`. The builder reads `sensors::network()` inline, which
+/// `.expect()`s without a registered `Registry` (#831).
+///
+/// `idle_expander` is `bind`'s second-widget carve-out (#772): it is a sibling
+/// of the bound `iface_group`, never the group itself, so capturing it
+/// strongly is correct rather than a pin — `nix/lint-bind-pins.py`'s header
+/// names this exact site.
+fn bind_iface_rows<S>(
+    iface_group: &adw::PreferencesGroup,
+    idle_expander: &adw::ExpanderRow,
+    signal: S,
+    cache: &Rc<RefCell<HashMap<String, IfaceRow>>>,
+) where
+    S: Signal<Item = sensors::NetIo> + 'static,
+{
     let idle_expander_for_bind = idle_expander.clone();
     let cache_for_bind = cache.clone();
-    bind(sensors::network(), &iface_group, move |iface_group, net| {
+    bind(signal, iface_group, move |iface_group, net| {
         let mut cache_mut = cache_for_bind.borrow_mut();
 
         // Whether the bucket layout needs rebuilding this tick (a row was
@@ -136,43 +200,6 @@ pub(super) fn build_traffic_groups() -> (adw::PreferencesGroup, adw::Preferences
             relayout(iface_group, &idle_expander_for_bind, &mut cache_mut);
         }
     });
-
-    // ── Totals + TCP group ─────────────────────────────────────────────────
-    let totals_group = adw::PreferencesGroup::new();
-
-    // Totals row: sum across non-loopback interfaces.
-    let totals_row = adw::ActionRow::builder().title("Total").build();
-    bind(
-        sensors::network().map(|net| {
-            let (rx, tx) = net
-                .interfaces
-                .iter()
-                .filter(|i| i.name != "lo")
-                .fold((0u64, 0u64), |(rx, tx), i| {
-                    (rx + i.rx_bytes_total, tx + i.tx_bytes_total)
-                });
-            format!("\u{2193} {} \u{2191} {}", fmt_bytes(rx), fmt_bytes(tx))
-        }),
-        &totals_row,
-        |row, text| row.set_subtitle(&text),
-    );
-    totals_group.add(&totals_row);
-
-    let tcp_row = adw::ActionRow::builder().title("TCP").build();
-    bind(
-        sensors::net_connections().map(|c| {
-            format!(
-                "{} established, {} listening",
-                c.established_total(),
-                c.tcp_listen + c.tcp6_listen,
-            )
-        }),
-        &tcp_row,
-        |row, text| row.set_subtitle(&text),
-    );
-    totals_group.add(&tcp_row);
-
-    (iface_group, totals_group)
 }
 
 /// Rebuild the two-bucket layout: inline active rows (name-sorted) in `group`,
@@ -298,5 +325,123 @@ fn build_iface_traffic_row(iface: &sensors::NetInterface) -> IfaceRow {
         value: detail,
         ticks_since_nonzero: 0,
         attached: None,
+    }
+}
+
+/// #831 regression coverage for this file's widget-pinning `bind` call site,
+/// in the shape `panels/connections.rs` established for #772: the apply
+/// closure must take the `&adw::PreferencesGroup` `bind` hands it rather than
+/// a strong clone captured from the enclosing scope, or the binding keeps the
+/// group alive for its own lifetime and defeats #224's `WeakRef` contract
+/// (`hytte-reactive/src/bind.rs:16-22`).
+#[cfg(all(test, feature = "system-tests"))]
+mod pin_tests {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    use hytte::adw::{self, prelude::*};
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk;
+    use hytte::services::sensors::{NetInterface, NetIo};
+
+    use super::{IfaceRow, bind_iface_rows};
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// One interface carrying traffic, so it lands in the **active** bucket
+    /// and the idle expander is never parented into the group.
+    fn active(name: &str) -> NetInterface {
+        NetInterface {
+            name: name.to_owned(),
+            rx_bytes_total: 1,
+            tx_bytes_total: 1,
+            rx_rate_bps: 1.0,
+            tx_rate_bps: 1.0,
+        }
+    }
+
+    /// Anti-vacuity guard for the pin test below: the binding must actually
+    /// apply, or "the widget died" would prove nothing about the closure.
+    #[gtk::test]
+    fn iface_rows_binding_applies_a_value() {
+        adw::init().expect("libadwaita init");
+        let iface_group = adw::PreferencesGroup::new();
+        let idle_expander = adw::ExpanderRow::new();
+        let cache: Rc<RefCell<HashMap<String, IfaceRow>>> = Rc::new(RefCell::new(HashMap::new()));
+        let net: Mutable<NetIo> = Mutable::new(NetIo::default());
+        bind_iface_rows(&iface_group, &idle_expander, net.signal_cloned(), &cache);
+        pump();
+
+        // `lo` is filtered out by the apply body, so it doubles as a check
+        // that the moved body is the one running.
+        net.set(NetIo {
+            interfaces: vec![active("lo"), active("eth0")],
+        });
+        pump();
+
+        assert_eq!(
+            cache.borrow().keys().collect::<Vec<_>>(),
+            vec!["eth0"],
+            "the emitted NetIo's interfaces must reach the group, minus loopback"
+        );
+        let cached = cache.borrow();
+        let row = cached.get("eth0").expect("eth0 cached");
+        assert!(
+            matches!(row.attached, Some(super::Bucket::Active)),
+            "an interface carrying traffic must be laid out into the active bucket"
+        );
+        assert!(
+            row.container.parent().is_some(),
+            "relayout must actually parent the row — `cache` is written before it runs"
+        );
+    }
+
+    /// Falsified by reintroducing the `iface_group_for_bind` strong clone the
+    /// apply closure used to capture: with it, `drop(iface_group)` is not the
+    /// last strong ref and the weak upgrade still succeeds.
+    ///
+    /// The `idle_expander` clone the closure *does* keep is the #772 carve-out.
+    /// The test drops its own `idle_expander` handle before the group, so the
+    /// widget survives only because the apply closure still holds it — which
+    /// is exactly the point: a live carve-out clone of a *sibling* widget does
+    /// not keep the bind target alive.
+    #[gtk::test]
+    fn iface_rows_binding_does_not_pin_iface_group() {
+        adw::init().expect("libadwaita init");
+        let iface_group = adw::PreferencesGroup::new();
+        let idle_expander = adw::ExpanderRow::new();
+        let weak = iface_group.downgrade();
+        let cache: Rc<RefCell<HashMap<String, IfaceRow>>> = Rc::new(RefCell::new(HashMap::new()));
+        let net: Mutable<NetIo> = Mutable::new(NetIo {
+            interfaces: vec![active("eth0")],
+        });
+        bind_iface_rows(&iface_group, &idle_expander, net.signal_cloned(), &cache);
+        pump();
+
+        // The per-interface rows are children of the group; a GTK child holds
+        // no reference to its parent, and the cache is what would otherwise
+        // outlive the drop below.
+        drop(cache);
+        drop(idle_expander);
+        drop(iface_group);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "bind_iface_rows must not pin its iface_group: a strong clone captured by the apply \
+             closure (rather than taking the closure's own `&adw::PreferencesGroup` argument from \
+             `bind`) would keep this alive for the life of the binding, defeating #224's WeakRef \
+             contract"
+        );
+
+        // The binding must release cleanly on the next emission, not panic on
+        // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
+        net.set(NetIo {
+            interfaces: vec![active("eth1")],
+        });
+        pump();
     }
 }

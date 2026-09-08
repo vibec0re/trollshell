@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::map_ref;
+use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self};
 use hytte::prelude::*;
 use hytte::services::networkd::{self, Link, LinkSource, OperationalState};
@@ -363,8 +364,28 @@ fn build_all_links_expander() -> adw::ExpanderRow {
     // we instead remove only links that disappeared, add only new ones, and
     // update survivors in place — leaving their chevron/revealer untouched.
     let cache: Rc<RefCell<HashMap<String, LinkRow>>> = Rc::new(RefCell::new(HashMap::new()));
+    bind_all_links(&expander, networkd::links(), &cache);
+
+    expander
+}
+
+/// Diff `signal`'s link list into `expander`, keeping the per-link widgets in
+/// `cache` so an expanded link survives a carrier blip (#152).
+///
+/// Split out of [`build_all_links_expander`] so this `bind` call site's
+/// `WeakRef` contract (#224, `hytte-reactive/src/bind.rs:16-22`) can be driven
+/// with a synthetic signal in tests, the same extraction #772 made for
+/// `bind_connections_group`. The builder reads `networkd::links()` inline,
+/// which `.expect()`s without a registered `Registry` (#831).
+fn bind_all_links<S>(
+    expander: &adw::ExpanderRow,
+    signal: S,
+    cache: &Rc<RefCell<HashMap<String, LinkRow>>>,
+) where
+    S: Signal<Item = Vec<Link>> + 'static,
+{
     let cache_for_bind = cache.clone();
-    bind(networkd::links(), &expander, move |expander, links| {
+    bind(signal, expander, move |expander, links| {
         let mut named: Vec<&Link> = links.iter().filter(|l| l.name != "lo").collect();
         named.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -411,8 +432,6 @@ fn build_all_links_expander() -> adw::ExpanderRow {
             }
         }
     });
-
-    expander
 }
 
 /// Build one link's disclosure: an activatable `AdwActionRow` (name + state
@@ -721,5 +740,103 @@ mod tests {
         for source in [LinkSource::Networkd, LinkSource::Unknown] {
             assert!(!shows_no_connection(Some(&up), source), "{source:?}");
         }
+    }
+}
+
+/// #831 regression coverage for this file's widget-pinning `bind` call site,
+/// in the shape `panels/connections.rs` established for #772: the apply
+/// closure must take the `&adw::ExpanderRow` `bind` hands it rather than a
+/// strong clone captured from the enclosing scope, or the binding keeps the
+/// expander alive for its own lifetime and defeats #224's `WeakRef` contract
+/// (`hytte-reactive/src/bind.rs:16-22`).
+///
+/// A separate module from `tests` above because these need a display server:
+/// that one is plain `#[cfg(test)]` (pure `status_view`/`link_status_text`
+/// logic) and must stay in the hermetic default run.
+#[cfg(all(test, feature = "system-tests"))]
+mod pin_tests {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    use hytte::adw::{self, prelude::*};
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk;
+    use hytte::services::networkd::{Link, OperationalState};
+
+    use super::{LinkRow, bind_all_links};
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    fn link(name: &str) -> Link {
+        Link {
+            name: name.to_string(),
+            operational: OperationalState::Routable,
+            ..Link::default()
+        }
+    }
+
+    /// Anti-vacuity guard for the pin test below: the binding must actually
+    /// apply, or "the widget died" would prove nothing about the closure.
+    #[gtk::test]
+    fn all_links_binding_applies_a_value() {
+        adw::init().expect("libadwaita init");
+        let expander = adw::ExpanderRow::new();
+        let cache: Rc<RefCell<HashMap<String, LinkRow>>> = Rc::new(RefCell::new(HashMap::new()));
+        let links: Mutable<Vec<Link>> = Mutable::new(Vec::new());
+        bind_all_links(&expander, links.signal_cloned(), &cache);
+        pump();
+
+        // `lo` is filtered out by the apply body, so it doubles as a check
+        // that the moved body is the one running.
+        links.set(vec![link("lo"), link("eth0")]);
+        pump();
+
+        assert_eq!(
+            cache.borrow().keys().collect::<Vec<_>>(),
+            vec!["eth0"],
+            "the emitted link list must reach the expander, minus loopback"
+        );
+        assert!(
+            cache.borrow().values().all(|r| r.action.parent().is_some()),
+            "each cached link's action row must actually be added to the expander — \
+             `cache` alone is written before `add_row` runs"
+        );
+    }
+
+    /// Falsified by reintroducing the `expander_for_bind` strong clone the
+    /// apply closure used to capture: with it, `drop(expander)` is not the
+    /// last strong ref and the weak upgrade still succeeds.
+    #[gtk::test]
+    fn all_links_binding_does_not_pin_expander() {
+        adw::init().expect("libadwaita init");
+        let expander = adw::ExpanderRow::new();
+        let weak = expander.downgrade();
+        let cache: Rc<RefCell<HashMap<String, LinkRow>>> = Rc::new(RefCell::new(HashMap::new()));
+        let links: Mutable<Vec<Link>> = Mutable::new(vec![link("eth0")]);
+        bind_all_links(&expander, links.signal_cloned(), &cache);
+        pump();
+
+        // The per-link rows are children of the expander, so they must go
+        // with it — a GTK child holds no reference to its parent, and the
+        // cache is what would otherwise outlive the drop below.
+        drop(cache);
+        drop(expander);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "bind_all_links must not pin its expander: a strong clone captured by the apply \
+             closure (rather than taking the closure's own `&adw::ExpanderRow` argument from \
+             `bind`) would keep this alive for the life of the binding, defeating #224's WeakRef \
+             contract"
+        );
+
+        // The binding must release cleanly on the next emission, not panic on
+        // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
+        links.set(vec![link("eth1")]);
+        pump();
     }
 }

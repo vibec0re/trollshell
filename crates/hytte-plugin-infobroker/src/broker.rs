@@ -31,6 +31,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Utc;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
@@ -984,10 +985,48 @@ async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
 
 // ── The socket server ─────────────────────────────────────────────────────────
 
-/// Bind the broker socket: unlink any stale socket, bind, tighten to `0600`
-/// (same-user-only, exactly like the host's own plugin socket). The parent is
-/// `$XDG_RUNTIME_DIR`, already `0700`.
-fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
+/// Set the first time [`serve`] stands down for a live incumbent (#995), so the
+/// explanation is logged once per process instead of once per SDK redial
+/// (≤5 s apart, forever, for as long as the duplicate runs).
+static STOOD_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Probe whether a live broker already owns the socket (#995). The plugin-side
+/// twin of the host's `trollshell::plugins::listener::socket_in_use`: a
+/// successful connect means another `hytte-plugin-infobroker` process is
+/// serving the path, so this one must stand down rather than unlink a working
+/// socket. A refused/failed connect means a stale socket file (a previous run
+/// left it) or no file at all — safe to reclaim. The probe connection is
+/// dropped immediately without sending a line, so the incumbent's accept loop
+/// reads EOF and reaps it on the next poll.
+async fn socket_in_use(path: &Path) -> bool {
+    UnixStream::connect(path).await.is_ok()
+}
+
+/// The outcome of trying to take the broker socket (#995).
+enum BindOutcome {
+    /// This process owns the socket.
+    Bound(UnixListener),
+    /// A live broker already answers on the path. Stand down: do NOT unlink it.
+    StoodDown,
+}
+
+/// Take the broker socket: probe for a live incumbent, then unlink any *stale*
+/// socket, bind, and tighten to `0600` (same-user-only, exactly like the host's
+/// own plugin socket). The parent is `$XDG_RUNTIME_DIR`, already `0700`.
+///
+/// The probe is the whole point (#995). This runs from
+/// [`crate::plugin`]'s `sources()`, which the SDK calls **after** it writes
+/// `Register` but **before** it reads a single host frame — so it runs even for
+/// a duplicate the host is about to reject on its `IdGuard`. The old
+/// unconditional `remove_file` → `bind` therefore destroyed the *incumbent*
+/// broker's socket on every one of the duplicate's ≤5 s redials: the incumbent
+/// kept a live listener on an unlinked inode, the path was left holding the
+/// duplicate's soon-dead socket, and every `hytte-infobroker` CLI dial got
+/// `ECONNREFUSED` while both processes logged success.
+async fn bind_socket(path: &Path) -> std::io::Result<BindOutcome> {
+    if socket_in_use(path).await {
+        return Ok(BindOutcome::StoodDown);
+    }
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -999,13 +1038,18 @@ fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
-    Ok(listener)
+    Ok(BindOutcome::Bound(listener))
 }
 
-/// Run the broker: load the durable grants, bind the socket, then loop serving
+/// Run the broker: load the durable grants, take the socket, then loop serving
 /// client connections and panel commands until the command lane closes (the
 /// plugin session tearing down — the socket is rebound fresh on the next
 /// session, which is what drops in-memory tokens on a shell restart).
+///
+/// "Take", not "bind": if a live broker already answers on the path this
+/// returns immediately without a listener (#995), because this function runs
+/// from `sources()` before the host has accepted the session and so also runs
+/// in a duplicate process the host is about to reject.
 ///
 /// SDK-free: `cmds`/`out` are plain tokio channels (the plugin passes the SDK's
 /// per-session lane ends, which are exactly these types), so this whole module
@@ -1034,8 +1078,23 @@ pub async fn serve(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: mpsc::UnboundedS
     );
     let mut state = BrokerState::new(grants);
 
-    let listener = match bind_socket(&sock) {
-        Ok(l) => l,
+    let listener = match bind_socket(&sock).await {
+        Ok(BindOutcome::Bound(l)) => l,
+        Ok(BindOutcome::StoodDown) => {
+            // #995: another broker is live on the path. Standing down means
+            // this session simply has no socket server — the SDK keeps the
+            // plugin alive and redials at ≤5 s, so warn ONCE per process
+            // rather than once per redial.
+            if !STOOD_DOWN.swap(true, Ordering::Relaxed) {
+                tracing_eprintln(&format!(
+                    "{} already has a live broker listening; standing down rather than \
+                     unlinking it (another hytte-plugin-infobroker is running — stop it, or \
+                     stop this one). Further stand-downs this process are silent.",
+                    sock.display()
+                ));
+            }
+            return;
+        }
         Err(e) => {
             tracing_eprintln(&format!("failed to bind {}: {e}", sock.display()));
             return;
@@ -1184,6 +1243,63 @@ mod tests {
 
     fn store(grants: Vec<Grant>) -> GrantStore {
         GrantStore::from_grants(grants)
+    }
+
+    /// #995: the socket is taken, not seized. A duplicate broker — which the
+    /// SDK starts through `sources()` *before* the host has accepted or
+    /// rejected its session, so this path runs on every ≤5 s redial of a
+    /// process the host is rejecting — must leave the incumbent's socket
+    /// exactly where it is. A *stale* socket file is still reclaimed, so a
+    /// normal restart rebinds.
+    ///
+    /// The inode assertion is the load-bearing one: before the fix
+    /// `bind_socket` unlinked unconditionally, so the path's inode changed and
+    /// the incumbent was left listening on an inode nothing could name.
+    /// Hermetic: a scratch dir, no daemons, no `XDG_RUNTIME_DIR`.
+    #[tokio::test]
+    async fn bind_socket_stands_down_on_a_live_broker_and_reclaims_a_stale_one() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hytte-infobroker.sock");
+
+        // Nothing on the path yet: the incumbent binds.
+        let BindOutcome::Bound(incumbent) = bind_socket(&path).await.expect("first bind") else {
+            panic!("an absent socket must be bound, not stood down");
+        };
+        let incumbent_inode = std::fs::metadata(&path).expect("socket exists").ino();
+
+        // The duplicate stands down — and does NOT touch the incumbent's inode.
+        assert!(
+            matches!(
+                bind_socket(&path).await.expect("duplicate completes"),
+                BindOutcome::StoodDown
+            ),
+            "a live broker on the path makes the duplicate stand down",
+        );
+        assert_eq!(
+            std::fs::metadata(&path).expect("socket still exists").ino(),
+            incumbent_inode,
+            "the duplicate never unlinks the incumbent's socket",
+        );
+
+        // ...and the incumbent still answers on the path, which is what the
+        // unconditional unlink actually broke for every CLI dial.
+        let (client, accepted) = tokio::join!(UnixStream::connect(&path), incumbent.accept());
+        client.expect("a client can still dial the path");
+        accepted.expect("the dial lands on the incumbent's listener");
+        drop(incumbent);
+
+        // A stale socket file (listener gone) is reclaimable, so a normal
+        // restart is not wedged by its predecessor's leftovers.
+        assert!(path.exists(), "the stale socket file is still on disk");
+        assert!(
+            matches!(
+                bind_socket(&path).await.expect("reclaim completes"),
+                BindOutcome::Bound(_)
+            ),
+            "a stale socket is reclaimed",
+        );
     }
 
     #[test]

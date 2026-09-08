@@ -113,6 +113,12 @@ impl Plugin for Infobroker {
     /// on this stream. Created per session; a disconnect drops it (rebinding the
     /// socket fresh on reconnect — which is what drops in-memory tokens on a
     /// shell restart, per the design).
+    ///
+    /// The SDK calls this **after** it writes `Register` but **before** it reads
+    /// any host frame, so it also runs in a duplicate process whose registration
+    /// the host is about to reject on its `IdGuard`. `serve` therefore probes
+    /// the path for a live incumbent and stands down instead of unlinking it
+    /// (#995) — do not reintroduce an unconditional bind here.
     fn sources(cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
         tokio::spawn(hytte_plugin_infobroker::serve(cmds, msg_tx));

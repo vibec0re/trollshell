@@ -102,6 +102,32 @@ range above is a floor, not a ceiling.
       a prompt sit **60 s** unanswered → resolves to Deny with a denied toast.
       Multi-monitor: the prompt lands on the focused output; hot-plug re-keys
       cleanly.
+- [ ] **(#996)** Two shells racing for the socket. With the deployed unit up,
+      start a dev shell (`cargo run -p trollshell`) — its journal must say
+      _"another trollshell instance holds the plugin host lock; not taking the
+      socket over"_ (or the older _"already has a live listener"_ line, if it
+      won the lock but found a pre-#996 incumbent) and **never** _"plugin host
+      listening"_. Then the harder one: `systemctl --user stop trollshell` and
+      race two starts off one barrier —
+      `for i in 1 2; do (sleep 1; cargo run -p trollshell) & done` — and check
+      `ss -xl | grep -c plugin.sock` reports **1**, with
+      `stat -c %i "$XDG_RUNTIME_DIR/trollshell/plugin.sock"` matching the
+      process that logged "plugin host listening". The lock file lives beside
+      it at `plugin.sock.lock` — 0-byte, `0600`, and never unlinked;
+      `fuser`/`lsof` on it names the holder. Kill the winner: the lock releases
+      with the process and the next start binds cleanly, with no stale-lock
+      recovery step.
+- [ ] **(#995)** A duplicate infobroker leaves the incumbent alone. With the
+      deployed `hytte-plugin-infobroker` unit serving
+      `$XDG_RUNTIME_DIR/hytte-infobroker.sock`, note
+      `stat -c %i` on that path, then start a second one by hand
+      (`cargo run -p hytte-plugin-infobroker`). Expect: **one** stand-down line
+      from the duplicate — `already has a live broker listening` — logged once
+      and **not** once per ≤5 s redial; the inode unchanged;
+      `ss -xl | grep -c hytte-infobroker` still **1**, and
+      `hytte-infobroker get departures` still working with a valid token
+      throughout. Then stop the incumbent, leaving the stale socket file, and
+      restart it: it must reclaim the path rather than refuse.
 - [ ] **(#544)** A plugin granted `Capability::RunCommand` emits
       `Effect::RunCommand` → the host spawns the argv and the plugin gets back
       an `EffectResult` with the exit status + captured stdout. A missing

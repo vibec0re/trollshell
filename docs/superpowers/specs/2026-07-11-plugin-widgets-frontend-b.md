@@ -3,6 +3,10 @@
 **Date:** 2026-07-11
 **Status:** Approved (stamped on #35 / #195; supersedes the issue-thread strawman)
 **Issues:** #35 (feature), #195 (design), #199 (reconciler, merged)
+**Amended:** 2026-09-08 (#998) — the capability model's "`RunCommand` is a
+separately-granted, higher-trust cap" line is superseded by route 0: the
+same-uid socket is the boundary and every manifest capability is auto-granted.
+See the amendment note under "Manifest, capabilities, effects".
 
 ## Summary
 
@@ -237,6 +241,48 @@ effect** with the plugin id, and keep **`RunCommand` a separately-granted,
 higher-trust cap**. The host maps each `Effect` to a real `do_thing`
 (`modal::toggle`, `niri::focus_*`, `mpris::*`, the pipewire setters, a spawn)
 and refuses any effect whose capability wasn't granted.
+
+> **Amended 2026-09-08 — route 0: the socket is the boundary (#998).** The
+> `RunCommand` sentence above is superseded. It described a second gate that
+> was never built and is now deliberately not going to be: **`RunCommand` is an
+> ordinary auto-granted manifest capability, exactly like the rest.** This is
+> the same decision Annika settled on
+> [#893](https://github.com/vibec0re/trollshell/issues/893#issuecomment-5568936135)
+> (2026-09-07T10:02Z — _"hmm ok if this adds nothing then let's not
+> overcomplicate things ❤️"_) and #956 recorded on the preem-GL spec, applied
+> here where it actually belongs; #956 amended that spec and left this one
+> asserting the opposite.
+>
+> - **The gate is the socket's file mode, not a capability tier.** The host
+>   socket lives under `$XDG_RUNTIME_DIR`, with the host setting its directory
+>   to `0700` and the socket to `0600` (`trollshell/src/plugins/listener.rs`),
+>   same-user-only by spec (`hytte-plugin-proto/src/topology.rs`). Another user
+>   or a sandboxed app cannot reach it. A same-uid process can — and a
+>   higher-trust tier would buy nothing against it, because that process can
+>   `systemd-run --user` its own plugin unit, or just run the binary.
+> - **What the host actually does:** `session.rs`'s `handle_conn` takes
+>   `manifest.capabilities` verbatim as the grant set, and
+>   `enforce_capabilities` is a membership test against it. So a plugin that
+>   declares `Capability::RunCommand` gets argv execution, attached and
+>   detached (`effects.rs`). That is enforcement of _declaration_ — it keeps a
+>   plugin inside the surface it asked for, and it keeps the audit log honest —
+>   not a trust decision about the peer.
+> - **Blast radius, plainly:** anything that can open the socket can run
+>   arbitrary argv as the user, and (via `Capability::Shader`, #893) compile
+>   arbitrary GLSL into the shell's GL context. Both are the same trust the
+>   native code of an already-running plugin has.
+> - **Still enforced, and worth keeping:** the manifest membership test above,
+>   the audit log (one line per brokered/dropped effect), the per-connection
+>   effect rate cap, one live connection per plugin id, and the shader hygiene
+>   caps (16 KiB source / 4 MiB data → placeholder). None of these are a
+>   security boundary; they bound the _ordinary_ mistake.
+> - **Upgrade path** if a plugin is ever not trusted: route 3 from the
+>   preem-GL spec (out-of-process host, own context) plus a real grant surface.
+>   Named, not built.
+>
+> One stale copy of the superseded sentence is known to survive outside this
+> spec, in `hytte-plugin-proto/src/manifest.rs`'s `Capability` doc comment; it
+> is out of #998's lane and wants its own docs-only pass.
 
 **Handshake:** plugin connects → `Register { manifest }` → host runs
 `Manifest::check_proto` (exact match on `proto`, else drop) and grants caps →

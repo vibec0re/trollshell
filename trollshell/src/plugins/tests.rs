@@ -4,6 +4,7 @@
 //! over a `UnixStream::pair` socketpair.
 
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::MetadataExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,7 +29,9 @@ use super::effects::{
     launch_argv, launch_outcome, launch_unit_name, map_page, map_page_for_layout,
     resolve_open_page,
 };
-use super::listener::{ACCEPT_BACKOFF, accept_backoff, socket_in_use};
+use super::listener::{
+    ACCEPT_BACKOFF, SocketClaim, accept_backoff, acquire_listen_lock, socket_in_use, take_socket,
+};
 use super::preem_render::{self, Scope};
 use super::pump::{
     any_sidebar_open, apply_forget, apply_open, request_remap, request_remap_holding,
@@ -1531,6 +1534,154 @@ async fn socket_in_use_detects_a_live_listener() {
         !socket_in_use(&path).await,
         "a stale socket (no listener) is not in use, so it can be reclaimed",
     );
+}
+
+// ── Single-instance lock (#996) ───────────────────────────────────────────
+
+/// #996 mechanism: the single-instance lock is **exclusive within one
+/// process** and released by dropping the handle. `File::try_lock` is
+/// `flock(LOCK_EX | LOCK_NB)`, whose lock lives on the open file description,
+/// so two separate opens of the same path conflict even here — which is what
+/// makes the racing test below possible without forking, and what makes the
+/// kernel release the lock when a shell dies rather than leaving stale state.
+/// Hermetic: a scratch dir, no sockets, no daemons.
+#[test]
+fn listen_lock_is_exclusive_within_one_process() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lock = dir.path().join("plugin.sock.lock");
+
+    let held = acquire_listen_lock(&lock)
+        .expect("lock file opens")
+        .expect("the first instance takes the lock");
+    assert!(
+        acquire_listen_lock(&lock)
+            .expect("lock file opens for the second instance too")
+            .is_none(),
+        "a second instance must NOT get the lock while the first holds it",
+    );
+
+    // Releasing (process exit, in production) makes it reclaimable — a restart
+    // must not be wedged by its predecessor's lock file, which is never
+    // unlinked.
+    drop(held);
+    assert!(
+        acquire_listen_lock(&lock)
+            .expect("lock file opens")
+            .is_some(),
+        "the lock is reclaimable once the holder drops it",
+    );
+}
+
+/// #996: the lock is taken **before** the probe, so a second instance is
+/// turned away by the lock (`Locked`) and never reaches the probe/unlink/bind
+/// sequence at all. This is the ordering assertion: with the pre-#996 code
+/// there was no lock and the loser fell through to `remove_file` + `bind`.
+/// The winner keeps a listener that actually answers on the path — the exact
+/// property the TOCTOU destroyed (the first binder stayed valid on an inode
+/// nothing could name, and accepted nothing for the rest of the process).
+#[tokio::test]
+async fn a_second_take_is_refused_by_the_lock_before_the_probe() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("plugin.sock");
+
+    let SocketClaim::Bound(listener, _lock) =
+        take_socket(&path).await.expect("the first instance binds")
+    else {
+        panic!("nothing holds the lock and no socket exists: the first take must bind");
+    };
+    let winner_inode = std::fs::metadata(&path).expect("socket exists").ino();
+
+    // The loser is refused by the LOCK, not by the liveness probe. Asserting
+    // the discriminant (not just "did not bind") is what pins the ordering:
+    // without the lock this would come back `AlreadyLive` at best, and on the
+    // real race — where both probe before either binds — a rebind.
+    assert!(
+        matches!(
+            take_socket(&path).await.expect("the second take completes"),
+            SocketClaim::Locked
+        ),
+        "a second instance is refused by the single-instance lock",
+    );
+    assert_eq!(
+        std::fs::metadata(&path).expect("socket still exists").ino(),
+        winner_inode,
+        "the loser never unlinks or rebinds the winner's socket",
+    );
+
+    // ...and the winner is not deaf: the path still routes to its listener.
+    let (client, accepted) = tokio::join!(UnixStream::connect(&path), listener.accept());
+    client.expect("a client can still dial the path");
+    accepted.expect("the connection lands on the winner's listener");
+}
+
+/// #996 regression, in the shape the issue proves it: two instances released
+/// from one barrier, over a **stale** socket file so the liveness probe cannot
+/// save them (it answers "reclaimable" for both). Exactly one binds; the other
+/// is refused by the lock. Before the fix both unlinked and both bound, and
+/// the loser of the bind race owned the path while the winner logged
+/// "plugin host listening" and accepted nothing.
+///
+/// Repeated, because a race that only fails sometimes must fail here often
+/// enough to be seen. Hermetic: two current-thread runtimes on two OS threads
+/// (the dev-dependency tokio has no `rt-multi-thread`), a scratch dir.
+#[test]
+fn racing_takes_never_both_bind_the_socket() {
+    for round in 0..16 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugin.sock");
+
+        // Leave a STALE socket file behind: `socket_in_use` says "reclaimable"
+        // to both racers, so only the lock can order them.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let stale = tokio::net::UnixListener::bind(&path).expect("bind stale socket");
+            drop(stale);
+        });
+        drop(rt);
+        assert!(
+            path.exists(),
+            "round {round}: the stale socket file is there"
+        );
+
+        // Two barriers: `start` releases both racers into probe→bind together,
+        // `settled` keeps each claim (and so its lock) alive until both have
+        // been through — otherwise the first racer could finish, drop its lock,
+        // and let the second bind legitimately, which is not the race.
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let settled = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let start = Arc::clone(&start);
+                let settled = Arc::clone(&settled);
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("runtime");
+                    start.wait();
+                    let claim = rt.block_on(take_socket(&path));
+                    let bound = matches!(claim, Ok(SocketClaim::Bound(..)));
+                    settled.wait();
+                    bound
+                })
+            })
+            .collect();
+
+        let outcomes: Vec<bool> = handles
+            .into_iter()
+            .map(|h| h.join().expect("racer thread joins"))
+            .collect();
+
+        assert_eq!(
+            outcomes.iter().filter(|bound| **bound).count(),
+            1,
+            "round {round}: exactly one racer takes the socket, got {outcomes:?}",
+        );
+    }
 }
 
 /// #436 item 2: an [`IdGuard`] claim is exclusive per id within one host's

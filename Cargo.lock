@@ -1248,6 +1248,7 @@ dependencies = [
  "hytte-plugin",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "ureq",

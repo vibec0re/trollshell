@@ -205,6 +205,57 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
         crash-loops. The **wrong** outcome to watch for is a 5 s reconnect loop
         in `journalctl --user -u trollshell-plugin-<id>`, which is what
         emitting `Node::Scrolled` unnegotiated would cause.
+- [ ] **(#961)** The tooltip property on the list-card three
+      (`Node::{Row, Text, Expander}`), on the same card #966 is verified with.
+      Everything here is hover-only, which is exactly why it lives in this file:
+      the headless suite reads `tooltip_text()` off widgets, it never puts a
+      pointer on glass.
+  - [ ] **An ellipsized `Text` explains itself.** Render a `Node::Text` with
+        `ellipsize: true` and **no** tooltip, long enough to truncate — a status
+        line in an agent row is the real case. Hover it: the popup shows the
+        **full** text, not the `…`-clipped version. Re-render the same id with
+        new text and hover again — the popup follows the text, it does not stay
+        on the first string.
+  - [ ] **Explicit wins, and short strings are legends.** Give that same node a
+        `tooltip: Some(…)` — the popup shows _that_, not the text. Then render a
+        **short** ellipsizing `Text` (nothing actually truncated) with no
+        tooltip: it still hovers its own text. That is the deliberate
+        simplification — the host does not consult the allocation — and this row
+        is the confirmation that it reads as a legend rather than as a bug. A
+        `Text` with `ellipsize: false` and no tooltip must show **nothing**.
+  - [ ] **The weather card, which changed under you.** No new plugin needed:
+        `hytte-plugin-weather`'s `text_line` is the tree's only `ellipsize: true`
+        producer, so from #961 on the card's **location** and **condition** lines
+        carry hover text equal to their own content. Open the weather card and
+        hover each: the popup must show the full string (the point, when a long
+        place name or condition is truncated) and must not be blank or stale
+        after a refresh moves the condition. This is the "legend, not a bug"
+        trade-off landing on a shipped card, so it is the row that says whether
+        the call was right.
+  - [ ] **A derived hover beats an expander's legend — by design.** Build a
+        `Node::Expander` whose **header is an ellipsizing `Text`** and which
+        also carries its own `tooltip`. Hover the header title: you get the
+        **title** (the derived string), not the legend, because GTK answers from
+        the deepest widget upward; the legend survives over the chevron and the
+        header padding. Confirm that reads as reasonable rather than broken —
+        and that the documented way out works: put the legend in an explicit
+        `tooltip` on the header `Text` and it wins.
+  - [ ] **Row legend, child override.** Put `tooltip` on a `Node::Row` whose
+        children carry none: hovering anywhere along the row shows the row's
+        string. Give **one** child (a `Label`/`Icon`) its own tooltip and hover
+        it: the child's string wins there, the row's still shows either side of
+        it.
+  - [ ] **The expander header, not its body.** Give a `Node::Expander` a
+        tooltip and **expand** it. Hovering the **header** shows it; hovering
+        the revealed **body** shows nothing (or whatever the body's own children
+        say). The wrong outcome — the one the host arms on the header button
+        specifically to avoid — is the header's legend following the pointer
+        down over every body row.
+  - [ ] **Old shell, new plugin.** A plugin built against this SDK, run against
+        a **pre-#961** shell, must still connect and render: all three
+        `tooltip`s are skipped as unknown fields, and the card looks exactly as
+        it did before — no hover text, no warning, no 5 s reconnect loop in
+        `journalctl --user -u trollshell-plugin-<id>`.
 - [ ] _(dormant — #555)_ The wire-vocabulary generation counter (`VOCAB`) is
       armed but untested against a real newer-vocab plugin (this PR appended
       no wire variant, so `VOCAB` stays at 1 and nothing exercises the reject

@@ -9,6 +9,8 @@
 //!   field — so every plugin that never wanted either now writes `spacing: 0,`
 //!   and `dense: false,` by hand. The builders default them, which is also what
 //!   makes the *next* additive field free rather than another mechanical sweep.
+//!   #961 collected on exactly that: `Row`'s `tooltip` cost the builder one
+//!   defaulted field and one [`Row::tooltip`] method, and no call site.
 //! - [`scrolled`] is a **negotiated** variant: emitting it against a host that
 //!   never advertised [`SCROLLED_VOCAB`] would kill the session's decode. The
 //!   builder does that check, exactly as [`shader`](crate::shader) does for
@@ -40,7 +42,7 @@ use hytte_plugin_proto::{Cls, Node, NodeId, SCROLLED_VOCAB};
 /// Start a [`Node::Row`] — a horizontal list row — with `children`.
 ///
 /// Defaults: no id, no classes, `spacing: 0` (the flush layout a `Row` had
-/// before #966).
+/// before #966), no tooltip.
 #[must_use]
 pub fn row(children: Vec<Node>) -> Row {
     Row {
@@ -48,6 +50,7 @@ pub fn row(children: Vec<Node>) -> Row {
         classes: Vec::new(),
         spacing: 0,
         children,
+        tooltip: None,
     }
 }
 
@@ -87,6 +90,7 @@ pub struct Row {
     classes: Vec<Cls>,
     spacing: u16,
     children: Vec<Node>,
+    tooltip: Option<String>,
 }
 
 impl Row {
@@ -101,6 +105,17 @@ impl Row {
     #[must_use]
     pub fn spacing(mut self, px: u16) -> Self {
         self.spacing = px;
+        self
+    }
+
+    /// Set the row's hover text (#961) — plain text, never markup.
+    ///
+    /// One legend for the whole row; a child with its own tooltip still wins
+    /// the hover where the pointer is over it. An older shell skips the field
+    /// and renders the row exactly as before.
+    #[must_use]
+    pub fn tooltip(mut self, text: impl Into<String>) -> Self {
+        self.tooltip = Some(text.into());
         self
     }
 
@@ -119,6 +134,7 @@ impl Row {
             classes: self.classes,
             spacing: self.spacing,
             children: self.children,
+            tooltip: self.tooltip,
         }
     }
 }
@@ -280,6 +296,7 @@ mod tests {
                 classes: vec![],
                 spacing: 0,
                 children: vec![label("a")],
+                tooltip: None,
             },
             "an unconfigured row must encode exactly what a pre-#966 literal did"
         );
@@ -294,6 +311,23 @@ mod tests {
                 classes: vec!["ts-row".into()],
                 spacing: 6,
                 children: vec![],
+                tooltip: None,
+            }
+        );
+    }
+
+    /// #961's field, and the reason the builder was worth having: it defaults
+    /// (`row_defaults_are_the_pre_966_shape` above pins the `None`) and it sets.
+    #[test]
+    fn row_carries_a_tooltip() {
+        assert_eq!(
+            row(vec![]).id("argus").tooltip("argus · running").build(),
+            Node::Row {
+                id: Some("argus".into()),
+                classes: vec![],
+                spacing: 0,
+                children: vec![],
+                tooltip: Some("argus · running".into()),
             }
         );
     }

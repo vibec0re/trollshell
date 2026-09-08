@@ -407,6 +407,7 @@ impl Plugin for Caw {
             id: Some("caw-facerow".to_owned()),
             classes: vec!["caw-facerow".to_owned()],
             children: vec![Node::Spacer, face, Node::Spacer],
+            tooltip: None,
         }];
 
         // Preem pixel-font speech (#368): her line is a `Node::Pixels` in
@@ -430,6 +431,7 @@ impl Plugin for Caw {
                 id: Some("caw-sayrow".to_owned()),
                 classes: vec!["caw-sayrow".to_owned()],
                 children: vec![Node::Spacer, bubble, Node::Spacer],
+                tooltip: None,
             });
         }
         if !action.is_empty() {
@@ -439,12 +441,14 @@ impl Plugin for Caw {
                 max_width_chars: None,
                 ellipsize: false,
                 classes: vec!["caw-act".to_owned(), "dim-label".to_owned()],
+                tooltip: None,
             };
             children.push(Node::Row {
                 spacing: 0,
                 id: Some("caw-actrow".to_owned()),
                 classes: vec!["caw-actrow".to_owned()],
                 children: vec![Node::Spacer, act, Node::Spacer],
+                tooltip: None,
             });
         }
 

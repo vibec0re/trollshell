@@ -371,6 +371,7 @@ fn error_line(msg: &str) -> Node {
                 max_width_chars: None,
                 ellipsize: false,
                 classes: vec!["dim-label".to_owned()],
+                tooltip: None,
             },
         ],
         tooltip: None,
@@ -390,6 +391,7 @@ fn unconfigured_card() -> Node {
                 max_width_chars: None,
                 ellipsize: false,
                 classes: vec!["dim-label".to_owned()],
+                tooltip: None,
             },
         ],
     )

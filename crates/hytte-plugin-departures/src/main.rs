@@ -669,6 +669,7 @@ fn status_text(text: &str, class: &str) -> Node {
         // lose its tail to an ellipsis.
         ellipsize: false,
         classes: vec![class.to_owned()],
+        tooltip: None,
     }
 }
 
@@ -719,6 +720,7 @@ fn row_node(r: &Row, now_unix: i64, armed: Option<&str>) -> Node {
             // the first place, not an adoption follow-up.)
             ellipsize: false,
             classes: vec!["ts-departure-direction".to_owned()],
+            tooltip: None,
         },
         // Time cell: the leave-by / departs-in token plus the local HH:MM.
         Node::Label {
@@ -742,6 +744,7 @@ fn row_node(r: &Row, now_unix: i64, armed: Option<&str>) -> Node {
         id: None,
         classes,
         children,
+        tooltip: None,
     };
     // Wrap the row in a Button so it becomes a click target (#236). A `Row` isn't
     // an event target, but a `Button` opts into the `Click` event by vocabulary —

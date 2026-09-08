@@ -363,6 +363,7 @@ fn error_content(msg: &str) -> Node {
                 max_width_chars: None,
                 ellipsize: false,
                 classes: Vec::new(),
+                tooltip: None,
             },
         ],
         tooltip: None,
@@ -496,6 +497,7 @@ fn text_line(id: &str, text: String, class: &str) -> Node {
         max_width_chars: None,
         ellipsize: true,
         classes: vec![class.to_owned()],
+        tooltip: None,
     }
 }
 

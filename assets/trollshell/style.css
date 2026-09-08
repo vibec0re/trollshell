@@ -602,6 +602,41 @@
     padding: 0.154em 0.615em;
 }
 
+/* The hyperhive agents card (#947). Two rules, both for the same reason: a
+ * hive with a dozen agents has to fit a sidebar that cannot scroll.
+ *
+ * `.ts-plugin-card` deliberately ships no padding ("the plugin owns its own
+ * inner spacing", #319), so without this the rows sit flush against the card
+ * edge — which is how they read next to the inset `Tasks` card in
+ * @kaesaecracker's screenshot. The plugin cannot express padding in the node
+ * vocabulary, so it lands here.
+ *
+ * The buttons are the height driver: a default Adwaita button carries a
+ * ~34 px min-height, and a row with two of them is a two-line row no matter
+ * how little text it holds. `min-height: 0` plus tight padding lets the row
+ * collapse to its text height. GTK CSS has no `max-height`, so the card's
+ * overall bound is NOT here — it is the plugin's own row cap (`MAX_ROWS`).
+ *
+ * NOTE for anyone testing a plugin change: this file is shell-side, so it
+ * takes effect only after the shell is rebuilt and restarted. Restarting the
+ * plugin alone picks up the node-tree half and none of this. */
+.ts-agents-card {
+    padding: 0.615em 0.769em;
+}
+.ts-agents-card button.ts-agent-btn {
+    min-height: 0;
+    min-width: 0;
+    padding: 0.077em 0.231em;
+}
+/* The name is a flat button so it can be clicked; it should read as the row's
+ * label, not as a control sitting in a box. */
+.ts-agents-card button.ts-agent-name {
+    min-height: 0;
+    padding: 0 0.154em;
+    background: none;
+    box-shadow: none;
+}
+
 /* Micro-terminal input (#369). The `hytte-plugin-terminal` plugin stacks a live
  * `Node::Entry` under its preem VFD dot-matrix screen; a bare GTK text field
  * clashes with it. Dress the entry in the same VFD palette as the screen

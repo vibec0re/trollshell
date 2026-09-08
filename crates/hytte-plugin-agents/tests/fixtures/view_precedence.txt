@@ -1,509 +1,513 @@
 View {
-    tree: ListBox {
+    tree: Box {
         id: Some(
             "agents-root",
         ),
+        dir: Vertical,
+        spacing: 2,
+        scroll: false,
         classes: [
-            "ts-agents-list",
+            "ts-agents-card",
         ],
         children: [
             Box {
                 id: None,
-                dir: Vertical,
-                spacing: 2,
+                dir: Horizontal,
+                spacing: 6,
                 scroll: false,
                 classes: [
-                    "ts-agent-row",
+                    "ts-agents-title",
                 ],
                 children: [
-                    Row {
+                    Label {
                         id: None,
+                        text: "Agents",
                         classes: [
-                            "ts-agent-head",
+                            "heading",
                         ],
-                        children: [
-                            Icon {
-                                id: None,
-                                name: "system-run-symbolic",
-                                classes: [
-                                    "ts-agent-runtime",
-                                ],
-                                tooltip: None,
-                            },
-                            Button {
-                                id: "chat:wedged",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-name",
-                                ],
-                                child: Label {
-                                    id: None,
-                                    text: "wedged",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
-                            Spacer,
-                            Icon {
-                                id: None,
-                                name: "dialog-error-symbolic",
-                                classes: [
-                                    "ts-agent-state",
-                                    "error",
-                                ],
-                                tooltip: Some(
-                                    "failed",
-                                ),
-                            },
-                        ],
+                        tooltip: None,
                     },
-                    Row {
+                    Spacer,
+                    Label {
                         id: None,
+                        text: "up · 5",
                         classes: [
-                            "ts-agent-foot",
+                            "dim-label",
+                            "numeric",
                         ],
-                        children: [
-                            Text {
-                                id: None,
-                                text: "failed",
-                                max_width_chars: None,
-                                ellipsize: true,
-                                classes: [
-                                    "dim-label",
-                                ],
-                            },
-                            Spacer,
-                            Button {
-                                id: "pause:wedged",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-pause",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "media-playback-start-symbolic",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
-                            Button {
-                                id: "edit:wedged",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-edit",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "document-edit-symbolic",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
-                        ],
+                        tooltip: None,
                     },
                 ],
                 tooltip: None,
             },
             Box {
                 id: None,
-                dir: Vertical,
-                spacing: 2,
+                dir: Horizontal,
+                spacing: 4,
                 scroll: false,
                 classes: [
                     "ts-agent-row",
                 ],
                 children: [
-                    Row {
+                    Icon {
                         id: None,
+                        name: "system-run-symbolic",
                         classes: [
-                            "ts-agent-head",
+                            "ts-agent-runtime",
                         ],
-                        children: [
-                            Icon {
-                                id: None,
-                                name: "system-run-symbolic",
-                                classes: [
-                                    "ts-agent-runtime",
-                                ],
-                                tooltip: None,
-                            },
-                            Button {
-                                id: "chat:locked-out",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-name",
-                                ],
-                                child: Label {
-                                    id: None,
-                                    text: "locked-out",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
-                            Spacer,
-                            Icon {
-                                id: None,
-                                name: "dialog-password-symbolic",
-                                classes: [
-                                    "ts-agent-state",
-                                    "warning",
-                                ],
-                                tooltip: Some(
-                                    "needs login",
-                                ),
-                            },
+                        tooltip: None,
+                    },
+                    Button {
+                        id: "chat:wedged",
+                        classes: [
+                            "flat",
+                            "ts-agent-name",
+                        ],
+                        child: Text {
+                            id: None,
+                            text: "wedged",
+                            max_width_chars: Some(
+                                14,
+                            ),
+                            ellipsize: true,
+                            classes: [],
+                        },
+                    },
+                    Icon {
+                        id: None,
+                        name: "dialog-error-symbolic",
+                        classes: [
+                            "ts-agent-state",
+                            "error",
+                        ],
+                        tooltip: Some(
+                            "failed",
+                        ),
+                    },
+                    Text {
+                        id: None,
+                        text: "failed",
+                        max_width_chars: Some(
+                            22,
+                        ),
+                        ellipsize: true,
+                        classes: [
+                            "dim-label",
                         ],
                     },
-                    Row {
-                        id: None,
+                    Spacer,
+                    Button {
+                        id: "pause:wedged",
                         classes: [
-                            "ts-agent-foot",
+                            "flat",
+                            "ts-agent-btn",
                         ],
-                        children: [
-                            Text {
-                                id: None,
-                                text: "needs login",
-                                max_width_chars: None,
-                                ellipsize: true,
-                                classes: [
-                                    "dim-label",
-                                ],
-                            },
-                            Spacer,
-                            Button {
-                                id: "pause:locked-out",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-pause",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "media-playback-start-symbolic",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
-                            Button {
-                                id: "edit:locked-out",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-edit",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "document-edit-symbolic",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
+                        child: Icon {
+                            id: None,
+                            name: "media-playback-start-symbolic",
+                            classes: [],
+                            tooltip: Some(
+                                "resume",
+                            ),
+                        },
+                    },
+                    Button {
+                        id: "details:wedged",
+                        classes: [
+                            "flat",
+                            "ts-agent-btn",
                         ],
+                        child: Icon {
+                            id: None,
+                            name: "dialog-information-symbolic",
+                            classes: [],
+                            tooltip: Some(
+                                "details",
+                            ),
+                        },
                     },
                 ],
-                tooltip: None,
+                tooltip: Some(
+                    "wedged\nfailed",
+                ),
             },
             Box {
                 id: None,
-                dir: Vertical,
-                spacing: 2,
+                dir: Horizontal,
+                spacing: 4,
                 scroll: false,
                 classes: [
                     "ts-agent-row",
                 ],
                 children: [
-                    Row {
+                    Icon {
                         id: None,
+                        name: "system-run-symbolic",
                         classes: [
-                            "ts-agent-head",
+                            "ts-agent-runtime",
                         ],
-                        children: [
-                            Icon {
-                                id: None,
-                                name: "system-run-symbolic",
-                                classes: [
-                                    "ts-agent-runtime",
-                                ],
-                                tooltip: None,
-                            },
-                            Button {
-                                id: "chat:parked",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-name",
-                                ],
-                                child: Label {
-                                    id: None,
-                                    text: "parked",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
-                            Spacer,
-                            Icon {
-                                id: None,
-                                name: "media-playback-pause-symbolic",
-                                classes: [
-                                    "ts-agent-state",
-                                    "dim-label",
-                                ],
-                                tooltip: Some(
-                                    "paused",
-                                ),
-                            },
+                        tooltip: None,
+                    },
+                    Button {
+                        id: "chat:locked-out",
+                        classes: [
+                            "flat",
+                            "ts-agent-name",
+                        ],
+                        child: Text {
+                            id: None,
+                            text: "locked-out",
+                            max_width_chars: Some(
+                                14,
+                            ),
+                            ellipsize: true,
+                            classes: [],
+                        },
+                    },
+                    Icon {
+                        id: None,
+                        name: "dialog-password-symbolic",
+                        classes: [
+                            "ts-agent-state",
+                            "warning",
+                        ],
+                        tooltip: Some(
+                            "needs login",
+                        ),
+                    },
+                    Text {
+                        id: None,
+                        text: "needs login",
+                        max_width_chars: Some(
+                            22,
+                        ),
+                        ellipsize: true,
+                        classes: [
+                            "dim-label",
                         ],
                     },
-                    Row {
-                        id: None,
+                    Spacer,
+                    Button {
+                        id: "pause:locked-out",
                         classes: [
-                            "ts-agent-foot",
+                            "flat",
+                            "ts-agent-btn",
                         ],
-                        children: [
-                            Text {
-                                id: None,
-                                text: "paused",
-                                max_width_chars: None,
-                                ellipsize: true,
-                                classes: [
-                                    "dim-label",
-                                ],
-                            },
-                            Spacer,
-                            Button {
-                                id: "pause:parked",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-pause",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "media-playback-start-symbolic",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
-                            Button {
-                                id: "edit:parked",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-edit",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "document-edit-symbolic",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
+                        child: Icon {
+                            id: None,
+                            name: "media-playback-start-symbolic",
+                            classes: [],
+                            tooltip: Some(
+                                "resume",
+                            ),
+                        },
+                    },
+                    Button {
+                        id: "details:locked-out",
+                        classes: [
+                            "flat",
+                            "ts-agent-btn",
                         ],
+                        child: Icon {
+                            id: None,
+                            name: "dialog-information-symbolic",
+                            classes: [],
+                            tooltip: Some(
+                                "details",
+                            ),
+                        },
                     },
                 ],
-                tooltip: None,
+                tooltip: Some(
+                    "locked-out\nneeds login",
+                ),
             },
             Box {
                 id: None,
-                dir: Vertical,
-                spacing: 2,
+                dir: Horizontal,
+                spacing: 4,
                 scroll: false,
                 classes: [
                     "ts-agent-row",
                 ],
                 children: [
-                    Row {
+                    Icon {
                         id: None,
+                        name: "system-run-symbolic",
                         classes: [
-                            "ts-agent-head",
+                            "ts-agent-runtime",
                         ],
-                        children: [
-                            Icon {
-                                id: None,
-                                name: "system-run-symbolic",
-                                classes: [
-                                    "ts-agent-runtime",
-                                ],
-                                tooltip: None,
-                            },
-                            Button {
-                                id: "chat:off",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-name",
-                                ],
-                                child: Label {
-                                    id: None,
-                                    text: "off",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
-                            Spacer,
-                            Icon {
-                                id: None,
-                                name: "software-update-available-symbolic",
-                                classes: [
-                                    "ts-agent-badge",
-                                    "ts-agent-upd",
-                                ],
-                                tooltip: Some(
-                                    "config commit pending — a rebuild would change this agent's locked rev",
-                                ),
-                            },
-                            Icon {
-                                id: None,
-                                name: "media-playback-stop-symbolic",
-                                classes: [
-                                    "ts-agent-state",
-                                    "dim-label",
-                                ],
-                                tooltip: Some(
-                                    "stopped",
-                                ),
-                            },
+                        tooltip: None,
+                    },
+                    Button {
+                        id: "chat:parked",
+                        classes: [
+                            "flat",
+                            "ts-agent-name",
+                        ],
+                        child: Text {
+                            id: None,
+                            text: "parked",
+                            max_width_chars: Some(
+                                14,
+                            ),
+                            ellipsize: true,
+                            classes: [],
+                        },
+                    },
+                    Icon {
+                        id: None,
+                        name: "media-playback-pause-symbolic",
+                        classes: [
+                            "ts-agent-state",
+                            "dim-label",
+                        ],
+                        tooltip: Some(
+                            "paused",
+                        ),
+                    },
+                    Text {
+                        id: None,
+                        text: "paused",
+                        max_width_chars: Some(
+                            22,
+                        ),
+                        ellipsize: true,
+                        classes: [
+                            "dim-label",
                         ],
                     },
-                    Row {
-                        id: None,
+                    Spacer,
+                    Button {
+                        id: "pause:parked",
                         classes: [
-                            "ts-agent-foot",
+                            "flat",
+                            "ts-agent-btn",
                         ],
-                        children: [
-                            Text {
-                                id: None,
-                                text: "stopped",
-                                max_width_chars: None,
-                                ellipsize: true,
-                                classes: [
-                                    "dim-label",
-                                ],
-                            },
-                            Spacer,
-                            Button {
-                                id: "pause:off",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-pause",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "media-playback-pause-symbolic",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
-                            Button {
-                                id: "edit:off",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-edit",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "document-edit-symbolic",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
+                        child: Icon {
+                            id: None,
+                            name: "media-playback-start-symbolic",
+                            classes: [],
+                            tooltip: Some(
+                                "resume",
+                            ),
+                        },
+                    },
+                    Button {
+                        id: "details:parked",
+                        classes: [
+                            "flat",
+                            "ts-agent-btn",
                         ],
+                        child: Icon {
+                            id: None,
+                            name: "dialog-information-symbolic",
+                            classes: [],
+                            tooltip: Some(
+                                "details",
+                            ),
+                        },
                     },
                 ],
-                tooltip: None,
+                tooltip: Some(
+                    "parked\npaused",
+                ),
             },
             Box {
                 id: None,
-                dir: Vertical,
-                spacing: 2,
+                dir: Horizontal,
+                spacing: 4,
                 scroll: false,
                 classes: [
                     "ts-agent-row",
                 ],
                 children: [
-                    Row {
+                    Icon {
                         id: None,
+                        name: "system-run-symbolic",
                         classes: [
-                            "ts-agent-head",
+                            "ts-agent-runtime",
                         ],
-                        children: [
-                            Icon {
-                                id: None,
-                                name: "system-run-symbolic",
-                                classes: [
-                                    "ts-agent-runtime",
-                                ],
-                                tooltip: None,
-                            },
-                            Button {
-                                id: "chat:busy",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-name",
-                                ],
-                                child: Label {
-                                    id: None,
-                                    text: "busy",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
-                            Spacer,
-                            Icon {
-                                id: None,
-                                name: "media-playback-start-symbolic",
-                                classes: [
-                                    "ts-agent-state",
-                                    "accent",
-                                ],
-                                tooltip: Some(
-                                    "running",
-                                ),
-                            },
+                        tooltip: None,
+                    },
+                    Button {
+                        id: "chat:off",
+                        classes: [
+                            "flat",
+                            "ts-agent-name",
+                        ],
+                        child: Text {
+                            id: None,
+                            text: "off",
+                            max_width_chars: Some(
+                                14,
+                            ),
+                            ellipsize: true,
+                            classes: [],
+                        },
+                    },
+                    Icon {
+                        id: None,
+                        name: "media-playback-stop-symbolic",
+                        classes: [
+                            "ts-agent-state",
+                            "dim-label",
+                        ],
+                        tooltip: Some(
+                            "stopped",
+                        ),
+                    },
+                    Text {
+                        id: None,
+                        text: "stopped",
+                        max_width_chars: Some(
+                            22,
+                        ),
+                        ellipsize: true,
+                        classes: [
+                            "dim-label",
                         ],
                     },
-                    Row {
+                    Spacer,
+                    Icon {
                         id: None,
+                        name: "software-update-available-symbolic",
                         classes: [
-                            "ts-agent-foot",
+                            "ts-agent-badge",
+                            "ts-agent-upd",
                         ],
-                        children: [
-                            Text {
-                                id: None,
-                                text: "running the P1 gate",
-                                max_width_chars: None,
-                                ellipsize: true,
-                                classes: [
-                                    "dim-label",
-                                ],
-                            },
-                            Spacer,
-                            Button {
-                                id: "pause:busy",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-pause",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "media-playback-pause-symbolic",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
-                            Button {
-                                id: "edit:busy",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-edit",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "document-edit-symbolic",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
+                        tooltip: Some(
+                            "config commit pending — a rebuild would change this agent's locked rev",
+                        ),
+                    },
+                    Button {
+                        id: "pause:off",
+                        classes: [
+                            "flat",
+                            "ts-agent-btn",
                         ],
+                        child: Icon {
+                            id: None,
+                            name: "media-playback-pause-symbolic",
+                            classes: [],
+                            tooltip: Some(
+                                "pause",
+                            ),
+                        },
+                    },
+                    Button {
+                        id: "details:off",
+                        classes: [
+                            "flat",
+                            "ts-agent-btn",
+                        ],
+                        child: Icon {
+                            id: None,
+                            name: "dialog-information-symbolic",
+                            classes: [],
+                            tooltip: Some(
+                                "details",
+                            ),
+                        },
                     },
                 ],
-                tooltip: None,
+                tooltip: Some(
+                    "off\nstopped",
+                ),
+            },
+            Box {
+                id: None,
+                dir: Horizontal,
+                spacing: 4,
+                scroll: false,
+                classes: [
+                    "ts-agent-row",
+                ],
+                children: [
+                    Icon {
+                        id: None,
+                        name: "system-run-symbolic",
+                        classes: [
+                            "ts-agent-runtime",
+                        ],
+                        tooltip: None,
+                    },
+                    Button {
+                        id: "chat:busy",
+                        classes: [
+                            "flat",
+                            "ts-agent-name",
+                        ],
+                        child: Text {
+                            id: None,
+                            text: "busy",
+                            max_width_chars: Some(
+                                14,
+                            ),
+                            ellipsize: true,
+                            classes: [],
+                        },
+                    },
+                    Icon {
+                        id: None,
+                        name: "media-playback-start-symbolic",
+                        classes: [
+                            "ts-agent-state",
+                            "accent",
+                        ],
+                        tooltip: Some(
+                            "running",
+                        ),
+                    },
+                    Text {
+                        id: None,
+                        text: "running the P1 gate",
+                        max_width_chars: Some(
+                            22,
+                        ),
+                        ellipsize: true,
+                        classes: [
+                            "dim-label",
+                        ],
+                    },
+                    Spacer,
+                    Button {
+                        id: "pause:busy",
+                        classes: [
+                            "flat",
+                            "ts-agent-btn",
+                        ],
+                        child: Icon {
+                            id: None,
+                            name: "media-playback-pause-symbolic",
+                            classes: [],
+                            tooltip: Some(
+                                "pause",
+                            ),
+                        },
+                    },
+                    Button {
+                        id: "details:busy",
+                        classes: [
+                            "flat",
+                            "ts-agent-btn",
+                        ],
+                        child: Icon {
+                            id: None,
+                            name: "dialog-information-symbolic",
+                            classes: [],
+                            tooltip: Some(
+                                "details",
+                            ),
+                        },
+                    },
+                ],
+                tooltip: Some(
+                    "busy\nrunning the P1 gate",
+                ),
             },
         ],
+        tooltip: None,
     },
     panel: Some(
         Box {
@@ -525,8 +529,11 @@ View {
                     ],
                     tooltip: None,
                 },
-                Row {
+                Box {
                     id: None,
+                    dir: Horizontal,
+                    spacing: 6,
+                    scroll: false,
                     classes: [
                         "ts-agent-detail",
                     ],
@@ -550,9 +557,13 @@ View {
                             ],
                         },
                     ],
+                    tooltip: None,
                 },
-                Row {
+                Box {
                     id: None,
+                    dir: Horizontal,
+                    spacing: 6,
+                    scroll: false,
                     classes: [
                         "ts-agent-detail",
                     ],
@@ -576,9 +587,13 @@ View {
                             ],
                         },
                     ],
+                    tooltip: None,
                 },
-                Row {
+                Box {
                     id: None,
+                    dir: Horizontal,
+                    spacing: 6,
+                    scroll: false,
                     classes: [
                         "ts-agent-detail",
                     ],
@@ -602,6 +617,7 @@ View {
                             ],
                         },
                     ],
+                    tooltip: None,
                 },
             ],
             tooltip: None,

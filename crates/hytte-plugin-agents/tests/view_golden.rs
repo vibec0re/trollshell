@@ -136,6 +136,14 @@ fn scenarios() -> Vec<(&'static str, Agents)> {
             )))));
             m
         }),
+        // Twelve agents in one ungrouped hive — @kaesaecracker's shape, and
+        // the case the compact row exists for. Pinned so a regression back to
+        // two-line rows shows up as a diff, not as a screenshot round trip.
+        ("twelve_ungrouped", {
+            let mut m = seed(GOLDEN_NOW);
+            m.update(Input::App(Msg::Status(Ok(many_agents(12)))));
+            m
+        }),
         // The same roster with one agent selected — the §6.4 panel in full.
         ("panel_selected", {
             let mut m = seed(GOLDEN_NOW);
@@ -149,12 +157,24 @@ fn scenarios() -> Vec<(&'static str, Agents)> {
                 },
             ))));
             m.update(Input::Event {
-                node: "edit:trollshell-choom".to_owned(),
+                node: "details:trollshell-choom".to_owned(),
                 kind: hytte_plugin::proto::EventKind::Click,
             });
             m
         }),
     ]
+}
+
+/// `n` running agents named `agent-0…`, in one ungrouped hive.
+fn many_agents(n: usize) -> Vec<AgentStatusRow> {
+    (0..n)
+        .map(|i| AgentStatusRow {
+            name: format!("agent-{i}"),
+            running: true,
+            status_text: Some(format!("working on task {i} of a rather long description")),
+            ..AgentStatusRow::default()
+        })
+        .collect()
 }
 
 fn golden_path(name: &str) -> PathBuf {

@@ -316,10 +316,10 @@ fn the_primary_click_opens_the_panel_and_never_pauses_the_loop() {
 /// The edit button is the same read-only detail in P1 (real editing waits for
 /// #952) — and likewise sends no frame.
 #[test]
-fn the_edit_click_opens_the_panel_and_sends_no_frame() {
+fn the_details_click_opens_the_panel_and_sends_no_frame() {
     let (mut m, mut rx) = model();
     m.update(status(roster("agent_status_grouped.json")));
-    let fx = m.update(click("edit:stray"));
+    let fx = m.update(click("details:stray"));
     assert_eq!(fx, vec![Effect::OpenPage(Page::PluginSelf)]);
     assert!(lines(&mut rx).is_empty());
     assert_eq!(
@@ -339,7 +339,7 @@ fn the_edit_click_opens_the_panel_and_sends_no_frame() {
 fn a_selection_that_vanishes_falls_back_to_the_overview() {
     let (mut m, _rx) = model();
     m.update(status(roster("agent_status_grouped.json")));
-    m.update(click("edit:stray"));
+    m.update(click("details:stray"));
     assert!(m.selected.is_some());
 
     m.update(status(roster("agent_status_precedence.json")));
@@ -468,6 +468,45 @@ fn toml_config(body: &str) -> hytte_plugin_agents::config::AgentsConfig {
     )])
     .expect("the test config assembles")
     .config
+}
+
+// ── group expanders ──────────────────────────────────────────────────────────
+
+/// A group's expander is **plugin-driven**: the host never self-toggles, so
+/// the model is the single source of truth for what is open
+/// (`crates/hytte-plugin-proto/src/wire.rs:365-405`). Clicking the header
+/// flips it, and the flip survives the next poll — otherwise a group the
+/// operator collapsed would spring open every two seconds.
+///
+/// Falsification: drop the `ids::GROUP` arm from `click` and the first
+/// assertion goes red; clear `expanded` in `fold_status` and the last one does.
+#[test]
+fn a_group_header_click_toggles_it_and_the_choice_survives_a_poll() {
+    let (mut m, mut rx) = model();
+    m.update(Input::App(Msg::Config(Box::new(toml_config(
+        "[display.trollshell-choom]\nproject = \"viberoot\"\n[display.nixos-choom]\nproject = \"nixos\"\n",
+    )))));
+    m.update(status(roster("agent_status_grouped.json")));
+
+    // A group with a running agent defaults open; one click collapses it.
+    m.update(click("group:viberoot"));
+    assert_eq!(m.expanded.get("viberoot"), Some(&false));
+    assert!(
+        lines(&mut rx).is_empty(),
+        "a header click asks the hive nothing"
+    );
+
+    // And it stays collapsed across polls.
+    m.update(status(roster("agent_status_grouped.json")));
+    assert_eq!(
+        m.expanded.get("viberoot"),
+        Some(&false),
+        "a collapsed group must not spring open on the next poll"
+    );
+
+    // Clicking again re-opens it.
+    m.update(click("group:viberoot"));
+    assert_eq!(m.expanded.get("viberoot"), Some(&true));
 }
 
 // ── a refused write ──────────────────────────────────────────────────────────

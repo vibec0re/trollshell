@@ -1,35 +1,85 @@
 View {
-    tree: ListBox {
+    tree: Box {
         id: Some(
             "agents-root",
         ),
+        dir: Vertical,
+        spacing: 2,
+        scroll: false,
         classes: [
-            "ts-agents-list",
+            "ts-agents-card",
         ],
         children: [
-            Label {
+            Box {
                 id: None,
-                text: "nixos",
+                dir: Horizontal,
+                spacing: 6,
+                scroll: false,
                 classes: [
-                    "heading",
-                    "dim-label",
-                    "ts-agents-group",
+                    "ts-agents-title",
+                ],
+                children: [
+                    Label {
+                        id: None,
+                        text: "Agents",
+                        classes: [
+                            "heading",
+                        ],
+                        tooltip: None,
+                    },
+                    Spacer,
+                    Label {
+                        id: None,
+                        text: "up · 3",
+                        classes: [
+                            "dim-label",
+                            "numeric",
+                        ],
+                        tooltip: None,
+                    },
                 ],
                 tooltip: None,
             },
-            Box {
-                id: None,
-                dir: Vertical,
-                spacing: 2,
-                scroll: false,
-                classes: [
-                    "ts-agent-row",
-                ],
+            Expander {
+                id: "group:nixos",
+                header: Box {
+                    id: None,
+                    dir: Horizontal,
+                    spacing: 6,
+                    scroll: false,
+                    classes: [
+                        "ts-agents-group",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "nixos",
+                            classes: [
+                                "heading",
+                            ],
+                            tooltip: None,
+                        },
+                        Spacer,
+                        Label {
+                            id: None,
+                            text: "1/1",
+                            classes: [
+                                "dim-label",
+                                "numeric",
+                            ],
+                            tooltip: None,
+                        },
+                    ],
+                    tooltip: None,
+                },
                 children: [
-                    Row {
+                    Box {
                         id: None,
+                        dir: Horizontal,
+                        spacing: 4,
+                        scroll: false,
                         classes: [
-                            "ts-agent-head",
+                            "ts-agent-row",
                         ],
                         children: [
                             Icon {
@@ -46,12 +96,37 @@ View {
                                     "flat",
                                     "ts-agent-name",
                                 ],
-                                child: Label {
+                                child: Text {
                                     id: None,
                                     text: "nixos-choom",
+                                    max_width_chars: Some(
+                                        14,
+                                    ),
+                                    ellipsize: true,
                                     classes: [],
-                                    tooltip: None,
                                 },
+                            },
+                            Icon {
+                                id: None,
+                                name: "media-playback-pause-symbolic",
+                                classes: [
+                                    "ts-agent-state",
+                                    "dim-label",
+                                ],
+                                tooltip: Some(
+                                    "paused",
+                                ),
+                            },
+                            Text {
+                                id: None,
+                                text: "paused",
+                                max_width_chars: Some(
+                                    22,
+                                ),
+                                ellipsize: true,
+                                classes: [
+                                    "dim-label",
+                                ],
                             },
                             Spacer,
                             Icon {
@@ -65,89 +140,87 @@ View {
                                     "config commit pending — a rebuild would change this agent's locked rev",
                                 ),
                             },
-                            Icon {
-                                id: None,
-                                name: "media-playback-pause-symbolic",
-                                classes: [
-                                    "ts-agent-state",
-                                    "dim-label",
-                                ],
-                                tooltip: Some(
-                                    "paused",
-                                ),
-                            },
-                        ],
-                    },
-                    Row {
-                        id: None,
-                        classes: [
-                            "ts-agent-foot",
-                        ],
-                        children: [
-                            Text {
-                                id: None,
-                                text: "paused",
-                                max_width_chars: None,
-                                ellipsize: true,
-                                classes: [
-                                    "dim-label",
-                                ],
-                            },
-                            Spacer,
                             Button {
                                 id: "pause:nixos-choom",
                                 classes: [
                                     "flat",
-                                    "ts-agent-pause",
+                                    "ts-agent-btn",
                                 ],
                                 child: Icon {
                                     id: None,
                                     name: "media-playback-start-symbolic",
                                     classes: [],
-                                    tooltip: None,
+                                    tooltip: Some(
+                                        "resume",
+                                    ),
                                 },
                             },
                             Button {
-                                id: "edit:nixos-choom",
+                                id: "details:nixos-choom",
                                 classes: [
                                     "flat",
-                                    "ts-agent-edit",
+                                    "ts-agent-btn",
                                 ],
                                 child: Icon {
                                     id: None,
-                                    name: "document-edit-symbolic",
+                                    name: "dialog-information-symbolic",
                                     classes: [],
-                                    tooltip: None,
+                                    tooltip: Some(
+                                        "details",
+                                    ),
                                 },
                             },
                         ],
+                        tooltip: Some(
+                            "nixos-choom\npaused",
+                        ),
                     },
                 ],
-                tooltip: None,
-            },
-            Label {
-                id: None,
-                text: "viberoot",
+                expanded: true,
                 classes: [
-                    "heading",
-                    "dim-label",
-                    "ts-agents-group",
+                    "ts-agents-group-row",
                 ],
-                tooltip: None,
             },
-            Box {
-                id: None,
-                dir: Vertical,
-                spacing: 2,
-                scroll: false,
-                classes: [
-                    "ts-agent-row",
-                ],
+            Expander {
+                id: "group:viberoot",
+                header: Box {
+                    id: None,
+                    dir: Horizontal,
+                    spacing: 6,
+                    scroll: false,
+                    classes: [
+                        "ts-agents-group",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "viberoot",
+                            classes: [
+                                "heading",
+                            ],
+                            tooltip: None,
+                        },
+                        Spacer,
+                        Label {
+                            id: None,
+                            text: "1/1",
+                            classes: [
+                                "dim-label",
+                                "numeric",
+                            ],
+                            tooltip: None,
+                        },
+                    ],
+                    tooltip: None,
+                },
                 children: [
-                    Row {
+                    Box {
                         id: None,
+                        dir: Horizontal,
+                        spacing: 4,
+                        scroll: false,
                         classes: [
-                            "ts-agent-head",
+                            "ts-agent-row",
                         ],
                         children: [
                             Icon {
@@ -164,14 +237,16 @@ View {
                                     "flat",
                                     "ts-agent-name",
                                 ],
-                                child: Label {
+                                child: Text {
                                     id: None,
                                     text: "choom",
+                                    max_width_chars: Some(
+                                        14,
+                                    ),
+                                    ellipsize: true,
                                     classes: [],
-                                    tooltip: None,
                                 },
                             },
-                            Spacer,
                             Icon {
                                 id: None,
                                 name: "media-playback-start-symbolic",
@@ -183,18 +258,12 @@ View {
                                     "running",
                                 ),
                             },
-                        ],
-                    },
-                    Row {
-                        id: None,
-                        classes: [
-                            "ts-agent-foot",
-                        ],
-                        children: [
                             Text {
                                 id: None,
                                 text: "reviewing PR #947",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    22,
+                                ),
                                 ellipsize: true,
                                 classes: [
                                     "dim-label",
@@ -205,141 +274,83 @@ View {
                                 id: "pause:trollshell-choom",
                                 classes: [
                                     "flat",
-                                    "ts-agent-pause",
+                                    "ts-agent-btn",
                                 ],
                                 child: Icon {
                                     id: None,
                                     name: "media-playback-pause-symbolic",
                                     classes: [],
-                                    tooltip: None,
+                                    tooltip: Some(
+                                        "pause",
+                                    ),
                                 },
                             },
                             Button {
-                                id: "edit:trollshell-choom",
+                                id: "details:trollshell-choom",
                                 classes: [
                                     "flat",
-                                    "ts-agent-edit",
+                                    "ts-agent-btn",
                                 ],
                                 child: Icon {
                                     id: None,
-                                    name: "document-edit-symbolic",
+                                    name: "dialog-information-symbolic",
                                     classes: [],
-                                    tooltip: None,
+                                    tooltip: Some(
+                                        "details",
+                                    ),
                                 },
                             },
                         ],
+                        tooltip: Some(
+                            "choom (trollshell-choom)\nreviewing PR #947",
+                        ),
                     },
                 ],
-                tooltip: None,
-            },
-            Label {
-                id: None,
-                text: "ungrouped",
+                expanded: true,
                 classes: [
-                    "heading",
-                    "dim-label",
-                    "ts-agents-group",
+                    "ts-agents-group-row",
                 ],
-                tooltip: None,
             },
-            Box {
-                id: None,
-                dir: Vertical,
-                spacing: 2,
-                scroll: false,
+            Expander {
+                id: "group:ungrouped",
+                header: Box {
+                    id: None,
+                    dir: Horizontal,
+                    spacing: 6,
+                    scroll: false,
+                    classes: [
+                        "ts-agents-group",
+                    ],
+                    children: [
+                        Label {
+                            id: None,
+                            text: "ungrouped",
+                            classes: [
+                                "heading",
+                            ],
+                            tooltip: None,
+                        },
+                        Spacer,
+                        Label {
+                            id: None,
+                            text: "0/1",
+                            classes: [
+                                "dim-label",
+                                "numeric",
+                            ],
+                            tooltip: None,
+                        },
+                    ],
+                    tooltip: None,
+                },
+                children: [],
+                expanded: false,
                 classes: [
-                    "ts-agent-row",
+                    "ts-agents-group-row",
                 ],
-                children: [
-                    Row {
-                        id: None,
-                        classes: [
-                            "ts-agent-head",
-                        ],
-                        children: [
-                            Icon {
-                                id: None,
-                                name: "system-run-symbolic",
-                                classes: [
-                                    "ts-agent-runtime",
-                                ],
-                                tooltip: None,
-                            },
-                            Button {
-                                id: "chat:stray",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-name",
-                                ],
-                                child: Label {
-                                    id: None,
-                                    text: "stray",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
-                            Spacer,
-                            Icon {
-                                id: None,
-                                name: "media-playback-stop-symbolic",
-                                classes: [
-                                    "ts-agent-state",
-                                    "dim-label",
-                                ],
-                                tooltip: Some(
-                                    "stopped",
-                                ),
-                            },
-                        ],
-                    },
-                    Row {
-                        id: None,
-                        classes: [
-                            "ts-agent-foot",
-                        ],
-                        children: [
-                            Text {
-                                id: None,
-                                text: "stopped",
-                                max_width_chars: None,
-                                ellipsize: true,
-                                classes: [
-                                    "dim-label",
-                                ],
-                            },
-                            Spacer,
-                            Button {
-                                id: "pause:stray",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-pause",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "media-playback-pause-symbolic",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
-                            Button {
-                                id: "edit:stray",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-edit",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "document-edit-symbolic",
-                                    classes: [],
-                                    tooltip: None,
-                                },
-                            },
-                        ],
-                    },
-                ],
-                tooltip: None,
             },
         ],
+        tooltip: None,
     },
     panel: Some(
         Box {
@@ -361,8 +372,11 @@ View {
                     ],
                     tooltip: None,
                 },
-                Row {
+                Box {
                     id: None,
+                    dir: Horizontal,
+                    spacing: 6,
+                    scroll: false,
                     classes: [
                         "ts-agent-detail",
                     ],
@@ -386,9 +400,13 @@ View {
                             ],
                         },
                     ],
+                    tooltip: None,
                 },
-                Row {
+                Box {
                     id: None,
+                    dir: Horizontal,
+                    spacing: 6,
+                    scroll: false,
                     classes: [
                         "ts-agent-detail",
                     ],
@@ -412,9 +430,13 @@ View {
                             ],
                         },
                     ],
+                    tooltip: None,
                 },
-                Row {
+                Box {
                     id: None,
+                    dir: Horizontal,
+                    spacing: 6,
+                    scroll: false,
                     classes: [
                         "ts-agent-detail",
                     ],
@@ -438,6 +460,7 @@ View {
                             ],
                         },
                     ],
+                    tooltip: None,
                 },
             ],
             tooltip: None,

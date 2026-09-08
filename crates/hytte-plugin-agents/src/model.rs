@@ -280,6 +280,15 @@ impl Hive {
     }
 }
 
+/// Which project groups the operator has explicitly expanded or collapsed,
+/// keyed by [`Group::header`].
+///
+/// Absent means "use the default" — open unless every agent in the group is
+/// stopped (see `view::group_open`). Only an actual click writes an entry, so
+/// a hive that gains a busy agent in a group nobody has touched still opens
+/// it, while a group somebody deliberately collapsed stays collapsed.
+pub type ExpandedGroups = BTreeMap<String, bool>;
+
 /// One group header plus the rows under it (spec §6.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Group<'a> {

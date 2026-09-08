@@ -399,11 +399,30 @@ tested end to end against a fake `host.sock`
 (`crates/hytte-plugin-agents/tests/fake_socket.rs`), which proves the wire and
 the reducer but cannot prove the hive agrees.
 
-- [ ] **(#947 P1)** The rows render legibly. Enable the plugin
+- [ ] **(#947 P1)** The card is framed and the rows are compact. Enable the
+      plugin
       (`programs.trollshell.plugins.agents.package = trollshell.packages.${system}.hytte-plugin-agents;`),
-      open the sidebar, and confirm one two-line card per agent: leading icon ·
-      name · state icon over status text · pause · edit. At Annika's font scale
-      the second line should ellipsize rather than widen the sidebar.
+      open the sidebar, and confirm: a title row reading `Agents` on the left
+      and `up · N` on the right, inset from the card edge like `Tasks` is;
+      **one line per agent** — icon · name · state glyph · status · pause · ⓘ;
+      and the pet card still visible below on a hive the size of yours.
+      Hovering a row must show the agent's **full** status text, the ⓘ must
+      say "details", and the state glyph its state word. **Note:** the padding
+      and the compact buttons are shell-side CSS
+      (`assets/trollshell/style.css`), so they need a shell rebuild —
+      restarting only the plugin picks up the node-tree half and leaves the
+      rows roomy.
+- [ ] **(#947 P1)** Group expanders. With two or more `[display.*].project`
+      values, each group is an expander with a `live/total` count; a group
+      whose agents are **all stopped** starts collapsed. Clicking a header
+      toggles it, and the choice must survive the next poll rather than
+      springing back open.
+- [ ] **(#947 P1)** The card cannot bound its own height — the vocabulary has
+      no scrollable region (`Box { scroll: true }` is a scroll _event target_)
+      and GTK CSS has no `max-height` — so on a hive with more than 20 agents
+      confirm it draws 20 rows and a `+N more` line rather than growing past
+      the sidebar. If you have fewer than 20, this is a read-only check of the
+      code path; the shell-side sidebar scroll bug is tracked separately.
 - [ ] **(#947 P1)** The status line is the harness's own text. Have an agent
       call its `set_status` tool and confirm the row's second line changes to
       that string within one poll (2 s by default) — not "running". A stopped

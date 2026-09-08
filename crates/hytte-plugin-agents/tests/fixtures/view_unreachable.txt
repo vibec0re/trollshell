@@ -1,68 +1,81 @@
 View {
-    tree: ListBox {
+    tree: Box {
         id: Some(
             "agents-root",
         ),
+        dir: Vertical,
+        spacing: 2,
+        scroll: false,
         classes: [
-            "ts-agents-list",
+            "ts-agents-card",
         ],
         children: [
             Box {
                 id: None,
-                dir: Vertical,
-                spacing: 2,
+                dir: Horizontal,
+                spacing: 6,
                 scroll: false,
                 classes: [
-                    "ts-agent-row",
-                    "ts-agents-notice",
+                    "ts-agents-title",
                 ],
                 children: [
-                    Row {
+                    Label {
                         id: None,
+                        text: "Agents",
                         classes: [
-                            "ts-agent-head",
+                            "heading",
                         ],
-                        children: [
-                            Icon {
-                                id: None,
-                                name: "network-offline-symbolic",
-                                classes: [
-                                    "ts-agent-state",
-                                    "dim-label",
-                                ],
-                                tooltip: None,
-                            },
-                            Label {
-                                id: None,
-                                text: "no hive",
-                                classes: [
-                                    "heading",
-                                ],
-                                tooltip: None,
-                            },
-                        ],
+                        tooltip: None,
                     },
-                    Row {
+                    Spacer,
+                    Label {
                         id: None,
+                        text: "no hive",
                         classes: [
-                            "ts-agent-foot",
+                            "dim-label",
+                            "numeric",
                         ],
-                        children: [
-                            Text {
-                                id: None,
-                                text: "permission denied — needs `hive-admin` group (re-login after adding)",
-                                max_width_chars: None,
-                                ellipsize: true,
-                                classes: [
-                                    "dim-label",
-                                ],
-                            },
-                        ],
+                        tooltip: None,
                     },
                 ],
                 tooltip: None,
             },
+            Box {
+                id: None,
+                dir: Horizontal,
+                spacing: 6,
+                scroll: false,
+                classes: [
+                    "ts-agents-notice",
+                ],
+                children: [
+                    Icon {
+                        id: None,
+                        name: "network-offline-symbolic",
+                        classes: [
+                            "ts-agent-state",
+                            "dim-label",
+                        ],
+                        tooltip: None,
+                    },
+                    Text {
+                        id: None,
+                        text: "permission denied — needs `hive-admin` group (re-login after adding)",
+                        max_width_chars: Some(
+                            22,
+                        ),
+                        ellipsize: true,
+                        classes: [
+                            "dim-label",
+                        ],
+                    },
+                ],
+                tooltip: Some(
+                    "permission denied — needs `hive-admin` group (re-login after adding)",
+                ),
+            },
         ],
+        tooltip: None,
     },
     panel: Some(
         Box {
@@ -84,8 +97,11 @@ View {
                     ],
                     tooltip: None,
                 },
-                Row {
+                Box {
                     id: None,
+                    dir: Horizontal,
+                    spacing: 6,
+                    scroll: false,
                     classes: [
                         "ts-agent-detail",
                     ],
@@ -109,9 +125,13 @@ View {
                             ],
                         },
                     ],
+                    tooltip: None,
                 },
-                Row {
+                Box {
                     id: None,
+                    dir: Horizontal,
+                    spacing: 6,
+                    scroll: false,
                     classes: [
                         "ts-agent-detail",
                     ],
@@ -135,9 +155,13 @@ View {
                             ],
                         },
                     ],
+                    tooltip: None,
                 },
-                Row {
+                Box {
                     id: None,
+                    dir: Horizontal,
+                    spacing: 6,
+                    scroll: false,
                     classes: [
                         "ts-agent-detail",
                     ],
@@ -161,6 +185,7 @@ View {
                             ],
                         },
                     ],
+                    tooltip: None,
                 },
             ],
             tooltip: None,

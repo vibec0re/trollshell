@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::config::AgentsConfig;
 use crate::hive::wire::{HiveUrls, Request, Scope};
 use crate::hive::{AgentStatusRow, HiveError};
-use crate::model::{Agent, AgentName, Hive};
+use crate::model::{Agent, AgentName, ExpandedGroups, Hive, Status};
 use crate::poll::{Cmd, Msg, poll_task};
 use crate::view::{self, PanelContext, ids};
 
@@ -58,6 +58,9 @@ pub struct Agents {
     pub now_unix: i64,
     /// When the last poll answered, in the clock's own unix seconds.
     pub last_poll_unix: Option<i64>,
+    /// Which project groups the operator has explicitly opened or collapsed.
+    /// Absent means the default (open unless the group is all-stopped).
+    pub expanded: ExpandedGroups,
     /// The previous poll's alarm flags, per agent — the **edge** detector §8
     /// requires ("a hive with one wedged agent must not toast every 5 s").
     prev_alarms: BTreeMap<String, Alarms>,
@@ -75,11 +78,25 @@ impl Agents {
             cfg: AgentsConfig::default(),
             urls: None,
             selected: None,
+            expanded: ExpandedGroups::new(),
             now_unix: 0,
             last_poll_unix: None,
             prev_alarms: BTreeMap::new(),
             cmd_tx,
         }
+    }
+
+    /// Whether the group headed `project` currently draws expanded — the
+    /// operator's explicit choice if there is one, else the default (open
+    /// unless every agent in it is stopped).
+    fn group_is_open(&self, project: &str) -> bool {
+        if let Some(explicit) = self.expanded.get(project) {
+            return *explicit;
+        }
+        crate::model::group(self.hive.agents(), &self.cfg)
+            .iter()
+            .find(|g| g.header() == project)
+            .is_none_or(|g| g.agents.iter().any(|a| a.status() != Status::Stopped))
     }
 
     /// The panel's non-model inputs.
@@ -262,11 +279,19 @@ impl Agents {
             }
             return Vec::new();
         }
-        if let Some(rest) = node.strip_prefix(ids::EDIT) {
+        if let Some(rest) = node.strip_prefix(ids::DETAILS) {
             // Read-only detail; real editing waits for #952 (spec §6.3).
             if let Some(name) = AgentName::parse(rest) {
                 return self.open_detail(name);
             }
+            return Vec::new();
+        }
+        if let Some(project) = node.strip_prefix(ids::GROUP) {
+            // The expander is plugin-driven: the host never self-toggles, so
+            // the model is the single source of truth for what is open
+            // (`crates/hytte-plugin-proto/src/wire.rs:365-405`).
+            let open = self.group_is_open(project);
+            self.expanded.insert(project.to_owned(), !open);
             return Vec::new();
         }
         if let Some(rest) = node.strip_prefix(ids::START) {
@@ -375,7 +400,7 @@ impl Plugin for Agents {
     }
 
     fn view(&self) -> View {
-        View::new(view::card(&self.hive, &self.cfg)).panel(view::panel(
+        View::new(view::card(&self.hive, &self.cfg, &self.expanded)).panel(view::panel(
             &self.hive,
             &self.cfg,
             self.selected.as_ref(),
@@ -388,5 +413,5 @@ impl Plugin for Agents {
 /// assert on the tree rather than on a screenshot.
 #[must_use]
 pub fn card_of(model: &Agents) -> Node {
-    view::card(&model.hive, &model.cfg)
+    view::card(&model.hive, &model.cfg, &model.expanded)
 }

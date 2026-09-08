@@ -446,10 +446,15 @@ title` in the stderr tail — worth a deliberate look on first run, since
       above in miniature: with a font bumped well up, the open sidebar still
       pushes tiled windows fully clear with no overlap and no dead gap (the open
       width is measured through the scroller unchanged), and the open/close
-      slide is still width-only — no vertical stretch. Finally a kanshi mode
-      switch (#442/#475) with the sidebar **open**: the scroller's viewport cap
-      follows the output's new usable height, so the stack keeps ending at the
-      bottom edge rather than at the old height.
+      slide is still width-only — no vertical stretch. Nothing tracks the
+      output's height on the shell side and nothing needs to: the surface is
+      anchored `Top + Bottom` with `exclusive_zone = 0`, so its allocation
+      already _is_ the work area minus the bar, and the viewport rides it on
+      every output. (An earlier round of this PR carried a
+      `max-content-height` cap plus a `notify::height` subscription for that
+      job; measured, the cap moved only the natural request — which nothing on a
+      both-edges-anchored axis reads — so it was deleted rather than left as a
+      live-verify item that could not fail.)
 
 ## Audio & media
 

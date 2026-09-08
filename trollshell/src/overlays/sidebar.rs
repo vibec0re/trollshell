@@ -69,15 +69,35 @@
 //! widget at least its minimum height, the layer surface's height is the
 //! compositor's to give, and the excess was drawn past the bottom edge with no
 //! way to reach it — a 12-agent hive card hid every card below it (the pet, in
-//! Mara's case). The scroller's own minimum height is its `min-content-height`
-//! (unset here), so the stack's height stops driving the surface's and the
-//! overflow becomes scroll instead.
+//! Mara's case).
 //!
-//! It is spliced **between** the `AdwClamp` and the card, so the revealer's
-//! child — the thing [`open_width`] measures — is the same `AdwClamp` it always
-//! was, and the numbers reaching it through the scroller are the card's own; see
+//! What stops the stack's height from driving the surface's is
+//! `vscrollbar_policy = Automatic`: with it, a scroller wrapping 12 × 60 px of
+//! rows measures `(min 58, nat 720)` vertically, and with `Never` it measures
+//! `(720, 720)` — the bare stack's own numbers. (58 px is GTK's floor for a
+//! scroller whose scrollbar may appear; `min-content-height` is `-1` either way
+//! and is *not* what does this.) That minimum is the whole fix: the toplevel
+//! stops being asked for a height the compositor cannot give, and the excess
+//! becomes scroll.
+//!
+//! The scroller is spliced **between** the `AdwClamp` and the card
+//! ([`build_clamped_scroller`], which `install` and the tests share so the tests
+//! measure the shipped nesting), so the revealer's child — the thing
+//! [`open_width`] measures — is the same `AdwClamp` it always was, and the
+//! numbers reaching it through the scroller are the card's own; see
 //! [`build_scroller`] for why `hscrollbar_policy = Never` is what makes that
-//! true, and [`wire_viewport_cap`] for where the height cap comes from.
+//! true.
+//!
+//! The surface's own allocation is what bounds the viewport, and it follows the
+//! compositor for free: anchored `Top + Bottom` with `exclusive_zone = 0`, the
+//! height we are configured at is already the work area minus the bar, on every
+//! output and across every mode switch. Nothing here needs to compute or track
+//! it. A `max-content-height` cap was tried (#965's first round) and measured
+//! inert on this surface — it moves only the *natural* measure, which nothing on
+//! a both-edges-anchored axis reads: with the toplevel height held at 300, caps
+//! of `-1`, `300` and a nonsensical `100` all produced the same
+//! `scroller_h=300 stack_h=720 vadjustment(upper=720, page=300)`. It was
+//! deleted rather than kept as decoration.
 //!
 //! ## Frame integration
 //!
@@ -307,18 +327,9 @@ pub fn install(monitor: &Monitor) {
     let window = build_sidebar_window(monitor, &key);
     let revealer = build_revealer();
     let card = build_card(monitor);
-    // The card stack scrolls (#965). Spliced *inside* the clamp, so the
-    // revealer's child stays the clamp `open_width` measures.
-    let scroller = build_scroller(&card);
-    // Scaled, like the card's own floor in `build_card`: an unscaled 320 cap
-    // over a card whose `em` padding and children grew with the font would try
-    // to tighten the card below its own minimum every time text-scaling is above
-    // the 1x baseline (#737). At 1x `scale` is a no-op, so this is the same 320.
-    let clamp = adw::Clamp::builder()
-        .maximum_size(scale(SIDEBAR_WIDTH))
-        .tightening_threshold(scale(SIDEBAR_WIDTH))
-        .child(&scroller)
-        .build();
+    // The clamp → scroller → card nesting (#965), built by the same helper the
+    // tests build it with so they measure what ships.
+    let clamp = build_clamped_scroller(&card);
     revealer.set_child(Some(&clamp));
     window.set_child(Some(&revealer));
 
@@ -330,10 +341,6 @@ pub fn install(monitor: &Monitor) {
     // region by default even after the revealer collapses to 0 width,
     // so without this the closed sidebar's region still swallows clicks.
     apply_input_passthrough(&window, false);
-    // Bound the scroller's *natural* height to the surface the compositor
-    // actually gave us, and keep it bound as that surface is reconfigured
-    // (#965). After `set_visible`, so the window has a `GdkSurface` to read.
-    wire_viewport_cap(&window, &scroller);
 
     // Slot holding the currently-armed settle timer so `close_all` can cancel it
     // before tearing the surface down (see field docs on SidebarPanel).
@@ -423,15 +430,47 @@ fn build_revealer() -> gtk::Revealer {
     revealer
 }
 
+/// The revealer's child exactly as [`install`] mounts it: `AdwClamp` →
+/// [`build_scroller`] → card (#965).
+///
+/// Split out of `install` **so the tests can build the shipped nesting**.
+/// `install` needs a live `Monitor` and a layer surface, so no test reaches it —
+/// and while this clamp was assembled inline there, splicing the bare card into
+/// it (the sidebar with no scroller at all, i.e. #965 fully un-fixed) left all
+/// 14 tests in this module green. They pinned the helper's *configuration* and
+/// nothing pinned where the helper was *mounted*. `gtk_tests::scrolled_tree`
+/// now goes through here, and asserts the clamp's child really is the scroller.
+///
+/// Scaled, like the card's own floor in `build_card`: an unscaled 320 cap over a
+/// card whose `em` padding and children grew with the font would try to tighten
+/// the card below its own minimum every time text-scaling is above the 1x
+/// baseline (#737). At 1x `scale` is a no-op, so this is the same 320.
+fn build_clamped_scroller(card: &gtk::Box) -> adw::Clamp {
+    adw::Clamp::builder()
+        .maximum_size(scale(SIDEBAR_WIDTH))
+        .tightening_threshold(scale(SIDEBAR_WIDTH))
+        .child(&build_scroller(card))
+        .build()
+}
+
 /// Vertical viewport for the card stack (#965): the cards scroll inside the
 /// surface instead of overflowing past its bottom edge.
 ///
-/// Mounted between the `AdwClamp` and the card in [`install`], which is what
-/// keeps it invisible to the width machinery — [`open_width`] measures the
-/// revealer's child, and that child is still the same clamp. The reason the
-/// clamp's *numbers* are also unchanged is the policy pair, and it is worth
-/// stating precisely because #737's contract rides on it:
+/// Mounted between the `AdwClamp` and the card ([`build_clamped_scroller`]),
+/// which is what keeps it invisible to the width machinery — [`open_width`]
+/// measures the revealer's child, and that child is still the same clamp. The
+/// reason the clamp's *numbers* are also unchanged is the policy pair, and it is
+/// worth stating precisely because #737's contract rides on it:
 ///
+/// * `vscrollbar_policy = Automatic` is **the fix**, and the only line here
+///   whose mutation is red. It is what decouples the scroller's vertical
+///   *minimum* from its child's: wrapping 12 × 60 px of rows it measures
+///   `(min 58, nat 720)`, and with `Never` it measures `(720, 720)` — the bare
+///   stack's own numbers, i.e. exactly the overflow #965 is about. (58 px is
+///   GTK's floor for a scroller whose scrollbar may appear; `min-content-height`
+///   is `-1` in both cases and has nothing to do with it.) The vertical mirror
+///   of the `Never` below: there we *want* the child's minimum to pass through,
+///   here we want it stopped. `gtk_tests::a_tall_card_scrolls_…` is the guard.
 /// * `hscrollbar_policy = Never` is what makes `GtkScrolledWindow` propagate its
 ///   child's **minimum** width straight through instead of substituting its own
 ///   `min-content-width`. That minimum is the entire horizontal contract of this
@@ -459,11 +498,15 @@ fn build_revealer() -> gtk::Revealer {
 ///   `Never` above is the guard.
 ///
 /// `propagate_natural_height` is the vertical half of the same idea: the
-/// scroller asks for the stack's real height rather than collapsing to
-/// `min-content-height`. It is bounded by [`wire_viewport_cap`] so the request
-/// can never exceed what the compositor can give us. The *minimum* height it
-/// reports is the small one either way — which is the actual fix: a card taller
-/// than the surface stops forcing an allocation the surface doesn't have.
+/// scroller reports the stack's real height as its natural rather than
+/// collapsing to `min-content-height`. Like its horizontal twin it is measured
+/// **inert on this surface** — flipping it to `false` moves no test — and for
+/// the same kind of reason: the height axis here belongs to the compositor (the
+/// toplevel is anchored `Top + Bottom`), so nothing reads the vertical natural.
+/// Kept because it is the truthful answer to "how tall would this like to be",
+/// which stops being unobservable the moment this tree is mounted anywhere that
+/// is not a both-edges-anchored layer surface. What actually fixes #965 is the
+/// *minimum* the first bullet removes, not this.
 fn build_scroller(card: &gtk::Box) -> gtk::ScrolledWindow {
     gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -473,71 +516,6 @@ fn build_scroller(card: &gtk::Box) -> gtk::ScrolledWindow {
         .overlay_scrolling(true)
         .child(card)
         .build()
-}
-
-/// The scroller's `max-content-height` for a surface `surface_height` px tall:
-/// the height itself, or `-1` ("no maximum", `GtkScrolledWindow`'s own spelling)
-/// while the compositor hasn't configured us yet and there is nothing honest to
-/// cap against.
-///
-/// Split out from [`wire_viewport_cap`] so the degenerate input is unit-testable
-/// without a live surface, the way [`open_width_from_natural`] is. The `0` case
-/// is reachable: [`install`] wires this up in the same breath as
-/// `window.set_visible(true)`, which realizes the surface but does not wait for
-/// the compositor's first configure. Passing that `0` through would clamp the
-/// natural height to nothing; `-1` leaves the scroller exactly as it behaves
-/// uncapped, and the first `notify::height` replaces it with the real number.
-fn viewport_cap(surface_height: i32) -> i32 {
-    if surface_height > 0 {
-        surface_height
-    } else {
-        -1
-    }
-}
-
-/// Keep the scroller's natural height bounded by the layer surface's **usable**
-/// height, live (#965).
-///
-/// The usable height is *read*, not reconstructed. This surface is anchored
-/// `Top + Bottom` with `exclusive_zone = 0`, and zero in the layer-shell
-/// protocol means "place me respecting everyone else's exclusive zones" — so the
-/// compositor has already subtracted the bar's reservation before it configures
-/// us, and the surface's own height **is** the monitor's work area minus the bar.
-///
-/// Deliberately not `modal.rs`'s arithmetic. `BarGeometry::available_card_height`
-/// → `clamp_card_height` reconstructs the same quantity as `monitor height − the
-/// bar's offset + measured thickness − the card's chrome`, and it has to: the
-/// drawer's surface is fullscreen with `exclusive_zone(-1)`, so it deliberately
-/// ignores the bar's zone and cannot measure the usable area. Copying that
-/// expression here would be a second, driftable spelling of a number this
-/// surface is already handed. Reusing the *measurement* instead is the same
-/// "read live, not once" rule [`open_width`] follows for the width (#737) and
-/// `frame.rs` follows for the bar's height (#441).
-///
-/// Live via `notify::height` on the `GdkSurface` rather than sampled once, so it
-/// tracks a resolution/mode switch (a kanshi profile change resizes the output
-/// in place, with no hot-plug) even while the sidebar is open — and it needs no
-/// help at all on a real hot-plug, where `close_all` + [`install`] build a fresh
-/// surface and this runs again (#225).
-///
-/// The handler holds a `WeakRef` to the scroller, not a strong clone. The
-/// closure is owned by the `GdkSurface`, so a strong clone would make the
-/// surface an owner of the widget subtree it displays — the exact pin
-/// `bind`'s `WeakRef` contract exists to avoid (#224), applied by hand here
-/// because this is a `connect_*` site rather than a `bind*` one. It also keeps
-/// the teardown order in `close_all` uninteresting: whichever of the surface and
-/// the widgets goes first, the other is not held up by this handler.
-fn wire_viewport_cap(window: &gtk::Window, scroller: &gtk::ScrolledWindow) {
-    let Some(surface) = window.surface() else {
-        return;
-    };
-    scroller.set_max_content_height(viewport_cap(surface.height()));
-    let weak = scroller.downgrade();
-    surface.connect_height_notify(move |surface| {
-        if let Some(scroller) = weak.upgrade() {
-            scroller.set_max_content_height(viewport_cap(surface.height()));
-        }
-    });
 }
 
 /// Card has a fixed `SIDEBAR_WIDTH` so when the revealer is fully expanded
@@ -999,19 +977,6 @@ mod tests {
         // Same situation: no panel installed → nothing animating → settled.
         assert!(is_settled_for_key("nonexistent"));
     }
-
-    /// The degenerate half of [`wire_viewport_cap`] (#965): a surface the
-    /// compositor hasn't configured yet reports height 0, and `0` is a *real*
-    /// cap to `GtkScrolledWindow` — it would clamp the natural height to
-    /// nothing. `-1` is that widget's spelling of "no maximum", which is
-    /// exactly the uncapped behaviour we want until the first configure lands.
-    #[test]
-    fn viewport_cap_is_the_surface_height_but_uncapped_before_the_first_configure() {
-        assert_eq!(viewport_cap(1044), 1044);
-        assert_eq!(viewport_cap(1), 1);
-        assert_eq!(viewport_cap(0), -1);
-        assert_eq!(viewport_cap(-1), -1);
-    }
 }
 
 // ── GTK integration tests (need a display → gated to `system-tests`) ─────────
@@ -1020,7 +985,7 @@ mod tests {
 mod gtk_tests {
     use std::time::Duration;
 
-    use super::{SIDEBAR_WIDTH, build_scroller, open_width, wire_viewport_cap};
+    use super::{SIDEBAR_WIDTH, build_clamped_scroller, open_width};
     use crate::scale::scale;
     use hytte::adw::{self, prelude::*};
     use hytte::gtk;
@@ -1091,7 +1056,12 @@ mod gtk_tests {
         card
     }
 
-    /// The revealer → `AdwClamp` → … tree `install` builds around `child`.
+    /// The **pre-#965** tree: revealer → `AdwClamp` → `child`, with no scroller
+    /// in between. Kept for exactly one job — the unscrolled control in
+    /// [`the_scroller_changes_no_width_measurement`] — so the width the shipped
+    /// tree measures is pinned against what the tree before this change
+    /// measured, rather than only against itself. Everything else goes through
+    /// [`scrolled_tree`].
     fn revealer_over(child: &impl IsA<gtk::Widget>) -> gtk::Revealer {
         let clamp = adw::Clamp::builder()
             .maximum_size(scale(SIDEBAR_WIDTH))
@@ -1104,12 +1074,33 @@ mod gtk_tests {
         revealer
     }
 
-    /// The **shipped** tree: revealer → `AdwClamp` → [`build_scroller`] → card
-    /// (#965). Built through the shell's own `build_scroller` rather than a
-    /// re-spelled copy, so a policy change there is measured by these tests
-    /// instead of drifting away from them.
+    /// The **shipped** tree: revealer → `AdwClamp` → `build_scroller` → card
+    /// (#965), assembled by `install`'s own [`build_clamped_scroller`] rather
+    /// than re-spelled here — so these tests measure both the scroller's
+    /// configuration *and* where it is mounted. While the clamp was assembled
+    /// inline in `install`, splicing the bare card into it (the fix reverted)
+    /// left every test in this module green.
+    ///
+    /// Hands back the scroller too, by asking the clamp for its child: a
+    /// mounting that stops going through the scroller fails right here, at the
+    /// seam, rather than somewhere downstream.
+    fn scrolled_tree(card: &gtk::Box) -> (gtk::Revealer, gtk::ScrolledWindow) {
+        let clamp = build_clamped_scroller(card);
+        let scroller = clamp
+            .child()
+            .and_then(|child| child.downcast::<gtk::ScrolledWindow>().ok())
+            .expect(
+                "install mounts the card stack inside a ScrolledWindow inside the clamp (#965)",
+            );
+        let revealer = gtk::Revealer::new();
+        revealer.set_transition_type(gtk::RevealerTransitionType::SlideRight);
+        revealer.set_child(Some(&clamp));
+        (revealer, scroller)
+    }
+
+    /// [`scrolled_tree`] for the width tests, which only need the revealer.
     fn tree(content_min: i32) -> gtk::Revealer {
-        revealer_over(&build_scroller(&card(content_min, 0)))
+        scrolled_tree(&card(content_min, 0)).0
     }
 
     /// A card whose contents fit inside the baseline reserves exactly the
@@ -1166,8 +1157,7 @@ mod gtk_tests {
         adw::init().expect("libadwaita init");
         let stack = card(0, HIVE_ROWS);
         let last = stack.last_child().expect("the stand-in hive card has rows");
-        let scroller = build_scroller(&stack);
-        let revealer = revealer_over(&scroller);
+        let (revealer, scroller) = scrolled_tree(&stack);
         revealer.set_reveal_child(true);
 
         let window = gtk::Window::new();
@@ -1294,7 +1284,9 @@ mod gtk_tests {
         let wide = scale(SIDEBAR_WIDTH) + 100;
         let mut widths = Vec::new();
         for (content_min, rows) in [(0, 0), (0, HIVE_ROWS), (wide, 0), (wide, HIVE_ROWS)] {
-            let scrolled = revealer_over(&build_scroller(&card(content_min, rows)));
+            let scrolled = scrolled_tree(&card(content_min, rows)).0;
+            // The control stays a hand-built **pre-#965** tree — the clamp over
+            // the bare card — which is the whole point of it.
             let plain = revealer_over(&card(content_min, rows));
             scrolled.set_reveal_child(true);
             plain.set_reveal_child(true);
@@ -1327,8 +1319,7 @@ mod gtk_tests {
     fn a_short_card_still_fills_the_viewport() {
         adw::init().expect("libadwaita init");
         let stack = card(0, 1);
-        let scroller = build_scroller(&stack);
-        let revealer = revealer_over(&scroller);
+        let (revealer, scroller) = scrolled_tree(&stack);
         revealer.set_reveal_child(true);
         let window = gtk::Window::new();
         window.set_child(Some(&revealer));
@@ -1347,63 +1338,6 @@ mod gtk_tests {
             stack_h, viewport_h,
             "a short card must still be allocated the whole viewport, or the sidebar's flex gap \
              stops anchoring the bottom plugin region to the bottom edge"
-        );
-    }
-
-    /// [`wire_viewport_cap`]'s live half (#965): the cap is the surface's own
-    /// height — read from the `GdkSurface`, not reconstructed from the monitor
-    /// and the bar — and it follows that surface as it is reconfigured, which is
-    /// what makes a kanshi mode switch under an open sidebar self-correcting.
-    ///
-    /// A plain `gtk::Window` stands in for the layer surface: the mechanism
-    /// under test is `notify::height` on the `GdkSurface`, which every mapped
-    /// toplevel has. What the *layer* surface adds is only where that number
-    /// comes from — anchored `Top + Bottom` with `exclusive_zone = 0`, the
-    /// compositor has already taken the bar's reservation off it.
-    #[gtk::test]
-    fn the_viewport_cap_tracks_the_surface_height() {
-        adw::init().expect("libadwaita init");
-        let scroller = build_scroller(&card(0, HIVE_ROWS));
-        let window = gtk::Window::new();
-        window.set_child(Some(&revealer_over(&scroller)));
-        window.set_default_size(scale(SIDEBAR_WIDTH), SURFACE_HEIGHT);
-        window.present();
-        pump();
-        wire_viewport_cap(&window, &scroller);
-        let first = window.surface().map_or(0, |s| s.height());
-        let capped = scroller.max_content_height();
-
-        // Resize the surface under the scroller — a mode switch, in miniature.
-        // Driven by growing a minimum the toplevel has to satisfy rather than by
-        // `set_default_size`, which a mapped window ignores (measured: it left
-        // the surface at its old height, and the assertion below then passed
-        // over a resize that never happened).
-        let grown = SURFACE_HEIGHT * 2;
-        scroller.set_size_request(-1, grown);
-        pump_until(2000, || {
-            window.surface().is_some_and(|s| s.height() >= grown)
-        });
-        let second = window.surface().map_or(0, |s| s.height());
-        let recapped = scroller.max_content_height();
-        window.set_child(None::<&gtk::Widget>);
-        window.destroy();
-
-        assert!(first > 0, "test setup: the window must be mapped and sized");
-        assert_eq!(
-            capped, first,
-            "the cap must be the surface's usable height ({first} px), not a number rebuilt from \
-             the monitor size and the bar's thickness"
-        );
-        assert_ne!(
-            second, first,
-            "test setup: the surface must actually have been reconfigured (still {first} px), or \
-             the live half of the cap goes untested"
-        );
-        assert_eq!(
-            recapped, second,
-            "the surface was reconfigured to {second} px and the cap stayed at {recapped} — a \
-             kanshi mode switch under an open sidebar would leave the viewport capped to the \
-             old output's height"
         );
     }
 

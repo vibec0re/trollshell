@@ -145,9 +145,16 @@ pub enum EventKind {
 ///   hover is a child's tooltip like any other, so inside an
 ///   [`Expander`](Node::Expander) header it wins over the header's own legend
 ///   — see the wire vocabulary's tooltip section for why that is left alone.
-/// - **A blank tooltip arms nothing.** Empty *or* whitespace-only, derived or
-///   explicit: [`node_tooltip`] filters, because GTK normalises `""` but not
-///   `"   "` and would pop an empty tooltip window on hover.
+///
+/// A **blank** tooltip — empty *or* whitespace-only, derived or explicit —
+/// arms nothing: [`node_tooltip`] filters, because GTK normalises `""` but not
+/// `"   "` and would pop an empty tooltip window on hover. Since an explicit
+/// value is read *before* the derived one, an explicit blank also **suppresses**
+/// the `Text` default rather than falling back to it, which is the plugin-side
+/// way to keep `ellipsize` and get no hover at all (spelled out for plugin
+/// authors in the wire vocabulary's tooltip section). Not a #961 refinement —
+/// it came out of #971's review — hence its own paragraph rather than a third
+/// bullet above.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node {
     /// A `gtk::Box`. `id` (optional) keys the node for diffing/reordering;

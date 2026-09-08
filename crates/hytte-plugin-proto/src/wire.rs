@@ -186,14 +186,23 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 /// child's tooltip is one nobody typed. It is left as-is deliberately: the
 /// derivation is a **per-node** function with no ancestor context, which is
 /// exactly what lets one accessor serve build and update alike, and suppressing
-/// it would take away the truncated string the reader came for. Two ways out,
-/// both plugin-side: set an explicit `tooltip` on the header `Text` (explicit
-/// always wins, so put the legend there), or don't ellipsize the header.
+/// it would take away the truncated string the reader came for. **Three** ways
+/// out, all plugin-side: set an explicit `tooltip` on the header `Text`
+/// (explicit always wins, so put the legend there); set an explicit **blank**
+/// one (`Some(" ")`) to opt that `Text` out of the derived hover entirely,
+/// keeping `ellipsize`; or don't ellipsize the header.
 ///
 /// A tooltip that is empty or **only whitespace** arms nothing at all — for the
 /// derived string and an explicit one alike. GTK normalises `""` to no tooltip
 /// but not `"   "`, which would pop a blank tooltip window on hover; the host
 /// filters instead, since a blank hover is strictly worse than none.
+///
+/// That is what makes the blank spelling an *escape* and not just a no-op
+/// (#971 second-pass review, LOW-B): a [`Text`](Node::Text)'s explicit tooltip
+/// is read **before** the derived one, so a blank there short-circuits the
+/// default and is then filtered away — the ellipsizing label keeps its `…` and
+/// gets no hover. "Give up `ellipsize`" is therefore not the only way to
+/// silence one.
 ///
 /// ## An ellipsized [`Text`](Node::Text) tooltips itself (#961)
 ///
@@ -518,6 +527,12 @@ pub enum Node {
         /// this is `None`, the label gets no tooltip at all. See the
         /// [tooltip section](Node#tooltips) on this enum for why the host does
         /// not gate the default on *actual* truncation.
+        ///
+        /// **A blank string arms nothing**, here or in the derived default: a
+        /// `text` that is empty or only whitespace produces no hover, and an
+        /// explicit blank set *here* wins over the derived string the way any
+        /// explicit value does — which is how an ellipsizing `Text` opts out of
+        /// the hover without giving up `ellipsize`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tooltip: Option<String>,
     },

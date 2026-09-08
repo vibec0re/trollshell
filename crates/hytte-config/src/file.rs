@@ -36,6 +36,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Directory (relative to `$HOME`) all trollshell config files live under.
 const CONFIG_SUBDIR: &str = ".config/trollshell";
 
+/// Symlink hops [`resolve_dangling_target`] will walk by hand before giving
+/// up and writing through the link itself — bounds a cycle to a bounded
+/// failure instead of an infinite loop.
+const MAX_SYMLINK_HOPS: u32 = 40;
+
 /// Distinguishes the temp files of two writes that overlap in time.
 ///
 /// Combined with the pid it is unique across the machine: two threads of this
@@ -190,7 +195,14 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
 /// symlinked into a dotfiles repo is written *through* rather than replaced by
 /// a regular file (#739). That is also what keeps the temp file on the target's
 /// own filesystem — `rename(2)` is only atomic within one. A target that
-/// doesn't exist yet can't be canonicalised, and needs no resolving.
+/// doesn't exist at all (no file, no symlink) can't be canonicalised, and
+/// needs no resolving. A target that exists **as a symlink whose destination
+/// hasn't been created yet** also can't be canonicalised — `canonicalize`
+/// requires every component including the last to exist — but *does* need
+/// resolving: without it the fallback used to be `path` itself, which
+/// `rename(2)`s a regular file over the link and permanently breaks a "link
+/// first, populate later" dotfiles setup (stow/chezmoi) on its first save
+/// (#986). [`resolve_dangling_target`] walks that chain by hand instead.
 ///
 /// **Permission-safe:** an existing target's mode is carried over at `open`
 /// time, before the body is written, so a hand-tightened `0600` config's
@@ -212,8 +224,10 @@ pub fn write_atomic(path: &Path, body: &str, durability: Durability) -> std::io:
     // follow it rather than replacing the link with a regular file. It also
     // keeps the temp file next to the real file — `rename(2)` is only atomic
     // within one filesystem. A target that doesn't exist yet can't be
-    // canonicalised, and needs no resolving.
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // canonicalised; `resolve_dangling_target` covers both "no file or link at
+    // all" (returns `path` unchanged, same as before) and "a symlink whose
+    // destination doesn't exist yet" (follows the link chain by hand).
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| resolve_dangling_target(path));
     let dir = target
         .parent()
         .ok_or_else(|| std::io::Error::other("config path has no parent directory"))?;
@@ -251,6 +265,39 @@ pub fn write_atomic(path: &Path, body: &str, durability: Durability) -> std::io:
         let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
     }
     Ok(())
+}
+
+/// Where a **dangling** symlink at `path` should actually be written.
+///
+/// Called only after `canonicalize(path)` has already failed. If nothing
+/// exists at `path` at all — not even a symlink — `read_link` fails
+/// immediately and this returns `path` unchanged, exactly the fallback
+/// `write_atomic` used before #986. If `path` is a symlink, this follows
+/// `read_link`'s chain by hand — resolving a relative destination against
+/// its own link's parent directory, the way any other relative symlink
+/// resolves — until it reaches a path that isn't itself a symlink. For a
+/// dangling link that endpoint is the never-yet-created target: the same
+/// place a working chain would have canonicalized to, had the target
+/// existed.
+///
+/// Bounded to [`MAX_SYMLINK_HOPS`] so a symlink cycle can't loop forever; a
+/// chain that long falls back to writing through `path` itself, same as an
+/// unresolvable target always has.
+fn resolve_dangling_target(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let Ok(link_target) = std::fs::read_link(&current) else {
+            return current;
+        };
+        current = if link_target.is_absolute() {
+            link_target
+        } else if let Some(parent) = current.parent() {
+            parent.join(&link_target)
+        } else {
+            link_target
+        };
+    }
+    path.to_path_buf()
 }
 
 /// Fill the freshly-opened temp file: fix up its mode, write the body, `fsync`.
@@ -484,6 +531,32 @@ mod tests {
         assert!(
             std::fs::symlink_metadata(&link).unwrap().is_symlink(),
             "the symlink must survive the write"
+        );
+        assert_eq!(std::fs::read_to_string(&realfile).unwrap(), "new\n");
+        assert_eq!(entries(&real), vec!["places.toml".to_string()]);
+    }
+
+    /// A "link first, populate later" dotfiles setup (stow/chezmoi): the link
+    /// exists but its destination hasn't been created yet, so
+    /// `canonicalize` fails on it (ENOENT on the final component). The write
+    /// must still land through the link — not replace it with a regular file
+    /// (#986). The non-dangling sibling is
+    /// [`writes_through_a_symlinked_target`], where the real file already
+    /// exists.
+    #[test]
+    fn writes_through_a_dangling_symlinked_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let realfile = real.join("places.toml");
+        let link = dir.path().join("places.toml");
+        std::os::unix::fs::symlink(&realfile, &link).unwrap();
+
+        assert!(write_path("test", &link, "new\n"));
+
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "the symlink must survive the write, not be replaced by a regular file"
         );
         assert_eq!(std::fs::read_to_string(&realfile).unwrap(), "new\n");
         assert_eq!(entries(&real), vec!["places.toml".to_string()]);

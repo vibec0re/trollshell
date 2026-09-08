@@ -341,7 +341,7 @@ fn reconcile_region(
     let mut prev: Option<gtk::Widget> = None;
     for render in renders {
         let preem_scope = Scope::card(&render.plugin_id);
-        let ui_tree = to_ui_node(&preem_scope, &render.tree);
+        let ui_tree = to_ui_node(&preem_scope, render.grants, &render.tree);
         if let Some(idx) = cards.iter().position(|c| c.plugin_id == render.plugin_id) {
             let card = &mut cards[idx];
             // Swap in the live connection's outbound, then re-render its tree.
@@ -687,6 +687,7 @@ fn render_active_panel(
         forget_previous_panel_scope(shown_scope, Some(&scope));
         reconciler.render(&to_ui_node(
             &scope,
+            render.grants,
             render.panel.as_ref().expect("filtered Some"),
         ));
     } else {
@@ -915,6 +916,8 @@ pub(super) fn clear_region_if_owned(
 /// whole binary suite still green.
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
+    use crate::plugins::shader_map::Grants;
+
     use super::{
         Animator, MountedCard, Scope, SlotRender, build_panel_child, build_region,
         drive_panel_child, forget_previous_panel_scope, preem_render, reconcile_region,
@@ -1005,6 +1008,7 @@ mod gtk_tests {
             generation: 1,
             tree: preem_tree("chip"),
             panel: Some(preem_tree("panel")),
+            grants: Grants::none(),
             outbound: tx.clone(),
         }
     }

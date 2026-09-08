@@ -519,6 +519,11 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // The manifest's granted capability set (#436), consulted per render frame in
     // the reader to drop effects the plugin never declared a cap for.
     let capabilities = manifest.capabilities.clone();
+    // The same manifest, read for the caps that gate a *node* rather than an
+    // effect (#893's `Capability::Shader`). Resolved once here and stamped on
+    // every `SlotRender` this connection parks, so the mapping pass on the GTK
+    // thread applies exactly what `enforce_capabilities` applies on this one.
+    let grants = super::shader_map::Grants::from_manifest(&manifest);
     // Unique per-connection token stamped on every card this connection parks,
     // so teardown can distinguish "still my card in the region" from "a successor
     // connection already replaced it" (#278).
@@ -742,6 +747,7 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                             generation,
                             tree,
                             panel,
+                            grants,
                             outbound: out_tx.clone(),
                         },
                         kept,

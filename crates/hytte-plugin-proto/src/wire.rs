@@ -566,7 +566,257 @@ pub enum Node {
         classes: Vec<Cls>,
         widget: Box<PreemWidget>,
     },
+    /// A **plugin-supplied fragment shader** over a **plugin-supplied data
+    /// buffer**, drawn by the shell on the GPU (#893).
+    ///
+    /// This is the vocabulary's one open-ended widget. Every other variant names
+    /// a thing the host knows how to draw; this one carries the drawing *code*.
+    /// The plugin writes a fragment shader body and a data grid; the shell
+    /// compiles the body **once**, keeps the linked program, and per frame
+    /// re-uploads only [`data`](Node::Shader::data) and the uniforms. That
+    /// asymmetry is the whole design: a shader widget's steady-state cost is its
+    /// data buffer, not its source.
+    ///
+    /// # The interface contract (versioned — see [`SHADER_VOCAB`])
+    ///
+    /// **The plugin writes the fragment body only.** No `#version`, no
+    /// `precision` declarations, no `in`/`out` declarations — the shell prepends
+    /// its own header (`#version 320 es` plus the `highp` precision defaults —
+    /// the same one its tree-owned shaders compile with) and a **preamble**
+    /// declaring the interface below. A body that re-declares any of these is a
+    /// duplicate-declaration compile error, which surfaces as the broken-widget
+    /// placeholder.
+    ///
+    /// Guaranteed inputs, all `uniform` unless stated:
+    ///
+    /// | name | type | meaning |
+    /// |---|---|---|
+    /// | `v_uv` | `in vec2` | `0..1` across the drawn rect, origin bottom-left |
+    /// | `u_time` | `float` | seconds since this surface's first frame |
+    /// | `u_resolution` | `vec2` | the drawn rect, in framebuffer pixels |
+    /// | `u_scale` | `float` | the node's integer [`scale`](Node::Shader::scale) hint |
+    /// | `u_data` | `sampler2D` | the data buffer, **nearest**-filtered, clamped |
+    /// | `u_data_size` | `vec2` | `(data_width, data_height)`, in texels |
+    /// | `u_bg` | `vec4` | the skin's screen field |
+    /// | `u_fg` | `vec4` | the skin's lit ink, accent-tinted as the kit tints it |
+    /// | `u_accent` | `vec4` | the desktop accent, or `u_fg` where none is installed |
+    /// | `u_success`, `u_warning`, `u_error` | `vec4` | the status roles, admitted to be legible on the skin's ground |
+    ///
+    /// The single output is `out vec4 fragColor`, declared by the preamble and
+    /// **not** by the body. Colours are non-premultiplied straight alpha in
+    /// `0..1`, and the surface composites over what is behind it — an `a` of `0`
+    /// is a transparent pixel, not a black one.
+    ///
+    /// Which channel a texel lands in depends on
+    /// [`format`](Node::Shader::format) — see [`ShaderData`].
+    ///
+    /// # When it repaints
+    ///
+    /// **On state change, and only on state change.** The surface runs no frame
+    /// clock of its own: `u_time` is sampled when a render happens, and a render
+    /// happens when the plugin sends a frame whose `Shader` node differs from
+    /// the one on screen (new `data`, new `fragment`, new size). So a shader
+    /// animates at the rate its plugin pushes data, and a plugin that stops
+    /// pushing leaves the last frame up rather than burning a GPU at 60 Hz for
+    /// ever. A plugin that wants motion sends data on a timer.
+    ///
+    /// # Sizing
+    ///
+    /// [`width`](Node::Shader::width) / [`height`](Node::Shader::height) are the
+    /// widget's logical size in pixels and [`scale`](Node::Shader::scale) is the
+    /// same integer upscale hint [`Pixels`](Node::Pixels) carries, with the same
+    /// defaults (`0` and an absent key both mean `1`) and the same host-side
+    /// clamp on an absurd scaled dimension. They are **not** the data grid:
+    /// `data_width` × `data_height` size the texture independently, so a
+    /// 16-texel spectrum can paint a 288×96 chip.
+    ///
+    /// # What the host enforces, and what it does not
+    ///
+    /// Settled on #893 and written down in
+    /// `docs/superpowers/specs/2026-09-06-preem-gl-renderer-design.md`'s
+    /// "Trust boundary for #893 — route 0": **the plugin socket is the
+    /// boundary**. It is `0600` in a `0700` directory under `$XDG_RUNTIME_DIR`
+    /// (see [`topology`](crate::topology)), so whoever can reach it already runs
+    /// as the user, and a shader is exactly as trusted as the native code that
+    /// plugin already runs.
+    ///
+    /// - **Enforced.** [`Capability::Shader`](crate::manifest::Capability::Shader)
+    ///   must be in the manifest — an ordinary auto-granted capability, like the
+    ///   rest — or the node renders the broken-widget placeholder with one
+    ///   warning. [`MAX_SHADER_SOURCE_BYTES`] on the source and
+    ///   [`MAX_SHADER_DATA_BYTES`] on the buffer, both refused to the same
+    ///   placeholder, because they cost nothing. `data.len()` must equal
+    ///   `data_width * data_height * format.bytes_per_texel()` — the invariant
+    ///   [`Pixels`](Node::Pixels) already carries. A compile or link error draws
+    ///   nothing and logs the driver's info log once.
+    /// - **Not enforced, deliberately.** No source validator: naga cannot parse
+    ///   GLSL ES at all (`#version 300/310/320 es` each fail `InvalidVersion` +
+    ///   `InvalidProfile("es")`, measured twice independently), so route 1's
+    ///   IR-expression and unbounded-loop caps had no enforcer and were dropped
+    ///   rather than pretended. No provenance check on the socket peer — it
+    ///   would only re-derive what the file mode already guarantees.
+    /// - **Blast radius, plainly: the whole shell.** GTK requests no robust
+    ///   context and there is one GL share group per display, so a shader that
+    ///   hangs or resets the GPU takes every GL surface in the process with it,
+    ///   and the realistic worst case is a shell restart. The upgrade path, if a
+    ///   plugin is ever *not* trusted, is an out-of-process shader host
+    ///   ("route 3") — named in the spec, not built.
+    ///
+    /// # Negotiated, like [`Preem`](Node::Preem)
+    ///
+    /// A plugin must not emit this on sight. It emits it only once the host has
+    /// advertised [`SHADER_VOCAB`] or better in
+    /// [`HostMsg::Hello`](crate::msg::HostMsg::Hello); an older host never
+    /// advertises, so it can never receive a variant it cannot decode. There is
+    /// no CPU form to degrade *to* — the widget is GPU-only by design (Annika,
+    /// #893: "EGL should be available for all targets") — so a plugin whose host
+    /// does not speak it renders something else, or nothing.
+    ///
+    /// One honest limit: declaring
+    /// [`Capability::Shader`](crate::manifest::Capability::Shader) is **not**
+    /// negotiated, because the manifest goes out before the host has said
+    /// anything. A pre-#893 host cannot decode that variant and drops the
+    /// connection. That is true of every capability ever appended, and a plugin
+    /// built around a shader widget was never going to work on such a host.
+    Shader {
+        /// Optional reconciliation key (see [`NodeId`]). Recommended: without
+        /// one the reconciler matches positionally, and a shader that changes
+        /// place among its siblings rebuilds — which throws away the compiled
+        /// program and restarts `u_time`.
+        id: Option<NodeId>,
+        /// The widget's logical width in pixels, before `scale`.
+        width: u32,
+        /// The widget's logical height in pixels, before `scale`.
+        height: u32,
+        /// Integer upscale hint, exactly [`Pixels`](Node::Pixels)'s: the natural
+        /// size is `width*scale` × `height*scale`. Defaulted, so a frame
+        /// omitting the key is 1×; `0` is treated as `1`.
+        #[serde(default = "pixels_scale_default")]
+        scale: u32,
+        /// The fragment shader **body** — no `#version`, no interface
+        /// declarations (see the variant docs). At most
+        /// [`MAX_SHADER_SOURCE_BYTES`] bytes.
+        fragment: String,
+        /// The data buffer: `data_width * data_height * format.bytes_per_texel()`
+        /// bytes, row-major from row 0. Rides the wire as one `MessagePack`
+        /// `bin` blob (`serde_bytes`), like [`Pixels`](Node::Pixels)'s. At most
+        /// [`MAX_SHADER_DATA_BYTES`] bytes.
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        /// How to read [`data`](Node::Shader::data).
+        format: ShaderData,
+        /// The data grid's width, in texels.
+        data_width: u32,
+        /// The data grid's height, in texels. `1` for a 1-D buffer.
+        data_height: u32,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
+        classes: Vec<Cls>,
+        /// Hover text — see the [tooltip section](Node#tooltips) on this enum.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tooltip: Option<String>,
+    },
 }
+
+/// How the host reads a [`Node::Shader`]'s data buffer into the `u_data`
+/// texture.
+///
+/// Three formats, chosen because they are the three shapes a plugin's data
+/// actually has: a byte per cell, a colour per cell, and a float per cell.
+/// All three are sampled with **nearest** filtering and `CLAMP_TO_EDGE` — a
+/// data grid is data, and an interpolated read of it is a wrong answer rather
+/// than a smoother one.
+///
+/// Appending a variant here ⇒ **bump [`VOCAB`](crate::VOCAB)** (#437), like any
+/// other wire enum a plugin can put on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ShaderData {
+    /// One unsigned byte per texel, sampled as `texture(u_data, uv).r` in
+    /// `0.0..=1.0` (`GL_R8`). `g`/`b` read `0.0` and `a` reads `1.0`.
+    R8,
+    /// Four unsigned bytes per texel in `[R, G, B, A]` order, straight (not
+    /// premultiplied) alpha, each sampled in `0.0..=1.0` (`GL_RGBA8`).
+    Rgba8,
+    /// One little-endian IEEE-754 `f32` per texel — four bytes — sampled
+    /// verbatim in `.r`, unclamped (`GL_R32F`). The format for a signal that is
+    /// not a colour: a spectrum, a waveform, a temperature.
+    ///
+    /// **Little-endian on the wire**, stated rather than assumed: the host
+    /// decodes with `f32::from_le_bytes` and uploads native floats, so the
+    /// buffer means the same thing whatever the plugin was built on.
+    R32f,
+}
+
+impl ShaderData {
+    /// How many bytes one texel of this format occupies in
+    /// [`Node::Shader::data`].
+    #[must_use]
+    pub const fn bytes_per_texel(self) -> usize {
+        match self {
+            Self::R8 => 1,
+            Self::Rgba8 | Self::R32f => 4,
+        }
+    }
+
+    /// Whether `data_len` is exactly `width * height * bytes_per_texel` —
+    /// computed in `u64` so the product cannot overflow.
+    ///
+    /// The [`Node::Shader`] analogue of the `len == w * h * 4` invariant
+    /// [`Pixels`](Node::Pixels) carries, and enforced in the same place: the
+    /// host, which is the trust boundary and the layer with `tracing`. A
+    /// mismatch renders the broken-widget placeholder rather than handing GL a
+    /// buffer shorter than the region it is told to read.
+    ///
+    /// `(0, 0, 0)` is consistent — a legitimately empty grid, which the host
+    /// still refuses to *draw* (there is nothing to sample) but which is not a
+    /// malformed frame.
+    #[must_use]
+    pub fn data_len_ok(self, width: u32, height: u32, data_len: usize) -> bool {
+        let expected = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|n| u64::try_from(self.bytes_per_texel()).ok().and_then(|per| n.checked_mul(per)));
+        expected == u64::try_from(data_len).ok()
+    }
+}
+
+/// The [`VOCAB`](crate::VOCAB) generation that carries the shader widget
+/// ([`Node::Shader`], [`ShaderData`],
+/// [`Capability::Shader`](crate::manifest::Capability::Shader)) — #893.
+///
+/// **Negotiated**, exactly like [`PREEM_VOCAB`](crate::preem::PREEM_VOCAB): a
+/// plugin emits [`Node::Shader`] only once
+/// [`Manifest::negotiated_vocab`](crate::manifest::Manifest::negotiated_vocab)
+/// has reached this number, so an old host — which advertises nothing in
+/// [`HostMsg::Hello`](crate::msg::HostMsg::Hello) — can never receive a variant
+/// it cannot decode. That is why generation 3 bumps
+/// [`VOCAB`](crate::VOCAB) (the census) and leaves
+/// [`VOCAB_UNCONDITIONAL`](crate::VOCAB_UNCONDITIONAL) alone; see that const
+/// for the rule.
+pub const SHADER_VOCAB: u16 = 3;
+
+/// The largest [`Node::Shader::fragment`] the host will hand a driver, in bytes.
+///
+/// **Hygiene, not security.** It is kept because it costs nothing and catches
+/// the obvious mistake (a plugin accidentally shipping a megabyte of generated
+/// GLSL); it is not a trust boundary, because the socket already is one — see
+/// the [`Node::Shader`] docs. 16 KiB is the number the design spec named, and
+/// it is roughly 400 lines of shader: two orders of magnitude above anything a
+/// widget needs and far below anything that stalls a compile.
+///
+/// Enforced on **both** sides: the `hytte-plugin` SDK's builder refuses to
+/// construct an over-cap node, and the host refuses to draw one (broken-widget
+/// placeholder plus one warning), because an SDK-built plugin is not the only
+/// thing that can dial the socket.
+pub const MAX_SHADER_SOURCE_BYTES: usize = 16 * 1024;
+
+/// The largest [`Node::Shader::data`] buffer the host will upload, in bytes.
+///
+/// 4 MiB — a 1024×1024 `Rgba8` grid, or a million floats — is far past any
+/// widget-sized data set and comfortably inside
+/// [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN)'s 16 MiB, so the frame limit is not
+/// silently doing this cap's job. Same posture as
+/// [`MAX_SHADER_SOURCE_BYTES`]: hygiene, enforced on both sides, degrading to
+/// the placeholder rather than dropping the connection.
+pub const MAX_SHADER_DATA_BYTES: usize = 4 * 1024 * 1024;
 
 // ── tree-shape caps (#901) ───────────────────────────────────────────────────
 //
@@ -991,10 +1241,16 @@ impl Node {
             // No float and no children — stated rather than defaulted, so a
             // float added to one of these later fails to compile here instead
             // of going unsanitised.
+            // `Shader` sits here for the same reason `Pixels` does: it carries
+            // no float. Its `fragment`/`data` limits are *size* checks and they
+            // are the host's (`trollshell/src/plugins/shader_map.rs`), on the
+            // same reasoning `Pixels`'s `len == w*h*4` check is host-side — the
+            // host is the trust boundary and the layer with `tracing`.
             Self::Label { .. }
             | Self::Text { .. }
             | Self::Icon { .. }
             | Self::Pixels { .. }
+            | Self::Shader { .. }
             | Self::Separator { .. }
             | Self::Spacer
             | Self::Entry { .. } => {}

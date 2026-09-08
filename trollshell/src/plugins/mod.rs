@@ -157,6 +157,7 @@ mod preem_render;
 mod pump;
 mod region;
 mod session;
+mod shader_map;
 mod wire_map;
 
 use datasource::DatasourceRouter;
@@ -356,6 +357,16 @@ struct SlotRender {
     /// A `SlotRender` parked in the dedicated `panels` mailbox always carries
     /// `Some`.
     panel: Option<wire::Node>,
+    /// What the producing connection's manifest asked for, as far as the
+    /// *mapping pass* is concerned (#893: whether it may render a
+    /// [`wire::Node::Shader`]).
+    ///
+    /// Carried on the render rather than looked up on the GTK side, because the
+    /// manifest lives on the tokio connection task and the mapping runs on the
+    /// GTK thread. Stamped once per frame from the same manifest
+    /// `enforce_capabilities` reads, so a node capability and an effect
+    /// capability cannot disagree about what a plugin declared.
+    grants: shader_map::Grants,
     outbound: mpsc::Sender<HostMsg>,
 }
 

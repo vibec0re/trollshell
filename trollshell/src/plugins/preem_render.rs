@@ -405,8 +405,14 @@ static UNSUPPORTED_WARNED: AtomicBool = AtomicBool::new(false);
 ///
 /// Process-global, so a test reads a **delta** around the operation under test
 /// (every preem test already serialises on the ink lock).
+/// One slot per [`Warned`] variant, in [`Warned::slot`] order. The length is
+/// the variant count, so a variant added without a counter is an
+/// index-out-of-bounds panic in the test that reads it rather than a silently
+/// aliased number.
 #[cfg(test)]
-static WARN_COUNTS: [std::sync::atomic::AtomicU32; 5] = [
+static WARN_COUNTS: [std::sync::atomic::AtomicU32; 7] = [
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
     std::sync::atomic::AtomicU32::new(0),
     std::sync::atomic::AtomicU32::new(0),
     std::sync::atomic::AtomicU32::new(0),
@@ -779,6 +785,25 @@ pub(super) enum Warned {
     /// both too big and too deep gets told both things once each. Raised by
     /// `wire_map`.
     DepthCap,
+    /// A tree carried a [`wire::Node::Shader`](hytte_plugin_proto::wire::Node::Shader)
+    /// from a plugin whose manifest does not declare
+    /// [`Capability::Shader`](hytte_plugin_proto::Capability::Shader) (#893);
+    /// the node renders the broken-widget placeholder and the rest of the tree
+    /// renders normally. Raised by
+    /// [`shader_map`](super::shader_map) — the third [`Warned`] this module does
+    /// not emit itself.
+    ShaderDenied,
+    /// A [`wire::Node::Shader`](hytte_plugin_proto::wire::Node::Shader) was out
+    /// of shape (#893): over the source or data size cap, a buffer whose length
+    /// does not match its grid, or a zero-sided surface. Also the placeholder.
+    ///
+    /// One slot for all four, unlike the `NodeCap`/`DepthCap` split above,
+    /// because they are the *same* mistake from the plugin author's side — "the
+    /// node I sent is malformed" — and the journal line names which. Its own
+    /// slot apart from [`ShaderDenied`](Warned::ShaderDenied) because *that* one
+    /// is a manifest fix and this one is a code fix. Raised by
+    /// [`shader_map`](super::shader_map).
+    ShaderCap,
 }
 
 impl Warned {
@@ -795,6 +820,8 @@ impl Warned {
             Self::InstanceCap => 2,
             Self::NodeCap => 3,
             Self::DepthCap => 4,
+            Self::ShaderDenied => 5,
+            Self::ShaderCap => 6,
         }
     }
 
@@ -1717,6 +1744,18 @@ fn config_eq(a: &vocab::PreemWidget, b: &vocab::PreemWidget) -> bool {
 ///
 /// [`vocab::StyleRef::accent`] and [`vocab::StyleRef::ink`] are the *other* half
 /// of a style reference and resolve through [`ink_for`].
+/// The skin a node that names none gets — [`display_style`] on a default
+/// [`vocab::StyleRef`].
+///
+/// #893's shader widget is the caller: a `Node::Shader` carries no style
+/// reference (giving it one is #885's follow-up, not this issue's), and the
+/// theme uniforms it publishes have to come from *some* skin. Routed through
+/// `display_style` rather than naming `DisplayStyle::ALL[0]` directly so the two
+/// answers cannot drift.
+pub(super) fn default_display_style() -> kit::DisplayStyle {
+    display_style(vocab::StyleRef::default())
+}
+
 fn display_style(style: vocab::StyleRef) -> kit::DisplayStyle {
     let name = style.style.name();
     kit::DisplayStyle::ALL
@@ -1774,7 +1813,7 @@ thread_local! {
 
 /// The role colors for this render, resolving them from the theme on first use
 /// since the last invalidation.
-fn role_inks() -> RoleInks {
+pub(super) fn role_inks() -> RoleInks {
     ROLE_INKS.with_borrow_mut(|memo| *memo.get_or_insert_with(resolve_role_inks))
 }
 

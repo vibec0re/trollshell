@@ -32,6 +32,7 @@ use hytte_plugin_proto::{HostMsg, preem as vocab, wire};
 use tokio::sync::mpsc;
 
 use crate::plugins::datasource::DatasourceRouter;
+use crate::plugins::shader_map::Grants;
 use crate::plugins::wire_map::to_ui_node;
 
 use super::*;
@@ -96,6 +97,7 @@ fn slot(plugin_id: &str, tree: wire::Node, tx: &mpsc::Sender<HostMsg>) -> SlotRe
         generation: 1,
         tree,
         panel: None,
+        grants: Grants::none(),
         outbound: tx.clone(),
     }
 }
@@ -156,9 +158,9 @@ fn an_animating_plugin_does_not_wake_a_static_bar_left_subscriber() {
     // is what actually registers `mover`'s preem instance in
     // `preem_render`'s scope table, not just the mailbox bookkeeping below.
     let resident_scope = Scope::card("t906-resident");
-    let _ = to_ui_node(&resident_scope, &static_node("chip"));
+    let _ = to_ui_node(&resident_scope, Grants::none(), &static_node("chip"));
     let mover_scope = Scope::card("t906-mover");
-    let _ = to_ui_node(&mover_scope, &marquee_node("chip"));
+    let _ = to_ui_node(&mover_scope, Grants::none(), &marquee_node("chip"));
 
     let bar_left: Mutable<Vec<SlotRender>> =
         Mutable::new(vec![slot("t906-resident", static_node("chip"), &tx)]);
@@ -262,8 +264,8 @@ fn a_departing_plugin_releases_both_its_scopes_with_no_region_alive() {
 
     // The renderer instances a real chip mount and a real drawer child would
     // have built, mapped the same way they map them.
-    let _ = to_ui_node(&card, &marquee_node("chip"));
-    let _ = to_ui_node(&panel, &marquee_node("panel"));
+    let _ = to_ui_node(&card, Grants::none(), &marquee_node("chip"));
+    let _ = to_ui_node(&panel, Grants::none(), &marquee_node("panel"));
     assert_eq!(preem_render::instance_count(&card), 1);
     assert_eq!(preem_render::instance_count(&panel), 1);
 

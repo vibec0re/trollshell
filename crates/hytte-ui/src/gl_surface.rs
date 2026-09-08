@@ -123,7 +123,7 @@ const SAMPLER_NAMES: [&str; 4] = ["u_tex0", "u_tex1", "u_tex2", "u_tex3"];
 /// ±1024 coordinate, reaching ~10⁶. Without `precision highp int` the mask
 /// arithmetic is free to wrap on a conforming driver, silently, on exactly the
 /// integer recurrences the bit-exactness argument rests on.
-const GLSL_HEADER: &str =
+pub(crate) const GLSL_HEADER: &str =
     "#version 320 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;";
 
 // ── the pipeline vocabulary ─────────────────────────────────────────────────
@@ -417,7 +417,7 @@ fn fresh_last_drawn(step_seq: u64) -> u64 {
 ///
 /// Returns `(x, y, w, h)` in framebuffer pixels; a degenerate input yields a
 /// zero rect, which draws nothing.
-fn fit_rect(alloc_w: i32, alloc_h: i32, buf_w: u32, buf_h: u32) -> (i32, i32, u32, u32) {
+pub(crate) fn fit_rect(alloc_w: i32, alloc_h: i32, buf_w: u32, buf_h: u32) -> (i32, i32, u32, u32) {
     let (aw, ah) = (i64::from(alloc_w), i64::from(alloc_h));
     let (bw, bh) = (i64::from(buf_w), i64::from(buf_h));
     if aw <= 0 || ah <= 0 || bw <= 0 || bh <= 0 {

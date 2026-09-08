@@ -7,8 +7,9 @@ use hytte_plugin_proto::{
     DEFAULT_SLIDER_STEP_FRACTION, DatasourceError, DatasourceOutcome, Dir, Effect, EffectOutcome,
     EventKind, HostMsg, LedStripConfig, LedStripState, LogLevel, MAX_FRAME_LEN, Manifest,
     MediaAction, Mount, NiriAction, Node, PROTO_VERSION, Page, PluginMsg, PreemWidget, ProtoError,
-    ProvidedDatasource, SliderFloats, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode,
-    decode_body, encode, encode_body, sane_fraction, sane_slider_floats,
+    MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, ProvidedDatasource, SHADER_VOCAB, ShaderData,
+    SliderFloats, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode,
+    encode_body, sane_fraction, sane_slider_floats,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -1805,6 +1806,7 @@ fn assert_node_floats_are_sane(node: &Node) {
         | Node::Separator { .. }
         | Node::Spacer
         | Node::Entry { .. }
+        | Node::Shader { .. }
         | Node::Preem { .. } => {}
     }
 }
@@ -1843,6 +1845,7 @@ fn node_float_bits(node: &Node) -> Vec<u64> {
         | Node::Separator { .. }
         | Node::Spacer
         | Node::Entry { .. }
+        | Node::Shader { .. }
         | Node::Preem { .. } => Vec::new(),
     }
 }
@@ -2310,4 +2313,217 @@ fn run_command_detached_round_trips_and_is_name_tagged() {
             output: Some("launched unit trollshell-launch-caw-11.service".into()),
         },
     });
+}
+
+// ── #893: the shader widget ──────────────────────────────────────────────────
+
+/// A `Shader` node round-trips through the wire with every field intact, in
+/// both of the shapes that differ on it: a tooltipped `R32f` strip at `scale: 2`
+/// and a bare `Rgba8` texel at `scale: 1`.
+///
+/// The `data` blob is what this really pins. It rides as one `MessagePack`
+/// `bin` (`serde_bytes`), not a per-byte integer array — the same encoding
+/// `Pixels` uses, and the reason a megabyte of data costs a megabyte on the
+/// wire rather than three.
+///
+/// **Falsified** by dropping `#[serde(with = "serde_bytes")]` from `data`: the
+/// `bin` marker assertion goes red (and the frame roughly triples).
+#[test]
+fn shader_nodes_round_trip_with_their_data_as_one_bin_blob() {
+    let strip = Node::Shader {
+        id: Some("spectrum".into()),
+        width: 144,
+        height: 48,
+        scale: 2,
+        fragment: "void main() { fragColor = vec4(texture(u_data, v_uv).r); }\n".into(),
+        data: 0.25f32
+            .to_le_bytes()
+            .into_iter()
+            .chain((-0.5f32).to_le_bytes())
+            .collect(),
+        format: ShaderData::R32f,
+        data_width: 2,
+        data_height: 1,
+        classes: vec!["ts-shader".into()],
+        tooltip: Some("audio spectrum".into()),
+    };
+    let body = encode_body(&strip);
+    assert!(contains(&body, b"Shader"), "externally tagged by name");
+    assert!(contains(&body, b"R32f"), "the format rides by variant name");
+    // `bin 8` (0xc4) with an 8-byte payload: the blob is one binary field, not
+    // an array of eight integers.
+    assert!(
+        body.windows(2).any(|w| w == [0xc4, 0x08]),
+        "data is a MessagePack bin blob",
+    );
+    assert_eq!(decode_body::<Node>(&body).expect("decode"), strip);
+
+    let texel = Node::Shader {
+        id: None,
+        width: 32,
+        height: 32,
+        scale: 1,
+        fragment: "void main() { fragColor = u_accent; }\n".into(),
+        data: vec![0x10, 0x20, 0x30, 0xff],
+        format: ShaderData::Rgba8,
+        data_width: 1,
+        data_height: 1,
+        classes: vec![],
+        tooltip: None,
+    };
+    let body = encode_body(&texel);
+    assert!(
+        !contains(&body, b"tooltip"),
+        "a None tooltip stays off the wire (skip_serializing_if)",
+    );
+    assert_eq!(decode_body::<Node>(&body).expect("decode"), texel);
+}
+
+/// `scale` is a `#[serde(default = …)]` field on `Shader` exactly as it is on
+/// `Pixels`, so a client that omits the key — a hand-rolled one in another
+/// language, which is the whole point of a schema-anchored proto — decodes to
+/// `1` rather than failing the frame.
+///
+/// Modeled with a replica of the variant minus `scale`, the same shape
+/// `pixels_without_scale_decodes_old_frame_compat` uses.
+///
+/// **Falsified** by removing `#[serde(default = "pixels_scale_default")]` from
+/// `Shader::scale`: the decode becomes a missing-field error.
+#[test]
+fn a_shader_frame_without_scale_decodes_to_one() {
+    #[derive(serde::Serialize)]
+    enum NodeNoScale {
+        Shader {
+            id: Option<String>,
+            width: u32,
+            height: u32,
+            fragment: String,
+            #[serde(with = "serde_bytes")]
+            data: Vec<u8>,
+            format: ShaderData,
+            data_width: u32,
+            data_height: u32,
+            classes: Vec<String>,
+        },
+    }
+
+    let body = encode_body(&NodeNoScale::Shader {
+        id: None,
+        width: 8,
+        height: 8,
+        fragment: "void main() { fragColor = u_fg; }\n".into(),
+        data: vec![0x80],
+        format: ShaderData::R8,
+        data_width: 1,
+        data_height: 1,
+        classes: vec![],
+    });
+    assert!(
+        !contains(&body, b"scale"),
+        "the replica frame carries no scale key",
+    );
+    match decode_body::<Node>(&body).expect("decode a scale-less Shader") {
+        Node::Shader { scale, .. } => assert_eq!(scale, 1, "absent scale means 1×"),
+        other => panic!("decoded to {other:?}"),
+    }
+}
+
+/// `ShaderData::bytes_per_texel` and the `data_len_ok` invariant it feeds — the
+/// `Shader` analogue of `Pixels`'s `len == w * h * 4`, and the check that stops
+/// the host handing GL a buffer shorter than the region it names.
+///
+/// **Falsified** by swapping the `checked_mul`s for plain `*`: the last case
+/// wraps to a tiny product and a one-byte buffer satisfies the widest grid the
+/// wire can express.
+#[test]
+fn shader_data_lengths_are_checked_in_wide_arithmetic() {
+    assert_eq!(ShaderData::R8.bytes_per_texel(), 1);
+    assert_eq!(ShaderData::Rgba8.bytes_per_texel(), 4);
+    assert_eq!(ShaderData::R32f.bytes_per_texel(), 4);
+
+    assert!(ShaderData::R8.data_len_ok(4, 2, 8));
+    assert!(!ShaderData::R8.data_len_ok(4, 2, 7));
+    assert!(!ShaderData::R8.data_len_ok(4, 2, 9));
+    assert!(ShaderData::Rgba8.data_len_ok(4, 2, 32));
+    assert!(ShaderData::R32f.data_len_ok(16, 1, 64));
+    assert!(
+        ShaderData::R8.data_len_ok(0, 0, 0),
+        "an empty grid is consistent, if not drawable",
+    );
+    assert!(
+        !ShaderData::R8.data_len_ok(u32::MAX, u32::MAX, 1),
+        "a wrapped product must not validate a one-byte buffer",
+    );
+}
+
+/// The two hygiene caps keep the numbers #893 settled, and the data cap stays
+/// under `MAX_FRAME_LEN` so the frame limit is not silently standing in for it.
+///
+/// Numbers in a test rather than only in a doc line because both are quoted in
+/// the `Node::Shader` contract, in the SDK builder's refusal and in the host's
+/// placeholder path — three places that have to agree.
+#[test]
+fn the_shader_hygiene_caps_keep_their_settled_numbers() {
+    assert_eq!(MAX_SHADER_SOURCE_BYTES, 16 * 1024, "16 KiB of source");
+    assert_eq!(MAX_SHADER_DATA_BYTES, 4 * 1024 * 1024, "4 MiB of data");
+    assert!(
+        MAX_SHADER_DATA_BYTES < MAX_FRAME_LEN,
+        "the data cap must bite before the frame limit does",
+    );
+}
+
+/// #893's generation is **3**, it bumps the census `VOCAB`, and it leaves
+/// `VOCAB_UNCONDITIONAL` alone — #882's rule, applied a second time.
+///
+/// That pairing is the whole compat story: a plugin rebuilt on this SDK still
+/// stamps generation 1 and so still clears a pre-#893 host's `check_vocab`,
+/// while `negotiated_vocab` only reaches `SHADER_VOCAB` against a host that
+/// advertised it in `Hello`.
+///
+/// **Falsified** by bumping `VOCAB_UNCONDITIONAL` to 3 as well (the third
+/// assertion goes red, and with it every older shell's acceptance of a rebuilt
+/// plugin), or by leaving `VOCAB` at 2 (the second).
+#[test]
+fn the_shader_generation_bumps_the_census_only() {
+    assert_eq!(SHADER_VOCAB, 3, "#893 is generation 3");
+    assert_eq!(VOCAB, SHADER_VOCAB, "the census reaches the newest variant");
+    assert_eq!(
+        VOCAB_UNCONDITIONAL, 1,
+        "a negotiated variant does not move the unconditional ceiling",
+    );
+
+    let m = Manifest::new("shader-plugin", Mount::SidebarTop);
+    assert_eq!(
+        m.negotiated_vocab(VOCAB),
+        SHADER_VOCAB,
+        "a host advertising the census negotiates the shader generation",
+    );
+    assert!(
+        m.negotiated_vocab(VOCAB_UNCONDITIONAL) < SHADER_VOCAB,
+        "a host that advertises nothing does not",
+    );
+    // The generation before this one: a shell on #882's vocabulary speaks preem
+    // and not shaders, and the arithmetic says so with no special case.
+    assert!(
+        m.negotiated_vocab(2) < SHADER_VOCAB,
+        "a #882-era host negotiates below the shader generation",
+    );
+}
+
+/// `Capability::Shader` is an ordinary externally-tagged capability: it rides
+/// the wire as its bare name and round-trips like the thirteen before it, and
+/// declaring it does not change the generation the manifest stamps.
+#[test]
+fn the_shader_capability_is_an_ordinary_manifest_capability() {
+    let mut m = Manifest::new("shader-plugin", Mount::SidebarTop);
+    m.capabilities = vec![Capability::Shader];
+    let body = encode_body(&m);
+    assert!(contains(&body, b"Shader"), "tagged by variant name");
+    let back: Manifest = decode_body(&body).expect("decode");
+    assert_eq!(back.capabilities, vec![Capability::Shader]);
+    assert_eq!(
+        back.vocab, VOCAB_UNCONDITIONAL,
+        "declaring the cap does not move the stamped generation",
+    );
+    back.check_vocab().expect("still clears a same-vocab host");
 }

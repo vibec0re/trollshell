@@ -322,6 +322,18 @@ impl Program {
         unsafe { gl::Uniform2iv(location, 1, value.as_ptr()) };
     }
 
+    /// Set a `vec2` uniform.
+    ///
+    /// Added for #893's shader widget, whose published interface states
+    /// `u_resolution` and `u_data_size` as `vec2` — a pair of pixel counts a
+    /// plugin author divides by, where the preem pipeline's own sizes are
+    /// integer indices and go through [`set_ivec2`](Self::set_ivec2).
+    pub fn set_vec2(&self, _gl: &Gl, name: &str, value: [f32; 2]) {
+        let location = self.location(name);
+        // SAFETY: as `set_ivec2`, with a two-element float array.
+        unsafe { gl::Uniform2fv(location, 1, value.as_ptr()) };
+    }
+
     /// Set a `vec4` uniform.
     pub fn set_vec4(&self, _gl: &Gl, name: &str, value: [f32; 4]) {
         let location = self.location(name);
@@ -468,8 +480,16 @@ pub enum Format {
     /// format is a max over those same values, and max is monotone, so it agrees
     /// with an integer max on every input.
     R8,
-    /// Single-channel 32-bit float (`GL_R32F`) — the 1-D data texture. Never
-    /// filtered (`texelFetch` only), so it needs no `OES_texture_float_linear`.
+    /// Four-channel 8-bit normalized (`GL_RGBA8`), sampled as four floats in
+    /// `0.0..=1.0`, **straight** (non-premultiplied) alpha.
+    ///
+    /// Added for #893's shader widget, whose data buffer may legitimately be a
+    /// grid of colours rather than a grid of intensities. Nothing in the preem
+    /// pipeline uses it — that one is exact integer work on [`R8`](Self::R8).
+    Rgba8,
+    /// Single-channel 32-bit float (`GL_R32F`) — the data texture. Never
+    /// filtered (`texelFetch`, or `NEAREST`), so it needs no
+    /// `OES_texture_float_linear`.
     R32f,
 }
 
@@ -478,7 +498,20 @@ impl Format {
     fn as_gl(self) -> (GLenum, GLenum, GLenum) {
         match self {
             Self::R8 => (gl::R8, gl::RED, gl::UNSIGNED_BYTE),
+            Self::Rgba8 => (gl::RGBA8, gl::RGBA, gl::UNSIGNED_BYTE),
             Self::R32f => (gl::R32F, gl::RED, gl::FLOAT),
+        }
+    }
+
+    /// How many bytes one texel of this format occupies in a CPU-side buffer.
+    ///
+    /// The unit [`Texture::upload_u8`] and [`Texture::upload_f32`] measure
+    /// their input in, and what a caller sizes a staging buffer with.
+    #[must_use]
+    pub const fn bytes_per_texel(self) -> usize {
+        match self {
+            Self::R8 => 1,
+            Self::Rgba8 | Self::R32f => 4,
         }
     }
 }
@@ -582,6 +615,58 @@ impl Texture {
         // SAFETY: a context is current, `self.id` is live, and `data` holds
         // exactly `width * height` elements — the region the call names — for
         // the duration of the call.
+        unsafe {
+            gl::BindTexture(gl::TEXTURE_2D, self.id);
+            gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
+            gl::TexSubImage2D(
+                gl::TEXTURE_2D,
+                0,
+                0,
+                0,
+                GLsizei::try_from(self.width).unwrap_or(0),
+                GLsizei::try_from(self.height).unwrap_or(0),
+                transfer,
+                kind,
+                data.as_ptr().cast(),
+            );
+            gl::BindTexture(gl::TEXTURE_2D, 0);
+        }
+    }
+
+    /// Overwrite the whole texture with `bytes`, for a **byte-typed** format
+    /// ([`Format::R8`] or [`Format::Rgba8`]).
+    ///
+    /// Short input is padded with zero and long input is truncated, exactly as
+    /// [`upload_f32`](Self::upload_f32) does and for the same reason: handing GL
+    /// a buffer smaller than the region the call names is undefined behaviour,
+    /// and the caller here is #893's shader widget, whose buffer arrives from an
+    /// out-of-process plugin. The host validates the length before it gets here;
+    /// this is the backstop that makes a validation bug a wrong picture rather
+    /// than a read past the end.
+    ///
+    /// `UNPACK_ALIGNMENT` is set to 1 — an `R8` row of odd width is not
+    /// 4-aligned, and GL's default of 4 would read the rows staggered.
+    pub fn upload_u8(&self, _gl: &Gl, bytes: &[u8]) {
+        debug_assert_ne!(
+            self.format,
+            Format::R32f,
+            "upload_u8 wants a byte-typed texture"
+        );
+        let wanted =
+            (self.width as usize) * (self.height as usize) * self.format.bytes_per_texel();
+        let mut staged;
+        let data = if bytes.len() == wanted {
+            bytes
+        } else {
+            staged = vec![0u8; wanted];
+            let take = bytes.len().min(wanted);
+            staged[..take].copy_from_slice(&bytes[..take]);
+            &staged
+        };
+        let (_, transfer, kind) = self.format.as_gl();
+        // SAFETY: a context is current, `self.id` is live, and `data` holds
+        // exactly `width * height * bytes_per_texel` bytes — the region the call
+        // names — for the duration of the call.
         unsafe {
             gl::BindTexture(gl::TEXTURE_2D, self.id);
             gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
@@ -904,13 +989,31 @@ pub fn read_rgba8(_gl: &Gl, width: u32, height: u32) -> Vec<u8> {
 mod tests {
     use super::{Blend, Error, Format, Stage};
 
-    /// The two formats keep the enum triples the shaders are written against —
-    /// a normalized `R8` (so `GL_MAX` blending is available at all) and an
-    /// unfiltered `R32F` data strip. Pure table check; no context needed.
+    /// The three formats keep the enum triples the shaders are written against
+    /// — a normalized `R8` (so `GL_MAX` blending is available at all), a
+    /// straight-alpha `RGBA8` for #893's colour grids, and an unfiltered `R32F`
+    /// data texture. Pure table check; no context needed.
     #[test]
     fn formats_map_to_the_enums_the_shaders_assume() {
         assert_eq!(Format::R8.as_gl(), (gl::R8, gl::RED, gl::UNSIGNED_BYTE));
+        assert_eq!(
+            Format::Rgba8.as_gl(),
+            (gl::RGBA8, gl::RGBA, gl::UNSIGNED_BYTE)
+        );
         assert_eq!(Format::R32f.as_gl(), (gl::R32F, gl::RED, gl::FLOAT));
+    }
+
+    /// The byte width the upload paths measure their input in. Wrong here and a
+    /// staging buffer is the wrong size, which is a read past the end rather
+    /// than a wrong picture — so it is worth a table of its own.
+    ///
+    /// **Falsified** by giving `Rgba8` a width of 1: the second assertion goes
+    /// red.
+    #[test]
+    fn texel_widths_match_the_transfer_types() {
+        assert_eq!(Format::R8.bytes_per_texel(), 1);
+        assert_eq!(Format::Rgba8.bytes_per_texel(), 4);
+        assert_eq!(Format::R32f.bytes_per_texel(), 4);
     }
 
     #[test]

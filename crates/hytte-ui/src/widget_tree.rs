@@ -302,6 +302,44 @@ pub enum Node {
         /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
     },
+    /// A **plugin-supplied** shader surface: a
+    /// [`ShaderSurface`](crate::shader_surface::ShaderSurface) running a
+    /// fragment body the host compiles once and then feeds a data buffer
+    /// (#893).
+    ///
+    /// The third member of the `Pixels` / `GlSurface` / `Shader` family, and it
+    /// is deliberately its **own kind** rather than a mode of either. Against
+    /// [`Pixels`](Node::Pixels): the pixels are computed on the GPU from state,
+    /// not carried as bytes. Against [`GlSurface`](Node::GlSurface): the shader
+    /// arrives at runtime instead of naming a host-registered pipeline, so the
+    /// two widgets have different resources, a different cache and a different
+    /// failure mode. Reusing one widget for the other node would put a
+    /// `downcast` `expect` — the kind invariant — one id collision away from an
+    /// abort.
+    ///
+    /// `width`/`height` are the **logical** natural size in pixels (the wire's
+    /// size times its `scale` hint), measured exactly as `Pixels` measures, and
+    /// `state.data_size` is the independent data grid.
+    ///
+    /// `state` is a **mutable prop**: a same-id re-render points the existing
+    /// surface at the new state in place, keeping the compiled program, and a
+    /// state equal to the one already held costs nothing at all.
+    Shader {
+        /// Optional diff/reorder key (see [`NodeId`]). Recommended: without one
+        /// a re-order rebuilds the widget, which throws the compiled program
+        /// away and restarts `u_time`.
+        id: Option<NodeId>,
+        /// Natural width in logical pixels.
+        width: u32,
+        /// Natural height in logical pixels.
+        height: u32,
+        /// The source, the data buffer and the theme bag (mutable prop).
+        /// Shared, so mapping one frame onto a second monitor costs a refcount
+        /// and settles on an `Arc::ptr_eq`.
+        state: Arc<crate::shader_surface::ShaderState>,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
+        classes: Vec<String>,
+    },
     /// A `gtk::Button`. `id` is **required** — it is the click event target.
     Button {
         /// **Required** diff key and [`EventKind::Click`] target.
@@ -592,6 +630,7 @@ enum NodeKind {
     Icon,
     Pixels,
     GlSurface,
+    Shader,
     Button,
     Progress,
     Slider,
@@ -915,6 +954,22 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             // Shared, not copied — the same `Arc` every monitor's mounting of
             // this node hands its own surface, exactly as the `Pixels` arm does.
             surface.set_state(*program, *width, *height, state);
+            apply_classes(&surface, classes);
+            (surface.upcast(), Vec::new())
+        }
+        Node::Shader {
+            width,
+            height,
+            state,
+            classes,
+            ..
+        } => {
+            // A `ShaderSurface`, never a `GlSurface` and never a
+            // `PixelSurface`: the compiled-program cache and the runtime source
+            // live in that widget, and `NodeKind::Shader` is what keeps the
+            // three from ever being handed one another's node.
+            let surface = crate::shader_surface::ShaderSurface::new();
+            surface.set_state(*width, *height, state);
             apply_classes(&surface, classes);
             (surface.upcast(), Vec::new())
         }
@@ -1264,6 +1319,21 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             // because a sibling animated, or the second monitor's pass over one
             // frame — queues no render at all.
             surface.set_state(*program, *width, *height, state);
+            reconcile_classes(surface, &retained.desc.classes, classes);
+        }
+        Node::Shader {
+            width,
+            height,
+            state,
+            classes,
+            ..
+        } => {
+            let surface = downcast::<crate::shader_surface::ShaderSurface>(&retained.widget);
+            // `state` is a mutable prop, and updating in place is what makes
+            // the compile-once claim true across frames: rebuilding the widget
+            // would throw away the linked program and restart `u_time`. The
+            // guard lives inside `set_state`, fast-pathed on `Arc::ptr_eq`.
+            surface.set_state(*width, *height, state);
             reconcile_classes(surface, &retained.desc.classes, classes);
         }
         Node::Button { classes, child, .. } => {
@@ -1766,6 +1836,7 @@ fn node_kind(node: &Node) -> NodeKind {
         Node::Icon { .. } => NodeKind::Icon,
         Node::Pixels { .. } => NodeKind::Pixels,
         Node::GlSurface { .. } => NodeKind::GlSurface,
+        Node::Shader { .. } => NodeKind::Shader,
         Node::Button { .. } => NodeKind::Button,
         Node::Progress { .. } => NodeKind::Progress,
         Node::Slider { .. } => NodeKind::Slider,
@@ -1787,6 +1858,7 @@ fn node_id(node: &Node) -> Option<&str> {
         | Node::Icon { id, .. }
         | Node::Pixels { id, .. }
         | Node::GlSurface { id, .. }
+        | Node::Shader { id, .. }
         | Node::Progress { id, .. }
         | Node::Revealer { id, .. } => id.as_deref(),
         // `Button`, `Slider`, `Expander`, and `Entry` all require an id — it is
@@ -1810,6 +1882,7 @@ fn node_classes(node: &Node) -> &[String] {
         | Node::Icon { classes, .. }
         | Node::Pixels { classes, .. }
         | Node::GlSurface { classes, .. }
+        | Node::Shader { classes, .. }
         | Node::Button { classes, .. }
         | Node::Progress { classes, .. }
         | Node::Slider { classes, .. }
@@ -2122,6 +2195,105 @@ mod diff_tests {
         let gl = |id| key(Some(id), NodeKind::GlSurface);
         let prev = vec![gl("a"), gl("b"), gl("c")];
         let next = vec![gl("c"), gl("a"), gl("b")];
+        let plan = plan_diff(&prev, &next);
+        assert_eq!(
+            plan.ops,
+            vec![SlotOp::Reuse(2), SlotOp::Reuse(0), SlotOp::Reuse(1)]
+        );
+        assert!(plan.removals.is_empty());
+    }
+
+    // ── Node::Shader (#893, the shader widget) ──────────────────────────────
+
+    /// A `ShaderState` shaped like a plugin's, for the diff tests below.
+    fn shader_state() -> Arc<crate::shader_surface::ShaderState> {
+        Arc::new(crate::shader_surface::ShaderState {
+            fragment: Arc::from("void main() { fragColor = u_fg; }"),
+            data: Arc::from(&[0u8, 64, 128, 255][..]),
+            format: crate::shader_surface::ShaderFormat::R8,
+            data_size: (4, 1),
+            scale: 1,
+            values: vec![("u_fg", crate::gl_surface::GlValue::Vec4([1.0, 1.0, 1.0, 1.0]))],
+        })
+    }
+
+    /// A `Shader` node reports its own kind and carries its id and classes
+    /// through the three shallow accessors every diff pass reads — the sites a
+    /// new `Node` variant is silently *missed* at, because `node_id` and
+    /// `node_classes` both end in an `or`-pattern arm that compiles perfectly
+    /// well without the new variant listed.
+    ///
+    /// **Falsified** by dropping `Node::Shader` from `node_id`'s or
+    /// `node_classes`' arm: the node lands in `Separator | Spacer`'s "no id, no
+    /// classes" bucket, every shader chip in a tree keys as `(None, Shader)`,
+    /// and they swap widgets — and compiled programs — on any insert.
+    #[test]
+    fn a_shader_node_carries_its_kind_id_and_classes() {
+        let node = Node::Shader {
+            id: Some("spectrum".to_owned()),
+            width: 288,
+            height: 96,
+            state: shader_state(),
+            classes: vec!["ts-shader".to_owned()],
+        };
+        assert_eq!(node_kind(&node), NodeKind::Shader);
+        assert_eq!(node_id(&node), Some("spectrum"));
+        assert_eq!(node_classes(&node), ["ts-shader".to_owned()]);
+        assert_eq!(child_key(&node), key(Some("spectrum"), NodeKind::Shader));
+    }
+
+    /// A `Shader` is its **own kind** against *both* of its neighbours, so an id
+    /// reused across either boundary rebuilds rather than reusing the widget.
+    ///
+    /// This is not hypothetical: the host renders the broken-widget placeholder
+    /// — a `Node::Pixels` of 0×0 — under the **same node id** when a plugin
+    /// lacks `Capability::Shader` or busts a size cap, so a plugin that fixes
+    /// its manifest flips `Pixels` → `Shader` in place. If the two shared a
+    /// `NodeKind`, `update_in_place` would downcast a `PixelSurface` to a
+    /// `ShaderSurface` and hit the kind-invariant `expect` — an abort — on the
+    /// first frame after the flip. `GlSurface` is the same story from the other
+    /// side: it is also a `GtkGLArea` subclass, so nothing but the kind stops
+    /// them being confused.
+    ///
+    /// **Falsified** by mapping `Node::Shader` to `NodeKind::Pixels` (or to
+    /// `NodeKind::GlSurface`): the corresponding pair reuses.
+    #[test]
+    fn a_shader_never_reuses_a_pixels_or_gl_surface_widget() {
+        for neighbour in [NodeKind::Pixels, NodeKind::GlSurface] {
+            let prev = vec![key(Some("chip"), neighbour)];
+            let next = vec![key(Some("chip"), NodeKind::Shader)];
+            let plan = plan_diff(&prev, &next);
+            assert_eq!(plan.ops, vec![SlotOp::Create], "{neighbour:?} → Shader");
+            assert_eq!(plan.removals, vec![0], "the {neighbour:?} widget is torn down");
+
+            // …and back the other way, which is the placeholder path.
+            let back = plan_diff(&next, &prev);
+            assert_eq!(back.ops, vec![SlotOp::Create], "Shader → {neighbour:?}");
+            assert_eq!(back.removals, vec![0]);
+        }
+    }
+
+    /// A same-id `Shader` re-render reuses its widget in place — which is what
+    /// makes "compiled once" true across frames, since a rebuilt surface drops
+    /// its program cache and restarts `u_time`.
+    #[test]
+    fn a_same_id_shader_reuses_in_place() {
+        let prev = vec![key(Some("spectrum"), NodeKind::Shader)];
+        let next = prev.clone();
+        let plan = plan_diff(&prev, &next);
+        assert_eq!(plan.ops, vec![SlotOp::Reuse(0)]);
+        assert!(plan.removals.is_empty());
+    }
+
+    /// Shader surfaces reorder and insert like every other keyed child. Worth
+    /// asserting rather than assuming: a chip that lost its widget to a
+    /// sibling's insert would recompile its shader on that frame, which is the
+    /// one cost this whole node exists to avoid.
+    #[test]
+    fn shaders_reorder_without_rebuilding() {
+        let sh = |id| key(Some(id), NodeKind::Shader);
+        let prev = vec![sh("a"), sh("b"), sh("c")];
+        let next = vec![sh("c"), sh("a"), sh("b")];
         let plan = plan_diff(&prev, &next);
         assert_eq!(
             plan.ops,
@@ -3632,6 +3804,91 @@ mod gtk_tests {
         // `update_in_place`: a same-id re-render keeps the widget and moves the
         // new props, rather than leaving the surface on its first frame for ever.
         rec.render(&hbox(vec![gl(144, 48)]));
+        let same = root
+            .first_child()
+            .expect("the box survived")
+            .first_child()
+            .expect("the surface survived");
+        assert_eq!(same, first, "the widget is reused, not rebuilt");
+        assert_eq!(
+            same.measure(gtk::Orientation::Horizontal, -1).1,
+            144,
+            "update_in_place moved the new width in",
+        );
+        assert_eq!(
+            same.measure(gtk::Orientation::Vertical, 144).1,
+            48,
+            "…and the new height",
+        );
+    }
+
+    /// The `Node::Shader` half of the same gap #954 found for `GlSurface`:
+    /// `build_node` and `update_in_place` are the only two sites that move a
+    /// shader node's props into the widget, and the four diff tests above go
+    /// through the shallow accessors and never look at what reached it.
+    ///
+    /// Without this, a shader chip mounted with a 0×0 natural size — or one
+    /// that never receives a new state, so it draws its first frame for ever —
+    /// ships clean.
+    ///
+    /// **No GL context needed**: `set_state` writes the natural size and the
+    /// dedup cell, and only `render` touches GL, so a surface reconciled into
+    /// an unmapped `gtk::Box` never realizes. The size `measure()` reports is
+    /// the hermetic witness that the props arrived.
+    ///
+    /// **Falsified** on both arms — replace either `surface.set_state(…)` with
+    /// `let _ = (width, height, state);` and this goes red, on the build
+    /// assertion and the update assertion respectively.
+    #[gtk::test]
+    fn a_shader_node_applies_its_props_on_build_and_on_update() {
+        fn shader(width: u32, height: u32) -> Node {
+            Node::Shader {
+                id: Some("spectrum".to_owned()),
+                width,
+                height,
+                state: Arc::new(crate::shader_surface::ShaderState {
+                    fragment: Arc::from("void main() { fragColor = u_fg; }"),
+                    data: Arc::from(&[0u8, 255][..]),
+                    format: crate::shader_surface::ShaderFormat::R8,
+                    data_size: (2, 1),
+                    scale: 1,
+                    values: vec![],
+                }),
+                classes: vec![],
+            }
+        }
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+
+        // `build_node`: the node's natural size reaches the widget — and the
+        // widget really is a `ShaderSurface`, not the `GlSurface` beside it.
+        rec.render(&hbox(vec![shader(288, 96)]));
+        let first = root
+            .first_child()
+            .expect("the box mounted")
+            .first_child()
+            .expect("the surface mounted");
+        let surface = first
+            .downcast_ref::<crate::shader_surface::ShaderSurface>()
+            .expect("a ShaderSurface, not some other widget");
+        assert_eq!(
+            first.measure(gtk::Orientation::Horizontal, -1).1,
+            288,
+            "build_node moved the node's width into the widget",
+        );
+        assert_eq!(
+            first.measure(gtk::Orientation::Vertical, 288).1,
+            96,
+            "…and its height, aspect-locked for the width offered",
+        );
+        assert!(
+            !surface.has_error(),
+            "an unmapped surface never realized, so it has no context error",
+        );
+
+        // `update_in_place`: a same-id re-render keeps the widget — which is
+        // the compiled program surviving — and moves the new props.
+        rec.render(&hbox(vec![shader(144, 48)]));
         let same = root
             .first_child()
             .expect("the box survived")

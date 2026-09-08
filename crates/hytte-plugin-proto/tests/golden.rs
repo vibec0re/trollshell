@@ -48,7 +48,8 @@ use hytte_plugin_proto::{
     HostMsg, LedStripConfig, LedStripState, LogLevel, Manifest, MarqueeConfig, MarqueeState,
     Mechanism, MediaAction, Mount, NiriAction, Node, NowPlaying, PROTO_VERSION, Page,
     PeakHoldConfig, PluginMsg, PreemWidget, ProvidedDatasource, SPECTRUM_BINS, ScopeConfig,
-    ScopeState, SevenSegConfig, SevenSegState, StateKey, StateSnapshot, StyleName, StyleRef,
+    ScopeState, SevenSegConfig, SevenSegState, ShaderData, StateKey, StateSnapshot, StyleName,
+    StyleRef,
     TextBoxConfig, TextBoxState, TextBoxWidth, UpcomingEvent, VOCAB, VOCAB_UNCONDITIONAL, decode,
     encode, preem, preem_id, preem_styled,
 };
@@ -161,6 +162,7 @@ fn full_manifest() -> Manifest {
             Capability::NowPlaying,
             Capability::DatasourceQuery,
             Capability::DatasourceProvider,
+            Capability::Shader,
         ],
         mount: Mount::SidebarLead,
         order: Some(-5),
@@ -709,6 +711,61 @@ fn tooltip_tree() -> Node {
     }
 }
 
+/// A tree carrying the #893 shader widget in both of the shapes that differ on
+/// the wire: an `R32f` strip with a tooltip and a non-default `scale`, and an
+/// `Rgba8` grid with neither.
+///
+/// Both matter. `scale` is a `#[serde(default = …)]` field with no
+/// `skip_serializing_if`, so it is always on the wire and a change to its
+/// default is visible here; `tooltip` does carry one, so the second node pins
+/// that a `None` tooltip stays **off** the wire — the property that keeps this
+/// variant additive for a decoder that has never heard of it.
+fn shader_tree() -> Node {
+    Node::Box {
+        id: Some("shader-root".into()),
+        dir: Dir::Vertical,
+        spacing: 4,
+        scroll: false,
+        classes: vec![],
+        children: vec![
+            Node::Shader {
+                id: Some("spectrum".into()),
+                width: 144,
+                height: 48,
+                scale: 2,
+                fragment: "void main() { fragColor = vec4(texture(u_data, v_uv).r); }\n".into(),
+                // Four `R32f` texels, little-endian, as the wire contract says.
+                data: 0.25f32
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain((-0.5f32).to_le_bytes())
+                    .chain(1.0f32.to_le_bytes())
+                    .chain(0.0f32.to_le_bytes())
+                    .collect(),
+                format: ShaderData::R32f,
+                data_width: 4,
+                data_height: 1,
+                classes: vec!["ts-shader".into()],
+                tooltip: Some("audio spectrum".into()),
+            },
+            Node::Shader {
+                id: None,
+                width: 32,
+                height: 32,
+                scale: 1,
+                fragment: "void main() { fragColor = u_accent; }\n".into(),
+                data: vec![0x10, 0x20, 0x30, 0xff],
+                format: ShaderData::Rgba8,
+                data_width: 1,
+                data_height: 1,
+                classes: vec![],
+                tooltip: None,
+            },
+        ],
+        tooltip: None,
+    }
+}
+
 fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
     vec![
         ("manifest_full_v1", Box::new(full_manifest())),
@@ -730,6 +787,14 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
             "plugin_render_preem_v1",
             Box::new(PluginMsg::Render {
                 tree: preem_tree(),
+                panel: None,
+                effects: vec![],
+            }),
+        ),
+        (
+            "plugin_render_shader_v1",
+            Box::new(PluginMsg::Render {
+                tree: shader_tree(),
                 panel: None,
                 effects: vec![],
             }),

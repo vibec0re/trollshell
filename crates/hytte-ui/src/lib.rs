@@ -11,6 +11,7 @@ mod monitor;
 pub mod multi_sparkline;
 mod pixels;
 mod popup;
+pub mod shader_surface;
 pub mod sparkline;
 pub mod widget_tree;
 
@@ -25,6 +26,11 @@ pub use gl_surface::{GlProgram, GlSurface, GlUniforms, GlValue};
 pub use layer_window::{Anchor, LayerWindowBuilder, Margin, layer_window, on_surface_ready};
 pub use monitor::Monitor;
 pub use multi_sparkline::MultiSparkline;
+// The other GPU surface (#893): a `GtkGLArea` running a *plugin-supplied*
+// fragment shader for `Node::Shader`, compiled once and fed a data buffer per
+// frame. Its interface contract — the preamble, the guaranteed uniforms — lives
+// in the module; the widget, the state and the format are what a shell names.
+pub use shader_surface::{ShaderFormat, ShaderState, ShaderSurface};
 // Exported for the shell as well as for the plugin reconciler (#857): a shell
 // that rasterises a `hytte-preem` surface in-process needs the same
 // nearest-neighbor raster widget the reconciler mounts for `Node::Pixels`, and

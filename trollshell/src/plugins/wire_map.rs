@@ -11,12 +11,17 @@ use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
 use hytte_plugin_proto::wire::{self, MAX_NODES_PER_TREE, MAX_TREE_DEPTH};
 
 use super::preem_render::{self, Scope, Warned};
+use super::shader_map::{self, Grants, ShaderNode};
 
-/// One mapping pass's state: the scope its preem instances live in, plus the
-/// two budgets [`MAX_NODES_PER_TREE`] and [`MAX_TREE_DEPTH`] give the tree
-/// (#901).
+/// One mapping pass's state: the scope its preem instances live in, what the
+/// plugin behind it is allowed to render, plus the two budgets
+/// [`MAX_NODES_PER_TREE`] and [`MAX_TREE_DEPTH`] give the tree (#901).
 struct Walk<'a> {
     scope: &'a Scope,
+    /// What this plugin's manifest asked for — today, whether it may render a
+    /// [`wire::Node::Shader`] (#893). Carried on the walk rather than looked up
+    /// per node: the manifest is per connection and the walk is per frame.
+    grants: Grants,
     /// Nodes still mappable. Decremented on **entry** to every node, so it
     /// bounds nodes *visited*.
     budget: Cell<usize>,
@@ -115,10 +120,11 @@ impl Walk<'_> {
 /// life of the shell, on the same latch as the preem keying diagnostics
 /// (`preem_render`'s `WARNED`), since a tree over a cap is over it on every
 /// frame.
-pub(super) fn to_ui_node(scope: &Scope, node: &wire::Node) -> UiNode {
+pub(super) fn to_ui_node(scope: &Scope, grants: Grants, node: &wire::Node) -> UiNode {
     preem_render::begin_pass(scope);
     let walk = Walk {
         scope,
+        grants,
         budget: Cell::new(MAX_NODES_PER_TREE),
         depth: Cell::new(0),
         over_budget: Cell::new(false),
@@ -487,6 +493,48 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             // positional key and warns at most once per tree per shell run, so
             // a hand-rolled plugin degrades rather than losing the widget.
             preem_render::map_widget(walk.scope, id.as_deref(), classes, &widget)
+        }
+        wire::Node::Shader {
+            id,
+            width,
+            height,
+            scale,
+            fragment,
+            data,
+            format,
+            data_width,
+            data_height,
+            classes,
+            tooltip: _,
+        } => {
+            // The second non-1:1 arm, and the only one with an *authorisation*
+            // in it: `Capability::Shader` gates the node, the two hygiene caps
+            // and the buffer-shape invariant gate its contents, and every "no"
+            // degrades to the broken-widget placeholder with one warning per
+            // tree. The whole policy — and the reason there is no validator
+            // beyond it — lives in `shader_map`.
+            //
+            // `tooltip` is deliberately dropped rather than mapped: the
+            // reconciler's `Node::Shader` carries none, because the three
+            // variants #957 gave a tooltip to are the ones a bar chip is made
+            // of, and adding a fourth is that issue's call rather than this
+            // one's. The wire field exists so it can be honoured later without
+            // a `PROTO_VERSION` bump.
+            shader_map::map_shader(
+                walk.scope,
+                walk.grants,
+                &ShaderNode {
+                    id: id.as_deref(),
+                    width: *width,
+                    height: *height,
+                    scale: *scale,
+                    fragment,
+                    data,
+                    format: *format,
+                    data_size: (*data_width, *data_height),
+                    classes,
+                },
+            )
         }
     };
     Some(mapped)

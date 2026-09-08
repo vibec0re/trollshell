@@ -1736,6 +1736,34 @@ session.
       relaunches with the new key; **Clear** → the row flips to "No key set"
       and the plugin drops back to canned. The key should never land in
       `plugins.json`, the unit file, or the logs.
+- [ ] **(#984)** …nor in the launch **argv**. The channel the list above left
+      out: `/proc/<pid>/environ` is `0400` but `/proc/<pid>/cmdline` is `0444`,
+      so a `--setenv=OPENROUTER_API_KEY=sk-…` argument was readable by any local
+      user for as long as the `systemd-run` process lived. With a key stored and
+      a plugin declaring the slot, **from a second local account** poll every
+      process's argv across a `Control.ReloadPlugins`:
+
+  ```sh
+  # second account, while a ReloadPlugins / key rotation runs in the first.
+  # One arg per line — a glob on `<` is an ambiguous redirect, and cmdline is
+  # NUL-separated, so `[^ ]*` would run past the argument boundary.
+  while :; do
+    for f in /proc/[0-9]*/cmdline; do tr '\0' '\n' < "$f" 2>/dev/null; done |
+      grep API_KEY
+  done
+  ```
+
+  Expect `--setenv=OPENROUTER_API_KEY` with **no** `=value` after it, and never
+  the key itself — across startup `reconcile`, a control-center start/stop, and
+  a key rotation (`relaunch_for_secret`), which are the three launch paths.
+  Confirm the plugin still actually **got** the key:
+  `systemctl --user show -p Environment trollshell-plugin-<id>` shows
+  `OPENROUTER_API_KEY=sk-…` (same-user, in scope per #956) and the plugin
+  answers with model-backed lines. The bare-`--setenv` mechanism itself checks
+  out with no shell running:
+  `SEKRIT=v systemd-run --user --pty --setenv=SEKRIT -- printenv SEKRIT`
+  prints `v`.
+
 - [ ] **(#538)** Plugins tab runtime overlay: run the shell with a declared
       plugin, open the control-center Plugins tab → the row shows a live
       "Connected · rendering in <mount>" badge. Stop/crash the plugin unit →

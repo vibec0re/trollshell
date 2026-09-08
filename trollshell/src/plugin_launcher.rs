@@ -80,16 +80,43 @@
 //!
 //! ## Secret injection (#392)
 //!
-//! [`launch`] takes `extra_env`, appended after the spec's declared `env` as
-//! additional `--setenv=<VAR>=<value>` arguments. That is the hook #392 (AI
-//! API-key management) rides on: [`resolve_secret_env`] reads each slot in
-//! [`PluginSpec::secrets`] from the login keyring (via [`crate::secrets`])
-//! and maps it to its injected `(<SLOT>_API_KEY, value)` pair; every
-//! `launch` call site builds `extra_env` this way before calling in — the
-//! secret never lands in the state file, a unit file, or the plugin's own
-//! config, and rotating a key is just stop + relaunch. Key *management*
-//! (writing/rotating/deleting the stored key itself) is [`crate::secrets`]
-//! and the control-center's AI Keys tab, not this module.
+//! [`launch`] takes `extra_env`. That is the hook #392 (AI API-key management)
+//! rides on: [`resolve_secret_env`] reads each slot in [`PluginSpec::secrets`]
+//! from the login keyring (via [`crate::secrets`]) and maps it to its injected
+//! `(<SLOT>_API_KEY, value)` pair; every `launch` call site builds `extra_env`
+//! this way before calling in — the secret never lands in the state file, a
+//! unit file, or the plugin's own config, and rotating a key is just stop +
+//! relaunch. Key *management* (writing/rotating/deleting the stored key itself)
+//! is [`crate::secrets`] and the control-center's AI Keys tab, not this module.
+//!
+//! ### …and never on the argv (#984)
+//!
+//! The one channel that list left out was the one that crosses the same-user
+//! boundary #956 settled on. `extra_env` used to render as
+//! `--setenv=<VAR>=<value>` **argv elements**, and while `/proc/<pid>/environ`
+//! is `0400` owner-only, `/proc/<pid>/cmdline` is `0444`: any local user could
+//! read every plugin's API key off the `systemd-run` process, at every launch,
+//! every reconcile relaunch and every key rotation.
+//!
+//! So the value travels over `systemd-run`'s **own environment** instead:
+//! [`systemd_run_command`] sets each `extra_env` pair with
+//! `Command::env` and [`systemd_run_args`] emits the **bare**
+//! `--setenv=<VAR>` form, which `systemd-run` documents as "when `=` and
+//! *VALUE* are omitted, the value of the variable with the same name in the
+//! program environment will be used" (`systemd-run(1)`, the option itself
+//! since v211). Ordering semantics are unchanged — a bare `--setenv=K` after a
+//! `--setenv=K=declared` still wins, so an injected secret still overrides a
+//! stale value declared in the spec.
+//!
+//! The spec's declared [`env`](PluginSpec::env) deliberately **stays** on the
+//! argv as `--setenv=K=V`: it is rendered by nix into the world-readable
+//! `plugins.json`, so argv discloses nothing that a `cat` of the state file
+//! doesn't, and keeping it there means a declared value is passed explicitly
+//! rather than being read back out of whatever the shell happened to inherit
+//! under the same name. Only secrets move.
+//!
+//! `systemctl --user show -p Environment` still shows the value — that is
+//! same-user and in scope per #956, and it is what the live-verify step reads.
 //!
 //! ## …and waiting for one that isn't there yet (#866)
 //!
@@ -191,10 +218,12 @@ struct PluginSpec {
     env: BTreeMap<String, String>,
     /// AI-key **slots** this plugin opts into (#392) — provider names (e.g.
     /// `"openrouter"`). At launch each slot's key is read from the login keyring
-    /// ([`crate::secrets`]) and injected as `--setenv=<SLOT>_API_KEY=<value>`
-    /// (see [`crate::secrets::env_var_for`]); a slot with no stored key is
-    /// skipped (the plugin runs keyless). A plugin that doesn't list a slot
-    /// never gets that key in its environment.
+    /// ([`crate::secrets`]) and injected as `<SLOT>_API_KEY` (see
+    /// [`crate::secrets::env_var_for`]) — over `systemd-run`'s inherited
+    /// environment plus a bare `--setenv=<SLOT>_API_KEY`, never as an argv
+    /// `=<value>` (#984). A slot with no stored key is skipped (the plugin runs
+    /// keyless). A plugin that doesn't list a slot never gets that key in its
+    /// environment.
     #[serde(default)]
     secrets: Vec<String>,
     /// Whether the host launches this plugin at startup. A disabled plugin is
@@ -487,8 +516,17 @@ fn parse_fingerprint(description: &str) -> Option<&str> {
 ///   (defaulting to [`DEFAULT_TARGET`]), so it is the *same* target the shell's
 ///   own unit binds to rather than a hardcoded guess at it — see the module
 ///   docs (#707).
-/// - `extra_env` comes **after** the spec's env, so an injected secret (#392)
-///   wins over a stale value declared in the spec.
+/// - the spec's declared `env` is passed value-inline as `--setenv=K=V`: it is
+///   nix-rendered into the world-readable state file, so the argv discloses
+///   nothing new, and an explicit value can't be shadowed by whatever the shell
+///   inherited under the same name.
+/// - `extra_env` (the #392 secret hook) is passed as the **bare**
+///   `--setenv=<NAME>` form, with the value supplied through `systemd-run`'s own
+///   environment by [`systemd_run_command`] — argv is `0444` in
+///   `/proc/<pid>/cmdline` and a secret must not ride it (#984). It still comes
+///   **after** the spec's env, and a bare `--setenv=K` still replaces an earlier
+///   `--setenv=K=V`, so an injected secret keeps winning over a stale value
+///   declared in the spec.
 /// - `--description=` carries the spec fingerprint (#695) so a later
 ///   [`reconcile`] can tell this unit's spec from the currently declared one.
 /// - `--` terminates option parsing before the config-supplied exec path.
@@ -514,17 +552,48 @@ fn systemd_run_args(
     for (k, v) in &spec.env {
         args.push(format!("--setenv={k}={v}"));
     }
-    for (k, v) in extra_env {
-        args.push(format!("--setenv={k}={v}"));
+    for (k, _) in extra_env {
+        // Bare name only — the value rides `systemd-run`'s environment (#984).
+        args.push(format!("--setenv={k}"));
     }
     args.push("--".to_owned());
     args.push(spec.exec.clone());
     args
 }
 
+/// The `systemd-run` invocation for one plugin launch: [`systemd_run_args`] as
+/// argv, plus every `extra_env` pair set in the child's **environment**.
+///
+/// This pairing is the whole of #984 and the single seam every launch path goes
+/// through ([`launch`] is the only caller, and every secret injection reaches
+/// `systemd-run` through it): the bare `--setenv=<NAME>` the argv builder emits
+/// is only meaningful because `NAME` is set here, and a secret value set here is
+/// only reachable by the unit because the argv names it. Keep them together.
+///
+/// `Command` inherits the shell's environment and adds these on top, which is
+/// what `systemd-run` needs — it resolves a bare `--setenv=<NAME>` out of its
+/// own environment. The values land in `/proc/<pid>/environ` (`0400`,
+/// owner-only) rather than `/proc/<pid>/cmdline` (`0444`, any local user).
+fn systemd_run_command(
+    id: &str,
+    spec: &PluginSpec,
+    extra_env: &[(String, String)],
+    target: &str,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("systemd-run");
+    cmd.args(systemd_run_args(id, spec, extra_env, target));
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd
+}
+
 /// Launch one declared plugin as a transient `trollshell-plugin-<id>.service`
 /// user unit. `extra_env` is the #392 secret-injection hook (see the module
-/// docs); every current caller builds it via [`resolve_secret_env`].
+/// docs); every current caller builds it via [`resolve_secret_env`], and its
+/// values reach the unit over `systemd-run`'s inherited environment rather than
+/// its argv ([`systemd_run_command`], #984). The **only** caller of
+/// [`systemd_run_command`], so that pairing can't be bypassed.
 ///
 /// Fails if the unit already exists (the plugin is running — `systemd-run`
 /// refuses to replace a live unit) or if there's no reachable user manager;
@@ -536,8 +605,7 @@ async fn launch(
     target: &str,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(systemd::is_valid_plugin_id(id), "invalid plugin id: {id:?}");
-    let output = tokio::process::Command::new("systemd-run")
-        .args(systemd_run_args(id, spec, extra_env, target))
+    let output = systemd_run_command(id, spec, extra_env, target)
         .output()
         .await
         .context("spawning systemd-run --user")?;
@@ -1640,12 +1708,148 @@ mod tests {
                 "--setenv=A=1",
                 // '=' in a *value* is fine (systemd splits on the first '=').
                 "--setenv=B=x=y",
-                // #392 hook: extra_env rides after the declared env.
-                "--setenv=PLUGIN_API_KEY=s3cret",
+                // #392 hook: extra_env rides after the declared env — and since
+                // #984 as the *bare* name, so the value never enters argv.
+                "--setenv=PLUGIN_API_KEY",
                 "--",
                 "/nix/store/abc/bin/demo",
             ]
         );
+    }
+
+    // ── Secrets never enter the argv (#984) ──────────────────────────────────
+
+    /// The variables a `Command` built by [`systemd_run_command`] sets
+    /// **explicitly** on the child (`get_envs` reports only the delta over the
+    /// inherited environment, which is exactly what we want to pin), as owned
+    /// strings sorted by name — `get_envs`'s own order is unspecified.
+    fn command_envs(cmd: &tokio::process::Command) -> Vec<(String, Option<String>)> {
+        let mut envs: Vec<(String, Option<String>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        envs.sort();
+        envs
+    }
+
+    #[test]
+    fn a_secret_reaches_systemd_run_through_the_environment_not_the_argv() {
+        // #984: `/proc/<pid>/environ` is 0400 owner-only, `/proc/<pid>/cmdline`
+        // is 0444 — any local user could read a plugin's API key off the
+        // `systemd-run` process for as long as it lived. The value must be in
+        // the child's environment and the argv must name the variable only.
+        const SECRET: &str = "sk-do-not-put-me-in-argv";
+        let mut s = spec("/nix/store/abc/bin/pet", true);
+        s.env.insert("PET_NAME".to_owned(), "nisse".to_owned());
+        let extra = [("OPENROUTER_API_KEY".to_owned(), SECRET.to_owned())];
+
+        let args = systemd_run_args("pet", &s, &extra, DEFAULT_TARGET);
+        assert!(
+            args.contains(&"--setenv=OPENROUTER_API_KEY".to_owned()),
+            "the bare form must name the variable: {args:?}"
+        );
+        // Nothing in the argv — under any spelling — carries the value.
+        assert!(
+            !args.iter().any(|a| a.contains(SECRET)),
+            "secret value found in argv: {args:?}"
+        );
+        // Specifically not the `NAME=value` rendering this issue is about.
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("--setenv=OPENROUTER_API_KEY=")),
+            "argv still assigns the secret inline: {args:?}"
+        );
+
+        // …and the value is really there, in the child's environment.
+        let cmd = systemd_run_command("pet", &s, &extra, DEFAULT_TARGET);
+        assert_eq!(
+            command_envs(&cmd),
+            vec![("OPENROUTER_API_KEY".to_owned(), Some(SECRET.to_owned()))],
+            "the secret must be set on the systemd-run process's environment"
+        );
+        // The command's argv is the pure builder's, unchanged.
+        assert_eq!(
+            cmd.as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            args
+        );
+    }
+
+    #[test]
+    fn the_declared_env_deliberately_stays_inline_on_the_argv() {
+        // The counterpart to the test above, pinning the scope of #984: only
+        // secrets moved. `spec.env` is nix-rendered into the world-readable
+        // `plugins.json`, so argv discloses nothing a `cat` doesn't, and an
+        // explicitly-passed value can't be shadowed by an inherited one.
+        let mut s = spec("/bin/demo", true);
+        s.env.insert("PET_NAME".to_owned(), "nisse".to_owned());
+        let cmd = systemd_run_command("demo", &s, &[], DEFAULT_TARGET);
+        let args = systemd_run_args("demo", &s, &[], DEFAULT_TARGET);
+        assert!(
+            args.contains(&"--setenv=PET_NAME=nisse".to_owned()),
+            "{args:?}"
+        );
+        assert!(
+            command_envs(&cmd).is_empty(),
+            "a declared env var must not be moved into the process environment"
+        );
+    }
+
+    #[test]
+    fn no_extra_env_pair_is_ever_rendered_with_a_value() {
+        // Belt and braces over the *set* of extra_env entries: whatever the
+        // caller passes, every one of them must render bare. `relaunch_for_secret`
+        // and `reconcile` reach `systemd-run` through the same builder, so this
+        // covers every injection path (see `launch`'s doc comment).
+        let s = spec("/bin/demo", true);
+        let extra = [
+            ("OPENROUTER_API_KEY".to_owned(), "sk-a".to_owned()),
+            ("ANTHROPIC_API_KEY".to_owned(), "sk-b".to_owned()),
+        ];
+        let args = systemd_run_args("demo", &s, &extra, DEFAULT_TARGET);
+        for (k, v) in &extra {
+            assert!(args.contains(&format!("--setenv={k}")), "{args:?}");
+            assert!(!args.iter().any(|a| a.contains(v)), "{args:?}");
+        }
+        let cmd = systemd_run_command("demo", &s, &extra, DEFAULT_TARGET);
+        assert_eq!(
+            command_envs(&cmd),
+            vec![
+                ("ANTHROPIC_API_KEY".to_owned(), Some("sk-b".to_owned())),
+                ("OPENROUTER_API_KEY".to_owned(), Some("sk-a".to_owned())),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_injected_secret_still_overrides_a_stale_declared_value() {
+        // #392's precedence rule, re-pinned because the rendering changed: the
+        // bare `--setenv=K` must still come *after* the declared `--setenv=K=V`.
+        // systemd's own semantics do the rest — measured on systemd 260.2, a
+        // later bare `--setenv=K` replaces an earlier `--setenv=K=declared`.
+        let mut s = spec("/bin/demo", true);
+        s.env
+            .insert("OPENROUTER_API_KEY".to_owned(), "stale".to_owned());
+        let extra = [("OPENROUTER_API_KEY".to_owned(), "fresh".to_owned())];
+        let args = systemd_run_args("demo", &s, &extra, DEFAULT_TARGET);
+        let declared = args
+            .iter()
+            .position(|a| a == "--setenv=OPENROUTER_API_KEY=stale")
+            .expect("the declared value is still passed inline");
+        let injected = args
+            .iter()
+            .position(|a| a == "--setenv=OPENROUTER_API_KEY")
+            .expect("the injected secret is passed bare");
+        assert!(declared < injected, "{args:?}");
     }
 
     // ── spec fingerprint (#695) ──────────────────────────────────────────────

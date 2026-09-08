@@ -62,6 +62,43 @@
 //! relax is now a belt-and-braces no-op (the toplevel won't actually deflate, and
 //! it no longer needs to).
 //!
+//! ## Scrolling
+//!
+//! The card stack sits in a [`gtk::ScrolledWindow`] ([`build_scroller`], #965).
+//! Without it a card taller than the surface simply overflowed: GTK allocates a
+//! widget at least its minimum height, the layer surface's height is the
+//! compositor's to give, and the excess was drawn past the bottom edge with no
+//! way to reach it — a 12-agent hive card hid every card below it (the pet, in
+//! Mara's case).
+//!
+//! What stops the stack's height from driving the surface's is
+//! `vscrollbar_policy = Automatic`: with it, a scroller wrapping 12 × 60 px of
+//! rows measures `(min 58, nat 720)` vertically, and with `Never` it measures
+//! `(720, 720)` — the bare stack's own numbers. (58 px is GTK's floor for a
+//! scroller whose scrollbar may appear; `min-content-height` is `-1` either way
+//! and is *not* what does this.) That minimum is the whole fix: the toplevel
+//! stops being asked for a height the compositor cannot give, and the excess
+//! becomes scroll.
+//!
+//! The scroller is spliced **between** the `AdwClamp` and the card
+//! ([`build_clamped_scroller`], which `install` and the tests share so the tests
+//! measure the shipped nesting), so the revealer's child — the thing
+//! [`open_width`] measures — is the same `AdwClamp` it always was, and the
+//! numbers reaching it through the scroller are the card's own; see
+//! [`build_scroller`] for why `hscrollbar_policy = Never` is what makes that
+//! true.
+//!
+//! The surface's own allocation is what bounds the viewport, and it follows the
+//! compositor for free: anchored `Top + Bottom` with `exclusive_zone = 0`, the
+//! height we are configured at is already the work area minus the bar, on every
+//! output and across every mode switch. Nothing here needs to compute or track
+//! it. A `max-content-height` cap was tried (#965's first round) and measured
+//! inert on this surface — it moves only the *natural* measure, which nothing on
+//! a both-edges-anchored axis reads: with the toplevel height held at 300, caps
+//! of `-1`, `300` and a nonsensical `100` all produced the same
+//! `scroller_h=300 stack_h=720 vadjustment(upper=720, page=300)`. It was
+//! deleted rather than kept as decoration.
+//!
 //! ## Frame integration
 //!
 //! The frame overlay (`Layer::Overlay`, above the bar) reads
@@ -290,15 +327,9 @@ pub fn install(monitor: &Monitor) {
     let window = build_sidebar_window(monitor, &key);
     let revealer = build_revealer();
     let card = build_card(monitor);
-    // Scaled, like the card's own floor in `build_card`: an unscaled 320 cap
-    // over a card whose `em` padding and children grew with the font would try
-    // to tighten the card below its own minimum every time text-scaling is above
-    // the 1x baseline (#737). At 1x `scale` is a no-op, so this is the same 320.
-    let clamp = adw::Clamp::builder()
-        .maximum_size(scale(SIDEBAR_WIDTH))
-        .tightening_threshold(scale(SIDEBAR_WIDTH))
-        .child(&card)
-        .build();
+    // The clamp → scroller → card nesting (#965), built by the same helper the
+    // tests build it with so they measure what ships.
+    let clamp = build_clamped_scroller(&card);
     revealer.set_child(Some(&clamp));
     window.set_child(Some(&revealer));
 
@@ -399,6 +430,94 @@ fn build_revealer() -> gtk::Revealer {
     revealer
 }
 
+/// The revealer's child exactly as [`install`] mounts it: `AdwClamp` →
+/// [`build_scroller`] → card (#965).
+///
+/// Split out of `install` **so the tests can build the shipped nesting**.
+/// `install` needs a live `Monitor` and a layer surface, so no test reaches it —
+/// and while this clamp was assembled inline there, splicing the bare card into
+/// it (the sidebar with no scroller at all, i.e. #965 fully un-fixed) left all
+/// 14 tests in this module green. They pinned the helper's *configuration* and
+/// nothing pinned where the helper was *mounted*. `gtk_tests::scrolled_tree`
+/// now goes through here, and asserts the clamp's child really is the scroller.
+///
+/// Scaled, like the card's own floor in `build_card`: an unscaled 320 cap over a
+/// card whose `em` padding and children grew with the font would try to tighten
+/// the card below its own minimum every time text-scaling is above the 1x
+/// baseline (#737). At 1x `scale` is a no-op, so this is the same 320.
+fn build_clamped_scroller(card: &gtk::Box) -> adw::Clamp {
+    adw::Clamp::builder()
+        .maximum_size(scale(SIDEBAR_WIDTH))
+        .tightening_threshold(scale(SIDEBAR_WIDTH))
+        .child(&build_scroller(card))
+        .build()
+}
+
+/// Vertical viewport for the card stack (#965): the cards scroll inside the
+/// surface instead of overflowing past its bottom edge.
+///
+/// Mounted between the `AdwClamp` and the card ([`build_clamped_scroller`]),
+/// which is what keeps it invisible to the width machinery — [`open_width`]
+/// measures the revealer's child, and that child is still the same clamp. The
+/// reason the clamp's *numbers* are also unchanged is the policy pair, and it is
+/// worth stating precisely because #737's contract rides on it:
+///
+/// * `vscrollbar_policy = Automatic` is **the fix**, and the only line here
+///   whose mutation is red. It is what decouples the scroller's vertical
+///   *minimum* from its child's: wrapping 12 × 60 px of rows it measures
+///   `(min 58, nat 720)`, and with `Never` it measures `(720, 720)` — the bare
+///   stack's own numbers, i.e. exactly the overflow #965 is about. (58 px is
+///   GTK's floor for a scroller whose scrollbar may appear; `min-content-height`
+///   is `-1` in both cases and has nothing to do with it.) The vertical mirror
+///   of the `Never` below: there we *want* the child's minimum to pass through,
+///   here we want it stopped. `gtk_tests::a_tall_card_scrolls_…` is the guard.
+/// * `hscrollbar_policy = Never` is what makes `GtkScrolledWindow` propagate its
+///   child's **minimum** width straight through instead of substituting its own
+///   `min-content-width`. That minimum is the entire horizontal contract of this
+///   subsystem: `build_card`'s `set_size_request` floor and any card whose own
+///   minimum exceeds the clamp's cap both reach [`open_width`] as a *minimum*,
+///   never as a natural (the clamp's whole job is to cap the natural at
+///   `scale(SIDEBAR_WIDTH)`). Switching this to `Automatic` would drop the card's
+///   minimum on the floor and hand back the bare baseline — re-introducing
+///   exactly the under-reserved exclusive zone #737 fixed, where the surface
+///   painted wider than the strip niri had reserved and overhung the tile beside
+///   it. `gtk_tests::wide_card_reserves_what_it_paints` is the guard.
+/// * `propagate_natural_width` carries the child's natural through as well, so
+///   the pair leaves *both* halves of `natural.max(minimum)` reading the card.
+///   (Belt and braces on this tree specifically: the clamp above caps the
+///   natural at the baseline anyway, so only the minimum can ever exceed it —
+///   flipping this one to `false` was measured too, and no test here moves.)
+/// * `overlay_scrolling` asks for the vertical scrollbar as an *indicator* drawn
+///   over the content rather than a widget allocated beside it — the sidebar has
+///   no room for a gutter, and #965 asked for it so the open width can't jump by
+///   a scrollbar's width the moment a card grows tall. Stated explicitly even
+///   though it is GTK's default, because it is a contract of this surface rather
+///   than a preference. It is **not**, however, what protects the width here:
+///   flipping it to `false` was measured against both width tests (realized and
+///   unrealized, GTK 4.22) and changed nothing, so this line is intent, and
+///   `Never` above is the guard.
+///
+/// `propagate_natural_height` is the vertical half of the same idea: the
+/// scroller reports the stack's real height as its natural rather than
+/// collapsing to `min-content-height`. Like its horizontal twin it is measured
+/// **inert on this surface** — flipping it to `false` moves no test — and for
+/// the same kind of reason: the height axis here belongs to the compositor (the
+/// toplevel is anchored `Top + Bottom`), so nothing reads the vertical natural.
+/// Kept because it is the truthful answer to "how tall would this like to be",
+/// which stops being unobservable the moment this tree is mounted anywhere that
+/// is not a both-edges-anchored layer surface. What actually fixes #965 is the
+/// *minimum* the first bullet removes, not this.
+fn build_scroller(card: &gtk::Box) -> gtk::ScrolledWindow {
+    gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_width(true)
+        .propagate_natural_height(true)
+        .overlay_scrolling(true)
+        .child(card)
+        .build()
+}
+
 /// Card has a fixed `SIDEBAR_WIDTH` so when the revealer is fully expanded
 /// the surface settles at exactly that width — and at exactly 0 when fully
 /// collapsed. No margins so there's no gap around the dark area. The bar
@@ -463,6 +582,14 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
     // Flex gap: eats whatever vertical space the calendar + tasks
     // didn't claim, so the bottom plugin region settles against the
     // bottom edge of the sidebar instead of floating in the middle.
+    //
+    // Still true inside the scroller's viewport (#965): a `GtkViewport`
+    // allocates its child `max(child natural, viewport)`, so a stack shorter
+    // than the surface is stretched to the full viewport and this gap still has
+    // the slack it needs (`gtk_tests::a_short_card_still_fills_the_viewport`).
+    // Once the stack outgrows the surface the gap collapses to 0 and the bottom
+    // region rides at the end of the scroll — which is the point: it is
+    // reachable there, where before it was drawn off the screen.
     let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     spacer.set_vexpand(true);
     card.append(&spacer);
@@ -856,34 +983,124 @@ mod tests {
 
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
-    use super::{SIDEBAR_WIDTH, open_width};
+    use std::time::Duration;
+
+    use super::{SIDEBAR_WIDTH, build_clamped_scroller, open_width};
     use crate::scale::scale;
     use hytte::adw::{self, prelude::*};
     use hytte::gtk;
 
-    /// The revealer → `AdwClamp` → card tree `install` builds, minus the parts
-    /// that need a live `Monitor` and the service registry (`build_card`'s
-    /// calendar/tasks/plugin slots). `content_min` is the minimum width of a
-    /// stand-in child, standing for whatever a real card's contents demand — an
-    /// `em`-padded calendar grid, a plugin card, a long event title.
-    fn tree(content_min: i32) -> gtk::Revealer {
+    /// Rows in the stand-in hive card: Mara's live-test case, the one that
+    /// pushed the pet card off the bottom of the screen (#963 → #965).
+    const HIVE_ROWS: i32 = 12;
+    /// Height of one such row, in px. `HIVE_ROWS * ROW_HEIGHT` has to exceed
+    /// [`SURFACE_HEIGHT`] by enough that the last row is unambiguously below
+    /// the viewport.
+    const ROW_HEIGHT: i32 = 60;
+    /// Stand-in for the layer surface's usable height (a short display, or a
+    /// tall one with a lot of cards above this one).
+    const SURFACE_HEIGHT: i32 = 300;
+
+    /// Run the GTK main loop until it has nothing left to dispatch, so a queued
+    /// resize/allocation actually happens. Same helper, same reason, as
+    /// `widgets::mpris`'s geometry tests.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// Drive the GTK main loop until `done()` holds, or `ms` of wall clock has
+    /// passed.
+    ///
+    /// Needed on top of [`pump`] for anything that only takes effect on a
+    /// **frame**: a scroll queues an allocation on the viewport, and the queue
+    /// is drained by a `GdkFrameClock` tick. `iteration(true)` blocks until a
+    /// source is ready, which is what lets that tick arrive — a spin on
+    /// `iteration(false)` starves the clock and measures the test's own loop
+    /// (the scroll then looks like it simply never happened). The deadline is
+    /// what guarantees termination when the frame the test wants never comes.
+    /// Same shape, and the same reason, as `plugins::region`'s `pump_for`.
+    fn pump_until(ms: u64, done: impl Fn() -> bool) {
+        let expired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = expired.clone();
+        gtk::glib::timeout_add_local_once(Duration::from_millis(ms), move || flag.set(true));
+        while !expired.get() && !done() {
+            gtk::glib::MainContext::default().iteration(true);
+        }
+    }
+
+    /// The `.ts-sidebar` card stack `build_card` builds, minus the parts that
+    /// need a live `Monitor` and the service registry (its calendar/tasks/plugin
+    /// slots).
+    ///
+    /// `content_min` is the minimum width of a stand-in child, standing for
+    /// whatever a real card's contents demand — an `em`-padded calendar grid, a
+    /// plugin card, a long event title. `rows` stacks that many fixed-height
+    /// blocks below it, standing for a list-shaped card: the agents hive, a
+    /// departures board with a full timetable.
+    fn card(content_min: i32, rows: i32) -> gtk::Box {
         let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
         card.add_css_class("ts-sidebar");
         card.set_size_request(scale(SIDEBAR_WIDTH), -1);
+        card.set_valign(gtk::Align::Fill);
+        card.set_vexpand(true);
         if content_min > 0 {
             let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
             content.set_size_request(content_min, -1);
             card.append(&content);
         }
+        for _ in 0..rows {
+            let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            row.set_size_request(-1, ROW_HEIGHT);
+            card.append(&row);
+        }
+        card
+    }
+
+    /// The **pre-#965** tree: revealer → `AdwClamp` → `child`, with no scroller
+    /// in between. Kept for exactly one job — the unscrolled control in
+    /// [`the_scroller_changes_no_width_measurement`] — so the width the shipped
+    /// tree measures is pinned against what the tree before this change
+    /// measured, rather than only against itself. Everything else goes through
+    /// [`scrolled_tree`].
+    fn revealer_over(child: &impl IsA<gtk::Widget>) -> gtk::Revealer {
         let clamp = adw::Clamp::builder()
             .maximum_size(scale(SIDEBAR_WIDTH))
             .tightening_threshold(scale(SIDEBAR_WIDTH))
-            .child(&card)
+            .child(child)
             .build();
         let revealer = gtk::Revealer::new();
         revealer.set_transition_type(gtk::RevealerTransitionType::SlideRight);
         revealer.set_child(Some(&clamp));
         revealer
+    }
+
+    /// The **shipped** tree: revealer → `AdwClamp` → `build_scroller` → card
+    /// (#965), assembled by `install`'s own [`build_clamped_scroller`] rather
+    /// than re-spelled here — so these tests measure both the scroller's
+    /// configuration *and* where it is mounted. While the clamp was assembled
+    /// inline in `install`, splicing the bare card into it (the fix reverted)
+    /// left every test in this module green.
+    ///
+    /// Hands back the scroller too, by asking the clamp for its child: a
+    /// mounting that stops going through the scroller fails right here, at the
+    /// seam, rather than somewhere downstream.
+    fn scrolled_tree(card: &gtk::Box) -> (gtk::Revealer, gtk::ScrolledWindow) {
+        let clamp = build_clamped_scroller(card);
+        let scroller = clamp
+            .child()
+            .and_then(|child| child.downcast::<gtk::ScrolledWindow>().ok())
+            .expect(
+                "install mounts the card stack inside a ScrolledWindow inside the clamp (#965)",
+            );
+        let revealer = gtk::Revealer::new();
+        revealer.set_transition_type(gtk::RevealerTransitionType::SlideRight);
+        revealer.set_child(Some(&clamp));
+        (revealer, scroller)
+    }
+
+    /// [`scrolled_tree`] for the width tests, which only need the revealer.
+    fn tree(content_min: i32) -> gtk::Revealer {
+        scrolled_tree(&card(content_min, 0)).0
     }
 
     /// A card whose contents fit inside the baseline reserves exactly the
@@ -920,6 +1137,207 @@ mod gtk_tests {
             "a card whose contents demand {wide} px paints {wide} px; the exclusive zone must \
              reserve at least that, not the {} px baseline (got {got})",
             scale(SIDEBAR_WIDTH)
+        );
+    }
+
+    /// #965: a card taller than the surface must **scroll**, not overflow.
+    ///
+    /// Mara's live-test case (#963): a hive with 12 agents grew the card past
+    /// the screen and everything below it — the pet card — was cut off with no
+    /// way to reach it. The pre-#965 tree had no scroller at all, so GTK
+    /// allocated the stack its full minimum height and the surface simply
+    /// clipped the excess.
+    ///
+    /// Asserts the rectangle and the hit, never `is_visible()` (#851/#838): the
+    /// last row is `visible` in both states here — that flag is orthogonal to
+    /// being on-screen, which is the whole reason this bug shipped invisible to
+    /// a visibility-based test.
+    #[gtk::test]
+    fn a_tall_card_scrolls_instead_of_hiding_the_cards_below_it() {
+        adw::init().expect("libadwaita init");
+        let stack = card(0, HIVE_ROWS);
+        let last = stack.last_child().expect("the stand-in hive card has rows");
+        let (revealer, scroller) = scrolled_tree(&stack);
+        revealer.set_reveal_child(true);
+
+        let window = gtk::Window::new();
+        window.set_child(Some(&revealer));
+        window.set_default_size(scale(SIDEBAR_WIDTH), SURFACE_HEIGHT);
+        window.present();
+        pump();
+
+        // Every measurement is taken in the scroller's coordinate space: it is
+        // the widget whose allocation clips (a `GtkScrolledWindow` viewport is
+        // `GTK_OVERFLOW_HIDDEN`), so "inside the viewport" is a statement about
+        // this rectangle and no other.
+        let viewport = f64::from(scroller.height());
+        let centre_of = |b: &gtk::graphene::Rect| {
+            (
+                f64::from(b.x()) + f64::from(b.width()) / 2.0,
+                f64::from(b.y()) + f64::from(b.height()) / 2.0,
+            )
+        };
+        let hits_last = |x: f64, y: f64| {
+            scroller
+                .pick(x, y, gtk::PickFlags::DEFAULT)
+                .is_some_and(|w| w == last || w.is_ancestor(&last))
+        };
+
+        let before = last
+            .compute_bounds(&scroller)
+            .expect("the last row is a descendant of the scroller");
+        let (bx, by) = centre_of(&before);
+        let (before_top, before_hit) = (f64::from(before.y()), hits_last(bx, by));
+        let visible_before = last.is_visible();
+
+        let vadj = scroller.vadjustment();
+        // `set_value` clamps to `upper - page_size`, i.e. the bottom of the
+        // scrollable range — asking for `upper` is asking to scroll to the end.
+        vadj.set_value(vadj.upper());
+        // The scroll only lands on a frame (it queues an allocation on the
+        // viewport), so this waits for one rather than spinning.
+        pump_until(2000, || {
+            last.compute_bounds(&scroller)
+                .is_some_and(|b| f64::from(b.y()) < viewport)
+        });
+        let (value, upper, page) = (vadj.value(), vadj.upper(), vadj.page_size());
+
+        let after = last
+            .compute_bounds(&scroller)
+            .expect("the last row is still a descendant of the scroller");
+        let (ax, ay) = centre_of(&after);
+        let (after_top, after_bottom) =
+            (f64::from(after.y()), f64::from(after.y() + after.height()));
+        let after_hit = hits_last(ax, ay);
+        let visible_after = last.is_visible();
+        // Measured here, on a *realized* tree with a live scrollbar, because
+        // that is the production case: the surface is mapped whenever
+        // `open_width` runs. `the_scroller_changes_no_width_measurement` pins
+        // the same number on unrealized trees, where a scrollbar that only
+        // materializes on realize would go unnoticed.
+        let width_while_scrolling = open_width(&revealer);
+
+        window.set_child(None::<&gtk::Widget>);
+        window.destroy();
+
+        let content = f64::from(ROW_HEIGHT * HIVE_ROWS);
+        assert!(
+            viewport > 0.0 && viewport < content,
+            "test setup: the viewport is {viewport} px for {content} px of cards — the case only \
+             means something when the stack is taller than the surface"
+        );
+        assert!(
+            visible_before && visible_after,
+            "test setup: the last row must be `visible` in BOTH states (before={visible_before}, \
+             after={visible_after}) — that is what makes the assertions below statements about \
+             geometry rather than about the visible flag, which is orthogonal to being on-screen \
+             and is why this bug shipped (#851/#838)"
+        );
+        assert!(
+            before_top >= viewport && !before_hit,
+            "before scrolling, the last card must lie below the {viewport} px viewport and be \
+             unreachable there (top={before_top}, picked={before_hit})"
+        );
+        assert!(
+            after_top >= 0.0 && after_bottom <= viewport,
+            "after scrolling to the bottom, the last card must lie inside the {viewport} px \
+             viewport — this is the #965 bug: with no scroller it never gets there \
+             (top={after_top}, bottom={after_bottom}; vadjustment value={value} upper={upper} \
+             page={page})"
+        );
+        assert!(
+            after_hit,
+            "a click at the centre of the scrolled-to last card must land on it \
+             (bounds y={after_top}..{after_bottom} in a {viewport} px viewport)"
+        );
+        assert_eq!(
+            width_while_scrolling,
+            scale(SIDEBAR_WIDTH),
+            "a mapped, actively scrolling sidebar must still reserve exactly the baseline: a \
+             scrollbar allocated beside the content instead of drawn over it would widen the \
+             exclusive zone the moment a card grew tall (#737/#965)"
+        );
+    }
+
+    /// The width invariant #965 must not disturb: the measured open width is
+    /// **identical** with and without the scroller, for a short card and for the
+    /// 12-row hive alike.
+    ///
+    /// Both halves matter and they fail to different mutations:
+    ///
+    /// * tall == short is the one the issue asks for — vertical content must not
+    ///   leak into the horizontal measurement (a non-overlay scrollbar appearing
+    ///   only once the content overflows would do exactly that).
+    /// * scrolled == unscrolled is the stronger statement, and the one that
+    ///   would catch a scrollbar allocated *unconditionally* (which the
+    ///   tall-vs-short half cannot see, being equally wrong on both sides): it
+    ///   pins the number to what the pre-#965 tree measured rather than merely
+    ///   to itself.
+    ///
+    /// Both halves are measured on **unrealized** trees, which is what
+    /// `a_tall_card_scrolls_instead_of_hiding_the_cards_below_it`'s closing
+    /// width assertion complements: that one measures a mapped surface with a
+    /// live scrollbar.
+    #[gtk::test]
+    fn the_scroller_changes_no_width_measurement() {
+        adw::init().expect("libadwaita init");
+        let wide = scale(SIDEBAR_WIDTH) + 100;
+        let mut widths = Vec::new();
+        for (content_min, rows) in [(0, 0), (0, HIVE_ROWS), (wide, 0), (wide, HIVE_ROWS)] {
+            let scrolled = scrolled_tree(&card(content_min, rows)).0;
+            // The control stays a hand-built **pre-#965** tree — the clamp over
+            // the bare card — which is the whole point of it.
+            let plain = revealer_over(&card(content_min, rows));
+            scrolled.set_reveal_child(true);
+            plain.set_reveal_child(true);
+            let (got, want) = (open_width(&scrolled), open_width(&plain));
+            assert_eq!(
+                got, want,
+                "a {content_min} px-minimum card with {rows} rows measures {want} px without the \
+                 scroller and {got} px with it — the scroller must be invisible to the exclusive \
+                 zone (#737/#965)"
+            );
+            widths.push(got);
+        }
+        assert_eq!(
+            widths[0], widths[1],
+            "a short card and a {HIVE_ROWS}-row card must reserve the same width; stacking cards \
+             is a vertical fact and must not widen the sidebar (#965)"
+        );
+        assert_eq!(
+            widths[2], widths[3],
+            "same for a card already wider than the baseline: {} px vs {} px",
+            widths[2], widths[3]
+        );
+    }
+
+    /// The flex-gap contract `build_card` documents survives the viewport: a
+    /// stack shorter than the surface is still stretched to the full viewport
+    /// height, so its `vexpand` spacer keeps the bottom plugin region pinned to
+    /// the bottom edge instead of letting it float mid-sidebar.
+    #[gtk::test]
+    fn a_short_card_still_fills_the_viewport() {
+        adw::init().expect("libadwaita init");
+        let stack = card(0, 1);
+        let (revealer, scroller) = scrolled_tree(&stack);
+        revealer.set_reveal_child(true);
+        let window = gtk::Window::new();
+        window.set_child(Some(&revealer));
+        window.set_default_size(scale(SIDEBAR_WIDTH), SURFACE_HEIGHT);
+        window.present();
+        pump();
+        let (stack_h, viewport_h) = (stack.height(), scroller.height());
+        window.set_child(None::<&gtk::Widget>);
+        window.destroy();
+        assert!(
+            viewport_h > ROW_HEIGHT,
+            "test setup: the viewport ({viewport_h} px) must be taller than the one {ROW_HEIGHT} \
+             px row in the stack"
+        );
+        assert_eq!(
+            stack_h, viewport_h,
+            "a short card must still be allocated the whole viewport, or the sidebar's flex gap \
+             stops anchoring the bottom plugin region to the bottom edge"
         );
     }
 

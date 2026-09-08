@@ -433,6 +433,28 @@ title` in the stderr tail — worth a deliberate look on first run, since
       tiled windows are pushed fully clear with neither overlap nor a dead
       gap; then lower the font again and confirm the reserved strip shrinks
       back to match instead of leaving a gap.
+- [ ] **(#965)** The sidebar **scrolls**. Found by @kaesaecracker on #963: a
+      hive of 12 agents grew the agents card past the bottom of the screen and
+      every card below it (the pet) was cut off with no way to reach it, because
+      the card stack sat in no scroller at all. Run the agents plugin with a
+      hive big enough to overflow (or shrink the output's height), open the
+      sidebar, and confirm the stack scrolls — wheel, drag, and keyboard — with
+      the pet card reachable at the bottom, and the scrollbar drawn **over** the
+      cards rather than beside them (overlay scrolling; a scrollbar taking
+      layout width would widen the reserved strip). Then re-check the two
+      properties this must not have disturbed, both of which are the #737 check
+      above in miniature: with a font bumped well up, the open sidebar still
+      pushes tiled windows fully clear with no overlap and no dead gap (the open
+      width is measured through the scroller unchanged), and the open/close
+      slide is still width-only — no vertical stretch. Nothing tracks the
+      output's height on the shell side and nothing needs to: the surface is
+      anchored `Top + Bottom` with `exclusive_zone = 0`, so its allocation
+      already _is_ the work area minus the bar, and the viewport rides it on
+      every output. (An earlier round of this PR carried a
+      `max-content-height` cap plus a `notify::height` subscription for that
+      job; measured, the cap moved only the natural request — which nothing on a
+      both-edges-anchored axis reads — so it was deleted rather than left as a
+      live-verify item that could not fail.)
 
 ## Audio & media
 

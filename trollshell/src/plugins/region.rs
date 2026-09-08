@@ -604,7 +604,7 @@ fn build_panel_child(
     // release rather than of its callers. It used to be the latter:
     // `active_panel_id` is one global selection and the only two things that
     // destroy a drawer window are `modal::close_all` (`modal.rs:1161`) and
-    // `overlays::sidebar::close_all` (`overlays/sidebar.rs:772`), both driven
+    // `overlays::sidebar::close_all` (`overlays/sidebar.rs:899`), both driven
     // from the same `monitors_changed` emission (`main.rs:240-241`), which tears
     // every monitor's surfaces down together — so no partial teardown existed to
     // drop a scope another monitor was still showing. But `Scope::panel` is
@@ -969,7 +969,7 @@ mod gtk_tests {
     /// That ownership mirrors production exactly: `main.rs`'s `build_bar` passes
     /// `plugins::bar_left_slot()` straight into the bar group as a temporary
     /// (`main.rs:412-416`), and `overlays::sidebar::build_card` does the same with
-    /// `card.append(&crate::plugins::sidebar_lead_slot())` (`sidebar.rs:452`), so
+    /// `card.append(&crate::plugins::sidebar_lead_slot())` (`sidebar.rs:571`), so
     /// the surface's widget tree holds the only reference. A test that kept a
     /// handle would keep the container alive and never see its `connect_destroy`
     /// run at all.
@@ -1546,8 +1546,8 @@ mod gtk_tests {
     /// the deeper production chain the bare-window tests above skip, and in
     /// `overlays::sidebar::close_all`'s real order.
     ///
-    /// `close_all` (`overlays/sidebar.rs:744-773`) destroys the toplevel while
-    /// `SidebarPanel` still holds its own `revealer` clone (`sidebar.rs:118-133`
+    /// `close_all` (`overlays/sidebar.rs:869-900`) destroys the toplevel while
+    /// `SidebarPanel` still holds its own `revealer` clone (`sidebar.rs:155-170`
     /// — note it holds **no** reference to the `card` box the regions live in)
     /// **and** while `wire_open_subscription`'s parked task still holds strong
     /// `window`/`revealer`/`card` clones through an aborted-but-not-yet-dropped
@@ -1568,9 +1568,14 @@ mod gtk_tests {
         let (tx, _rx) = mpsc::channel::<HostMsg>(4);
         let renders = Mutable::new(vec![render_of("region-sidebar", &tx)]);
 
-        // window → revealer → AdwClamp → card → region: `sidebar::install`'s
-        // nesting (`sidebar.rs:290-303`), with the region appended into the card
-        // as a temporary exactly as `build_card` does (`sidebar.rs:452`).
+        // window → revealer → AdwClamp → ScrolledWindow → card → region:
+        // `sidebar::install`'s nesting (`sidebar.rs:323-334`), with the region
+        // appended into the card as a temporary exactly as `build_card` does
+        // (`sidebar.rs:571`). The scroller (and GTK's own `GtkViewport` inside
+        // it) joined that chain in #965, adding two strong refs between the
+        // clamp and the card — mirrored here rather than skipped, since a
+        // viewport that outlived its scroller would strand the whole card,
+        // region included.
         let region = build_region(
             renders.signal_cloned(),
             gtk::Orientation::Vertical,
@@ -1580,7 +1585,9 @@ mod gtk_tests {
         let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
         card.append(&region);
         drop(region);
-        let clamp = adw::Clamp::builder().child(&card).build();
+        let scroller = gtk::ScrolledWindow::builder().child(&card).build();
+        let clamp = adw::Clamp::builder().child(&scroller).build();
+        drop(scroller);
         let revealer = gtk::Revealer::new();
         revealer.set_child(Some(&clamp));
         drop(clamp);
@@ -1590,8 +1597,8 @@ mod gtk_tests {
         // The only other strong reference on this path, and the one that decides
         // *when* the cascade completes: `wire_open_subscription` parks a
         // `spawn_local`'d loop capturing `window`, `revealer` **and `card`**
-        // clones (`sidebar.rs:486-497`), and `close_all` only **aborts** it
-        // (`sidebar.rs:754`). Abort is not release — `JoinHandle::abort` is
+        // clones (`sidebar.rs:613-624`), and `close_all` only **aborts** it
+        // (`sidebar.rs:881`). Abort is not release — `JoinHandle::abort` is
         // `self.source.destroy()` while the handle keeps its own `Source` ref
         // (glib-0.22.5 `src/main_context_futures.rs:328`, `:294-298`), so the
         // future and its `card` clone die at `TaskSource::finalize` (`:84`),
@@ -1615,7 +1622,7 @@ mod gtk_tests {
         pump();
 
         // `close_all`'s order, and `SidebarPanel`'s field order after it
-        // (`sidebar.rs:118-133`): abort the subscription, destroy the toplevel,
+        // (`sidebar.rs:155-170`): abort the subscription, destroy the toplevel,
         // then let the drained record drop — `window`, `revealer`, …,
         // `subscription` last.
         subscription.abort();
@@ -1632,7 +1639,7 @@ mod gtk_tests {
             "a hot-unplugged sidebar must free the plugin regions inside its \
              card: nothing on the sidebar's own teardown path holds them past \
              the drain (its two subscriptions and its settle timer are \
-             aborted/cancelled explicitly, `sidebar.rs:754`/`:758`/`:768-770`, \
+             aborted/cancelled explicitly, `sidebar.rs:881`/`:885`/`:895-897`, \
              and the records that hold the widget clones drop with the \
              iteration), so the only thing that can strand them is the region \
              pinning itself (#909)",

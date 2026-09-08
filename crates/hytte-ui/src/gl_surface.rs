@@ -439,11 +439,31 @@ pub(crate) fn fit_rect(alloc_w: i32, alloc_h: i32, buf_w: u32, buf_h: u32) -> (i
     )
 }
 
+/// The identity previously-built [`imp::Resources`] must match `grid` and
+/// `program` to be reused for a render — extracted out of `ensure_resources`
+/// so the reuse decision itself is unit-tested without a GL context, the same
+/// way [`steps_owed`] is.
+///
+/// **`grid` alone was the pre-#979 key.** `program` is an explicit mutable
+/// prop — `GlSurface::set_state` accepts a new [`GlProgram`] and
+/// `widget_tree`'s `update_in_place` repoints an existing `GlSurface` at it in
+/// place — so a node that keeps its id and grid while changing `program` used
+/// to draw the *old* pipeline's compiled shaders: latent while `preem_gl`
+/// registers exactly one pipeline, live the moment a second one does (#979).
+fn resources_reusable(
+    built_grid: (u32, u32),
+    built_program: GlProgram,
+    grid: (u32, u32),
+    program: GlProgram,
+) -> bool {
+    built_grid == grid && built_program == program
+}
+
 mod imp {
     use super::{
         GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline, GlProgram, GlTarget, GlUniforms,
         GlValue, PROGRAMS, SAMPLER_NAMES, abandon_gl, fit_rect, fresh_last_drawn, gdk, glib,
-        steps_owed,
+        resources_reusable, steps_owed,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
@@ -478,7 +498,14 @@ mod imp {
         data_source: Option<Arc<[f32]>>,
         framebuffer: hgl::Framebuffer,
         vao: hgl::VertexArray,
+        /// The grid **and** the program these objects were compiled for —
+        /// together the whole reuse key `ensure_resources` checks (see
+        /// [`super::resources_reusable`]). `program` names *which* pipeline
+        /// `programs` holds compiled shaders for; without it a program swap
+        /// at a constant grid was indistinguishable from an unchanged render
+        /// and kept the old pipeline's shaders (#979).
         grid: (u32, u32),
+        program: GlProgram,
     }
 
     #[derive(Default)]
@@ -637,7 +664,7 @@ mod imp {
             // cost us. Five enum-only calls per render.
             hgl::reset_fixed_function_state(&gl);
 
-            if !self.ensure_resources(&gl, &pipeline, state.grid, state.step_seq) {
+            if !self.ensure_resources(&gl, &pipeline, program, state.grid, state.step_seq) {
                 return;
             }
             let mut held = self.resources.borrow_mut();
@@ -675,18 +702,21 @@ mod imp {
             &self,
             gl: &hgl::Gl,
             pipeline: &GlPipeline,
+            program: GlProgram,
             grid: (u32, u32),
             step_seq: u64,
         ) -> bool {
             if let Some(resources) = self.resources.borrow().as_ref()
-                && resources.grid == grid
+                && resources_reusable(resources.grid, resources.program, grid, program)
             {
                 return true;
             }
-            // A grid change means new textures, which means a cleared
-            // accumulator — so the step count restarts with it, at
-            // `fresh_last_drawn` rather than at zero. See there.
-            match Resources::build(gl, pipeline, grid) {
+            // A grid change **or** a program change means new textures /
+            // freshly compiled shaders, which means a cleared accumulator —
+            // so the step count restarts with it, at `fresh_last_drawn`
+            // rather than at zero. See there, and see `resources_reusable`
+            // for why `program` is part of this decision too (#979).
+            match Resources::build(gl, pipeline, program, grid) {
                 Ok(resources) => {
                     self.resources.replace(Some(resources));
                     self.last_drawn.set(fresh_last_drawn(step_seq));
@@ -712,6 +742,7 @@ mod imp {
         fn build(
             gl: &hgl::Gl,
             pipeline: &GlPipeline,
+            program: GlProgram,
             grid: (u32, u32),
         ) -> Result<Self, hgl::Error> {
             let (cols, rows) = (grid.0.max(1), grid.1.max(1));
@@ -756,6 +787,7 @@ mod imp {
                 framebuffer: hgl::Framebuffer::new(gl),
                 vao: hgl::VertexArray::new(gl),
                 grid: (cols, rows),
+                program,
             };
             resources.clear_accumulator(gl);
             Ok(resources)
@@ -950,6 +982,127 @@ mod imp {
             }
         }
     }
+
+    // ── #979: a real GL context, so the actual rebuild decision is exercised ──
+    //
+    // Nested inside `mod imp` (rather than the file's outer `#[cfg(test)] mod
+    // tests`) so it can call the private `ensure_resources` and read
+    // `Resources::programs` directly — the reuse *decision* is covered
+    // hermetically by `resources_reusable`'s own tests above; this is the one
+    // place that proves `ensure_resources` actually wires that decision to a
+    // real rebuild.
+    #[cfg(all(test, feature = "system-tests"))]
+    mod tests {
+        use super::{
+            GlBlend, GlDraw, GlPass, GlPipeline, GlProgram, GlSurface, GlTarget, gdk, hgl,
+        };
+        use gtk::prelude::*;
+
+        // This test never calls `run` — only `ensure_resources` /
+        // `Resources::build` — so the two pipelines below only need to differ
+        // in how many programs they compile; their passes are never drawn.
+        const VERTEX: &str = "
+            void main() {
+                vec2 p = vec2(
+                    float((gl_VertexID & 1) << 2) - 1.0,
+                    float((gl_VertexID & 2) << 1) - 1.0
+                );
+                gl_Position = vec4(p, 0.0, 1.0);
+            }";
+        const FRAGMENT: &str = "
+            out vec4 frag_color;
+            void main() {
+                frag_color = vec4(1.0);
+            }";
+        const PASS: GlPass = GlPass {
+            vertex: VERTEX,
+            fragment: FRAGMENT,
+            target: GlTarget::Screen,
+            inputs: &[],
+            blend: GlBlend::Replace,
+            draw: GlDraw::FullScreen,
+        };
+        const ONE_PASS: [GlPass; 1] = [PASS];
+        const TWO_PASSES: [GlPass; 2] = [PASS, PASS];
+
+        /// A real, made-current `GdkGLContext`, realized (never mapped/shown —
+        /// `GtkGLArea` creates its context in `realize`, same as the module
+        /// docs say) without needing a live main loop.
+        ///
+        /// `None` when this display cannot produce one. That is expected in
+        /// the `nix flake check` sandbox, which ships no mesa at all (see the
+        /// #893 design spec's "CI has no GL"); a local `xvfb-run` may or may
+        /// not have a software GL driver available either.
+        fn real_gl() -> Option<(gtk::Window, gtk::GLArea, hgl::Gl)> {
+            let window = gtk::Window::new();
+            let area = gtk::GLArea::new();
+            area.set_allowed_apis(gdk::GLAPI::GLES);
+            window.set_child(Some(&area));
+            gtk::prelude::WidgetExt::realize(&window);
+            area.realize();
+            if area.error().is_some() {
+                return None;
+            }
+            area.make_current();
+            let gl = hgl::Gl::current().ok()?;
+            Some((window, area, gl))
+        }
+
+        /// **#979.** `ensure_resources` must rebuild — not reuse — when the
+        /// program changes at a constant grid. Registers two pipelines that
+        /// compile a different number of programs, builds `Resources` for the
+        /// first, then asks for the second at the *same* grid: the pre-#979
+        /// code (keyed on `grid` alone) would have reported the first
+        /// `Resources` reusable and kept its one compiled program.
+        ///
+        /// **Falsified** by reverting `ensure_resources`'s condition to
+        /// `resources.grid == grid` (dropping the program from the key): the
+        /// final assertion goes red, seeing `1` program instead of `2`.
+        #[gtk::test]
+        fn a_program_change_at_a_constant_grid_rebuilds_resources() {
+            let Some((_window, _area, gl)) = real_gl() else {
+                eprintln!(
+                    "skipping a_program_change_at_a_constant_grid_rebuilds_resources: no GL \
+                     context on this display — expected under the sandboxed `nix flake check` \
+                     runner, which has no mesa in its closure"
+                );
+                return;
+            };
+
+            let one = GlPipeline {
+                aux: 0,
+                step: &[],
+                frame: &ONE_PASS,
+            };
+            let two = GlPipeline {
+                aux: 0,
+                step: &[],
+                frame: &TWO_PASSES,
+            };
+            let prog_one = GlProgram("gl_surface_test.one_pass");
+            let prog_two = GlProgram("gl_surface_test.two_pass");
+
+            let surface = GlSurface::default();
+            assert!(
+                surface.ensure_resources(&gl, &one, prog_one, (4, 4), 0),
+                "the first build must succeed"
+            );
+            assert_eq!(
+                surface.resources.borrow().as_ref().unwrap().programs.len(),
+                1,
+                "the one-pass pipeline compiles exactly one program",
+            );
+
+            // Constant grid, different program.
+            assert!(surface.ensure_resources(&gl, &two, prog_two, (4, 4), 0));
+            assert_eq!(
+                surface.resources.borrow().as_ref().unwrap().programs.len(),
+                2,
+                "a program swap at a constant grid must rebuild Resources, not reuse the \
+                 one-pass pipeline's compiled shaders (#979)",
+            );
+        }
+    }
 }
 
 glib::wrapper! {
@@ -1017,7 +1170,7 @@ impl Default for GlSurface {
 mod tests {
     use super::{
         GlProgram, GlUniforms, GlValue, MAX_STEPS_PER_RENDER, abandon_gl, fit_rect,
-        fresh_last_drawn, gl_abandoned, steps_owed,
+        fresh_last_drawn, gl_abandoned, resources_reusable, steps_owed,
     };
     use std::sync::Arc;
 
@@ -1164,6 +1317,35 @@ mod tests {
         let other = GlProgram("preem.gauge");
         assert_eq!(scope, GlProgram("preem.scope"));
         assert_ne!(scope, other);
+    }
+
+    /// **#979**: `ensure_resources`' reuse check keys previously-built
+    /// `Resources` on the grid **and** the program, not the grid alone. A
+    /// program is a mutable prop (`GlSurface::set_state` can hand a node a new
+    /// one; `widget_tree`'s `update_in_place` repoints an existing surface at
+    /// it in place), so a grid-only key would reuse the old pipeline's
+    /// compiled shaders after a program swap — silently, since the surface
+    /// still has a `Resources` and `ensure_resources` would report success.
+    ///
+    /// **Falsified** by dropping the `built_program == program` conjunct from
+    /// `resources_reusable` (the pre-#979 behavior): the second assertion goes
+    /// red — a same-grid, different-program pair reads as reusable again.
+    #[test]
+    fn a_program_change_at_a_constant_grid_is_not_reusable() {
+        let scope = GlProgram("preem.scope");
+        let gauge = GlProgram("preem.gauge");
+        assert!(
+            resources_reusable((288, 96), scope, (288, 96), scope),
+            "same grid, same program: reuse"
+        );
+        assert!(
+            !resources_reusable((288, 96), scope, (288, 96), gauge),
+            "constant grid, changed program: must rebuild, not reuse the old pipeline"
+        );
+        assert!(
+            !resources_reusable((288, 96), scope, (144, 96), scope),
+            "a grid change alone must still rebuild — unchanged pre-#979 behavior"
+        );
     }
 
     /// The abandon latch is one-way and idempotent — the property the host's

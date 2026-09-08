@@ -212,13 +212,7 @@ pub(super) fn broker_effect(
             // timeout, no kill — and hands the program to the systemd user
             // manager so it outlives a `trollshell.service` restart.
             if *detached {
-                dispatch_detached_run_command(
-                    plugin_id,
-                    *id,
-                    argv,
-                    outbound,
-                    detached_unit.take(),
-                );
+                dispatch_detached_run_command(plugin_id, *id, argv, outbound, detached_unit.take());
             } else {
                 tracing::info!(plugin = %plugin_id, id = *id, argc = argv.len(), "plugin effect: RunCommand");
                 run_command(plugin_id, *id, argv.clone(), outbound.clone());
@@ -1962,7 +1956,7 @@ mod tests {
     fn filter_forwarded_env_skips_empty_and_unset_values_and_preserves_order() {
         let env = filter_forwarded_env(&FORWARDED_ENV, |name| match name {
             "WAYLAND_DISPLAY" => Some(String::new()), // set, but empty — skipped
-            "NIRI_SOCKET" => None,                     // unset — skipped
+            "NIRI_SOCKET" => None,                    // unset — skipped
             "DISPLAY" => Some(":0".to_owned()),
             "XDG_RUNTIME_DIR" => Some("/run/user/1000".to_owned()),
             other => panic!("FORWARDED_ENV grew a name this fixture doesn't cover: {other}"),

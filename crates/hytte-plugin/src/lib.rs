@@ -399,6 +399,17 @@
 //!   allocation), so a short ellipsizing string in a wide container hovers
 //!   itself — a legend, not a bug. Set a tooltip, or leave `ellipsize` off,
 //!   where that is unwanted.
+//!
+//! **The derived hover is a child tooltip, so it wins where the pointer is over
+//! it.** The case to know about: an [`Node::Expander`] whose header *is* an
+//! ellipsizing [`Node::Text`] hands the reader the title back instead of the
+//! header's legend, since GTK answers a hover from the deepest widget upward.
+//! Put the legend on the header `Text` itself (explicit beats derived), or
+//! don't ellipsize a header you want to explain.
+//!
+//! **A blank tooltip arms nothing**, derived or explicit: an empty or
+//! whitespace-only string is dropped by the host rather than popping an empty
+//! tooltip window.
 
 use std::time::Duration;
 

@@ -223,6 +223,23 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
         simplification — the host does not consult the allocation — and this row
         is the confirmation that it reads as a legend rather than as a bug. A
         `Text` with `ellipsize: false` and no tooltip must show **nothing**.
+  - [ ] **The weather card, which changed under you.** No new plugin needed:
+        `hytte-plugin-weather`'s `text_line` is the tree's only `ellipsize: true`
+        producer, so from #961 on the card's **location** and **condition** lines
+        carry hover text equal to their own content. Open the weather card and
+        hover each: the popup must show the full string (the point, when a long
+        place name or condition is truncated) and must not be blank or stale
+        after a refresh moves the condition. This is the "legend, not a bug"
+        trade-off landing on a shipped card, so it is the row that says whether
+        the call was right.
+  - [ ] **A derived hover beats an expander's legend — by design.** Build a
+        `Node::Expander` whose **header is an ellipsizing `Text`** and which
+        also carries its own `tooltip`. Hover the header title: you get the
+        **title** (the derived string), not the legend, because GTK answers from
+        the deepest widget upward; the legend survives over the chevron and the
+        header padding. Confirm that reads as reasonable rather than broken —
+        and that the documented way out works: put the legend in an explicit
+        `tooltip` on the header `Text` and it wins.
   - [ ] **Row legend, child override.** Put `tooltip` on a `Node::Row` whose
         children carry none: hovering anywhere along the row shows the row's
         string. Give **one** child (a `Label`/`Icon`) its own tooltip and hover

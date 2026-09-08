@@ -141,7 +141,13 @@ pub enum EventKind {
 ///   explicit tooltip gets its own full `text` as the hover, which is the only
 ///   way a reader can see what the `…` swallowed. [`node_tooltip`] is where
 ///   that derivation lives, so the snapshot in [`NodeDesc::tooltip`] records
-///   the *effective* string and a later text change re-applies it.
+///   the *effective* string and a later text change re-applies it. A derived
+///   hover is a child's tooltip like any other, so inside an
+///   [`Expander`](Node::Expander) header it wins over the header's own legend
+///   — see the wire vocabulary's tooltip section for why that is left alone.
+/// - **A blank tooltip arms nothing.** Empty *or* whitespace-only, derived or
+///   explicit: [`node_tooltip`] filters, because GTK normalises `""` but not
+///   `"   "` and would pop an empty tooltip window on hover.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node {
     /// A `gtk::Box`. `id` (optional) keys the node for diffing/reordering;
@@ -249,9 +255,9 @@ pub enum Node {
         classes: Vec<String>,
         /// Hover text (`set_tooltip_text`), or `None` — which is **not** the
         /// same as "no tooltip": an `ellipsize: true` node with `None` here
-        /// gets its own `text` as the hover (#961). See
-        /// [the tooltip section](Node#tooltips) and [`node_tooltip`], which is
-        /// where that default is applied.
+        /// gets its own `text` as the hover, unless that text is blank (#961).
+        /// See [the tooltip section](Node#tooltips) and [`node_tooltip`], which
+        /// is where that default is applied.
         tooltip: Option<String>,
     },
     /// A `gtk::Image` set from a themed icon `name`.
@@ -632,6 +638,17 @@ struct ExpanderState {
     /// The clickable header button — the whole header row. Held because it is
     /// the widget an expander's tooltip is armed on ([`tooltip_target`]): the
     /// node's own widget is the outer box, which also holds the revealed body.
+    ///
+    /// **Invariant: this is the button currently mounted under the outer box.**
+    /// It is written once, in [`build_node`], and read once, in
+    /// [`tooltip_target`] — alone among this struct's fields, whose other
+    /// handles are each read for a mutation a test observes *through* the tree,
+    /// so a stale one of those goes red on its own. A stale one here would
+    /// silently arm the tooltip on an orphan. [`update_in_place`] keeps the
+    /// invariant by rebuilding only the header **child** inside
+    /// [`header_box`](ExpanderState::header_box), never the button;
+    /// `an_expander_tooltip_survives_a_header_rebuild` is what pins that
+    /// (#971 review, MEDIUM-1) — read it before touching the header path.
     header_button: gtk::Button,
     /// The body wrapper; `expanded` drives `set_reveal_child`.
     revealer: gtk::Revealer,
@@ -2115,8 +2132,17 @@ fn node_classes(node: &Node) -> &[String] {
 /// whose `text` changes re-applies the derived hover for free, and one that
 /// stops ellipsizing has its hover cleared by the same `prev != new` compare
 /// that clears an explicit one.
+///
+/// A **blank** string (empty, or only whitespace) is `None` here, for every
+/// variant and for the derived `Text` string alike (#971 review, LOW-1). GTK
+/// normalises `""` to no tooltip on its own but does **not** normalise `"   "`:
+/// `has-tooltip` goes true and hovering pops an empty tooltip window. A blank
+/// hover is strictly worse than none, and the filter sits at this seam rather
+/// than in [`apply_tooltip`] so [`desc_of`]'s snapshot records the *effective*
+/// value — otherwise a drop from `Some("  ")` to `None` would look like a
+/// change to the reconciler while being a no-op on the widget.
 fn node_tooltip(node: &Node) -> Option<&str> {
-    match node {
+    let tooltip = match node {
         Node::Box { tooltip, .. }
         | Node::Label { tooltip, .. }
         | Node::Icon { tooltip, .. }
@@ -2149,7 +2175,8 @@ fn node_tooltip(node: &Node) -> Option<&str> {
             .as_deref()
             .or_else(|| ellipsize.then_some(text.as_str())),
         _ => None,
-    }
+    };
+    tooltip.filter(|t| !t.trim().is_empty())
 }
 
 /// The widget a node's tooltip is armed on.
@@ -4697,6 +4724,109 @@ mod gtk_tests {
             "flipping ellipsize off takes the derived hover away again"
         );
         assert!(!back.has_tooltip());
+    }
+
+    /// The header **button** is the widget an `Expander`'s tooltip is armed on
+    /// ([`tooltip_target`]), and [`ExpanderState::header_button`] is the only
+    /// handle to it — nothing else in [`update_in_place`]'s `Expander` arm reads
+    /// that field, so a change to the header path that re-creates or re-parents
+    /// the button would leave the tooltip on an orphan with every other test
+    /// green. Every other `Expander` tooltip test keeps one header node for the
+    /// whole render sequence, so none of them walks the **rebuild** branch at
+    /// all; this is the render that does (the header node's *kind* changes, so
+    /// [`reusable`] is false) while a tooltip is live. #963's agents card is
+    /// exactly that shape — a title `Label` becoming a warning `Icon`.
+    ///
+    /// The code is already correct; this is the pin, not a fix (#971 review,
+    /// MEDIUM-1 — the same shape as #958's).
+    ///
+    /// **Falsified** by adding `es.header_button = gtk::Button::new();` to the
+    /// rebuild branch: this goes red on the second assertion, and it is the
+    /// only test in the suite that does.
+    #[gtk::test]
+    fn an_expander_tooltip_survives_a_header_rebuild() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        let node = |header: Node, tip: &str| Node::Expander {
+            id: "hive".to_owned(),
+            header: Box::new(header),
+            children: vec![lbl(Some("d"), "argus")],
+            expanded: true,
+            classes: vec![],
+            tooltip: Some(tip.to_owned()),
+        };
+
+        rec.render(&node(lbl(Some("h"), "hive"), "4 agents, 1 failed"));
+        let (button, _, _) = expander_parts(&root);
+        assert_eq!(button.tooltip_text().as_deref(), Some("4 agents, 1 failed"));
+
+        // Label → Icon: `reusable` is false, so the header child is torn down
+        // and a fresh one is prepended into the same header box.
+        rec.render(&node(
+            Node::Icon {
+                id: Some("h".to_owned()),
+                name: "dialog-warning-symbolic".to_owned(),
+                classes: vec![],
+                tooltip: None,
+            },
+            "4 agents, 2 failed",
+        ));
+        let (after, _, _) = expander_parts(&root);
+        assert_eq!(after, button, "the header BUTTON itself is never rebuilt");
+        assert_eq!(
+            after.tooltip_text().as_deref(),
+            Some("4 agents, 2 failed"),
+            "a header rebuild must not move the tooltip off the mounted button",
+        );
+    }
+
+    /// A **blank** tooltip arms nothing — neither a derived one nor an explicit
+    /// one (#971 review, LOW-1).
+    ///
+    /// GTK normalises `""` to no tooltip by itself, so the empty case was never
+    /// broken and is asserted here to record that; `"   "` it does **not**
+    /// normalise, and before the filter it set `has-tooltip` and popped an empty
+    /// tooltip window on hover. The derived string is the case that matters —
+    /// it is the one place a plugin grows a tooltip it never wrote — but the
+    /// filter sits at [`node_tooltip`] and so covers all seven variants, which
+    /// the `Label` half pins.
+    ///
+    /// **Falsified** by dropping the `.filter(…)` from [`node_tooltip`]: the two
+    /// whitespace assertions go red (`has_tooltip` true, `tooltip_text`
+    /// `Some("   ")`); the empty ones stay green, which is the measurement that
+    /// says GTK — not this filter — handles `""`.
+    #[gtk::test]
+    fn a_blank_tooltip_arms_nothing() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+
+        for text in ["", "   ", "\t\n "] {
+            rec.render(&hbox(vec![text_tip(Some("t"), text, true, None)]));
+            let label = only_child(&root);
+            assert_eq!(
+                label.tooltip_text(),
+                None,
+                "a blank derived hover is worse than none ({text:?})"
+            );
+            assert!(
+                !label.has_tooltip(),
+                "…and GTK must arm no hover ({text:?})"
+            );
+        }
+
+        // The same guard covers an *explicit* tooltip, on any variant.
+        rec.render(&hbox(vec![lbl_tip(Some("a"), "x", Some("  "))]));
+        let label = only_child(&root);
+        assert_eq!(label.tooltip_text(), None, "an explicit blank is blank too");
+        assert!(!label.has_tooltip());
+
+        // …and a real string still works after all that, so the filter is not
+        // simply swallowing everything.
+        rec.render(&hbox(vec![lbl_tip(Some("a"), "x", Some("what x means"))]));
+        assert_eq!(
+            only_child(&root).tooltip_text().as_deref(),
+            Some("what x means")
+        );
     }
 
     // ── List-card layout (#966) ──────────────────────────────────────────────

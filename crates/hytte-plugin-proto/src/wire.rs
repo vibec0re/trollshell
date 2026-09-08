@@ -155,7 +155,7 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 ///   input; `set_tooltip_markup` would hand it a parser.)
 /// - It is **not** part of a node's identity: only `kind` and `id` decide reuse,
 ///   so changing a tooltip never rebuilds a widget.
-/// - **Seven** of the seventeen variants, not all of them — the ones a chip or a
+/// - **Seven** of the eighteen variants, not all of them — the ones a chip or a
 ///   list card is made of: [`Box`](Node::Box), [`Label`](Node::Label),
 ///   [`Icon`](Node::Icon) and [`Shader`](Node::Shader) (#893, a picture with
 ///   nowhere else to say what it is), then — since #961 — [`Row`](Node::Row),
@@ -176,6 +176,24 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 /// **up** until one answers, so a child's own tooltip always wins over its
 /// container's: a [`Row`](Node::Row) tooltip explains the whole row *except*
 /// wherever a child says something more specific.
+///
+/// **A derived [`Text`](Node::Text) hover is a child like any other, and it
+/// wins too** (#971 review, LOW-2). If an [`Expander`](Node::Expander)'s header
+/// *is* an ellipsizing `Text`, hovering the title gives you the title — the
+/// string the host derived, which the plugin never wrote — and the expander's
+/// own legend survives only over the chevron and the header padding. That is
+/// the rule above working as stated; the surprise is only that the winning
+/// child's tooltip is one nobody typed. It is left as-is deliberately: the
+/// derivation is a **per-node** function with no ancestor context, which is
+/// exactly what lets one accessor serve build and update alike, and suppressing
+/// it would take away the truncated string the reader came for. Two ways out,
+/// both plugin-side: set an explicit `tooltip` on the header `Text` (explicit
+/// always wins, so put the legend there), or don't ellipsize the header.
+///
+/// A tooltip that is empty or **only whitespace** arms nothing at all — for the
+/// derived string and an explicit one alike. GTK normalises `""` to no tooltip
+/// but not `"   "`, which would pop a blank tooltip window on hover; the host
+/// filters instead, since a blank hover is strictly worse than none.
 ///
 /// ## An ellipsized [`Text`](Node::Text) tooltips itself (#961)
 ///

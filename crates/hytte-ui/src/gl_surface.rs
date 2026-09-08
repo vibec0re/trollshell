@@ -993,7 +993,9 @@ mod imp {
     // real rebuild.
     #[cfg(all(test, feature = "system-tests"))]
     mod tests {
-        use super::{GlBlend, GlDraw, GlPass, GlPipeline, GlProgram, GlSurface, GlTarget, gdk, hgl};
+        use super::{
+            GlBlend, GlDraw, GlPass, GlPipeline, GlProgram, GlSurface, GlTarget, gdk, hgl,
+        };
         use gtk::prelude::*;
 
         // This test never calls `run` — only `ensure_resources` /

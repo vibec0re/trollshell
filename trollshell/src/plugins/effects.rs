@@ -981,7 +981,15 @@ pub(super) async fn start_detached(
     unit: &str,
     argv: &[String],
 ) -> Result<LaunchReport, String> {
-    start_detached_with(plugin_id, id, unit, argv, "systemd-run", LAUNCH_CALL_TIMEOUT).await
+    start_detached_with(
+        plugin_id,
+        id,
+        unit,
+        argv,
+        "systemd-run",
+        LAUNCH_CALL_TIMEOUT,
+    )
+    .await
 }
 
 /// [`start_detached`] with the `systemd-run` program and its launch-call
@@ -1382,13 +1390,13 @@ impl AuditLog {
 
 #[cfg(test)]
 mod tests {
+    use super::DatasourceRouter;
     use super::{
         AuditDecision, AuditLog, EffectOutcome, FORWARDED_ENV, MAX_VOLUME, MIN_VOLUME,
         RUN_COMMAND_MAX_OUTPUT, broker_effect, clamp_volume, command_outcome, effect_kind,
         filter_forwarded_env, format_audit_line, launch_argv, launch_outcome, start_detached_with,
         truncate_on_char_boundary,
     };
-    use super::DatasourceRouter;
     use hytte_plugin_proto::{AudioAction, Effect, HostMsg, MediaAction, NiriAction, Page};
     use std::cell::RefCell;
     use std::time::Duration;
@@ -1781,7 +1789,9 @@ mod tests {
             &["true".to_owned()],
         );
         assert!(
-            !argv.iter().any(|a| a.starts_with("--setenv=WAYLAND_DISPLAY")),
+            !argv
+                .iter()
+                .any(|a| a.starts_with("--setenv=WAYLAND_DISPLAY")),
             "an empty WAYLAND_DISPLAY must never appear as \
              --setenv=WAYLAND_DISPLAY=: {argv:?}",
         );

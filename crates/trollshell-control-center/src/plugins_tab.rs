@@ -3353,4 +3353,76 @@ mod gtk_tests {
 
         dismiss(&window);
     }
+
+    /// The generation is stamped **at spawn**, not at completion — which is
+    /// the whole of the ordering guarantee. Taking it inside the completion
+    /// closure would make every result the newest one, turning the #983 gate
+    /// into a production no-op while the rest of the suite stays green,
+    /// because every other test issues its generations by hand and never goes
+    /// through [`super::refresh_plugins`].
+    ///
+    /// That blind spot is the same one the #989 side closed deliberately with
+    /// `install_shell_probe` + its tick counter: the five mutations in the PR
+    /// body all land inside `on_poll_result` / `accept` / `apply`, and none
+    /// targets the *caller*. Supplied by the adversarial review of `32bf073`,
+    /// which confirmed it red under exactly that mutation and green here.
+    ///
+    /// No bus needed: `refresh_plugins` returns as soon as it has spawned, so
+    /// `issued` must already have advanced by the time it does.
+    #[gtk::test]
+    fn a_poll_is_stamped_when_it_is_spawned() {
+        adw::init().expect("libadwaita init");
+        let (_bin, state) = build_tab();
+
+        let before = state.polls.issued.get();
+        super::refresh_plugins(&state);
+        super::refresh_plugins(&state);
+
+        assert_eq!(
+            state.polls.issued.get(),
+            before + 2,
+            "both polls must take their generation at spawn; a generation taken at \
+             completion makes every result the newest and the #983 gate a no-op"
+        );
+    }
+
+    /// The other side of the `Err` gate: a failure that *is* the newest poll
+    /// must still tear the list down to the "Unavailable" placeholder.
+    ///
+    /// Every other test that asserts that placeholder goes through
+    /// [`poll_failed`], which calls `set_placeholder` **directly** and so
+    /// bypasses `on_poll_result` entirely — leaving the `Err` arm pinned only
+    /// in its *refusing* direction ([`a_stale_failure_cannot_tear_down_a_live_list`]).
+    /// No-op that arm and the whole suite stays green while the tab silently
+    /// loses its shell-is-down state: a dead shell would leave the last good
+    /// list frozen on screen forever. That is half of this module's own
+    /// "the gate covers every arm" claim, in the direction that matters to the
+    /// user. Supplied by the adversarial review of `32bf073`.
+    #[gtk::test]
+    fn a_fresh_failure_still_shows_the_unavailable_placeholder() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+
+        let seed = state.polls.issue();
+        on_poll_result(&state, seed, poll_ok(&["clock", "departures"], "active"));
+        pump();
+        let window = present(&bin, 640);
+        click(&state, "departures");
+
+        let newest = state.polls.issue();
+        on_poll_result(&state, newest, poll_err());
+        pump();
+
+        assert!(
+            state.by_id.borrow().is_empty(),
+            "the newest poll failing must replace the live list with the placeholder"
+        );
+        assert_eq!(
+            state.parked.borrow().as_ref().map(|park| park.id.as_str()),
+            Some("departures"),
+            "…and park the selection for the next good poll to restore"
+        );
+
+        dismiss(&window);
+    }
 }

@@ -303,7 +303,7 @@ struct ShellProbe {
 /// reuses that same source rather than a compiled-in `CARGO_PKG_VERSION`.
 async fn probe_shell_status() -> ShellProbe {
     let connection = probe_shell().await;
-    let revision = if connection.is_ok() {
+    let revision = if should_probe_revision(&connection) {
         revision().await.ok()
     } else {
         None
@@ -312,6 +312,19 @@ async fn probe_shell_status() -> ShellProbe {
         connection,
         revision,
     }
+}
+
+/// Whether a probe whose connection half came back as `connection` should go
+/// on to ask for `Revision`.
+///
+/// A named predicate rather than an inline `if` so the one property
+/// [`probe_shell_status`] buys — a *disconnected* tick costs one fast
+/// `ServiceUnknown` instead of stacking a second 3 s timeout behind it — is
+/// reachable from a test. `probe_shell_status` itself is a bare async fn over
+/// `hytte_bus::call` and every #989 test hand-builds its [`ShellProbe`], so
+/// nothing could otherwise reach this branch (the review of `32bf073`, LOW 4).
+fn should_probe_revision(connection: &Result<(String, String), hytte_bus::BusError>) -> bool {
+    connection.is_ok()
 }
 
 /// `Revision` → the running shell's build git revision (#601). See
@@ -337,6 +350,17 @@ fn install_shell_probe(probe: &ShellProbeUi, interval: Duration) -> glib::Source
     })
 }
 
+/// Holds [`ShellProbeUi`]'s single in-flight slot for as long as it lives, and
+/// releases it on `Drop` — including the drop that happens when a completion
+/// callback is discarded without ever running. See [`ShellProbeUi::poll`].
+struct InFlightSlot(Rc<Cell<bool>>);
+
+impl Drop for InFlightSlot {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 /// The banner + footer pair, and the bookkeeping that lets them be re-probed
 /// on a timer instead of once at window build (#989).
 ///
@@ -348,7 +372,8 @@ struct ShellProbeUi {
     banner: adw::Banner,
     revision: gtk::Label,
     /// Set while a probe is outstanding, so a tick landing on top of a slow
-    /// round trip skips rather than stacking a second one.
+    /// round trip skips rather than stacking a second one. Released by
+    /// [`InFlightSlot`]'s `Drop`, never by hand.
     ///
     /// This is the whole ordering story for these probes, and why they need no
     /// generation counter the way the Plugins tab's polls do (#983): only ever
@@ -389,23 +414,37 @@ impl ShellProbeUi {
         }
     }
 
-    /// Claim the single in-flight slot for this tick, or refuse it (`false`)
-    /// because a probe is still outstanding. Released by the completion.
-    fn claim(&self) -> bool {
-        !self.in_flight.replace(true)
+    /// Claim the single in-flight slot for this tick, or `None` because a
+    /// probe is still outstanding. The returned guard releases the slot when
+    /// it drops.
+    fn claim(&self) -> Option<InFlightSlot> {
+        if self.in_flight.replace(true) {
+            return None;
+        }
+        Some(InFlightSlot(self.in_flight.clone()))
     }
 
     /// Probe the shell and apply the outcome — unless one is already in
     /// flight, in which case this tick is skipped.
+    ///
+    /// The slot guard is **moved into the completion closure**, so the slot is
+    /// released whether that closure runs or is dropped unrun. That second
+    /// case is real: [`spawn_on_runtime`] calls its callback only `if let
+    /// Ok(v) = rx.await`, so a sender dropped without sending (a panic inside
+    /// [`probe_shell_status`], runtime teardown) would otherwise leave
+    /// `in_flight` stuck at `true` and every later tick taking the skip path
+    /// forever — freezing the banner and footer in whatever state they were
+    /// last in, which is #989's own symptom reintroduced by the mechanism that
+    /// fixes it (the review of `32bf073`, LOW 3).
     fn poll(&self) {
         self.ticks.set(self.ticks.get().saturating_add(1));
-        if !self.claim() {
+        let Some(slot) = self.claim() else {
             tracing::debug!("a shell probe is still in flight — skipping this tick");
             return;
-        }
+        };
         let ui = self.clone();
         spawn_on_runtime(probe_shell_status(), move |probe| {
-            ui.in_flight.set(false);
+            drop(slot);
             ui.apply(&probe);
         });
     }
@@ -747,7 +786,7 @@ mod tests {
 
     use super::{
         DEFAULT_LOG_LEVEL, build_env_filter, format_banner_message, format_revision_footer,
-        is_shell_not_running,
+        is_shell_not_running, should_probe_revision,
     };
 
     // #780: with `RUST_LOG` unset, the effective filter must default to
@@ -923,6 +962,34 @@ mod tests {
         };
         assert!(!is_shell_not_running(&no_name));
     }
+
+    // ── The probe's second call (#989) ──────────────────────────────────────
+
+    // The one performance property `probe_shell_status` buys: a tick against a
+    // shell that isn't there costs one fast `ServiceUnknown`, not that plus a
+    // second 3 s timeout stacked behind it. The predicate is named precisely
+    // so this is reachable — the async fn around it is a bare `hytte_bus::call`
+    // chain no hermetic test can drive (the review of `32bf073`, LOW 4).
+    #[test]
+    fn a_failed_connection_probe_skips_the_revision_call() {
+        let down: Result<(String, String), hytte_bus::BusError> =
+            Err(hytte_bus::BusError::Permanent {
+                reason: "unused".to_owned(),
+                dbus_name: Some("org.freedesktop.DBus.Error.ServiceUnknown".to_owned()),
+            });
+        assert!(
+            !should_probe_revision(&down),
+            "a Control that did not answer Ping will not answer Revision either"
+        );
+    }
+
+    // …and the other direction, so the skip is not simply "never ask".
+    #[test]
+    fn a_reachable_shell_is_still_asked_for_its_revision() {
+        let up: Result<(String, String), hytte_bus::BusError> =
+            Ok(("pong".to_owned(), "0.1.0".to_owned()));
+        assert!(should_probe_revision(&up));
+    }
 }
 
 /// The banner/footer probe's widget-level behaviour (#989).
@@ -935,6 +1002,8 @@ mod tests {
 /// what #989 broke.
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use gtk::glib;
@@ -967,6 +1036,59 @@ mod gtk_tests {
             }),
             revision: None,
         }
+    }
+
+    /// A `tracing` writer that collects every emitted line in memory, so a
+    /// test can count log lines rather than infer them from state.
+    ///
+    /// Hand-rolled rather than reached for from `tracing-subscriber`'s test
+    /// helpers because `TestWriter` goes to the captured stdout, which a test
+    /// cannot read back.
+    #[derive(Clone)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture buffer is never held across a panic")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` with an `INFO` subscriber installed for this thread, and
+    /// return the lines it emitted.
+    ///
+    /// `set_default` is thread-local, so this neither needs nor disturbs a
+    /// global subscriber, and `#[gtk::test]` runs the body on the same thread.
+    fn captured_logs(body: impl FnOnce()) -> Vec<String> {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturedLog(buffer.clone()))
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            body();
+        }
+        let bytes = buffer.lock().expect("no panic while capturing").clone();
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     /// The banner and footer as `build_window` wires them, plus the probe
@@ -1084,7 +1206,7 @@ mod gtk_tests {
     /// still out has to skip, and the slot has to be released when that round
     /// trip completes.
     ///
-    /// Falsified by making `claim` return `true` unconditionally: the second
+    /// Falsified by making `claim` return `Some` unconditionally: the second
     /// assertion fails, and in production each tick would then pile another
     /// three-call probe (with 3 s timeouts) on top of the last.
     #[gtk::test]
@@ -1092,17 +1214,107 @@ mod gtk_tests {
         adw::init().expect("libadwaita init");
         let (_banner, _label, ui) = probe_ui();
 
-        assert!(ui.claim(), "the first tick must probe");
+        let slot = ui.claim().expect("the first tick must probe");
         assert!(
-            !ui.claim(),
+            ui.claim().is_none(),
             "a tick landing on a still-outstanding probe must skip rather than stack a second"
         );
 
-        // What the completion does.
-        ui.in_flight.set(false);
+        // What the completion does — by dropping the guard, not by hand.
+        drop(slot);
         assert!(
-            ui.claim(),
+            ui.claim().is_some(),
             "the slot must be free again once the probe completes"
+        );
+    }
+
+    /// The slot is released by [`super::InFlightSlot`]'s `Drop`, so a
+    /// completion that is *discarded rather than run* frees it too.
+    ///
+    /// `spawn_on_runtime` invokes its callback only `if let Ok(v) = rx.await`,
+    /// so a sender dropped without sending (a panic inside the probe, runtime
+    /// teardown) drops the closure — and with it the guard it owns — without
+    /// ever calling it. Before this guard existed the release lived *inside*
+    /// that callback, so such a probe wedged `in_flight` at `true` and every
+    /// later tick skipped forever, freezing the banner in whatever state it
+    /// was last in: #989's own symptom, reintroduced by #989's fix (the review
+    /// of `32bf073`, LOW 3).
+    ///
+    /// Falsified by emptying `InFlightSlot::drop`'s body: the last assertion
+    /// fails.
+    #[gtk::test]
+    fn a_discarded_completion_still_releases_the_slot() {
+        adw::init().expect("libadwaita init");
+        let (_banner, _label, ui) = probe_ui();
+
+        // Exactly what `poll` builds: a guard owned by the completion closure.
+        let slot = ui.claim().expect("the first tick must probe");
+        let completion: Box<dyn FnOnce(ShellProbe)> = Box::new(move |_probe| {
+            drop(slot);
+        });
+        assert!(
+            ui.claim().is_none(),
+            "sanity: the slot is held while the closure is alive"
+        );
+
+        // The oneshot's sender went away, so `spawn_on_runtime` drops the
+        // callback instead of calling it.
+        drop(completion);
+
+        assert!(
+            ui.claim().is_some(),
+            "a completion dropped without running must not wedge the probe forever"
+        );
+    }
+
+    /// The #780 property this PR explicitly buys: at a 2 s cadence the probe
+    /// logs on **transitions**, not on every tick.
+    ///
+    /// Without the guard, a shell left down overnight writes one `INFO` line
+    /// every two seconds — 1 800 an hour — into the user's journal. Counting
+    /// real emitted lines rather than inspecting `shown`, because a mutation
+    /// that drops the guard while keeping `shown` correct would sail past a
+    /// state assertion (the review of `32bf073`, LOW 5).
+    ///
+    /// Falsified by removing `apply`'s `if *self.shown.borrow() != message`
+    /// guard: four probes then emit four lines and the first assertion fails.
+    #[gtk::test]
+    fn the_probe_logs_transitions_not_every_tick() {
+        adw::init().expect("libadwaita init");
+        let (_banner, _label, ui) = probe_ui();
+
+        let lines = captured_logs(|| {
+            // Down, and staying down: one line, not four.
+            ui.apply(&not_running());
+            ui.apply(&not_running());
+            ui.apply(&not_running());
+            ui.apply(&not_running());
+        });
+        assert_eq!(
+            lines.len(),
+            1,
+            "a shell that stays down must log once, not once per tick: {lines:#?}"
+        );
+        assert!(
+            lines[0].contains("unreachable"),
+            "the one line must be the outage: {:?}",
+            lines[0]
+        );
+
+        // …and a real change still speaks up, so the guard is not "never log".
+        let lines = captured_logs(|| {
+            ui.apply(&connected());
+            ui.apply(&connected());
+        });
+        assert_eq!(
+            lines.len(),
+            1,
+            "the shell coming back is a transition and must log exactly once: {lines:#?}"
+        );
+        assert!(
+            lines[0].contains("answered"),
+            "the one line must be the recovery: {:?}",
+            lines[0]
         );
     }
 
@@ -1127,8 +1339,10 @@ mod gtk_tests {
     fn the_probe_re_runs_on_its_interval() {
         adw::init().expect("libadwaita init");
         let (_banner, _label, ui) = probe_ui();
-        assert!(ui.claim(), "hold the in-flight slot for the whole test");
 
+        let _slot = ui
+            .claim()
+            .expect("hold the in-flight slot for the whole test");
         let source = install_shell_probe(&ui, Duration::from_millis(5));
         let deadline = Instant::now() + Duration::from_secs(2);
         while ui.ticks.get() < 3 && Instant::now() < deadline {

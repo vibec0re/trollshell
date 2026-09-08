@@ -36,9 +36,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Directory (relative to `$HOME`) all trollshell config files live under.
 const CONFIG_SUBDIR: &str = ".config/trollshell";
 
-/// Symlink hops [`resolve_dangling_target`] will walk by hand before giving
-/// up and writing through the link itself — bounds a cycle to a bounded
-/// failure instead of an infinite loop.
+/// Symlink hops [`resolve_dangling_target`] will walk by hand, matching
+/// Linux's own `MAXSYMLINKS`: a chain exactly this long still resolves, the
+/// same as the kernel's own path resolution would follow. One hop longer —
+/// which includes a genuine cycle (`a -> b -> a`, even a self-referential
+/// `a -> a`), which never terminates at any bound — returns an
+/// [`std::io::Error`] instead of guessing.
 const MAX_SYMLINK_HOPS: u32 = 40;
 
 /// Distinguishes the temp files of two writes that overlap in time.
@@ -173,7 +176,9 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
     }
 }
 
-/// Atomically replace `path`'s contents with `body`, creating the parent dir.
+/// Atomically replace `path`'s contents with `body`, creating `path`'s own
+/// parent directory (which is not necessarily its resolved target's parent —
+/// see Symlink-safe below).
 ///
 /// The workspace's single copy of tmp + `fsync` + `rename(2)` + cleanup (#739);
 /// every config file written through [`write()`], plus `places`' own writer,
@@ -196,13 +201,18 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
 /// a regular file (#739). That is also what keeps the temp file on the target's
 /// own filesystem — `rename(2)` is only atomic within one. A target that
 /// doesn't exist at all (no file, no symlink) can't be canonicalised, and
-/// needs no resolving. A target that exists **as a symlink whose destination
+/// needs no resolving — [`resolve_dangling_target`] returns `path` unchanged
+/// for that case. A target that exists **as a symlink whose destination
 /// hasn't been created yet** also can't be canonicalised — `canonicalize`
 /// requires every component including the last to exist — but *does* need
-/// resolving: without it the fallback used to be `path` itself, which
-/// `rename(2)`s a regular file over the link and permanently breaks a "link
-/// first, populate later" dotfiles setup (stow/chezmoi) on its first save
-/// (#986). [`resolve_dangling_target`] walks that chain by hand instead.
+/// resolving: the old fallback of `path` itself `rename(2)`d a regular file
+/// over the link and permanently broke a "link first, populate later"
+/// dotfiles setup (stow/chezmoi) on its first save (#986).
+/// [`resolve_dangling_target`] walks that chain by hand instead — and, since
+/// a genuine symlink cycle can never be "resolved" at any bound, returns an
+/// error rather than another guess when the chain doesn't end within
+/// [`MAX_SYMLINK_HOPS`]; this function propagates it, so every link in a
+/// cycle is left exactly as it was rather than one of them being replaced.
 ///
 /// **Permission-safe:** an existing target's mode is carried over at `open`
 /// time, before the body is written, so a hand-tightened `0600` config's
@@ -214,7 +224,13 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
 /// [`Durability`].
 ///
 /// Any failure removes the temp file rather than leaving litter behind, and
-/// leaves the target untouched.
+/// leaves the target untouched. Every returned error names the *resolved*
+/// `target`, not just the original `path` — for a symlinked `path` those can
+/// differ, and a caller logging `path.display()` alongside the error (e.g.
+/// [`write_path`]'s `warn!`) would otherwise have no way to tell which
+/// directory actually failed. The error's [`std::io::ErrorKind`] is
+/// preserved (only the message is rewritten), so a caller matching on it
+/// still can.
 pub fn write_atomic(path: &Path, body: &str, durability: Durability) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -226,11 +242,20 @@ pub fn write_atomic(path: &Path, body: &str, durability: Durability) -> std::io:
     // within one filesystem. A target that doesn't exist yet can't be
     // canonicalised; `resolve_dangling_target` covers both "no file or link at
     // all" (returns `path` unchanged, same as before) and "a symlink whose
-    // destination doesn't exist yet" (follows the link chain by hand).
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| resolve_dangling_target(path));
-    let dir = target
-        .parent()
-        .ok_or_else(|| std::io::Error::other("config path has no parent directory"))?;
+    // destination doesn't exist yet" (follows the link chain by hand) — and
+    // errors out, rather than falling back to `path`, on a chain that never
+    // terminates (a cycle). Propagate that: no temp file has been created yet,
+    // so an early return here leaves every link in the chain untouched.
+    let target = match std::fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(_) => resolve_dangling_target(path)?,
+    };
+    let dir = target.parent().ok_or_else(|| {
+        std::io::Error::other(format!(
+            "{}: config path has no parent directory",
+            target.display()
+        ))
+    })?;
     let tmp = dir.join(tmp_name(&target));
 
     // The mode the target already carries, if any. Applied at `open` so the
@@ -254,9 +279,19 @@ pub fn write_atomic(path: &Path, body: &str, durability: Durability) -> std::io:
 
     if let Err(e) = swap() {
         // Best-effort: a failed write must not leave litter, but the write's
-        // own error is what the caller needs to see.
+        // own error is what the caller needs to see. The kind is preserved —
+        // callers may still match on it — but the message is rewritten to
+        // name `target`: for a symlinked `path` that's the *resolved*
+        // location, which a bare `path.display()` in the caller's own log
+        // line (e.g. `write_path`'s `warn!`) can't show. Without this, a
+        // missing directory on the target side of a dangling-symlink write
+        // surfaces as a bare "No such file or directory" with nothing to say
+        // which directory.
         let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+        return Err(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", target.display()),
+        ));
     }
 
     if matches!(durability, Durability::FsyncParent) {
@@ -280,24 +315,59 @@ pub fn write_atomic(path: &Path, body: &str, durability: Durability) -> std::io:
 /// place a working chain would have canonicalized to, had the target
 /// existed.
 ///
-/// Bounded to [`MAX_SYMLINK_HOPS`] so a symlink cycle can't loop forever; a
-/// chain that long falls back to writing through `path` itself, same as an
-/// unresolvable target always has.
-fn resolve_dangling_target(path: &Path) -> PathBuf {
+/// A relative destination is joined onto its link's parent **lexically**:
+/// any `..` component `read_link` handed back is kept exactly as-is, never
+/// popped off by hand. A hand-rolled normalizer would be wrong the moment a
+/// directory earlier in the path is itself a symlink — `b -> ../c` resolved
+/// from inside `a -> real/b` does not generally mean "collapse to `real/c`";
+/// which real directory `..` lands in depends on where `real` itself
+/// actually is, and only the kernel's own path resolution — which sees the
+/// whole filesystem, not just this one link's text — can answer that
+/// correctly. Leaving `..` untouched and letting `open(2)`/`rename(2)`
+/// resolve the final joined path is what keeps this correct; a lexical
+/// `..`-collapsing "fix" here would silently write into the wrong directory.
+///
+/// # Errors
+/// An [`std::io::Error`] (kind [`std::io::ErrorKind::Other`] — `ErrorKind`'s
+/// `FilesystemLoop` variant, which would name this precisely, is still
+/// unstable on this MSRV) naming the stuck path, if the chain is still a
+/// symlink after [`MAX_SYMLINK_HOPS`] hops. A genuine cycle (`a -> b -> a`,
+/// even a self-referential `a -> a`) never terminates at any bound, and the
+/// pre-#986 behaviour — falling back to `path` in that case — is exactly the
+/// bug #986 exists to fix: it would `rename(2)` a regular file over the
+/// link. The caller must propagate this rather than swallow it, so every
+/// link in a genuine cycle survives the write attempt untouched.
+fn resolve_dangling_target(path: &Path) -> std::io::Result<PathBuf> {
     let mut current = path.to_path_buf();
     for _ in 0..MAX_SYMLINK_HOPS {
-        let Ok(link_target) = std::fs::read_link(&current) else {
-            return current;
-        };
-        current = if link_target.is_absolute() {
-            link_target
-        } else if let Some(parent) = current.parent() {
-            parent.join(&link_target)
-        } else {
-            link_target
-        };
+        match std::fs::read_link(&current) {
+            Err(_) => return Ok(current),
+            Ok(link_target) => {
+                current = if link_target.is_absolute() {
+                    link_target
+                } else if let Some(parent) = current.parent() {
+                    parent.join(&link_target)
+                } else {
+                    link_target
+                };
+            }
+        }
     }
-    path.to_path_buf()
+    // `MAX_SYMLINK_HOPS` links resolved without ever landing on a
+    // non-symlink. One more `read_link` distinguishes a chain of *exactly*
+    // that length (which must still succeed — the kernel's own resolver
+    // would follow it too) from a longer chain or a cycle (which can't be
+    // resolved at this bound, or any other).
+    if std::fs::read_link(&current).is_err() {
+        Ok(current)
+    } else {
+        Err(std::io::Error::other(format!(
+            "{}: symlink chain did not resolve within {} hops (stuck at {})",
+            path.display(),
+            MAX_SYMLINK_HOPS,
+            current.display()
+        )))
+    }
 }
 
 /// Fill the freshly-opened temp file: fix up its mode, write the body, `fsync`.
@@ -560,6 +630,132 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&realfile).unwrap(), "new\n");
         assert_eq!(entries(&real), vec!["places.toml".to_string()]);
+    }
+
+    /// The resolved target — not just the original `path` — must be
+    /// discoverable from the returned error, so a caller's `error = %e` log
+    /// (`write_path`) or a stringified error (`PlacesError::Write`) tells the
+    /// operator which directory is actually missing, rather than a bare "No
+    /// such file or directory" naming nothing. Review follow-up on #986: a
+    /// dangling symlink whose target's own directory doesn't exist either.
+    #[test]
+    fn a_missing_target_directory_names_the_resolved_path_in_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_dir = dir.path().join("nope");
+        let target = missing_dir.join("places.toml");
+        let link = dir.path().join("places.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = write_atomic(&link, "new\n", Durability::FileOnly).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains(&target.display().to_string()),
+            "error must name the resolved target, not just the original link: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "the link must survive a failed write"
+        );
+        assert!(
+            !missing_dir.exists(),
+            "the missing directory must not be created"
+        );
+    }
+
+    /// A symlink that points at itself resolves to nothing no matter how
+    /// many hops are allowed. The pre-#986 fallback of writing through
+    /// `path` itself would `rename(2)` a regular file over exactly this
+    /// link — review follow-up on #986's HIGH finding.
+    #[test]
+    fn a_self_referential_symlink_is_rejected_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("a");
+        std::os::unix::fs::symlink(&link, &link).unwrap();
+
+        assert!(!write_path("test", &link, "new\n"));
+
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "a self-referential symlink must not be replaced by a regular file"
+        );
+    }
+
+    /// The two-link sibling of the self-loop above: `a -> b -> a`. Neither
+    /// link may be touched by a rejected write.
+    #[test]
+    fn a_two_link_symlink_cycle_is_rejected_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        assert!(!write_path("test", &a, "new\n"));
+
+        assert!(
+            std::fs::symlink_metadata(&a).unwrap().is_symlink(),
+            "the first link of a rejected cycle must survive"
+        );
+        assert!(
+            std::fs::symlink_metadata(&b).unwrap().is_symlink(),
+            "the second link of a rejected cycle must survive"
+        );
+    }
+
+    /// Builds a chain of `n` symlinks under `dir`:
+    /// `link0 -> link1 -> … -> link{n-1} -> final.toml`, where `final.toml`
+    /// is never created. Returns `(link0, final.toml)` — the entry point a
+    /// caller writes through, and the path a successful resolve must land
+    /// on.
+    fn symlink_chain(dir: &Path, n: u32) -> (PathBuf, PathBuf) {
+        let final_target = dir.join("final.toml");
+        let mut next = final_target.clone();
+        for i in (0..n).rev() {
+            let link = dir.join(format!("link{i}"));
+            std::os::unix::fs::symlink(&next, &link).unwrap();
+            next = link;
+        }
+        (next, final_target)
+    }
+
+    /// A chain exactly [`MAX_SYMLINK_HOPS`] long is still an ordinary,
+    /// resolvable symlink chain — the same length the kernel's own path
+    /// resolution would follow — so it must succeed, not be mistaken for a
+    /// cycle. Review follow-up on #986's off-by-one MEDIUM finding: the
+    /// lower boundary of the fixed bound.
+    #[test]
+    fn a_symlink_chain_at_exactly_the_hop_bound_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entry, target) = symlink_chain(dir.path(), MAX_SYMLINK_HOPS);
+
+        assert!(write_path("test", &entry, "new\n"));
+
+        assert!(
+            std::fs::symlink_metadata(&entry).unwrap().is_symlink(),
+            "the entry link must survive a successful write-through"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    }
+
+    /// One hop past the bound must be rejected — the upper boundary the
+    /// off-by-one fix exists to place correctly, the sibling of the previous
+    /// test.
+    #[test]
+    fn a_symlink_chain_one_past_the_hop_bound_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entry, target) = symlink_chain(dir.path(), MAX_SYMLINK_HOPS + 1);
+
+        assert!(!write_path("test", &entry, "new\n"));
+
+        assert!(
+            std::fs::symlink_metadata(&entry).unwrap().is_symlink(),
+            "the entry link must survive a rejected write"
+        );
+        assert!(
+            !target.exists(),
+            "an over-long chain must not create the target"
+        );
     }
 
     /// A reader hammering the file while a writer replaces it must never see a

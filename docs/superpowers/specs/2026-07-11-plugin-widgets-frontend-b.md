@@ -175,6 +175,19 @@ enum EventKind { Click, Scroll { dx: f64, dy: f64 } }   // v1; matches the recon
   > stayed byte-identical. `ellipsize` had already shipped on `Node::Text`
   > (#297); of the three props named here only `margins` is still unbuilt.
 
+  > **And then the list-y plugin did arrive (2026-09-08, #966).** The trigger
+  > this sentence actually predicted — "when the first list-y plugin needs
+  > them" — was Mara's live test of the agents card (#963): `Node::Row` grew
+  > `spacing` and `Node::ListBox` grew `dense`, both the same optional-field
+  > class as `tooltip`, both `skip_serializing_if`-defaulted so every golden
+  > fixture that predates them is still byte-identical. What the sentence did
+  > **not** anticipate is the third gap, which is not a prop at all:
+  > `Node::Box`'s `scroll` had always been an _event target_ and GTK CSS has no
+  > `max-height`, so a plugin could not bound its own card by any combination of
+  > this vocabulary — `Node::Scrolled` is the appended variant that fixes it
+  > (`VOCAB` 3 → 4, negotiated on `SCROLLED_VOCAB` like #882/#893), and `scroll`
+  > keeps its meaning with a doc line saying it is not a viewport.
+
 ## Message envelope
 
 ```rust
@@ -340,6 +353,8 @@ plugin still speaks the wire directly and reimplements this loop.
 - More `StateKey`s (battery, media, net, niri workspaces/window, cpu, weather,
   power-profile) — additive.
 - `Row`/`ListBox` nodes + richer props for list-y widgets — additive.
+  _Shipped: the nodes long ago, their `spacing`/`dense` props plus a
+  `Node::Scrolled` viewport in #966 (see the retraction notes above)._
 - **Frontend D** (config + scripts) and **frontend A** (WASM) as later feeds for
   the _same_ reconciler, if wanted.
 

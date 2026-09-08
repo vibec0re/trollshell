@@ -2680,10 +2680,12 @@ fn the_shader_generation_bumps_the_census_only() {
     // is no longer the newest. That the census reaches the *newest* variant is
     // pinned by `the_viewport_generation_bumps_the_census_only` below, which is
     // where the next appended variant moves the equality to.
-    assert!(
-        VOCAB >= SHADER_VOCAB,
-        "the census must still cover the shader generation",
-    );
+    const {
+        assert!(
+            VOCAB >= SHADER_VOCAB,
+            "the census must still cover the shader generation",
+        );
+    }
     assert_eq!(
         VOCAB_UNCONDITIONAL, 1,
         "a negotiated variant does not move the unconditional ceiling",

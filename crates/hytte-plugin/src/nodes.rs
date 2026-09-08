@@ -17,13 +17,22 @@
 //! ```ignore
 //! use hytte_plugin::nodes;
 //!
-//! nodes::list(vec![
-//!     nodes::row(vec![name, nodes::spacer(), value]).spacing(6).id("argus").build(),
+//! use hytte_plugin::proto::Node;
+//!
+//! let card = nodes::list(vec![
+//!     nodes::row(vec![name, Node::Spacer, value])
+//!         .id("argus")
+//!         .spacing(6)
+//!         .build(),
 //!     // …one row per agent…
 //! ])
 //! .class("boxed-list")
 //! .dense(true)
-//! .build()
+//! .build();
+//!
+//! // Bounded at 240 px against a shell that has a viewport; the bare card
+//! // against one that hasn't.
+//! nodes::scrolled(240, card).id("hive-body").build()
 //! ```
 
 use hytte_plugin_proto::{Cls, Node, NodeId, SCROLLED_VOCAB};

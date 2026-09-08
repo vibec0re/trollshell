@@ -1729,8 +1729,14 @@ fn chevron_icon(expanded: bool) -> &'static str {
 ///
 /// - `propagate_natural_height(true)` — the scroller asks for its child's
 ///   natural height, so a child **shorter** than the cap is not stretched to it.
-///   Without this a `ScrolledWindow` requests a fixed small minimum and every
-///   bounded card would render at that size, cap or no cap.
+///   Stated because it is the documented spelling of that intent, **not**
+///   because it is measurably load-bearing today: removing it leaves
+///   `a_child_shorter_than_max_height_is_not_stretched` green, because the
+///   `GtkViewport` GTK wraps a non-scrollable child in already reports that
+///   child's minimum height, and `max_content_height` clamps the minimum as well
+///   as the natural. It is kept so the request does not quietly depend on that
+///   wrapping — a natively scrollable child would come with no `GtkViewport`
+///   and no propagation.
 /// - `policy(Never, Automatic)` — vertical only. `Never` on the horizontal axis
 ///   is what propagates the child's natural **width** unchanged, so wrapping a
 ///   card in a viewport never narrows it or grows a horizontal scrollbar.
@@ -2592,7 +2598,8 @@ mod gtk_tests {
     // `#[gtk::test]` runs every test on one shared GTK main thread (GTK is
     // single-threaded), so these run serially but correctly under the default
     // multithreaded `cargo test` harness — no manual `gtk::init` juggling.
-    use super::{Dir, EventKind, Node, Reconciler};
+    use super::{DENSE_ROW_CLASS, Dir, EventKind, Node, Reconciler};
+    use gtk::glib;
     use gtk::prelude::*;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -3249,6 +3256,7 @@ mod gtk_tests {
         Node::ListBox {
             id: id.map(ToOwned::to_owned),
             classes: vec![],
+            dense: false,
             children,
         }
     }
@@ -3257,6 +3265,7 @@ mod gtk_tests {
         Node::Row {
             id: id.map(ToOwned::to_owned),
             classes: vec![],
+            spacing: 0,
             children,
         }
     }
@@ -3265,6 +3274,7 @@ mod gtk_tests {
         Node::ListBox {
             id: id.map(ToOwned::to_owned),
             classes: classes.into_iter().map(ToOwned::to_owned).collect(),
+            dense: false,
             children,
         }
     }
@@ -4325,5 +4335,604 @@ mod gtk_tests {
         rec.render(&hbox(vec![lbl(Some("a"), "x")]));
         assert_eq!(only_child(&root).tooltip_text(), None);
         assert_eq!(root.first_child().unwrap().tooltip_text(), None);
+    }
+
+    // ── List-card layout (#966) ──────────────────────────────────────────────
+
+    /// Install libadwaita's stylesheet **and** the shipped `hytte-ui` sheet, at
+    /// the same provider priority production uses.
+    ///
+    /// Both halves matter and neither is optional: without `adw::init` there is
+    /// no row height floor to drop and the dense measurement is trivially equal;
+    /// without the library sheet the `hytte-dense-row` class is an inert string
+    /// and the test would prove only that the reconciler calls `add_css_class`.
+    ///
+    /// The CSS comes from [`crate::app::DEFAULT_STYLESHEET`] — the **shipped**
+    /// file, `include_str!`'d there — rather than a copy retyped here, so
+    /// deleting the rule from `assets/hytte-ui/style.css` turns these tests red.
+    /// It is also the only reachable copy under `nix flake check`: crane's source
+    /// filter strips `assets/` bar that one file.
+    fn install_theme() {
+        adw::init().expect("libadwaita init");
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(crate::app::DEFAULT_STYLESHEET);
+        let display = gtk::gdk::Display::default().expect("a display");
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+
+    fn spaced_row(id: &str, spacing: u16, children: Vec<Node>) -> Node {
+        Node::Row {
+            id: Some(id.to_owned()),
+            classes: vec![],
+            spacing: i32::from(spacing),
+            children,
+        }
+    }
+
+    /// The shape the issue is about: a `.boxed-list` card of one-line rows —
+    /// libadwaita's carded list, which is what makes the wrapper's height floor
+    /// bite (a class-less `GtkListBox` gets a much smaller one).
+    fn dense_list(dense: bool, rows: usize) -> Node {
+        Node::ListBox {
+            id: Some("agents".to_owned()),
+            classes: vec!["boxed-list".to_owned()],
+            dense,
+            children: (0..rows)
+                .map(|i| spaced_row(&format!("r{i}"), 0, vec![lbl(None, "argus")]))
+                .collect(),
+        }
+    }
+
+    /// The natural height of a realized list, at a width wide enough that no row
+    /// wraps.
+    fn natural_height(widget: &gtk::Widget) -> i32 {
+        widget.measure(gtk::Orientation::Vertical, 320).1
+    }
+
+    /// #966 (2): a 12-row dense list must be **materially** shorter than the
+    /// default one, because the height went into the `GtkListBoxRow` wrappers
+    /// GTK auto-creates and a plugin cannot reach them.
+    ///
+    /// Every number is **measured in the same run**, never a magic constant: the
+    /// floor is the theme's and moves with it, so the assertions are stated
+    /// against a bare label and against the row count. They are printed too, and
+    /// quoted in the PR — on this CI theme a 12-row `.boxed-list` goes 251 px →
+    /// 203 px, and one row 20 px → 16 px, which is exactly its label.
+    ///
+    /// **Falsified** three ways, each turning a different assertion red:
+    /// deleting the `apply_dense_rows` call from `build_node`, deleting the
+    /// `.hytte-dense-row` rule from `assets/hytte-ui/style.css`, or dropping
+    /// `padding: 0` from that rule (the one-row equality is what catches the
+    /// last one — the `min-height` alone leaves the padding behind).
+    #[gtk::test]
+    fn a_dense_list_is_exactly_as_tall_as_its_rows_content() {
+        const ROWS: usize = 12;
+        install_theme();
+
+        // One tree per measurement, each mounted fresh: the CSS class is set at
+        // build, so nothing here depends on invalidation (the flip test below is
+        // where that is exercised).
+        let height_of = |tree: &Node| {
+            let root = root();
+            let mut rec = Reconciler::new(&root, |_, _| {});
+            rec.render(tree);
+            natural_height(&root.first_child().expect("mounted"))
+        };
+        let plain_h = height_of(&dense_list(false, ROWS));
+        let dense_h = height_of(&dense_list(true, ROWS));
+        // Single-row lists isolate one wrapper's own contribution from the
+        // hairline separators a multi-row list also pays.
+        let plain_1 = height_of(&dense_list(false, 1));
+        let dense_1 = height_of(&dense_list(true, 1));
+        let label_h = height_of(&lbl(None, "argus"));
+        let rows = i32::try_from(ROWS).expect("12 fits an i32");
+        let content_h = label_h * rows;
+
+        println!(
+            "#966 dense measurement: {ROWS} `.boxed-list` rows — default {plain_h}px, \
+             dense {dense_h}px ({content_h}px of that is content); one row — default \
+             {plain_1}px, dense {dense_1}px, bare label {label_h}px"
+        );
+
+        // The exact claim, and the strong one: with `min-height: 0; padding: 0`
+        // the wrapper has no height of its own, so one dense row *is* its
+        // content. Deleting either the class or the stylesheet rule turns this
+        // back into the theme's floor.
+        assert_eq!(
+            dense_1, label_h,
+            "one dense row is exactly its content: {dense_1}px vs a {label_h}px label",
+        );
+        // Not vacuous: the theme really does charge for the wrapper, so there is
+        // something for `dense` to give back.
+        assert!(
+            plain_1 > dense_1,
+            "…where the default row adds the theme's floor: {plain_1}px vs {dense_1}px",
+        );
+        assert!(
+            dense_h < plain_h,
+            "so a dense list is shorter: dense {dense_h}px vs default {plain_h}px",
+        );
+        // Across the whole list, everything left over the content is the
+        // hairline separators between rows — at most a pixel each. The default
+        // list is far over that, which is the ~700 px #966 opened on.
+        assert!(
+            dense_h - content_h <= rows,
+            "a dense list carries at most a hairline per row over its content: \
+             {dense_h}px vs {content_h}px of content",
+        );
+        assert!(
+            plain_h - content_h > rows,
+            "…where the default list carries the wrapper floor as well: \
+             {plain_h}px vs {content_h}px of content",
+        );
+    }
+
+    /// `dense` is a **mutable prop**, both directions: flipping it on a
+    /// same-id re-render re-marks the wrappers of rows that were *reused*, not
+    /// only ones built fresh.
+    ///
+    /// **Falsified** by moving the `apply_dense_rows` call out of
+    /// `update_in_place` (build-only): the first flip does nothing, because
+    /// every row is reused and no wrapper is ever revisited.
+    #[gtk::test]
+    fn flipping_dense_re_marks_reused_rows_in_both_directions() {
+        const ROWS: usize = 3;
+        install_theme();
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&dense_list(false, ROWS));
+
+        // Realized in a window, because the *height* half of this test needs a
+        // frame clock: a CSS class change invalidates the style, but the
+        // recomputed size request only lands on a frame. Measuring an unrooted
+        // tree straight after the render reads the stale cached height, and the
+        // flip looks like it did nothing.
+        root.set_valign(gtk::Align::Start);
+        let window = gtk::Window::new();
+        window.set_child(Some(&root));
+        window.set_default_size(320, 600);
+        window.present();
+        pump();
+
+        let widget = root.first_child().expect("list mounted");
+        let before = widget.height();
+        let wrappers = |w: &gtk::Widget| -> Vec<bool> {
+            children(w)
+                .iter()
+                .map(|row| row.has_css_class(DENSE_ROW_CLASS))
+                .collect()
+        };
+        assert_eq!(wrappers(&widget), vec![false; ROWS], "not dense to start");
+        let first_row = widget.first_child().expect("a row").first_child();
+
+        rec.render(&dense_list(true, ROWS));
+        pump_until(2000, || widget.height() < before);
+        assert_eq!(
+            root.first_child().expect("still mounted"),
+            widget,
+            "the list widget is reused across the flip",
+        );
+        assert_eq!(
+            widget.first_child().expect("a row").first_child(),
+            first_row,
+            "…and so are the rows, so this is the reuse path",
+        );
+        assert_eq!(
+            wrappers(&widget),
+            vec![true; ROWS],
+            "every wrapper is marked — including ones that were only reused"
+        );
+        let dense = widget.height();
+        assert!(dense < before, "dense {dense}px vs default {before}px");
+
+        rec.render(&dense_list(false, ROWS));
+        pump_until(2000, || widget.height() > dense);
+        assert_eq!(
+            wrappers(&widget),
+            vec![false; ROWS],
+            "…and unmarked again on the way back"
+        );
+        assert_eq!(
+            widget.height(),
+            before,
+            "flipping back restores the original height exactly",
+        );
+    }
+
+    /// #966 (1): a `Row`'s `spacing` reaches the backing box, and updates in
+    /// place on a same-id re-render rather than rebuilding it.
+    ///
+    /// **Falsified** by dropping `boxw.set_spacing` from `update_in_place`'s
+    /// `Row` arm: the widget is still reused, but the gap stays at its build
+    /// value forever.
+    #[gtk::test]
+    fn row_spacing_applies_and_updates_in_place() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+
+        rec.render(&spaced_row("r", 0, vec![lbl(None, "a"), lbl(None, "b")]));
+        let widget = root.first_child().expect("row mounted");
+        let boxw = widget.clone().downcast::<gtk::Box>().expect("a gtk::Box");
+        assert_eq!(boxw.spacing(), 0, "the pre-#966 default is flush");
+        let narrow = natural_width(&widget);
+
+        rec.render(&spaced_row("r", 8, vec![lbl(None, "a"), lbl(None, "b")]));
+        assert_eq!(
+            root.first_child().expect("still mounted"),
+            widget,
+            "spacing is a mutable prop, not part of the node's identity",
+        );
+        assert_eq!(boxw.spacing(), 8);
+        assert_eq!(
+            natural_width(&widget),
+            narrow + 8,
+            "one gap between two children widens the row by exactly the spacing",
+        );
+    }
+
+    fn natural_width(widget: &gtk::Widget) -> i32 {
+        widget.measure(gtk::Orientation::Horizontal, -1).1
+    }
+
+    /// A tall child inside a `Node::Scrolled` is **realized in a window** so the
+    /// viewport has a real allocation to clip against, then measured in the
+    /// scroller's own coordinate space — the widget whose allocation clips.
+    ///
+    /// Returns `(scroller, body, last_row)`.
+    fn mount_bounded_card(
+        max_height: i32,
+        rows: usize,
+    ) -> (gtk::ScrolledWindow, gtk::Widget, gtk::Widget) {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        let tree = Node::Scrolled {
+            id: Some("card".to_owned()),
+            max_height,
+            classes: vec![],
+            child: Box::new(Node::Box {
+                id: Some("body".to_owned()),
+                dir: Dir::Vertical,
+                spacing: 0,
+                scroll: false,
+                classes: vec![],
+                children: (0..rows)
+                    .map(|i| lbl(Some(&format!("r{i}")), "a row of text"))
+                    .collect(),
+                tooltip: None,
+            }),
+        };
+        rec.render(&tree);
+        let scroller = root
+            .first_child()
+            .expect("the viewport mounted")
+            .downcast::<gtk::ScrolledWindow>()
+            .expect("a GtkScrolledWindow");
+        let body = scroller
+            .child()
+            .expect("the viewport has a child")
+            // GTK wraps a non-scrollable child in a GtkViewport, so the box we
+            // sent is one level further down than `set_child` suggests.
+            .downcast::<gtk::Viewport>()
+            .expect("a GtkViewport")
+            .child()
+            .expect("our box");
+        let last = body.last_child().expect("the body has rows");
+
+        // `max_content_height` bounds the viewport's **natural height request**;
+        // the allocation only follows it where the parent honours that request.
+        // A sidebar card stack does (children get their natural height, stack
+        // top-aligned), and this mount says so explicitly — without the
+        // `valign`, the window's own 600 px is handed straight down and the
+        // scroller renders five times its cap with nothing wrong in the code.
+        root.set_valign(gtk::Align::Start);
+        let window = gtk::Window::new();
+        window.set_child(Some(&root));
+        window.set_default_size(320, 600);
+        window.present();
+        pump();
+        (scroller, body, last)
+    }
+
+    fn pump() {
+        while glib::MainContext::default().iteration(false) {}
+    }
+
+    /// Drive the main loop until `done()` or the deadline. A scroll only lands
+    /// on a **frame** (it queues an allocation on the viewport), and
+    /// `iteration(true)` is what lets the frame clock tick — spinning on
+    /// `iteration(false)` starves it and the scroll looks like it never
+    /// happened. Same shape, same reason, as the sidebar's `pump_until` (#965).
+    fn pump_until(ms: u64, done: impl Fn() -> bool) {
+        let expired = Rc::new(std::cell::Cell::new(false));
+        let flag = expired.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(ms), move || {
+            flag.set(true);
+        });
+        while !expired.get() && !done() {
+            glib::MainContext::default().iteration(true);
+        }
+    }
+
+    /// #966 (3), the whole point: a child taller than `max_height` is **clipped
+    /// to it and scrollable**.
+    ///
+    /// Asserts the rectangle and the hit, never `is_visible()` (#851/#838): the
+    /// last row is `visible` in both states here — that flag is orthogonal to
+    /// being on-screen, which is exactly how a geometry bug ships past a
+    /// visibility-based test.
+    ///
+    /// **Falsified** by dropping `apply_max_height` from `build_node` (the
+    /// scroller then takes the child's full natural height and `upper ==
+    /// page_size`, so there is nothing to scroll).
+    #[gtk::test]
+    fn a_child_taller_than_max_height_is_clipped_to_it_and_scrolls() {
+        const CAP: i32 = 120;
+        install_theme();
+        let (scroller, _body, last) = mount_bounded_card(CAP, 30);
+
+        assert!(
+            natural_height(&scroller.clone().upcast()) <= CAP,
+            "the viewport must not REQUEST more than its cap: {}px vs {CAP}px",
+            natural_height(&scroller.clone().upcast()),
+        );
+        assert!(
+            scroller.height() <= CAP,
+            "…and, given a parent that honours the request, is allocated no more: {}px vs {CAP}px",
+            scroller.height(),
+        );
+        let vadj = scroller.vadjustment();
+        assert!(
+            vadj.upper() > vadj.page_size(),
+            "a clipped child leaves something to scroll: upper {} vs page {}",
+            vadj.upper(),
+            vadj.page_size(),
+        );
+
+        let viewport = f64::from(scroller.height());
+        let bounds = |w: &gtk::Widget| w.compute_bounds(&scroller);
+        let hits_last = |b: &gtk::graphene::Rect| {
+            let (x, y) = (
+                f64::from(b.x()) + f64::from(b.width()) / 2.0,
+                f64::from(b.y()) + f64::from(b.height()) / 2.0,
+            );
+            scroller
+                .pick(x, y, gtk::PickFlags::DEFAULT)
+                .is_some_and(|w| w == last || w.is_ancestor(&last))
+        };
+
+        let before = bounds(&last).expect("the last row is inside the scroller");
+        assert!(
+            f64::from(before.y()) >= viewport,
+            "before scrolling, the last row sits BELOW the viewport ({}px vs {viewport}px)",
+            before.y(),
+        );
+        assert!(!hits_last(&before), "…and nothing there is pickable");
+        assert!(
+            last.is_visible(),
+            "…while `is_visible` says the opposite — the #851 lesson, stated",
+        );
+
+        vadj.set_value(vadj.upper());
+        pump_until(2000, || {
+            bounds(&last).is_some_and(|b| f64::from(b.y()) < viewport)
+        });
+        let after = bounds(&last).expect("still inside the scroller");
+        assert!(
+            f64::from(after.y()) < viewport && f64::from(after.y() + after.height()) <= viewport,
+            "after scrolling to the end the last row is fully inside the viewport: {after:?}",
+        );
+        assert!(hits_last(&after), "…and it is pickable there");
+    }
+
+    /// The other half of the contract: a child **shorter** than the cap is not
+    /// stretched to it. That is what `propagate_natural_height` buys, and it is
+    /// what lets a plugin wrap a list whose length it does not know.
+    ///
+    /// **Falsified** by dropping `apply_max_height` (the card inflates to the
+    /// window). Deliberately *not* falsified by dropping
+    /// `set_propagate_natural_height` — see [`new_viewport`] for why that
+    /// setting is inert here and kept anyway.
+    #[gtk::test]
+    fn a_child_shorter_than_max_height_is_not_stretched() {
+        const CAP: i32 = 400;
+        install_theme();
+        let (scroller, body, last) = mount_bounded_card(CAP, 2);
+        let vadj = scroller.vadjustment();
+        let content = natural_height(&body);
+        let viewport = f64::from(scroller.height());
+
+        assert!(
+            content < CAP,
+            "the premise: a two-row card is well under the cap ({content}px of {CAP}px)",
+        );
+        assert!(
+            viewport < f64::from(CAP) / 2.0,
+            "a two-row card must not be inflated to the cap: {viewport}px of {CAP}px",
+        );
+        // The *lower* bound is the load-bearing half, and an upper bound alone
+        // stays green through exactly the bug this pins: a
+        // `GtkScrolledWindow`'s own minimum is near zero, so without
+        // `propagate_natural_height` the card **collapses** rather than
+        // inflating. Stated as the rectangle and the hit (#851), not as
+        // arithmetic on the scroller's chrome: the whole body must fit inside
+        // the viewport, and the last row must be pickable where it is drawn.
+        let bounds = body
+            .compute_bounds(&scroller)
+            .expect("the body is inside the scroller");
+        assert!(
+            f64::from(bounds.y()) >= 0.0 && f64::from(bounds.y() + bounds.height()) <= viewport,
+            "the whole {content}px body fits inside the {viewport}px viewport: {bounds:?}",
+        );
+        let last_bounds = last
+            .compute_bounds(&scroller)
+            .expect("the last row is inside the scroller");
+        let hit = scroller.pick(
+            f64::from(last_bounds.x()) + f64::from(last_bounds.width()) / 2.0,
+            f64::from(last_bounds.y()) + f64::from(last_bounds.height()) / 2.0,
+            gtk::PickFlags::DEFAULT,
+        );
+        assert!(
+            hit.is_some_and(|w| w == last || w.is_ancestor(&last)),
+            "…and its last row is pickable there",
+        );
+        assert!(
+            vadj.upper() <= vadj.page_size() + 1.0,
+            "…so there is nothing to scroll: upper {} vs page {}",
+            vadj.upper(),
+            vadj.page_size(),
+        );
+    }
+
+    /// `max_height` is a mutable prop: re-bounding a card reuses the viewport
+    /// widget (and everything under it) rather than rebuilding the subtree.
+    ///
+    /// **Falsified** by dropping `apply_max_height` from `update_in_place`: the
+    /// widget is still reused, but the cap stays at its build value.
+    #[gtk::test]
+    fn max_height_updates_in_place() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        let card = |max_height: i32| Node::Scrolled {
+            id: Some("card".to_owned()),
+            max_height,
+            classes: vec![],
+            child: Box::new(lbl(Some("body"), "x")),
+        };
+
+        rec.render(&card(120));
+        let scroller = root
+            .first_child()
+            .expect("mounted")
+            .downcast::<gtk::ScrolledWindow>()
+            .expect("a GtkScrolledWindow");
+        assert_eq!(scroller.max_content_height(), 120);
+
+        rec.render(&card(240));
+        assert_eq!(
+            root.first_child().expect("still mounted"),
+            scroller.clone().upcast::<gtk::Widget>(),
+            "the viewport widget is reused",
+        );
+        assert_eq!(scroller.max_content_height(), 240);
+
+        // `0` means unbounded, and GTK spells that `-1` — so a plugin can hand
+        // over a computed cap of zero instead of branching on the node.
+        rec.render(&card(0));
+        assert_eq!(scroller.max_content_height(), -1);
+    }
+
+    /// A bounded card inside a **scrolling surface** (the sidebar, #965) keeps
+    /// its own adjustment: driving the inner viewport to its end moves nothing
+    /// on the outer one, so the two do not fight over a shared offset.
+    ///
+    /// That independence is the structural half of "no double-scroll fight".
+    /// The *gesture* half — which of the two a wheel tick reaches — is
+    /// `GtkScrolledWindow`'s standard kinetic chaining (innermost first, handing
+    /// the gesture outward at its ends) and is **not** asserted here: this suite
+    /// has no way to synthesize a `GdkScrollEvent` onto a surface, so it lives
+    /// in `docs/live-verify.md` instead, said plainly rather than half-tested.
+    #[gtk::test]
+    fn a_bounded_card_inside_a_scrolling_surface_keeps_its_own_adjustment() {
+        install_theme();
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&Node::Scrolled {
+            id: Some("card".to_owned()),
+            max_height: 120,
+            classes: vec![],
+            child: Box::new(Node::Box {
+                id: Some("body".to_owned()),
+                dir: Dir::Vertical,
+                spacing: 0,
+                scroll: false,
+                classes: vec![],
+                children: (0..30)
+                    .map(|i| lbl(Some(&format!("r{i}")), "a row of text"))
+                    .collect(),
+                tooltip: None,
+            }),
+        });
+        let inner = root
+            .first_child()
+            .expect("the viewport mounted")
+            .downcast::<gtk::ScrolledWindow>()
+            .expect("a GtkScrolledWindow");
+
+        // The sidebar's own scroller, stood in for: a short surface with the
+        // card plus enough below it that the surface scrolls too.
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        column.append(&root);
+        for _ in 0..20 {
+            column.append(&gtk::Label::new(Some("another card")));
+        }
+        let outer = gtk::ScrolledWindow::new();
+        outer.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        outer.set_child(Some(&column));
+        let window = gtk::Window::new();
+        window.set_child(Some(&outer));
+        window.set_default_size(320, 200);
+        window.present();
+        pump();
+
+        let (iadj, oadj) = (inner.vadjustment(), outer.vadjustment());
+        assert!(iadj.upper() > iadj.page_size(), "the card scrolls");
+        assert!(oadj.upper() > oadj.page_size(), "…and so does the surface");
+        assert!(
+            oadj.value() < 1.0,
+            "both start at the top: the surface is at {}",
+            oadj.value(),
+        );
+
+        iadj.set_value(iadj.upper());
+        pump_until(2000, || iadj.value() > 0.0);
+        assert!(iadj.value() > 0.0, "the card scrolled inside itself");
+        assert!(
+            oadj.value() < 1.0,
+            "…and the surface did not move with it (it is at {}) — separate adjustments, \
+             no shared offset",
+            oadj.value(),
+        );
+    }
+
+    /// The distinction #966 came from, pinned rather than only documented:
+    /// `Box { scroll: true }` is an **event target**, not a viewport. It builds
+    /// a plain `gtk::Box` that measures at its children's full height and clips
+    /// nothing — so a plugin that reached for it to bound a card got no bound.
+    ///
+    /// **Falsified** by making the `scroll` flag build a `ScrolledWindow`: the
+    /// downcast fails and the height assertion goes with it.
+    #[gtk::test]
+    fn a_scroll_enabled_box_is_not_a_viewport() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        let tall = |scroll: bool| Node::Box {
+            id: Some("b".to_owned()),
+            dir: Dir::Vertical,
+            spacing: 0,
+            scroll,
+            classes: vec![],
+            children: (0..30)
+                .map(|i| lbl(Some(&format!("r{i}")), "a row of text"))
+                .collect(),
+            tooltip: None,
+        };
+
+        rec.render(&tall(false));
+        let plain = natural_height(&root.first_child().expect("mounted"));
+        rec.render(&tall(true));
+        let widget = root.first_child().expect("mounted");
+        assert!(
+            widget.downcast_ref::<gtk::ScrolledWindow>().is_none(),
+            "`scroll` must not silently wrap the box in a viewport",
+        );
+        assert_eq!(
+            natural_height(&widget),
+            plain,
+            "`scroll` bounds nothing — that is what `Node::Scrolled` is for",
+        );
     }
 }

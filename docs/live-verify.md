@@ -420,9 +420,12 @@ the reducer but cannot prove the hive agrees.
 - [ ] **(#947 P1)** The card cannot bound its own height — the vocabulary has
       no scrollable region (`Box { scroll: true }` is a scroll _event target_)
       and GTK CSS has no `max-height` — so on a hive with more than 20 agents
-      confirm it draws 20 rows and a `+N more` line rather than growing past
-      the sidebar. If you have fewer than 20, this is a read-only check of the
-      code path; the shell-side sidebar scroll bug is tracked separately.
+      confirm it draws 20 rows and a `+N more` line rather than growing
+      without limit. If you have fewer than 20, this is a read-only check of
+      the code path. **Belt-and-braces since #967**: the sidebar itself
+      scrolls now, so a long card no longer hides the pet card below it — the
+      cap is what stops a large hive turning the sidebar into one very long
+      scroll.
 - [ ] **(#947 P1)** The status line is the harness's own text. Have an agent
       call its `set_status` tool and confirm the row's second line changes to
       that string within one poll (2 s by default) — not "running". A stopped

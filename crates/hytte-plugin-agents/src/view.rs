@@ -28,10 +28,17 @@
 //!    It attaches an `EventControllerScroll` that forwards deltas to the
 //!    plugin (`wire.rs:134-145`, `widget_tree.rs:826-829`); the widget is a
 //!    plain `gtk::Box` that neither clips nor scrolls. Combined with GTK CSS
-//!    having no `max-height`, **a plugin cannot bound its own card with a
-//!    scrollable region** — so the card bounds itself by *rendering less*:
-//!    one-line rows, collapsible groups, and [`MAX_ROWS`]. A real inner
-//!    scroll needs the shell-side sidebar fix.
+//!    having no `max-height`, **a plugin still cannot bound its own card with
+//!    a scrollable region** — so the card bounds itself by *rendering less*:
+//!    one-line rows, collapsible groups, and [`MAX_ROWS`].
+//!
+//!    The **sidebar** does scroll now — #967 put the card stack in a
+//!    `gtk::ScrolledWindow` (`trollshell/src/overlays/sidebar.rs`), so a card
+//!    taller than the surface no longer hides the ones below it. That changes
+//!    the *consequence* of a long roster from "the pet card is unreachable"
+//!    to "you scroll", but not the plugin-side facts above: this card still
+//!    has no way to cap its own height, and a 200-agent hive rendered in full
+//!    would still be a 200-row scroll. `MAX_ROWS` stays.
 
 use hytte_plugin::proto::{Dir, Node};
 

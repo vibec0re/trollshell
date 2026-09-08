@@ -14,31 +14,49 @@
 //! Learned from @kaesaecracker's live screenshots against a 12-agent hive, and
 //! each one is why the obvious spelling is *not* what is written below:
 //!
-//! 1. **`Node::Row` has no spacing.** The host builds it as
-//!    `gtk::Box::new(Horizontal, 0)` (`crates/hytte-ui/src/widget_tree.rs`'s
-//!    `build_node`) — the gap is hardcoded, not a field. A `Row` of
-//!    icon + label renders them touching, which is exactly how `⚙argus` came
-//!    out in the panel header. Everything here uses `Box { dir: Horizontal,
-//!    spacing }` instead, and `Row` appears nowhere.
+//! 1. **`Node::Row` had no spacing** — the host built it as
+//!    `gtk::Box::new(Horizontal, 0)`, the gap hardcoded rather than a field,
+//!    so a `Row` of icon + label rendered them touching (`⚙argus`, in the
+//!    panel header). #969 gave `Row` a `spacing`, but this file still uses
+//!    `Box { dir: Horizontal, spacing }` throughout and `Row` appears
+//!    nowhere — because `Row` carries **no `tooltip`**, and the agent row's
+//!    whole point is that hovering it shows the untruncated status
+//!    ([`agent_row`]). A `Row` for the handful of rows that need no hover
+//!    would render identically to the `Box` they already are, at the cost of
+//!    two row kinds in one file.
 //! 2. **`ListBox` auto-wraps every child in a `GtkListBoxRow`**
-//!    (`widget_tree.rs:708-716`), which carries libadwaita's row min-height.
-//!    That is most of why twelve agents came to ~700 px. The card is a plain
-//!    vertical `Box`; nothing here is a `ListBox`.
+//!    (`widget_tree.rs:708-716`), which carried libadwaita's row min-height —
+//!    most of why twelve agents came to ~700 px. #969's `ListBox { dense }`
+//!    zeroes that wrapper. This card is still a plain vertical `Box`: it
+//!    needs no `.boxed-list` styling, and a dense `ListBox` would re-introduce
+//!    a wrapper widget for no gain the rows can show.
+//!
+//!    (Both of those fields exist because of what these screenshots turned
+//!    up — #966 was filed off this file's findings and #969 implemented it.
+//!    They are recorded here as *history plus a current reason*, not as live
+//!    limitations, so the next plugin author is not misled either way.)
 //! 3. **`Box { scroll: true }` is a scroll *event target*, not a viewport.**
 //!    It attaches an `EventControllerScroll` that forwards deltas to the
-//!    plugin (`wire.rs:134-145`, `widget_tree.rs:826-829`); the widget is a
-//!    plain `gtk::Box` that neither clips nor scrolls. Combined with GTK CSS
-//!    having no `max-height`, **a plugin still cannot bound its own card with
-//!    a scrollable region** — so the card bounds itself by *rendering less*:
-//!    one-line rows, collapsible groups, and [`MAX_ROWS`].
+//!    plugin (`wire.rs:134-145`); the widget is a plain `gtk::Box` that
+//!    neither clips nor scrolls. GTK CSS has no `max-height` either, so when
+//!    this card was written there was **no** way for a plugin to bound its own
+//!    height — hence the bound it does have: one-line rows, collapsible
+//!    groups, and [`MAX_ROWS`].
 //!
-//!    The **sidebar** does scroll now — #967 put the card stack in a
-//!    `gtk::ScrolledWindow` (`trollshell/src/overlays/sidebar.rs`), so a card
-//!    taller than the surface no longer hides the ones below it. That changes
-//!    the *consequence* of a long roster from "the pet card is unreachable"
-//!    to "you scroll", but not the plugin-side facts above: this card still
-//!    has no way to cap its own height, and a 200-agent hive rendered in full
-//!    would still be a 200-row scroll. `MAX_ROWS` stays.
+//!    **Both halves of that have since been fixed, and neither is undone
+//!    here.** #967 put the sidebar's card stack in a `gtk::ScrolledWindow`, so
+//!    a tall card no longer hides the cards below it; and #969 added
+//!    [`Node::Scrolled`] (`{ max_height, child }`), a real viewport a plugin
+//!    can ask for — the variant #966 opened precisely because `Box::scroll`
+//!    was mistaken for one here.
+//!
+//!    This card does **not** use `Scrolled` yet, on purpose. The sidebar is
+//!    already a scroller, so wrapping the roster in a second one nests
+//!    scroll-within-scroll, which is a feel question rather than a
+//!    correctness one and wants @kaesaecracker's eyes on the real thing
+//!    first. `MAX_ROWS` therefore stays as the bound, now belt-and-braces
+//!    rather than load-bearing. Swapping it for a `Scrolled { max_height }`
+//!    is the natural follow-up once the scrolled sidebar has been seen.
 
 use hytte_plugin::proto::{Dir, Node};
 

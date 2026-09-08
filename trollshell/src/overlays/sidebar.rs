@@ -1198,7 +1198,7 @@ mod gtk_tests {
             .expect("the last row is a descendant of the scroller");
         let (bx, by) = centre_of(&before);
         let (before_top, before_hit) = (f64::from(before.y()), hits_last(bx, by));
-        let visible_but_offscreen = last.is_visible();
+        let visible_before = last.is_visible();
 
         let vadj = scroller.vadjustment();
         // `set_value` clamps to `upper - page_size`, i.e. the bottom of the
@@ -1219,6 +1219,7 @@ mod gtk_tests {
         let (after_top, after_bottom) =
             (f64::from(after.y()), f64::from(after.y() + after.height()));
         let after_hit = hits_last(ax, ay);
+        let visible_after = last.is_visible();
         // Measured here, on a *realized* tree with a live scrollbar, because
         // that is the production case: the surface is mapped whenever
         // `open_width` runs. `the_scroller_changes_no_width_measurement` pins
@@ -1236,9 +1237,11 @@ mod gtk_tests {
              means something when the stack is taller than the surface"
         );
         assert!(
-            visible_but_offscreen,
-            "test setup: the last row must be `visible` in both states, so that the assertions \
-             below are about geometry rather than about the visible flag (#851)"
+            visible_before && visible_after,
+            "test setup: the last row must be `visible` in BOTH states (before={visible_before}, \
+             after={visible_after}) — that is what makes the assertions below statements about \
+             geometry rather than about the visible flag, which is orthogonal to being on-screen \
+             and is why this bug shipped (#851/#838)"
         );
         assert!(
             before_top >= viewport && !before_hit,

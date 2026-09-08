@@ -280,9 +280,13 @@ and refuses any effect whose capability wasn't granted.
 >   preem-GL spec (out-of-process host, own context) plus a real grant surface.
 >   Named, not built.
 >
-> One stale copy of the superseded sentence is known to survive outside this
-> spec, in `hytte-plugin-proto/src/manifest.rs`'s `Capability` doc comment; it
-> is out of #998's lane and wants its own docs-only pass.
+> The wire crate got here first and is already correct:
+> `hytte-plugin-proto/src/manifest.rs`'s `Capability` doc says in as many words
+> that _"separately granted" is aspirational, not enforced_ and points at the
+> #893 boundary. One doc still repeats the superseded phrasing —
+> `2026-09-07-agentic-desktop-design.md`'s "the higher-trust, separately
+> granted capability" — which is outside #998's scope and wants its own pass;
+> nothing it designs depends on the tier existing.
 
 **Handshake:** plugin connects → `Register { manifest }` → host runs
 `Manifest::check_proto` (exact match on `proto`, else drop) and grants caps →

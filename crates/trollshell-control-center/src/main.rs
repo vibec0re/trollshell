@@ -1136,7 +1136,13 @@ mod gtk_tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let ticks = ui.ticks.get();
-        source.remove();
+        // Look the source up rather than `SourceId::remove()`, which unwraps:
+        // under the falsifying mutation the source has already destroyed
+        // itself, and a panic there would pre-empt the assertion below and
+        // report the wrong reason for the red.
+        if let Some(source) = glib::MainContext::default().find_source_by_id(&source) {
+            source.destroy();
+        }
 
         assert!(
             ticks >= 3,

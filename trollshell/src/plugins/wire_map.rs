@@ -211,10 +211,15 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
         wire::Node::Row {
             id,
             classes,
+            spacing,
             children,
         } => UiNode::Row {
             id: id.clone(),
             classes: classes.clone(),
+            // The wire says `u16` (a negative gap is not a thing a plugin can
+            // mean); the reconciler says `i32`, matching `gtk_box_set_spacing`.
+            // `From` rather than `try_into`: every `u16` is an `i32`.
+            spacing: i32::from(*spacing),
             children: children
                 .iter()
                 .filter_map(|child| map_node(walk, child))
@@ -223,14 +228,27 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
         wire::Node::ListBox {
             id,
             classes,
+            dense,
             children,
         } => UiNode::ListBox {
             id: id.clone(),
             classes: classes.clone(),
+            dense: *dense,
             children: children
                 .iter()
                 .filter_map(|child| map_node(walk, child))
                 .collect(),
+        },
+        wire::Node::Scrolled {
+            id,
+            max_height,
+            classes,
+            child,
+        } => UiNode::Scrolled {
+            id: id.clone(),
+            max_height: i32::from(*max_height),
+            classes: classes.clone(),
+            child: Box::new(map_node(walk, child)?),
         },
         wire::Node::Label {
             id,

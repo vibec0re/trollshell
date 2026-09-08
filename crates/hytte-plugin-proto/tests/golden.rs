@@ -175,9 +175,11 @@ fn full_manifest() -> Manifest {
 /// The `ListBox`/`Row` pair, nested inside [`node_tree`] below.
 fn list_tree() -> Node {
     Node::ListBox {
+        dense: false,
         id: Some("list".into()),
         classes: vec!["ts-list".into()],
         children: vec![Node::Row {
+            spacing: 0,
             id: Some("row-0".into()),
             classes: vec!["ts-row".into()],
             children: vec![Node::Text {
@@ -202,6 +204,7 @@ fn expander_tree() -> Node {
             tooltip: None,
         }),
         children: vec![Node::Row {
+            spacing: 0,
             id: Some("lamp".into()),
             classes: vec![],
             children: vec![Node::Label {
@@ -765,6 +768,48 @@ fn shader_tree() -> Node {
     }
 }
 
+/// A tree carrying all three of #966's list-card additions in their **set**
+/// state: a bounded [`Node::Scrolled`] viewport around a `dense`
+/// [`Node::ListBox`] of spaced [`Node::Row`]s.
+///
+/// This is the mirror image of what the older fixtures pin. `spacing` and
+/// `dense` both carry `skip_serializing_if`, so every fixture that predates them
+/// stays byte-identical *because* those trees leave them at the default — which
+/// proves the absence but says nothing about the presence. Here they are all
+/// non-default, so the bytes pin the field names, their encoded types
+/// (`u16`/`bool`), and — through `Scrolled` — the appended variant's own tag.
+fn vocab_gaps_tree() -> Node {
+    Node::Scrolled {
+        id: Some("hive-body".into()),
+        max_height: 240,
+        classes: vec!["ts-card-scroll".into()],
+        child: Box::new(Node::ListBox {
+            id: Some("agents".into()),
+            classes: vec!["boxed-list".into()],
+            dense: true,
+            children: vec![Node::Row {
+                id: Some("argus".into()),
+                classes: vec!["ts-row".into()],
+                spacing: 6,
+                children: vec![
+                    Node::Icon {
+                        id: None,
+                        name: "emblem-system-symbolic".into(),
+                        classes: vec![],
+                        tooltip: None,
+                    },
+                    Node::Label {
+                        id: None,
+                        text: "argus".into(),
+                        classes: vec![],
+                        tooltip: None,
+                    },
+                ],
+            }],
+        }),
+    }
+}
+
 fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
     vec![
         ("manifest_full_v1", Box::new(full_manifest())),
@@ -802,6 +847,14 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
             "plugin_render_tooltip_v1",
             Box::new(PluginMsg::Render {
                 tree: tooltip_tree(),
+                panel: None,
+                effects: vec![],
+            }),
+        ),
+        (
+            "plugin_render_vocab_gaps_v1",
+            Box::new(PluginMsg::Render {
+                tree: vocab_gaps_tree(),
                 panel: None,
                 effects: vec![],
             }),

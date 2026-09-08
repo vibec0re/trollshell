@@ -253,7 +253,15 @@ fn read_monitors() -> Vec<Monitor> {
 /// fallback for [`install_default_css`] when the on-disk copy is missing. The
 /// on-disk path is still preferred so edits don't force a recompile; this only
 /// backstops a deployment that shipped without its assets.
-const DEFAULT_STYLESHEET: &str = include_str!(concat!(
+///
+/// `pub(crate)` so `widget_tree`'s dense-row measurement (#966) can install the
+/// **shipped** rule rather than a copy of it retyped in the test: a test that
+/// declares its own CSS proves the reconciler adds a class and nothing about
+/// whether `assets/hytte-ui/style.css` gives that class any meaning. This
+/// constant is the only reachable copy in the sandboxed `system-tests` run —
+/// crane's source filter strips `assets/` bar this one file, precisely because
+/// it is `include_str!`'d here.
+pub(crate) const DEFAULT_STYLESHEET: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../assets/hytte-ui/style.css"
 ));

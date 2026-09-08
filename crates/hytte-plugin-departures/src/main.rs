@@ -501,6 +501,7 @@ impl Plugin for Board {
             }
         };
         Node::ListBox {
+            dense: false,
             id: Some(ROOT_ID.to_owned()),
             classes: vec!["ts-departures".to_owned()],
             children,
@@ -737,6 +738,7 @@ fn row_node(r: &Row, now_unix: i64, armed: Option<&str>) -> Node {
     }
 
     let row = Node::Row {
+        spacing: 0,
         id: None,
         classes,
         children,

@@ -366,6 +366,7 @@ impl Plugin for Timer {
             classes: vec!["monospace".to_owned()],
         };
         let presets = Node::Row {
+            spacing: 0,
             id: Some("timer-presets".to_owned()),
             classes: Vec::new(),
             children: vec![
@@ -375,6 +376,7 @@ impl Plugin for Timer {
             ],
         };
         let controls = Node::Row {
+            spacing: 0,
             id: Some("timer-controls".to_owned()),
             classes: Vec::new(),
             children: vec![

@@ -187,6 +187,31 @@
 //! }
 //! ```
 //!
+//! ## Sizing a list card: `spacing`, `dense`, and a real viewport (#966)
+//!
+//! Mara's live test of a 12-agent list card found three things the vocabulary
+//! could not express, all of them host-side. The [`nodes`] module is the
+//! ergonomic front for the fixes (it also defaults the two new fields, so a
+//! literal you already wrote keeps working):
+//!
+//! - **[`Node::Row`] now carries `spacing`** — before it, a row's children butted
+//!   together (`⚙argus`) unless you padded with [`Node::Spacer`]s.
+//!   `nodes::row(children).spacing(6)`.
+//! - **[`Node::ListBox`] now carries `dense`.** The host wraps every list child
+//!   in a `GtkListBoxRow` — that is what makes `.boxed-list` paint — and the
+//!   wrapper carries libadwaita's row height floor, which was most of the ~700 px
+//!   that card took. `nodes::list(rows).dense(true)` drops it, and the rows are
+//!   as tall as their content. You cannot reach the wrapper any other way: it
+//!   never appears in the tree you sent.
+//! - **[`Node::Scrolled`] bounds a card.** GTK CSS has no `max-height` and
+//!   [`Node::Box`]'s `scroll` is only an *event target* — it forwards wheel
+//!   deltas and neither clips nor scrolls — so before #966 a long list simply
+//!   grew and pushed everything below it off the surface.
+//!   `nodes::scrolled(240, body).build()` wraps `body` in a vertical viewport
+//!   that is as tall as its content up to 240 px and scrolls the rest, and
+//!   **degrades to the bare child** against a shell too old to decode the
+//!   variant (it is negotiated, like the preem and shader vocabularies).
+//!
 //! For a **collapsible** section, reach for [`Node::Expander`] instead of
 //! hand-rolling a button + chevron + revealer. It renders a flat, full-width
 //! header (your `header` node, with a trailing disclosure chevron) over a
@@ -369,6 +394,7 @@ use hytte_plugin_proto::{
 pub use hytte_preem as preem;
 
 pub mod display;
+pub mod nodes;
 pub mod shader;
 
 mod runtime;

@@ -174,7 +174,14 @@ pub const PROTO_VERSION: u16 = 1;
 /// [`ShaderData`](wire::ShaderData), and
 /// [`Capability::Shader`](manifest::Capability::Shader)), negotiated the same
 /// way against [`SHADER_VOCAB`](wire::SHADER_VOCAB).
-pub const VOCAB: u16 = 3;
+///
+/// Generation `4` is #966's bounded viewport
+/// ([`Node::Scrolled`](wire::Node::Scrolled)), negotiated against
+/// [`SCROLLED_VOCAB`](wire::SCROLLED_VOCAB). (#966 also added
+/// [`Node::Row`](wire::Node::Row)'s `spacing` and
+/// [`Node::ListBox`](wire::Node::ListBox)'s `dense`, which are optional
+/// **fields** and so bump nothing — only the variant moves this counter.)
+pub const VOCAB: u16 = 4;
 
 /// The highest [`VOCAB`] generation whose variants a plugin may put on the wire
 /// **without the host first advertising support** (#882).
@@ -185,8 +192,9 @@ pub const VOCAB: u16 = 3;
 /// [`Manifest::vocab`](manifest::Manifest::vocab) — the number an older host
 /// exact-checks at the handshake.
 ///
-/// The two diverge because #882 added a *negotiated* generation, and #893's
-/// shader widget ([`SHADER_VOCAB`](wire::SHADER_VOCAB)) is the second. A plugin emits
+/// The two diverge because #882 added a *negotiated* generation; #893's shader
+/// widget ([`SHADER_VOCAB`](wire::SHADER_VOCAB)) is the second and #966's bounded
+/// viewport ([`SCROLLED_VOCAB`](wire::SCROLLED_VOCAB)) the third. A plugin emits
 /// [`Node::Preem`](wire::Node::Preem) only after the host advertised
 /// [`PREEM_VOCAB`](preem::PREEM_VOCAB) in [`HostMsg::Hello`](msg::HostMsg::Hello),
 /// so an old host — which never advertises — can never receive one, and the
@@ -231,8 +239,8 @@ pub use state::{
 pub use topology::{SOCKET_DIR, SOCKET_FILE, socket_path};
 pub use wire::{
     Cls, DEFAULT_SLIDER_MAX, DEFAULT_SLIDER_MIN, DEFAULT_SLIDER_STEP_FRACTION, Dir, EventKind,
-    MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Node, NodeId, SHADER_VOCAB, ShaderData,
-    SliderFloats, sane_fraction, sane_slider_floats,
+    MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Node, NodeId, SCROLLED_VOCAB, SHADER_VOCAB,
+    ShaderData, SliderFloats, sane_fraction, sane_slider_floats,
 };
 
 #[cfg(feature = "tokio")]

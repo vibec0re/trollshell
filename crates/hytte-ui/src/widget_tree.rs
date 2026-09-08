@@ -158,19 +158,43 @@ pub enum Node {
         id: Option<NodeId>,
         /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
+        /// Inter-child gap in pixels (`set_spacing`; mutable prop). `0` is the
+        /// flush layout a `Row` had before #966.
+        spacing: i32,
         /// Child nodes, diffed by key/position.
         children: Vec<Node>,
     },
     /// A vertical list **container** stacking its children (typically
-    /// [`Node::Row`]s). Materialized as a vertical `gtk::Box`; children diff
+    /// [`Node::Row`]s). Materialized as a real `gtk::ListBox`; children diff
     /// like a `Box`'s.
     ListBox {
         /// Optional diff/reorder key (see [`NodeId`]).
         id: Option<NodeId>,
         /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<String>,
+        /// Drop the auto-created `GtkListBoxRow` wrappers' theme height floor
+        /// (mutable prop; #966) by marking each with
+        /// [`DENSE_ROW_CLASS`](crate::widget_tree::DENSE_ROW_CLASS). See
+        /// [`apply_dense_rows`].
+        dense: bool,
         /// Child nodes (typically [`Node::Row`]s), diffed by key/position.
         children: Vec<Node>,
+    },
+    /// A **bounded viewport**: a `gtk::ScrolledWindow` that is as tall as its
+    /// child up to `max_height`, and scrolls the rest (#966).
+    ///
+    /// Distinct from [`Node::Box`]'s `scroll`, which only makes a box a *source*
+    /// of [`EventKind::Scroll`] and neither clips nor bounds anything.
+    Scrolled {
+        /// Optional diff/reorder key (see [`NodeId`]).
+        id: Option<NodeId>,
+        /// Maximum height in pixels (`set_max_content_height`; mutable prop).
+        /// `0` (or negative) means unbounded — a pass-through wrapper.
+        max_height: i32,
+        /// GTK CSS classes applied verbatim (`add_css_class`).
+        classes: Vec<String>,
+        /// The viewport's single child node.
+        child: Box<Node>,
     },
     /// A `gtk::Label`.
     Label {
@@ -633,6 +657,7 @@ enum NodeKind {
     Box,
     Row,
     ListBox,
+    Scrolled,
     Label,
     Text,
     Icon,
@@ -843,6 +868,42 @@ fn list_row_of(child: &gtk::Widget) -> Option<gtk::ListBoxRow> {
     child.parent().and_downcast::<gtk::ListBoxRow>()
 }
 
+/// The CSS class [`apply_dense_rows`] marks a dense list's auto-created
+/// `GtkListBoxRow` wrappers with. The rule that gives it meaning
+/// (`min-height: 0; padding: 0`) ships in the **library** stylesheet
+/// (`assets/hytte-ui/style.css`), because `dense` is part of the node
+/// vocabulary rather than anything trollshell-specific — hence the `hytte-`
+/// prefix the repo's class convention gives library classes.
+///
+/// A class rather than a direct property call because the floor is *CSS*:
+/// libadwaita sets `min-height` on the `row` node, and GTK's
+/// `gtk_widget_set_size_request` can only raise a widget's minimum, never lower
+/// it below what the style computes. So the only lever that reaches it is
+/// another CSS rule at a higher provider priority — which is what
+/// `install_default_css` loads the library sheet at.
+pub const DENSE_ROW_CLASS: &str = "hytte-dense-row";
+
+/// Mark (or unmark) every auto-created `GtkListBoxRow` wrapper in `list` for the
+/// dense rule (#966).
+///
+/// Walks the list's direct children — which *are* the wrappers — rather than
+/// hooking the insert path, so one call covers newly built rows, rows reused
+/// from the previous render, and a `dense` flip in either direction. That
+/// single-seam shape is deliberate: build and update call the same function
+/// with the same argument, so they cannot drift the way two per-arm edits can
+/// (the reason [`node_tooltip`] is shaped that way too).
+fn apply_dense_rows(list: &gtk::ListBox, dense: bool) {
+    let mut cursor = list.first_child();
+    while let Some(row) = cursor {
+        cursor = row.next_sibling();
+        if dense {
+            row.add_css_class(DENSE_ROW_CLASS);
+        } else {
+            row.remove_css_class(DENSE_ROW_CLASS);
+        }
+    }
+}
+
 // ── Build / update ──────────────────────────────────────────────────────────
 
 /// Build a fresh widget subtree for `node`, wiring its event handlers **once**
@@ -880,15 +941,21 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             (boxw.upcast(), kids)
         }
         Node::Row {
-            classes, children, ..
+            classes,
+            spacing,
+            children,
+            ..
         } => {
-            let boxw = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            let boxw = gtk::Box::new(gtk::Orientation::Horizontal, *spacing);
             apply_classes(&boxw, classes);
             let kids = build_children(&Container::Box(boxw.clone()), children, on_event);
             (boxw.upcast(), kids)
         }
         Node::ListBox {
-            classes, children, ..
+            classes,
+            dense,
+            children,
+            ..
         } => {
             // A **real** `gtk::ListBox` (not a plain vertical Box) so libadwaita's
             // `.boxed-list` card styling — which selects `list.boxed-list` — can
@@ -898,7 +965,23 @@ fn build_node(node: &Node, on_event: &EventFn) -> RetainedNode {
             list.set_selection_mode(gtk::SelectionMode::None);
             apply_classes(&list, classes);
             let kids = build_children(&Container::List(list.clone()), children, on_event);
+            // After the children exist: the wrappers this marks are created by
+            // GTK on `append`, so there is nothing to mark before that.
+            apply_dense_rows(&list, *dense);
             (list.upcast(), kids)
+        }
+        Node::Scrolled {
+            max_height,
+            classes,
+            child,
+            ..
+        } => {
+            let sw = new_viewport();
+            apply_max_height(&sw, *max_height);
+            apply_classes(&sw, classes);
+            let realized = build_node(child, on_event);
+            sw.set_child(Some(&realized.widget));
+            (sw.upcast(), vec![realized])
         }
         Node::Label { text, classes, .. } => {
             let label = gtk::Label::new(Some(text));
@@ -1235,12 +1318,16 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             );
         }
         Node::Row {
-            classes, children, ..
+            classes,
+            spacing,
+            children,
+            ..
         } => {
             // A Row is a horizontal gtk::Box with no scroll or orientation props
             // to mutate (orientation is fixed by the kind, which reuse already
-            // matched on), so only classes + children reconcile.
+            // matched on), so only spacing + classes + children reconcile.
             let boxw = downcast::<gtk::Box>(&retained.widget);
+            boxw.set_spacing(*spacing);
             reconcile_classes(boxw, &retained.desc.classes, classes);
             diff_children(
                 &Container::Box(boxw.clone()),
@@ -1250,7 +1337,10 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
             );
         }
         Node::ListBox {
-            classes, children, ..
+            classes,
+            dense,
+            children,
+            ..
         } => {
             // A ListBox is a real gtk::ListBox; children reconcile through the
             // List container, which handles the GtkListBoxRow wrapping.
@@ -1262,6 +1352,24 @@ fn update_in_place(retained: &mut RetainedNode, new: &Node, on_event: &EventFn) 
                 children,
                 on_event,
             );
+            // After the diff, for the same reason `build_node` marks after
+            // building: a freshly-inserted child only has its wrapper once GTK
+            // has created it. Marking the whole list every render also covers a
+            // `dense` flip on rows that were merely reused.
+            apply_dense_rows(list, *dense);
+        }
+        Node::Scrolled {
+            max_height,
+            classes,
+            child,
+            ..
+        } => {
+            let sw = downcast::<gtk::ScrolledWindow>(&retained.widget);
+            apply_max_height(sw, *max_height);
+            reconcile_classes(sw, &retained.desc.classes, classes);
+            reconcile_single(&mut retained.children, child, on_event, |c| {
+                sw.set_child(c);
+            });
         }
         Node::Label { text, classes, .. } => {
             let label = downcast::<gtk::Label>(&retained.widget);
@@ -1613,6 +1721,39 @@ fn chevron_icon(expanded: bool) -> &'static str {
     }
 }
 
+/// Build the `gtk::ScrolledWindow` behind a [`Node::Scrolled`] (#966).
+///
+/// The three settings are what make it a *bounded viewport* rather than a
+/// scroller in the ordinary sense, and all three are fixed by the node kind (so
+/// they are set once, at build, and never reconciled):
+///
+/// - `propagate_natural_height(true)` — the scroller asks for its child's
+///   natural height, so a child **shorter** than the cap is not stretched to it.
+///   Without this a `ScrolledWindow` requests a fixed small minimum and every
+///   bounded card would render at that size, cap or no cap.
+/// - `policy(Never, Automatic)` — vertical only. `Never` on the horizontal axis
+///   is what propagates the child's natural **width** unchanged, so wrapping a
+///   card in a viewport never narrows it or grows a horizontal scrollbar.
+/// - `overlay_scrolling(true)` — the indicator floats over the content instead
+///   of taking width from it, so wrapping a card does not reflow its rows.
+fn new_viewport() -> gtk::ScrolledWindow {
+    let sw = gtk::ScrolledWindow::new();
+    sw.set_propagate_natural_height(true);
+    sw.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    sw.set_overlay_scrolling(true);
+    sw
+}
+
+/// Apply a [`Node::Scrolled`]'s height cap. Shared by build and update so the
+/// two cannot drift, and so a changed `max_height` re-bounds a reused viewport.
+///
+/// `0` (and any negative value, which the wire's `u16` cannot produce but a
+/// direct `hytte-ui` caller can) maps to GTK's `-1` — *no maximum* — so the node
+/// degrades to a pass-through wrapper rather than collapsing to nothing.
+fn apply_max_height(sw: &gtk::ScrolledWindow, max_height: i32) {
+    sw.set_max_content_height(if max_height > 0 { max_height } else { -1 });
+}
+
 /// Set a [`Node::Text`] label's flow mode. Shared by build and update so the
 /// two never drift, and so an `ellipsize` flip toggles in place:
 /// - `ellipsize == true` → single-line, truncate with a trailing ellipsis
@@ -1839,6 +1980,7 @@ fn node_kind(node: &Node) -> NodeKind {
         Node::Box { .. } => NodeKind::Box,
         Node::Row { .. } => NodeKind::Row,
         Node::ListBox { .. } => NodeKind::ListBox,
+        Node::Scrolled { .. } => NodeKind::Scrolled,
         Node::Label { .. } => NodeKind::Label,
         Node::Text { .. } => NodeKind::Text,
         Node::Icon { .. } => NodeKind::Icon,
@@ -1868,7 +2010,8 @@ fn node_id(node: &Node) -> Option<&str> {
         | Node::GlSurface { id, .. }
         | Node::Shader { id, .. }
         | Node::Progress { id, .. }
-        | Node::Revealer { id, .. } => id.as_deref(),
+        | Node::Revealer { id, .. }
+        | Node::Scrolled { id, .. } => id.as_deref(),
         // `Button`, `Slider`, `Expander`, and `Entry` all require an id — it is
         // their event target (a click for Button/Expander, a value change for
         // Slider, a text submit for Entry).
@@ -1896,7 +2039,11 @@ fn node_classes(node: &Node) -> &[String] {
         | Node::Slider { classes, .. }
         | Node::Expander { classes, .. }
         | Node::Entry { classes, .. }
-        | Node::Separator { classes } => classes,
+        | Node::Separator { classes }
+        // `Scrolled` *does* carry classes, unlike `Revealer`: a viewport has a
+        // frame, and a plugin that wants one styled (a rule, a fade) has no
+        // other handle on it — the `GtkScrolledWindow` is not a node it sent.
+        | Node::Scrolled { classes, .. } => classes,
         // `Revealer` carries no classes of its own (see the `Node` vocab); it
         // is a transparent open/close wrapper, so style its child instead.
         // `Spacer` is style-less on purpose — a structural gap, never itself

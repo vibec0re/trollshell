@@ -212,46 +212,13 @@ pub(super) fn broker_effect(
             // timeout, no kill — and hands the program to the systemd user
             // manager so it outlives a `trollshell.service` restart.
             if *detached {
-                // `detached_unit` is `Some` exactly when
-                // `detached_launch_unit_for_audit` allocated one, i.e. exactly
-                // when the id is unit-name safe — so the audit line and the
-                // `--unit=` are guaranteed to be one string on that arm. For a
-                // rejected id it is `None`, and the `None` arm below DOES fire
-                // (#964 M-2: it did not before this fix, and the comment here
-                // used to claim it couldn't) — `launch_detached`'s signature
-                // takes an owned `String`, not an `Option`, so *something* has
-                // to be recomputed to hand it. That recompute is written rather
-                // than an `expect`/panic because a panic here runs on the GTK
-                // main thread and would take the whole shell down; the worst it
-                // can do, now, is name a unit to nobody at all — not the audit
-                // line (already true before this fix) and, as of #964 M-2, not
-                // this tracing line either. `start_detached`'s own
-                // `is_valid_plugin_id` guard means it is never asked of systemd
-                // regardless.
-                match detached_unit.take() {
-                    Some(unit) => {
-                        #[cfg(test)]
-                        tests::TRACING_UNIT.with(|cell| *cell.borrow_mut() = Some(unit.clone()));
-                        tracing::info!(plugin = %plugin_id, id = *id, argc = argv.len(), unit = %unit, "plugin effect: RunCommand (detached launch)");
-                        launch_detached(plugin_id, *id, unit, argv.clone(), outbound.clone());
-                    }
-                    None => {
-                        #[cfg(test)]
-                        tests::TRACING_UNIT.with(|cell| *cell.borrow_mut() = None);
-                        tracing::info!(
-                            plugin = %plugin_id, id = *id, argc = argv.len(),
-                            "plugin effect: RunCommand (detached launch; id is not \
-                             unit-name safe, direct-spawn fallback)",
-                        );
-                        launch_detached(
-                            plugin_id,
-                            *id,
-                            allocate_launch_unit(plugin_id, *id),
-                            argv.clone(),
-                            outbound.clone(),
-                        );
-                    }
-                }
+                dispatch_detached_run_command(
+                    plugin_id,
+                    *id,
+                    argv,
+                    outbound,
+                    detached_unit.take(),
+                );
             } else {
                 tracing::info!(plugin = %plugin_id, id = *id, argc = argv.len(), "plugin effect: RunCommand");
                 run_command(plugin_id, *id, argv.clone(), outbound.clone());
@@ -294,6 +261,54 @@ pub(super) fn broker_effect(
             tracing::info!(plugin = %plugin_id, request_id = *request_id, "plugin effect: DatasourceResult");
             datasource.deliver_result(*request_id, plugin_id.to_owned(), outcome.clone());
         }
+    }
+}
+
+/// The `Some`/`None` split on [`detached_launch_unit_for_audit`]'s result, for
+/// a detached [`Effect::RunCommand`] (#953). Pulled out of [`broker_effect`]
+/// itself only to keep that function under clippy's line cap; the logic and
+/// its rationale live here (mirrors why [`detached_launch_unit_for_audit`]
+/// itself is a separate function).
+///
+/// `detached_unit` is `Some` exactly when the id is unit-name safe — the
+/// audit line and the `--unit=` are guaranteed to be one string on that arm.
+/// For a rejected id it is `None`, and the `None` arm below DOES fire (#964
+/// M-2 review: it did not before that fix, and a comment here used to claim
+/// it couldn't) — [`launch_detached`]'s signature takes an owned `String`,
+/// not an `Option`, so *something* has to be recomputed to hand it. That
+/// recompute is written rather than an `expect`/panic because a panic here
+/// runs on the GTK main thread and would take the whole shell down; the worst
+/// it can do, now, is name a unit to nobody at all — not the audit line
+/// (already true before the M-2 fix) and, as of that fix, not this tracing
+/// line either. `start_detached`'s own `is_valid_plugin_id` guard means it is
+/// never asked of systemd regardless.
+fn dispatch_detached_run_command(
+    plugin_id: &str,
+    id: u64,
+    argv: &[String],
+    outbound: &mpsc::Sender<HostMsg>,
+    detached_unit: Option<String>,
+) {
+    if let Some(unit) = detached_unit {
+        #[cfg(test)]
+        tests::TRACING_UNIT.with(|cell| *cell.borrow_mut() = Some(unit.clone()));
+        tracing::info!(plugin = %plugin_id, id, argc = argv.len(), unit = %unit, "plugin effect: RunCommand (detached launch)");
+        launch_detached(plugin_id, id, unit, argv.to_vec(), outbound.clone());
+    } else {
+        #[cfg(test)]
+        tests::TRACING_UNIT.with(|cell| *cell.borrow_mut() = None);
+        tracing::info!(
+            plugin = %plugin_id, id, argc = argv.len(),
+            "plugin effect: RunCommand (detached launch; id is not unit-name \
+             safe, direct-spawn fallback)",
+        );
+        launch_detached(
+            plugin_id,
+            id,
+            allocate_launch_unit(plugin_id, id),
+            argv.to_vec(),
+            outbound.clone(),
+        );
     }
 }
 
@@ -1133,6 +1148,15 @@ pub(super) fn launch_outcome(report: &Result<LaunchReport, String>) -> EffectOut
 /// exercises the launch itself calls [`start_detached`]/`start_detached_with`
 /// directly instead, so nothing depends on the spawn below actually firing in
 /// a test binary.
+///
+/// `unit` has to be owned (`String`, not `&str`): the `#[cfg(not(test))]`
+/// block moves it into a `'static` future handed to
+/// `hytte::reactive::runtime::handle().spawn`. In a `#[cfg(test)]` build that
+/// block is compiled out and `unit` is only ever `.clone()`d for the capture
+/// below, so clippy's `needless_pass_by_value` fires *only* in that
+/// compilation — silenced narrowly rather than changing the signature the
+/// real (non-test) caller needs.
+#[cfg_attr(test, allow(clippy::needless_pass_by_value))]
 fn launch_detached(
     plugin_id: &str,
     id: u64,

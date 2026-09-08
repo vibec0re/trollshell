@@ -103,7 +103,12 @@ use crate::{CONTROL_IFACE, CONTROL_NAME, CONTROL_PATH, spawn_on_runtime};
 /// each row's connected/rendering badge **in place** (a changed plugin set
 /// triggers a rebuild instead), so the badges track the host without the user
 /// reopening the tab.
-const PLUGIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
+///
+/// `pub(crate)`: since #989 the window's connection banner and revision footer
+/// re-probe on **this** cadence (`crate::SHELL_PROBE_INTERVAL`) rather than a
+/// number of their own, because they answer the same question about the same
+/// endpoint and them disagreeing was the defect.
+pub(crate) const PLUGIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How long a user-initiated toggle holds the switch against a poll that
 /// hasn't caught up yet (#944), before "truth wins" regardless.
@@ -1940,6 +1945,11 @@ mod gtk_tests {
     /// receives it (#983): every listed plugin in `active_state`, and no
     /// runtime overlay — the poll-ordering tests care about the `ActiveState`
     /// a completion carries, not about the connected/rendering badge.
+    ///
+    /// The `Ok` wrapper is the point, not an oversight: this and [`poll_err`]
+    /// are the two arms of the same [`PollResult`], and a test reads better
+    /// naming the outcome than spelling `Ok(…)` at each of its call sites.
+    #[allow(clippy::unnecessary_wraps, reason = "the Ok arm of a PollResult pair")]
     fn poll_ok(plugin_ids: &[&str], active_state: &str) -> PollResult {
         let units = plugin_ids
             .iter()
@@ -3186,9 +3196,7 @@ mod gtk_tests {
         );
         let snapshot = state.snapshot.borrow();
         assert_eq!(
-            snapshot
-                .get("clock")
-                .map(|snap| snap.active_state.as_str()),
+            snapshot.get("clock").map(|snap| snap.active_state.as_str()),
             Some("active"),
             "the cache every selection change renders from must hold the newest answer"
         );
@@ -3296,10 +3304,7 @@ mod gtk_tests {
             2,
             "a stale failure must not replace a freshly-confirmed list with the placeholder"
         );
-        assert!(
-            state.parked.borrow().is_none(),
-            "…and so must park nothing"
-        );
+        assert!(state.parked.borrow().is_none(), "…and so must park nothing");
         assert_eq!(
             state.selected.borrow().as_deref(),
             Some("departures"),

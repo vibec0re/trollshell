@@ -7,9 +7,9 @@ use hytte_plugin_proto::{
     DEFAULT_SLIDER_STEP_FRACTION, DatasourceError, DatasourceOutcome, Dir, Effect, EffectOutcome,
     EventKind, HostMsg, LedStripConfig, LedStripState, LogLevel, MAX_FRAME_LEN,
     MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Manifest, MediaAction, Mount, NiriAction, Node,
-    PROTO_VERSION, Page, PluginMsg, PreemWidget, ProtoError, ProvidedDatasource, SHADER_VOCAB,
-    ShaderData, SliderFloats, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode,
-    decode_body, encode, encode_body, sane_fraction, sane_slider_floats,
+    PROTO_VERSION, Page, PluginMsg, PreemWidget, ProtoError, ProvidedDatasource, SCROLLED_VOCAB,
+    SHADER_VOCAB, ShaderData, SliderFloats, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL,
+    decode, decode_body, encode, encode_body, sane_fraction, sane_slider_floats,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -43,9 +43,11 @@ fn sample_tree() -> Node {
                 tooltip: None,
             },
             Node::ListBox {
+                dense: false,
                 id: Some("list".into()),
                 classes: vec!["ts-list".into()],
                 children: vec![Node::Row {
+                    spacing: 0,
                     id: Some("row-0".into()),
                     classes: vec!["ts-row".into()],
                     children: vec![
@@ -291,6 +293,7 @@ fn expander_round_trips() {
                 tooltip: None,
             }),
             children: vec![Node::Row {
+                spacing: 0,
                 id: Some("lamp".into()),
                 classes: vec![],
                 children: vec![Node::Label {
@@ -518,6 +521,185 @@ fn an_older_host_skips_a_tooltip_it_has_never_heard_of() {
             classes: vec![],
         },
     );
+}
+
+// ── List-card layout: Row::spacing, ListBox::dense, Node::Scrolled (#966) ────
+//
+// Two compat classes in one issue, and the tests are separated along that seam:
+// `spacing`/`dense` are **optional fields** (same class as `tooltip` above — no
+// `PROTO_VERSION`, no `VOCAB`), while `Scrolled` is an **appended variant** and
+// so bumps `VOCAB` and rides the `Hello` negotiation.
+
+fn spaced_row(spacing: u16) -> Node {
+    Node::Row {
+        id: Some("argus".into()),
+        classes: vec!["ts-row".into()],
+        spacing,
+        children: vec![],
+    }
+}
+
+fn dense_list(dense: bool) -> Node {
+    Node::ListBox {
+        id: Some("agents".into()),
+        classes: vec!["boxed-list".into()],
+        dense,
+        children: vec![spaced_row(6)],
+    }
+}
+
+#[test]
+fn row_spacing_and_list_dense_round_trip() {
+    for spacing in [0_u16, 6, u16::MAX] {
+        let node = spaced_row(spacing);
+        let back: Node = decode(&encode(&node)).expect("decode spaced row");
+        assert_eq!(node, back, "spacing={spacing} round-trips");
+    }
+    for dense in [false, true] {
+        let node = dense_list(dense);
+        let back: Node = decode(&encode(&node)).expect("decode dense list");
+        assert_eq!(node, back, "dense={dense} round-trips");
+    }
+}
+
+#[test]
+fn a_default_spacing_or_dense_never_reaches_the_wire() {
+    // `skip_serializing_if = "is_default"` is what keeps every already-committed
+    // golden fixture byte-identical across #966: a tree that asks for neither
+    // encodes exactly as it did before the fields existed. Losing either
+    // attribute would silently move `tests/fixtures/plugin_render_v1.hex`.
+    assert!(
+        !contains(&encode_body(&spaced_row(0)), b"spacing"),
+        "a zero row spacing costs no bytes",
+    );
+    assert!(
+        contains(&encode_body(&spaced_row(6)), b"spacing"),
+        "…but a set one is named on the wire (named-map encoding)",
+    );
+    assert!(
+        !contains(&encode_body(&dense_list(false)), b"dense"),
+        "a non-dense list costs no bytes",
+    );
+    assert!(
+        contains(&encode_body(&dense_list(true)), b"dense"),
+        "…but a dense one is named on the wire",
+    );
+}
+
+#[test]
+fn a_pre_966_row_and_list_frame_still_decodes() {
+    // Backward: a plugin built before #966 emits `{"Row": { id, classes,
+    // children }}` with no `spacing` key at all (and the same for `dense`).
+    // `#[serde(default)]` must accept that as the old layout rather than failing
+    // the frame — this is what keeps every already-deployed plugin binary
+    // rendering against a new shell.
+    #[derive(serde::Serialize)]
+    enum NodeOld {
+        Row {
+            id: Option<String>,
+            classes: Vec<String>,
+            children: Vec<NodeOld>,
+        },
+        ListBox {
+            id: Option<String>,
+            classes: Vec<String>,
+            children: Vec<NodeOld>,
+        },
+    }
+
+    let body = encode_body(&NodeOld::ListBox {
+        id: Some("agents".into()),
+        classes: vec!["boxed-list".into()],
+        children: vec![NodeOld::Row {
+            id: Some("argus".into()),
+            classes: vec!["ts-row".into()],
+            children: vec![],
+        }],
+    });
+    assert!(!contains(&body, b"spacing"), "an old frame carries no key");
+    assert!(!contains(&body, b"dense"), "an old frame carries no key");
+    let decoded: Node = decode_body(&body).expect("decode pre-#966 list frame");
+    assert_eq!(
+        decoded,
+        Node::ListBox {
+            id: Some("agents".into()),
+            classes: vec!["boxed-list".into()],
+            dense: false,
+            children: vec![Node::Row {
+                id: Some("argus".into()),
+                classes: vec!["ts-row".into()],
+                spacing: 0,
+                children: vec![],
+            }],
+        },
+        "absent keys default to the pre-#966 layout",
+    );
+}
+
+#[test]
+fn an_older_host_skips_the_list_props_it_has_never_heard_of() {
+    // Forward — the direction that matters for #437. A plugin rebuilt on the new
+    // SDK asks for spacing and a dense list against a shell that predates both
+    // fields. The named-map encoding has no `deny_unknown_fields`, so the old
+    // decoder *skips* the keys and lays the card out exactly as it did before,
+    // rather than failing the whole frame. That is what puts these two on the
+    // additive side and `Scrolled` on the other: an unknown **field** is skipped
+    // where an unknown **variant** kills the decode and crash-loops the session.
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    enum NodeOld {
+        Row {
+            id: Option<String>,
+            classes: Vec<String>,
+            children: Vec<NodeOld>,
+        },
+    }
+
+    let body = encode_body(&spaced_row(6));
+    assert!(contains(&body, b"spacing"), "the new frame does carry it");
+    let old: NodeOld = decode_body(&body).expect("a pre-#966 host still decodes the frame");
+    assert_eq!(
+        old,
+        NodeOld::Row {
+            id: Some("argus".into()),
+            classes: vec!["ts-row".into()],
+            children: vec![],
+        },
+    );
+}
+
+#[test]
+fn scrolled_round_trips_with_its_child() {
+    for max_height in [0_u16, 240, u16::MAX] {
+        let node = Node::Scrolled {
+            id: Some("hive-body".into()),
+            max_height,
+            classes: vec!["ts-card-scroll".into()],
+            child: Box::new(dense_list(true)),
+        };
+        let back: Node = decode(&encode(&node)).expect("decode viewport");
+        assert_eq!(node, back, "max_height={max_height} round-trips");
+    }
+}
+
+#[test]
+fn the_clamp_recurses_through_a_viewport() {
+    // `Scrolled` shares the mandatory-single-child clamp arm with
+    // `Button`/`Revealer`. Falsified by dropping it from that arm: a `NaN`
+    // fraction inside a bounded card then reaches the host unsanitised, and only
+    // this assertion notices (the round-trip above passes either way, since
+    // `clamp_in_place` is not on the encode path).
+    let node = Node::Scrolled {
+        id: None,
+        max_height: 240,
+        classes: vec![],
+        child: Box::new(Node::Progress {
+            id: Some("p".into()),
+            fraction: f64::NAN,
+            classes: vec![],
+        }),
+    }
+    .clamped();
+    assert_node_floats_are_sane(&node);
 }
 
 // ── Slider node + ValueChanged event (#315) ──────────────────────────────────
@@ -1610,6 +1792,7 @@ fn containers_burying(inner: Node) -> Vec<(&'static str, Node)> {
         (
             "row",
             Node::Row {
+                spacing: 0,
                 id: None,
                 classes: vec![],
                 children: vec![inner.clone()],
@@ -1618,6 +1801,7 @@ fn containers_burying(inner: Node) -> Vec<(&'static str, Node)> {
         (
             "list-box",
             Node::ListBox {
+                dense: false,
                 id: None,
                 classes: vec![],
                 children: vec![inner.clone()],
@@ -1788,7 +1972,9 @@ fn assert_node_floats_are_sane(node: &Node) {
                 assert_node_floats_are_sane(child);
             }
         }
-        Node::Button { child, .. } | Node::Revealer { child, .. } => {
+        Node::Button { child, .. }
+        | Node::Revealer { child, .. }
+        | Node::Scrolled { child, .. } => {
             assert_node_floats_are_sane(child);
         }
         Node::Expander {
@@ -1831,7 +2017,9 @@ fn node_float_bits(node: &Node) -> Vec<u64> {
         Node::Box { children, .. }
         | Node::Row { children, .. }
         | Node::ListBox { children, .. } => children.iter().flat_map(node_float_bits).collect(),
-        Node::Button { child, .. } | Node::Revealer { child, .. } => node_float_bits(child),
+        Node::Button { child, .. }
+        | Node::Revealer { child, .. }
+        | Node::Scrolled { child, .. } => node_float_bits(child),
         Node::Expander {
             header, children, ..
         } => node_float_bits(header)
@@ -2488,17 +2676,32 @@ fn the_shader_hygiene_caps_keep_their_settled_numbers() {
 #[test]
 fn the_shader_generation_bumps_the_census_only() {
     assert_eq!(SHADER_VOCAB, 3, "#893 is generation 3");
-    assert_eq!(VOCAB, SHADER_VOCAB, "the census reaches the newest variant");
+    // `>=`, not `==`: #966's viewport is generation 4, so the shader generation
+    // is no longer the newest. That the census reaches the *newest* variant is
+    // pinned by `the_viewport_generation_bumps_the_census_only` below, which is
+    // where the next appended variant moves the equality to.
+    const {
+        assert!(
+            VOCAB >= SHADER_VOCAB,
+            "the census must still cover the shader generation",
+        );
+    }
     assert_eq!(
         VOCAB_UNCONDITIONAL, 1,
         "a negotiated variant does not move the unconditional ceiling",
     );
 
     let m = Manifest::new("shader-plugin", Mount::SidebarTop);
-    assert_eq!(
-        m.negotiated_vocab(VOCAB),
-        SHADER_VOCAB,
+    // `>=` for the same reason as above: a host advertising today's census
+    // negotiates generation 4, which still unlocks shaders.
+    assert!(
+        m.negotiated_vocab(VOCAB) >= SHADER_VOCAB,
         "a host advertising the census negotiates the shader generation",
+    );
+    assert_eq!(
+        m.negotiated_vocab(SHADER_VOCAB),
+        SHADER_VOCAB,
+        "…and a host advertising exactly generation 3 negotiates exactly it",
     );
     assert!(
         m.negotiated_vocab(VOCAB_UNCONDITIONAL) < SHADER_VOCAB,
@@ -2509,6 +2712,53 @@ fn the_shader_generation_bumps_the_census_only() {
     assert!(
         m.negotiated_vocab(2) < SHADER_VOCAB,
         "a #882-era host negotiates below the shader generation",
+    );
+}
+
+/// #966's generation is **4**, it bumps the census `VOCAB`, and it leaves
+/// `VOCAB_UNCONDITIONAL` alone — #882's rule, applied a third time.
+///
+/// The equality `VOCAB == SCROLLED_VOCAB` is the "newest variant" pin that used
+/// to live on `SHADER_VOCAB`: appending the next wire variant moves it here, and
+/// forgetting to bump `VOCAB` with it turns this red.
+///
+/// **Falsified** by bumping `VOCAB_UNCONDITIONAL` to 4 as well (the third
+/// assertion goes red, and with it every older shell's acceptance of a rebuilt
+/// plugin), or by leaving `VOCAB` at 3 (the second).
+#[test]
+fn the_viewport_generation_bumps_the_census_only() {
+    assert_eq!(SCROLLED_VOCAB, 4, "#966 is generation 4");
+    assert_eq!(
+        VOCAB, SCROLLED_VOCAB,
+        "the census reaches the newest variant"
+    );
+    assert_eq!(
+        VOCAB_UNCONDITIONAL, 1,
+        "a negotiated variant does not move the unconditional ceiling",
+    );
+
+    let m = Manifest::new("agents", Mount::SidebarTop);
+    assert_eq!(
+        m.negotiated_vocab(VOCAB),
+        SCROLLED_VOCAB,
+        "a host advertising the census negotiates the viewport generation",
+    );
+    assert!(
+        m.negotiated_vocab(VOCAB_UNCONDITIONAL) < SCROLLED_VOCAB,
+        "a host that advertises nothing does not",
+    );
+    // The generation before this one: a shell on #893's vocabulary speaks
+    // shaders and not viewports, and the arithmetic says so with no special case.
+    assert!(
+        m.negotiated_vocab(SHADER_VOCAB) < SCROLLED_VOCAB,
+        "a #893-era host negotiates below the viewport generation",
+    );
+    // …and a plugin rebuilt on this SDK still clears a pre-#966 host's check,
+    // which is the whole reason the variant is negotiated rather than declared
+    // unconditional.
+    assert_eq!(
+        m.vocab, VOCAB_UNCONDITIONAL,
+        "the stamped generation an old host exact-checks did not move",
     );
 }
 

@@ -403,6 +403,7 @@ impl Plugin for Caw {
 
         // Center the 128 px face in the wider card.
         let mut children = vec![Node::Row {
+            spacing: 0,
             id: Some("caw-facerow".to_owned()),
             classes: vec!["caw-facerow".to_owned()],
             children: vec![Node::Spacer, face, Node::Spacer],
@@ -425,6 +426,7 @@ impl Plugin for Caw {
                 speech::speech_node(&message, "caw-say", vec!["caw-say".to_owned()])
             };
             children.push(Node::Row {
+                spacing: 0,
                 id: Some("caw-sayrow".to_owned()),
                 classes: vec!["caw-sayrow".to_owned()],
                 children: vec![Node::Spacer, bubble, Node::Spacer],
@@ -439,6 +441,7 @@ impl Plugin for Caw {
                 classes: vec!["caw-act".to_owned(), "dim-label".to_owned()],
             };
             children.push(Node::Row {
+                spacing: 0,
                 id: Some("caw-actrow".to_owned()),
                 classes: vec!["caw-actrow".to_owned()],
                 children: vec![Node::Spacer, act, Node::Spacer],

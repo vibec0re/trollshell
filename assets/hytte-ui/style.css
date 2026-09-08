@@ -90,3 +90,23 @@
 .hytte-popup-catcher > box {
     background: transparent;
 }
+
+/* Dense plugin lists (#966).
+   A `Node::ListBox` is materialized as a real GtkListBox so libadwaita's
+   `.boxed-list` card styling can paint, and GTK auto-wraps every child in a
+   GtkListBoxRow that carries the theme's row height floor — most of the height
+   a list of one-line rows takes. `ListBox { dense: true }` has the reconciler
+   mark each wrapper with this class (widget_tree::DENSE_ROW_CLASS) so the rows
+   are exactly as tall as their content.
+
+   It has to be CSS: gtk_widget_set_size_request can only RAISE a widget's
+   minimum, never lower it below what the style computes, and the floor is a
+   `min-height` on the `row` node. This sheet is installed at
+   STYLE_PROVIDER_PRIORITY_APPLICATION, above the theme, so it wins without
+   needing a more specific selector. The row's own padding goes with it — a
+   dense list hands the height budget back to the plugin, which pads its own
+   `Node::Row` children through `classes`. */
+.hytte-dense-row {
+    min-height: 0;
+    padding: 0;
+}

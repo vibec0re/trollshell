@@ -111,6 +111,25 @@ fn pixels_scale_default() -> u32 {
     1
 }
 
+/// `serde(skip_serializing_if)` predicate for an additive scalar field whose
+/// [`Default`] is the pre-existing behaviour — [`Node::Row`]'s `spacing` and
+/// [`Node::ListBox`]'s `dense` (#966).
+///
+/// Keeping the default **off the wire** is what makes those two fields free in
+/// both compat directions *and* leaves every already-committed golden fixture
+/// byte-identical: a tree that sets neither encodes exactly the bytes it did
+/// before the fields existed.
+///
+/// Deliberately **generic**. The obvious spelling — `fn(&u16) -> bool`,
+/// `fn(&bool) -> bool` — trips `clippy::trivially_copy_pass_by_ref` (pedantic,
+/// denied workspace-wide), which is the stated reason [`Node::Text`]'s
+/// `ellipsize` carries no `skip_serializing_if` at all. A type parameter has no
+/// known size, so the lint does not fire, and serde infers `T` at each call
+/// site.
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
 /// The closed widget vocabulary. A plugin's view is a single root [`Node`].
 ///
 /// Mirrors `hytte_ui::Node`: `Box { scroll }` carries the scroll flag
@@ -157,6 +176,56 @@ fn pixels_scale_default() -> u32 {
 /// the whole decode. Pinned by `tests/proto.rs` in both directions, and by the
 /// `tests/fixtures/plugin_render_v1.hex` golden bytes, which did not move: the
 /// `skip_serializing_if` keeps a `None` tooltip off the wire entirely.
+///
+/// # Laying out a list card (#966)
+///
+/// A real list card — Mara's live test of the agents plugin (#963) — hit three
+/// walls at once, all of them host-side, all of them things the plugin could not
+/// work around from its side of the socket:
+///
+/// - **[`Row`](Node::Row) had no `spacing`**, so its children butted up against
+///   each other (`⚙argus`) unless the plugin padded with [`Spacer`](Node::Spacer)s.
+///   Fixed by [`Row::spacing`](Node::Row#structfield.spacing), an additive
+///   `u16` (`0` = the old behaviour), mapped to `gtk_box_set_spacing`.
+///   [`Box`](Node::Box) already carried a `spacing`, so it is untouched.
+/// - **[`ListBox`](Node::ListBox) auto-wraps every child** in a `GtkListBoxRow`,
+///   which carries libadwaita's row min-height — most of the ~700 px a 12-row
+///   card took. Fixed by [`ListBox::dense`](Node::ListBox#structfield.dense), an
+///   additive `bool` that has the host drop that floor.
+/// - **There was no viewport at all.** See the next section.
+///
+/// # `Box { scroll }` is an event target, **not** a viewport
+///
+/// [`Box::scroll`](Node::Box#structfield.scroll) makes the box a *source of
+/// scroll events*: the host attaches a `GtkEventControllerScroll` and forwards
+/// raw wheel deltas as [`EventKind::Scroll`], for a plugin that wants to treat
+/// the wheel as an input (step a value, page a list it re-renders itself). It
+/// **does not clip, does not scroll, and does not bound the box's height** — the
+/// box still measures and renders at its children's full natural size.
+///
+/// That is the confusion #966 came from, and it was unfixable plugin-side: GTK
+/// CSS has no `max-height`, so a plugin could not bound its own card by any
+/// combination of the vocabulary it had. [`Scrolled`](Node::Scrolled) is the
+/// viewport half; `scroll` keeps its existing meaning unchanged.
+///
+/// # Compat class of the three
+///
+/// `spacing` and `dense` are **optional fields**, so
+/// [`PROTO_VERSION`](crate::PROTO_VERSION) *and* [`VOCAB`](crate::VOCAB) both
+/// stay put — the crate root's rules put an optional field
+/// (`#[serde(default)]` + `#[serde(skip_serializing_if = …)]`) on the
+/// same-version side, and the `VOCAB` rule is scoped to *appending a wire
+/// variant*. Their `skip_serializing_if` ([`is_default`]) keeps the pre-#966
+/// value off the wire entirely, which is why every committed golden fixture that
+/// predates them is byte-identical.
+///
+/// [`Scrolled`](Node::Scrolled) **is** an appended variant, so it bumps
+/// [`VOCAB`](crate::VOCAB) (3 → 4) and is **negotiated** on
+/// [`SCROLLED_VOCAB`] exactly as #882's preem and #893's shader generations are:
+/// a plugin emits it only after the host advertised that generation in
+/// [`HostMsg::Hello`](crate::msg::HostMsg::Hello), so an old host can never
+/// receive a variant it cannot decode and
+/// [`VOCAB_UNCONDITIONAL`](crate::VOCAB_UNCONDITIONAL) stays at 1.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Node {
     /// A `gtk::Box`. `id` (optional) keys the node for diffing/reordering;
@@ -168,7 +237,18 @@ pub enum Node {
     Box {
         id: Option<NodeId>,
         dir: Dir,
+        /// Inter-child gap in pixels (`gtk_box_set_spacing`). `Box` has carried
+        /// this since v1 — [`Row`](Node::Row) is the one that grew it in #966.
         spacing: i32,
+        /// Make the box a **scroll event target**: the host attaches an
+        /// event controller and forwards wheel deltas as
+        /// [`EventKind::Scroll`].
+        ///
+        /// **This is not a viewport.** It neither clips nor scrolls nor bounds
+        /// the box's height; the box still measures at its children's full
+        /// natural size. For an inner viewport that clips and scrolls, use
+        /// [`Scrolled`](Node::Scrolled) — see
+        /// [the section on this enum](Node#box--scroll--is-an-event-target-not-a-viewport).
         scroll: bool,
         classes: Vec<Cls>,
         children: Vec<Node>,
@@ -185,6 +265,17 @@ pub enum Node {
     Row {
         id: Option<NodeId>,
         classes: Vec<Cls>,
+        /// Inter-child gap in pixels, mapped straight onto the backing
+        /// `gtk::Box`'s `spacing` (#966). A **mutable prop**: a same-id
+        /// re-render with a new value re-spaces the row in place rather than
+        /// rebuilding it.
+        ///
+        /// `0` — the default, and what a pre-#966 frame decodes to — is exactly
+        /// the old flush layout, so nothing that did not ask for spacing moves.
+        /// `u16` rather than `Box`'s `i32` because a negative gap is not a thing
+        /// a plugin can mean; the host widens it to `i32` at the map.
+        #[serde(default, skip_serializing_if = "is_default")]
+        spacing: u16,
         children: Vec<Node>,
     },
     /// A vertical list **container** stacking its children (typically
@@ -194,7 +285,127 @@ pub enum Node {
     ListBox {
         id: Option<NodeId>,
         classes: Vec<Cls>,
+        /// Drop the per-row height floor (#966).
+        ///
+        /// The host materializes a `ListBox` as a real `GtkListBox`, which
+        /// **auto-wraps every child** in a `GtkListBoxRow` so libadwaita's
+        /// `.boxed-list` card styling can paint. That wrapper carries the
+        /// theme's row min-height and padding, which is most of the height a
+        /// dense list of one-line rows takes — a plugin cannot reach the
+        /// wrapper (it never appears in the tree it sent), so this is the only
+        /// way to ask for a tight list.
+        ///
+        /// `true` has the host mark each wrapper so the shipped stylesheet
+        /// zeroes its `min-height` and `padding`; the rows are then exactly as
+        /// tall as their content. A **mutable prop**: flipping it on a same-id
+        /// re-render re-marks the existing wrappers in place, both directions.
+        ///
+        /// Style the *rows'* own padding from the plugin as usual — `classes`
+        /// on the [`Row`](Node::Row) children — which is the point: dense hands
+        /// the height budget back to the plugin instead of spending it in the
+        /// wrapper.
+        #[serde(default, skip_serializing_if = "is_default")]
+        dense: bool,
         children: Vec<Node>,
+    },
+    /// A **bounded viewport**: a vertical scroller that is as tall as its child
+    /// wants to be, up to `max_height`, and scrolls the rest (#966).
+    ///
+    /// This is the vocabulary's only way for a plugin to bound its own card.
+    /// GTK CSS has no `max-height`, and
+    /// [`Box::scroll`](Node::Box#structfield.scroll) is an *event target* that
+    /// neither clips nor scrolls — so before this variant a long list inside a
+    /// card grew without limit and pushed everything below it off the surface.
+    ///
+    /// The host materializes it as a `GtkScrolledWindow` with
+    /// `propagate-natural-height`, a **vertical-only** policy (never / automatic)
+    /// and overlay scrolling, so:
+    ///
+    /// - a child **shorter** than `max_height` is not stretched — the node is
+    ///   invisible in that case, which is what lets a plugin wrap a list whose
+    ///   length it does not know;
+    /// - a child **taller** than `max_height` is clipped to it and scrollable;
+    /// - the child's natural **width** is propagated unchanged (no horizontal
+    ///   scrollbar, no horizontal clipping).
+    ///
+    /// `max_height` is a **mutable prop** (a same-id re-render re-bounds the
+    /// viewport in place). `0` means *unbounded* — the node becomes a
+    /// pass-through wrapper — so a plugin can compute the cap and hand over `0`
+    /// rather than branching on whether to emit the node at all.
+    ///
+    /// # Nesting: the innermost viewport wins
+    ///
+    /// A `Scrolled` inside a scrolling surface (the shell's sidebar, #965) takes
+    /// the wheel while the pointer is over it, and hands the gesture back to the
+    /// surface once its own adjustment is at the end — that is `GtkScrolledWindow`'s
+    /// standard kinetic chaining, not something the host adds. So a bounded card
+    /// scrolls inside itself first, and the sidebar scrolls once the card is at
+    /// its end.
+    ///
+    /// # Negotiated (#966)
+    ///
+    /// Appending this variant bumps [`VOCAB`](crate::VOCAB) to
+    /// [`SCROLLED_VOCAB`], and — like [`Preem`](Node::Preem) and
+    /// [`Shader`](Node::Shader) — a plugin must only emit it once the host has
+    /// advertised that generation in
+    /// [`HostMsg::Hello`](crate::msg::HostMsg::Hello). The fallback is trivial
+    /// and lossless in kind: render the child on its own, unbounded, which is
+    /// exactly what every pre-#966 card did. The SDK's
+    /// `hytte_plugin::nodes::scrolled` does that branch for you.
+    ///
+    /// **The bump costs an old shell nothing**, measured against the real
+    /// `origin/main` proto crate linked alongside this one (#969 review):
+    /// [`Manifest::new`](crate::manifest::Manifest::new) stamps
+    /// `vocab = VOCAB_UNCONDITIONAL = 1`, which is the number an old host
+    /// exact-checks, so a plugin rebuilt on this SDK still registers cleanly;
+    /// that host then advertises 3, `negotiated_vocab` yields 3, and the variant
+    /// is never emitted. An old host also silently skips `Row::spacing` and
+    /// `ListBox::dense` as unknown keys. What the negotiation buys is visible in
+    /// the one case that bypasses it: a `Scrolled` put on the wire regardless
+    /// makes an old decoder fail with ``unknown variant `Scrolled` `` — the
+    /// whole frame, i.e. #437's 5 s reconnect loop.
+    ///
+    /// # Why a variant, and not a `max_height` field on [`Box`](Node::Box)
+    ///
+    /// A field would have been additive and bumped nothing, so it was the
+    /// default answer; two things ruled it out.
+    ///
+    /// **It is not expressible without changing the reconciler's
+    /// `update_in_place` contract.** A host's retained widget is simultaneously
+    /// the one its parent container appends/removes/reorders and the one
+    /// `update_in_place` downcasts; wrapping a box in a scroller splits those
+    /// into two objects, and flipping the field on a *reused* node would have to
+    /// swap which of them is parented — which `update_in_place` cannot do,
+    /// because it holds no handle on the parent, and there are five different
+    /// parent shapes. That is a contract change, not an impossibility: folding
+    /// the flag into the reconciler's kind discriminant so a flip rebuilds would
+    /// work, at the cost of the discriminant no longer being a variant
+    /// discriminant.
+    ///
+    /// **The decisive reason is the other repair.** Making the flip sound by
+    /// always wrapping *every* [`Box`](Node::Box) in a scroller would, for every
+    /// already-deployed plugin and for a field almost none of them set:
+    ///
+    /// - rename the styled widget's GTK CSS node from `box` to
+    ///   `scrolledwindow`, so every `box.foo` selector silently stops matching
+    ///   (the host applies a node's `classes` to exactly that widget);
+    /// - drop every box's **minimum** height to near zero, since that is a
+    ///   `GtkScrolledWindow`'s own minimum — changing how existing cards behave
+    ///   under pressure;
+    /// - put a scroll-**consuming** widget in front of
+    ///   [`Box::scroll`](Node::Box#structfield.scroll)'s controller, i.e. break
+    ///   the one meaning that flag has.
+    ///
+    /// A separate variant costs an old shell nothing (above) and names the thing
+    /// — which, given #966 opened on `scroll` being mistaken for a viewport, is
+    /// a real benefit rather than the justification.
+    Scrolled {
+        id: Option<NodeId>,
+        /// The viewport's maximum height in pixels; `0` = unbounded.
+        max_height: u16,
+        classes: Vec<Cls>,
+        /// The single child the viewport bounds.
+        child: Box<Node>,
     },
     /// A `gtk::Label`.
     Label {
@@ -840,6 +1051,25 @@ impl ShaderData {
 /// for the rule.
 pub const SHADER_VOCAB: u16 = 3;
 
+/// The [`VOCAB`](crate::VOCAB) generation that carries the bounded viewport
+/// ([`Node::Scrolled`]) — #966.
+///
+/// **Negotiated**, exactly like [`SHADER_VOCAB`] and
+/// [`PREEM_VOCAB`](crate::preem::PREEM_VOCAB): a plugin emits [`Node::Scrolled`]
+/// only once
+/// [`Manifest::negotiated_vocab`](crate::manifest::Manifest::negotiated_vocab)
+/// has reached this number, so an old host — which advertises nothing in
+/// [`HostMsg::Hello`](crate::msg::HostMsg::Hello) — can never receive a variant
+/// it cannot decode. Generation 4 therefore bumps [`VOCAB`](crate::VOCAB) (the
+/// census) and leaves [`VOCAB_UNCONDITIONAL`](crate::VOCAB_UNCONDITIONAL) alone;
+/// see that const for the rule.
+///
+/// The degradation is the cheapest of the three so far: where preem falls back
+/// to a CPU raster and a shader to [`Node::Pixels`], a plugin that cannot use a
+/// viewport simply renders the child unwrapped — an unbounded card, i.e. exactly
+/// what it rendered before #966.
+pub const SCROLLED_VOCAB: u16 = 4;
+
 /// The largest [`Node::Shader::fragment`] the host will hand a driver, in bytes.
 ///
 /// **Hygiene, not security.** It is kept because it costs nothing and catches
@@ -1276,7 +1506,9 @@ impl Node {
                     child.clamp_in_place();
                 }
             }
-            Self::Button { child, .. } | Self::Revealer { child, .. } => child.clamp_in_place(),
+            Self::Button { child, .. }
+            | Self::Revealer { child, .. }
+            | Self::Scrolled { child, .. } => child.clamp_in_place(),
             Self::Expander {
                 header, children, ..
             } => {

@@ -247,12 +247,20 @@ fn wire_node_maps_to_ui_node_exhaustively() {
 /// children like `Box`, and `Text` carries `max_width_chars` **and** the
 /// #297 `ellipsize` flag. A `Spacer` between the cluster and the value maps
 /// 1:1 (the justification primitive).
+///
+/// Since #966 it also pins the two additive list props across the map:
+/// `ListBox::dense` carries as-is, and `Row::spacing` **widens** from the
+/// wire's `u16` to the reconciler's `i32` — the one arithmetic step in this
+/// otherwise 1:1 file, and the one thing a field-for-field `assert_eq!` on a
+/// zero would not have caught.
 #[test]
 fn wire_row_listbox_text_map_to_ui() {
     let tree = wire::Node::ListBox {
+        dense: true,
         id: Some("list".into()),
         classes: vec!["ts-list".into()],
         children: vec![wire::Node::Row {
+            spacing: 6,
             id: Some("r0".into()),
             classes: vec!["ts-row".into()],
             children: vec![
@@ -276,9 +284,11 @@ fn wire_row_listbox_text_map_to_ui() {
     let expected = UiNode::ListBox {
         id: Some("list".into()),
         classes: vec!["ts-list".into()],
+        dense: true,
         children: vec![UiNode::Row {
             id: Some("r0".into()),
             classes: vec!["ts-row".into()],
+            spacing: 6,
             children: vec![
                 UiNode::Text {
                     id: None,
@@ -296,6 +306,40 @@ fn wire_row_listbox_text_map_to_ui() {
                 },
             ],
         }],
+    };
+    assert_eq!(
+        to_ui_node(&Scope::detached("map"), Grants::none(), &tree),
+        expected
+    );
+}
+
+/// #966's bounded viewport maps 1:1, `max_height` widening `u16` → `i32` the
+/// way `Row::spacing` does, and its **mandatory** child recursing through the
+/// same `?` path `Button`/`Revealer` use — so a viewport whose only child fell
+/// past a cap is dropped with it rather than mapping to an empty scroller.
+#[test]
+fn wire_scrolled_maps_to_ui() {
+    let tree = wire::Node::Scrolled {
+        id: Some("card-body".into()),
+        max_height: 240,
+        classes: vec!["ts-card-scroll".into()],
+        child: Box::new(wire::Node::Label {
+            id: None,
+            text: "row".into(),
+            classes: vec![],
+            tooltip: None,
+        }),
+    };
+    let expected = UiNode::Scrolled {
+        id: Some("card-body".into()),
+        max_height: 240,
+        classes: vec!["ts-card-scroll".into()],
+        child: Box::new(UiNode::Label {
+            id: None,
+            text: "row".into(),
+            classes: vec![],
+            tooltip: None,
+        }),
     };
     assert_eq!(
         to_ui_node(&Scope::detached("map"), Grants::none(), &tree),
@@ -4238,6 +4282,7 @@ fn instances_are_swept_when_their_node_leaves_the_tree() {
         )
     };
     let row = |children: Vec<wire::Node>| wire::Node::Row {
+        spacing: 0,
         id: Some("row".into()),
         classes: vec![],
         children,

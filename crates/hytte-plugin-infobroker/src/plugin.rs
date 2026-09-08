@@ -290,6 +290,7 @@ impl Infobroker {
                 id: CHIP_ID.to_owned(),
                 classes: vec!["flat".to_owned()],
                 child: Box::new(Node::Row {
+                    spacing: 0,
                     id: None,
                     classes: Vec::new(),
                     children: chip_children,
@@ -448,6 +449,7 @@ fn muted_text(text: &str) -> Node {
 /// A native carded list of rows.
 fn list(children: Vec<Node>) -> Node {
     Node::ListBox {
+        dense: false,
         id: None,
         classes: vec!["boxed-list".to_owned()],
         children,
@@ -502,6 +504,7 @@ fn action_row(title: &str, subtitle: &str, trailing: Option<Node>) -> Node {
         children.push(t);
     }
     Node::Row {
+        spacing: 0,
         id: None,
         classes: Vec::new(),
         children,
@@ -582,6 +585,7 @@ fn audit_row(a: &AuditView, now_unix: i64) -> Node {
         tooltip: None,
     };
     Node::Row {
+        spacing: 0,
         id: None,
         classes: Vec::new(),
         children: vec![

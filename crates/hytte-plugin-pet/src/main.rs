@@ -357,6 +357,7 @@ impl Plugin for Pet {
         // remaining slot. With no bubble the row collapses to just the face —
         // the leading face stays put either way.
         Node::Row {
+            spacing: 0,
             id: Some("pet-root".to_owned()),
             classes: vec!["pet-root".to_owned()],
             children,

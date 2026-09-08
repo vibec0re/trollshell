@@ -163,6 +163,48 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       sidebar, change/stop the track, then **reopen** the sidebar — the
       audio-widget marquee should show the _current_ track immediately, not a
       stale one from before the sidebar closed.
+- [ ] **(#966)** The list-card layout vocabulary, on a real card (the agents
+      plugin, #963, is the motivating consumer). Three checks, one card:
+  - [ ] **Row spacing.** A `Node::Row` built with `spacing: 6` (or
+        `nodes::row(..).spacing(6)`) puts a visible gap between its children —
+        the `⚙argus` collision that opened #966 is gone — and re-rendering the
+        same row id with a different spacing **re-spaces in place**, no flicker,
+        no rebuild.
+  - [ ] **Dense grouped list.** Render a `boxed-list` `Node::ListBox` of ~12
+        one-line rows in the sidebar, once with `dense: false` and once with
+        `dense: true`. Dense is materially shorter and the rows are as tall as
+        their text; the card's rounded frame and hairline separators survive.
+        Toggle `dense` on a live re-render — the height changes without the
+        rows blinking (they are reused, not rebuilt). Headless the same shape
+        measures 12 rows at **251 px → 203 px**, and one row at
+        **20 px → 16 px**, which is exactly its label
+        (`hytte_ui::widget_tree::gtk_tests::a_dense_list_is_exactly_as_tall_as_its_rows_content`,
+        which prints those numbers). Confirm the on-glass saving is bigger, not
+        smaller: the CI theme charges 4 px a row where the real Adwaita row
+        floor is much taller.
+  - [ ] **A bounded card, inside a scrolling sidebar.** Wrap the list in
+        `Node::Scrolled { max_height: 240 }`. Short list → the card is its
+        content's height, **not** padded out to 240 px. Long list → the card
+        stops at 240 px and scrolls **inside itself**, with everything below it
+        (the pet card) still reachable.
+    - [ ] **Which scroller wins.** Point at the card and wheel: the **card**
+          scrolls. Keep wheeling past its end: the **sidebar** takes over
+          (`GtkScrolledWindow`'s standard kinetic chaining — innermost first,
+          handed outward at the ends). Point outside the card: the sidebar
+          scrolls, always. There is no fight — the two hold separate
+          adjustments, pinned headless by
+          `a_bounded_card_inside_a_scrolling_surface_keeps_its_own_adjustment`;
+          **this row is the gesture half**, which the headless suite cannot
+          synthesize, so it is only ever verified here.
+  - [ ] **Old shell, new plugin.** A plugin built against this SDK, run against
+        a **pre-#966** shell, must still connect: `Row::spacing` and
+        `ListBox::dense` are skipped as unknown fields (the card lays out as it
+        did before), and `nodes::scrolled(..).build()` sees no
+        `SCROLLED_VOCAB` in `Hello` and emits the bare child — an unbounded
+        card, i.e. exactly the pre-#966 rendering. Nothing warns, nothing
+        crash-loops. The **wrong** outcome to watch for is a 5 s reconnect loop
+        in `journalctl --user -u trollshell-plugin-<id>`, which is what
+        emitting `Node::Scrolled` unnegotiated would cause.
 - [ ] _(dormant — #555)_ The wire-vocabulary generation counter (`VOCAB`) is
       armed but untested against a real newer-vocab plugin (this PR appended
       no wire variant, so `VOCAB` stays at 1 and nothing exercises the reject

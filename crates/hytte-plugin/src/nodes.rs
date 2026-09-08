@@ -208,6 +208,17 @@ impl Scrolled {
     /// the viewport existed — so a plugin can call this unconditionally and let
     /// the shell decide.
     ///
+    /// The fallback returns the **child alone**, so this node's own
+    /// [`id`](Self::id) and [`class`](Self::class)es go with the frame they
+    /// described — an old host sees neither. That is deliberate rather than
+    /// lossy: negotiation is fixed for the life of a session, so the degraded
+    /// tree is consistently shaped and matches itself render to render through
+    /// `plan_diff`'s keyless positional path; and the classes styled a viewport
+    /// that no longer exists. Put anything the *card* needs on the child, not
+    /// here. (Contrast [`shader`](crate::shader), which hands the fallback back
+    /// to the plugin as an `Option` rather than choosing one — the right shape
+    /// there, because a shader's fallback is a whole second rendering.)
+    ///
     /// Use [`build_unnegotiated`](Self::build_unnegotiated) only where the wire
     /// shape itself is under test.
     #[must_use]

@@ -1742,6 +1742,11 @@ fn chevron_icon(expanded: bool) -> &'static str {
 ///   card in a viewport never narrows it or grows a horizontal scrollbar.
 /// - `overlay_scrolling(true)` — the indicator floats over the content instead
 ///   of taking width from it, so wrapping a card does not reflow its rows.
+///   **This restates GTK4's own default and pins nothing**: `overlay-scrolling`
+///   is already `TRUE`, deleting the call cannot regress any test here, and no
+///   assertion in this file checks that width guarantee. It is written out for
+///   the same reason the policy above is — so the three properties that decide
+///   what this widget *is* are read together — not because it is doing work.
 fn new_viewport() -> gtk::ScrolledWindow {
     let sw = gtk::ScrolledWindow::new();
     sw.set_propagate_natural_height(true);
@@ -4934,5 +4939,51 @@ mod gtk_tests {
             plain,
             "`scroll` bounds nothing — that is what `Node::Scrolled` is for",
         );
+    }
+
+    /// A `Scrolled` must never reuse a `Box`'s widget, even under a stable id —
+    /// the two are the confusable pair this issue is about (a plugin migrating
+    /// off `Box { scroll }` keeps its id). [`update_in_place`]'s
+    /// `downcast::<gtk::ScrolledWindow>` is a main-thread panic if it ever does,
+    /// so the kind discriminant is load-bearing for the whole shell.
+    ///
+    /// The generic machinery is already covered by
+    /// `keyed_kind_change_recreates` and `kind_change_recreates_widget`, both
+    /// `Label` → `Button` — and both stay green under the mutation below, which
+    /// is exactly why #358 and #893 each wrote a per-variant instance for their
+    /// own confusable pair (`a_gl_surface_never_reuses_a_pixels_widget`,
+    /// `a_shader_never_reuses_a_pixels_or_gl_surface_widget`). This is #966's.
+    ///
+    /// **Falsified** by [`node_kind`]'s `Scrolled` arm returning
+    /// `NodeKind::Box`: `kind invariant: widget type matches its node kind`,
+    /// with every other test in this file still green.
+    #[gtk::test]
+    fn a_scrolled_never_reuses_a_box_widget() {
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&Node::Box {
+            id: Some("body".to_owned()),
+            dir: Dir::Vertical,
+            spacing: 0,
+            scroll: false,
+            classes: vec![],
+            children: vec![lbl(None, "x")],
+            tooltip: None,
+        });
+        let first = root.first_child().expect("mounted");
+        assert!(first.downcast_ref::<gtk::Box>().is_some(), "a Box first");
+
+        rec.render(&Node::Scrolled {
+            id: Some("body".to_owned()),
+            max_height: 120,
+            classes: vec![],
+            child: Box::new(lbl(None, "x")),
+        });
+        let now = root.first_child().expect("mounted");
+        assert!(
+            now.downcast_ref::<gtk::ScrolledWindow>().is_some(),
+            "the same id across a kind change must REBUILD, not reuse the Box",
+        );
+        assert_ne!(now, first, "a different widget object");
     }
 }

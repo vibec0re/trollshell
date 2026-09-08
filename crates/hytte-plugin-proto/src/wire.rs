@@ -352,6 +352,53 @@ pub enum Node {
     /// and lossless in kind: render the child on its own, unbounded, which is
     /// exactly what every pre-#966 card did. The SDK's
     /// `hytte_plugin::nodes::scrolled` does that branch for you.
+    ///
+    /// **The bump costs an old shell nothing**, measured against the real
+    /// `origin/main` proto crate linked alongside this one (#969 review):
+    /// [`Manifest::new`](crate::manifest::Manifest::new) stamps
+    /// `vocab = VOCAB_UNCONDITIONAL = 1`, which is the number an old host
+    /// exact-checks, so a plugin rebuilt on this SDK still registers cleanly;
+    /// that host then advertises 3, `negotiated_vocab` yields 3, and the variant
+    /// is never emitted. An old host also silently skips `Row::spacing` and
+    /// `ListBox::dense` as unknown keys. What the negotiation buys is visible in
+    /// the one case that bypasses it: a `Scrolled` put on the wire regardless
+    /// makes an old decoder fail with ``unknown variant `Scrolled` `` — the
+    /// whole frame, i.e. #437's 5 s reconnect loop.
+    ///
+    /// # Why a variant, and not a `max_height` field on [`Box`](Node::Box)
+    ///
+    /// A field would have been additive and bumped nothing, so it was the
+    /// default answer; two things ruled it out.
+    ///
+    /// **It is not expressible without changing the reconciler's
+    /// `update_in_place` contract.** A host's retained widget is simultaneously
+    /// the one its parent container appends/removes/reorders and the one
+    /// `update_in_place` downcasts; wrapping a box in a scroller splits those
+    /// into two objects, and flipping the field on a *reused* node would have to
+    /// swap which of them is parented — which `update_in_place` cannot do,
+    /// because it holds no handle on the parent, and there are five different
+    /// parent shapes. That is a contract change, not an impossibility: folding
+    /// the flag into the reconciler's kind discriminant so a flip rebuilds would
+    /// work, at the cost of the discriminant no longer being a variant
+    /// discriminant.
+    ///
+    /// **The decisive reason is the other repair.** Making the flip sound by
+    /// always wrapping *every* [`Box`](Node::Box) in a scroller would, for every
+    /// already-deployed plugin and for a field almost none of them set:
+    ///
+    /// - rename the styled widget's GTK CSS node from `box` to
+    ///   `scrolledwindow`, so every `box.foo` selector silently stops matching
+    ///   (the host applies a node's `classes` to exactly that widget);
+    /// - drop every box's **minimum** height to near zero, since that is a
+    ///   `GtkScrolledWindow`'s own minimum — changing how existing cards behave
+    ///   under pressure;
+    /// - put a scroll-**consuming** widget in front of
+    ///   [`Box::scroll`](Node::Box#structfield.scroll)'s controller, i.e. break
+    ///   the one meaning that flag has.
+    ///
+    /// A separate variant costs an old shell nothing (above) and names the thing
+    /// — which, given #966 opened on `scroll` being mistaken for a viewport, is
+    /// a real benefit rather than the justification.
     Scrolled {
         id: Option<NodeId>,
         /// The viewport's maximum height in pixels; `0` = unbounded.

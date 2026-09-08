@@ -184,6 +184,28 @@ pub enum Capability {
     /// lists a datasource but omits this cap is refused and warned). The motivating
     /// providers are `hytte-plugin-departures` and `hytte-plugin-weather`.
     DatasourceProvider,
+    /// Render a [`Node::Shader`](crate::wire::Node::Shader) — a plugin-supplied
+    /// fragment shader the shell compiles and runs on the GPU (#893).
+    ///
+    /// Unlike every other capability here it gates a **node**, not an
+    /// [`Effect`](crate::effect::Effect): a `Shader` node from a plugin whose
+    /// manifest omits this renders the broken-widget placeholder with one
+    /// warning, and the rest of that plugin's tree renders normally.
+    ///
+    /// **Ordinary, and deliberately so.** It is auto-granted from the manifest
+    /// and audit-logged exactly like the rest — Annika's call on #893
+    /// (2026-09-07): the plugin socket's own `0600`-in-`0700` file mode already
+    /// is the boundary, so a provenance check on top of it "adds nothing". What
+    /// the capability buys is *legibility*: a plugin that can run GPU code says
+    /// so in its manifest, where the control-center and the audit log can see
+    /// it. See [`Node::Shader`](crate::wire::Node::Shader) for the enforced /
+    /// not-enforced split and the blast radius.
+    ///
+    /// Declaring it costs compatibility with a pre-#893 host, which cannot
+    /// decode the variant and will drop the connection — the same as every
+    /// capability appended before it, and stated on
+    /// [`Node::Shader`](crate::wire::Node::Shader).
+    Shader,
 }
 
 /// Where a plugin's view mounts in the shell. Wire-side vocabulary the host

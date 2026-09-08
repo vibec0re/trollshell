@@ -711,6 +711,18 @@ pub(super) async fn drive_scope_releaser(live: impl Signal<Item = HashSet<String
             // has no `Scope::panel` instances, and forgetting a scope that holds
             // none is a `HashMap` miss — cheaper than asking first.
             preem_render::forget_scope(&Scope::card(gone));
+            // …and the shader states keyed under the same card scope (#893).
+            // **This line is the one #968's second review found missing**, and
+            // it leaked in exactly the corner #920/#921 exist to cover: the
+            // region retain loops are monitor-shaped, so with no monitor alive
+            // — a docked lid closing, every output unplugged — this releaser is
+            // the *only* thing that runs. Measured on the state it was missing
+            // from: 1000 plugins joining and departing held 1000 scopes and
+            // 4 MB of buffers for the life of the shell, and at the wire caps
+            // that is 4 MiB + 16 KiB per shader node id per departed plugin.
+            // The panel half was already covered, via
+            // `forget_departed_panel_scope` below; the card half was not.
+            super::shader_map::forget_scope(&Scope::card(gone));
             // The panel scope goes through `region`, not straight to
             // `preem_render`: releasing it has to drop the per-monitor refcount
             // entry `region` keeps for it as well, or the store and the count

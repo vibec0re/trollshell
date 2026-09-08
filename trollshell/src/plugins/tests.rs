@@ -39,6 +39,7 @@ use super::session::{
     EFFECT_BURST, EffectRateLimiter, IdGuard, OUTBOUND_CAPACITY, REGISTER_TIMEOUT,
     effect_capability, enforce_capabilities, handle_conn, push_gate, state_key_capability,
 };
+use super::shader_map::{self, Grants};
 use super::wire_map::{clamp_pixels_scale, pixels_len_ok, to_ui_node, to_wire_event};
 use super::{BrokeredEffect, ListenerCtx, SlotRender};
 
@@ -236,7 +237,10 @@ fn wire_node_maps_to_ui_node_exhaustively() {
         ],
         tooltip: Some("the whole card".into()),
     };
-    assert_eq!(to_ui_node(&Scope::detached("map"), &tree), expected);
+    assert_eq!(
+        to_ui_node(&Scope::detached("map"), Grants::none(), &tree),
+        expected
+    );
 }
 
 /// The list nodes map field-for-field: `Row`/`ListBox` recurse their
@@ -293,7 +297,10 @@ fn wire_row_listbox_text_map_to_ui() {
             ],
         }],
     };
-    assert_eq!(to_ui_node(&Scope::detached("map"), &tree), expected);
+    assert_eq!(
+        to_ui_node(&Scope::detached("map"), Grants::none(), &tree),
+        expected
+    );
 }
 
 /// The #333 `Expander` maps 1:1: the boxed `header` and the body `children`
@@ -334,7 +341,10 @@ fn wire_expander_maps_to_ui() {
         expanded: true,
         classes: vec!["boxed-list".into()],
     };
-    assert_eq!(to_ui_node(&Scope::detached("map"), &tree), expected);
+    assert_eq!(
+        to_ui_node(&Scope::detached("map"), Grants::none(), &tree),
+        expected
+    );
 }
 
 #[test]
@@ -374,7 +384,10 @@ fn wire_entry_maps_to_ui() {
         placeholder: "type a command…".into(),
         classes: vec!["monospace".into()],
     };
-    assert_eq!(to_ui_node(&Scope::detached("map"), &tree), expected);
+    assert_eq!(
+        to_ui_node(&Scope::detached("map"), Grants::none(), &tree),
+        expected
+    );
 }
 
 /// Every wire `Page` maps to the identically-named `modal::Page` in the
@@ -486,6 +499,7 @@ fn render_of(
             tooltip: None,
         },
         panel: None,
+        grants: Grants::none(),
         outbound: tx.clone(),
     }
 }
@@ -616,7 +630,7 @@ fn pixels_bad_len_degrades_to_empty_surface() {
         classes: vec!["ts-lcd".into()],
     };
     assert_eq!(
-        to_ui_node(&Scope::detached("pixels"), &bad),
+        to_ui_node(&Scope::detached("pixels"), Grants::none(), &bad),
         UiNode::Pixels {
             id: Some("lcd".into()),
             width: 0,
@@ -639,7 +653,7 @@ fn pixels_bad_len_degrades_to_empty_surface() {
         classes: vec![],
     };
     assert_eq!(
-        to_ui_node(&Scope::detached("pixels"), &good),
+        to_ui_node(&Scope::detached("pixels"), Grants::none(), &good),
         UiNode::Pixels {
             id: None,
             width: 1,
@@ -683,7 +697,7 @@ fn pixels_scale_is_clamped_at_the_host_seam() {
         scale,
         classes: vec![],
     };
-    let ui_scale = |n: &wire::Node| match to_ui_node(&Scope::detached("scale"), n) {
+    let ui_scale = |n: &wire::Node| match to_ui_node(&Scope::detached("scale"), Grants::none(), n) {
         UiNode::Pixels { scale, .. } => scale,
         other => panic!("expected Pixels, got {other:?}"),
     };
@@ -708,7 +722,7 @@ fn progress_and_slider_floats_are_sanitised_at_the_host_seam() {
         fraction,
         classes: vec![],
     };
-    let ui_fraction = |n: &wire::Node| match to_ui_node(&scope, n) {
+    let ui_fraction = |n: &wire::Node| match to_ui_node(&scope, Grants::none(), n) {
         UiNode::Progress { fraction, .. } => fraction,
         other => panic!("expected Progress, got {other:?}"),
     };
@@ -738,7 +752,7 @@ fn progress_and_slider_floats_are_sanitised_at_the_host_seam() {
         enabled: true,
         classes: vec![],
     };
-    let mapped = to_ui_node(&scope, &slider(10.0, 5.0, f64::NAN, 0.0));
+    let mapped = to_ui_node(&scope, Grants::none(), &slider(10.0, 5.0, f64::NAN, 0.0));
     let UiNode::Slider {
         min,
         max,
@@ -757,7 +771,7 @@ fn progress_and_slider_floats_are_sanitised_at_the_host_seam() {
     // A legal slider is left exactly alone, so the seam costs nothing normal.
     let legal = slider(0.0, 1.0, 0.3, 0.1);
     assert_eq!(
-        to_ui_node(&scope, &legal),
+        to_ui_node(&scope, Grants::none(), &legal),
         UiNode::Slider {
             id: "sld".into(),
             min: 0.0,
@@ -2831,7 +2845,7 @@ fn mapped_pixels(scope: &Scope, node: &wire::Node) -> (u32, u32, Vec<u8>) {
 /// actually handed out, so a test can ask whether two mapping passes shared one
 /// allocation (#911).
 fn mapped_frame(scope: &Scope, node: &wire::Node) -> (u32, u32, Arc<[u8]>) {
-    match to_ui_node(scope, node) {
+    match to_ui_node(scope, Grants::none(), node) {
         UiNode::Pixels {
             width,
             height,
@@ -2892,7 +2906,7 @@ fn gauge_row<'a>(gauges: impl IntoIterator<Item = (Option<&'a str>, f32)>) -> wi
 /// — how the sibling-keying tests read one node's frame out of a multi-node
 /// render.
 fn mapped_row_pixels(scope: &Scope, node: &wire::Node) -> Vec<(u32, u32, Vec<u8>)> {
-    match to_ui_node(scope, node) {
+    match to_ui_node(scope, Grants::none(), node) {
         UiNode::Box { children, .. } => children
             .into_iter()
             .map(|child| match child {
@@ -3235,7 +3249,7 @@ fn mapped_gl(
     scope: &Scope,
     node: &wire::Node,
 ) -> (u32, u32, Arc<hytte::ui::gl_surface::GlUniforms>) {
-    match to_ui_node(scope, node) {
+    match to_ui_node(scope, Grants::none(), node) {
         UiNode::GlSurface {
             width,
             height,
@@ -3295,7 +3309,10 @@ fn the_cpu_arm_still_emits_the_kits_own_bytes_as_a_pixels_node() {
     let node = preem_node(Some("sc"), gl_scope_widget(samples.clone()));
 
     assert!(
-        matches!(to_ui_node(&key, &node), UiNode::Pixels { .. }),
+        matches!(
+            to_ui_node(&key, Grants::none(), &node),
+            UiNode::Pixels { .. }
+        ),
         "with the kill switch on, a Scope is a raster surface",
     );
     let mut oracle = kit::Scope::with_size(48, 24).scale(2).persistence(184);
@@ -3369,9 +3386,9 @@ fn both_scope_arms_animate_and_park_in_lockstep() {
     let cpu = Scope::detached("park-cpu");
     let gl = Scope::detached("park-gl");
 
-    let _ = to_ui_node(&cpu, &node);
+    let _ = to_ui_node(&cpu, Grants::none(), &node);
     super::preem_gl::with_gl_arm(|| {
-        let _ = to_ui_node(&gl, &node);
+        let _ = to_ui_node(&gl, Grants::none(), &node);
     });
 
     // `persistence: 184` settles in 17 steps; walk past that so the parked tail
@@ -3542,9 +3559,9 @@ fn both_scope_arms_take_the_same_catch_up_clamp() {
     let node = preem_node(Some("sc"), gl_scope_widget(vec![0.5, -0.5]));
     let cpu = Scope::detached("catch-up-cpu");
     let gl = Scope::detached("catch-up-gl");
-    let _ = to_ui_node(&cpu, &node);
+    let _ = to_ui_node(&cpu, Grants::none(), &node);
     super::preem_gl::with_gl_arm(|| {
-        let _ = to_ui_node(&gl, &node);
+        let _ = to_ui_node(&gl, Grants::none(), &node);
     });
 
     let moved = preem_render::advance_all(10.0);
@@ -3593,7 +3610,10 @@ fn a_failed_gl_context_rebuilds_the_scope_onto_the_cpu_kit() {
         let node = preem_node(Some("sc"), gl_scope_widget(samples.clone()));
 
         assert!(
-            matches!(to_ui_node(&key, &node), UiNode::GlSurface { .. }),
+            matches!(
+                to_ui_node(&key, Grants::none(), &node),
+                UiNode::GlSurface { .. }
+            ),
             "the GL arm is chosen while a context is still possible",
         );
         let before = preem_render::probe(&key, Some("sc")).expect("the instance exists");
@@ -3601,7 +3621,10 @@ fn a_failed_gl_context_rebuilds_the_scope_onto_the_cpu_kit() {
         hytte::ui::gl_surface::abandon_gl("no GL in this test");
 
         assert!(
-            matches!(to_ui_node(&key, &node), UiNode::Pixels { .. }),
+            matches!(
+                to_ui_node(&key, Grants::none(), &node),
+                UiNode::Pixels { .. }
+            ),
             "a lost context drops the scope to the raster arm",
         );
         let after = preem_render::probe(&key, Some("sc")).expect("the instance survives");
@@ -3666,7 +3689,10 @@ fn a_settled_gl_scope_falls_back_without_waiting_for_a_frame_that_never_comes() 
         );
 
         assert!(
-            matches!(to_ui_node(&key, &node), UiNode::GlSurface { .. }),
+            matches!(
+                to_ui_node(&key, Grants::none(), &node),
+                UiNode::GlSurface { .. }
+            ),
             "the GL arm is chosen while a context is still possible",
         );
         // The premise, and the reason the animating path cannot save this one.
@@ -3695,7 +3721,10 @@ fn a_settled_gl_scope_falls_back_without_waiting_for_a_frame_that_never_comes() 
         // …and what it now produces is the kit's own frame, from a fresh
         // phosphor: the GL arm never drew a trail there was anything to inherit.
         assert!(
-            matches!(to_ui_node(&key, &node), UiNode::Pixels { .. }),
+            matches!(
+                to_ui_node(&key, Grants::none(), &node),
+                UiNode::Pixels { .. }
+            ),
             "a lost context drops even a settled scope to the raster arm",
         );
         let mut oracle = kit::Scope::with_size(48, 24).scale(2).persistence(256);
@@ -3951,10 +3980,10 @@ fn a_state_change_updates_the_instance_in_place() {
         )
     };
 
-    let _ = to_ui_node(&scope, &at(0.25));
+    let _ = to_ui_node(&scope, Grants::none(), &at(0.25));
     assert_eq!(preem_render::probe(&scope, Some("gg")), Some((1, 1)));
 
-    let _ = to_ui_node(&scope, &at(0.75));
+    let _ = to_ui_node(&scope, Grants::none(), &at(0.75));
     assert_eq!(
         preem_render::probe(&scope, Some("gg")),
         Some((1, 2)),
@@ -4107,10 +4136,10 @@ fn a_config_or_kind_change_rebuilds_the_instance() {
         )
     };
 
-    let _ = to_ui_node(&scope, &dots(vocab::StyleName::Vfd));
+    let _ = to_ui_node(&scope, Grants::none(), &dots(vocab::StyleName::Vfd));
     assert_eq!(preem_render::probe(&scope, Some("w")), Some((1, 1)));
 
-    let _ = to_ui_node(&scope, &dots(vocab::StyleName::Crt));
+    let _ = to_ui_node(&scope, Grants::none(), &dots(vocab::StyleName::Crt));
     assert_eq!(
         preem_render::probe(&scope, Some("w")),
         Some((2, 2)),
@@ -4119,6 +4148,7 @@ fn a_config_or_kind_change_rebuilds_the_instance() {
 
     let _ = to_ui_node(
         &scope,
+        Grants::none(),
         &preem_node(
             Some("w"),
             vocab::PreemWidget::SevenSeg {
@@ -4171,11 +4201,11 @@ fn a_gauge_resize_rebuilds_the_instance_at_the_new_size() {
         other => panic!("a gauge maps to a Pixels node, got {other:?}"),
     };
 
-    let wide = to_ui_node(&scope, &dial(144, 64));
+    let wide = to_ui_node(&scope, Grants::none(), &dial(144, 64));
     assert_eq!(preem_render::probe(&scope, Some("g")), Some((1, 1)));
     assert_eq!(pixels(&wide), (288, 128), "the default face, at ×2");
 
-    let small = to_ui_node(&scope, &dial(48, 48));
+    let small = to_ui_node(&scope, Grants::none(), &dial(48, 48));
     assert_eq!(
         preem_render::probe(&scope, Some("g")),
         Some((2, 2)),
@@ -4184,7 +4214,7 @@ fn a_gauge_resize_rebuilds_the_instance_at_the_new_size() {
     assert_eq!(pixels(&small), (96, 96), "…at the square size it asked for");
 
     // And back again: nothing latches.
-    let wide_again = to_ui_node(&scope, &dial(144, 64));
+    let wide_again = to_ui_node(&scope, Grants::none(), &dial(144, 64));
     assert_eq!(preem_render::probe(&scope, Some("g")), Some((3, 3)));
     assert_eq!(pixels(&wide_again), (288, 128));
 
@@ -4213,10 +4243,10 @@ fn instances_are_swept_when_their_node_leaves_the_tree() {
         children,
     };
 
-    let _ = to_ui_node(&scope, &row(vec![leaf("a"), leaf("b")]));
+    let _ = to_ui_node(&scope, Grants::none(), &row(vec![leaf("a"), leaf("b")]));
     assert_eq!(preem_render::instance_count(&scope), 2);
 
-    let _ = to_ui_node(&scope, &row(vec![leaf("a")]));
+    let _ = to_ui_node(&scope, Grants::none(), &row(vec![leaf("a")]));
     assert_eq!(
         preem_render::instance_count(&scope),
         1,
@@ -4252,10 +4282,10 @@ fn an_un_idd_preem_node_is_keyed_by_its_ordinal() {
         )
     };
 
-    let _ = to_ui_node(&scope, &anon("one"));
+    let _ = to_ui_node(&scope, Grants::none(), &anon("one"));
     assert_eq!(preem_render::probe(&scope, None), Some((1, 1)));
 
-    let _ = to_ui_node(&scope, &anon("two"));
+    let _ = to_ui_node(&scope, Grants::none(), &anon("two"));
     assert_eq!(
         preem_render::probe(&scope, None),
         Some((1, 2)),
@@ -4287,7 +4317,7 @@ fn id_d_gauges_keep_their_own_needles_when_a_sibling_is_removed() {
     let _ink = preem_ink_lock();
     let scope = Scope::detached("keying-id-row");
     let three = gauge_row([(Some("g0"), 0.15), (Some("g1"), 0.5), (Some("g2"), 0.85)]);
-    let _ = to_ui_node(&scope, &three);
+    let _ = to_ui_node(&scope, Grants::none(), &three);
 
     // A fresh needle rests at the low end whatever its target, so the three are
     // pixel-identical until they have swung apart. Advance first, or every
@@ -4353,7 +4383,7 @@ fn anonymous_gauges_transplant_a_needle_and_warn_once() {
     let scope = Scope::detached("keying-anonymous-row");
     let warned = preem_render::anonymous_warnings();
     let three = gauge_row([(None, 0.15), (None, 0.5), (None, 0.85)]);
-    let _ = to_ui_node(&scope, &three);
+    let _ = to_ui_node(&scope, Grants::none(), &three);
     assert_eq!(
         preem_render::anonymous_warnings() - warned,
         1,
@@ -4410,14 +4440,14 @@ fn the_anonymous_preem_warning_is_once_per_scope_not_once_per_frame() {
     let anon = preem_node(None, widget());
 
     let card = Scope::detached("anon-warn-card");
-    let _ = to_ui_node(&card, &anon);
+    let _ = to_ui_node(&card, Grants::none(), &anon);
     assert_eq!(
         preem_render::anonymous_warnings() - base,
         1,
         "the first anonymous node in a scope warns",
     );
-    let _ = to_ui_node(&card, &anon);
-    let _ = to_ui_node(&card, &anon);
+    let _ = to_ui_node(&card, Grants::none(), &anon);
+    let _ = to_ui_node(&card, Grants::none(), &anon);
     assert_eq!(
         preem_render::anonymous_warnings() - base,
         1,
@@ -4427,7 +4457,7 @@ fn the_anonymous_preem_warning_is_once_per_scope_not_once_per_frame() {
     // A plugin's two trees are two scopes, and each deserves to hear about its
     // own: the latch is keyed by `Scope`, not by a process-wide flag.
     let panel = Scope::detached("anon-warn-panel");
-    let _ = to_ui_node(&panel, &anon);
+    let _ = to_ui_node(&panel, Grants::none(), &anon);
     assert_eq!(
         preem_render::anonymous_warnings() - base,
         2,
@@ -4436,7 +4466,7 @@ fn the_anonymous_preem_warning_is_once_per_scope_not_once_per_frame() {
 
     // And the contract-honoring spelling is silent.
     let id_d = Scope::detached("anon-warn-id-d");
-    let _ = to_ui_node(&id_d, &preem_node(Some("dm"), widget()));
+    let _ = to_ui_node(&id_d, Grants::none(), &preem_node(Some("dm"), widget()));
     assert_eq!(
         preem_render::anonymous_warnings() - base,
         2,
@@ -4490,14 +4520,14 @@ fn the_anonymous_preem_warning_survives_an_emptied_scope() {
         tooltip: None,
     };
 
-    let _ = to_ui_node(&scope, &anon);
+    let _ = to_ui_node(&scope, Grants::none(), &anon);
     assert_eq!(
         preem_render::anonymous_warnings() - base,
         1,
         "the node's first appearance warns",
     );
 
-    let _ = to_ui_node(&scope, &nothing);
+    let _ = to_ui_node(&scope, Grants::none(), &nothing);
     assert_eq!(
         preem_render::instance_count(&scope),
         0,
@@ -4505,9 +4535,9 @@ fn the_anonymous_preem_warning_survives_an_emptied_scope() {
     );
 
     // Present → absent → present → absent → present: still one line.
-    let _ = to_ui_node(&scope, &anon);
-    let _ = to_ui_node(&scope, &nothing);
-    let _ = to_ui_node(&scope, &anon);
+    let _ = to_ui_node(&scope, Grants::none(), &anon);
+    let _ = to_ui_node(&scope, Grants::none(), &nothing);
+    let _ = to_ui_node(&scope, Grants::none(), &anon);
     assert_eq!(
         preem_render::anonymous_warnings() - base,
         1,
@@ -4517,7 +4547,7 @@ fn the_anonymous_preem_warning_survives_an_emptied_scope() {
     // And an explicit teardown — a card leaving its region, or the drawer
     // closing on a panel — does not re-arm it either.
     preem_render::forget_scope(&scope);
-    let _ = to_ui_node(&scope, &anon);
+    let _ = to_ui_node(&scope, Grants::none(), &anon);
     assert_eq!(
         preem_render::anonymous_warnings() - base,
         1,
@@ -4553,7 +4583,7 @@ fn label_tree(children: usize) -> wire::Node {
 
 /// The ids of a mapped [`label_tree`]'s children, in order.
 fn mapped_label_ids(scope: &Scope, node: &wire::Node) -> Vec<String> {
-    match to_ui_node(scope, node) {
+    match to_ui_node(scope, Grants::none(), node) {
         UiNode::Box { children, .. } => children
             .into_iter()
             .map(|child| match child {
@@ -4625,8 +4655,8 @@ fn preem_nodes_past_the_instance_cap_render_the_placeholder_and_warn_once() {
 
     // Two more frames of the same tree: the prefix keeps its instances (an
     // over-cap tree must not churn the table), and the line does not repeat.
-    let _ = to_ui_node(&scope, &over);
-    let _ = to_ui_node(&scope, &over);
+    let _ = to_ui_node(&scope, Grants::none(), &over);
+    let _ = to_ui_node(&scope, Grants::none(), &over);
     assert_eq!(
         preem_render::instance_cap_warnings() - base,
         1,
@@ -4712,8 +4742,8 @@ fn a_tree_over_the_node_cap_keeps_its_prefix_and_warns_once() {
         "an over-cap tree is one journal line",
     );
 
-    let _ = to_ui_node(&scope, &over);
-    let _ = to_ui_node(&scope, &over);
+    let _ = to_ui_node(&scope, Grants::none(), &over);
+    let _ = to_ui_node(&scope, Grants::none(), &over);
     assert_eq!(
         preem_render::node_cap_warnings() - base,
         1,
@@ -4777,7 +4807,7 @@ fn the_instance_cap_answers_the_same_for_every_monitor_pass() {
         .map(|i| format!("g{i}"))
         .collect();
     let full = gauge_row(ids.iter().map(|id| (Some(id.as_str()), 0.5)));
-    let _ = to_ui_node(&scope, &full);
+    let _ = to_ui_node(&scope, Grants::none(), &full);
     assert_eq!(
         preem_render::instance_count(&scope),
         wire::MAX_PREEM_NODES_PER_TREE,
@@ -4928,7 +4958,7 @@ fn a_tree_deeper_than_the_depth_cap_is_walked_to_the_cap_and_warns_once() {
     let scope = Scope::detached("depth-cap-over");
 
     let over = box_chain(wire::MAX_TREE_DEPTH + 1);
-    let mapped = to_ui_node(&scope, &over);
+    let mapped = to_ui_node(&scope, Grants::none(), &over);
     assert_eq!(
         mapped_chain_depth(&mapped),
         wire::MAX_TREE_DEPTH,
@@ -4946,8 +4976,8 @@ fn a_tree_deeper_than_the_depth_cap_is_walked_to_the_cap_and_warns_once() {
          merged diagnostic would have told the author to send fewer nodes",
     );
 
-    let _ = to_ui_node(&scope, &over);
-    let _ = to_ui_node(&scope, &over);
+    let _ = to_ui_node(&scope, Grants::none(), &over);
+    let _ = to_ui_node(&scope, Grants::none(), &over);
     assert_eq!(
         preem_render::depth_cap_warnings() - depth_base,
         1,
@@ -4959,7 +4989,11 @@ fn a_tree_deeper_than_the_depth_cap_is_walked_to_the_cap_and_warns_once() {
     // `unwrap_or(Spacer)` is reachable at all. Its own scope, so the latch above
     // does not hide its line.
     let buttons = Scope::detached("depth-cap-buttons");
-    let mapped = to_ui_node(&buttons, &button_chain(wire::MAX_TREE_DEPTH + 1));
+    let mapped = to_ui_node(
+        &buttons,
+        Grants::none(),
+        &button_chain(wire::MAX_TREE_DEPTH + 1),
+    );
     assert!(
         matches!(mapped, UiNode::Spacer),
         "a Button's child is not optional, so the refused level takes every ancestor down \
@@ -4988,7 +5022,7 @@ fn a_tree_exactly_at_the_depth_cap_is_walked_whole() {
     let scope = Scope::detached("depth-cap-exact");
 
     let exact = box_chain(wire::MAX_TREE_DEPTH);
-    let mapped = to_ui_node(&scope, &exact);
+    let mapped = to_ui_node(&scope, Grants::none(), &exact);
     assert_eq!(
         mapped_chain_depth(&mapped),
         wire::MAX_TREE_DEPTH,
@@ -5025,8 +5059,8 @@ fn two_preem_nodes_sharing_an_id_collapse_onto_one_instance_and_warn_once() {
 
     let clash = gauge_row([(Some("g"), 0.15), (Some("g"), 0.85)]);
     let control = gauge_row([(Some("a"), 0.15), (Some("b"), 0.85)]);
-    let _ = to_ui_node(&shared, &clash);
-    let _ = to_ui_node(&distinct, &control);
+    let _ = to_ui_node(&shared, Grants::none(), &clash);
+    let _ = to_ui_node(&distinct, Grants::none(), &control);
     assert_eq!(
         preem_render::duplicate_id_warnings() - base,
         1,
@@ -5059,8 +5093,8 @@ fn two_preem_nodes_sharing_an_id_collapse_onto_one_instance_and_warn_once() {
          dragged between both targets every pass",
     );
 
-    let _ = to_ui_node(&shared, &clash);
-    let _ = to_ui_node(&shared, &clash);
+    let _ = to_ui_node(&shared, Grants::none(), &clash);
+    let _ = to_ui_node(&shared, Grants::none(), &clash);
     assert_eq!(
         preem_render::duplicate_id_warnings() - base,
         1,
@@ -5118,11 +5152,11 @@ fn a_tree_of_distinct_preem_ids_never_warns() {
         tooltip: None,
     };
 
-    let _ = to_ui_node(&card, &mixed);
+    let _ = to_ui_node(&card, Grants::none(), &mixed);
     // A second pass over the same tree — what a second monitor does.
-    let _ = to_ui_node(&card, &mixed);
+    let _ = to_ui_node(&card, Grants::none(), &mixed);
     // The same ids in the plugin's *other* tree.
-    let _ = to_ui_node(&panel, &mixed);
+    let _ = to_ui_node(&panel, Grants::none(), &mixed);
 
     assert_eq!(
         preem_render::instance_count(&card),
@@ -5161,7 +5195,7 @@ fn the_anonymous_and_duplicate_preem_warnings_are_independent() {
 
     // One anonymous node, then a pair sharing "g": both defects, one tree.
     let tree = gauge_row([(None, 0.2), (Some("g"), 0.4), (Some("g"), 0.6)]);
-    let _ = to_ui_node(&scope, &tree);
+    let _ = to_ui_node(&scope, Grants::none(), &tree);
     assert_eq!(
         preem_render::anonymous_warnings() - anon_base,
         1,
@@ -5179,7 +5213,7 @@ fn the_anonymous_and_duplicate_preem_warnings_are_independent() {
     );
 
     for _ in 0..2 {
-        let _ = to_ui_node(&scope, &tree);
+        let _ = to_ui_node(&scope, Grants::none(), &tree);
     }
     assert_eq!(
         preem_render::anonymous_warnings() - anon_base,
@@ -5214,7 +5248,8 @@ fn an_unrenderable_preem_widget_degrades_to_an_empty_surface() {
         },
     );
 
-    let degraded = preem_render::with_unsupported_widgets(|| to_ui_node(&scope, &node));
+    let degraded =
+        preem_render::with_unsupported_widgets(|| to_ui_node(&scope, Grants::none(), &node));
     assert_eq!(
         degraded,
         UiNode::Pixels {
@@ -5272,20 +5307,20 @@ fn only_animated_widgets_keep_the_clock_awake() {
             },
         },
     );
-    let _ = to_ui_node(&scope, &pure);
+    let _ = to_ui_node(&scope, Grants::none(), &pure);
     assert!(
         !preem_render::any_animating(),
         "a static dot matrix must not keep the animation clock awake",
     );
 
-    let _ = to_ui_node(&scope, &marquee(20.0));
+    let _ = to_ui_node(&scope, Grants::none(), &marquee(20.0));
     assert!(
         preem_render::any_animating(),
         "a scrolling marquee is what the clock exists for",
     );
 
     // `0.0` (and, per the vocabulary, a non-finite value) parks the message.
-    let _ = to_ui_node(&scope, &marquee(0.0));
+    let _ = to_ui_node(&scope, Grants::none(), &marquee(0.0));
     assert!(
         !preem_render::any_animating(),
         "a parked speed stops asking for ticks",
@@ -5322,7 +5357,7 @@ fn step_based_animation_is_anchored_to_elapsed_time_and_capped() {
     );
 
     let three = Scope::detached("steps-three");
-    let _ = to_ui_node(&three, &node);
+    let _ = to_ui_node(&three, Grants::none(), &node);
     assert!(advanced(preem_render::ANIM_STEP_SECS * 3.0));
     let mut oracle = kit::PeakHold::new(0.05);
     oracle.push(1.0);
@@ -5336,7 +5371,7 @@ fn step_based_animation_is_anchored_to_elapsed_time_and_capped() {
     );
 
     let stalled = Scope::detached("steps-stalled");
-    let _ = to_ui_node(&stalled, &node);
+    let _ = to_ui_node(&stalled, Grants::none(), &node);
     // A resume-from-suspend sized `dt`: hundreds of steps' worth.
     assert!(advanced(30.0));
     let mut capped = kit::PeakHold::new(0.05);
@@ -5499,7 +5534,7 @@ async fn a_legacy_plugin_is_never_sent_the_vocabulary_advertisement() {
 fn pump_rounds(scope: &Scope, node: &wire::Node, ticks: u32) -> (u32, u32) {
     for _ in 0..ticks {
         let _ = advanced(preem_render::ANIM_STEP_SECS);
-        let _ = to_ui_node(scope, node);
+        let _ = to_ui_node(scope, Grants::none(), node);
     }
     preem_render::probe(scope, Some("w")).expect("the node keeps its instance")
 }
@@ -5593,7 +5628,7 @@ fn a_non_finite_config_float_does_not_rebuild_every_pass() {
     // The control: a finite config, a moving target. One build, N applies.
     let control = Scope::detached("nan-config-control");
     for target in targets {
-        let _ = to_ui_node(&control, &gauge(0.7, target));
+        let _ = to_ui_node(&control, Grants::none(), &gauge(0.7, target));
     }
     assert_eq!(
         preem_render::probe(&control, Some("w")),
@@ -5604,7 +5639,7 @@ fn a_non_finite_config_float_does_not_rebuild_every_pass() {
     // The same, with a NaN in the config: it must behave identically.
     let scope = Scope::detached("nan-config");
     for target in targets {
-        let _ = to_ui_node(&scope, &gauge(f32::NAN, target));
+        let _ = to_ui_node(&scope, Grants::none(), &gauge(f32::NAN, target));
     }
     assert_eq!(
         preem_render::probe(&scope, Some("w")).map(|(builds, _)| builds),
@@ -5615,7 +5650,7 @@ fn a_non_finite_config_float_does_not_rebuild_every_pass() {
 
     // A genuine config change must still rebuild — the tolerance above must not
     // have been bought by making every config compare equal.
-    let _ = to_ui_node(&scope, &gauge(0.9, 0.5));
+    let _ = to_ui_node(&scope, Grants::none(), &gauge(0.9, 0.5));
     assert_eq!(
         preem_render::probe(&scope, Some("w")).map(|(builds, _)| builds),
         Some(2),
@@ -5668,7 +5703,7 @@ fn a_masked_peak_hold_does_not_ask_for_pixel_identical_repaints() {
 
     // Drop the explicit peak and the hold is what gets drawn again: it must
     // resume reporting movement, and it must have kept decaying meanwhile.
-    let _ = to_ui_node(&scope, &strip(None));
+    let _ = to_ui_node(&scope, Grants::none(), &strip(None));
     assert!(
         preem_render::any_animating(),
         "with no explicit peak the hold is the drawn value, so it animates again",
@@ -5730,7 +5765,7 @@ fn the_phosphor_settle_bound_follows_the_configured_persistence() {
     // 1. A long phosphor must fade all the way to black rather than freezing.
     let slow = Scope::detached("settle-slow");
     let slow_node = traced(255);
-    let _ = to_ui_node(&slow, &slow_node);
+    let _ = to_ui_node(&slow, Grants::none(), &slow_node);
     let lit = mapped_pixels(&slow, &slow_node);
     assert_ne!(
         lit, all_off,
@@ -5785,7 +5820,7 @@ fn the_phosphor_settle_bound_follows_the_configured_persistence() {
     //    inside the 64 the old constant spent on pixel-identical repaints.
     let quick = Scope::detached("settle-quick");
     let quick_node = traced(184);
-    let _ = to_ui_node(&quick, &quick_node);
+    let _ = to_ui_node(&quick, Grants::none(), &quick_node);
     let mut spent = 0;
     while preem_render::any_animating() && spent < 64 {
         let _ = advanced(preem_render::ANIM_STEP_SECS);
@@ -5887,7 +5922,7 @@ fn marquee_scroll_direction_follows_the_speeds_sign() {
     );
 
     let forward = Scope::detached("marquee-forward");
-    let _ = to_ui_node(&forward, &node(20.0));
+    let _ = to_ui_node(&forward, Grants::none(), &node(20.0));
     assert!(advanced(0.5));
     assert_eq!(
         mapped_pixels(&forward, &node(20.0)),
@@ -5897,7 +5932,7 @@ fn marquee_scroll_direction_follows_the_speeds_sign() {
     );
 
     let backward = Scope::detached("marquee-backward");
-    let _ = to_ui_node(&backward, &node(-20.0));
+    let _ = to_ui_node(&backward, Grants::none(), &node(-20.0));
     assert!(advanced(0.5));
     assert_eq!(
         mapped_pixels(&backward, &node(-20.0)),
@@ -5916,6 +5951,7 @@ fn advance_all_names_only_the_scopes_that_moved() {
     let still = Scope::card("static");
     let _ = to_ui_node(
         &animated,
+        Grants::none(),
         &preem_node(
             Some("mq"),
             vocab::PreemWidget::Marquee {
@@ -5933,6 +5969,7 @@ fn advance_all_names_only_the_scopes_that_moved() {
     );
     let _ = to_ui_node(
         &still,
+        Grants::none(),
         &preem_node(
             Some("dm"),
             vocab::PreemWidget::DotMatrix {
@@ -6067,7 +6104,7 @@ fn a_settled_mount_stops_ticking_and_a_state_change_starts_it_again() {
     };
     let mine = [scope.clone()];
 
-    let _ = to_ui_node(&scope, &gauge(0.9));
+    let _ = to_ui_node(&scope, Grants::none(), &gauge(0.9));
     assert!(
         tick_decision(&mine, 1_000_000).keep_going,
         "a needle heading for a new target must keep its mount's clock armed",
@@ -6094,7 +6131,7 @@ fn a_settled_mount_stops_ticking_and_a_state_change_starts_it_again() {
     );
 
     // The state change. Same config, new target: `apply`, not `build`.
-    let _ = to_ui_node(&scope, &gauge(0.1));
+    let _ = to_ui_node(&scope, Grants::none(), &gauge(0.1));
     assert!(
         tick_decision(&mine, 3_000_000).keep_going,
         "a new target on a settled needle must re-arm the mount — this is what the mapping \
@@ -6113,8 +6150,8 @@ fn a_tick_leaves_scopes_its_mount_does_not_name_alone() {
     let mine = Scope::card("tick-mine");
     let theirs = Scope::card("tick-theirs");
     let node = tick_marquee(20.0);
-    let _ = to_ui_node(&mine, &node);
-    let _ = to_ui_node(&theirs, &node);
+    let _ = to_ui_node(&mine, Grants::none(), &node);
+    let _ = to_ui_node(&theirs, Grants::none(), &node);
 
     let only_mine = [mine.clone()];
     // Baseline tick, then a full step.
@@ -6155,7 +6192,7 @@ fn a_tick_after_a_long_gap_advances_the_resume_cap_not_the_gap() {
     let _ink = preem_ink_lock();
     let scope = Scope::card("tick-stall");
     let node = tick_marquee(20.0);
-    let _ = to_ui_node(&scope, &node);
+    let _ = to_ui_node(&scope, Grants::none(), &node);
     let oracle = tick_marquee_oracle();
     assert!(
         oracle.scrolls() && oracle.period() > 100,
@@ -6219,7 +6256,7 @@ fn a_frame_clock_slower_than_the_step_rate_still_runs_at_the_right_speed() {
     let _ink = preem_ink_lock();
     let scope = Scope::card("tick-slow-clock");
     let node = tick_marquee(20.0);
-    let _ = to_ui_node(&scope, &node);
+    let _ = to_ui_node(&scope, Grants::none(), &node);
     let oracle = tick_marquee_oracle();
     assert!(
         oracle.period() > 20,
@@ -6267,7 +6304,7 @@ fn two_mounts_showing_one_scope_advance_it_once_per_frame() {
     let _ink = preem_ink_lock();
     let scope = Scope::card("tick-shared");
     let node = tick_marquee(20.0);
-    let _ = to_ui_node(&scope, &node);
+    let _ = to_ui_node(&scope, Grants::none(), &node);
     let oracle = tick_marquee_oracle();
     // Two mounts — say the same chip in two monitors' bar-left regions — each
     // naming the one shared scope, exactly as `Animator`'s scopes closure would.
@@ -6329,7 +6366,7 @@ fn a_tick_worth_no_elapsed_time_reports_no_motion() {
             state: vocab::GaugeState { target: 0.9 },
         },
     );
-    let _ = to_ui_node(&scope, &gauge);
+    let _ = to_ui_node(&scope, Grants::none(), &gauge);
     let mine = [scope.clone()];
     assert!(
         preem_render::any_animating(),
@@ -7996,5 +8033,207 @@ async fn assert_launched_then_clean_up(report: &LaunchReport) {
                 "the launched program must still be running after the effect returned",
             );
         }
+    }
+}
+
+/// **`wire_map`'s own `Shader` arm** (#893): the field plumbing from
+/// `wire::Node::Shader` into the `ShaderNode` view `shader_map` reads.
+///
+/// `shader_map`'s tests cover the policy and the mapping; this covers the ten
+/// lines between them, which are exactly the kind that transpose a pair. A
+/// swapped `width`/`height`, a `data_width` fed from `width`, or a dropped
+/// `scale` would leave every other test in the tree green — the reconciler node
+/// would simply be the wrong shape, and no assertion anywhere else looks at it.
+///
+/// Deliberately asymmetric numbers on every axis (144 ≠ 48, 8 ≠ 2, scale 3) so
+/// a transposition cannot coincide.
+///
+/// **Falsified** by swapping `width`/`height` or `data_width`/`data_height` in
+/// `wire_map`'s arm, or by passing `node.scale` where `1` is expected.
+#[test]
+fn a_wire_shader_node_maps_its_fields_across_intact() {
+    let data: Vec<u8> = (0u8..16).collect();
+    let tree = wire::Node::Shader {
+        id: Some("spectrum".into()),
+        width: 144,
+        height: 48,
+        scale: 3,
+        fragment: "void main() { fragColor = u_accent; }".into(),
+        data: data.clone(),
+        format: wire::ShaderData::Rgba8,
+        data_width: 2,
+        data_height: 2,
+        classes: vec!["ts-shader".into()],
+        tooltip: Some("dropped on purpose — the reconciler node carries none".into()),
+    };
+
+    let scope = Scope::detached("wire-shader");
+    match to_ui_node(&scope, Grants::all(), &tree) {
+        UiNode::Shader {
+            id,
+            width,
+            height,
+            state,
+            classes,
+            tooltip,
+        } => {
+            assert_eq!(id.as_deref(), Some("spectrum"));
+            assert_eq!(
+                tooltip.as_deref(),
+                Some("dropped on purpose — the reconciler node carries none"),
+                "…and since #968 review M3 it is carried rather than dropped",
+            );
+            assert_eq!((width, height), (144 * 3, 48 * 3), "size × the scale hint");
+            assert_eq!(state.scale, 3, "…and the hint itself reaches the shader");
+            assert_eq!(&*state.fragment, "void main() { fragColor = u_accent; }");
+            assert_eq!(&*state.data, &data[..]);
+            assert_eq!(state.data_size, (2, 2), "the data grid, not the surface");
+            assert_eq!(state.format, hytte::ui::ShaderFormat::Rgba8);
+            assert_eq!(classes, vec!["ts-shader".to_owned()]);
+        }
+        other => panic!("mapped to {other:?}"),
+    }
+}
+
+/// The same node from a plugin that never declared `Capability::Shader` maps to
+/// the broken-widget placeholder, **and its siblings still render** — the
+/// property that makes this a degradation rather than a dropped frame.
+///
+/// **Falsified** by returning `None` from `map_node`'s `Shader` arm on a
+/// refusal: the placeholder disappears and the `Box` comes back one child
+/// short, which is the failure mode this file's whole posture rejects.
+#[test]
+fn an_ungranted_shader_degrades_without_taking_its_siblings() {
+    let tree = wire::Node::Box {
+        id: Some("root".into()),
+        dir: wire::Dir::Vertical,
+        spacing: 0,
+        scroll: false,
+        classes: vec![],
+        children: vec![
+            wire::Node::Label {
+                id: Some("before".into()),
+                text: "before".into(),
+                classes: vec![],
+                tooltip: None,
+            },
+            wire::Node::Shader {
+                id: Some("denied".into()),
+                width: 32,
+                height: 32,
+                scale: 1,
+                fragment: "void main() { fragColor = u_fg; }".into(),
+                data: vec![0, 0, 0, 0],
+                format: wire::ShaderData::Rgba8,
+                data_width: 1,
+                data_height: 1,
+                classes: vec!["ts-shader".into()],
+                tooltip: None,
+            },
+            wire::Node::Label {
+                id: Some("after".into()),
+                text: "after".into(),
+                classes: vec![],
+                tooltip: None,
+            },
+        ],
+        tooltip: None,
+    };
+
+    let scope = Scope::detached("wire-shader-denied");
+    match to_ui_node(&scope, Grants::none(), &tree) {
+        UiNode::Box { children, .. } => {
+            assert_eq!(children.len(), 3, "the tree keeps its shape");
+            assert!(matches!(&children[0], UiNode::Label { text, .. } if text == "before"));
+            assert!(matches!(&children[2], UiNode::Label { text, .. } if text == "after"));
+            match &children[1] {
+                UiNode::Pixels {
+                    id,
+                    width,
+                    height,
+                    data,
+                    classes,
+                    ..
+                } => {
+                    assert_eq!(id.as_deref(), Some("denied"), "the key survives");
+                    assert_eq!((*width, *height), (0, 0), "an empty surface");
+                    assert!(data.is_empty());
+                    assert_eq!(classes, &vec!["ts-shader".to_owned()], "CSS chrome stays");
+                }
+                other => panic!("the refused node mapped to {other:?}"),
+            }
+        }
+        other => panic!("mapped to {other:?}"),
+    }
+}
+
+/// **#968 review M1, the invalidation half.** A desktop-accent change rebuilds
+/// a shader node's shared state even though the node's own bytes did not move.
+///
+/// This is the #396 live re-tint reaching the shader arm: the theme bag is
+/// resolved per mapping pass, so a cache keyed on the wire node alone would keep
+/// handing back the *old* accent until the plugin's data happened to change —
+/// which for a static shader is never.
+///
+/// Lives here rather than beside the other `shader_map` tests because it writes
+/// `hytte_preem`'s process-global accent, and [`PREEM_INK_LOCK`] is what stops
+/// that racing every other preem test in this binary.
+///
+/// **Falsified** by dropping `held.values == values` from `shared_state`'s
+/// comparison: the second state is pointer-equal to the first and the assertion
+/// goes red.
+#[test]
+fn an_accent_change_rebuilds_a_shader_nodes_shared_state() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("shader-retint");
+    shader_map::forget_scope(&scope);
+
+    let tree = shader_tree_node();
+    let before = shader_state_of(&scope, &tree);
+
+    // The same write `pump::tint_in_process_surfaces` performs on a theme move.
+    kit::set_accent(Some([0xff, 0x00, 0x99, 0xff]));
+    let after = shader_state_of(&scope, &tree);
+    kit::set_accent(None);
+    let restored = shader_state_of(&scope, &tree);
+
+    assert_ne!(
+        before.values, after.values,
+        "the accent must reach the shader's theme bag at all",
+    );
+    assert!(
+        !std::sync::Arc::ptr_eq(&before, &after),
+        "a re-tint must rebuild the shared state, not reuse the old accent",
+    );
+    assert_eq!(
+        restored.values, before.values,
+        "…and putting the accent back restores the original bag",
+    );
+    shader_map::forget_scope(&scope);
+}
+
+/// A `wire::Node::Shader` for the re-tint test — reads `u_accent`, so the
+/// colour it is drawn in is the thing under test.
+fn shader_tree_node() -> wire::Node {
+    wire::Node::Shader {
+        id: Some("retint".into()),
+        width: 32,
+        height: 32,
+        scale: 1,
+        fragment: "void main() { fragColor = u_accent; }".into(),
+        data: vec![0, 0, 0, 0],
+        format: wire::ShaderData::Rgba8,
+        data_width: 1,
+        data_height: 1,
+        classes: vec![],
+        tooltip: None,
+    }
+}
+
+/// One mapping pass over `tree`, returning the shader state it produced.
+fn shader_state_of(scope: &Scope, tree: &wire::Node) -> std::sync::Arc<hytte::ui::ShaderState> {
+    match to_ui_node(scope, Grants::all(), tree) {
+        UiNode::Shader { state, .. } => state,
+        other => panic!("mapped to {other:?}"),
     }
 }

@@ -2364,11 +2364,17 @@ fn print_frozen_node_hex() {
 // ── 4. negotiation ──────────────────────────────────────────────────────────
 
 /// The two counters mean different things and must not be collapsed: the census
-/// has moved to generation 2, the *unconditional* ceiling has not.
+/// has moved past generation 1, the *unconditional* ceiling has not.
+///
+/// The census is asserted as `>=` rather than `==` since #893 added generation
+/// 3 on top: what this test is about is that the census **counts** a negotiated
+/// variant while the unconditional ceiling does not, and pinning `VOCAB` to
+/// preem's own number would have made every later generation edit this line for
+/// no signal. `SHADER_VOCAB`'s own test in `proto.rs` pins the newest one.
 #[test]
 fn preem_is_a_negotiated_generation_not_an_unconditional_one() {
     assert_eq!(PREEM_VOCAB, 2, "the preem vocabulary is generation 2");
-    assert_eq!(VOCAB, PREEM_VOCAB, "the census counts it");
+    const { assert!(VOCAB >= PREEM_VOCAB, "the census counts it") };
     assert_eq!(
         VOCAB_UNCONDITIONAL, 1,
         "…but a plugin must not emit Node::Preem without an advertisement, so the \
@@ -2411,8 +2417,10 @@ fn negotiated_vocab_matrix() {
     old_plugin.vocab = 1;
     old_plugin.vocab_max = None; // pre-#882: the field did not exist
 
-    // new plugin + new host → preem
-    assert_eq!(new_plugin.negotiated_vocab(VOCAB), PREEM_VOCAB);
+    // new plugin + new host → preem. `>=`, not `==`: since #893 the census sits
+    // above `PREEM_VOCAB`, and what this row claims is that a fully-current pair
+    // negotiates *at least* the preem generation.
+    assert!(new_plugin.negotiated_vocab(VOCAB) >= PREEM_VOCAB);
     assert!(new_plugin.negotiates_vocab());
 
     // new plugin + old host → falls back to Pixels

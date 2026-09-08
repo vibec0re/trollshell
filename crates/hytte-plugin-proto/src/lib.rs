@@ -169,7 +169,12 @@ pub const PROTO_VERSION: u16 = 1;
 /// Generation `2` is #882's preem vocabulary
 /// ([`Node::Preem`](wire::Node::Preem) + [`HostMsg::Hello`](msg::HostMsg::Hello)),
 /// which is **negotiated** — see [`VOCAB_UNCONDITIONAL`].
-pub const VOCAB: u16 = 2;
+///
+/// Generation `3` is #893's shader widget ([`Node::Shader`](wire::Node::Shader),
+/// [`ShaderData`](wire::ShaderData), and
+/// [`Capability::Shader`](manifest::Capability::Shader)), negotiated the same
+/// way against [`SHADER_VOCAB`](wire::SHADER_VOCAB).
+pub const VOCAB: u16 = 3;
 
 /// The highest [`VOCAB`] generation whose variants a plugin may put on the wire
 /// **without the host first advertising support** (#882).
@@ -180,7 +185,8 @@ pub const VOCAB: u16 = 2;
 /// [`Manifest::vocab`](manifest::Manifest::vocab) — the number an older host
 /// exact-checks at the handshake.
 ///
-/// The two diverge because #882 added a *negotiated* generation. A plugin emits
+/// The two diverge because #882 added a *negotiated* generation, and #893's
+/// shader widget ([`SHADER_VOCAB`](wire::SHADER_VOCAB)) is the second. A plugin emits
 /// [`Node::Preem`](wire::Node::Preem) only after the host advertised
 /// [`PREEM_VOCAB`](preem::PREEM_VOCAB) in [`HostMsg::Hello`](msg::HostMsg::Hello),
 /// so an old host — which never advertises — can never receive one, and the
@@ -225,7 +231,8 @@ pub use state::{
 pub use topology::{SOCKET_DIR, SOCKET_FILE, socket_path};
 pub use wire::{
     Cls, DEFAULT_SLIDER_MAX, DEFAULT_SLIDER_MIN, DEFAULT_SLIDER_STEP_FRACTION, Dir, EventKind,
-    Node, NodeId, SliderFloats, sane_fraction, sane_slider_floats,
+    MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Node, NodeId, SHADER_VOCAB, ShaderData,
+    SliderFloats, sane_fraction, sane_slider_floats,
 };
 
 #[cfg(feature = "tokio")]

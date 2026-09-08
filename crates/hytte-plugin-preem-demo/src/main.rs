@@ -144,7 +144,10 @@ use hytte_plugin::display::{
     AccentRole, DotMatrix, FlipBoard, Gauge, Marquee, Mechanism, Scope, SevenSeg, StyleName,
     TextBox,
 };
-use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node, SPECTRUM_BINS, StateKey};
+use hytte_plugin::proto::{
+    Capability, Dir, Effect, EventKind, Manifest, Mount, Node, SPECTRUM_BINS, ShaderData, StateKey,
+};
+use hytte_plugin::shader::Shader;
 use hytte_plugin::{CmdSender, Input, Plugin, View};
 
 /// Stable plugin id — the host's mount-slot ownership key.
@@ -273,6 +276,27 @@ const MARQUEE_STEP_DOTS: usize = 2;
 const MARQUEE_SPEED_DPS: f32 = 20.0;
 /// The textbox wrap width: 22 columns at ×2 scale = 274 px.
 const TEXT_COLS: u32 = 22;
+
+/// The shader widget's node id (#893). Keyed like every other widget here, and
+/// for a sharper reason: without an id the reconciler matches positionally, a
+/// re-order rebuilds the surface, and rebuilding a shader surface throws away
+/// its compiled program and restarts `u_time`.
+const SHADER_ID: &str = "preem-demo-shader";
+/// The plugin-supplied fragment **body**. `include_str!` rather than an inline
+/// literal so `nix/lint-glsl.py` can compile it in CI (a `&'static str` in a
+/// `.rs` is opaque to every check in the tree) and so it reads as GLSL in an
+/// editor. The file's own header explains what it draws.
+const SHADER_FRAG: &str = include_str!("../shaders/spectrum.frag");
+/// The shader chip's logical size, before [`SHADER_SCALE`]. 144×48 is the
+/// `Scope` tile's shape, so the two sit as a matched pair on the card — one
+/// drawn by the kit, one by the plugin's own GLSL, from the same bands.
+const SHADER_W: u32 = 144;
+/// See [`SHADER_W`].
+const SHADER_H: u32 = 48;
+/// The shader chip's integer upscale: 288×96 on screen, matching the panel
+/// meter beside it. Also reaches the shader as `u_scale`, which is how its
+/// scanlines stay one line per *logical* row.
+const SHADER_SCALE: u32 = 2;
 
 /// The demo's entire state — rebuilt on every (re)connect, re-derived from
 /// the next snapshot.
@@ -467,6 +491,39 @@ impl PreemDemo {
             style.name()
         )
     }
+
+    /// The #893 shader widget: the **same** spectrum bands the `Scope` above it
+    /// sweeps, handed to the GPU as a data buffer instead of rasterised into
+    /// pixels.
+    ///
+    /// The buffer is `SPECTRUM_BINS` little-endian `f32`s — the wire's stated
+    /// byte order, so the frame means the same thing whatever the plugin was
+    /// built on — and it is the *only* thing that changes between frames. The
+    /// source is sent every frame too (the node carries it), but the shell
+    /// hashes it, finds the program it already linked, and re-uploads nothing
+    /// but these sixty-four bytes.
+    ///
+    /// Returns `None` against a host that has not advertised the shader
+    /// vocabulary, which is every shell built before #893 — the negotiation, not
+    /// a failure. [`view`](Plugin::view) draws a label in its place, so the card
+    /// still explains itself rather than silently losing a tile.
+    fn shader_node(&self) -> Option<Node> {
+        let mut data = Vec::with_capacity(SPECTRUM_BINS * 4);
+        for band in self.bins {
+            data.extend_from_slice(&band.to_le_bytes());
+        }
+        Shader::new(SHADER_ID, SHADER_FRAG)
+            .size(SHADER_W, SHADER_H)
+            .scale(SHADER_SCALE)
+            .data(
+                ShaderData::R32f,
+                u32::try_from(SPECTRUM_BINS).unwrap_or(1),
+                1,
+                data,
+            )
+            .tooltip("plugin-supplied fragment shader over the audio spectrum (#893)")
+            .node()
+    }
 }
 
 impl Plugin for PreemDemo {
@@ -478,7 +535,12 @@ impl Plugin for PreemDemo {
     /// Subscribes to `Clock` (the heartbeat), `AudioSpectrum` (the scope tile's
     /// input, #405) and `SlotVisible` (the scope's park gate, #422), mounts
     /// `SidebarTop` under the clock demo (`order = 1`; unordered co-mounts sort
-    /// as 0 — #303). No capabilities: the demo asks nothing of the shell.
+    /// as 0 — #303).
+    ///
+    /// One capability, [`Capability::Shader`] (#893): the demo renders a
+    /// plugin-supplied fragment shader, and the host draws the broken-widget
+    /// placeholder for a `Node::Shader` whose manifest does not declare it. It
+    /// asks nothing else of the shell — no effects, no personal-data pushes.
     ///
     /// The #884 vocabulary negotiation needs no declaration here:
     /// `Manifest::new` stamps the `vocab`/`vocab_max` pair for every plugin.
@@ -489,6 +551,7 @@ impl Plugin for PreemDemo {
             StateKey::AudioSpectrum,
             StateKey::SlotVisible,
         ];
+        m.capabilities = vec![Capability::Shader];
         m
     }
 
@@ -638,6 +701,17 @@ impl Plugin for PreemDemo {
                 self.marquee.node(MARQUEE_ID, MARQUEE_MSG),
                 self.textbox.node(TEXT_ID, &Self::textbox_line(style)),
                 self.scope.node(SCOPE_ID),
+                // #893, on glass, directly under the `Scope`: the same bands,
+                // one tile rasterised by the kit and one drawn by *this
+                // plugin's own GLSL* on the GPU. A host that has not advertised
+                // the shader vocabulary gets the label instead — the
+                // negotiation showing its work rather than a missing tile.
+                self.shader_node().unwrap_or_else(|| Node::Label {
+                    id: Some(SHADER_ID.to_owned()),
+                    text: "shader widget: this shell does not speak it".to_owned(),
+                    classes: vec!["dim-label".to_owned()],
+                    tooltip: None,
+                }),
                 self.gauge.node(GAUGE_ID),
                 // #931, on glass: the same needle at three sizes, reading the
                 // same value. The default above is the 288 px panel meter; these
@@ -703,8 +777,10 @@ mod tests {
     use hytte_plugin::display::{Marquee, RenderMode, StyleName, display_style};
     use hytte_plugin::proto::preem::{AccentRole, PreemWidget};
     use hytte_plugin::proto::{
-        ClockState, EventKind, Node, PluginMsg, StateKey, StateSnapshot, decode, encode,
+        Capability, ClockState, EventKind, Node, PluginMsg, ShaderData, StateKey, StateSnapshot,
+        decode, encode,
     };
+    use hytte_plugin::shader::testing::with_shader_support;
     use hytte_plugin::{Input, Plugin};
 
     fn fresh() -> PreemDemo {
@@ -1415,5 +1491,116 @@ mod tests {
             let back: PluginMsg = decode(&encode(&render)).expect("render frame decodes");
             assert!(render == back, "{mode:?} round-trips");
         }
+    }
+
+    /// **The shader tile (#893).** Against a shader-speaking host the card
+    /// carries a `Node::Shader` whose data buffer is the model's own bands, in
+    /// little-endian `f32` — which is the wire's stated byte order and the one
+    /// thing a hand-rolled client would get wrong.
+    ///
+    /// This is also the assertion that keeps the demo's shader *reachable*: the
+    /// tile is only built when the negotiation says yes, so without forcing it
+    /// the whole path is dead code in every test.
+    ///
+    /// **Falsified** by dropping `Capability::Shader` from the manifest (the
+    /// last assertion), or by shipping the bands as native-endian bytes on a
+    /// big-endian target — which is exactly why the bytes, not the floats, are
+    /// what this compares.
+    #[test]
+    fn the_shader_tile_carries_the_bands_as_little_endian_floats() {
+        let mut m = shown();
+        let mut bands = [0.0_f32; super::SPECTRUM_BINS];
+        bands[3] = 0.75;
+        bands[super::SPECTRUM_BINS - 1] = 1.0;
+        let _ = m.update(spectrum(bands));
+
+        let node = with_shader_support(true, || m.shader_node()).expect("the tile builds");
+        match node {
+            Node::Shader {
+                id,
+                width,
+                height,
+                scale,
+                fragment,
+                data,
+                format,
+                data_width,
+                data_height,
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some(super::SHADER_ID));
+                assert_eq!((width, height, scale), (144, 48, 2));
+                assert_eq!(format, ShaderData::R32f);
+                assert_eq!(
+                    (data_width as usize, data_height),
+                    (super::SPECTRUM_BINS, 1),
+                    "one row of bands",
+                );
+                assert!(
+                    format.data_len_ok(data_width, data_height, data.len()),
+                    "the host's own shape invariant holds for what we send",
+                );
+                let expected: Vec<u8> = bands.iter().flat_map(|b| b.to_le_bytes()).collect();
+                assert_eq!(data, expected, "little-endian, band order preserved");
+                // Body-only, per the wire contract: no `#version`, no interface
+                // declarations — the shell prepends both, and re-declaring one
+                // is a duplicate-declaration compile error the plugin only
+                // learns about from the journal. Line-oriented and
+                // comment-skipping, since the file's own header *talks about*
+                // `#version` and `uniform` at length.
+                for line in fragment.lines().map(str::trim) {
+                    if line.starts_with("//") {
+                        continue;
+                    }
+                    for banned in ["#version", "uniform ", "out vec4", "in vec2"] {
+                        assert!(
+                            !line.starts_with(banned),
+                            "the body must not declare `{banned}`: {line}",
+                        );
+                    }
+                }
+            }
+            other => panic!("built {other:?}"),
+        }
+
+        // The capability that makes the host draw it rather than the
+        // broken-widget placeholder.
+        assert!(
+            PreemDemo::manifest()
+                .capabilities
+                .contains(&Capability::Shader),
+            "the manifest must declare the capability its own view needs",
+        );
+    }
+
+    /// A host that has not advertised the shader vocabulary gets the **label**
+    /// in the tile's place, under the same node id — so an older shell renders a
+    /// card that explains itself instead of one with a hole in it.
+    ///
+    /// **Falsified** by `.expect()`ing the node in `view` instead of falling
+    /// back: the demo would panic against every pre-#893 shell.
+    #[test]
+    fn an_old_shell_gets_a_label_where_the_shader_would_be() {
+        let m = shown();
+        assert!(
+            with_shader_support(false, || m.shader_node()).is_none(),
+            "no advertisement, no node",
+        );
+
+        let tree = with_shader_support(false, || {
+            with_render_mode(RenderMode::State, || m.view().tree)
+        });
+        let mut found = false;
+        let mut stack = vec![&tree];
+        while let Some(n) = stack.pop() {
+            match n {
+                Node::Label { id, .. } if id.as_deref() == Some(super::SHADER_ID) => found = true,
+                Node::Shader { .. } => panic!("emitted a Shader node at an unadvertised host"),
+                Node::Box { children, .. } => stack.extend(children.iter()),
+                Node::Button { child, .. } => stack.push(child),
+                _ => {}
+            }
+        }
+        assert!(found, "the fallback label stands in for the tile");
     }
 }

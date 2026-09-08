@@ -1065,6 +1065,87 @@ session.
      confirm the scope falls back to the CPU kit with one journal line rather
      than showing a blank chip. The phosphor restarts from black, which is the
      honest outcome — the GL arm never drew a trail to inherit.
+- [ ] **(#893)** **The shader widget: a plugin's own GLSL on the GPU.** A
+      plugin ships a fragment body plus a data buffer; the shell compiles the
+      body once and per frame re-uploads only the buffer. Everything up to the
+      draw call is gated in CI — the wire round-trip, the capability check, the
+      two size caps, the program-reuse rule, the six reconciler sites, and the
+      demo's own shader body compiled by `nix/lint-glsl.py`. The draw, again, is
+      yours.
+  1. **It animates on glass.** Open `hytte-plugin-preem-demo`'s card: directly
+     under the `Scope` there is now a second tile of the same shape, drawn by
+     the plugin's own `spectrum.frag` — bars from the audio spectrum, a cap line
+     at each band's top, and a beam sweeping across every four seconds. Play
+     something: the bars must move with the audio and the beam must cross
+     smoothly. In silence the beam steps once a second, and **that is the
+     contract, not a bug** — a shader surface renders when its plugin pushes
+     state and at no other time, so the motion rate _is_ the push rate
+     (~20 Hz with audio, 1 Hz on the clock heartbeat alone).
+  2. **It is themed.** Change the desktop accent with the card open: the warm
+     half of the shader's colour cycle and its cap lines must move with it, with
+     no plugin restart — the theme bag is rebuilt on every mapping pass, like
+     every other preem widget's palette. `u_bg` / `u_fg` / `u_accent` /
+     `u_success` / `u_warning` / `u_error` are the published set.
+  3. **A broken shader shows the placeholder, once.** Edit
+     `crates/hytte-plugin-preem-demo/shaders/spectrum.frag` to something that
+     cannot compile (`fragColour` for `fragColor` is enough), rebuild and
+     restart just that plugin. The tile must go **empty** — an empty rect where
+     it was, the rest of the card untouched — and
+     `journalctl --user -u trollshell | grep -i "shader"` must show **exactly
+     one** line carrying the driver's first error line. Not one per frame: the
+     failed source is latched by its own hash, so the driver is asked once. Put
+     the file back afterwards. (`nix flake check` will refuse the broken
+     version, which is the point of the `glsl` check — build the plugin
+     directly with `cargo build -p hytte-plugin-preem-demo` for this.)
+  4. **The same source does not recompile.** With the tile running, watch
+     `RUST_LOG=hytte_ui=debug journalctl --user -u trollshell -f`. Every actual
+     compile emits **one** `compiling a plugin shader` line carrying a
+     `source_key`, so the evidence is countable rather than an absence: across
+     thousands of frames of an unchanged shader there must be exactly **one**,
+     and editing the body and restarting the plugin must produce exactly one
+     more, with a _different_ key. The tile must not flicker as frames arrive,
+     and the beam must not jump back to the left edge — a rebuilt widget
+     restarts `u_time`, which is what that would look like. The hermetic half is
+     `the_same_source_is_compiled_once` in
+     `crates/hytte-ui/src/shader_surface.rs`; glass adds that the reconciler
+     really is reusing the widget.
+  5. **The capability really gates it.** Delete
+     `m.capabilities = vec![Capability::Shader];` from the demo's `manifest()`,
+     rebuild and restart the plugin: the tile must become the same empty
+     placeholder, the rest of the card must render normally, and the journal
+     must carry **one** line naming the missing capability. This is the whole of
+     #893's trust boundary that is enforced — the socket's own file mode is the
+     rest of it (route 0), and there is no source validator by design.
+  6. **A shader hanging the GPU takes the shell with it.** Stated so it is not
+     discovered: GTK requests no robust context and there is one GL share group
+     per display, so a runaway plugin shader is the same trust as the plugin's
+     own native code and the realistic worst case is a shell restart. Nothing to
+     verify — this is the risk being accepted, with route 3 (an out-of-process
+     shader host) named as the upgrade if a plugin is ever not trusted. The same
+     goes for a **failed** context: the latch is sticky for the process and the
+     shader widget has no CPU arm, so every shader stays a placeholder until the
+     shell restarts (`Refusal::NoGl` says why).
+  7. **Alpha is premultiplied — the one contract clause no test can reach.**
+     Everything else on this page is either gated hermetically or visible in the
+     demo; this is neither, because `spectrum.frag` is opaque. Replace its body
+     temporarily with two lines:
+
+     ```glsl
+     void main() { fragColor = vec4(0.5, 0.0, 0.0, 0.5); }
+     ```
+
+     `cargo build -p hytte-plugin-preem-demo`, restart the plugin, and look at
+     the tile against the card behind it. **Premultiplied is what the contract
+     says**, so this must read as an evenly half-transparent red — the card
+     showing through. If it reads as _full_ red (or as a dark, muddy red), the
+     framebuffer is being treated as straight alpha and the contract wording in
+     `Node::Shader`'s docs, `hytte-ui`'s `shader_surface` module docs and the
+     SDK's `shader` module docs is wrong in the same three places — fix the text,
+     not the shader. Then put `spectrum.frag` back.
+
+     Stated plainly: this was read off GDK's memory format
+     (`GDK_MEMORY_DEFAULT`), not off a screen. It is the claim in this PR with
+     the least evidence behind it.
 
 ## Screen recording
 

@@ -369,6 +369,7 @@ use hytte_plugin_proto::{
 pub use hytte_preem as preem;
 
 pub mod display;
+pub mod shader;
 
 mod runtime;
 

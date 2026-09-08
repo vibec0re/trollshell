@@ -32,6 +32,7 @@ use hytte_plugin_proto::{HostMsg, preem as vocab, wire};
 use tokio::sync::mpsc;
 
 use crate::plugins::datasource::DatasourceRouter;
+use crate::plugins::shader_map::{self, Grants};
 use crate::plugins::wire_map::to_ui_node;
 
 use super::*;
@@ -96,6 +97,7 @@ fn slot(plugin_id: &str, tree: wire::Node, tx: &mpsc::Sender<HostMsg>) -> SlotRe
         generation: 1,
         tree,
         panel: None,
+        grants: Grants::none(),
         outbound: tx.clone(),
     }
 }
@@ -156,9 +158,9 @@ fn an_animating_plugin_does_not_wake_a_static_bar_left_subscriber() {
     // is what actually registers `mover`'s preem instance in
     // `preem_render`'s scope table, not just the mailbox bookkeeping below.
     let resident_scope = Scope::card("t906-resident");
-    let _ = to_ui_node(&resident_scope, &static_node("chip"));
+    let _ = to_ui_node(&resident_scope, Grants::none(), &static_node("chip"));
     let mover_scope = Scope::card("t906-mover");
-    let _ = to_ui_node(&mover_scope, &marquee_node("chip"));
+    let _ = to_ui_node(&mover_scope, Grants::none(), &marquee_node("chip"));
 
     let bar_left: Mutable<Vec<SlotRender>> =
         Mutable::new(vec![slot("t906-resident", static_node("chip"), &tx)]);
@@ -262,8 +264,8 @@ fn a_departing_plugin_releases_both_its_scopes_with_no_region_alive() {
 
     // The renderer instances a real chip mount and a real drawer child would
     // have built, mapped the same way they map them.
-    let _ = to_ui_node(&card, &marquee_node("chip"));
-    let _ = to_ui_node(&panel, &marquee_node("panel"));
+    let _ = to_ui_node(&card, Grants::none(), &marquee_node("chip"));
+    let _ = to_ui_node(&panel, Grants::none(), &marquee_node("panel"));
     assert_eq!(preem_render::instance_count(&card), 1);
     assert_eq!(preem_render::instance_count(&panel), 1);
 
@@ -365,4 +367,87 @@ fn a_repaint_nudge_does_not_wake_the_scope_releaser() {
     );
 
     preem_render::forget_scope(&Scope::card("t921-steady"));
+}
+
+/// **The shader half of the same release (#968 second review, M1(d)).**
+///
+/// #893's `shader_map` keeps an `Arc<ShaderState>` per scope per node id — the
+/// source and the whole data buffer — and it is released on the *same four*
+/// sites `preem_render`'s instance table is. This test pins the fourth, which
+/// was missing when the cache landed: with no monitor alive there is no region
+/// retain loop to run, so this releaser is the only thing that releases a
+/// departed plugin's **card** scope. (The panel half already went through
+/// `region::forget_departed_panel_scope`, which does call it.)
+///
+/// Measured on the state it was missing from: a thousand plugins joining and
+/// departing this way retained a thousand scopes and 4 MB of buffers for the
+/// life of the shell — and at the wire caps that is `MAX_SHADER_DATA_BYTES`
+/// (4 MiB) plus 16 KiB of source per shader node id per departed plugin. It is
+/// exactly the corner #920/#921 were both written to close: "a
+/// `monitors_changed` carrying an empty list, which is a docked laptop's lid
+/// closing or every output unplugged".
+///
+/// **Falsified** by deleting the `shader_map::forget_scope(&Scope::card(gone))`
+/// line from `drive_scope_releaser`: the count stays at the number of
+/// reconnects instead of returning to zero.
+#[test]
+fn a_departing_plugin_releases_its_shader_states_with_no_region_alive() {
+    let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+
+    // Ten joins and departures through the real releaser, each with a live
+    // shader node — enough to show the table growing rather than settling. The
+    // leak is unbounded in the plugin's *lifetime* count, not in its size, so a
+    // small N is as diagnostic as a large one.
+    for round in 0..10 {
+        let id = format!("t968-leaver-{round}");
+        let card = Scope::card(&id);
+        let node = shader_node("tile");
+        let _ = to_ui_node(&card, Grants::all(), &node);
+        assert_eq!(
+            shader_map::cached_states(&card),
+            1,
+            "the mapping pass cached this plugin's shader state",
+        );
+
+        let mailboxes: [Mutable<Vec<SlotRender>>; RENDER_MAILBOXES] = [
+            Mutable::new(Vec::new()),
+            Mutable::new(Vec::new()),
+            Mutable::new(Vec::new()),
+            Mutable::new(vec![slot(&id, node.clone(), &tx)]),
+            Mutable::new(Vec::new()),
+            Mutable::new(Vec::new()),
+            Mutable::new(Vec::new()),
+        ];
+        let bar_left = mailboxes[3].clone();
+
+        let mut releaser = pin!(drive_scope_releaser(live_plugin_ids_signal(mailboxes)));
+        step(&mut releaser); // seed: the plugin is here
+        assert_eq!(shader_map::cached_states(&card), 1);
+
+        bar_left.set(Vec::new()); // it leaves, with no region alive
+        step(&mut releaser);
+        assert_eq!(
+            shader_map::cached_states(&card),
+            0,
+            "round {round}: a departed plugin's shader states must be released \
+             by the releaser — with no monitor there is no retain loop to do it",
+        );
+    }
+}
+
+/// A `wire::Node::Shader` with a real buffer, for the release tests.
+fn shader_node(id: &str) -> wire::Node {
+    wire::Node::Shader {
+        id: Some(id.to_owned()),
+        width: 32,
+        height: 32,
+        scale: 1,
+        fragment: "void main() { fragColor = u_fg; }".into(),
+        data: vec![0u8; 4096],
+        format: wire::ShaderData::R8,
+        data_width: 4096,
+        data_height: 1,
+        classes: vec![],
+        tooltip: None,
+    }
 }

@@ -49,6 +49,22 @@ let
   #     learned to see subdirectories, turned the check red with exit 2. A
   #     shared body added later goes in both places, with a decision about
   #     which stage(s) to compile it under.
+  #
+  #     Since #893 there are two more producers, both covered by the same
+  #     extension clause and both scanned by the lint: `hytte-ui`'s shader-widget
+  #     vertex stage (`crates/hytte-ui/src/shader_*.vert`) and plugins' widget
+  #     fragment *bodies* (e.g. the preem demo's `shaders/spectrum.frag`), which
+  #     are compiled with `SHADER_PREAMBLE` spliced in front because they do not
+  #     compile alone.
+  #
+  #     **The lint's body scan is tree-wide, to match this clause exactly.** It
+  #     took two tries to get there and both intermediate spellings shipped a
+  #     hole: a literal one-directory list missed a second plugin's `shaders/`
+  #     entirely, and a `crates/*/shaders` glob still missed
+  #     `crates/<crate>/src/stray.frag` and `trollshell/shaders/stray2.frag` —
+  #     both measured shipping green (#968 reviews L5 and its residual). Because
+  #     this filter has *no* directory constraint, only a tree-wide scan agrees
+  #     with it by construction; anything convention-shaped agrees by luck.
   # No OTHER stylesheets/icons are kept: everything else in `assets/` is
   # loaded from disk at runtime — the binary resolves them via the
   # makeWrapper env (TROLLSHELL_DATA_DIR / HYTTE_UI_DATA_DIR → the `assets`

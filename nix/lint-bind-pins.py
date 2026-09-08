@@ -46,6 +46,75 @@ keep them clean here: the clone's *source* identifier is not `bind`'s target
 (so it is not a discard). A change that starts flagging either one is a bug in
 this script, not a finding.
 
+THE SITE SHAPE — WHY THE `&` IS OPTIONAL (#973)
+-----------------------------------------------
+`bind` takes `impl IsA<Widget>`, so a call site spells its widget argument one
+of two ways, and the check has to see both:
+
+    bind(sig, &container, move |container, v| …)   // a local, borrowed here
+    bind(sig, container,  move |container, v| …)   // already a `&W` parameter
+
+The second is the *extraction* shape (#772, #972): a builder's `bind` call is
+split into `fn bind_rows(container: &W, signal: S)` so the binding can be
+driven with a synthetic signal in a test, and the parameter is passed straight
+through — `W: IsA<Widget> + Clone` rules out re-borrowing, so there is no
+sigil to match on. Until #973 this script required a leading `&`, so every
+extracted helper sat outside its coverage: a strong clone reintroduced inside
+one scanned green, and the two guards traded off exactly where they should
+have overlapped. The probe below is that case.
+
+Widening to a bare identifier was measured before it was taken, because a
+wider match is only worth having if the rows it adds are clean. Across the
+three roots it surfaces **24 further argument-matches**:
+
+  * **13 are a path tail** and are rejected outright. `bind_two_way(sig, &sw,
+    gtk::Switch::set_active, |w| …)` also puts an identifier immediately
+    before a closure — a `::`-preceded identifier is never a local widget
+    binding, hence the `(?<!:)` in `SITE_RE`. A self-test fixture pins this,
+    because without the rejection that shape *is* reported.
+  * **8 use the closure's own widget parameter** and so can never be flagged
+    (the `param_name.startswith("_")` gate below).
+  * **3 discard it**, and all three are the *anchor idiom* — `bind` used
+    purely to tie a subscription's lifetime to a widget the closure never
+    touches: `components/open_refresh.rs` (`on_open`), `widgets/calendar.rs`
+    (`wire_clock_bind`), `widgets/tasks.rs` (`wire_lists_bind`). None clones
+    its anchor, so none is a hit, and none can become one without someone
+    writing the defect.
+  * **0 new pins.** The tree is still `0 pin(s)` after the widening.
+
+All eleven surviving rows are a `&W` parameter of the enclosing function, but
+they are *not* all named `bind_*` — `wire_events_bind`, `wire_clock_bind`,
+`wire_tasks_bind`, `wire_lists_bind`, `wire_visibility_and_state`, `on_open`
+and `reactive_list` take the same shape under other names. A narrower rule
+keyed on the helper's *name* would therefore have missed live sites, and a rule
+keyed on the enclosing function's parameter types would fail *silently*
+(under-reporting) — the same failure direction #973 is a report of. A bare
+identifier plus the existing discard gate fails loudly instead, which is the
+tolerable direction for a lint.
+
+`panels/connections.rs`'s `bind_connections_group` is worth knowing about: it
+is the carve-out above *at a bare-parameter site* — target `conn_group`, with
+`other_expander.clone()` captured for a genuinely different widget — and the
+widening leaves it unflagged for both of the reasons in that section.
+
+THE PROBE
+---------
+The regression this file exists to prevent is checked on every run by
+`self_test()` below, but the end-to-end version is worth keeping by hand:
+reintroduce #834's exact defect shape (`git show 8cb1ddd --
+trollshell/src/widgets/tray.rs`) *inside* a helper, e.g. in
+`trollshell/src/panels/vpn.rs`'s `bind_tunnel_groups`:
+
+    let groups: … = …;
+    let column_for_bind = column.clone();          // + a strong clone
+    bind(signal, column, move |_column, tunnels| { // + a discarded parameter
+        …  column_for_bind.remove(&g);  …          // + the clone used instead
+    });
+
+then run the scanner. Before #973 that reported `0 pin(s)`, exit 0, and adding
+a single `&` at the call site — nothing else changed — flipped it to
+`1 pin(s)`. It now reports the pin either way. Revert with `git checkout --`.
+
 WHY A PARSER-ISH SCAN AND NOT A REGEX
 -------------------------------------
 This is the part worth preserving. The obvious implementation — "match
@@ -88,8 +157,9 @@ USAGE
     python3 nix/lint-bind-pins.py [ROOT ...]      # from the repo root
 
 Exits 0 when clean, 1 when a pin is found (naming every site), 2 when the scan
-itself is untrustworthy (a root has gone missing, or too few call sites were
-seen to believe the result).
+itself is untrustworthy — a root has gone missing, too few call sites were seen
+to believe the result, or `self_test()` (which runs first, on every invocation,
+against the fixtures at the bottom of this file) disagrees with the scanner.
 """
 
 import os
@@ -125,6 +195,12 @@ BIND_FNS = (
 MIN_CALL_SITES = 100
 
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+
+# The widget argument sitting immediately before the apply closure. Groups:
+# 1 the optional `&` sigil, 2 the widget identifier, 3 an optional `move`,
+# 4 the closure's parameter list. Rationale for the optional sigil and the
+# `::` rejection is at the use site in `scan_file`, and in "THE SITE SHAPE".
+SITE_RE = rf"(&\s*)?(?<!:)\b({IDENT})\s*,\s*(move\s+)?\|([^|]*)\|"
 
 
 def blank_noise(src: str) -> str:
@@ -221,11 +297,21 @@ def scan_file(path: str, src: str, hits: list) -> int:
         args = clean[open_paren + 1 : end - 1]
         base = open_paren + 1
 
-        # `&<widget>, (move)? |params|` — the widget argument immediately
+        # `[&]<widget>, (move)? |params|` — the widget argument immediately
         # followed by the apply closure, whichever argument position it sits in.
-        for am in re.finditer(rf"&\s*({IDENT})\s*,\s*(move\s+)?\|([^|]*)\|", args):
-            target = am.group(1)
-            first_param = (am.group(3).split(",") or [""])[0].strip()
+        #
+        # The `&` is optional (#973): an extracted `bind_*(widget: &W, signal)`
+        # helper passes its own parameter through with no sigil, and requiring
+        # one put every such site outside this check. See "THE SITE SHAPE"
+        # above for the measured cost of the widening.
+        #
+        # `(?<!:)` rejects a path tail — `bind_two_way(sig, &sw,
+        # gtk::Switch::set_active, |w| …)` also puts an identifier immediately
+        # before a closure, and it is never a local widget binding.
+        for am in re.finditer(SITE_RE, args):
+            sigil = "&" if am.group(1) else ""
+            target = am.group(2)
+            first_param = (am.group(4).split(",") or [""])[0].strip()
             pm = re.match(rf"^(?:mut\s+)?({IDENT})", first_param)
             param_name = pm.group(1) if pm else ""
 
@@ -253,12 +339,171 @@ def scan_file(path: str, src: str, hits: list) -> int:
             )
             if used:
                 line = src[: base + am.start()].count("\n") + 1
-                hits.append((path, line, m.group(1), target, param_name, used))
+                hits.append((path, line, m.group(1), sigil, target, param_name, used))
 
     return call_sites
 
 
+# Fixtures for `self_test()`, run on every invocation. Each is a snippet of
+# Rust and the number of pins the scanner must find in it. They exist because
+# this check spent months reporting green over a shape it could not see (#973):
+# the tree being clean proves nothing about whether the scanner still *works*,
+# and only a case that is deliberately dirty can tell the two apart.
+#
+# Every fixture is a real shape from the tree, not an invention:
+#   the amp / helper pins   #834's defect, at both call-site spellings
+#   the two carve-outs      traffic.rs's `idle_expander_for_bind` and
+#                           playback.rs's `placeholder_for_bind`
+#   the anchor idiom        open_refresh.rs / tasks.rs / calendar.rs
+#   the path tail           bind_two_way's setter argument
+SELF_TEST_CASES: tuple[tuple[str, int, str], ...] = (
+    (
+        "amp pin (#834 shape, borrowed local)",
+        1,
+        """
+        fn build() {
+            let container = gtk::Box::new();
+            let container_for_signal = container.clone();
+            bind(tray::items(), &container, move |_, items| {
+                update_tray(&container_for_signal, &items);
+            });
+        }
+        """,
+    ),
+    (
+        "helper pin (#973 shape, `&W` parameter passed bare)",
+        1,
+        """
+        fn bind_tunnel_groups<S>(column: &gtk::Box, signal: S) {
+            let column_for_bind = column.clone();
+            bind(signal, column, move |_column, tunnels| {
+                column_for_bind.remove(&tunnels);
+            });
+        }
+        """,
+    ),
+    (
+        "helper pin reached through a transitive clone chain",
+        1,
+        """
+        fn bind_rows<S>(group: &adw::PreferencesGroup, signal: S) {
+            let a = group.clone();
+            let b = a.clone();
+            bind(signal, group, move |_g, rows| {
+                b.set_rows(rows);
+            });
+        }
+        """,
+    ),
+    (
+        "helper using its own parameter (the fix; must stay clean)",
+        0,
+        """
+        fn bind_tunnel_groups<S>(column: &gtk::Box, signal: S) {
+            bind(signal, column, move |column, tunnels| {
+                column.remove(&tunnels);
+            });
+        }
+        """,
+    ),
+    (
+        "second-widget carve-out at a bare-parameter site (must stay clean)",
+        0,
+        """
+        fn bind_iface_rows<S>(iface_group: &adw::PreferencesGroup, signal: S) {
+            let idle_expander = build_idle_expander();
+            let idle_expander_for_bind = idle_expander.clone();
+            bind(signal, iface_group, move |iface_group, links| {
+                iface_group.set_rows(&links);
+                idle_expander_for_bind.set_visible(!links.is_empty());
+            });
+        }
+        """,
+    ),
+    (
+        "second-widget carve-out with a discarded parameter (must stay clean)",
+        0,
+        """
+        fn bind_placeholder<S>(list: &gtk::ListBox, signal: S) {
+            let placeholder = build_placeholder();
+            let placeholder_for_bind = placeholder.clone();
+            bind(signal, list, move |_list, streams| {
+                placeholder_for_bind.set_visible(streams.is_empty());
+            });
+        }
+        """,
+    ),
+    (
+        "anchor idiom — bare target, discarded parameter, no clone",
+        0,
+        """
+        fn on_open<W>(monitor: &Monitor, anchor: &W, refresh: impl Fn()) {
+            bind(sidebar::open_signal(monitor), anchor, move |_, open| {
+                if open {
+                    refresh();
+                }
+            });
+        }
+        """,
+    ),
+    (
+        "path tail — `::`-qualified setter must never become the target",
+        0,
+        """
+        fn build() {
+            let set_active = gtk::Switch::new();
+            let set_active_clone = set_active.clone();
+            bind_two_way(dnd::enabled(), &dnd_switch, gtk::Switch::set_active, |_w| {
+                set_active_clone.is_active()
+            });
+        }
+        """,
+    ),
+    (
+        "comment and string contents must not produce phantom hits",
+        0,
+        """
+        fn build() {
+            let container = gtk::Box::new();
+            let container_for_bind = container.clone();
+            // bind(sig, container, move |_c, v| { container_for_bind.set(v); });
+            let doc = "bind(sig, container, move |_c, v| container_for_bind)";
+            container.set_tooltip(doc);
+        }
+        """,
+    ),
+)
+
+
+def self_test() -> list[str]:
+    """Run the scanner over the fixtures; return a list of failure lines."""
+    failures = []
+    for name, expected, src in SELF_TEST_CASES:
+        hits: list = []
+        scan_file("<self-test>", src, hits)
+        if len(hits) != expected:
+            found = ", ".join(f"{t} captures {u}" for _, _, _, _, t, _, u in hits) or "nothing"
+            failures.append(f"  {name}: expected {expected} pin(s), found {len(hits)} ({found})")
+    return failures
+
+
 def main(argv: list[str]) -> int:
+    # Before anything else: does the scanner still find a pin it is supposed to
+    # find, and still ignore the shapes it is supposed to ignore? A clean tree
+    # cannot answer either question, which is how #973 stayed green.
+    failures = self_test()
+    if failures:
+        print("bind-pin scan: SELF-TEST FAILED", file=sys.stderr)
+        for line in failures:
+            print(line, file=sys.stderr)
+        print(
+            "\nThe scanner disagrees with its own fixtures, so any verdict it gives on the\n"
+            "tree is meaningless. Fix scan_file()/SITE_RE rather than the expectations —\n"
+            "and if a fixture is genuinely wrong, say why in the header section it cites.",
+            file=sys.stderr,
+        )
+        return 2
+
     roots = argv[1:] or list(DEFAULT_ROOTS)
 
     # A missing root would make `os.walk` yield nothing and the scan pass
@@ -308,11 +553,11 @@ def main(argv: list[str]) -> int:
         "strong clone:\n",
         file=sys.stderr,
     )
-    for path, line, fn, target, param, used in hits:
+    for path, line, fn, sigil, target, param, used in hits:
         clones = ", ".join(used)
         print(f"  {path}:{line}", file=sys.stderr)
         print(
-            f"      {fn}(.., &{target}, move |{param}, ..|)  captures: {clones}",
+            f"      {fn}(.., {sigil}{target}, move |{param}, ..|)  captures: {clones}",
             file=sys.stderr,
         )
     print(

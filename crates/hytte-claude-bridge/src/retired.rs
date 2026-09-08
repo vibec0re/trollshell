@@ -673,7 +673,10 @@ mod tests {
 
         load(&path(&dir), CAP);
 
-        assert!(!stale.exists(), "the stale temp file should have been swept");
+        assert!(
+            !stale.exists(),
+            "the stale temp file should have been swept"
+        );
     }
 
     /// The sweep is scoped to this file's own temp-name shape — it must not

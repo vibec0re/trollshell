@@ -274,8 +274,12 @@ pub(super) fn broker_effect(
 /// runs on the GTK main thread and would take the whole shell down; the worst
 /// it can do, now, is name a unit to nobody at all — not the audit line
 /// (already true before the M-2 fix) and, as of that fix, not this tracing
-/// line either. `start_detached`'s own `is_valid_plugin_id` guard means it is
-/// never asked of systemd regardless.
+/// line either (`plugins::tests::rejected_plugin_id_records_no_phantom_unit`
+/// installs a real `tracing_subscriber` and reads the formatted line back to
+/// pin that — see the second-pass #964 review: an earlier version pinned a
+/// hand-mirrored capture cell instead, which could drift from the macro it
+/// stood in for). `start_detached`'s own `is_valid_plugin_id` guard means the
+/// recomputed unit is never asked of systemd regardless.
 fn dispatch_detached_run_command(
     plugin_id: &str,
     id: u64,
@@ -284,13 +288,9 @@ fn dispatch_detached_run_command(
     detached_unit: Option<String>,
 ) {
     if let Some(unit) = detached_unit {
-        #[cfg(test)]
-        tests::TRACING_UNIT.with(|cell| *cell.borrow_mut() = Some(unit.clone()));
         tracing::info!(plugin = %plugin_id, id, argc = argv.len(), unit = %unit, "plugin effect: RunCommand (detached launch)");
         launch_detached(plugin_id, id, unit, argv.to_vec(), outbound.clone());
     } else {
-        #[cfg(test)]
-        tests::TRACING_UNIT.with(|cell| *cell.borrow_mut() = None);
         tracing::info!(
             plugin = %plugin_id, id, argc = argv.len(),
             "plugin effect: RunCommand (detached launch; id is not unit-name \
@@ -1143,6 +1143,23 @@ pub(super) fn launch_outcome(report: &Result<LaunchReport, String>) -> EffectOut
 /// directly instead, so nothing depends on the spawn below actually firing in
 /// a test binary.
 ///
+/// **Honest gap (#964 LOW, second-pass review):** because the whole
+/// `#[cfg(not(test))]` block below is compiled out under test, the one-line
+/// hop `start_detached(&plugin_id, id, &unit, &argv)` — handing *this*
+/// function's `unit`/`argv` on to `start_detached` — is not exercised by any
+/// test in either direction: swapping `&unit` here for a literal, or `&argv`
+/// for an empty slice, compiles and stays green across the whole suite,
+/// `system-tests` included (confirmed: MUT-D in the review). What IS covered,
+/// on both sides of this gap, is real: the M-1 pair pins `unit` up through
+/// `record_audit`/this function's own parameter on one side, and
+/// `start_detached_with`'s `unit` through to the real `--unit=` argv on the
+/// other — this one hop, joining them, is the only uncovered link, and it
+/// would need an injectable spawner on `launch_detached` itself (mirroring
+/// `start_detached`'s `program`/`timeout` seam) to close. Not done here:
+/// #964 didn't ask for the chain closed end to end, only for the four named
+/// mechanisms, and this hop is a straight pass-through with no branch or
+/// transformation in it.
+///
 /// `unit` has to be owned (`String`, not `&str`): the `#[cfg(not(test))]`
 /// block moves it into a `'static` future handed to
 /// `hytte::reactive::runtime::handle().spawn`. In a `#[cfg(test)]` build that
@@ -1490,35 +1507,125 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
 
-    // #964 item 1 / M-2 review: test-only capture of what `record_audit`,
-    // `launch_detached` and the `tracing::info!` call in `broker_effect`'s
-    // `RunCommand` arm were each told, so a test can assert they all agree on
-    // the unit name (or all agree there isn't one) without a real audit file,
-    // a real log subscriber, or a real (or even completed) launch — see
-    // `record_audit`'s, `launch_detached`'s and `broker_effect`'s own call
-    // sites for the writes. `pub(super)` so the parent module's
-    // `#[cfg(test)]` call sites can reach them as `tests::…`.
+    // #964 item 1: test-only capture of what `record_audit` and
+    // `launch_detached` were each told, so a test can assert they agree on the
+    // unit name without a real audit file or a real (or even completed)
+    // launch — see `record_audit`'s and `launch_detached`'s own call sites for
+    // the writes. `pub(super)` so the parent module's `#[cfg(test)]` call
+    // sites can reach them as `tests::…`.
+    //
+    // The `tracing::info!` line for a detached `RunCommand` (#964 M-2 review)
+    // is deliberately NOT one of these hand-mirrored cells any more — a
+    // second-pass review found that a hand-written capture written next to
+    // the macro it describes can drift from it (delete both the macro call
+    // and its mirror together and the guard goes green on the exact
+    // regression it exists to catch). `rejected_plugin_id_records_no_phantom_unit`
+    // now installs a real `tracing_subscriber` and reads the actual formatted
+    // line back instead.
     thread_local! {
         pub(super) static LAST_AUDIT_LINE: RefCell<Option<String>> = const { RefCell::new(None) };
         pub(super) static LAST_DETACHED_DISPATCH_UNIT: RefCell<Option<String>> =
             const { RefCell::new(None) };
-        /// What `broker_effect`'s `tracing::info!` call for a detached
-        /// `RunCommand` was told to name as the unit (#964 M-2 review) —
-        /// `Some(unit)` on the accepted-id arm, `None` on the rejected-id arm
-        /// (which now omits the `unit = …` field entirely rather than log one
-        /// nobody will find in `systemctl --user`). Not a real subscriber hook;
-        /// mirrors `LAST_AUDIT_LINE`'s technique of writing at the call site.
-        pub(super) static TRACING_UNIT: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
-    /// Clear all three #964 capture cells. Every test that reads them starts by
+    /// Clear both #964 capture cells. Every test that reads them starts by
     /// calling this, so a prior test that ran on the same worker thread
     /// (thread-locals are per OS thread, and `cargo test` reuses threads across
     /// tests) can never leave a stale value behind.
     fn reset_captures() {
         LAST_AUDIT_LINE.with(|cell| *cell.borrow_mut() = None);
         LAST_DETACHED_DISPATCH_UNIT.with(|cell| *cell.borrow_mut() = None);
-        TRACING_UNIT.with(|cell| *cell.borrow_mut() = None);
+    }
+
+    /// Write `script` to `path` and make it executable — via a **short-lived
+    /// child process**, never this process's own `std::fs::write` (#964
+    /// HIGH-1 review).
+    ///
+    /// `std::fs::write` + `set_permissions` leaves a *writable* file
+    /// descriptor on `path` open in *this* process between the two calls.
+    /// Every other test in the same binary that spawns a process
+    /// (`tokio::process::Command`, the re-exec'ing launch tests, …) calls
+    /// `fork()` before its own `execve` — and `fork()` duplicates the whole
+    /// fd table; `CLOEXEC` closes a descriptor at *exec*, not at fork. If a
+    /// concurrent fork lands in the window between this test's `write` and
+    /// its own `execve` of the SAME stub path, the forked child inherits our
+    /// writable fd, and `execve` on a file that is open for writing anywhere
+    /// in the process tree fails with `ETXTBSY` ("text file busy") — silently
+    /// misdiagnosed downstream as `FallbackReason::NoSystemdRun`, since
+    /// that's exactly what a failed `Command::spawn` looks like to
+    /// `systemd_run_launch_with`. Measured: 4 such failures in 50 hermetic
+    /// `cargo test -p trollshell` runs across the two stub-writing tests in
+    /// this file, 0 in 20 runs before the second site existed.
+    ///
+    /// Doing the write **and** the chmod inside a child (`sh -c 'cat > "$1"
+    /// && chmod 755 "$1"'`, `script` piped over the child's stdin so no shell
+    /// quoting of its content is needed) means the writable fd on `path`
+    /// never exists in *this* process at all — only in the short-lived
+    /// child's own fd table, which is irrelevant to what any *other* fork in
+    /// this process inherits.
+    fn write_test_stub(path: &std::path::Path, script: &str) {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("cat > \"$1\" && chmod 755 \"$1\"")
+            .arg("sh") // $0 — conventionally the program name, unused here
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn the stub-writing child");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(script.as_bytes())
+            .expect("write the script to the child's stdin");
+        let status = child
+            .wait()
+            .expect("wait for the stub-writing child to exit");
+        assert!(status.success(), "writing the test stub failed: {status:?}");
+    }
+
+    /// A `tracing_subscriber::fmt` writer that appends every write to a
+    /// shared, lockable buffer (#964 MEDIUM-1 review) — so a test can install
+    /// it as the default subscriber for one call and read back the *actual*
+    /// formatted log text afterward, the same fidelity `LAST_AUDIT_LINE`
+    /// already has for the audit line. Cloning shares the same underlying
+    /// buffer (it's an `Arc`), which is what `tracing_subscriber`'s
+    /// `MakeWriter` contract requires (it clones the writer per event).
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLog {
+        /// Run `f` with this buffer installed as the default `tracing`
+        /// subscriber (ANSI off, so the text is greppable), then return
+        /// everything it wrote as a `String`.
+        fn capture(f: impl FnOnce()) -> String {
+            let log = CapturedLog::default();
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, f);
+            String::from_utf8(log.0.lock().expect("capture buffer lock").clone())
+                .expect("tracing output is UTF-8")
+        }
     }
 
     #[test]
@@ -1770,22 +1877,16 @@ mod tests {
     /// added, so it stays hermetic.
     #[tokio::test]
     async fn the_dispatched_unit_reaches_the_systemd_run_argv() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let dir = tempfile::tempdir().expect("tempdir");
         let argv_file = dir.path().join("argv");
         let stub = dir.path().join("stub.sh");
-        std::fs::write(
+        write_test_stub(
             &stub,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
                 argv_file.display()
             ),
-        )
-        .expect("write stub");
-        let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&stub, perms).expect("chmod stub");
+        );
 
         let unit = "trollshell-launch-ts964-argv-7.service";
         let report = start_detached_with(
@@ -1813,22 +1914,35 @@ mod tests {
     /// `unit=`/`slice=` for a unit `start_detached` never actually asks
     /// systemd to create — it takes the direct-spawn fallback instead
     /// (`FallbackReason::UnsafePluginId`).
+    ///
+    /// #964 MEDIUM-1 review: the tracing half of this used to assert on a
+    /// hand-mirrored `TRACING_UNIT` cell written three lines from the
+    /// `tracing::info!` call it stood in for — so deleting the macro call
+    /// *and* its mirror together (exactly what "simplifying"
+    /// `dispatch_detached_run_command` back to one code path would do) left
+    /// this test green on the very regression it was filed to catch. It now
+    /// installs a real `tracing_subscriber` ([`CapturedLog::capture`]) and
+    /// reads the actual formatted line back — the same fidelity
+    /// `LAST_AUDIT_LINE` already had for the audit line — so deleting the
+    /// macro call this time takes the assertion's evidence with it.
     #[test]
     fn rejected_plugin_id_records_no_phantom_unit() {
         reset_captures();
         let (tx, _rx) = mpsc::channel::<HostMsg>(4);
         let router = DatasourceRouter::default();
 
-        broker_effect(
-            "my plugin",
-            &Effect::RunCommand {
-                id: 1,
-                argv: vec!["true".to_owned()],
-                detached: true,
-            },
-            &tx,
-            &router,
-        );
+        let log = CapturedLog::capture(|| {
+            broker_effect(
+                "my plugin",
+                &Effect::RunCommand {
+                    id: 1,
+                    argv: vec!["true".to_owned()],
+                    detached: true,
+                },
+                &tx,
+                &router,
+            );
+        });
 
         let audit_line = LAST_AUDIT_LINE
             .with(|cell| cell.borrow().clone())
@@ -1847,13 +1961,18 @@ mod tests {
         // what wasn't was the shell's own default-level `tracing::info!` line
         // for the same effect, which named the very unit the audit line
         // withheld (and did so unsanitized, with the id's raw space still in
-        // it — not even a legal unit name). Assert that surface too.
-        let tracing_unit = TRACING_UNIT.with(|cell| cell.borrow().clone());
+        // it — not even a legal unit name). Assert the REAL log text, not a
+        // stand-in for it.
         assert!(
-            tracing_unit.is_none(),
+            log.contains("RunCommand"),
+            "sanity: the subscriber must have captured something, or the \
+             assertion below would pass vacuously on an empty capture: {log:?}",
+        );
+        assert!(
+            !log.contains("unit="),
             "a rejected plugin id must not name a unit in the tracing line \
              either — an operator reading the shell's own log would see a unit \
-             `systemctl --user list-units` never has: {tracing_unit:?}",
+             `systemctl --user list-units` never has: {log}",
         );
     }
 
@@ -1867,22 +1986,16 @@ mod tests {
     /// invocation rather than as a timing flake.
     #[tokio::test]
     async fn detached_launch_timeout_never_retries() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let dir = tempfile::tempdir().expect("tempdir");
         let counter = dir.path().join("invocations");
         let stub = dir.path().join("stub.sh");
-        std::fs::write(
+        write_test_stub(
             &stub,
-            format!(
+            &format!(
                 "#!/bin/sh\necho invoked >> '{}'\nsleep 3\n",
                 counter.display()
             ),
-        )
-        .expect("write stub");
-        let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&stub, perms).expect("chmod stub");
+        );
 
         let unit = "trollshell-launch-ts964-timeout-1.service";
         let report = start_detached_with(
@@ -1910,14 +2023,21 @@ mod tests {
         assert!(text.contains(unit), "must name the unit: {text}");
 
         // #964 L-1 review: `.expect`, not `.unwrap_or_default()` — a missing
-        // file (the stub killed before its own `echo` landed) and a file
-        // proving a retry are different failures, and collapsing the first
-        // into "0 invocations" would print the retry-hazard message for what
-        // is actually a scheduling artifact of this test, not of the code
-        // under test. Measured headroom: 25 consecutive runs under concurrent
-        // `cargo build` load, 25/25 green at 338-377ms (the stub sleeps 3s and
-        // this test's own timeout is 300ms, so ~40ms is real slack for
-        // `/bin/sh` + one `echo`) — comfortably not the flaky case this guards.
+        // file and a file proving a retry are different failures, and
+        // collapsing the first into "0 invocations" would print the
+        // retry-hazard message for a failure that isn't one.
+        //
+        // A prior version of this comment claimed the missing-file case was
+        // only "the stub killed before its own `echo` landed" and measured
+        // 25/25 green as evidence it wouldn't happen — that framing turned
+        // out to be wrong, and the second-pass #964 review is the one that
+        // found why: the missing-file case observed in practice is
+        // `ETXTBSY` on the stub's own `execve` (`write_test_stub`'s doc has
+        // the mechanism), not a timing artifact of the sleep/timeout race at
+        // all. `write_test_stub` closes that specific hole, but this
+        // `.expect` still earns its keep for whatever other way a stub can
+        // fail to run — it turns "silently reads as zero retries" into a
+        // named panic either way.
         let invocations = std::fs::read_to_string(&counter)
             .expect("the stub must have recorded its invocation before the timeout fired");
         assert_eq!(

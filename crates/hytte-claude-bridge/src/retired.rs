@@ -381,7 +381,11 @@ fn sweep_stale_temp_files(path: &Path) {
             // tmp_path only ever writes ASCII.
             continue;
         };
-        if !file_name.starts_with(&prefix) || !file_name.ends_with(".tmp") {
+        if !file_name.starts_with(&prefix)
+            || !Path::new(file_name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+        {
             continue;
         }
         let stale = dir.join(file_name);

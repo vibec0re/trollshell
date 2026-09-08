@@ -228,7 +228,7 @@ mod tests {
             "ANTHROPIC_VERTEX_BASE_URL",
         ] {
             assert!(
-                offenders(|n| (n == name).then(|| String::new())).is_empty(),
+                offenders(|n| (n == name).then(String::new)).is_empty(),
                 "{name}"
             );
         }

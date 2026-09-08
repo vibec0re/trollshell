@@ -134,7 +134,13 @@ fn stripped(value: &toml::Value) -> toml::Value {
 /// Reported rather than logged: the merge has never seen a file name, and with
 /// three or four candidate layers in play an unattributed "your `_unset` is
 /// malformed" is close to useless.
+///
+/// `#[non_exhaustive]` because a third field is plausible — the layer it came
+/// from, if [`crate::subsystem::Loaded`] ever returns these the way it returns
+/// unknown keys (#1008) — and it costs nothing here: every construction site
+/// is inside this crate.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MalformedUnset {
     /// Dotted path of the offending marker, or of the offending element
     /// inside it: `_unset`, `core._unset`, `core._unset[1]`.
@@ -162,6 +168,12 @@ impl fmt::Display for MalformedUnset {
 /// so there is nothing under it to unset; #987), which makes its shape not a
 /// thing to complain about. Run this on each layer **before** merging: after
 /// the merge every marker is gone, well-formed or not.
+///
+/// [`MalformedUnset::key`] is a dotted path, so a quoted TOML key containing a
+/// literal `.` reads as a nesting separator here — the same ambiguity
+/// [`crate::subsystem::collect_paths`] documents. It is diagnostic-only in
+/// this direction: the worst case is a warning that points at a slightly wrong
+/// path, never a key acted on that should not have been.
 #[must_use]
 pub fn malformed_unset(table: &toml::Table) -> Vec<MalformedUnset> {
     let mut out = Vec::new();

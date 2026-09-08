@@ -325,9 +325,12 @@ pub(super) fn map_shader(scope: &Scope, grants: Grants, node: &ShaderNode<'_>) -
 ///
 /// # What it costs, stated
 ///
-/// One value comparison per mapping pass — which **replaces** a memcpy of the
-/// same size plus the memcmp `set_state` was doing anyway, and removes the GPU
-/// upload entirely. Strictly cheaper on every axis, not a trade.
+/// One value comparison per mapping pass, plus — on a hit — a [`Scope`] clone,
+/// an `id.to_owned()` for the touched set, and two hash lookups. That
+/// **replaces** a memcpy of the fragment and the buffer plus the memcmp
+/// `set_state` was doing anyway, and removes the GPU upload entirely. Far
+/// cheaper for anything but a tiny node; for a 64-byte demo tile the two are
+/// within noise of each other, which is the honest way to put it.
 ///
 /// # Anonymous nodes are not cached
 ///
@@ -337,6 +340,14 @@ pub(super) fn map_shader(scope: &Scope, grants: Grants, node: &ShaderNode<'_>) -
 /// anonymous shader therefore pays the old cost, which is one more reason
 /// [`Node::Shader`](hytte_plugin_proto::wire::Node::Shader)'s own docs recommend
 /// an id.
+///
+/// **Two shader nodes sharing one id in a tree defeat the cache the same way**,
+/// and more quietly: each pass overwrites the other's entry, so neither ever
+/// hits. The pixels stay correct — the states are rebuilt, not swapped — but the
+/// upload dedup never fires. That is the mild end of the same mistake
+/// `Warned::DuplicateId` warns about for preem nodes, where two widgets really
+/// do collapse onto one renderer; here it costs performance rather than
+/// correctness, which is why it is documented rather than diagnosed.
 fn shared_state(scope: &Scope, node: &ShaderNode<'_>, scale: u32) -> Arc<ShaderState> {
     let values = theme_values();
     let Some(id) = node.id else {
@@ -386,10 +397,31 @@ thread_local! {
     /// The per-scope, per-node-id shared states — see [`shared_state`].
     ///
     /// GTK-main-thread-only, like every other table in the mapping path.
-    /// Swept by [`end_pass`], which `wire_map::to_ui_node` calls at the close of
-    /// every mapping pass, and dropped wholesale by [`forget_scope`] when a
-    /// plugin leaves its region — the same lifecycle `preem_render`'s instance
-    /// table has, for the same reason.
+    ///
+    /// # The four release sites, enumerated
+    ///
+    /// This used to say "the same lifecycle `preem_render`'s instance table
+    /// has", which was true of three of that table's four sites and false of
+    /// the fourth — and the missing one leaked a whole shader state (source plus
+    /// buffer, up to 16 KiB + 4 MiB per node id) per departed plugin for the
+    /// life of the shell. Naming a lifecycle by reference is how that got
+    /// through, so the sites are listed rather than compared:
+    ///
+    /// 1. [`end_pass`] — swept per mapping pass; a node that left the tree drops
+    ///    its state at the close of the pass that stopped touching it. Called by
+    ///    `wire_map::to_ui_node`.
+    /// 2. `region::reconcile_region`'s retain loop — a card leaving its region.
+    ///    Covered by `card_leaving_its_region_releases_its_shader_states`.
+    /// 3. `region::forget_departed_panel_scope` / `forget_previous_panel_scope`
+    ///    — the drawer panel's half, refcounted across monitors.
+    /// 4. `pump::drive_scope_releaser` — **the one that was missing**. The
+    ///    region loops above are monitor-shaped, so with no monitor alive
+    ///    (a docked lid closing, every output unplugged) this #921 subscriber is
+    ///    the only thing that runs. Covered by
+    ///    `a_departing_plugin_releases_its_shader_states_with_no_region_alive`.
+    ///
+    /// A `forget_scope` on a scope holding nothing is a `HashMap` miss, so every
+    /// one of them is unconditional.
     static STATES: RefCell<HashMap<Scope, HashMap<String, Arc<ShaderState>>>> =
         RefCell::new(HashMap::new());
 

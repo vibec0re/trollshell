@@ -922,7 +922,7 @@ pub(super) fn clear_region_if_owned(
 /// whole binary suite still green.
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
-    use crate::plugins::shader_map::Grants;
+    use crate::plugins::shader_map::{self, Grants};
 
     use super::{
         Animator, MountedCard, Scope, SlotRender, build_panel_child, build_region,
@@ -1053,6 +1053,71 @@ mod gtk_tests {
             "a card leaving its region must release the tree's renderer instances, \
              not park them for the session",
         );
+    }
+
+    /// **The shader half of that release** (#968 second review, M1(e)).
+    ///
+    /// The three `shader_map::forget_scope` calls in this file sit beside their
+    /// `preem_render::forget_scope` partners, and until now *nothing* covered
+    /// them: deleting all three left the whole shipped suite green. That gap is
+    /// what let the fourth site — `pump`'s releaser — go missing in the first
+    /// place, so the lane gets a test rather than a second reading.
+    ///
+    /// A shader state is the expensive thing to leak: the source plus the whole
+    /// data buffer, up to 16 KiB + 4 MiB per node id.
+    ///
+    /// **Deletion check:** removing the `shader_map::forget_scope` call from
+    /// `reconcile_region`'s retain loop turns the final assertion red
+    /// (`left: 1, right: 0`).
+    #[gtk::test]
+    fn card_leaving_its_region_releases_its_shader_states() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+        let scope = Scope::card("shader-leaver");
+        shader_map::forget_scope(&scope);
+
+        let render = SlotRender {
+            plugin_id: "shader-leaver".to_owned(),
+            tree: shader_tree(),
+            panel: None,
+            grants: Grants::all(),
+            ..render_of("shader-leaver", &tx)
+        };
+        reconcile_region(&container, &cards, &[render], "ts-plugin-chip");
+        assert_eq!(
+            shader_map::cached_states(&scope),
+            1,
+            "the mounted card's shader node must have a cached state",
+        );
+
+        // The plugin disconnects: its render leaves the region's mailbox.
+        reconcile_region(&container, &cards, &[], "ts-plugin-chip");
+        assert!(cards.borrow().is_empty(), "the card itself must be gone");
+        assert_eq!(
+            shader_map::cached_states(&scope),
+            0,
+            "a card leaving its region must release its shader states — the \
+             source and the whole data buffer — not park them for the session",
+        );
+    }
+
+    /// A tree of one `Node::Shader` with a real buffer.
+    fn shader_tree() -> wire::Node {
+        wire::Node::Shader {
+            id: Some("tile".to_owned()),
+            width: 32,
+            height: 32,
+            scale: 1,
+            fragment: "void main() { fragColor = u_fg; }".to_owned(),
+            data: vec![0u8; 1024],
+            format: wire::ShaderData::R8,
+            data_width: 1024,
+            data_height: 1,
+            classes: vec![],
+            tooltip: None,
+        }
     }
 
     /// A tree of one **animating** preem node, at `speed` dots per second — `0.0`

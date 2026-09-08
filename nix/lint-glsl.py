@@ -44,12 +44,15 @@ Exactly what the shell compiles, assembled the same way:
     would be checking a source that never ships;
   * every other body is compiled as-is, at the stage its extension names;
   * **#893's shader widget** the same way: its vertex stage
-    (`crates/hytte-ui/src/shader_*.vert`) compiles as written, and every
-    plugin-supplied fragment *body* shipped in this tree (today
-    `crates/hytte-plugin-preem-demo/shaders/*.frag`) compiles with the
-    interface `SHADER_PREAMBLE` spliced in front of it — read out of
-    `shader_surface.rs`, so adding a uniform to the published contract changes
-    what this validates in the same commit.
+    (`crates/hytte-ui/src/shader_*.vert`) compiles as written, and **every**
+    plugin-supplied fragment *body* the crane filter ships — that is, every
+    `.frag` under `crates/` or `trollshell/` that `preem_gl/` does not already
+    own — compiles with the interface `SHADER_PREAMBLE` spliced in front of it,
+    read out of `shader_surface.rs`, so adding a uniform to the published
+    contract changes what this validates in the same commit. The scan is
+    tree-wide rather than convention-shaped because `nix/package.nix`'s filter
+    is `lib.hasSuffix ".frag"` with no directory constraint: anything narrower
+    leaves a shipped-but-unlinted hole.
 
 It refuses to pass vacuously, and every one of those guards is exit **2** (a
 broken check) rather than exit 1 (a broken shader): a missing header, a missing
@@ -108,19 +111,38 @@ WIDGET_SHADER_DIR = Path("crates/hytte-ui/src")
 PREAMBLE_SOURCE = WIDGET_SHADER_DIR / "shader_surface.rs"
 """The Rust file carrying `SHADER_PREAMBLE`, read rather than duplicated."""
 
-# Directories holding plugin-supplied fragment **bodies** shipped in this tree.
-# Each `.frag` under one of these is compiled as `header + preamble + body`,
-# which is exactly what `ShaderSurface::draw` hands the driver.
+# Plugin-supplied fragment **bodies** shipped in this tree. Each is compiled as
+# `header + preamble + body`, which is exactly what `ShaderSurface::draw` hands
+# the driver.
 #
-# **Globbed, not listed** (#968 review L5). `nix/package.nix`'s crane filter is
-# `lib.hasSuffix ".frag"` with no directory constraint, so it ships *every*
-# `.frag` in the tree; a hardcoded one-entry list here meant a second plugin
-# adding `crates/hytte-plugin-foo/shaders/x.frag` would ship **unlinted**, with
-# no floor moving to say so — exactly the "one silently stops covering a file
-# the other ships" hazard `nix/package.nix`'s own comment warns about. The glob
-# and the filter now agree by construction: any crate that puts widget bodies in
-# a `shaders/` directory is covered the day it lands.
-WIDGET_BODY_DIRS = sorted(Path("crates").glob("*/shaders"))
+# **Every `.frag` the crane filter ships, minus the ones another rule already
+# owns.** This is the third spelling and the reason is worth keeping: the filter
+# in `nix/package.nix` is `lib.hasSuffix ".frag"` with *no* directory
+# constraint, so anything else here leaves a shipped-but-unlinted hole. A
+# one-entry literal list missed a second plugin's `shaders/` dir entirely; a
+# `crates/*/shaders` glob still missed `crates/<crate>/src/stray.frag` and
+# `trollshell/shaders/stray2.frag`, both measured shipping green (#968 second
+# review, L5 residual). Scanning the whole tree is the only spelling that agrees
+# with the filter *by construction* rather than by convention.
+#
+# The two carve-outs are rules, not exceptions: `preem_gl/` is compiled by the
+# preem half above (as-written, or with its `concat!` splice), and anything
+# under a build/output directory is not source.
+WIDGET_BODY_ROOTS = [Path("crates"), Path("trollshell")]
+WIDGET_BODY_EXCLUDE_DIRS = {"preem_gl", "target"}
+
+
+def widget_bodies() -> list[Path]:
+    """Every `.frag` the crane filter ships that the preem half does not own."""
+    found: list[Path] = []
+    for root in WIDGET_BODY_ROOTS:
+        if not root.is_dir():
+            fail(f"{root} is missing — wrong root, or the workspace moved")
+        for path in root.rglob("*.frag"):
+            if WIDGET_BODY_EXCLUDE_DIRS.isdisjoint(part for part in path.parts):
+                found.append(path)
+    return sorted(found)
+
 
 # Floors, on the same "current counts, not counts-with-headroom" rule as
 # MIN_SHADERS above: a lint that tolerates a missing file cannot tell a deletion
@@ -331,7 +353,7 @@ def main() -> int:
     failures = 0
     compiled = 0
     widget_stages = 0
-    widget_bodies = 0
+    widget_body_count = 0
     with tempfile.TemporaryDirectory() as tmp:
         staged_index = 0
 
@@ -378,30 +400,30 @@ def main() -> int:
         for path in sorted(WIDGET_SHADER_DIR.glob("shader_*.vert")):
             widget_stages += 1
             compile_assembled(f"{path.name} (widget vertex stage)", "", path)
-        if not WIDGET_BODY_DIRS:
-            fail(
-                "no `crates/*/shaders` directory found — wrong root, or every "
-                "plugin's widget bodies moved. The crane filter still ships any "
-                "`.frag` in the tree, so a silent empty scan here is the hazard "
-                "this floor exists to catch"
-            )
-        for directory in WIDGET_BODY_DIRS:
-            if not directory.is_dir():
-                fail(f"{directory} is missing — wrong root, or a demo's shaders moved")
-            unknown = [p for p in sorted(directory.rglob("*")) if p.is_file() and p.suffix != ".frag"]
+        # A `shaders/` directory is the *convention* for widget bodies, and
+        # this keeps it honest: a non-`.frag` file in one is a file whose stage
+        # nobody has decided, and it would ship only if it were a `.frag`.
+        for directory in sorted(Path("crates").glob("*/shaders")):
+            unknown = [
+                q for q in sorted(directory.rglob("*")) if q.is_file() and q.suffix != ".frag"
+            ]
             if unknown:
                 fail(
                     "a shader-widget body directory may hold only `.frag` bodies (they are "
                     "compiled with the fragment preamble in front); found: "
-                    f"{', '.join(str(p) for p in unknown)}"
+                    f"{', '.join(str(q) for q in unknown)}"
                 )
-            for path in sorted(directory.rglob("*.frag")):
-                widget_bodies += 1
-                compile_assembled(f"{path.name} (widget body)", preamble, path)
+        # …but the *scan* is every `.frag` the crane filter ships, wherever it
+        # sits, because that filter has no directory constraint. Paths are
+        # printed in full: with the scan tree-wide, a bare filename no longer
+        # says which crate it came from.
+        for path in widget_bodies():
+            widget_body_count += 1
+            compile_assembled(f"{path} (widget body)", preamble, path)
 
     print(
         f"lint-glsl: {compiled} shader compilation(s) "
-        f"({widget_stages} widget stage(s), {widget_bodies} widget body(ies)), {failures} failed"
+        f"({widget_stages} widget stage(s), {widget_body_count} widget body(ies)), {failures} failed"
     )
     if compiled < MIN_COMPILATIONS:
         fail(
@@ -414,9 +436,9 @@ def main() -> int:
             f"the `shader_*.vert` scan of {WIDGET_SHADER_DIR} found nothing, so #893's "
             "vertex stage went unchecked"
         )
-    if widget_bodies < MIN_WIDGET_BODIES:
+    if widget_body_count < MIN_WIDGET_BODIES:
         fail(
-            f"only {widget_bodies} shader-widget body(ies), expected ≥ {MIN_WIDGET_BODIES} — "
+            f"only {widget_body_count} shader-widget body(ies), expected ≥ {MIN_WIDGET_BODIES} — "
             "a bundled plugin's fragment body went missing, so the one artifact proving "
             "the #893 contract compiles was never compiled"
         )

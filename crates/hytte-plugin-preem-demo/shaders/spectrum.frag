@@ -50,7 +50,15 @@ void main() {
     // The ink breathes between the skin's own lit ink and the desktop accent,
     // which is a live demonstration that both reach the shader: change the
     // desktop accent with this card open and the warm half of the cycle moves.
-    vec3 ink = mix(u_fg.rgb, u_accent.rgb, 0.5 + 0.5 * sin(u_time * 0.6));
+    //
+    // 2π/9 rad/s — a **9-second** period, and 9 divides 3600, so the cycle is
+    // continuous across `u_time`'s hourly wrap. The contract states that rule
+    // and this is the reference shader a plugin author copies, so it had better
+    // obey it: at the previous `0.6` (period 10.47 s, not a divisor) the ink
+    // stepped from "almost all u_fg" to "half accent" in one frame, once an
+    // hour. Nothing can lint this — pick a rate `2π·k/3600`, or drive motion
+    // from `fract(u_time / P)` with `P` dividing 3600, as the beam above does.
+    vec3 ink = mix(u_fg.rgb, u_accent.rgb, 0.5 + 0.5 * sin(u_time * 0.6981317));
 
     vec3 color = mix(u_bg.rgb, ink, lit * 0.85);
     color = mix(color, u_accent.rgb, cap * 0.9);

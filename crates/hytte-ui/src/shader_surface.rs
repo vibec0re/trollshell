@@ -35,6 +35,15 @@
 //! synchronously, inside the render callback: there is no window in which the
 //! widget is "compiling", so nothing has to hold a previous frame across one.
 //!
+//! Both of those bounds are per **source**, and the journal one remembers the
+//! last [`WARNED_SOURCES`] of them (a one-entry latch let two broken sources
+//! alternating write a line every frame — #968's second review). The case
+//! neither bounds is a plugin that *generates* its body wrongly, producing a
+//! fresh key every frame: that writes a line and pays a compile per frame, by
+//! construction, and no cache keyed on the source can help it. Stated rather
+//! than left as "one line for as long as it keeps sending it", which stopped
+//! being the whole truth when the latch grew a bound.
+//!
 //! # When it repaints
 //!
 //! On state change, and only on state change — see the
@@ -322,7 +331,23 @@ struct Failure<E> {
     key: u64,
 }
 
-/// A one-shot-per-source journal latch.
+/// How many distinct failed sources a [`WarnLatch`] remembers.
+///
+/// Small and fixed. The latch is a *bound on the log*, and a one-entry MRU is
+/// not one: two broken sources alternating each evict the other, so every frame
+/// writes a line (#968 second review, M2 residual — measured at 10 lines for 10
+/// alternating frames). Eight covers alternation and any realistic hand-written
+/// set of broken shaders, in 64 bytes.
+///
+/// It is deliberately **not** unbounded. A plugin that *generates* its body
+/// wrongly — a counter in a comment is enough — produces a fresh key every
+/// frame, and remembering them all would be a slow leak keyed by the plugin's
+/// own bug. Such a plugin writes a line per frame either way, because it also
+/// forces a recompile per frame by construction; the FIFO keeps the memory
+/// bounded and the diagnostic honest about what it is seeing.
+const WARNED_SOURCES: usize = 8;
+
+/// A journal latch over the last [`WARNED_SOURCES`] failed source keys.
 ///
 /// A bare `bool` was the bug (#968 review M2): set on the first compile failure
 /// and never cleared, it silenced the *second* distinct broken shader entirely —
@@ -331,21 +356,33 @@ struct Failure<E> {
 /// sequence (break, fix, break differently) is inside the contract rather than
 /// exotic, and the diagnostic it swallows is the one the whole
 /// "broken shader → placeholder + one warning" story rests on.
+///
+/// A one-entry MRU was the *second* bug, in the other direction: it bounded the
+/// log only while at most one broken source was in play. A bounded FIFO closes
+/// both — one line per distinct broken source, with alternation staying quiet.
 #[derive(Debug, Default)]
 struct WarnLatch {
-    /// The source key the last line was written for.
-    said: Option<u64>,
+    /// The keys already reported, oldest first. At most [`WARNED_SOURCES`].
+    said: std::collections::VecDeque<u64>,
 }
 
 impl WarnLatch {
     /// Whether to write a line for `key`: `true` the first time this key is
-    /// seen, `false` for every repeat of the *same* key, `true` again for a
-    /// different one.
+    /// seen, `false` for every repeat of a key still remembered.
+    ///
+    /// A key evicted by [`WARNED_SOURCES`] can be reported a second time. That
+    /// is the cost of the bound, and it is the right way round: over-reporting a
+    /// shader that has been broken, replaced eight times over and broken again
+    /// the same way is a journal line; under-reporting is a blank widget nobody
+    /// is told about.
     fn claim(&mut self, key: u64) -> bool {
-        if self.said == Some(key) {
+        if self.said.contains(&key) {
             return false;
         }
-        self.said = Some(key);
+        if self.said.len() == WARNED_SOURCES {
+            self.said.pop_front();
+        }
+        self.said.push_back(key);
         true
     }
 }
@@ -827,6 +864,13 @@ pub fn would_upload(held: Option<&Arc<[u8]>>, incoming: &Arc<[u8]>) -> bool {
 /// continuous across the wrap. A shader with a period that does *not* divide it
 /// jumps once an hour; that is the documented cost, stated in the contract, and
 /// it is a far smaller one than degrading forever.
+///
+/// **Nothing can lint that rule**, and the bundled reference shader broke it on
+/// its first outing — `crates/hytte-plugin-preem-demo/shaders/spectrum.frag`
+/// used `sin(u_time * 0.6)` (period 10.47 s), which stepped the ink colour in
+/// one frame at every wrap. It now uses `2π/9` and says why, because the demo is
+/// what a plugin author copies. If this constant ever moves, that file is the
+/// one to re-check.
 const TIME_WRAP_SECS: f64 = 3600.0;
 
 /// Seconds since this surface's first frame, wrapped to [`TIME_WRAP_SECS`].
@@ -900,8 +944,8 @@ impl Default for ShaderSurface {
 #[cfg(test)]
 mod tests {
     use super::{
-        Arc, ProgramCache, SHADER_PREAMBLE, SHADER_VERT, ShaderFormat, TIME_WRAP_SECS, WarnLatch,
-        first_line, source_key, would_upload, wrapped_seconds,
+        Arc, ProgramCache, SHADER_PREAMBLE, SHADER_VERT, ShaderFormat, TIME_WRAP_SECS,
+        WARNED_SOURCES, WarnLatch, first_line, source_key, would_upload, wrapped_seconds,
     };
 
     /// A counting builder, standing in for `hgl::Program::compile`. The cache is
@@ -1123,9 +1167,33 @@ mod tests {
 
     // ── #968 review fixes ────────────────────────────────────────────────────
 
+    /// A journal line for `source`, if the shipped composition would write one.
+    ///
+    /// Drives `ProgramCache::ensure` **and** `WarnLatch::claim` exactly the way
+    /// `draw` does — the latch is asked only on the `Err` arm, never for a
+    /// source that compiled. Written as a helper because the previous version of
+    /// this test called `claim()` for a *good* source to stand in for the fixed
+    /// shader in between, which the shell never does; its final assertion then
+    /// pinned behaviour production cannot reach (#968 second review).
+    fn compile_and_maybe_warn(
+        cache: &mut ProgramCache<u32>,
+        latch: &mut WarnLatch,
+        builder: &Builder,
+        source: &str,
+        broken: bool,
+    ) -> bool {
+        let source: Arc<str> = Arc::from(source);
+        builder.fail.set(broken);
+        match cache.ensure(&source, |s| builder.build(s)) {
+            Ok(_) => false,
+            Err(failure) => latch.claim(failure.key),
+        }
+    }
+
     /// **M2.** The journal latch is keyed by **source**, so a plugin that ships
     /// a broken shader, fixes it, then breaks it *differently* gets a line for
-    /// each break.
+    /// each break — driven through the shipped composition rather than by
+    /// poking `claim` directly.
     ///
     /// The bug this replaces was a `Cell<bool>` set on the first failure and
     /// never cleared: the second distinct broken source was compiled, failed,
@@ -1134,31 +1202,99 @@ mod tests {
     /// the diagnostic it swallowed is the one the whole
     /// "broken shader → placeholder + one warning" story rests on.
     ///
+    /// **A → good B → A stays silent**, and that is the stated rule rather than
+    /// an accident: a successful compile never reaches the latch, so A is still
+    /// remembered when it comes back. It was already reported, and the *compile*
+    /// is retried either way (`ensure` clears `failed` on the good build).
+    ///
     /// **Falsified** by making [`WarnLatch::claim`] a one-way bool (`if
-    /// self.said.is_some() { return false }`): the third assertion goes red,
-    /// which is exactly the shipped-bug behaviour.
+    /// !self.said.is_empty() { return false }`): the "SECOND broken source"
+    /// assertion goes red, which is exactly the shipped-bug behaviour.
     #[test]
     fn the_compile_warning_latch_is_per_source_not_per_surface() {
-        let mut latch = WarnLatch::default();
-        let (a, b, c) = (
-            source_key("broken A"),
-            source_key("fine B"),
-            source_key("broken C"),
-        );
+        const A: &str = "void main() { fragColourA = u_fg; }";
+        const B: &str = "void main() { fragColor = u_fg; }";
+        const C: &str = "void main() { fragColourC = u_fg; }";
 
-        assert!(latch.claim(a), "the first broken source is reported");
-        for _ in 0..8 {
-            assert!(!latch.claim(a), "…and then goes quiet while it persists");
-        }
-        // A source that compiled never reaches the latch — this stands in for
-        // the fixed shader in between, and shows the latch is not a counter.
-        assert!(latch.claim(b), "a different key is a different line");
+        let builder = Builder::default();
+        let mut cache: ProgramCache<u32> = ProgramCache::default();
+        let mut latch = WarnLatch::default();
+
         assert!(
-            latch.claim(c),
+            compile_and_maybe_warn(&mut cache, &mut latch, &builder, A, true),
+            "the first broken source is reported",
+        );
+        for _ in 0..8 {
+            assert!(
+                !compile_and_maybe_warn(&mut cache, &mut latch, &builder, A, true),
+                "…and then goes quiet while it persists",
+            );
+        }
+        assert!(
+            !compile_and_maybe_warn(&mut cache, &mut latch, &builder, B, false),
+            "a source that compiles writes no failure line at all",
+        );
+        assert!(
+            compile_and_maybe_warn(&mut cache, &mut latch, &builder, C, true),
             "a SECOND broken source must be reported, not swallowed",
         );
-        assert!(!latch.claim(c), "…once");
-        assert!(latch.claim(a), "and the first one again, if it comes back");
+        assert!(
+            !compile_and_maybe_warn(&mut cache, &mut latch, &builder, C, true),
+            "…once",
+        );
+        assert!(
+            !compile_and_maybe_warn(&mut cache, &mut latch, &builder, A, true),
+            "and A, already reported, stays quiet when it comes back",
+        );
+    }
+
+    /// **M2 residual (#968 second review).** Two broken sources **alternating**
+    /// cost two journal lines in total, not one per frame.
+    ///
+    /// A one-entry MRU bounded the log only while at most one broken source was
+    /// in play: alternation evicted the other key every frame, so every frame
+    /// wrote a line — measured at 10 for 10 frames. The bound is what the latch
+    /// is *for*, so it has to hold under the case a one-slot cache breaks on.
+    ///
+    /// **Falsified** by shrinking [`WARNED_SOURCES`] to `1`: the first count is
+    /// 10.
+    #[test]
+    fn two_broken_sources_alternating_cost_two_lines() {
+        const A: &str = "void main() { fragColourA = u_fg; }";
+        const B: &str = "void main() { fragColourB = u_fg; }";
+
+        let builder = Builder::default();
+        let mut cache: ProgramCache<u32> = ProgramCache::default();
+        let mut latch = WarnLatch::default();
+
+        let mut lines = 0_u32;
+        for frame in 0..10 {
+            let source = if frame % 2 == 0 { A } else { B };
+            if compile_and_maybe_warn(&mut cache, &mut latch, &builder, source, true) {
+                lines += 1;
+            }
+        }
+        assert_eq!(lines, 2, "two distinct broken sources, two lines");
+
+        // The bound holds, and it is the right way round: `WARNED_SOURCES` more
+        // distinct broken sources evict A, so A is reported a *second* time
+        // rather than blanking the widget in silence.
+        for n in 0..WARNED_SOURCES {
+            let source = format!("void main() {{ fragColour{n} = u_fg; }}");
+            if compile_and_maybe_warn(&mut cache, &mut latch, &builder, &source, true) {
+                lines += 1;
+            }
+        }
+        assert_eq!(
+            lines as usize,
+            2 + WARNED_SOURCES,
+            "each new distinct broken source is reported once",
+        );
+        assert!(
+            compile_and_maybe_warn(&mut cache, &mut latch, &builder, A, true),
+            "A was evicted by the bound, so it is reported again rather than \
+             silently blanking the widget",
+        );
     }
 
     /// **L2.** A source whose hash collides with a latched-**failed** key is

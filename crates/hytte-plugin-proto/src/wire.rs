@@ -646,7 +646,11 @@ pub enum Node {
     ///   on it would judder and then freeze on a long-running desktop. Any
     ///   period that divides 3600 (a second, four seconds, a minute, ten
     ///   minutes) is continuous across the wrap; one that does not jumps once an
-    ///   hour.
+    ///   hour. Nothing checks this for you — pick a rate of `2π·k/3600` for a
+    ///   sine, or drive motion from `fract(u_time / P)` with `P` dividing 3600.
+    ///   The bundled reference shader
+    ///   (`crates/hytte-plugin-preem-demo/shaders/spectrum.frag`) obeys the rule
+    ///   in both of its animations and says so at each.
     /// - **It restarts when the widget is unmapped and remapped**, because the
     ///   surface's GL objects and its epoch go together and a remap is genuinely
     ///   a new first frame.
@@ -768,6 +772,12 @@ pub enum ShaderData {
     R8,
     /// Four unsigned bytes per texel in `[R, G, B, A]` order, straight (not
     /// premultiplied) alpha, each sampled in `0.0..=1.0` (`GL_RGBA8`).
+    ///
+    /// **The data grid is straight; the output is premultiplied.** So
+    /// `fragColor = texture(u_data, uv)` on a partially transparent `Rgba8`
+    /// grid is the one composition the contract does not do for you — write
+    /// `vec4(c.rgb * c.a, c.a)` instead. Fully opaque texels (the common case)
+    /// pass through unchanged either way.
     Rgba8,
     /// One little-endian IEEE-754 `f32` per texel — four bytes — sampled
     /// verbatim in `.r`, unclamped (`GL_R32F`). The format for a signal that is

@@ -407,6 +407,14 @@ file:
 ~/.config/trollshell/anthropic.key      # chmod 600; trimmed, empty == unset
 ```
 
+**`api` mode's live path is deliberately unverified (#752).** It builds a
+`POST /v1/messages` request against the Anthropic API and is billed per
+token. Its request/response handling is covered by unit tests, but the live
+path has never been exercised against a real key by the maintainers — no
+request built by this code has been sent to the API. Treat it as
+best-effort; if you run it with a real key and it misbehaves, open an issue
+with the response (redact the key).
+
 `CLAUDE_BRIDGE_THINKING` (`disabled` by default, or `adaptive` / `auto`) is
 `api`-mode-only and load-bearing there: `max_tokens` bounds thinking _plus_
 answer text, and these consumers ask for only a couple of hundred tokens of

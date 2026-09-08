@@ -509,16 +509,18 @@ in
       # ordinary way, which is the replacement for the pre-#866
       # `systemd.user.services.…Service.Environment` escape hatch.
       #
-      # ── SECURITY CONTROL — the billing scrub, carried across ────────────────
-      # The retired unit's `UnsetEnvironment=` listed the four variables that
-      # would silently move `claude` off the subscription and onto metered API
-      # credits (or Bedrock/Vertex). A transient `systemd-run` unit has no
-      # `UnsetEnvironment=`, so the scrub is re-expressed here as four EMPTY
-      # `env` values, which is equivalent for every consumer that reads them:
+      # ── SECURITY CONTROL — the billing/redirect scrub, carried across ───────
+      # The retired unit's `UnsetEnvironment=` listed the variables that would
+      # silently move `claude` off the subscription — onto metered API
+      # credits, a cloud provider's billing (Bedrock/Vertex/Foundry), or a
+      # different endpoint entirely (#994). A transient `systemd-run` unit has
+      # no `UnsetEnvironment=`, so the scrub is re-expressed here as EMPTY
+      # `env` values for each of them, which is equivalent for every consumer
+      # that reads them:
       #
       #   * envguard (crates/hytte-claude-bridge/src/envguard.rs `redirects`)
-      #     treats an empty credential and an empty boolean flag alike as
-      #     NOT a redirect, so the bridge starts;
+      #     treats an empty credential, an empty boolean flag, and an empty
+      #     endpoint override alike as NOT a redirect, so the bridge starts;
       #   * `messages::load_key_from` falls through an empty ANTHROPIC_API_KEY
       #     to ~/.config/trollshell/anthropic.key, exactly as under the unit;
       #   * the launcher appends injected secrets as `--setenv`s AFTER the
@@ -529,7 +531,7 @@ in
       # WITHOUT this, anyone with ANTHROPIC_API_KEY exported in their user
       # manager's environment gets a bridge that refuses to start in the DEFAULT
       # mode, restart-loops, and hits systemd's start limit. Do not drop these
-      # four lines. They are also why `secrets` below can be declared in `api`
+      # lines. They are also why `secrets` below can be declared in `api`
       # mode without contradiction: the scrub sets the floor, the injection
       # overrides it, and in the `claude` modes nothing overrides it.
       (lib.mkIf cb.enable {
@@ -542,13 +544,17 @@ in
               CLAUDE_BRIDGE_MODE = cb.mode;
               CLAUDE_BRIDGE_PORT = toString cb.port;
               CLAUDE_BRIDGE_TIMEOUT_SECS = toString cb.timeoutSeconds;
-              # The billing scrub — see the block comment above. Empty, not
-              # absent: `--setenv=K=` overrides whatever the user manager
-              # inherited, which is the whole job.
+              # The billing/redirect scrub — see the block comment above.
+              # Empty, not absent: `--setenv=K=` overrides whatever the user
+              # manager inherited, which is the whole job.
               ANTHROPIC_API_KEY = "";
               ANTHROPIC_AUTH_TOKEN = "";
               CLAUDE_CODE_USE_BEDROCK = "";
               CLAUDE_CODE_USE_VERTEX = "";
+              CLAUDE_CODE_USE_FOUNDRY = "";
+              ANTHROPIC_BASE_URL = "";
+              ANTHROPIC_BEDROCK_BASE_URL = "";
+              ANTHROPIC_VERTEX_BASE_URL = "";
               # Belt-and-braces dummy key. Nothing in the bridge reads it (it is
               # keyless and validates no bearer at all); the copy that actually
               # prevents a leak is the one on the CONSUMING plugin, because

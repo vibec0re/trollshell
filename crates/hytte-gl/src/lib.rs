@@ -652,8 +652,7 @@ impl Texture {
             Format::R32f,
             "upload_u8 wants a byte-typed texture"
         );
-        let wanted =
-            (self.width as usize) * (self.height as usize) * self.format.bytes_per_texel();
+        let wanted = (self.width as usize) * (self.height as usize) * self.format.bytes_per_texel();
         let mut staged;
         let data = if bytes.len() == wanted {
             bytes

@@ -237,7 +237,10 @@ fn wire_node_maps_to_ui_node_exhaustively() {
         ],
         tooltip: Some("the whole card".into()),
     };
-    assert_eq!(to_ui_node(&Scope::detached("map"), Grants::none(), &tree), expected);
+    assert_eq!(
+        to_ui_node(&Scope::detached("map"), Grants::none(), &tree),
+        expected
+    );
 }
 
 /// The list nodes map field-for-field: `Row`/`ListBox` recurse their
@@ -294,7 +297,10 @@ fn wire_row_listbox_text_map_to_ui() {
             ],
         }],
     };
-    assert_eq!(to_ui_node(&Scope::detached("map"), Grants::none(), &tree), expected);
+    assert_eq!(
+        to_ui_node(&Scope::detached("map"), Grants::none(), &tree),
+        expected
+    );
 }
 
 /// The #333 `Expander` maps 1:1: the boxed `header` and the body `children`
@@ -335,7 +341,10 @@ fn wire_expander_maps_to_ui() {
         expanded: true,
         classes: vec!["boxed-list".into()],
     };
-    assert_eq!(to_ui_node(&Scope::detached("map"), Grants::none(), &tree), expected);
+    assert_eq!(
+        to_ui_node(&Scope::detached("map"), Grants::none(), &tree),
+        expected
+    );
 }
 
 #[test]
@@ -375,7 +384,10 @@ fn wire_entry_maps_to_ui() {
         placeholder: "type a command…".into(),
         classes: vec!["monospace".into()],
     };
-    assert_eq!(to_ui_node(&Scope::detached("map"), Grants::none(), &tree), expected);
+    assert_eq!(
+        to_ui_node(&Scope::detached("map"), Grants::none(), &tree),
+        expected
+    );
 }
 
 /// Every wire `Page` maps to the identically-named `modal::Page` in the
@@ -3297,7 +3309,10 @@ fn the_cpu_arm_still_emits_the_kits_own_bytes_as_a_pixels_node() {
     let node = preem_node(Some("sc"), gl_scope_widget(samples.clone()));
 
     assert!(
-        matches!(to_ui_node(&key, Grants::none(), &node), UiNode::Pixels { .. }),
+        matches!(
+            to_ui_node(&key, Grants::none(), &node),
+            UiNode::Pixels { .. }
+        ),
         "with the kill switch on, a Scope is a raster surface",
     );
     let mut oracle = kit::Scope::with_size(48, 24).scale(2).persistence(184);
@@ -3595,7 +3610,10 @@ fn a_failed_gl_context_rebuilds_the_scope_onto_the_cpu_kit() {
         let node = preem_node(Some("sc"), gl_scope_widget(samples.clone()));
 
         assert!(
-            matches!(to_ui_node(&key, Grants::none(), &node), UiNode::GlSurface { .. }),
+            matches!(
+                to_ui_node(&key, Grants::none(), &node),
+                UiNode::GlSurface { .. }
+            ),
             "the GL arm is chosen while a context is still possible",
         );
         let before = preem_render::probe(&key, Some("sc")).expect("the instance exists");
@@ -3603,7 +3621,10 @@ fn a_failed_gl_context_rebuilds_the_scope_onto_the_cpu_kit() {
         hytte::ui::gl_surface::abandon_gl("no GL in this test");
 
         assert!(
-            matches!(to_ui_node(&key, Grants::none(), &node), UiNode::Pixels { .. }),
+            matches!(
+                to_ui_node(&key, Grants::none(), &node),
+                UiNode::Pixels { .. }
+            ),
             "a lost context drops the scope to the raster arm",
         );
         let after = preem_render::probe(&key, Some("sc")).expect("the instance survives");
@@ -3668,7 +3689,10 @@ fn a_settled_gl_scope_falls_back_without_waiting_for_a_frame_that_never_comes() 
         );
 
         assert!(
-            matches!(to_ui_node(&key, Grants::none(), &node), UiNode::GlSurface { .. }),
+            matches!(
+                to_ui_node(&key, Grants::none(), &node),
+                UiNode::GlSurface { .. }
+            ),
             "the GL arm is chosen while a context is still possible",
         );
         // The premise, and the reason the animating path cannot save this one.
@@ -3697,7 +3721,10 @@ fn a_settled_gl_scope_falls_back_without_waiting_for_a_frame_that_never_comes() 
         // …and what it now produces is the kit's own frame, from a fresh
         // phosphor: the GL arm never drew a trail there was anything to inherit.
         assert!(
-            matches!(to_ui_node(&key, Grants::none(), &node), UiNode::Pixels { .. }),
+            matches!(
+                to_ui_node(&key, Grants::none(), &node),
+                UiNode::Pixels { .. }
+            ),
             "a lost context drops even a settled scope to the raster arm",
         );
         let mut oracle = kit::Scope::with_size(48, 24).scale(2).persistence(256);
@@ -4962,7 +4989,11 @@ fn a_tree_deeper_than_the_depth_cap_is_walked_to_the_cap_and_warns_once() {
     // `unwrap_or(Spacer)` is reachable at all. Its own scope, so the latch above
     // does not hide its line.
     let buttons = Scope::detached("depth-cap-buttons");
-    let mapped = to_ui_node(&buttons, Grants::none(), &button_chain(wire::MAX_TREE_DEPTH + 1));
+    let mapped = to_ui_node(
+        &buttons,
+        Grants::none(),
+        &button_chain(wire::MAX_TREE_DEPTH + 1),
+    );
     assert!(
         matches!(mapped, UiNode::Spacer),
         "a Button's child is not optional, so the refused level takes every ancestor down \
@@ -5217,7 +5248,8 @@ fn an_unrenderable_preem_widget_degrades_to_an_empty_surface() {
         },
     );
 
-    let degraded = preem_render::with_unsupported_widgets(|| to_ui_node(&scope, Grants::none(), &node));
+    let degraded =
+        preem_render::with_unsupported_widgets(|| to_ui_node(&scope, Grants::none(), &node));
     assert_eq!(
         degraded,
         UiNode::Pixels {
@@ -8001,5 +8033,130 @@ async fn assert_launched_then_clean_up(report: &LaunchReport) {
                 "the launched program must still be running after the effect returned",
             );
         }
+    }
+}
+
+/// **`wire_map`'s own `Shader` arm** (#893): the field plumbing from
+/// `wire::Node::Shader` into the `ShaderNode` view `shader_map` reads.
+///
+/// `shader_map`'s tests cover the policy and the mapping; this covers the ten
+/// lines between them, which are exactly the kind that transpose a pair. A
+/// swapped `width`/`height`, a `data_width` fed from `width`, or a dropped
+/// `scale` would leave every other test in the tree green — the reconciler node
+/// would simply be the wrong shape, and no assertion anywhere else looks at it.
+///
+/// Deliberately asymmetric numbers on every axis (144 ≠ 48, 8 ≠ 2, scale 3) so
+/// a transposition cannot coincide.
+///
+/// **Falsified** by swapping `width`/`height` or `data_width`/`data_height` in
+/// `wire_map`'s arm, or by passing `node.scale` where `1` is expected.
+#[test]
+fn a_wire_shader_node_maps_its_fields_across_intact() {
+    let data: Vec<u8> = (0u8..16).collect();
+    let tree = wire::Node::Shader {
+        id: Some("spectrum".into()),
+        width: 144,
+        height: 48,
+        scale: 3,
+        fragment: "void main() { fragColor = u_accent; }".into(),
+        data: data.clone(),
+        format: wire::ShaderData::Rgba8,
+        data_width: 2,
+        data_height: 2,
+        classes: vec!["ts-shader".into()],
+        tooltip: Some("dropped on purpose — the reconciler node carries none".into()),
+    };
+
+    let scope = Scope::detached("wire-shader");
+    match to_ui_node(&scope, Grants::all(), &tree) {
+        UiNode::Shader {
+            id,
+            width,
+            height,
+            state,
+            classes,
+        } => {
+            assert_eq!(id.as_deref(), Some("spectrum"));
+            assert_eq!((width, height), (144 * 3, 48 * 3), "size × the scale hint");
+            assert_eq!(state.scale, 3, "…and the hint itself reaches the shader");
+            assert_eq!(&*state.fragment, "void main() { fragColor = u_accent; }");
+            assert_eq!(&*state.data, &data[..]);
+            assert_eq!(state.data_size, (2, 2), "the data grid, not the surface");
+            assert_eq!(state.format, hytte::ui::ShaderFormat::Rgba8);
+            assert_eq!(classes, vec!["ts-shader".to_owned()]);
+        }
+        other => panic!("mapped to {other:?}"),
+    }
+}
+
+/// The same node from a plugin that never declared `Capability::Shader` maps to
+/// the broken-widget placeholder, **and its siblings still render** — the
+/// property that makes this a degradation rather than a dropped frame.
+///
+/// **Falsified** by returning `None` from `map_node`'s `Shader` arm on a
+/// refusal: the placeholder disappears and the `Box` comes back one child
+/// short, which is the failure mode this file's whole posture rejects.
+#[test]
+fn an_ungranted_shader_degrades_without_taking_its_siblings() {
+    let tree = wire::Node::Box {
+        id: Some("root".into()),
+        dir: wire::Dir::Vertical,
+        spacing: 0,
+        scroll: false,
+        classes: vec![],
+        children: vec![
+            wire::Node::Label {
+                id: Some("before".into()),
+                text: "before".into(),
+                classes: vec![],
+                tooltip: None,
+            },
+            wire::Node::Shader {
+                id: Some("denied".into()),
+                width: 32,
+                height: 32,
+                scale: 1,
+                fragment: "void main() { fragColor = u_fg; }".into(),
+                data: vec![0, 0, 0, 0],
+                format: wire::ShaderData::Rgba8,
+                data_width: 1,
+                data_height: 1,
+                classes: vec!["ts-shader".into()],
+                tooltip: None,
+            },
+            wire::Node::Label {
+                id: Some("after".into()),
+                text: "after".into(),
+                classes: vec![],
+                tooltip: None,
+            },
+        ],
+        tooltip: None,
+    };
+
+    let scope = Scope::detached("wire-shader-denied");
+    match to_ui_node(&scope, Grants::none(), &tree) {
+        UiNode::Box { children, .. } => {
+            assert_eq!(children.len(), 3, "the tree keeps its shape");
+            assert!(matches!(&children[0], UiNode::Label { text, .. } if text == "before"));
+            assert!(matches!(&children[2], UiNode::Label { text, .. } if text == "after"));
+            match &children[1] {
+                UiNode::Pixels {
+                    id,
+                    width,
+                    height,
+                    data,
+                    classes,
+                    ..
+                } => {
+                    assert_eq!(id.as_deref(), Some("denied"), "the key survives");
+                    assert_eq!((*width, *height), (0, 0), "an empty surface");
+                    assert!(data.is_empty());
+                    assert_eq!(classes, &vec!["ts-shader".to_owned()], "CSS chrome stays");
+                }
+                other => panic!("the refused node mapped to {other:?}"),
+            }
+        }
+        other => panic!("mapped to {other:?}"),
     }
 }

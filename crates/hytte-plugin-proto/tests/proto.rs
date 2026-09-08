@@ -5,11 +5,11 @@
 use hytte_plugin_proto::{
     AudioAction, Capability, ClockState, ConsentDecision, DEFAULT_SLIDER_MAX, DEFAULT_SLIDER_MIN,
     DEFAULT_SLIDER_STEP_FRACTION, DatasourceError, DatasourceOutcome, Dir, Effect, EffectOutcome,
-    EventKind, HostMsg, LedStripConfig, LedStripState, LogLevel, MAX_FRAME_LEN, Manifest,
-    MediaAction, Mount, NiriAction, Node, PROTO_VERSION, Page, PluginMsg, PreemWidget, ProtoError,
-    MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, ProvidedDatasource, SHADER_VOCAB, ShaderData,
-    SliderFloats, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode,
-    encode_body, sane_fraction, sane_slider_floats,
+    EventKind, HostMsg, LedStripConfig, LedStripState, LogLevel, MAX_FRAME_LEN,
+    MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Manifest, MediaAction, Mount, NiriAction, Node,
+    PROTO_VERSION, Page, PluginMsg, PreemWidget, ProtoError, ProvidedDatasource, SHADER_VOCAB,
+    ShaderData, SliderFloats, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode,
+    decode_body, encode, encode_body, sane_fraction, sane_slider_floats,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -2466,10 +2466,12 @@ fn shader_data_lengths_are_checked_in_wide_arithmetic() {
 fn the_shader_hygiene_caps_keep_their_settled_numbers() {
     assert_eq!(MAX_SHADER_SOURCE_BYTES, 16 * 1024, "16 KiB of source");
     assert_eq!(MAX_SHADER_DATA_BYTES, 4 * 1024 * 1024, "4 MiB of data");
-    assert!(
-        MAX_SHADER_DATA_BYTES < MAX_FRAME_LEN,
-        "the data cap must bite before the frame limit does",
-    );
+    const {
+        assert!(
+            MAX_SHADER_DATA_BYTES < MAX_FRAME_LEN,
+            "the data cap must bite before the frame limit does",
+        );
+    }
 }
 
 /// #893's generation is **3**, it bumps the census `VOCAB`, and it leaves

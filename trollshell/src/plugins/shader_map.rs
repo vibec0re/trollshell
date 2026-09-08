@@ -18,7 +18,8 @@
 //! `$XDG_RUNTIME_DIR`, so anything that can send a frame already runs as the
 //! user, and a shader is exactly as trusted as the plugin's own native code.
 //!
-//! So what lives here is a capability check and three cheap shape checks. There
+//! So what lives here is a capability check, a "does this session still have GL"
+//! check, and four cheap shape checks. There
 //! is **no source validator**, and that is a measured absence rather than a
 //! todo: naga — the one Rust GLSL frontend in reach — cannot parse the ES
 //! profile at all (`#version 300/310/320 es` each come back `InvalidVersion` +
@@ -37,9 +38,9 @@
 
 use std::sync::Arc;
 
+use hytte::ui::Node as UiNode;
 use hytte::ui::gl_surface::GlValue;
 use hytte::ui::shader_surface::{ShaderFormat, ShaderState};
-use hytte::ui::Node as UiNode;
 use hytte_plugin_proto::wire::{MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, ShaderData};
 use hytte_plugin_proto::{Capability, Manifest};
 use hytte_preem as kit;
@@ -82,6 +83,12 @@ impl Grants {
     pub(super) fn none() -> Self {
         Self::default()
     }
+
+    /// Every grant — the test spelling of a manifest that declared them all.
+    #[cfg(test)]
+    pub(super) fn all() -> Self {
+        Self { shader: true }
+    }
 }
 
 /// A borrowed view of a [`wire::Node::Shader`]'s fields, so the checks below
@@ -111,8 +118,7 @@ pub(super) struct ShaderNode<'a> {
 ///
 /// A closed enum rather than a `bool` + a log line, because the *decision* is
 /// what a hermetic test can assert (CI has no GL and cannot look at the pixels)
-/// and because two of these five want different journal lines pointing at
-/// different fixes.
+/// and because they want different journal lines pointing at different fixes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Refusal {
     /// The plugin's manifest does not declare [`Capability::Shader`].
@@ -137,39 +143,91 @@ pub(super) enum Refusal {
     /// but nothing to draw and nothing to sample, so it takes the placeholder
     /// rather than allocating a degenerate texture.
     EmptyGrid,
+    /// GL has been abandoned for this process — a context failed to create, and
+    /// `hytte-ui` latched it.
+    ///
+    /// The one refusal here that is nobody's mistake, and the one with **no
+    /// fallback**: a kit widget has a CPU implementation to fall back to and the
+    /// shader widget has none by design (Annika, #893: "EGL should be available
+    /// for all targets"). So the node takes the placeholder rather than mounting
+    /// a `GtkGLArea` that can never draw — which would also pay for a fresh
+    /// failed context per shader node, per monitor, per frame.
+    NoGl,
+}
+
+/// Whether this process still has GL, as far as the mapping pass is concerned.
+///
+/// A two-state enum rather than a `bool` so [`refusal`] cannot be called with
+/// the sense inverted, and so it reads at the call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GlAvailability {
+    /// No context failure has been observed.
+    Available,
+    /// A context failed to create and `hytte-ui` latched it for the process.
+    Abandoned,
+}
+
+impl GlAvailability {
+    /// What `hytte-ui` currently says. GTK-main-thread-local, like the latch
+    /// itself.
+    fn current() -> Self {
+        if hytte::ui::gl_surface::gl_abandoned() {
+            Self::Abandoned
+        } else {
+            Self::Available
+        }
+    }
 }
 
 impl Refusal {
     /// Which one-shot diagnostic slot this refusal claims.
     ///
-    /// Two slots, not five: "you did not ask for the capability" and "your node
-    /// is out of shape" are the two different mistakes with two different fixes,
-    /// and a tree that makes both gets told both once. Splitting the three shape
-    /// refusals further would spend three of the eight bits
-    /// [`Warned`](super::preem_render::Warned) has on one node kind.
+    /// Two slots, not six: "you did not ask for the capability" and "this node
+    /// will not draw" are the two different messages, and a tree that trips both
+    /// gets told both once. Splitting the four remaining refusals further would
+    /// spend four of the eight bits [`Warned`](super::preem_render::Warned) has
+    /// on one node kind — and their journal lines already name which one fired,
+    /// which is what an operator actually reads.
+    ///
+    /// [`NoGl`](Refusal::NoGl) shares the shape slot even though it is nobody's
+    /// mistake, because `hytte-ui` has already logged the context failure once
+    /// for the process; this line's job is only to say *which widgets* went
+    /// quiet as a result.
     fn slot(self) -> Warned {
         match self {
             Self::NoCapability => Warned::ShaderDenied,
             Self::SourceTooLarge { .. }
             | Self::DataTooLarge { .. }
             | Self::MalformedData { .. }
-            | Self::EmptyGrid => Warned::ShaderCap,
+            | Self::EmptyGrid
+            | Self::NoGl => Warned::ShaderCap,
         }
     }
 }
 
 /// Whether this node may be drawn, and if not, why.
 ///
-/// Pure, so the whole policy is testable without GTK, without GL and without a
-/// socket — which matters because every one of these paths ends in "the same
-/// empty placeholder", and the pixels cannot tell them apart.
+/// Pure — `gl` is passed in rather than read from
+/// [`gl_abandoned`](hytte::ui::gl_surface::gl_abandoned) here — so the whole
+/// policy is testable without GTK, without GL and without a socket, which
+/// matters because every one of these paths ends in "the same empty
+/// placeholder" and the pixels cannot tell them apart.
 ///
-/// Order is deliberate: the capability first, because a plugin that may not draw
-/// shaders at all should be told *that* rather than told its buffer is the wrong
-/// length. After that, cheapest check first.
-pub(super) fn refusal(grants: Grants, node: &ShaderNode<'_>) -> Option<Refusal> {
+/// Order is deliberate. The capability comes first, because a plugin that may
+/// not draw shaders at all should be told *that* rather than told its buffer is
+/// the wrong length, and because it is the one refusal here the plugin author
+/// can fix. `gl` comes second for the mirror reason: it is the one nobody can.
+/// After that, cheapest check first.
+pub(super) fn refusal(
+    grants: Grants,
+    gl: GlAvailability,
+    node: &ShaderNode<'_>,
+) -> Option<Refusal> {
     if !grants.shader {
         return Some(Refusal::NoCapability);
+    }
+    if gl == GlAvailability::Abandoned {
+        return Some(Refusal::NoGl);
     }
     if node.fragment.len() > MAX_SHADER_SOURCE_BYTES {
         return Some(Refusal::SourceTooLarge {
@@ -198,7 +256,7 @@ pub(super) fn refusal(grants: Grants, node: &ShaderNode<'_>) -> Option<Refusal> 
 /// Map one shader node, applying [`refusal`] and — where it says yes — building
 /// the [`ShaderState`] the widget draws from.
 pub(super) fn map_shader(scope: &Scope, grants: Grants, node: &ShaderNode<'_>) -> UiNode {
-    if let Some(refused) = refusal(grants, node) {
+    if let Some(refused) = refusal(grants, GlAvailability::current(), node) {
         warn(scope, node, refused);
         return placeholder(node);
     }
@@ -302,6 +360,15 @@ fn warn(scope: &Scope, node: &ShaderNode<'_>, refused: Refusal) {
             "plugin Shader has a zero-sized surface or data grid; rendering the placeholder \
              (further occurrences in this tree are silenced)",
         ),
+        Refusal::NoGl => tracing::warn!(
+            plugin = scope.plugin_id(),
+            tree = ?scope.role(),
+            node = ?node.id,
+            "no OpenGL context in this session, so this plugin's Shader nodes render the \
+             broken-widget placeholder — unlike a preem widget there is no CPU arm to fall \
+             back to, by design. hytte-ui has already logged the context failure itself \
+             (further occurrences in this tree are silenced)",
+        ),
     }
 }
 
@@ -350,9 +417,8 @@ fn theme_values() -> Vec<(&'static str, GlValue)> {
         || kit::palette_snapshot(style),
     );
     let roles = preem_render::role_inks();
-    let role = |ink: Option<kit::Rgba>| {
-        ink.map_or(palette.ink, |ink| style.admit_role_ink(ink, None))
-    };
+    let role =
+        |ink: Option<kit::Rgba>| ink.map_or(palette.ink, |ink| style.admit_role_ink(ink, None));
     vec![
         ("u_bg", rgba(palette.bg)),
         ("u_fg", rgba(base.ink)),
@@ -381,8 +447,8 @@ fn rgba(color: kit::Rgba) -> GlValue {
 #[cfg(test)]
 mod tests {
     use super::{
-        Grants, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Refusal, ShaderData, ShaderNode,
-        Warned, map_shader, refusal, theme_values,
+        GlAvailability, Grants, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Refusal,
+        ShaderData, ShaderNode, Warned, map_shader, refusal, theme_values,
     };
     use crate::plugins::preem_render::{self, Scope};
     use hytte::ui::Node as UiNode;
@@ -417,15 +483,25 @@ mod tests {
     fn a_shader_without_the_capability_is_refused_first() {
         let data = [1u8, 2, 3, 4];
         let node = ok_node("void main() { fragColor = u_fg; }", &data);
-        assert_eq!(refusal(Grants::none(), &node), Some(Refusal::NoCapability));
-        assert_eq!(refusal(granted(), &node), None, "granted, it draws");
+        assert_eq!(
+            refusal(Grants::none(), GlAvailability::Available, &node),
+            Some(Refusal::NoCapability)
+        );
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, &node),
+            None,
+            "granted, it draws"
+        );
 
         // Even a node that is *also* malformed is reported as the capability
         // problem: telling a plugin its buffer is short when it may not draw
         // shaders at all sends it after the wrong bug.
         let mut broken = ok_node("void main() {}", &data);
         broken.data_size = (99, 99);
-        assert_eq!(refusal(Grants::none(), &broken), Some(Refusal::NoCapability));
+        assert_eq!(
+            refusal(Grants::none(), GlAvailability::Available, &broken),
+            Some(Refusal::NoCapability)
+        );
     }
 
     /// **The 16 KiB source cap**, at the boundary: exactly at the cap draws,
@@ -437,11 +513,18 @@ mod tests {
     fn the_source_cap_bites_one_byte_over() {
         let data = [0u8];
         let at_cap = "x".repeat(MAX_SHADER_SOURCE_BYTES);
-        assert_eq!(refusal(granted(), &ok_node(&at_cap, &data)), None);
+        assert_eq!(
+            refusal(
+                granted(),
+                GlAvailability::Available,
+                &ok_node(&at_cap, &data)
+            ),
+            None
+        );
 
         let over = "x".repeat(MAX_SHADER_SOURCE_BYTES + 1);
         assert_eq!(
-            refusal(granted(), &ok_node(&over, &data)),
+            refusal(granted(), GlAvailability::Available, &ok_node(&over, &data)),
             Some(Refusal::SourceTooLarge {
                 bytes: MAX_SHADER_SOURCE_BYTES + 1
             }),
@@ -456,13 +539,13 @@ mod tests {
         let at_cap = vec![0u8; MAX_SHADER_DATA_BYTES];
         let mut node = ok_node("void main() {}", &at_cap);
         node.data_size = (u32::try_from(MAX_SHADER_DATA_BYTES).unwrap(), 1);
-        assert_eq!(refusal(granted(), &node), None);
+        assert_eq!(refusal(granted(), GlAvailability::Available, &node), None);
 
         let over = vec![0u8; MAX_SHADER_DATA_BYTES + 1];
         let mut node = ok_node("void main() {}", &over);
         node.data_size = (u32::try_from(MAX_SHADER_DATA_BYTES + 1).unwrap(), 1);
         assert_eq!(
-            refusal(granted(), &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::DataTooLarge {
                 bytes: MAX_SHADER_DATA_BYTES + 1
             }),
@@ -484,10 +567,14 @@ mod tests {
         let mut node = ok_node("void main() {}", &four);
         node.format = ShaderData::Rgba8;
         node.data_size = (1, 1);
-        assert_eq!(refusal(granted(), &node), None, "1 Rgba8 texel is 4 bytes");
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, &node),
+            None,
+            "1 Rgba8 texel is 4 bytes"
+        );
         node.data_size = (2, 1);
         assert_eq!(
-            refusal(granted(), &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::MalformedData { bytes: 4 }),
             "2 Rgba8 texels want 8",
         );
@@ -495,10 +582,14 @@ mod tests {
         let mut node = ok_node("void main() {}", &sixteen);
         node.format = ShaderData::R32f;
         node.data_size = (4, 1);
-        assert_eq!(refusal(granted(), &node), None, "4 f32 texels are 16 bytes");
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, &node),
+            None,
+            "4 f32 texels are 16 bytes"
+        );
         node.data_size = (4, 2);
         assert_eq!(
-            refusal(granted(), &node),
+            refusal(granted(), GlAvailability::Available, &node),
             Some(Refusal::MalformedData { bytes: 16 }),
         );
     }
@@ -512,12 +603,59 @@ mod tests {
         let empty: [u8; 0] = [];
         let mut node = ok_node("void main() {}", &empty);
         node.data_size = (0, 0);
-        assert_eq!(refusal(granted(), &node), Some(Refusal::EmptyGrid));
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, &node),
+            Some(Refusal::EmptyGrid)
+        );
 
         let data = [0u8];
         let mut node = ok_node("void main() {}", &data);
         node.width = 0;
-        assert_eq!(refusal(granted(), &node), Some(Refusal::EmptyGrid));
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, &node),
+            Some(Refusal::EmptyGrid)
+        );
+    }
+
+    /// **No GL, no shader** — and, unlike a kit widget, no CPU arm to fall back
+    /// to: the widget is GPU-only by design (#893, Annika: "EGL should be
+    /// available for all targets"), so a session whose context failed renders
+    /// the placeholder rather than mounting a `GtkGLArea` that can never draw.
+    ///
+    /// Checked **after** the capability so a plugin missing it is still told the
+    /// thing it can fix, and **before** the shape checks so a session with no GL
+    /// does not report a buffer length nobody was going to read.
+    ///
+    /// **Falsified** by deleting the `gl == Abandoned` guard: the first
+    /// assertion becomes `None` and the node mounts a doomed GL area on every
+    /// frame, on every monitor.
+    #[test]
+    fn an_abandoned_gl_session_refuses_every_shader() {
+        let data = [1u8, 2, 3, 4];
+        let node = ok_node("void main() { fragColor = u_fg; }", &data);
+        assert_eq!(
+            refusal(granted(), GlAvailability::Abandoned, &node),
+            Some(Refusal::NoGl),
+        );
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, &node),
+            None,
+            "with a context it draws",
+        );
+        assert_eq!(
+            refusal(Grants::none(), GlAvailability::Abandoned, &node),
+            Some(Refusal::NoCapability),
+            "the plugin-fixable refusal still wins",
+        );
+
+        // A malformed node in a GL-less session reports the session, not the
+        // buffer: there is nothing to read the buffer *with*.
+        let mut broken = ok_node("void main() {}", &data);
+        broken.data_size = (99, 99);
+        assert_eq!(
+            refusal(granted(), GlAvailability::Abandoned, &broken),
+            Some(Refusal::NoGl),
+        );
     }
 
     /// **Every refusal renders the placeholder**, keeping the node's id and
@@ -527,8 +665,18 @@ mod tests {
     /// refused on every frame and every monitor, so an unlatched warning is one
     /// line per frame per monitor for the life of the shell.
     ///
-    /// **Falsified** by returning the real node from `map_shader` on a refusal
-    /// (the first assertion), or by dropping the `warn_once` guard (the count).
+    /// **Falsified** by returning the real node from [`map_shader`] on a
+    /// refusal (the first assertion), or by deleting the `warn(…)` call
+    /// entirely (the count drops to 0).
+    ///
+    /// **What it does not prove, measured rather than assumed:** the *latch* at
+    /// this call site. [`preem_render::warnings`] counts the times `warn_once`
+    /// **claimed** the latch, not the times a line was written, so replacing
+    /// `if warn_once(…) { … }` with `let _ = warn_once(…); …` still reads 1 —
+    /// verified green. That convention ("every call site is
+    /// `if warn_once(scope, what) { tracing::warn!(…) }` and nothing else") is
+    /// stated on `warn_once` itself and held by inspection here, exactly as it
+    /// is for the five diagnostics that predate this one.
     #[test]
     fn a_refused_shader_renders_the_placeholder_and_warns_once() {
         let classes = ["ts-shader".to_owned()];

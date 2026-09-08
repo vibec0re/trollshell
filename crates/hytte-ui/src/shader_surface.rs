@@ -242,13 +242,9 @@ impl<P> ProgramCache<P> {
         // state cache hands the same allocation back on a re-map, then the hash,
         // then the bytes — cheapest test first, and the last one is what makes a
         // hash collision a slow path rather than a wrong picture.
-        if self
-            .held
-            .as_ref()
-            .is_some_and(|(held_key, source, _)| {
-                *held_key == key && (Arc::ptr_eq(source, fragment) || **source == **fragment)
-            })
-        {
+        if self.held.as_ref().is_some_and(|(held_key, source, _)| {
+            *held_key == key && (Arc::ptr_eq(source, fragment) || **source == **fragment)
+        }) {
             return Ok(self.held.as_ref().map(|(_, _, program)| program));
         }
         if self.failed == Some(key) {
@@ -278,7 +274,10 @@ impl<P> ProgramCache<P> {
 /// extract. One line keeps a broken shader a journal *line* rather than a
 /// journal *page*, and the full log is one `RUST_LOG=debug` away.
 fn first_line(log: &str) -> &str {
-    log.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("(no driver diagnostic)")
+    log.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("(no driver diagnostic)")
 }
 
 mod imp {
@@ -606,7 +605,6 @@ mod imp {
                 vao: hgl::VertexArray::new(gl),
             })
         }
-
     }
 
     /// Re-allocate the data texture if the grid or the format moved, then
@@ -798,7 +796,10 @@ mod tests {
             Some(1)
         );
         assert_eq!(
-            cache.ensure(&second, |s| builder.build(s)).unwrap().copied(),
+            cache
+                .ensure(&second, |s| builder.build(s))
+                .unwrap()
+                .copied(),
             Some(2),
             "a new source links a new program"
         );

@@ -2374,7 +2374,7 @@ fn print_frozen_node_hex() {
 #[test]
 fn preem_is_a_negotiated_generation_not_an_unconditional_one() {
     assert_eq!(PREEM_VOCAB, 2, "the preem vocabulary is generation 2");
-    assert!(VOCAB >= PREEM_VOCAB, "the census counts it");
+    const { assert!(VOCAB >= PREEM_VOCAB, "the census counts it") };
     assert_eq!(
         VOCAB_UNCONDITIONAL, 1,
         "…but a plugin must not emit Node::Preem without an advertisement, so the \

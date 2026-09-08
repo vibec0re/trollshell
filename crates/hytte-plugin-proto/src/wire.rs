@@ -598,9 +598,9 @@ pub enum Node {
     /// | `u_data` | `sampler2D` | the data buffer, **nearest**-filtered, clamped |
     /// | `u_data_size` | `vec2` | `(data_width, data_height)`, in texels |
     /// | `u_bg` | `vec4` | the skin's screen field |
-    /// | `u_fg` | `vec4` | the skin's lit ink, accent-tinted as the kit tints it |
-    /// | `u_accent` | `vec4` | the desktop accent, or `u_fg` where none is installed |
-    /// | `u_success`, `u_warning`, `u_error` | `vec4` | the status roles, admitted to be legible on the skin's ground |
+    /// | `u_fg` | `vec4` | the skin's **own** lit ink, un-tinted |
+    /// | `u_accent` | `vec4` | the same ink as the desktop accent tints it — what an un-pinned preem widget draws with. Equal to `u_fg` when no accent is installed, or on a skin that declines to follow one |
+    /// | `u_success`, `u_warning`, `u_error` | `vec4` | the status roles, admitted to be legible on the skin's ground (#940) |
     ///
     /// The single output is `out vec4 fragColor`, declared by the preamble and
     /// **not** by the body. Colours are non-premultiplied straight alpha in
@@ -648,7 +648,9 @@ pub enum Node {
     ///   placeholder, because they cost nothing. `data.len()` must equal
     ///   `data_width * data_height * format.bytes_per_texel()` — the invariant
     ///   [`Pixels`](Node::Pixels) already carries. A compile or link error draws
-    ///   nothing and logs the driver's info log once.
+    ///   nothing and logs the driver's first info-log line once. A session whose
+    ///   GL context failed renders the placeholder too — there is no CPU arm to
+    ///   fall back to, which is what "GPU-only by design" costs.
     /// - **Not enforced, deliberately.** No source validator: naga cannot parse
     ///   GLSL ES at all (`#version 300/310/320 es` each fail `InvalidVersion` +
     ///   `InvalidProfile("es")`, measured twice independently), so route 1's
@@ -773,7 +775,11 @@ impl ShaderData {
     pub fn data_len_ok(self, width: u32, height: u32, data_len: usize) -> bool {
         let expected = u64::from(width)
             .checked_mul(u64::from(height))
-            .and_then(|n| u64::try_from(self.bytes_per_texel()).ok().and_then(|per| n.checked_mul(per)));
+            .and_then(|n| {
+                u64::try_from(self.bytes_per_texel())
+                    .ok()
+                    .and_then(|per| n.checked_mul(per))
+            });
         expected == u64::try_from(data_len).ok()
     }
 }

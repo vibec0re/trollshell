@@ -2159,7 +2159,17 @@ mod diff_tests {
     /// a `GlSurface` and hit the `downcast` expect — the "kind invariant"
     /// panic — on the first frame after a flip.
     ///
-    /// **Falsified** by mapping `Node::GlSurface` to `NodeKind::Pixels`.
+    /// **Falsified** by dropping the `&& prev[i].kind == nk.kind` clause from
+    /// [`plan_diff`]'s keyed lookup: both directions then reuse.
+    ///
+    /// (An earlier version of this note claimed "falsified by mapping
+    /// `Node::GlSurface` to `NodeKind::Pixels`". Measured while writing the
+    /// `Shader` twin below: that mutation leaves this test **green**, because
+    /// it builds its `ChildKey`s by hand and never calls `node_kind`. Corrected
+    /// rather than left standing — in a tree where these claims are the review
+    /// currency, a wrong one costs more than a missing one. The `node_kind`
+    /// mapping is covered by
+    /// [`a_gl_surface_node_carries_its_kind_id_and_classes`] above.)
     #[test]
     fn a_gl_surface_never_reuses_a_pixels_widget() {
         let prev = vec![key(Some("scope"), NodeKind::Pixels)];
@@ -2213,20 +2223,28 @@ mod diff_tests {
             format: crate::shader_surface::ShaderFormat::R8,
             data_size: (4, 1),
             scale: 1,
-            values: vec![("u_fg", crate::gl_surface::GlValue::Vec4([1.0, 1.0, 1.0, 1.0]))],
+            values: vec![(
+                "u_fg",
+                crate::gl_surface::GlValue::Vec4([1.0, 1.0, 1.0, 1.0]),
+            )],
         })
     }
 
     /// A `Shader` node reports its own kind and carries its id and classes
-    /// through the three shallow accessors every diff pass reads — the sites a
-    /// new `Node` variant is silently *missed* at, because `node_id` and
-    /// `node_classes` both end in an `or`-pattern arm that compiles perfectly
-    /// well without the new variant listed.
+    /// through the three shallow accessors every diff pass reads.
     ///
-    /// **Falsified** by dropping `Node::Shader` from `node_id`'s or
-    /// `node_classes`' arm: the node lands in `Separator | Spacer`'s "no id, no
-    /// classes" bucket, every shader chip in a tree keys as `(None, Shader)`,
-    /// and they swap widgets — and compiled programs — on any insert.
+    /// **Falsified** three ways, each measured rather than assumed:
+    ///
+    /// - `node_kind` returning `NodeKind::Pixels` for `Node::Shader` — the
+    ///   first assertion. (This is the *only* test that covers that mapping;
+    ///   `a_shader_never_reuses_a_pixels_or_gl_surface_widget` below builds its
+    ///   `ChildKey`s by hand and stays green through it — verified.)
+    /// - **Moving** `Node::Shader` into `node_id`'s `Separator | Spacer => None`
+    ///   arm. Simply *omitting* it is a compile error — both matches are
+    ///   exhaustive — so the reachable mistake is the wrong arm, which compiles
+    ///   and silently keys every shader chip in a tree as `(None, Shader)`; they
+    ///   then swap widgets, and compiled programs, on any insert.
+    /// - The same move into `node_classes`' `Revealer | Spacer => &[]` arm.
     #[test]
     fn a_shader_node_carries_its_kind_id_and_classes() {
         let node = Node::Shader {
@@ -2255,8 +2273,17 @@ mod diff_tests {
     /// side: it is also a `GtkGLArea` subclass, so nothing but the kind stops
     /// them being confused.
     ///
-    /// **Falsified** by mapping `Node::Shader` to `NodeKind::Pixels` (or to
-    /// `NodeKind::GlSurface`): the corresponding pair reuses.
+    /// **Falsified** by dropping the `&& prev[i].kind == nk.kind` clause from
+    /// [`plan_diff`]'s keyed lookup: both pairs then reuse. (Not by editing
+    /// `ChildKey`'s `PartialEq` — `plan_diff` compares the `kind` fields
+    /// directly and never uses that impl, measured; a mutation there leaves this
+    /// green.)
+    ///
+    /// **What it does not cover, stated rather than implied:** this builds its
+    /// `ChildKey`s directly, so it says nothing about `node_kind` — mapping
+    /// `Node::Shader` to `NodeKind::Pixels` leaves it green, measured, not
+    /// assumed. That mapping is
+    /// [`a_shader_node_carries_its_kind_id_and_classes`]'s first assertion.
     #[test]
     fn a_shader_never_reuses_a_pixels_or_gl_surface_widget() {
         for neighbour in [NodeKind::Pixels, NodeKind::GlSurface] {
@@ -2264,7 +2291,11 @@ mod diff_tests {
             let next = vec![key(Some("chip"), NodeKind::Shader)];
             let plan = plan_diff(&prev, &next);
             assert_eq!(plan.ops, vec![SlotOp::Create], "{neighbour:?} → Shader");
-            assert_eq!(plan.removals, vec![0], "the {neighbour:?} widget is torn down");
+            assert_eq!(
+                plan.removals,
+                vec![0],
+                "the {neighbour:?} widget is torn down"
+            );
 
             // …and back the other way, which is the placeholder path.
             let back = plan_diff(&next, &prev);

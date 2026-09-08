@@ -63,7 +63,9 @@
 //! [`fits_data_cap`] are the pure predicates, and
 //! [`testing::with_shader_support`] forces the negotiation.
 
-use crate::proto::{MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Node, SHADER_VOCAB, ShaderData};
+use crate::proto::{
+    MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Node, SHADER_VOCAB, ShaderData,
+};
 
 /// Whether this session's host advertised the shader vocabulary (#893) — i.e.
 /// whether [`negotiated_vocab`](crate::display::negotiated_vocab) has reached
@@ -255,8 +257,8 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Node, Shader, ShaderData,
-        fits_data_cap, fits_source_cap, host_speaks_shader, testing::with_shader_support,
+        MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Node, Shader, ShaderData, fits_data_cap,
+        fits_source_cap, host_speaks_shader, testing::with_shader_support,
     };
 
     const BODY: &str = "void main() { fragColor = u_accent; }";
@@ -387,7 +389,10 @@ mod tests {
                 other => panic!("built {other:?}"),
             }
 
-            let anon = Shader::new("gone", BODY).anonymous().node().expect("builds");
+            let anon = Shader::new("gone", BODY)
+                .anonymous()
+                .node()
+                .expect("builds");
             match anon {
                 Node::Shader { id, .. } => assert_eq!(id, None),
                 other => panic!("built {other:?}"),

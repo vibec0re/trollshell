@@ -49,9 +49,8 @@ use hytte_plugin_proto::{
     Mechanism, MediaAction, Mount, NiriAction, Node, NowPlaying, PROTO_VERSION, Page,
     PeakHoldConfig, PluginMsg, PreemWidget, ProvidedDatasource, SPECTRUM_BINS, ScopeConfig,
     ScopeState, SevenSegConfig, SevenSegState, ShaderData, StateKey, StateSnapshot, StyleName,
-    StyleRef,
-    TextBoxConfig, TextBoxState, TextBoxWidth, UpcomingEvent, VOCAB, VOCAB_UNCONDITIONAL, decode,
-    encode, preem, preem_id, preem_styled,
+    StyleRef, TextBoxConfig, TextBoxState, TextBoxWidth, UpcomingEvent, VOCAB, VOCAB_UNCONDITIONAL,
+    decode, encode, preem, preem_id, preem_styled,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;

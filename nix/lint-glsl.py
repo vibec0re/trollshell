@@ -26,8 +26,10 @@ runs the reference ES compiler over the shipped sources at build time, adds
 zero `Cargo.lock` entries, and goes red in seconds on a cold checkout.
 
 #893's own trust boundary — validating an untrusted plugin's shader at
-*runtime*, before it reaches the driver — is a different problem with a
-different answer, and this script does not solve it.
+*runtime*, before it reaches the driver — is a different problem, and it was
+answered by deciding there is no such validator: the plugin socket is the
+boundary (route 0), naga cannot read a plugin's ES shader anyway, and this
+script only ever sees sources that live in this tree.
 
 WHAT IT CHECKS
 --------------
@@ -40,7 +42,14 @@ Exactly what the shell compiles, assembled the same way:
     `BLUR_DIR`) is compiled once per splice, with the splice text, because
     that body does not compile on its own — and compiling it "as written"
     would be checking a source that never ships;
-  * every other body is compiled as-is, at the stage its extension names.
+  * every other body is compiled as-is, at the stage its extension names;
+  * **#893's shader widget** the same way: its vertex stage
+    (`crates/hytte-ui/src/shader_*.vert`) compiles as written, and every
+    plugin-supplied fragment *body* shipped in this tree (today
+    `crates/hytte-plugin-preem-demo/shaders/*.frag`) compiles with the
+    interface `SHADER_PREAMBLE` spliced in front of it — read out of
+    `shader_surface.rs`, so adding a uniform to the published contract changes
+    what this validates in the same commit.
 
 It refuses to pass vacuously, and every one of those guards is exit **2** (a
 broken check) rather than exit 1 (a broken shader): a missing header, a missing
@@ -81,6 +90,35 @@ SHADER_DIR = Path("trollshell/src/plugins/preem_gl")
 HEADER_SOURCE = Path("crates/hytte-ui/src/gl_surface.rs")
 PROGRAM_SOURCE = SHADER_DIR / "program.rs"
 
+# ── #893's shader widget ─────────────────────────────────────────────────────
+#
+# A plugin's fragment body is assembled differently: header + the interface
+# PREAMBLE + the body, with no vertex stage of its own. Bodies that live in this
+# tree get compiled here for the same reason the preem ones do — a typo would
+# otherwise ship green and surface as an empty rect on glass, with only a
+# journal line to say so.
+#
+# A plugin's *runtime* source is a different problem with a different answer and
+# this script does not touch it: #893 settled that the plugin socket is the
+# trust boundary, so there is no runtime validator at all (and naga, the only
+# Rust GLSL frontend in reach, cannot parse the ES profile anyway).
+WIDGET_SHADER_DIR = Path("crates/hytte-ui/src")
+"""Where the widget's own **vertex** stage lives — compiled as written."""
+
+PREAMBLE_SOURCE = WIDGET_SHADER_DIR / "shader_surface.rs"
+"""The Rust file carrying `SHADER_PREAMBLE`, read rather than duplicated."""
+
+# Directories holding plugin-supplied fragment **bodies** shipped in this tree.
+# Each `.frag` under one of these is compiled as `header + preamble + body`,
+# which is exactly what `ShaderSurface::draw` hands the driver.
+WIDGET_BODY_DIRS = [Path("crates/hytte-plugin-preem-demo/shaders")]
+
+# Floors, on the same "current counts, not counts-with-headroom" rule as
+# MIN_SHADERS above: a lint that tolerates a missing file cannot tell a deletion
+# from a tidy-up.
+MIN_WIDGET_STAGES = 1  # shader_fullscreen.vert
+MIN_WIDGET_BODIES = 1  # the preem demo's spectrum.frag
+
 # The floors. These are the **current** counts, not counts-with-headroom, and
 # the difference is the point: a lint that tolerates one missing file cannot
 # tell a deletion from a tidy-up. Adding a shader means bumping the number in
@@ -94,10 +132,16 @@ PROGRAM_SOURCE = SHADER_DIR / "program.rs"
 MIN_SHADERS = 6
 # Compilations, not files: `scope_blur.frag` is one body compiled twice. A
 # splice that stops being found (a moved `include_str!` path, a `concat!` this
-# script's parser stops recognising) drops this to 6 — today that shows up as a
+# script's parser stops recognising) drops this — today that shows up as a
 # compile failure only because the body happens not to build without its
 # splice, which is luck rather than a guard.
-MIN_COMPILATIONS = 7
+#
+# Since #893 this counts all three groups (6 preem files → 7 compilations, plus
+# 1 widget stage and 1 widget body). Bumped 7 → 9 with them rather than left
+# with two compilations of slack: the whole point of a floor at the current
+# count is that it cannot tolerate a deletion, and the two per-group floors
+# below do not add up to this one on their own.
+MIN_COMPILATIONS = 9
 # Distinct bodies that must be spliced rather than compiled as written.
 MIN_SPLICED_BODIES = 1
 
@@ -148,6 +192,35 @@ def read_header() -> str:
     if "#version" not in header:
         fail(f"GLSL_HEADER carries no `#version` directive: {header!r}")
     return header
+
+
+def read_preamble() -> str:
+    """The `SHADER_PREAMBLE` const, as `ShaderSurface::draw` splices it (#893).
+
+    A plugin ships a fragment *body*; the shell prepends the version header and
+    then this, which declares `v_uv`, `fragColor` and every uniform the contract
+    publishes. Compiling a body without it fails on the first identifier, so a
+    check that skipped this would be checking a source that never ships.
+
+    Read out of the Rust source for the same reason `read_header` is: adding a
+    uniform to the contract then changes what this validates, in the same
+    commit, with nothing to remember. The const is a **raw** string (`r"…"`), so
+    there are no escapes to undo — keep it that way if you touch it.
+    """
+    if not PREAMBLE_SOURCE.is_file():
+        fail(f"{PREAMBLE_SOURCE} is missing — wrong root, or the module moved")
+    text = PREAMBLE_SOURCE.read_text(encoding="utf-8")
+    match = re.search(
+        r'const\s+SHADER_PREAMBLE\s*:\s*&str\s*=\s*r"((?:[^"])*)"\s*;',
+        text,
+        re.DOTALL,
+    )
+    if not match:
+        fail(f'no `const SHADER_PREAMBLE: &str = r"…";` in {PREAMBLE_SOURCE}')
+    preamble = match.group(1)
+    if "fragColor" not in preamble:
+        fail(f"SHADER_PREAMBLE declares no `fragColor` output: {preamble!r}")
+    return preamble
 
 
 def concat_bodies(text: str) -> list[str]:
@@ -248,39 +321,88 @@ def main() -> int:
 
     failures = 0
     compiled = 0
+    widget_stages = 0
+    widget_bodies = 0
     with tempfile.TemporaryDirectory() as tmp:
+        staged_index = 0
+
+        def compile_assembled(label: str, prefix: str, path: Path) -> None:
+            """Assemble `header + prefix + path` and run glslangValidator on it."""
+            nonlocal failures, compiled, staged_index
+            source = f"{header}\n{prefix}{path.read_text(encoding='utf-8')}"
+            staged = Path(tmp) / f"{path.stem}.{staged_index}{path.suffix}"
+            staged_index += 1
+            staged.write_text(source, encoding="utf-8")
+            result = subprocess.run(
+                ["glslangValidator", str(staged)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            compiled += 1
+            if result.returncode == 0:
+                print(f"  ok    {label}")
+                return
+            failures += 1
+            print(f"  FAIL  {label}")
+            # The line numbers are into the *assembled* source, which is what
+            # the driver sees too — so print the prepended line count to make
+            # them translatable back to the file on disk.
+            offset = header.count("\n") + 1 + prefix.count("\n")
+            print(f"        (line numbers include {offset} prepended header/splice lines)")
+            for line in (result.stdout + result.stderr).splitlines():
+                if line.strip():
+                    print(f"        {line}")
+
         for path in shaders:
             for index, prefix in enumerate(splices.get(path.name, [""])):
-                source = f"{header}\n{prefix}{path.read_text(encoding='utf-8')}"
-                staged = Path(tmp) / f"{path.stem}.{index}{path.suffix}"
-                staged.write_text(source, encoding="utf-8")
                 label = path.name if prefix == "" else f"{path.name} (splice {index})"
-                result = subprocess.run(
-                    ["glslangValidator", str(staged)],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                compiled += 1
-                if result.returncode == 0:
-                    print(f"  ok    {label}")
-                    continue
-                failures += 1
-                print(f"  FAIL  {label}")
-                # The line numbers are into the *assembled* source, which is
-                # what the driver sees too — so print the header's line count
-                # to make them translatable back to the file on disk.
-                offset = header.count("\n") + 1 + prefix.count("\n")
-                print(f"        (line numbers include {offset} prepended header/splice lines)")
-                for line in (result.stdout + result.stderr).splitlines():
-                    if line.strip():
-                        print(f"        {line}")
+                compile_assembled(label, prefix, path)
 
-    print(f"lint-glsl: {compiled} shader compilation(s), {failures} failed")
+        # ── #893's shader widget ─────────────────────────────────────────────
+        #
+        # Two shapes, and they are assembled differently. The widget's own
+        # vertex stage is a complete shader and compiles as written; a plugin's
+        # fragment *body* only compiles with the interface preamble in front of
+        # it, which is precisely the splice case the preem half already has.
+        preamble = read_preamble()
+        for path in sorted(WIDGET_SHADER_DIR.glob("shader_*.vert")):
+            widget_stages += 1
+            compile_assembled(f"{path.name} (widget vertex stage)", "", path)
+        for directory in WIDGET_BODY_DIRS:
+            if not directory.is_dir():
+                fail(f"{directory} is missing — wrong root, or a demo's shaders moved")
+            unknown = [p for p in sorted(directory.rglob("*")) if p.is_file() and p.suffix != ".frag"]
+            if unknown:
+                fail(
+                    "a shader-widget body directory may hold only `.frag` bodies (they are "
+                    "compiled with the fragment preamble in front); found: "
+                    f"{', '.join(str(p) for p in unknown)}"
+                )
+            for path in sorted(directory.rglob("*.frag")):
+                widget_bodies += 1
+                compile_assembled(f"{path.name} (widget body)", preamble, path)
+
+    print(
+        f"lint-glsl: {compiled} shader compilation(s) "
+        f"({widget_stages} widget stage(s), {widget_bodies} widget body(ies)), {failures} failed"
+    )
     if compiled < MIN_COMPILATIONS:
         fail(
             f"only {compiled} compilation(s), expected ≥ {MIN_COMPILATIONS} — a shader "
             "or a splice went missing, so this run checked less than it should have"
+        )
+    if widget_stages < MIN_WIDGET_STAGES:
+        fail(
+            f"only {widget_stages} shader-widget stage(s), expected ≥ {MIN_WIDGET_STAGES} — "
+            f"the `shader_*.vert` scan of {WIDGET_SHADER_DIR} found nothing, so #893's "
+            "vertex stage went unchecked"
+        )
+    if widget_bodies < MIN_WIDGET_BODIES:
+        fail(
+            f"only {widget_bodies} shader-widget body(ies), expected ≥ {MIN_WIDGET_BODIES} — "
+            "a bundled plugin's fragment body went missing, so the one artifact proving "
+            "the #893 contract compiles was never compiled"
         )
     return 1 if failures else 0
 

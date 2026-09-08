@@ -38,8 +38,25 @@
 //!
 //! The marker never survives into the merged table — a subsystem's schema
 //! would otherwise have to know about it, and it would be reported as an
-//! unknown key. It is only meaningful inside a table; arrays replace whole, so
-//! there is nothing in an array element to unset.
+//! unknown key. "Never" is meant literally, at every depth and through every
+//! shape: a marker in a table being *replaced* whole, and one inside an
+//! array-of-tables element, are stripped on the way through too (#987). It is
+//! only *honoured* inside a table; arrays replace whole, so there is nothing
+//! in an array element for it to act on.
+//!
+//! # A marker the merge cannot honour
+//!
+//! `_unset = "color"` — a bare string rather than an array — is the obvious
+//! typo, since every other value in these files is scalar. It removes nothing.
+//! Dropping it in silence is the invisible-failure mode [`crate::subsystem`]
+//! argues against for every other key shape in this crate (#988), so
+//! [`malformed_unset`] finds every such marker and
+//! [`crate::subsystem::assemble`] logs it **naming the layer file**. The
+//! detection lives here, next to the code that honours the marker; the
+//! reporting lives there, where the file name is — the same split, for the
+//! same reason, as rule 4's unknown keys.
+
+use std::fmt;
 
 /// Reserved key naming the keys to drop from the layer below.
 ///
@@ -52,6 +69,10 @@ pub const UNSET_KEY: &str = "_unset";
 /// Only keys the overlay actually mentions are touched, which is the whole of
 /// "absent falls through": there is no branch that removes an unmentioned key,
 /// because there is no code that looks at one.
+///
+/// A malformed [`UNSET_KEY`] is dropped rather than honoured; run
+/// [`malformed_unset`] over the same table *before* merging if you want to
+/// **say** so.
 pub fn merge_into(base: &mut toml::Table, overlay: &toml::Table) {
     // The explicit-unset half of "absent is not null". Runs first so an
     // overlay may both unset an inherited key and set a fresh value for it.
@@ -70,21 +91,111 @@ pub fn merge_into(base: &mut toml::Table, overlay: &toml::Table) {
             // sub-table would be replaced and every key the overlay did not
             // restate would vanish.
             (Some(toml::Value::Table(into)), toml::Value::Table(from)) => merge_into(into, from),
-            // A table with nothing under it (or a scalar under it) still has
-            // to be stripped of any nested `_unset` markers, so it goes
-            // through the same merge against an empty table rather than
-            // being cloned verbatim.
-            (_, toml::Value::Table(from)) => {
-                let mut fresh = toml::Table::new();
-                merge_into(&mut fresh, from);
-                base.insert(key.clone(), toml::Value::Table(fresh));
-            }
-            // Everything else — scalars *and arrays* — replaces whole. An
-            // array is deliberately not concatenated or merged element-wise:
-            // appending leaves no way to remove an inherited element.
+            // Everything else — scalars, arrays, and a table with nothing (or
+            // a scalar) under it — replaces whole. An array is deliberately
+            // not concatenated or merged element-wise: appending leaves no way
+            // to remove an inherited element.
+            //
+            // The replacement goes through `stripped` rather than being cloned
+            // verbatim, which is what makes "the marker never survives" true
+            // inside it too — including inside an array-of-tables element,
+            // where a verbatim clone used to carry the marker through to the
+            // schema as a bogus unknown key (#987).
             _ => {
-                base.insert(key.clone(), value.clone());
+                base.insert(key.clone(), stripped(value));
             }
+        }
+    }
+}
+
+/// `value` with every [`UNSET_KEY`] marker removed, at every depth and through
+/// arrays as well as tables.
+///
+/// This is the *replacement* path, so no marker inside it has anything to act
+/// on: whatever stood under this key in the layer below is gone whole (rules 1
+/// and 3) before the replacement lands. Stripping is therefore the complete
+/// treatment, not half of one.
+fn stripped(value: &toml::Value) -> toml::Value {
+    match value {
+        // Merging into an empty table applies the marker to nothing (correct:
+        // there is nothing below it) and strips it, recursing on the way.
+        toml::Value::Table(from) => {
+            let mut fresh = toml::Table::new();
+            merge_into(&mut fresh, from);
+            toml::Value::Table(fresh)
+        }
+        toml::Value::Array(items) => toml::Value::Array(items.iter().map(stripped).collect()),
+        other => other.clone(),
+    }
+}
+
+/// A [`UNSET_KEY`] marker whose shape [`merge_into`] cannot honour.
+///
+/// Reported rather than logged: the merge has never seen a file name, and with
+/// three or four candidate layers in play an unattributed "your `_unset` is
+/// malformed" is close to useless.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MalformedUnset {
+    /// Dotted path of the offending marker, or of the offending element
+    /// inside it: `_unset`, `core._unset`, `core._unset[1]`.
+    pub key: String,
+    /// The TOML type actually found where an array of key names was expected.
+    pub found: &'static str,
+}
+
+impl fmt::Display for MalformedUnset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} should be a key name, but is a {}",
+            self.key, self.found
+        )
+    }
+}
+
+/// Every [`UNSET_KEY`] marker in `table` that [`merge_into`] will drop without
+/// honouring: one that is not an array, and every non-string element of one
+/// that is.
+///
+/// Walks nested tables, and *only* tables — a marker inside an array element
+/// is stripped unconditionally and means nothing there (arrays replace whole,
+/// so there is nothing under it to unset; #987), which makes its shape not a
+/// thing to complain about. Run this on each layer **before** merging: after
+/// the merge every marker is gone, well-formed or not.
+#[must_use]
+pub fn malformed_unset(table: &toml::Table) -> Vec<MalformedUnset> {
+    let mut out = Vec::new();
+    collect_malformed(table, "", &mut out);
+    out
+}
+
+fn collect_malformed(table: &toml::Table, prefix: &str, out: &mut Vec<MalformedUnset>) {
+    match table.get(UNSET_KEY) {
+        None => {}
+        Some(toml::Value::Array(names)) => {
+            for (i, name) in names.iter().enumerate() {
+                if name.as_str().is_none() {
+                    out.push(MalformedUnset {
+                        key: format!("{prefix}{UNSET_KEY}[{i}]"),
+                        found: name.type_str(),
+                    });
+                }
+            }
+        }
+        Some(other) => out.push(MalformedUnset {
+            key: format!("{prefix}{UNSET_KEY}"),
+            found: other.type_str(),
+        }),
+    }
+
+    for (key, value) in table {
+        // Already reported above, and never a table worth descending into
+        // even when somebody writes one there.
+        if key == UNSET_KEY {
+            continue;
+        }
+        if let toml::Value::Table(nested) = value {
+            collect_malformed(nested, &format!("{prefix}{key}."), out);
         }
     }
 }
@@ -191,15 +302,25 @@ mod tests {
     }
 
     /// A nested `_unset` is honoured at its own level, and never survives —
-    /// including when the base has no counterpart table for it to act on.
+    /// including when the base has no counterpart table for it to act on, and
+    /// including inside an array-of-tables element, which replaces whole and
+    /// used to be cloned verbatim, marker and all (#987).
+    ///
+    /// Red if `stripped` stops recursing through arrays (`entry[0]._unset`
+    /// survives, and `assemble` then reports it as an unknown key), and red
+    /// if it stops recursing through the tables inside them
+    /// (`entry[0].deep._unset` does).
     #[test]
     fn unset_works_at_every_table_depth_and_never_survives() {
         let out = merged(
-            r"
+            r#"
             [leds.core]
             color = 1
             width = 2
-            ",
+
+            [[entry]]
+            name = "old"
+            "#,
             r#"
             [leds.core]
             _unset = ["color"]
@@ -207,6 +328,14 @@ mod tests {
             [fresh.branch]
             _unset = ["nothing-here"]
             kept = true
+
+            [[entry]]
+            _unset = ["name"]
+            name = "A"
+
+            [entry.deep]
+            _unset = ["also-nothing"]
+            nested = true
             "#,
         );
 
@@ -220,6 +349,25 @@ mod tests {
         assert!(
             !fresh.contains_key(UNSET_KEY),
             "a table with no base counterpart must still be stripped"
+        );
+
+        let entries = out["entry"].as_array().expect("array of tables");
+        assert_eq!(entries.len(), 1, "arrays still replace whole");
+        let entry = entries[0].as_table().expect("element is a table");
+        assert_eq!(
+            entry["name"].as_str(),
+            Some("A"),
+            "a marker inside an array element acts on nothing, not on its own siblings"
+        );
+        assert!(
+            !entry.contains_key(UNSET_KEY),
+            "a marker inside an array element must not reach the schema either"
+        );
+        let deep = entry["deep"].as_table().expect("nested table survives");
+        assert_eq!(deep["nested"].as_bool(), Some(true));
+        assert!(
+            !deep.contains_key(UNSET_KEY),
+            "…nor one in a table nested inside an array element"
         );
     }
 
@@ -361,5 +509,100 @@ mod tests {
     #[test]
     fn merge_all_of_nothing_is_empty() {
         assert!(merge_all(Vec::new()).is_empty());
+    }
+
+    // ── #988: a marker the merge cannot honour ──────────────────────────────
+
+    /// A bare string is the obvious typo. It is found, with its type named, so
+    /// the caller that *does* know the file name can say so.
+    ///
+    /// Red if the non-array arm of `collect_malformed` goes away.
+    #[test]
+    fn a_marker_that_is_not_an_array_is_reported_with_its_type() {
+        assert_eq!(
+            malformed_unset(&table(r#"_unset = "color""#)),
+            [MalformedUnset {
+                key: "_unset".into(),
+                found: "string",
+            }]
+        );
+        assert_eq!(
+            malformed_unset(&table("[core]\n_unset = 3\n")),
+            [MalformedUnset {
+                key: "core._unset".into(),
+                found: "integer",
+            }],
+            "and at depth, with the path that leads to it"
+        );
+    }
+
+    /// A well-formed array with one element that is not a key name: the array
+    /// is still honoured for its string elements, and only the offender is
+    /// named — by index, since a key name is exactly what it lacks.
+    ///
+    /// Red if the element loop in `collect_malformed` goes away.
+    #[test]
+    fn a_non_string_element_is_reported_by_index_and_its_neighbours_still_apply() {
+        let overlay = table("[core]\n_unset = [\"color\", 3]\n");
+
+        assert_eq!(
+            malformed_unset(&overlay),
+            [MalformedUnset {
+                key: "core._unset[1]".into(),
+                found: "integer",
+            }]
+        );
+
+        let out = merge(table("[core]\ncolor = \"amber\"\nwidth = 2\n"), &overlay);
+        let core = out["core"].as_table().expect("table");
+        assert!(
+            !core.contains_key("color"),
+            "the usable element is honoured"
+        );
+        assert_eq!(core["width"].as_integer(), Some(2));
+    }
+
+    /// The guarantee that must not be traded away for the warning: a malformed
+    /// marker is still stripped, so it never reaches the schema as an unknown
+    /// key on top of being useless.
+    #[test]
+    fn a_malformed_marker_is_still_stripped_at_every_depth() {
+        let out = merged(
+            r#"color = "amber""#,
+            "_unset = 3\n\n[core]\n_unset = \"width\"\n",
+        );
+
+        assert!(!out.contains_key(UNSET_KEY));
+        assert!(
+            !out["core"]
+                .as_table()
+                .expect("table")
+                .contains_key(UNSET_KEY)
+        );
+        assert_eq!(
+            out["color"].as_str(),
+            Some("amber"),
+            "and it removes nothing, which is the whole reason it must be said out loud"
+        );
+    }
+
+    /// A well-formed marker is not a complaint — the warning has to be a
+    /// signal, not noise on every file that uses the feature.
+    #[test]
+    fn a_well_formed_marker_is_not_reported() {
+        assert!(
+            malformed_unset(&table(
+                "_unset = [\"a\"]\n\n[core]\n_unset = [\"b\", \"c\"]\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    /// A marker inside an array element is stripped without comment: arrays
+    /// replace whole, so there is nothing under it to unset and its shape
+    /// cannot matter (#987). Only tables are walked.
+    #[test]
+    fn a_marker_inside_an_array_element_is_not_reported() {
+        assert!(malformed_unset(&table("[[entry]]\n_unset = 3\nname = \"A\"\n")).is_empty());
     }
 }

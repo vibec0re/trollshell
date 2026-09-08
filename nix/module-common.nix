@@ -423,8 +423,9 @@ self:
 
           The retired unit's `UnsetEnvironment=` scrub is carried across, not
           dropped: a transient unit has no such setting, so the home-manager
-          module renders the same four billing-redirect variables as **empty**
-          entries in the plugin's `env` instead. Empty reads as "not set" to
+          module renders every variable named in
+          `crates/hytte-claude-bridge/src/envguard.rs`'s `REDIRECT_VARS` as
+          **empty** entries in the plugin's `env` instead. Empty reads as "not set" to
           every consumer — envguard does not trip, the key file is still
           consulted — and the launcher appends injected secrets *after* the
           declared env, so `api` mode's keyring key still wins. Both layers are

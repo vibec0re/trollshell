@@ -44,22 +44,38 @@ Exactly what the shell compiles, assembled the same way:
     would be checking a source that never ships;
   * every other body is compiled as-is, at the stage its extension names;
   * **#893's shader widget** the same way: its vertex stage
-    (`crates/hytte-ui/src/shader_*.vert`) compiles as written, and **every**
-    plugin-supplied fragment *body* the crane filter ships — that is, every
-    `.frag` under `crates/` or `trollshell/` that `preem_gl/` does not already
-    own — compiles with the interface `SHADER_PREAMBLE` spliced in front of it,
-    read out of `shader_surface.rs`, so adding a uniform to the published
-    contract changes what this validates in the same commit. The scan is
-    tree-wide rather than convention-shaped because `nix/package.nix`'s filter
-    is `lib.hasSuffix ".frag"` with no directory constraint: anything narrower
-    leaves a shipped-but-unlinted hole.
+    (`shader_*.vert`, anywhere under `crates/hytte-ui/src/`) compiles as
+    written, and **every** plugin-supplied fragment *body* the crane filter
+    ships — that is, every `.frag` anywhere in the tree that `preem_gl/` does
+    not already own — compiles with the interface `SHADER_PREAMBLE` spliced in
+    front of it, read out of `shader_surface.rs`, so adding a uniform to the
+    published contract changes what this validates in the same commit.
+
+    The scan really is tree-wide now: repo root, recursive, for both
+    `.frag` and `.vert`, minus `target/`, `.git/`, `.claude/`, `.direnv/` and
+    a `result`/`result-<output>` build-output symlink (none of which ever
+    carry shader source — see `EXCLUDED_DIR_NAMES`). `nix/package.nix`'s
+    filter is
+    `lib.hasSuffix ".frag"` / `".vert"` on the full path with **no** directory
+    constraint at all, so anything narrower than the whole tree agrees with
+    that filter by convention rather than by construction — and convention
+    shipped real holes twice: a one-entry literal list, then a
+    `crates/*/shaders` glob, each missed a real `.frag` the filter still ships
+    (#968's second review, the L5 residual). `.vert` had the same hole one
+    layer further in, since it was never scanned outside `preem_gl/` and a
+    *non-recursive* `WIDGET_SHADER_DIR.glob("shader_*.vert")` (#980). A
+    `.vert` found outside both of those two shapes is not one this script has
+    an assembly recipe for — unlike a `.frag`, which is unconditionally a
+    widget body — so it is a hard failure (exit 2) rather than a shader this
+    check silently never compiled.
 
 It refuses to pass vacuously, and every one of those guards is exit **2** (a
 broken check) rather than exit 1 (a broken shader): a missing header, a missing
 shader directory, an unknown extension, a subdirectory it does not know how to
-compile, fewer shaders than `MIN_SHADERS`, fewer compilations than
-`MIN_COMPILATIONS`, or no spliced body at all. Deleting `scope_decay.frag` —
-the file carrying the whole phosphor recurrence — used to be green.
+compile, a `.vert` file outside the two known shapes, fewer shaders than
+`MIN_SHADERS`, fewer compilations than `MIN_COMPILATIONS`, or no spliced body
+at all. Deleting `scope_decay.frag` — the file carrying the whole phosphor
+recurrence — used to be green.
 
 WHAT IT DOES NOT CHECK
 ----------------------
@@ -82,6 +98,7 @@ from the repo root. `nix flake check`'s `glsl` check runs the same line.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -111,37 +128,97 @@ WIDGET_SHADER_DIR = Path("crates/hytte-ui/src")
 PREAMBLE_SOURCE = WIDGET_SHADER_DIR / "shader_surface.rs"
 """The Rust file carrying `SHADER_PREAMBLE`, read rather than duplicated."""
 
-# Plugin-supplied fragment **bodies** shipped in this tree. Each is compiled as
-# `header + preamble + body`, which is exactly what `ShaderSurface::draw` hands
-# the driver.
+# `nix/package.nix`'s crane filter is `lib.hasSuffix ".frag"` / `".vert"` on
+# the full repo-relative path — **no** directory constraint at all. Two prior
+# spellings of this scan each agreed with that filter by convention rather
+# than by construction, and each shipped a real hole this way: a one-entry
+# literal list (`WIDGET_BODY_DIRS = [Path("crates/hytte-plugin-preem-demo/
+# shaders")]`) missed a second plugin's `shaders/` dir entirely; the
+# `crates/*/shaders` glob that replaced it still missed
+# `crates/<crate>/src/stray.frag` and `trollshell/shaders/stray2.frag`, both
+# measured shipping green (#968 second review, the L5 residual). `.vert` had
+# the same shape of hole one layer further in — it was never scanned outside
+# `SHADER_DIR` and a *non-recursive*, name-prefixed
+# `WIDGET_SHADER_DIR.glob("shader_*.vert")` (#980). The only spelling that
+# agrees with the filter by construction, for both extensions, is a walk of
+# the whole tree.
 #
-# **Every `.frag` the crane filter ships, minus the ones another rule already
-# owns.** This is the third spelling and the reason is worth keeping: the filter
-# in `nix/package.nix` is `lib.hasSuffix ".frag"` with *no* directory
-# constraint, so anything else here leaves a shipped-but-unlinted hole. A
-# one-entry literal list missed a second plugin's `shaders/` dir entirely; a
-# `crates/*/shaders` glob still missed `crates/<crate>/src/stray.frag` and
-# `trollshell/shaders/stray2.frag`, both measured shipping green (#968 second
-# review, L5 residual). Scanning the whole tree is the only spelling that agrees
-# with the filter *by construction* rather than by convention.
+# `EXCLUDED_DIR_NAMES` is *not* part of matching the filter — the filter has
+# no such list — it exists purely so this scanner does not walk into
+# `target/` (large, and never shader source), `.git/` (ditto, plus binary
+# objects), `.claude/` / `.direnv/` (tool state, already `.gitignore`d), or a
+# `result`/`result-<output>` symlink left by a previous `nix build` (which
+# resolves into the store — arbitrarily large, and a candidate for a walk
+# cycle if `os.walk` ever *did* follow it, which is why the pruning happens
+# during the walk rather than as a filter on its results; see
+# `find_tree_wide`).
 #
-# The two carve-outs are rules, not exceptions: `preem_gl/` is compiled by the
-# preem half above (as-written, or with its `concat!` splice), and anything
-# under a build/output directory is not source.
-WIDGET_BODY_ROOTS = [Path("crates"), Path("trollshell")]
-WIDGET_BODY_EXCLUDE_DIRS = {"preem_gl", "target"}
+# The nix-symlink match is deliberately narrow — `name == "result" or
+# name.startswith("result-")`, the exact two shapes `nix build` names its
+# output links (`result`, or `result-<output>` for a multi-output
+# derivation) — **not** a bare `name.startswith("result")`. A prefix match
+# would prune any legitimately-tracked directory that happens to start with
+# those letters (`results/`, `resultset/`, `result_cache/`, …), which is
+# precisely the same *convention*-shaped hole this scan exists to close for
+# `.frag`/`.vert` discovery itself, just relocated into the exclusion list.
+EXCLUDED_DIR_NAMES = {"target", ".git", ".claude", ".direnv"}
+
+
+def _is_excluded_dir(name: str) -> bool:
+    """`target`/`.git`/`.claude`/`.direnv`, or a `result`/`result-<output>` link."""
+    return name in EXCLUDED_DIR_NAMES or name == "result" or name.startswith("result-")
+
+
+def find_tree_wide(suffix: str) -> list[Path]:
+    """Every file under the repo root ending in `suffix`, minus excluded dirs.
+
+    Walks with `os.walk` rather than `Path.rglob`: dropping a name from
+    `dirnames` prunes that subtree *before* `os.walk` descends into it, where
+    filtering `rglob`'s results after the fact would still have walked (and,
+    for a `result` symlink, `rglob` follows symlinks — walked *through*)
+    everything first. `os.walk`'s default `followlinks=False` means a
+    `result` symlink is never entered at all, which is the point.
+    """
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk("."):
+        dirnames[:] = [d for d in dirnames if not _is_excluded_dir(d)]
+        found.extend(Path(dirpath) / name for name in filenames if name.endswith(suffix))
+    return sorted(found)
 
 
 def widget_bodies() -> list[Path]:
-    """Every `.frag` the crane filter ships that the preem half does not own."""
-    found: list[Path] = []
-    for root in WIDGET_BODY_ROOTS:
-        if not root.is_dir():
-            fail(f"{root} is missing — wrong root, or the workspace moved")
-        for path in root.rglob("*.frag"):
-            if WIDGET_BODY_EXCLUDE_DIRS.isdisjoint(part for part in path.parts):
-                found.append(path)
-    return sorted(found)
+    """Every `.frag` the crane filter ships that the preem half does not own.
+
+    Unconditional: any `.frag` outside `SHADER_DIR` *is* a widget body — there
+    is no narrower convention left to check it against, on purpose (see the
+    comment above `EXCLUDED_DIR_NAMES`).
+    """
+    return sorted(path for path in find_tree_wide(".frag") if SHADER_DIR not in path.parents)
+
+
+def widget_vertex_stages() -> tuple[list[Path], list[Path]]:
+    """`(known, unknown)` `.vert` files outside `SHADER_DIR`.
+
+    Unlike a fragment body, a vertex stage has no catch-all recipe: the only
+    known assembly is "as written", and the only known *location* for a #893
+    widget vertex stage is anywhere under `WIDGET_SHADER_DIR`, name-prefixed
+    `shader_*.vert` — the convention `shader_fullscreen.vert` set, and nothing
+    has changed since. A `.vert` found anywhere else outside `SHADER_DIR` is
+    not a shape this script has a recipe for, so `main` fails loudly on it
+    (exit 2) instead of guessing an assembly, or — worse — going back to
+    silently never compiling it, which is exactly the hole this tree-wide walk
+    exists to close.
+    """
+    known: list[Path] = []
+    unknown: list[Path] = []
+    for path in find_tree_wide(".vert"):
+        if SHADER_DIR in path.parents:
+            continue
+        if WIDGET_SHADER_DIR in path.parents and path.name.startswith("shader_"):
+            known.append(path)
+        else:
+            unknown.append(path)
+    return sorted(known), sorted(unknown)
 
 
 # Floors, on the same "current counts, not counts-with-headroom" rule as
@@ -397,9 +474,18 @@ def main() -> int:
         # fragment *body* only compiles with the interface preamble in front of
         # it, which is precisely the splice case the preem half already has.
         preamble = read_preamble()
-        for path in sorted(WIDGET_SHADER_DIR.glob("shader_*.vert")):
+        known_stages, unknown_verts = widget_vertex_stages()
+        if unknown_verts:
+            fail(
+                "found `.vert` file(s) outside preem_gl/ that are not "
+                f"`{WIDGET_SHADER_DIR}/**/shader_*.vert` — this script has no assembly "
+                "recipe for them, so it cannot silently compile them (possibly wrong) or "
+                "silently skip them (the exact hole a tree-wide scan exists to close): "
+                f"{', '.join(str(p) for p in unknown_verts)}"
+            )
+        for path in known_stages:
             widget_stages += 1
-            compile_assembled(f"{path.name} (widget vertex stage)", "", path)
+            compile_assembled(f"{path} (widget vertex stage)", "", path)
         # A `shaders/` directory is the *convention* for widget bodies, and
         # this keeps it honest: a non-`.frag` file in one is a file whose stage
         # nobody has decided, and it would ship only if it were a `.frag`.
@@ -413,17 +499,18 @@ def main() -> int:
                     "compiled with the fragment preamble in front); found: "
                     f"{', '.join(str(q) for q in unknown)}"
                 )
-        # …but the *scan* is every `.frag` the crane filter ships, wherever it
-        # sits, because that filter has no directory constraint. Paths are
-        # printed in full: with the scan tree-wide, a bare filename no longer
-        # says which crate it came from.
+        # …the *scan* is every `.frag` the crane filter ships, wherever it
+        # sits under the repo root, because that filter has no directory
+        # constraint. Paths are printed in full: with the scan tree-wide, a
+        # bare filename no longer says which crate it came from.
         for path in widget_bodies():
             widget_body_count += 1
             compile_assembled(f"{path} (widget body)", preamble, path)
 
     print(
         f"lint-glsl: {compiled} shader compilation(s) "
-        f"({widget_stages} widget stage(s), {widget_body_count} widget body(ies)), {failures} failed"
+        f"({widget_stages} widget stage(s), {widget_body_count} widget body(ies)), "
+        f"{failures} failed"
     )
     if compiled < MIN_COMPILATIONS:
         fail(

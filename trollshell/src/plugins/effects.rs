@@ -55,25 +55,51 @@ use super::datasource::DatasourceRouter;
 /// `outbound`), a datasource query routes to a **different** connection (the
 /// provider) and its result back again, so the broker hands those two effects to
 /// the router rather than answering on `outbound`.
+///
+/// Pulled out of [`broker_effect`] itself only to keep that function under
+/// clippy's line cap; the logic and its rationale live here.
+///
+/// A detached launch's audit line has to name the unit it started (#953 M1) —
+/// that is what makes the line reconcilable against `systemctl --user
+/// list-units 'trollshell-launch-*'`. The name isn't final until the host
+/// allocates its uniquifier (M2), so it is allocated *here*, before the audit
+/// record, and the finished string is handed to the launcher unchanged: the
+/// line and the unit systemd actually starts are then the same string by
+/// construction, not by two matching `format!` calls.
+///
+/// `is_valid_plugin_id` is checked here too (#964 item 2), not only later
+/// inside `start_detached` — so a plugin id that can't be a unit-name segment
+/// never gets a phantom `unit=`/`slice=` logged for a unit that is never
+/// actually asked of systemd. Without this, `start_detached`'s own guard
+/// still takes the direct-spawn fallback correctly, but the audit line would
+/// already have claimed a unit that doesn't exist — the same shape of defect
+/// M1 was filed for, just on the rejected-id path (see the second-pass review
+/// on #960). For a rejected id this returns `None`, so the recompute in
+/// [`broker_effect`]'s `RunCommand` match arm (`.take().unwrap_or_else(…)`)
+/// still runs and allocates a unit string — but that string is never read
+/// again: `start_detached`'s own `is_valid_plugin_id` check fires first and
+/// returns through `spawn_detached`, which takes no unit name at all.
+fn detached_launch_unit_for_audit(plugin_id: &str, effect: &Effect) -> Option<String> {
+    match effect {
+        Effect::RunCommand { id, detached, .. }
+            if *detached && systemd::is_valid_plugin_id(plugin_id) =>
+        {
+            Some(allocate_launch_unit(plugin_id, *id))
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn broker_effect(
     plugin_id: &str,
     effect: &Effect,
     outbound: &mpsc::Sender<HostMsg>,
     datasource: &DatasourceRouter,
 ) {
-    // #953 M1: a detached launch's audit line has to name the unit it started —
-    // that is what makes the line reconcilable against
-    // `systemctl --user list-units 'trollshell-launch-*'`. The name isn't final
-    // until the host allocates its uniquifier (M2), so allocate it *here*,
-    // before the audit record, and hand the finished string to the launcher:
-    // the line and the unit systemd actually starts are then the same string by
-    // construction rather than by two matching format! calls.
-    let mut detached_unit = match effect {
-        Effect::RunCommand { id, detached, .. } if *detached => {
-            Some(allocate_launch_unit(plugin_id, *id))
-        }
-        _ => None,
-    };
+    // #953 M1 / #964 item 2: allocated *here*, before the audit record, and
+    // handed to the launcher unchanged — see `detached_launch_unit_for_audit`'s
+    // doc for why, and for the rejected-id case.
+    let mut detached_unit = detached_launch_unit_for_audit(plugin_id, effect);
     // Every effect reaching the broker cleared capability enforcement + the rate
     // cap upstream (`session`), so it is an `Allowed` decision in the persisted
     // audit log (#510); the dropped ones are recorded at their `session` drop sites.
@@ -560,6 +586,25 @@ const LAUNCH_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// this is a *grouping*, not a dependency. Measured: `--collect` still garbage-
 /// collects a unit inside it (a `-- false` launch leaves `LoadState=not-found`
 /// and the name is immediately reusable).
+///
+/// # The slice itself, once empty (#964 item 5)
+///
+/// Measured (systemd 260.2): once every unit inside it has been collected,
+/// `trollshell-launch.slice` stays `loaded active` rather than stopping on its
+/// own — a slice with no member processes just sits there; it does not go
+/// `failed` and needs no `reset-failed`.
+///
+/// **Decision: leave it.** An idle slice is a cgroup with zero member
+/// processes — the cost is one row in `systemctl --user list-units` and
+/// whatever bytes the kernel keeps for an empty cgroup, not a leaked process,
+/// fd, or timer. Actively `systemctl --user stop`-ing it once the last unit
+/// collects would need the broker to track "is this the last unit in the
+/// slice", which is exactly the bookkeeping the manager already owns — and
+/// stopping it would undercut the one thing the slice is *for*: a single
+/// stable name (`systemctl --user stop trollshell-launch.slice`) that always
+/// reaches every currently-running detached launch, launched before or after
+/// this moment. If a concrete cost ever turns up, this comment is where to
+/// revisit the call.
 pub(super) const LAUNCH_SLICE: &str = "trollshell-launch.slice";
 
 /// Why a detached launch took the direct-spawn fallback instead of the systemd
@@ -732,11 +777,30 @@ pub(super) const FORWARDED_ENV: [&str; 4] = [
 /// unset or empty (so a launch never asserts an empty `DISPLAY=` over the
 /// manager's real one) or non-UTF-8 (which `--setenv=` cannot carry). Order
 /// follows [`FORWARDED_ENV`] so the argv is deterministic.
+///
+/// Thin over [`filter_forwarded_env`], which does the actual skip and is the
+/// unit-testable half (#964 item 4) — mutating the real process environment in
+/// a test needs `std::env::set_var`, which edition 2024 marks `unsafe` (and is
+/// process-global besides), so the filter is pulled out pure and fed a fake
+/// lookup instead.
 fn forwarded_env() -> Vec<(String, String)> {
-    FORWARDED_ENV
+    filter_forwarded_env(&FORWARDED_ENV, |name| std::env::var(name).ok())
+}
+
+/// The empty/unset/non-UTF-8 skip [`forwarded_env`] applies (#953 L5, #964
+/// item 4), pulled out as a pure function over an injected `lookup` so it is
+/// testable without touching the process environment. `lookup` returns `None`
+/// for a name that is unset or not valid UTF-8 (exactly what
+/// `std::env::var(name).ok()` already collapses both cases to); `Some("")` is
+/// distinct from `None` and is the case this filters out on top.
+fn filter_forwarded_env(
+    names: &[&str],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    names
         .iter()
         .filter_map(|name| {
-            let value = std::env::var(name).ok()?;
+            let value = lookup(name)?;
             (!value.is_empty()).then(|| ((*name).to_owned(), value))
         })
         .collect()
@@ -803,13 +867,23 @@ pub(super) fn classify_systemd_run_failure(status: &str, stderr: &str) -> Launch
 /// Ask the systemd user manager to start `argv` as the transient unit `unit`
 /// (#953). Returns as soon as the manager has taken the start job — the
 /// program's own lifetime is never observed here.
-async fn systemd_run_launch(
+///
+/// The program to run and the launch-call timeout are parameters (#964 item
+/// 3), not the hardcoded `"systemd-run"` / [`LAUNCH_CALL_TIMEOUT`] pair the
+/// only production caller ([`start_detached`], via [`start_detached_with`])
+/// fixes them at — a test can instead pass a fast stub program and a
+/// millisecond-scale timeout to pin the never-retry guarantee on
+/// [`LaunchFailure::Unknown`] without a slow real timeout or a real absent
+/// user manager.
+async fn systemd_run_launch_with(
     plugin_id: &str,
     id: u64,
     unit: &str,
     argv: &[String],
+    program: &str,
+    timeout: Duration,
 ) -> Result<(), LaunchFailure> {
-    let mut cmd = tokio::process::Command::new("systemd-run");
+    let mut cmd = tokio::process::Command::new(program);
     cmd.args(launch_argv(plugin_id, id, unit, &forwarded_env(), argv))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -818,7 +892,7 @@ async fn systemd_run_launch(
         // short-lived `systemd-run` helper. The transient unit it has already
         // asked for is the manager's, and is untouched by the helper dying.
         .kill_on_drop(true);
-    let output = match tokio::time::timeout(LAUNCH_CALL_TIMEOUT, cmd.output()).await {
+    let output = match tokio::time::timeout(timeout, cmd.output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(e)) => {
             return Err(LaunchFailure::NothingStarted(
@@ -831,13 +905,16 @@ async fn systemd_run_launch(
         // running. Reporting it as a plain failure would invite the plugin to
         // retry with a fresh id and end up with two copies, so it is reported as
         // an *unknown* outcome naming the unit — the operator can settle it with
-        // one `systemctl --user status`, and the host does not guess.
+        // one `systemctl --user status`, and the host does not guess **or
+        // retry** (#964 item 3 pins the no-retry half at the [`start_detached`]
+        // call site, one level up, since retrying is a decision the *dispatch*
+        // makes, not this helper).
         Err(_) => {
             return Err(LaunchFailure::Unknown(format!(
                 "systemd-run --user did not answer within {}s; the launch outcome is \
                  UNKNOWN and was not retried (a retry could start a second copy) — \
                  check `systemctl --user status {unit}`",
-                LAUNCH_CALL_TIMEOUT.as_secs(),
+                timeout.as_secs(),
             )));
         }
     };
@@ -904,6 +981,23 @@ pub(super) async fn start_detached(
     unit: &str,
     argv: &[String],
 ) -> Result<LaunchReport, String> {
+    start_detached_with(plugin_id, id, unit, argv, "systemd-run", LAUNCH_CALL_TIMEOUT).await
+}
+
+/// [`start_detached`] with the `systemd-run` program and its launch-call
+/// timeout as parameters (#964 item 3) — the same seam as
+/// [`systemd_run_launch_with`], threaded one level up so a test can exercise
+/// the *dispatch* decision (never retrying a [`LaunchFailure::Unknown`]), not
+/// only the bare classifier. Production reaches this only through
+/// [`start_detached`], fixed at `"systemd-run"` / [`LAUNCH_CALL_TIMEOUT`].
+async fn start_detached_with(
+    plugin_id: &str,
+    id: u64,
+    unit: &str,
+    argv: &[String],
+    program: &str,
+    timeout: Duration,
+) -> Result<LaunchReport, String> {
     if argv.is_empty() {
         return Err("empty argv; nothing to launch".to_owned());
     }
@@ -919,7 +1013,7 @@ pub(super) async fn start_detached(
         );
         return spawn_detached(argv, FallbackReason::UnsafePluginId);
     }
-    match systemd_run_launch(plugin_id, id, unit, argv).await {
+    match systemd_run_launch_with(plugin_id, id, unit, argv, program, timeout).await {
         Ok(()) => Ok(LaunchReport::Unit(unit.to_owned())),
         Err(LaunchFailure::NothingStarted(reason, msg)) => {
             tracing::warn!(
@@ -928,6 +1022,10 @@ pub(super) async fn start_detached(
             );
             spawn_detached(argv, reason)
         }
+        // #964 item 3: never retried. `Unknown` in particular means the manager
+        // may already have taken the start job — retrying here is exactly the
+        // action that could produce a second copy of the program, so both
+        // failure shapes are surfaced to the plugin as-is.
         Err(LaunchFailure::Refused(msg) | LaunchFailure::Unknown(msg)) => Err(msg),
     }
 }
@@ -973,6 +1071,13 @@ fn launch_detached(
     argv: Vec<String>,
     outbound: mpsc::Sender<HostMsg>,
 ) {
+    // #964 item 1: captured synchronously, before the launch itself is handed
+    // to the background runtime — this is the exact `unit` string
+    // `broker_effect` decided on, so a test can compare it against the `unit=`
+    // its `record_audit` call logged for the same effect without waiting on
+    // (or faking) the async launch that follows.
+    #[cfg(test)]
+    tests::LAST_DETACHED_DISPATCH_UNIT.with(|cell| *cell.borrow_mut() = Some(unit.clone()));
     let plugin_id = plugin_id.to_owned();
     hytte::reactive::runtime::handle().spawn(async move {
         let report = start_detached(&plugin_id, id, &unit, &argv).await;
@@ -1140,15 +1245,25 @@ pub(super) fn record_audit(
     decision: AuditDecision,
     unit: Option<&str>,
 ) {
+    // #964 item 1: in `#[cfg(test)]` builds `audit_sink()` is hard-wired to
+    // `None` (see its doc — tests touch no filesystem), which meant the audit
+    // line was never even *formatted* under test, let alone inspectable. The
+    // line is now built unconditionally and stashed for the test module
+    // before the real (production-only) sink decides whether to persist it,
+    // so `broker_effect`'s callers can assert on the exact record it produced
+    // — in particular, that a detached launch's `unit=` is the same string
+    // the launcher was handed (see `tests::LAST_DETACHED_DISPATCH_UNIT`).
+    let line = format_audit_line(
+        &now_rfc3339(),
+        plugin_id,
+        effect_kind(effect),
+        decision,
+        audit_effect_id(effect),
+        unit,
+    );
+    #[cfg(test)]
+    tests::LAST_AUDIT_LINE.with(|cell| *cell.borrow_mut() = Some(line.clone()));
     if let Some(tx) = audit_sink() {
-        let line = format_audit_line(
-            &now_rfc3339(),
-            plugin_id,
-            effect_kind(effect),
-            decision,
-            audit_effect_id(effect),
-            unit,
-        );
         let _ = tx.send(line);
     }
 }
@@ -1268,10 +1383,37 @@ impl AuditLog {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditDecision, AuditLog, EffectOutcome, MAX_VOLUME, MIN_VOLUME, RUN_COMMAND_MAX_OUTPUT,
-        clamp_volume, command_outcome, effect_kind, format_audit_line, truncate_on_char_boundary,
+        AuditDecision, AuditLog, EffectOutcome, FORWARDED_ENV, MAX_VOLUME, MIN_VOLUME,
+        RUN_COMMAND_MAX_OUTPUT, broker_effect, clamp_volume, command_outcome, effect_kind,
+        filter_forwarded_env, format_audit_line, launch_argv, launch_outcome, start_detached_with,
+        truncate_on_char_boundary,
     };
-    use hytte_plugin_proto::{AudioAction, Effect, MediaAction, NiriAction, Page};
+    use super::DatasourceRouter;
+    use hytte_plugin_proto::{AudioAction, Effect, HostMsg, MediaAction, NiriAction, Page};
+    use std::cell::RefCell;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    // #964 item 1: test-only capture of what `record_audit` and `launch_detached`
+    // were each called with, so a test can assert the two agree on the unit
+    // name without a real audit file or a real (or even completed) launch — see
+    // `record_audit`'s and `launch_detached`'s call sites for the writes.
+    // `pub(super)` so the parent module's `#[cfg(test)]` call sites can reach
+    // them as `tests::LAST_…`.
+    thread_local! {
+        pub(super) static LAST_AUDIT_LINE: RefCell<Option<String>> = const { RefCell::new(None) };
+        pub(super) static LAST_DETACHED_DISPATCH_UNIT: RefCell<Option<String>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Clear both #964-item-1 capture cells. Every test that reads them starts
+    /// by calling this, so a prior test that ran on the same worker thread
+    /// (thread-locals are per OS thread, and `cargo test` reuses threads across
+    /// tests) can never leave a stale value behind.
+    fn reset_audit_capture() {
+        LAST_AUDIT_LINE.with(|cell| *cell.borrow_mut() = None);
+        LAST_DETACHED_DISPATCH_UNIT.with(|cell| *cell.borrow_mut() = None);
+    }
 
     #[test]
     fn command_outcome_maps_success_and_stdout() {
@@ -1460,5 +1602,192 @@ mod tests {
         log.append("first").expect("append creates parents");
         let contents = std::fs::read_to_string(&path).expect("read");
         assert_eq!(contents, "first\n");
+    }
+
+    // ── #964: four detached-launch mechanisms PR #960's review found unpinned ──
+
+    /// #964 item 1 (M1's residue): the unit `broker_effect` allocates for a
+    /// detached launch is handed to BOTH `record_audit` (as its
+    /// `unit=`/`slice=`) and the launcher — nothing before this test enforced
+    /// they stay the same string. Captures both synchronously (no need to
+    /// await, or fake, the background launch itself: `launch_detached` stashes
+    /// its `unit` parameter before it ever calls `.spawn`) and compares.
+    ///
+    /// Falsifies the exact M1 defect the second-pass review reproduced by
+    /// hand: passing `record_audit` a `None`, or a freshly-reallocated name,
+    /// instead of the string `launch_detached` actually receives.
+    #[test]
+    fn detached_launch_audit_unit_matches_the_dispatched_unit() {
+        reset_audit_capture();
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let router = DatasourceRouter::default();
+
+        broker_effect(
+            "caw",
+            &Effect::RunCommand {
+                id: 42,
+                argv: vec!["true".to_owned()],
+                detached: true,
+            },
+            &tx,
+            &router,
+        );
+
+        let audit_line = LAST_AUDIT_LINE
+            .with(|cell| cell.borrow().clone())
+            .expect("a detached RunCommand must record an audit line");
+        let dispatched_unit = LAST_DETACHED_DISPATCH_UNIT
+            .with(|cell| cell.borrow().clone())
+            .expect("a detached RunCommand must reach launch_detached");
+        let audit_unit = audit_line
+            .split("unit=")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_else(|| panic!("audit line carries no unit=: {audit_line}"));
+
+        assert_eq!(
+            audit_unit, dispatched_unit,
+            "the audit unit= must be the exact string the launcher was handed \
+             (audit line: {audit_line:?})",
+        );
+    }
+
+    /// #964 item 2: `is_valid_plugin_id` is now checked before
+    /// `allocate_launch_unit` runs for the audit record (see `broker_effect`),
+    /// so a plugin id that can't be a unit-name segment never logs a phantom
+    /// `unit=`/`slice=` for a unit `start_detached` never actually asks
+    /// systemd to create — it takes the direct-spawn fallback instead
+    /// (`FallbackReason::UnsafePluginId`).
+    #[test]
+    fn rejected_plugin_id_records_no_phantom_unit() {
+        reset_audit_capture();
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let router = DatasourceRouter::default();
+
+        broker_effect(
+            "my plugin",
+            &Effect::RunCommand {
+                id: 1,
+                argv: vec!["true".to_owned()],
+                detached: true,
+            },
+            &tx,
+            &router,
+        );
+
+        let audit_line = LAST_AUDIT_LINE
+            .with(|cell| cell.borrow().clone())
+            .expect("even a rejected id's effect is still audited");
+        assert!(
+            !audit_line.contains("unit="),
+            "a rejected plugin id must not log a unit for a unit that was \
+             never created: {audit_line}",
+        );
+        assert!(
+            !audit_line.contains("slice="),
+            "no unit means no slice either: {audit_line}",
+        );
+    }
+
+    /// #964 item 3 / #953 L4: a `systemd-run` call that times out must be
+    /// reported as `LaunchFailure::Unknown` and never retried — a retry is
+    /// exactly the action that could start a second copy of the program,
+    /// since the manager may already have taken the first start job. Drives
+    /// `start_detached_with` against a stub that sleeps well past a
+    /// millisecond-scale test timeout (never a slow real one) and counts its
+    /// own invocations, so a reintroduced retry shows up as a second recorded
+    /// invocation rather than as a timing flake.
+    #[tokio::test]
+    async fn detached_launch_timeout_never_retries() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counter = dir.path().join("invocations");
+        let stub = dir.path().join("stub.sh");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho invoked >> '{}'\nsleep 3\n",
+                counter.display()
+            ),
+        )
+        .expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("stat stub").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod stub");
+
+        let unit = "trollshell-launch-ts964-timeout-1.service";
+        let report = start_detached_with(
+            "caw",
+            1,
+            unit,
+            &["true".to_owned()],
+            stub.to_str().expect("tempdir path is UTF-8"),
+            Duration::from_millis(300),
+        )
+        .await;
+
+        let outcome = launch_outcome(&report);
+        assert!(
+            !outcome.ok,
+            "a call that timed out must never be reported as a successful launch",
+        );
+        let text = outcome
+            .output
+            .expect("a failed outcome still carries a message");
+        assert!(
+            text.contains("UNKNOWN"),
+            "must name the outcome UNKNOWN, not a plain failure: {text}",
+        );
+        assert!(text.contains(unit), "must name the unit: {text}");
+
+        let invocations = std::fs::read_to_string(&counter).unwrap_or_default();
+        assert_eq!(
+            invocations.lines().count(),
+            1,
+            "a timed-out systemd-run call must be invoked exactly once — a \
+             retry could start a second copy of the program: {invocations:?}",
+        );
+    }
+
+    /// #964 item 4 / #953 L5: an empty (but *set*) env value must never reach
+    /// the `--setenv=` argv — an empty `DISPLAY=` would override the user
+    /// manager's real one with nothing, which is worse than not forwarding it
+    /// at all. `filter_forwarded_env` is `forwarded_env`'s pure half
+    /// (production goes through `std::env::var`, which edition 2024 makes
+    /// awkward to fake without `unsafe`), so the empty-value skip is
+    /// unit-testable via an injected lookup instead of mutating the real
+    /// process environment.
+    #[test]
+    fn filter_forwarded_env_skips_empty_values_and_never_reaches_the_argv() {
+        assert!(FORWARDED_ENV.contains(&"WAYLAND_DISPLAY"));
+        let names = ["WAYLAND_DISPLAY", "DISPLAY", "NIRI_SOCKET"];
+        let env = filter_forwarded_env(&names, |name| match name {
+            "WAYLAND_DISPLAY" => Some(String::new()), // set, but empty
+            "DISPLAY" => Some(":0".to_owned()),
+            _ => None, // NIRI_SOCKET unset
+        });
+        assert_eq!(
+            env,
+            vec![("DISPLAY".to_owned(), ":0".to_owned())],
+            "an empty-but-set value must be skipped, same as an unset one",
+        );
+
+        let argv = launch_argv(
+            "caw",
+            1,
+            "trollshell-launch-caw-1.service",
+            &env,
+            &["true".to_owned()],
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--setenv=WAYLAND_DISPLAY")),
+            "an empty WAYLAND_DISPLAY must never appear as \
+             --setenv=WAYLAND_DISPLAY=: {argv:?}",
+        );
+        assert!(
+            argv.contains(&"--setenv=DISPLAY=:0".to_owned()),
+            "a non-empty value must still be forwarded: {argv:?}",
+        );
     }
 }

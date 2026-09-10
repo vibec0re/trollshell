@@ -281,103 +281,133 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle]) {
         evidence.display()
     );
 
-    // One case per *several* ticks: push the state, re-render it
-    // `SETTLE_RENDERS` times so every texture in the area's pool holds it, then
-    // read the framebuffer back **twice** with a render between and require the
-    // two to be identical. See [`SETTLE_RENDERS`] for what that is guarding.
-    let phase = Rc::new(std::cell::Cell::new(0_u32));
-    let index = Rc::new(std::cell::Cell::new(0_usize));
-    let failures = Rc::new(std::cell::Cell::new(0_u32));
-    let first: Rc<RefCell<Option<Capture>>> = Rc::new(RefCell::new(None));
-    let cases = Rc::new(cases);
+    // One case per *several* ticks — see [`Runner::step`].
+    let runner = Rc::new(Runner {
+        cases,
+        evidence,
+        index: std::cell::Cell::new(0),
+        phase: std::cell::Cell::new(0),
+        failures: std::cell::Cell::new(0),
+        first: RefCell::new(None),
+    });
 
     glib::timeout_add_local(std::time::Duration::from_millis(60), {
         let area = area.clone();
         let app = app.clone();
-        move || {
-            let at = index.get();
-            if at >= cases.len() {
-                println!("-- summary --");
-                if failures.get() == 0 {
-                    println!(
-                        "PASS all {} case(s) inside the proposed ceiling on every channel",
-                        cases.len()
-                    );
-                } else {
-                    println!(
-                        "FAIL {} of {} case(s) — see the per-case verdict above",
-                        failures.get(),
-                        cases.len()
-                    );
-                    FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                println!("=== preem_gl_diff done — paste this into issue #893 ===");
-                app.quit();
-                return glib::ControlFlow::Break;
-            }
-
-            let case = &cases[at];
-            let label = label(case);
-            let done = |passed: bool| {
-                if !passed {
-                    failures.set(failures.get() + 1);
-                }
-                index.set(at + 1);
-                phase.set(0);
-                first.borrow_mut().take();
-            };
-
-            match phase.get() {
-                0 => {
-                    drive(&area, case);
-                    phase.set(1);
-                }
-                p if p <= SETTLE_RENDERS => {
-                    area.queue_render();
-                    phase.set(p + 1);
-                }
-                p if p == SETTLE_RENDERS + 1 => match capture(&area, &label) {
-                    Ok(shot) => {
-                        *first.borrow_mut() = Some(shot);
-                        area.queue_render();
-                        phase.set(p + 1);
-                    }
-                    Err(why) => {
-                        println!("FAIL(context) {label}: {why}");
-                        done(false);
-                    }
-                },
-                _ => {
-                    let held = first.borrow_mut().take();
-                    match (held, capture(&area, &label)) {
-                        (Some(a), Ok(b)) if a.raw == b.raw && a.alloc == b.alloc => {
-                            let passed = measure(case, &b, &evidence);
-                            done(passed);
-                        }
-                        (Some(_), Ok(_)) => {
-                            // Two renders of one state disagreed, so whatever
-                            // the numbers would say, they are not this state's.
-                            println!(
-                                "FAIL(unstable) {label}: two readbacks of the same state differ — \
-                                 the area's texture pool has not settled after {SETTLE_RENDERS} \
-                                 renders; raise SETTLE_RENDERS"
-                            );
-                            done(false);
-                        }
-                        (_, Err(why)) => {
-                            println!("FAIL(context) {label}: {why}");
-                            done(false);
-                        }
-                        (None, Ok(_)) => {
-                            println!("FAIL(context) {label}: the first readback went missing");
-                            done(false);
-                        }
-                    }
-                }
-            }
-            glib::ControlFlow::Continue
-        }
+        move || runner.step(&area, &app)
     });
+}
+
+/// The tick machine that walks the cases.
+struct Runner {
+    cases: Vec<Case>,
+    /// Where [`write_evidence`] puts its images.
+    evidence: std::path::PathBuf,
+    /// The case being driven.
+    index: std::cell::Cell<usize>,
+    /// Which tick within that case — see [`Runner::step`]'s phases.
+    phase: std::cell::Cell<u32>,
+    failures: std::cell::Cell<u32>,
+    /// The first of the two readbacks, held for the stability check.
+    first: RefCell<Option<Capture>>,
+}
+
+impl Runner {
+    /// One timeout tick.
+    ///
+    /// A case takes `SETTLE_RENDERS + 3` of these: push the state, re-render it
+    /// [`SETTLE_RENDERS`] times so every texture in the area's pool holds it,
+    /// then read the framebuffer back **twice** with a render between and
+    /// require the two to be identical. See [`SETTLE_RENDERS`] for what that is
+    /// guarding — it is the whole of #1072.
+    fn step(&self, area: &GlSurface, app: &gtk::Application) -> glib::ControlFlow {
+        let at = self.index.get();
+        let Some(case) = self.cases.get(at) else {
+            self.summary();
+            app.quit();
+            return glib::ControlFlow::Break;
+        };
+        let label = label(case);
+
+        match self.phase.get() {
+            0 => {
+                drive(area, case);
+                self.phase.set(1);
+            }
+            p if p <= SETTLE_RENDERS => {
+                area.queue_render();
+                self.phase.set(p + 1);
+            }
+            p if p == SETTLE_RENDERS + 1 => match capture(area, &label) {
+                Ok(shot) => {
+                    *self.first.borrow_mut() = Some(shot);
+                    area.queue_render();
+                    self.phase.set(p + 1);
+                }
+                Err(why) => {
+                    println!("FAIL(context) {label}: {why}");
+                    self.done(at, false);
+                }
+            },
+            _ => {
+                let held = self.first.borrow_mut().take();
+                let passed = match (held, capture(area, &label)) {
+                    (Some(a), Ok(b)) if a.raw == b.raw && a.alloc == b.alloc => {
+                        measure(case, &b, &self.evidence)
+                    }
+                    (Some(_), Ok(_)) => {
+                        // Two renders of one state disagreed, so whatever the
+                        // numbers would say, they are not this state's.
+                        println!(
+                            "FAIL(unstable) {label}: two readbacks of the same state differ — \
+                             the area's texture pool has not settled after {SETTLE_RENDERS} \
+                             renders; raise SETTLE_RENDERS"
+                        );
+                        false
+                    }
+                    (_, Err(why)) => {
+                        println!("FAIL(context) {label}: {why}");
+                        false
+                    }
+                    (None, Ok(_)) => {
+                        println!("FAIL(context) {label}: the first readback went missing");
+                        false
+                    }
+                };
+                self.done(at, passed);
+            }
+        }
+        glib::ControlFlow::Continue
+    }
+
+    /// Record a case's verdict and move to the next one.
+    fn done(&self, at: usize, passed: bool) {
+        if !passed {
+            self.failures.set(self.failures.get() + 1);
+        }
+        self.index.set(at + 1);
+        self.phase.set(0);
+        self.first.borrow_mut().take();
+    }
+
+    /// The closing verdict, and the process exit status behind it.
+    fn summary(&self) {
+        println!("-- summary --");
+        if self.failures.get() == 0 {
+            println!(
+                "PASS all {} case(s) inside the proposed ceiling on every channel",
+                self.cases.len()
+            );
+        } else {
+            println!(
+                "FAIL {} of {} case(s) — see the per-case verdict above",
+                self.failures.get(),
+                self.cases.len()
+            );
+            FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        println!("=== preem_gl_diff done — paste this into issue #893 ===");
+    }
 }
 
 /// The sample batch every case stamps — a wave with steep segments, so the
@@ -640,7 +670,7 @@ fn print_regions(deltas: &[u8], reference: &kit::Frame) {
 /// Netpbm rather than PNG, and deliberately: PNG needs a deflate stream, which
 /// means a dependency, and this is an example in a workspace that has no image
 /// crate. `P6`/`P5` are eight lines of `Vec<u8>` and every viewer and
-/// `netpbm`/ImageMagick reads them — `pnmtopng gates/crt.idle0.delta.pgm` if a
+/// `netpbm`/`ImageMagick` reads them — `pnmtopng gates/crt.idle0.delta.pgm` if a
 /// browser is what you have.
 fn write_evidence(
     dir: &std::path::Path,

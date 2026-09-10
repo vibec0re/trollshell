@@ -1391,14 +1391,14 @@ preem_gl_diff` prints a per-channel mean / p99 / max against the CPU kit
      edges is rasterisation coverage, flat across the field is gamma/sRGB, in
      the lit interior is shader math. It runs headless too, which is how the
      #1072 numbers were taken:
-     ```sh
+     `sh
      nix develop --command bash -c '
        MESA=$(nix build nixpkgs#mesa --no-link --print-out-paths)
        export LIBGL_ALWAYS_SOFTWARE=1 LIBGL_DRIVERS_PATH="$MESA/lib" \
               LD_LIBRARY_PATH="$MESA/lib:$LD_LIBRARY_PATH" GDK_BACKEND=x11 \
               __EGL_VENDOR_LIBRARY_FILENAMES="$MESA/share/glvnd/egl_vendor.d/50_mesa.json"
        xvfb-run -a cargo run -p trollshell --example preem_gl_diff'
-     ```
+     `
      (`LIBGL_DRIVERS_PATH` wants `$MESA/lib/dri`; the four variables are the
      #1036 spike's recipe and all of them are load-bearing.) Exit status is the
      verdict — it is `1` on any failure, including the one that matters most,

@@ -97,7 +97,7 @@ pub(crate) enum Verdict {
     /// **Every compared pixel is `0, 0, 0`** — the GL arm drew nothing at all.
     ///
     /// Split out of [`Self::UndrawnFramebuffer`] for #1070's review finding M2
-    /// (https://github.com/vibec0re/trollshell/pull/1070#issuecomment-5621283282):
+    /// (<https://github.com/vibec0re/trollshell/pull/1070#issuecomment-5621283282>):
     /// a glvnd stub for an unimplemented entry point returns `0` without
     /// trapping, so a wrong dispatch table degrades to an empty compile log or
     /// a no-op texture allocation — a **silent black chip**, with no GL error,
@@ -670,13 +670,13 @@ mod tests {
         });
         let map = super::delta_map(&gl, &cpu, layout(w, h));
         assert_eq!(map.len(), w * h, "one byte per pixel");
-        assert_eq!(map[1 * w + 2], 77, "at the reference's own (2, 1)");
+        assert_eq!(map[w + 2], 77, "at the reference's own (2, 1)");
         assert_eq!(map.iter().filter(|d| **d > 0).count(), 1);
 
         // …and the same flip for the image the harness writes beside it.
         let image = super::gl_image(&gl, layout(w, h));
         assert_eq!(image.len(), w * h * 3, "RGB, no alpha");
-        assert_eq!(&image[(1 * w + 2) * 3..(1 * w + 2) * 3 + 3], &[0, 77, 0]);
+        assert_eq!(&image[(w + 2) * 3..(w + 2) * 3 + 3], &[0, 77, 0]);
     }
 
     /// **A beam in the wrong place fails**, even when every channel is inside

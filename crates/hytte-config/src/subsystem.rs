@@ -299,6 +299,18 @@ fn parse_layer(body: &str, path: Option<&Path>) -> Result<toml::Table, ConfigErr
 /// [`Subsystem::validate`] rejects the result. An *unknown* key is none of
 /// these — it is warned and reported in [`Loaded::unknown_keys`].
 pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>, ConfigError> {
+    // #1022: several tests below call `assemble` directly — bypassing both
+    // `capture` and the `assembled` test helper, the two call sites named in
+    // `crate::test_tracing`'s own doc — because they assert on something
+    // other than a `warn!` (an error variant, a key name, a round-tripped
+    // byte string) and never needed a capture. They can still race a
+    // *shared* callsite's first-ever registration against a
+    // `capture()`-using test (every `tracing::warn!` in this generic function
+    // is one `static` shared by every `S`, not one per monomorphization —
+    // see `crate::test_tracing`'s doc). Compiled out entirely outside
+    // `cargo test`, so this is invisible to `load`'s real, non-test callers.
+    #[cfg(test)]
+    crate::test_tracing::ensure_global_default();
     // Kept as two parallel vectors rather than pairs: the diagnostics below
     // need the file name beside each table, and `merge::inert_unset` needs the
     // tables as one slice because its question — "does *any* layer set this
@@ -1013,7 +1025,14 @@ palette = ["amber", "rust"]
             .collect()
     }
 
+    /// Calls [`crate::test_tracing::ensure_global_default`] before touching
+    /// `assemble` at all — this is the *other* required call site (see
+    /// `capture`'s doc and `crate::test_tracing`'s): several tests call
+    /// `assembled` directly, with no [`capture`] guard, so the global default
+    /// has to be reachable from here too, or those tests are exactly the
+    /// subscriber-less thread #1022 is about.
     fn assembled(bodies: &[&str]) -> Loaded<Leds> {
+        crate::test_tracing::ensure_global_default();
         assemble::<Leds>(&layers(bodies)).expect("assembles")
     }
 
@@ -1495,23 +1514,155 @@ kept = true
         }
     }
 
+    /// Installs a capturing [`tracing::Subscriber`] as this thread's ambient
+    /// default and returns a handle to the events it records
+    /// ([`Captured::events`]) plus the [`tracing::dispatcher::DefaultGuard`]
+    /// that keeps it installed for the scope of the caller (drop the guard,
+    /// or let it fall out of scope, to uninstall).
+    ///
+    /// Also calls [`crate::test_tracing::ensure_global_default`] first: see
+    /// that module's doc for the mechanism this exists to close (#1022) — in
+    /// short, without a permanently-registered global default, a callsite
+    /// first touched on a subscriber-less thread anywhere in this binary can
+    /// cache `Interest::never()` for the rest of the process, which would
+    /// make this very capture blind to a `warn!`/`error!` it should have
+    /// seen, depending on unrelated test scheduling.
     fn capture() -> (Captured, tracing::dispatcher::DefaultGuard) {
+        crate::test_tracing::ensure_global_default();
         let captured = Captured::default();
         let guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(captured.clone()));
-        // Belt and braces, kept deliberately. The hazard is real — with zero
-        // live dispatchers `tracing-core` caches a callsite's interest as
-        // `never` for the whole binary (`callsite.rs`'s
-        // `interest.unwrap_or_else(Interest::never)`) — but `Dispatch::new`
-        // above already closes it: constructing a `Dispatch` registers it and
-        // rebuilds interest for every registered callsite over the live list.
-        // What this call covers is the narrower `Rebuilder::JustOne` path,
-        // where with a single live dispatcher the rebuild degrades to
-        // "whatever *this* thread's default is" — genuinely thread-sensitive,
-        // and one line to insure against. It can only widen interest here
-        // (`Captured::enabled` is unconditionally true), so it cannot poison a
-        // sibling test.
-        tracing::callsite::rebuild_interest_cache();
         (captured, guard)
+    }
+
+    /// The global default from #1022's fix must reach a thread that never
+    /// calls [`capture`] or [`assembled`] at all — exactly the shape
+    /// `an_unknown_key_is_reported_and_does_not_fail_the_load` and
+    /// `an_unknown_key_inside_an_optional_table_is_named_and_kept` (elsewhere
+    /// in this module) have always had: they call `assembled`/`assemble`
+    /// directly, with no subscriber of their own, and before this fix could
+    /// win the exact race this test constructs on purpose.
+    ///
+    /// # Ordering matters — this is not the same shape as the deleted
+    /// "poison before any `Dispatch` exists" test
+    ///
+    /// [`capture`] is installed **first**, before the bare thread below ever
+    /// touches the callsite — deliberately, so `capture`'s own `Dispatch::new`
+    /// has already run and found nothing yet to fix (the callsite doesn't
+    /// exist in the registry until the bare thread creates it). The old,
+    /// pre-#1022 shape of this test called `capture` *after* the bare touch,
+    /// which just re-exercises `Dispatch::new`'s unconditional full-registry
+    /// rebuild — a real, still-true property, but not the one this fix adds,
+    /// and it would pass even with [`crate::test_tracing::ensure_global_default`]
+    /// deleted (I checked: it did, 0 of the mutation's failures were this
+    /// test).
+    ///
+    /// # What actually saves this test is *not* `Rebuilder::JustOne` (PR
+    /// #1043 review, finding F1)
+    ///
+    /// With `capture` installed first, two dispatchers are concurrently live
+    /// by the time the bare thread below runs — the permanent global plus
+    /// `capture`'s own ephemeral one — so `DISPATCHERS.has_just_one` is
+    /// already `false` and the bare thread's first-ever registration takes
+    /// `Rebuilder::Read` (the full live-registrar list), never
+    /// `Rebuilder::JustOne`'s single-thread-ambient shortcut. What closes the
+    /// race here is the *fold* over that full list: it can only land on
+    /// `never()` if every entry says `never()`, and our permanently-registered
+    /// global always says `always()`, so the folded result can't be
+    /// `never()` either. See [`crate::test_tracing`]'s doc for the fold rule
+    /// and for `a_bare_thread_touching_a_callsite_while_only_the_global_is_live`,
+    /// the sibling test below that exercises the actual `JustOne` path this
+    /// test's own assertion used to (wrongly) credit.
+    ///
+    /// The callsite here is private to this test (its own `tracing::warn!`
+    /// invocation, at its own source line), so its first-ever registration is
+    /// guaranteed to happen on the bare thread below, not on whichever thread
+    /// some *other* test's shared callsite happens to race on.
+    #[test]
+    fn a_bare_thread_that_never_calls_capture_still_sees_the_global_default() {
+        fn fire() {
+            tracing::warn!(marker = "1022-bare-thread", "1022 bare-thread probe");
+        }
+
+        // Guarantee the global default is live before anything below runs —
+        // exactly what every real `capture`/`assembled` call already does; a
+        // test doesn't get to assume some *other* test won that race first.
+        crate::test_tracing::ensure_global_default();
+
+        // Install the capturing `Dispatch` *before* the callsite below has
+        // ever been touched by anyone — its own construction has nothing
+        // registered yet to rebuild, so it cannot be what saves this test.
+        let (captured, _guard) = capture();
+
+        // First-ever touch, on a bare thread with no `set_default` anywhere
+        // in its stack — the scenario that used to cache `Interest::never()`
+        // for whichever callsite got here first (#1022), with the capturing
+        // thread's own fix-on-construction chance already spent on nothing.
+        std::thread::spawn(fire).join().expect("bare thread");
+
+        fire();
+        assert!(
+            captured
+                .events()
+                .iter()
+                .any(|e| e.fields.get("marker").map(String::as_str) == Some("1022-bare-thread")),
+            "a callsite first touched on a subscriber-less thread, after the \
+             capturing Dispatch already existed, must still be observed: the \
+             permanently-registered global default keeps the folded interest \
+             off Interest::never() (Rebuilder::Read, not JustOne — see this \
+             test's doc), so the first-ever touch can never cache never()"
+        );
+    }
+
+    /// The narrower claim this module's other #1022 regression test doesn't
+    /// actually exercise (PR #1043 review, finding F1): a **truly** bare
+    /// registration, with no other `Dispatch` concurrently live anywhere in
+    /// the process, so `DISPATCHERS.has_just_one` is still `true` and the
+    /// callsite's first-ever registration takes `Rebuilder::JustOne`
+    /// (`tracing-core = 0.1.36`'s `src/callsite.rs:561-565`) — whose
+    /// `for_each` resolves the touching thread's ambient default via
+    /// `dispatcher::get_default`, i.e. the global fallback this fix installs.
+    ///
+    /// `capture` is installed *after* the bare thread's touch here (the
+    /// opposite order from the sibling test above) precisely so nothing else
+    /// is registered yet when that touch happens. This makes the test **not
+    /// discriminating on its own** against removing the fix entirely: with
+    /// `ensure_global_default`'s body disabled, the callsite would cache
+    /// `never()` on the bare touch, but `capture`'s own subsequent
+    /// `Dispatch::new` unconditionally rebuilds every already-registered
+    /// callsite (see `crate::test_tracing`'s doc) and would rescue it anyway
+    /// — the same pre-existing mechanism that makes the *other* test's old,
+    /// deleted ordering non-discriminating. What this test isolates instead
+    /// is [`crate::test_tracing::AlwaysInterested`]'s `register_callsite`
+    /// actually being consulted on the `JustOne` path: swap it for a
+    /// subscriber whose `register_callsite` returns anything other than
+    /// `Interest::always()` and this is the test that is supposed to notice.
+    #[test]
+    fn a_bare_thread_touching_a_callsite_while_only_the_global_is_live() {
+        fn fire() {
+            tracing::warn!(marker = "1043-justone", "JustOne-path probe");
+        }
+
+        crate::test_tracing::ensure_global_default();
+
+        // Only the permanent global is live at this point (in isolation —
+        // see the doc above on why this can't be guaranteed under the
+        // default parallel test harness). First-ever touch, on a bare
+        // thread, before any ephemeral `capture()` `Dispatch` exists
+        // anywhere: the `Rebuilder::JustOne` shortcut is what resolves this
+        // registration, not the full-list fold.
+        std::thread::spawn(fire).join().expect("bare thread");
+
+        let (captured, _guard) = capture();
+        fire();
+        assert!(
+            captured
+                .events()
+                .iter()
+                .any(|e| e.fields.get("marker").map(String::as_str) == Some("1043-justone")),
+            "a callsite whose first-ever registration took the JustOne path \
+             while only the global default was live must still be observed \
+             once a real capture exists"
+        );
     }
 
     /// The malformed-marker warnings, selected on the **exact** message rather

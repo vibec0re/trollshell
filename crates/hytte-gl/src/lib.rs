@@ -65,8 +65,10 @@
 //! `GdkGLAPI::GLES` so the dialect is deterministic rather than
 //! driver-dependent. Every function this crate calls is therefore restricted
 //! to the **GL 4.x ∩ GLES 3.2** intersection, where the names and enum values
-//! are identical; libepoxy exports both families from one dispatch table, so
-//! one loader serves both. Shaders are compiled with an explicit version
+//! are identical; glvnd's dispatch (the route [`loader`] uses first, #1067)
+//! serves both families from one process-wide table, with libepoxy's own
+//! `epoxy_<name>` variables as the fallback — see [`loader`] for which route
+//! actually wins on this platform. Shaders are compiled with an explicit version
 //! header the caller supplies ([`Program::compile`]) rather than one baked into
 //! the source, so the same GLSL body can be re-targeted without editing it.
 
@@ -598,8 +600,9 @@ thread_local! {
 /// # Why once, and why per thread
 ///
 /// It is a property of the implementation, not of a context: every context this
-/// process creates comes from the same driver through the same libepoxy
-/// dispatch table (see [`loader`]), and GTK gives a display one share group. So
+/// process creates comes from the same driver through the same process-wide
+/// dispatch table [`loader`] installs once — glvnd's on this platform (#1067),
+/// libepoxy's as the fallback — and GTK gives a display one share group. So
 /// one query serves every `GdkGLContext`, exactly as one `gl::load_with` does.
 /// The memo is per **thread** rather than process-wide because the [`Gl`] token
 /// is `!Send` — a second thread with a context of its own has to make its own

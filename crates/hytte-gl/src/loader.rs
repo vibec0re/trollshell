@@ -132,7 +132,14 @@ enum Source {
     /// libepoxy's `epoxy_<name>` function-pointer **variables**.
     Epoxy(&'static libloading::Library),
     /// Plain Khronos names, out of an object that exports them as functions.
-    Plain(&'static libloading::Library),
+    ///
+    /// Carries its own [`describe`](Self::describe) label rather than a
+    /// hardcoded one: production only ever builds this from `open(None)` (the
+    /// process image), but the hermetic test also wraps a **libepoxy** handle
+    /// in this variant to drive the refusal gate without a fourth source
+    /// (#1070's review, M6) — a hardcoded "process image" label would name the
+    /// wrong library in that refusal message.
+    Plain(&'static libloading::Library, &'static str),
 }
 
 impl Source {
@@ -169,14 +176,38 @@ impl Source {
                 // `*found` is the address *of* the `epoxy_glFoo` variable, not
                 // its value — see the module header's first epoxy trap.
                 let variable: *const *const c_void = (*found).cast();
-                // SAFETY: `variable` is the address dlsym reported for a symbol
-                // this library defines, and epoxy defines every `epoxy_gl*` as
-                // an initialised `PFNGLFOOPROC` — so it is a live, aligned,
-                // pointer-sized object in the mapping, which `library` (leaked,
-                // `'static`) keeps mapped. Reading it is one aligned load.
-                unsafe { *variable }
+                // SAFETY: this crate cannot verify, at runtime, which ELF
+                // symbol type `variable` actually is — `libloading`/`dlsym`
+                // erase the object/function distinction, and only
+                // `dladdr1(…, RTLD_DL_SYMENT)` reading `ELF64_ST_TYPE(st_info)`
+                // could recover it (#1070's review, M3; not done here). The
+                // read rests entirely on libepoxy's *published ABI*, an
+                // external contract this crate cannot check, the same way
+                // `hytte-ecal` trusts libecal's: `variable` is the address
+                // dlsym reported for a symbol `library` defines, and epoxy's
+                // public header declares every `epoxy_gl*` an initialised
+                // `PFNGLFOOPROC` — a live, aligned, pointer-sized object in the
+                // mapping, which `library` (leaked, `'static`) keeps mapped.
+                // Reading it is one aligned load.
+                let held = unsafe { *variable };
+                // Cheap runtime guard for the one shape a broken ABI claim
+                // would produce that a plain null check would miss: `held`
+                // reading back as the address of the *variable itself* rather
+                // than a distinct function pointer, which is what happens if
+                // `epoxy_glFoo` turns out not to be the pointer-sized data
+                // object the SAFETY comment above assumes. The hermetic test
+                // asserts this half directly (`resolve must return the
+                // pointer the epoxy_glGetString variable *holds*, not the
+                // address of the variable itself`); this is the same check
+                // made live, so a future libepoxy that violates the ABI
+                // degrades this route to "resolved nothing, fall through to
+                // Plain" rather than installing a wild pointer.
+                if held.is_null() || held == *found {
+                    return std::ptr::null();
+                }
+                held
             }
-            Self::Plain(library) => {
+            Self::Plain(library, _) => {
                 // SAFETY: as above — a plain dlsym, whose address is only ever
                 // stored by `gl::load_with` and called through the `gl` crate's
                 // own generated signatures.
@@ -193,7 +224,7 @@ impl Source {
         match self {
             Self::Glvnd(_) => "libEGL.so.1 (eglGetProcAddress)",
             Self::Epoxy(_) => "libepoxy (epoxy_* variables)",
-            Self::Plain(_) => "process image (plain names)",
+            Self::Plain(_, name) => name,
         }
     }
 }
@@ -203,13 +234,26 @@ impl Source {
 /// rather than a null call somewhere in a draw.
 ///
 /// Deliberately spans all four families this crate uses — shader compilation,
-/// texture storage, framebuffers, and the instanced draw — so a GLES 2-era
-/// dispatch table (which has none of `TexStorage2D` / `DrawArraysInstanced` /
-/// `VertexArray`) is rejected up front.
+/// texture storage, framebuffers, and the instanced draw — so on
+/// [`Source::Epoxy`] and [`Source::Plain`], where this is a **real gate**, a
+/// GLES 2-era dispatch table (which has none of `TexStorage2D` /
+/// `DrawArraysInstanced` / `VertexArray`) is rejected up front.
 ///
-/// A real gate on [`Source::Epoxy`] and [`Source::Plain`], and **vacuously true
-/// on [`Source::Glvnd`]**, which answers non-null for any `gl`-shaped name at
-/// all — see the module header for why that is not a reason to drop it.
+/// **Vacuously true on [`Source::Glvnd`]** — the route that always wins on
+/// this platform — which answers non-null for any `gl`-shaped name at all
+/// (see the module header); this function cannot reject anything there. #1070's
+/// review (M2) measured what a vendor missing one of these entry points does
+/// instead: a glvnd dispatch stub for an unimplemented call *returns*, it does
+/// not trap. `glCreateShader` answers `0`; `glGetShaderiv` on it is a no-op
+/// that never writes `status`, so [`Program::compile`](crate::Program::compile)
+/// degrades to [`Error::Compile`] with an **empty** driver log rather than an
+/// abort; `glTexStorage2D` similarly no-ops with no GL error raised, leaving a
+/// texture that exists with no storage. Low probability in this tree —
+/// `set_allowed_apis(GLES)` plus GDK's own GLES 3.2 context negotiation fails
+/// first on hardware that thin, which is the `area.error()` exit
+/// `real_gl()` (`crates/hytte-ui/src/gl_surface.rs`) now names apart from a
+/// loader failure — but it is a real gap this function does not close, and
+/// the vacuity noted above is the only guarantee route 1 gets.
 fn required_symbols_present() -> bool {
     gl::CreateShader::is_loaded()
         && gl::TexStorage2D::is_loaded()
@@ -265,7 +309,10 @@ fn load_once() -> Result<&'static str, String> {
 
     match open(None) {
         Ok(library) => {
-            if let Some(won) = install(Source::Plain(library), &mut attempts) {
+            if let Some(won) = install(
+                Source::Plain(library, "process image (plain names)"),
+                &mut attempts,
+            ) {
                 return Ok(won);
             }
         }
@@ -275,6 +322,29 @@ fn load_once() -> Result<&'static str, String> {
     Err(attempts.join("; "))
 }
 
+/// The closure [`install`] hands to [`gl::load_with`], named rather than
+/// written inline at the call site.
+///
+/// #1070's review (M1) found the hermetic test could not see a `resolve` that
+/// **ignores its own argument** — three separate mutations of exactly that
+/// shape (this closure discarding `symbol`, [`Source::Glvnd::resolve`]
+/// discarding it, [`Source::Epoxy::resolve`] discarding it) left every test
+/// green, because the old test only ever probed `resolve("glGetString")` and
+/// a discarding mutant answers that one name correctly while silently binding
+/// **every** other entry point to `glGetString`'s dispatch stub —
+/// `required_symbols_present` cannot tell, since it only checks non-null-ness.
+/// Naming this closure gives the test one place, reachable through
+/// [`install`]'s actual seam, to assert `hand_off("glGetString") !=
+/// hand_off("glTexStorage2D")` through — see the test module below. It does
+/// not close the gap completely: a mutant that bypasses this function and
+/// re-inlines a discarding closure at the `gl::load_with` call site is still
+/// invisible to any test that only calls `resolve` or `loader_for` directly.
+/// That is mutation testing's ordinary "delete the mechanism, not perturb it"
+/// limit, not a bug in this fix.
+fn loader_for(source: Source) -> impl FnMut(&'static str) -> *const c_void {
+    move |symbol| source.resolve(symbol)
+}
+
 /// Point [`gl::load_with`] at `source` and check the entry points this crate
 /// needs actually resolved.
 ///
@@ -282,7 +352,7 @@ fn load_once() -> Result<&'static str, String> {
 /// little and the caller should try the next, with the reason pushed onto
 /// `attempts`.
 fn install(source: Source, attempts: &mut Vec<String>) -> Option<&'static str> {
-    gl::load_with(|symbol| source.resolve(symbol));
+    gl::load_with(loader_for(source));
     if required_symbols_present() {
         tracing::debug!(source = source.describe(), "GL entry points resolved");
         Some(source.describe())
@@ -336,7 +406,8 @@ fn open(soname: Option<&str>) -> Result<&'static libloading::Library, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EPOXY_SONAMES, GLVND_EGL_SONAME, GetProcAddress, Source, install, load_once, open,
+        EPOXY_SONAMES, GLVND_EGL_SONAME, GetProcAddress, Source, install, load_once, loader_for,
+        open,
     };
 
     /// Map GTK's GL closure into this test binary.
@@ -380,15 +451,34 @@ mod tests {
     /// (caught by the `.data` comparison, in a test that only reads pointers,
     /// instead of by a SIGSEGV in a draw); dropping the
     /// [`required_symbols_present`] gate out of [`install`] (section 2);
-    /// rewiring [`load_once`] to a different source order (section 3).
+    /// rewiring [`load_once`] to a different source order (section 3). Since
+    /// #1070's review (M1), also falsified by any of the three sites listed on
+    /// [`loader_for`]'s own doc discarding the name they are handed — caught
+    /// by the `hand_off`/`hand_off_epoxy` assertions right after sections 1
+    /// and 2, which none of the four mutations above touch.
     #[test]
     fn the_loader_resolves_entry_points_on_this_platform() {
         map_gtk_gl_closure();
 
         // ---- 1. glvnd -------------------------------------------------------
-        let egl = open(Some(GLVND_EGL_SONAME)).unwrap_or_else(|why| {
-            panic!("{GLVND_EGL_SONAME} must be mapped in a process linked against gtk-4: {why}")
-        });
+        // Whether `GLVND_EGL_SONAME` is mapped here is an incidental nixpkgs
+        // packaging fact (gtk4 built with the GStreamer media backend, whose
+        // `libgstgl` is what pulls glvnd's libEGL onto this test binary's
+        // closure — see the module header), not a property this crate
+        // controls. A gtk4 repackaging that drops it takes route 1 off this
+        // *test's* closure while the shell keeps working (route 2, epoxy,
+        // wins instead) — so this precondition is a loud SKIP, not a fail
+        // (#1070's review, M4). Every other assertion below still panics.
+        let Ok(egl) = open(Some(GLVND_EGL_SONAME)) else {
+            eprintln!(
+                "SKIP the_loader_resolves_entry_points_on_this_platform: {GLVND_EGL_SONAME} is \
+                 not mapped in this process. This is expected if this platform's gtk4 was built \
+                 without the GStreamer media backend; the shell still resolves GL through route \
+                 2 (libepoxy). If gtk4 on this platform is expected to carry glvnd's libEGL, \
+                 that expectation has changed and this skip is the signal to look.",
+            );
+            return;
+        };
         // SAFETY: as in `glvnd()` above — a dlsym typed as the signature glvnd
         // defines for it, never called through here.
         let get_proc_address = *unsafe { egl.get::<GetProcAddress>(b"eglGetProcAddress") }
@@ -408,6 +498,20 @@ mod tests {
             !glvnd.resolve("glHytteNotARealEntryPoint").is_null(),
             "glvnd is documented here as answering non-null for names no vendor implements; if \
              that has changed, the module header's reasoning about liveness needs rewriting",
+        );
+
+        // #1070's review (M1): the assertions above call `Source::resolve`
+        // directly, which cannot see a discard at the seam `install` actually
+        // uses — `gl::load_with(loader_for(source))`. Asserting *through*
+        // `loader_for` closes that gap: a `resolve`/`loader_for` that
+        // discards its argument and always answers `glGetString`'s stub would
+        // still pass every assertion above but fail this one.
+        let mut hand_off = loader_for(glvnd);
+        assert_ne!(
+            hand_off("glGetString"),
+            hand_off("glTexStorage2D"),
+            "the resolver install hands to gl::load_with must pass each name through, not \
+             collapse every entry point onto whichever name was asked for first",
         );
 
         // ---- 2. libepoxy ----------------------------------------------------
@@ -440,12 +544,31 @@ mod tests {
              address of the variable itself (libloading's Symbol<T> derefs to the dlsym address)",
         );
 
+        // Same seam as glvnd's, above (#1070's review, M1): asserted through
+        // `loader_for` so a discard at the `install`/`gl::load_with` handoff
+        // is caught even though the epoxy route prefixes the name first.
+        let mut hand_off_epoxy = loader_for(Source::Epoxy(epoxy));
+        assert_ne!(
+            hand_off_epoxy("glGetString"),
+            hand_off_epoxy("glTexStorage2D"),
+            "same, for the epoxy_<name> prefix path",
+        );
+
         // ---- 1c. plain names ------------------------------------------------
         // The shipped bug, pinned as a fact about this platform rather than a
         // guess: libepoxy exports no unprefixed `gl*` at all, so the route the
         // loader used to take for *every* source finds nothing here.
+        //
+        // This deliberately wraps the **libepoxy** handle in `Source::Plain`
+        // rather than opening a fourth, genuinely-plain library — the point is
+        // to drive `install`'s refusal gate with a source that resolves
+        // nothing, and epoxy's handle is already open. Its label says so
+        // (#1070's review, M6): production only ever builds `Source::Plain`
+        // from the process image, and a hardcoded "process image" label here
+        // would misname what this refusal is actually about.
+        let plain_over_epoxy = Source::Plain(epoxy, "libepoxy (via Plain, refusal-gate test)");
         assert!(
-            Source::Plain(epoxy).resolve("glGetString").is_null(),
+            plain_over_epoxy.resolve("glGetString").is_null(),
             "libepoxy is documented here as exporting only epoxy_gl* variables; a non-null plain \
              glGetString would mean this platform changed and the module header is stale",
         );
@@ -453,19 +576,19 @@ mod tests {
         // ---- 2. the gate ----------------------------------------------------
         // `required_symbols_present` is what turns a source that resolved *too
         // little* into a fallthrough instead of a table of null pointers a draw
-        // would call into. `Source::Plain(epoxy)` is a source that answers null
+        // would call into. `plain_over_epoxy` is a source that answers null
         // for everything (asserted just above), so installing it must be
         // refused — and the refusal must name the source, since that string is
         // the whole of the `Error::Load` message anyone triages from.
         let mut attempts = Vec::new();
         assert!(
-            install(Source::Plain(epoxy), &mut attempts).is_none(),
+            install(plain_over_epoxy, &mut attempts).is_none(),
             "a source that resolves nothing must be refused, not installed",
         );
         assert!(
             attempts
                 .last()
-                .is_some_and(|why| why.starts_with(Source::Plain(epoxy).describe())),
+                .is_some_and(|why| why.starts_with(plain_over_epoxy.describe())),
             "the refusal must name which source it was: {attempts:?}",
         );
 

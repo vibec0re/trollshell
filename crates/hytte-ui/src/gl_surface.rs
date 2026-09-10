@@ -490,7 +490,12 @@ impl WarnLatch {
         if self.said.contains(&key) {
             return false;
         }
-        if self.said.len() == WARNED_LENGTHS {
+        // `>=`, not `==` (PR #1048 fix round, INFO): `==` is exactly what let
+        // `WARNED_LENGTHS = 0` pass as an unbounded latch pre-#1046 — the
+        // empty deque's `len()` is `0`, so `== 0` was already true and
+        // `pop_front` never ran. `>=` makes that class of mistake
+        // unreachable instead of merely tested for.
+        if self.said.len() >= WARNED_LENGTHS {
             self.said.pop_front();
         }
         self.said.push_back(key);
@@ -559,7 +564,23 @@ fn warn_on_data_failure(latch: &RefCell<WarnLatch>, failure: &DataFailure) {
 /// Resets `data_source` then `data_len` before reporting, so the strip
 /// really does read as empty (`u_data_len = 0`, matching the message) and
 /// the next call retries rather than short-circuiting on `Arc::ptr_eq`
-/// against data that was never actually uploaded.
+/// against data that was never actually uploaded. See
+/// `refusing_a_data_strip_zeros_its_length_and_forgets_the_source` for the
+/// test that drives this directly.
+///
+/// **What is pinned is this helper, not the arm that calls it** (PR #1048
+/// fix round, LOW 2): the test constructs a [`DataFailure`] and calls this
+/// function by hand — it cannot see whether `upload_data`'s `Err` arm
+/// writes anything to `self.data_len` *after* this call returns. Today it
+/// does not (the call is immediately followed by `return`), but that is a
+/// property of the call site, not of this function, and closing that gap
+/// hermetically needs the GL-backed half — `Texture::new` actually failing
+/// — which is #1036's, not this one's. `data_len` genuinely has to be
+/// `&mut` here (this is the one place that zeros it), so unlike
+/// `shader_surface`'s `_data_shape` (its `refuse_data_grid` twin), this
+/// contract cannot be moved from a test into the type system: there is no
+/// way to take `data_len` by shared reference and still do the reset it
+/// exists to do.
 fn refuse_data_strip(
     data_source: &mut Option<Arc<[f32]>>,
     data_len: &mut u32,
@@ -1916,10 +1937,11 @@ mod tests {
         );
     }
 
-    /// **PR #1031 third-pass review LOW 1 (#1046).** The FIFO bound this
-    /// PR added to `WarnLatch` is what makes eviction possible at all — with
-    /// no clear-on-success anywhere in this module, eviction is the *only*
-    /// path back to a second line for a length already reported. A port of
+    /// **PR #1031 third-pass review LOW 1 (#1046), tightened by the #1048
+    /// fix round.** The FIFO bound this PR added to `WarnLatch` is what
+    /// makes eviction possible at all — with no clear-on-success anywhere in
+    /// this module, eviction is the *only* path back to a second line for a
+    /// length already reported. A port of
     /// `shader_surface::two_broken_sources_alternating_cost_two_lines`, the
     /// twin this bound shipped without a test for.
     ///
@@ -1928,25 +1950,60 @@ mod tests {
     /// repeatedly, and a repeat claim returns early without pushing, so
     /// `said` never grows past one entry and the FIFO is never filled.
     ///
-    /// **Falsified** by setting `WARNED_LENGTHS` to `0`: `self.said.len() ==
-    /// WARNED_LENGTHS` (now `0`) is already true on the empty latch, so
-    /// `pop_front` never runs and nothing is ever evicted — the final claim
-    /// below goes quiet instead of firing again.
+    /// **Two-sided and literal-anchored** (PR #1048 fix round, LOW 1): the
+    /// original version looped `0..WARNED_LENGTHS`, so it moved with the
+    /// constant and stayed green at `WARNED_LENGTHS` shrunk to `3` or grown
+    /// to `9` — it pinned only that eviction happens, not the bound's
+    /// value. This version fills the latch to exactly one short of the
+    /// bound (asserting `a` still latched there), then makes the claim that
+    /// fills it, then evicts. `BOUND` is a literal, checked against
+    /// [`WARNED_LENGTHS`] rather than substituted for it, so a shrink or
+    /// grow of the real constant is exactly what makes the `assert_eq!`
+    /// fail — the same "pin external wire units as literals" discipline
+    /// applied to an internal bound.
+    ///
+    /// **Falsified** by setting `WARNED_LENGTHS` to `0`: `self.said.len() >=
+    /// WARNED_LENGTHS` is already true on the empty latch, so `pop_front`
+    /// runs (and pops nothing) and `a` is evicted on the very first
+    /// follow-up claim — the `assert_eq!` against `BOUND` catches the
+    /// mismatch immediately. Also falsified by `WARNED_LENGTHS` set to `7`
+    /// or `9`: the `assert_eq!` fails either way, where the old loop-form
+    /// test stayed green.
     #[test]
     fn a_length_evicted_by_the_bound_is_reported_again() {
+        const BOUND: usize = 8;
+        assert_eq!(
+            WARNED_LENGTHS, BOUND,
+            "this test's arithmetic is written for a bound of 8 — update BOUND (and the \
+             arithmetic below) if WARNED_LENGTHS changes",
+        );
+
         let mut latch = WarnLatch::default();
 
         let a = u64::from(100_000_u32);
         assert!(latch.claim(a), "the first refused length is reported");
 
-        // `WARNED_LENGTHS` further distinct lengths evict `a` from the FIFO.
-        for n in 0..WARNED_LENGTHS {
+        // One short of the bound: `a` must still be the oldest entry, not
+        // yet evicted.
+        for n in 0..BOUND - 1 {
             let key = (200_000 + n) as u64;
             assert!(
                 latch.claim(key),
                 "each new distinct length is reported once"
             );
         }
+        assert!(
+            !latch.claim(a),
+            "a must still be latched one short of the bound — the FIFO holds BOUND entries, \
+             and only BOUND - 1 have been added since a",
+        );
+
+        // The claim that fills the bound: the *next* insert is the one that
+        // evicts `a`, not this one.
+        assert!(
+            latch.claim(300_000),
+            "the length that fills the bound is itself new, so it is reported",
+        );
 
         assert!(
             latch.claim(a),
@@ -1955,12 +2012,18 @@ mod tests {
         );
     }
 
-    /// **PR #1031 third-pass review LOW 2(a) (#1046).** The refusal arm's
-    /// *state* half, pinned with no GL context: [`DATA_STRIP_REFUSED`]
+    /// **PR #1031 third-pass review LOW 2(a) (#1046).** [`refuse_data_strip`]'s
+    /// state half, pinned with no GL context: [`DATA_STRIP_REFUSED`]
     /// promises the strip "reads as empty (`u_data_len = 0`)", and that is
-    /// [`refuse_data_strip`] actually zeroing `data_len` — not merely the
-    /// sentence claiming it. It also forgets `data_source`, so a later
-    /// successful upload is not skipped as an unchanged repeat.
+    /// this helper actually zeroing `data_len` — not merely the sentence
+    /// claiming it. It also forgets `data_source`, so a later successful
+    /// upload is not skipped as an unchanged repeat.
+    ///
+    /// **This pins the helper, not the arm that calls it** (PR #1048 fix
+    /// round, LOW 2) — see [`refuse_data_strip`]'s own doc for why that
+    /// residual gap (a live driver has to refuse an allocation to exercise
+    /// `upload_data`'s actual `Err` arm) is inherent to the boundary #1046
+    /// drew, not something this test can close on its own.
     ///
     /// **Falsified** by deleting `*data_len = 0;` from `refuse_data_strip`:
     /// this test's `data_len` assertion goes red while `cargo test` and

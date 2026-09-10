@@ -154,7 +154,12 @@ impl Plugin for NiriLayouts {
     fn sources(mut cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
         let (msg_tx, msg_rx) = hytte_plugin::tokio::sync::mpsc::unbounded_channel();
         hytte_plugin::tokio::spawn(async move {
-            while let Some(Cmd::Apply(layout)) = cmds.recv().await {
+            while let Some(cmd) = cmds.recv().await {
+                // Destructured on its own line, not folded into the `while let`
+                // pattern: a second `Cmd` variant must be a compile error here,
+                // where `while let Some(Cmd::Apply(..))` would instead treat it
+                // as a non-match and silently end the worker for the session.
+                let Cmd::Apply(layout) = cmd;
                 // `Socket::send` is blocking std I/O, so it goes to the blocking
                 // pool rather than stalling the SDK's current-thread runtime
                 // (which is also servicing the host socket).

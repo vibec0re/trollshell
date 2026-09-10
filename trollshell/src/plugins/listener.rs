@@ -107,12 +107,39 @@ pub(super) fn acquire_listen_lock(lock: &Path) -> std::io::Result<Option<File>> 
     }
 }
 
+/// The host socket this instance owns: the bound listener **and** the
+/// single-instance lock, as one value.
+///
+/// The two are one value on purpose. The lock must be held for exactly as long
+/// as the listener — an accept loop that outlives its lock lets the next
+/// instance past the gate while this one is still serving — and when the caller
+/// held them as two bindings that invariant rested on a `_lock` binding whose
+/// deletion nothing could observe (a one-character mutation, suite green). Here
+/// it is structural: dropping the socket releases the lock, and there is no way
+/// to keep accepting without keeping the lock.
+pub(super) struct HostSocket {
+    listener: UnixListener,
+    /// The single-instance flock (#996), held for this socket's whole life and
+    /// released by the kernel when the process dies. Never read — its `Drop` is
+    /// the whole contract.
+    _lock: File,
+}
+
+impl HostSocket {
+    /// Accept one plugin connection. Delegates to the bound listener while the
+    /// lock stays held (it is a field of the same value).
+    pub(super) async fn accept(
+        &self,
+    ) -> std::io::Result<(UnixStream, tokio::net::unix::SocketAddr)> {
+        self.listener.accept().await
+    }
+}
+
 /// The outcome of trying to take ownership of the host socket (#996).
 pub(super) enum SocketClaim {
-    /// This instance owns the socket. Carries the bound listener **and** the
-    /// lock handle, which the caller must hold for the listener's whole life —
-    /// dropping it would let a second instance in behind us.
-    Bound(UnixListener, File),
+    /// This instance owns the socket: the bound listener and the lock it holds
+    /// for its whole life, as one [`HostSocket`].
+    Bound(HostSocket),
     /// Another instance holds the single-instance lock: it either already owns
     /// the socket or is between its own probe and bind. Stand down.
     Locked,
@@ -154,7 +181,10 @@ pub(super) async fn take_socket(path: &Path) -> std::io::Result<SocketClaim> {
     }
     let listener = UnixListener::bind(path)?;
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    Ok(SocketClaim::Bound(listener, lock))
+    Ok(SocketClaim::Bound(HostSocket {
+        listener,
+        _lock: lock,
+    }))
 }
 
 /// Bind the host socket and accept plugin connections forever. The path comes
@@ -184,11 +214,11 @@ pub(super) async fn listen(ctx: &ListenerCtx) -> std::io::Result<()> {
     // refused) is reclaimed, so a normal restart — which stops the old process
     // before starting the new — still rebinds cleanly.
     //
-    // `_lock` is the single-instance flock, deliberately bound for the rest of
-    // this function: it must outlive the accept loop, and `listen` only returns
-    // when the host is going away.
-    let (listener, _lock) = match take_socket(&path).await? {
-        SocketClaim::Bound(listener, lock) => (listener, lock),
+    // The claim carries the single-instance flock *inside* the socket value, so
+    // the lock lives exactly as long as the accept loop below — `listen` only
+    // returns when the host is going away, and there is no binding to drop.
+    let socket = match take_socket(&path).await? {
+        SocketClaim::Bound(socket) => socket,
         SocketClaim::Locked => {
             tracing::warn!(
                 lock = %lock_path(&path).display(),
@@ -208,7 +238,7 @@ pub(super) async fn listen(ctx: &ListenerCtx) -> std::io::Result<()> {
     tracing::info!(socket = %path.display(), "plugin host listening");
 
     loop {
-        match listener.accept().await {
+        match socket.accept().await {
             Ok((stream, _addr)) => {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {

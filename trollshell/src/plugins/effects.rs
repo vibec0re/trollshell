@@ -267,10 +267,14 @@ pub(super) fn broker_effect(
             // #963's agents card could show a URL but not open it without
             // asking for arbitrary argv execution.
             //
-            // Unlike `RunCommand` this is NOT offloaded to the tokio runtime.
-            // `launch_default_for_uri` is a GLib call, and the broker is already
-            // on the GTK main thread — which is exactly where `main.rs`'s Open
-            // actions make the same call. Only the reply hops to the runtime.
+            // Unlike `RunCommand` this is not offloaded to the tokio runtime:
+            // it is a GLib call and must start on the GTK main thread, which is
+            // exactly where the broker (and `main.rs`'s own Open actions) are.
+            // But nothing here *waits* — the `_async` entry point returns as
+            // soon as the request is in flight and answers on a callback, so a
+            // plugin-supplied URI can never hold the main loop (the sync
+            // sibling does blocking content-type I/O on it). The reply then
+            // hops to the runtime as before.
             broker_open_uri(plugin_id, *id, uri, outbound);
         }
     }
@@ -586,9 +590,13 @@ fn command_outcome(success: bool, stdout: &[u8]) -> EffectOutcome {
 // highest-trust capability in the vocabulary for a job the desktop already does.
 //
 // So the host takes the URI instead of a command line. The plugin names a
-// destination, the host validates its scheme, and `gio::AppInfo::launch_default_for_uri`
-// — the same call `main.rs`'s screenshot/recording Open actions use — resolves
-// the handler. There is no argv anywhere on this path.
+// destination, the host validates its scheme, and `gio::AppInfo` — the same
+// desktop-portal-backed resolution `main.rs`'s screenshot/recording Open
+// actions use — resolves the handler. There is no argv anywhere on this path.
+//
+// One thing differs from `main.rs`, and it is the whole reason the launch is
+// asynchronous here: there the URI is a local file the shell just wrote, here
+// it is whatever the plugin said. See `open_uri_with`.
 
 /// The URI schemes the host will open for a plugin (#1045).
 ///
@@ -598,14 +606,20 @@ fn command_outcome(success: bool, stdout: &[u8]) -> EffectOutcome {
 /// means what its name says and cannot be re-aimed at some unrelated protocol
 /// handler.
 ///
-/// This is **host policy, not wire vocabulary** — widening it (Annika flagged
-/// `mailto:` as an open question on #1045) is a change here alone, with no proto
-/// bump and no plugin rebuild.
+/// This is **host policy, not wire vocabulary** — widening it is a change here
+/// alone, with no proto bump and no plugin rebuild. (#1045's own triage note
+/// raises `mailto:` as the obvious candidate and parks it, to be taken to #947
+/// if the allow-list should go wider. Nobody has asked for it yet.)
 const ALLOWED_URI_SCHEMES: [&str; 3] = ["http", "https", "file"];
 
 /// Cap on a plugin-supplied URI (bytes, #1045). Far above any real link; it
 /// exists so a runaway plugin cannot push a multi-megabyte string (the frame cap
 /// is 16 MiB) through a `tracing` line and into the journal.
+///
+/// **Inclusive**: a URI of exactly this many bytes is opened, one byte more is
+/// refused as [`UriRefusal::TooLong`]. Both sides of that boundary are pinned in
+/// `check_uri_allows_only_http_https_and_file`, so the comparison cannot drift
+/// by one silently.
 const MAX_URI_BYTES: usize = 4096;
 
 /// Why the host refused to open a plugin-supplied URI (#1045). Carried into the
@@ -615,7 +629,8 @@ const MAX_URI_BYTES: usize = 4096;
 pub(super) enum UriRefusal {
     /// Empty, or whitespace only.
     Empty,
-    /// Longer than [`MAX_URI_BYTES`].
+    /// Longer than [`MAX_URI_BYTES`] — which is itself still openable; the cap
+    /// is inclusive.
     TooLong(usize),
     /// Contains an ASCII control character (a newline, or — the reason this is
     /// checked at all rather than left to `GLib` — an interior NUL, which cannot
@@ -697,28 +712,62 @@ pub(super) fn check_uri(uri: &str) -> Result<&str, UriRefusal> {
     }
 }
 
-/// Validate a plugin-supplied URI and, if it passes, open it with `launch` —
-/// returning the [`EffectOutcome`] the plugin gets back either way (#1045).
+/// The verdict sink an [`Effect::OpenUri`] launcher answers on (#1045).
 ///
-/// The launcher is a parameter for the same reason
-/// [`start_detached_with`]'s program is (#964 item 3): the real one starts a
-/// **browser**, so a test that drove the production path would either open one
-/// or have to be gated out of the hermetic suite. Here a test passes a recording
-/// stub and asserts on the outcome; production passes
-/// [`launch_default_for_uri`]. Unlike the `#[cfg(test)]`-compiled-out
-/// [`launch_detached`], nothing about this path is skipped under test — the
-/// validation, the log line and the outcome mapping are the same code in both
-/// builds, and only the final `GLib` call differs.
+/// A launch is **asynchronous**: the launcher returns as soon as the request is
+/// in flight and the desktop's answer arrives here, later. `Send` because a
+/// test's stub answers from another thread — the production one is called back
+/// by `GLib` on the main context it was started from.
+pub(super) type LaunchDone = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
+
+/// Validate a plugin-supplied URI and, if it passes, ask `launch` to open it,
+/// handing the [`EffectOutcome`] the plugin gets back to `report` (#1045).
+///
+/// # Why this reports instead of returning
+///
+/// It used to be `-> EffectOutcome`, and that signature *encoded* "the verdict
+/// is known synchronously" — which on this path means waiting for the launch on
+/// the **GTK main thread**. [`broker_effect`] runs inside `mod.rs`'s
+/// `spawn_local`, so anything that blocks here blocks every bar, drawer, overlay
+/// and every other plugin's rendering. `g_app_info_launch_default_for_uri`'s own
+/// documentation says it "does synchronous I/O on the uri to detect the type of
+/// the file if required", so a plugin-supplied `file:///mnt/nas/x` on a hung
+/// mount is **one effect** away from freezing the shell. (The shell's own
+/// screenshot toast makes the same call, but over a path it just wrote to local
+/// disk. The call and the thread are the same; the *input* is what differs, and
+/// here the input is the plugin's.)
+///
+/// So the launcher takes a [`LaunchDone`] and nothing on this path waits: the
+/// function returns as soon as the request is in flight, and `report` fires from
+/// the launcher's own callback. The refusal arm still reports inline — no I/O
+/// happens there, by construction, since [`check_uri`] is pure.
+///
+/// The async `GLib` entry point is also the one that carries **real error
+/// information** when the portal puts an application chooser in front of the
+/// user (its sync sibling cannot), so the `ok` the plugin is told is the
+/// desktop's actual verdict rather than "the request was accepted".
+///
+/// # Why the launcher is injected
+///
+/// The same reason [`start_detached_with`]'s program is (#964 item 3): the real
+/// one starts a **browser**, so a test that drove the production path would
+/// either open one or have to leave the hermetic suite. A test passes a
+/// recording stub and fires the callback itself; production passes
+/// [`launch_default_for_uri_async`]. Unlike the `#[cfg(test)]`-compiled-out
+/// [`launch_detached`], nothing here is skipped under test — the validation, the
+/// log lines and the outcome mapping are the same code in both builds, and only
+/// the final `GLib` call differs.
 ///
 /// A refusal is logged at **warn** (the plugin asked for something the host will
 /// not do) and a launch failure too (no handler registered, portal error); a
 /// success is `info`, matching every other brokered effect.
-pub(super) fn open_uri_outcome(
+pub(super) fn open_uri_with(
     plugin_id: &str,
     id: u64,
     uri: &str,
-    launch: impl FnOnce(&str) -> Result<(), String>,
-) -> EffectOutcome {
+    launch: impl FnOnce(&str, LaunchDone),
+    report: impl FnOnce(EffectOutcome) + Send + 'static,
+) {
     let scheme = match check_uri(uri) {
         Ok(scheme) => scheme,
         Err(refusal) => {
@@ -733,57 +782,93 @@ pub(super) fn open_uri_outcome(
                 %reason,
                 "plugin effect: OpenUri refused",
             );
-            return EffectOutcome {
+            report(EffectOutcome {
                 ok: false,
                 output: Some(reason),
-            };
+            });
+            return;
         }
     };
     tracing::info!(plugin = %plugin_id, id, %scheme, "plugin effect: OpenUri");
-    match launch(uri) {
-        Ok(()) => EffectOutcome {
-            ok: true,
-            output: None,
-        },
-        Err(e) => {
-            tracing::warn!(
-                plugin = %plugin_id, id, %scheme, error = %e,
-                "plugin effect: OpenUri failed to launch a handler",
-            );
-            EffectOutcome {
-                ok: false,
-                output: Some(format!("launch failed: {e}")),
-            }
-        }
-    }
+    let plugin_id = plugin_id.to_owned();
+    let scheme = scheme.to_owned();
+    launch(
+        uri,
+        Box::new(move |result| {
+            let outcome = match result {
+                Ok(()) => EffectOutcome {
+                    ok: true,
+                    output: None,
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = %plugin_id, id, %scheme, error = %e,
+                        "plugin effect: OpenUri failed to launch a handler",
+                    );
+                    EffectOutcome {
+                        ok: false,
+                        output: Some(format!("launch failed: {e}")),
+                    }
+                }
+            };
+            report(outcome);
+        }),
+    );
 }
 
 /// Hand `uri` to the desktop's default handler — the production launcher behind
-/// [`open_uri_outcome`] (#1045).
+/// [`open_uri_with`] (#1045).
 ///
-/// `gio::AppInfo::launch_default_for_uri` over shelling out to `xdg-open`, for
-/// the reason [`crate::main`]'s `open_screenshot` gives: the same
-/// desktop-portal-backed resolution with no subprocess of our own. Must run on
-/// the GTK main thread, which is where [`broker_effect`] already is.
-fn launch_default_for_uri(uri: &str) -> Result<(), String> {
-    gio::AppInfo::launch_default_for_uri(uri, gio::AppLaunchContext::NONE)
-        .map_err(|e| e.to_string())
+/// `gio::AppInfo` over shelling out to `xdg-open`, for the reason
+/// [`crate::main`]'s `open_screenshot` gives: the same desktop-portal-backed
+/// resolution with no subprocess of our own. The **`_async`** entry point
+/// specifically, because the sync one does blocking content-type I/O on the URI
+/// and this one is plugin-supplied — see [`open_uri_with`]. It returns
+/// immediately and `GLib` invokes `done` on the main context when the desktop
+/// has answered.
+///
+/// Must be *started* on the GTK main thread (the binding asserts main-context
+/// ownership), which is where [`broker_effect`] already is.
+fn launch_default_for_uri_async(uri: &str, done: LaunchDone) {
+    gio::AppInfo::launch_default_for_uri_async(
+        uri,
+        gio::AppLaunchContext::NONE,
+        gio::Cancellable::NONE,
+        move |result| done(result.map_err(|e| e.to_string())),
+    );
 }
 
-/// Broker one [`Effect::OpenUri`] (#1045): validate + launch on this (GTK)
-/// thread, then route the outcome back to the plugin as
-/// [`HostMsg::EffectResult`] keyed by `id`.
+/// Broker one [`Effect::OpenUri`] (#1045): validate on this (GTK) thread, start
+/// the launch without waiting for it, and route the outcome back to the plugin
+/// as [`HostMsg::EffectResult`] keyed by `id` whenever it arrives.
 fn broker_open_uri(plugin_id: &str, id: u64, uri: &str, outbound: &mpsc::Sender<HostMsg>) {
-    let outcome = open_uri_outcome(plugin_id, id, uri, launch_default_for_uri);
-    reply_effect_result(plugin_id, id, outcome, outbound.clone());
+    broker_open_uri_with(plugin_id, id, uri, launch_default_for_uri_async, outbound);
+}
+
+/// [`broker_open_uri`] with the launcher injected — the seam a test drives, so
+/// the hermetic suite never starts a browser (#1045).
+fn broker_open_uri_with(
+    plugin_id: &str,
+    id: u64,
+    uri: &str,
+    launch: impl FnOnce(&str, LaunchDone),
+    outbound: &mpsc::Sender<HostMsg>,
+) {
+    let plugin = plugin_id.to_owned();
+    let outbound = outbound.clone();
+    open_uri_with(plugin_id, id, uri, launch, move |outcome| {
+        reply_effect_result(&plugin, id, outcome, outbound);
+    });
 }
 
 /// Send one [`EffectOutcome`] back to the originating plugin as
 /// [`HostMsg::EffectResult`], from the **GTK main thread** (#1045).
 ///
 /// [`run_command`] can `send().await` inline because it is already inside a
-/// spawned task; the `OpenUri` arm is not, so the send is what hops to the
-/// runtime here. It is a `send().await` and not the consent overlay's
+/// spawned task; the `OpenUri` arm is not (it is on the main thread, either
+/// straight from [`broker_effect`] for a refusal or from `GLib`'s launch
+/// callback), so the send is what hops to the runtime here. It is a
+/// `send().await` and not the consent overlay's
 /// `try_send`: this is a one-shot reply a plugin may be waiting on to toast a
 /// refusal, so it should wait for outbound capacity rather than be dropped on a
 /// momentarily full channel. It only fails once the connection's writer is gone,
@@ -1749,13 +1834,13 @@ mod tests {
     use super::{
         AuditDecision, AuditLog, EffectOutcome, FORWARDED_ENV, LaunchReport, MAX_URI_BYTES,
         MAX_VOLUME, MIN_VOLUME, RUN_COMMAND_MAX_OUTPUT, UriRefusal, audit_effect_id, broker_effect,
-        check_uri, clamp_volume, command_outcome, effect_kind, filter_forwarded_env,
-        format_audit_line, launch_outcome, open_uri_outcome, start_detached_with,
-        truncate_on_char_boundary,
+        broker_open_uri_with, check_uri, clamp_volume, command_outcome, effect_kind,
+        filter_forwarded_env, format_audit_line, launch_outcome, open_uri_with,
+        start_detached_with, truncate_on_char_boundary,
     };
     use hytte_plugin_proto::{AudioAction, Effect, HostMsg, MediaAction, NiriAction, Page};
-    use std::cell::RefCell;
-    use std::time::Duration;
+    use std::cell::{Cell, RefCell};
+    use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
 
     // #964 item 1: test-only capture of what `record_audit` and
@@ -2400,6 +2485,35 @@ mod tests {
 
     // ── OpenUri (#1045) ──────────────────────────────────────────────────────
 
+    /// Drive [`open_uri_with`] with a launcher that answers **inline**, and hand
+    /// back the single [`EffectOutcome`] it reported.
+    ///
+    /// The reporting seam is what makes the launch non-blocking (review F1), but
+    /// most of what is worth asserting about `OpenUri` — the allow-list, the
+    /// reason text, which URI the launcher was handed — is about the *verdict*,
+    /// not about when it arrives. This collapses the callback back to a value so
+    /// those tables stay readable; the timing property has its own test below,
+    /// with a launcher that deliberately does not answer inline.
+    fn open_uri_reported(
+        plugin_id: &str,
+        id: u64,
+        uri: &str,
+        launch: impl FnOnce(&str) -> Result<(), String>,
+    ) -> EffectOutcome {
+        let (tx, rx) = std::sync::mpsc::channel();
+        open_uri_with(
+            plugin_id,
+            id,
+            uri,
+            |uri, done| done(launch(uri)),
+            move |outcome| {
+                tx.send(outcome).expect("the receiver is still alive");
+            },
+        );
+        rx.try_recv()
+            .expect("an inline launcher reports its verdict before returning")
+    }
+
     /// The host's scheme allow-list, as a table (#1045).
     ///
     /// This is the whole enforced policy of the effect, and it is pure, so it
@@ -2474,6 +2588,25 @@ mod tests {
         // And the length cap, which bites before the 16 MiB frame limit does.
         let long = format!("https://x/{}", "a".repeat(MAX_URI_BYTES));
         assert_eq!(check_uri(&long), Err(UriRefusal::TooLong(long.len())));
+        // Both sides of the boundary, because the row above is 10 B over and so
+        // is refused under `>` *and* `>=` — the one-byte drift the cap's own
+        // comparison could take without any test noticing (review F3).
+        let at_cap = format!(
+            "https://x/{}",
+            "a".repeat(MAX_URI_BYTES - "https://x/".len())
+        );
+        assert_eq!(at_cap.len(), MAX_URI_BYTES);
+        assert_eq!(
+            check_uri(&at_cap),
+            Ok("https"),
+            "the cap is inclusive: exactly {MAX_URI_BYTES} B is still openable",
+        );
+        let over = format!("{at_cap}a");
+        assert_eq!(
+            check_uri(&over),
+            Err(UriRefusal::TooLong(MAX_URI_BYTES + 1)),
+            "…and one byte past it is refused",
+        );
     }
 
     /// #1045: a refused URI never reaches the launcher, and the plugin is told
@@ -2486,7 +2619,7 @@ mod tests {
     #[test]
     fn a_refused_scheme_never_launches_and_reports_not_ok() {
         let seen = RefCell::new(Vec::<String>::new());
-        let outcome = open_uri_outcome("agents", 5, "mailto:annika@hannig.cc", |uri| {
+        let outcome = open_uri_reported("agents", 5, "mailto:annika@hannig.cc", |uri| {
             seen.borrow_mut().push(uri.to_owned());
             Ok(())
         });
@@ -2502,6 +2635,137 @@ mod tests {
         );
     }
 
+    /// #1045 / review M7: **no** refusal shape reaches the launcher — not just
+    /// the `mailto:` the test above happens to use.
+    ///
+    /// The early return in `open_uri_with` is one branch, but the eleven other
+    /// refusal shapes only ever reach the pure `check_uri` table, so nothing
+    /// asserted that a refusal *and* a launch could not both happen for them.
+    /// This asserts nothing about the outcomes on purpose: the call count is the
+    /// only thing it looks at, so the launcher is the only thing that can
+    /// falsify it (the review's M7 — make the refusal path launch anyway while
+    /// still reporting `ok: false` — reds this and the test above, and nothing
+    /// else).
+    #[test]
+    fn no_refused_uri_shape_reaches_the_launcher() {
+        let calls = Cell::new(0usize);
+        let long = format!("https://x/{}", "a".repeat(MAX_URI_BYTES));
+        let refused = [
+            "mailto:annika@hannig.cc",
+            "javascript:alert(1)",
+            "ssh://box.example/",
+            "data:text/html,<script>x</script>",
+            "",
+            "   ",
+            "pr1ma.darkest.space/agents",
+            "://pr1ma.darkest.space/",
+            "  https://pr1ma.darkest.space/",
+            "1http://pr1ma.darkest.space/",
+            "https://x/\nSet-Cookie: y",
+            "https://x/\0y",
+            long.as_str(),
+        ];
+        for (i, uri) in refused.into_iter().enumerate() {
+            let outcome = open_uri_reported("agents", i as u64, uri, |_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            });
+            assert!(
+                !outcome.ok,
+                "{uri:?} is a refusal, so the plugin is told so",
+            );
+        }
+        assert_eq!(
+            calls.get(),
+            0,
+            "no refused URI shape may reach the launcher",
+        );
+    }
+
+    /// #1045 / review F1: a slow launch must not hold the GTK main loop.
+    ///
+    /// `broker_effect` runs inside `mod.rs`'s `spawn_local` on the GTK main
+    /// thread, and `GLib`'s **synchronous** `launch_default_for_uri` "does
+    /// synchronous I/O on the uri to detect the type of the file if required" —
+    /// so a plugin-supplied `file:///mnt/nas/x` on a hung mount was one effect
+    /// away from freezing every bar, drawer, overlay and every other plugin's
+    /// rendering. The launcher is asynchronous now, and this is what says so.
+    ///
+    /// The stub answers after 2 s **from another thread**, so the only way this
+    /// call can cost 2 s is if the broker waits for the verdict. Three
+    /// assertions, each independently load-bearing: the arm returns in well
+    /// under the launch's own latency; a *second* effect brokered while that
+    /// launch is still outstanding gets its verdict first (the host kept
+    /// working); and the parked verdict still lands afterwards, so
+    /// non-blocking did not become fire-and-forget.
+    ///
+    /// **Falsified** by re-synchronising the seam — making `open_uri_with` wait
+    /// for `report` before returning, which is exactly what a `-> EffectOutcome`
+    /// signature forces: the elapsed assertion then goes red at ~2 s.
+    #[tokio::test]
+    async fn a_slow_open_uri_launch_does_not_block_the_broker() {
+        reset_captures();
+        let (tx, mut rx) = mpsc::channel::<HostMsg>(4);
+        let router = DatasourceRouter::default();
+
+        let started = Instant::now();
+        broker_open_uri_with(
+            "agents",
+            11,
+            "https://pr1ma.darkest.space/agents/argus",
+            |_uri, done| {
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(2));
+                    done(Ok(()));
+                });
+            },
+            &tx,
+        );
+        let returned_in = started.elapsed();
+        assert!(
+            returned_in < Duration::from_millis(100),
+            "the broker must not wait for the launch; it took {returned_in:?}",
+        );
+
+        // The main loop is free while that launch is outstanding: the next
+        // effect is brokered and answered without waiting on it. (A refused
+        // scheme, so this reaches no launcher and starts no browser.)
+        broker_effect(
+            "agents",
+            &Effect::open_uri(12, "ssh://box.example/"),
+            &tx,
+            &router,
+        );
+        let first = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the next effect is answered while the first launch is in flight")
+            .expect("the channel is still open");
+        match first {
+            HostMsg::EffectResult { id, outcome } => {
+                assert_eq!(id, 12, "the later effect overtakes the outstanding launch");
+                assert!(!outcome.ok, "…and it is the refusal, reported inline");
+            }
+            other => panic!("expected an EffectResult, got {other:?}"),
+        }
+
+        // And the parked verdict still lands once the desktop answers — the
+        // half that keeps "non-blocking" from becoming "fire and forget".
+        let second = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the launch's own verdict is not dropped")
+            .expect("the channel is still open");
+        match second {
+            HostMsg::EffectResult { id, outcome } => {
+                assert_eq!(id, 11, "keyed by the launch's own correlation token");
+                assert!(
+                    outcome.ok,
+                    "the launcher answered Ok, so that is what the plugin is told",
+                );
+            }
+            other => panic!("expected an EffectResult, got {other:?}"),
+        }
+    }
+
     /// #1045: an allowed URI is handed to the launcher **verbatim** and its
     /// verdict becomes the plugin's outcome — both arms.
     ///
@@ -2515,7 +2779,7 @@ mod tests {
     #[test]
     fn an_allowed_uri_reaches_the_launcher_and_its_verdict_is_the_outcome() {
         let seen = RefCell::new(Vec::<String>::new());
-        let outcome = open_uri_outcome(
+        let outcome = open_uri_reported(
             "agents",
             6,
             "https://pr1ma.darkest.space/agents/argus",
@@ -2533,7 +2797,7 @@ mod tests {
         assert_eq!(outcome.output, None, "…and carries no output to report");
 
         // The other arm: no handler registered, a portal error, …
-        let outcome = open_uri_outcome("agents", 7, "file:///home/annika/shot.png", |_| {
+        let outcome = open_uri_reported("agents", 7, "file:///home/annika/shot.png", |_| {
             Err("no application is registered as handling this file".to_owned())
         });
         assert!(!outcome.ok, "a failed launch is not a success");
@@ -2551,9 +2815,11 @@ mod tests {
     /// `EffectResult` back on the connection's own channel.
     ///
     /// Hermetic: a refused scheme is deliberately used, so `broker_effect`
-    /// reaches no launcher and no browser starts. (There is no `broker_effect`
-    /// test for an *allowed* URI for exactly that reason — the allowed path is
-    /// covered above through the injected launcher.)
+    /// reaches no launcher and no browser starts. (`broker_effect` picks the
+    /// production launcher, so an *allowed* URI cannot be driven through this
+    /// entry point at all; the allowed path goes through `broker_open_uri_with`
+    /// in `a_slow_open_uri_launch_does_not_block_the_broker`, and through the
+    /// injected launcher above.)
     ///
     /// **Falsified** by dropping the `reply_effect_result` call from the
     /// `OpenUri` arm: the `recv()` below then times out with the sender still

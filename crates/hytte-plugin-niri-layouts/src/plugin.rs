@@ -482,16 +482,18 @@ mod tests {
     /// renders as `image-missing`, silently, on Annika's bar. This is the only
     /// gate between a typo and that.
     ///
-    /// **Where it actually gates**, corrected (#1038 review, MED-4 — the claim
-    /// here used to be false): the devShell, whose `XDG_DATA_DIRS` carries the
-    /// theme by hand (`nix/devshell.nix`), and the package build's check phase,
-    /// whose `preCheck` now exports the same thing (`nix/package.nix`) — so
-    /// every `nix build .#trollshell` (and every package slice, and `nix flake
-    /// check`, which builds them) runs it for real. nixpkgs puts **no** icon
-    /// theme on a build's `XDG_DATA_DIRS` of its own accord, which is why it was
-    /// silently skipping in both CI paths before. `checks.system-tests` sets its
-    /// own `preCheck` and so still skips it; that is one line in `flake.nix`,
-    /// outside this crate.
+    /// **Where it actually gates**, corrected twice now (#1038 review MED-4,
+    /// then #1053's own review LOW-5 on this same paragraph): the devShell,
+    /// whose `XDG_DATA_DIRS` carries the theme by hand (`nix/devshell.nix`);
+    /// the package build's check phase, whose `preCheck` exports the same
+    /// thing (`nix/package.nix`) — so every `nix build .#trollshell` (and
+    /// every package slice, and `nix flake check`, which builds them) runs it
+    /// for real; and, since this PR, `checks.system-tests`'s own `preCheck`
+    /// (`flake.nix`), which previously overrode `package.nix`'s and did not
+    /// inherit the export, so this test silently skipped there even though it
+    /// failed loudly in the package build. nixpkgs puts **no** icon theme on a
+    /// build's `XDG_DATA_DIRS` of its own accord, which is why all three paths
+    /// needed their own export rather than inheriting one.
     ///
     /// A skip is indistinguishable from a pass in captured output, so the build
     /// that means this to gate says so with `TROLLSHELL_REQUIRE_ICON_THEME=1`

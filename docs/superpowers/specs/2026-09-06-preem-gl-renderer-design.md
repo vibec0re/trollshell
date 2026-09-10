@@ -212,8 +212,11 @@ CPU goldens keep gating the CPU arm **byte-exactly** — unchanged. The GL arm g
 a bounded per-channel delta against the same goldens, per the #893 verdict.
 
 **CI has no GL.** `flake.nix`'s `system-tests` check runs `xvfb-run -a cargo test`
-in a nix sandbox with no `/dev/dri` and no mesa in the closure. So CI checks what
-it can, all pure-CPU:
+in a nix sandbox with no `/dev/dri` and no mesa in the closure.
+
+(2026-09-10, #1077: superseded — the system-tests check runs the GL tests under Mesa llvmpipe.)
+
+So CI checks what it can, all pure-CPU:
 
 | check                                                                                                                                           | where                                                 |
 | ----------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |

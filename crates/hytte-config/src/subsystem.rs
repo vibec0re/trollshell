@@ -2679,4 +2679,123 @@ kept = true
         assert_eq!(bad, 3, "…and a rejected one falls to the default handed in");
         assert_eq!(rejected, vec![InvalidValue::written(&ROWS, "\"many\"")]);
     }
+
+    // ── #1040 V1: the journal line the loader emits per rejected key ────────
+
+    const LEVEL: env::EnvKnob = env::EnvKnob::same(
+        "TROLLSHELL_TEST_PAIR_LEVEL",
+        "level",
+        "a level from 0 to 255",
+    );
+    const LABEL: env::EnvKnob =
+        env::EnvKnob::same("TROLLSHELL_TEST_PAIR_LABEL", "label", "a non-empty label");
+
+    /// A two-key schema whose values are judged per key — the smallest thing
+    /// that can show "one key's mistake, one key's cost".
+    ///
+    /// Both fields are raw `toml::Value` (the #1040 T1 rule), so `level =
+    /// "many"` is a perfectly **well-typed** TOML string that serde has no
+    /// reason to reject: the verdict is [`Subsystem::parsed`]'s, which is
+    /// exactly the path [`load_layer`] emits a line for.
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(default)]
+    struct Pair {
+        level: toml::Value,
+        label: toml::Value,
+    }
+
+    impl Default for Pair {
+        fn default() -> Self {
+            Self {
+                level: toml::Value::Integer(1),
+                label: "hi".into(),
+            }
+        }
+    }
+
+    impl Subsystem for Pair {
+        const NAME: &'static str = "pair";
+        const DEFAULT_TOML: &'static str = "level = 1\nlabel = \"hi\"\n";
+        type Error = std::convert::Infallible;
+        type Resolved = (u8, String);
+
+        fn validate(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn parsed(&self) -> ((u8, String), Vec<InvalidValue>) {
+            let mut rejected = Vec::new();
+            let level = keep(
+                spelling(&self.level)
+                    .parse::<u8>()
+                    .map_err(|_| InvalidValue::of(&LEVEL, &self.level)),
+                1,
+                &mut rejected,
+            );
+            let raw = spelling(&self.label);
+            let label = keep(
+                if raw.is_empty() {
+                    Err(InvalidValue::of(&LABEL, &self.label))
+                } else {
+                    Ok(raw)
+                },
+                "hi".to_string(),
+                &mut rejected,
+            );
+            ((level, label), rejected)
+        }
+    }
+
+    /// A **well-typed** value that the subsystem's own parser turns down costs
+    /// its own key, warns **once**, and leaves every other key applied.
+    ///
+    /// This is #1040 V1's whole behaviour, asserted at the place the journal
+    /// line is actually produced — [`load_layer`], the generic loader every
+    /// subsystem inherits. Before PR #1085's review (F2) the only test of that
+    /// emission lived in the `core-leds` pilot, so deleting the `warn!` loop
+    /// (mutation MUT-B) left `hytte-config` green at 162 while the mechanism
+    /// family #2 is told it gets for free was gone.
+    ///
+    /// **Red if the emission loop goes** (no line), **if it stops naming the
+    /// key** (the rendered sentence is compared whole), or **if a rejection
+    /// takes the file down with it** (`label` would not be `"desk"`).
+    #[test]
+    fn a_rejected_but_well_typed_value_warns_once_and_leaves_the_other_key_applied() {
+        let mut file = crate::test_support::Overlay::new(Pair::NAME);
+        file.write("level = \"many\"\nlabel = \"desk\"\n");
+        let (captured, _guard) = capture();
+
+        let resolved = load_layer::<Pair>(&file.layers()).expect("the file is TOML");
+
+        assert_eq!(
+            resolved,
+            (1, "desk".to_string()),
+            "the bad key takes its built-in default and the good one still applies"
+        );
+        let warned = captured.warnings();
+        assert_eq!(
+            warned.len(),
+            1,
+            "one line, for the one bad key: {warned:#?}"
+        );
+        assert_eq!(
+            warned[0],
+            rejected_value_message(&InvalidValue::written(&LEVEL, "\"many\"").to_string()),
+            "…naming the key, quoting the TOML, and stating the consequence"
+        );
+    }
+
+    /// A file with **no** mistake in it says nothing — the negative that makes
+    /// "one line per rejected key" mean something.
+    #[test]
+    fn a_file_with_nothing_wrong_in_it_warns_about_nothing() {
+        let mut file = crate::test_support::Overlay::new(Pair::NAME);
+        file.write("level = 4\nlabel = \"desk\"\n");
+        let (captured, _guard) = capture();
+
+        let resolved = load_layer::<Pair>(&file.layers()).expect("the file is TOML");
+
+        assert_eq!(resolved, (4, "desk".to_string()));
+        assert_eq!(captured.warnings(), Vec::<String>::new());
+    }
 }

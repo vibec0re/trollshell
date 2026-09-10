@@ -41,17 +41,33 @@
 //! [`Stamp`] is `(mtime, len)`. An mtime-only stamp misses an edit saved inside
 //! the same mtime granule as the poll's own `stat`, and misses it
 //! **permanently** — the stamp is updated unconditionally, so the movement is
-//! never seen again. Linux's ext4/btrfs/tmpfs carry nanoseconds, so on a normal
-//! machine the window is theoretical, but a coarse-granularity filesystem (a
-//! network mount, a FAT stick someone points `XDG_CONFIG_DIRS` at) is not
-//! exotic. A length is a cheap discriminator on the same `stat` call, not a
-//! second syscall, and it catches the overwhelmingly common shape of a
-//! same-granule edit (a value getting longer or shorter).
+//! never seen again. Linux's ext4/btrfs/tmpfs carry nanoseconds, so on the
+//! overlay the window is theoretical, and a coarse-granularity filesystem (a
+//! network mount, a FAT stick someone points `XDG_CONFIG_DIRS` at) is the
+//! obvious exception. A length is a cheap discriminator on the same `stat`
+//! call, not a second syscall, and it catches the overwhelmingly common shape
+//! of a same-granule edit (a value getting longer or shorter).
+//!
+//! **The `$XDG_CONFIG_DIRS` base layer is not the theoretical case, and once
+//! nix renders one it is the normal one.** Every file in the nix store carries
+//! the constant mtime `1970-01-01 00:00:01`, so for a store-backed base layer
+//! the mtime is *never* a discriminator and `len` is the only one — and the
+//! worked example of a missable edit above (`style = "vfd"` → `style = "lcd"`)
+//! is byte-identical in length. home-manager mitigates it in practice, since
+//! each rebuild renders a **new store path** and the layer file is a different
+//! inode rather than an edited one, but nothing here relies on that.
 //!
 //! It is **not** a hash: two edits that land in one granule *and* keep the byte
 //! count identical are still missed, which is the honest limit of stat-polling
-//! and the reason a real watch (inotify) is the eventual answer rather than a
-//! finer stamp. `places`' own `ConfigWatcher` predates this and is mtime-only.
+//! and the reason a real watch (inotify) — or a cheap content hash for the base
+//! layer — is the eventual answer rather than a finer stamp. That fix is
+//! **#1081's**, not this module's history: #1081 is the PR that renders the nix
+//! base layer and its review is where the constant-mtime measurement was made.
+//! It belongs here because after #1044's hoist `stamp` below is the single
+//! implementation nine subsystems inherit — `core_leds.rs` has none of its own
+//! any more — so #1081 should be rebased over this and land its fix at this
+//! function. `places`' own `ConfigWatcher` predates all of it and is
+//! mtime-only.
 
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -90,6 +106,12 @@ pub type Stamp = Option<(SystemTime, u64)>;
 pub type EnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// One layer's [`Stamp`].
+///
+/// The single implementation nine subsystems inherit, and therefore where a
+/// real change-detection fix lands. See the module doc for what `(mtime, len)`
+/// can and cannot see — in particular that a nix-store base layer's mtime is
+/// the constant `1970-01-01 00:00:01`, so for that layer the length is the only
+/// discriminator (#1081).
 fn stamp(path: &Path) -> Stamp {
     let meta = std::fs::metadata(path).ok()?;
     Some((meta.modified().ok()?, meta.len()))
@@ -359,6 +381,56 @@ mod tests {
         }
     }
 
+    /// A subsystem that declares **no** environment at all — one key, one
+    /// parser, and deliberately **no `resolve`**.
+    ///
+    /// This is the shape `trollshell/src/config/mod.rs`'s recipe tells family
+    /// #2 to write for any key group that was never spelt as a `TROLLSHELL_*`
+    /// variable, which is most of the nine — "omit it entirely; the trait's
+    /// default is 'there is no environment to layer'". It exists because every
+    /// *other* `Subsystem` in the workspace overrides `resolve`, so without it
+    /// the defaulted body is dead to CI: changing it to
+    /// `Self::Resolved::default()` — a subsystem silently discarding its whole
+    /// merged file layer — left the entire suite green (PR #1085 review, F1,
+    /// mutation MUT-A).
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(default)]
+    struct Plain {
+        level: toml::Value,
+    }
+
+    impl Default for Plain {
+        fn default() -> Self {
+            Self {
+                level: toml::Value::Integer(1),
+            }
+        }
+    }
+
+    impl Subsystem for Plain {
+        const NAME: &'static str = "plain";
+        const DEFAULT_TOML: &'static str = "# no variable ever carried this\nlevel = 1\n";
+        type Error = std::convert::Infallible;
+        type Resolved = u8;
+
+        fn validate(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn parsed(&self) -> (u8, Vec<InvalidValue>) {
+            let mut rejected = Vec::new();
+            let level = keep(
+                parse_level(&spelling(&self.level))
+                    .map_err(|_| InvalidValue::of(&LEVEL, &self.level)),
+                1,
+                &mut rejected,
+            );
+            (level, rejected)
+        }
+
+        // No `resolve`. That is the point of this type.
+    }
+
     fn overlay() -> Overlay {
         Overlay::new(Dial::NAME)
     }
@@ -593,6 +665,36 @@ mod tests {
             Vec::<String>::new(),
             "a reload announces nothing"
         );
+    }
+
+    /// A subsystem that declares no environment gets its **merged file layer**
+    /// back, unchanged, even with every variable in the process set.
+    ///
+    /// The one test of [`Subsystem::resolve`]'s *defaulted* body, and the
+    /// reason it exists: `Dial` and `CoreLedsConfig` both override `resolve`,
+    /// so the default was dead to CI — mutation MUT-A (return
+    /// `Self::Resolved::default()` instead of `layered`, i.e. throw the whole
+    /// file away) left 162 / 503 / 561 / 44 green (PR #1085 review, F1).
+    ///
+    /// The three values are deliberately distinct: `7` is the file, `1` is
+    /// [`Plain::DEFAULT_TOML`]'s value and `0` is `u8::default()` — so a
+    /// mutation that reaches for either fallback is told apart from one that
+    /// merely reads the wrong layer.
+    #[test]
+    fn a_subsystem_that_declares_no_environment_keeps_its_merged_file_layer() {
+        let mut file = Overlay::new(Plain::NAME);
+        file.write("level = 7\n");
+        // As far as this lookup is concerned, *every* variable is set — and a
+        // subsystem with no `resolve` must still ignore all of them.
+        let everything_is_set = |_: &str| Some("9".to_string());
+
+        let (resolved, watcher) = boot::<Plain>(&file.layers(), &everything_is_set);
+
+        assert_eq!(
+            resolved, 7,
+            "the merged file layer, not the built-in default (1) and not u8::default() (0)"
+        );
+        assert_eq!(*watcher.last_good(), 7, "…and the watcher holds it too");
     }
 
     /// The poll cadence is a few seconds — `places.toml`'s AC cadence. Pinned so

@@ -757,6 +757,28 @@ mod tests {
     /// means it is registered but is nobody's default — a state in which
     /// [`logged_errors`] would read 0 for reasons that have nothing to do with
     /// the supervisor.
+    ///
+    /// # What can take the slot in *this* binary, now that one thing can
+    ///
+    /// The slot is singular and this module claims it. Until #1044 nothing else
+    /// in this crate or its dev-dependencies could reach `set_global_default`
+    /// at all; that is no longer true — the `test-support` dev-dependency makes
+    /// [`hytte_config::test_support::capture`] reachable from this binary, and
+    /// `capture` installs `AlwaysInterested` as the global on its way past
+    /// (PR #1085 review, F4). Nothing here calls it today, so this is latent
+    /// rather than a bug, but the failure mode is scheduling-dependent and
+    /// blames the wrong thing: one sibling test reaching `capture()` first wins
+    /// the slot, `ErrorCounter` comes back `Registered`, and **all eleven**
+    /// tests in this module trip this assert.
+    ///
+    /// So: **a test in this module must not call `capture()`.** There is no way
+    /// to have two global defaults, and `ErrorCounter` is this binary's, chosen
+    /// because the cache that decides whether the supervisor's `error!` runs at
+    /// all is itself process-global (see the note above [`CAPTURE_TAGS`]). A
+    /// test here that wants to assert on a log line adds a tag to
+    /// [`CAPTURE_TAGS`] and reads it back through [`logged_errors`]; a test that
+    /// genuinely needs a thread-local `Captured` has to make `ErrorCounter`
+    /// forward to it, not install a second global.
     fn install_error_counter() {
         static INSTALLED: OnceLock<hytte_config::test_support::Installed> = OnceLock::new();
         let outcome = *INSTALLED
@@ -765,9 +787,10 @@ mod tests {
             outcome,
             hytte_config::test_support::Installed::GlobalDefault,
             "another global default was installed first, so ErrorCounter receives \
-             nothing and every log assertion in this module would read 0 — \
-             nothing else in this crate or its dev-dependencies is expected to \
-             call set_global_default"
+             nothing and every log assertion in this module would read 0 — in \
+             this binary the one other thing that takes the slot is \
+             hytte_config::test_support::capture(), which no test in this \
+             module may call (see install_error_counter's doc)"
         );
     }
 

@@ -558,7 +558,7 @@ pub enum Input<M> {
     ///
     /// That is not decoration. [`output`](Input::Event::output) landed in
     /// #1050 as a third field, and adding a field to a struct variant is a
-    /// source break for every plugin in the tree: the arm appears in twelve
+    /// source break for every plugin in the tree: the arm appears in thirteen
     /// plugin crates, each of which had to be edited. The attribute is what
     /// makes that the **last** such sweep — a fourth field can be added without
     /// touching a single plugin, because every arm already ends in `..` and

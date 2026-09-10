@@ -445,6 +445,25 @@ pub(crate) fn on_battery_snapshot() -> bool {
     shared::get::<UpowerShared>().is_some_and(|s| s.on_battery.get())
 }
 
+/// [`on_battery_snapshot`], reachable from outside this crate.
+///
+/// `on_battery_snapshot` stays `pub(crate)` — its own doc above is the single
+/// source of truth for the contract (degrades to AC on every unknown case,
+/// never to the stretched cadence) — and every in-crate poller (`places`,
+/// `wifiscan`, `netconn`, `app_usage`) wraps it with its own private
+/// `fn on_battery() -> bool` rather than calling it by name directly, so a
+/// grep for the real accessor always lands on one place. `trollshell`'s
+/// `config::core_leds` (#1041) is the first battery-aware poller that lives in
+/// a *different* crate, so `pub(crate)` cannot reach it from there — this is
+/// that identical one-line wrapper, re-exported rather than widening the
+/// original. Not to be confused with [`on_battery`] above: that one returns a
+/// `Signal` and requires the thread-local registry (the GTK main thread); this
+/// one is the any-thread snapshot, for a poller running on a tokio worker.
+#[must_use]
+pub fn on_battery_now() -> bool {
+    on_battery_snapshot()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

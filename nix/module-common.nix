@@ -770,5 +770,126 @@ self:
         per-plugin runtime knobs go through `env` / `secrets` above.
       '';
     };
+
+    # Base-layer config files (#866/#868's layering; #1041 is the first family
+    # to render one from nix). `crates/hytte-config/src/xdg.rs` reads three
+    # directories per subsystem: nix's BASE (`$XDG_CONFIG_DIRS`, read-only,
+    # never written by hand), your own OVERLAY (`$XDG_CONFIG_HOME`, never
+    # touched by nix), and the built-in default underneath both. This option
+    # is the nix side of the base layer ONLY — it must never render into the
+    # overlay path, which is reserved for a hand edit a rebuild must not
+    # clobber and a hand edit must not block. See the two platform modules for
+    # how each keeps that split (`nix/hm-module.nix` splices a nix-store
+    # directory onto `$XDG_CONFIG_DIRS` via a session variable, since
+    # home-manager's own `xdg.configFile` writes the *overlay* path;
+    # `nix/nixos-module.nix` writes `/etc/xdg` directly, which is already the
+    # default base entry `hytte-config` falls back to when
+    # `$XDG_CONFIG_DIRS` is unset).
+    #
+    # The option shape every later subsystem family copies (decided once,
+    # #1041): one attrset per subsystem name under `config.<subsystem>`,
+    # renders to `<base>/trollshell/<subsystem>.toml`. `core-leds` is the
+    # first and, for now, only one — a new family adds a sibling attrset here
+    # with its own typed fields (mirroring
+    # `trollshell/src/config/<subsystem>.rs`'s `Knob` vocabulary), not a
+    # generic free-form passthrough: a typed submodule (no `freeformType`)
+    # means an unknown key is a **module-eval** error naming the bad option
+    # path, rather than a nix-store file that fails to load until the shell
+    # is actually run.
+    config.core-leds = lib.mkOption {
+      type = lib.types.submodule {
+        options = {
+          style = lib.mkOption {
+            type = lib.types.nullOr (
+              lib.types.enum [
+                "vfd"
+                "lcd"
+                "oled"
+                "crt"
+              ]
+            );
+            default = null;
+            example = "crt";
+            description = ''
+              The Stats drawer's per-core LED panel (#857) skin. `null`
+              (the default) sets no `style` key at all — the file layer
+              below (your own `core-leds.toml` overlay, if any) or the
+              built-in default (`vfd`) decides instead. See
+              `trollshell/src/config/core_leds.rs`'s `DisplayStyle` for what
+              each value looks like.
+            '';
+          };
+
+          color = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            example = "heat";
+            description = ''
+              The per-core LED panel's colour axis: one of
+              style/rainbow/transpride/heat, or a `"#rrggbb"` literal. A
+              plain string rather than an enum because the accepted
+              vocabulary is open-ended (any 6-digit hex triplet); an
+              unrecognised word still fails the *file* schema per-key at
+              load time (`core_leds.rs`'s `CoreLedsConfig::parsed`), not at
+              nix eval, the same way a hand-edited overlay's typo would.
+              `null` (the default) sets no `color` key.
+            '';
+          };
+
+          rows = lib.mkOption {
+            type = lib.types.nullOr (
+              lib.types.either (lib.types.ints.between 0 64) (lib.types.enum [ "rect" ])
+            );
+            default = null;
+            example = "rect";
+            description = ''
+              A pinned row count for the LED panel (1-64), or `0` /
+              `"rect"` for the automatic wide rectangle picked from the
+              core count — both file spellings `core_leds.rs` accepts.
+              `null` (the default) sets no `rows` key at all, which is
+              *not* the same as `0`/`"rect"`: it lets a lower layer (the
+              overlay, or the built-in default) decide instead of pinning
+              the automatic shape at this layer.
+            '';
+          };
+
+          fill = lib.mkOption {
+            type = lib.types.nullOr (
+              lib.types.enum [
+                "spare"
+                "blank"
+              ]
+            );
+            default = null;
+            example = "blank";
+            description = ''
+              What a ragged last row's leftover slots look like: `spare`
+              fills them with unlit lamps, `blank` leaves the tail bare.
+              Only visible when the row count divides unevenly and the
+              skin ghosts (vfd/lcd). `null` (the default) sets no `fill`
+              key.
+            '';
+          };
+        };
+      };
+      default = { };
+      example = lib.literalExpression ''
+        {
+          style = "crt";
+          color = "heat";
+        }
+      '';
+      description = ''
+        The per-core LED panel's (#857) base-layer dressing, rendered to
+        `core-leds.toml` under nix's `$XDG_CONFIG_DIRS` base layer (never
+        your own `$XDG_CONFIG_HOME` overlay — see the note above `config`).
+        Every field defaults to `null` ("no opinion"), so setting only
+        `style` here leaves `color`/`rows`/`fill` to whatever the overlay
+        or the built-in default says. A value here is still the *lowest*
+        of the two nix-writable precedence layers: your own hand-edited
+        `~/.config/trollshell/core-leds.toml` always wins over it, and a
+        rebuild that changes this option never touches that file.
+      '';
+    };
   };
 }

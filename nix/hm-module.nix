@@ -53,6 +53,50 @@ let
     })
   );
 
+  # Base-layer config files (#866/#868, #1041): each
+  # `programs.trollshell.config.<subsystem>` attrset renders to
+  # `<subsystem>.toml` — one store-path file per subsystem that declares at
+  # least one non-null field, `null`s filtered out first (TOML has no null,
+  # and an omitted key here just means "no opinion", left to the layer below).
+  # `cfg.config` is a fixed attrset of typed submodules (`core-leds` today),
+  # not an `attrsOf`, so this stays a plain `mapAttrs` over its known keys
+  # rather than the `attrsOf`-keyed-by-id shape `pluginsState` above uses.
+  configFiles = lib.filterAttrs (_: v: v != null) (
+    lib.mapAttrs (
+      name: value:
+      let
+        filtered = lib.filterAttrs (_: v: v != null) value;
+      in
+      if filtered == { } then null else (pkgs.formats.toml { }).generate "${name}.toml" filtered
+    ) cfg.config
+  );
+
+  # A directory holding every rendered `configFiles` entry under
+  # `trollshell/<name>.toml`, spliced onto `XDG_CONFIG_DIRS` below via
+  # home-manager's `xdg.systemDirs.config` (plus an explicit unit
+  # `Environment=` entry — see `configDirsUnitEnvironment` further down, and
+  # #1041 review H1 for why a bare `home.sessionVariables.XDG_CONFIG_DIRS`
+  # here would have been both a hard eval conflict and a search-path
+  # truncation for the whole session).
+  #
+  # Deliberately NOT `xdg.configFile` — that home-manager option writes under
+  # `$XDG_CONFIG_HOME`, which `crates/hytte-config/src/xdg.rs` treats as the
+  # OVERLAY: "yours, never touched by nix". `plugins.json` (above) lives there
+  # on purpose — it predates the #866/#868 base/overlay layering, uses
+  # first-existing-file-wins (not a merge), and is meant to be fully
+  # nix-managed with no user hand-edit path. A `core-leds.toml`-shaped
+  # subsystem is the opposite: the overlay is the one place a hand edit is
+  # promised to survive a rebuild untouched, so nix's own rendering has to
+  # land in a genuine *base* directory instead — the same reason the NixOS
+  # module (`nix/nixos-module.nix`) writes this to `/etc/xdg` rather than
+  # reusing its `plugins.json` idiom unexamined.
+  configBase = pkgs.runCommand "trollshell-config-base" { } ''
+    mkdir -p $out/trollshell
+    ${lib.concatStringsSep "\n" (
+      lib.mapAttrsToList (name: file: "ln -s ${file} $out/trollshell/${name}.toml") configFiles
+    )}
+  '';
+
   # Night light (#222, #577): the wlsunset user unit's ExecStart.
   #
   # Coordinates are NOT baked in here any more. Nix-eval time cannot consult a
@@ -165,6 +209,57 @@ let
     TROLLSHELL_NIGHTLIGHT_LATITUDE = toString nl.latitude;
     TROLLSHELL_NIGHTLIGHT_LONGITUDE = toString nl.longitude;
   });
+
+  # Base-layer config files' XDG_CONFIG_DIRS entry (#1041, `configBase`
+  # above), deliberately NOT folded into `trollshellSessionEnv`.
+  #
+  # #1081 review H1: a bare `home.sessionVariables.XDG_CONFIG_DIRS = "…";`
+  # here — which is what going through `trollshellSessionEnv` would produce —
+  # is a **hard eval failure** the moment anything else sets
+  # `xdg.systemDirs.config` (home-manager's own purpose-built option for
+  # exactly this), because `home.sessionVariables` is a `lazyAttrsOf` of
+  # scalars: two definitions of the same key conflict, they do not merge.
+  # Measured:
+  #
+  #   error: The option `home.sessionVariables.XDG_CONFIG_DIRS' has
+  #   conflicting definition values:
+  #   - In `…/modules/misc/xdg-system-dirs.nix': "/opt/example/etc/xdg…"
+  #   - In `nix/hm-module.nix': "/nix/store/…-trollshell-config-base:/etc/xdg"
+  #
+  # It also silently REPLACES the whole session search path rather than
+  # extending it — measured at 7 real entries collapsed to 2 on a machine
+  # that also sources NixOS's `/etc/set-environment`. `home.sessionVariables`
+  # lands in `hm-session-vars.sh`, so that truncation would have hit every
+  # app in the login session, not just trollshell.
+  #
+  # `xdg.systemDirs.config` (`home-manager`'s `modules/misc/
+  # xdg-system-dirs.nix`) is the option built for this: it APPENDS
+  # `configBase` ahead of whatever `XDG_CONFIG_DIRS` already resolves to
+  # (`"${configDirs}\${XDG_CONFIG_DIRS:+:$XDG_CONFIG_DIRS}"`), composes with
+  # any other module's own `xdg.systemDirs.config` entry by list
+  # concatenation instead of conflicting, and — the other half of the fix —
+  # writes the SAME value into `systemd.user.sessionVariables.XDG_CONFIG_DIRS`
+  # (home-manager's `modules/systemd.nix`, rendered as
+  # `environment.d/10-home-manager.conf`), which the systemd **user
+  # manager** itself reads for every unit it starts. That is the delivery
+  # path `home.sessionVariables` alone cannot reach — the exact #568 lesson
+  # `trollshellSessionEnv`'s own doc above states — so this is the fix for a
+  # unit-less config knob that #568 was itself filed about, applied to a
+  # variable rather than a `TROLLSHELL_*` one.
+  #
+  # Belt and suspenders: the trollshell unit ALSO gets an explicit
+  # `Environment=` line below (independent of `trollshellSessionEnv`, and
+  # NOT going through the shell-expansion form above, which systemd's
+  # `Environment=` does not understand — #1081 review's own caveat), so the
+  # shell sees the base layer regardless of `environment.d` import timing.
+  # `/etc/xdg` is the literal fallback there, not the live `$XDG_CONFIG_DIRS`
+  # `xdg.systemDirs.config` would append to: a unit's own environment has no
+  # ambient shell variable to expand in the first place (the whole reason
+  # #568 exists), so appending to "whatever is already set" is meaningless
+  # for a process a manager execs fresh.
+  configDirsUnitEnvironment = lib.optional (
+    configFiles != { }
+  ) "\"XDG_CONFIG_DIRS=${configBase}:/etc/xdg\"";
 in
 {
   _file = "nix/hm-module.nix";
@@ -274,6 +369,15 @@ in
         # Environment= so shells and the service agree.
         home.sessionVariables = trollshellSessionEnv;
 
+        # Base-layer config files (#1041 H1 fix): the home-manager option
+        # built for extending XDG_CONFIG_DIRS — see the long comment on
+        # `configDirsUnitEnvironment` above for why this is not folded into
+        # `trollshellSessionEnv`/`home.sessionVariables` instead. `optionals`
+        # rather than `mkIf` because this is a plain list-typed option, not
+        # an attrset — an empty list here is the option's own default, so
+        # there is nothing to gate.
+        xdg.systemDirs.config = lib.optionals (configFiles != { }) [ "${configBase}" ];
+
         systemd.user.services.trollshell = lib.mkIf cfg.systemd.enable {
           Unit = {
             Description = "trollshell — bar, drawer, services";
@@ -292,8 +396,15 @@ in
             # hm-session-vars.sh (#568). Each assignment is quoted whole so a
             # value with spaces (wallpaper.reloadCommand) survives systemd's
             # Environment= word splitting; embedded double quotes in a value
-            # are not supported.
-            Environment = lib.mapAttrsToList (name: value: "\"${name}=${value}\"") trollshellSessionEnv;
+            # are not supported. `configDirsUnitEnvironment` (#1041 H1 fix)
+            # is appended rather than folded into `trollshellSessionEnv`
+            # itself, since that attrset also feeds `home.sessionVariables`
+            # and a literal XDG_CONFIG_DIRS there conflicts with
+            # `xdg.systemDirs.config`'s own write to the same key — see the
+            # long comment on `configDirsUnitEnvironment` in the `let` above.
+            Environment =
+              (lib.mapAttrsToList (name: value: "\"${name}=${value}\"") trollshellSessionEnv)
+              ++ configDirsUnitEnvironment;
           };
           Install.WantedBy = [ cfg.systemd.target ];
         };

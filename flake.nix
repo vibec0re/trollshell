@@ -377,6 +377,35 @@
             touch $out
           '';
 
+          # `programs.trollshell.config.core-leds`'s nix-side vocabulary
+          # (`style`/`fill` enums, `rows`'s cap) hand-mirrors Rust's
+          # `DisplayStyle`/`parse_core_leds_fill`/`MAX_ROWS` (#1041, #1081
+          # review M6) with nothing failing if the two drift — and this
+          # option is explicitly the template nine more subsystem families
+          # copy. Same posture as `bind-pins` above: a source-level defect no
+          # compile in this flake can see, so a script rather than a test,
+          # with no cargoArtifacts so it goes red in seconds.
+          #
+          # Deliberately NOT a `cargo test`: a first version of this lived in
+          # `trollshell/src/config/core_leds.rs` reading
+          # `nix/module-common.nix` off disk via `CARGO_MANIFEST_DIR`, and it
+          # passed locally while failing in CI — `nix/package.nix`'s crane
+          # source filter keeps only `.rs`/`.toml`/lockfile/CSS/shader files,
+          # so the sandboxed `workspace` compile `cargo test --workspace`
+          # runs inside has no `.nix` files at all (the same `include_str!`
+          # trap CLAUDE.md documents for `assets/`, reached by
+          # `std::fs::read_to_string` instead). Widening the crane filter to
+          # keep `*.nix` was rejected — every `.nix` edit would then
+          # invalidate `workspace`'s source hash and force a full recompile.
+          # `nix/lint-core-leds-vocab.py`'s own header has the full story.
+          core-leds-vocab =
+            pkgs.runCommand "trollshell-core-leds-vocab-check" { nativeBuildInputs = [ pkgs.python3 ]; }
+              ''
+                cd ${self}
+                python3 nix/lint-core-leds-vocab.py
+                touch $out
+              '';
+
           # The preem GL renderer's shaders, compiled in the dialect the shell
           # compiles them in (#893 stage B). Same posture and same reasons as
           # `bind-pins` above: a source-level defect no compile in this flake
@@ -994,6 +1023,244 @@
                 builtins.deepSeq { inherit falsePredicates; } "ok";
             in
             pkgs.runCommand "trollshell-nixos-module-nightlight-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # #1041: `programs.trollshell.config.core-leds` renders a base-layer
+          # `core-leds.toml` spliced onto the trollshell unit's own
+          # `XDG_CONFIG_DIRS` (`nix/hm-module.nix`'s `configBase` +
+          # `configDirsUnitEnvironment`) — NOT under
+          # `xdg.configFile`/`$XDG_CONFIG_HOME`, which is the OVERLAY
+          # `crates/hytte-config/src/xdg.rs` reserves for a hand edit. This
+          # check forces the module eval, resolves the rendered store path out
+          # of the trollshell **unit**'s own `Service.Environment` — not the
+          # login-shell `home.sessionVariables` surface, which #1081 review
+          # M1 found gave `nix build` a green check while the unit itself had
+          # gone dark (mutation N1: drop `XDG_CONFIG_DIRS` from
+          # `Service.Environment` alone, leaving `home.sessionVariables`
+          # untouched — `#568`'s exact lesson, applied to this variable
+          # instead of a `TROLLSHELL_*` one) — and TOML round-trips its bytes
+          # against the values set. The positive half of the #1041
+          # module-eval coverage; the negative half (an unknown key) is
+          # nixos-module-core-leds-unknown-key below, since the submodule type
+          # is declared once in module-common.nix and shared by both modules.
+          # `hm-module-core-leds-composes-with-xdg-systemdirs` below covers
+          # the *other* half of H1 — that this doesn't collide with a user's
+          # own `xdg.systemDirs.config`.
+          hm-module-core-leds =
+            let
+              hm = home-manager.lib.homeManagerConfiguration {
+                inherit pkgs;
+                modules = [
+                  self.homeModules.default
+                  {
+                    home = {
+                      username = "alice";
+                      homeDirectory = "/home/alice";
+                      stateVersion = "24.11";
+                      enableNixpkgsReleaseCheck = false;
+                    };
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      config.core-leds = {
+                        style = "lcd";
+                        rows = "rect";
+                      };
+                    };
+                  }
+                ];
+              };
+              cfg = hm.config;
+              # Each entry of `Service.Environment` is a NIX string carrying
+              # its own literal `"…"` quoting (`nix/hm-module.nix`'s
+              # `"\"${name}=${value}\""`, for systemd's own list-of-quoted-
+              # strings syntax) — find the `XDG_CONFIG_DIRS=` one and strip
+              # both the embedded quotes and the key.
+              environment = cfg.systemd.user.services.trollshell.Service.Environment;
+              xdgEntry = pkgs.lib.findFirst (e: pkgs.lib.hasPrefix "\"XDG_CONFIG_DIRS=" e) null environment;
+              xdgValue = pkgs.lib.removeSuffix "\"" (pkgs.lib.removePrefix "\"XDG_CONFIG_DIRS=" xdgEntry);
+              # The leading entry is `configBase` (nix/hm-module.nix): a
+              # store path is never a mid-list entry, so splitting on ":" and
+              # taking the head is exactly what the shell's own
+              # `xdg::config_dirs` parse does.
+              base = builtins.head (pkgs.lib.splitString ":" xdgValue);
+              renderedFile = "${base}/trollshell/core-leds.toml";
+              probe =
+                assert xdgEntry != null;
+                renderedFile;
+            in
+            pkgs.runCommand "trollshell-hm-module-core-leds-check"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                inherit probe;
+              }
+              ''
+                python3 -c '
+                import tomllib
+                with open("${renderedFile}", "rb") as f:
+                    data = tomllib.load(f)
+                assert data == {"style": "lcd", "rows": "rect"}, data
+                '
+                touch $out
+              '';
+
+          # #1081 review H1, other half: `xdg.systemDirs.config` is a shared
+          # home-manager option — a user (or another module) setting it
+          # themselves must compose with `nix/hm-module.nix`'s own entry
+          # (list concatenation), not conflict with it. A bare
+          # `home.sessionVariables.XDG_CONFIG_DIRS = "…";` here — what routing
+          # through `trollshellSessionEnv`/`home.sessionVariables` directly
+          # would have produced — throws "conflicting definition values" the
+          # moment anything else defines that same option, which this fixture
+          # reproduces (`/opt/example/etc/xdg`, the exact path the review
+          # measured against). Both entries present is the positive half;
+          # a clean eval (no `mkForce`, no throw) is the half that used to
+          # fail outright.
+          hm-module-core-leds-composes-with-xdg-systemdirs =
+            let
+              hm = home-manager.lib.homeManagerConfiguration {
+                inherit pkgs;
+                modules = [
+                  self.homeModules.default
+                  {
+                    home = {
+                      username = "alice";
+                      homeDirectory = "/home/alice";
+                      stateVersion = "24.11";
+                      enableNixpkgsReleaseCheck = false;
+                    };
+                    xdg.systemDirs.config = [ "/opt/example/etc/xdg" ];
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      config.core-leds.style = "crt";
+                    };
+                  }
+                ];
+              };
+              cfg = hm.config;
+              dirs = cfg.xdg.systemDirs.config;
+              probe =
+                assert builtins.elem "/opt/example/etc/xdg" dirs;
+                assert pkgs.lib.any (e: pkgs.lib.hasInfix "trollshell-config-base" e) dirs;
+                builtins.deepSeq { inherit dirs; } "ok";
+            in
+            pkgs.runCommand "trollshell-hm-module-core-leds-composes-with-xdg-systemdirs-check"
+              {
+                inherit probe;
+              }
+              ''
+                echo "$probe" >/dev/null
+                touch $out
+              '';
+
+          # The NixOS-module half of the same rendering (#1041): writes
+          # straight into /etc/xdg (nix/nixos-module.nix), the default
+          # $XDG_CONFIG_DIRS base entry, so no session variable to resolve —
+          # `cfg.environment.etc` names the store path directly.
+          nixos-module-core-leds =
+            let
+              nixos = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.default
+                  {
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      weather.fallbackCity = "Berlin";
+                      config.core-leds = {
+                        style = "lcd";
+                        rows = "rect";
+                      };
+                    };
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = {
+                      device = "/dev/sda1";
+                      fsType = "ext4";
+                    };
+                    system.stateVersion = "24.11";
+                  }
+                ];
+              };
+              cfg = nixos.config;
+              renderedFile = cfg.environment.etc."xdg/trollshell/core-leds.toml".source;
+            in
+            pkgs.runCommand "trollshell-nixos-module-core-leds-check" { nativeBuildInputs = [ pkgs.python3 ]; }
+              ''
+                python3 -c '
+                import tomllib
+                with open("${renderedFile}", "rb") as f:
+                    data = tomllib.load(f)
+                assert data == {"style": "lcd", "rows": "rect"}, data
+                '
+                touch $out
+              '';
+
+          # The negative half of #1041's module-eval coverage: an unrecognised
+          # key under `config.core-leds` must fail at module EVAL, not at
+          # runtime when the shell tries to load a nix-store file it cannot
+          # parse. `programs.trollshell.config.core-leds` is a typed
+          # submodule with no `freeformType` (module-common.nix), so this is
+          # really proving the module system's own "does not exist" behaviour
+          # applies here — worth pinning anyway, since a later change to a
+          # `freeformType`/`extraConfig` escape hatch would silently lose it.
+          #
+          # Forcing an unrelated top-level attribute (`config.system.
+          # stateVersion`) is NOT enough to trigger this, measured: a
+          # submodule-typed option's own unmatched-definition check is
+          # scoped to that option's nested `evalModules`, run lazily when
+          # THAT option's value is actually forced — unlike a genuinely
+          # top-level typo (`networking.hostNam`), which the outer
+          # `evalModules`' own check catches on almost any access. So this
+          # forces `config.programs.trollshell.config.core-leds` itself
+          # (`deepSeq`, not just WHNF, since a shallow force can stop short
+          # of the bad key).
+          #
+          # #1081 review M4: `builtins.tryEval` reports only success/failure,
+          # never the thrown message — verified, there is no way to recover
+          # "The option `…` does not exist"'s text from it — so on its own
+          # this check cannot tell "`bogus` is unmatched inside a real
+          # `core-leds` option" from "`core-leds` itself doesn't exist any
+          # more" (mutation N3: rename the option at
+          # `nix/module-common.nix`'s declaration — this check stayed green
+          # for the wrong reason). The fix is the **control arm** below:
+          # the identical fixture minus `bogus` must come back `success =
+          # true`. Only a genuine per-key rejection makes both hold at once —
+          # renaming the option away fails the control too.
+          nixos-module-core-leds-unknown-key =
+            let
+              fixture =
+                coreLeds:
+                (nixpkgs.lib.nixosSystem {
+                  inherit system;
+                  modules = [
+                    self.nixosModules.default
+                    {
+                      programs.trollshell = {
+                        enable = true;
+                        package = stubPackage;
+                        config.core-leds = coreLeds;
+                      };
+                      boot.loader.grub.enable = false;
+                      fileSystems."/" = {
+                        device = "/dev/sda1";
+                        fsType = "ext4";
+                      };
+                      system.stateVersion = "24.11";
+                    }
+                  ];
+                }).config.programs.trollshell.config.core-leds;
+              result = builtins.tryEval (builtins.deepSeq (fixture { bogus = "nope"; }) "ok");
+              control = builtins.tryEval (builtins.deepSeq (fixture { style = "lcd"; }) "ok");
+              probe =
+                assert !result.success;
+                assert control.success;
+                builtins.deepSeq { inherit result control; } "ok";
+            in
+            pkgs.runCommand "trollshell-nixos-module-core-leds-unknown-key-check" { inherit probe; } ''
               echo "$probe" >/dev/null
               touch $out
             '';

@@ -1961,25 +1961,57 @@ session.
     TOML _at all_ (an unterminated string, or an integer too big for TOML's i64
     like `rows = 9223372036854775808`) — the "caught mid-edit" bullet above.
 
-  - **The base layer.** Nix does not render a base file yet (out of #869's
-    lane). To exercise the layer by hand, put a `core-leds.toml` under a
-    directory on `XDG_CONFIG_DIRS` (e.g.
-    `XDG_CONFIG_DIRS=/tmp/base:$XDG_CONFIG_DIRS` with
-    `/tmp/base/trollshell/core-leds.toml`), restart, and confirm your
-    `$XDG_CONFIG_HOME` overlay beats it key by key while a key only the base
-    states still applies. Then edit the **base** file with the shell up: every
-    layer is stat'd on every poll, so a base edit reloads live too — no
-    restart needed for that either (only for putting a new directory on
-    `XDG_CONFIG_DIRS`, which the shell reads once at startup).
-  - **The one edit the poller can miss.** The watcher stamps each layer's
-    mtime _and_ its length. An edit that lands inside a single mtime granule
-    **and** keeps the byte count identical (`style = "vfd"` → `style = "lcd"`,
-    14 bytes either way) is invisible to it, permanently — not late. On
-    ext4/btrfs/tmpfs, which carry nanosecond mtimes, this cannot happen; on a
-    coarse-granularity mount (a network share, a FAT stick you pointed
-    `XDG_CONFIG_DIRS` at) it can. Touch the file again and it reloads. This is
-    the honest limit of stat-polling, not a bug to file — a real inotify watch
-    is the eventual answer.
+  - **The base layer, nix-rendered (#1041).** Set
+    `programs.trollshell.config.core-leds.style = "lcd";` (home-manager or the
+    NixOS module — see `nix/module-common.nix`'s description for the full
+    field list) and rebuild. With no overlay file at all
+    (`~/.config/trollshell/core-leds.toml` absent), the panel must come up
+    **LCD** with no restart of the shell needed beyond the one the rebuild
+    itself does — the base layer is read at startup the same as any other
+    layer. Then create a bare overlay
+    (`echo 'style = "crt"' > ~/.config/trollshell/core-leds.toml`) and confirm
+    it beats the nix-set base live within ~3 s, while a key only the base
+    states (e.g. `color`, if you set one) still applies through the overlay.
+  - **Whether a later rebuild reaches an already-running shell depends on
+    which module rendered the base file (#1041 M5).** The NixOS module writes
+    `/etc/xdg/trollshell/core-leds.toml` as a symlink that `nixos-rebuild
+switch` repoints atomically to a new store path every rebuild; the running
+    shell keeps re-reading that same stable path, so — now that the watcher's
+    stamp hashes content instead of trusting a nix-store file's permanently
+    frozen mtime (below) — a `nixos-rebuild switch` alone, no shell restart,
+    reaches the panel within ~3 s/~15 s. home-manager is different:
+    `programs.trollshell.config.core-leds` renders into a _fresh_ nix-store
+    directory every `home-manager switch`, and that path is baked into the
+    trollshell unit's own `Environment=` at process start — the same reason a
+    changed `TROLLSHELL_*` value needs a restart under `systemd.enable`
+    (#568) — so a home-manager rebuild needs
+    `systemctl --user restart trollshell` to reach a running shell; only a
+    hand-edited **overlay** reloads live under that module.
+  - **Battery-aware reload cadence (#1041).** On battery, the poll cadence
+    stretches from 3 s to 15 s (`trollshell/src/config/core_leds.rs`'s
+    `BATTERY_CONFIG_POLL_INTERVAL`). Unplug, wait for the battery chip to
+    confirm `on battery`, then edit `core-leds.toml` and save: the panel
+    should still re-skin, but expect up to ~15 s rather than ~3 s before it
+    does. Plug back in and the very next edit should be back to ~3 s. A
+    laptop with no battery, or with
+    `programs.trollshell.enableRecommendedServices = false` (no UPower),
+    should stay at the AC cadence the whole time — `upower::on_battery_now`
+    degrades to "on AC" whenever the real state isn't known, never to the
+    slower one.
+  - **The one edit the poller used to be able to miss, fixed (#1041 M5).** The
+    watcher's stamp is a modification time _and a content hash_ — no longer
+    just a byte length — because a same-length edit landing inside one mtime
+    granule (`style = "vfd"` → `style = "lcd"`, 14 bytes either way) used to be
+    invisible to it, permanently, and every file the nix base layer renders
+    carries the _same frozen mtime_ regardless of granule (every Nix store
+    file's mtime is the constant `1970-01-01T00:00:01Z`, measured). Confirm by
+    hand: with the shell up, save `style = "vfd"` then immediately
+    `style = "lcd"` — same byte count both times — and the panel must re-skin
+    within ~3 s. What is still, honestly, not covered: two edits landing in
+    one granule that also **hash** identically (a content collision, not a
+    length one) — astronomically unlikely for a four-key TOML file, not
+    mathematically impossible, and a real inotify watch remains the eventual
+    answer for that residue.
 
 - [ ] **(#862)** **Accent tracking for the shell's own preem surfaces** — the
       Stats drawer's per-core LED panel is rasterised in-process, and until

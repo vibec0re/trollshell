@@ -1550,12 +1550,23 @@ mod tests {
     /// #1024 N3/N4: `write_response` must not park its caller forever when the
     /// peer never reads. `UnixStream::pair()` gives a connected pair with no
     /// listener/socket file involved; the response is built oversized on
-    /// purpose (tens of thousands of grant rows — several MB of JSON) so the
+    /// purpose (thousands of grant rows — hundreds of KB of JSON) so the
     /// write genuinely fills the kernel buffer and blocks, rather than landing
     /// entirely in slack and returning instantly regardless of the bound.
     ///
     /// The outer `tokio::time::timeout` turns "the internal bound was deleted"
     /// into a failing assertion instead of a test binary that hangs forever.
+    ///
+    /// #1024 review New-2: `started` is taken before `write_response`, and
+    /// `encode_response` runs *inside* it (before the write, and before the
+    /// 2 s block can even begin), so the row count feeds this test's upper
+    /// bound too, not just how hard the write blocks. Was `100_000` rows,
+    /// which measured 2.82–3.46 s wall under ~2x CPU oversubscription against
+    /// a 4 s ceiling (`WRITE_RESPONSE_TIMEOUT` + 2 s) — survived 100/100
+    /// whole-binary runs there, but on a margin note, not a repro. `10_000`
+    /// rows (~95 KB, still >2× the default UDS buffers) keeps the write
+    /// genuinely blocking (still RED with the timeout deleted) while cutting
+    /// the encode cost this bound has to absorb.
     #[tokio::test]
     async fn write_response_gives_up_on_a_client_that_never_reads() {
         let (mut server, _client_that_never_reads) =
@@ -1564,7 +1575,7 @@ mod tests {
         let huge = Response {
             ok: true,
             grants: Some(
-                (0..100_000)
+                (0..10_000)
                     .map(|i| GrantOut {
                         agent: format!("agent-{i:06}"),
                         datasource: "departures".to_owned(),

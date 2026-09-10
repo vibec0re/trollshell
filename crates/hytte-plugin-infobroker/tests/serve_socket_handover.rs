@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use hytte_plugin_infobroker::grants::{Grant, to_toml};
 use hytte_plugin_infobroker::paths::{GRANTS_FILE, SOCKET_FILE, STATE_DIR};
-use hytte_plugin_infobroker::{BrokerMsg, BrokerSnapshot, serve};
+use hytte_plugin_infobroker::{BrokerMsg, BrokerSnapshot, Cmd, serve};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -103,15 +103,37 @@ const GIVE_UP: Duration = Duration::from_secs(5);
 const WRITE_PARK_GIVE_UP: Duration = Duration::from_secs(10);
 
 /// How many `always` grants to pre-seed for scenario C: enough that a
-/// `{"op":"grants"}` response is several MB of JSON, comfortably larger than
-/// any default Linux UDS socket buffer, so a client that never reads it
-/// genuinely blocks the write instead of the whole reply sliding into kernel
-/// slack and returning instantly regardless of any bound.
-const HUGE_GRANT_COUNT: usize = 80_000;
+/// `{"op":"grants"}` response is comfortably larger than any default Linux
+/// UDS socket buffer (`wmem_default`/`rmem_default` = 212 992 B on a typical
+/// kernel), so a client that never reads it genuinely blocks the write
+/// instead of the whole reply sliding into kernel slack and returning
+/// instantly regardless of any bound.
+///
+/// #1024 review New-1: was `80_000` (~7.6 MB of JSON), which left scenario
+/// C's session-1/session-2 seed bounds (`GIVE_UP`/`WRITE_PARK_GIVE_UP`) on as
+/// little as 0.83× margin under ~2x CPU oversubscription — `GrantStore::load`
+/// parses this file synchronously, twice per scenario run (once per
+/// session), and that cost is pure CPU, so it scales straight with
+/// contention. `ubuntu-latest` is 4 vCPU and this suite runs twice per `nix
+/// flake check` alongside two `nixosTest` VMs and the package build's
+/// `doCheck`, i.e. genuinely oversubscribed. Measured (112 burners on 64
+/// cores): `8_000` (~760 KB, still ≈2× the combined default UDS buffers, so
+/// the write still genuinely blocks) restores the margin to 7.63×/5.73× on
+/// the two bounds while keeping mutation (c) RED and the suite green.
+const HUGE_GRANT_COUNT: usize = 8_000;
 
 // ── Shared harness ──────────────────────────────────────────────────────────
 
-/// The last `n` lines of `s`, with a byte/line count header when truncated.
+/// #1024 review New-7: a byte cap alongside `tail_lines`' line cap. With the
+/// `{snap:?}`-formatted full-snapshot dumps gone (L3) nothing today emits a
+/// single line long enough to blow this up on its own, but capping only
+/// lines made that true by accident, not by construction — a future
+/// regression that prints one very long line would sail straight through the
+/// line cap.
+const TAIL_MAX_BYTES: usize = 4096;
+
+/// The last `n` lines of `s`, further capped to at most [`TAIL_MAX_BYTES`],
+/// with a byte/line count header when either cap actually trims something.
 /// #1024 review L3: a failing scenario's child can legitimately print
 /// megabytes (a `{:?}`-formatted `BrokerSnapshot` holding `HUGE_GRANT_COUNT`
 /// grants used to do exactly that), and dumping all of it into a panic
@@ -119,14 +141,29 @@ const HUGE_GRANT_COUNT: usize = 80_000;
 /// reason is almost always in the last handful of lines, not the middle.
 fn tail_lines(s: &str, n: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
-    if lines.len() <= n {
-        return s.to_owned();
+    let by_lines = lines.len() > n;
+    let mut tail = if by_lines {
+        lines[lines.len() - n..].join("\n")
+    } else {
+        s.to_owned()
+    };
+    let by_bytes = tail.len() > TAIL_MAX_BYTES;
+    if by_bytes {
+        let mut start = tail.len() - TAIL_MAX_BYTES;
+        while !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        tail = tail[start..].to_owned();
+    }
+    if !by_lines && !by_bytes {
+        return tail;
     }
     format!(
-        "[{} bytes, {} lines total — showing last {n}]\n{}",
+        "[{} bytes, {} lines total — showing last {} bytes]\n{}",
         s.len(),
         lines.len(),
-        lines[lines.len() - n..].join("\n"),
+        tail.len(),
+        tail,
     )
 }
 
@@ -154,14 +191,25 @@ fn tail_lines(s: &str, n: usize) -> String {
 /// the child" (`in_scenario_child()` false, so the `_inner` test returns
 /// immediately) — both exit 0 with no scenario ever having run.
 fn run_inner(inner_test_name: &str, runtime_dir: &Path, state_dir: &Path) {
+    let args = [
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+        inner_test_name,
+    ];
+    // #1024 review New-6: the whole "exactly one `_inner` test per re-exec"
+    // guarantee rests on `--exact` actually being in this argv — assert it
+    // rather than only trusting the literal array above never drifts, since
+    // a future refactor that builds `args` differently (e.g. conditionally)
+    // could drop it silently.
+    assert!(
+        args.contains(&"--exact"),
+        "run_inner must always re-exec with --exact, or a dropped filter could run more than \
+         the intended _inner test (#1024 review New-6)",
+    );
     let exe = std::env::current_exe().expect("this test binary's own path");
     let mut child = std::process::Command::new(exe)
-        .args([
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-            inner_test_name,
-        ])
+        .args(args)
         .env(SCENARIO_MARKER, "1")
         .env("XDG_RUNTIME_DIR", runtime_dir)
         .env("XDG_STATE_HOME", state_dir)
@@ -242,6 +290,109 @@ fn in_scenario_child() -> bool {
     std::env::var_os(SCENARIO_MARKER).is_some()
 }
 
+/// The bare path (module path stripped of the crate-name segment, `::f`
+/// suffix stripped) of the function this macro is invoked inside — e.g.
+/// inside `a_session_handover_survives_a_predecessor_parked_in_read`, this
+/// expands to that exact string.
+///
+/// #1024 review New-5: each scenario's `_inner` test name used to be written
+/// three times by hand (the `_inner` fn itself, the literal passed to
+/// [`run_inner`], and the literal in the `_inner`'s own [`SCENARIO_OK_PREFIX`]
+/// print) with nothing enforcing any of them agree with the *outer* test's
+/// own identity. Mutation `swapname` — pointing scenario A's outer test at
+/// scenario C's `_inner` name — passed green, because [`run_inner`]'s M1
+/// check only ever proved the string it was given was internally
+/// self-consistent with what the resulting child printed, never that the
+/// caller had actually named *itself*. Deriving the name from the calling
+/// function's own identity removes the literal (and the copy-paste) instead
+/// of just deduplicating it.
+macro_rules! this_fn_name {
+    () => {{
+        fn f() {}
+        fn type_name_of<T>(_: T) -> &'static str {
+            std::any::type_name::<T>()
+        }
+        let full = type_name_of(f);
+        let full = &full[..full.len() - "::f".len()];
+        // Every `#[tokio::test] async fn` body desugars to a closure, so an
+        // item defined inside one (like `f` above) picks up a
+        // "::{{closure}}" path segment for each level of that desugaring —
+        // strip from the first one onward to get back to the enclosing
+        // test fn's own name (confirmed by running this: without the strip,
+        // the derived name was
+        // "…the_next_sessions_seed::{{closure}}", not the bare fn name).
+        let full = full.split("::{{closure}}").next().unwrap_or(full);
+        // `type_name` is crate-qualified ("<crate>::<path>"); libtest's own
+        // test names are not, so strip the leading crate-name segment.
+        full.split_once("::").map_or(full, |(_, rest)| rest)
+    }};
+}
+
+/// Assert (#1024 review New-3) that a bounded seed genuinely landed *inside*
+/// `bound` by wall clock, not just that `tokio::time::timeout` didn't return
+/// `Err`. `#[tokio::test]` builds a **current-thread** runtime by default,
+/// and `serve`'s `GrantStore::load` parses `grants.toml` synchronously (no
+/// `.await` inside it) — while that runs, the executor cannot poll any other
+/// future on this thread, timer included, so a seed that arrives late can
+/// still see the timeout wrapper return `Ok` (measured on the unmutated
+/// tree: 7.310 s elapsed through a `timeout(GIVE_UP = 5s, ..)` that returned
+/// `Ok`, no panic). [`spawn_serve`] fixes the root cause (moving `serve`'s
+/// execution off this thread entirely, so the timer keeps running); this
+/// assertion is the belt-and-suspenders check that a wedge is still caught
+/// here, precisely and fast, rather than only by `run_inner`'s coarse
+/// [`CHILD_GIVE_UP`] kill.
+fn assert_seeded_within(started: Instant, bound: Duration, what: &str) {
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < bound,
+        "{what} took {elapsed:?}, at or past its {bound:?} bound on the happy path — a wedge \
+         should be caught here, not deferred to run_inner's coarse {CHILD_GIVE_UP:?} kill \
+         (#1024 review New-3)",
+    );
+}
+
+/// Run [`serve`] on tokio's blocking thread pool via `Handle::block_on`,
+/// rather than a plain `tokio::spawn` onto this test's own async worker
+/// thread.
+///
+/// #1024 review New-3: `#[tokio::test]` builds a **current-thread** runtime,
+/// so a plain `tokio::spawn(serve(..))` runs `serve` — including its
+/// synchronous `GrantStore::load` TOML parse, which has no `.await` inside it
+/// — on the SAME single OS thread this test's own future (every
+/// `tokio::time::timeout` in this file included) is polled on. While that
+/// parse runs, the thread can't poll anything else, so a `timeout` wrapping a
+/// seed that arrives late can still observe `Ok` — measured on the unmutated
+/// tree: 7.310 s elapsed through a `timeout(GIVE_UP = 5s, ..)` that returned
+/// `Ok`, no panic, because `Timeout` polls its inner future first and by the
+/// time the executor got back to the timer the inner future had already
+/// resolved.
+///
+/// Enabling tokio's `rt-multi-thread` feature (`#[tokio::test(flavor =
+/// "multi_thread", ..)]`) would fix that, but is out of #1024's lane — this
+/// crate's `Cargo.toml` isn't in it — and isn't reachable from this crate's
+/// own dependency graph anyway: confirmed by trying it, `cargo test -p
+/// hytte-plugin-infobroker` alone then fails to compile ("the runtime flavor
+/// `multi_thread` requires the `rt-multi-thread` feature"), even though it
+/// would happen to compile under a full `cargo test --workspace` because
+/// unrelated sibling crates (`hytte-bus`, `hytte-services`, …) request that
+/// feature and Cargo unifies it in for that wider build.
+///
+/// `spawn_blocking` needs only the already-enabled `rt` feature and moves
+/// `serve`'s entire execution — async and blocking parts alike — onto
+/// tokio's separate blocking-pool thread, leaving this test's own single
+/// worker thread free to keep polling its timers. `Handle::block_on` from
+/// inside a `spawn_blocking` closure is the bridge tokio's own docs recommend
+/// for running async code from a blocking context (and is *not* the "block_on
+/// inside an async task" pattern that panics — the blocking-pool closure is
+/// plain sync code, not itself a polled future).
+fn spawn_serve(
+    cmds: mpsc::UnboundedReceiver<Cmd>,
+    out: mpsc::UnboundedSender<BrokerMsg>,
+) -> tokio::task::JoinHandle<()> {
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || handle.block_on(serve(cmds, out)))
+}
+
 /// Wait for the next [`BrokerMsg::Update`], skipping any interleaved
 /// `RequestConsent`/`Query` message. None of these scenarios trigger either.
 async fn recv_update(out: &mut mpsc::UnboundedReceiver<BrokerMsg>) -> Option<BrokerSnapshot> {
@@ -301,13 +452,18 @@ fn seed_large_grants(state_dir: &Path) {
 /// #995 bug this test exists to pin).
 #[tokio::test]
 async fn a_session_handover_survives_a_predecessor_parked_in_read() {
+    // #1024 review New-6: guard against ever running the outer half inside a
+    // re-exec'd child too (structural, not just "the re-exec always passes
+    // --exact" — see `run_inner`'s New-6 assertion for that half).
+    if in_scenario_child() {
+        return;
+    }
     let runtime_dir = tempfile::tempdir().expect("XDG_RUNTIME_DIR scratch dir");
     let state_dir = tempfile::tempdir().expect("XDG_STATE_HOME scratch dir");
-    run_inner(
-        "a_session_handover_survives_a_predecessor_parked_in_read_inner",
-        runtime_dir.path(),
-        state_dir.path(),
-    );
+    // #1024 review New-5: derived from this function's own name, not a
+    // hand-typed literal that could silently name a different scenario.
+    let inner_name = format!("{}_inner", this_fn_name!());
+    run_inner(&inner_name, runtime_dir.path(), state_dir.path());
 }
 
 #[tokio::test]
@@ -321,12 +477,14 @@ async fn a_session_handover_survives_a_predecessor_parked_in_read_inner() {
     // Session 1: binds cleanly.
     let (cmds1_tx, cmds1_rx) = mpsc::unbounded_channel();
     let (out1_tx, mut out1_rx) = mpsc::unbounded_channel::<BrokerMsg>();
-    let session1 = tokio::spawn(serve(cmds1_rx, out1_tx));
+    let session1 = spawn_serve(cmds1_rx, out1_tx);
 
+    let started1 = Instant::now();
     let snap1 = tokio::time::timeout(GIVE_UP, recv_update(&mut out1_rx))
         .await
         .expect("session 1 must seed within a bounded window, not hang the harness — #1024 L4")
         .expect("session 1's lane produced a snapshot");
+    assert_seeded_within(started1, GIVE_UP, "session 1's seed");
     assert_eq!(
         snap1.notice, None,
         "session 1 must bind cleanly: {:?}",
@@ -348,7 +506,7 @@ async fn a_session_handover_survives_a_predecessor_parked_in_read_inner() {
     // still alive and holding the listener.
     let (cmds2_tx, cmds2_rx) = mpsc::unbounded_channel();
     let (out2_tx, mut out2_rx) = mpsc::unbounded_channel::<BrokerMsg>();
-    let session2 = tokio::spawn(serve(cmds2_rx, out2_tx));
+    let session2 = spawn_serve(cmds2_rx, out2_tx);
 
     // Give session 2 a window to attempt (and, under mutation (a), complete)
     // an unsynchronized probe of session 1's still-live listener before this
@@ -377,10 +535,12 @@ async fn a_session_handover_survives_a_predecessor_parked_in_read_inner() {
     send_line(&mut parked_client, r#"{"op":"grants"}"#).await;
     let _ = read_line(&mut parked_client).await;
 
+    let started2 = Instant::now();
     let snap2 = tokio::time::timeout(GIVE_UP, recv_update(&mut out2_rx))
         .await
         .expect("session 2 must seed within the bounded handover window — RED under mutation (a)")
         .expect("session 2's lane produced a snapshot");
+    assert_seeded_within(started2, GIVE_UP, "session 2's seed");
     assert_eq!(
         snap2.notice, None,
         "session 2 must come up Kept, not stand down against its own predecessor: {:?}",
@@ -409,7 +569,9 @@ async fn a_session_handover_survives_a_predecessor_parked_in_read_inner() {
     // `run_inner` requires this exact line in the parent process's view of
     // the child's stdout, so a no-op child (renamed `_inner` fn, or a marker
     // that never reached it) cannot pass silently.
-    println!("{SCENARIO_OK_PREFIX}a_session_handover_survives_a_predecessor_parked_in_read_inner");
+    // #1024 review New-5: derived from this function's own name, matching
+    // the outer test's derivation of the same name — see `this_fn_name!`.
+    println!("{SCENARIO_OK_PREFIX}{}", this_fn_name!());
 }
 
 // ── Scenario B: a genuinely foreign owner ───────────────────────────────────
@@ -434,6 +596,10 @@ async fn a_session_handover_survives_a_predecessor_parked_in_read_inner() {
 /// time, never dropped until this check is done).
 #[tokio::test]
 async fn a_foreign_listener_gets_stood_down_with_the_notice_rendered() {
+    // #1024 review New-6: see the sibling scenario's identical guard.
+    if in_scenario_child() {
+        return;
+    }
     let runtime_dir = tempfile::tempdir().expect("XDG_RUNTIME_DIR scratch dir");
     let state_dir = tempfile::tempdir().expect("XDG_STATE_HOME scratch dir");
     let sock_path = runtime_dir.path().join(SOCKET_FILE);
@@ -442,11 +608,10 @@ async fn a_foreign_listener_gets_stood_down_with_the_notice_rendered() {
         .expect("stat the freshly bound foreign socket")
         .ino();
 
-    run_inner(
-        "a_foreign_listener_gets_stood_down_with_the_notice_rendered_inner",
-        runtime_dir.path(),
-        state_dir.path(),
-    );
+    // #1024 review New-5: derived from this function's own name — see
+    // `this_fn_name!`'s doc.
+    let inner_name = format!("{}_inner", this_fn_name!());
+    run_inner(&inner_name, runtime_dir.path(), state_dir.path());
 
     // #1024 review M2: the notice (checked in `_inner`) only proves the panel
     // was told — it says nothing about whether the stood-down session left
@@ -477,8 +642,21 @@ async fn a_foreign_listener_gets_stood_down_with_the_notice_rendered() {
     while let Ok(Ok((mut stale, _))) =
         tokio::time::timeout(Duration::from_millis(200), foreign.accept()).await
     {
+        // #1024 review New-4: the same 200 ms bound as `accept()` above, on
+        // the `read_line` too — this is parent-side, post-child code, and
+        // today it can't actually hang (`run_inner` has already reaped the
+        // child, so every backlog connection is a plain EOF), but it is the
+        // one un-bounded I/O call left in a file that just added bounds
+        // everywhere else, guarding against a future regression rather than
+        // a live one.
+        let drained = tokio::time::timeout(Duration::from_millis(200), read_line(&mut stale))
+            .await
+            .expect(
+                "draining a backlog connection must not hang — a stale probe that sends nothing \
+                 should EOF immediately (#1024 review New-4)",
+            );
         assert!(
-            read_line(&mut stale).await.is_none(),
+            drained.is_none(),
             "drained a backlog connection that sent data — expected only #995's silent, \
              write-nothing liveness probe",
         );
@@ -517,12 +695,14 @@ async fn a_foreign_listener_gets_stood_down_with_the_notice_rendered_inner() {
     }
     let (cmds_tx, cmds_rx) = mpsc::unbounded_channel();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<BrokerMsg>();
-    let session = tokio::spawn(serve(cmds_rx, out_tx));
+    let session = spawn_serve(cmds_rx, out_tx);
 
+    let started = Instant::now();
     let snap = tokio::time::timeout(GIVE_UP, recv_update(&mut out_rx))
         .await
         .expect("a stood-down session must still seed a panel snapshot")
         .expect("the lane produced a snapshot");
+    assert_seeded_within(started, GIVE_UP, "the stood-down session's seed");
 
     let notice = snap.notice.expect(
         "a foreign live listener must produce a stand-down notice — RED under mutation (b)",
@@ -536,9 +716,9 @@ async fn a_foreign_listener_gets_stood_down_with_the_notice_rendered_inner() {
     let _ = tokio::time::timeout(Duration::from_secs(2), session).await;
 
     // #1024 review M1 — see the sibling scenario for why this line matters.
-    println!(
-        "{SCENARIO_OK_PREFIX}a_foreign_listener_gets_stood_down_with_the_notice_rendered_inner"
-    );
+    // #1024 review New-5 — derived from this function's own name, matching
+    // the outer test's derivation of the same name.
+    println!("{SCENARIO_OK_PREFIX}{}", this_fn_name!());
 }
 
 // ── Scenario C: a client that never reads a large response ─────────────────
@@ -554,14 +734,17 @@ async fn a_foreign_listener_gets_stood_down_with_the_notice_rendered_inner() {
 /// [`WRITE_PARK_GIVE_UP`] safety net fires — a bounded failure, not a hang.
 #[tokio::test]
 async fn a_client_that_never_reads_does_not_delay_the_next_sessions_seed() {
+    // #1024 review New-6: see the sibling scenario's identical guard.
+    if in_scenario_child() {
+        return;
+    }
     let runtime_dir = tempfile::tempdir().expect("XDG_RUNTIME_DIR scratch dir");
     let state_dir = tempfile::tempdir().expect("XDG_STATE_HOME scratch dir");
     seed_large_grants(state_dir.path());
-    run_inner(
-        "a_client_that_never_reads_does_not_delay_the_next_sessions_seed_inner",
-        runtime_dir.path(),
-        state_dir.path(),
-    );
+    // #1024 review New-5: derived from this function's own name — see
+    // `this_fn_name!`'s doc.
+    let inner_name = format!("{}_inner", this_fn_name!());
+    run_inner(&inner_name, runtime_dir.path(), state_dir.path());
 }
 
 #[tokio::test]
@@ -574,12 +757,14 @@ async fn a_client_that_never_reads_does_not_delay_the_next_sessions_seed_inner()
 
     let (cmds1_tx, cmds1_rx) = mpsc::unbounded_channel();
     let (out1_tx, mut out1_rx) = mpsc::unbounded_channel::<BrokerMsg>();
-    let session1 = tokio::spawn(serve(cmds1_rx, out1_tx));
+    let session1 = spawn_serve(cmds1_rx, out1_tx);
 
+    let started1 = Instant::now();
     let snap1 = tokio::time::timeout(GIVE_UP, recv_update(&mut out1_rx))
         .await
         .expect("session 1 must seed within a bounded window, not hang the harness — #1024 L4")
         .expect("session 1's lane produced a snapshot");
+    assert_seeded_within(started1, GIVE_UP, "session 1's seed");
     assert_eq!(
         snap1.notice, None,
         "session 1 must bind cleanly: {:?}",
@@ -600,14 +785,16 @@ async fn a_client_that_never_reads_does_not_delay_the_next_sessions_seed_inner()
 
     let (cmds2_tx, cmds2_rx) = mpsc::unbounded_channel();
     let (out2_tx, mut out2_rx) = mpsc::unbounded_channel::<BrokerMsg>();
-    let session2 = tokio::spawn(serve(cmds2_rx, out2_tx));
+    let session2 = spawn_serve(cmds2_rx, out2_tx);
 
+    let started2 = Instant::now();
     let snap2 = tokio::time::timeout(WRITE_PARK_GIVE_UP, recv_update(&mut out2_rx))
         .await
         .expect(
             "session 2 must seed within write_response's bound — RED if that timeout is removed",
         )
         .expect("session 2's lane produced a snapshot");
+    assert_seeded_within(started2, WRITE_PARK_GIVE_UP, "session 2's seed");
     assert_eq!(
         snap2.notice, None,
         "session 2 must come up Kept: {:?}",
@@ -623,7 +810,7 @@ async fn a_client_that_never_reads_does_not_delay_the_next_sessions_seed_inner()
     drop(stuck_client);
 
     // #1024 review M1 — see the first scenario for why this line matters.
-    println!(
-        "{SCENARIO_OK_PREFIX}a_client_that_never_reads_does_not_delay_the_next_sessions_seed_inner"
-    );
+    // #1024 review New-5 — derived from this function's own name, matching
+    // the outer test's derivation of the same name.
+    println!("{SCENARIO_OK_PREFIX}{}", this_fn_name!());
 }

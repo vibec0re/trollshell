@@ -70,9 +70,10 @@ pub enum AudioAction {
 /// frame (bundled with the tree so a frame is atomic). Each maps to a real host
 /// command, gated on the matching capability.
 ///
-/// All variants are fire-and-forget **except** [`Effect::RunCommand`], whose
-/// outcome comes back as a [`HostMsg::EffectResult`](crate::msg::HostMsg::EffectResult)
-/// keyed by its `id`.
+/// All variants are fire-and-forget **except** [`Effect::RunCommand`] and
+/// [`Effect::OpenUri`], whose outcomes come back as a
+/// [`HostMsg::EffectResult`](crate::msg::HostMsg::EffectResult) keyed by their
+/// `id`.
 ///
 /// Appending a variant here ⇒ **bump [`VOCAB`](crate::VOCAB)** (#437): a plugin
 /// emits these on its render frame, so an older host must be able to detect and
@@ -232,6 +233,82 @@ pub enum Effect {
         request_id: u64,
         outcome: DatasourceOutcome,
     },
+    /// Open `uri` with the **desktop's default handler** (cap:
+    /// [`OpenUri`](crate::manifest::Capability::OpenUri), #1045). `id`
+    /// correlates the resulting
+    /// [`HostMsg::EffectResult`](crate::msg::HostMsg::EffectResult), like
+    /// [`RunCommand`](Effect::RunCommand) — so a plugin can toast a refusal
+    /// rather than watch a click do nothing.
+    ///
+    /// The host resolves it with `gio::AppInfo`, the same desktop-portal-backed
+    /// resolution the shell's own screenshot / recording toasts use for their
+    /// **Open** action. Not a subprocess, not a shell: the plugin names a
+    /// destination and the *desktop* decides which program opens it. The launch
+    /// is asynchronous host-side, so the outcome arrives when the desktop has
+    /// answered rather than in lock-step with the frame that emitted it.
+    ///
+    /// # Why this is not `RunCommand`
+    ///
+    /// Opening a link was already expressible — `Effect::launch(id, ["xdg-open",
+    /// url])` — but only for a plugin holding
+    /// [`RunCommand`](crate::manifest::Capability::RunCommand), which is
+    /// arbitrary argv execution as the user (the highest-trust capability in the
+    /// vocabulary). That is the wrong trust shape for a card whose other needs
+    /// are its own panel and a toast: #963's agents card renders an
+    /// `agent page https://…` row nobody can follow, and making the row a button
+    /// should not cost the plugin a general exec grant. `OpenUri` is a **narrow
+    /// intent**: one string, host-validated, resolved by the desktop. In trust
+    /// order it sits above [`Notify`](crate::manifest::Capability::Notify) (it
+    /// starts a program of the user's choosing) and well below
+    /// [`RunCommand`](crate::manifest::Capability::RunCommand) (it cannot name
+    /// one).
+    ///
+    /// # The host validates the scheme
+    ///
+    /// Only `http`, `https` and `file` are brokered. Everything else — a
+    /// `mailto:`, a `javascript:`, an `ssh://`, an empty or scheme-less string —
+    /// is refused with a warn and an [`EffectOutcome`] of `ok: false` whose
+    /// `output` names the refused scheme; nothing is launched. The allow-list is
+    /// host policy, not wire vocabulary, so widening it later is a host change
+    /// alone and needs no new variant here. (#1045's triage note parks
+    /// `mailto:` as the obvious candidate, to be taken to #947 if it should go
+    /// wider — nobody has asked for it yet.)
+    ///
+    /// Note what the allow-list does and does not buy. It is **not** a sandbox:
+    /// `file:///…` reaches the user's own default handler for that file type,
+    /// and a same-user process on the plugin socket could always do more than
+    /// this (see [`super::manifest::Capability`]'s route-0 note). It is a
+    /// legibility guard — the effect does what its name says and cannot be
+    /// smuggled into launching a handler for an unrelated protocol.
+    ///
+    /// # Use [`Effect::open_uri`], and know the older-host behaviour
+    ///
+    /// An appended **variant**, not a field: a host that predates #1045 cannot
+    /// decode it at all — `rmp-serde` fails the whole frame
+    /// ([`ProtoError::Decode`](crate::codec::ProtoError::Decode)) rather than
+    /// skipping it the way it skips an unknown *field*, which is why appending a
+    /// variant bumps [`VOCAB`](crate::VOCAB) where adding a field does not.
+    ///
+    /// For a plugin that **declares the capability it emits**, that never
+    /// happens, and the reason is the capability rather than the counter: the
+    /// host drops any effect whose gating capability the manifest did not name
+    /// (see [`Capability`](crate::manifest::Capability)), and
+    /// `Capability::OpenUri` is *itself* a variant a pre-#1045 host cannot
+    /// decode — so such a plugin is dropped at `Register` with a handshake-read
+    /// warn, before it can send a render frame. **Declare
+    /// [`Capability::OpenUri`](crate::manifest::Capability::OpenUri) whenever
+    /// you emit this**: emitting it without declaring it is a plugin bug that
+    /// costs you a silently-dead click on a current host and the #437
+    /// crash-loop on an older one. See [`OPEN_URI_VOCAB`] for why that residual
+    /// is named rather than bought off with the unconditional ceiling.
+    OpenUri {
+        /// The plugin's correlation token, echoed on the
+        /// [`EffectResult`](crate::msg::HostMsg::EffectResult).
+        id: u64,
+        /// The destination. `http`/`https`/`file` only; anything else is
+        /// refused by the host.
+        uri: String,
+    },
 }
 
 impl Effect {
@@ -284,7 +361,85 @@ impl Effect {
             detached: true,
         }
     }
+
+    /// Open `uri` with the desktop's default handler ([`Effect::OpenUri`],
+    /// #1045), routing the outcome back as an [`EffectOutcome`] keyed by `id`.
+    /// `http`/`https`/`file` only — the host refuses any other scheme with
+    /// `ok: false` rather than launching anything.
+    ///
+    /// Prefer this over a struct literal, for the same reason
+    /// [`Effect::run_command`] exists: a later optional field then stays
+    /// source-compatible for out-of-tree plugins.
+    #[must_use]
+    pub fn open_uri(id: u64, uri: impl Into<String>) -> Self {
+        Effect::OpenUri {
+            id,
+            uri: uri.into(),
+        }
+    }
 }
+
+/// The [`VOCAB`](crate::VOCAB) generation that carries the open-a-link intent
+/// ([`Effect::OpenUri`] + [`Capability::OpenUri`](crate::manifest::Capability::OpenUri))
+/// — #1045.
+///
+/// **Census-only**, like [`SHADER_VOCAB`](crate::wire::SHADER_VOCAB),
+/// [`SCROLLED_VOCAB`](crate::wire::SCROLLED_VOCAB) and
+/// [`PREEM_VOCAB`](crate::preem::PREEM_VOCAB): generation 5 bumps
+/// [`VOCAB`](crate::VOCAB) and leaves
+/// [`VOCAB_UNCONDITIONAL`](crate::VOCAB_UNCONDITIONAL) alone, so a plugin
+/// rebuilt on this SDK still stamps generation 1 and still clears an older
+/// host's [`check_vocab`](crate::manifest::Manifest::check_vocab).
+///
+/// # Why the unconditional ceiling stays where it is
+///
+/// This is the **first appended plugin→host [`Effect`] variant since the counter
+/// existed** (#437 introduced it after [`Effect::RequestConsent`] and the
+/// datasource legs had already landed), and the first gated by a *capability*
+/// rather than by a [`HostMsg::Hello`](crate::msg::HostMsg::Hello)
+/// advertisement — so the argument is worth stating exactly rather than by
+/// analogy with #882/#893/#966.
+///
+/// **For a plugin that declares the capability it emits**, the #437 hazard the
+/// unconditional counter exists to catch — an old host silently failing to
+/// decode a *render* frame, redialing, and crash-looping — cannot arise. An
+/// [`Effect`] only reaches a host's broker from a plugin that declared the
+/// gating [`Capability`](crate::manifest::Capability) (the host drops every
+/// other effect), and `Capability::OpenUri` is itself a variant a pre-#1045 host
+/// cannot decode — so that plugin's `Register` frame fails to decode and the
+/// connection is dropped at the handshake, loudly, before any render frame
+/// carrying an `OpenUri` could be sent.
+///
+/// **That condition is a plugin-authoring property, not a wire property**, and
+/// nothing enforces it: the SDK does not gate which effects an author may emit
+/// (`hytte-plugin`'s crate docs say so), so a plugin can emit `OpenUri` while
+/// forgetting `Capability::OpenUri` in its manifest. Such a plugin is already
+/// broken against a #1045 host — the effect is dropped with a warn and **no
+/// [`EffectOutcome`] ever comes back**, so a click silently does nothing — and
+/// against a pre-#1045 host it is broken worse: its `Register` *succeeds* (the
+/// manifest carries no unknown variant and still stamps generation
+/// [`VOCAB_UNCONDITIONAL`](crate::VOCAB_UNCONDITIONAL)), and the first render
+/// frame carrying the effect fails to decode, which with a redialing SDK is the
+/// #437 crash-loop. Pinned by `an_undeclared_open_uri_still_registers_on_an_old_host`.
+///
+/// Moving the ceiling to 5 *would* convert that into a loud handshake refusal —
+/// and would also refuse every **other** plugin rebuilt on this SDK against
+/// every older shell, including all the ones that never open a link. That is the
+/// trade #953 called "strictly worse" and #882/#893/#966 each declined: a
+/// guaranteed compat break for everyone, to catch one authoring bug that already
+/// misbehaves visibly on a current host. So the ceiling stays at 1 and the
+/// residual is named here instead of papered over.
+///
+/// The price for a *correct* plugin is the one every appended capability has
+/// paid since the first (stated on
+/// [`Capability::Shader`](crate::manifest::Capability::Shader)): declaring
+/// `OpenUri` costs compatibility with a pre-#1045 host, which drops the
+/// connection with a `plugin handshake read failed` warn naming the undecodable
+/// variant.
+///
+/// A plugin that wants to branch rather than rely on that can compare this
+/// against [`negotiated_vocab`](crate::manifest::Manifest::negotiated_vocab).
+pub const OPEN_URI_VOCAB: u16 = 5;
 
 /// The outcome of a datasource query (#509). Travels twice: from a provider back
 /// to the host in [`Effect::DatasourceResult`], and from the host on to the

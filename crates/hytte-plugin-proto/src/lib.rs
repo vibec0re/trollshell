@@ -181,7 +181,18 @@ pub const PROTO_VERSION: u16 = 1;
 /// [`Node::Row`](wire::Node::Row)'s `spacing` and
 /// [`Node::ListBox`](wire::Node::ListBox)'s `dense`, which are optional
 /// **fields** and so bump nothing — only the variant moves this counter.)
-pub const VOCAB: u16 = 4;
+///
+/// Generation `5` is #1045's open-a-link intent
+/// ([`Effect::OpenUri`](effect::Effect::OpenUri) +
+/// [`Capability::OpenUri`](manifest::Capability::OpenUri)), marked by
+/// [`OPEN_URI_VOCAB`](effect::OPEN_URI_VOCAB). It is census-only like the three
+/// before it, but for a different reason — its **capability**, not a `Hello`
+/// advertisement, is what keeps the variant away from a host that can't decode
+/// it, and that holds for a plugin which declares the capability it emits (an
+/// undeclared emit is a plugin bug with a named residual). It is also the first
+/// appended [`Effect`](effect::Effect) variant since this counter existed. See
+/// [`OPEN_URI_VOCAB`](effect::OPEN_URI_VOCAB).
+pub const VOCAB: u16 = 5;
 
 /// The highest [`VOCAB`] generation whose variants a plugin may put on the wire
 /// **without the host first advertising support** (#882).
@@ -194,7 +205,14 @@ pub const VOCAB: u16 = 4;
 ///
 /// The two diverge because #882 added a *negotiated* generation; #893's shader
 /// widget ([`SHADER_VOCAB`](wire::SHADER_VOCAB)) is the second and #966's bounded
-/// viewport ([`SCROLLED_VOCAB`](wire::SCROLLED_VOCAB)) the third. A plugin emits
+/// viewport ([`SCROLLED_VOCAB`](wire::SCROLLED_VOCAB)) the third. (#1045's
+/// [`OPEN_URI_VOCAB`](effect::OPEN_URI_VOCAB) is the fourth to leave this const
+/// alone, on a capability argument rather than a `Hello` one. Read the rule
+/// below against it before appending the next `Effect`: a plugin *may* emit
+/// `OpenUri` with no advertisement — what stops an old host seeing one is the
+/// plugin having declared the gating capability, which nothing enforces. #1045
+/// weighed the residual against refusing every rebuilt plugin and chose to name
+/// it; its docs carry the reasoning and the test that pins it.) A plugin emits
 /// [`Node::Preem`](wire::Node::Preem) only after the host advertised
 /// [`PREEM_VOCAB`](preem::PREEM_VOCAB) in [`HostMsg::Hello`](msg::HostMsg::Hello),
 /// so an old host — which never advertises — can never receive one, and the
@@ -217,7 +235,7 @@ pub const VOCAB_UNCONDITIONAL: u16 = 1;
 pub use codec::{MAX_FRAME_LEN, ProtoError, decode, decode_body, encode, encode_body};
 pub use effect::{
     AudioAction, ConsentDecision, DatasourceError, DatasourceOutcome, Effect, EffectOutcome,
-    MediaAction, NiriAction, Page,
+    MediaAction, NiriAction, OPEN_URI_VOCAB, Page,
 };
 pub use manifest::{Capability, Manifest, Mount, ProvidedDatasource, StateKey};
 pub use msg::{HostMsg, LogLevel, PluginMsg};

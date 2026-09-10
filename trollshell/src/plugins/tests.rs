@@ -1985,6 +1985,51 @@ fn effect_capability_maps_each_effect() {
         }),
         Capability::Consent,
     );
+    // #1045: opening a link is its OWN capability, not a corner of
+    // `RunCommand`. That is the entire point of the variant — a plugin that
+    // may open a link must not thereby be able to run a program.
+    assert_eq!(
+        effect_capability(&Effect::open_uri(1, "https://example.invalid/")),
+        Capability::OpenUri,
+    );
+}
+
+/// #1045: the enforcement seam treats `OpenUri` like every other effect — an
+/// un-capped one is dropped in the reader, exactly as an un-capped
+/// `RunCommand` is — and, the half that matters for the trust argument, the two
+/// capabilities do **not** substitute for one another in either direction.
+///
+/// **Falsified** by deleting the `Effect::OpenUri` arm from
+/// `session::effect_capability` (the match is exhaustive, so it cannot be
+/// deleted — it can only be *mis-mapped*, e.g. to `Capability::RunCommand`,
+/// which turns the second and third assertions red).
+#[test]
+fn enforce_capabilities_drops_an_uncapped_open_uri() {
+    let open = Effect::open_uri(3, "https://pr1ma.darkest.space/agents/argus");
+
+    assert!(
+        enforce_capabilities(&[], "p", vec![open.clone()]).is_empty(),
+        "a plugin that declared no caps cannot open a link",
+    );
+    // Holding the highest-trust cap does not imply the narrow one…
+    assert!(
+        enforce_capabilities(&[Capability::RunCommand], "p", vec![open.clone()]).is_empty(),
+        "RunCommand does not stand in for OpenUri",
+    );
+    // …and holding the narrow one emphatically does not imply the other.
+    assert!(
+        enforce_capabilities(
+            &[Capability::OpenUri],
+            "p",
+            vec![Effect::run_command(4, vec!["true".into()])],
+        )
+        .is_empty(),
+        "OpenUri does not stand in for RunCommand",
+    );
+
+    let kept = enforce_capabilities(&[Capability::Notify, Capability::OpenUri], "p", vec![open]);
+    assert_eq!(kept.len(), 1, "the declared cap lets it through");
+    assert!(matches!(kept[0], Effect::OpenUri { id: 3, .. }));
 }
 
 /// #436 item 3: `enforce_capabilities` keeps only effects whose capability

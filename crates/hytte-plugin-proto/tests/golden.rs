@@ -40,6 +40,15 @@
 //! Inspect `git diff crates/hytte-plugin-proto/tests/fixtures/` before
 //! committing — a diff you can't explain from the source change is exactly
 //! the wire break this suite exists to catch.
+//!
+//! One diff shape *is* explainable and looks alarming: appending the **16th**
+//! [`Capability`] crosses `MessagePack`'s `fixarray` limit (15), so the capability
+//! array header in `manifest_full_v1` and `plugin_register_v1` goes from one
+//! byte (`0x9f`) to three (`dc 00 10`) and **every byte after it shifts**. The
+//! same applies to any list here that grows past 15. Nothing is broken (both
+//! encodings decode); the "every pre-existing byte keeps its position" heuristic
+//! just stops applying for that one commit. See
+//! `the_capability_list_is_one_variant_from_an_array16_header` in `proto.rs`.
 
 use hytte_plugin_proto::{
     AccentRole, AudioAction, AudioSpectrum, Capability, ClockState, ConsentDecision,
@@ -162,6 +171,7 @@ fn full_manifest() -> Manifest {
             Capability::DatasourceQuery,
             Capability::DatasourceProvider,
             Capability::Shader,
+            Capability::OpenUri,
         ],
         mount: Mount::SidebarLead,
         order: Some(-5),
@@ -318,7 +328,8 @@ fn panel_tree() -> Node {
 }
 
 /// Every [`Effect`] variant, including [`Effect::Notify`], [`Effect::RaiseOsd`],
-/// and [`Effect::RequestConsent`] (#487) — the "each Effect" entry.
+/// [`Effect::RequestConsent`] (#487) and [`Effect::OpenUri`] (#1045) — the "each
+/// Effect" entry.
 fn effect_table() -> Vec<Effect> {
     vec![
         Effect::OpenPage(Page::PluginSelf),
@@ -372,6 +383,11 @@ fn effect_table() -> Vec<Effect> {
                 message: "fetch failed".into(),
             },
         },
+        // #1045. Built through the constructor, like the two `RunCommand`
+        // helpers are exercised in `proto.rs`: the fixture then pins what a
+        // plugin actually puts on the wire, not a struct literal that happens to
+        // agree with it today.
+        Effect::open_uri(14, "https://pr1ma.darkest.space/agents/argus"),
     ]
 }
 

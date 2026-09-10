@@ -300,6 +300,73 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
         `tooltip`s are skipped as unknown fields, and the card looks exactly as
         it did before — no hover text, no warning, no 5 s reconnect loop in
         `journalctl --user -u trollshell-plugin-<id>`.
+- [ ] **(#1045)** The `OpenUri` effect — a plugin opening a link **without**
+      `Capability::RunCommand`. Nothing in CI can see this: it ends in the
+      desktop's default handler, and the hermetic tests inject a stub launcher
+      precisely so `cargo test` never starts a browser.
+  - [ ] **The happy path.** Give a plugin `capabilities: vec![Capability::OpenUri]`
+        (and nothing else that can launch) and have it emit
+        `Effect::open_uri(id, "https://pr1ma.darkest.space/")` from `update` on a
+        click. The **browser opens** on the focused output, and
+        `journalctl --user -u trollshell` logs
+        `plugin effect: OpenUri … scheme=https` at info. The audit log
+        (`$XDG_STATE_HOME/trollshell/effects-audit.log`) gains a matching
+        `effect=OpenUri decision=allowed id=<id>` line — with **no** `unit=`
+        (nothing was handed to systemd; that field belongs to a detached
+        `RunCommand`).
+  - [ ] **A refused scheme is toastable, not silent.** Same plugin, emit
+        `Effect::open_uri(id, "mailto:annika@hannig.cc")`. **Nothing launches**;
+        the journal warns `plugin effect: OpenUri refused` carrying
+        `reason=refused: scheme "mailto" is not openable`; and the plugin receives
+        `Input::EffectResult { ok: false, output: Some(reason) }` it can render
+        (the point of the round-trip — confirm the plugin's own toast/label
+        actually shows it, not just that the host logged it). Repeat with
+        `ssh://box.example/` and a bare `pr1ma.darkest.space/agents` (no
+        scheme).
+  - [ ] **`file:` really opens.** `Effect::open_uri(id, "file:///…/shot.png")`
+        opens the image viewer — the same handler resolution the shell's own
+        screenshot toast uses.
+  - [ ] **An uppercase scheme really resolves.** `check_uri` accepts
+        `HTTPS://pr1ma.darkest.space/` because RFC 3986 says schemes are
+        case-insensitive, but whether **GLib** then finds a handler for it is a
+        runtime question no unit test can answer. Emit one: the browser must
+        open exactly as for the lowercase form. If it does not, the allow-list
+        is accepting something the desktop cannot resolve and the case-folding
+        belongs in the host, not just in the comparison.
+  - [ ] **A slow launch does not freeze the shell** (the reason the launch is
+        asynchronous — review F1 on PR #1049). Point one at a hung mount:
+        `sudo mount -t nfs 10.0.0.254:/nowhere /mnt/hang -o hard,timeo=600` on
+        an address that black-holes, then emit
+        `Effect::open_uri(id, "file:///mnt/hang/x.png")`. The bar clock must
+        keep ticking, the drawer must still open, and other plugins must keep
+        rendering, for as long as that launch is outstanding — GLib's
+        _synchronous_ entry point does content-type I/O on the URI and would
+        have frozen all of it. The `EffectResult` arrives late, or not until the
+        mount gives up; that is expected. (`umount -f -l /mnt/hang` after.)
+  - [ ] **The capability is load-bearing.** Remove `Capability::OpenUri` from
+        the plugin's manifest, keep the effect, restart it: the click does
+        nothing, and the journal warns
+        `plugin effect requires a capability it didn't declare; dropped`, with
+        a matching `decision=dropped(ungranted-capability)` audit line. Then give it
+        `Capability::RunCommand` **instead** — still dropped, since the two caps
+        do not substitute for each other.
+  - [ ] **Old shell, new plugin** (the compat claim `OPEN_URI_VOCAB`'s docs
+        make). Run a plugin built against this SDK and declaring
+        `Capability::OpenUri` against a **pre-#1045** shell: it must be dropped
+        at the handshake with a `plugin handshake read failed` warn naming the
+        undecodable variant — _not_ mount a card that silently ignores clicks.
+        A plugin rebuilt on this SDK that does **not** declare the cap must
+        still connect and render normally against that same old shell (this is
+        what `VOCAB_UNCONDITIONAL` staying at 1 buys, and it is the half worth
+        checking).
+  - [ ] **The named residual, seen once** (review F2 on PR #1049). Same old
+        shell; this time run a plugin that **emits** `Effect::open_uri` while
+        declaring only `Capability::Notify`. It must `Register` successfully and
+        mount — and then, on the first click that emits the effect, the old
+        shell logs a decode failure and the SDK redials on its 5 s backoff:
+        the #437 crash-loop. Confirm it looks exactly like that, because this is
+        the failure mode `VOCAB_UNCONDITIONAL` was deliberately left unable to
+        catch, and the docs claim it is a plugin bug rather than a wire hazard.
 - [ ] _(dormant — #555)_ The wire-vocabulary generation counter (`VOCAB`) is
       armed but untested against a real newer-vocab plugin (this PR appended
       no wire variant, so `VOCAB` stays at 1 and nothing exercises the reject

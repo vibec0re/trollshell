@@ -120,10 +120,15 @@
 //!   `trollshell-launch.slice` instead, never awaited and never timed out, so it
 //!   outlives a shell restart — #953),
 //!   [`Effect::RequestConsent`] (→ the consent overlay, #487), the two datasource
-//!   legs (#509), and, since #648, [`Effect::Niri`] / [`Effect::Media`] /
+//!   legs (#509), since #648 [`Effect::Niri`] / [`Effect::Media`] /
 //!   [`Effect::Audio`] (→ niri IPC / MPRIS transport on the active player /
-//!   the default sink). The broker's match carries no catch-all, so a *new*
-//!   effect variant is a compile error there rather than a silent drop.
+//!   the default sink), and since #1045 [`Effect::OpenUri`] (→ the desktop's
+//!   default handler for a host-validated `http`/`https`/`file` URI — the narrow
+//!   grant a card needs to make a link followable without asking for
+//!   `RunCommand`; its outcome routes back like `RunCommand`'s, so a refused
+//!   scheme is something the plugin can toast). The broker's match carries no
+//!   catch-all, so a *new* effect variant is a compile error there rather than a
+//!   silent drop.
 //!   Capability **enforcement** is host
 //!   policy (#436): an effect whose [`Capability`] the plugin didn't declare in
 //!   its manifest is dropped with a warn in the connection reader

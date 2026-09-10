@@ -241,15 +241,15 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
 /// `path.display()` alongside the error (e.g. [`write_path`]'s `warn!`)
 /// would otherwise have no way to tell which directory actually failed. The
 /// error's [`std::io::ErrorKind`] is preserved (only the message is
-/// rewritten), so a caller matching on it still can. The one exception is
-/// the bare `create_dir_all(parent)?` below: it runs before `target` is
-/// resolved, so its error reaches the caller unwrapped — e.g. a `path`
-/// component that already exists as a plain file surfaces as a pathless
-/// `File exists (os error 17)`, naming neither `path` nor `target`
-/// (review follow-up on #1000, tracked as #1009).
+/// rewritten), so a caller matching on it still can. The `create_dir_all`
+/// step runs before `target` is resolved, so its error names `parent` — the
+/// original `path`'s directory — instead: a `path` component that already
+/// exists as a plain file surfaces as `<parent>: File exists (os error 17)`
+/// rather than a pathless one (review follow-up on #1000 / #1009).
 pub fn write_atomic(path: &Path, body: &str, durability: Durability) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", parent.display())))?;
     }
 
     // Resolve symlinks: `std::fs::write` wrote *through* a symlinked target, so
@@ -746,6 +746,37 @@ mod tests {
         assert!(
             !missing_dir.exists(),
             "the missing directory must not be created"
+        );
+    }
+
+    /// The one error raised before `target` is resolved — `create_dir_all`
+    /// on the original `path`'s parent — must name that parent too, or a
+    /// `path` component that already exists as a plain file reaches the
+    /// caller as a pathless `File exists (os error 17)` (#1009's second
+    /// item). The kind is preserved exactly as the later errors preserve it.
+    #[test]
+    fn a_plain_file_in_the_way_of_the_parent_names_that_parent_in_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("cfg");
+        std::fs::write(&plain, "not a directory\n").unwrap();
+        let path = plain.join("places.toml");
+
+        let err = write_atomic(&path, "new\n", Durability::FileOnly).unwrap_err();
+
+        let raw = std::fs::create_dir_all(&plain).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            raw.kind(),
+            "the kind must be the OS's own: {err}"
+        );
+        assert!(
+            err.to_string().contains(&plain.display().to_string()),
+            "error must name the parent that is in the way: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&plain).unwrap(),
+            "not a directory\n",
+            "the plain file must survive untouched"
         );
     }
 

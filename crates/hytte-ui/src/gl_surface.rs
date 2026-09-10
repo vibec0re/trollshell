@@ -552,6 +552,25 @@ fn warn_on_data_failure(latch: &RefCell<WarnLatch>, failure: &DataFailure) {
     }
 }
 
+/// The whole refusal arm of `Resources::upload_data`'s reallocation — the
+/// **state** half of the promise [`DATA_STRIP_REFUSED`] makes, pulled out so
+/// it is observable with no GL context (PR #1031 third-pass review LOW 2).
+///
+/// Resets `data_source` then `data_len` before reporting, so the strip
+/// really does read as empty (`u_data_len = 0`, matching the message) and
+/// the next call retries rather than short-circuiting on `Arc::ptr_eq`
+/// against data that was never actually uploaded.
+fn refuse_data_strip(
+    data_source: &mut Option<Arc<[f32]>>,
+    data_len: &mut u32,
+    warned: &RefCell<WarnLatch>,
+    failure: &DataFailure,
+) {
+    *data_source = None;
+    *data_len = 0;
+    warn_on_data_failure(warned, failure);
+}
+
 /// The line a driver-refused data-strip (re)allocation writes to the
 /// journal.
 ///
@@ -595,7 +614,7 @@ mod imp {
         DataFailure, GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline, GlProgram,
         GlTarget, GlUniforms, GlValue, PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED,
         PROGRAMS, SAMPLER_NAMES, WarnLatch, abandon_gl, fit_rect, fresh_last_drawn, gdk, glib,
-        resources_reusable, steps_owed, warn_on_data_failure,
+        refuse_data_strip, resources_reusable, steps_owed,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
@@ -953,7 +972,7 @@ mod imp {
         /// error was re-swallowed there — the exact bug #1023 item 3 fixed.
         /// Taking the latch instead removes the seam rather than testing it:
         /// the refusal arm below is the only place the `Err` exists, and it
-        /// hands it straight to [`super::warn_on_data_failure`], which has its
+        /// hands it straight to [`super::refuse_data_strip`], which has its
         /// own hermetic test.
         ///
         /// On a refusal `self.data_len` is reset to `0` first, so the next
@@ -985,9 +1004,12 @@ mod imp {
                 let texture = match hgl::Texture::new(gl, hgl::Format::R32f, len, 1) {
                     Ok(texture) => texture,
                     Err(error) => {
-                        self.data_source = None;
-                        self.data_len = 0;
-                        warn_on_data_failure(warned, &DataFailure { error, len });
+                        refuse_data_strip(
+                            &mut self.data_source,
+                            &mut self.data_len,
+                            warned,
+                            &DataFailure { error, len },
+                        );
                         return;
                     }
                 };
@@ -1488,8 +1510,9 @@ impl Default for GlSurface {
 mod tests {
     use super::{
         DATA_STRIP_REFUSED, DataFailure, GlProgram, GlUniforms, GlValue, MAX_STEPS_PER_RENDER,
-        PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED, WarnLatch, abandon_gl, fit_rect,
-        fresh_last_drawn, gl_abandoned, hgl, resources_reusable, steps_owed, warn_on_data_failure,
+        PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED, WARNED_LENGTHS, WarnLatch,
+        abandon_gl, fit_rect, fresh_last_drawn, gl_abandoned, hgl, refuse_data_strip,
+        resources_reusable, steps_owed, warn_on_data_failure,
     };
     use std::cell::RefCell;
     use std::sync::Arc;
@@ -1890,6 +1913,80 @@ mod tests {
         assert!(
             !DATA_STRIP_REFUSED.contains("keeps whatever it last held"),
             "must not claim stale samples are still being read: {DATA_STRIP_REFUSED:?}",
+        );
+    }
+
+    /// **PR #1031 third-pass review LOW 1 (#1046).** The FIFO bound this
+    /// PR added to `WarnLatch` is what makes eviction possible at all — with
+    /// no clear-on-success anywhere in this module, eviction is the *only*
+    /// path back to a second line for a length already reported. A port of
+    /// `shader_surface::two_broken_sources_alternating_cost_two_lines`, the
+    /// twin this bound shipped without a test for.
+    ///
+    /// `a_second_differently_sized_refused_data_strip_still_gets_its_own_line`
+    /// looks like it would cover this and does not: it claims the same key
+    /// repeatedly, and a repeat claim returns early without pushing, so
+    /// `said` never grows past one entry and the FIFO is never filled.
+    ///
+    /// **Falsified** by setting `WARNED_LENGTHS` to `0`: `self.said.len() ==
+    /// WARNED_LENGTHS` (now `0`) is already true on the empty latch, so
+    /// `pop_front` never runs and nothing is ever evicted — the final claim
+    /// below goes quiet instead of firing again.
+    #[test]
+    fn a_length_evicted_by_the_bound_is_reported_again() {
+        let mut latch = WarnLatch::default();
+
+        let a = u64::from(100_000_u32);
+        assert!(latch.claim(a), "the first refused length is reported");
+
+        // `WARNED_LENGTHS` further distinct lengths evict `a` from the FIFO.
+        for n in 0..WARNED_LENGTHS {
+            let key = (200_000 + n) as u64;
+            assert!(latch.claim(key), "each new distinct length is reported once");
+        }
+
+        assert!(
+            latch.claim(a),
+            "a was evicted by the bound, so it is reported again rather than silently blanking \
+             the widget",
+        );
+    }
+
+    /// **PR #1031 third-pass review LOW 2(a) (#1046).** The refusal arm's
+    /// *state* half, pinned with no GL context: [`DATA_STRIP_REFUSED`]
+    /// promises the strip "reads as empty (`u_data_len = 0`)", and that is
+    /// [`refuse_data_strip`] actually zeroing `data_len` — not merely the
+    /// sentence claiming it. It also forgets `data_source`, so a later
+    /// successful upload is not skipped as an unchanged repeat.
+    ///
+    /// **Falsified** by deleting `*data_len = 0;` from `refuse_data_strip`:
+    /// this test's `data_len` assertion goes red while `cargo test` and
+    /// workspace clippy both stay green, because nothing downstream of the
+    /// swallowed length is reachable without a live driver.
+    #[test]
+    fn refusing_a_data_strip_zeros_its_length_and_forgets_the_source() {
+        let mut data_source: Option<Arc<[f32]>> = Some(Arc::from(&[1.0_f32, 2.0, 3.0][..]));
+        let mut data_len = 100;
+        let warned = RefCell::new(WarnLatch::default());
+        let failure = DataFailure {
+            error: hgl::Error::TextureSize {
+                size: (100, 1),
+                limit: 4096,
+            },
+            len: 100,
+        };
+
+        refuse_data_strip(&mut data_source, &mut data_len, &warned, &failure);
+
+        assert_eq!(
+            data_len, 0,
+            "u_data_len must actually become 0 — DATA_STRIP_REFUSED says the strip reads as \
+             empty",
+        );
+        assert!(
+            data_source.is_none(),
+            "the source must be forgotten too, so a later successful upload is not skipped as \
+             an unchanged repeat",
         );
     }
 }

@@ -321,9 +321,18 @@ fn data_upload_key(state: &ShaderState) -> u64 {
 /// because the only test that observes that line needs a live driver and so
 /// runs nowhere. The seam was removed rather than tested: `upload_data`
 /// takes the latch, reports for itself, and hands back the texture to sample
-/// — `None` when there is none — which turns the caller's skip into a
-/// `let … else` the compiler enforces instead of a `return` that can be
-/// dropped (round 2's L2, #968 review L7).
+/// — `None` when there is none — which turns round 2's L2 (#968 review L7)
+/// from a `return` a caller can drop into a `let … else` whose `else` arm
+/// must diverge, so that exact one-line mistake no longer compiles.
+///
+/// **That is a property of this spelling, not of the type** (PR #1031
+/// third-pass review LOW 3): `if upload_data(…).is_none() { }` still
+/// compiles, still passes every argument including the widget's own latch,
+/// and reinstates L7 anyway — the frame draws with `u_data_size` describing
+/// a grid that was never bound, forever, because the shape is never
+/// advanced so the refusal repeats every frame. The `let … else` shape at
+/// the call site is the contract; the `Option` return only makes that shape
+/// possible, and does not by itself enforce it.
 ///
 /// `hgl::Error` is plain data a test can construct by hand; only *producing*
 /// a genuine refusal — `hgl::Texture::new` really turning a grid down — needs
@@ -342,6 +351,29 @@ fn warn_on_data_upload_failure(
             DATA_UPLOAD_REFUSED
         );
     }
+}
+
+/// The whole refusal arm of `upload_data`'s reallocation: latch-and-log via
+/// [`warn_on_data_upload_failure`], plus the *state* half neither that
+/// function nor its own test touches — pulled out so the retry contract
+/// #977 exists for is observable with no GL context (PR #1031 third-pass
+/// review LOW 2).
+///
+/// `data_shape` is threaded through and never written: that omission **is**
+/// the contract this pins. Advancing it here is the pre-#977 bug, restored
+/// verbatim — `upload_data`'s own comment at its call site explains why: a
+/// `Texture::new` that now fails honestly must leave the shape where it
+/// was, so the next frame retries the same allocation instead of sampling a
+/// texture with no storage behind it.
+fn refuse_data_strip(
+    _data_shape: &mut (u32, u32, ShaderFormat),
+    data_source: &mut Option<Arc<[u8]>>,
+    warned: &RefCell<WarnLatch>,
+    state: &ShaderState,
+    error: &hgl::Error,
+) {
+    *data_source = None;
+    warn_on_data_upload_failure(warned, state, error);
 }
 
 /// The compiled-program cache: **one** program, keyed by its source.
@@ -520,8 +552,8 @@ mod imp {
     use super::{
         Arc, COMPILE_FAILURE_REFUSED, Cell, Failure, Instant, ProgramCache,
         RESOURCES_ALLOCATION_REFUSED, RefCell, SHADER_PREAMBLE, SHADER_VERT, ShaderState,
-        WarnLatch, abandon_gl, first_line, fit_rect, gdk, glib, source_key,
-        warn_on_data_upload_failure, would_upload, wrapped_seconds,
+        WarnLatch, abandon_gl, first_line, fit_rect, gdk, glib, refuse_data_strip, source_key,
+        would_upload, wrapped_seconds,
     };
     use crate::gl_surface::{GLSL_HEADER, GlValue};
     use gtk::prelude::*;
@@ -918,7 +950,7 @@ mod imp {
     /// Returns **the texture to sample**, or `None` if the driver refused the
     /// (re)allocation and this frame must be skipped — in which case the
     /// refusal has already been latched and logged, once per shape, through
-    /// [`super::warn_on_data_upload_failure`] (#977, #1023 item 1).
+    /// [`super::refuse_data_strip`] (#977, #1023 item 1).
     ///
     /// **Handing the texture back rather than an `Ok`/`Err` is the point**
     /// (PR #1031 review H1/L2): the caller cannot draw without the return
@@ -967,8 +999,7 @@ mod imp {
                     // PR #1031 review H1 is that the caller cannot ignore
                     // this: it gets `None`, not an `Err` it may drop, and it
                     // needs the texture this returns in order to draw at all.
-                    *data_source = None;
-                    warn_on_data_upload_failure(warned, state, &error);
+                    refuse_data_strip(data_shape, data_source, warned, state, &error);
                     return None;
                 }
             };
@@ -1127,7 +1158,8 @@ mod tests {
         Arc, COMPILE_FAILURE_REFUSED, DATA_UPLOAD_REFUSED, ProgramCache,
         RESOURCES_ALLOCATION_REFUSED, RefCell, SHADER_PREAMBLE, SHADER_VERT, ShaderFormat,
         ShaderState, TIME_WRAP_SECS, WARNED_SOURCES, WarnLatch, data_key, first_line, hgl,
-        source_key, warn_on_data_upload_failure, would_upload, wrapped_seconds,
+        refuse_data_strip, source_key, warn_on_data_upload_failure, would_upload,
+        wrapped_seconds,
     };
 
     /// A counting builder, standing in for `hgl::Program::compile`. The cache is
@@ -1848,6 +1880,45 @@ mod tests {
             2,
             "…and both shapes are latched, keyed by data_upload_key, so a later repeat of \
              either stays quiet",
+        );
+    }
+
+    /// **PR #1031 third-pass review LOW 2(b) (#1046).** The refusal arm's
+    /// *state* half, pinned with no GL context: on a refused reallocation
+    /// the shape must **not** advance, or the next frame skips the retry
+    /// and samples a texture with no storage behind it — the pre-#977 bug,
+    /// restored verbatim (`upload_data`'s own comment at its call site
+    /// explains why).
+    ///
+    /// **Falsified** by adding `*data_shape = shape;` (the very assignment
+    /// the `Ok` arm makes two lines below the refusal) to
+    /// [`refuse_data_strip`]: this test's shape assertion goes red while
+    /// `cargo test` and workspace clippy both stay green, because the
+    /// GL-backed call site this feeds (`imp::upload_data`) needs a live
+    /// driver to reach.
+    #[test]
+    fn refusing_a_data_strip_does_not_advance_its_shape() {
+        let mut data_shape = (4_u32, 4_u32, ShaderFormat::R8);
+        let mut data_source: Option<Arc<[u8]>> = Some(Arc::from(&[0u8; 4][..]));
+        let warned = RefCell::new(WarnLatch::default());
+        let state = state_with_data_size((8, 8));
+        let error = hgl::Error::TextureSize {
+            size: (8, 8),
+            limit: 4096,
+        };
+
+        refuse_data_strip(&mut data_shape, &mut data_source, &warned, &state, &error);
+
+        assert_eq!(
+            data_shape,
+            (4, 4, ShaderFormat::R8),
+            "a refused reallocation must not advance the shape — the next frame has to retry \
+             the same allocation, not sample a texture with no storage behind it (pre-#977 bug)",
+        );
+        assert!(
+            data_source.is_none(),
+            "the source must still be forgotten so a later successful upload is not skipped as \
+             an unchanged repeat",
         );
     }
 }

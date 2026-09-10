@@ -839,8 +839,7 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                     // nothing to do with which monitors exist. The cap is
                     // pure (review MEDIUM-2); this is where its one warning
                     // per connection per violation kind actually fires.
-                    let (hidden_on, violation) =
-                        capped_hidden_on(hidden_on, &mut hidden_on_warned);
+                    let (hidden_on, violation) = capped_hidden_on(hidden_on, &mut hidden_on_warned);
                     if let Some((_, msg)) = violation {
                         tracing::warn!(plugin = %plugin_id, "{msg}");
                     }

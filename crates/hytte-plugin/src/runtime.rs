@@ -2608,7 +2608,10 @@ mod tests {
             let PluginMsg::Render { effects, .. } = next_plugin_frame(&mut hrd).await else {
                 panic!("a click that changes the view must still produce a Render frame");
             };
-            assert!(effects.is_empty(), "the undeclared OpenUri effect must be dropped");
+            assert!(
+                effects.is_empty(),
+                "the undeclared OpenUri effect must be dropped"
+            );
 
             // Second click, same effect kind: the drop repeats, the warning
             // does not.

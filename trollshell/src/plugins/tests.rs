@@ -2124,7 +2124,9 @@ fn hidden_on_with_a_name_over_the_byte_cap_becomes_empty_and_warns() {
 
     let mut violated = HashSet::new();
     // Trip the OTHER cap first, to prove the two slots are independent.
-    let many: Vec<String> = (0..=MAX_HIDDEN_ON_ENTRIES).map(|i| format!("o{i}")).collect();
+    let many: Vec<String> = (0..=MAX_HIDDEN_ON_ENTRIES)
+        .map(|i| format!("o{i}"))
+        .collect();
     let (_, first) = capped_hidden_on(many, &mut violated);
     assert!(matches!(
         first,
@@ -2196,7 +2198,9 @@ async fn an_over_cap_hidden_on_reaches_the_mailbox_empty() {
     )
     .await
     .expect("send Register");
-    let over_cap: Vec<String> = (0..=MAX_HIDDEN_ON_ENTRIES).map(|i| format!("o{i}")).collect();
+    let over_cap: Vec<String> = (0..=MAX_HIDDEN_ON_ENTRIES)
+        .map(|i| format!("o{i}"))
+        .collect();
     write_frame(
         &mut pwr,
         &PluginMsg::Render {

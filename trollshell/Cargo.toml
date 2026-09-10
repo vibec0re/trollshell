@@ -24,6 +24,15 @@ system-tests = []
 anyhow.workspace = true
 chrono.workspace = true
 hytte = { path = "../crates/hytte" }
+# The config-file layering (#866/#868), for `src/config/` — the XDG search
+# path, the four merge rules and the `Subsystem` reader/validator/writer.
+# `hytte-config` is the GTK-free leaf `hytte-services` and the control-center
+# already share (#640); linking it here adds no new resolved package, since
+# `hytte` pulls it in through `hytte-services` already. It is deliberately
+# *not* reached through a `hytte` re-export: the umbrella re-exports the four
+# runtime crates, and this is a leaf both the shell and a settings app link
+# directly.
+hytte-config = { path = "../crates/hytte-config" }
 # Plugin host transport (#35 PR 2): the GTK-free wire protocol + its tokio
 # framing helpers. GTK/adw/futures-signals still go through `hytte`'s
 # re-exports; tokio + the proto crate aren't re-exported, so they're direct.

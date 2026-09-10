@@ -39,6 +39,10 @@
 
 pub mod assets;
 pub mod components;
+// In the closure since #869: `panels::stats` reads the per-core LED panel's
+// dressing from `config::core_leds`, the config-file layering's first live
+// subsystem.
+pub mod config;
 pub mod modal;
 pub mod overlays;
 pub mod panels;

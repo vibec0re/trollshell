@@ -299,6 +299,18 @@ fn parse_layer(body: &str, path: Option<&Path>) -> Result<toml::Table, ConfigErr
 /// [`Subsystem::validate`] rejects the result. An *unknown* key is none of
 /// these — it is warned and reported in [`Loaded::unknown_keys`].
 pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>, ConfigError> {
+    // #1022: several tests below call `assemble` directly — bypassing both
+    // `capture` and the `assembled` test helper, the two call sites named in
+    // the fix's own doc comment (`tests::ensure_global_default`) — because
+    // they assert on something other than a `warn!` (an error variant, a key
+    // name, a round-tripped byte string) and never needed a capture. They can
+    // still race a *shared* callsite's first-ever registration against a
+    // `capture()`-using test (every `tracing::warn!` in this generic function
+    // is one `static` shared by every `S`, not one per monomorphization — see
+    // `tests::ensure_global_default`'s doc). Compiled out entirely outside
+    // `cargo test`, so this is invisible to `load`'s real, non-test callers.
+    #[cfg(test)]
+    tests::ensure_global_default();
     // Kept as two parallel vectors rather than pairs: the diagnostics below
     // need the file name beside each table, and `merge::inert_unset` needs the
     // tables as one slice because its question — "does *any* layer set this
@@ -1013,7 +1025,13 @@ palette = ["amber", "rust"]
             .collect()
     }
 
+    /// Calls [`ensure_global_default`] before touching `assemble` at all —
+    /// this is the *other* required call site (see its doc and `capture`'s):
+    /// several tests call `assembled` directly, with no [`capture`] guard, so
+    /// the global default has to be reachable from here too, or those tests
+    /// are exactly the subscriber-less thread #1022 is about.
     fn assembled(bodies: &[&str]) -> Loaded<Leds> {
+        ensure_global_default();
         assemble::<Leds>(&layers(bodies)).expect("assembles")
     }
 
@@ -1495,155 +1513,205 @@ kept = true
         }
     }
 
-    /// Fire every `warn!` callsite the tests below observe through
-    /// [`capture`] — once, with **no** subscriber installed on this thread or
-    /// anywhere else in the process — purely to force each one into
-    /// `tracing-core`'s global callsite registry before `capture` constructs
-    /// its own `Dispatch`. Whatever `Interest` these throwaway hits land on is
-    /// irrelevant, which is the whole point: see `capture`'s doc for why.
-    ///
-    /// Three today: [`MALFORMED_UNSET_MESSAGE`] (a `_unset` that isn't an
-    /// array of strings), [`INERT_UNSET_MESSAGE`] (a well-formed `_unset`
-    /// naming a key nothing sets), and rule 4's "unknown key in config;
-    /// ignoring it". A new `warn!`/`debug!` in [`assemble`] that a test
-    /// starts asserting on through `capture` needs a line here too, or it
-    /// inherits the same 2 % flake this function exists to close (#1022).
-    ///
-    /// Same fix as #1020's `counting_events`
-    /// (`trollshell/src/plugins/shader_map.rs`) and #1032's
-    /// `warm_up_callsites` (`crates/hytte-services/src/hooks.rs`) — read
-    /// either's doc comment for the full `tracing-core` mechanism. This one
-    /// matches #1020's shape rather than #1032's: `assemble` is a pure,
-    /// in-memory, synchronous function with no I/O to amortise, so it warms
-    /// up on every `capture()` call rather than once behind a `OnceCell` —
-    /// #1032 only needed that gate because its subject (`hooks::run_inner`)
-    /// spawns a real subprocess per branch.
-    fn warm_up_callsites() {
-        let _ = assembled(&["[core]\n_unset = \"color\"\n"]);
-        let _ = assembled(&["[core]\n_unset = [\"colr\"]\n"]);
-        let _ = assembled(&["[core]\ncolour = \"cyan\"\n"]);
-    }
-
-    /// # Why a callsite can go silently unobserved (#1022)
+    /// # Why a callsite can go silently unobserved, and why warming callsites
+    /// up cannot close it (#1022)
     ///
     /// `tracing-core` caches a callsite's `Interest` **process-wide** the
-    /// first time it fires. If that first-ever fire lands on a thread with no
-    /// subscriber installed — anywhere in the binary, not necessarily this
-    /// test — the callsite is cached `Interest::never()` for the rest of the
-    /// process, and it stays that way: once a callsite is *registered*, a
-    /// later hit only re-reads the cached value rather than recomputing it.
-    /// `an_unknown_key_is_reported_and_does_not_fail_the_load` (below) is
-    /// exactly such a thread — it calls `assembled` with no `capture()`
-    /// guard, and if libtest schedules it as one of the first hits ever on
-    /// the "unknown key" callsite, it can poison the very callsite several of
-    /// the negative tests below use as their live control.
+    /// first time it fires. That first-ever registration
+    /// (`DefaultCallsite::register`, reached the first time any macro at that
+    /// source location runs anywhere in the process) computes the cached
+    /// value via `DISPATCHERS.rebuilder()` (`tracing-core = 0.1.36`,
+    /// `src/callsite.rs:544-548`), which — whenever at most one `Dispatch` is
+    /// currently live anywhere in the process — takes the `Rebuilder::JustOne`
+    /// shortcut (`src/callsite.rs:561-565`): its `for_each` calls
+    /// `dispatcher::get_default(f)`, i.e. "whatever *the registering thread's
+    /// own* ambient default is," not the full live-dispatcher list. If that
+    /// thread has no subscriber installed at that exact moment, the callsite
+    /// is cached `Interest::never()` for the rest of the process: once
+    /// *registered*, a later hit on *any* thread only re-reads the cached
+    /// value rather than recomputing it.
     ///
-    /// [`warm_up_callsites`] closes this by making sure every callsite this
-    /// module's tests observe is already *registered* (in whatever interest
-    /// state) before this function constructs its own `Dispatch`:
-    /// `Dispatch::new`'s construction (`tracing_core::callsite::register_dispatch`)
-    /// unconditionally walks the *entire* callsite registry and rebuilds
-    /// every already-registered callsite's interest against the full set of
-    /// currently-live dispatchers — not the narrower "just this thread's
-    /// default" shortcut a first-ever registration can take. Since the only
-    /// `Subscriber` this module ever constructs is [`Captured`], which is
-    /// unconditionally `enabled`, that rebuild can only ever land on
-    /// `Interest::always()` for these callsites, no matter which thread races
-    /// which. This is the same reasoning #1020's `counting_events` and
-    /// #1032's `warm_up_callsites` rely on.
+    /// `assemble<S: Subsystem>` is generic, but every `tracing::warn!` inside
+    /// it expands to a `static` item local to the function body — and a
+    /// `static` inside a generic function is **not** monomorphized; Rust
+    /// emits exactly one instance, shared by every instantiation, because a
+    /// `static`'s address cannot depend on a type parameter. So
+    /// `assemble::<Leds>` (used by [`assembled`], the helper most tests call)
+    /// and `assemble::<InertDefault>`/`assemble::<BadDefault>`/`assemble::<OptTable>`
+    /// (the one-off `Subsystem` impls the "built-in default" tests below
+    /// define locally) all share the *same* three callsites — there is no
+    /// per-type isolation to rely on.
     ///
-    /// This **replaces** the previous `rebuild_interest_cache()` "belt and
-    /// braces" call rather than keeping it alongside: that call had the exact
-    /// same `Rebuilder::JustOne` blind spot as the bug it was insuring
-    /// against (it can only rebuild interest for callsites already in the
-    /// registry, and it runs on *this* thread after `set_default` — no help
-    /// if a sibling thread poisons the callsite in between, or already did so
-    /// before this function ever ran). Warming the callsites up first and
-    /// then relying on `Dispatch::new`'s own unconditional full-registry
-    /// rebuild closes both gaps; a second manual rebuild afterward would
-    /// recompute the same already-correct answer.
+    /// This module has tests that call `assemble`/`assembled` with **no**
+    /// subscriber installed at all — `an_unknown_key_is_reported_and_does_not_fail_the_load`
+    /// and `an_unknown_key_inside_an_optional_table_is_named_and_kept` among
+    /// them, both by design; neither needs [`capture`] since neither asserts
+    /// on a `warn!`. Either can win a shared callsite's first-ever
+    /// registration race on its own bare thread. Whether that poisons the
+    /// callsite for a *different*, `capture()`-using test depends on
+    /// scheduling: `Dispatch::new`'s construction
+    /// (`tracing_core::callsite::register_dispatch`, `src/dispatcher.rs:479`
+    /// → `src/callsite.rs:484-487`) unconditionally rebuilds every
+    /// *already-registered* callsite against every currently-live dispatcher,
+    /// which un-poisons it — but only if that callsite is already in the
+    /// registry by the time some `capture()`-holding test's own
+    /// `Dispatch::new` runs. Warming callsites up first (this crate's
+    /// original attempt here, and #1020's and #1032's shape) only moves
+    /// *which* thread can lose that race; it cannot make a bare-thread
+    /// registration impossible, because the warm-up itself has to touch each
+    /// callsite from *some* thread, and an unrelated unguarded test can
+    /// always touch the same shared callsite first. Measured: main
+    /// (unpatched) **8/500** whole-binary runs under load across three
+    /// different tests; warming up before installing the capture `Dispatch`
+    /// (matching #1020/#1032), **2/300**; warming up *inside* the guarded
+    /// scope instead, **3/500** — a reduction, never a closure, because
+    /// neither shape touches the actual defect: a subscriber-less thread can
+    /// exist in this binary at all.
+    ///
+    /// # The fix: make a subscriber-less thread impossible
+    ///
+    /// [`ensure_global_default`] installs [`AlwaysInterested`] — a trivial,
+    /// unconditionally-`enabled` `Subscriber` — as the **process-wide global
+    /// default**, exactly once, from [`capture`] and [`assembled`], *and*
+    /// from [`assemble`] itself under `#[cfg(test)]`: several tests below
+    /// call `assemble::<SomeLocalType>` directly, past both of the other two,
+    /// so `assemble` is the one call site every path actually funnels
+    /// through (compiled out entirely for `load`'s real, non-test callers —
+    /// see `assemble`'s own doc). Once installed, `dispatcher::get_default`'s
+    /// fallback
+    /// (`src/dispatcher.rs`, `Entered::current`: `Some(default) => default,
+    /// None => get_global()`) means *every* thread's ambient default —
+    /// including a bare thread that never called `set_default`, and
+    /// including the `Rebuilder::JustOne` path above — resolves to
+    /// `AlwaysInterested` instead of `Dispatch::none()`. A first-ever
+    /// registration can therefore never compute `Interest::never()` again,
+    /// for any callsite, on any thread, for the rest of the process: there is
+    /// no more bare-ambient case left to race. `capture`'s own `set_default`
+    /// still shadows the global default on its thread (thread-local beats
+    /// global), so a capturing test's own events land in its own `Captured`
+    /// exactly as before — the global default only ever matters for
+    /// *registration*, never for where an actually-`enabled` event's payload
+    /// goes.
+    ///
+    /// `warm_up_callsites` (both shapes) is gone: with a live global default
+    /// always present, pre-touching callsites buys nothing.
+    struct AlwaysInterested;
+
+    impl tracing::Subscriber for AlwaysInterested {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        // No thread-local capture is listening on the global default itself
+        // (every real assertion goes through `capture`'s `set_default`,
+        // which shadows this on its own thread), so there is nowhere for an
+        // event delivered here to usefully go. Dropping it is harmless.
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Installs [`AlwaysInterested`] as the global default exactly once for
+    /// the whole test binary. Called from [`capture`] and [`assembled`], and
+    /// — `pub(super)`, since this is the one call the parent module's
+    /// `assemble` also needs — from `assemble` itself under `#[cfg(test)]`,
+    /// which is the call that actually makes every path unskippable: several
+    /// tests below call `assemble` directly, past both `capture` and
+    /// `assembled`. `set_global_default` can only succeed once per process;
+    /// nothing else in this crate or its dev-dependencies (`tempfile`,
+    /// `temp-env`) calls it, so a second call racing this one is expected to
+    /// find the `Once` already tripped, never to hit `set_global_default`
+    /// itself a second time.
+    pub(super) fn ensure_global_default() {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            // `tracing::subscriber::set_global_default` wraps its argument in
+            // `Dispatch::new` itself (`tracing-0.1.44`'s `subscriber.rs:42`),
+            // so this alone is what fires `callsite::register_dispatch`.
+            tracing::subscriber::set_global_default(AlwaysInterested)
+                .expect("this Once guards the only set_global_default call in this test binary");
+        });
+    }
+
     fn capture() -> (Captured, tracing::dispatcher::DefaultGuard) {
-        warm_up_callsites();
+        ensure_global_default();
         let captured = Captured::default();
         let guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(captured.clone()));
         (captured, guard)
     }
 
-    /// A callsite touched on a bare thread with **no** subscriber, *before*
-    /// this process has ever constructed a `Dispatch`, must still be observed
-    /// once one exists — the property [`warm_up_callsites`] leans on.
+    /// The global default from #1022's fix must reach a thread that never
+    /// calls [`capture`] or [`assembled`] at all — exactly the shape
+    /// `an_unknown_key_is_reported_and_does_not_fail_the_load` and
+    /// `an_unknown_key_inside_an_optional_table_is_named_and_kept` (elsewhere
+    /// in this module) have always had: they call `assembled`/`assemble`
+    /// directly, with no subscriber of their own, and before this fix could
+    /// win the exact race this test constructs on purpose.
+    ///
+    /// # Ordering matters — this is not the same shape as the deleted
+    /// "poison before any `Dispatch` exists" test
+    ///
+    /// [`capture`] is installed **first**, before the bare thread below ever
+    /// touches the callsite — deliberately, so `capture`'s own `Dispatch::new`
+    /// has already run and found nothing yet to fix (the callsite doesn't
+    /// exist in the registry until the bare thread creates it). The old,
+    /// pre-#1022 shape of this test called `capture` *after* the bare touch,
+    /// which just re-exercises `Dispatch::new`'s unconditional full-registry
+    /// rebuild — a real, still-true property, but not the one this fix adds,
+    /// and it would pass even with [`ensure_global_default`] deleted (I
+    /// checked: it did, 0 of the mutation's failures were this test). With
+    /// `capture` first, the only thing standing between the bare thread's
+    /// touch and a permanently-cached `never()` is the global default's
+    /// `dispatcher::get_default` fallback to `get_global()` — see
+    /// `ensure_global_default`'s doc.
     ///
     /// The callsite here is private to this test (its own `tracing::warn!`
-    /// invocation, at its own source line — the macro's `static` is keyed by
-    /// source location, so no other test in the binary can have registered
-    /// it first), which is what makes "before any `Dispatch` exists" a
-    /// condition this test can actually construct rather than hope for.
-    ///
-    /// # Why this is guaranteed, not just observed (verified against the
-    /// pinned `tracing-core = 0.1.36` source)
-    ///
-    /// A `Dispatch`'s construction (`tracing_core::callsite::register_dispatch`,
-    /// called from `Dispatch::new`) unconditionally walks the *entire*
-    /// callsite registry and rebuilds every already-registered callsite's
-    /// interest against the full, current set of live dispatchers — a
-    /// `Rebuilder::Write` pass over the whole `LOCKED_DISPATCHERS` vec, never
-    /// the narrower `Rebuilder::JustOne` shortcut a callsite's own *first*
-    /// registration can take (`DISPATCHERS.rebuilder()`, used by both
-    /// `DefaultCallsite::register` and the standalone
-    /// `rebuild_interest_cache()`, degrades to "whatever the registering
-    /// thread's own ambient default is" whenever at most one `Dispatch` has
-    /// ever existed in the process so far — the actual #1022 hazard). A
-    /// callsite that is already *registered* — regardless of what interest
-    /// it happens to be cached with — before a `Dispatch::new` call is
-    /// therefore guaranteed correct immediately after it, because that
-    /// unconditional full rebuild fixes it.
-    ///
-    /// This is exactly why [`warm_up_callsites`] fires
-    /// [`MALFORMED_UNSET_MESSAGE`]'s, [`INERT_UNSET_MESSAGE`]'s and the
-    /// unknown-key callsites *before* `capture` constructs its own
-    /// `Dispatch`, rather than relying on `rebuild_interest_cache()`
-    /// afterward (the previous "belt and braces" call, removed): whatever
-    /// state those callsites are in — untouched, or already poisoned by an
-    /// unguarded sibling test racing them, such as
-    /// `an_unknown_key_is_reported_and_does_not_fail_the_load` below —
-    /// `capture`'s own `Dispatch::new` is what makes them correct, and it can
-    /// only do that for callsites the warm-up has already put in the
-    /// registry.
-    ///
-    /// A callsite touched for the *first* time only **after** a `Dispatch`
-    /// already exists is the complementary, dangerous case — the
-    /// `Rebuilder::JustOne` shortcut above, asking a bare thread with no
-    /// subscriber. That shape reproduces #1022 directly and reliably (20/20
-    /// runs of the whole binary in isolation, 12/15 embedded in the full
-    /// suite — see the PR body), but it is **not** committed here: a
-    /// dedicated callsite only this test ever touches makes it a coin flip
-    /// on process-wide `Dispatch` timing on every single run, which is a new
-    /// standalone flake in the same family, not a regression test. It was
-    /// run as a falsification (mutate, observe red, revert — `git status`
-    /// clean afterward), the same way #1020's and #1032's PRs falsify their
-    /// own fixes, not kept as code.
+    /// invocation, at its own source line), so its first-ever registration is
+    /// guaranteed to happen on the bare thread below, not on whichever thread
+    /// some *other* test's shared callsite happens to race on.
     #[test]
-    fn a_callsite_touched_before_the_dispatch_exists_is_observed_after_one_is_installed() {
+    fn a_bare_thread_that_never_calls_capture_still_sees_the_global_default() {
         fn fire() {
-            tracing::warn!(marker = "1022-before", "1022 poison probe");
+            tracing::warn!(marker = "1022-bare-thread", "1022 bare-thread probe");
         }
 
-        // Touched on a bare thread, with no subscriber anywhere in its
-        // stack, before this process has ever constructed a `Dispatch`.
-        std::thread::spawn(fire).join().expect("bare thread");
+        // Guarantee the global default is live before anything below runs —
+        // exactly what every real `capture`/`assembled` call already does; a
+        // test doesn't get to assume some *other* test won that race first.
+        ensure_global_default();
 
-        let captured = Captured::default();
-        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(captured.clone()));
+        // Install the capturing `Dispatch` *before* the callsite below has
+        // ever been touched by anyone — its own construction has nothing
+        // registered yet to rebuild, so it cannot be what saves this test.
+        let (captured, _guard) = capture();
+
+        // First-ever touch, on a bare thread with no `set_default` anywhere
+        // in its stack — the scenario that used to cache `Interest::never()`
+        // for whichever callsite got here first (#1022), with the capturing
+        // thread's own fix-on-construction chance already spent on nothing.
+        std::thread::spawn(fire).join().expect("bare thread");
 
         fire();
         assert!(
             captured
                 .events()
                 .iter()
-                .any(|e| e.fields.get("marker").map(String::as_str) == Some("1022-before")),
-            "a callsite registered before any Dispatch existed must be \
-             observed once one is installed: Dispatch::new's construction \
-             rebuilds every already-registered callsite unconditionally"
+                .any(|e| e.fields.get("marker").map(String::as_str) == Some("1022-bare-thread")),
+            "a callsite first touched on a subscriber-less thread, after the \
+             capturing Dispatch already existed, must still be observed: the \
+             global default makes Rebuilder::JustOne's ambient default the \
+             global AlwaysInterested subscriber instead of Dispatch::none(), \
+             so the first-ever touch can never cache never()"
         );
     }
 

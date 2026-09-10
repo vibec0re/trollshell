@@ -24,14 +24,14 @@ USAGE:
     hytte-plugin-niri-layouts --help          this text
 
     <layout>: equal  — every column the same width, 1/n each
-              golden — first column 61.8 %, every other column 38.2 %
+              golden — first column 75 %, every other column 25 %
               split  — every column 50 %
 
 Counts are COLUMNS, not windows: niri widths are per column, so a stacked
 column of three windows is one column.
 
 As a niri bind (etc/niri/binds.kdl):
-    Mod+Shift+E { spawn \"hytte-plugin-niri-layouts\" \"apply\" \"equal\"; }";
+    Mod+Alt+E { spawn \"hytte-plugin-niri-layouts\" \"apply\" \"equal\"; }";
 
 /// What the command line asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

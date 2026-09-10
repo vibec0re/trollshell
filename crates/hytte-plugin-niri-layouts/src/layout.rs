@@ -9,29 +9,26 @@
 use niri_ipc::{Window, Workspace};
 use std::collections::BTreeMap;
 
-/// The wide column's share under [`Layout::Golden`] — 1/φ, rounded to the three
-/// digits the golden ratio is usually written with.
-pub(crate) const GOLDEN_MAJOR: f64 = 0.618;
+/// The wide column's share under [`Layout::Golden`] — **75 %**.
+///
+/// Not 1/φ (0.618) any more. The layout keeps the name, but the number is
+/// Annika's, measured on her own glass against the first cut: "Golden: mhm
+/// looks off. maybe bettter `[ ~70% ] [ ~30% ]`. Typ ratio 0.4", then, on the
+/// round that carried 70/30 — "hmm no choom was thinking more like 75 : 25 I
+/// guess", `[ wide 75% ] [ narrow ]` (#1019, 2026-09-10). 0.618/0.382 left the
+/// narrow column too wide to read as a sidekick; **0.75/0.25** is the number
+/// she settled on, and a measured preference beats a derivation from φ.
+pub(crate) const GOLDEN_MAJOR: f64 = 0.75;
 
-/// Every other column's share under [`Layout::Golden`] — 1 − 1/φ.
-pub(crate) const GOLDEN_MINOR: f64 = 0.382;
+/// Every other column's share under [`Layout::Golden`] — **25 %**.
+///
+/// Deliberately `1 - GOLDEN_MAJOR` written out rather than computed: the two
+/// are what niri is asked for, and spelling both makes the pair greppable
+/// against the tooltip, the usage text and the wire-byte test that pin them.
+pub(crate) const GOLDEN_MINOR: f64 = 0.25;
 
 /// Every column's share under [`Layout::Split`].
 pub(crate) const SPLIT_SHARE: f64 = 0.5;
-
-/// Columns in a layout pictogram's LED grid — five is the narrowest grid that
-/// can say all three shapes with a blank column between runs: `▮ ▮ ▮`,
-/// `▮▮▮ ▮`, `▮▮ ▮▮`.
-pub(crate) const PICTOGRAM_COLS: usize = 5;
-
-/// Rows in a layout pictogram's LED grid. Six lands the rendered buffer on
-/// **71 px** tall (the kit's fixed `PAD`/`CELL`/`GAP` lattice), which is the
-/// height the bar's existing preem chips already are — `hytte-plugin-timer`'s
-/// and `hytte-plugin-bar-clock-demo`'s seven-segment readouts are 70 px
-/// (`DIGIT_H` 54 + 2 × `PAD` 8). Picked to match them rather than chosen for
-/// its own sake; see #313's lesson, quoted in the kit's `led_matrix` docs, on
-/// why the buffer size *is* the size.
-pub(crate) const PICTOGRAM_ROWS: usize = 6;
 
 /// One of the three arrangements the chip and the CLI both offer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,10 +36,19 @@ pub(crate) enum Layout {
     /// Every column the same width: `1/n` each (so `n = 1` is a full-width
     /// column).
     Equal,
-    /// The leftmost column wide, every other one narrow — issue #1019's
-    /// `[========] [====] ( .... ) [====]` sketch.
+    /// The leftmost column wide (75 %), every other one narrow (25 %) — issue
+    /// #1019's `[========] [====] ( .... ) [====]` sketch.
     Golden,
     /// Every column half the working area, whatever `n` is.
+    ///
+    /// **At two columns this is the same plan as [`Layout::Equal`]** — `[0.5,
+    /// 0.5]`, byte for byte — and two windows is exactly the count the chip
+    /// first appears at (#1038 review, LOW-5). Both buttons stay: the
+    /// coincidence is only at `n = 2`, and they diverge the moment a third
+    /// column opens (`equal` gives thirds, `split` keeps halves and lets the
+    /// third scroll off). The tooltips say what each one does rather than
+    /// claiming they differ; `equal_and_split_coincide_at_two_columns` pins the
+    /// overlap so it is a known property rather than a surprise.
     Split,
 }
 
@@ -64,37 +70,48 @@ impl Layout {
         Self::ALL.into_iter().find(|l| l.id() == id)
     }
 
-    /// The **lit columns** of this layout's pictogram, left to right.
+    /// The **themed icon name** this layout's button shows.
     ///
-    /// Each entry is a column index into a [`PICTOGRAM_COLS`]-wide LED grid; a
-    /// lit column is lit for its whole height, so a run of adjacent entries
-    /// reads as one wide bar and a lone entry as a narrow one. The unlit column
-    /// between two runs is what separates them — a blank cell is a whole cell
-    /// plus two gaps of dark field, against the single gap between lamps inside
-    /// a run.
+    /// Adwaita symbolics, not the preem pictograms #1026 shipped: "Using preem
+    /// for icons ultra gonk idé typ. […] Looks shit. Adwaita icons fine."
+    /// (Annika, #1019, 2026-09-10). Each is resolved against the shell's
+    /// `GtkIconTheme`, so an unknown name renders as `image-missing` — the
+    /// three are therefore pinned as literals here **and** checked against the
+    /// Adwaita theme actually on `$XDG_DATA_DIRS` by
+    /// `every_icon_name_exists_in_the_adwaita_theme_on_the_search_path`.
     ///
-    /// The pictograms say the same thing [`proportions`](Self::proportions)
-    /// does: three equal bars, one wide bar then a narrow one, two halves.
-    pub(crate) fn pictogram_columns(self) -> &'static [usize] {
+    /// Why these three, out of the 714 names Adwaita 50 ships:
+    ///
+    /// - `equal` → **`view-grid-symbolic`**: four identically-sized tiles. The
+    ///   theme has no "n equal columns" glyph at all; equal tiles is the
+    ///   closest thing it says.
+    /// - `golden` → **`sidebar-show-right-symbolic`**: a frame split into a
+    ///   wide left area and a narrow right panel. That *is* the layout —
+    ///   [`GOLDEN_MAJOR`] left, [`GOLDEN_MINOR`] right — and it is the only
+    ///   asymmetric split in the theme that leans the right way (its mirror,
+    ///   `sidebar-show-symbolic`, puts the narrow panel on the left).
+    /// - `split` → **`view-dual-symbolic`**: a frame divided into two equal
+    ///   panes, which is [`SPLIT_SHARE`] drawn.
+    pub(crate) fn icon(self) -> &'static str {
         match self {
-            // │ ▮ ▮ ▮ │ — three bars of equal width.
-            Self::Equal => &[0, 2, 4],
-            // │ ▮▮▮ ▮ │ — one wide bar, then the narrow rest.
-            Self::Golden => &[0, 1, 2, 4],
-            // │ ▮▮ ▮▮ │ — two halves.
-            Self::Split => &[0, 1, 3, 4],
+            Self::Equal => "view-grid-symbolic",
+            Self::Golden => "sidebar-show-right-symbolic",
+            Self::Split => "view-dual-symbolic",
         }
     }
 
     /// The button's hover text — the only words the chip has.
     ///
-    /// A pictogram says nothing on its own, and neither the `Node::Button` nor
-    /// the `Node::Pixels` it wraps can carry a tooltip, so this hangs on the
-    /// `Node::Box` between them; see `plugin::layout_button`.
+    /// An icon says nothing on its own. `Node::Button` carries no `tooltip`
+    /// field but [`Node::Icon`](hytte_plugin::proto::Node::Icon) does (it is
+    /// one of the seven that do, and the docs there call an icon "the
+    /// load-bearing case"), so this hangs on the icon itself and GTK's
+    /// deepest-widget-first hover resolution puts it under the pointer; see
+    /// `plugin::layout_button`.
     pub(crate) fn tooltip(self) -> &'static str {
         match self {
             Self::Equal => "Equal columns — every column the same width",
-            Self::Golden => "Golden — first column 61.8 %, the rest 38.2 %",
+            Self::Golden => "Golden — first column 75 %, the rest 25 %",
             Self::Split => "Split — every column 50 %",
         }
     }
@@ -102,7 +119,7 @@ impl Layout {
     /// The proportion for each of `columns` columns, left to right.
     ///
     /// **This is the one function to edit** if issue #1019's question 1 is
-    /// answered "B" (the narrow columns *share* the remaining 38.2 % so
+    /// answered "B" (the narrow columns *share* the remaining 25 % so
     /// everything stays on screen) rather than the "A" reading built here: swap
     /// the `Golden` arm's `GOLDEN_MINOR` for
     /// `GOLDEN_MINOR / (columns - 1) as f64` and nothing else moves — not the
@@ -112,10 +129,10 @@ impl Layout {
     /// nothing).
     ///
     /// **`columns == 1` is deliberately not special-cased.** `Equal` gives a
-    /// lone column the full `1.0`, but `Golden` gives it `0.618` and `Split`
+    /// lone column the full `1.0`, but `Golden` gives it `0.75` and `Split`
     /// gives it `0.5` — i.e. clicking either on a single window *narrows* it.
     /// That is the layouts working, not a bug to round away: each button says
-    /// "make the screen this shape", and pre-setting the main column to 61.8 %
+    /// "make the screen this shape", and pre-setting the main column to 75 %
     /// (or half) is how you make room for the window you are about to open.
     /// `Split` narrowing a lone window is also literally what #1019 asked for
     /// ("split: all windows have width 50%"). Raised as a NIT on the #1026
@@ -211,7 +228,7 @@ pub(crate) fn plan(
 
 #[cfg(test)]
 mod tests {
-    use super::{GOLDEN_MAJOR, GOLDEN_MINOR, Layout, PICTOGRAM_COLS, plan};
+    use super::{GOLDEN_MAJOR, GOLDEN_MINOR, Layout, plan};
     use niri_ipc::{Window, WindowLayout, Workspace};
 
     const OUTPUT: &str = "DP-1";
@@ -449,8 +466,8 @@ mod tests {
 
     #[test]
     fn golden_is_wide_first_then_narrow_rest() {
-        // Reading A of #1019 question 1: the first column takes 61.8 % and every
-        // other column takes 38.2 %, so the tail scrolls off to the right.
+        // Reading A of #1019 question 1: the first column takes 75 % and every
+        // other column takes 25 %, so the tail scrolls off to the right.
         assert_eq!(Layout::Golden.proportions(1), vec![GOLDEN_MAJOR]);
         assert_eq!(
             Layout::Golden.proportions(2),
@@ -494,26 +511,20 @@ mod tests {
     }
 
     #[test]
-    fn every_layout_has_a_distinct_pictogram_and_a_non_empty_tooltip() {
-        let mut shapes: Vec<&[usize]> = Layout::ALL.iter().map(|l| l.pictogram_columns()).collect();
-        shapes.sort_unstable();
-        shapes.dedup();
-        assert_eq!(shapes.len(), 3, "three shapes, not one repeated");
+    fn every_layout_has_a_distinct_symbolic_icon_and_a_non_empty_tooltip() {
+        let mut names: Vec<&str> = Layout::ALL.iter().map(|l| l.icon()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 3, "three icons, not one repeated");
         for layout in Layout::ALL {
-            let columns = layout.pictogram_columns();
-            assert!(!columns.is_empty(), "{} lights nothing", layout.id());
             assert!(
-                columns.iter().all(|&c| c < PICTOGRAM_COLS),
-                "{} lights a column outside the grid: {columns:?}",
-                layout.id()
-            );
-            assert!(
-                columns.windows(2).all(|w| w[0] < w[1]),
-                "{} lists its columns out of order or twice: {columns:?}",
-                layout.id()
+                layout.icon().ends_with("-symbolic"),
+                "{} must wear a symbolic, not a full-colour icon: {}",
+                layout.id(),
+                layout.icon()
             );
             // A blank or whitespace-only tooltip arms nothing at all host-side,
-            // which would leave the pictogram unexplained.
+            // which would leave the icon unexplained.
             assert!(
                 !layout.tooltip().trim().is_empty(),
                 "{} needs a legend",
@@ -522,36 +533,73 @@ mod tests {
         }
     }
 
-    /// The pictograms are the [`Layout::proportions`] rules drawn: the number of
-    /// **runs** of adjacent lit columns is the number of distinct widths the
-    /// layout hands out, and their relative lengths are the ordering.
+    /// The three names, **pinned as literals**. Which glyph each layout wears
+    /// is Annika's call ("Adwaita icons fine", #1019), so a rename has to be a
+    /// deliberate edit here rather than a silent drift in `icon()` — and it is
+    /// this list that
+    /// `plugin::every_icon_name_exists_in_the_adwaita_theme_on_the_search_path`
+    /// then resolves against the theme actually on disk.
     #[test]
-    fn the_pictograms_say_what_the_proportions_do() {
-        fn runs(columns: &[usize]) -> Vec<usize> {
-            let mut out: Vec<usize> = Vec::new();
-            for (i, &c) in columns.iter().enumerate() {
-                if i > 0 && c == columns[i - 1] + 1 {
-                    *out.last_mut().expect("a run was started") += 1;
-                } else {
-                    out.push(1);
-                }
-            }
-            out
-        }
+    fn the_three_icon_names_are_the_ones_that_were_chosen() {
+        assert_eq!(Layout::Equal.icon(), "view-grid-symbolic");
+        assert_eq!(Layout::Golden.icon(), "sidebar-show-right-symbolic");
+        assert_eq!(Layout::Split.icon(), "view-dual-symbolic");
+    }
 
-        assert_eq!(
-            runs(Layout::Equal.pictogram_columns()),
-            vec![1, 1, 1],
-            "equal draws three bars of one width"
-        );
-        let golden = runs(Layout::Golden.pictogram_columns());
-        assert_eq!(golden.len(), 2, "golden draws a wide bar and a narrow one");
+    /// Golden's two shares, pinned as **literal fractions** rather than read
+    /// back out of [`GOLDEN_MAJOR`] / [`GOLDEN_MINOR`].
+    ///
+    /// Comparing a constant to itself pins nothing: the 61.8/38.2 this replaced
+    /// would have survived every other test in this file unchanged, and so
+    /// would the 70/30 that replaced *that* for a day. 75/25 is the number
+    /// Annika settled on ("hmm no choom was thinking more like 75 : 25 I
+    /// guess", #1019, 2026-09-10), so it is written out at both ends. The
+    /// **wire** unit is pinned separately, in `niri`'s byte test — this is the
+    /// domain fraction only.
+    #[test]
+    fn golden_is_seventy_five_twenty_five_in_fractions() {
         assert!(
-            golden[0] > golden[1],
-            "and the WIDE one comes first (reading A): {golden:?}"
+            (GOLDEN_MAJOR - 0.75).abs() < f64::EPSILON,
+            "the wide column is 0.75 of the working area, got {GOLDEN_MAJOR}"
         );
-        let split = runs(Layout::Split.pictogram_columns());
-        assert_eq!(split.len(), 2, "split draws two bars");
-        assert_eq!(split[0], split[1], "of equal width: {split:?}");
+        assert!(
+            (GOLDEN_MINOR - 0.25).abs() < f64::EPSILON,
+            "and every other column 0.25, got {GOLDEN_MINOR}"
+        );
+    }
+
+    /// `equal` and `split` are the **same plan** at two columns, which is the
+    /// count the chip first appears at (#1038 review, LOW-5).
+    ///
+    /// Pinned rather than fixed: keeping all three buttons is the call (they
+    /// diverge at three columns, and Annika asked for the chip at more than one
+    /// window, not for three distinct plans at exactly two). This test is here
+    /// so the overlap is a documented property — if a later round wants them to
+    /// differ at `n = 2`, this is the test that says so out loud.
+    #[test]
+    fn equal_and_split_coincide_at_two_columns() {
+        assert_eq!(Layout::Equal.proportions(2), Layout::Split.proportions(2));
+        assert_ne!(
+            Layout::Equal.proportions(3),
+            Layout::Split.proportions(3),
+            "…and only at two: a third column separates them again"
+        );
+    }
+
+    /// The tooltips are the only words the chip has, so they must say the
+    /// numbers the code actually sends — a legend claiming 70 % over a 75 %
+    /// layout is worse than none.
+    #[test]
+    fn every_tooltip_states_its_own_percentages() {
+        assert!(
+            Layout::Golden.tooltip().contains("75 %") && Layout::Golden.tooltip().contains("25 %"),
+            "got {:?}",
+            Layout::Golden.tooltip()
+        );
+        assert!(
+            Layout::Split.tooltip().contains("50 %"),
+            "got {:?}",
+            Layout::Split.tooltip()
+        );
     }
 }

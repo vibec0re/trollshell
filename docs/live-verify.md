@@ -360,32 +360,62 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       "requires a capability it didn't declare; dropped" and no
       drawer/OSD/toast should fire.
 - [ ] **(#1019)** Niri layouts — nothing about this plugin can be verified
-      without a live niri session, so all three legs are live-only. **The
-      chip:** on a workspace with three tiled columns, click each of the three
+      without a live niri session, so every leg is live-only. **The chip:** on a
+      workspace with three tiled columns, click each of the three
       buttons on the bar (`equal` / `golden` / `split`, left to right) and check
       the columns land on the **stated widths**, not merely that they moved —
-      `equal` a third of the screen each, `golden` a first column at ~62 % of
-      the screen with ~38 % ones after it, `split` half the screen each (so the
-      third scrolls off). Measuring the width is the point: `SetProportion` is a
+      `equal` a third of the screen each, `golden` a first column at **75 %** of
+      the screen with **25 %** ones after it, `split` half the screen each (so
+      the third scrolls off). Measuring the width is the point: `SetProportion` is a
       percentage, and the pre-review build sent fractions, which niri clamped to
       each window's **minimum width** — every button "resized the columns" while
       doing the same wrong thing. If all three snap columns to a thin sliver,
-      that regression is back. Each button should show a **preem
-      LED panel** (VFD skin, accent-tinted like the timer's seven-segment chip)
-      whose lit columns draw the layout — `▮ ▮ ▮`, `▮▮▮ ▮`, `▮▮ ▮▮` — at the
-      same height as the timer chip beside it, not an Adwaita glyph and not an
-      `image-missing` box. Hovering a panel should show its legend (the tooltip
-      lives on the box between the button and the panel, since neither a
-      `Button` nor a `Pixels` node can carry one). **Stacked columns count
-      once:** stack three windows into one
+      that regression is back. Each button should show an **Adwaita symbolic
+      icon** — `view-grid-symbolic` (equal), `sidebar-show-right-symbolic`
+      (golden: a wide area with a narrow right panel), `view-dual-symbolic`
+      (split) — and **not** an `image-missing` box, and not the preem LED panels
+      #1026 shipped (round 2 replaced those). Hovering a glyph should show its
+      legend, and the golden one should read "first column 75 %, the rest 25 %".
+      (**`equal` and `split` are the same plan at exactly two columns** — halves
+      either way; they differ from a third column on. Deliberate, but say so if
+      two identical-looking buttons read badly on glass.)
+      **Stacked columns count once:** stack three windows into one
       column beside a single other window and click `split` — you should get
-      **two** half-width columns, not four quarter-width ones. **The CLI:**
+      **two** half-width columns, not four quarter-width ones.
+      **Show/hide (#1019 round 2):** on a workspace with **one** window the chip
+      should not be on the bar at all; open a second window and it should appear
+      within a frame or two; close back to one and it should go again. The
+      _window_ count is what matters, not the column count — two windows
+      **stacked in one column** must show the chip, and a floating window counts
+      too. Switch to a workspace with two windows and back, without opening
+      anything: the chip should follow the switch. Do the same on a **second
+      monitor** — changing workspace on the _unfocused_ output must not move the
+      chip. Then `systemctl --user restart niri` (or restart the compositor how
+      you normally would) and confirm the chip comes back without restarting the
+      plugin, and does not blink off and on if you land on the same workspace.
+      **Restart the shell, not the plugin** two or three times
+      (`systemctl --user restart trollshell`) and check the plugin's unit:
+      `systemctl --user status trollshell-plugin-niri-layouts` should still show
+      one process and, if you look, one `niri-layouts-watch` thread — not one per
+      restart (that leak is what #1038's review found). The chip should be back
+      and correct after each restart. With niri unreachable
+      (`env -u NIRI_SOCKET`, or the plugin started before niri) the journal
+      should carry exactly **one** `WARNING: cannot watch niri …` line per
+      outage, saying the chip stays hidden — that line is the only signal that
+      an absent niri, rather than a one-window workspace, is why the chip is
+      gone.
+      Known cosmetic residual to look for and report: while hidden, the plugin
+      renders an empty tree but the shell still draws its own `.ts-plugin-chip`
+      pill, so a few pixels of translucent rounded background may remain where
+      the chip was. If that is visible enough to bother you, say so — closing it
+      is a host-side change (`trollshell/src/plugins/region.rs`), not a plugin
+      one. **The CLI:**
       from a terminal in the session, `hytte-plugin-niri-layouts apply golden`
       should do the same thing and exit `0`; on an empty workspace it should
       print "no tiled columns" and still exit `0`; with `NIRI_SOCKET` unset
       (`env -u NIRI_SOCKET hytte-plugin-niri-layouts apply equal`) it should
       print niri's own error and exit non-zero. **The bind:** merge the three
-      `Mod+Shift+{E,G,S}` binds from `etc/niri/binds.kdl` and confirm they work
+      `Mod+Alt+{E,G,S}` binds from `etc/niri/binds.kdl` and confirm they work
       with the **shell stopped** (`systemctl --user stop trollshell`) — that is
       the whole point of the standalone hat. Finally, make niri refuse a
       request (an old niri without `--id` on `set-window-width`) and confirm the

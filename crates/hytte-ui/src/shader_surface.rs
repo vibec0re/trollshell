@@ -446,8 +446,8 @@ fn first_line(log: &str) -> &str {
 mod imp {
     use super::{
         Arc, Cell, DATA_UPLOAD_REFUSED, Failure, Instant, ProgramCache, RefCell, SHADER_PREAMBLE,
-        SHADER_VERT, ShaderState, WarnLatch, abandon_gl, data_key, first_line, fit_rect, gdk,
-        glib, source_key, would_upload, wrapped_seconds,
+        SHADER_VERT, ShaderState, WarnLatch, abandon_gl, data_key, first_line, fit_rect, gdk, glib,
+        source_key, would_upload, wrapped_seconds,
     };
     use crate::gl_surface::{GLSL_HEADER, GlValue};
     use gtk::prelude::*;
@@ -1521,8 +1521,16 @@ mod tests {
     #[test]
     fn data_key_distinguishes_width_height_and_format() {
         let base = data_key(64, 64, ShaderFormat::R8);
-        assert_ne!(base, data_key(65, 64, ShaderFormat::R8), "width must matter");
-        assert_ne!(base, data_key(64, 65, ShaderFormat::R8), "height must matter");
+        assert_ne!(
+            base,
+            data_key(65, 64, ShaderFormat::R8),
+            "width must matter"
+        );
+        assert_ne!(
+            base,
+            data_key(64, 65, ShaderFormat::R8),
+            "height must matter"
+        );
         assert_ne!(
             base,
             data_key(64, 64, ShaderFormat::Rgba8),
@@ -1559,10 +1567,7 @@ mod tests {
 
         assert!(latch.claim(a), "the first refused shape is reported");
         for _ in 0..8 {
-            assert!(
-                !latch.claim(a),
-                "…and then goes quiet while it persists",
-            );
+            assert!(!latch.claim(a), "…and then goes quiet while it persists",);
         }
         assert!(
             latch.claim(b),

@@ -884,7 +884,11 @@ mod imp {
         /// retries rather than sampling a texture whose shape does not match
         /// what `data_len` claims (the same discipline
         /// `shader_surface::upload_data` follows for its own retry).
-        fn upload_data(&mut self, gl: &hgl::Gl, data: Option<&Arc<[f32]>>) -> Result<(), DataFailure> {
+        fn upload_data(
+            &mut self,
+            gl: &hgl::Gl,
+            data: Option<&Arc<[f32]>>,
+        ) -> Result<(), DataFailure> {
             let Some(data) = data else {
                 self.data_source = None;
                 self.data_len = 0;
@@ -1224,8 +1228,8 @@ mod imp {
                 frame: &ONE_PASS,
             };
             let program = GlProgram("gl_surface_test.data_strip");
-            let mut resources = Resources::build(&gl, &one, program, (4, 4))
-                .expect("a small grid always builds");
+            let mut resources =
+                Resources::build(&gl, &one, program, (4, 4)).expect("a small grid always builds");
 
             let mut latch = WarnLatch::default();
             let mut warn = |data: &Arc<[f32]>| match resources.upload_data(&gl, Some(data)) {

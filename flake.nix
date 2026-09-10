@@ -457,10 +457,20 @@
               # bindgen's clang/llvm dep (the shared bulk is `llvm-21.1.8-lib`),
               # so the marginal closure delta is 6 new paths / ~274 MiB, not
               # the full ~1057 MiB `mesa` closure.
+              #
+              # `systemd` since #1082: `systemd-run` is on `$PATH` here for the
+              # `trollshell/src/plugins/tests.rs` detached-launch tests
+              # (`plugin_launcher.rs`'s #419 launch path). The sandbox has no
+              # `systemd --user` manager and no session bus, so `systemd-run`
+              # always fails to connect and every detached launch takes the
+              # direct-spawn fallback (`FallbackReason::NoUserManager`) — see
+              # the doc comments on `detached_launch_falls_back_without_a_user_manager`
+              # and its two siblings for which shape each one exercises there.
               nativeCheckInputs = [
                 pkgs.dbus
                 pkgs.xvfb-run
                 pkgs.mesa
+                pkgs.systemd
               ];
               doCheck = true;
               # Leaf/terminal check: nothing consumes its target dir. crane
@@ -513,6 +523,21 @@
                 # this build means the three tests to run for real, so a
                 # missing/refused GL context must fail the check, not skip it.
                 export TROLLSHELL_REQUIRE_GL=1
+                # #1082, on the same precedent: `pkgs.systemd` above puts
+                # `systemd-run` on `$PATH`, so
+                # `detached_launch_falls_back_without_a_user_manager`'s own
+                # "is systemd-run on PATH at all" probe must find it here — a
+                # miss would mean this check's `nativeCheckInputs` regressed,
+                # and a silent skip would hide exactly that. This variable's
+                # reach is that one `assert!` — its two siblings
+                # (`detached_launch_returns_at_once_…`,
+                # `two_launches_with_one_effect_id_both_start`) have no skip
+                # branch to gate: they run and pass regardless of whether
+                # `systemd-run` is on `$PATH` at all, since
+                # `assert_launched_then_clean_up` accepts and classifies
+                # whichever `LaunchReport` fallback the sandbox produces
+                # (`NoSystemdRun` or `NoUserManager`).
+                export TROLLSHELL_REQUIRE_SYSTEMD_RUN=1
               '';
               checkPhaseCargoCommand = ''
                 xvfb-run -a cargo test --workspace --locked --features system-tests

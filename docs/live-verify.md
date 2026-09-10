@@ -420,6 +420,18 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       the whole point of the standalone hat. Finally, make niri refuse a
       request (an old niri without `--id` on `set-window-width`) and confirm the
       chip raises a toast carrying niri's own error text.
+- [ ] **(#1039)** Empty-tree chip hide — a plugin whose rendered root is a
+      childless container (`Row`/`Box`/`ListBox`) must not leave a nub in the
+      bar. With #1038's `hytte-plugin-niri-layouts` chip (which renders an
+      empty `Row` under its root id whenever the focused workspace has one
+      window or fewer) enabled, focus a workspace with exactly **one** window:
+      the chip should disappear from the bar entirely — no pill, no gap, nothing
+      to hover or click — not merely lose its buttons. Add a second window to
+      the workspace and the chip should reappear with its three buttons. The
+      host-side behavior is unit-tested under `xvfb-run`
+      (`trollshell/src/plugins/region.rs`'s `gtk_tests`); this entry only
+      confirms it reads right on real glass, since niri-layouts' own empty-root
+      trigger (#1038) has no niri session to test against in CI.
 
 ## Infobroker
 

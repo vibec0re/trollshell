@@ -322,8 +322,9 @@ fn head_and_tail_keeps_a_panic_line_a_backtrace_pushed_off_the_end() {
 }
 
 /// #1033 third pass ("`tail_lines`' byte cap … has no test of its own"): one
-/// enormous line trips no line cap at all, so only the byte caps can hold it.
-/// RED if either [`clamp_bytes`] call is dropped.
+/// enormous line trips no line cap at all, so only a byte cap can hold it.
+/// A single line is entirely head (there are no lines left over for a tail),
+/// so this is the head cap's test. RED if the head [`clamp_bytes`] is dropped.
 #[test]
 fn head_and_tail_byte_caps_one_enormous_line() {
     let huge = "x".repeat(HEAD_MAX_BYTES + TAIL_MAX_BYTES + 10_000);
@@ -335,8 +336,46 @@ fn head_and_tail_byte_caps_one_enormous_line() {
         out.len(),
     );
     assert!(
-        out.contains("truncated at a byte cap"),
-        "the byte cap must announce itself:\n{out}",
+        out.contains("head truncated at a byte cap"),
+        "the head byte cap must announce itself:\n{out}",
+    );
+}
+
+/// The tail cap's own test, and the reason it is separate: the single-line
+/// fixture above leaves `tail_n == 0`, so it stays green with the tail
+/// [`clamp_bytes`] deleted outright (measured — mutation (i) passed 3/3 until
+/// this test existed). Only a fixture with an over-long line in *both* halves
+/// exercises the two caps independently.
+///
+/// RED if either [`clamp_bytes`] call is dropped.
+#[test]
+fn head_and_tail_byte_caps_each_half_independently() {
+    let mut lines = vec!["H".repeat(HEAD_MAX_BYTES + 1_000)];
+    for i in 1..49 {
+        lines.push(format!("filler line {i}"));
+    }
+    lines.push("T".repeat(TAIL_MAX_BYTES + 1_000));
+    let input = lines.join("\n");
+    assert_eq!(
+        input.lines().count(),
+        50,
+        "the fixture must exceed HEAD_LINES + TAIL_LINES so both halves are real",
+    );
+
+    let out = head_and_tail(&input);
+    assert!(
+        out.contains("head truncated at a byte cap"),
+        "the head half must be byte-capped:\n{}",
+        &out[..out.len().min(200)],
+    );
+    assert!(
+        out.contains("tail truncated at a byte cap"),
+        "the tail half must be byte-capped too — RED under mutation (i)",
+    );
+    assert!(
+        out.len() < HEAD_MAX_BYTES + TAIL_MAX_BYTES + 500,
+        "the two caps plus the header/markers must bound the whole output, got {} bytes",
+        out.len(),
     );
 }
 

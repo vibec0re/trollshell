@@ -314,7 +314,7 @@ mod tests {
     /// callsites anyway; measured to be a no-op (250-run full-binary
     /// campaign, 0 failures) and, worse, itself the exact "subscriber-less
     /// first fire" its own doc comment warned about — removed.
-    pub(super) async fn capture() -> (Captured, tracing::dispatcher::DefaultGuard) {
+    pub(super) fn capture() -> (Captured, tracing::dispatcher::DefaultGuard) {
         let cap = Captured::default();
         let dispatch = tracing::Dispatch::new(Registry::default().with(cap.clone()));
         let guard = tracing::dispatcher::set_default(&dispatch);
@@ -325,7 +325,7 @@ mod tests {
     async fn success_logs_info_and_captures_stdout() {
         TestHome::with(|home| async move {
             home.write_script("theme-changed", "#!/bin/sh\necho hi\nexit 0\n", 0o755);
-            let (cap, _guard) = capture().await;
+            let (cap, _guard) = capture();
 
             super::run("theme-changed", &[]);
 
@@ -354,7 +354,7 @@ mod tests {
                 "#!/bin/sh\necho boom 1>&2\nexit 7\n",
                 0o755,
             );
-            let (cap, _guard) = capture().await;
+            let (cap, _guard) = capture();
 
             super::run("theme-changed", &[]);
 
@@ -395,7 +395,7 @@ mod tests {
             let sentinel = home.root.join("sentinel");
             let body = format!("#!/bin/sh\ntouch {}\n", sentinel.display());
             home.write_script("theme-changed", &body, 0o644); // no exec bit
-            let (cap, _guard) = capture().await;
+            let (cap, _guard) = capture();
 
             super::run("theme-changed", &[]);
 
@@ -428,7 +428,7 @@ mod tests {
     async fn timeout_kills_child_and_warns() {
         TestHome::with(|home| async move {
             home.write_script("theme-changed", "#!/bin/sh\nsleep 30\n", 0o755);
-            let (cap, _guard) = capture().await;
+            let (cap, _guard) = capture();
 
             let started = std::time::Instant::now();
             super::run("theme-changed", &[]);
@@ -453,7 +453,7 @@ mod tests {
     async fn missing_script_logs_debug_only() {
         TestHome::with(|home| async move {
             let _ = home.hooks_dir(); // dir exists, no script written
-            let (cap, _guard) = capture().await;
+            let (cap, _guard) = capture();
 
             super::run("theme-changed", &[]);
 
@@ -483,7 +483,7 @@ mod tests {
                 sentinel.display(),
             );
             home.write_script("theme-changed", &body, 0o755);
-            let (_cap, _guard) = capture().await;
+            let (_cap, _guard) = capture();
 
             super::run("theme-changed", &[("TROLLSHELL_THEME", "dark")]);
 

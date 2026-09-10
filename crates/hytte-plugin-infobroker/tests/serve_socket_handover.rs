@@ -382,9 +382,9 @@ fn assert_seeded_within(started: Instant, bound: Duration, what: &str) {
 /// tokio's separate blocking-pool thread, leaving this test's own single
 /// worker thread free to keep polling its timers. `Handle::block_on` from
 /// inside a `spawn_blocking` closure is the bridge tokio's own docs recommend
-/// for running async code from a blocking context (and is *not* the "block_on
-/// inside an async task" pattern that panics — the blocking-pool closure is
-/// plain sync code, not itself a polled future).
+/// for running async code from a blocking context (and is *not* the
+/// "`block_on` inside an async task" pattern that panics — the
+/// blocking-pool closure is plain sync code, not itself a polled future).
 fn spawn_serve(
     cmds: mpsc::UnboundedReceiver<Cmd>,
     out: mpsc::UnboundedSender<BrokerMsg>,

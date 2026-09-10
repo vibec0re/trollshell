@@ -1274,6 +1274,43 @@ mod tests {
         );
     }
 
+    /// A **reload** must not re-announce. The deprecation line is a startup
+    /// event; the poll runs every few seconds for the life of the shell, so an
+    /// announcing reload would fill the journal with the same line forever.
+    ///
+    /// The capture is installed *after* the startup resolution, so it observes
+    /// the poll and nothing else. **Red if `Watcher::poll` passes
+    /// `Deprecations::Announce`** — the call-site half of the latch, which the
+    /// `resolve`-level test above cannot see.
+    #[test]
+    fn a_reload_does_not_re_announce_a_pinned_variable() {
+        let pinned = env(&[("TROLLSHELL_CORE_LEDS_STYLE", "crt")]);
+        let mut overlay = Overlay::new();
+        overlay.write("color = \"heat\"\n");
+        let mut watcher = Watcher::observe(overlay.layers());
+        let current = watcher.resolved(&pinned, Deprecations::Announce);
+
+        let (captured, _guard) = capture();
+        overlay.write("color = \"rainbow\"\n");
+        let next = watcher.poll(current, &pinned).expect("changed → reload");
+
+        assert_eq!(
+            next.color,
+            ColorMap::Rainbow,
+            "live control: the reload under observation must actually have happened"
+        );
+        assert_eq!(
+            next.style,
+            DisplayStyle::Crt,
+            "…with the variable still won"
+        );
+        assert!(
+            deprecations(&captured).is_empty(),
+            "a reload must not repeat the startup line: {:?}",
+            captured.events()
+        );
+    }
+
     /// An unknown key is loud and harmless (merge rule 4): the file still
     /// loads, and the keys around the typo still apply.
     #[test]

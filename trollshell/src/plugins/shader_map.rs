@@ -252,11 +252,13 @@ impl Refusal {
     /// **Three slots, not eight**, split by *who fixes it*:
     ///
     /// - [`Warned::ShaderDenied`] — the manifest. One refusal.
-    /// - [`Warned::ShaderCap`] — the plugin's rendering code. Five refusals,
-    ///   all of them "the node I sent is malformed"; their journal lines name
-    ///   which, which is what an operator actually reads. Splitting them
-    ///   further would spend five of [`Warned`](super::preem_render::Warned)'s
-    ///   eight bits on one node kind.
+    /// - [`Warned::ShaderCap`] — the plugin's rendering code. Classifies all
+    ///   five shape refusals — "the node I sent is malformed" — but as of
+    ///   #1023 item 2 only **four** of them (`SourceTooLarge`, `DataTooLarge`,
+    ///   `MalformedData`, `EmptyGrid`) actually *claim* it in [`warn`]; see
+    ///   the section below for the fifth. Splitting the four further would
+    ///   spend more of [`Warned`](super::preem_render::Warned)'s eight bits on
+    ///   one node kind.
     /// - [`Warned::ShaderNoGpu`] — the session, i.e. a shell restart. Two
     ///   refusals, which cannot both fire in one run.
     ///
@@ -272,6 +274,20 @@ impl Refusal {
     /// run, so a context failure an hour later wrote **nothing at all** — every
     /// shader on screen blank, the one line that names the restart already
     /// spent on an unrelated plugin's mistake.
+    ///
+    /// # `GridTooLarge` is classified here but gated elsewhere (#1023 item 2)
+    ///
+    /// [`GridTooLarge`](Refusal::GridTooLarge) still maps to
+    /// [`Warned::ShaderCap`] below — it is still a shape mistake, a code fix,
+    /// same as its four siblings — but [`warn`] does not call
+    /// [`preem_render::warn_once`] with it: `Warned` is out of bits (all
+    /// eight spoken for since #981, same as the section above), so a *ninth*
+    /// slot the way `NoGl`/`CpuForced` got a *third* was not available. Its
+    /// gating instead claims [`WARNED_GRID_TOO_LARGE`], its own per-scope
+    /// latch, so a tree that already claimed `ShaderCap` for one of the other
+    /// four shape refusals still gets this one's line — the diagnosis #977
+    /// exists to produce, which #1020's review (LOW 1) found silently
+    /// swallowed by a sibling mistake in the same tree.
     fn slot(self) -> Warned {
         match self {
             Self::NoCapability => Warned::ShaderDenied,
@@ -576,14 +592,48 @@ fn placeholder(node: &ShaderNode<'_>) -> UiNode {
     }
 }
 
+thread_local! {
+    /// Per-scope latch for [`Refusal::GridTooLarge`] (#1023 item 2), kept
+    /// apart from [`Warned`]/`WARN_COUNTS` because that table is out of bits
+    /// after #981 (`Warned::slot`'s own doc: "all eight are spoken for") —
+    /// there is no ninth slot to give this refusal the way #981's
+    /// `NoGl`/`CpuForced` split got its own.
+    ///
+    /// Before this, `GridTooLarge` rode `Warned::ShaderCap` with the other
+    /// four shape refusals, so a tree that had already claimed that slot for
+    /// **any** of them — `SourceTooLarge`, `DataTooLarge`, `MalformedData`,
+    /// `EmptyGrid` — never got #977's `GridTooLarge` line at all (#1020
+    /// review LOW 1). One shot per scope, **never cleared**, on the same
+    /// "outlives `ScopeState`" reasoning `WARNED` itself documents — not
+    /// touched by `forget_scope` here, matching `preem_render::forget_scope`
+    /// not touching `WARNED`.
+    static WARNED_GRID_TOO_LARGE: RefCell<HashSet<Scope>> = RefCell::new(HashSet::new());
+}
+
+/// Claim the [`Refusal::GridTooLarge`] latch for `scope`: `true` the first
+/// time it is asked for, `false` for the rest of the shell's run. See
+/// [`WARNED_GRID_TOO_LARGE`].
+fn warn_once_grid_too_large(scope: &Scope) -> bool {
+    WARNED_GRID_TOO_LARGE.with_borrow_mut(|warned| warned.insert(scope.clone()))
+}
+
 /// One journal line per refusal *kind* per plugin tree, for the life of the
 /// shell — the [`Warned`] latch, on the same terms as the node/depth caps.
 ///
 /// A refused node is refused on **every** frame (the manifest does not change,
 /// and neither does a 20 KiB source), so an unlatched warning would be one line
 /// per frame per monitor.
+///
+/// [`Refusal::GridTooLarge`] is the one exception: it claims
+/// [`WARNED_GRID_TOO_LARGE`] instead of [`Warned`]'s shared shape slot
+/// (#1023 item 2) — see there for why.
 fn warn(scope: &Scope, node: &ShaderNode<'_>, refused: Refusal) {
-    if !preem_render::warn_once(scope, refused.slot()) {
+    let claimed = if let Refusal::GridTooLarge { .. } = refused {
+        warn_once_grid_too_large(scope)
+    } else {
+        preem_render::warn_once(scope, refused.slot())
+    };
+    if !claimed {
         return;
     }
     match refused {
@@ -976,9 +1026,12 @@ mod tests {
             Some(Refusal::GridTooLarge { size: (32_768, 1) }),
         );
 
-        // It is a *shape* refusal — a plugin-side code fix — so it shares the
-        // shape warn slot rather than spending one of the last of Warned's
-        // eight bits.
+        // It is a *shape* refusal — a plugin-side code fix — so it is still
+        // *classified* under the shape slot rather than spending one of the
+        // last of Warned's eight bits. Since #1023 item 2 it no longer
+        // *claims* that slot for gating, though — see `Refusal::slot`'s own
+        // doc, and `a_grid_too_large_refusal_is_not_swallowed_by_an_earlier_shape_refusal`
+        // for the proof. `.slot()` here is the classification only.
         assert_eq!(
             Refusal::GridTooLarge { size: (32_768, 1) }.slot(),
             Warned::ShaderCap,
@@ -1814,6 +1867,48 @@ mod tests {
         assert_eq!(
             emitted, 2,
             "the shape refusal must not swallow the session refusal — that is #981",
+        );
+    }
+
+    /// **#1023 item 2: `GridTooLarge` is not swallowed by an earlier shape
+    /// refusal.**
+    ///
+    /// The other half of #981's proof, run through the same harness: before
+    /// this fix, `GridTooLarge` rode `Warned::ShaderCap` with the other four
+    /// shape refusals (`Refusal::slot`'s own doc), so a tree that already
+    /// claimed that slot for a `SourceTooLarge` mistake never got #977's line
+    /// for a later `GridTooLarge` one in the same tree — the diagnosis #977
+    /// exists to produce, silently swallowed by an unrelated sibling mistake
+    /// (#1020 review LOW 1).
+    ///
+    /// **Falsified** by routing `Refusal::GridTooLarge` back through
+    /// `preem_render::warn_once(scope, refused.slot())` in [`warn`] (i.e.
+    /// deleting the `if let Refusal::GridTooLarge { .. }` branch): the count
+    /// drops from 2 to 1, exactly the pre-#1023 reading.
+    #[test]
+    fn a_grid_too_large_refusal_is_not_swallowed_by_an_earlier_shape_refusal() {
+        let over_source = "x".repeat(MAX_SHADER_SOURCE_BYTES + 1);
+        let small = [0u8; 4];
+        let source_too_large = ok_node(&over_source, &small);
+
+        // #977's own reported input: 32 KiB of R8, a legal length for its
+        // grid, and unallocatable — same construction as
+        // `a_grid_side_over_the_extent_cap_is_refused`.
+        let over_grid = vec![0u8; MAX_SHADER_DATA_EXTENT as usize + 1];
+        let grid_too_large = ok_node("void main() {}", &over_grid);
+
+        let emitted = counting_events("shader-grid-too-large-not-swallowed", |scope| {
+            // A plugin ships one over-cap source at startup, claiming
+            // `Warned::ShaderCap` for the tree…
+            let _ = map_shader(scope, granted(), &source_too_large);
+            // …and, later in the same run, sends a grid too wide for the
+            // per-axis cap. Before #1023 this second refusal wrote nothing.
+            let _ = map_shader(scope, granted(), &grid_too_large);
+        });
+        assert_eq!(
+            emitted, 2,
+            "a shape refusal already claimed must not swallow a later GridTooLarge — that is \
+             #1023 item 2",
         );
     }
 

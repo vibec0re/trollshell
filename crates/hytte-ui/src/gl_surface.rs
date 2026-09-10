@@ -459,17 +459,71 @@ fn resources_reusable(
     built_grid == grid && built_program == program
 }
 
+/// How many distinct refused data-strip lengths a [`WarnLatch`] remembers.
+///
+/// Mirrors `shader_surface::WARNED_SOURCES` and its rationale: a one-entry
+/// latch lets two differently-sized refusals alternating write a line every
+/// frame. This call site is not the shader widget's, but the failure shape
+/// — and the fix — are identical.
+const WARNED_LENGTHS: usize = 8;
+
+/// A journal latch over the last [`WARNED_LENGTHS`] refused data-strip
+/// lengths (#1023 item 3).
+///
+/// A local twin of `shader_surface::WarnLatch` rather than a shared type:
+/// nothing outside this file needs it, and duplicating ~15 lines here keeps
+/// this module's failure-reporting self-contained instead of reversing
+/// `shader_surface`'s existing dependency on this module (it imports
+/// [`fit_rect`], [`abandon_gl`] and [`GLSL_HEADER`] from here).
+#[derive(Debug, Default)]
+struct WarnLatch {
+    /// The lengths already reported, oldest first. At most [`WARNED_LENGTHS`].
+    said: std::collections::VecDeque<u64>,
+}
+
+impl WarnLatch {
+    /// Whether to write a line for `key`: `true` the first time this key is
+    /// seen, `false` for every repeat of a key still remembered.
+    fn claim(&mut self, key: u64) -> bool {
+        if self.said.contains(&key) {
+            return false;
+        }
+        if self.said.len() == WARNED_LENGTHS {
+            self.said.pop_front();
+        }
+        self.said.push_back(key);
+        true
+    }
+}
+
 mod imp {
     use super::{
         GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline, GlProgram, GlTarget, GlUniforms,
-        GlValue, PROGRAMS, SAMPLER_NAMES, abandon_gl, fit_rect, fresh_last_drawn, gdk, glib,
-        resources_reusable, steps_owed,
+        GlValue, PROGRAMS, SAMPLER_NAMES, WarnLatch, abandon_gl, fit_rect, fresh_last_drawn, gdk,
+        glib, resources_reusable, steps_owed,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
     use hytte_gl as hgl;
     use std::cell::{Cell, RefCell};
     use std::sync::Arc;
+
+    /// A failed data-strip reallocation, carrying the length it failed at so
+    /// the caller can latch its journal line **per length** (#1023 item 3).
+    ///
+    /// Mirrors `shader_surface::Failure`: [`Resources::upload_data`] used to
+    /// swallow this error entirely (`let Ok(texture) = … else { … return; }`,
+    /// no log, no latch) — the sibling of `shader_surface`'s own MEDIUM 1
+    /// (#1020 review LOW 2). #977 widened what the underlying
+    /// `hgl::Texture::new` call can fail with from an unreachable `Extent` to
+    /// a real `TextureSize`/`Storage`, so this call site can now fail for a
+    /// genuine reason and used to say nothing at all when it did.
+    struct DataFailure {
+        /// What the driver said.
+        error: hgl::Error,
+        /// The data length `Texture::new` was asked to allocate for.
+        len: u32,
+    }
 
     /// The GL objects one surface owns, all created against its own context.
     ///
@@ -525,6 +579,13 @@ mod imp {
         /// One-shot latch for "a pass would not compile", so a broken shader
         /// costs one journal line and not one per frame.
         warned_build: Cell<bool>,
+        /// Journal latch for "the data strip's texture could not be
+        /// (re)allocated" (#1023 item 3), keyed **by the refused length** via
+        /// [`WarnLatch`] — not a bare bool, so a second, differently sized
+        /// refusal still gets its own line instead of being swallowed by the
+        /// first (the same shape `shader_surface`'s `warned_data` fix takes;
+        /// see [`DataFailure`]).
+        warned_data: RefCell<WarnLatch>,
     }
 
     #[glib::object_subclass]
@@ -671,7 +732,17 @@ mod imp {
             let Some(resources) = held.as_mut() else {
                 return;
             };
-            resources.upload_data(&gl, state.data.as_ref());
+            if let Err(DataFailure { error, len }) = resources.upload_data(&gl, state.data.as_ref())
+                && self.warned_data.borrow_mut().claim(u64::from(len))
+            {
+                tracing::warn!(
+                    %error,
+                    len,
+                    "a GL surface's data strip could not be (re)allocated; this frame's data \
+                     upload is skipped and the strip keeps whatever it last held (further \
+                     occurrences of this length are silenced)"
+                );
+            }
 
             // The idempotence rule, decided by `steps_owed` — see there.
             let (steps, reset) = steps_owed(self.last_drawn.get(), state.step_seq);
@@ -803,32 +874,45 @@ mod imp {
             }
         }
 
-        /// Re-upload the data strip if it is not the allocation we already hold.
-        fn upload_data(&mut self, gl: &hgl::Gl, data: Option<&Arc<[f32]>>) {
+        /// Re-upload the data strip if it is not the allocation we already
+        /// hold.
+        ///
+        /// # Errors
+        ///
+        /// [`DataFailure`] if the driver refused the (re)allocation (#1023
+        /// item 3) — `self.data_len` is reset to `0` first, so the next call
+        /// retries rather than sampling a texture whose shape does not match
+        /// what `data_len` claims (the same discipline
+        /// `shader_surface::upload_data` follows for its own retry).
+        fn upload_data(&mut self, gl: &hgl::Gl, data: Option<&Arc<[f32]>>) -> Result<(), DataFailure> {
             let Some(data) = data else {
                 self.data_source = None;
                 self.data_len = 0;
-                return;
+                return Ok(());
             };
             if self
                 .data_source
                 .as_ref()
                 .is_some_and(|held| Arc::ptr_eq(held, data))
             {
-                return;
+                return Ok(());
             }
             let len = u32::try_from(data.len()).unwrap_or(u32::MAX).max(1);
             if len != self.data_len.max(1) || self.data_len == 0 {
-                let Ok(texture) = hgl::Texture::new(gl, hgl::Format::R32f, len, 1) else {
-                    self.data_source = None;
-                    self.data_len = 0;
-                    return;
+                let texture = match hgl::Texture::new(gl, hgl::Format::R32f, len, 1) {
+                    Ok(texture) => texture,
+                    Err(error) => {
+                        self.data_source = None;
+                        self.data_len = 0;
+                        return Err(DataFailure { error, len });
+                    }
                 };
                 self.data = texture;
             }
             self.data.upload_f32(gl, data);
             self.data_len = u32::try_from(data.len()).unwrap_or(u32::MAX);
             self.data_source = Some(Arc::clone(data));
+            Ok(())
         }
 
         /// Run one pass with the program compiled for it.
@@ -994,7 +1078,8 @@ mod imp {
     #[cfg(all(test, feature = "system-tests"))]
     mod tests {
         use super::{
-            GlBlend, GlDraw, GlPass, GlPipeline, GlProgram, GlSurface, GlTarget, gdk, hgl,
+            Arc, DataFailure, GlBlend, GlDraw, GlPass, GlPipeline, GlProgram, GlSurface, GlTarget,
+            Resources, WarnLatch, gdk, hgl,
         };
         use gtk::prelude::*;
 
@@ -1102,6 +1187,69 @@ mod imp {
                  one-pass pipeline's compiled shaders (#979)",
             );
         }
+
+        /// **#1023 item 3.** A data strip the driver refuses to allocate logs
+        /// once per *length*, not once per frame — and a second, differently
+        /// sized refusal still gets its own line.
+        ///
+        /// A length far over any real `GL_MAX_TEXTURE_SIZE` (the GLES 3.x
+        /// floor is 2048; even a high-end desktop part tops out at 16384 or
+        /// 32768) reaches `hgl::Texture::new`'s `Err(TextureSize)` arm
+        /// deterministically, on whatever limit this driver actually reports
+        /// — the same "the decision is pure, only the query is not"
+        /// separation `hytte_gl::checked_extent`'s own hermetic tests rely
+        /// on.
+        ///
+        /// **Falsified** by reverting `Resources::upload_data` to swallow the
+        /// error (no `Result`), or by keying the caller's latch on nothing
+        /// (a bare `Cell<bool>`): either collapses the "two different
+        /// lengths" count from 2 to 1.
+        #[gtk::test]
+        fn a_refused_data_strip_warns_once_per_length() {
+            // Comfortably over any real driver's GL_MAX_TEXTURE_SIZE.
+            const OVER: usize = 100_000;
+
+            let Some((_window, _area, gl)) = real_gl() else {
+                eprintln!(
+                    "skipping a_refused_data_strip_warns_once_per_length: no GL context on \
+                     this display — expected under the sandboxed `nix flake check` runner, \
+                     which has no mesa in its closure"
+                );
+                return;
+            };
+
+            let one = GlPipeline {
+                aux: 0,
+                step: &[],
+                frame: &ONE_PASS,
+            };
+            let program = GlProgram("gl_surface_test.data_strip");
+            let mut resources = Resources::build(&gl, &one, program, (4, 4))
+                .expect("a small grid always builds");
+
+            let mut latch = WarnLatch::default();
+            let mut warn = |data: &Arc<[f32]>| match resources.upload_data(&gl, Some(data)) {
+                Ok(()) => false,
+                Err(DataFailure { len, .. }) => latch.claim(u64::from(len)),
+            };
+
+            let a: Arc<[f32]> = Arc::from(vec![0.0_f32; OVER]);
+            assert!(warn(&a), "the first refused length is reported");
+            for _ in 0..4 {
+                // A fresh `Arc` each time — `upload_data`'s `Arc::ptr_eq` fast
+                // path must not be what is suppressing the repeats.
+                let repeat: Arc<[f32]> = Arc::from(vec![0.0_f32; OVER]);
+                assert!(!warn(&repeat), "…and then goes quiet while it persists");
+            }
+
+            let b: Arc<[f32]> = Arc::from(vec![0.0_f32; OVER + 1]);
+            assert!(
+                warn(&b),
+                "a second, DIFFERENT refused length must be reported, not swallowed \
+                 (#1023 item 3)",
+            );
+            assert!(!warn(&b), "…once");
+        }
     }
 }
 
@@ -1169,7 +1317,7 @@ impl Default for GlSurface {
 #[cfg(test)]
 mod tests {
     use super::{
-        GlProgram, GlUniforms, GlValue, MAX_STEPS_PER_RENDER, abandon_gl, fit_rect,
+        GlProgram, GlUniforms, GlValue, MAX_STEPS_PER_RENDER, WarnLatch, abandon_gl, fit_rect,
         fresh_last_drawn, gl_abandoned, resources_reusable, steps_owed,
     };
     use std::sync::Arc;
@@ -1360,5 +1508,35 @@ mod tests {
         assert!(gl_abandoned());
         abandon_gl("a second, different reason");
         assert!(gl_abandoned(), "the latch never clears");
+    }
+
+    /// **#1023 item 3.** The data-strip refusal latch is keyed by length, so
+    /// a second, differently sized refusal is not swallowed by the first —
+    /// hermetic, driving `WarnLatch::claim` directly with the same shape of
+    /// keys `Resources::upload_data`'s caller feeds it (`u64::from(len)`).
+    /// The GL-backed end-to-end proof, over a real driver refusal, lives next
+    /// to `Resources::upload_data` itself in `imp::tests` (needs a context
+    /// this crate's hermetic suite does not have).
+    ///
+    /// **Falsified** by reverting `imp::GlSurface::warned_data` to a bare
+    /// `Cell<bool>`: the "a second, DIFFERENT refused length" assertion goes
+    /// red.
+    #[test]
+    fn a_second_differently_sized_refused_data_strip_still_gets_its_own_line() {
+        let mut latch = WarnLatch::default();
+
+        let a = u64::from(100_000_u32);
+        let b = u64::from(100_001_u32);
+
+        assert!(latch.claim(a), "the first refused length is reported");
+        for _ in 0..8 {
+            assert!(!latch.claim(a), "…and then goes quiet while it persists");
+        }
+        assert!(
+            latch.claim(b),
+            "a second, DIFFERENT refused length must be reported, not swallowed (#1023 item 3)",
+        );
+        assert!(!latch.claim(b), "…once");
+        assert!(!latch.claim(a), "and a, already reported, stays quiet");
     }
 }

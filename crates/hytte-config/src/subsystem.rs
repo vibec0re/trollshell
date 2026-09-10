@@ -512,8 +512,10 @@ fn schema_paths<S: Subsystem>(have: &toml::Table) -> Option<BTreeSet<String>> {
 ///   trailing `(" ", " ")` inside an inline table and the ordinary `(" ", "")`
 ///   in a standard one — and clears the previous last value's suffix when that
 ///   is pure whitespace, because it has just stopped being the last value and
-///   its space would otherwise render as `{ a = 1 , b = 2 }`. Only an inline
-///   table ever has whitespace there.
+///   its space would otherwise render as `{ a = 1 , b = 2 }`. An inline table
+///   is the shape that has anything there; in a standard table the most that
+///   rule can match is trailing whitespace on a line, in a table this save is
+///   adding a key to anyway.
 fn set_value(table: &mut dyn toml_edit::TableLike, key: &str, mut value: toml_edit::Value) {
     let Some(carried) = carried_suffix(table, key) else {
         if let Some(last) = last_whitespace_suffixed_key(table)

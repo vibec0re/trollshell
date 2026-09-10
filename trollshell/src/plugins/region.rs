@@ -3307,7 +3307,13 @@ mod gtk_tests {
     /// Driven by a real `GdkFrameClock`, the same shape as
     /// `a_hidden_mount_stops_ticking_and_resumes_when_shown` — no ticking here
     /// is GTK's own gate (mapped/realized), so only a real frame clock can
-    /// answer it.
+    /// answer it. The marquee crawls at 0.01 dots/s for the same reason that
+    /// test's does: `Renderer::animates` is config-driven, so it keeps the
+    /// callback armed regardless of speed, while `advance` compares whole
+    /// dots and so reports no movement across the few hundred ms this test
+    /// spans — keeping the tick closure out of `request_preem_repaint`, which
+    /// needs a registered `PluginHandles` this `#[gtk::test]` has no booted
+    /// `App` to provide.
     ///
     /// **Deletion check:** dropping the `.filter(|card| card.root.get_visible())`
     /// from `build_region`'s scopes closure turns the first assertion red (a
@@ -3321,7 +3327,7 @@ mod gtk_tests {
         let renders = Mutable::new(vec![
             SlotRender {
                 hidden_on: vec!["B".to_owned()],
-                ..marquee_render_of("hidden-marquee", &tx, 20.0)
+                ..marquee_render_of("hidden-marquee", &tx, 0.01)
             },
             render_with_tree("sibling", &tx, row_with_label_tree("root", "l", "hi")),
         ]);
@@ -3355,7 +3361,7 @@ mod gtk_tests {
         // reads, just filtered — so this pins that it still covers the
         // show-again edge rather than assuming it from the fix alone.
         renders.set(vec![
-            marquee_render_of("hidden-marquee", &tx, 20.0),
+            marquee_render_of("hidden-marquee", &tx, 0.01),
             render_with_tree("sibling", &tx, row_with_label_tree("root", "l", "hi")),
         ]);
         pump();

@@ -2631,36 +2631,48 @@ mod tests {
             }
         }
 
-        let (plugin_end, host_end) = duplex(64 * 1024);
-        let (prd, pwr) = tokio::io::split(plugin_end);
-        let (mut hrd, mut hwr) = tokio::io::split(host_end);
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // Falsification note (PR body): without the `biased` shutdown-first
+        // arm, the race between the "11:00" frame and the shutdown notice is
+        // *probabilistic* — a single trial can pass by luck (measured: 1 red
+        // in 5 with `biased` removed). Looping many independent sessions is
+        // what makes this a reliable falsifier: the fixed tree passes every
+        // trial deterministically (`biased` always breaks the tie the same
+        // way), while the mutation reds within a handful of trials.
+        for _ in 0..20 {
+            LOG.lock().unwrap().clear();
 
-        let host = async move {
-            eat_handshake(&mut hrd, "shutdown-order-test").await;
-            send(&mut hwr, &snapshot("10:00")).await;
-            assert!(
-                matches!(
-                    next_plugin_frame(&mut hrd).await,
-                    PluginMsg::Render { .. }
-                ),
-                "the update from before the signal must still render normally"
+            let (plugin_end, host_end) = duplex(64 * 1024);
+            let (prd, pwr) = tokio::io::split(plugin_end);
+            let (mut hrd, mut hwr) = tokio::io::split(host_end);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let host = async move {
+                eat_handshake(&mut hrd, "shutdown-order-test").await;
+                send(&mut hwr, &snapshot("10:00")).await;
+                assert!(
+                    matches!(
+                        next_plugin_frame(&mut hrd).await,
+                        PluginMsg::Render { .. }
+                    ),
+                    "the update from before the signal must still render normally"
+                );
+                shutdown_tx.send(true).expect("receiver still alive");
+                // Sent right after the notice: the biased shutdown-first arm
+                // must win this race every time, so this must never reach
+                // `update`.
+                send(&mut hwr, &snapshot("11:00")).await;
+            };
+
+            let (result, ()) = tokio::join!(session::<Logged, _, _>(prd, pwr, shutdown_rx), host);
+            assert!(result.is_ok(), "a shutdown notice ends the session cleanly");
+
+            let log = LOG.lock().unwrap();
+            assert_eq!(
+                log.as_slice(),
+                &["update", "shutdown"],
+                "shutdown must run exactly once, after the one update the signal didn't race out"
             );
-            shutdown_tx.send(true).expect("receiver still alive");
-            // Sent right after the notice: the biased shutdown-first arm must
-            // win this race every time, so this must never reach `update`.
-            send(&mut hwr, &snapshot("11:00")).await;
-        };
-
-        let (result, ()) = tokio::join!(session::<Logged, _, _>(prd, pwr, shutdown_rx), host);
-        assert!(result.is_ok(), "a shutdown notice ends the session cleanly");
-
-        let log = LOG.lock().unwrap();
-        assert_eq!(
-            log.as_slice(),
-            &["update", "shutdown"],
-            "shutdown must run exactly once, after the one update the signal didn't race out"
-        );
+        }
     }
 
     /// (b) A `shutdown` hook that overruns [`SHUTDOWN_GRACE`] is cut off — the

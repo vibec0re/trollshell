@@ -52,6 +52,14 @@
 //! mode #641 taught this repo to avoid. Neither takes the shell down —
 //! [`load_or_default`] degrades to the built-in default with a loud `error!`.
 //!
+//! A third shape gets the same treatment for the same reason: a
+//! [`crate::merge::UNSET_KEY`] marker the merge cannot honour — `_unset =
+//! "color"` rather than `_unset = ["color"]`. [`crate::merge`] detects it,
+//! because that is where the marker is honoured; [`assemble`] warns about it,
+//! because that is where the layer's *file name* is (#988). It is not a
+//! `ConfigError`: the rest of the file is fine, and the user gets a named,
+//! actionable line in the journal instead of a shell that will not start.
+//!
 //! # Why the writer patches instead of re-rendering
 //!
 //! Same reason as `places` (#703): once the control center can edit a file a
@@ -182,6 +190,27 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// The one message a malformed [`merge::UNSET_KEY`] produces.
+///
+/// A `const` rather than a literal in the macro so the tests can select on the
+/// *exact* message instead of a substring: a filter that greps for `_unset`
+/// turns green-and-blind the day somebody rewords the string, which is the
+/// failure mode the negative test ("a well-formed marker warns about nothing")
+/// exists to rule out. Interpolated into the `warn!` below, so the two cannot
+/// drift.
+const MALFORMED_UNSET_MESSAGE: &str = "_unset must be an array of key names; ignoring it";
+
+/// How a layer is named in a diagnostic. `None` is [`Subsystem::DEFAULT_TOML`],
+/// which is not a file — a complaint about *that* one is our bug, not the
+/// user's, and saying so is the difference between "go fix your config" and
+/// "go file an issue".
+fn layer_name(path: Option<&Path>) -> String {
+    path.map_or_else(
+        || "the built-in default".to_string(),
+        |path| path.display().to_string(),
+    )
+}
+
 /// Parse one layer body, naming the file in the error.
 fn parse_layer(body: &str, path: Option<&Path>) -> Result<toml::Table, ConfigError> {
     body.parse::<toml::Table>().map_err(|e| ConfigError::Parse {
@@ -200,12 +229,31 @@ fn parse_layer(body: &str, path: Option<&Path>) -> Result<toml::Table, ConfigErr
 /// [`Subsystem::validate`] rejects the result. An *unknown* key is none of
 /// these — it is warned and reported in [`Loaded::unknown_keys`].
 pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>, ConfigError> {
-    let mut tables = Vec::with_capacity(layers.len() + 1);
-    tables.push(parse_layer(S::DEFAULT_TOML, None)?);
+    let mut tables: Vec<(Option<&Path>, toml::Table)> = Vec::with_capacity(layers.len() + 1);
+    tables.push((None, parse_layer(S::DEFAULT_TOML, None)?));
     for (path, body) in layers {
-        tables.push(parse_layer(body, Some(path))?);
+        tables.push((Some(path.as_path()), parse_layer(body, Some(path))?));
     }
-    let merged = merge::merge_all(tables);
+
+    // #988: a `_unset` the merge cannot honour is dropped either way, so it
+    // has to be *said* — otherwise the user gets the inherited value back with
+    // no signal at all, which is the invisible failure the module docs above
+    // argue against for every other key shape. Per layer and before the merge,
+    // because after it every marker is gone and there is nothing left to
+    // attribute to a file.
+    for (path, table) in &tables {
+        for bad in merge::malformed_unset(table) {
+            tracing::warn!(
+                subsystem = S::NAME,
+                layer = %layer_name(*path),
+                key = %bad.key,
+                found = bad.found,
+                "{MALFORMED_UNSET_MESSAGE}"
+            );
+        }
+    }
+
+    let merged = merge::merge_all(tables.into_iter().map(|(_, table)| table));
 
     let mut unknown_keys = Vec::new();
     let config: S = serde_ignored::deserialize(merged.into_deserializer(), |path| {
@@ -320,9 +368,21 @@ fn wanted<S: Subsystem + serde::Serialize>(value: &S) -> Result<toml::Table, Con
     }
 }
 
-/// Every dotted key path in `table`, tables included.
+/// Every dotted key path in `table`, tables included — except the
+/// [`merge::UNSET_KEY`] marker, at any depth.
+///
+/// The exclusion is by name, deliberately, rather than left to
+/// [`serde_ignored`]: [`merge::merge_into`] strips the marker before the
+/// schema ever sees the table, so `serde_ignored` structurally *cannot* report
+/// it as ignored, and [`schema_paths`] would then count it as schema-owned. The
+/// stale sweep in [`patch`] would go on to delete the user's explicit erasure
+/// on the next save — silently, and with the erased key falling back to the
+/// inherited value on the load after that (#990).
 fn collect_paths(table: &toml::Table, prefix: &str, out: &mut BTreeSet<String>) {
     for (key, value) in table {
+        if key == merge::UNSET_KEY {
+            continue;
+        }
         let path = format!("{prefix}{key}");
         if let toml::Value::Table(nested) = value {
             collect_paths(nested, &format!("{path}."), out);
@@ -472,11 +532,42 @@ fn patch(
 /// only the keys whose value actually changed, plus schema-owned keys the
 /// value no longer carries.
 ///
-/// A [`crate::merge::UNSET_KEY`] marker in the file is one of the keys the
-/// schema does not know, so it survives a save — and stays correct, because a
-/// save also writes the key it unset back explicitly, and the merge applies
-/// the removal before the assignments. The marker is then redundant rather
-/// than wrong.
+/// A [`crate::merge::UNSET_KEY`] marker survives a save **of the table it
+/// lives in**. Not because [`serde_ignored`] reports it as a key the schema
+/// does not know — it cannot, the merge eats the marker before the schema is
+/// ever shown the table — but because [`collect_paths`] excludes it by name,
+/// so the stale sweep never counts it as schema-owned (#990).
+///
+/// It also stays *correct*, in both of the two cases there are. When the value
+/// still carries the key that was unset, the save writes it back explicitly
+/// and the merge applies removals before assignments, so the marker is
+/// redundant rather than wrong. When the value no longer carries it — an
+/// `Option` gone to `None`, which is the shape that made the erasure worth
+/// spelling in the first place — the marker is the only thing holding the
+/// erasure, and deleting it would silently restore the inherited value on the
+/// next load.
+///
+/// **What that clause excludes, today.** The marker goes with its table
+/// whenever [`patch`] loses the table itself, which happens in two shapes —
+/// both pre-existing, both tracked by **#1008**, neither fixed here because
+/// the remedy is in [`patch`]'s recursion gate rather than in this seam:
+///
+/// 1. **The table spelled inline.** `patch` recurses only into
+///    [`toml_edit::Item::is_table`], which is false for
+///    `core = { brightness = 7, _unset = ["label"] }`, so the inline table is
+///    replaced wholesale — taking the marker, and any key the schema does not
+///    know, with it. That second half predates #990: it is the older
+///    "unrelated keys survive" guarantee, and no fixture caught it because
+///    they all use standard tables.
+/// 2. **A schema field of type `Option<Table>` gone to `None`.** The stale
+///    sweep matches the *table's* own path, which [`collect_paths`] correctly
+///    still inserts (the table is schema-owned even though the marker inside
+///    it is not), so `doc.remove` takes the whole `[core]` block.
+///
+/// `a_save_of_an_inline_table_loses_the_marker_and_unknown_keys_today` and
+/// `a_save_that_drops_an_optional_table_takes_the_marker_with_it_today` pin
+/// both shapes as they behave *now*, so the gap is visible rather than
+/// silent; #1008 flips them.
 ///
 /// # Errors
 /// [`ConfigError::Encode`] when `existing` is not valid TOML — refusing rather
@@ -967,5 +1058,401 @@ kept = true
 
         assert!(matches!(err, ConfigError::Invalid(_)), "got {err:?}");
         assert!(!path.exists(), "a rejected save must not create the file");
+    }
+
+    // ── #990: a save keeps the user's `_unset` marker ────────────────────────
+
+    /// The marker is the user's, never the schema's — at the root and at
+    /// depth, in one document so a fix that only handles the top level cannot
+    /// pass.
+    ///
+    /// Red before [`collect_paths`] excluded [`merge::UNSET_KEY`] by name:
+    /// [`merge::merge_into`] strips the marker before `serde_ignored` can
+    /// report it as ignored, so [`schema_paths`] counted both markers as
+    /// schema-owned and [`patch`]'s stale sweep deleted them.
+    #[test]
+    fn a_save_keeps_the_users_unset_marker_at_every_depth() {
+        let existing = "_unset = [\"enabled\"]\n\n[core]\n_unset = [\"label\"]\nbrightness = 7\n";
+        let value = config_from(existing);
+
+        let out = render_overlay(existing, &value).expect("renders");
+
+        assert!(
+            out.contains("_unset = [\"enabled\"]"),
+            "the root marker must survive a save: {out}"
+        );
+        assert!(
+            out.contains("_unset = [\"label\"]"),
+            "and so must one inside a table: {out}"
+        );
+    }
+
+    /// What the deletion actually costs, which is why #990 is not cosmetic: an
+    /// erasure whose key the value no longer carries is held by the marker
+    /// *alone*. Drop it on a save about something else and the inherited value
+    /// comes back on the next load, silently.
+    ///
+    /// Red before the fix — the second load sees `label = Some("old")`.
+    #[test]
+    fn an_unset_marker_still_erases_after_a_save_of_an_unrelated_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("base.toml");
+        let overlay = dir.path().join("core-leds.toml");
+        std::fs::write(&base, "[core]\nlabel = \"old\"\n").expect("seed the base layer");
+        std::fs::write(&overlay, "[core]\n_unset = [\"label\"]\nbrightness = 7\n")
+            .expect("seed the overlay");
+        let paths = [base, overlay.clone()];
+
+        let mut value = load_from::<Leds>(&paths).expect("loads").config;
+        assert_eq!(value.core.label, None, "the marker erases the base's label");
+
+        // A save that has nothing to do with `label` at all.
+        value.core.brightness = 5;
+        save_overlay_to(&overlay, &value).expect("saves");
+        let written = std::fs::read_to_string(&overlay).expect("read back");
+        assert!(
+            written.contains("_unset"),
+            "the marker must survive the save: {written}"
+        );
+
+        let reloaded = load_from::<Leds>(&paths).expect("reloads").config;
+        assert_eq!(reloaded.core.brightness, 5, "the save itself still took");
+        assert_eq!(
+            reloaded.core.label, None,
+            "…and the erasure must still hold on the next load: {written}"
+        );
+    }
+
+    // ── #988: a marker the merge cannot honour is said out loud ─────────────
+
+    /// Captured `tracing` events, in the shape `hytte-services`' `hooks` tests
+    /// use: a shared buffer, a field visitor, and a thread-local
+    /// [`tracing::dispatcher::set_default`] guard so one test's subscriber
+    /// cannot leak into another's.
+    ///
+    /// Hand-rolled over [`tracing::Subscriber`] rather than assembled from
+    /// `tracing_subscriber`'s `Registry` + `Layer`, which is what `hooks` does:
+    /// this crate is the GTK-free leaf whose whole point is a short dependency
+    /// list (`serde`, `serde_ignored`, `toml`, `toml_edit`, `tracing`), and a
+    /// capture that only ever needs `event` does not justify widening it.
+    #[derive(Clone, Default)]
+    struct Captured {
+        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        message: String,
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    impl Captured {
+        fn events(&self) -> Vec<CapturedEvent> {
+            self.events.lock().expect("not poisoned").clone()
+        }
+    }
+
+    impl tracing::Subscriber for Captured {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .expect("not poisoned")
+                .push(CapturedEvent {
+                    level: *event.metadata().level(),
+                    message: visitor.message,
+                    fields: visitor.fields,
+                });
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        message: String,
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            } else {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            // `%` sigils and the message itself arrive here; the wrappers
+            // `tracing` uses render their `Display` form through `Debug`.
+            let rendered = format!("{value:?}");
+            if field.name() == "message" {
+                self.message = rendered;
+            } else {
+                self.fields.insert(field.name().to_string(), rendered);
+            }
+        }
+    }
+
+    fn capture() -> (Captured, tracing::dispatcher::DefaultGuard) {
+        let captured = Captured::default();
+        let guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(captured.clone()));
+        // Belt and braces, kept deliberately. The hazard is real — with zero
+        // live dispatchers `tracing-core` caches a callsite's interest as
+        // `never` for the whole binary (`callsite.rs`'s
+        // `interest.unwrap_or_else(Interest::never)`) — but `Dispatch::new`
+        // above already closes it: constructing a `Dispatch` registers it and
+        // rebuilds interest for every registered callsite over the live list.
+        // What this call covers is the narrower `Rebuilder::JustOne` path,
+        // where with a single live dispatcher the rebuild degrades to
+        // "whatever *this* thread's default is" — genuinely thread-sensitive,
+        // and one line to insure against. It can only widen interest here
+        // (`Captured::enabled` is unconditionally true), so it cannot poison a
+        // sibling test.
+        tracing::callsite::rebuild_interest_cache();
+        (captured, guard)
+    }
+
+    /// The malformed-marker warnings, selected on the **exact** message rather
+    /// than on a substring of it. A `contains("_unset")` filter would turn
+    /// green-and-blind if the `warn!` were ever reworded — including the
+    /// negative test below, whose whole job is to observe an absence.
+    fn unset_warnings(captured: &Captured) -> Vec<CapturedEvent> {
+        captured
+            .events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::WARN && e.message == MALFORMED_UNSET_MESSAGE)
+            .collect()
+    }
+
+    /// A `_unset` the merge cannot honour removes nothing. Saying so is the
+    /// whole fix — and it has to name the layer, because with three or four
+    /// candidate files in play an unattributed complaint is close to useless.
+    ///
+    /// Red if the [`merge::malformed_unset`] loop in [`assemble`] goes away.
+    #[test]
+    fn a_malformed_unset_marker_warns_naming_the_layer() {
+        let (captured, _guard) = capture();
+
+        let loaded = assembled(&["[core]\n_unset = \"color\"\n"]);
+
+        let warnings = unset_warnings(&captured);
+        assert_eq!(warnings.len(), 1, "one marker, one warning: {warnings:#?}");
+        let fields = &warnings[0].fields;
+        assert_eq!(
+            fields.get("layer").map(String::as_str),
+            Some("/layer/0.toml"),
+            "the file the user can open: {fields:#?}"
+        );
+        assert_eq!(fields.get("key").map(String::as_str), Some("core._unset"));
+        assert_eq!(fields.get("found").map(String::as_str), Some("string"));
+        assert_eq!(
+            fields.get("subsystem").map(String::as_str),
+            Some("core-leds")
+        );
+
+        assert_eq!(
+            loaded.config.core.color, "amber",
+            "the marker removed nothing, which is exactly what the warning is for"
+        );
+        assert!(
+            loaded.unknown_keys.is_empty(),
+            "and it is still stripped, so it is not an unknown key on top: {:?}",
+            loaded.unknown_keys
+        );
+    }
+
+    /// Every element that is not a key name is named, by index — a marker with
+    /// one usable entry and two typos must not report just the first.
+    #[test]
+    fn every_non_key_name_element_of_an_unset_marker_is_warned_about() {
+        let (captured, _guard) = capture();
+
+        let loaded = assembled(&["[core]\n_unset = [\"color\", 3, true]\n"]);
+
+        let warnings = unset_warnings(&captured);
+        let named: Vec<(&str, &str)> = warnings
+            .iter()
+            .map(|e| {
+                (
+                    e.fields.get("key").map_or("", String::as_str),
+                    e.fields.get("found").map_or("", String::as_str),
+                )
+            })
+            .collect();
+        assert_eq!(
+            named,
+            [("core._unset[1]", "integer"), ("core._unset[2]", "boolean")],
+            "each offender, by index and type: {warnings:#?}"
+        );
+
+        assert_eq!(
+            loaded.config.core.color, "",
+            "the usable element is still honoured, so the default's amber is gone"
+        );
+    }
+
+    /// The warning must be a signal, not noise on every file that uses the
+    /// feature: a well-formed marker says nothing.
+    ///
+    /// The layer carries an unknown key alongside the marker purely as a
+    /// **live control**. Asserting an absence against a capture that observed
+    /// nothing at all is not an assertion — swap the thread's subscriber for
+    /// `Dispatch::none()` and a bare "no `_unset` warning" test stays green
+    /// while the two positive tests above go red. The control event proves the
+    /// capture was wired at the moment the absence was observed.
+    #[test]
+    fn a_well_formed_unset_marker_is_not_warned_about() {
+        let (captured, _guard) = capture();
+
+        let loaded = assembled(&["[core]\n_unset = [\"color\"]\nnope = 1\n"]);
+
+        let events = captured.events();
+        assert!(
+            events.iter().any(|e| e.level == tracing::Level::WARN
+                && e.fields.get("key").map(String::as_str) == Some("core.nope")),
+            "the control event must land, or the absence below proves nothing: {events:#?}"
+        );
+        assert!(
+            unset_warnings(&captured).is_empty(),
+            "a well-formed marker must draw no complaint: {events:#?}"
+        );
+        assert_eq!(loaded.config.core.color, "", "and it was honoured");
+        assert_eq!(
+            loaded.unknown_keys,
+            ["core.nope"],
+            "the control is the ordinary rule-4 path, unchanged"
+        );
+    }
+
+    /// The other arm of [`layer_name`]: a malformed marker in
+    /// [`Subsystem::DEFAULT_TOML`] is **our** bug, and the warning has to say
+    /// so rather than name a file the user could go and edit.
+    ///
+    /// It is also the arm a future `DEFAULT_TOML` edit could start hitting
+    /// silently, since no fixture on the happy path ever reaches it.
+    #[test]
+    fn a_malformed_marker_in_the_built_in_default_is_named_as_ours() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct BadDefault {
+            #[serde(default)]
+            color: String,
+        }
+
+        impl Subsystem for BadDefault {
+            const NAME: &'static str = "bad-default";
+            const DEFAULT_TOML: &'static str = "_unset = \"color\"\ncolor = \"amber\"\n";
+            type Error = std::convert::Infallible;
+            fn validate(&self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        let (captured, _guard) = capture();
+
+        let loaded = assemble::<BadDefault>(&[]).expect("assembles");
+
+        let warnings = unset_warnings(&captured);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        let fields = &warnings[0].fields;
+        assert_eq!(
+            fields.get("layer").map(String::as_str),
+            Some("the built-in default"),
+            "not a path — there is no file to send anyone to: {fields:#?}"
+        );
+        assert_eq!(fields.get("key").map(String::as_str), Some("_unset"));
+        assert_eq!(fields.get("found").map(String::as_str), Some("string"));
+        assert_eq!(loaded.config.color, "amber", "and it removed nothing");
+    }
+
+    // ── #1008: two shapes where `patch` still loses the marker ──────────────
+    //
+    // Both pin **today's** behaviour, honestly and without `#[ignore]`, so the
+    // gap `render_overlay`'s doc now names is visible in the suite rather than
+    // only in prose. #1008 flips both: the assertions below become the
+    // opposite, and these comments come out with them. Neither is a regression
+    // from #990 — `patch` is byte-identical to the pre-#990 tree.
+
+    /// **#1008 shape 1, current behaviour.** [`patch`] recurses only into
+    /// [`toml_edit::Item::is_table`], which an *inline* table is not, so the
+    /// whole table is replaced by a fresh standard one — losing the marker and
+    /// every key the schema does not know along with it.
+    ///
+    /// The unknown-key half is the older guarantee
+    /// `a_save_preserves_keys_and_tables_the_schema_does_not_know` states;
+    /// that fixture only uses standard tables, which is why nothing caught it.
+    #[test]
+    fn a_save_of_an_inline_table_loses_the_marker_and_unknown_keys_today() {
+        let existing = "core = { brightness = 7, _unset = [\"label\"], mystery = 42 }\n";
+        let mut value = config_from(existing);
+        value.core.brightness = 5;
+
+        let out = render_overlay(existing, &value).expect("renders");
+
+        assert!(
+            !out.contains(merge::UNSET_KEY),
+            "#1008 will flip this to `contains`: {out}"
+        );
+        assert!(
+            !out.contains("mystery"),
+            "#1008 will flip this too — an unknown key inside an inline table \
+             is swept with it: {out}"
+        );
+        assert_eq!(
+            config_from(&out).core.brightness,
+            5,
+            "the save itself still takes, which is why this is quiet"
+        );
+    }
+
+    /// **#1008 shape 2, current behaviour.** A schema field of type
+    /// `Option<Table>` gone to `None` makes the stale sweep match the
+    /// *table's* path — which [`collect_paths`] rightly still inserts, the
+    /// table being schema-owned even though the marker inside it is not — so
+    /// `doc.remove` takes the block, the marker, its comment and the unknown
+    /// key together.
+    #[test]
+    fn a_save_that_drops_an_optional_table_takes_the_marker_with_it_today() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct OptTable {
+            #[serde(default)]
+            enabled: bool,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            core: Option<Core>,
+        }
+
+        impl Subsystem for OptTable {
+            const NAME: &'static str = "opt-table";
+            const DEFAULT_TOML: &'static str = "enabled = true\n";
+            type Error = std::convert::Infallible;
+            fn validate(&self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        let existing = "enabled = true\n\n[core]\n# do not inherit the base's label\n_unset = [\"label\"]\nmystery = 1\nbrightness = 7\n";
+        let value = OptTable {
+            enabled: true,
+            core: None,
+        };
+
+        let out = render_overlay(existing, &value).expect("renders");
+
+        assert_eq!(
+            out, "enabled = true\n",
+            "#1008 will flip this: today the whole block goes, marker, \
+             comment and unknown key with it"
+        );
     }
 }

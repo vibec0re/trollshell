@@ -1490,11 +1490,19 @@ mod tests {
 
             // Flip the verdict while the chip tree stays byte-identical.
             send(&mut hwr, &HostMsg::SlotVisibility { visible: true }).await;
+            // Bounded, for [`next_render`]'s reason: the exact bug this test
+            // exists to catch — a `View` change that never reaches the wire —
+            // makes the awaited frame *not arrive at all*, and an unbounded read
+            // then hangs the suite rather than naming itself. Measured: a
+            // no-op `View::hidden_on` builder hung `cargo test` past 10 min
+            // before this bound; with it, the same mutation fails in 5 s.
             let PluginMsg::Render {
                 tree, hidden_on, ..
-            } = next_plugin_frame(&mut hrd).await
+            } = tokio::time::timeout(Duration::from_secs(5), next_plugin_frame(&mut hrd))
+                .await
+                .expect("a hidden_on change alone must re-render (within 5 s)")
             else {
-                panic!("a hidden_on change alone must re-render");
+                panic!("a hidden_on change alone must produce a Render frame");
             };
             assert!(
                 matches!(tree, Node::Label { ref text, .. } if text == "chip"),

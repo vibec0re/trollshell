@@ -165,6 +165,16 @@ pub enum HostMsg {
         /// it outside the #305 opt-in rule — there is no undecodable variant tag
         /// for an old plugin to choke on — and outside the
         /// [`VOCAB`](crate::VOCAB) census for the same reason.
+        ///
+        /// The `default` is belt-and-braces, and measurably so: serde's
+        /// `missing_field` helper already yields `None` for a missing
+        /// `Option<T>` field, so removing the attribute here changes no
+        /// behaviour and reds no test (the #1050 mutation campaign checked, and
+        /// found the same of [`panel`](PluginMsg::Render::panel)). It is kept
+        /// because it states the intent, matches every sibling, and becomes
+        /// load-bearing the moment the field stops being an `Option`. A
+        /// `Vec<String>` like [`Render.hidden_on`](PluginMsg::Render::hidden_on)
+        /// gets no such implicit default and genuinely needs its `default`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
     },

@@ -8,9 +8,11 @@
 use std::fmt::Write as _;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hytte::gtk::gio;
+use hytte::gtk::gio::prelude::CancellableExt;
+use hytte::gtk::{gio, glib};
 use hytte::services::{mpris, niri, notifications, pipewire, systemd};
 use hytte_plugin_proto::{
     AudioAction, Effect, EffectOutcome, HostMsg, MediaAction, NiriAction, Page,
@@ -622,6 +624,15 @@ const ALLOWED_URI_SCHEMES: [&str; 3] = ["http", "https", "file"];
 /// by one silently.
 const MAX_URI_BYTES: usize = 4096;
 
+/// How long the desktop may take to resolve and launch a handler for a
+/// plugin-supplied URI before the host gives up on it (#1060). Same constant
+/// class as [`RUN_COMMAND_TIMEOUT`]: without a bound, a stuck portal or a
+/// D-Bus-activated handler that never completes its `GTask` means `report` is
+/// never called, and the boxed [`LaunchDone`] — plus its captured `Sender`
+/// clone, several frames up the closure chain — is retained for the life of
+/// the process. This is the second pass on #1049's own N1.
+const OPEN_URI_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Why the host refused to open a plugin-supplied URI (#1045). Carried into the
 /// [`EffectOutcome::output`] the plugin gets back, so a refusal is something it
 /// can toast rather than a click that silently does nothing.
@@ -760,7 +771,11 @@ pub(super) type LaunchDone = Box<dyn FnOnce(Result<(), String>) + Send + 'static
 ///
 /// A refusal is logged at **warn** (the plugin asked for something the host will
 /// not do) and a launch failure too (no handler registered, portal error); a
-/// success is `info`, matching every other brokered effect.
+/// success is `info`, matching every other brokered effect. Both the refusal
+/// and this accepted-for-launch line carry the URI itself (truncated the same
+/// way, #1060 review N2) — previously only a refused destination was
+/// recoverable from the journal, which is backwards from what a forensic read
+/// wants.
 pub(super) fn open_uri_with(
     plugin_id: &str,
     id: u64,
@@ -789,7 +804,11 @@ pub(super) fn open_uri_with(
             return;
         }
     };
-    tracing::info!(plugin = %plugin_id, id, %scheme, "plugin effect: OpenUri");
+    tracing::info!(
+        plugin = %plugin_id, id, %scheme,
+        uri = %truncate_on_char_boundary(uri, 256),
+        "plugin effect: OpenUri",
+    );
     let plugin_id = plugin_id.to_owned();
     let scheme = scheme.to_owned();
     launch(
@@ -816,6 +835,66 @@ pub(super) fn open_uri_with(
     );
 }
 
+/// Race a `start`ed launch against a timer `arm_timer` sets up: if `start`'s
+/// own callback has not answered `done` by the time `arm_timer`'s trigger
+/// fires, the [`gio::Cancellable`] handed to `start` is cancelled and `done` is
+/// called here instead, with a "timed out" outcome (#1060, review N1).
+///
+/// `start` is handed a fresh `Cancellable` up front rather than being asked to
+/// make its own, so this function — not the launcher — owns cancelling it: the
+/// whole point is that a launcher which never calls back on its own must still
+/// get bounded, and it cannot bound itself if it never runs again to do so.
+///
+/// `arm_timer` is *how* the timer is armed, not *when* it fires — production
+/// ([`launch_default_for_uri_async`]) hands it a closure that wires the trigger
+/// into a real [`glib::timeout_add_local_once`] at [`OPEN_URI_TIMEOUT`], so the
+/// trigger and `start`'s own callback both actually run on the thread this was
+/// called from — the GTK main context — making the race an *ordering*
+/// question, not a data race between threads. A test hands `arm_timer` a
+/// closure that fires the trigger **immediately**, so the whole ordering
+/// question — "whichever fires first wins, and reports exactly once" — is
+/// exercised synchronously, with no real `GLib` main loop running and nothing
+/// to wait on: see the tests below for why that matters for a `MainContext`
+/// that is a process-wide singleton every test thread shares.
+///
+/// Whichever side (the trigger or `start`'s callback) runs first takes `done`
+/// out of the shared cell and calls it; the other finds the cell already empty
+/// and does nothing. The cell is an `Arc<Mutex<..>>` rather than the simpler
+/// `Rc<RefCell<..>>` only because [`LaunchDone`] itself is `Send` (a test's
+/// stub is allowed to answer from another thread, see its doc) and a value
+/// boxed as `dyn FnOnce + Send` cannot close over a non-`Send` `Rc`.
+fn launch_with_timeout(
+    arm_timer: impl FnOnce(Box<dyn FnOnce()>),
+    start: impl FnOnce(&gio::Cancellable, LaunchDone),
+    done: LaunchDone,
+) {
+    let cancellable = gio::Cancellable::new();
+    let done: Arc<Mutex<Option<LaunchDone>>> = Arc::new(Mutex::new(Some(done)));
+
+    let timer_cancellable = cancellable.clone();
+    let timer_done = Arc::clone(&done);
+    arm_timer(Box::new(move || {
+        let Some(done) = timer_done.lock().expect("launch-done lock").take() else {
+            // `start`'s own callback already reported; nothing to do.
+            return;
+        };
+        timer_cancellable.cancel();
+        done(Err("launch timed out".to_owned()));
+    }));
+
+    start(
+        &cancellable,
+        Box::new(move |result| {
+            let Some(done) = done.lock().expect("launch-done lock").take() else {
+                // The timer already reported (and cancelled us); a late
+                // answer arriving after that must not report a second time.
+                return;
+            };
+            done(result);
+        }),
+    );
+}
+
 /// Hand `uri` to the desktop's default handler — the production launcher behind
 /// [`open_uri_with`] (#1045).
 ///
@@ -829,12 +908,28 @@ pub(super) fn open_uri_with(
 ///
 /// Must be *started* on the GTK main thread (the binding asserts main-context
 /// ownership), which is where [`broker_effect`] already is.
+///
+/// Bounded by [`OPEN_URI_TIMEOUT`] via [`launch_with_timeout`] (#1060): a real
+/// [`gio::Cancellable`] is passed in place of the `Cancellable::NONE` this used
+/// to launch with, so a stuck portal or a handler that never completes its
+/// `GTask` gets cancelled — which makes `GLib` complete it with a `Cancelled`
+/// error instead of leaving it, and the boxed closure this call's own trampoline
+/// holds, outstanding forever.
 fn launch_default_for_uri_async(uri: &str, done: LaunchDone) {
-    gio::AppInfo::launch_default_for_uri_async(
-        uri,
-        gio::AppLaunchContext::NONE,
-        gio::Cancellable::NONE,
-        move |result| done(result.map_err(|e| e.to_string())),
+    let uri = uri.to_owned();
+    launch_with_timeout(
+        |fire| {
+            glib::timeout_add_local_once(OPEN_URI_TIMEOUT, fire);
+        },
+        move |cancellable, done| {
+            gio::AppInfo::launch_default_for_uri_async(
+                &uri,
+                gio::AppLaunchContext::NONE,
+                Some(cancellable),
+                move |result| done(result.map_err(|e| e.to_string())),
+            );
+        },
+        done,
     );
 }
 
@@ -1629,8 +1724,9 @@ fn effect_kind(effect: &Effect) -> &'static str {
 
 /// Format one audit line (#510): `<rfc3339> plugin=<id> effect=<kind>
 /// decision=<decision>`, plus — for the effects that carry one — the
-/// correlation `id=`, and for a detached launch the `unit=` and `slice=` it
-/// started (#953 M1). Pure (timestamp injected) so the format is unit-testable.
+/// correlation `id=`, an `OpenUri`'s destination as `uri=` (#1060), and for a
+/// detached launch the `unit=` and `slice=` it started (#953 M1). Pure
+/// (timestamp injected) so the format is unit-testable.
 ///
 /// The audit name `RunCommand(detached)` exists so a reviewer can reconcile the
 /// log against `systemctl --user list-units 'trollshell-launch-*'` — which the
@@ -1639,16 +1735,25 @@ fn effect_kind(effect: &Effect) -> &'static str {
 /// fields the line omitted. `unit=` closes that; `slice=` names the one command
 /// that clears whatever is left (`systemctl --user stop trollshell-launch.slice`).
 ///
+/// `uri=` exists for the same forensic reason (#1060 review N2): before it, the
+/// audit log's only trace of an `OpenUri` was `decision=allowed` with no
+/// destination, for a refused URI exactly as much as an opened one (this line
+/// is written in [`broker_effect`] before [`check_uri`] gets a say — that
+/// decision only ever means "cleared capability enforcement + the rate cap"),
+/// so "which links did this plugin ask to open" was unanswerable from the audit
+/// log alone, refused or not.
+///
 /// Every interpolated value is either host-built or run through
-/// [`sanitize_field`] — the plugin id and the unit name both embed
-/// plugin-supplied text, so neither can inject whitespace or a newline and forge
-/// a record.
+/// [`sanitize_field`] — the plugin id, the unit name, and now the uri all embed
+/// plugin-supplied text, so none of them can inject whitespace or a newline and
+/// forge a record.
 pub(super) fn format_audit_line(
     ts: &str,
     plugin_id: &str,
     kind: &str,
     decision: AuditDecision,
     effect_id: Option<u64>,
+    uri: Option<&str>,
     unit: Option<&str>,
 ) -> String {
     let id = sanitize_field(plugin_id);
@@ -1656,6 +1761,9 @@ pub(super) fn format_audit_line(
     let mut line = format!("{ts} plugin={id} effect={kind} decision={d}");
     if let Some(effect_id) = effect_id {
         let _ = write!(line, " id={effect_id}");
+    }
+    if let Some(uri) = uri {
+        let _ = write!(line, " uri={}", sanitize_field(uri));
     }
     if let Some(unit) = unit {
         let _ = write!(line, " unit={} slice={LAUNCH_SLICE}", sanitize_field(unit));
@@ -1699,12 +1807,14 @@ pub(super) fn record_audit(
     // so `broker_effect`'s callers can assert on the exact record it produced
     // — in particular, that a detached launch's `unit=` is the same string
     // the launcher was handed (see `tests::LAST_DETACHED_DISPATCH_UNIT`).
+    let uri = audit_effect_uri(effect);
     let line = format_audit_line(
         &now_rfc3339(),
         plugin_id,
         effect_kind(effect),
         decision,
         audit_effect_id(effect),
+        uri.as_deref(),
         unit,
     );
     #[cfg(test)]
@@ -1723,6 +1833,24 @@ fn audit_effect_id(effect: &Effect) -> Option<u64> {
         // The two effects whose outcome comes back as a `HostMsg::EffectResult`
         // keyed by this token (#953 M1, #1045).
         Effect::RunCommand { id, .. } | Effect::OpenUri { id, .. } => Some(*id),
+        _ => None,
+    }
+}
+
+/// The destination an [`Effect::OpenUri`] asked to open, truncated the same
+/// way the tracing lines are and run through [`sanitize_field`] so it can't
+/// inject whitespace and forge a fresh audit record (#1060 review N2). `None`
+/// for every other effect kind, which has no comparable plugin-supplied
+/// destination worth carrying.
+///
+/// Called from [`record_audit`], whose call site in [`broker_effect`] runs
+/// before [`check_uri`] gets a say — so this is populated whether the launch
+/// goes on to succeed, fail, or get refused; the audit log's only other
+/// per-effect signal (`decision=`) can't tell those apart, and the refusal
+/// itself was already answerable from the journal alone before this existed.
+fn audit_effect_uri(effect: &Effect) -> Option<String> {
+    match effect {
+        Effect::OpenUri { uri, .. } => Some(sanitize_field(&truncate_on_char_boundary(uri, 256))),
         _ => None,
     }
 }
@@ -1833,10 +1961,10 @@ mod tests {
     use super::DatasourceRouter;
     use super::{
         AuditDecision, AuditLog, EffectOutcome, FORWARDED_ENV, LaunchReport, MAX_URI_BYTES,
-        MAX_VOLUME, MIN_VOLUME, RUN_COMMAND_MAX_OUTPUT, UriRefusal, audit_effect_id, broker_effect,
-        broker_open_uri_with, check_uri, clamp_volume, command_outcome, effect_kind,
-        filter_forwarded_env, format_audit_line, launch_outcome, open_uri_with,
-        start_detached_with, truncate_on_char_boundary,
+        MAX_VOLUME, MIN_VOLUME, RUN_COMMAND_MAX_OUTPUT, UriRefusal, audit_effect_id,
+        audit_effect_uri, broker_effect, broker_open_uri_with, check_uri, clamp_volume,
+        command_outcome, effect_kind, filter_forwarded_env, format_audit_line, launch_outcome,
+        launch_with_timeout, open_uri_with, start_detached_with, truncate_on_char_boundary,
     };
     use hytte_plugin_proto::{AudioAction, Effect, HostMsg, MediaAction, NiriAction, Page};
     use std::cell::{Cell, RefCell};
@@ -2027,6 +2155,7 @@ mod tests {
                 AuditDecision::Allowed,
                 None,
                 None,
+                None,
             ),
             "2026-07-24T00:00:00Z plugin=timer effect=RunCommand decision=allowed",
         );
@@ -2036,6 +2165,7 @@ mod tests {
             "bad\nid here",
             "Notify",
             AuditDecision::DroppedRateCap,
+            None,
             None,
             None,
         );
@@ -2128,6 +2258,7 @@ mod tests {
             AuditDecision::Allowed,
             audit_effect_id(&Effect::open_uri(9, "https://example.invalid/")),
             None,
+            None,
         );
         assert_eq!(
             line,
@@ -2140,6 +2271,55 @@ mod tests {
             }),
             None,
             "a fire-and-forget effect still has nothing to correlate",
+        );
+    }
+
+    /// #1060 (review N2): the audit record for `OpenUri` carries the
+    /// destination, not just the correlation id — before this, `decision=
+    /// allowed` was the entire trace an `OpenUri` left in the audit log, for a
+    /// refused URI exactly as much as an opened one. Sanitized the same way
+    /// the plugin id and unit fields are (`sanitize_field`), because an
+    /// audit-line value can't otherwise contain a space or newline without
+    /// forging a fresh `key=value` field into the record.
+    ///
+    /// **Falsified** by dropping the `uri` field from `format_audit_line`, or
+    /// by dropping `Effect::OpenUri`'s arm from `audit_effect_uri` (its
+    /// `_ => None` catch-all makes that compile).
+    #[test]
+    fn an_open_uri_audit_line_carries_its_destination() {
+        assert_eq!(
+            audit_effect_uri(&Effect::open_uri(9, "https://example.invalid/x?y=1")),
+            Some("https://example.invalid/x?y=1".to_owned()),
+        );
+        assert_eq!(
+            audit_effect_uri(&Effect::RunCommand {
+                id: 1,
+                argv: vec!["true".to_owned()],
+                detached: false,
+            }),
+            None,
+            "no other effect kind has a comparable destination to record",
+        );
+        // A uri with an embedded space can't be allowed to inject a second
+        // `key=value` field into the audit line.
+        assert_eq!(
+            audit_effect_uri(&Effect::open_uri(1, "https://x/a b")),
+            Some("https://x/a_b".to_owned()),
+        );
+
+        let line = format_audit_line(
+            "2026-09-10T00:00:00Z",
+            "agents",
+            "OpenUri",
+            AuditDecision::Allowed,
+            Some(9),
+            audit_effect_uri(&Effect::open_uri(9, "https://example.invalid/x?y=1")).as_deref(),
+            None,
+        );
+        assert_eq!(
+            line,
+            "2026-09-10T00:00:00Z plugin=agents effect=OpenUri decision=allowed \
+             id=9 uri=https://example.invalid/x?y=1",
         );
     }
 
@@ -2862,8 +3042,130 @@ mod tests {
              correlation id: {audit_line}",
         );
         assert!(
+            audit_line.contains("uri=ssh://box.example/"),
+            "the audit line names the destination even for a refused scheme — \
+             this line is written before `check_uri` gets a say (#1060 review \
+             N2): {audit_line}",
+        );
+        assert!(
             !audit_line.contains("unit="),
             "no unit is involved in opening a link: {audit_line}",
+        );
+    }
+
+    /// #1060 (review N2): the "accepted, about to launch" info line names the
+    /// destination, not just the scheme — before this it was the one line in
+    /// the file that logged a plugin-supplied string without it, and it was
+    /// backwards from what forensics wants: a *refused* URI was already
+    /// recoverable from the journal, an opened one was not.
+    ///
+    /// **Falsified** by dropping the `uri` field from the `tracing::info!` call
+    /// in `open_uri_with`'s accepted arm.
+    #[test]
+    fn an_open_uri_info_line_carries_the_destination() {
+        reset_captures();
+        let log = CapturedLog::capture(|| {
+            open_uri_with(
+                "agents",
+                13,
+                "https://pr1ma.darkest.space/agents/argus",
+                |_uri, done| done(Ok(())),
+                |_outcome| {},
+            );
+        });
+        assert!(
+            !log.is_empty(),
+            "sanity: the subscriber must have captured something, or the \
+             assertion below would pass vacuously on an empty capture: {log:?}",
+        );
+        assert!(
+            log.contains("uri=https://pr1ma.darkest.space/agents/argus"),
+            "the info line names the destination the plugin asked to open: {log}",
+        );
+    }
+
+    // ── Launch timeout (#1060, review N1) ─────────────────────────────────────
+    //
+    // [`launch_with_timeout`]'s *ordering* logic (whichever of the timer or
+    // `start`'s own callback fires first wins, and the loser is a no-op) is
+    // what these two tests pin — not real 10 s wall-clock timing, and
+    // deliberately not a real `glib::MainContext`. `glib::timeout_add_local*`
+    // acquires the **process-wide default** main context (not a per-thread
+    // one), which the default `cargo test` harness runs many tests on
+    // concurrently across OS threads — a second test blocked in
+    // `MainContext::default().iteration(true)` at the same moment panics any
+    // other thread that so much as tries to arm a timer on it ("default main
+    // context already acquired by another thread"). So each test hands
+    // `launch_with_timeout` an `arm_timer` that fires its trigger
+    // **synchronously, immediately** — real enough to exercise the guard's
+    // ordering logic (by controlling exactly when the trigger and `start`'s own
+    // callback each run relative to one another), with no main loop, no
+    // waiting, and no shared global to race on.
+
+    /// #1060 review N1: a launch whose `start` never calls back at all — the
+    /// stuck-portal / hung-`GTask` shape the finding names — still gets a
+    /// verdict.
+    ///
+    /// **Falsified** by removing the `arm_timer(...)` call in
+    /// [`launch_with_timeout`]: `start` never calls back, nothing else ever
+    /// does either, and `rx.try_recv()` below finds nothing rather than the
+    /// timeout outcome — non-blocking, so the mutation reds this test
+    /// immediately instead of hanging it.
+    #[test]
+    fn an_outstanding_launch_that_never_calls_back_still_reports() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        launch_with_timeout(
+            |fire| fire(),
+            |_cancellable, _done| {
+                // The stuck-portal / hung-`GTask` shape: `done` is simply
+                // never called.
+            },
+            Box::new(move |result| {
+                tx.send(result).expect("the receiver is still alive");
+            }),
+        );
+        let result = rx
+            .try_recv()
+            .expect("a verdict must arrive, not never — the timer is the only thing that can");
+        let output = result.expect_err("an unanswered launch times out, it does not succeed");
+        assert!(
+            output.contains("timed out"),
+            "the outcome names why: {output}",
+        );
+    }
+
+    /// #1060 review N1: a `start` that calls back **after** the timer already
+    /// fired must not produce a second report — the timer and the late
+    /// callback race, and only the winner gets to call `done`. `arm_timer`
+    /// fires before `start` runs at all here, so `start`'s own `done(Ok(()))`
+    /// below is unambiguously the "late" side of the race.
+    ///
+    /// **Falsified** by removing the once-guard in [`launch_with_timeout`] (the
+    /// `Option::take` on the shared cell): both the timer and the late
+    /// callback then call `done`, and the second `try_recv` below — which
+    /// expects to find nothing — finds the late `Ok(())` instead.
+    #[test]
+    fn a_late_callback_after_the_timer_does_not_report_twice() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        launch_with_timeout(
+            |fire| fire(),
+            |_cancellable, done| {
+                // "Late": this only runs after `arm_timer` above has already
+                // fired and reported.
+                done(Ok(()));
+            },
+            Box::new(move |result| {
+                tx.send(result).expect("the receiver is still alive");
+            }),
+        );
+        let first = rx.try_recv().expect("the timer's own report arrives");
+        assert!(
+            first.is_err(),
+            "the timer reports the timeout; it must win the race, not the late Ok(())",
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the late callback must not deliver a second report",
         );
     }
 }

@@ -551,22 +551,19 @@ impl BrokerState {
     /// pushes a fresh snapshot afterwards.
     fn apply_cmd(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Revoke { agent, datasource } => match self.grants.revoke(&agent, &datasource) {
-                Ok(true) => {
+            Cmd::Revoke { agent, datasource } => {
+                // `revoke` (#1065) queues its persist off-thread and returns
+                // immediately; only whether a row was actually removed is
+                // synchronous, which is all a token kill needs.
+                if self.grants.revoke(&agent, &datasource) {
                     // Revoking a grant invalidates any live tokens riding on it.
                     let killed = self.tokens.revoke_agent(&agent);
                     tracing_eprintln(&format!(
                         "revoked {agent}/{datasource}; killed {killed} token(s)"
                     ));
                 }
-                Ok(false) => {}
-                Err(e) => tracing_eprintln(&format!("revoke {agent}/{datasource} failed: {e}")),
-            },
-            Cmd::Allow { agent, datasource } => {
-                if let Err(e) = self.grants.grant_always(&agent, &datasource) {
-                    tracing_eprintln(&format!("allow {agent}/{datasource} failed: {e}"));
-                }
             }
+            Cmd::Allow { agent, datasource } => self.grants.grant_always(&agent, &datasource),
             // The host-pushed calendar digest replaces the live copy `get calendar`
             // serves (#484).
             Cmd::Calendar(entries) => self.calendar = entries,
@@ -593,7 +590,7 @@ impl BrokerState {
         };
         match dispatch {
             Dispatch::Answer(response, toast) => {
-                write_response(&mut stream, &response).await;
+                write_response(&mut stream, response).await;
                 ConnResult::Answered { toast }
             }
             Dispatch::Consent {
@@ -695,9 +692,9 @@ impl BrokerState {
     ) -> (Response, Option<Toast>) {
         match decision {
             ConsentDecision::Deny => {
-                if let Err(e) = self.grants.grant_deny(agent, datasource) {
-                    tracing_eprintln(&format!("persisting deny for {agent}/{datasource}: {e}"));
-                }
+                // #1065: persists off-thread; failures self-log from inside
+                // the detached write, not here.
+                self.grants.grant_deny(agent, datasource);
                 self.record(agent, "auth", Outcome::Denied, now);
                 (
                     Response::denied(
@@ -708,9 +705,7 @@ impl BrokerState {
                 )
             }
             ConsentDecision::AllowAlways => {
-                if let Err(e) = self.grants.grant_always(agent, datasource) {
-                    tracing_eprintln(&format!("persisting always for {agent}/{datasource}: {e}"));
-                }
+                self.grants.grant_always(agent, datasource);
                 let token = self.tokens.mint_scoped(agent, now, TokenScope::Grant);
                 self.record(agent, "auth", Outcome::Granted, now);
                 (auth_ok_response(agent, &token), None)
@@ -895,12 +890,112 @@ fn tracing_eprintln(msg: &str) {
 /// expect to actually hit in production.
 const WRITE_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Row count (summed across `grants`/`departures`/`calendar`, the
+/// `Response` fields that scale with data rather than being O(1)) above
+/// which [`write_response`] serializes on [`tokio::task::spawn_blocking`]
+/// instead of inline on the select loop's own thread (#1065).
+///
+/// Calibrated against `encode_response`'s own wall time crossing ~1 ms — the
+/// bound #1059 already treats as "worth moving off this runtime thread" for
+/// `GrantStore::load`. Measured directly (`--release`, the profile that
+/// actually ships; `cargo test`'s debug profile is slower per row and would
+/// only argue for offloading *earlier*) with a `grants` response shaped like
+/// [`crate::wire::GrantOut`], `best_of_7` per size, on the 64-core box this
+/// was measured on:
+///
+/// | rows | encode time |
+/// | ---: | ---: |
+/// | 8 000 | 542.5 µs |
+/// | 10 000 | 679.5 µs |
+/// | 20 000 | 1.325 ms |
+///
+/// ~65 ns/row (each grant row is exactly 82 bytes of JSON — #1059/#1024's own
+/// figure), crossing 1 ms at ≈15 000 rows (≈1.2 MiB encoded). `12_000` sits a
+/// margin below that measured crossing, so a CI runner slower per-core than
+/// this box (`ubuntu-latest`'s 4 vCPU, the same machine #1059's
+/// `STARVED_TIMER_SLACK` rationale names) still offloads before it would hit
+/// 1 ms itself — while staying well above anything `hytte-plugin-infobroker`
+/// serves in realistic use: `departures`/`weather`/`calendar` are all
+/// bounded by a human-scale dataset, so only a pathologically large
+/// `grants.toml` reaches this row count at all. (The existing
+/// `write_response_gives_up_on_a_client_that_never_reads` fixture is 10 000
+/// grant rows, deliberately below this threshold — its own doc explains why
+/// that size was chosen, and this constant doesn't change its behaviour.)
+const LARGE_RESPONSE_ROWS: usize = 12_000;
+
+// Compile-time cross-check for
+// `write_response_gives_up_on_a_client_that_never_reads`'s 10 000-row
+// fixture (`tests` module below): it relies on `encode_response` running
+// *inline* (its own doc explains why), which only holds while its row count
+// stays under `LARGE_RESPONSE_ROWS`. A future change that lowers the
+// threshold past 10 000 fails the build here instead of silently
+// invalidating that test's timing assumptions. The anonymous `const _` form
+// is the idiom for this: unlike a named const it needs no reference to avoid
+// `dead_code`, and it's still evaluated (and so still enforced) at compile
+// time regardless.
+const _: () = assert!(10_000 < LARGE_RESPONSE_ROWS);
+
+/// Cheap proxy for "how much JSON `encode_response` is about to render",
+/// computed without doing the encode: the summed length of `Response`'s
+/// variable-size fields. `ok`/`error`/`hint`/`token`/etc. are all O(1)
+/// scalars, so they don't move this number regardless of how many are set.
+fn response_row_count(resp: &Response) -> usize {
+    resp.grants.as_ref().map_or(0, Vec::len)
+        + resp.departures.as_ref().map_or(0, Vec::len)
+        + resp.calendar.as_ref().map_or(0, Vec::len)
+}
+
 /// Write one response line (JSON + `\n`) to a client stream, best-effort —
 /// bounded by [`WRITE_RESPONSE_TIMEOUT`] so a client that connects and never
 /// reads cannot park `serve`'s caller (and the process-wide [`SOCKET`] mutex
 /// it holds) indefinitely.
-async fn write_response(stream: &mut UnixStream, response: &Response) {
-    let mut out = encode_response(response);
+///
+/// Takes `response` by value (rather than `&Response`) so a large payload can
+/// move into the [`spawn_blocking`](tokio::task::spawn_blocking) branch below
+/// without a clone — every call site already owns a freshly built `Response`
+/// it doesn't reuse afterwards.
+///
+/// # `encode_response` off-thread for large responses (#1065)
+///
+/// A `grants`/`departures`/`calendar` response can carry thousands of rows —
+/// [`response_row_count`] at or above [`LARGE_RESPONSE_ROWS`] means
+/// `serde_json::to_string` costs real time (≥~1 ms at this crate's measured
+/// rate — see that constant's doc), which, run inline like the write itself
+/// used to be, would stall every other timer on this session's
+/// current-thread runtime for the duration, the same starvation class #1059
+/// fixed for `GrantStore::load`. Below the threshold `encode_response` runs
+/// inline: the overwhelming majority of responses (`auth`, a single `get`)
+/// are a handful of scalar fields, and `spawn_blocking`'s own scheduling hop
+/// isn't free either.
+async fn write_response(stream: &mut UnixStream, response: Response) {
+    write_response_with_encoder(stream, response, encode_response).await;
+}
+
+/// [`write_response`], with the (potentially offloaded) encode step supplied
+/// by the caller — the test seam for the property this function exists to
+/// buy: "a slow `encode_response` does not stall a concurrent timer on this
+/// runtime". Production is just `write_response`, i.e.
+/// `write_response_with_encoder(stream, response, encode_response)`;
+/// `tests::write_response_offloads_a_slow_encode_of_a_large_response_without_delaying_a_concurrent_timer`
+/// injects one that blocks for two seconds instead — same shape as
+/// `serve_with_grant_loader`'s injected loader (#1059) and
+/// `grants::GrantStore::save_with`'s injected writer (#1065), one seam per
+/// offloaded step.
+async fn write_response_with_encoder<E>(stream: &mut UnixStream, response: Response, encode: E)
+where
+    E: FnOnce(&Response) -> String + Send + 'static,
+{
+    let mut out = if response_row_count(&response) >= LARGE_RESPONSE_ROWS {
+        match tokio::task::spawn_blocking(move || encode(&response)).await {
+            Ok(out) => out,
+            Err(e) => {
+                tracing_eprintln(&format!("encode_response panicked: {e}"));
+                r#"{"ok":false,"error":"broker: response encode failed"}"#.to_owned()
+            }
+        }
+    } else {
+        encode(&response)
+    };
     out.push('\n');
     let write = async {
         stream.write_all(out.as_bytes()).await?;
@@ -1259,11 +1354,14 @@ fn load_grants() -> GrantStore {
 ///
 /// The remaining synchronous work in this module is deliberately left inline
 /// and is a different class: `bind_socket`'s `remove_file`/`bind`/
-/// `set_permissions` are three syscalls on a tmpfs, not an unbounded parse,
-/// and `GrantStore::save` (reached from `apply_cmd`/`apply_consent`) borrows
-/// `state` mutably so it cannot cross a `spawn_blocking` boundary without
-/// restructuring `grants.rs` — out of #1059's lane, and a per-click cost
-/// rather than the per-session-start one measured here.
+/// `set_permissions` are three syscalls on a tmpfs, not an unbounded parse.
+/// `GrantStore::save` (reached from `apply_cmd`/`apply_consent`) *was* left
+/// inline for the same reason as this module's own `encode_response` — a
+/// per-click/per-request cost, not per-session-start, and out of #1059's
+/// lane — but #1065 closed both: `save` now serializes under `state`'s
+/// mutable borrow and hands the bytes to a detached `spawn_blocking` write
+/// (see [`crate::grants::GrantStore::save`]), and `write_response` offloads
+/// `encode_response` past [`LARGE_RESPONSE_ROWS`] the same way.
 // One cohesive `select!` loop (accept / command / timeout) over the parked-request
 // state (consent + query maps); splitting its arms into helpers would scatter that
 // shared state for no readability gain — same stance as the host's `handle_conn`.
@@ -1379,7 +1477,7 @@ pub async fn serve_with_grant_loader<L>(
                         if let Some(mut p) = pending.remove(&request_id) {
                             let (resp, toast) =
                                 state.apply_consent(&p.agent, &p.datasource, decision, now_unix());
-                            write_response(&mut p.stream, &resp).await;
+                            write_response(&mut p.stream, resp).await;
                             send_update(&out, state.snapshot(now_unix()), toast);
                         }
                         // else: a late/unknown decision (already timed out) — ignore.
@@ -1389,7 +1487,7 @@ pub async fn serve_with_grant_loader<L>(
                     Cmd::QueryResult { request_id, outcome } => {
                         if let Some(mut q) = pending_queries.remove(&request_id) {
                             let resp = query_response(&q.datasource, outcome);
-                            write_response(&mut q.stream, &resp).await;
+                            write_response(&mut q.stream, resp).await;
                         }
                         // else: a late/unknown result (already timed out) — ignore.
                     }
@@ -1450,7 +1548,7 @@ pub async fn serve_with_grant_loader<L>(
                     if let Some(mut p) = pending.remove(&id) {
                         let (resp, toast) =
                             state.on_consent_timeout(&p.agent, &p.datasource, now_unix());
-                        write_response(&mut p.stream, &resp).await;
+                        write_response(&mut p.stream, resp).await;
                         send_update(&out, state.snapshot(now_unix()), toast);
                     }
                 }
@@ -1467,7 +1565,7 @@ pub async fn serve_with_grant_loader<L>(
                             "{}: datasource query timed out (no host response)",
                             q.datasource
                         ));
-                        write_response(&mut q.stream, &resp).await;
+                        write_response(&mut q.stream, resp).await;
                     }
                 }
             }
@@ -1479,6 +1577,7 @@ pub async fn serve_with_grant_loader<L>(
 mod tests {
     use super::*;
     use crate::grants::Grant;
+    use tokio::io::AsyncReadExt as _;
 
     fn store(grants: Vec<Grant>) -> GrantStore {
         GrantStore::from_grants(grants)
@@ -1676,10 +1775,14 @@ mod tests {
             ..Response::default()
         };
 
+        // #1065: this fixture's 10_000 rows stays below `LARGE_RESPONSE_ROWS`
+        // on purpose (see the `const _: () = assert!(...)` guard above
+        // `LARGE_RESPONSE_ROWS`'s definition), so `encode_response` still runs
+        // inline here and the timing math below is unaffected by that change.
         let started = std::time::Instant::now();
         tokio::time::timeout(
             WRITE_RESPONSE_TIMEOUT + std::time::Duration::from_secs(5),
-            write_response(&mut server, &huge),
+            write_response(&mut server, huge),
         )
         .await
         .expect(
@@ -1705,6 +1808,71 @@ mod tests {
              fires without a mutation",
             started.elapsed(),
         );
+    }
+
+    /// The #1065 property, the #1059 way: an injected **slow**
+    /// `encode_response` step must not delay a concurrent 100 ms timer on the
+    /// same current-thread runtime — same methodology as
+    /// `grants::tests::save_offloads_a_slow_writer_without_delaying_a_concurrent_timer`,
+    /// one offloaded step over (`write_response_with_encoder`'s injected
+    /// `encode` versus `GrantStore::save_with`'s injected `writer`).
+    ///
+    /// The peer drains its side so the *write* half (already covered by
+    /// `write_response_gives_up_on_a_client_that_never_reads` above) isn't
+    /// what this test is measuring — only the encode step is meant to be slow
+    /// here.
+    #[tokio::test]
+    async fn write_response_offloads_a_slow_encode_of_a_large_response_without_delaying_a_concurrent_timer()
+     {
+        let (mut server, mut client) =
+            UnixStream::pair().expect("a connected socketpair needs no listener at all");
+        let drain = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = client.read_to_end(&mut buf).await;
+        });
+
+        // At `LARGE_RESPONSE_ROWS`, so `write_response_with_encoder` takes the
+        // `spawn_blocking` branch — the property under test only holds there.
+        let huge = Response {
+            ok: true,
+            grants: Some(
+                (0..LARGE_RESPONSE_ROWS)
+                    .map(|i| GrantOut {
+                        agent: format!("agent-{i:06}"),
+                        datasource: "departures".to_owned(),
+                        scope: "*".to_owned(),
+                        decision: "always".to_owned(),
+                    })
+                    .collect(),
+            ),
+            ..Response::default()
+        };
+
+        let start = std::time::Instant::now();
+        let timer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            start.elapsed()
+        });
+
+        // The injected "encode": two seconds of `std::thread::sleep` standing
+        // in for a pathologically slow serialization. Real `encode_response`
+        // never sleeps.
+        write_response_with_encoder(&mut server, huge, |resp| {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            encode_response(resp)
+        })
+        .await;
+
+        drop(server); // lets the drain task observe EOF
+        let elapsed = timer
+            .await
+            .expect("the concurrent 100ms timer task must not panic");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "the 100ms timer fired at {elapsed:?} — the injected 2s encode stalled this \
+             runtime's other tasks, so large responses are not actually encoded off-thread",
+        );
+        drain.await.expect("drain task must not panic");
     }
 
     #[test]

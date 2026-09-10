@@ -8398,6 +8398,15 @@ async fn attached_run_command_still_awaits_the_program_and_routes_its_exit_statu
 /// This is the test the falsification deletes into: making the detached path
 /// await the program — `--wait` on the systemd path, `kill_on_drop` on the
 /// fallback — turns the assertions red.
+///
+/// **In `checks.system-tests` (#1082):** the sandbox has `systemd-run` on
+/// `$PATH` (`pkgs.systemd`, added there for this issue) but no `systemd --user`
+/// manager and no session bus — so `systemd-run` runs, fails to connect
+/// ("Failed to connect to user scope bus …"), `classify_systemd_run_failure`
+/// reads that as [`FallbackReason::NoUserManager`], and the launch takes the
+/// direct-spawn fallback. `assert_launched_then_clean_up` accepts either
+/// [`LaunchReport`] shape, so this test needs no gate of its own — it exercises
+/// the *fallback* path unconditionally there, never the unit path.
 #[cfg(feature = "system-tests")]
 #[tokio::test]
 async fn detached_launch_returns_at_once_and_the_program_outlives_the_call() {
@@ -8426,6 +8435,11 @@ async fn detached_launch_returns_at_once_and_the_program_outlives_the_call() {
 /// must both start, because the host, not the plugin, owns the unit name's
 /// uniqueness. Before the fix the second got systemd's `Unit … was already
 /// loaded or has a fragment file` while the first was still running.
+///
+/// **In `checks.system-tests` (#1082):** as with its sibling above, the
+/// sandbox has no user manager, so both launches take the direct-spawn
+/// fallback — still two distinct pids, so the uniqueness assertions hold with
+/// no manager in the loop at all.
 #[cfg(feature = "system-tests")]
 #[tokio::test]
 async fn two_launches_with_one_effect_id_both_start() {
@@ -8452,6 +8466,51 @@ async fn two_launches_with_one_effect_id_both_start() {
     assert_launched_then_clean_up(&second).await;
 }
 
+/// Whether `systemd-run` resolves on `$PATH`, honouring
+/// `TROLLSHELL_REQUIRE_SYSTEMD_RUN` the way `hytte-ui`'s `gl_surface.rs`
+/// honours `TROLLSHELL_REQUIRE_GL` via its `real_gl_or_skip` (#1077's
+/// precedent, itself modelled on `TROLLSHELL_REQUIRE_ICON_THEME`): a skip is
+/// indistinguishable from a pass in captured output, so the build that means
+/// this to gate (CI's `system-tests` check, since #1082 puts `pkgs.systemd` in
+/// its `nativeCheckInputs`) sets `TROLLSHELL_REQUIRE_SYSTEMD_RUN=1`, and a
+/// missing `systemd-run` there is a real regression — the sandbox lost a
+/// dependency it is supposed to have — so it **fails** naming the reason,
+/// rather than skipping quietly. Without the variable (a bare
+/// `cargo test --features system-tests` on a box that genuinely has no
+/// systemd) it still skips, because failing a run that could never have
+/// answered the question helps nobody.
+///
+/// Only `detached_launch_falls_back_without_a_user_manager` calls this: the
+/// other gated launch tests (`detached_launch_returns_at_once_…`,
+/// `two_launches_with_one_effect_id_both_start`) accept *either*
+/// [`LaunchReport`] shape via `assert_launched_then_clean_up`, so a missing
+/// `systemd-run` doesn't stop them from exercising the direct-spawn fallback —
+/// they need no gate of their own.
+#[cfg(feature = "system-tests")]
+async fn systemd_run_on_path_or_skip(test_name: &str) -> bool {
+    let found = tokio::process::Command::new("systemd-run")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .is_ok();
+    if found {
+        return true;
+    }
+    let required =
+        std::env::var_os("TROLLSHELL_REQUIRE_SYSTEMD_RUN").is_some_and(|want| want == "1");
+    assert!(
+        !required,
+        "TROLLSHELL_REQUIRE_SYSTEMD_RUN=1, but systemd-run is not on PATH for {test_name}",
+    );
+    eprintln!(
+        "SKIPPED {test_name}: no systemd-run on PATH, so the NoUserManager shape cannot arise"
+    );
+    false
+}
+
 /// #953 H1, the behavioural half: with no user manager reachable, a detached
 /// launch must take the **direct-spawn fallback** — the path the docs promise
 /// and the code could not reach before this fix.
@@ -8460,21 +8519,18 @@ async fn two_launches_with_one_effect_id_both_start() {
 /// unsound under a parallel test harness), so the scrubbed environment is
 /// applied by re-executing *this test binary* on the inner test below. That is
 /// also exactly the shape the reviewer used to falsify the first cut.
+///
+/// **In `checks.system-tests` (#1082):** this is literally the sandbox's own
+/// case — `systemd-run` is on `$PATH` (`pkgs.systemd`), but there is no
+/// `systemd --user` manager and no session bus, which is exactly the
+/// `NoUserManager` shape this test drives on purpose (via the scrubbed
+/// re-exec below) rather than getting for free. It runs and passes there.
 #[cfg(feature = "system-tests")]
 #[tokio::test]
 async fn detached_launch_falls_back_without_a_user_manager() {
     // Only meaningful where `systemd-run` exists but the bus does not; with no
     // `systemd-run` at all the fallback is already the trivial path.
-    if tokio::process::Command::new("systemd-run")
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .is_err()
-    {
-        eprintln!("skipping: no systemd-run on PATH, so the NoUserManager shape cannot arise");
+    if !systemd_run_on_path_or_skip("detached_launch_falls_back_without_a_user_manager").await {
         return;
     }
     let exe = std::env::current_exe().expect("the test binary's own path");

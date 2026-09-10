@@ -924,6 +924,46 @@ mod tests {
         }
     }
 
+    /// Constant chip tree **and** constant panel, but the `View`'s `hidden_on`
+    /// flips on a slot-visibility toggle (#1050). The per-screen verdict is the
+    /// one thing a plugin routinely changes *without* changing what it draws —
+    /// #1019's chip renders the identical three icons whether or not the active
+    /// workspace on some output has two windows — so if dedup did not cover it,
+    /// the frame that hides the chip would be the frame that gets swallowed.
+    struct HiddenOn {
+        hide: bool,
+    }
+
+    impl Plugin for HiddenOn {
+        type Msg = std::convert::Infallible;
+        type Cmd = std::convert::Infallible;
+
+        fn manifest() -> Manifest {
+            Manifest::new("hidden-on-test", Mount::BarCenter)
+        }
+
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+            Self { hide: false }
+        }
+
+        fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
+            if let Input::SlotVisible(v) = input {
+                self.hide = v;
+            }
+            Vec::new()
+        }
+
+        fn view(&self) -> View {
+            let v = View::new(Node::Label {
+                id: Some("hidden-on-chip".to_owned()),
+                text: "chip".to_owned(),
+                classes: Vec::new(),
+                tooltip: None,
+            });
+            if self.hide { v.hidden_on(["DP-2"]) } else { v }
+        }
+    }
+
     /// A minimal I/O "task" for [`Commander`]: it *is* the sources stream —
     /// each command drained from the [`CmdReceiver`] is turned into an app
     /// message. Stands in for a real plugin's socket/HTTP task, which likewise
@@ -1419,6 +1459,69 @@ mod tests {
         };
 
         let (result, ()) = tokio::join!(session::<Paneled, _, _>(prd, pwr), host);
+        assert!(result.is_ok(), "Shutdown ends the session cleanly");
+    }
+
+    #[tokio::test]
+    async fn hidden_on_change_alone_forces_a_render() {
+        // #1050: the per-screen verdict is part of the `View`, so a change to it
+        // alone must still emit a `Render` — and an identical view must still be
+        // deduped. Exactly the #349 argument for `panel`, and worth its own test
+        // because this is the field a real plugin changes *most* often without
+        // changing its tree.
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            let PluginMsg::Register { .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("first frame must be Register");
+            };
+            let PluginMsg::Log { .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("second frame must be the greeting Log");
+            };
+            let PluginMsg::Render { hidden_on, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("third frame must be the seed Render");
+            };
+            assert!(
+                hidden_on.is_empty(),
+                "the seed view is hidden nowhere, and an empty set stays off the wire",
+            );
+
+            // Flip the verdict while the chip tree stays byte-identical.
+            send(&mut hwr, &HostMsg::SlotVisibility { visible: true }).await;
+            let PluginMsg::Render {
+                tree, hidden_on, ..
+            } = next_plugin_frame(&mut hrd).await
+            else {
+                panic!("a hidden_on change alone must re-render");
+            };
+            assert!(
+                matches!(tree, Node::Label { ref text, .. } if text == "chip"),
+                "the chip tree is unchanged across the flip — the change is the verdict",
+            );
+            assert_eq!(
+                hidden_on,
+                vec!["DP-2".to_owned()],
+                "the render carries the new per-screen verdict",
+            );
+
+            // The same visibility again → identical view → deduped. The Ping is
+            // the sync barrier: the next frame must be its Pong.
+            send(&mut hwr, &HostMsg::SlotVisibility { visible: true }).await;
+            send(&mut hwr, &HostMsg::Ping { seq: 5 }).await;
+            assert!(
+                matches!(
+                    next_plugin_frame(&mut hrd).await,
+                    PluginMsg::Pong { seq: 5 }
+                ),
+                "an identical view (hidden_on included) must be deduped",
+            );
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<HiddenOn, _, _>(prd, pwr), host);
         assert!(result.is_ok(), "Shutdown ends the session cleanly");
     }
 

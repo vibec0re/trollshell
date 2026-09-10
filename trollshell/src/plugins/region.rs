@@ -1239,7 +1239,7 @@ mod gtk_tests {
     use super::{
         Animator, MountedCard, Scope, SlotRender, build_panel_child, build_region,
         drive_panel_child, forget_previous_panel_scope, preem_render, reconcile_region,
-        render_active_panel,
+        render_active_panel, unknown_connectors,
     };
     // The #921 releaser lives in `pump` (beside the animation driver whose
     // "still animating" predicate a leaked scope corrupts), but the mounts it has
@@ -1385,6 +1385,83 @@ mod gtk_tests {
         }
     }
 
+    /// A `Row` holding one `Button`, so a card has something clickable to fire
+    /// an [`HostMsg::Event`] from (#1050's `output` coverage). `id` is the
+    /// button's, which is what the event addresses.
+    fn button_tree(id: &str) -> wire::Node {
+        wire::Node::Row {
+            id: Some("root".to_owned()),
+            classes: vec![],
+            spacing: 0,
+            children: vec![wire::Node::Button {
+                id: id.to_owned(),
+                classes: vec![],
+                child: Box::new(wire::Node::Label {
+                    id: None,
+                    text: "go".to_owned(),
+                    classes: vec![],
+                    tooltip: None,
+                }),
+            }],
+            tooltip: None,
+        }
+    }
+
+    /// A render with real content and an explicit `hidden_on` set (#1050) — the
+    /// shape #1019's chip emits once it folds per output.
+    ///
+    /// The tree is deliberately **non-empty**: with an empty one the #1042 rule
+    /// would hide the card on its own and every per-screen assertion would pass
+    /// for the wrong reason.
+    fn hidden_on_render(
+        plugin_id: &str,
+        tx: &mpsc::Sender<HostMsg>,
+        hidden_on: &[&str],
+    ) -> SlotRender {
+        SlotRender {
+            hidden_on: hidden_on.iter().map(|s| (*s).to_owned()).collect(),
+            ..render_with_tree(plugin_id, tx, row_with_label_tree("root", "label", "chip"))
+        }
+    }
+
+    /// One mounted card's root widget, by plugin id — the widget whose
+    /// `is_visible()` the per-card half of the visibility rule sets.
+    fn card_root(cards: &Rc<RefCell<Vec<MountedCard>>>, plugin_id: &str) -> gtk::Box {
+        cards
+            .borrow()
+            .iter()
+            .find(|c| c.plugin_id == plugin_id)
+            .unwrap_or_else(|| panic!("plugin {plugin_id} must have a mounted card"))
+            .root
+            .clone()
+    }
+
+    /// The region container inside a window built by [`mount_region_on`] — the
+    /// widget the region-collapse rule sets, reached the way production does
+    /// (through the widget tree) since the test drops its own handle.
+    fn region_of(window: &gtk::Window) -> gtk::Widget {
+        window.child().expect("the region is the window's child")
+    }
+
+    /// The first `gtk::Button` in `root`'s subtree — how a test presses a card's
+    /// button without reaching into the reconciler's private retained tree.
+    fn find_button(root: &impl IsA<gtk::Widget>) -> gtk::Button {
+        fn walk(w: &gtk::Widget) -> Option<gtk::Button> {
+            if let Ok(b) = w.clone().downcast::<gtk::Button>() {
+                return Some(b);
+            }
+            let mut child = w.first_child();
+            while let Some(c) = child {
+                if let Some(found) = walk(&c) {
+                    return Some(found);
+                }
+                child = c.next_sibling();
+            }
+            None
+        }
+        walk(root.as_ref()).expect("the tree must contain a button")
+    }
+
     /// A bare `Label` as the tree **root** — a leaf, not a container. Used to
     /// prove the empty-root hide is scoped to containers: a leaf never
     /// qualifies, even with blank text.
@@ -1525,6 +1602,437 @@ mod gtk_tests {
              region mounted at all — got {width_with_empty_region}px vs \
              {width_with_no_region}px; a visible zero-size region still costs the group \
              one `spacing` gap",
+        );
+    }
+
+    // ── Per-screen visibility (#1050) ────────────────────────────────────────
+    //
+    // The topology under test, in every case below: **one** render list, two
+    // regions reconciled from it — `a` standing for monitor A, `b` for monitor
+    // B. That is production's shape (`main.rs` builds a `Bar` per monitor, each
+    // with its own `plugins::bar_*_slot(monitor)` over the same mailbox), and it
+    // is the only shape in which the bug Annika reported can exist at all: on a
+    // single screen every one of these assertions is vacuously true.
+
+    /// A card the frame hides on B is invisible in B's region and **visible in
+    /// A's** — from the identical `SlotRender`.
+    ///
+    /// The second half is the one that matters. Making a card disappear is easy;
+    /// making it disappear on exactly one screen while the other reconciler
+    /// reads the same list is the feature, and a `hidden_on` check that ignored
+    /// the connector (hiding everywhere the moment the list is non-empty) would
+    /// satisfy a B-only test.
+    ///
+    /// Proven by the flag **and** by measured width, per the #851 lesson that
+    /// `is_visible()` alone is not "not on screen": each region carries a busy
+    /// sibling, so what is measured is the hidden card's own contribution — zero
+    /// if hidden, one region `spacing` gap if GTK still lays it out.
+    ///
+    /// **Deletion check (M1):** dropping the `&& !hidden_on_this_output(…)` from
+    /// [`card_shows_here`] turns the B assertions red; inverting the connector
+    /// comparison turns the A assertions red.
+    #[gtk::test]
+    fn a_card_hidden_on_one_output_still_shows_on_the_other() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+
+        let a = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let b = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards_a: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+        let cards_b: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+
+        // Baseline width, per region: the busy sibling alone.
+        let busy = || render_with_tree("busy", &tx, row_with_label_tree("root", "l", "hi"));
+        reconcile_region(&a, &cards_a, &[busy()], "ts-plugin-chip", Some("A"));
+        reconcile_region(&b, &cards_b, &[busy()], "ts-plugin-chip", Some("B"));
+        let width_a_busy_only = a.measure(gtk::Orientation::Horizontal, -1).1;
+        let width_b_busy_only = b.measure(gtk::Orientation::Horizontal, -1).1;
+
+        // One shared list: a chip hidden on B, plus the busy sibling. Both
+        // regions reconcile from the very same slice.
+        let renders = [
+            hidden_on_render("layouts", &tx, &["B"]),
+            render_with_tree("busy", &tx, row_with_label_tree("root", "l", "hi")),
+        ];
+        reconcile_region(&a, &cards_a, &renders, "ts-plugin-chip", Some("A"));
+        reconcile_region(&b, &cards_b, &renders, "ts-plugin-chip", Some("B"));
+
+        assert!(
+            card_root(&cards_a, "layouts").is_visible(),
+            "monitor A is not named in hidden_on, so its copy of the card must still paint",
+        );
+        assert!(
+            !card_root(&cards_b, "layouts").is_visible(),
+            "monitor B is named in hidden_on, so its copy of the card must be hidden",
+        );
+
+        let width_a = a.measure(gtk::Orientation::Horizontal, -1).1;
+        let width_b = b.measure(gtk::Orientation::Horizontal, -1).1;
+        assert!(
+            width_a > width_a_busy_only,
+            "A's region must actually grow by the shown card — got {width_a}px vs \
+             {width_a_busy_only}px with the busy plugin alone",
+        );
+        assert_eq!(
+            width_b, width_b_busy_only,
+            "B's hidden card must cost nothing, not even the region's inter-card spacing — \
+             got {width_b}px vs {width_b_busy_only}px with the busy plugin alone",
+        );
+    }
+
+    /// The region-collapse half: when the hidden card is the region's **only**
+    /// card, B's region container hides (so it contributes no `spacing` to B's
+    /// bar group, #1042 HIGH-1) while A's stays visible.
+    ///
+    /// This is a genuinely separate mechanism from the card flag above — the
+    /// container's `set_visible` is a different line, evaluated before the card
+    /// loop — and it is the one that decides whether the promise in
+    /// `docs/live-verify.md` ("no pill, no gap") survives per screen.
+    ///
+    /// **Deletion check (M2):** reverting the container predicate to
+    /// `!root_renders_nothing(&r.tree)` (i.e. dropping #1050's contribution to
+    /// the collapse rule, keeping the card flag) turns the B-collapse assertion
+    /// and the bar-group width red while every other test here stays green.
+    #[gtk::test]
+    fn a_lone_hidden_card_collapses_only_the_region_on_that_output() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+
+        // Each monitor's bar group: hytte-ui's `gtk::Box::new(Horizontal, 6)`.
+        let group_b = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        group_b.append(&gtk::Label::new(Some("nb")));
+        let width_b_no_region = group_b.measure(gtk::Orientation::Horizontal, -1).1;
+
+        let a = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let b = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        b.set_visible(false);
+        group_b.append(&b);
+        let cards_a: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+        let cards_b: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let renders = [hidden_on_render("layouts", &tx, &["B"])];
+        reconcile_region(&a, &cards_a, &renders, "ts-plugin-chip", Some("A"));
+        reconcile_region(&b, &cards_b, &renders, "ts-plugin-chip", Some("B"));
+
+        assert!(
+            a.is_visible(),
+            "A's region holds a card that still paints, so it must stay visible",
+        );
+        assert!(
+            !b.is_visible(),
+            "B's only card is hidden here, so B's region must collapse — a visible \
+             zero-size region still costs its bar group one `spacing` gap",
+        );
+        let width_b = group_b.measure(gtk::Orientation::Horizontal, -1).1;
+        assert_eq!(
+            width_b, width_b_no_region,
+            "B's bar group must measure exactly as if no region were mounted — got \
+             {width_b}px vs {width_b_no_region}px",
+        );
+    }
+
+    /// The toggle back: a later frame that drops B from `hidden_on` re-shows the
+    /// card there, rather than leaving it hidden by a stale flag.
+    ///
+    /// The mirror of `a_later_render_with_content_shows_the_card_again` for the
+    /// per-screen half, and it exercises the **reuse** path — same plugin id,
+    /// same tree, so the card widget is updated in place rather than rebuilt,
+    /// which is precisely where a "set it once at mount" implementation would
+    /// pass the tests above and still be wrong on glass.
+    ///
+    /// **Deletion check (M3):** moving the `set_visible(has_content)` out of the
+    /// update arm (leaving it only on the new-card arm) turns the re-show
+    /// assertion red.
+    #[gtk::test]
+    fn clearing_hidden_on_re_shows_the_card_on_that_output() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let b = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+
+        reconcile_region(
+            &b,
+            &cards,
+            &[hidden_on_render("layouts", &tx, &["B"])],
+            "ts-plugin-chip",
+            Some("B"),
+        );
+        assert!(
+            !card_root(&cards, "layouts").is_visible(),
+            "precondition: hidden on B",
+        );
+
+        reconcile_region(
+            &b,
+            &cards,
+            &[hidden_on_render("layouts", &tx, &[])],
+            "ts-plugin-chip",
+            Some("B"),
+        );
+        assert!(
+            card_root(&cards, "layouts").is_visible(),
+            "an empty hidden_on must re-show the card on B",
+        );
+        assert!(b.is_visible(), "…and un-collapse B's region along with it",);
+    }
+
+    /// A connector that matches no monitor hides nothing — the documented wire
+    /// contract, and the reason the host does no validation of these names.
+    ///
+    /// Covers the plugin-author typo (`"DP1"` for `"DP-1"`) and the
+    /// currently-unplugged screen in one: both present as a name nobody
+    /// answers to, and the correct behaviour for both is "show the card".
+    /// The failure mode this guards is a fuzzy comparison — a prefix or
+    /// case-insensitive match would hide the chip on a screen the plugin never
+    /// named.
+    ///
+    /// **Deletion check (M4):** relaxing [`hidden_on_this_output`]'s `==` to a
+    /// `starts_with`/`eq_ignore_ascii_case` turns this red.
+    #[gtk::test]
+    fn a_hidden_on_name_matching_no_monitor_hides_nothing() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+
+        reconcile_region(
+            &container,
+            &cards,
+            // "DP" is a prefix of this region's connector, "dp-1" its
+            // case-fold; neither is its name.
+            &[hidden_on_render(
+                "layouts",
+                &tx,
+                &["DP", "dp-1", "HDMI-A-9"],
+            )],
+            "ts-plugin-chip",
+            Some("DP-1"),
+        );
+
+        assert!(
+            card_root(&cards, "layouts").is_visible(),
+            "only an exact connector match may hide a card",
+        );
+        assert!(container.is_visible(), "…and the region stays with it");
+    }
+
+    /// A region whose monitor reports **no** connector never hides by name.
+    ///
+    /// The safe direction, stated as a test: showing a chip the plugin wanted
+    /// hidden is cosmetic, whereas hiding one it wanted shown removes a control
+    /// the user can no longer reach. An implementation that treated `None` as
+    /// "matches everything" (or panicked on it) would be a real regression on
+    /// any output GDK cannot name.
+    ///
+    /// **Deletion check (M5):** replacing [`hidden_on_this_output`]'s
+    /// `let Some(connector) = connector else { return false }` with `return
+    /// true` turns this red.
+    #[gtk::test]
+    fn a_region_with_no_connector_is_never_hidden_by_name() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+
+        reconcile_region(
+            &container,
+            &cards,
+            &[hidden_on_render("layouts", &tx, &["A", "B", "DP-1"])],
+            "ts-plugin-chip",
+            None,
+        );
+
+        assert!(
+            card_root(&cards, "layouts").is_visible(),
+            "a nameless monitor cannot be named, so nothing hides on it",
+        );
+    }
+
+    /// #1050 does not weaken #1042: a card whose tree renders nothing is still
+    /// hidden even on a monitor `hidden_on` says nothing about.
+    ///
+    /// The two rules are a disjunction, and this pins the *other* disjunct so a
+    /// future edit cannot quietly replace `renders_nothing || hidden_here` with
+    /// `hidden_here` alone.
+    ///
+    /// **Deletion check (M6):** dropping the `!root_renders_nothing(&render.tree)`
+    /// term from [`card_shows_here`] turns this red while every #1050 test above
+    /// stays green.
+    #[gtk::test]
+    fn an_empty_tree_is_still_hidden_on_an_unnamed_output() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+
+        reconcile_region(
+            &container,
+            &cards,
+            &[render_with_tree("empty", &tx, empty_row_tree("root"))],
+            "ts-plugin-chip",
+            Some("A"),
+        );
+
+        assert!(
+            !card_root(&cards, "empty").is_visible(),
+            "the #1042 empty-tree hide must survive #1050's addition",
+        );
+    }
+
+    /// End to end through the **production** mount: two real regions built by
+    /// [`build_region`] on the same `Mutable`, one per monitor, driven by a
+    /// signal update rather than a direct `reconcile_region` call.
+    ///
+    /// The direct-call tests above cannot see a `build_region` that forgets to
+    /// pass its `connector` into the bind closure — they hand the argument in
+    /// themselves. This one can: it only ever sets the mutable.
+    ///
+    /// **Deletion check (M7):** hard-coding `None` for the `connector` argument
+    /// inside `build_region`'s `bind` closure turns this red and leaves every
+    /// other test in this module green.
+    #[gtk::test]
+    fn the_mounted_region_carries_its_own_monitors_connector() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let renders = Mutable::new(Vec::new());
+        let win_a = mount_region_on(&renders, Some("A"));
+        let win_b = mount_region_on(&renders, Some("B"));
+        win_a.present();
+        win_b.present();
+        pump();
+
+        renders.set(vec![hidden_on_render("layouts", &tx, &["B"])]);
+        pump();
+
+        assert!(
+            region_of(&win_a).is_visible(),
+            "A's mounted region shows the card…",
+        );
+        assert!(
+            !region_of(&win_b).is_visible(),
+            "…and B's, reading the same mutable, collapses",
+        );
+
+        renders.set(vec![hidden_on_render("layouts", &tx, &["A"])]);
+        pump();
+
+        assert!(
+            !region_of(&win_a).is_visible(),
+            "flipping which output is named flips which region collapses…",
+        );
+        assert!(region_of(&win_b).is_visible(), "…both ways");
+    }
+
+    /// A click on monitor B's copy of a mirrored card reaches the plugin tagged
+    /// `output: Some("B")` — the half of #1050 that lets a plugin act on the
+    /// screen that was pressed rather than on whichever output holds keyboard
+    /// focus (#1019's reported symptom).
+    ///
+    /// Both monitors' copies are clicked in one test, because the failure this
+    /// guards is not "no output" but "the *wrong* output": a single-monitor
+    /// assertion passes against an implementation that stamps a constant.
+    ///
+    /// **Deletion check (M8):** replacing `output: ev_output.clone()` with
+    /// `output: None` turns both assertions red; stamping a constant connector
+    /// turns exactly one of them red.
+    #[gtk::test]
+    fn a_click_carries_the_connector_of_the_monitor_it_came_from() {
+        adw::init().expect("libadwaita init");
+        let (tx, mut rx) = mpsc::channel::<HostMsg>(8);
+
+        let a = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let b = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards_a: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+        let cards_b: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let renders = [render_with_tree("layouts", &tx, button_tree("go"))];
+        reconcile_region(&a, &cards_a, &renders, "ts-plugin-chip", Some("A"));
+        reconcile_region(&b, &cards_b, &renders, "ts-plugin-chip", Some("B"));
+
+        find_button(&card_root(&cards_b, "layouts")).emit_clicked();
+        assert_eq!(
+            rx.try_recv().expect("B's click reaches the plugin"),
+            HostMsg::Event {
+                node: "go".to_owned(),
+                kind: wire::EventKind::Click,
+                output: Some("B".to_owned()),
+            },
+        );
+
+        find_button(&card_root(&cards_a, "layouts")).emit_clicked();
+        assert_eq!(
+            rx.try_recv().expect("A's click reaches the plugin"),
+            HostMsg::Event {
+                node: "go".to_owned(),
+                kind: wire::EventKind::Click,
+                output: Some("A".to_owned()),
+            },
+        );
+    }
+
+    /// The drawer panel's events carry **no** output, and that is deliberate:
+    /// `modal.rs`'s `build_pages_stack()` takes no `Monitor`, so there is no
+    /// screen to name. `None` means "not attributable", never "the primary".
+    ///
+    /// Pinned rather than left to the doc comment, because the tempting "fix"
+    /// for a future reader is to stamp some default here, which would hand a
+    /// plugin a confidently wrong screen.
+    ///
+    /// **Deletion check (M9):** stamping any `Some(...)` on the panel's event
+    /// turns this red.
+    #[gtk::test]
+    fn a_panel_event_carries_no_output() {
+        adw::init().expect("libadwaita init");
+        let (tx, mut rx) = mpsc::channel::<HostMsg>(4);
+        let panels = Mutable::new(vec![SlotRender {
+            panel: Some(button_tree("panel-go")),
+            ..render_of("paneled", &tx)
+        }]);
+        let active = Mutable::new(Some("paneled".to_owned()));
+        let window = mount_panel_child(&panels, &active);
+        window.present();
+        pump();
+
+        find_button(&window.child().expect("the panel child is mounted")).emit_clicked();
+        assert_eq!(
+            rx.try_recv().expect("the panel click reaches the plugin"),
+            HostMsg::Event {
+                node: "panel-go".to_owned(),
+                kind: wire::EventKind::Click,
+                output: None,
+            },
+        );
+    }
+
+    /// [`unknown_connectors`] names exactly the entries no attached monitor
+    /// answers to — the debug line's payload, and the only thing that makes an
+    /// ignored connector diagnosable rather than merely silent.
+    ///
+    /// Pure, so it needs no second monitor: the caller does the GDK lookup and
+    /// hands the known set in, which is why the split exists.
+    ///
+    /// **Deletion check (M10):** inverting the filter (`known.contains`) turns
+    /// this red.
+    #[test]
+    fn unknown_connectors_names_only_the_unmatched() {
+        let known: std::collections::HashSet<String> = ["DP-1".to_owned(), "eDP-1".to_owned()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            unknown_connectors(
+                &[
+                    "DP-1".to_owned(),
+                    "DP1".to_owned(),
+                    "eDP-1".to_owned(),
+                    "HDMI-A-2".to_owned(),
+                ],
+                &known,
+            ),
+            vec!["DP1", "HDMI-A-2"],
+        );
+        assert!(
+            unknown_connectors(&[], &known).is_empty(),
+            "an empty hidden_on has nothing to report",
         );
     }
 

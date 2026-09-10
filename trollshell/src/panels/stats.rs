@@ -2756,6 +2756,49 @@ mod pin_tests {
         );
     }
 
+    /// The dressing the emission carries is the dressing the panel draws in —
+    /// the wiring #869's live reload rests on, and the one thing the tooltip
+    /// assertion above cannot see.
+    ///
+    /// Measured rather than compared pixel-for-pixel because `PixelSurface`
+    /// exposes no buffer getter: its *natural* size is the buffer size times
+    /// `core_panel_scale`, so a dressing that changes the matrix shape changes
+    /// the measurement. Four cores as a 1x4 column is a different shape from
+    /// four cores as the automatic wide rectangle.
+    ///
+    /// Falsified by rasterising `CoreLeds::default()` instead of the emitted
+    /// dressing: both measurements then agree and this goes red.
+    #[gtk::test]
+    fn per_core_leds_binding_follows_the_emitted_dressing() {
+        adw::init().expect("libadwaita init");
+        let panel = PixelSurface::new();
+        let src: Mutable<(CpuLoad, CoreLeds)> = Mutable::new(dressed(four_cores()));
+        bind_per_core_leds(&panel, src.signal_cloned());
+        pump();
+        let (_, automatic, _, _) = panel.measure(gtk::Orientation::Horizontal, -1);
+
+        src.set((
+            four_cores(),
+            CoreLeds {
+                rows: Some(4),
+                ..CoreLeds::default()
+            },
+        ));
+        pump();
+        let (_, pinned, _, _) = panel.measure(gtk::Orientation::Horizontal, -1);
+
+        assert!(
+            automatic > 0 && pinned > 0,
+            "anti-vacuity: both frames must have reached the surface, got {automatic} and {pinned}"
+        );
+        assert_ne!(
+            automatic, pinned,
+            "a pinned row count must reshape the panel: the emitted CoreLeds is what the \
+             rasteriser dresses with, so ignoring it (and always using the default) leaves the \
+             two measurements identical"
+        );
+    }
+
     /// Falsified by reintroducing a `panel_for_bind` strong clone in the apply
     /// closure: with it, `drop(panel)` is not the last strong ref and the weak
     /// upgrade still succeeds.

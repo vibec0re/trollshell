@@ -3588,7 +3588,7 @@ mod gtk_tests {
     /// must write nothing at all. Neither test above starts from a success,
     /// so a mutation that only fires on the first-ever *successful* poll (an
     /// extra `LogTransition::None if previous.is_none()` arm emitting
-    /// "ListPlugins recovered") survives the whole suite. Supplied by the
+    /// "`ListPlugins` recovered") survives the whole suite. Supplied by the
     /// adversarial review of `232a8a2` (#1035, MED 2).
     #[gtk::test]
     fn a_first_poll_that_succeeds_is_silent() {

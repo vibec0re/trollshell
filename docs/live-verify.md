@@ -300,6 +300,48 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
         `tooltip`s are skipped as unknown fields, and the card looks exactly as
         it did before — no hover text, no warning, no 5 s reconnect loop in
         `journalctl --user -u trollshell-plugin-<id>`.
+- [ ] **(#1045)** The `OpenUri` effect — a plugin opening a link **without**
+      `Capability::RunCommand`. Nothing in CI can see this: it ends in the
+      desktop's default handler, and the hermetic tests inject a stub launcher
+      precisely so `cargo test` never starts a browser.
+  - [ ] **The happy path.** Give a plugin `capabilities: vec![Capability::OpenUri]`
+        (and nothing else that can launch) and have it emit
+        `Effect::open_uri(id, "https://pr1ma.darkest.space/")` from `update` on a
+        click. The **browser opens** on the focused output, and
+        `journalctl --user -u trollshell` logs
+        `plugin effect: OpenUri … scheme=https` at info. The audit log
+        (`$XDG_STATE_HOME/trollshell/effects-audit.log`) gains a matching
+        `effect=OpenUri decision=allowed id=<id>` line — with **no** `unit=`
+        (nothing was handed to systemd; that field belongs to a detached
+        `RunCommand`).
+  - [ ] **A refused scheme is toastable, not silent.** Same plugin, emit
+        `Effect::open_uri(id, "mailto:annika@hannig.cc")`. **Nothing launches**;
+        the journal warns `plugin effect: OpenUri refused` carrying
+        `reason=refused: scheme "mailto" is not openable`; and the plugin receives
+        `Input::EffectResult { ok: false, output: Some(reason) }` it can render
+        (the point of the round-trip — confirm the plugin's own toast/label
+        actually shows it, not just that the host logged it). Repeat with
+        `ssh://box.example/` and a bare `pr1ma.darkest.space/agents` (no
+        scheme).
+  - [ ] **`file:` really opens.** `Effect::open_uri(id, "file:///…/shot.png")`
+        opens the image viewer — the same handler resolution the shell's own
+        screenshot toast uses.
+  - [ ] **The capability is load-bearing.** Remove `Capability::OpenUri` from
+        the plugin's manifest, keep the effect, restart it: the click does
+        nothing, and the journal warns
+        `plugin effect requires a capability it didn't declare; dropped`, with
+        a matching `decision=dropped(ungranted-capability)` audit line. Then give it
+        `Capability::RunCommand` **instead** — still dropped, since the two caps
+        do not substitute for each other.
+  - [ ] **Old shell, new plugin** (the compat claim `OPEN_URI_VOCAB`'s docs
+        make). Run a plugin built against this SDK and declaring
+        `Capability::OpenUri` against a **pre-#1045** shell: it must be dropped
+        at the handshake with a `plugin handshake read failed` warn naming the
+        undecodable variant — _not_ mount a card that silently ignores clicks.
+        A plugin rebuilt on this SDK that does **not** declare the cap must
+        still connect and render normally against that same old shell (this is
+        what `VOCAB_UNCONDITIONAL` staying at 1 buys, and it is the half worth
+        checking).
 - [ ] _(dormant — #555)_ The wire-vocabulary generation counter (`VOCAB`) is
       armed but untested against a real newer-vocab plugin (this PR appended
       no wire variant, so `VOCAB` stays at 1 and nothing exercises the reject

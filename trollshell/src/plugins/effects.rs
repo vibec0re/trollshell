@@ -637,9 +637,7 @@ impl UriRefusal {
             UriRefusal::TooLong(len) => {
                 format!("refused: URI is {len} B, over the {MAX_URI_BYTES} B cap")
             }
-            UriRefusal::Control => {
-                "refused: URI contains a control character".to_owned()
-            }
+            UriRefusal::Control => "refused: URI contains a control character".to_owned(),
             UriRefusal::NoScheme => {
                 format!("refused: no URI scheme ({allowed} only)")
             }
@@ -1749,9 +1747,10 @@ impl AuditLog {
 mod tests {
     use super::DatasourceRouter;
     use super::{
-        AuditDecision, AuditLog, EffectOutcome, FORWARDED_ENV, LaunchReport, MAX_VOLUME,
-        MIN_VOLUME, RUN_COMMAND_MAX_OUTPUT, broker_effect, clamp_volume, command_outcome,
-        effect_kind, filter_forwarded_env, format_audit_line, launch_outcome, start_detached_with,
+        AuditDecision, AuditLog, EffectOutcome, FORWARDED_ENV, LaunchReport, MAX_URI_BYTES,
+        MAX_VOLUME, MIN_VOLUME, RUN_COMMAND_MAX_OUTPUT, UriRefusal, audit_effect_id, broker_effect,
+        check_uri, clamp_volume, command_outcome, effect_kind, filter_forwarded_env,
+        format_audit_line, launch_outcome, open_uri_outcome, start_detached_with,
         truncate_on_char_boundary,
     };
     use hytte_plugin_proto::{AudioAction, Effect, HostMsg, MediaAction, NiriAction, Page};
@@ -2020,6 +2019,42 @@ mod tests {
                 body: String::new(),
             }),
             "Notify",
+        );
+        assert_eq!(
+            effect_kind(&Effect::open_uri(1, "https://example.invalid/")),
+            "OpenUri",
+        );
+    }
+
+    /// #1045: `OpenUri` carries a correlation token like `RunCommand` does, so
+    /// its audit line has to name it — that is what ties a logged open to the
+    /// `EffectResult` the plugin got back. The fire-and-forget effects still
+    /// have nothing to correlate.
+    ///
+    /// **Falsified** by dropping `Effect::OpenUri` from `audit_effect_id`'s
+    /// arm (it has a `_ => None` catch-all, so that compiles): the first
+    /// assertion goes red.
+    #[test]
+    fn an_open_uri_audit_line_carries_its_correlation_id() {
+        let line = format_audit_line(
+            "2026-09-10T00:00:00Z",
+            "agents",
+            effect_kind(&Effect::open_uri(9, "https://example.invalid/")),
+            AuditDecision::Allowed,
+            audit_effect_id(&Effect::open_uri(9, "https://example.invalid/")),
+            None,
+        );
+        assert_eq!(
+            line,
+            "2026-09-10T00:00:00Z plugin=agents effect=OpenUri decision=allowed id=9",
+        );
+        assert_eq!(
+            audit_effect_id(&Effect::Notify {
+                summary: String::new(),
+                body: String::new(),
+            }),
+            None,
+            "a fire-and-forget effect still has nothing to correlate",
         );
     }
 
@@ -2360,6 +2395,209 @@ mod tests {
             env,
             vec![("DISPLAY".to_owned(), " ".to_owned())],
             "a whitespace-only value is deliberately NOT treated as empty",
+        );
+    }
+
+    // ── OpenUri (#1045) ──────────────────────────────────────────────────────
+
+    /// The host's scheme allow-list, as a table (#1045).
+    ///
+    /// This is the whole enforced policy of the effect, and it is pure, so it
+    /// is pinned here rather than behind a browser. `Ok` names the scheme the
+    /// host recognised (lower- or upper-case, per RFC 3986); every `Err` is a
+    /// refusal the plugin gets back as `ok: false`.
+    ///
+    /// **Falsified** by adding `"mailto"` to `ALLOWED_URI_SCHEMES` — the
+    /// `mailto:` row then returns `Ok` and this goes red. (Confirmed by hand;
+    /// see the PR's mutation table.)
+    #[test]
+    fn check_uri_allows_only_http_https_and_file() {
+        let allowed = [
+            ("https://pr1ma.darkest.space/agents/argus", "https"),
+            ("http://localhost:3000/x?y=1#z", "http"),
+            ("file:///home/annika/shot.png", "file"),
+            // RFC 3986 says a scheme is case-insensitive, so this is the same
+            // destination as the first row and is treated as such.
+            ("HTTPS://pr1ma.darkest.space/", "HTTPS"),
+        ];
+        for (uri, scheme) in allowed {
+            assert_eq!(check_uri(uri), Ok(scheme), "{uri} must be openable");
+        }
+
+        // The refusals, each with the reason the plugin is told.
+        assert_eq!(
+            check_uri("mailto:annika@hannig.cc"),
+            Err(UriRefusal::Scheme("mailto".to_owned())),
+            "a mail composer is not what this effect is for (and is #1045's \
+             open question, deliberately left refused)",
+        );
+        assert_eq!(
+            check_uri("javascript:alert(1)"),
+            Err(UriRefusal::Scheme("javascript".to_owned())),
+        );
+        assert_eq!(
+            check_uri("ssh://box.example/"),
+            Err(UriRefusal::Scheme("ssh".to_owned())),
+        );
+        assert_eq!(
+            check_uri("data:text/html,<script>x</script>"),
+            Err(UriRefusal::Scheme("data".to_owned())),
+        );
+        assert_eq!(check_uri(""), Err(UriRefusal::Empty));
+        assert_eq!(check_uri("   "), Err(UriRefusal::Empty));
+        // No scheme at all: a bare host, and the two shapes a sloppier parser
+        // would mis-read as one (`"  https"` and `"1http"` are not schemes).
+        assert_eq!(
+            check_uri("pr1ma.darkest.space/agents"),
+            Err(UriRefusal::NoScheme)
+        );
+        assert_eq!(
+            check_uri("://pr1ma.darkest.space/"),
+            Err(UriRefusal::NoScheme)
+        );
+        assert_eq!(
+            check_uri("  https://pr1ma.darkest.space/"),
+            Err(UriRefusal::NoScheme)
+        );
+        assert_eq!(
+            check_uri("1http://pr1ma.darkest.space/"),
+            Err(UriRefusal::NoScheme)
+        );
+        // A control character never reaches the launcher: a newline would
+        // otherwise ride into the log, and an interior NUL cannot survive the
+        // &str -> C string conversion `launch_default_for_uri` does at all.
+        assert_eq!(
+            check_uri("https://x/\nSet-Cookie: y"),
+            Err(UriRefusal::Control)
+        );
+        assert_eq!(check_uri("https://x/\0y"), Err(UriRefusal::Control));
+        // And the length cap, which bites before the 16 MiB frame limit does.
+        let long = format!("https://x/{}", "a".repeat(MAX_URI_BYTES));
+        assert_eq!(check_uri(&long), Err(UriRefusal::TooLong(long.len())));
+    }
+
+    /// #1045: a refused URI never reaches the launcher, and the plugin is told
+    /// why — the whole reason the effect carries an `id` and answers with an
+    /// `EffectResult` instead of being fire-and-forget.
+    ///
+    /// **Falsified** by making the refusal path return `ok: true`, or by
+    /// dropping the early return so the launcher runs anyway (the recorded
+    /// call count then goes to 1).
+    #[test]
+    fn a_refused_scheme_never_launches_and_reports_not_ok() {
+        let seen = RefCell::new(Vec::<String>::new());
+        let outcome = open_uri_outcome("agents", 5, "mailto:annika@hannig.cc", |uri| {
+            seen.borrow_mut().push(uri.to_owned());
+            Ok(())
+        });
+        assert!(!outcome.ok, "a refused scheme is not a success");
+        let output = outcome.output.expect("a refusal names its reason");
+        assert!(
+            output.contains("mailto"),
+            "the plugin is told which scheme was refused, so it can toast it: {output}",
+        );
+        assert!(
+            seen.borrow().is_empty(),
+            "the launcher must not run for a refused URI",
+        );
+    }
+
+    /// #1045: an allowed URI is handed to the launcher **verbatim** and its
+    /// verdict becomes the plugin's outcome — both arms.
+    ///
+    /// The launcher is injected for the reason `start_detached_with`'s program
+    /// is (#964 item 3): the real one starts a browser, which has no business
+    /// happening in `cargo test`.
+    ///
+    /// **Falsified** by passing the launcher anything but its own `uri`
+    /// argument (the first assertion), or by mapping a launch `Err` to
+    /// `ok: true` (the second).
+    #[test]
+    fn an_allowed_uri_reaches_the_launcher_and_its_verdict_is_the_outcome() {
+        let seen = RefCell::new(Vec::<String>::new());
+        let outcome = open_uri_outcome(
+            "agents",
+            6,
+            "https://pr1ma.darkest.space/agents/argus",
+            |uri| {
+                seen.borrow_mut().push(uri.to_owned());
+                Ok(())
+            },
+        );
+        assert_eq!(
+            seen.into_inner(),
+            vec!["https://pr1ma.darkest.space/agents/argus".to_owned()],
+            "the launcher gets the plugin's URI unmodified",
+        );
+        assert!(outcome.ok, "a successful launch is a successful outcome");
+        assert_eq!(outcome.output, None, "…and carries no output to report");
+
+        // The other arm: no handler registered, a portal error, …
+        let outcome = open_uri_outcome("agents", 7, "file:///home/annika/shot.png", |_| {
+            Err("no application is registered as handling this file".to_owned())
+        });
+        assert!(!outcome.ok, "a failed launch is not a success");
+        let output = outcome.output.expect("a failed launch names the error");
+        assert!(
+            output.contains("no application is registered"),
+            "the handler's own error reaches the plugin: {output}",
+        );
+    }
+
+    /// #1045, end to end through the broker: a refused `OpenUri` is still
+    /// audited as an allowed *effect* (it cleared capability enforcement
+    /// upstream — the refusal is host policy inside the broker, a different
+    /// decision from `dropped(ungranted-capability)`), and the plugin gets its
+    /// `EffectResult` back on the connection's own channel.
+    ///
+    /// Hermetic: a refused scheme is deliberately used, so `broker_effect`
+    /// reaches no launcher and no browser starts. (There is no `broker_effect`
+    /// test for an *allowed* URI for exactly that reason — the allowed path is
+    /// covered above through the injected launcher.)
+    ///
+    /// **Falsified** by dropping the `reply_effect_result` call from the
+    /// `OpenUri` arm: the `recv()` below then times out with the sender still
+    /// alive, i.e. the plugin waits forever for a verdict.
+    #[tokio::test]
+    async fn broker_reports_a_refused_open_uri_back_to_the_plugin() {
+        reset_captures();
+        let (tx, mut rx) = mpsc::channel::<HostMsg>(4);
+        let router = DatasourceRouter::default();
+
+        broker_effect(
+            "agents",
+            &Effect::open_uri(8, "ssh://box.example/"),
+            &tx,
+            &router,
+        );
+
+        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the plugin must get a verdict, not wait forever")
+            .expect("the channel is still open");
+        match msg {
+            HostMsg::EffectResult { id, outcome } => {
+                assert_eq!(id, 8, "keyed by the plugin's own correlation token");
+                assert!(!outcome.ok, "a refused scheme reports failure");
+                assert!(
+                    outcome.output.is_some_and(|o| o.contains("ssh")),
+                    "…and names the refused scheme",
+                );
+            }
+            other => panic!("expected an EffectResult, got {other:?}"),
+        }
+
+        let audit_line = LAST_AUDIT_LINE
+            .with(|cell| cell.borrow().clone())
+            .expect("every brokered effect is audited");
+        assert!(
+            audit_line.contains("effect=OpenUri decision=allowed id=8"),
+            "the audit line records the effect the plugin was granted, with its \
+             correlation id: {audit_line}",
+        );
+        assert!(
+            !audit_line.contains("unit="),
+            "no unit is involved in opening a link: {audit_line}",
         );
     }
 }

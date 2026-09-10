@@ -8,9 +8,9 @@ use hytte_plugin_proto::{
     EventKind, HostMsg, LedStripConfig, LedStripState, LogLevel, MAX_FRAME_LEN,
     MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Manifest, MediaAction, Mount, NiriAction, Node,
     OPEN_URI_VOCAB, PROTO_VERSION, Page, PluginMsg, PreemWidget, ProtoError, ProvidedDatasource,
-    SCROLLED_VOCAB,
-    SHADER_VOCAB, ShaderData, SliderFloats, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL,
-    decode, decode_body, encode, encode_body, sane_fraction, sane_slider_floats,
+    SCROLLED_VOCAB, SHADER_VOCAB, ShaderData, SliderFloats, StateKey, StateSnapshot, VOCAB,
+    VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body, sane_fraction,
+    sane_slider_floats,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────

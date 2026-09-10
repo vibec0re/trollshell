@@ -548,21 +548,29 @@ pub enum Input<M> {
         kind: EventKind,
     },
     /// The outcome of a brokered
-    /// [`Effect::RunCommand`](proto::Effect::RunCommand), keyed by the
-    /// command's `id`.
+    /// [`Effect::RunCommand`](proto::Effect::RunCommand) or
+    /// [`Effect::OpenUri`](proto::Effect::OpenUri), keyed by the effect's `id`.
     ///
-    /// Both spawn modes reply here, but they mean different things (#953). For
-    /// an attached `RunCommand` ([`Effect::run_command`](proto::Effect::run_command))
-    /// this is the program's own exit status plus its captured stdout. For a
-    /// detached launch ([`Effect::launch`](proto::Effect::launch)) it arrives
-    /// **immediately** and reports only whether the *launch* succeeded — the
-    /// host hands the program to the systemd user manager and never waits for
-    /// it, so there is no exit status to report.
+    /// Three things reply here, and they mean different things:
+    ///
+    /// - an **attached** `RunCommand` ([`Effect::run_command`](proto::Effect::run_command))
+    ///   — the program's own exit status plus its captured stdout;
+    /// - a **detached launch** ([`Effect::launch`](proto::Effect::launch), #953)
+    ///   — arrives immediately and reports only whether the *launch* succeeded,
+    ///   since the host hands the program to the systemd user manager and never
+    ///   waits for it;
+    /// - an **`OpenUri`** ([`Effect::open_uri`](proto::Effect::open_uri), #1045)
+    ///   — whether the desktop's default handler was started. A URI the host
+    ///   refuses (a scheme outside `http`/`https`/`file`) comes back `ok: false`
+    ///   with the reason in [`output`](proto::EffectOutcome::output), which is
+    ///   there so a plugin can toast it instead of leaving a click that
+    ///   silently does nothing.
     EffectResult {
-        /// The `id` the plugin chose on the originating `RunCommand`.
+        /// The `id` the plugin chose on the originating effect.
         id: u64,
         /// Whether it succeeded, and any captured output — or, for a detached
-        /// launch, whether it started and what it was named.
+        /// launch, whether it started and what it was named; or, for an
+        /// `OpenUri`, why it was refused.
         outcome: EffectOutcome,
     },
     /// The plugin's mount surface became visible (`true`) or hidden (`false`) —

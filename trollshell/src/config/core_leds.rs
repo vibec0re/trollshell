@@ -1373,14 +1373,34 @@ mod tests {
             .into_iter()
             .find(|w| w.starts_with("TROLLSHELL_CORE_LEDS_ROWS is set to `0`"))
             .expect("the unusable-variable line");
+
+        // The line the variable path produces is built from `env_accepts` …
         assert!(
-            !line.contains("or 0"),
-            "the line that rejects `0` must not offer `0` back: {line}"
+            line.contains(ROWS.env_accepts),
+            "the variable's line must be built from its own vocabulary: {line}"
         );
+        // … and that vocabulary must not contain the `0` spelling anywhere.
+        // A digit search rather than a substring one on purpose: `!contains(
+        // "or 0")` passed the whole file vocabulary through unnoticed
+        // (mutation V4a, green — it renders as "expected 0 or \"rect\" …",
+        // which reads exactly as self-contradictory and contains no "or 0").
+        // The variable's vocabulary is the one sentence here with no digit `0`
+        // in it at all: "1 to 64" has none.
+        assert!(
+            !ROWS.env_accepts.contains('0'),
+            "the vocabulary offered for a rejected `0` must not contain a `0`: {:?}",
+            ROWS.env_accepts
+        );
+        // …while the file, which really does take it, says so — and the two
+        // are genuinely different strings, not one shared by both paths.
         assert!(
             ROWS.file_accepts.contains("0 or \"rect\""),
-            "…while the file, which does take it, says so: {:?}",
+            "the file vocabulary must teach the spelling the file accepts: {:?}",
             ROWS.file_accepts
+        );
+        assert_ne!(
+            ROWS.env_accepts, ROWS.file_accepts,
+            "this is the one knob whose two spellings differ; collapsing them is the bug"
         );
     }
 

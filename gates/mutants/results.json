@@ -1,0 +1,575 @@
+[
+ {
+  "id": "M1",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "env_key's env-wins branch: a parsed variable stops winning",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "fb90b5c913959d8e686532af770273c7",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 578,
+  "failed": 7,
+  "failing": [
+   "config::core_leds::tests::a_reload_does_not_re_announce_a_pinned_variable",
+   "config::core_leds::tests::a_set_variable_announces_its_deprecation_once",
+   "config::core_leds::tests::a_set_variable_beats_the_file",
+   "config::core_leds::tests::a_silent_resolution_announces_nothing",
+   "config::core_leds::tests::an_env_pinned_key_survives_a_reload",
+   "config::core_leds::tests::the_service_start_loads_once_and_announces_once",
+   "config::core_leds::tests::the_startup_resolution_announces"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "M2",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "the once-only announce gate is inverted",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "efae32e484811db57862617001a9027a",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 579,
+  "failed": 6,
+  "failing": [
+   "config::core_leds::tests::a_reload_does_not_re_announce_a_pinned_variable",
+   "config::core_leds::tests::a_set_variable_announces_its_deprecation_once",
+   "config::core_leds::tests::a_silent_resolution_announces_nothing",
+   "config::core_leds::tests::the_deprecation_line_carries_its_fields",
+   "config::core_leds::tests::the_service_start_loads_once_and_announces_once",
+   "config::core_leds::tests::the_startup_resolution_announces"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "M3",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "poll announces instead of staying silent",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "a8702f42fdbcb04b16660fa7d82db7d5",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 583,
+  "failed": 2,
+  "failing": [
+   "config::core_leds::tests::a_reload_does_not_re_announce_a_pinned_variable",
+   "config::core_leds::tests::a_reload_does_not_repeat_the_unusable_variable_line"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "M4",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "the reload itself: poll never re-reads",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "93bcccb56c010cc45f1dcd7bf4b76227",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 573,
+  "failed": 12,
+  "failing": [
+   "config::core_leds::tests::a_bad_value_reloads_the_keys_beside_it",
+   "config::core_leds::tests::a_changed_file_is_picked_up",
+   "config::core_leds::tests::a_deleted_file_falls_back_to_the_defaults",
+   "config::core_leds::tests::a_file_caught_mid_edit_keeps_the_last_good_config",
+   "config::core_leds::tests::a_newly_created_file_is_picked_up",
+   "config::core_leds::tests::a_reload_does_not_re_announce_a_pinned_variable",
+   "config::core_leds::tests::a_reload_does_not_repeat_the_unusable_variable_line",
+   "config::core_leds::tests::an_edit_inside_one_mtime_granule_is_still_seen",
+   "config::core_leds::tests::an_edit_landing_after_the_load_is_not_lost",
+   "config::core_leds::tests::an_edit_to_the_base_layer_reloads_too",
+   "config::core_leds::tests::an_env_pinned_key_survives_a_reload",
+   "config::core_leds::tests::the_watch_loop_republishes_the_watcher_it_was_given"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "M5",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "the last-good keep: a bad reload overwrites last_good",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "2ecda207dd149db572e927acb3579ad4",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "config::core_leds::tests::a_file_caught_mid_edit_keeps_the_last_good_config"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "M6",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "rows_spelling's Count(0) arm stops meaning rect",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "7947157127de629a7842021033a0f42a",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 579,
+  "failed": 6,
+  "failing": [
+   "config::core_leds::tests::a_rejected_value_is_reported_as_the_toml_it_was_written_as",
+   "config::core_leds::tests::a_reload_does_not_repeat_the_unusable_variable_line",
+   "config::core_leds::tests::a_startup_loads_the_config_exactly_once",
+   "config::core_leds::tests::the_file_rejects_exactly_what_the_env_parsers_reject",
+   "config::core_leds::tests::the_service_start_loads_once_and_announces_once",
+   "config::core_leds::tests::zero_rows_is_the_files_spelling_of_rect"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "M7",
+  "file": "trollshell/src/panels/stats.rs",
+  "note": "the panel rasterises CoreLeds::default() instead of the emission",
+  "md5_before": "6561c2c4cf98e0d509d9c8d305494f14",
+  "md5_after": "48224badbdaeea8e88d0ce70f16e3f93",
+  "md5_restored": "6561c2c4cf98e0d509d9c8d305494f14",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 583,
+  "failed": 2,
+  "failing": [
+   "panels::stats::pin_tests::a_config_change_alone_re_skins_the_row",
+   "panels::stats::pin_tests::per_core_leds_binding_follows_the_emitted_dressing"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "X1",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "boot passes Silent (F3's original defect)",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "907732ca6a128007e36956fb2c9bd617",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 583,
+  "failed": 2,
+  "failing": [
+   "config::core_leds::tests::the_service_start_loads_once_and_announces_once",
+   "config::core_leds::tests::the_startup_resolution_announces"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "X2",
+  "file": "trollshell/src/config/mod.rs",
+  "note": "overlay_display_in returns a literal",
+  "md5_before": "f8ba6db8cdc69dc6fd9f80f1bee955de",
+  "md5_after": "f1ac13db82561b62d9eed9a3ff799d24",
+  "md5_restored": "f8ba6db8cdc69dc6fd9f80f1bee955de",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "config::tests::the_line_names_the_resolved_overlay_path"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "X3",
+  "file": "trollshell/src/config/mod.rs",
+  "note": "deprecation_message reworded",
+  "md5_before": "f8ba6db8cdc69dc6fd9f80f1bee955de",
+  "md5_after": "731ff4693635cbd68465e2d2e0e72d72",
+  "md5_restored": "f8ba6db8cdc69dc6fd9f80f1bee955de",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "config::tests::the_deprecation_sentence_is_this_exact_sentence"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "X5",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "stamping_before baselines every stamp to None",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "0b4c5dced2257918bd91fac0f1545343",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 583,
+  "failed": 2,
+  "failing": [
+   "config::core_leds::tests::a_deleted_file_falls_back_to_the_defaults",
+   "config::core_leds::tests::a_watcher_starts_from_now"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "N1",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "stamping_before loads a second time (F1's defect)",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "2b9a244178817f3169d71050a4d01f19",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 582,
+  "failed": 3,
+  "failing": [
+   "config::core_leds::tests::a_startup_loads_the_config_exactly_once",
+   "config::core_leds::tests::a_startup_reports_an_unusable_file_exactly_once",
+   "config::core_leds::tests::the_service_start_loads_once_and_announces_once"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "N2",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "the row cap is removed",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "5b374b0114067e01e3c88e0c3628f590",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "config::core_leds::tests::a_row_count_is_capped_in_both_spellings"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "N3",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "Rows::Word is not handed through untouched",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "e5c11d82a60df5545581b1b13a3465a6",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 582,
+  "failed": 3,
+  "failing": [
+   "config::core_leds::tests::a_bad_value_leaves_every_other_key_applied",
+   "config::core_leds::tests::a_rejected_value_is_reported_as_the_toml_it_was_written_as",
+   "config::core_leds::tests::the_word_rect_is_a_file_spelling_too"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "N4",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "stamp drops the length",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "f3f18c4f5700d415af1b86bafa7b3ac0",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "config::core_leds::tests::an_edit_inside_one_mtime_granule_is_still_seen"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "N5",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "announce before/instead of after the parse",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "b926b83ff2764344172aca17e1621e8f",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 580,
+  "failed": 5,
+  "failing": [
+   "config::core_leds::tests::a_set_variable_announces_its_deprecation_once",
+   "config::core_leds::tests::an_unset_variable_announces_nothing",
+   "config::core_leds::tests::the_deprecation_line_carries_its_fields",
+   "config::core_leds::tests::the_service_start_loads_once_and_announces_once",
+   "config::core_leds::tests::the_startup_resolution_announces"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "N6",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "InvalidValue::of stops quoting",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "5c5b257fb898ad94d874a8ee44273a99",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "config::core_leds::tests::a_rejected_value_is_reported_as_the_toml_it_was_written_as"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "N7",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "MAX_ROWS moves, the sentence does not",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "78ee3046920474e0dbef29fc89c5f6ff",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 583,
+  "failed": 2,
+  "failing": [
+   "config::core_leds::tests::a_row_count_is_capped_in_both_spellings",
+   "config::core_leds::tests::the_diagnostic_quotes_the_cap_it_enforces"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "N8",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "poll ignores an all-absent stamp set (a delete)",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "77912fcc11c291e735d095d55bdbfb49",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "config::core_leds::tests::a_deleted_file_falls_back_to_the_defaults"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "N9",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "InvalidValue's Display reworded",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "c08ebdf797394019ced20f7a743867fa",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 583,
+  "failed": 2,
+  "failing": [
+   "config::core_leds::tests::a_bad_value_leaves_every_other_key_applied",
+   "config::core_leds::tests::a_rejected_value_is_reported_as_the_toml_it_was_written_as"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "Z4",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "the unusable-variable line is never emitted",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "7370d467e124ed11327434a56477f94b",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 583,
+  "failed": 2,
+  "failing": [
+   "config::core_leds::tests::an_unset_variable_announces_nothing",
+   "config::core_leds::tests::the_variable_line_does_not_offer_a_spelling_the_variable_rejects"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "Z7",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "poll's next != current dedup removed",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "a189eb779eaa9ca687f86384ecd0aa10",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 583,
+  "failed": 2,
+  "failing": [
+   "config::core_leds::tests::a_changed_file_is_picked_up",
+   "config::core_leds::tests::a_file_caught_mid_edit_keeps_the_last_good_config"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "Z1",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "V3/Z1: watch rebuilds its own watcher instead of taking the one it was given",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "1d8ecea7adf56502c7f5ed8d4ccf211a",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "config::core_leds::tests::the_watch_loop_republishes_the_watcher_it_was_given"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "Z2",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "V3/Z2: start runs the startup sequence twice",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "9fe939bbdfee122e783bb3d2f444ee50",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "config::core_leds::tests::the_service_start_loads_once_and_announces_once"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "Z3",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "V3/Z3: start bypasses boot and resolves Silent (F3 one level up)",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "dde27612bb4653964e50730cf7f056cd",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "config::core_leds::tests::the_service_start_loads_once_and_announces_once"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "Z5",
+  "file": "trollshell/src/panels/stats.rs",
+  "note": "V3/Z5: the row's map_ref! drops the config signal",
+  "md5_before": "6561c2c4cf98e0d509d9c8d305494f14",
+  "md5_after": "cadfef0b706bda04ca7924cbadeb3775",
+  "md5_restored": "6561c2c4cf98e0d509d9c8d305494f14",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "panels::stats::pin_tests::a_config_change_alone_re_skins_the_row"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "V1a",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "V1: a bad key poisons the whole file again",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "23afa065ed116f1165d5038022af37ef",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 583,
+  "failed": 2,
+  "failing": [
+   "config::core_leds::tests::a_bad_value_leaves_every_other_key_applied",
+   "config::core_leds::tests::a_bad_value_reloads_the_keys_beside_it"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "V2a",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "V2: the layers are stamped AFTER they are read (the lost-edit window)",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "b2ae9b1b9bd40a9d9096ad73f1e6de79",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "config::core_leds::tests::an_edit_landing_after_the_load_is_not_lost"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "V7a",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "V7: the unusable-variable line is emitted on every reload again",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "03a5f8a5cbb41c50cff9c44808e61872",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 583,
+  "failed": 2,
+  "failing": [
+   "config::core_leds::tests::a_reload_does_not_repeat_the_unusable_variable_line",
+   "config::core_leds::tests::a_silent_resolution_announces_nothing"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "V9a",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "V9: the Rows catch-all stops deserializing (back to a whole-file Schema error)",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "d9ab79e7e896d094f6009b8837149644",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "config::core_leds::tests::a_rows_value_of_the_wrong_type_is_a_per_key_rejection"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "V10a",
+  "file": "trollshell/src/config/mod.rs",
+  "note": "V10: the deprecation line stops emitting its structured fields",
+  "md5_before": "f8ba6db8cdc69dc6fd9f80f1bee955de",
+  "md5_after": "f33b85be17164a020b290fa5ea64f22c",
+  "md5_restored": "f8ba6db8cdc69dc6fd9f80f1bee955de",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "config::core_leds::tests::the_deprecation_line_carries_its_fields"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "W1",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "the per-key rejection line is never emitted",
+  "md5_before": "5308764246ef5f3f6f513ec8c460d3b2",
+  "md5_after": "516b99c8bf34a531ef6f48850b12cc2e",
+  "md5_restored": "5308764246ef5f3f6f513ec8c460d3b2",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "config::core_leds::tests::a_bad_value_leaves_every_other_key_applied"
+  ],
+  "verdict": "RED"
+ },
+ {
+  "id": "V4a",
+  "file": "trollshell/src/config/core_leds.rs",
+  "note": "V4: the two rows vocabularies are collapsed back into one",
+  "md5_before": "3d02c947c1a5d3adeae72c0cf90ca713",
+  "md5_after": "2a891cb2aab2a8f56f416d392943b5af",
+  "md5_restored": "3d02c947c1a5d3adeae72c0cf90ca713",
+  "restored_ok": true,
+  "compiled": true,
+  "passed": 584,
+  "failed": 1,
+  "failing": [
+   "config::core_leds::tests::the_variable_line_does_not_offer_a_spelling_the_variable_rejects"
+  ],
+  "verdict": "RED"
+ }
+]

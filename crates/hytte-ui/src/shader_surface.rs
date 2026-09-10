@@ -1567,7 +1567,7 @@ mod tests {
 
         assert!(latch.claim(a), "the first refused shape is reported");
         for _ in 0..8 {
-            assert!(!latch.claim(a), "…and then goes quiet while it persists",);
+            assert!(!latch.claim(a), "…and then goes quiet while it persists");
         }
         assert!(
             latch.claim(b),

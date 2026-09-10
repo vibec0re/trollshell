@@ -1102,13 +1102,33 @@ fn core_panel_surface() -> PixelSurface {
 /// having the apply closure read a snapshot, so a config change repaints
 /// immediately instead of on the next CPU tick.
 fn build_per_core_leds_row() -> gtk::Box {
+    per_core_leds_row(sensors::cpu(), core_leds::signal())
+}
+
+/// [`build_per_core_leds_row`] with its two live inputs handed in.
+///
+/// The split is #831's shape applied one level out from
+/// [`bind_per_core_leds`], and #1040 V3 is why it goes this far: #869 moved
+/// the feature's central wiring — the `map_ref!` that folds the config signal
+/// in beside the CPU one — into the builder, where both accessors
+/// `.expect()` without a registered `Registry` and so nothing could drive it.
+/// Dropping `core_leds::signal()` from that fold kills #869's entire payoff
+/// (the panel stops re-skinning on a save) and left the suite green;
+/// `bind_per_core_leds`' own tests pin the apply closure, not what feeds it.
+///
+/// What stays unpinned is now the *one* line above: the two accessor calls.
+fn per_core_leds_row<C, L>(cpu: C, leds: L) -> gtk::Box
+where
+    C: Signal<Item = CpuLoad> + 'static,
+    L: Signal<Item = CoreLeds> + 'static,
+{
     let row = core_panel_row();
     let panel = core_panel_surface();
     row.append(&panel);
 
     let dressed = map_ref! {
-        let cpu = sensors::cpu(),
-        let leds = core_leds::signal() =>
+        let cpu = cpu,
+        let leds = leds =>
         (cpu.clone(), *leds)
     };
     bind_per_core_leds(&panel, dressed);
@@ -2713,7 +2733,7 @@ mod pin_tests {
     use hytte::services::sensors::CpuLoad;
     use hytte::ui::PixelSurface;
 
-    use super::{CoreLeds, bind_per_core_leds, build_top_apps_expander};
+    use super::{CoreLeds, bind_per_core_leds, build_top_apps_expander, per_core_leds_row};
 
     /// Run the GTK main loop until it has nothing left to dispatch.
     fn pump() {
@@ -2799,6 +2819,55 @@ mod pin_tests {
             "a pinned row count must reshape the panel: the emitted CoreLeds is what the \
              rasteriser dresses with, so ignoring it (and always using the default) leaves the \
              two measurements identical"
+        );
+    }
+
+    /// **A config save alone re-skins the panel** — the row's own wiring, not
+    /// just the binding under it (#1040 V3, mutation Z5).
+    ///
+    /// #869's payoff is that `core-leds.toml` is live: save an edit, the panel
+    /// re-skins with no restart. The mechanism is the `map_ref!` inside
+    /// [`per_core_leds_row`] that folds the config signal in beside the CPU
+    /// one — and dropping it (passing `CoreLeds::default()` instead) left the
+    /// whole suite green, because `per_core_leds_binding_follows_the_emitted_dressing`
+    /// pins [`bind_per_core_leds`], which is downstream of the fold.
+    ///
+    /// Driven here with the CPU source held **still**: only the dressing
+    /// moves, so a panel that re-measures can only have heard the config
+    /// signal. Measured rather than compared pixel-for-pixel for the reason
+    /// its sibling gives — `PixelSurface` exposes no buffer getter, but its
+    /// natural size follows the matrix shape.
+    #[gtk::test]
+    fn a_config_change_alone_re_skins_the_row() {
+        adw::init().expect("libadwaita init");
+        let cpu: Mutable<CpuLoad> = Mutable::new(four_cores());
+        let leds: Mutable<CoreLeds> = Mutable::new(CoreLeds::default());
+        let row = per_core_leds_row(cpu.signal_cloned(), leds.signal());
+        pump();
+
+        let panel: PixelSurface = row
+            .first_child()
+            .expect("the row holds the surface")
+            .downcast()
+            .expect("…and it is a PixelSurface");
+        let (_, automatic, _, _) = panel.measure(gtk::Orientation::Horizontal, -1);
+
+        // Only the dressing moves. The CPU signal is untouched.
+        leds.set(CoreLeds {
+            rows: Some(4),
+            ..CoreLeds::default()
+        });
+        pump();
+        let (_, pinned, _, _) = panel.measure(gtk::Orientation::Horizontal, -1);
+
+        assert!(
+            automatic > 0 && pinned > 0,
+            "anti-vacuity: both frames must have reached the surface, got {automatic} and {pinned}"
+        );
+        assert_ne!(
+            automatic, pinned,
+            "a config save alone must reshape the panel: dropping core_leds::signal() from the \
+             row's map_ref! leaves the two measurements identical and #869's live re-skin dead"
         );
     }
 

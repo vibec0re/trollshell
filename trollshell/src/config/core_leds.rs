@@ -26,7 +26,20 @@
 //! `warn!` naming the accepted values, then fall through to the layer below.
 //! It does not win, and it does not take anything down. Exactly one line, not
 //! two — the deprecation announcement is made only for a value that parsed,
-//! and the unusable-value line names the key and the file itself.
+//! and the unusable-value line names the key and the file itself. Both lines
+//! are startup-only: a process's environment is fixed at `exec`, so a reload
+//! has nothing new to say about one.
+//!
+//! # A bad *value* costs its own key, and only its own key
+//!
+//! Every key is judged on its own in [`CoreLedsConfig::parsed`]: the keys that
+//! parse apply, each key that does not falls back to the built-in default with
+//! one warning naming it, and [`CoreLedsConfig::validate`] is `Infallible` so
+//! nothing in this schema can be a whole-file rejection (#1040 V1). What is
+//! still whole-file is a layer that is not TOML **at all** — an unterminated
+//! string, an integer literal too large for TOML's `i64` — which at startup
+//! degrades to the built-in defaults with a loud `error!` and on a reload
+//! keeps the last good file.
 //!
 //! # Two spellings, one parser
 //!
@@ -36,23 +49,25 @@
 //! automatic rectangle, which is what [`CoreLedsConfig::DEFAULT_TOML`] states,
 //! and [`rows_spelling`] maps that back onto the variable's vocabulary so
 //! **one** parser decides both — [`CoreLedsConfig::parsed`] is the only path
-//! from raw spelling to [`CoreLeds`], and [`CoreLedsConfig::validate`] is that
-//! same call with the value discarded, so "what the file rejects" and "what
-//! the variable rejects" cannot drift.
+//! from raw spelling to [`CoreLeds`], so "what the file rejects" and "what the
+//! variable rejects" cannot drift. The one deliberate divergence is that `0`,
+//! which the variable never took, so the two vocabularies are stated
+//! separately on the [`Knob`] (#1040 V4).
 //!
 //! # Live reload
 //!
 //! [`Watcher`] polls every layer's [`stamp`] on [`CONFIG_POLL_INTERVAL`] — the
 //! `places.toml` idiom (`hytte_services::places::watch_config`), a single
 //! `stat` per layer per tick, re-reading only when a stamp actually moves. A
-//! reload that fails to parse or validate **keeps the last good file layer**
-//! and warns; a deleted layer falls back to the layer below it (and, with
-//! nothing left, to the built-in defaults); a reload never re-announces a
-//! deprecated variable, and the variable keeps winning across reloads.
+//! reload of a layer that is not TOML **keeps the last good file layer** and
+//! warns; a deleted layer falls back to the layer below it (and, with nothing
+//! left, to the built-in defaults); a reload never re-announces a deprecated
+//! variable, and the variable keeps winning across reloads.
 //!
-//! The config is loaded **once** per process, in [`startup`]; the watcher only
-//! stamps. Two loads at startup would double every diagnostic and open a race
-//! against an edit landing between them — see [`Watcher::observing`].
+//! The config is stamped and then loaded **once** per process, in [`boot`];
+//! the watcher does neither. Two loads at startup would double every
+//! diagnostic, and stamping *after* the load loses an edit made in between
+//! permanently — see [`Watcher::observing`].
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -64,7 +79,7 @@ use hytte_config::subsystem::{self, ConfigError, Subsystem};
 use hytte_config::xdg;
 use hytte_preem::{ColorMap, DisplayStyle, Fill};
 
-use super::{warn_deprecated_env, warn_unusable_env};
+use super::{warn_deprecated_env, warn_rejected_value, warn_unusable_env};
 
 // ── The resolved dressing ────────────────────────────────────────────────────
 
@@ -211,6 +226,10 @@ fn rows_spelling(rows: &Rows) -> String {
         Rows::Count(0) => "rect".to_string(),
         Rows::Count(n) => n.to_string(),
         Rows::Word(word) => word.clone(),
+        // A value of neither TOML type — `rows = true`, `rows = 4.0`. Rendered
+        // as the TOML it is and handed to the same judge, which rejects it and
+        // names it; see [`Rows::Other`].
+        Rows::Other(value) => value.to_string(),
     }
 }
 
@@ -227,6 +246,10 @@ fn rows_as_written(rows: &Rows) -> String {
     match rows {
         Rows::Count(n) => n.to_string(),
         Rows::Word(word) => format!("{word:?}"),
+        // `toml::Value`'s `Display` *is* its TOML rendering — `true`, `4.0`,
+        // `[1]` — which is the whole reason the catch-all carries a
+        // `toml::Value` rather than a `serde::de::IgnoredAny`.
+        Rows::Other(value) => value.to_string(),
     }
 }
 
@@ -244,36 +267,58 @@ struct Knob {
     var: &'static str,
     /// The `core-leds.toml` key it moved to.
     key: &'static str,
-    /// What both accept, phrased to read after "expected" and after "it
-    /// accepts" — the two sentences it appears in
-    /// ([`crate::config::unusable_env_message`] and
-    /// [`crate::config::deprecation_message`]) plus [`InvalidValue`]'s.
-    expected: &'static str,
+    /// What the **variable** accepts, phrased to read after "expected" in
+    /// [`crate::config::unusable_env_message`].
+    env_accepts: &'static str,
+    /// What the **file key** accepts, phrased to read after "it accepts" in
+    /// [`crate::config::deprecation_message`] and after "expected" in
+    /// [`InvalidValue`]'s.
+    ///
+    /// Separate from [`Self::env_accepts`] for one key only, and #1040 V4 is
+    /// why it has to be: `rows` is the pilot's single translation point
+    /// between the two vocabularies (TOML's `0` is the file's spelling of the
+    /// word `rect`, and the variable never took a `0`), so one shared string
+    /// made the *variable*'s own line self-contradictory —
+    /// "`0` … is not valid; expected "rect" (or 0)". Where the two agree,
+    /// [`Knob::same`] states the vocabulary once.
+    file_accepts: &'static str,
 }
 
-const STYLE: Knob = Knob {
-    var: "TROLLSHELL_CORE_LEDS_STYLE",
-    key: "style",
-    expected: "one of vfd/lcd/oled/crt",
-};
-const COLOR: Knob = Knob {
-    var: "TROLLSHELL_CORE_LEDS_COLOR",
-    key: "color",
-    expected: "one of style/rainbow/transpride/heat, or an #rrggbb literal",
-};
+impl Knob {
+    /// A knob whose file spelling and variable spelling are identical — the
+    /// normal case, and the one a family-#2 author should expect to be in.
+    const fn same(var: &'static str, key: &'static str, accepts: &'static str) -> Self {
+        Self {
+            var,
+            key,
+            env_accepts: accepts,
+            file_accepts: accepts,
+        }
+    }
+}
+
+const STYLE: Knob = Knob::same(
+    "TROLLSHELL_CORE_LEDS_STYLE",
+    "style",
+    "one of vfd/lcd/oled/crt",
+);
+const COLOR: Knob = Knob::same(
+    "TROLLSHELL_CORE_LEDS_COLOR",
+    "color",
+    "one of style/rainbow/transpride/heat, or an #rrggbb literal",
+);
 const ROWS: Knob = Knob {
     var: "TROLLSHELL_CORE_LEDS_ROWS",
     key: "rows",
+    // The variable never took a `0` — `TROLLSHELL_CORE_LEDS_ROWS=0` is
+    // rejected — so its own line must not offer one (#1040 V4).
+    env_accepts: "rect for the automatic rectangle, or a row count from 1 to 64",
     // Both file spellings of the automatic shape, and the cap, stated in the
     // one place a user reads about this key outside `DEFAULT_TOML` — which,
     // until nix renders a base file, exists nowhere on disk (#1040 F5).
-    expected: "\"rect\" (or 0) for the automatic rectangle, or a row count from 1 to 64",
+    file_accepts: "0 or \"rect\" for the automatic rectangle, or a row count from 1 to 64",
 };
-const FILL: Knob = Knob {
-    var: "TROLLSHELL_CORE_LEDS_FILL",
-    key: "fill",
-    expected: "one of spare/blank",
-};
+const FILL: Knob = Knob::same("TROLLSHELL_CORE_LEDS_FILL", "fill", "one of spare/blank");
 
 // ── The file schema ──────────────────────────────────────────────────────────
 
@@ -317,7 +362,8 @@ impl std::fmt::Display for InvalidValue {
 /// value no parser accepts). There is deliberately no `deny_unknown_fields`:
 /// merge rule 4 says an unknown key warns and is ignored, and
 /// [`subsystem::assemble`] is what implements that.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// No `Eq`: [`Rows::Other`] carries a `toml::Value`, which can hold a float.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct CoreLedsConfig {
     style: String,
@@ -326,26 +372,38 @@ pub struct CoreLedsConfig {
     fill: String,
 }
 
-/// The two TOML spellings the `rows` key accepts.
+/// The TOML spellings the `rows` key accepts — **and every other one**, so
+/// that no `rows` value can take the file down with it.
 ///
 /// `#[serde(untagged)]`, so `rows = 0` **and** `rows = "rect"` both
 /// deserialize and both reach [`parse_core_leds_rows`], which stays the single
 /// judge. That is not a convenience: `rect` is the word the deprecated
 /// `TROLLSHELL_CORE_LEDS_ROWS` accepted and the word the deprecation line walks
 /// a migrating user toward, so a file that rejected it broke #869's own
-/// contract — and rejected it as a **whole-file** `ConfigError::Schema`, taking
-/// every other key in the file down with the typo and dropping the panel back
-/// to built-in defaults (#1040 F5).
+/// contract.
 ///
-/// The residual whole-file case is a value that is neither an integer nor a
-/// string — `rows = true`, `rows = [1]`. That is the price of a `serde`-shaped
-/// schema and it is *tested* rather than pretended away
-/// (`a_rows_value_of_the_wrong_type_is_still_a_whole_file_error`): there is no
-/// per-key hook in `hytte_config::subsystem` for a type mismatch, since the
-/// mismatch happens inside `serde`'s deserializer before any subsystem code
-/// runs. Hoisting one is #1041's business, not this PR's. The two spellings a
-/// user plausibly writes are both covered here.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// # Why there is a catch-all variant
+///
+/// Every *other* key here is a `String`, so serde accepts whatever the user
+/// wrote and [`CoreLedsConfig::parsed`] judges it per key. `rows` is the one
+/// key with a non-string schema, and without [`Self::Other`] serde would
+/// decide its fate first: `rows = true`, `rows = 4.0`, `rows = [1]` all failed
+/// as a **whole-file** `ConfigError::Schema` before the subsystem saw a byte,
+/// taking every other key in the file down with the typo (#1040 V9). A
+/// catch-all restores the invariant the pilot is meant to demonstrate — *a bad
+/// value costs its own key and nothing else* — and it costs one variant.
+///
+/// The residual whole-file cases are now exactly the ones where the file is
+/// **not TOML**: an unterminated string, and an integer literal too large for
+/// TOML's `i64` (`rows = 9223372036854775808`, a `ConfigError::Parse` from the
+/// TOML lexer). Neither ever reaches serde, let alone this type; both are
+/// tested (`a_file_that_is_not_toml_is_still_a_whole_file_error`).
+///
+/// A family-#2 author copying this needs the rule, not the enum: **a schema
+/// field whose type is narrower than "any TOML scalar" hands its verdict to
+/// serde, and serde's verdict is whole-file.** Keep fields raw, or give them a
+/// catch-all.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum Rows {
     /// A TOML integer: `0` is the automatic rectangle, anything else is a row
@@ -354,6 +412,9 @@ pub enum Rows {
     /// A TOML string: the environment variable's own vocabulary, handed to
     /// [`parse_core_leds_rows`] untouched.
     Word(String),
+    /// Anything else the file said — kept as the TOML it was so the diagnostic
+    /// can quote it back, then rejected per key like any other bad value.
+    Other(toml::Value),
 }
 
 impl Default for CoreLedsConfig {
@@ -376,28 +437,92 @@ impl Default for CoreLedsConfig {
 }
 
 impl CoreLedsConfig {
-    /// The file's raw spellings as the resolved [`CoreLeds`], or the first key
-    /// that does not parse.
+    /// The file's raw spellings as the resolved [`CoreLeds`], beside **every**
+    /// key that did not parse.
     ///
-    /// The one path from spelling to value: [`Self::validate`] is this call
-    /// with the value thrown away, and the resolver is this call with the
-    /// environment layered on top. Nothing else may parse a `core-leds.toml`
-    /// value.
-    fn parsed(&self) -> Result<CoreLeds, InvalidValue> {
+    /// The one path from spelling to value: the resolver is this call with the
+    /// environment layered on top, and nothing else may parse a
+    /// `core-leds.toml` value.
+    ///
+    /// # A bad value costs its own key, and only its own key (#1040 V1)
+    ///
+    /// This returns a `CoreLeds` **and** a list, not a `Result`, and that is
+    /// the whole shape of the fix. It used to `?` on the first bad key and
+    /// hand the error to [`Subsystem::validate`], where
+    /// `hytte_config::subsystem::assemble` turns any validation failure into a
+    /// whole-file `ConfigError::Invalid`. The *message* named one key; the
+    /// *effect* dropped all four. A file saying
+    ///
+    /// ```toml
+    /// style = "crt"
+    /// rows  = "many"
+    /// ```
+    ///
+    /// rendered the stock VFD panel with `style` silently gone, while the
+    /// journal talked only about `rows` — the reader's three good keys looked
+    /// ignored for no reason. Now `style` applies, `rows` falls back to the
+    /// built-in default, and exactly one line names `rows`.
+    ///
+    /// The per-key fallback is the **built-in default** for that key, not the
+    /// merged layer underneath it: [`hytte_config::merge`] merges the layers
+    /// before anything is parsed, so by the time a value is judged there is no
+    /// provenance left to fall back through. That is what
+    /// [`crate::config::rejected_value_message`] says in as many words.
+    ///
+    /// This is also the template half a family #2 copies, and the rule is
+    /// short: **keep every schema field raw and judge it here.** A field typed
+    /// as the parsed value hands its verdict to serde, and serde's verdict is
+    /// whole-file (see [`Rows::Other`] for the one key that needed a catch-all
+    /// to get out of that).
+    fn parsed(&self) -> (CoreLeds, Vec<InvalidValue>) {
+        /// Take the parsed value, or record why it was rejected and take the
+        /// built-in default for that key. A free `fn` rather than a closure
+        /// because it is used at four different `T`s.
+        fn keep<T>(
+            result: Result<T, InvalidValue>,
+            default: T,
+            rejected: &mut Vec<InvalidValue>,
+        ) -> T {
+            match result {
+                Ok(value) => value,
+                Err(invalid) => {
+                    rejected.push(invalid);
+                    default
+                }
+            }
+        }
+
+        let mut rejected = Vec::new();
+        let fallback = CoreLeds::default();
         let rows = rows_spelling(&self.rows);
-        Ok(CoreLeds {
-            style: parse_core_leds_style(&self.style)
-                .map_err(|bad| InvalidValue::of(&STYLE, bad))?,
-            color: parse_core_leds_color(&self.color)
-                .map_err(|bad| InvalidValue::of(&COLOR, bad))?,
+        let leds = CoreLeds {
+            style: keep(
+                parse_core_leds_style(&self.style).map_err(|bad| InvalidValue::of(&STYLE, bad)),
+                fallback.style,
+                &mut rejected,
+            ),
+            color: keep(
+                parse_core_leds_color(&self.color).map_err(|bad| InvalidValue::of(&COLOR, bad)),
+                fallback.color,
+                &mut rejected,
+            ),
             // The offending value is reported in the spelling the *file* uses,
             // not the one the parser was handed: `rows = 0` is spelt `rect`
             // going in, and echoing `rect` back at a user who wrote something
             // else would name a value that is nowhere in their file.
-            rows: parse_core_leds_rows(&rows)
-                .map_err(|_| InvalidValue::written(&ROWS, &rows_as_written(&self.rows)))?,
-            fill: parse_core_leds_fill(&self.fill).map_err(|bad| InvalidValue::of(&FILL, bad))?,
-        })
+            rows: keep(
+                parse_core_leds_rows(&rows)
+                    .map_err(|_| InvalidValue::written(&ROWS, &rows_as_written(&self.rows))),
+                fallback.rows,
+                &mut rejected,
+            ),
+            fill: keep(
+                parse_core_leds_fill(&self.fill).map_err(|bad| InvalidValue::of(&FILL, bad)),
+                fallback.fill,
+                &mut rejected,
+            ),
+        };
+        (leds, rejected)
     }
 }
 
@@ -414,7 +539,9 @@ impl InvalidValue {
         Self {
             key: knob.key,
             value: value.to_string(),
-            expected: knob.expected,
+            // The *file* vocabulary: this diagnostic is only ever produced on
+            // the file path, and for `rows` the two differ (#1040 V4).
+            expected: knob.file_accepts,
         }
     }
 }
@@ -432,6 +559,10 @@ impl Subsystem for CoreLedsConfig {
 # rebuild never clobbers a hand edit and a hand edit never blocks a rebuild.
 # Delete a key to fall back to the value below; `_unset = ["style"]` erases a
 # key an underlying layer set (TOML has no null, so this is how it is spelt).
+#
+# A value no parser accepts costs its own key and nothing else: that key takes
+# the built-in default, one journal line names it, and every other key in the
+# file still applies.
 
 # The kit skin — the panel's physical character.
 #   vfd         near-black field with a phosphor halo off every lit lamp
@@ -464,12 +595,29 @@ rows = 0
 fill = "spare"
 "##;
 
-    type Error = InvalidValue;
+    /// **Nothing** can fail whole-file validation here, and the type says so.
+    ///
+    /// `hytte_config::subsystem::assemble` maps any `validate` error onto
+    /// `ConfigError::Invalid`, which is a **whole-file** rejection — the load
+    /// returns no config at all and the caller falls back to the built-in
+    /// defaults (at startup) or keeps the last good file (on a reload). That
+    /// is the right contract for a config whose keys are interdependent, and
+    /// the wrong one for this pilot, whose four knobs are independent
+    /// look-and-feel values: one typo would revert the other three (#1040 V1).
+    ///
+    /// So the judgement moves into [`CoreLedsConfig::parsed`], which reports
+    /// every bad key and defaults *that key* — and `Infallible` is then the
+    /// honest `Error`, exactly as this trait's own doc suggests ("when there
+    /// is nothing the type system did not already catch"). A family #2 whose
+    /// keys really do constrain each other should use a real error here; one
+    /// whose keys are independent should copy this.
+    type Error = std::convert::Infallible;
 
-    /// Every value goes through the same parser the environment variable used,
-    /// so the file rejects exactly what the variable rejected.
+    /// See [`Self::Error`]: every value is judged per key in
+    /// [`CoreLedsConfig::parsed`], so there is nothing left for the whole-file
+    /// gate to reject.
     fn validate(&self) -> Result<(), Self::Error> {
-        self.parsed().map(|_| ())
+        Ok(())
     }
 }
 
@@ -514,15 +662,33 @@ fn env_key<'a, T>(
     match parse(raw) {
         Ok(value) => {
             if announce == Deprecations::Announce {
-                warn_deprecated_env(CoreLedsConfig::NAME, knob.var, knob.key, knob.expected);
+                // The *file* vocabulary: this line's job is to tell the reader
+                // what to type in the file it names.
+                warn_deprecated_env(CoreLedsConfig::NAME, knob.var, knob.key, knob.file_accepts);
             }
             value
         }
         Err(bad) => {
-            // Not gated on `announce`: an unusable variable is still unusable
-            // after a reload, and this line is a fact about the environment
-            // rather than the once-per-startup announcement the latch guards.
-            warn_unusable_env(CoreLedsConfig::NAME, knob.var, bad, knob.key, knob.expected);
+            // Gated on `announce` exactly like the line above (#1040 V7).
+            // The earlier reading — "an unusable variable is still unusable
+            // after a reload, so this is a fact rather than an announcement" —
+            // was true and still produced a line every three seconds for the
+            // life of the shell. A process's environment is fixed at `exec`
+            // (nothing here calls `set_var`; it is an `unsafe fn`), so the
+            // repeat could never carry news, and `live-verify.md` promises the
+            // reader **exactly one**.
+            if announce == Deprecations::Announce {
+                // The *variable* vocabulary: this line is about what the
+                // variable would have had to say, and for `rows` the file
+                // accepts a spelling the variable never did (#1040 V4).
+                warn_unusable_env(
+                    CoreLedsConfig::NAME,
+                    knob.var,
+                    bad,
+                    knob.key,
+                    knob.env_accepts,
+                );
+            }
             fallback
         }
     }
@@ -537,7 +703,7 @@ fn env_key<'a, T>(
 /// and one that read it would depend on the developer's shell.
 fn resolve(
     layered: CoreLeds,
-    lookup: &impl Fn(&str) -> Option<String>,
+    lookup: &dyn Fn(&str) -> Option<String>,
     announce: Deprecations,
 ) -> CoreLeds {
     let (style, color, rows, fill) = (
@@ -624,17 +790,25 @@ fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
     Some((meta.modified().ok()?, meta.len()))
 }
 
-/// The merged, validated file layer — no environment.
+/// Every layer's [`stamp`], in path order — one `stat` per layer.
+fn stamps_of(paths: &[PathBuf]) -> Vec<Option<(SystemTime, u64)>> {
+    paths.iter().map(|p| stamp(p)).collect()
+}
+
+/// The merged file layer, with every rejected key reported and defaulted — no
+/// environment.
+///
+/// The `Err` here is a file that is not usable **as a file**: not TOML, or a
+/// layer that exists and cannot be read. A known key holding a value nothing
+/// accepts is *not* one of those (#1040 V1) — it costs its own key, warns, and
+/// the rest of the file loads.
 fn load_layer(paths: &[PathBuf]) -> Result<CoreLeds, ConfigError> {
     let loaded = subsystem::load_from::<CoreLedsConfig>(paths)?;
-    // `load_from` already ran `validate`, which *is* `parsed`, so this cannot
-    // fail — mapped rather than unwrapped so the impossible case degrades to
-    // the same "keep the last good one" path as a real error instead of
-    // panicking in the shell's main loop.
-    loaded
-        .config
-        .parsed()
-        .map_err(|e| ConfigError::Invalid(e.to_string()))
+    let (leds, rejected) = loaded.config.parsed();
+    for invalid in &rejected {
+        warn_rejected_value(CoreLedsConfig::NAME, invalid.key, &invalid.to_string());
+    }
+    Ok(leds)
 }
 
 /// Watches every `core-leds.toml` layer for live reload by polling their
@@ -643,6 +817,7 @@ fn load_layer(paths: &[PathBuf]) -> Result<CoreLeds, ConfigError> {
 /// Holds the last file layer that loaded cleanly, which is what a malformed
 /// save keeps: the panel goes on rendering the last good skin rather than
 /// snapping back to the built-in default the moment a hand edit is mid-word.
+#[derive(Clone)]
 struct Watcher {
     paths: Vec<PathBuf>,
     stamps: Vec<Option<(SystemTime, u64)>>,
@@ -650,27 +825,38 @@ struct Watcher {
 }
 
 impl Watcher {
-    /// Start watching from *now*: the current stamps are the baseline, so the
-    /// first [`poll`](Self::poll) reports only edits made after construction.
+    /// Watch `paths` from the baseline `stamps`, seeded with the file layer
+    /// `last_good` that the caller has already loaded.
     ///
-    /// **Stamp-only** — it does not load (#1040 F1). `last_good` is seeded from
-    /// the caller's already-loaded value, because the process loads this config
-    /// exactly once, in [`startup`]. Before this split, `start` loaded and then
-    /// handed `watch` a constructor that loaded *again*: two `unknown key`
-    /// warnings for one typo, two `config unusable` errors for one broken file,
-    /// and — worse — a race, since an edit landing between the two loads was
-    /// baselined into the poller's stamps while the published value came from
-    /// the first load, leaving the panel one save stale until the next edit.
-    /// `places::ConfigWatcher::new` splits the same way and for the same
-    /// reason: it stamps, and `PlacesService::start` does the one load.
+    /// **Neither stamps nor loads** — it takes both from the caller, and both
+    /// halves of that are load-bearing.
     ///
-    /// A supervised restart of [`watch`] re-stamps from now and re-seeds from
-    /// the same startup value. That is a panic path, the seed is only ever the
-    /// *fallback* for a poll that has not fired yet, and the next save corrects
-    /// it; reloading there would put the double-load back for the sake of an
-    /// edge nobody is in.
-    fn observing(paths: Vec<PathBuf>, last_good: CoreLeds) -> Self {
-        let stamps = paths.iter().map(|p| stamp(p)).collect();
+    /// *Not loading* is #1040 F1: before it, `start` loaded and then handed
+    /// `watch` a constructor that loaded *again*, so one typo produced two
+    /// `unknown key` warnings and one broken file two `config unusable`
+    /// errors.
+    ///
+    /// *Not stamping* is #1040 V2, and it is the half that fixing F1 left
+    /// behind. Whoever takes the baseline has to take it **before** the load,
+    /// or an edit landing in between is baselined into the stamps while the
+    /// published value predates it — and, because [`Self::poll`] updates its
+    /// stamps unconditionally, that edit is then missed *forever*, not merely
+    /// late. Splitting the load out of the constructor moved the window rather
+    /// than closing it (the stamp still happened after the load, just on the
+    /// runtime worker that first polled the spawned task); taking both here as
+    /// parameters means [`boot`] can order them correctly and there is no
+    /// second place that could get it wrong.
+    ///
+    /// A supervised restart of [`watch`] resumes from this same baseline — the
+    /// watcher is `Clone` and the factory hands out a copy — so an edit made
+    /// during a panic-and-restart is picked up by the next poll rather than
+    /// silently baselined away. `places::ConfigWatcher::new` splits the load
+    /// out the same way; the stamp ordering is this pilot's addition.
+    fn observing(
+        paths: Vec<PathBuf>,
+        stamps: Vec<Option<(SystemTime, u64)>>,
+        last_good: CoreLeds,
+    ) -> Self {
         Self {
             paths,
             stamps,
@@ -681,7 +867,7 @@ impl Watcher {
     /// The dressing this environment and the current file layers resolve to.
     fn resolved(
         &self,
-        lookup: &impl Fn(&str) -> Option<String>,
+        lookup: &dyn Fn(&str) -> Option<String>,
         announce: Deprecations,
     ) -> CoreLeds {
         resolve(self.last_good, lookup, announce)
@@ -690,10 +876,19 @@ impl Watcher {
     /// Reload and return the fresh dressing when some layer's mtime has moved
     /// *and* the result differs from `current`; otherwise `None`.
     ///
-    /// A layer that stops parsing (or stops validating) keeps
-    /// [`Self::last_good`] and warns — once per edit rather than once per tick,
-    /// because the stamp is taken before the load, so a file left malformed is
-    /// not re-read until it is saved again.
+    /// A layer that stops **parsing as TOML** keeps [`Self::last_good`] and
+    /// warns — once per edit rather than once per tick, because the stamp is
+    /// taken before the load, so a file left malformed is not re-read until it
+    /// is saved again. That is the mid-word save: half a string typed, the
+    /// panel should not flicker.
+    ///
+    /// A layer that parses but holds a value nothing accepts is a *different*
+    /// case since #1040 V1 and is **not** an error: the good keys apply, the
+    /// bad key takes the built-in default, and one warning names it. The
+    /// asymmetry is deliberate — `style = "cr` is a file caught mid-edit,
+    /// `style = "crt"` beside `rows = "many"` is a finished file with one
+    /// mistake in it, and reverting the other three keys to punish the fourth
+    /// is what V1 was filed about.
     ///
     /// A layer that is **deleted** is a different case and is deliberately not
     /// treated as an error (#1040 F7): its stamp goes to `None`, the load
@@ -705,9 +900,9 @@ impl Watcher {
     fn poll(
         &mut self,
         current: CoreLeds,
-        lookup: &impl Fn(&str) -> Option<String>,
+        lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Option<CoreLeds> {
-        let now: Vec<Option<(SystemTime, u64)>> = self.paths.iter().map(|p| stamp(p)).collect();
+        let now = stamps_of(&self.paths);
         if now == self.stamps {
             return None;
         }
@@ -728,16 +923,26 @@ impl Watcher {
 }
 
 /// Poll the layers and republish on a real change, so an edit reaches the
-/// panel within [`CONFIG_POLL_INTERVAL`] without restarting the shell.
+/// panel within `interval` without restarting the shell.
 ///
-/// `seed` is [`startup`]'s already-loaded file layer, threaded through rather
-/// than re-loaded here — see [`Watcher::observing`]. It is `Copy`, which is
-/// what lets this ride `spawn_supervised`'s `Fn` factory unchanged.
-async fn watch(leds: Mutable<CoreLeds>, seed: CoreLeds) {
-    let mut watcher = Watcher::observing(xdg::config_layers(CoreLedsConfig::NAME), seed);
+/// Takes the [`Watcher`] rather than building one: [`boot`] already stamped
+/// and loaded, in that order, and re-doing either here would put back the
+/// double diagnostic (#1040 F1) and the lost-edit window (#1040 V2). The
+/// watcher is `Clone`, which is what lets this ride `spawn_supervised`'s `Fn`
+/// factory — a restart resumes from the same baseline instead of re-stamping.
+///
+/// `lookup` and `interval` are parameters for the same reason `paths` is one:
+/// the loop is then drivable in a test at a cadence a test can wait for, and
+/// [`CoreLedsService`] is the single place production values are chosen.
+async fn watch(
+    leds: Mutable<CoreLeds>,
+    mut watcher: Watcher,
+    lookup: EnvLookup,
+    interval: Duration,
+) {
     loop {
-        tokio::time::sleep(CONFIG_POLL_INTERVAL).await;
-        if let Some(next) = watcher.poll(leds.get(), &process_env) {
+        tokio::time::sleep(interval).await;
+        if let Some(next) = watcher.poll(leds.get(), &*lookup) {
             tracing::info!(subsystem = CoreLedsConfig::NAME, "config changed; reloaded");
             leds.set(next);
         }
@@ -764,24 +969,41 @@ fn initial_load(paths: &[PathBuf]) -> CoreLeds {
     }
 }
 
-/// The process's **one** startup resolution: load the layers once, then resolve
-/// the environment over them announcing every deprecated variable that is set.
+/// The process's **one** startup sequence: stamp the layers, load them once,
+/// resolve the environment over them announcing every deprecated variable that
+/// is set, and hand back the dressing to publish beside the poller that will
+/// keep it fresh.
 ///
-/// Returns the file layer (the poller's seed) beside the resolved dressing,
-/// because the two are different things and [`watch`] needs the former —
-/// resolving is where the environment wins, and seeding the watcher with a
-/// value the environment already overrode would make the *file's* value
-/// unrecoverable on the first reload.
+/// # The order of the first two lines is the fix (#1040 V2)
+///
+/// **Stamp, then load.** An edit that lands in between is then read by *this*
+/// load with a stamp that predates it, so the next [`Watcher::poll`] sees the
+/// stamp move and re-reads — the edit arrives one tick late, at worst.
+/// Loading first and stamping after inverts that: the poller's baseline
+/// already includes the edit while the published value does not, and since
+/// `poll` updates its stamps unconditionally the edit is lost **permanently**.
+/// Measured on the previous head: file said `crt`, panel said `lcd`, three
+/// polls, nothing. There is no re-read loop here on purpose — erring toward
+/// "poll again" is free, and a stat-read-stat retry would only narrow a window
+/// that is already harmless in this direction.
+///
+/// The watcher is seeded with the **file layer**, not the resolved dressing:
+/// resolving is where the environment wins, and seeding with a value the
+/// environment already overrode would make the file's own value unrecoverable
+/// on the first reload.
 ///
 /// This is the only place in production that passes
-/// [`Deprecations::Announce`], and it takes `lookup` rather than reading the
-/// process environment so a test can drive the real call site (#1040 F3):
-/// before, `Deprecations::Announce` sat inline in [`CoreLedsService::start`],
-/// where flipping it to `Silent` left the whole suite green and nobody would
-/// ever have heard a deprecation line again.
-fn startup(paths: &[PathBuf], lookup: &impl Fn(&str) -> Option<String>) -> (CoreLeds, CoreLeds) {
+/// [`Deprecations::Announce`], and it takes `paths`/`lookup` rather than
+/// reaching for the process so the real call site is drivable in a test
+/// (#1040 F3/V3).
+fn boot(paths: &[PathBuf], lookup: &dyn Fn(&str) -> Option<String>) -> (CoreLeds, Watcher) {
+    let stamps = stamps_of(paths);
     let layered = initial_load(paths);
-    (layered, resolve(layered, lookup, Deprecations::Announce))
+    let resolved = resolve(layered, lookup, Deprecations::Announce);
+    (
+        resolved,
+        Watcher::observing(paths.to_vec(), stamps, layered),
+    )
 }
 
 // ── The service ──────────────────────────────────────────────────────────────
@@ -791,27 +1013,66 @@ pub struct CoreLedsHandles {
     leds: Mutable<CoreLeds>,
 }
 
-pub struct CoreLedsService;
+/// How a knob's deprecated environment variable is read.
+///
+/// A boxed `Fn` rather than a direct `std::env::var`, because `unsafe_code =
+/// "forbid"` rules out `std::env::set_var` (an `unsafe fn` in edition 2024): a
+/// test that drove the real environment could not exist at all, and one that
+/// read it would depend on the developer's shell.
+type EnvLookup = std::sync::Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// The `core-leds.toml` service: one startup load, one announcing resolution,
+/// and a supervised poller.
+///
+/// # Why it carries its three inputs instead of reaching for them
+///
+/// [`Service::start`] is what the process actually runs, and until #1040 V3 it
+/// was the one function here with **zero** coverage — every test drove a
+/// hand-rolled replica of it, so mutations that made `start` load twice, or
+/// skip the announcing resolution entirely, left the suite green. Nobody would
+/// ever have heard a deprecation line again and CI would not have noticed.
+///
+/// Holding `paths`, `lookup` and `interval` as fields means a test constructs
+/// this over a scratch overlay and a fake environment and then calls the
+/// **real** `start`. What is left unpinned is [`service`]'s three argument
+/// expressions — deliberately, and that is as thin as this can get without
+/// `set_var`: they are `xdg::config_layers`, `process_env` and one `const`,
+/// each covered on its own elsewhere.
+pub struct CoreLedsService {
+    /// Layer paths, lowest precedence first.
+    paths: Vec<PathBuf>,
+    /// How a deprecated variable is read.
+    lookup: EnvLookup,
+    /// How often [`watch`] re-stats the layers.
+    interval: Duration,
+}
 
 impl Service for CoreLedsService {
     type Handles = CoreLedsHandles;
 
     fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
-        // One load, one announcing resolution — both inside `startup`, which
-        // is also what a test drives. Nothing here chooses a `Deprecations`,
-        // so this call site cannot get the once-ness wrong.
-        let (layered, resolved) = startup(&xdg::config_layers(CoreLedsConfig::NAME), &process_env);
+        // One stamp, one load, one announcing resolution — all inside `boot`,
+        // in that order. Nothing here chooses a `Deprecations` or a stamp
+        // ordering, so this call site cannot get either wrong.
+        let (resolved, watcher) = boot(&self.paths, &*self.lookup);
         let leds = Mutable::new(resolved);
+        let Self {
+            lookup, interval, ..
+        } = self;
         spawn_supervised("core-leds", {
             let leds = leds.clone();
-            move || watch(leds.clone(), layered)
+            move || watch(leds.clone(), watcher.clone(), lookup.clone(), interval)
         });
         CoreLedsHandles { leds }
     }
 }
 
 pub fn service() -> CoreLedsService {
-    CoreLedsService
+    CoreLedsService {
+        paths: xdg::config_layers(CoreLedsConfig::NAME),
+        lookup: std::sync::Arc::new(process_env),
+        interval: CONFIG_POLL_INTERVAL,
+    }
 }
 
 /// Signal of the per-core LED panel's dressing, re-firing on every live config
@@ -828,10 +1089,10 @@ pub fn signal() -> impl Signal<Item = CoreLeds> {
 #[cfg(test)]
 mod tests {
     use super::{
-        COLOR, CONFIG_POLL_INTERVAL, CoreLeds, CoreLedsConfig, Deprecations, FILL, InvalidValue,
-        MAX_ROWS, ROWS, Rows, STYLE, Watcher, initial_load, parse_core_leds_color,
-        parse_core_leds_fill, parse_core_leds_rows, parse_core_leds_style, parse_hex_rgb, resolve,
-        rows_spelling, startup,
+        COLOR, CONFIG_POLL_INTERVAL, CoreLeds, CoreLedsConfig, CoreLedsService, Deprecations, FILL,
+        InvalidValue, MAX_ROWS, Mutable, ROWS, Rows, STYLE, Service, Watcher, boot, initial_load,
+        parse_core_leds_color, parse_core_leds_fill, parse_core_leds_rows, parse_core_leds_style,
+        parse_hex_rgb, resolve, rows_spelling, stamps_of, watch,
     };
     use hytte_config::subsystem::{self, Subsystem};
     use hytte_preem::{ColorMap, DisplayStyle, Fill};
@@ -852,6 +1113,34 @@ mod tests {
 
     fn no_env() -> impl Fn(&str) -> Option<String> {
         env(&[])
+    }
+
+    /// What the file's keys resolved to, whatever it also rejected — the
+    /// half of [`CoreLedsConfig::parsed`] the panel renders.
+    fn applied(config: &CoreLedsConfig) -> CoreLeds {
+        config.parsed().0
+    }
+
+    /// Every key the file was rejected on, in schema order — the half a
+    /// journal line is written for.
+    ///
+    /// This is what `validate()` used to return, and the difference is the
+    /// point of #1040 V1: a `Vec` means "these keys took the built-in default
+    /// and the others applied", where the old `Result` meant "the whole file
+    /// is gone".
+    fn rejections(config: &CoreLedsConfig) -> Vec<InvalidValue> {
+        config.parsed().1
+    }
+
+    /// The one key a config was rejected on.
+    ///
+    /// # Panics
+    /// If it was rejected on none, or on more than one — either way the test
+    /// asking is asking the wrong question.
+    fn only_rejection(config: &CoreLedsConfig) -> InvalidValue {
+        let mut rejected = rejections(config);
+        assert_eq!(rejected.len(), 1, "expected exactly one rejected key");
+        rejected.remove(0)
     }
 
     // ── The documented default ──────────────────────────────────────────────
@@ -875,7 +1164,7 @@ mod tests {
             "DEFAULT_TOML and the serde fallback must be the same config"
         );
         assert_eq!(
-            loaded.config.parsed().expect("the default validates"),
+            applied(&loaded.config),
             CoreLeds::default(),
             "…and both must parse to the dressing the env path produced when unset"
         );
@@ -919,7 +1208,7 @@ mod tests {
         // Accepted: every skin, by the kit's own `name()` vocabulary.
         for style in DisplayStyle::ALL {
             assert_eq!(parse_core_leds_style(style.name()), Ok(style));
-            assert!(with_style(style.name()).validate().is_ok());
+            assert!(rejections(&with_style(style.name())).is_empty());
         }
         // Accepted: every named map, plus the `#rrggbb` literal.
         for map in ColorMap::ALL {
@@ -938,8 +1227,8 @@ mod tests {
         // and the offending spelling named.
         assert_eq!(parse_core_leds_style("plasma"), Err("plasma"));
         assert_eq!(
-            with_style("plasma").validate(),
-            Err(InvalidValue::of(&STYLE, "plasma"))
+            rejections(&with_style("plasma")),
+            [InvalidValue::of(&STYLE, "plasma")]
         );
 
         assert_eq!(parse_core_leds_color("puce"), Err("puce"));
@@ -947,23 +1236,23 @@ mod tests {
         // components, so accepting it would mean inventing a colour.
         assert_eq!(parse_core_leds_color("rgb"), Err("rgb"));
         assert_eq!(
-            with(|c| c.color = "puce".into()).validate(),
-            Err(InvalidValue::of(&COLOR, "puce"))
+            rejections(&with(|c| c.color = "puce".into())),
+            [InvalidValue::of(&COLOR, "puce")]
         );
 
         assert_eq!(parse_core_leds_rows("0"), Err("0"), "0 rows is a typo");
         assert_eq!(parse_core_leds_rows("-2"), Err("-2"));
         assert_eq!(parse_core_leds_rows("many"), Err("many"));
         assert_eq!(
-            with(|c| c.rows = Rows::Count(-2)).validate(),
-            Err(InvalidValue::written(&ROWS, "-2")),
+            rejections(&with(|c| c.rows = Rows::Count(-2))),
+            [InvalidValue::written(&ROWS, "-2")],
             "a negative row count is rejected in the integer spelling too"
         );
 
         assert_eq!(parse_core_leds_fill("none"), Err("none"));
         assert_eq!(
-            with(|c| c.fill = "none".into()).validate(),
-            Err(InvalidValue::of(&FILL, "none"))
+            rejections(&with(|c| c.fill = "none".into())),
+            [InvalidValue::of(&FILL, "none")]
         );
     }
 
@@ -989,10 +1278,7 @@ mod tests {
             Ok(Some(MAX_ROWS))
         );
         assert_eq!(
-            with(|c| c.rows = Rows::Count(cap))
-                .parsed()
-                .expect("valid")
-                .rows,
+            applied(&with(|c| c.rows = Rows::Count(cap))).rows,
             Some(MAX_ROWS)
         );
 
@@ -1001,8 +1287,8 @@ mod tests {
         let over = MAX_ROWS + 1;
         assert_eq!(parse_core_leds_rows(&over.to_string()), Err("65"));
         assert_eq!(
-            with(|c| c.rows = Rows::Count(cap + 1)).validate(),
-            Err(InvalidValue::written(&ROWS, "65"))
+            rejections(&with(|c| c.rows = Rows::Count(cap + 1))),
+            [InvalidValue::written(&ROWS, "65")]
         );
 
         // …and so is every shape of absurd, including the two that used to
@@ -1011,8 +1297,8 @@ mod tests {
             assert_eq!(parse_core_leds_rows(absurd), Err(absurd), "{absurd} rows");
         }
         assert_eq!(
-            with(|c| c.rows = Rows::Count(i64::MAX)).validate(),
-            Err(InvalidValue::written(&ROWS, "9223372036854775807"))
+            rejections(&with(|c| c.rows = Rows::Count(i64::MAX))),
+            [InvalidValue::written(&ROWS, "9223372036854775807")]
         );
     }
 
@@ -1030,44 +1316,79 @@ mod tests {
     #[test]
     fn a_rejected_value_is_reported_as_the_toml_it_was_written_as() {
         assert_eq!(
-            with_style("plasma")
-                .validate()
-                .expect_err("plasma is not a skin")
-                .to_string(),
+            only_rejection(&with_style("plasma")).to_string(),
             "style = \"plasma\" is not valid; expected one of vfd/lcd/oled/crt",
             "a string key's value is quoted — `style = plasma` is not TOML at all"
         );
         assert_eq!(
-            with(|c| c.rows = Rows::Count(-2))
-                .validate()
-                .expect_err("-2 is not a row count")
-                .to_string(),
-            "rows = -2 is not valid; expected \"rect\" (or 0) for the automatic \
-             rectangle, or a row count from 1 to 64",
+            only_rejection(&with(|c| c.rows = Rows::Count(-2))).to_string(),
+            "rows = -2 is not valid; expected 0 or \"rect\" for the \
+             automatic rectangle, or a row count from 1 to 64",
             "…while an integer key's is bare"
         );
         assert_eq!(
-            with(|c| c.rows = Rows::Word("many".into()))
-                .validate()
-                .expect_err("many is not a row count")
-                .to_string(),
-            "rows = \"many\" is not valid; expected \"rect\" (or 0) for the automatic \
-             rectangle, or a row count from 1 to 64",
+            only_rejection(&with(|c| c.rows = Rows::Word("many".into()))).to_string(),
+            "rows = \"many\" is not valid; expected 0 or \"rect\" for the \
+             automatic rectangle, or a row count from 1 to 64",
             "…and `rows`' string arm quotes, because that is what the file says"
         );
     }
 
     /// The cap the diagnostic quotes is the cap the parser enforces.
     ///
-    /// `ROWS.expected` spells the bound out for the reader ("a row count from
-    /// 1 to 64") because that sentence is what a migrating user gets in the
-    /// journal, and it is a literal. **Red if [`MAX_ROWS`] moves without it.**
+    /// `ROWS`' two vocabularies spell the bound out for the reader ("a row
+    /// count from 1 to 64") because that sentence is what a migrating user
+    /// gets in the journal, and both are literals. **Red if [`MAX_ROWS`] moves
+    /// without them.**
     #[test]
     fn the_diagnostic_quotes_the_cap_it_enforces() {
+        for accepts in [ROWS.file_accepts, ROWS.env_accepts] {
+            assert!(
+                accepts.contains(&format!("1 to {MAX_ROWS}")),
+                "the row cap {MAX_ROWS} is not the one {accepts:?} promises"
+            );
+        }
+    }
+
+    /// **The two vocabularies differ in exactly one spelling, and each line
+    /// states its own** (#1040 V4).
+    ///
+    /// `rows` is the pilot's single translation point: TOML's `0` is the
+    /// file's spelling of the word `rect`, and `TROLLSHELL_CORE_LEDS_ROWS=0`
+    /// is rejected. One shared `expected` string therefore made the
+    /// *variable*'s own rejection line contradict itself, verbatim:
+    ///
+    /// ```text
+    /// TROLLSHELL_CORE_LEDS_ROWS is set to `0`, which is not valid;
+    ///   expected "rect" (or 0) …
+    /// ```
+    ///
+    /// **Red if the two are collapsed back into one string** — in either
+    /// direction: sharing the file's wording puts `0` back in the variable's
+    /// line, sharing the variable's takes the file's own spelling out of the
+    /// deprecation line that is supposed to teach it.
+    #[test]
+    fn the_variable_line_does_not_offer_a_spelling_the_variable_rejects() {
+        let (captured, _guard) = capture();
+        let resolved = resolve(
+            CoreLeds::default(),
+            &env(&[("TROLLSHELL_CORE_LEDS_ROWS", "0")]),
+            Deprecations::Announce,
+        );
+
+        assert_eq!(resolved.rows, None, "live control: `0` fell through");
+        let line = warnings(&captured)
+            .into_iter()
+            .find(|w| w.starts_with("TROLLSHELL_CORE_LEDS_ROWS is set to `0`"))
+            .expect("the unusable-variable line");
         assert!(
-            ROWS.expected.contains(&format!("1 to {MAX_ROWS}")),
-            "the row cap {MAX_ROWS} is not the one {:?} promises",
-            ROWS.expected
+            !line.contains("or 0"),
+            "the line that rejects `0` must not offer `0` back: {line}"
+        );
+        assert!(
+            ROWS.file_accepts.contains("0 or \"rect\""),
+            "…while the file, which does take it, says so: {:?}",
+            ROWS.file_accepts
         );
     }
 
@@ -1085,20 +1406,11 @@ mod tests {
         assert_eq!(rows_spelling(&Rows::Word("rect".into())), "rect");
 
         assert_eq!(
-            with(|c| c.rows = Rows::Count(0))
-                .parsed()
-                .expect("valid")
-                .rows,
+            applied(&with(|c| c.rows = Rows::Count(0))).rows,
             None,
             "0 is the automatic rectangle"
         );
-        assert_eq!(
-            with(|c| c.rows = Rows::Count(3))
-                .parsed()
-                .expect("valid")
-                .rows,
-            Some(3)
-        );
+        assert_eq!(applied(&with(|c| c.rows = Rows::Count(3))).rows, Some(3));
     }
 
     /// **`rows = "rect"` works in the file** — the word the deprecated variable
@@ -1121,7 +1433,7 @@ mod tests {
             "rows = \"rect\"\nstyle = \"crt\"\n".into(),
         )])
         .expect("a string `rows` assembles");
-        let resolved = rect.config.parsed().expect("valid");
+        let resolved = applied(&rect.config);
         assert_eq!(resolved.rows, None, "the word is the automatic rectangle");
         assert_eq!(
             resolved.style,
@@ -1130,41 +1442,121 @@ mod tests {
         );
 
         assert_eq!(
-            with(|c| c.rows = Rows::Word("4".into()))
-                .parsed()
-                .expect("valid")
-                .rows,
+            applied(&with(|c| c.rows = Rows::Word("4".into()))).rows,
             Some(4),
             "the string arm goes through the same single judge"
         );
         assert_eq!(
-            with(|c| c.rows = Rows::Word("many".into())).validate(),
-            Err(InvalidValue::written(&ROWS, "\"many\"")),
+            rejections(&with(|c| c.rows = Rows::Word("many".into()))),
+            [InvalidValue::written(&ROWS, "\"many\"")],
             "an unknown word is a named per-key error, not a serde type message"
         );
     }
 
-    /// The residual whole-file case, **tested rather than pretended away**: a
-    /// `rows` that is neither an integer nor a string.
+    /// **A bad value costs its own key and nothing else** — the headline
+    /// claim, asserted on the *effect* rather than on the message (#1040 V1).
     ///
-    /// `serde` decides this inside its own deserializer, before any subsystem
-    /// code runs, and `hytte_config::subsystem` offers no per-key hook for a
-    /// type mismatch — so `rows = true` is a `ConfigError::Schema` and takes
-    /// the file with it. Documented on [`Rows`], flagged to #1041, and pinned
-    /// here so the day a per-key hook exists this test is the thing that
-    /// notices (#1040 F5).
+    /// Until this round the claim was false. `parsed` `?`-ed on the first bad
+    /// key, `validate` was that call, and `subsystem::assemble` turns a
+    /// `validate` error into a whole-file `ConfigError::Invalid` — so this
+    /// file resolved to the stock VFD/heat panel with `style = "crt"` silently
+    /// gone, while the journal talked only about `rows`. Every assertion in
+    /// the suite was about the message; nothing looked at what the panel got.
+    ///
+    /// **Red if the judgement moves back behind a `?`** — or if `validate`
+    /// stops being `Infallible`, which is the same defect one level up.
     #[test]
-    fn a_rows_value_of_the_wrong_type_is_still_a_whole_file_error() {
-        let err = subsystem::assemble::<CoreLedsConfig>(&[(
-            PathBuf::from("/o.toml"),
-            "rows = true\nstyle = \"crt\"\n".into(),
-        )])
-        .expect_err("a boolean `rows` fits neither arm");
+    fn a_bad_value_leaves_every_other_key_applied() {
+        let mut overlay = Overlay::new();
+        overlay.write("style = \"crt\"\ncolor = \"rainbow\"\nrows = \"many\"\n");
 
-        assert!(
-            matches!(err, subsystem::ConfigError::Schema(ref m) if m.contains("rows")),
-            "the key must at least be named: {err}"
+        let (captured, _guard) = capture();
+        let leds = initial_load(&overlay.layers());
+
+        assert_eq!(leds.style, DisplayStyle::Crt, "the good keys apply");
+        assert_eq!(leds.color, ColorMap::Rainbow, "…all of them");
+        assert_eq!(
+            leds.rows,
+            CoreLeds::default().rows,
+            "…and only the bad key falls back to the built-in default"
         );
+        assert_eq!(
+            warnings(&captured),
+            [
+                "rows = \"many\" is not valid; expected 0 or \"rect\" for the automatic \
+              rectangle, or a row count from 1 to 64 — ignoring this key and using \
+              the built-in default"
+            ],
+            "exactly one line, naming exactly the key that was dropped, and saying \
+             what happened to it"
+        );
+        assert_eq!(
+            errors(&captured),
+            Vec::<String>::new(),
+            "and no `config unusable` error: the file was usable"
+        );
+    }
+
+    /// A `rows` of the wrong *type* is a per-key rejection too (#1040 V9).
+    ///
+    /// It used to be the one residual whole-file case: `serde` decided
+    /// `rows = true` inside its own deserializer, before any subsystem code
+    /// ran, so a `ConfigError::Schema` took the file with it. [`Rows::Other`]
+    /// is the catch-all that gives the judgement back to
+    /// [`CoreLedsConfig::parsed`], where it belongs — including `rows = 4.0`,
+    /// the plausible float typo, which the old carve-out's doc did not even
+    /// list.
+    ///
+    /// **Red if `Rows::Other` is dropped**: every case below goes back to
+    /// being a `ConfigError::Schema` and `assemble` returns `Err`.
+    #[test]
+    fn a_rows_value_of_the_wrong_type_is_a_per_key_rejection() {
+        for (body, written) in [
+            ("rows = true\nstyle = \"crt\"\n", "true"),
+            ("rows = 4.0\nstyle = \"crt\"\n", "4.0"),
+            ("rows = [1]\nstyle = \"crt\"\n", "[1]"),
+        ] {
+            let loaded =
+                subsystem::assemble::<CoreLedsConfig>(&[(PathBuf::from("/o.toml"), body.into())])
+                    .unwrap_or_else(|e| panic!("{body:?} must still load: {e}"));
+
+            assert_eq!(
+                applied(&loaded.config).style,
+                DisplayStyle::Crt,
+                "{body:?}: the key beside it survived"
+            );
+            assert_eq!(
+                only_rejection(&loaded.config),
+                InvalidValue::written(&ROWS, written),
+                "{body:?}: named, and quoted as the TOML it was written as"
+            );
+        }
+    }
+
+    /// The residual whole-file cases, **tested rather than pretended away**:
+    /// a layer that is not TOML at all.
+    ///
+    /// These never reach `serde`, let alone this schema — the TOML parser
+    /// rejects the bytes, and there is nothing per-key to say about a file
+    /// whose keys cannot be told apart. Both are `ConfigError::Parse`, both
+    /// keep the last good file on a reload, and the second one is the reason
+    /// `rows = 9223372036854775808` behaves differently from
+    /// `rows = 9223372036854775807` (which is a plain per-key rejection):
+    /// TOML integers are `i64`, so the larger literal is a lexing failure.
+    #[test]
+    fn a_file_that_is_not_toml_is_still_a_whole_file_error() {
+        for body in [
+            "style = \"crt\n",
+            "rows = 9223372036854775808\nstyle = \"crt\"\n",
+        ] {
+            let err =
+                subsystem::assemble::<CoreLedsConfig>(&[(PathBuf::from("/o.toml"), body.into())])
+                    .expect_err("not TOML");
+            assert!(
+                matches!(err, subsystem::ConfigError::Parse { .. }),
+                "{body:?} must fail as a parse error, got {err}"
+            );
+        }
     }
 
     /// The four keys, each set to a non-default value, land where they should.
@@ -1178,7 +1570,7 @@ mod tests {
                 .expect("assembles");
 
         assert_eq!(
-            loaded.config.parsed().expect("valid"),
+            applied(&loaded.config),
             CoreLeds {
                 style: DisplayStyle::Crt,
                 color: ColorMap::Rgb(0x9b, 0x59, 0xb6),
@@ -1201,7 +1593,7 @@ mod tests {
             (PathBuf::from("/overlay.toml"), "rows = 3\n".into()),
         ];
         let loaded = subsystem::assemble::<CoreLedsConfig>(&layers).expect("assembles");
-        let resolved = loaded.config.parsed().expect("valid");
+        let resolved = applied(&loaded.config);
 
         assert_eq!(resolved.rows, Some(3), "the overlay wins");
         assert_eq!(
@@ -1315,6 +1707,15 @@ mod tests {
     struct CapturedEvent {
         level: tracing::Level,
         message: String,
+        /// Everything but the message, rendered.
+        ///
+        /// Kept rather than dropped since #1040 V10: the PR advertises that
+        /// these lines carry `subsystem`/`var`/`key`/`accepts`/`file` "for
+        /// anything that wants to filter on them", and this file's copy of the
+        /// harness used to throw them away — so nothing asserted a single one
+        /// and the claim was unfalsifiable. `hytte-config`'s copy always kept
+        /// them; the divergence is what #1044's hoist has to reconcile.
+        fields: HashMap<String, String>,
     }
 
     impl Captured {
@@ -1333,7 +1734,7 @@ mod tests {
         fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
         fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
         fn event(&self, event: &tracing::Event<'_>) {
-            let mut visitor = MessageVisitor::default();
+            let mut visitor = FieldVisitor::default();
             event.record(&mut visitor);
             self.events
                 .lock()
@@ -1341,6 +1742,7 @@ mod tests {
                 .push(CapturedEvent {
                     level: *event.metadata().level(),
                     message: visitor.message,
+                    fields: visitor.fields,
                 });
         }
         fn enter(&self, _: &tracing::span::Id) {}
@@ -1348,21 +1750,29 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct MessageVisitor {
+    struct FieldVisitor {
         message: String,
+        fields: HashMap<String, String>,
     }
 
-    impl tracing::field::Visit for MessageVisitor {
+    impl tracing::field::Visit for FieldVisitor {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
             if field.name() == "message" {
                 self.message = value.to_string();
+            } else {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
             }
         }
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             // The message itself arrives here: `tracing` renders format args
-            // through `Debug`, and `Arguments`' `Debug` is its `Display`.
+            // through `Debug`, and `Arguments`' `Debug` is its `Display`. So
+            // do `%` sigils, whose wrapper renders `Display` through `Debug`.
+            let rendered = format!("{value:?}");
             if field.name() == "message" {
-                self.message = format!("{value:?}");
+                self.message = rendered;
+            } else {
+                self.fields.insert(field.name().to_string(), rendered);
             }
         }
     }
@@ -1412,7 +1822,7 @@ mod tests {
             knob.var,
             knob.key,
             &crate::config::overlay_display(CoreLedsConfig::NAME),
-            knob.expected,
+            knob.file_accepts,
         )
     }
 
@@ -1503,14 +1913,21 @@ mod tests {
     }
 
     /// `Deprecations::Silent` — what every reload passes — says nothing at
-    /// all, so a live shell does not repeat the line every few seconds.
+    /// all, for **either** line, so a live shell does not repeat itself every
+    /// few seconds. Both a variable that parsed and one that did not are set
+    /// here, since since #1040 V7 the two are gated together.
     ///
-    /// **Red if the reload path is switched to `Announce`.**
+    /// The live control is the resolution itself rather than a line that was
+    /// observed: an absence-of-output test cannot use its own subject as
+    /// evidence that the subject ran. `crt` reaching the result proves both
+    /// variables were read on this thread.
+    ///
+    /// **Red if either warning stops being gated on `Deprecations`.**
     #[test]
     fn a_silent_resolution_announces_nothing() {
         let (captured, _guard) = capture();
 
-        resolve(
+        let resolved = resolve(
             CoreLeds::default(),
             &env(&[
                 ("TROLLSHELL_CORE_LEDS_STYLE", "crt"),
@@ -1519,16 +1936,21 @@ mod tests {
             Deprecations::Silent,
         );
 
-        let events = captured.events();
-        assert!(
-            events.iter().any(|e| e
-                .message
-                .contains("TROLLSHELL_CORE_LEDS_COLOR is set to `puce`")),
-            "live control: the capture must be observing this thread, got {events:?}"
+        assert_eq!(
+            resolved.style,
+            DisplayStyle::Crt,
+            "live control: the resolution under observation actually ran"
         );
-        assert!(
-            deprecations(&captured).is_empty(),
-            "a reload must not re-announce: {events:?}"
+        assert_eq!(
+            resolved.color,
+            CoreLeds::default().color,
+            "…including the unusable half, which fell through"
+        );
+        assert_eq!(
+            warnings(&captured),
+            Vec::<String>::new(),
+            "a reload says nothing: {:?}",
+            captured.events()
         );
     }
 
@@ -1544,15 +1966,15 @@ mod tests {
     /// symmetric half, and "the once-ness is a property of the two call sites"
     /// only closes with both.
     ///
-    /// **Red if `startup` stops announcing.**
+    /// **Red if `boot` stops announcing.**
     #[test]
     fn the_startup_resolution_announces() {
         let (captured, _guard) = capture();
 
-        let (layered, resolved) = startup(&[], &env(&[("TROLLSHELL_CORE_LEDS_STYLE", "crt")]));
+        let (resolved, watcher) = boot(&[], &env(&[("TROLLSHELL_CORE_LEDS_STYLE", "crt")]));
 
         assert_eq!(
-            layered,
+            watcher.last_good,
             CoreLeds::default(),
             "live control: with no layers the file half is the documented default"
         );
@@ -1624,13 +2046,35 @@ mod tests {
         }
     }
 
-    /// The startup sequence, minus the tokio spawn: **one** load, then a
-    /// stamp-only watcher seeded from it — what `CoreLedsService::start` does
-    /// through [`startup`].
+    /// The watcher [`boot`] hands back for `paths`, with no environment.
+    ///
+    /// The production function itself since #1040 V3 — it used to be a
+    /// hand-rolled replica of it, which is exactly why mutations to the real
+    /// one survived.
     fn watching(paths: Vec<PathBuf>) -> Watcher {
-        let seed = initial_load(&paths);
-        Watcher::observing(paths, seed)
+        boot(&paths, &no_env()).1
     }
+
+    /// A [`CoreLedsService`] over a scratch overlay and a fake environment,
+    /// polling at `interval` — so [`Service::start`], the function the process
+    /// actually runs, is the thing under test rather than a copy of it
+    /// (#1040 V3).
+    fn service_over(
+        paths: Vec<PathBuf>,
+        lookup: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+        interval: Duration,
+    ) -> CoreLedsService {
+        CoreLedsService {
+            paths,
+            lookup: std::sync::Arc::new(lookup),
+            interval,
+        }
+    }
+
+    /// An interval no test waits for: for the `start`-level tests, whose
+    /// subject is the synchronous half and whose spawned poller must stay out
+    /// of the way.
+    const NEVER: Duration = Duration::from_secs(3600);
 
     /// The payoff: an edit while the shell runs re-resolves without a restart.
     ///
@@ -1676,12 +2120,19 @@ mod tests {
         assert_eq!(next.fill, Fill::Blank);
     }
 
-    /// A malformed save keeps the last good config rather than snapping the
-    /// panel back to the built-in default mid-edit.
+    /// A save caught **mid-edit** — bytes that are not TOML — keeps the last
+    /// good config rather than snapping the panel back to the built-in default
+    /// while a string is half typed.
+    ///
+    /// The sibling case, a file that *is* TOML with one unusable value, is
+    /// deliberately **not** this: it is a finished file with one mistake in
+    /// it, so the good keys apply and the bad key takes the built-in default
+    /// (`a_bad_value_reloads_the_keys_beside_it` below, #1040 V1). The
+    /// asymmetry is the whole judgement, so both halves are pinned.
     ///
     /// **Red if the `Err` arm of `Watcher::poll` overwrites `last_good`.**
     #[test]
-    fn a_malformed_file_keeps_the_last_good_config() {
+    fn a_file_caught_mid_edit_keeps_the_last_good_config() {
         let mut overlay = Overlay::new();
         overlay.write("style = \"crt\"\n");
         let mut watcher = watching(overlay.layers());
@@ -1697,19 +2148,41 @@ mod tests {
         );
         assert_eq!(watcher.resolved(&no_env(), Deprecations::Silent), good);
 
-        // Valid TOML, invalid value — the other half of "unusable".
-        overlay.write("style = \"plasma\"\n");
-        assert_eq!(watcher.poll(good, &no_env()), None);
-        assert_eq!(
-            watcher.resolved(&no_env(), Deprecations::Silent),
-            good,
-            "a rejected value keeps the last good skin too"
-        );
-
         // …and a repaired file is picked up again.
         overlay.write("style = \"oled\"\n");
         let next = watcher.poll(good, &no_env()).expect("repaired → reload");
         assert_eq!(next.style, DisplayStyle::Oled);
+    }
+
+    /// A **live save** with one bad value republishes the keys beside it
+    /// (#1040 V1), rather than keeping the whole last-good skin.
+    ///
+    /// This is the reload half of `a_bad_value_leaves_every_other_key_applied`
+    /// and the one a human actually meets: they add `color = "rainbow"` to a
+    /// working file, fat-finger `rows` in the same save, and — before this
+    /// round — got neither, with a journal line about `rows` only.
+    ///
+    /// **Red if a rejected value goes back to being a whole-file failure**:
+    /// `poll` then returns `None` and the panel keeps the old colour.
+    #[test]
+    fn a_bad_value_reloads_the_keys_beside_it() {
+        let mut overlay = Overlay::new();
+        overlay.write("style = \"crt\"\n");
+        let mut watcher = watching(overlay.layers());
+        let good = watcher.resolved(&no_env(), Deprecations::Silent);
+
+        overlay.write("style = \"crt\"\ncolor = \"rainbow\"\nrows = \"many\"\n");
+        let next = watcher
+            .poll(good, &no_env())
+            .expect("the good keys in the save must reach the panel");
+
+        assert_eq!(next.color, ColorMap::Rainbow, "the key beside the typo");
+        assert_eq!(next.style, DisplayStyle::Crt, "…and the one that was fine");
+        assert_eq!(
+            next.rows,
+            CoreLeds::default().rows,
+            "…while the typo alone falls back to the built-in default"
+        );
     }
 
     /// An environment-pinned key stays pinned across a reload: the file moves,
@@ -1779,6 +2252,43 @@ mod tests {
         );
     }
 
+    /// **A bad variable costs one line for the life of the shell**, not one
+    /// per reload (#1040 V7).
+    ///
+    /// The unusable-value line used to be ungated, on the argument that "an
+    /// unusable variable is still unusable after an edit". True, and still one
+    /// extra journal line every three seconds forever — against a
+    /// `live-verify.md` bullet that promises **exactly one** two lines after
+    /// telling the reader that a repeating line means a bug. A process's
+    /// environment cannot change under it, so the repeat could never carry
+    /// news.
+    ///
+    /// **Red if the unusable-value warning stops being gated on
+    /// `Deprecations`.**
+    #[test]
+    fn a_reload_does_not_repeat_the_unusable_variable_line() {
+        let broken = env(&[("TROLLSHELL_CORE_LEDS_STYLE", "plasma")]);
+        let mut overlay = Overlay::new();
+        overlay.write("color = \"heat\"\n");
+        let mut watcher = watching(overlay.layers());
+        let current = watcher.resolved(&broken, Deprecations::Announce);
+
+        let (captured, _guard) = capture();
+        overlay.write("color = \"rainbow\"\n");
+        let next = watcher.poll(current, &broken).expect("changed → reload");
+
+        assert_eq!(
+            next.color,
+            ColorMap::Rainbow,
+            "live control: the reload under observation must actually have happened"
+        );
+        assert_eq!(
+            warnings(&captured),
+            Vec::<String>::new(),
+            "a reload says nothing about a variable that was already reported"
+        );
+    }
+
     /// An unknown key is loud and harmless (merge rule 4): the file still
     /// loads, and the keys around the typo still apply.
     #[test]
@@ -1789,7 +2299,7 @@ mod tests {
                 .expect("assembles");
 
         assert_eq!(loaded.unknown_keys, ["colour"]);
-        let resolved = loaded.config.parsed().expect("valid");
+        let resolved = applied(&loaded.config);
         assert_eq!(resolved.style, DisplayStyle::Crt);
         assert_eq!(resolved.color, ColorMap::Heat, "the typo did nothing");
     }
@@ -1813,8 +2323,7 @@ mod tests {
         overlay.write("colour = \"rainbow\"\nstyle = \"crt\"\n");
 
         let (captured, _guard) = capture();
-        let (layered, _resolved) = startup(&overlay.layers(), &no_env());
-        let _watcher = Watcher::observing(overlay.layers(), layered);
+        let (_resolved, watcher) = boot(&overlay.layers(), &no_env());
 
         assert_eq!(
             warnings(&captured),
@@ -1822,7 +2331,7 @@ mod tests {
             "one unknown key, one warning — live-verify.md promises exactly this"
         );
         assert_eq!(
-            layered.style,
+            watcher.last_good.style,
             DisplayStyle::Crt,
             "live control: the load under observation actually happened"
         );
@@ -1832,11 +2341,10 @@ mod tests {
     #[test]
     fn a_startup_reports_an_unusable_file_exactly_once() {
         let mut overlay = Overlay::new();
-        overlay.write("style = \"plasma\"\n");
+        overlay.write("style = \"crt\n");
 
         let (captured, _guard) = capture();
-        let (layered, _resolved) = startup(&overlay.layers(), &no_env());
-        let _watcher = Watcher::observing(overlay.layers(), layered);
+        let (_resolved, watcher) = boot(&overlay.layers(), &no_env());
 
         assert_eq!(
             errors(&captured),
@@ -1844,9 +2352,54 @@ mod tests {
             "one broken file, one error"
         );
         assert_eq!(
-            layered,
+            watcher.last_good,
             CoreLeds::default(),
             "…and it degrades to the built-in default rather than taking the shell down"
+        );
+    }
+
+    // ── The service: what the process actually runs (#1040 V3) ──────────────
+
+    /// **`Service::start` loads once and announces once** — the two properties
+    /// F1 and F3 established, asserted at the call site that has them rather
+    /// than at a replica of it.
+    ///
+    /// This is #1040 V3's whole point. Until it existed, `start` had *zero*
+    /// coverage: making it call the startup sequence twice (mutation Z2), or
+    /// skip it entirely and resolve `Silent` inline (Z3, F3's original defect
+    /// one level up), left the suite at 562 passed. Nobody would ever have
+    /// heard a deprecation line again and CI would not have noticed.
+    ///
+    /// **Red if `start` loads twice, announces twice, or stops announcing.**
+    #[test]
+    fn the_service_start_loads_once_and_announces_once() {
+        let mut overlay = Overlay::new();
+        overlay.write("colour = \"rainbow\"\nstyle = \"crt\"\n");
+        let service = service_over(
+            overlay.layers(),
+            env(&[("TROLLSHELL_CORE_LEDS_FILL", "blank")]),
+            NEVER,
+        );
+
+        let (captured, _guard) = capture();
+        let handles = service.start(hytte::reactive::runtime::handle());
+
+        assert_eq!(
+            warnings(&captured),
+            [
+                "unknown key in config; ignoring it".to_string(),
+                announced(&FILL),
+            ],
+            "one load and one announcing resolution, in that order"
+        );
+        assert_eq!(
+            handles.leds.get(),
+            CoreLeds {
+                style: DisplayStyle::Crt,
+                fill: Fill::Blank,
+                ..CoreLeds::default()
+            },
+            "live control: the file's key and the variable's key both reached the handle"
         );
     }
 
@@ -1927,6 +2480,181 @@ mod tests {
 
         assert_eq!(next.style, DisplayStyle::Crt);
         assert_eq!(next.color, ColorMap::Rainbow);
+    }
+
+    /// **An edit made between the stamp and the load is not lost** (#1040 V2).
+    ///
+    /// The window is real and was measured on the previous head: `boot`
+    /// published at T1, the spawned poller stamped at T2 when a runtime worker
+    /// first polled the task, and a save landing in between was baselined into
+    /// the poller's stamps while the published value predated it. Because
+    /// [`Watcher::poll`] updates its stamps unconditionally, that save was
+    /// then missed **forever** — file said `crt`, panel said `lcd`, three
+    /// polls, nothing.
+    ///
+    /// The race is simulated rather than raced: the save is injected exactly
+    /// where the window is, between the two halves of `boot`. That is what
+    /// makes the assertion deterministic *and* what makes the mutation
+    /// meaningful — with the two lines swapped back (stamp after load) the
+    /// baseline includes the edit, `poll` returns `None`, and this goes red.
+    #[test]
+    fn an_edit_between_the_stamp_and_the_load_is_not_lost() {
+        let mut overlay = Overlay::new();
+        overlay.write("style = \"lcd\"\n");
+
+        // `boot`, hand-inlined so the save can land in the gap. The order of
+        // these two lines is the fix; everything else here is scaffolding.
+        let stamps = stamps_of(&overlay.layers());
+        overlay.write("style = \"crt\"\n");
+        let layered = initial_load(&overlay.layers());
+        let mut watcher = Watcher::observing(overlay.layers(), stamps, layered);
+
+        let published = watcher.resolved(&no_env(), Deprecations::Silent);
+        let next = watcher.poll(published, &no_env());
+
+        assert_eq!(
+            next.or(Some(published)).map(|leds| leds.style),
+            Some(DisplayStyle::Crt),
+            "the save in the window must reach the panel, by this poll at the latest"
+        );
+    }
+
+    /// **The watcher [`boot`] built is the one [`watch`] polls** — the loop
+    /// itself, driven for real (#1040 V3, mutation Z1).
+    ///
+    /// `watch` is production code with no other coverage: every other reload
+    /// test calls [`Watcher::poll`] by hand. A `watch` that rebuilt its own
+    /// watcher (F1's exact defect, moved one function along) would re-load,
+    /// double every diagnostic, re-open V2's race at full width — and, because
+    /// it would rebuild from `xdg::config_layers`, watch the *process's* real
+    /// layers instead of the ones it was handed, which is what this notices.
+    ///
+    /// Driven on the shared runtime at a 10 ms cadence rather than the
+    /// production three seconds, which is why `watch` takes its interval as a
+    /// parameter.
+    #[test]
+    fn the_watch_loop_republishes_the_watcher_it_was_given() {
+        let mut overlay = Overlay::new();
+        overlay.write("style = \"lcd\"\n");
+        let (resolved, watcher) = boot(&overlay.layers(), &no_env());
+        let leds = Mutable::new(resolved);
+        assert_eq!(leds.get().style, DisplayStyle::Lcd, "live control");
+
+        overlay.write("style = \"crt\"\ncolor = \"rainbow\"\n");
+
+        let seen = hytte::reactive::runtime::handle().block_on({
+            let leds = leds.clone();
+            async move {
+                let watching = watch(
+                    leds.clone(),
+                    watcher,
+                    std::sync::Arc::new(no_env()),
+                    Duration::from_millis(10),
+                );
+                tokio::select! {
+                    () = watching => false,
+                    republished = settles(&leds, DisplayStyle::Crt) => republished,
+                }
+            }
+        });
+
+        assert!(
+            seen,
+            "the save must reach the Mutable through the loop, got {:?}",
+            leds.get()
+        );
+        assert_eq!(leds.get().color, ColorMap::Rainbow, "…whole, not partly");
+    }
+
+    /// Wait (up to ~3 s) for `leds` to carry `want`, so the loop test has a
+    /// bound instead of a fixed sleep.
+    async fn settles(leds: &Mutable<CoreLeds>, want: DisplayStyle) -> bool {
+        for _ in 0..600 {
+            if leds.get().style == want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    /// **Two layers really are watched** — an edit to the *base* reloads live
+    /// too, not just an edit to the overlay (#1040 V8).
+    ///
+    /// Every other watcher test uses `Overlay::layers`, which is one path, so
+    /// nothing pinned that `Watcher` stats each layer rather than the last one
+    /// (or the first). It also settles what `live-verify.md` should say: the
+    /// base layer needs no restart either.
+    #[test]
+    fn an_edit_to_the_base_layer_reloads_too() {
+        let mut base = Overlay::new();
+        let mut overlay = Overlay::new();
+        base.write("style = \"crt\"\nfill = \"blank\"\n");
+        overlay.write("style = \"lcd\"\n");
+        let layers = vec![base.path.clone(), overlay.path.clone()];
+
+        let mut watcher = watching(layers);
+        let current = watcher.resolved(&no_env(), Deprecations::Silent);
+        assert_eq!(current.style, DisplayStyle::Lcd, "the overlay wins");
+        assert_eq!(
+            current.fill,
+            Fill::Blank,
+            "…over the base it does not state"
+        );
+
+        base.write("style = \"crt\"\nfill = \"spare\"\ncolor = \"rainbow\"\n");
+        let next = watcher
+            .poll(current, &no_env())
+            .expect("a base-layer edit is a change too");
+
+        assert_eq!(next.color, ColorMap::Rainbow, "the base's new key applies");
+        assert_eq!(next.fill, Fill::Spare, "…and its changed one");
+        assert_eq!(
+            next.style,
+            DisplayStyle::Lcd,
+            "…while the overlay still wins"
+        );
+    }
+
+    /// The structured fields the PR body advertises are **actually emitted**
+    /// (#1040 V10).
+    ///
+    /// The sentence is what a human reads; the fields are what a
+    /// `journalctl`/`RUST_LOG` filter selects on, and until this round nothing
+    /// asserted a single one — this file's copy of the capture harness dropped
+    /// them on the floor, so the claim could not have been false in a way any
+    /// test could see.
+    #[test]
+    fn the_deprecation_line_carries_its_fields() {
+        let (captured, _guard) = capture();
+        resolve(
+            CoreLeds::default(),
+            &env(&[("TROLLSHELL_CORE_LEDS_STYLE", "crt")]),
+            Deprecations::Announce,
+        );
+
+        let event = captured
+            .events()
+            .into_iter()
+            .find(|e| e.message == announced(&STYLE))
+            .expect("the deprecation line");
+        assert_eq!(
+            event.fields.get("subsystem").map(String::as_str),
+            Some("core-leds")
+        );
+        assert_eq!(
+            event.fields.get("var").map(String::as_str),
+            Some("TROLLSHELL_CORE_LEDS_STYLE")
+        );
+        assert_eq!(event.fields.get("key").map(String::as_str), Some("style"));
+        assert_eq!(
+            event.fields.get("accepts").map(String::as_str),
+            Some(STYLE.file_accepts)
+        );
+        assert_eq!(
+            event.fields.get("file").map(String::as_str),
+            Some(crate::config::overlay_display(CoreLedsConfig::NAME).as_str())
+        );
     }
 
     /// The poll cadence is `places.toml`'s, and short enough that an edit

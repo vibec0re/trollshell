@@ -1714,15 +1714,19 @@ session.
     new rectangle.
 - [ ] **(#869)** **`core-leds.toml` — the config-file pilot.** Phase 1 of
       #866: the LED panel's four knobs are the first subsystem read through
-      the #868 layering, and the first thing in the shell you can edit in a
-      file and see change without restarting. Everything below wants a live
-      shell; nothing about it can be judged headlessly.
+      the #868 layering — `places.toml` has reloaded live since long before
+      this, but it goes through none of the layering, so this is the shape the
+      other nine subsystems copy. Everything below wants a live shell; nothing
+      about it can be judged headlessly.
   - **The payoff, in one move.** With the shell running and the Stats drawer
     open, create `~/.config/trollshell/core-leds.toml` containing
     `style = "crt"` and save. Within ~3 s the panel should re-skin to the CRT
-    tube — scanlines and vignette — with **no restart**. Change it to
-    `color = "transpride"`, save, watch the lamps re-band. This is the whole
-    point of the phase; if it needs a restart, the pilot failed.
+    tube — scanlines and vignette — with **no restart**. Now add
+    `color = "transpride"` on a second line _beside_ it (don't replace the
+    file, or `style` reverts to VFD in the same reload and the CRT check will
+    look like it regressed), save, and watch the lamps re-band while the
+    scanlines stay. This is the whole point of the phase; if it needs a
+    restart, the pilot failed.
   - **A missing file is silent.** With no `core-leds.toml` anywhere, the panel
     must look exactly as it did before #869 (VFD skin, heat map, automatic
     rectangle, spare fill) and the journal must carry **no** config warning at
@@ -1759,36 +1763,69 @@ session.
     TROLLSHELL_CORE_LEDS_STYLE is set to `plasma`, which is not valid; expected one of vfd/lcd/oled/crt — ignoring it and taking `style` from /home/annika/.config/trollshell/core-leds.toml
     ```
 
-  - **A malformed file keeps the last good skin.** With the shell running and
-    a working `core-leds.toml`, save a deliberately broken one (`style = "crt`
-    — unterminated string, or `style = "plasma"` — a value no parser accepts).
-    The panel must keep rendering the **last good** skin, not snap back to the
-    default, and the journal gets one warning per save (not one per poll).
-    Repair the file and save: the panel picks it up again.
+    One for the life of the shell, not one per reload: edit and save the file
+    a few times and confirm the line does **not** come back. A process's
+    environment cannot change under it, so a repeat would be pure noise.
+
+  - **A file caught mid-edit keeps the last good skin.** With the shell
+    running and a working `core-leds.toml`, save a deliberately broken one —
+    `style = "crt` with the closing quote missing, i.e. bytes that are not
+    TOML. The panel must keep rendering the **last good** skin, not snap back
+    to the default, and the journal gets one warning per save (not one per
+    poll). Repair the file and save: the panel picks it up again. Note this is
+    _only_ about bytes that are not TOML; a file that parses with one unusable
+    value is a different case, two bullets down.
   - **Deleting the file gives the defaults back.** With a working
     `core-leds.toml` applied, `rm` it. Within ~3 s the panel must return to the
     built-in look (VFD, heat, automatic rectangle, spare fill) — a delete is an
     intent, not a mistake, and it is the only way to get the stock look back
     without hand-restoring every key. Note the asymmetry with the line above:
-    an unparseable file keeps the last good skin, an absent one does not.
+    a file caught mid-edit keeps the last good skin, an absent one does not.
   - **An unknown key is loud and harmless.** Add `colour = "rainbow"` (British
     spelling) alongside a valid `style`. Expect **one** `unknown key in config`
     warning naming `colour` (one, not two — the config is loaded exactly once
     per startup), the panel unchanged in colour, and the `style` beside it
     still applied.
   - **`rows` takes both spellings, and is capped.** `rows = "rect"` — the word
-    the deprecated variable took — must work exactly as `rows = 0` does, and a
-    typo like `rows = "many"` must be a _per-key_ rejection that leaves the
-    rest of the file applied, not a whole-file failure that drops the panel to
-    defaults. `rows = 65` is rejected the same way; the budget box shows nine
-    rows at 1×, so anything past 64 is a typo rather than an intent.
+    the deprecated variable took — must work exactly as `rows = 0` does.
+    `rows = 65` is rejected; the budget box shows nine rows at 1×, so anything
+    past 64 is a typo rather than an intent.
+  - **A bad value costs its own key, and only its own key.** Put
+    `style = "crt"` and `rows = "many"` in the file together and save. The
+    panel must go **CRT** with the automatic rectangle — the good key applied,
+    the bad key back to its built-in default — and the journal must carry
+    exactly one line, naming `rows` and saying what happened to it:
+
+    ```text
+    rows = "many" is not valid; expected 0 or "rect" for the automatic rectangle, or a row count from 1 to 64 — ignoring this key and using the built-in default
+    ```
+
+    Not a whole-file failure that drops the panel to stock VFD with `style`
+    silently gone. The same holds for `rows = 65`, `rows = true`, `rows = 4.0`,
+    `color = "puce"` — anything a known key holds that no parser takes. What is
+    still whole-file is a file that is not TOML _at all_ (an unterminated
+    string, or an integer too big for TOML's i64 like
+    `rows = 9223372036854775808`) — the "caught mid-edit" bullet above.
+
   - **The base layer.** Nix does not render a base file yet (out of #869's
     lane). To exercise the layer by hand, put a `core-leds.toml` under a
     directory on `XDG_CONFIG_DIRS` (e.g.
     `XDG_CONFIG_DIRS=/tmp/base:$XDG_CONFIG_DIRS` with
     `/tmp/base/trollshell/core-leds.toml`), restart, and confirm your
     `$XDG_CONFIG_HOME` overlay beats it key by key while a key only the base
-    states still applies.
+    states still applies. Then edit the **base** file with the shell up: every
+    layer is stat'd on every poll, so a base edit reloads live too — no
+    restart needed for that either (only for putting a new directory on
+    `XDG_CONFIG_DIRS`, which the shell reads once at startup).
+  - **The one edit the poller can miss.** The watcher stamps each layer's
+    mtime _and_ its length. An edit that lands inside a single mtime granule
+    **and** keeps the byte count identical (`style = "vfd"` → `style = "lcd"`,
+    14 bytes either way) is invisible to it, permanently — not late. On
+    ext4/btrfs/tmpfs, which carry nanosecond mtimes, this cannot happen; on a
+    coarse-granularity mount (a network share, a FAT stick you pointed
+    `XDG_CONFIG_DIRS` at) it can. Touch the file again and it reloads. This is
+    the honest limit of stat-polling, not a bug to file — a real inotify watch
+    is the eventual answer.
 
 - [ ] **(#862)** **Accent tracking for the shell's own preem surfaces** — the
       Stats drawer's per-core LED panel is rasterised in-process, and until

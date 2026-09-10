@@ -70,6 +70,11 @@ tokio = { workspace = true, features = [
 # ownership goes through `hytte_bus::own_name`, never a raw zbus connection —
 # same version/features as hytte-services' dep.
 zbus.workspace = true
+# `Rows::Other` keeps a rejected `rows` value as the TOML it was written as, so
+# the diagnostic can quote it back instead of the whole file failing serde
+# (#1040 V9). No new resolved package: `hytte-config` already links it, and
+# every layer this crate reads went through `toml` on the way in.
+toml.workspace = true
 tracing.workspace = true
 # Workspace `tracing-subscriber` sets `default-features = false` (what
 # hytte-services' dev-dependency needs); widen back to the full default set

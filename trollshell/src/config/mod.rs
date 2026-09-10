@@ -65,12 +65,15 @@ use hytte_config::xdg;
 /// out of structured fields. The fields are emitted as well, for anything that
 /// wants to filter on them.
 ///
-/// `accepts` is the knob's vocabulary, and it is part of the sentence rather
-/// than a field for the same reason (#1040 F5): the only place `core-leds.toml`
-/// explains that the automatic shape is spelt `0` *or* `"rect"` is
-/// `DEFAULT_TOML`, which — until nix renders a base file — exists nowhere on
-/// disk for the reader to open. The line that tells a user to move a value into
-/// a file has to tell them what the file accepts, or they will guess.
+/// `accepts` is the knob's **file** vocabulary — this line's whole job is to
+/// tell the reader what to type in the file it names, so where the two
+/// vocabularies differ it is the file's that belongs here (#1040 V4). It is
+/// part of the sentence rather than a field for the same reason (#1040 F5):
+/// the only place `core-leds.toml` explains that the automatic shape is spelt
+/// `0` *or* `"rect"` is `DEFAULT_TOML`, which — until nix renders a base file —
+/// exists nowhere on disk for the reader to open. The line that tells a user to
+/// move a value into a file has to tell them what the file accepts, or they
+/// will guess.
 pub fn deprecation_message(var: &str, key: &str, file: &str, accepts: &str) -> String {
     format!("{var} is deprecated; set `{key}` in {file} — it accepts {accepts}")
 }
@@ -83,12 +86,20 @@ pub fn deprecation_message(var: &str, key: &str, file: &str, accepts: &str) -> S
 /// instructions to assemble. This says all of it once — what was set, what was
 /// expected, what happens instead, and where the value belongs now.
 ///
-/// It is emitted on a **reload** as well as at startup, unlike
-/// [`deprecation_message`]: an unusable variable is still unusable after an
-/// edit, and the line is a fact about the current environment rather than a
-/// one-off announcement. That is also why it never says "deprecated" in the
-/// once-only sense the [`core_leds::Deprecations`] latch guards — the
-/// deprecation *announcement* stays exactly once per set variable.
+/// Emitted **once at startup**, exactly like [`deprecation_message`] and
+/// through the same [`core_leds::Deprecations`] gate (#1040 V7). It used to be
+/// emitted on every reload as well, on the argument that "an unusable variable
+/// is still unusable after an edit" — true, but so is the environment: a
+/// process's variables are fixed at `exec` and this shell never calls
+/// `set_var` (it is an `unsafe fn` and this crate forbids unsafe), so there is
+/// no outage that can *end* and nothing a repeat could tell the reader. It
+/// cost one extra journal line per save for the life of the shell, against a
+/// `live-verify.md` bullet that promises **exactly one**.
+///
+/// `accepts` here is the knob's **variable** vocabulary, not its file one:
+/// they differ wherever a key has a TOML spelling the variable never took
+/// (`rows = 0`, #1040 V4), and this sentence is about what the *variable*
+/// would have had to say.
 pub fn unusable_env_message(
     var: &str,
     value: &str,
@@ -99,6 +110,23 @@ pub fn unusable_env_message(
     format!(
         "{var} is set to `{value}`, which is not valid; expected {accepts} — ignoring it and taking `{key}` from {file}"
     )
+}
+
+/// The **one** line a rejected value for a *known file key* produces.
+///
+/// The third sentence in the family, and the one #1040 V1 needed: a bad value
+/// in the file no longer takes the whole file down, so the reader has to be
+/// told which key was dropped **and** what happened to it. `invalid` is the
+/// subsystem's own rendering of "what you wrote, and what was expected"
+/// ([`core_leds::InvalidValue`]); this adds the consequence.
+///
+/// "the built-in default" rather than "the layer below" is precise, not vague:
+/// the layers are merged *before* anything is parsed, so by the time a value
+/// is judged there is no provenance left to fall back through. The key falls
+/// all the way to [`hytte_config::subsystem::Subsystem::DEFAULT_TOML`]'s
+/// value, which is what the sentence says.
+pub fn rejected_value_message(invalid: &str) -> String {
+    format!("{invalid} — ignoring this key and using the built-in default")
 }
 
 /// Where a subsystem's overlay lives, as a string fit for a log line, resolved
@@ -169,9 +197,24 @@ pub fn warn_unusable_env(subsystem: &str, var: &str, value: &str, key: &str, acc
     );
 }
 
+/// Warn that one **file key** held a value nothing accepts, and that the
+/// built-in default is being used for it.
+///
+/// One line per rejected key, emitted where the file is loaded — so a file
+/// with two typos says two things and a file with none says nothing. The
+/// *rest* of the file still applies, which is the whole reason this line
+/// exists (#1040 V1): before it, a single bad value was a whole-file
+/// `ConfigError::Invalid` and the reader got one message naming one key while
+/// every *other* key silently reverted too.
+pub fn warn_rejected_value(subsystem: &str, key: &str, invalid: &str) {
+    tracing::warn!(subsystem, key, "{}", rejected_value_message(invalid));
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{deprecation_message, overlay_display_in, unusable_env_message};
+    use super::{
+        deprecation_message, overlay_display_in, rejected_value_message, unusable_env_message,
+    };
     use hytte_config::xdg;
 
     /// A controlled environment: one absolute `$XDG_CONFIG_HOME`, nothing else
@@ -224,6 +267,23 @@ mod tests {
             "TROLLSHELL_CORE_LEDS_STYLE is set to `plasma`, which is not valid; \
              expected one of vfd/lcd/oled/crt — ignoring it and taking `style` \
              from /x/core-leds.toml"
+        );
+    }
+
+    /// The rejected-file-value sentence, as a literal.
+    ///
+    /// The consequence clause is the load-bearing half: #1040 V1 was a PR that
+    /// *said* a bad value left the rest of the file applied while the code
+    /// dropped the whole file, and a human reading the journal has no way to
+    /// tell the two apart except by what this line claims. Building the
+    /// expectation from [`rejected_value_message`] would assert it against
+    /// itself; `docs/live-verify.md` quotes it verbatim.
+    #[test]
+    fn the_rejected_value_sentence_is_this_exact_sentence() {
+        assert_eq!(
+            rejected_value_message("rows = \"many\" is not valid; expected a row count"),
+            "rows = \"many\" is not valid; expected a row count \
+             — ignoring this key and using the built-in default"
         );
     }
 

@@ -249,6 +249,71 @@ mod tests {
         }
     }
 
+    const POLL_STEP: std::time::Duration = std::time::Duration::from_millis(10);
+    const POLL_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Poll every [`POLL_STEP`], up to [`POLL_BOUND`] total, until `ready`
+    /// returns `true`. Panics with `describe()`'s message if the bound
+    /// elapses first.
+    ///
+    /// Replaces the old fixed-sleep-then-assert shape (#1028): `run_inner`
+    /// (`hooks.rs:46`) awaits `tokio::fs::metadata`, which tokio dispatches
+    /// to its blocking pool, before its first `tracing` call — so a flat
+    /// sleep is not a bound on when that call lands under a loaded runner.
+    async fn poll_until(mut ready: impl FnMut() -> bool, describe: impl FnOnce() -> String) {
+        let deadline = std::time::Instant::now() + POLL_BOUND;
+        loop {
+            if ready() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out after {POLL_BOUND:?}: {}",
+                describe()
+            );
+            tokio::time::sleep(POLL_STEP).await;
+        }
+    }
+
+    /// [`poll_until`] specialised for the `Captured` event log: wait for an
+    /// event matching `pred` (described by `what`, for the panic message),
+    /// then return the full captured list at that point — for asserting on
+    /// other fields of the same event, or for a negative assertion (e.g.
+    /// "no WARN events") that is only meaningful once the positive one has
+    /// actually landed rather than being vacuously true on a timeout that
+    /// never happened.
+    async fn wait_for(
+        cap: &Captured,
+        what: &str,
+        mut pred: impl FnMut(&CapturedEvent) -> bool,
+    ) -> Vec<CapturedEvent> {
+        poll_until(
+            || cap.events.lock().unwrap().iter().any(&mut pred),
+            || {
+                let events = cap.events.lock().unwrap().clone();
+                format!("waiting for {what}; events seen: {events:#?}")
+            },
+        )
+        .await;
+        cap.events.lock().unwrap().clone()
+    }
+
+    /// No callsite warm-up here (see #1028 fix-round review, PR #1032): in
+    /// `tracing-core` 0.1.36, `Dispatch::new` (`src/dispatcher.rs:479`)
+    /// calls `callsite::register_dispatch`, which ends in
+    /// `CALLSITES.rebuild_interest(dispatchers)` (`src/callsite.rs:484-487`)
+    /// — a rebuild over *every already-registered* callsite against every
+    /// live dispatcher. `capture()` below constructs a fresh `Dispatch::new`
+    /// on every call, which un-poisons any callsite a prior test cached
+    /// `Interest::never()` for. There is no subscriber-less first fire to
+    /// guard against in this harness: `spawn_task` (`hooks.rs:35`) prefers
+    /// `Handle::try_current()`, which inside `#[tokio::test(flavor =
+    /// "current_thread")]` is the test's own runtime, so `run_inner` always
+    /// runs on the thread whose thread-local default is already the
+    /// capture dispatch. A prior revision of this file warmed up the
+    /// callsites anyway; measured to be a no-op (250-run full-binary
+    /// campaign, 0 failures) and, worse, itself the exact "subscriber-less
+    /// first fire" its own doc comment warned about — removed.
     pub(super) fn capture() -> (Captured, tracing::dispatcher::DefaultGuard) {
         let cap = Captured::default();
         let dispatch = tracing::Dispatch::new(Registry::default().with(cap.clone()));
@@ -264,32 +329,19 @@ mod tests {
 
             super::run("theme-changed", &[]);
 
-            // Wait up to 2s for completion + log emission.
-            for _ in 0..40 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if cap
-                    .events
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|e| e.level == tracing::Level::INFO)
-                {
-                    break;
-                }
-            }
+            wait_for(&cap, "an INFO 'ran' event", |e| {
+                e.level == tracing::Level::INFO
+                    && e.message.contains("ran")
+                    && e.fields.get("event").is_some_and(|s| s == "theme-changed")
+            })
+            .await;
 
-            let events = cap.events.lock().unwrap().clone();
-            assert!(
-                events
-                    .iter()
-                    .any(|e| e.level == tracing::Level::INFO && e.message.contains("ran")),
-                "expected an INFO 'ran' event, got: {events:#?}",
-            );
-            assert!(
-                events.iter().any(|e| e.level == tracing::Level::INFO
-                    && e.fields.get("stdout").is_some_and(|s| s.contains("hi"))),
-                "expected an INFO event with stdout=hi, got: {events:#?}",
-            );
+            wait_for(&cap, "an INFO event with stdout=hi", |e| {
+                e.level == tracing::Level::INFO
+                    && e.fields.get("stdout").is_some_and(|s| s.contains("hi"))
+                    && e.fields.get("event").is_some_and(|s| s == "theme-changed")
+            })
+            .await;
         })
         .await;
     }
@@ -306,29 +358,21 @@ mod tests {
 
             super::run("theme-changed", &[]);
 
-            for _ in 0..40 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if cap
-                    .events
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|e| e.level == tracing::Level::WARN)
-                {
-                    break;
-                }
-            }
+            let events = wait_for(&cap, "a WARN 'script failed' event", |e| {
+                e.level == tracing::Level::WARN
+                    && e.message.contains("failed")
+                    && e.fields.get("event").is_some_and(|s| s == "theme-changed")
+            })
+            .await;
 
-            let events = cap.events.lock().unwrap().clone();
             let warn = events
                 .iter()
-                .find(|e| e.level == tracing::Level::WARN)
-                .unwrap_or_else(|| panic!("expected a WARN event, got: {events:#?}"));
-            assert!(
-                warn.message.contains("failed"),
-                "warn msg: {:?}",
-                warn.message,
-            );
+                .find(|e| {
+                    e.level == tracing::Level::WARN
+                        && e.message.contains("failed")
+                        && e.fields.get("event").is_some_and(|s| s == "theme-changed")
+                })
+                .expect("wait_for guarantees a matching WARN event is present");
             assert!(
                 warn.fields
                     .get("stderr")
@@ -355,15 +399,26 @@ mod tests {
 
             super::run("theme-changed", &[]);
 
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let events = wait_for(&cap, "a WARN 'not executable' event", |e| {
+                e.level == tracing::Level::WARN
+                    && e.message.contains("not executable")
+                    && e.fields.get("event").is_some_and(|s| s == "theme-changed")
+            })
+            .await;
 
-            let events = cap.events.lock().unwrap().clone();
+            // The WARN above proves the rejection branch ran, but that
+            // alone doesn't rule out some other branch *also* spawning the
+            // script — assert that at the event level too: no INFO "ran"
+            // for this event is present in the capture.
             assert!(
-                events.iter().any(
-                    |e| e.level == tracing::Level::WARN && e.message.contains("not executable")
-                ),
-                "expected WARN 'not executable', got: {events:#?}",
+                !events.iter().any(|e| e.level == tracing::Level::INFO
+                    && e.message.contains("ran")
+                    && e.fields.get("event").is_some_and(|s| s == "theme-changed")),
+                "expected no INFO 'ran' event for theme-changed, got: {events:#?}",
             );
+
+            // Not vacuous: the positive wait above already established the
+            // script was rejected before this negative check runs.
             assert!(!sentinel.exists(), "script must not have been executed");
         })
         .await;
@@ -378,31 +433,17 @@ mod tests {
             let started = std::time::Instant::now();
             super::run("theme-changed", &[]);
 
-            for _ in 0..40 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if cap
-                    .events
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|e| e.level == tracing::Level::WARN && e.message.contains("timed out"))
-                {
-                    break;
-                }
-            }
+            wait_for(&cap, "a WARN 'timed out' event", |e| {
+                e.level == tracing::Level::WARN
+                    && e.message.contains("timed out")
+                    && e.fields.get("event").is_some_and(|s| s == "theme-changed")
+            })
+            .await;
 
             let elapsed = started.elapsed();
             assert!(
                 elapsed < std::time::Duration::from_secs(5),
                 "timeout should fire well before 10s; took {elapsed:?}",
-            );
-
-            let events = cap.events.lock().unwrap().clone();
-            assert!(
-                events
-                    .iter()
-                    .any(|e| e.level == tracing::Level::WARN && e.message.contains("timed out")),
-                "expected WARN 'timed out', got: {events:#?}",
             );
         })
         .await;
@@ -416,16 +457,15 @@ mod tests {
 
             super::run("theme-changed", &[]);
 
-            // Spawn happens on a background task — give it a tick to land.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let events = wait_for(&cap, "a DEBUG 'no script' event", |e| {
+                e.level == tracing::Level::DEBUG
+                    && e.message.contains("no script")
+                    && e.fields.get("event").is_some_and(|s| s == "theme-changed")
+            })
+            .await;
 
-            let events = cap.events.lock().unwrap().clone();
-            assert!(
-                events
-                    .iter()
-                    .any(|e| e.level == tracing::Level::DEBUG && e.message.contains("no script")),
-                "expected a DEBUG 'no script' event, got: {events:#?}",
-            );
+            // Not vacuous: only checked once the positive wait above has
+            // actually landed, not after an unconditional fixed delay.
             assert!(
                 !events.iter().any(|e| e.level == tracing::Level::WARN),
                 "expected no WARN events, got: {events:#?}",
@@ -447,12 +487,15 @@ mod tests {
 
             super::run("theme-changed", &[("TROLLSHELL_THEME", "dark")]);
 
-            for _ in 0..40 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if sentinel.exists() {
-                    break;
-                }
-            }
+            // Poll the content, not the inode: the shell's `>` redirect
+            // does `open(O_CREAT|O_TRUNC)` before `printf` writes, so
+            // `sentinel.exists()` goes true while the file is still empty
+            // — polling existence alone can observe that partial state.
+            poll_until(
+                || std::fs::read_to_string(&sentinel).is_ok_and(|s| !s.is_empty()),
+                || format!("waiting for the script to write {}", sentinel.display()),
+            )
+            .await;
 
             let contents = std::fs::read_to_string(&sentinel)
                 .expect("script should have written sentinel");

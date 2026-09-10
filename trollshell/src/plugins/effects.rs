@@ -731,6 +731,16 @@ pub(super) fn check_uri(uri: &str) -> Result<&str, UriRefusal> {
 /// by `GLib` on the main context it was started from.
 pub(super) type LaunchDone = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
 
+/// What `arm_timer` in [`launch_with_timeout`] hands back: called if `start`'s
+/// own callback wins the race, so the timer's source is torn down instead of
+/// firing into a no-op [`OPEN_URI_TIMEOUT`] later, still holding the shared
+/// `Arc<Mutex<..>>` and the `Cancellable` open for the rest of the window
+/// (#1060 review F3). Production wires this to [`glib::SourceId::remove`]; a
+/// test's stub can record whether it ran. `Send` for the same reason
+/// [`LaunchDone`] is — this closure is captured inside `start`'s own boxed
+/// callback, which the same bound applies to.
+type TimerCancel = Box<dyn FnOnce() + Send>;
+
 /// Validate a plugin-supplied URI and, if it passes, ask `launch` to open it,
 /// handing the [`EffectOutcome`] the plugin gets back to `report` (#1045).
 ///
@@ -793,7 +803,7 @@ pub(super) fn open_uri_with(
             // kind and the correlation id.
             tracing::warn!(
                 plugin = %plugin_id, id,
-                uri = %truncate_on_char_boundary(uri, 256),
+                uri = %truncate_uri_for_log(uri),
                 %reason,
                 "plugin effect: OpenUri refused",
             );
@@ -806,7 +816,7 @@ pub(super) fn open_uri_with(
     };
     tracing::info!(
         plugin = %plugin_id, id, %scheme,
-        uri = %truncate_on_char_boundary(uri, 256),
+        uri = %truncate_uri_for_log(uri),
         "plugin effect: OpenUri",
     );
     let plugin_id = plugin_id.to_owned();
@@ -863,8 +873,29 @@ pub(super) fn open_uri_with(
 /// `Rc<RefCell<..>>` only because [`LaunchDone`] itself is `Send` (a test's
 /// stub is allowed to answer from another thread, see its doc) and a value
 /// boxed as `dyn FnOnce + Send` cannot close over a non-`Send` `Rc`.
+///
+/// The once-guard on the *timer* side (the `take()` inside `arm_timer`'s
+/// closure, just below) is not defensive boilerplate: it is the half that
+/// matters in production. Every test in this file has the timer win the race
+/// by firing `arm_timer`'s trigger before `start` ever runs — but the timer
+/// losing is the ~100% real-world order (a launch resolves in milliseconds
+/// with the 10 s timer still live behind it), and that guard is the only
+/// thing standing between an ordinary successful open and a second `done`
+/// call — i.e. a `.take().expect(..)` panic on an already-empty cell, on the
+/// GTK main thread, ten seconds after the link opened fine (#1060 review F1;
+/// see `a_timer_firing_after_the_callback_already_reported_is_a_no_op`).
+///
+/// When `start`'s own callback wins instead, `arm_timer`'s trigger is still
+/// armed and would otherwise fire into that now-empty cell's no-op branch
+/// [`OPEN_URI_TIMEOUT`] later — holding this closure's `Arc<Mutex<..>>` and
+/// the `Cancellable` open for the whole window. `arm_timer` returns a
+/// [`TimerCancel`] for exactly that: the callback arm calls it before calling
+/// `done`, tearing the timer's source down instead of leaving it parked
+/// (#1060 review F3; see `the_callback_winning_cancels_the_still_armed_timer`).
+/// The once-guard above is kept regardless, as the belt to this teardown's
+/// braces.
 fn launch_with_timeout(
-    arm_timer: impl FnOnce(Box<dyn FnOnce()>),
+    arm_timer: impl FnOnce(Box<dyn FnOnce()>) -> TimerCancel,
     start: impl FnOnce(&gio::Cancellable, LaunchDone),
     done: LaunchDone,
 ) {
@@ -873,7 +904,7 @@ fn launch_with_timeout(
 
     let timer_cancellable = cancellable.clone();
     let timer_done = Arc::clone(&done);
-    arm_timer(Box::new(move || {
+    let cancel_timer = arm_timer(Box::new(move || {
         let Some(done) = timer_done.lock().expect("launch-done lock").take() else {
             // `start`'s own callback already reported; nothing to do.
             return;
@@ -890,6 +921,12 @@ fn launch_with_timeout(
                 // answer arriving after that must not report a second time.
                 return;
             };
+            // `start` answered first: the timer is still armed and would
+            // otherwise fire ten seconds from now into the no-op branch
+            // above, holding this closure's `Arc<Mutex<..>>` and the
+            // `Cancellable` open for the rest of the window (#1060 review
+            // F3) — tear it down rather than let it.
+            cancel_timer();
             done(result);
         }),
     );
@@ -914,12 +951,16 @@ fn launch_with_timeout(
 /// to launch with, so a stuck portal or a handler that never completes its
 /// `GTask` gets cancelled — which makes `GLib` complete it with a `Cancelled`
 /// error instead of leaving it, and the boxed closure this call's own trampoline
-/// holds, outstanding forever.
+/// holds, outstanding forever. The `arm_timer` closure below hands back the
+/// armed [`glib::SourceId`] as a [`TimerCancel`], so a launch that resolves on
+/// its own (the common case) removes the still-live timer source instead of
+/// leaving it to fire into a no-op ten seconds later (#1060 review F3).
 fn launch_default_for_uri_async(uri: &str, done: LaunchDone) {
     let uri = uri.to_owned();
     launch_with_timeout(
         |fire| {
-            glib::timeout_add_local_once(OPEN_URI_TIMEOUT, fire);
+            let source_id = glib::timeout_add_local_once(OPEN_URI_TIMEOUT, fire);
+            Box::new(move || source_id.remove())
         },
         move |cancellable, done| {
             gio::AppInfo::launch_default_for_uri_async(
@@ -1655,6 +1696,26 @@ fn truncate_on_char_boundary(s: &str, max: usize) -> String {
     s[..end].to_owned()
 }
 
+/// Truncate a plugin-supplied URI to at most 256 bytes for a log or the audit
+/// trail, the same as [`truncate_on_char_boundary`], but append `…` when it
+/// actually cut something off (#1060 review N1). Without this a cut URI reads
+/// as a shorter, complete-looking destination the plugin never actually
+/// asked for — recoverable in principle (`MAX_URI_BYTES` is 4096, so a
+/// truncated record is reachable, not theoretical) but only if the reader
+/// knows to distrust it. Not applied to [`truncate_on_char_boundary`] itself:
+/// that helper also bounds captured `RunCommand` output
+/// ([`RUN_COMMAND_MAX_OUTPUT`]), which has its own exact-length expectations
+/// this marker has no business changing.
+fn truncate_uri_for_log(uri: &str) -> String {
+    const MAX_LOGGED_URI_BYTES: usize = 256;
+    let truncated = truncate_on_char_boundary(uri, MAX_LOGGED_URI_BYTES);
+    if truncated.len() < uri.len() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
 // ── Persisted effect audit log (#510) ────────────────────────────────────────
 //
 // Every brokered effect — and every one dropped by capability enforcement (#436)
@@ -1850,7 +1911,7 @@ fn audit_effect_id(effect: &Effect) -> Option<u64> {
 /// itself was already answerable from the journal alone before this existed.
 fn audit_effect_uri(effect: &Effect) -> Option<String> {
     match effect {
-        Effect::OpenUri { uri, .. } => Some(sanitize_field(&truncate_on_char_boundary(uri, 256))),
+        Effect::OpenUri { uri, .. } => Some(sanitize_field(&truncate_uri_for_log(uri))),
         _ => None,
     }
 }
@@ -1965,6 +2026,7 @@ mod tests {
         audit_effect_uri, broker_effect, broker_open_uri_with, check_uri, clamp_volume,
         command_outcome, effect_kind, filter_forwarded_env, format_audit_line, launch_outcome,
         launch_with_timeout, open_uri_with, start_detached_with, truncate_on_char_boundary,
+        truncate_uri_for_log,
     };
     use hytte_plugin_proto::{AudioAction, Effect, HostMsg, MediaAction, NiriAction, Page};
     use std::cell::{Cell, RefCell};
@@ -3115,7 +3177,13 @@ mod tests {
     fn an_outstanding_launch_that_never_calls_back_still_reports() {
         let (tx, rx) = std::sync::mpsc::channel();
         launch_with_timeout(
-            |fire| fire(),
+            |fire| {
+                fire();
+                // The timer wins this race (see the module comment above), so
+                // `start`'s callback below never runs and this cancel handle
+                // is never invoked; a no-op suffices.
+                Box::new(|| {})
+            },
             |_cancellable, _done| {
                 // The stuck-portal / hung-`GTask` shape: `done` is simply
                 // never called.
@@ -3148,7 +3216,12 @@ mod tests {
     fn a_late_callback_after_the_timer_does_not_report_twice() {
         let (tx, rx) = std::sync::mpsc::channel();
         launch_with_timeout(
-            |fire| fire(),
+            |fire| {
+                fire();
+                // The timer wins this race too, so this cancel handle is
+                // never invoked; a no-op suffices.
+                Box::new(|| {})
+            },
             |_cancellable, done| {
                 // "Late": this only runs after `arm_timer` above has already
                 // fired and reported.
@@ -3166,6 +3239,120 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "the late callback must not deliver a second report",
+        );
+    }
+
+    /// #1060 review F1, the **other** order: `start`'s own callback answers
+    /// first and the timer fires afterwards. This is the ~100% production
+    /// order — a launch that resolves in milliseconds with the 10 s timer
+    /// still live behind it — and the timer-side once-guard is the only thing
+    /// between it and a second `done` call on an already-answered launch.
+    ///
+    /// **Falsified** by removing the timer-side once-guard in
+    /// [`launch_with_timeout`] (the `Option::take` on the shared cell inside
+    /// the `arm_timer` closure): the late timer then unwraps a `None` and
+    /// panics — in production, on the GTK main thread, `OPEN_URI_TIMEOUT`
+    /// after every *successful* open.
+    #[test]
+    fn a_timer_firing_after_the_callback_already_reported_is_a_no_op() {
+        /// The trigger `arm_timer` is handed, parked instead of fired.
+        type Armed = std::rc::Rc<std::cell::RefCell<Option<Box<dyn FnOnce()>>>>;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let armed = Armed::default();
+        let stash = std::rc::Rc::clone(&armed);
+        launch_with_timeout(
+            move |fire| {
+                // Armed, not fired: the real timer is `OPEN_URI_TIMEOUT` out.
+                *stash.borrow_mut() = Some(fire);
+                // The callback below answers before this test ever fires the
+                // trigger, so `launch_with_timeout` cancels it (#1060 review
+                // F3, exercised separately below) — this test isn't asserting
+                // that, so a no-op cancel handle suffices here.
+                Box::new(|| {})
+            },
+            |_cancellable, done| done(Ok(())),
+            Box::new(move |result| {
+                tx.send(result).expect("the receiver is still alive");
+            }),
+        );
+        let first = rx.try_recv().expect("the launch's own callback reports");
+        assert!(first.is_ok(), "the callback won the race: {first:?}");
+
+        let fire = armed
+            .borrow_mut()
+            .take()
+            .expect("the timer was armed at all");
+        fire();
+        assert!(
+            rx.try_recv().is_err(),
+            "the timer fired after the callback already reported; it must be a \
+             no-op, not a second report",
+        );
+    }
+
+    /// #1060 review F3: when `start`'s own callback wins the race, the
+    /// timer's source must be torn down rather than left armed to fire into a
+    /// no-op `OPEN_URI_TIMEOUT` later, holding a strong `Arc<Mutex<..>>` and
+    /// a `Cancellable` open for the whole window. `arm_timer` returns a
+    /// `TimerCancel` for exactly this — production wires it to
+    /// `glib::SourceId::remove`; this stub records whether it ran.
+    ///
+    /// The timer's own trigger is never fired in this test at all: the
+    /// callback answers synchronously inside `start`, so if
+    /// `launch_with_timeout` does not call the returned cancel handle, this
+    /// test's flag simply never flips — there is no separate "late timer"
+    /// step needed to observe the omission.
+    ///
+    /// **Falsified** by dropping the `cancel_timer()` call in
+    /// [`launch_with_timeout`]'s callback arm.
+    #[test]
+    fn the_callback_winning_cancels_the_still_armed_timer() {
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+        launch_with_timeout(
+            move |_fire| {
+                // Never fired: `start`'s callback answers first below, so the
+                // timer must be cancelled rather than parked for 10 s.
+                let cancel_tx = cancel_tx.clone();
+                Box::new(move || cancel_tx.send(()).expect("the receiver is still alive"))
+            },
+            |_cancellable, done| done(Ok(())),
+            Box::new(|_result| {}),
+        );
+        cancel_rx.try_recv().expect(
+            "the callback won the race; the timer's still-armed source must be \
+             cancelled, not left to fire into a no-op later",
+        );
+    }
+
+    /// #1060 review N1: a URI longer than the 256-byte logging cap is
+    /// recorded with a trailing `…`, so the audit trail and the journal never
+    /// state a destination shorter than what the plugin actually supplied
+    /// without saying so.
+    ///
+    /// **Falsified** by dropping the `…` suffix from
+    /// [`truncate_uri_for_log`]: the assertion on the long URI fails, since
+    /// the returned string would then end in a plain "x" with nothing marking
+    /// it as cut.
+    #[test]
+    fn truncate_uri_for_log_marks_a_cut_uri_but_not_a_short_one() {
+        let long = format!("https://example.invalid/{}", "x".repeat(300));
+        let truncated = truncate_uri_for_log(&long);
+        assert!(
+            truncated.len() < long.len(),
+            "sanity: the input must actually be long enough to truncate",
+        );
+        assert!(
+            truncated.ends_with('…'),
+            "a cut URI must say so, not read as a complete shorter one: {truncated}",
+        );
+
+        let short = "https://pr1ma.darkest.space/";
+        assert_eq!(
+            truncate_uri_for_log(short),
+            short,
+            "a URI under the cap round-trips unchanged — no marker on what was \
+             never cut",
         );
     }
 }

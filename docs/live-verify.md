@@ -309,11 +309,12 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
         `Effect::open_uri(id, "https://pr1ma.darkest.space/")` from `update` on a
         click. The **browser opens** on the focused output, and
         `journalctl --user -u trollshell` logs
-        `plugin effect: OpenUri … scheme=https` at info. The audit log
-        (`$XDG_STATE_HOME/trollshell/effects-audit.log`) gains a matching
-        `effect=OpenUri decision=allowed id=<id>` line — with **no** `unit=`
-        (nothing was handed to systemd; that field belongs to a detached
-        `RunCommand`).
+        `plugin effect: OpenUri … scheme=https uri=https://pr1ma.darkest.space/`
+        at info. The audit log (`$XDG_STATE_HOME/trollshell/effects-audit.log`)
+        gains a matching
+        `effect=OpenUri decision=allowed id=<id> uri=https://pr1ma.darkest.space/`
+        line — with **no** `unit=` (nothing was handed to systemd; that field
+        belongs to a detached `RunCommand`).
   - [ ] **A refused scheme is toastable, not silent.** Same plugin, emit
         `Effect::open_uri(id, "mailto:annika@hannig.cc")`. **Nothing launches**;
         the journal warns `plugin effect: OpenUri refused` carrying
@@ -333,16 +334,29 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
         open exactly as for the lowercase form. If it does not, the allow-list
         is accepting something the desktop cannot resolve and the case-folding
         belongs in the host, not just in the comparison.
-  - [ ] **A slow launch does not freeze the shell** (the reason the launch is
-        asynchronous — review F1 on PR #1049). Point one at a hung mount:
+  - [ ] **A hung launch is bounded, not silently open-ended** (the reason the
+        launch is asynchronous — review F1 on PR #1049 — and, since #1060, the
+        reason it is also timed out). No code path reaches the real
+        `launch_default_for_uri_async` in CI — every hermetic test injects its
+        own launcher stub, by design — so **this row is the only place
+        anywhere that observes the production wiring**; a build that silently
+        reverted to the pre-#1060 `Cancellable::NONE` (no timer, no bound)
+        would pass every other check in the repo and only be caught here.
+        Point one at a hung mount:
         `sudo mount -t nfs 10.0.0.254:/nowhere /mnt/hang -o hard,timeo=600` on
         an address that black-holes, then emit
         `Effect::open_uri(id, "file:///mnt/hang/x.png")`. The bar clock must
         keep ticking, the drawer must still open, and other plugins must keep
         rendering, for as long as that launch is outstanding — GLib's
         _synchronous_ entry point does content-type I/O on the URI and would
-        have frozen all of it. The `EffectResult` arrives late, or not until the
-        mount gives up; that is expected. (`umount -f -l /mnt/hang` after.)
+        have frozen all of it. Within **~10 s** (`OPEN_URI_TIMEOUT`) — not
+        "whenever the mount gives up", which can be minutes — the plugin must
+        receive an `EffectResult` with `ok: false` and
+        `output: Some("launch failed: launch timed out")`, and the journal
+        must warn `plugin effect: OpenUri failed to launch a handler`
+        carrying `error=launch timed out`. If the result never arrives, or
+        only arrives once the mount itself times out, the #1060 bound has
+        regressed. (`umount -f -l /mnt/hang` after.)
   - [ ] **The capability is load-bearing.** Remove `Capability::OpenUri` from
         the plugin's manifest, keep the effect, restart it: the click does
         nothing, and the journal warns

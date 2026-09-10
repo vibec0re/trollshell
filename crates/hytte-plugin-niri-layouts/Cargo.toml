@@ -31,3 +31,10 @@ hytte-plugin = { path = "../hytte-plugin" }
 # shared with `hytte-services`' shell-side client, which is why #1019 promoted
 # it to `[workspace.dependencies]` (#453); it adds no resolved package.
 niri-ipc.workspace = true
+
+[dev-dependencies]
+# One test serialises a `Request` and asserts the literal bytes niri's own
+# `niri msg action set-window-width --id N 50%` writes, so the percentage unit
+# is pinned at the wire rather than at a Rust enum (#1026 review, HIGH-1).
+# `niri-ipc` already depends on it, so this adds no resolved package.
+serde_json.workspace = true

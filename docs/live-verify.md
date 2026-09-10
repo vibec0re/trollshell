@@ -318,10 +318,15 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
 - [ ] **(#1019)** Niri layouts — nothing about this plugin can be verified
       without a live niri session, so all three legs are live-only. **The
       chip:** on a workspace with three tiled columns, click each of the three
-      buttons on the bar (`equal` / `golden` / `split`, left to right) and
-      watch the columns resize — `equal` to a third each, `golden` to a wide
-      first column with two narrow ones after it, `split` to half the working
-      area each (so the third scrolls off). Each button should show a **preem
+      buttons on the bar (`equal` / `golden` / `split`, left to right) and check
+      the columns land on the **stated widths**, not merely that they moved —
+      `equal` a third of the screen each, `golden` a first column at ~62 % of
+      the screen with ~38 % ones after it, `split` half the screen each (so the
+      third scrolls off). Measuring the width is the point: `SetProportion` is a
+      percentage, and the pre-review build sent fractions, which niri clamped to
+      each window's **minimum width** — every button "resized the columns" while
+      doing the same wrong thing. If all three snap columns to a thin sliver,
+      that regression is back. Each button should show a **preem
       LED panel** (VFD skin, accent-tinted like the timer's seven-segment chip)
       whose lit columns draw the layout — `▮ ▮ ▮`, `▮▮▮ ▮`, `▮▮ ▮▮` — at the
       same height as the timer chip beside it, not an Adwaita glyph and not an

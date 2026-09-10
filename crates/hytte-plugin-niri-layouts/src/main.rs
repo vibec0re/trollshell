@@ -47,6 +47,15 @@
 //! | `golden` | first `0.618`, **every other one** `0.382` |
 //! | `split` | `0.5` for every column |
 //!
+//! Those are **fractions**, which is the unit [`layout`] thinks in. niri's
+//! `SizeChange::SetProportion` is a **percentage** of the working area, so
+//! `niri::percent` scales at the one seam before the socket — `0.5` goes on the
+//! wire as `50.0`, exactly what `niri msg action set-window-width 50%` writes.
+//! Getting that wrong is invisible on glass (niri clamps a sub-1 % request to
+//! the window's minimum width, so every layout still "resizes the columns"),
+//! which is why the wire number is pinned against niri's own contract rather
+//! than against the constants above.
+//!
 //! The triage on #1019 put three questions to Annika and built its own defaults
 //! meanwhile; she answered all three ("scroll off to the side / n1 / preem"),
 //! and this is what each became:

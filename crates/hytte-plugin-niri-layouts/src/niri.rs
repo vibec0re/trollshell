@@ -68,11 +68,28 @@ pub(crate) fn apply(transport: &mut impl Transport, layout: Layout) -> Result<us
                 // Always by id: `None` would mean "the focused window", which is
                 // exactly one of the n columns we are walking.
                 id: Some(id),
-                change: SizeChange::SetProportion(proportion),
+                change: SizeChange::SetProportion(percent(proportion)),
             }),
         )?;
     }
     Ok(plan.len())
+}
+
+/// The planner's fraction as the **percentage** `SizeChange::SetProportion`
+/// actually carries.
+///
+/// This is the one seam where the domain unit meets the wire unit, and the wire
+/// unit is a percentage of the working area, `0.0..=100.0` — not a fraction.
+/// `niri msg action set-window-width 50%` puts `50.0` on this wire: niri-ipc's
+/// `impl FromStr for SizeChange` strips the `%` and keeps the number unscaled
+/// (its own test asserts `"10%".parse() == SetProportion(10.)`), and niri's wiki
+/// equates the action's `"100%"` with the KDL config's `proportion 1.0`, so full
+/// width is `100.0`.
+///
+/// Keeping [`layout`] in fractions and converting here means `1.0 / n` stays
+/// readable as "one n-th of the screen" and exactly one line knows the unit.
+fn percent(proportion: f64) -> f64 {
+    proportion * 100.0
 }
 
 fn windows(transport: &mut impl Transport) -> Result<Vec<Window>, String> {
@@ -243,8 +260,49 @@ pub(crate) mod fake {
 mod tests {
     use super::fake::{Fake, tile};
     use super::{Transport, apply};
-    use crate::layout::{GOLDEN_MAJOR, GOLDEN_MINOR, Layout};
+    use crate::layout::Layout;
     use niri_ipc::{Reply, Request, Response};
+
+    // ── The wire unit ────────────────────────────────────────────────────────
+    //
+    // Every expectation below is a **literal percentage**, deliberately not
+    // derived from this crate's `GOLDEN_MAJOR` / `SPLIT_SHARE` / `1.0 / n`.
+    // Comparing the wire back to the constants it came from is a closed loop —
+    // it pins *a* number without ever stating what niri means by it, and it is
+    // how this crate shipped 0.5 % where it meant 50 % (#1026 review, HIGH-1).
+    //
+    // The numbers come from niri, not from here: `set-window-width 50%` parses
+    // to `SetProportion(50.0)` (niri-ipc's `impl FromStr for SizeChange`, whose
+    // own test asserts `"10%" == SetProportion(10.)`), and `"100%"` is the KDL
+    // config's `proportion 1.0` (niri wiki, Fullscreen-and-Maximize) — so full
+    // width is 100.0 and a half is 50.0.
+
+    #[test]
+    fn split_asks_for_fifty_percent_per_column_not_half_a_percent() {
+        let mut niri = Fake::with(vec![tile(10, 1), tile(20, 2), tile(30, 3)]);
+
+        let applied = apply(&mut niri, Layout::Split).expect("the fake answers everything");
+
+        assert_eq!(applied, 3);
+        assert_eq!(
+            niri.widths(),
+            vec![(10, 50.0), (20, 50.0), (30, 50.0)],
+            "half the working area is 50.0 on this wire, not 0.5"
+        );
+    }
+
+    #[test]
+    fn equal_over_four_columns_asks_for_twenty_five_percent_each() {
+        let mut niri = Fake::with(vec![tile(10, 1), tile(20, 2), tile(30, 3), tile(40, 4)]);
+
+        apply(&mut niri, Layout::Equal).expect("the fake answers everything");
+
+        assert_eq!(
+            niri.widths(),
+            vec![(10, 25.0), (20, 25.0), (30, 25.0), (40, 25.0)],
+            "a quarter of the working area is 25.0, not 0.25"
+        );
+    }
 
     #[test]
     fn sends_one_set_width_per_column_left_to_right() {
@@ -255,7 +313,35 @@ mod tests {
         assert_eq!(applied, 3);
         assert_eq!(
             niri.widths(),
-            vec![(10, GOLDEN_MAJOR), (20, GOLDEN_MINOR), (30, GOLDEN_MINOR)]
+            vec![(10, 61.8), (20, 38.2), (30, 38.2)],
+            "golden's wide column is 61.8 % of the working area, not 0.618 %"
+        );
+    }
+
+    /// The unit pinned at the **bytes**, not at a Rust enum: this is the exact
+    /// line `niri msg action set-window-width --id 10 50%` writes to the socket.
+    #[test]
+    fn the_request_serialises_to_niris_own_percentage_bytes() {
+        let mut niri = Fake::two_columns();
+
+        apply(&mut niri, Layout::Split).expect("the fake answers everything");
+
+        let actions: Vec<String> = niri
+            .seen
+            .iter()
+            .filter(|r| matches!(r, Request::Action(_)))
+            .map(|r| serde_json::to_string(r).expect("a Request serialises"))
+            .collect();
+
+        assert_eq!(
+            actions,
+            vec![
+                r#"{"Action":{"SetWindowWidth":{"id":10,"change":{"SetProportion":50.0}}}}"#
+                    .to_owned(),
+                r#"{"Action":{"SetWindowWidth":{"id":20,"change":{"SetProportion":50.0}}}}"#
+                    .to_owned(),
+            ],
+            "these are the bytes `niri msg action set-window-width --id N 50%` writes"
         );
     }
 
@@ -333,6 +419,6 @@ mod tests {
         let applied = apply(&mut niri, Layout::Split).expect("the fallback path");
 
         assert_eq!(applied, 2);
-        assert_eq!(niri.widths(), vec![(10, 0.5), (20, 0.5)]);
+        assert_eq!(niri.widths(), vec![(10, 50.0), (20, 50.0)]);
     }
 }

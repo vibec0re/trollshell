@@ -552,8 +552,9 @@ mod tests {
         assert_eq!(apply_and_report(&mut niri, Layout::Split), None);
         assert_eq!(
             niri.widths(),
-            vec![(10, 0.5), (20, 0.5)],
-            "it really did apply, it just has nothing to say about it"
+            vec![(10, 50.0), (20, 50.0)],
+            "it really did apply (at niri's percentage unit), it just has \
+             nothing to say about it"
         );
     }
 

@@ -1200,6 +1200,152 @@ mod tests {
         );
     }
 
+    /// **Each of the four `EmptyGrid` disjuncts, pinned individually.**
+    /// `a_zero_sided_node_is_refused` above only ever trips `node.width == 0`
+    /// and `node.data_size.0 == 0` — its `(0, 0)` fixture trips both
+    /// data-size disjuncts at once, and neither of its two cases touches
+    /// `node.height` at all. That left `node.height == 0` and
+    /// `node.data_size.1 == 0` unpinned: the adversarial review of #1034
+    /// found that dropping both from `refusal()`'s guard
+    /// (`node.width == 0 || node.height == 0 || node.data_size.0 == 0 ||
+    /// node.data_size.1 == 0`) leaves the full `cargo test -p trollshell`
+    /// green (#1037).
+    ///
+    /// These four fixtures are the host mirror of the SDK's isolating cases
+    /// in `the_sdk_refuses_a_zero_sided_grid_or_surface`
+    /// (`crates/hytte-plugin/src/shader.rs`) — its "0x4 grid" / "4x0 grid" /
+    /// "0x64 surface" / "64x0 surface" cases — so the two tables read as one.
+    ///
+    /// **Falsified** by deleting any one of the four disjuncts from
+    /// `refusal()`'s zero-side guard: exactly the matching assertion below
+    /// goes red, and the other three stay green.
+    #[test]
+    fn each_empty_grid_disjunct_is_refused_on_its_own() {
+        // `node.width == 0`: a zero-width drawn surface over an otherwise
+        // valid 1x1 data grid.
+        let data = [0u8];
+        let mut node = ok_node("void main() {}", &data);
+        node.width = 0;
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            Some(Refusal::EmptyGrid),
+            "width == 0",
+        );
+
+        // `node.height == 0`: a zero-height drawn surface, otherwise the same.
+        let mut node = ok_node("void main() {}", &data);
+        node.height = 0;
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            Some(Refusal::EmptyGrid),
+            "height == 0",
+        );
+
+        // `node.data_size.0 == 0`: a 0xN data grid with an empty buffer —
+        // `data_len_ok(0, 4, 0)` holds (0 texels, 0 bytes), so `MalformedData`
+        // does not fire first.
+        let empty: [u8; 0] = [];
+        let mut node = ok_node("void main() {}", &empty);
+        node.data_size = (0, 4);
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            Some(Refusal::EmptyGrid),
+            "data_size.0 == 0",
+        );
+
+        // `node.data_size.1 == 0`: an Nx0 data grid, same reasoning.
+        let mut node = ok_node("void main() {}", &empty);
+        node.data_size = (4, 0);
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            Some(Refusal::EmptyGrid),
+            "data_size.1 == 0",
+        );
+    }
+
+    /// **`1×1` is accepted, on either axis of the shape check** (#1037
+    /// review, LOW-1) — the host mirror of the SDK's two positive assertions
+    /// in `the_sdk_refuses_a_zero_sided_grid_or_surface`
+    /// (`crates/hytte-plugin/src/shader.rs`): "1x1 grid over the default
+    /// 64x64 surface" and "1x1 surface over the default 1x1 grid". Neither
+    /// side had a host-side fixture proving `1` is the smallest *accepted*
+    /// side before #1037 — every existing test on this guard only ever
+    /// proved what gets refused.
+    ///
+    /// That gap matters because `refusal()`'s zero-side guard reads
+    /// `node.width == 0 || node.height == 0 || …` (`shader_map.rs:361`):
+    /// widening either surface disjunct from `== 0` to `<= 1` still refuses
+    /// every fixture `each_empty_grid_disjunct_is_refused_on_its_own` and
+    /// `a_zero_sided_node_is_refused` assert on (all of them are exactly `0`,
+    /// never `1`), so that widening shipped green everywhere else on this
+    /// guard.
+    ///
+    /// **Falsified** by widening `node.width == 0 || node.height == 0` to
+    /// `node.width <= 1 || node.height <= 1` in `refusal()`'s zero-side
+    /// guard: the `1x1 surface` assertion below goes red (refused instead of
+    /// accepted).
+    #[test]
+    fn a_1x1_grid_or_surface_is_accepted() {
+        // A 1×1 data grid (one R8 byte) over the default 144×48 surface.
+        let one_texel = [0u8];
+        let node = ok_node("void main() {}", &one_texel);
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            None,
+            "1x1 grid over a 144x48 surface",
+        );
+
+        // A 1×1 drawn surface over the default 4×1 data grid.
+        let strip = [0u8, 1, 2, 3];
+        let mut node = ok_node("void main() {}", &strip);
+        node.width = 1;
+        node.height = 1;
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            None,
+            "1x1 surface over a 4x1 grid",
+        );
+    }
+
+    /// **The check order, where two refusals fire at once.** Mirrors the
+    /// SDK's `empty_grid_sits_between_malformed_data_and_grid_too_large`
+    /// (`crates/hytte-plugin/src/shader.rs`): `refusal()` is a chain of early
+    /// returns, so which variant a node gets is decided by position, not just
+    /// by predicate, and the zero-side guard overlaps two of its neighbours
+    /// (`MalformedData`, `GridTooLarge`) on real inputs. The host side had no
+    /// fixture for this before #1037.
+    ///
+    /// **Falsified** by moving the zero-side guard in `refusal()`: hoisted
+    /// above the `data_len_ok` check, the first assertion goes red; sunk
+    /// below the extent check, the second does.
+    #[test]
+    fn empty_grid_sits_between_malformed_data_and_grid_too_large() {
+        // `MalformedData` before `EmptyGrid`: a 0x4 grid with three bytes is
+        // both zero-sided and inconsistent; the host reports the length,
+        // because that is the more basic mistake.
+        let three = [1u8, 2, 3];
+        let mut node = ok_node("void main() {}", &three);
+        node.data_size = (0, 4);
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            Some(Refusal::MalformedData { bytes: 3 }),
+            "a zero-sided grid whose buffer also mismatches is MalformedData",
+        );
+
+        // `EmptyGrid` before `GridTooLarge`: a 0 x (EXTENT+1) grid with an
+        // empty buffer is a consistent shape (0 texels, 0 bytes), so
+        // `MalformedData` does not fire, and it is both zero-sided and over
+        // the extent cap; the host reports the empty grid.
+        let empty: [u8; 0] = [];
+        let mut node = ok_node("void main() {}", &empty);
+        node.data_size = (0, MAX_SHADER_DATA_EXTENT + 1);
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            Some(Refusal::EmptyGrid),
+            "a zero-sided grid whose other axis is over the extent cap is EmptyGrid",
+        );
+    }
+
     /// **No GL, no shader** — and, unlike a kit widget, no CPU arm to fall back
     /// to: the widget is GPU-only by design (#893, Annika: "EGL should be
     /// available for all targets"), so a session whose context failed renders

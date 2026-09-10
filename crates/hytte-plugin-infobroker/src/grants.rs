@@ -676,6 +676,8 @@ mod tests {
     /// check would miss exactly that failure mode.
     #[test]
     fn write_atomic_never_exposes_a_torn_file_to_a_concurrent_reader() {
+        const ITERATIONS: usize = 20_000;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("grants.toml");
 
@@ -695,7 +697,6 @@ mod tests {
         // not "file doesn't exist yet".
         write_atomic(&path, &small).expect("seed write");
 
-        const ITERATIONS: usize = 20_000;
         let writer_path = path.clone();
         let (small_w, large_w) = (small.clone(), large.clone());
         let writer = std::thread::spawn(move || {
@@ -711,11 +712,12 @@ mod tests {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue; // a transient read error is not tearing; keep polling
             };
-            if text.is_empty() {
-                // Only reachable if `write_atomic` regresses to a non-atomic
-                // truncate-then-write; a real rename(2) never exposes this.
-                panic!("read a fully empty grants.toml mid-write — a torn (truncated) write");
-            }
+            // Only reachable if `write_atomic` regresses to a non-atomic
+            // truncate-then-write; a real rename(2) never exposes this.
+            assert!(
+                !text.is_empty(),
+                "read a fully empty grants.toml mid-write — a torn (truncated) write"
+            );
             reads += 1;
             match parse_grants(&text) {
                 Ok(grants) => assert!(

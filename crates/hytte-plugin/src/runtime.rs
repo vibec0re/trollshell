@@ -1248,6 +1248,47 @@ mod tests {
         }
     }
 
+    /// #1058 review LOW-1: emits an ungranted effect on click but its view
+    /// **never changes** — deliberately unlike `Linker`, whose view text
+    /// bumps on every click and so would still force a send even if the
+    /// capability guard's placement regressed. Isolates "does an all-dropped
+    /// effects step still put a frame on the wire" from "did the view
+    /// change", which `Linker`'s own tests cannot.
+    struct SilentLinker;
+
+    impl Plugin for SilentLinker {
+        type Msg = std::convert::Infallible;
+        type Cmd = std::convert::Infallible;
+
+        fn manifest() -> Manifest {
+            Manifest::new("silent-linker-test", Mount::SidebarTop) // no capabilities
+        }
+
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+            Self
+        }
+
+        fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
+            if let Input::Event { node, kind, .. } = input
+                && node == "silent-btn"
+                && matches!(kind, EventKind::Click)
+            {
+                return vec![Effect::open_uri(1, "https://example.invalid/")];
+            }
+            Vec::new()
+        }
+
+        fn view(&self) -> View {
+            Node::Label {
+                id: Some("silent-lbl".to_owned()),
+                text: "constant".to_owned(),
+                classes: Vec::new(),
+                tooltip: None,
+            }
+            .into()
+        }
+    }
+
     // ── Host-side helpers ────────────────────────────────────────────────────
 
     /// #904: a plugin whose view is **constant** but poisoned — a `NaN`
@@ -2675,6 +2716,56 @@ mod tests {
         };
 
         let (result, ()) = tokio::join!(session::<Linker<true>, _, _>(prd, pwr), host);
+        assert!(result.is_ok());
+    }
+
+    /// #1058 review LOW-1: a step whose only output was an ungranted effect
+    /// must still put a frame on the wire — the host's own `runtime_render`
+    /// (the control-center's "rendering"/`last_seen` freshness signal) only
+    /// refreshes when a frame arrives, and an all-dropped batch is not a
+    /// reason to withhold one. `SilentLinker`'s view never changes, so
+    /// `changed` alone can never explain a send here — only the pre-guard
+    /// effects presence can.
+    ///
+    /// **Falsified** by deciding `send` on the post-guard (filtered) effects
+    /// instead of the effects `update` actually returned (this test reds — a
+    /// `Pong` arrives where the expected `Render` was, because no frame was
+    /// ever sent for the click).
+    #[tokio::test]
+    async fn an_all_dropped_step_still_sends_a_frame() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            eat_handshake(&mut hrd, "silent-linker-test").await;
+
+            send(
+                &mut hwr,
+                &HostMsg::Event {
+                    node: "silent-btn".to_owned(),
+                    kind: EventKind::Click,
+                    output: None,
+                },
+            )
+            .await;
+            // The click's effect is ungranted, so a `Log{Warn}` frame
+            // precedes the `Render` — not what this test is pinning; skip it.
+            let PluginMsg::Log { .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("the ungranted effect must still warn via a Log frame");
+            };
+            let PluginMsg::Render { effects, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!(
+                    "an all-dropped-effects step must still produce a Render frame, \
+                     even though the view itself never changes"
+                );
+            };
+            assert!(effects.is_empty(), "the ungranted effect is still dropped");
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<SilentLinker, _, _>(prd, pwr), host);
         assert!(result.is_ok());
     }
 }

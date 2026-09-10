@@ -7,7 +7,7 @@
 //! that talks to niri, and it does nothing this module has not decided.
 
 use niri_ipc::{Output, Window, Workspace};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// The output-width breakpoint between [`Layout::Golden`]'s two pairs
 /// (#1052).
@@ -47,10 +47,20 @@ pub(crate) const GOLDEN_WIDE_MINOR: f64 = 0.25;
 ///
 /// This is where the layout's name came from before #1019's second round
 /// replaced it everywhere with [`GOLDEN_WIDE_MAJOR`]/[`GOLDEN_WIDE_MINOR`]
-/// for Annika's ultrawide. A 25 % narrow column is fine at 2560 px and wider,
-/// but on a 1920- or 2560-wide laptop screen it leaves too little room to
-/// use the narrow column for anything — "Can we make this adaptive?" (#1052,
-/// 2026-09-10) — so a screen below the breakpoint gets the golden cut back.
+/// for Annika's ultrawide. [`GOLDEN_BREAKPOINT`] px and wider keeps that wide
+/// pair; **below** it a flat 25 % narrow column leaves too little room to use
+/// on a smaller screen — "Can we make this adaptive?" (#1052, 2026-09-10) —
+/// so it gets the golden cut back instead.
+///
+/// One boundary is genuinely ambiguous and deliberately left as shipped
+/// (#1056 review, MED-1): a screen reporting **exactly** 2560 logical px — a
+/// 1440p monitor at 1x scale, or a 4K panel read back at 1.5x — reads as
+/// "wide" under today's `width < GOLDEN_BREAKPOINT` test (see [`golden_pair`])
+/// and gets 75/25, not the golden cut, even though 2560×1440 is a common
+/// monitor size that might want the narrower breakpoint. Which side of the
+/// line that screen belongs on is Annika's call to make, not this comment's;
+/// [`GOLDEN_BREAKPOINT`] is the one place to move if the answer turns out to
+/// be "at or below 2560".
 pub(crate) const GOLDEN_NARROW_MAJOR: f64 = 0.618;
 
 /// Every other column's share under [`Layout::Golden`] on a narrow output —
@@ -266,10 +276,15 @@ pub(crate) fn target_output_name<'a>(
 /// The logical width (px) of the output named `name` in `outputs`, or `None`
 /// if no output has that name or it reports no logical geometry at all (a
 /// disabled or headless output) — see [`golden_pair`] (#1052).
-pub(crate) fn logical_width_of(outputs: &[Output], name: &str) -> Option<u32> {
+///
+/// Keyed by name rather than a linear scan over a flattened list (#1056
+/// review, NIT-2): niri's own `Outputs` reply is already a
+/// `HashMap<String, Output>` keyed by connector name, and a `Vec` + `find` on
+/// `Output.name` both throws that structure away and assumes the map key and
+/// the `name` field never diverge.
+pub(crate) fn logical_width_of(outputs: &HashMap<String, Output>, name: &str) -> Option<u32> {
     outputs
-        .iter()
-        .find(|output| output.name == name)
+        .get(name)
         .and_then(|output| output.logical.as_ref())
         .map(|logical| logical.width)
 }
@@ -343,6 +358,7 @@ mod tests {
         GOLDEN_WIDE_MINOR, Layout, golden_pair, logical_width_of, plan, target_output_name,
     };
     use niri_ipc::{LogicalOutput, Output, Transform, Window, WindowLayout, Workspace};
+    use std::collections::HashMap;
 
     const OUTPUT: &str = "DP-1";
     const OTHER_OUTPUT: &str = "HDMI-A-1";
@@ -920,10 +936,13 @@ mod tests {
 
     #[test]
     fn logical_width_of_finds_the_named_output() {
-        let outputs = vec![
-            output_with_logical_width(OUTPUT, 1920),
-            output_with_logical_width(OTHER_OUTPUT, 3440),
-        ];
+        let outputs = HashMap::from([
+            (OUTPUT.to_owned(), output_with_logical_width(OUTPUT, 1920)),
+            (
+                OTHER_OUTPUT.to_owned(),
+                output_with_logical_width(OTHER_OUTPUT, 3440),
+            ),
+        ]);
 
         assert_eq!(logical_width_of(&outputs, OUTPUT), Some(1920));
         assert_eq!(logical_width_of(&outputs, OTHER_OUTPUT), Some(3440));
@@ -931,9 +950,9 @@ mod tests {
 
     #[test]
     fn logical_width_of_is_none_for_an_unknown_name() {
-        let outputs = vec![output_with_logical_width(OUTPUT, 1920)];
+        let outputs = HashMap::from([(OUTPUT.to_owned(), output_with_logical_width(OUTPUT, 1920))]);
         assert_eq!(logical_width_of(&outputs, "eDP-1"), None);
-        assert_eq!(logical_width_of(&[], OUTPUT), None);
+        assert_eq!(logical_width_of(&HashMap::new(), OUTPUT), None);
     }
 
     #[test]
@@ -941,6 +960,36 @@ mod tests {
         let mut headless = output_with_logical_width(OUTPUT, 1920);
         headless.logical = None;
 
-        assert_eq!(logical_width_of(&[headless], OUTPUT), None);
+        let outputs = HashMap::from([(OUTPUT.to_owned(), headless)]);
+        assert_eq!(logical_width_of(&outputs, OUTPUT), None);
+    }
+
+    // ── Hardcoded breakpoint strings (#1056 review, LOW-2) ──────────────────
+
+    /// `cli::USAGE`, `Layout::Golden.tooltip()` and `main.rs`'s module docs
+    /// each spell [`GOLDEN_BREAKPOINT`] out as a literal "2560" rather than
+    /// deriving it: `USAGE` and `tooltip()` are `&'static str`s built at
+    /// compile time from string literals (no `const_format`-shaped crate is
+    /// in this workspace to interpolate a `const` into one), and the module
+    /// docs in `main.rs` are plain `//!` comments, not data at all. None of
+    /// them can read the constant, so this reads *them* and checks they still
+    /// agree with it — a `GOLDEN_BREAKPOINT` bump that doesn't also touch
+    /// every one of these fails here instead of shipping a doc that lies
+    /// (#1056 review, LOW-2).
+    #[test]
+    fn hardcoded_breakpoint_strings_track_the_constant() {
+        let breakpoint = GOLDEN_BREAKPOINT.to_string();
+        let spellings: [(&str, &str); 3] = [
+            ("cli::USAGE", crate::cli::USAGE),
+            ("Layout::Golden::tooltip()", Layout::Golden.tooltip()),
+            ("main.rs's module docs", include_str!("main.rs")),
+        ];
+        for (label, text) in spellings {
+            assert!(
+                text.contains(breakpoint.as_str()),
+                "{label} does not name the breakpoint as {breakpoint} — it \
+                 drifted from GOLDEN_BREAKPOINT, got: {text:?}"
+            );
+        }
     }
 }

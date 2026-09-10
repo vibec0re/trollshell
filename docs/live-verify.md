@@ -455,6 +455,12 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       debug line explaining why, not a crash or a silent 61.8/38.2. The CLI
       hat picks up the same rule: `hytte-plugin-niri-layouts apply golden` run
       from a terminal on each output should match its chip's split exactly.
+      **Known boundary, flag rather than fix (#1056 review, MED-1):** a
+      screen reporting **exactly** 2560 logical px — a 1440p monitor at 1x
+      scale, or a 4K panel read back at 1.5x — lands on the wide side today
+      (`>= 2560` → 75/25), not the golden cut. If that reads wrong on real
+      glass, say so on #1052 rather than changing `GOLDEN_BREAKPOINT`
+      yourself — Annika hasn't picked a side of that boundary yet.
 
 ## Infobroker
 

@@ -16,6 +16,7 @@ use crate::layout::{self, Layout};
 use crate::plugin::PLUGIN_ID;
 use niri_ipc::socket::Socket;
 use niri_ipc::{Action, Output, Reply, Request, Response, SizeChange, Window, Workspace};
+use std::collections::HashMap;
 
 /// One niri request, one niri reply.
 ///
@@ -25,6 +26,15 @@ use niri_ipc::{Action, Output, Reply, Request, Response, SizeChange, Window, Wor
 /// [`apply`] surfaces verbatim.
 pub(crate) trait Transport {
     fn send(&mut self, request: Request) -> Result<Reply, String>;
+
+    /// Where a diagnostic that isn't a niri error goes — real stderr for
+    /// [`SocketTransport`], captured into [`fake::Fake::logs`] for the tests
+    /// below (#1056 review, LOW-1). The only diagnostic today is
+    /// [`apply`]'s Golden missing-width fallback; this seam is what lets a
+    /// test assert it was emitted without piping the process's real stderr
+    /// through a pipe — the same shape `watch.rs`'s `Backend::log` already
+    /// uses for its own diagnostics.
+    fn log(&mut self, line: &str);
 }
 
 /// The real transport: one short-lived `$NIRI_SOCKET` connection per request.
@@ -42,6 +52,12 @@ impl Transport for SocketTransport {
         socket
             .send(request)
             .map_err(|e| format!("niri ipc failed: {e}"))
+    }
+
+    fn log(&mut self, line: &str) {
+        // stderr, which systemd routes to the journal for a plugin unit —
+        // the same destination `watch.rs`'s `SocketBackend::log` writes to.
+        eprintln!("{line}");
     }
 }
 
@@ -72,12 +88,7 @@ pub(crate) fn apply(transport: &mut impl Transport, layout: Layout) -> Result<us
     let target_output = layout::target_output_name(&workspaces, output.as_deref());
     let logical_width = target_output.and_then(|name| layout::logical_width_of(&outputs, name));
     if layout == Layout::Golden && logical_width.is_none() {
-        eprintln!(
-            "[{PLUGIN_ID}] golden: no logical width for the target output{}; \
-             defaulting to the >= {}px pair (75 % / 25 %)",
-            target_output.map_or_else(String::new, |name| format!(" ({name})")),
-            layout::GOLDEN_BREAKPOINT,
-        );
+        transport.log(&missing_width_diagnostic(target_output));
     }
     let golden = layout::golden_pair(logical_width);
 
@@ -94,6 +105,22 @@ pub(crate) fn apply(transport: &mut impl Transport, layout: Layout) -> Result<us
         )?;
     }
     Ok(plan.len())
+}
+
+/// The line [`apply`] logs when [`Layout::Golden`] can't resolve a logical
+/// width for the target output (#1052) — built from
+/// [`layout::GOLDEN_WIDE_MAJOR`]/[`layout::GOLDEN_WIDE_MINOR`] rather than a
+/// hand-typed "75 % / 25 %", so a change to the fallback pair can't leave
+/// this message naming the wrong one (#1056 review, LOW-1).
+fn missing_width_diagnostic(target_output: Option<&str>) -> String {
+    format!(
+        "[{PLUGIN_ID}] golden: no logical width for the target output{}; \
+         defaulting to the >= {}px pair ({:.0} % / {:.0} %)",
+        target_output.map_or_else(String::new, |name| format!(" ({name})")),
+        layout::GOLDEN_BREAKPOINT,
+        layout::GOLDEN_WIDE_MAJOR * 100.0,
+        layout::GOLDEN_WIDE_MINOR * 100.0,
+    )
 }
 
 /// The planner's fraction as the **percentage** `SizeChange::SetProportion`
@@ -127,12 +154,14 @@ fn workspaces(transport: &mut impl Transport) -> Result<Vec<Workspace>, String> 
     }
 }
 
-/// Every connected output — the map niri's `Outputs` request replies with,
-/// flattened to a `Vec` since [`layout::logical_width_of`] just looks one up
-/// by name (#1052).
-fn outputs(transport: &mut impl Transport) -> Result<Vec<Output>, String> {
+/// Every connected output, keyed by connector name — the exact shape niri's
+/// `Outputs` request replies with, left unflattened (#1056 review, NIT-2): a
+/// `Vec` would make [`layout::logical_width_of`] linear-search by
+/// `Output.name`, which is both O(n) and assumes the map key and that field
+/// never diverge. `HashMap::get` is O(1) and needs no such assumption.
+fn outputs(transport: &mut impl Transport) -> Result<HashMap<String, Output>, String> {
     match ask(transport, Request::Outputs)? {
-        Response::Outputs(outputs) => Ok(outputs.into_values().collect()),
+        Response::Outputs(outputs) => Ok(outputs),
         other => Err(unexpected("Outputs", &other)),
     }
 }
@@ -248,6 +277,10 @@ pub(crate) mod fake {
         /// Fail every request at the transport layer (no socket at all).
         pub(crate) transport_error: Option<String>,
         pub(crate) seen: Vec<Request>,
+        /// Every line [`Transport::log`] was called with, in order (#1056
+        /// review, LOW-1) — the captured-diagnostic seam `watch.rs`'s
+        /// `Script::logs` already uses for the same purpose.
+        pub(crate) logs: Vec<String>,
     }
 
     impl Fake {
@@ -260,6 +293,7 @@ pub(crate) mod fake {
                 action_error: None,
                 transport_error: None,
                 seen: Vec::new(),
+                logs: Vec::new(),
             }
         }
 
@@ -319,15 +353,20 @@ pub(crate) mod fake {
                 other => Err(format!("fake got an unscripted request: {other:?}")),
             })
         }
+
+        fn log(&mut self, line: &str) {
+            self.logs.push(line.to_owned());
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fake::{Fake, tile};
-    use super::{Transport, apply};
+    use super::fake::{self, Fake, tile};
+    use super::{Transport, apply, missing_width_diagnostic};
     use crate::layout::Layout;
     use niri_ipc::{Reply, Request, Response};
+    use std::collections::HashMap;
 
     // ── The wire unit ────────────────────────────────────────────────────────
     //
@@ -479,8 +518,16 @@ mod tests {
 
         apply(&mut niri, Layout::Equal).expect("the fake answers everything");
 
+        // Asserted against the **raw, unfiltered** `seen` log rather than
+        // `niri.queries()` (#1056 review, NIT-1): `queries()` filters actions
+        // out before this test ever sees the vec, so an action slipped in
+        // between two snapshots would be invisible to it and the "before
+        // acting" half of this test's name would be untested. Slicing the
+        // first four entries of `seen` pins both the identity *and* the
+        // position of each snapshot relative to everything else `apply` sends.
+        let first_four: Vec<String> = niri.seen[..4].iter().map(|r| format!("{r:?}")).collect();
         assert_eq!(
-            niri.queries(),
+            first_four,
             vec![
                 "Windows".to_owned(),
                 "Workspaces".to_owned(),
@@ -530,12 +577,27 @@ mod tests {
         apply(&mut narrow, Layout::Equal).expect("narrow, equal");
         apply(&mut wide, Layout::Equal).expect("wide, equal");
         assert_eq!(narrow.widths(), wide.widths());
+        // Pinned against the literal too (#1056 review, NIT-3): comparing
+        // narrow against wide alone would also pass if both were wrong in the
+        // same way (`Equal` and `Split` coincide at two columns — see
+        // `layout::tests::equal_and_split_coincide_at_two_columns`), so this
+        // half of the test was really comparing one value against itself.
+        assert_eq!(
+            narrow.widths(),
+            vec![(10, 50.0), (20, 50.0)],
+            "two equal columns are 50 % each, regardless of output width"
+        );
 
         let mut narrow = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 1920);
         let mut wide = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 3440);
         apply(&mut narrow, Layout::Split).expect("narrow, split");
         apply(&mut wide, Layout::Split).expect("wide, split");
         assert_eq!(narrow.widths(), wide.widths());
+        assert_eq!(
+            narrow.widths(),
+            vec![(10, 50.0), (20, 50.0)],
+            "split at two columns is also 50 % each — same literal pin as above"
+        );
     }
 
     /// "Missing output" (#1052): the target output isn't in what `Outputs`
@@ -553,6 +615,27 @@ mod tests {
         assert_eq!(niri.widths(), vec![(10, 75.0), (20, 25.0)]);
     }
 
+    /// The diagnostic (#1056 review, LOW-1) that goes with the fallback
+    /// above: unpinned before this, so a `Transport::log` call that silently
+    /// stopped firing — or drifted from the fallback pair it names — would
+    /// have shipped unnoticed. `missing_width_diagnostic` builds the exact
+    /// line from [`crate::layout::GOLDEN_WIDE_MAJOR`]/`GOLDEN_WIDE_MINOR`, so
+    /// this also guards against the message naming a stale pair.
+    #[test]
+    fn golden_logs_the_fallback_pair_from_the_constants_when_width_is_unknown() {
+        let mut niri = Fake::two_columns();
+        niri.outputs.clear();
+
+        apply(&mut niri, Layout::Golden).expect("querying still works");
+
+        assert_eq!(
+            niri.logs,
+            vec![missing_width_diagnostic(Some(fake::OUTPUT))],
+            "one diagnostic line, naming the target output and the fallback \
+             pair actually sent"
+        );
+    }
+
     #[test]
     fn golden_asks_outputs_exactly_once_per_apply() {
         let mut niri = Fake::with_output_width(vec![tile(10, 1), tile(20, 2), tile(30, 3)], 1920);
@@ -563,6 +646,65 @@ mod tests {
             niri.queries().iter().filter(|q| *q == "Outputs").count(),
             1,
             "one Outputs request per apply, not one per column"
+        );
+    }
+
+    // ── `apply`'s own targeting invariant (#1056 review, MED-2) ─────────────
+    //
+    // `apply` resolves Golden's width through `layout::target_output_name`,
+    // which the PR body calls "the same rule `plan()` uses internally, so the
+    // two can never pick different workspaces" — but nothing wired that
+    // invariant to a test at the `apply` level before this. The obvious wrong
+    // refactor (`output.as_deref()` instead of `target_output_name(&workspaces,
+    // output.as_deref())`) passed the whole suite: `target_output_name`'s own
+    // fallback behaviour was unit-tested in isolation
+    // (`layout::tests::target_output_name_falls_back_like_plan_does`) but
+    // never exercised through `apply` itself.
+
+    /// With no focused output niri-side, `plan` falls back to the globally
+    /// focused workspace — so the *width* has to be resolved through that
+    /// workspace's own output too, not off the (absent) focused-output name.
+    /// Reddens against `let target_output = output.as_deref();` in place of
+    /// `layout::target_output_name(&workspaces, output.as_deref())`.
+    #[test]
+    fn golden_resolves_the_width_through_the_workspace_when_no_output_is_focused() {
+        let mut niri = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 1920);
+        niri.focused_output = None;
+
+        apply(&mut niri, Layout::Golden).expect("the fallback path");
+
+        assert_eq!(
+            niri.widths(),
+            vec![(10, 61.8), (20, 38.2)],
+            "the target workspace still sits on a 1920 px output, so it gets the golden cut"
+        );
+    }
+
+    /// Same invariant, but with two *different* widths in play so a
+    /// wrong-output resolution actually diverges from the right one — the
+    /// single-output fixture above can't tell "resolved through the right
+    /// name" apart from "resolved through the wrong one" when there is only
+    /// one name to resolve. Deterministic now that [`outputs`] keeps the
+    /// niri-shaped `HashMap` rather than a flattened, arbitrarily-ordered
+    /// `Vec` (#1056 review, NIT-2) — the reviewer measured the equivalent
+    /// `Vec`-backed check catching a wrong-output mutant only 1 run in 6.
+    #[test]
+    fn golden_resolves_the_width_through_the_focused_workspaces_own_output_with_two_outputs() {
+        let mut niri = Fake::two_columns();
+        niri.outputs = HashMap::from([
+            (
+                fake::OUTPUT.to_owned(),
+                fake::output_with_logical_width(1920),
+            ),
+            ("HDMI-A-1".to_owned(), fake::output_with_logical_width(3440)),
+        ]);
+
+        apply(&mut niri, Layout::Golden).expect("the fake answers everything");
+
+        assert_eq!(
+            niri.widths(),
+            vec![(10, 61.8), (20, 38.2)],
+            "the focused workspace sits on fake::OUTPUT (1920 px), not HDMI-A-1 (3440 px)"
         );
     }
 
@@ -608,6 +750,8 @@ mod tests {
             fn send(&mut self, _request: Request) -> Result<Reply, String> {
                 Ok(Ok(Response::Handled))
             }
+
+            fn log(&mut self, _line: &str) {}
         }
 
         let err = apply(&mut Confused, Layout::Equal).expect_err("Handled is not a window list");

@@ -254,19 +254,29 @@ impl GrantStore {
     /// part of this that touches `self`. The rendered bytes are then queued on
     /// the store's **single writer lane** (below), whose task does the actual
     /// I/O off this thread: `mkdir -p` the state dir (tightened to `0700`),
-    /// write to a sibling `.<file>.<pid>.<ticket>.tmp`, `fsync` it, then
-    /// `rename(2)` over the target — the same write-then-rename shape
-    /// `hytte_config::file::write_atomic` uses for `places.toml`/the
-    /// `~/.config/trollshell/*` writer. This crate doesn't otherwise depend on
-    /// `hytte-config` (and doesn't gain that dependency here), so
-    /// [`write_atomic`] is the sequence copied rather than the function
-    /// imported — `grants.toml` doesn't need that helper's symlink-following
-    /// (it is state, not a hand-edited dotfile) or its parent-directory
-    /// `fsync`, which is exactly `Durability::FileOnly`: the file's own
-    /// `fsync` is kept because without it the rename can be durable while the
-    /// data is not, resurrecting a zero-length `grants.toml` — which *parses*,
-    /// as zero grants (`empty_body_is_an_empty_store`), i.e. every grant
-    /// silently forgotten.
+    /// write to a sibling `.<file>.<pid>.<ticket>.tmp` **at the target's own
+    /// mode**, `fsync` it, then `rename(2)` over the target — the same
+    /// write-then-rename shape `hytte_config::file::write_atomic` uses for
+    /// `places.toml`/the `~/.config/trollshell/*` writer. This crate doesn't
+    /// otherwise depend on `hytte-config` (and doesn't gain that dependency
+    /// here), so [`write_atomic`] is the sequence copied rather than the
+    /// function imported. It diverges from that helper in exactly three
+    /// stated places, and no others:
+    ///
+    /// 1. **no symlink-following** — `grants.toml` is state, not a
+    ///    hand-edited dotfile that a user might symlink into a dotfile repo;
+    /// 2. **no parent-directory `fsync`** — which is precisely that helper's
+    ///    `Durability::FileOnly`. The file's *own* `fsync` is kept, because
+    ///    without it the rename can be durable while the data is not,
+    ///    resurrecting a zero-length `grants.toml` — which *parses*, as zero
+    ///    grants (`empty_body_is_an_empty_store`), i.e. every grant silently
+    ///    forgotten;
+    /// 3. **a `0600` first-run default** where that helper takes the umask.
+    ///    Mode *preservation* is mirrored, not skipped (#1074 review M6): a
+    ///    `rename(2)` carries the temp's mode onto the target, so a temp born
+    ///    at the umask would silently undo a `chmod 600` on every save. Only
+    ///    the mode of a file that doesn't exist yet differs, and it differs
+    ///    tighter — see [`target_mode`].
     ///
     /// Atomicity closes PR #1064's review finding F2: since #1059 moved the
     /// session-start grant *load* to `spawn_blocking`, it is genuinely
@@ -304,6 +314,19 @@ impl GrantStore {
     /// still alive would hang forever in `Runtime::drop` (measured — see the
     /// PR).
     ///
+    /// **The scope of that guarantee is one store handle, for saves issued
+    /// with a runtime in context** (#1074 review M7). The lane is a field of
+    /// *this* `GrantStore`, so two stores loaded over the same path each get
+    /// their own, and the no-runtime fallback below writes outside the lane
+    /// altogether — either way two writes to one file can complete out of
+    /// order, exactly as they did before the lane existed. Neither is
+    /// reachable in-tree: every mutator runs on the broker's `select!` loop
+    /// (`Handle::try_current()` is `Ok` there, and `Ok` inside
+    /// `spawn_blocking` too), the CLI never mutates, and session N+1's store
+    /// cannot apply a `Cmd` until session N's loop has exited. A second
+    /// mutator on another thread, or a second live store, would need its own
+    /// answer rather than inheriting this one.
+    ///
     /// # Without a tokio runtime (#1074 review M4)
     ///
     /// `grant_always`/`grant_deny`/`revoke` are `pub`, and the same library
@@ -312,7 +335,8 @@ impl GrantStore {
     /// pre-#1065 **inline** write on the calling thread — the same behaviour
     /// the CLI would have got before this change, and the same fallback used
     /// if the writer task is gone (a shutting-down runtime), where dropping
-    /// the write would be worse than blocking briefly for it.
+    /// the write would be worse than blocking briefly for it. Both of those
+    /// writes bypass the lane, per the scope note above.
     ///
     /// A store with no backing file is a no-op (test / no-`HOME`). A failure —
     /// encoding, creating the state dir, the write, or the rename — is logged
@@ -368,6 +392,12 @@ impl GrantStore {
 /// Run one write step on the calling thread, logging a failure the way the
 /// writer task does. The no-runtime / dead-writer fallback for
 /// [`GrantStore::save_with`].
+///
+/// **This write does not participate in the lane's ordering** (#1074 review
+/// M7): it is issued straight to the filesystem, concurrently with anything
+/// [`spawn_writer`]'s task already has in flight. Only reachable with no
+/// runtime in context (so: not from any in-tree mutator, all of which run on
+/// the broker's runtime) or once that task is gone.
 fn write_inline<W>(path: &Path, text: &str, writer: W)
 where
     W: FnOnce(&Path, &str) -> std::io::Result<()>,
@@ -388,7 +418,20 @@ where
 /// than N.
 ///
 /// The loop ends when the store (and with it the sender) is dropped, so a
-/// store's task never outlives it.
+/// store's task never outlives it — and a snapshot already queued when the
+/// sender goes is still written, because `recv` drains the buffer before it
+/// reports the channel closed. Session teardown therefore loses nothing.
+///
+/// **Runtime shutdown is the other side of the `spawn`-not-`spawn_blocking`
+/// trade** (#1074 review M8): dropping the runtime *cancels* this task, so a
+/// snapshot still sitting in the channel is silently dropped — measured, a
+/// `Runtime::drop` immediately after one `grant_always` returned in 39.5 µs
+/// with `grants.toml` never created. That is the price of not hanging (a
+/// blocking-pool thread parked in `blocking_recv` is never woken by
+/// shutdown, so the alternative deadlocks). Production never pays it:
+/// `hytte_plugin::run<P>() -> !` `block_on`s a diverging loop, so the SDK
+/// runtime is not dropped at all — the reachable half of this class is
+/// `SIGTERM`, tracked with the SDK exit hook in #1079.
 fn spawn_writer(handle: &tokio::runtime::Handle, path: PathBuf) -> UnboundedSender<WriteJob> {
     let (tx, mut rx) = unbounded_channel::<WriteJob>();
     handle.spawn(async move {
@@ -432,15 +475,18 @@ static TMP_TICKET: AtomicU64 = AtomicU64::new(0);
 
 /// Atomically replace `path`'s contents with `text`: create its parent
 /// directory (tightened to `0700`, same as [`GrantStore::load`]'s caller
-/// expects), write **and `fsync`** a sibling temp file, then `rename(2)` over
-/// the target.
+/// expects), write **and `fsync`** a sibling temp file **at the target's own
+/// mode**, then `rename(2)` over the target.
 ///
 /// Copies `hytte_config::file::write_atomic`'s core sequence — a temp file in
 /// the target's own directory, so the rename stays on one filesystem and is
-/// genuinely atomic — without linking that crate. What it deliberately does
-/// *not* copy is that helper's symlink-following (`grants.toml` is state, not
-/// a hand-edited dotfile) and its optional parent-directory `fsync`, i.e. it
-/// is precisely that helper's `Durability::FileOnly`.
+/// genuinely atomic, opened at the mode the target already carries so the
+/// rename cannot change it — without linking that crate. The full list of
+/// what it deliberately does *not* copy is on [`GrantStore::save`]'s doc, and
+/// it is three items: no symlink-following (`grants.toml` is state, not a
+/// hand-edited dotfile), no optional parent-directory `fsync` (i.e. precisely
+/// that helper's `Durability::FileOnly`), and a `0600` rather than umask
+/// default for a file that does not exist yet ([`target_mode`]).
 ///
 /// The **file's own `fsync` is not optional** and is why this writes through
 /// `OpenOptions` instead of `std::fs::write` (#1074 review M2): without it the
@@ -470,7 +516,7 @@ fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or("grants.toml");
     let tmp = dir.join(format!(".{name}.{}.{ticket}.tmp", std::process::id()));
-    if let Err(e) = fill_tmp(&tmp, text) {
+    if let Err(e) = fill_tmp(&tmp, text, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
@@ -481,15 +527,54 @@ fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Write `text` into the freshly-created temp file and `fsync` it — the
-/// durability half of [`write_atomic`], mirroring `hytte_config::file`'s
+/// The mode `grants.toml` should carry after the rename: the one it already
+/// has, or `0600` when there is no file yet (#1074 review M6).
+///
+/// A `rename(2)` carries the *temp* file's mode onto the target, so a temp
+/// born at the process umask (0644 under the usual 0022) silently undoes a
+/// `chmod 600` on every save — a regression against `main`, whose
+/// `std::fs::write` was a `create+truncate` open that left an existing file's
+/// mode alone. `hytte_config::file::write_atomic` preserves the target's mode
+/// for exactly this reason; the only place this differs from that helper is
+/// the **first-run** default, which is `0600` rather than the umask, because
+/// `grants.toml` is the broker's policy file rather than a hand-edited
+/// dotfile. The 0700 state dir (see [`tighten_dir`]) is defence in depth on
+/// top, not a substitute: a mode leaks past the directory through backups,
+/// `rsync -a`, tarballs, and an `$XDG_STATE_HOME` pointed somewhere shared.
+#[cfg(unix)]
+fn target_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o7777)
+}
+
+/// Write `text` into a freshly-created temp file for `target` and `fsync` it —
+/// the durability half of [`write_atomic`], mirroring `hytte_config::file`'s
 /// `fill`. See that function's doc for why the `sync_all` is load-bearing.
-fn fill_tmp(tmp: &Path, text: &str) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(tmp)?;
+///
+/// `target`'s mode ([`target_mode`]) is applied at `open` **and** re-asserted
+/// on the fd, the same belt-and-braces `fill` uses: `OpenOptions::mode` only
+/// takes effect when `open` actually creates the file, so it is silently
+/// ignored if a temp file from a crashed earlier run happens to be sitting at
+/// this name — which is reachable here precisely because a crash mid-write is
+/// what [`sweep_stale_tmp`] exists to clean up after.
+fn fill_tmp(tmp: &Path, text: &str, target: &Path) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    let _ = target;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    let mode = target_mode(target);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(mode);
+    }
+    let mut file = opts.open(tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
     file.write_all(text.as_bytes())?;
     file.sync_all()
 }
@@ -498,11 +583,21 @@ fn fill_tmp(tmp: &Path, text: &str) -> std::io::Result<()> {
 /// [`sweep_stale_tmp`] treats it as crash litter rather than a live write.
 ///
 /// A real [`write_atomic`] holds its temp file for one write + one `fsync` —
-/// sub-millisecond in practice, and bounded by the disk even when it isn't. A
-/// minute is several orders of magnitude of headroom, which matters because
-/// the CLI links this library too: a `hytte-infobroker` invocation calling
-/// [`GrantStore::load`] must never delete the temp file of a write the broker
-/// process is in the middle of.
+/// sub-millisecond in practice. A minute is several orders of magnitude of
+/// headroom, which matters because the CLI links this library too: a
+/// `hytte-infobroker` invocation calling [`GrantStore::load`] would otherwise
+/// be able to delete the temp file of a write the broker process is in the
+/// middle of.
+///
+/// Headroom, not a guarantee: a write whose `write_all`+`fsync` is stuck on a
+/// wedged disk past this bound can still have its temp swept by a concurrent
+/// `load`, after which the `rename` fails `ENOENT` and that one write is
+/// logged and lost. Accepted — the in-memory store is still the session's
+/// source of truth, and a disk that slow has already broken more than this.
+///
+/// Clock skew can only make the sweep *more* conservative: `SystemTime::
+/// elapsed` returns `Err` for a future mtime, and [`sweep_stale_tmp`]'s
+/// `is_ok_and` treats that as not-stale.
 const STALE_TMP_AGE: Duration = Duration::from_mins(1);
 
 /// Delete `path`'s stale `.<file>.<pid>.<ticket>.tmp` siblings (#1074 review
@@ -512,8 +607,15 @@ const STALE_TMP_AGE: Duration = Duration::from_mins(1);
 /// installs a signal handler, so a `systemctl stop` landing inside a write
 /// window leaves the temp file behind with nothing to clean it up — one
 /// orphan per unlucky stop, accumulating in the state dir forever. Sweeping at
-/// store open is the cheap half of the answer (the signal-handler half is an
-/// SDK-wide question, out of this lane).
+/// store open is the cheap half of the answer; the *lost write* half is an
+/// SDK-wide question — every plugin that persists state has the same window —
+/// tracked in #1079 rather than bolted into this one crate.
+///
+/// Only files this module could itself have written are candidates: the name
+/// must match `.<file>.<pid>.<ticket>.tmp` **exactly**, both middle fields
+/// parsed as integers (#1074 review M9). A prefix+suffix match alone would
+/// also delete something like `.grants.toml.backup-before-i-edited-it.tmp`,
+/// and then claim in the log that a crash left it.
 ///
 /// Best-effort throughout: a missing directory, an unreadable entry or a
 /// failed unlink is not a reason to fail a load.
@@ -521,7 +623,6 @@ fn sweep_stale_tmp(path: &Path) {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
         return;
     };
-    let prefix = format!(".{name}.");
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -530,11 +631,7 @@ fn sweep_stale_tmp(path: &Path) {
         let Some(entry_name) = entry_name.to_str() else {
             continue;
         };
-        if !entry_name.starts_with(&prefix)
-            || !Path::new(entry_name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
-        {
+        if !is_own_tmp_name(entry_name, name) {
             continue;
         }
         let stale = entry
@@ -548,6 +645,25 @@ fn sweep_stale_tmp(path: &Path) {
             ));
         }
     }
+}
+
+/// Whether `entry` is a name [`write_atomic`] could have minted for `target`:
+/// exactly `.<target>.<pid>.<ticket>.tmp`, with both middle fields parsing as
+/// integers. Split rather than regex'd — the crate has no regex dependency
+/// and this is the whole grammar.
+fn is_own_tmp_name(entry: &str, target: &str) -> bool {
+    let Some(rest) = entry
+        .strip_prefix('.')
+        .and_then(|r| r.strip_prefix(target))
+        .and_then(|r| r.strip_prefix('.'))
+        .and_then(|r| r.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((pid, ticket)) = rest.split_once('.') else {
+        return false;
+    };
+    pid.parse::<u64>().is_ok() && ticket.parse::<u64>().is_ok()
 }
 
 /// Best-effort `0700` on the state dir (same-user-only, like the socket dir).
@@ -862,10 +978,22 @@ mod tests {
     /// because nothing ever re-writes the file. In grant terms: a revoked
     /// grant silently comes back at the next broker restart.
     ///
-    /// The slow first writer makes it deterministic; the settle is a fixed
-    /// sleep rather than a poll on purpose — polling for "the revoke is on
-    /// disk" would see the *fast* second write land first and pass, missing
-    /// the slow first write inverting it 300 ms later.
+    /// The slow first writer is what makes it deterministic **under the
+    /// mutation**; on the fixed tree it never runs at all, and that is
+    /// correct. Both saves are issued with no yield between them on a
+    /// current-thread runtime, so both jobs are in the channel before the
+    /// drain task is first polled and the coalescing loop drops job 1 unrun
+    /// (measured: `slow_writer_ran=0 fast_writer_ran=1`). What this test
+    /// therefore pins on the fixed tree is **latest-wins**; what it pins
+    /// under the mutation is submission order.
+    /// `two_uncoalesced_saves_are_written_in_order` below covers the other
+    /// half — two jobs the drain picks up separately, neither coalesced —
+    /// since coalescing here would otherwise mask a regression in exactly
+    /// that path.
+    ///
+    /// The settle is a fixed sleep rather than a poll on purpose: polling for
+    /// "the revoke is on disk" would see the *fast* second write land first
+    /// and pass, missing the slow first write inverting it 300 ms later.
     #[tokio::test]
     async fn overlapping_saves_land_out_of_order() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -889,6 +1017,63 @@ mod tests {
             on_disk.is_empty(),
             "grants.toml permanently holds the PRE-revoke snapshot {on_disk:?} — the \
              revoked grant comes back at the next broker restart",
+        );
+    }
+
+    /// The mechanism `spawn_writer`'s doc leads with, which coalescing hides
+    /// from the test above (#1074 re-review): **two jobs the drain task picks
+    /// up separately**, neither collapsed into the other, must be written in
+    /// submission order — and both must actually run.
+    ///
+    /// The gap between the two saves is what separates them: the first save
+    /// is queued, the test then awaits long enough for the drain task to be
+    /// polled and to have started job 1's `spawn_blocking`, and only then
+    /// queues job 2. Job 1 is therefore no longer in the channel when the
+    /// coalescing `try_recv` loop runs, so both writers run and the order is
+    /// the lane's, not the pool's. Injected writers record their order and
+    /// their bytes, so a swap is visible as more than just the final content.
+    #[tokio::test]
+    async fn two_uncoalesced_saves_are_written_in_order() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("grants.toml");
+        std::fs::write(&path, "").expect("seed empty file");
+        let mut store = GrantStore::load(&path).expect("loads the empty seed");
+
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Job 1 — a slow write, so the drain task is still inside it when
+        // job 2 is queued and the coalescing loop cannot swallow job 1.
+        store.grants.push(Grant::always("claude", "departures"));
+        let first = Arc::clone(&order);
+        store.save_with(move |p, t| {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            first.lock().expect("order lock").push("first");
+            write_atomic(p, t)
+        });
+        // Let the drain task pick job 1 up and get into its `spawn_blocking`.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Job 2 — the newer snapshot, queued while job 1 is mid-write.
+        store.grants.clear();
+        let second = Arc::clone(&order);
+        store.save_with(move |p, t| {
+            second.lock().expect("order lock").push("second");
+            write_atomic(p, t)
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(
+            *order.lock().expect("order lock"),
+            vec!["first", "second"],
+            "both queued writes must run, in submission order — a coalesced or \
+             reordered lane shows up here before it shows up on disk",
+        );
+        let on_disk = parse_grants(&std::fs::read_to_string(&path).expect("reads")).expect("toml");
+        assert!(
+            on_disk.is_empty(),
+            "the newer (revoke) snapshot must be the one left on disk, got {on_disk:?}",
         );
     }
 
@@ -1018,6 +1203,113 @@ mod tests {
         );
     }
 
+    /// #1074 re-review M6: a `rename(2)` carries the **temp file's** mode onto
+    /// the target, so a temp born at the process umask silently re-opens
+    /// `grants.toml` on every save. `main`'s `std::fs::write` was a
+    /// `create+truncate` open and left an existing file's mode alone;
+    /// `hytte_config::file::write_atomic` preserves it deliberately. Measured
+    /// before the fix: 0600 → **0644** after one save.
+    ///
+    /// Runs through the real `write_atomic` with no runtime (the M4 inline
+    /// path), so this is the shipping code path and not an injected writer.
+    #[cfg(unix)]
+    #[test]
+    fn save_preserves_the_files_mode_and_defaults_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode_of = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o7777;
+
+        // A file the user has already tightened must stay tightened.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("grants.toml");
+        std::fs::write(&path, "").expect("seed empty file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+        let mut store = GrantStore::load(&path).expect("loads the empty seed");
+        store.grant_always("claude", "departures");
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "a save re-opened the grant store's mode — `chmod 600 grants.toml` must \
+             survive a grant change, as it did before the tmp+rename",
+        );
+
+        // An unusual-but-deliberate mode is preserved too, not normalised.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod 640");
+        store.grant_deny("scratch", "departures");
+        assert_eq!(
+            mode_of(&path),
+            0o640,
+            "the target's own mode is what's kept"
+        );
+
+        // First run — no file yet, so there is no mode to preserve. Grants
+        // are secrets-adjacent: default tight, not to the umask.
+        let fresh_dir = tempfile::tempdir().expect("tempdir");
+        let fresh = fresh_dir.path().join("grants.toml");
+        let mut store = GrantStore::load(&fresh).expect("missing file → empty store");
+        store.grant_always("claude", "departures");
+        assert_eq!(
+            mode_of(&fresh),
+            0o600,
+            "a grants.toml created from scratch must not be born at the umask",
+        );
+    }
+
+    /// #1074 re-review M10: the third arm of `save_with` — the writer task is
+    /// gone (its runtime is shutting down), `send` fails, and the closure has
+    /// to come back out of `SendError` and run inline rather than be dropped
+    /// with the grant change in it.
+    ///
+    /// Built the way the review built it: the lane is created under runtime A,
+    /// A is dropped (cancelling the drain task and closing the receiver), and
+    /// the next save happens under runtime B — where `try_current()` succeeds,
+    /// so the no-runtime arm is *not* what catches this.
+    #[test]
+    fn a_save_whose_writer_task_is_gone_still_lands_inline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("grants.toml");
+        std::fs::write(&path, "").expect("seed empty file");
+        let mut store = GrantStore::load(&path).expect("loads the empty seed");
+
+        let rt_a = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime A");
+        rt_a.block_on(async {
+            store.grant_always("claude", "departures");
+            // Let the drain task run once, so the lane is live rather than
+            // merely constructed.
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        });
+        drop(rt_a); // cancels the drain task; the receiver goes with it
+        assert!(
+            store.writer.get().is_some(),
+            "the lane must already exist, or this test is exercising the cold path",
+        );
+
+        let rt_b = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime B");
+        rt_b.block_on(async {
+            store.grant_always("scratch", "weather");
+        });
+
+        // No polling: the fallback is a synchronous write, so it has landed
+        // by the time `grant_always` returned.
+        let on_disk = parse_grants(&std::fs::read_to_string(&path).expect("reads")).expect("toml");
+        assert_eq!(
+            on_disk,
+            vec![
+                Grant::always("claude", "departures"),
+                Grant::always("scratch", "weather"),
+            ],
+            "a save queued on a dead writer lane must fall back to the inline write, \
+             not be silently dropped along with the closure",
+        );
+    }
+
     /// #1074 review M5: a `systemctl stop` inside a write window leaves a
     /// temp sibling that nothing ever cleans up (`run() -> !` never returns
     /// and there is no signal handler), so opening the store sweeps the
@@ -1034,11 +1326,21 @@ mod tests {
         let fresh = dir.path().join(".grants.toml.4243.1.tmp");
         let other = dir.path().join(".places.toml.4242.0.tmp");
         let unrelated = dir.path().join("notes.txt");
-        for p in [&stale, &fresh, &other, &unrelated] {
+        // A hand-made backup that merely *looks* like our temp naming: right
+        // prefix, right suffix, but the middle is not `<pid>.<ticket>`
+        // (#1074 re-review M9 — the reviewer's own file, deleted by the
+        // prefix+suffix match this replaces).
+        let lookalike = dir
+            .path()
+            .join(".grants.toml.backup-before-i-edited-it.tmp");
+        // …and one that has the right number of fields but not numbers.
+        let lookalike2 = dir.path().join(".grants.toml.mine.0.tmp");
+        for p in [&stale, &fresh, &other, &unrelated, &lookalike, &lookalike2] {
             std::fs::write(p, "body\n").expect("writes");
         }
-        // Age the two that are meant to look like crash litter.
-        for p in [&stale, &other] {
+        // Age everything that is meant to look like crash litter — including
+        // the lookalikes, so age is never what spares them.
+        for p in [&stale, &other, &lookalike, &lookalike2] {
             let file = std::fs::File::options().write(true).open(p).expect("opens");
             let old = std::time::SystemTime::now() - (STALE_TMP_AGE + Duration::from_mins(1));
             file.set_times(std::fs::FileTimes::new().set_modified(old))
@@ -1058,6 +1360,18 @@ mod tests {
             "only THIS file's temp siblings are ours to delete",
         );
         assert!(unrelated.exists(), "a non-temp sibling is never touched");
+        assert!(
+            lookalike.exists(),
+            "only names this module could have MINTED are ours to delete — \
+             `.grants.toml.<pid>.<ticket>.tmp`, both numbers. A hand-made backup that \
+             happens to share the prefix and the suffix is somebody else's file, and \
+             deleting it while logging \"left by a crash mid-write\" is a lie as well as \
+             a loss",
+        );
+        assert!(
+            lookalike2.exists(),
+            "the two middle fields must PARSE as integers, not merely be present",
+        );
     }
 
     /// The #1065 atomicity property: a concurrent reader of `grants.toml`

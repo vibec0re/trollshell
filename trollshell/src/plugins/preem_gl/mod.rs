@@ -29,6 +29,14 @@
 //!    CPU implementation, and it is the reference the GL arm is measured
 //!    against, so a blank chip would be strictly worse than drawing it.
 //!
+//! The switch is **unconditional**, and since #978 that includes the widget
+//! that has no CPU arm: `shader_map::refusal` reads [`shader_arm`] and refuses
+//! every plugin shader while the switch is set, drawing the broken-widget
+//! placeholder. An operator who set the variable *because* GL was wedging the
+//! session was otherwise still running plugin GPU code — the one widget in the
+//! shell that compiles a plugin's own GLSL was the one widget that ignored the
+//! kill switch.
+//!
 //! # What this module does not do
 //!
 //! It does not touch `pump.rs`. `Renderer::ScopeGl` carries the same
@@ -93,6 +101,20 @@ thread_local! {
     /// decision actually lives.
     #[cfg(test)]
     static TEST_ARM: std::cell::Cell<Arm> = const { std::cell::Cell::new(Arm::Cpu) };
+
+    /// The arm the **shader** path sees under `cargo test`, defaulting to
+    /// **GL** — the production default, unlike [`TEST_ARM`].
+    ///
+    /// The two test defaults differ because the two widgets differ in exactly
+    /// one way that matters here: a kit widget has a CPU renderer and the
+    /// shader widget has none. [`TEST_ARM`] defaults to CPU so the byte-parity
+    /// suite measures the kit; defaulting *this* one to CPU would make
+    /// [`shader_arm`] answer `Cpu` for the whole test binary and every mapped
+    /// shader in the suite would take the kill switch's refusal, proving
+    /// nothing about the paths those tests exist to cover. A test that wants
+    /// the switch on says so with [`with_cpu_kill_switch`].
+    #[cfg(test)]
+    static TEST_SHADER_ARM: std::cell::Cell<Arm> = const { std::cell::Cell::new(Arm::Gl) };
 }
 
 /// Run `body` with the GL arm selected — the seam the `ScopeGl` state-machine
@@ -116,6 +138,49 @@ pub(super) fn arm() -> Arm {
         return Arm::Cpu;
     }
     configured_arm()
+}
+
+/// The arm the **shader widget** takes — the kill switch, and only the kill
+/// switch (#978).
+///
+/// Deliberately *not* [`arm`]: that one folds the context-failure latch in
+/// because a kit widget wants one answer ("draw on the CPU"), while
+/// `shader_map` wants the two apart. A shader has no CPU arm at all, so both
+/// answers are "the placeholder", but they are different diagnoses pointing at
+/// different fixes — *unset the variable* against *restart the shell* — and
+/// `shader_map::refusal` keeps its own [`GlAvailability`] input for the
+/// latch. Folding them here would hand it one `Cpu` for two causes and the
+/// journal would name the wrong one roughly half the time.
+///
+/// The spec is unambiguous that the switch reaches here at all:
+/// `docs/superpowers/specs/2026-09-06-preem-gl-renderer-design.md` calls
+/// `TROLLSHELL_PREEM_RENDERER=cpu` "the kill switch, forcing CPU regardless of
+/// GL availability", and before #978 the one widget in the shell that runs a
+/// *plugin's* GPU code was the one widget that ignored it — an operator who
+/// set it because GL was wedging the session still had plugin shaders
+/// compiling and drawing, with the whole shell as the blast radius.
+///
+/// [`GlAvailability`]: super::shader_map::GlAvailability
+pub(super) fn shader_arm() -> Arm {
+    #[cfg(test)]
+    {
+        TEST_SHADER_ARM.get()
+    }
+    #[cfg(not(test))]
+    {
+        configured_arm()
+    }
+}
+
+/// Run `body` with the kill switch on, as far as [`shader_arm`] is concerned —
+/// the seam `shader_map`'s refusal tests use, since the real switch is an env
+/// var read once per process.
+#[cfg(test)]
+pub(super) fn with_cpu_kill_switch<T>(body: impl FnOnce() -> T) -> T {
+    let previous = TEST_SHADER_ARM.replace(Arm::Cpu);
+    let out = body();
+    TEST_SHADER_ARM.set(previous);
+    out
 }
 
 /// The configured arm, before the context-failure latch is consulted.
@@ -166,7 +231,28 @@ pub(super) fn install() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Arm, RENDERER_ENV, arm_from_env};
+    use super::{Arm, RENDERER_ENV, arm_from_env, shader_arm, with_cpu_kill_switch};
+
+    /// The shader path's test default is **GL**, and [`with_cpu_kill_switch`]
+    /// is the seam that turns it off and puts it back.
+    ///
+    /// The default matters as much as the seam: it is the production default,
+    /// so every other test in the suite that maps a shader node exercises the
+    /// path a real session takes rather than the refusal. Flipping this
+    /// `const` initialiser to `Arm::Cpu` turns roughly a dozen `shader_map`
+    /// and `pump` assertions red, which is the intended tripwire.
+    ///
+    /// **Falsified** by making [`with_cpu_kill_switch`] not restore the
+    /// previous value (the third assertion), or by defaulting
+    /// `TEST_SHADER_ARM` to `Arm::Cpu` (the first).
+    #[test]
+    fn the_shader_arm_defaults_to_gl_and_the_seam_turns_it_off() {
+        assert_eq!(shader_arm(), Arm::Gl, "the production default");
+        with_cpu_kill_switch(|| {
+            assert_eq!(shader_arm(), Arm::Cpu, "the seam turns the switch on");
+        });
+        assert_eq!(shader_arm(), Arm::Gl, "…and puts it back");
+    }
 
     /// The switch keeps the name the module docs, `docs/live-verify.md` and the
     /// journal all quote. A rename that misses one of those leaves an operator

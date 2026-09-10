@@ -986,7 +986,9 @@ pub enum Node {
     ///   rest — or the node renders the broken-widget placeholder with one
     ///   warning. [`MAX_SHADER_SOURCE_BYTES`] on the source and
     ///   [`MAX_SHADER_DATA_BYTES`] on the buffer, both refused to the same
-    ///   placeholder, because they cost nothing. `data.len()` must equal
+    ///   placeholder, because they cost nothing. [`MAX_SHADER_DATA_EXTENT`] on
+    ///   each grid side individually, which the byte cap does not imply — see
+    ///   that constant. `data.len()` must equal
     ///   `data_width * data_height * format.bytes_per_texel()` — the invariant
     ///   [`Pixels`](Node::Pixels) already carries. A compile or link error draws
     ///   nothing and logs the driver's first info-log line once. A session whose
@@ -1048,9 +1050,11 @@ pub enum Node {
         data: Vec<u8>,
         /// How to read [`data`](Node::Shader::data).
         format: ShaderData,
-        /// The data grid's width, in texels.
+        /// The data grid's width, in texels. At most
+        /// [`MAX_SHADER_DATA_EXTENT`].
         data_width: u32,
-        /// The data grid's height, in texels. `1` for a 1-D buffer.
+        /// The data grid's height, in texels. `1` for a 1-D buffer. At most
+        /// [`MAX_SHADER_DATA_EXTENT`].
         data_height: u32,
         /// GTK CSS classes applied verbatim (`add_css_class`).
         classes: Vec<Cls>,
@@ -1188,7 +1192,47 @@ pub const MAX_SHADER_SOURCE_BYTES: usize = 16 * 1024;
 /// silently doing this cap's job. Same posture as
 /// [`MAX_SHADER_SOURCE_BYTES`]: hygiene, enforced on both sides, degrading to
 /// the placeholder rather than dropping the connection.
+///
+/// **It bounds the buffer, not the grid.** A million floats laid out as
+/// `data_width = 1_048_576, data_height = 1` is inside this cap and is not a
+/// texture any driver will allocate — see [`MAX_SHADER_DATA_EXTENT`], which is
+/// the other half of the contract and is checked separately (#977).
 pub const MAX_SHADER_DATA_BYTES: usize = 4 * 1024 * 1024;
+
+/// The largest side a [`Node::Shader`]'s data grid may have, in texels —
+/// applied to [`data_width`](Node::Shader::data_width) and
+/// [`data_height`](Node::Shader::data_height) **individually** (#977).
+///
+/// # Why the byte cap is not enough
+///
+/// [`MAX_SHADER_DATA_BYTES`] bounds `width * height * bytes_per_texel`, and a
+/// product says nothing about its factors. `32768 × 1` in [`ShaderData::R8`] is
+/// 32 KiB — three orders of magnitude *under* the byte cap — and is wider than
+/// the `GL_MAX_TEXTURE_SIZE` of a great many parts. GLES 3.x guarantees only
+/// 2048; desktop parts typically report 16384. A grid over the driver's limit
+/// is not a slow draw or a clipped one, it is a `glTexStorage2D` that fails: the
+/// texture exists with **no storage**, every sample reads `vec4(0, 0, 0, 1)`,
+/// and the widget is a black rectangle for as long as it lives.
+///
+/// # Why 4096
+///
+/// Above any data grid a widget has (the reference shader's is 16 texels wide),
+/// and at or under the `GL_MAX_TEXTURE_SIZE` of the desktop parts this shell
+/// targets. It is picked to be *stated* rather than to be exactly right for
+/// every driver: this cap is **hygiene**, the same posture as the two byte caps,
+/// and it is what makes the failure a journal line in a hermetic test rather
+/// than a black rectangle. The **driver** is asked as well, in the host's GL
+/// layer, which is what catches a part whose real limit is below this number.
+///
+/// A 4 MiB buffer is still reachable — `2048 × 2048` in [`ShaderData::R8`] is
+/// exactly [`MAX_SHADER_DATA_BYTES`] — so the two caps do not squeeze each
+/// other; they bound different mistakes.
+///
+/// Host-side only, like the tree-shape caps below: the proto decodes a node, it
+/// never allocates a texture. A tighter documented bound on an existing optional
+/// field is a host refusal, not a wire change — no [`VOCAB`](crate::VOCAB) or
+/// `PROTO_VERSION` bump.
+pub const MAX_SHADER_DATA_EXTENT: u32 = 4096;
 
 // ── tree-shape caps (#901) ───────────────────────────────────────────────────
 //

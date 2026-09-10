@@ -51,7 +51,11 @@
 //! 3. **Sizes are checked before they reach GL.** Every dimension crossing into
 //!    a `glTexStorage2D`/`glViewport` is converted through `i32::try_from` and
 //!    refused rather than truncated, because a wrapped negative extent is a
-//!    `GL_INVALID_VALUE` at best and a driver crash at worst.
+//!    `GL_INVALID_VALUE` at best and a driver crash at worst. Since #977 a
+//!    texture extent is also checked against the driver's own
+//!    `GL_MAX_TEXTURE_SIZE`, and the allocation itself against `glGetError` —
+//!    an extent inside `GLsizei` can still be one this part will not allocate,
+//!    and that failure is silent and permanent unless someone asks.
 //!
 //! # Dialect
 //!
@@ -112,6 +116,34 @@ pub enum Error {
         /// The offending `width × height`.
         size: (u32, u32),
     },
+    /// A dimension is over this implementation's `GL_MAX_TEXTURE_SIZE` (#977).
+    ///
+    /// Separate from [`Extent`](Error::Extent) because it is a different fact
+    /// with a different fix: the number is legal, *this driver* will not take
+    /// it, and the limit it did not fit is the useful half of the message.
+    TextureSize {
+        /// The offending `width × height`.
+        size: (u32, u32),
+        /// What the driver reported for `GL_MAX_TEXTURE_SIZE`.
+        limit: u32,
+    },
+    /// `glTexStorage2D` raised a GL error, so the texture object exists with no
+    /// storage behind it (#977).
+    ///
+    /// Immutable-storage allocation is the one call in this crate whose failure
+    /// is otherwise **completely silent**: `glGenTextures` succeeds, the id is
+    /// valid, every later `glTexSubImage2D` on it raises
+    /// `GL_INVALID_OPERATION`, and sampling an incomplete texture unit returns
+    /// `vec4(0, 0, 0, 1)` — a black rectangle, no error anywhere, for the life
+    /// of the surface. So this is checked even though the crate does not
+    /// otherwise poll `glGetError` on the render path (see
+    /// [`Gl::take_error`]): it happens once per allocation, not once per draw.
+    Storage {
+        /// The extent that was asked for.
+        size: (u32, u32),
+        /// The raw `glGetError` code the driver returned first.
+        code: u32,
+    },
 }
 
 impl fmt::Display for Error {
@@ -124,6 +156,17 @@ impl fmt::Display for Error {
                 write!(f, "framebuffer incomplete (status {status:#x})")
             }
             Self::Extent { size: (w, h) } => write!(f, "unusable texture extent {w}x{h}"),
+            Self::TextureSize {
+                size: (w, h),
+                limit,
+            } => write!(
+                f,
+                "texture extent {w}x{h} is over this driver's GL_MAX_TEXTURE_SIZE of {limit}"
+            ),
+            Self::Storage { size: (w, h), code } => write!(
+                f,
+                "the driver refused storage for a {w}x{h} texture (glGetError {code:#x})"
+            ),
         }
     }
 }
@@ -205,10 +248,13 @@ impl Gl {
     /// error forever; hitting the bound returns the first code like any other
     /// non-empty queue, rather than hanging.
     ///
-    /// A debugging seam, not a control-flow one: the render path is written so
-    /// that a GL error cannot change what is drawn, and polling `glGetError`
-    /// per draw is itself a synchronisation point on some drivers. The parity
-    /// harness calls it; the shell does not.
+    /// Not a **per-draw** seam: the render path is written so that a GL error
+    /// cannot change what is drawn, and polling `glGetError` per draw is itself
+    /// a synchronisation point on some drivers. It is called per *allocation*,
+    /// which is a different rate entirely — [`Texture::new`] brackets its
+    /// `glTexStorage2D` with it (#977), because a refused immutable-storage
+    /// allocation is otherwise completely silent and permanent. The parity
+    /// harness calls it too; nothing calls it on the frame path.
     #[must_use]
     pub fn take_error(&self) -> Option<u32> {
         /// Enough to clear any queue a conforming driver keeps, and a bound on
@@ -530,27 +576,138 @@ pub struct Texture {
     _not_send: PhantomData<*const ()>,
 }
 
+/// What [`max_texture_size`] answers when the driver's own answer is unusable.
+///
+/// `GL_MAX_TEXTURE_SIZE` is required to be at least 2048 in GLES 3.x and at
+/// least 1024 in every GL profile that has the query at all, so a
+/// non-positive answer means the query did not happen (no context, a
+/// dispatch stub that resolved to nothing) rather than that the driver
+/// really refuses every texture. Refusing every allocation on that basis
+/// would turn a *missing measurement* into a blank shell, so the unknown
+/// case declines to enforce and leaves the verdict to the `glTexStorage2D`
+/// error check below — which needs no query to be right.
+const UNKNOWN_MAX_TEXTURE_SIZE: u32 = u32::MAX;
+
+thread_local! {
+    /// This thread's memoized `GL_MAX_TEXTURE_SIZE` — see [`max_texture_size`].
+    static MAX_TEXTURE_SIZE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// This implementation's `GL_MAX_TEXTURE_SIZE`, queried **once** per thread.
+///
+/// # Why once, and why per thread
+///
+/// It is a property of the implementation, not of a context: every context this
+/// process creates comes from the same driver through the same libepoxy
+/// dispatch table (see [`loader`]), and GTK gives a display one share group. So
+/// one query serves every `GdkGLContext`, exactly as one `gl::load_with` does.
+/// The memo is per **thread** rather than process-wide because the [`Gl`] token
+/// is `!Send` — a second thread with a context of its own has to make its own
+/// claim anyway, and a `Cell` on the thread it is read from needs no
+/// synchronisation on the path that reads it every allocation.
+///
+/// A driver answering `<= 0` is treated as *unknown*, not as *zero*: see
+/// [`UNKNOWN_MAX_TEXTURE_SIZE`].
+fn max_texture_size(_gl: &Gl) -> u32 {
+    MAX_TEXTURE_SIZE.with(|cached| {
+        if let Some(known) = cached.get() {
+            return known;
+        }
+        let mut value: GLint = 0;
+        // SAFETY: a context is current (the `&Gl` token). `GetIntegerv` writes
+        // one `GLint` through a pointer to a live local, and
+        // `GL_MAX_TEXTURE_SIZE` is a single-valued implementation limit in both
+        // GL 4.x and GLES 3.x — so exactly one write, into a slot that is big
+        // enough for it.
+        unsafe {
+            gl::GetIntegerv(gl::MAX_TEXTURE_SIZE, &raw mut value);
+        }
+        let limit = u32::try_from(value).unwrap_or(0);
+        let limit = if limit == 0 {
+            UNKNOWN_MAX_TEXTURE_SIZE
+        } else {
+            limit
+        };
+        cached.set(Some(limit));
+        tracing::debug!(limit, "GL_MAX_TEXTURE_SIZE");
+        limit
+    })
+}
+
+/// Both extents as positive `GLsizei`s, or the reason they are unusable.
+///
+/// Split out of [`Texture::new`] as a pure function so the decision — which is
+/// the half of #977 a hermetic test can reach, CI having no GL at all — is
+/// testable without a context. The order matters: an extent that is zero or
+/// does not fit `GLsizei` is [`Error::Extent`] whatever the driver says, so the
+/// range check comes first and `limit` is only consulted for a number that was
+/// otherwise fine.
+fn checked_extent(width: u32, height: u32, limit: u32) -> Result<(GLsizei, GLsizei), Error> {
+    let extent = |v: u32| (v > 0).then(|| GLsizei::try_from(v).ok()).flatten();
+    let (Some(w), Some(h)) = (extent(width), extent(height)) else {
+        return Err(Error::Extent {
+            size: (width, height),
+        });
+    };
+    if width > limit || height > limit {
+        return Err(Error::TextureSize {
+            size: (width, height),
+            limit,
+        });
+    }
+    Ok((w, h))
+}
+
 impl Texture {
     /// Allocate a `width`×`height` texture with immutable storage.
     ///
-    /// Both extents must be positive and fit `GLsizei`; anything else is
-    /// [`Error::Extent`] rather than a truncating cast.
-    pub fn new(_gl: &Gl, format: Format, width: u32, height: u32) -> Result<Self, Error> {
-        let extent = |v: u32| (v > 0).then(|| GLsizei::try_from(v).ok()).flatten();
-        let (Some(w), Some(h)) = (extent(width), extent(height)) else {
-            return Err(Error::Extent {
-                size: (width, height),
-            });
-        };
+    /// Both extents must be positive, fit `GLsizei`, and be within this
+    /// driver's `GL_MAX_TEXTURE_SIZE`; anything else is [`Error::Extent`] or
+    /// [`Error::TextureSize`] rather than a truncating cast or a doomed
+    /// allocation. `glTexStorage2D` is then checked for real — see
+    /// [`Error::Storage`] for why that one call gets a `glGetError` when the
+    /// render path deliberately does not.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Extent`], [`Error::TextureSize`] or [`Error::Storage`], per
+    /// above. Every one of them leaves **no** GL object behind: the failing
+    /// paths either allocate nothing or delete what they allocated.
+    pub fn new(gl_ctx: &Gl, format: Format, width: u32, height: u32) -> Result<Self, Error> {
+        let (w, h) = checked_extent(width, height, max_texture_size(gl_ctx))?;
         let (internal, _, _) = format.as_gl();
+        // Anything already queued belongs to whoever queued it; draining first
+        // is what makes the check below an answer about *this* allocation
+        // rather than about the last thing that went wrong anywhere.
+        let _ = gl_ctx.take_error();
         let mut id: GLuint = 0;
         // SAFETY: a context is current. `GenTextures` writes one id through a
         // pointer to a live local; the rest operate on that id while it is
-        // bound, with extents already validated as positive `GLsizei`s.
+        // bound, with extents already validated as positive `GLsizei`s within
+        // the driver's own limit.
         unsafe {
             gl::GenTextures(1, &raw mut id);
             gl::BindTexture(gl::TEXTURE_2D, id);
             gl::TexStorage2D(gl::TEXTURE_2D, 1, internal, w, h);
+        }
+        // Before the parameter calls, so nothing else can queue an error that
+        // would be read as this allocation's.
+        if let Some(code) = gl_ctx.take_error() {
+            // SAFETY: a context is current and `id` is the name `GenTextures`
+            // just wrote — deleting it is how this path leaves nothing behind.
+            unsafe {
+                gl::BindTexture(gl::TEXTURE_2D, 0);
+                gl::DeleteTextures(1, &raw const id);
+            }
+            return Err(Error::Storage {
+                size: (width, height),
+                code,
+            });
+        }
+        // SAFETY: a context is current and `id` is bound, with storage the call
+        // above allocated successfully. Every parameter is a documented
+        // `GL_TEXTURE_2D` enum pair.
+        unsafe {
             gl::TexParameteri(
                 gl::TEXTURE_2D,
                 gl::TEXTURE_MIN_FILTER,
@@ -986,7 +1143,78 @@ pub fn read_rgba8(_gl: &Gl, width: u32, height: u32) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Blend, Error, Format, Stage};
+    use super::{Blend, Error, Format, Stage, UNKNOWN_MAX_TEXTURE_SIZE, checked_extent};
+
+    /// **#977.** The extent decision, which is the half of the driver check a
+    /// hermetic test can reach — CI has no GL at all, so `Texture::new`'s
+    /// `glGetError` half is live-verify.
+    ///
+    /// Three separate facts, and they are different errors on purpose: a zero
+    /// or `GLsizei`-overflowing side is [`Error::Extent`] whatever the driver
+    /// says; a legal side over the driver's limit is [`Error::TextureSize`],
+    /// which carries the limit because the limit is the useful half of the
+    /// message; and everything inside both is `Ok`.
+    ///
+    /// The `32768 × 1` case is #977's own failing input: 32 KiB of `R8` data,
+    /// three orders of magnitude under the wire's byte cap, and wider than a
+    /// great many parts will allocate. Before this check it returned `Ok` on a
+    /// texture with no storage.
+    ///
+    /// **Falsified** by dropping the `width > limit || height > limit` guard
+    /// (the two `TextureSize` assertions become `Ok`), or by moving it above
+    /// the range check (the zero case reports the wrong error).
+    #[test]
+    fn the_extent_check_separates_a_bad_number_from_a_bad_driver_fit() {
+        assert_eq!(checked_extent(16, 1, 4096), Ok((16, 1)));
+        assert_eq!(checked_extent(4096, 4096, 4096), Ok((4096, 4096)), "at it");
+
+        assert_eq!(
+            checked_extent(32768, 1, 4096),
+            Err(Error::TextureSize {
+                size: (32768, 1),
+                limit: 4096
+            }),
+            "#977's failing input: legal bytes, unallocatable grid",
+        );
+        assert_eq!(
+            checked_extent(1, 8192, 4096),
+            Err(Error::TextureSize {
+                size: (1, 8192),
+                limit: 4096
+            }),
+            "the height axis is checked too, not only the width",
+        );
+
+        for (w, h) in [(0, 1), (1, 0), (0, 0)] {
+            assert_eq!(
+                checked_extent(w, h, 4096),
+                Err(Error::Extent { size: (w, h) }),
+                "a zero side is a bad number, not a bad fit",
+            );
+        }
+        let over = u32::MAX;
+        assert_eq!(
+            checked_extent(over, 1, over),
+            Err(Error::Extent { size: (over, 1) }),
+            "…and so is one that does not fit GLsizei, even under the limit",
+        );
+    }
+
+    /// A driver that does not answer the query must not be read as a driver
+    /// that refuses every texture — the sentinel declines to enforce and leaves
+    /// the verdict to `glTexStorage2D`'s own error.
+    ///
+    /// **Falsified** by making `max_texture_size` cache a literal `0` for an
+    /// unusable answer: every allocation in the shell then fails
+    /// `TextureSize`, which is a blank shell built out of a missing
+    /// measurement.
+    #[test]
+    fn an_unknown_driver_limit_refuses_nothing() {
+        assert_eq!(
+            checked_extent(65_536, 65_536, UNKNOWN_MAX_TEXTURE_SIZE),
+            Ok((65_536, 65_536)),
+        );
+    }
 
     /// The three formats keep the enum triples the shaders are written against
     /// — a normalized `R8` (so `GL_MAX` blending is available at all), a
@@ -1038,6 +1266,20 @@ mod tests {
                 .contains("0x8cd6")
         );
         assert!(Error::Extent { size: (0, 48) }.to_string().contains("0x48"));
+        let too_big = Error::TextureSize {
+            size: (32768, 1),
+            limit: 4096,
+        }
+        .to_string();
+        assert!(too_big.contains("32768x1"), "{too_big}");
+        assert!(too_big.contains("4096"), "the limit it missed: {too_big}");
+        let storage = Error::Storage {
+            size: (32768, 1),
+            code: 0x0501,
+        }
+        .to_string();
+        assert!(storage.contains("32768x1"), "{storage}");
+        assert!(storage.contains("0x501"), "the driver's code: {storage}");
         assert!(
             Error::Load {
                 message: "libepoxy.so.0: not found".to_owned()

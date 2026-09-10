@@ -433,7 +433,8 @@ static UNSUPPORTED_WARNED: AtomicBool = AtomicBool::new(false);
 /// [`warnings_for`] instead, which is scoped the same way the latch is and so
 /// carries no such precondition.
 #[cfg(test)]
-static WARN_COUNTS: [std::sync::atomic::AtomicU32; 7] = [
+static WARN_COUNTS: [std::sync::atomic::AtomicU32; 8] = [
+    std::sync::atomic::AtomicU32::new(0),
     std::sync::atomic::AtomicU32::new(0),
     std::sync::atomic::AtomicU32::new(0),
     std::sync::atomic::AtomicU32::new(0),
@@ -820,13 +821,40 @@ pub(super) enum Warned {
     /// of shape (#893): over the source or data size cap, a buffer whose length
     /// does not match its grid, or a zero-sided surface. Also the placeholder.
     ///
-    /// One slot for all four, unlike the `NodeCap`/`DepthCap` split above,
+    /// One slot for all five, unlike the `NodeCap`/`DepthCap` split above,
     /// because they are the *same* mistake from the plugin author's side — "the
     /// node I sent is malformed" — and the journal line names which. Its own
     /// slot apart from [`ShaderDenied`](Warned::ShaderDenied) because *that* one
     /// is a manifest fix and this one is a code fix. Raised by
     /// [`shader_map`](super::shader_map).
     ShaderCap,
+    /// This session will not run **any** plugin shader (#981): either the GL
+    /// context failed and `hytte-ui` latched it, or
+    /// `TROLLSHELL_PREEM_RENDERER=cpu` is set (#978). Every `Node::Shader` in
+    /// every tree renders the broken-widget placeholder.
+    ///
+    /// # Why it is not [`ShaderCap`](Warned::ShaderCap)
+    ///
+    /// It used to be, and that swallowed the only line that says how to get the
+    /// widgets back (#981). The two other slots are split on *who fixes it* —
+    /// `ShaderDenied` is a manifest edit, `ShaderCap` is a code edit — and this
+    /// is neither: it is a **shell restart** (the `gl_abandoned` latch is
+    /// sticky for the process by design, and an env var is read once at
+    /// startup). Sharing a slot with a plugin-side mistake meant a plugin that
+    /// shipped one over-cap source at startup claimed the slot for the shell's
+    /// run, and a context failure an hour later went entirely unreported —
+    /// every shader on screen blank, `hytte-ui`'s own line saying only "no
+    /// OpenGL context for a `GlSurface`", and nothing naming the restart.
+    ///
+    /// # Why the two causes *do* share this one
+    ///
+    /// They are the same fact about the session — "there is no GPU arm here" —
+    /// reached two ways, they are mutually exhaustive for a given run (a shell
+    /// does not un-set an env var or un-latch the failure), and their journal
+    /// lines each name their own cause. Splitting them would spend the last of
+    /// [`WARNED`]'s eight bits on a pair that can only fire one at a time.
+    /// Raised by [`shader_map`](super::shader_map).
+    ShaderNoGpu,
 }
 
 impl Warned {
@@ -835,7 +863,9 @@ impl Warned {
     ///
     /// One exhaustive match so a new variant is a compile error here rather than
     /// an aliased bit *and* an aliased counter. The mask is a `u8`, so it holds
-    /// eight; a ninth variant needs a wider integer, and this is where to look.
+    /// eight — and since #981 **all eight are spoken for**. A ninth diagnostic
+    /// needs a wider integer here, in [`WARNED`]'s value type and in
+    /// [`WARN_COUNTS`]'s length; there is no free bit left to borrow.
     const fn slot(self) -> u32 {
         match self {
             Self::NoId => 0,
@@ -845,6 +875,7 @@ impl Warned {
             Self::DepthCap => 4,
             Self::ShaderDenied => 5,
             Self::ShaderCap => 6,
+            Self::ShaderNoGpu => 7,
         }
     }
 

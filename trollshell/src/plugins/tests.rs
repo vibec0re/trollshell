@@ -2866,22 +2866,34 @@ fn the_accent_reaches_the_shells_own_preem_surfaces() {
 
 // ── #883: shell-side preem renderers ─────────────────────────────────────────
 
-/// Serialises every test that renders through `hytte-preem` against the one
-/// that *moves* the kit's accent.
+/// Serialises every test that renders through `hytte-preem` — **or reads a
+/// value derived from the kit's palette** — against the ones that *move* the
+/// kit's accent.
 ///
 /// `hytte_preem`'s accent is a process-global `AtomicU32` that **every** widget
 /// reads at render time (`style.rs`'s `palette()`), and the harness runs test
 /// functions concurrently in one process. A parity test compares two renders
 /// taken moments apart; an accent flip landing between them would make them
 /// differ for a reason that has nothing to do with the code under test. Every
-/// preem test below takes this lock, and so does
-/// [`the_accent_reaches_the_shells_own_preem_surfaces`], which is the only test
-/// that writes the global.
+/// preem test below takes this lock, and so do the two that write the global —
+/// [`the_accent_reaches_the_shells_own_preem_surfaces`] and
+/// [`an_accent_change_re_tints_a_gl_scope_without_rebuilding_it`].
+///
+/// # Not only rendering tests (#1005)
+///
+/// The rule above said "renders through `hytte-preem`", and that wording missed
+/// a whole file. `shader_map`'s state cache keys on `theme_values()`, which is
+/// `palette_snapshot` — the accent, once removed — so an accent flip landing
+/// mid-test is a **cache miss** there rather than a wrong picture, and it
+/// surfaced as an extra data-texture upload roughly one run in four under CPU
+/// competition. Those tests take this lock now, which is why it is `pub(super)`
+/// rather than private to this file. The rule is therefore: *anything whose
+/// assertion depends on the kit's palette staying still* takes it.
 static PREEM_INK_LOCK: Mutex<()> = Mutex::new(());
 
 /// Take [`PREEM_INK_LOCK`], surviving a poisoning by an unrelated test's panic
 /// (the data is `()`, so there is nothing to be inconsistent about).
-fn preem_ink_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(super) fn preem_ink_lock() -> std::sync::MutexGuard<'static, ()> {
     PREEM_INK_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

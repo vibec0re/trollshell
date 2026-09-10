@@ -1592,6 +1592,19 @@ mod tests {
              not actually have blocked; widen the payload if this becomes flaky",
             started.elapsed(),
         );
+        // #1024 review L1: the write is only meaningful proof of the bound if
+        // it actually blocked long enough to hit it. Without this lower
+        // bound, a payload too small to fill the kernel buffer (or the
+        // internal timeout wrapper deleted outright — see mutation E) both
+        // return near-instantly and the test above stays green either way.
+        assert!(
+            started.elapsed() >= WRITE_RESPONSE_TIMEOUT,
+            "write_response returned in {:?}, before its own timeout ({WRITE_RESPONSE_TIMEOUT:?}) \
+             could have fired — the write may never have actually blocked, so this test cannot \
+             tell \"correctly bounded\" from \"never blocked at all\"; widen the payload if this \
+             fires without a mutation",
+            started.elapsed(),
+        );
     }
 
     #[test]

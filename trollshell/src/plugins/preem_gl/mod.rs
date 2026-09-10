@@ -89,11 +89,11 @@ pub(super) const RENDERER_ENV: &str = "TROLLSHELL_PREEM_RENDERER";
 /// Which renderer a `Scope` takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Arm {
-    /// A `GtkGLArea` running the [`SCOPE`] pipeline — opt-in via `gl` while
-    /// #1072 is open; the PR that closes it makes this the default again.
+    /// A `GtkGLArea` running the [`SCOPE`] pipeline — the default.
     Gl,
     /// The `hytte-preem` kit, rasterised in-process into a `PixelSurface` —
-    /// the default while #1072 is open.
+    /// the kill switch's arm, the fallback for a failed context, and what
+    /// every kind without a GL arm takes.
     Cpu,
 }
 

@@ -1411,6 +1411,7 @@ session.
      not been bisected individually. Exit status is the verdict — it is `1` on
      any failure, including `FAIL(nothing)`: a GL arm that drew literally
      nothing, which the deltas alone cannot catch against a dark skin.
+
   5. **CPU and GL side by side.** Two shells cannot share the session, so do it
      in sequence on the same preem-demo card and compare screenshots — or put a
      GL scope next to a CPU-only kit widget (the gauge, which has no GL arm in
@@ -1428,6 +1429,7 @@ session.
      confirm the scope falls back to the CPU kit with one journal line rather
      than showing a blank chip. The phosphor restarts from black, which is the
      honest outcome — the GL arm never drew a trail to inherit.
+
 - [ ] **(#893)** **The shader widget: a plugin's own GLSL on the GPU.** A
       plugin ships a fragment body plus a data buffer; the shell compiles the
       body once and per frame re-uploads only the buffer. Everything up to the

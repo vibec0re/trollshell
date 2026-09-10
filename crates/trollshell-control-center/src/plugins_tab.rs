@@ -58,6 +58,18 @@
 //! a Start/Stop call) is what stops `refresh_detail`'s own `set_active` from
 //! recording a bogus intent of its own.
 //!
+//! # Polls are ordered, not serialised (#983)
+//!
+//! The 2 s tick and [`refresh_plugins_soon`]'s two extra polls overlap freely,
+//! and each is two sequential `Control` calls with a 3 s timeout apiece — so
+//! completions can and do arrive out of order. Every poll therefore carries a
+//! [`PollGenerations`] stamp and [`on_poll_result`] drops any result older
+//! than the newest already applied. That is a *different* door from the
+//! [`PendingToggle`] latch above: the latch protects a toggle the poll hasn't
+//! caught up with, whereas this protects the view from a poll the poll itself
+//! has already superseded — the latch is legitimately spent by then, so it is
+//! not there to help.
+//!
 //! # `AdwBreakpointBin`, on contract (#856)
 //!
 //! #856 recorded what using that widget *off* contract costs: it warns once per
@@ -91,7 +103,12 @@ use crate::{CONTROL_IFACE, CONTROL_NAME, CONTROL_PATH, spawn_on_runtime};
 /// each row's connected/rendering badge **in place** (a changed plugin set
 /// triggers a rebuild instead), so the badges track the host without the user
 /// reopening the tab.
-const PLUGIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
+///
+/// `pub(crate)`: since #989 the window's connection banner and revision footer
+/// re-probe on **this** cadence (`crate::SHELL_PROBE_INTERVAL`) rather than a
+/// number of their own, because they answer the same question about the same
+/// endpoint and them disagreeing was the defect.
+pub(crate) const PLUGIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How long a user-initiated toggle holds the switch against a poll that
 /// hasn't caught up yet (#944), before "truth wins" regardless.
@@ -273,6 +290,67 @@ enum PluginsView {
     Unavailable,
 }
 
+/// Monotonic ordering over the tab's **overlapping** `Control` polls (#983).
+///
+/// Nothing serialises the polls. [`build_page`]'s timer fires every
+/// [`PLUGIN_POLL_INTERVAL`], [`refresh_plugins_soon`] adds two more after a
+/// toggle, and each one is a [`list_plugins_and_states`] round trip — two
+/// sequential calls with a 3 s timeout each, so 0–6 s wide — spawned onto the
+/// shared runtime and fired-and-forgotten by [`spawn_on_runtime`]. One slow
+/// reply is therefore enough to make completions arrive out of order, and
+/// [`apply_plugins`] rewrites [`PluginsState::snapshot`] wholesale: a stale
+/// `inactive` landing after a newer `active` re-bounces the detail switch
+/// (**after** #944/#945's latch was legitimately cleared by the newer poll, so
+/// that mechanism cannot help — this is a different door) and regresses every
+/// row's status column with it.
+///
+/// The cure is ordering, not exclusion: each spawn takes an [`issue`]d
+/// generation, and its completion [`accept`]s it only if no newer generation
+/// has already been applied. An older result is dropped whole — including its
+/// `Err`, which would otherwise replace a live list with the "Unavailable"
+/// placeholder. Deliberately *not* an in-flight guard: skipping ticks while a
+/// 3 s poll drags would also stop [`refresh_plugins_soon`]'s settle re-poll
+/// from ever landing, and the newest answer is the one worth having.
+///
+/// [`issue`]: PollGenerations::issue
+/// [`accept`]: PollGenerations::accept
+#[derive(Default)]
+struct PollGenerations {
+    /// The generation handed to the most recently spawned poll.
+    issued: Cell<u64>,
+    /// The newest generation whose result has been applied to the tab. `0`
+    /// until the first completion, which is below every issued generation.
+    applied: Cell<u64>,
+}
+
+impl PollGenerations {
+    /// Stamp a freshly spawned poll with the next generation.
+    ///
+    /// `saturating_add` only to keep the arithmetic total: at one poll per
+    /// [`PLUGIN_POLL_INTERVAL`] the counter needs ~10¹² years to reach
+    /// `u64::MAX`, so the saturating branch is unreachable rather than a
+    /// behaviour worth designing around.
+    fn issue(&self) -> u64 {
+        let next = self.issued.get().saturating_add(1);
+        self.issued.set(next);
+        next
+    }
+
+    /// Claim `generation` as the newest applied, or refuse it (`false`)
+    /// because a newer poll's result already landed.
+    ///
+    /// Strictly greater: a generation is issued once, so an equal value can
+    /// only be the same poll's completion running twice, which is not a thing
+    /// [`spawn_on_runtime`] does.
+    fn accept(&self, generation: u64) -> bool {
+        if generation <= self.applied.get() {
+            return false;
+        }
+        self.applied.set(generation);
+        true
+    }
+}
+
 /// Shared, mutable state threaded through the Plugins tab's refresh path so the
 /// build, the detail pane's handlers and the poll timer all drive the same
 /// widgets.
@@ -298,6 +376,8 @@ struct PluginsState {
     parked: Rc<RefCell<Option<ParkedSelection>>>,
     /// What's currently shown, gating rebuild vs. in-place update.
     view: Rc<Cell<PluginsView>>,
+    /// Ordering over the overlapping polls (#983) — see [`PollGenerations`].
+    polls: Rc<PollGenerations>,
     /// A user toggle the poll hasn't confirmed yet (#944) — see
     /// [`PendingToggle`]. `None` whenever the shown plugin's switch is free to
     /// follow the snapshot.
@@ -341,6 +421,7 @@ struct WeakPluginsState {
     selected: Rc<RefCell<Option<String>>>,
     parked: Rc<RefCell<Option<ParkedSelection>>>,
     view: Rc<Cell<PluginsView>>,
+    polls: Rc<PollGenerations>,
     pending: Rc<RefCell<Option<PendingToggle>>>,
     syncing: Rc<Cell<bool>>,
     selecting: Rc<Cell<bool>>,
@@ -377,6 +458,7 @@ impl PluginsState {
             selected: self.selected.clone(),
             parked: self.parked.clone(),
             view: self.view.clone(),
+            polls: self.polls.clone(),
             pending: self.pending.clone(),
             syncing: self.syncing.clone(),
             selecting: self.selecting.clone(),
@@ -408,6 +490,7 @@ impl WeakPluginsState {
             selected: self.selected.clone(),
             parked: self.parked.clone(),
             view: self.view.clone(),
+            polls: self.polls.clone(),
             pending: self.pending.clone(),
             syncing: self.syncing.clone(),
             selecting: self.selecting.clone(),
@@ -515,6 +598,7 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
         selected: Rc::new(RefCell::new(None)),
         parked: Rc::new(RefCell::new(None)),
         view: Rc::new(Cell::new(PluginsView::Uninit)),
+        polls: Rc::new(PollGenerations::default()),
         pending: Rc::new(RefCell::new(None)),
         syncing: Rc::new(Cell::new(false)),
         selecting: Rc::new(Cell::new(false)),
@@ -790,9 +874,42 @@ fn id_for_row(state: &PluginsState, row: &gtk::ListBoxRow) -> Option<String> {
 /// unchanged, rebuilding the rows on any structural change, and showing a
 /// single placeholder when there are no plugins (informational) or the shell is
 /// unreachable ("unavailable").
+///
+/// The spawn is stamped with a [`PollGenerations::issue`]d generation that
+/// [`on_poll_result`] compares against the newest already applied, so a slow
+/// poll completing after a faster later one is dropped rather than rewriting
+/// the tab with its stale answer (#983).
 fn refresh_plugins(state: &PluginsState) {
+    let generation = state.polls.issue();
     let state = state.clone();
-    spawn_on_runtime(list_plugins_and_states(), move |res| match res {
+    spawn_on_runtime(list_plugins_and_states(), move |res| {
+        on_poll_result(&state, generation, res);
+    });
+}
+
+/// One [`list_plugins_and_states`] completion, applied to the tab — or
+/// dropped, if a newer poll already landed (#983).
+///
+/// Split out of [`refresh_plugins`]' closure so the ordering guard is
+/// reachable from a test: a `gtk_test` can drive two completions in the wrong
+/// order without a session bus to answer `ListPlugins`, which is the only way
+/// to reproduce the inversion deterministically.
+///
+/// The generation gate covers **every** arm, not just the success one: an
+/// `Err` from a poll that timed out at t+3 s is exactly as stale as an `Ok`
+/// from it, and letting it through would replace a live list with the
+/// "Unavailable" placeholder — parking the selection and blanking the
+/// snapshot — a second after a newer poll proved the shell is answering fine.
+fn on_poll_result(state: &PluginsState, generation: u64, res: PollResult) {
+    if !state.polls.accept(generation) {
+        tracing::debug!(
+            generation,
+            applied = state.polls.applied.get(),
+            "dropping an out-of-order plugin poll"
+        );
+        return;
+    }
+    match res {
         Ok((units, states)) if !units.is_empty() => {
             let rt: HashMap<String, PluginRuntime> = states
                 .into_iter()
@@ -808,10 +925,10 @@ fn refresh_plugins(state: &PluginsState) {
                     )
                 })
                 .collect();
-            apply_plugins(&state, &units, &rt);
+            apply_plugins(state, &units, &rt);
         }
         Ok(_) => set_placeholder(
-            &state,
+            state,
             PluginsView::Empty,
             "No plugins installed",
             "Install a trollshell-plugin unit to manage it here.",
@@ -819,13 +936,13 @@ fn refresh_plugins(state: &PluginsState) {
         Err(err) => {
             tracing::info!(%err, "ListPlugins failed");
             set_placeholder(
-                &state,
+                state,
                 PluginsView::Unavailable,
                 "Unavailable",
                 "Is trollshell running?",
             );
         }
-    });
+    }
 }
 
 /// Apply a non-empty unit list + runtime overlay: update the existing rows in
@@ -1398,8 +1515,18 @@ fn seen_suffix(secs: u64) -> String {
 
 // ── Plugins tab Control calls (#348) ─────────────────────────────────────────
 
+/// `ListPlugins`' reply: `(id, active_state, enabled)` per plugin user unit.
+type PollUnits = Vec<(String, String, bool)>;
+
+/// `ListPluginStates`' reply (#423): `(id, rendering, mount, last_seen_secs,
+/// violations)` per plugin with a live host connection.
+type PollStates = Vec<(String, bool, String, u64, u32)>;
+
+/// What one [`list_plugins_and_states`] round trip hands [`on_poll_result`].
+type PollResult = Result<(PollUnits, PollStates), hytte_bus::BusError>;
+
 /// `ListPlugins` → `[(id, active_state, enabled)]` for each plugin user unit.
-async fn list_plugins() -> Result<Vec<(String, String, bool)>, hytte_bus::BusError> {
+async fn list_plugins() -> Result<PollUnits, hytte_bus::BusError> {
     hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
@@ -1413,8 +1540,7 @@ async fn list_plugins() -> Result<Vec<(String, String, bool)>, hytte_bus::BusErr
 /// `ListPluginStates` → `[(id, rendering, mount, last_seen_secs, violations)]`
 /// for each plugin with a live host connection (#423). The runtime overlay the
 /// Plugins tab draws on top of the unit list.
-async fn list_plugin_states() -> Result<Vec<(String, bool, String, u64, u32)>, hytte_bus::BusError>
-{
+async fn list_plugin_states() -> Result<PollStates, hytte_bus::BusError> {
     hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
         .at_path(CONTROL_PATH)
         .iface(CONTROL_IFACE)
@@ -1429,13 +1555,7 @@ async fn list_plugin_states() -> Result<Vec<(String, bool, String, u64, u32)>, h
 /// (#423). The overlay is **best-effort**: a `ListPluginStates` error (e.g. an
 /// older shell that predates it) degrades to no overlay rather than blanking the
 /// unit list, so the tab still works against a shell without the method.
-async fn list_plugins_and_states() -> Result<
-    (
-        Vec<(String, String, bool)>,
-        Vec<(String, bool, String, u64, u32)>,
-    ),
-    hytte_bus::BusError,
-> {
+async fn list_plugins_and_states() -> PollResult {
     let units = list_plugins().await?;
     let states = list_plugin_states().await.unwrap_or_default();
     Ok((units, states))
@@ -1480,9 +1600,62 @@ async fn set_plugin_enabled(id: &str, enabled: bool) -> Result<(), hytte_bus::Bu
 #[cfg(test)]
 mod tests {
     use super::{
-        PluginRuntime, is_running, mount_or_unknown, plugin_subtitle, runtime_overlay,
-        same_plugin_set, seen_suffix, status_cell, violations_suffix,
+        PluginRuntime, PollGenerations, is_running, mount_or_unknown, plugin_subtitle,
+        runtime_overlay, same_plugin_set, seen_suffix, status_cell, violations_suffix,
     };
+
+    // ── Poll ordering (#983) ────────────────────────────────────────────────
+    //
+    // The widget-level consequences live in `gtk_tests`; these pin the
+    // ordering rule itself, hermetically (no display, no bus).
+
+    /// The defect's shape in one assertion: two polls are outstanding, the
+    /// newer one completes first, and the older one is then refused.
+    #[test]
+    fn a_generation_older_than_the_newest_applied_is_refused() {
+        let polls = PollGenerations::default();
+        let slow = polls.issue();
+        let fresh = polls.issue();
+        assert!(fresh > slow, "generations must be monotonic");
+        assert!(polls.accept(fresh), "the newest result applies");
+        assert!(!polls.accept(slow), "an older result is dropped");
+    }
+
+    /// The common case, and the mutation an ordering test alone would miss: a
+    /// gate that refused everything would also "fix" the defect. Every
+    /// in-order completion must apply.
+    #[test]
+    fn every_in_order_completion_is_accepted() {
+        let polls = PollGenerations::default();
+        for _ in 0..5 {
+            let generation = polls.issue();
+            assert!(
+                polls.accept(generation),
+                "a poll that completes before the next one is issued must always apply"
+            );
+        }
+    }
+
+    /// The first completion of a fresh tab must apply: `applied` starts at
+    /// `0`, below every issued generation.
+    #[test]
+    fn the_first_poll_of_a_fresh_tab_is_accepted() {
+        let polls = PollGenerations::default();
+        let first = polls.issue();
+        assert!(first > 0, "a generation must be above the applied floor");
+        assert!(polls.accept(first));
+    }
+
+    /// Strictly greater, not "greater or equal": re-running one completion is
+    /// not something `spawn_on_runtime` does, and treating it as fresh would
+    /// let a duplicated stale delivery through.
+    #[test]
+    fn the_newest_generation_is_not_accepted_twice() {
+        let polls = PollGenerations::default();
+        let only = polls.issue();
+        assert!(polls.accept(only));
+        assert!(!polls.accept(only), "the same generation must apply once");
+    }
 
     /// A connected plugin's runtime state, for the overlay tests.
     fn rt(rendering: bool, mount: &str, last_seen_secs: u64, violations: u32) -> PluginRuntime {
@@ -1687,7 +1860,8 @@ mod gtk_tests {
 
     use super::{
         BIN_MIN_WIDTH_PX, COLLAPSE_WIDTH_PX, PENDING_TOGGLE_TIMEOUT, PendingToggle, PluginRuntime,
-        PluginsState, apply_plugins, build_tab, on_toggle_result, refresh_detail,
+        PluginsState, PollResult, apply_plugins, build_tab, on_poll_result, on_toggle_result,
+        refresh_detail,
     };
 
     /// Run the GTK main loop until it has nothing left to dispatch, so a queued
@@ -1765,6 +1939,46 @@ mod gtk_tests {
             "Is trollshell running?",
         );
         pump();
+    }
+
+    /// One `list_plugins_and_states` reply as [`super::on_poll_result`]
+    /// receives it (#983): every listed plugin in `active_state`, and no
+    /// runtime overlay — the poll-ordering tests care about the `ActiveState`
+    /// a completion carries, not about the connected/rendering badge.
+    ///
+    /// The `Ok` wrapper is the point, not an oversight: this and [`poll_err`]
+    /// are the two arms of the same [`PollResult`], and a test reads better
+    /// naming the outcome than spelling `Ok(…)` at each of its call sites.
+    #[allow(clippy::unnecessary_wraps, reason = "the Ok arm of a PollResult pair")]
+    fn poll_ok(plugin_ids: &[&str], active_state: &str) -> PollResult {
+        let units = plugin_ids
+            .iter()
+            .map(|id| ((*id).to_owned(), active_state.to_owned(), true))
+            .collect();
+        Ok((units, Vec::new()))
+    }
+
+    /// A failed poll's completion — what a `ListPlugins` timeout hands
+    /// [`super::on_poll_result`].
+    fn poll_err() -> PollResult {
+        Err(hytte_bus::BusError::Permanent {
+            reason: "timed out".to_owned(),
+            dbus_name: None,
+        })
+    }
+
+    /// The status column's current word for `id`'s sidebar row (#887) — the
+    /// row half of "the view must not regress", beside the detail switch.
+    fn status_text(state: &PluginsState, id: &str) -> String {
+        let rows = state.by_id.borrow();
+        let text = rows
+            .get(id)
+            .unwrap_or_else(|| panic!("no row for {id}"))
+            .status
+            .text()
+            .to_string();
+        drop(rows);
+        text
     }
 
     /// Every `GtkWindowControls` under `root`, at any depth.
@@ -2926,6 +3140,288 @@ mod gtk_tests {
             "the surviving parked intent must still be B's wish"
         );
         drop(parked);
+
+        dismiss(&window);
+    }
+
+    // ── Poll ordering (#983) ────────────────────────────────────────────────
+
+    /// The base case: a completion older than the newest already applied is
+    /// dropped whole, so neither the detail switch nor the sidebar rows
+    /// regress to what it read.
+    ///
+    /// Driven through [`super::on_poll_result`] rather than
+    /// [`super::apply_plugins`] because the generation is exactly what
+    /// distinguishes the two completions — the payloads are both perfectly
+    /// valid `ListPlugins` replies, and either one is right at the moment its
+    /// call was made.
+    ///
+    /// Falsified by deleting the `state.polls.accept(generation)` guard in
+    /// `on_poll_result`: the stale `inactive` then lands and this fails at the
+    /// switch assertion, with the status column back on `Stopped`.
+    #[gtk::test]
+    fn a_stale_poll_result_cannot_regress_the_switch_or_the_rows() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+
+        let seed = state.polls.issue();
+        on_poll_result(&state, seed, poll_ok(&["clock"], "inactive"));
+        pump();
+        let window = present(&bin, 640);
+        assert!(!state.detail.switch.is_active(), "clock starts stopped");
+
+        // The slow poll is spawned first and completes last — the whole shape
+        // of the defect.
+        let slow = state.polls.issue();
+        let fresh = state.polls.issue();
+        on_poll_result(&state, fresh, poll_ok(&["clock"], "active"));
+        pump();
+        assert!(
+            state.detail.switch.is_active(),
+            "sanity: the newer poll must be applied normally"
+        );
+        assert_eq!(status_text(&state, "clock"), "Not connected");
+
+        on_poll_result(&state, slow, poll_ok(&["clock"], "inactive"));
+        pump();
+
+        assert!(
+            state.detail.switch.is_active(),
+            "an out-of-order completion must not bounce the switch back to its stale ActiveState"
+        );
+        assert_eq!(
+            status_text(&state, "clock"),
+            "Not connected",
+            "…nor regress the sidebar row it also rewrites"
+        );
+        let snapshot = state.snapshot.borrow();
+        assert_eq!(
+            snapshot.get("clock").map(|snap| snap.active_state.as_str()),
+            Some("active"),
+            "the cache every selection change renders from must hold the newest answer"
+        );
+        drop(snapshot);
+
+        dismiss(&window);
+    }
+
+    /// #983's reported sequence, end to end: the user flips the switch on, a
+    /// later poll confirms the transition and **legitimately** spends the
+    /// #944/#945 latch, and only then does the poll that was spawned before
+    /// the flip complete — carrying the pre-toggle truth.
+    ///
+    /// This is the case the latch cannot cover, which is why it needed its own
+    /// mechanism: by the time the stale result lands, `pending` is `None`
+    /// because a poll genuinely agreed with the user, so `resolve_pending` has
+    /// nothing left to hold the switch with.
+    ///
+    /// Falsified by deleting the `accept` guard: the switch flips off at the
+    /// last assertion, exactly as the issue describes.
+    #[gtk::test]
+    fn a_late_stale_poll_cannot_rebounce_the_switch_after_the_latch_cleared() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+
+        let seed = state.polls.issue();
+        on_poll_result(&state, seed, poll_ok(&["clock"], "inactive"));
+        pump();
+        let window = present(&bin, 640);
+
+        // t=0 — the user flips the switch on; `refresh_plugins_soon` spawns a
+        // poll (P0) whose `ListPluginStates` half will drag.
+        *state.pending.borrow_mut() = Some(PendingToggle {
+            plugin_id: "clock".to_owned(),
+            wanted: true,
+            since: Instant::now(),
+        });
+        let p0 = state.polls.issue();
+
+        // t=1.4 — P1 comes back `activating`: `is_running` agrees with the
+        // wanted state, so `resolve_pending` retires the intent.
+        let p1 = state.polls.issue();
+        on_poll_result(&state, p1, poll_ok(&["clock"], "activating"));
+        pump();
+        assert!(
+            state.pending.borrow().is_none(),
+            "sanity: a confirming poll must spend the latch — this test is about what happens \
+             *after* that"
+        );
+        assert!(state.detail.switch.is_active());
+
+        // t=2.1 — P2, `active`.
+        let p2 = state.polls.issue();
+        on_poll_result(&state, p2, poll_ok(&["clock"], "active"));
+        pump();
+        assert!(state.detail.switch.is_active());
+
+        // t=2.4 — P0 finally completes, three seconds stale.
+        on_poll_result(&state, p0, poll_ok(&["clock"], "inactive"));
+        pump();
+
+        assert!(
+            state.detail.switch.is_active(),
+            "the switch must not re-bounce off a poll that predates the toggle"
+        );
+        assert_eq!(
+            status_text(&state, "clock"),
+            "Not connected",
+            "and the row must not regress to Stopped with it"
+        );
+
+        dismiss(&window);
+    }
+
+    /// The guard covers the `Err` arm too: a poll that times out at t+3 s is
+    /// exactly as stale as one that answers, and letting it through would tear
+    /// a live list down to the "Unavailable" placeholder — parking the
+    /// selection and blanking the snapshot — a second after a newer poll
+    /// proved the shell is answering.
+    ///
+    /// Falsified by deleting the `accept` guard: the rows go to one
+    /// placeholder and this fails at the row-count assertion.
+    #[gtk::test]
+    fn a_stale_failure_cannot_tear_down_a_live_list() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+
+        let seed = state.polls.issue();
+        on_poll_result(&state, seed, poll_ok(&["clock", "departures"], "active"));
+        pump();
+        let window = present(&bin, 640);
+        click(&state, "departures");
+
+        let slow = state.polls.issue();
+        let fresh = state.polls.issue();
+        on_poll_result(&state, fresh, poll_ok(&["clock", "departures"], "active"));
+        pump();
+
+        // The slow poll's 3 s timeout finally fires.
+        on_poll_result(&state, slow, poll_err());
+        pump();
+
+        assert_eq!(
+            state.by_id.borrow().len(),
+            2,
+            "a stale failure must not replace a freshly-confirmed list with the placeholder"
+        );
+        assert!(state.parked.borrow().is_none(), "…and so must park nothing");
+        assert_eq!(
+            state.selected.borrow().as_deref(),
+            Some("departures"),
+            "the user's selection must survive it"
+        );
+        assert!(
+            !state.snapshot.borrow().is_empty(),
+            "the snapshot must not be blanked by a superseded failure"
+        );
+
+        dismiss(&window);
+    }
+
+    /// The other half of the guard, and the mutation that would otherwise pass
+    /// silently: it must drop **only** stale results. A run of in-order
+    /// completions — the overwhelmingly common case — has to apply every one
+    /// of them, or the tab simply stops updating.
+    ///
+    /// Falsified by making `accept` return `false` unconditionally: the switch
+    /// never follows the second poll and this fails immediately.
+    #[gtk::test]
+    fn in_order_polls_all_apply() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+
+        let seed = state.polls.issue();
+        on_poll_result(&state, seed, poll_ok(&["clock"], "inactive"));
+        pump();
+        let window = present(&bin, 640);
+
+        for (active_state, running) in [
+            ("active", true),
+            ("inactive", false),
+            ("active", true),
+            ("failed", false),
+        ] {
+            let generation = state.polls.issue();
+            on_poll_result(&state, generation, poll_ok(&["clock"], active_state));
+            pump();
+            assert_eq!(
+                state.detail.switch.is_active(),
+                running,
+                "an in-order poll reporting {active_state} must be applied"
+            );
+        }
+
+        dismiss(&window);
+    }
+
+    /// The generation is stamped **at spawn**, not at completion — which is
+    /// the whole of the ordering guarantee. Taking it inside the completion
+    /// closure would make every result the newest one, turning the #983 gate
+    /// into a production no-op while the rest of the suite stays green,
+    /// because every other test issues its generations by hand and never goes
+    /// through [`super::refresh_plugins`].
+    ///
+    /// That blind spot is the same one the #989 side closed deliberately with
+    /// `install_shell_probe` + its tick counter: the five mutations in the PR
+    /// body all land inside `on_poll_result` / `accept` / `apply`, and none
+    /// targets the *caller*. Supplied by the adversarial review of `32bf073`,
+    /// which confirmed it red under exactly that mutation and green here.
+    ///
+    /// No bus needed: `refresh_plugins` returns as soon as it has spawned, so
+    /// `issued` must already have advanced by the time it does.
+    #[gtk::test]
+    fn a_poll_is_stamped_when_it_is_spawned() {
+        adw::init().expect("libadwaita init");
+        let (_bin, state) = build_tab();
+
+        let before = state.polls.issued.get();
+        super::refresh_plugins(&state);
+        super::refresh_plugins(&state);
+
+        assert_eq!(
+            state.polls.issued.get(),
+            before + 2,
+            "both polls must take their generation at spawn; a generation taken at \
+             completion makes every result the newest and the #983 gate a no-op"
+        );
+    }
+
+    /// The other side of the `Err` gate: a failure that *is* the newest poll
+    /// must still tear the list down to the "Unavailable" placeholder.
+    ///
+    /// Every other test that asserts that placeholder goes through
+    /// [`poll_failed`], which calls `set_placeholder` **directly** and so
+    /// bypasses `on_poll_result` entirely — leaving the `Err` arm pinned only
+    /// in its *refusing* direction ([`a_stale_failure_cannot_tear_down_a_live_list`]).
+    /// No-op that arm and the whole suite stays green while the tab silently
+    /// loses its shell-is-down state: a dead shell would leave the last good
+    /// list frozen on screen forever. That is half of this module's own
+    /// "the gate covers every arm" claim, in the direction that matters to the
+    /// user. Supplied by the adversarial review of `32bf073`.
+    #[gtk::test]
+    fn a_fresh_failure_still_shows_the_unavailable_placeholder() {
+        adw::init().expect("libadwaita init");
+        let (bin, state) = build_tab();
+
+        let seed = state.polls.issue();
+        on_poll_result(&state, seed, poll_ok(&["clock", "departures"], "active"));
+        pump();
+        let window = present(&bin, 640);
+        click(&state, "departures");
+
+        let newest = state.polls.issue();
+        on_poll_result(&state, newest, poll_err());
+        pump();
+
+        assert!(
+            state.by_id.borrow().is_empty(),
+            "the newest poll failing must replace the live list with the placeholder"
+        );
+        assert_eq!(
+            state.parked.borrow().as_ref().map(|park| park.id.as_str()),
+            Some("departures"),
+            "…and park the selection for the next good poll to restore"
+        );
 
         dismiss(&window);
     }

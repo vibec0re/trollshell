@@ -10,7 +10,12 @@
 //!
 //! An `adw::ViewStack` of tabs plus a banner that appears only when the shell
 //! did *not* answer `Ping`/`Version` (#959) — a connected session shows no
-//! banner at all. The **Places** tab ([`places_tab`], #640/#703) is
+//! banner at all. That probe, and the revision footer's, **re-run on the
+//! Plugins tab's cadence** (#989): they used to be one-shot from
+//! [`build_window`], which pinned "trollshell is not running" for the whole
+//! session when the app was launched before the shell — the ordinary order
+//! after login — and never brought the banner back when a running shell died.
+//! The **Places** tab ([`places_tab`], #640/#703) is
 //! a full editor for `~/.config/trollshell/places.toml` — the named places that
 //! drive departures, Wi-Fi-fingerprint place detection and walk time — plus the
 //! session-only weather-location override this tab used to be (#391). It is the
@@ -28,7 +33,7 @@
 //! compatmaxx: reuse the existing GNOME client, provide the backend. When the
 //! shell isn't running the app degrades gracefully rather than panicking.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -58,6 +63,25 @@ pub(crate) const CONTROL_IFACE: &str = "mov.vibec0re.trollshell.Control";
 /// consistency between the two binaries.
 const DEFAULT_LOG_LEVEL: tracing_subscriber::filter::LevelFilter =
     tracing_subscriber::filter::LevelFilter::INFO;
+
+/// The banner's text before the first probe answers — what the window is
+/// built with, and what [`ShellProbeUi`] therefore starts out believing is on
+/// screen.
+const CONNECTING_BANNER: &str = "Connecting to trollshell…";
+
+/// How often the shell probes behind the connection banner and the revision
+/// footer re-run (#989).
+///
+/// Deliberately *the Plugins tab's* cadence rather than a number of its own:
+/// the banner and that tab answer the same question — is the shell there? —
+/// against the same `Control` endpoint, and them disagreeing is exactly the
+/// defect. Before #989 the probes were one-shot from [`build_window`], so a
+/// control-center launched before the shell (the ordinary order after login
+/// or a `home-manager switch`) pinned "trollshell is not running" and
+/// "unavailable" for the rest of the session while the Plugins tab listed
+/// live plugins underneath, and a shell that died mid-session never brought
+/// the banner back at all.
+const SHELL_PROBE_INTERVAL: Duration = plugins_tab::PLUGIN_POLL_INTERVAL;
 
 /// Builds the `EnvFilter` that gates the global `tracing` subscriber.
 ///
@@ -128,7 +152,7 @@ fn build_window(app: &adw::Application) {
     let header = adw::HeaderBar::builder().title_widget(&switcher).build();
 
     let banner = adw::Banner::builder()
-        .title("Connecting to trollshell…")
+        .title(CONNECTING_BANNER)
         .revealed(true)
         .build();
 
@@ -153,13 +177,22 @@ fn build_window(app: &adw::Application) {
         .content(&toolbar)
         .build();
 
-    // The tab poll timers are scoped to this window: drop them on close so a
-    // dismissed window stops polling `Control` (Plugins) and stat'ing
-    // `places.toml` (Places), and a re-launch while another window is still
-    // resident can't leave the first window's timers double-polling behind it
-    // (#542). Wrapped in a cell + `.take()` so the one-shot removal is clean
-    // under the `Fn` close handler.
-    let polls = RefCell::new(vec![plugins_poll, places_poll]);
+    // The shell probe behind the banner and the footer (#989): once now, then
+    // on `SHELL_PROBE_INTERVAL` for as long as the window lives, so a shell
+    // that starts after the control-center clears the banner and one that dies
+    // mid-session brings it back — both directions out of
+    // `format_banner_message`'s existing `None`/`Some` contract.
+    let probe = ShellProbeUi::new(&banner, &revision_label);
+    probe.poll();
+    let shell_poll = install_shell_probe(&probe, SHELL_PROBE_INTERVAL);
+
+    // The poll timers are scoped to this window: drop them on close so a
+    // dismissed window stops polling `Control` (Plugins, and since #989 the
+    // banner/footer probe) and stat'ing `places.toml` (Places), and a re-launch
+    // while another window is still resident can't leave the first window's
+    // timers double-polling behind it (#542). Wrapped in a cell + `.take()` so
+    // the one-shot removal is clean under the `Fn` close handler.
+    let polls = RefCell::new(vec![plugins_poll, places_poll, shell_poll]);
     window.connect_close_request(move |_| {
         for source in polls.take() {
             source.remove();
@@ -167,8 +200,6 @@ fn build_window(app: &adw::Application) {
         glib::Propagation::Proceed
     });
 
-    check_shell_connection(&banner);
-    check_shell_revision(&revision_label);
     window.present();
 }
 
@@ -176,8 +207,9 @@ fn build_window(app: &adw::Application) {
 
 /// Build the footer bar: a single dim, end-aligned label reporting the running
 /// shell's build revision. Deliberately small and unobtrusive — a footer, not a
-/// tab or dialog — and refreshed once at startup alongside the connection
-/// banner (see [`check_shell_revision`]).
+/// tab or dialog — and refreshed on the same probe as the connection banner
+/// (see [`ShellProbeUi`]), which since #989 re-runs on a timer rather than
+/// once at startup.
 fn build_revision_footer() -> (gtk::Box, gtk::Label) {
     let label = gtk::Label::builder()
         .label("Shell revision: checking…")
@@ -225,10 +257,33 @@ fn format_revision_footer(version: Option<&str>, revision: Option<&str>) -> Stri
     }
 }
 
-/// Probe `Control.Version` and `Control.Revision` on the shared tokio runtime
-/// and set the footer label from the combined result. Mirrors
-/// [`check_shell_connection`]'s shape (spawn on the runtime, deliver back over
-/// [`spawn_on_runtime`]'s oneshot).
+// ── The shell probe behind the banner and the footer (#959/#601, #989) ───────
+
+/// One round of "is the shell there, and which build is it?" — the single
+/// source both the connection banner and the revision footer are drawn from.
+///
+/// One probe rather than two (#989) because the two questions are the same
+/// question asked twice: the banner needs `Ping` + `Version`, the footer needs
+/// `Version` + `Revision`, and running them as separate periodic probes would
+/// double the traffic only to let the two surfaces disagree about the same
+/// endpoint at the same instant.
+struct ShellProbe {
+    /// `Ping` then `Version` — [`format_banner_message`]'s input, and the
+    /// footer's version half.
+    connection: Result<(String, String), hytte_bus::BusError>,
+    /// `Revision`, or `None` when that call failed (or was never made because
+    /// the connection probe already proved the endpoint isn't answering).
+    revision: Option<String>,
+}
+
+/// Run one [`ShellProbe`] on the shared tokio runtime.
+///
+/// The `Revision` call is skipped outright when the connection probe failed:
+/// a `Control` that did not answer `Ping` will not answer `Revision` either,
+/// and `(None, None)` is already exactly the footer's shell-not-running text.
+/// That keeps a *disconnected* tick down to one fast `ServiceUnknown` instead
+/// of stacking a second timeout on top of it — which matters now that this
+/// runs every [`SHELL_PROBE_INTERVAL`] rather than once.
 ///
 /// # Why this calls `Control.Version`/`Control.Revision` and not a local resolver
 ///
@@ -246,34 +301,190 @@ fn format_revision_footer(version: Option<&str>, revision: Option<&str>) -> Stri
 /// D-Bus round trip below. The same reasoning applies to `Version` (#959):
 /// the banner already round-trips it per-connection-check, so the footer
 /// reuses that same source rather than a compiled-in `CARGO_PKG_VERSION`.
-fn check_shell_revision(label: &gtk::Label) {
-    let label = label.clone();
-    spawn_on_runtime(
-        async {
-            let version = version().await;
-            let revision = revision().await;
-            (version, revision)
-        },
-        move |(version, revision)| {
-            label.set_text(&format_revision_footer(
-                version.ok().as_deref(),
-                revision.ok().as_deref(),
-            ));
-        },
-    );
+async fn probe_shell_status() -> ShellProbe {
+    let connection = probe_shell().await;
+    let revision = if should_probe_revision(&connection) {
+        revision().await.ok()
+    } else {
+        None
+    };
+    ShellProbe {
+        connection,
+        revision,
+    }
 }
 
-/// `Version` → the running shell's reported version (#959; the same call
-/// [`probe_shell`] uses for the banner).
-async fn version() -> Result<String, hytte_bus::BusError> {
-    control_call("Version").await
+/// Whether a probe whose connection half came back as `connection` should go
+/// on to ask for `Revision`.
+///
+/// A named predicate rather than an inline `if` so the one property
+/// [`probe_shell_status`] buys — a *disconnected* tick costs one fast
+/// `ServiceUnknown` instead of stacking a second 3 s timeout behind it — is
+/// reachable from a test. `probe_shell_status` itself is a bare async fn over
+/// `hytte_bus::call` and every #989 test hand-builds its [`ShellProbe`], so
+/// nothing could otherwise reach this branch (the review of `32bf073`, LOW 4).
+fn should_probe_revision(connection: &Result<(String, String), hytte_bus::BusError>) -> bool {
+    connection.is_ok()
 }
 
 /// `Revision` → the running shell's build git revision (#601). See
-/// [`check_shell_revision`] for why this is a plain `Control` round trip and
+/// [`probe_shell_status`] for why this is a plain `Control` round trip and
 /// not a local resolve.
 async fn revision() -> Result<String, hytte_bus::BusError> {
     control_call("Revision").await
+}
+
+/// Install the periodic shell probe, returning its `SourceId` so the window
+/// can drop it on close (#542).
+///
+/// `interval` is a parameter rather than [`SHELL_PROBE_INTERVAL`] read inside,
+/// so a test can install a fast one and assert the timer genuinely re-fires.
+/// Deleting this timer is exactly the mutation that reintroduces #989, and
+/// every other test here drives [`ShellProbeUi::apply`] by hand — none of them
+/// would notice.
+fn install_shell_probe(probe: &ShellProbeUi, interval: Duration) -> glib::SourceId {
+    let probe = probe.clone();
+    glib::timeout_add_local(interval, move || {
+        probe.poll();
+        glib::ControlFlow::Continue
+    })
+}
+
+/// Holds [`ShellProbeUi`]'s single in-flight slot for as long as it lives, and
+/// releases it on `Drop` — including the drop that happens when a completion
+/// callback is discarded without ever running. See [`ShellProbeUi::poll`].
+struct InFlightSlot(Rc<Cell<bool>>);
+
+impl Drop for InFlightSlot {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+/// The banner + footer pair, and the bookkeeping that lets them be re-probed
+/// on a timer instead of once at window build (#989).
+///
+/// Holds its two widgets strongly: the timer that owns this closure is removed
+/// on `close-request` (#542), so the whole thing is dropped with the window,
+/// and neither widget holds the timer back.
+#[derive(Clone)]
+struct ShellProbeUi {
+    banner: adw::Banner,
+    revision: gtk::Label,
+    /// Set while a probe is outstanding, so a tick landing on top of a slow
+    /// round trip skips rather than stacking a second one. Released by
+    /// [`InFlightSlot`]'s `Drop`, never by hand.
+    ///
+    /// This is the whole ordering story for these probes, and why they need no
+    /// generation counter the way the Plugins tab's polls do (#983): only ever
+    /// one is in flight, so completions cannot arrive out of order in the
+    /// first place. The tab cannot use the same discipline — skipping ticks
+    /// there would also drop its post-toggle settle re-poll — which is why the
+    /// two mechanisms differ.
+    in_flight: Rc<Cell<bool>>,
+    /// The banner message currently on screen (`None` = hidden), so a probe
+    /// that says the same thing as the last one doesn't add a log line. At a
+    /// 2 s cadence the unconditional `info!` this replaced would be one line
+    /// every two seconds for as long as the shell is down — and `INFO` is the
+    /// default level for this binary (#780).
+    shown: Rc<RefCell<Option<String>>>,
+    /// How many times [`poll`](Self::poll) has been called, skipped ticks
+    /// included.
+    ///
+    /// Carried in production rather than behind `cfg(test)` because the timer
+    /// is the whole of #989 and nothing else makes it falsifiable: every other
+    /// test here drives [`apply`](Self::apply) by hand, so deleting the timer
+    /// would leave them all green. `the_probe_re_runs_on_its_interval` watches
+    /// this instead. One `Cell` increment every [`SHELL_PROBE_INTERVAL`].
+    ticks: Rc<Cell<u32>>,
+}
+
+impl ShellProbeUi {
+    /// Seed from what is actually on screen: the banner is built revealed,
+    /// carrying [`CONNECTING_BANNER`], so the first probe to answer is a
+    /// genuine transition either way and gets logged.
+    fn new(banner: &adw::Banner, revision: &gtk::Label) -> Self {
+        let shown = banner.is_revealed().then(|| banner.title().to_string());
+        Self {
+            banner: banner.clone(),
+            revision: revision.clone(),
+            in_flight: Rc::new(Cell::new(false)),
+            shown: Rc::new(RefCell::new(shown)),
+            ticks: Rc::new(Cell::new(0)),
+        }
+    }
+
+    /// Claim the single in-flight slot for this tick, or `None` because a
+    /// probe is still outstanding. The returned guard releases the slot when
+    /// it drops.
+    fn claim(&self) -> Option<InFlightSlot> {
+        if self.in_flight.replace(true) {
+            return None;
+        }
+        Some(InFlightSlot(self.in_flight.clone()))
+    }
+
+    /// Probe the shell and apply the outcome — unless one is already in
+    /// flight, in which case this tick is skipped.
+    ///
+    /// The slot guard is **moved into the completion closure**, so the slot is
+    /// released whether that closure runs or is dropped unrun. That second
+    /// case is real: [`spawn_on_runtime`] calls its callback only `if let
+    /// Ok(v) = rx.await`, so a sender dropped without sending (a panic inside
+    /// [`probe_shell_status`], runtime teardown) would otherwise leave
+    /// `in_flight` stuck at `true` and every later tick taking the skip path
+    /// forever — freezing the banner and footer in whatever state they were
+    /// last in, which is #989's own symptom reintroduced by the mechanism that
+    /// fixes it (the review of `32bf073`, LOW 3).
+    fn poll(&self) {
+        self.ticks.set(self.ticks.get().saturating_add(1));
+        let Some(slot) = self.claim() else {
+            tracing::debug!("a shell probe is still in flight — skipping this tick");
+            return;
+        };
+        let ui = self.clone();
+        spawn_on_runtime(probe_shell_status(), move |probe| {
+            drop(slot);
+            ui.apply(&probe);
+        });
+    }
+
+    /// Reflect one probe outcome into the banner and the footer.
+    ///
+    /// [`format_banner_message`]'s `None`/`Some` contract drives the banner in
+    /// **both** directions (#989): `Some` reveals it with the text, `None`
+    /// hides it. That is what makes a shell started after the control-center
+    /// clear the banner, and a shell that dies mid-session bring it back —
+    /// from the same call, with no separate "has it been shown yet?" state.
+    ///
+    /// Split out from [`poll`](Self::poll) so a `gtk_test` can drive a
+    /// sequence of outcomes through it with no session bus to answer `Ping`.
+    fn apply(&self, probe: &ShellProbe) {
+        let message = format_banner_message(&probe.connection);
+        if *self.shown.borrow() != message {
+            self.shown.replace(message.clone());
+            match &probe.connection {
+                Err(err) => tracing::info!(%err, "trollshell control endpoint unreachable"),
+                Ok((_pong, version)) => {
+                    tracing::info!(%version, "trollshell control endpoint answered");
+                }
+            }
+        }
+        match &message {
+            Some(text) => {
+                self.banner.set_title(text);
+                self.banner.set_revealed(true);
+            }
+            None => self.banner.set_revealed(false),
+        }
+        let version = probe
+            .connection
+            .as_ref()
+            .ok()
+            .map(|(_pong, version)| version.as_str());
+        self.revision
+            .set_text(&format_revision_footer(version, probe.revision.as_deref()));
+    }
 }
 
 // ── AI Keys tab (#392) ─────────────────────────────────────────────────────
@@ -444,53 +655,6 @@ async fn clear_ai_key(slot: String) -> Result<(), hytte_bus::BusError> {
         .await
 }
 
-/// Probe the running shell's control endpoint on the shared tokio runtime, then
-/// update `banner` back on the GTK main thread with the result. Never blocks the
-/// UI and never panics when the shell is absent.
-///
-/// #959: the banner only carries information when the shell is *not*
-/// reachable — a successful probe hides it (`set_revealed(false)`) rather than
-/// leaving a permanent "Connected to trollshell …" notice up for the entire
-/// session. A later poll that succeeds again (there isn't one today, but
-/// nothing here assumes there won't be) would hide it again the same way.
-fn check_shell_connection(banner: &adw::Banner) {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-
-    // The D-Bus call runs on the process-wide hytte tokio runtime; the reply is
-    // carried back over a oneshot the GTK main loop awaits below. Awaiting a
-    // tokio oneshot receiver needs no runtime context, so it polls cleanly on
-    // glib's executor.
-    hytte_reactive::runtime::handle().spawn(async move {
-        // The receiver is dropped if the window closed first — ignore the send
-        // error in that case.
-        let _ = tx.send(probe_shell().await);
-    });
-
-    let banner = banner.clone();
-    glib::spawn_future_local(async move {
-        let message = match rx.await {
-            Ok(probe) => {
-                if let Err(err) = &probe {
-                    tracing::info!(%err, "trollshell control endpoint unreachable");
-                }
-                format_banner_message(&probe)
-            }
-            Err(_) => {
-                // Sender dropped without sending (task cancelled) — unreachable
-                // in practice, but degrade to the disconnected message.
-                Some("Could not reach trollshell".to_owned())
-            }
-        };
-        match message {
-            Some(text) => {
-                banner.set_title(&text);
-                banner.set_revealed(true);
-            }
-            None => banner.set_revealed(false),
-        }
-    });
-}
-
 /// Format the connection banner's text from a [`probe_shell`] outcome. `None`
 /// means "hide the banner" (the shell answered); `Some` carries the text to
 /// show.
@@ -501,6 +665,11 @@ fn check_shell_connection(banner: &adw::Banner) {
 /// [`is_shell_not_running`]) from any other bus failure, which gets a literal
 /// `Connection error: {err}` rather than being folded into the same "not
 /// running" text — per #959, only a state the bus layer actually reports.
+///
+/// #989 leans on the `None`/`Some` split as a *two-way* contract rather than a
+/// one-shot: [`ShellProbeUi::apply`] runs it on every probe, so the same
+/// function that first revealed the banner is what later hides it, and what
+/// reveals it again if the shell goes away.
 fn format_banner_message(probe: &Result<(String, String), hytte_bus::BusError>) -> Option<String> {
     match probe {
         Ok(_) => None,
@@ -617,7 +786,7 @@ mod tests {
 
     use super::{
         DEFAULT_LOG_LEVEL, build_env_filter, format_banner_message, format_revision_footer,
-        is_shell_not_running,
+        is_shell_not_running, should_probe_revision,
     };
 
     // #780: with `RUST_LOG` unset, the effective filter must default to
@@ -792,5 +961,406 @@ mod tests {
             dbus_name: None,
         };
         assert!(!is_shell_not_running(&no_name));
+    }
+
+    // ── The probe's second call (#989) ──────────────────────────────────────
+
+    // The one performance property `probe_shell_status` buys: a tick against a
+    // shell that isn't there costs one fast `ServiceUnknown`, not that plus a
+    // second 3 s timeout stacked behind it. The predicate is named precisely
+    // so this is reachable — the async fn around it is a bare `hytte_bus::call`
+    // chain no hermetic test can drive (the review of `32bf073`, LOW 4).
+    #[test]
+    fn a_failed_connection_probe_skips_the_revision_call() {
+        let down: Result<(String, String), hytte_bus::BusError> =
+            Err(hytte_bus::BusError::Permanent {
+                reason: "unused".to_owned(),
+                dbus_name: Some("org.freedesktop.DBus.Error.ServiceUnknown".to_owned()),
+            });
+        assert!(
+            !should_probe_revision(&down),
+            "a Control that did not answer Ping will not answer Revision either"
+        );
+    }
+
+    // …and the other direction, so the skip is not simply "never ask".
+    #[test]
+    fn a_reachable_shell_is_still_asked_for_its_revision() {
+        let up: Result<(String, String), hytte_bus::BusError> =
+            Ok(("pong".to_owned(), "0.1.0".to_owned()));
+        assert!(should_probe_revision(&up));
+    }
+}
+
+/// The banner/footer probe's widget-level behaviour (#989).
+///
+/// Gated on `system-tests` for the same reason [`plugins_tab`]'s module is:
+/// `AdwBanner`'s revealed state is a real widget property, so "the banner
+/// hides, then comes back" cannot be asserted without a display server. The
+/// *text* for each individual outcome is already pinned hermetically by
+/// `tests` above — what these add is the **sequence**, which is the whole of
+/// what #989 broke.
+#[cfg(all(test, feature = "system-tests"))]
+mod gtk_tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use gtk::glib;
+
+    use super::{
+        CONNECTING_BANNER, ShellProbe, ShellProbeUi, build_revision_footer, install_shell_probe,
+    };
+
+    const NOT_RUNNING: &str = "trollshell is not running — start the shell to manage it";
+    const UNAVAILABLE_FOOTER: &str = "Shell revision: unavailable (trollshell not running)";
+
+    /// A probe that reached the shell.
+    fn connected() -> ShellProbe {
+        ShellProbe {
+            connection: Ok(("pong".to_owned(), "0.1.0".to_owned())),
+            revision: Some("34e3d96".to_owned()),
+        }
+    }
+
+    /// A probe against a `Control` name nobody owns — the shell is not
+    /// running. Exactly the `BusError` shape a real `dbus-daemon` produces for
+    /// a destination with no owner (#959 confirmed it empirically).
+    fn not_running() -> ShellProbe {
+        ShellProbe {
+            connection: Err(hytte_bus::BusError::Permanent {
+                reason: "The name mov.vibec0re.trollshell.Control was not provided by any \
+                         .service files"
+                    .to_owned(),
+                dbus_name: Some("org.freedesktop.DBus.Error.ServiceUnknown".to_owned()),
+            }),
+            revision: None,
+        }
+    }
+
+    /// A `tracing` writer that collects every emitted line in memory, so a
+    /// test can count log lines rather than infer them from state.
+    ///
+    /// Hand-rolled rather than reached for from `tracing-subscriber`'s test
+    /// helpers because `TestWriter` goes to the captured stdout, which a test
+    /// cannot read back.
+    #[derive(Clone)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture buffer is never held across a panic")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` with an `INFO` subscriber installed for this thread, and
+    /// return the lines it emitted.
+    ///
+    /// `set_default` is thread-local, so this neither needs nor disturbs a
+    /// global subscriber, and `#[gtk::test]` runs the body on the same thread.
+    fn captured_logs(body: impl FnOnce()) -> Vec<String> {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturedLog(buffer.clone()))
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            body();
+        }
+        let bytes = buffer.lock().expect("no panic while capturing").clone();
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The banner and footer as `build_window` wires them, plus the probe
+    /// state that drives both.
+    fn probe_ui() -> (adw::Banner, gtk::Label, ShellProbeUi) {
+        let banner = adw::Banner::builder()
+            .title(CONNECTING_BANNER)
+            .revealed(true)
+            .build();
+        let (_bar, label) = build_revision_footer();
+        let ui = ShellProbeUi::new(&banner, &label);
+        (banner, label, ui)
+    }
+
+    /// #989 in one sequence: launched before the shell, then the shell starts,
+    /// then it dies, then it comes back. The banner has to follow all four
+    /// steps, and the footer with it.
+    ///
+    /// Before this fix only the first step ever ran — the probes were one-shot
+    /// from `build_window` — so steps 2 and 3 are precisely the two
+    /// divergences the issue reports: a "not running" banner sitting over a
+    /// Plugins tab full of live plugins, and a banner that never reappears
+    /// after the shell dies.
+    ///
+    /// Falsified by removing the re-probe (dropping the
+    /// `glib::timeout_add_local(SHELL_PROBE_INTERVAL, …)` in `build_window`)
+    /// — but *that* mutation is invisible to a test driving `apply` directly,
+    /// so the honest falsification is at this level: no-op `apply`'s
+    /// `set_revealed` calls and this fails at step 2.
+    #[gtk::test]
+    fn the_banner_reveals_and_hides_in_both_directions() {
+        adw::init().expect("libadwaita init");
+        let (banner, label, ui) = probe_ui();
+
+        // 1. Launched before the shell.
+        ui.apply(&not_running());
+        assert!(
+            banner.is_revealed(),
+            "a failed probe must reveal the banner"
+        );
+        assert_eq!(banner.title().as_str(), NOT_RUNNING);
+        assert_eq!(label.text().as_str(), UNAVAILABLE_FOOTER);
+
+        // 2. `systemctl --user start trollshell` — the next probe must HIDE
+        //    the banner, not leave it pinned for the session.
+        ui.apply(&connected());
+        assert!(
+            !banner.is_revealed(),
+            "#989: a later successful probe must hide a banner an earlier failure revealed"
+        );
+        assert_eq!(
+            label.text().as_str(),
+            "trollshell 0.1.0 · revision 34e3d96",
+            "the footer must follow the same probe"
+        );
+
+        // 3. The shell dies mid-session — the banner must come BACK.
+        ui.apply(&not_running());
+        assert!(
+            banner.is_revealed(),
+            "#989: a failure after a success must re-reveal the banner"
+        );
+        assert_eq!(banner.title().as_str(), NOT_RUNNING);
+        assert_eq!(label.text().as_str(), UNAVAILABLE_FOOTER);
+
+        // 4. …and back again, as many times as the shell restarts.
+        ui.apply(&connected());
+        assert!(!banner.is_revealed());
+        assert_eq!(label.text().as_str(), "trollshell 0.1.0 · revision 34e3d96");
+    }
+
+    /// The startup case on its own: the window is built with the banner
+    /// revealed and reading "Connecting to trollshell…", so a first probe that
+    /// succeeds has to clear it rather than leave that placeholder up.
+    #[gtk::test]
+    fn a_first_successful_probe_clears_the_connecting_placeholder() {
+        adw::init().expect("libadwaita init");
+        let (banner, label, ui) = probe_ui();
+        assert!(banner.is_revealed(), "sanity: built revealed");
+        assert_eq!(banner.title().as_str(), CONNECTING_BANNER);
+
+        ui.apply(&connected());
+
+        assert!(!banner.is_revealed());
+        assert_eq!(label.text().as_str(), "trollshell 0.1.0 · revision 34e3d96");
+    }
+
+    /// A bus error that is *not* "nothing owns this name" keeps its own text
+    /// across the transition, and still clears on the next success — #959's
+    /// distinction has to survive being applied repeatedly.
+    #[gtk::test]
+    fn a_connection_error_banner_also_clears_on_the_next_success() {
+        adw::init().expect("libadwaita init");
+        let (banner, _label, ui) = probe_ui();
+
+        ui.apply(&ShellProbe {
+            connection: Err(hytte_bus::BusError::Permanent {
+                reason: "not authorised".to_owned(),
+                dbus_name: Some("org.freedesktop.DBus.Error.AccessDenied".to_owned()),
+            }),
+            revision: None,
+        });
+        assert!(banner.is_revealed());
+        let title = banner.title();
+        assert!(
+            title.as_str().starts_with("Connection error:"),
+            "expected the distinct connection-error text, got {title:?}"
+        );
+
+        ui.apply(&connected());
+        assert!(!banner.is_revealed());
+    }
+
+    /// The probes must not stack: a tick that lands while a slow round trip is
+    /// still out has to skip, and the slot has to be released when that round
+    /// trip completes.
+    ///
+    /// Falsified by making `claim` return `Some` unconditionally: the second
+    /// assertion fails, and in production each tick would then pile another
+    /// three-call probe (with 3 s timeouts) on top of the last.
+    #[gtk::test]
+    fn only_one_probe_is_in_flight_at_a_time() {
+        adw::init().expect("libadwaita init");
+        let (_banner, _label, ui) = probe_ui();
+
+        let slot = ui.claim().expect("the first tick must probe");
+        assert!(
+            ui.claim().is_none(),
+            "a tick landing on a still-outstanding probe must skip rather than stack a second"
+        );
+
+        // What the completion does — by dropping the guard, not by hand.
+        drop(slot);
+        assert!(
+            ui.claim().is_some(),
+            "the slot must be free again once the probe completes"
+        );
+    }
+
+    /// The slot is released by [`super::InFlightSlot`]'s `Drop`, so a
+    /// completion that is *discarded rather than run* frees it too.
+    ///
+    /// `spawn_on_runtime` invokes its callback only `if let Ok(v) = rx.await`,
+    /// so a sender dropped without sending (a panic inside the probe, runtime
+    /// teardown) drops the closure — and with it the guard it owns — without
+    /// ever calling it. Before this guard existed the release lived *inside*
+    /// that callback, so such a probe wedged `in_flight` at `true` and every
+    /// later tick skipped forever, freezing the banner in whatever state it
+    /// was last in: #989's own symptom, reintroduced by #989's fix (the review
+    /// of `32bf073`, LOW 3).
+    ///
+    /// Falsified by emptying `InFlightSlot::drop`'s body: the last assertion
+    /// fails.
+    #[gtk::test]
+    fn a_discarded_completion_still_releases_the_slot() {
+        adw::init().expect("libadwaita init");
+        let (_banner, _label, ui) = probe_ui();
+
+        // Exactly what `poll` builds: a guard owned by the completion closure.
+        let slot = ui.claim().expect("the first tick must probe");
+        let completion: Box<dyn FnOnce(ShellProbe)> = Box::new(move |_probe| {
+            drop(slot);
+        });
+        assert!(
+            ui.claim().is_none(),
+            "sanity: the slot is held while the closure is alive"
+        );
+
+        // The oneshot's sender went away, so `spawn_on_runtime` drops the
+        // callback instead of calling it.
+        drop(completion);
+
+        assert!(
+            ui.claim().is_some(),
+            "a completion dropped without running must not wedge the probe forever"
+        );
+    }
+
+    /// The #780 property this PR explicitly buys: at a 2 s cadence the probe
+    /// logs on **transitions**, not on every tick.
+    ///
+    /// Without the guard, a shell left down overnight writes one `INFO` line
+    /// every two seconds — 1 800 an hour — into the user's journal. Counting
+    /// real emitted lines rather than inspecting `shown`, because a mutation
+    /// that drops the guard while keeping `shown` correct would sail past a
+    /// state assertion (the review of `32bf073`, LOW 5).
+    ///
+    /// Falsified by removing `apply`'s `if *self.shown.borrow() != message`
+    /// guard: four probes then emit four lines and the first assertion fails.
+    #[gtk::test]
+    fn the_probe_logs_transitions_not_every_tick() {
+        adw::init().expect("libadwaita init");
+        let (_banner, _label, ui) = probe_ui();
+
+        let lines = captured_logs(|| {
+            // Down, and staying down: one line, not four.
+            ui.apply(&not_running());
+            ui.apply(&not_running());
+            ui.apply(&not_running());
+            ui.apply(&not_running());
+        });
+        assert_eq!(
+            lines.len(),
+            1,
+            "a shell that stays down must log once, not once per tick: {lines:#?}"
+        );
+        assert!(
+            lines[0].contains("unreachable"),
+            "the one line must be the outage: {:?}",
+            lines[0]
+        );
+
+        // …and a real change still speaks up, so the guard is not "never log".
+        let lines = captured_logs(|| {
+            ui.apply(&connected());
+            ui.apply(&connected());
+        });
+        assert_eq!(
+            lines.len(),
+            1,
+            "the shell coming back is a transition and must log exactly once: {lines:#?}"
+        );
+        assert!(
+            lines[0].contains("answered"),
+            "the one line must be the recovery: {:?}",
+            lines[0]
+        );
+    }
+
+    /// The timer itself: the probe has to keep firing, not run once. This is
+    /// the mechanism #989 was missing, and the one every other test in this
+    /// module is blind to — they all drive `apply` by hand.
+    ///
+    /// The in-flight slot is held for the whole test so each tick takes the
+    /// skip path: there is no session bus here to answer `Ping`, and this is
+    /// about the timer re-firing, not about what a probe returns.
+    ///
+    /// Falsified by making `install_shell_probe`'s closure return
+    /// `glib::ControlFlow::Break` (a one-shot timer, i.e. the pre-#989
+    /// behaviour): the tick count stops at 1 and this fails at the deadline.
+    ///
+    /// The loop drains the context **non-blocking** and sleeps between passes
+    /// rather than calling `iteration(true)`: a broken timer leaves nothing to
+    /// dispatch, and a blocking iteration would then park forever — hanging
+    /// not just this test but every `#[gtk::test]` sharing the main context,
+    /// which is a hang rather than a red line and so no falsification at all.
+    #[gtk::test]
+    fn the_probe_re_runs_on_its_interval() {
+        adw::init().expect("libadwaita init");
+        let (_banner, _label, ui) = probe_ui();
+
+        let _slot = ui
+            .claim()
+            .expect("hold the in-flight slot for the whole test");
+        let source = install_shell_probe(&ui, Duration::from_millis(5));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ui.ticks.get() < 3 && Instant::now() < deadline {
+            while glib::MainContext::default().iteration(false) {}
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let ticks = ui.ticks.get();
+        // Look the source up rather than `SourceId::remove()`, which unwraps:
+        // under the falsifying mutation the source has already destroyed
+        // itself, and a panic there would pre-empt the assertion below and
+        // report the wrong reason for the red.
+        if let Some(source) = glib::MainContext::default().find_source_by_id(&source) {
+            source.destroy();
+        }
+
+        assert!(
+            ticks >= 3,
+            "the probe must keep re-running on its interval; it fired {ticks} time(s)"
+        );
     }
 }

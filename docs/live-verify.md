@@ -1930,6 +1930,38 @@ session.
       still falls back to exactly
       `Shell revision: unavailable (trollshell not running)` (kept
       byte-for-byte — nothing else needed updating for the change).
+- [ ] **(#983/#989)** The control-center's polls **agree with each other and
+      with reality**, both directions, without a relaunch.
+      **(a) #989 — banner and footer follow the shell.** Stop the shell
+      (`systemctl --user stop trollshell`), then launch the control-center
+      _while it is down_ — the ordinary order after login or a
+      `home-manager switch`. The banner reads "trollshell is not running" and
+      the footer reads `Shell revision: unavailable (trollshell not running)`,
+      as before. Now, **without touching the window**, run
+      `systemctl --user start trollshell`: within ~2 s the banner must
+      **disappear on its own** and the footer must fill in with
+      `trollshell <version> · revision <hash>`. Before #989 both were probed
+      once at window build, so the banner stayed pinned for the whole session
+      while the Plugins tab happily listed live plugins underneath it. Then
+      `systemctl --user stop trollshell` again with the window still open: the
+      banner must **come back** within ~2 s and the footer return to
+      "unavailable" — the reappearance is the half nothing did before. Repeat
+      the start/stop a couple of times; it must track every time. Also check
+      the app's own `journalctl --user` (or its terminal): while the shell is
+      down there must be **one** `trollshell control endpoint unreachable`
+      line per outage, not one every two seconds — the probe logs on
+      transitions only.
+      **(b) #983 — the Plugins tab under a slow shell.** The generation guard
+      only shows itself when a poll is genuinely slow, which the hermetic
+      tests fabricate. To provoke it live, put the machine under load (a
+      `nix build` of something large works) and, with the Plugins tab open on
+      a plugin's detail page, **flip its switch on and off a few times**. The
+      switch must settle on what you asked for and the sidebar's status column
+      must move forwards only — `Stopped → Starting… → Rendering` — never
+      flicking back to `Stopped` a second _after_ it already read `Rendering`.
+      A single stale-looking blink of the switch or the status word is the
+      defect; before #983 it was reproducible whenever one `ListPlugins`
+      round trip overran the next tick.
 
 ## Documentation site (GitHub Pages)
 

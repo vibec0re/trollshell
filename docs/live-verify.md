@@ -1751,8 +1751,7 @@ session.
 
     The vocabulary in that line is the **file**'s, which matters for exactly
     one knob: start with `TROLLSHELL_CORE_LEDS_ROWS=rect` instead and the line
-    must offer `0 or "rect" for the automatic rectangle, or a row count from 1
-to 64` — the `0` included, because the file takes it and this line is the
+    must offer `0 or "rect" for the automatic rectangle, or a row count from 1 to 64` — the `0` included, because the file takes it and this line is the
     only place on disk that says so until nix renders a base file. (The
     _unusable_-variable line below is the other way round: it must **not**
     offer a `0`, since the variable never took one.)

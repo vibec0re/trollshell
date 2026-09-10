@@ -122,6 +122,19 @@ pub enum StateKey {
 /// program itself. Declaration order in this enum is append-only (it is the
 /// wire's, and appending keeps every existing name's meaning), so the ordering
 /// lives here rather than in the variant sequence.
+///
+/// # Appending the 16th one changes more bytes than you expect
+///
+/// There are **15** variants. `rmp-serde` writes a 15-element `Vec` with a
+/// one-byte `fixarray` header (`0x9f`); the 16th crosses to `array16`
+/// (`dc 00 10`), three bytes. Nothing breaks — both encodings decode — but it
+/// shifts **every byte after the capability array** in the `manifest_full_v1`
+/// and `plugin_register_v1` golden fixtures, ending the "every pre-existing byte
+/// keeps its position" property that has made each capability's fixture diff
+/// auditable at a glance since #882. Expect an alarming-looking diff, say so in
+/// the PR, and check the shift is only that. Pinned (and made a compile error to
+/// ignore) by `the_capability_list_is_one_variant_from_an_array16_header` in
+/// `tests/proto.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Capability {
     /// Open drawer pages ([`Effect::OpenPage`](crate::effect::Effect::OpenPage)).

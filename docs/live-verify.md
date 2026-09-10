@@ -326,6 +326,23 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
   - [ ] **`file:` really opens.** `Effect::open_uri(id, "file:///…/shot.png")`
         opens the image viewer — the same handler resolution the shell's own
         screenshot toast uses.
+  - [ ] **An uppercase scheme really resolves.** `check_uri` accepts
+        `HTTPS://pr1ma.darkest.space/` because RFC 3986 says schemes are
+        case-insensitive, but whether **GLib** then finds a handler for it is a
+        runtime question no unit test can answer. Emit one: the browser must
+        open exactly as for the lowercase form. If it does not, the allow-list
+        is accepting something the desktop cannot resolve and the case-folding
+        belongs in the host, not just in the comparison.
+  - [ ] **A slow launch does not freeze the shell** (the reason the launch is
+        asynchronous — review F1 on PR #1049). Point one at a hung mount:
+        `sudo mount -t nfs 10.0.0.254:/nowhere /mnt/hang -o hard,timeo=600` on
+        an address that black-holes, then emit
+        `Effect::open_uri(id, "file:///mnt/hang/x.png")`. The bar clock must
+        keep ticking, the drawer must still open, and other plugins must keep
+        rendering, for as long as that launch is outstanding — GLib's
+        _synchronous_ entry point does content-type I/O on the URI and would
+        have frozen all of it. The `EffectResult` arrives late, or not until the
+        mount gives up; that is expected. (`umount -f -l /mnt/hang` after.)
   - [ ] **The capability is load-bearing.** Remove `Capability::OpenUri` from
         the plugin's manifest, keep the effect, restart it: the click does
         nothing, and the journal warns
@@ -342,6 +359,14 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
         still connect and render normally against that same old shell (this is
         what `VOCAB_UNCONDITIONAL` staying at 1 buys, and it is the half worth
         checking).
+  - [ ] **The named residual, seen once** (review F2 on PR #1049). Same old
+        shell; this time run a plugin that **emits** `Effect::open_uri` while
+        declaring only `Capability::Notify`. It must `Register` successfully and
+        mount — and then, on the first click that emits the effect, the old
+        shell logs a decode failure and the SDK redials on its 5 s backoff:
+        the #437 crash-loop. Confirm it looks exactly like that, because this is
+        the failure mode `VOCAB_UNCONDITIONAL` was deliberately left unable to
+        catch, and the docs claim it is a plugin bug rather than a wire hazard.
 - [ ] _(dormant — #555)_ The wire-vocabulary generation counter (`VOCAB`) is
       armed but untested against a real newer-vocab plugin (this PR appended
       no wire variant, so `VOCAB` stays at 1 and nothing exercises the reject

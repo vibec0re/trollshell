@@ -3029,13 +3029,18 @@ fn an_older_host_cannot_decode_an_open_uri_at_all() {
 /// a different argument.
 ///
 /// The three before it are safe because the plugin waits for a `Hello`. This one
-/// is safe because the *capability* gates it: an effect only rides the wire from
-/// a plugin whose manifest declared the gating cap, and `Capability::OpenUri` is
-/// itself undecodable on a pre-#1045 host, so that plugin never gets past
-/// `Register` — pinned by `an_older_host_cannot_decode_an_open_uri_capability`
-/// below. Bumping the unconditional ceiling would not save that plugin; it would
-/// only add a handshake refusal for every plugin rebuilt on this SDK that never
-/// opens a link.
+/// is safe **for a plugin that declares the capability it emits**: the host only
+/// brokers an effect whose gating cap the manifest named, and
+/// `Capability::OpenUri` is itself undecodable on a pre-#1045 host, so that
+/// plugin never gets past `Register` — pinned by
+/// `an_older_host_cannot_decode_an_open_uri_capability` below. That condition is
+/// a plugin-authoring property and nothing enforces it; the residual (an
+/// undeclared emit registers fine on an old host and then crash-loops on the
+/// first render frame) is pinned by
+/// `an_undeclared_open_uri_still_registers_on_an_old_host` and argued on
+/// `OPEN_URI_VOCAB`. Bumping the unconditional ceiling would catch that one
+/// authoring bug at the cost of a handshake refusal for every plugin rebuilt on
+/// this SDK that never opens a link — the trade #882/#893/#966 each declined.
 ///
 /// The equality `VOCAB == OPEN_URI_VOCAB` is the "newest variant" pin that used
 /// to live on `SCROLLED_VOCAB`: appending the next wire variant moves it here,
@@ -3131,4 +3136,167 @@ fn an_older_host_cannot_decode_an_open_uri_capability() {
     let old: ManifestOld =
         decode_body(&encode_body(&m)).expect("a manifest without the new cap still decodes");
     assert_eq!(old.capabilities, vec![CapabilityOld::Notify]);
+}
+
+/// The **residual** the census-only argument leaves behind (#1045, review F2).
+///
+/// The argument for leaving `VOCAB_UNCONDITIONAL` at 1 is that a plugin emitting
+/// `OpenUri` must have declared `Capability::OpenUri`, and that capability is
+/// what a pre-#1045 host chokes on at `Register`. That is an authoring property,
+/// not a wire property: nothing SDK-side gates which effects an author emits
+/// (`hytte-plugin`'s crate docs say so in as many words). So the residual is a
+/// plugin that emits the effect and *forgets* the capability — and this pins
+/// what happens to it, as a fact rather than as prose, so the next author
+/// appending an `Effect` variant inherits the true statement and not an absolute
+/// one.
+///
+/// Both halves matter: the `Register` **succeeds** on the old host (so the
+/// plugin mounts and looks healthy) and the render frame **fails** (so it
+/// crash-loops on the first click that emits one) — the #437 hazard exactly.
+///
+/// **Falsified** by giving `Effect` a `#[serde(other)]` catch-all (the second
+/// half stops erroring), or by anything that made the manifest itself
+/// undecodable without the cap (the first half stops decoding, which would mean
+/// the residual had closed and this test should be deleted along with the
+/// paragraph on `OPEN_URI_VOCAB`).
+#[test]
+fn an_undeclared_open_uri_still_registers_on_an_old_host() {
+    // A pre-#1045 host's decoders, for the two frames that matter.
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    enum CapabilityOld {
+        Notify,
+    }
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    struct ManifestOld {
+        id: String,
+        capabilities: Vec<CapabilityOld>,
+        #[serde(default)]
+        vocab: u16,
+    }
+    #[derive(serde::Deserialize, Debug)]
+    enum EffectOld {
+        Notify { summary: String, body: String },
+    }
+
+    // The authoring mistake: the effect is emitted, the capability is not
+    // declared.
+    let mut manifest = Manifest::new("agents", Mount::SidebarTop);
+    manifest.capabilities = vec![Capability::Notify];
+
+    // Half one — the handshake goes through. The manifest carries no unknown
+    // variant, and it still stamps the unconditional generation, so the old
+    // host's `check_vocab` is cleared too: nothing warns, nothing is refused.
+    let old: ManifestOld = decode_body(&encode_body(&manifest))
+        .expect("a manifest that never names the new cap decodes on a pre-#1045 host");
+    assert_eq!(old.capabilities, vec![CapabilityOld::Notify]);
+    assert_eq!(
+        old.vocab, VOCAB_UNCONDITIONAL,
+        "…and stamps a generation that old host accepts",
+    );
+    assert!(
+        old.vocab < OPEN_URI_VOCAB,
+        "which is exactly why the handshake does not catch this",
+    );
+
+    // Half two — and then the first render frame carrying the effect does not
+    // decode at all. On a live socket that is a dropped frame, and with a
+    // redialing SDK it is the #437 crash-loop.
+    let effect = Effect::open_uri(1, "https://pr1ma.darkest.space/agents/argus");
+    let err = decode_body::<EffectOld>(&encode_body(&effect))
+        .expect_err("the render frame's effect is undecodable on that same old host");
+    assert!(
+        matches!(err, ProtoError::Decode(_)),
+        "the whole body fails; an unknown variant is not skipped: {err:?}",
+    );
+
+    // The control: the identical render frame *without* the new effect decodes
+    // fine on that decoder, so half two is about the appended variant and not
+    // about the mirror enum being wrong.
+    let benign = Effect::Notify {
+        summary: "Timer done".into(),
+        body: "25:00 timer finished".into(),
+    };
+    decode_body::<EffectOld>(&encode_body(&benign))
+        .expect("a pre-#1045 effect in the same frame position still decodes");
+}
+
+/// `Capability` is **one variant away from a MessagePack width crossing**
+/// (#1045, review F4).
+///
+/// `rmp-serde` encodes a 15-element `Vec` with a one-byte `fixarray` header
+/// (`0x9f`); the 16th element crosses to `array16` (`dc 00 10`), which is three
+/// bytes. So appending capability number 16 shifts **every byte after the
+/// capability array** in `manifest_full_v1` and `plugin_register_v1` — the two
+/// golden fixtures that carry a full capability list.
+///
+/// That is not a compat break (both encodings decode), but it does end the
+/// property that made #882/#893/#966/#1045's fixture diffs auditable at a
+/// glance: "every pre-existing byte keeps its position". Whoever appends the
+/// 16th capability should expect a fixture diff that looks alarming and is not,
+/// and should say so in the PR — this test is where that fact is parked, and it
+/// goes red in the same commit that needs to read it.
+/// The list is kept honest by an **exhaustive match**, not by a count: append a
+/// variant to `Capability` and this stops compiling, which is the point — the
+/// author lands in the docs above before they regenerate a fixture.
+#[test]
+fn the_capability_list_is_one_variant_from_an_array16_header() {
+    let all = [
+        Capability::OpenPage,
+        Capability::Niri,
+        Capability::Media,
+        Capability::Audio,
+        Capability::RunCommand,
+        Capability::RaiseOsd,
+        Capability::Notify,
+        Capability::Consent,
+        Capability::Calendar,
+        Capability::SessionState,
+        Capability::NowPlaying,
+        Capability::DatasourceQuery,
+        Capability::DatasourceProvider,
+        Capability::Shader,
+        Capability::OpenUri,
+    ];
+    for cap in all {
+        // No wildcard arm on purpose: a 16th variant makes this non-exhaustive
+        // and the test fails to compile until the array above is extended too.
+        match cap {
+            Capability::OpenPage
+            | Capability::Niri
+            | Capability::Media
+            | Capability::Audio
+            | Capability::RunCommand
+            | Capability::RaiseOsd
+            | Capability::Notify
+            | Capability::Consent
+            | Capability::Calendar
+            | Capability::SessionState
+            | Capability::NowPlaying
+            | Capability::DatasourceQuery
+            | Capability::DatasourceProvider
+            | Capability::Shader
+            | Capability::OpenUri => {}
+        }
+    }
+    assert_eq!(all.len(), 15, "fifteen capabilities today");
+
+    // The array header is the first byte of the encoded `Vec`, so this reads the
+    // width directly rather than searching for a byte pattern that could occur
+    // anywhere in a payload.
+    let caps = encode_body(&all.to_vec());
+    assert_eq!(
+        caps[0], 0x9f,
+        "15 elements still fit MessagePack's one-byte fixarray header",
+    );
+
+    // …and the crossing this test exists to warn about, demonstrated rather
+    // than asserted in prose: one more element and the header is three bytes.
+    let mut sixteen = all.to_vec();
+    sixteen.push(Capability::OpenUri);
+    let wider = encode_body(&sixteen);
+    assert_eq!(
+        &wider[..3],
+        &[0xdc, 0x00, 0x10],
+        "the 16th element crosses to array16, shifting every byte after it",
+    );
 }

@@ -40,6 +40,15 @@
 //! Inspect `git diff crates/hytte-plugin-proto/tests/fixtures/` before
 //! committing — a diff you can't explain from the source change is exactly
 //! the wire break this suite exists to catch.
+//!
+//! One diff shape *is* explainable and looks alarming: appending the **16th**
+//! [`Capability`] crosses MessagePack's `fixarray` limit (15), so the capability
+//! array header in `manifest_full_v1` and `plugin_register_v1` goes from one
+//! byte (`0x9f`) to three (`dc 00 10`) and **every byte after it shifts**. The
+//! same applies to any list here that grows past 15. Nothing is broken (both
+//! encodings decode); the "every pre-existing byte keeps its position" heuristic
+//! just stops applying for that one commit. See
+//! `the_capability_list_is_one_variant_from_an_array16_header` in `proto.rs`.
 
 use hytte_plugin_proto::{
     AccentRole, AudioAction, AudioSpectrum, Capability, ClockState, ConsentDecision,

@@ -65,6 +65,12 @@
 //! host before it is brokered, so
 //! [`Manifest::capabilities`](proto::Manifest::capabilities) has to name every
 //! capability the plugin's effects need or those effects simply never happen.
+//! **Getting that pairing wrong costs more than the dropped effect**: for a
+//! capability whose generation an older shell predates — `Shader` (#893),
+//! `OpenUri` (#1045) — declaring it is also what makes that shell refuse the
+//! plugin *loudly at the handshake*, so an undeclared emit sails through
+//! `Register` there and then fails to decode on the first render frame carrying
+//! it, i.e. the #437 crash-loop. Declare what you emit.
 //! A plugin's **own** external I/O — send a frame on the WebSocket it holds,
 //! fire an HTTP call — is not a shell effect: the design does that in-process and
 //! never round-trips it through the host. But `update` is sync, so it cannot do
@@ -564,7 +570,10 @@ pub enum Input<M> {
     ///   refuses (a scheme outside `http`/`https`/`file`) comes back `ok: false`
     ///   with the reason in [`output`](proto::EffectOutcome::output), which is
     ///   there so a plugin can toast it instead of leaving a click that
-    ///   silently does nothing.
+    ///   silently does nothing. A refusal answers immediately; a *launch*
+    ///   answers when the desktop has resolved the handler, which may be after
+    ///   an application-chooser dialog, so do not assume it lands in the same
+    ///   frame as the click.
     EffectResult {
         /// The `id` the plugin chose on the originating effect.
         id: u64,

@@ -240,10 +240,12 @@ pub enum Effect {
     /// [`RunCommand`](Effect::RunCommand) — so a plugin can toast a refusal
     /// rather than watch a click do nothing.
     ///
-    /// The host resolves it with `gio::AppInfo::launch_default_for_uri`, the
-    /// same call the shell's own screenshot / recording toasts use for their
+    /// The host resolves it with `gio::AppInfo`, the same desktop-portal-backed
+    /// resolution the shell's own screenshot / recording toasts use for their
     /// **Open** action. Not a subprocess, not a shell: the plugin names a
-    /// destination and the *desktop* decides which program opens it.
+    /// destination and the *desktop* decides which program opens it. The launch
+    /// is asynchronous host-side, so the outcome arrives when the desktop has
+    /// answered rather than in lock-step with the frame that emitted it.
     ///
     /// # Why this is not `RunCommand`
     ///
@@ -267,9 +269,10 @@ pub enum Effect {
     /// `mailto:`, a `javascript:`, an `ssh://`, an empty or scheme-less string —
     /// is refused with a warn and an [`EffectOutcome`] of `ok: false` whose
     /// `output` names the refused scheme; nothing is launched. The allow-list is
-    /// host policy, not wire vocabulary, so widening it later (Annika flagged
-    /// `mailto:` as an open question on #1045) is a host change alone and needs
-    /// no new variant here.
+    /// host policy, not wire vocabulary, so widening it later is a host change
+    /// alone and needs no new variant here. (#1045's triage note parks
+    /// `mailto:` as the obvious candidate, to be taken to #947 if it should go
+    /// wider — nobody has asked for it yet.)
     ///
     /// Note what the allow-list does and does not buy. It is **not** a sandbox:
     /// `file:///…` reaches the user's own default handler for that file type,
@@ -286,13 +289,18 @@ pub enum Effect {
     /// skipping it the way it skips an unknown *field*, which is why appending a
     /// variant bumps [`VOCAB`](crate::VOCAB) where adding a field does not.
     ///
-    /// That never happens in practice, and the reason is the capability, not the
-    /// counter: an effect only rides the wire from a plugin whose manifest
-    /// declared its gating capability (the host drops the rest — see
-    /// [`Capability`](crate::manifest::Capability)), and `Capability::OpenUri`
-    /// is *itself* a variant a pre-#1045 host cannot decode, so such a plugin is
-    /// already dropped at `Register` with a handshake-read warn. See
-    /// [`OPEN_URI_VOCAB`] for why that makes generation 5 a census-only bump.
+    /// For a plugin that **declares the capability it emits**, that never
+    /// happens, and the reason is the capability rather than the counter: the
+    /// host drops any effect whose gating capability the manifest did not name
+    /// (see [`Capability`](crate::manifest::Capability)), and
+    /// `Capability::OpenUri` is *itself* a variant a pre-#1045 host cannot
+    /// decode — so such a plugin is dropped at `Register` with a handshake-read
+    /// warn, before it can send a render frame. **Declare
+    /// [`Capability::OpenUri`](crate::manifest::Capability::OpenUri) whenever
+    /// you emit this**: emitting it without declaring it is a plugin bug that
+    /// costs you a silently-dead click on a current host and the #437
+    /// crash-loop on an older one. See [`OPEN_URI_VOCAB`] for why that residual
+    /// is named rather than bought off with the unconditional ceiling.
     OpenUri {
         /// The plugin's correlation token, echoed on the
         /// [`EffectResult`](crate::msg::HostMsg::EffectResult).
@@ -383,27 +391,51 @@ impl Effect {
 /// rebuilt on this SDK still stamps generation 1 and still clears an older
 /// host's [`check_vocab`](crate::manifest::Manifest::check_vocab).
 ///
-/// # Why it is safe to leave the unconditional ceiling alone
+/// # Why the unconditional ceiling stays where it is
 ///
-/// The three generations before this one are gated on the host having
-/// advertised them in [`HostMsg::Hello`](crate::msg::HostMsg::Hello). This one
-/// is gated by something stronger and earlier: **its capability**. An
-/// [`Effect`] only reaches a host from a plugin that declared the gating
-/// [`Capability`](crate::manifest::Capability) (the host drops every other
-/// effect before brokering it), and `Capability::OpenUri` is itself a variant a
-/// pre-#1045 host cannot decode — so that plugin's `Register` frame fails to
-/// decode and the connection is dropped at the handshake, before any render
-/// frame carrying an `OpenUri` could be sent. The #437 hazard the unconditional
-/// counter exists to catch — an old host silently failing to decode a *render*
-/// frame, redialing, and crash-looping — therefore cannot arise here.
+/// This is the **first appended plugin→host [`Effect`] variant since the counter
+/// existed** (#437 introduced it after [`Effect::RequestConsent`] and the
+/// datasource legs had already landed), and the first gated by a *capability*
+/// rather than by a [`HostMsg::Hello`](crate::msg::HostMsg::Hello)
+/// advertisement — so the argument is worth stating exactly rather than by
+/// analogy with #882/#893/#966.
 ///
-/// The price is the one every appended capability has paid since the first
-/// (stated on [`Capability::Shader`](crate::manifest::Capability::Shader)):
-/// declaring `OpenUri` costs compatibility with a pre-#1045 host, which drops
-/// the connection with a `plugin handshake read failed` warn naming the
-/// undecodable variant. Bumping `VOCAB_UNCONDITIONAL` would not improve that
-/// plugin's fate one bit — it would only add a refusal for every *other* plugin
-/// rebuilt on this SDK, including the ones that never open a link.
+/// **For a plugin that declares the capability it emits**, the #437 hazard the
+/// unconditional counter exists to catch — an old host silently failing to
+/// decode a *render* frame, redialing, and crash-looping — cannot arise. An
+/// [`Effect`] only reaches a host's broker from a plugin that declared the
+/// gating [`Capability`](crate::manifest::Capability) (the host drops every
+/// other effect), and `Capability::OpenUri` is itself a variant a pre-#1045 host
+/// cannot decode — so that plugin's `Register` frame fails to decode and the
+/// connection is dropped at the handshake, loudly, before any render frame
+/// carrying an `OpenUri` could be sent.
+///
+/// **That condition is a plugin-authoring property, not a wire property**, and
+/// nothing enforces it: the SDK does not gate which effects an author may emit
+/// (`hytte-plugin`'s crate docs say so), so a plugin can emit `OpenUri` while
+/// forgetting `Capability::OpenUri` in its manifest. Such a plugin is already
+/// broken against a #1045 host — the effect is dropped with a warn and **no
+/// [`EffectOutcome`] ever comes back**, so a click silently does nothing — and
+/// against a pre-#1045 host it is broken worse: its `Register` *succeeds* (the
+/// manifest carries no unknown variant and still stamps generation
+/// [`VOCAB_UNCONDITIONAL`](crate::VOCAB_UNCONDITIONAL)), and the first render
+/// frame carrying the effect fails to decode, which with a redialing SDK is the
+/// #437 crash-loop. Pinned by `an_undeclared_open_uri_still_registers_on_an_old_host`.
+///
+/// Moving the ceiling to 5 *would* convert that into a loud handshake refusal —
+/// and would also refuse every **other** plugin rebuilt on this SDK against
+/// every older shell, including all the ones that never open a link. That is the
+/// trade #953 called "strictly worse" and #882/#893/#966 each declined: a
+/// guaranteed compat break for everyone, to catch one authoring bug that already
+/// misbehaves visibly on a current host. So the ceiling stays at 1 and the
+/// residual is named here instead of papered over.
+///
+/// The price for a *correct* plugin is the one every appended capability has
+/// paid since the first (stated on
+/// [`Capability::Shader`](crate::manifest::Capability::Shader)): declaring
+/// `OpenUri` costs compatibility with a pre-#1045 host, which drops the
+/// connection with a `plugin handshake read failed` warn naming the undecodable
+/// variant.
 ///
 /// A plugin that wants to branch rather than rely on that can compare this
 /// against [`negotiated_vocab`](crate::manifest::Manifest::negotiated_vocab).

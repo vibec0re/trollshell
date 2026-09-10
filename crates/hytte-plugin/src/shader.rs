@@ -51,7 +51,7 @@
 //!
 //! # Why the builder can say no
 //!
-//! [`Shader::node`] returns an `Option`, and both of its `None`s are deliberate:
+//! [`Shader::node`] returns an `Option`, and every `None` is deliberate:
 //!
 //! - **The host has not advertised [`SHADER_VOCAB`]** — see
 //!   [`host_speaks_shader`]. Emitting the node anyway would send a variant an
@@ -59,18 +59,40 @@
 //!   the redial crash-loop the vocabulary counter exists to prevent (#437).
 //!   There is no CPU form to fall back to, so the plugin decides what to render
 //!   instead — a label, a `preem` widget, or nothing.
-//! - **The source is over [`MAX_SHADER_SOURCE_BYTES`]** — the host refuses it
-//!   too (broken-widget placeholder plus a warning), so refusing here turns a
-//!   silent blank chip into a value the plugin can branch on. The data cap
-//!   ([`MAX_SHADER_DATA_BYTES`]) is refused the same way.
+//! - **The source, the buffer, or the grid it describes fails one of the
+//!   host's data caps** — the same four
+//!   `trollshell/src/plugins/shader_map.rs`'s `refusal` enforces on the node
+//!   it receives: the source over [`MAX_SHADER_SOURCE_BYTES`], the buffer
+//!   over [`MAX_SHADER_DATA_BYTES`], `data.len()` not equal to `data_width *
+//!   data_height * format.bytes_per_texel()`, or a grid side over
+//!   [`MAX_SHADER_DATA_EXTENT`] (#1021, mirroring #1020's host-side extent
+//!   cap). [`Shader::cap_refusal`] names which, and with what numbers, so
+//!   refusing here turns a silent blank chip into a value the plugin can log
+//!   or branch on, instead of shipping a node the host quietly replaces with
+//!   the broken-widget placeholder.
 //!
-//! Both are testable without a session: [`fits_source_cap`] and
-//! [`fits_data_cap`] are the pure predicates, and
-//! [`testing::with_shader_support`] forces the negotiation.
+//! **This SDK-side check is a courtesy to the plugin author, not a security
+//! boundary — route 0, the plugin socket itself, is that** (#893's trust
+//! boundary; see
+//! `docs/superpowers/specs/2026-09-06-preem-gl-renderer-design.md` §"Trust
+//! boundary for #893"). The host makes every one of these decisions again,
+//! independently, over the bytes it actually received, and does not trust
+//! this crate's arithmetic.
+//!
+//! All of it is testable without a session: [`fits_source_cap`],
+//! [`fits_data_cap`], [`fits_data_extent`] and [`Shader::cap_refusal`] are the
+//! pure predicates, and [`testing::with_shader_support`] forces the
+//! negotiation.
 
 use crate::proto::{
     MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Node, SHADER_VOCAB, ShaderData,
 };
+// `MAX_SHADER_DATA_EXTENT` is not among `hytte-plugin-proto`'s root
+// re-exports (`proto::MAX_SHADER_DATA_BYTES` et al. above), so it is read
+// straight from `wire` — the same module
+// `trollshell/src/plugins/shader_map.rs` reads it from — rather than widening
+// `hytte-plugin-proto`'s public surface for this one constant.
+use hytte_plugin_proto::wire::MAX_SHADER_DATA_EXTENT;
 
 /// Whether this session's host advertised the shader vocabulary (#893) — i.e.
 /// whether [`negotiated_vocab`](crate::display::negotiated_vocab) has reached
@@ -96,6 +118,65 @@ pub fn fits_source_cap(fragment: &str) -> bool {
 #[must_use]
 pub fn fits_data_cap(len: usize) -> bool {
     len <= MAX_SHADER_DATA_BYTES
+}
+
+/// Whether `(width, height)` is within the host's per-axis grid-extent cap
+/// ([`MAX_SHADER_DATA_EXTENT`]), checked on each side individually.
+///
+/// The cap [`fits_data_cap`] does not imply: a product says nothing about its
+/// factors, so a `32768 × 1` `R8` grid is 32 KiB — three orders of magnitude
+/// under [`MAX_SHADER_DATA_BYTES`] — and still wider than a great many
+/// drivers' `GL_MAX_TEXTURE_SIZE` (see [`MAX_SHADER_DATA_EXTENT`]'s docs for
+/// the full story, #977/#1020).
+#[must_use]
+pub fn fits_data_extent(width: u32, height: u32) -> bool {
+    width <= MAX_SHADER_DATA_EXTENT && height <= MAX_SHADER_DATA_EXTENT
+}
+
+/// Why [`Shader::node`] refused to build over a source, buffer, or grid cap —
+/// the typed diagnostic behind that `None`, for a plugin author who wants to
+/// know *why* rather than only *whether*. Returned by [`Shader::cap_refusal`].
+///
+/// Mirrors `trollshell/src/plugins/shader_map.rs`'s host-side `Refusal`
+/// field-for-field, over the same [`crate::proto`] wire constants and the
+/// same [`ShaderData::data_len_ok`] invariant — one source of truth for each
+/// number, read from both sides of the socket.
+///
+/// **This is a courtesy to the plugin author, not a security boundary** — see
+/// the [module docs](self). Route 0, the socket itself, is that boundary
+/// (#893's trust boundary); the host makes this same decision again,
+/// independently, over the bytes it actually received, and does not trust
+/// this crate's arithmetic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShaderCapRefusal {
+    /// The source is over [`MAX_SHADER_SOURCE_BYTES`].
+    SourceTooLarge {
+        /// What was given.
+        bytes: usize,
+    },
+    /// The buffer is over [`MAX_SHADER_DATA_BYTES`].
+    DataTooLarge {
+        /// What was given.
+        bytes: usize,
+    },
+    /// `data.len()` is not `width * height * format.bytes_per_texel()` — the
+    /// same invariant a malformed [`Node::Pixels`](crate::proto::Node::Pixels)
+    /// buffer trips.
+    MalformedData {
+        /// What was given.
+        len: usize,
+        /// The grid claimed, in texels.
+        size: (u32, u32),
+        /// The format claimed.
+        format: ShaderData,
+    },
+    /// A data-grid side is over [`MAX_SHADER_DATA_EXTENT`], applied to
+    /// `data_width`/`data_height` individually — the cap the byte total
+    /// does not imply. See [`fits_data_extent`].
+    GridTooLarge {
+        /// The grid that was claimed, in texels.
+        size: (u32, u32),
+    },
 }
 
 /// Builder for a [`Node::Shader`].
@@ -169,11 +250,13 @@ impl Shader {
     /// The data buffer and the grid it describes.
     ///
     /// `data.len()` must be exactly `width * height * format.bytes_per_texel()`
-    /// — the host renders the broken-widget placeholder otherwise, on the same
-    /// terms a malformed [`Pixels`](crate::proto::Node::Pixels) buffer gets.
-    /// This is deliberately **not** checked here: a builder that silently
-    /// reshaped or padded a mismatched buffer would hide the plugin's own bug,
-    /// and the host's journal line names both numbers.
+    /// — the same invariant a malformed [`Pixels`](crate::proto::Node::Pixels)
+    /// buffer trips. This setter does **not** reshape or pad a mismatched
+    /// buffer to fit — that would hide the plugin's own bug — but
+    /// [`Shader::node`] does refuse to build one
+    /// ([`ShaderCapRefusal::MalformedData`], #1021), naming the exact numbers
+    /// given rather than a guessed-at fix, on the same terms the host's own
+    /// journal line does.
     #[must_use]
     pub fn data(mut self, format: ShaderData, width: u32, height: u32, data: Vec<u8>) -> Self {
         self.format = format;
@@ -203,14 +286,51 @@ impl Shader {
         self
     }
 
+    /// The specific source/buffer/grid cap this builder would be refused for,
+    /// if any — the typed counterpart to [`Shader::node`]'s `None`. See
+    /// [`ShaderCapRefusal`] and the [module docs](self) for what this is (a
+    /// courtesy diagnostic) and is not (a security boundary).
+    ///
+    /// Checked in the same order `shader_map::refusal` does over the fields it
+    /// shares with this type — cheapest and most fundamental first: source
+    /// size, then buffer size, then the shape invariant, then the per-axis
+    /// extent.
+    #[must_use]
+    pub fn cap_refusal(&self) -> Option<ShaderCapRefusal> {
+        if self.fragment.len() > MAX_SHADER_SOURCE_BYTES {
+            return Some(ShaderCapRefusal::SourceTooLarge {
+                bytes: self.fragment.len(),
+            });
+        }
+        if self.data.len() > MAX_SHADER_DATA_BYTES {
+            return Some(ShaderCapRefusal::DataTooLarge {
+                bytes: self.data.len(),
+            });
+        }
+        if !self
+            .format
+            .data_len_ok(self.data_width, self.data_height, self.data.len())
+        {
+            return Some(ShaderCapRefusal::MalformedData {
+                len: self.data.len(),
+                size: (self.data_width, self.data_height),
+                format: self.format,
+            });
+        }
+        if !fits_data_extent(self.data_width, self.data_height) {
+            return Some(ShaderCapRefusal::GridTooLarge {
+                size: (self.data_width, self.data_height),
+            });
+        }
+        None
+    }
+
     /// The node, or `None` if this host cannot draw it or the payload is over a
-    /// cap — see the [module docs](self) for both cases.
+    /// cap — see the [module docs](self) for both cases, and
+    /// [`Shader::cap_refusal`] for a typed reason in the latter.
     #[must_use]
     pub fn node(self) -> Option<Node> {
-        if !host_speaks_shader()
-            || !fits_source_cap(&self.fragment)
-            || !fits_data_cap(self.data.len())
-        {
+        if !host_speaks_shader() || self.cap_refusal().is_some() {
             return None;
         }
         Some(Node::Shader {
@@ -267,8 +387,9 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Node, Shader, ShaderData, fits_data_cap,
-        fits_source_cap, host_speaks_shader, testing::with_shader_support,
+        MAX_SHADER_DATA_BYTES, MAX_SHADER_DATA_EXTENT, MAX_SHADER_SOURCE_BYTES, Node, Shader,
+        ShaderCapRefusal, ShaderData, fits_data_cap, fits_data_extent, fits_source_cap,
+        host_speaks_shader, testing::with_shader_support,
     };
 
     const BODY: &str = "void main() { fragColor = u_accent; }";
@@ -323,18 +444,189 @@ mod tests {
 
     /// The same, for the 4 MiB data cap.
     ///
-    /// **Falsified** by dropping the `fits_data_cap` guard.
+    /// **Falsified** by dropping the `fits_data_cap` guard from
+    /// [`Shader::cap_refusal`].
     #[test]
     fn the_sdk_refuses_a_buffer_over_the_cap() {
         with_shader_support(true, || {
             assert!(fits_data_cap(MAX_SHADER_DATA_BYTES));
             assert!(!fits_data_cap(MAX_SHADER_DATA_BYTES + 1));
             let over = vec![0u8; MAX_SHADER_DATA_BYTES + 1];
+            // width * 1 * 1 == over.len(), so this is a pure bytes-cap
+            // refusal — the shape invariant underneath it is satisfied.
+            let width = u32::try_from(MAX_SHADER_DATA_BYTES + 1).unwrap();
+            let shader = Shader::new("s", BODY).data(ShaderData::R8, width, 1, over);
+            assert_eq!(
+                shader.cap_refusal(),
+                Some(ShaderCapRefusal::DataTooLarge {
+                    bytes: MAX_SHADER_DATA_BYTES + 1
+                }),
+            );
+            assert!(shader.node().is_none());
+        });
+    }
+
+    /// **The SDK refuses a grid side over the per-axis extent cap** (#1021,
+    /// mirroring #1020's host-side `Refusal::GridTooLarge` in
+    /// `trollshell/src/plugins/shader_map.rs`'s `refusal`): exactly at the cap
+    /// builds, one texel over — on either axis — does not. The byte cap does
+    /// not imply this one: a `32768×1` `R8` grid is 32 KiB, three orders of
+    /// magnitude under [`MAX_SHADER_DATA_BYTES`], and is refused here anyway.
+    ///
+    /// **Falsified** by dropping the `fits_data_extent` guard from
+    /// [`Shader::cap_refusal`], or by writing it `<`: the at-cap assertions
+    /// go red.
+    #[test]
+    fn the_sdk_refuses_a_grid_over_the_extent_cap() {
+        with_shader_support(true, || {
+            assert!(fits_data_extent(MAX_SHADER_DATA_EXTENT, 1));
+            let at_cap = vec![0u8; MAX_SHADER_DATA_EXTENT as usize];
             assert!(
                 Shader::new("s", BODY)
-                    .data(ShaderData::R8, 1, 1, over)
+                    .data(ShaderData::R8, MAX_SHADER_DATA_EXTENT, 1, at_cap.clone())
                     .node()
-                    .is_none(),
+                    .is_some(),
+                "exactly at the cap still builds",
+            );
+            assert!(
+                Shader::new("s", BODY)
+                    .data(ShaderData::R8, 1, MAX_SHADER_DATA_EXTENT, at_cap)
+                    .node()
+                    .is_some(),
+                "…on either axis",
+            );
+
+            assert!(!fits_data_extent(MAX_SHADER_DATA_EXTENT + 1, 1));
+            let over = vec![0u8; MAX_SHADER_DATA_EXTENT as usize + 1];
+            let shader =
+                Shader::new("s", BODY).data(ShaderData::R8, MAX_SHADER_DATA_EXTENT + 1, 1, over);
+            assert_eq!(
+                shader.cap_refusal(),
+                Some(ShaderCapRefusal::GridTooLarge {
+                    size: (MAX_SHADER_DATA_EXTENT + 1, 1)
+                }),
+                "one texel over the width is refused",
+            );
+            assert!(shader.node().is_none());
+
+            // #977/#1020's own reported input, spelled out: 32 KiB of R8, a
+            // legal length for its grid, and unallocatable by many drivers.
+            let issue = vec![0u8; 32_768];
+            assert_eq!(
+                Shader::new("s", BODY)
+                    .data(ShaderData::R8, 32_768, 1, issue)
+                    .cap_refusal(),
+                Some(ShaderCapRefusal::GridTooLarge { size: (32_768, 1) }),
+            );
+        });
+    }
+
+    /// The specific at-cap shapes named in #1021 — accepted whole, not just
+    /// individually under one cap, but under all three checks at once (bytes,
+    /// the shape invariant, and per-axis extent).
+    ///
+    /// - `4096×1` `R8`: the per-axis extent cap itself, 4 KiB — nowhere near
+    ///   the byte cap.
+    /// - `1024×1024` `Rgba8`: [`MAX_SHADER_DATA_BYTES`]'s own documented
+    ///   example, 4 MiB exactly.
+    /// - `2048×2048` `R8`: the byte cap reached in a grid a GPU will actually
+    ///   take — the corrected shape of the boundary test #977 fixed on the
+    ///   host side (`shader_map.rs`'s `the_data_cap_bites_one_byte_over`,
+    ///   which rejected the same buffer laid out `1×MAX_SHADER_DATA_BYTES`).
+    #[test]
+    fn the_documented_at_cap_shapes_are_all_accepted() {
+        with_shader_support(true, || {
+            assert!(
+                Shader::new("s", BODY)
+                    .data(
+                        ShaderData::R8,
+                        MAX_SHADER_DATA_EXTENT,
+                        1,
+                        vec![0; MAX_SHADER_DATA_EXTENT as usize],
+                    )
+                    .node()
+                    .is_some(),
+                "4096x1 R8",
+            );
+            assert!(
+                Shader::new("s", BODY)
+                    .data(ShaderData::Rgba8, 1024, 1024, vec![0; 1024 * 1024 * 4])
+                    .node()
+                    .is_some(),
+                "1024x1024 Rgba8 == MAX_SHADER_DATA_BYTES exactly",
+            );
+            let side = u32::try_from(MAX_SHADER_DATA_BYTES).unwrap().isqrt();
+            assert_eq!(
+                side, 2048,
+                "documented as the byte cap's square R8 side, and within the extent cap",
+            );
+            assert!(
+                Shader::new("s", BODY)
+                    .data(ShaderData::R8, side, side, vec![0; MAX_SHADER_DATA_BYTES])
+                    .node()
+                    .is_some(),
+                "2048x2048 R8 == MAX_SHADER_DATA_BYTES exactly",
+            );
+        });
+    }
+
+    /// **Agreement with the host, by construction.**
+    /// `trollshell/src/plugins/shader_map.rs` cannot be linked from this crate
+    /// (it pulls in the whole GTK/GL shell), so its `Refusal` variants and
+    /// boundary shapes are copied here as literal expectations instead of
+    /// being asserted directly against its `refusal()`. What actually makes
+    /// the two sides agree is that both read the *same*
+    /// [`MAX_SHADER_SOURCE_BYTES`] / [`MAX_SHADER_DATA_BYTES`] /
+    /// [`MAX_SHADER_DATA_EXTENT`] constants and the same
+    /// `ShaderData::data_len_ok` invariant out of `hytte-plugin-proto`'s
+    /// `wire` module — there is exactly one copy of each number, and this
+    /// test only pins that both sides still consult it the same way.
+    ///
+    /// Each case below is transcribed from `shader_map.rs`'s own tests:
+    /// `the_data_cap_bites_one_byte_over`,
+    /// `a_grid_side_over_the_extent_cap_is_refused`, and
+    /// `a_buffer_that_does_not_match_its_grid_is_refused`.
+    #[test]
+    fn sdk_and_host_agree_on_the_boundary_shapes() {
+        with_shader_support(true, || {
+            // shader_map.rs `the_data_cap_bites_one_byte_over`: one byte over
+            // the byte cap is refused for its bytes, even though the shape
+            // and extent checks beneath it would also fire — bytes is the
+            // more basic fact and is checked first, on both sides.
+            let width = u32::try_from(MAX_SHADER_DATA_BYTES + 1).unwrap();
+            let over = vec![0u8; MAX_SHADER_DATA_BYTES + 1];
+            assert_eq!(
+                Shader::new("s", BODY)
+                    .data(ShaderData::R8, width, 1, over)
+                    .cap_refusal(),
+                Some(ShaderCapRefusal::DataTooLarge {
+                    bytes: MAX_SHADER_DATA_BYTES + 1
+                }),
+            );
+
+            // shader_map.rs `a_grid_side_over_the_extent_cap_is_refused`: the
+            // #977 issue input — 32 KiB of R8, a legal length for its grid,
+            // refused anyway.
+            let issue = vec![0u8; 32_768];
+            assert_eq!(
+                Shader::new("s", BODY)
+                    .data(ShaderData::R8, 32_768, 1, issue)
+                    .cap_refusal(),
+                Some(ShaderCapRefusal::GridTooLarge { size: (32_768, 1) }),
+            );
+
+            // shader_map.rs `a_buffer_that_does_not_match_its_grid_is_refused`:
+            // 2 Rgba8 texels claimed (8 bytes wanted), 4 given.
+            let four = vec![0u8; 4];
+            assert_eq!(
+                Shader::new("s", BODY)
+                    .data(ShaderData::Rgba8, 2, 1, four)
+                    .cap_refusal(),
+                Some(ShaderCapRefusal::MalformedData {
+                    len: 4,
+                    size: (2, 1),
+                    format: ShaderData::Rgba8,
+                }),
             );
         });
     }
@@ -410,28 +702,30 @@ mod tests {
         });
     }
 
-    /// The builder does **not** reshape a mismatched buffer — it hands the host
-    /// exactly what the plugin said, so the host's journal line names the
-    /// plugin's own numbers instead of a silently padded pair.
+    /// **The SDK refuses a mismatched buffer, and does not reshape or pad it**
+    /// (#1021, mirroring #1020's host-side `Refusal::MalformedData`):
+    /// [`ShaderCapRefusal::MalformedData`] names exactly what the plugin
+    /// gave — the buffer length and the grid it claimed — rather than a
+    /// guessed-at fix, on the same terms the host's own journal line does.
+    ///
+    /// **Falsified** by dropping the `data_len_ok` guard from
+    /// [`Shader::cap_refusal`], or by having [`Shader::data`] silently
+    /// pad/truncate the buffer to fit instead: the numbers asserted below
+    /// would then belong to a reshaped buffer, not the plugin's own.
     #[test]
-    fn a_mismatched_buffer_is_passed_through_not_reshaped() {
+    fn a_mismatched_buffer_is_refused_not_reshaped() {
         with_shader_support(true, || {
-            let node = Shader::new("s", BODY)
-                .data(ShaderData::Rgba8, 4, 4, vec![0; 3])
-                .node()
-                .expect("builds — the shape check is the host's");
-            match node {
-                Node::Shader {
-                    data,
-                    data_width,
-                    data_height,
-                    ..
-                } => {
-                    assert_eq!(data.len(), 3, "not padded to 64");
-                    assert_eq!((data_width, data_height), (4, 4), "not reshaped to fit");
-                }
-                other => panic!("built {other:?}"),
-            }
+            let shader = Shader::new("s", BODY).data(ShaderData::Rgba8, 4, 4, vec![0; 3]);
+            assert_eq!(
+                shader.cap_refusal(),
+                Some(ShaderCapRefusal::MalformedData {
+                    len: 3,
+                    size: (4, 4),
+                    format: ShaderData::Rgba8,
+                }),
+                "names the plugin's own numbers, not a padded/reshaped guess",
+            );
+            assert!(shader.node().is_none());
         });
     }
 }

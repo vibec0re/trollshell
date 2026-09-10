@@ -9,7 +9,7 @@ A Rust workspace with two layers:
 - **`hytte`** — a library-first toolkit for composing GTK4 + libadwaita + `gtk4-layer-shell` Wayland desktop shells. Split across `crates/hytte-*`.
 - **`trollshell`** — the personal shell binary built on `hytte`, targeting the **Niri** compositor.
 
-"Composable, not configurable": there is no config DSL. The shell is wired up in plain Rust in `trollshell/src/main.rs`. The canonical design is `docs/superpowers/specs/2026-04-24-hytte-trollshell-design.md`; most subsequent features have a design spec under `docs/superpowers/specs/` (the why) and a plan under `docs/superpowers/plans/` (the how), named by feature or version — the literal same-stem `<date>-<feature>` pairing doesn't hold for all of them. Consult these before changing a subsystem — they are the source of truth for intent.
+"Composable, not configurable": there is no config DSL. The shell is wired up in plain Rust in `trollshell/src/main.rs`. **Design lives in GitHub discussions, epics and issues** — a feature is specced on its thread (Annika, Discussion #1063, 2026-09-10), and a build issue links the epic or discussion it came from. `docs/superpowers/{specs,plans}/` is the **April 2026 archive** of the original design (`2026-04-24-hytte-trollshell-design.md`) and the early version specs; consult it for the intent of the subsystems that date from then, but do not add to it — a new design goes on a discussion or an epic, never into that folder.
 
 ## Build / run / test
 

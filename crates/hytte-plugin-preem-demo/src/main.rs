@@ -1476,7 +1476,7 @@ mod tests {
             let view = with_render_mode(mode, || m.view());
             let render = PluginMsg::Render {
                 tree: view.tree,
-                panel: view.panel,
+                panel: view.panel.map(Box::new),
                 hidden_on: view.hidden_on,
                 effects: Vec::new(),
             };

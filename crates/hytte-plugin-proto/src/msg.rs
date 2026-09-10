@@ -13,34 +13,15 @@ use crate::wire::{EventKind, Node, NodeId};
 use serde::{Deserialize, Serialize};
 
 /// Plugin → host frames.
-// `clippy::large_enum_variant`, tripped by #1050's 24-byte `hidden_on`:
-// `Render` is 336 bytes (`tree` 144 + `panel` 144 + `hidden_on` 24 + `effects`
-// 24) against `Register`'s 120, and the 216-byte gap just crosses the lint's
-// 200-byte default — it was 192 before this field.
-//
-// Allowed rather than boxed, because the lint's cost model does not apply to
-// this type. `PluginMsg` is a **per-frame envelope**: `codec::read_frame`
-// deserializes exactly one, the reader loop destructures it immediately, and
-// nothing in the workspace stores it — there is no `Vec<PluginMsg>`, no
-// `mpsc` channel of them, no queue (the only `Vec<PluginMsg>` anywhere is a
-// two-element golden-fixture table). So the "largest variant" cost is one
-// stack move per frame, not per-element bloat across a collection.
-//
-// The fix the lint suggests is nevertheless a real (small) improvement, and is
-// named here so it is a decision rather than an oversight: `panel:
-// Option<Node>` reserves a full `Node` (144 B) on **every** frame although most
-// plugins never render a panel, and `Option<Box<Node>>` would take `Render` to
-// 200 B and the gap to 80 — serializing identically (`Box` is transparent to
-// serde, so no fixture moves). It is not done here because it changes a field
-// #1050 is not about, across the SDK, the host and seven plugin crates' test
-// helpers — see the follow-up issue for that boxing.
-//
-// The `#[allow]` below sits on the whole enum rather than on `Render` (or its
-// `panel` field) alone, so it silences `large_enum_variant` for every variant
-// this enum ever gains, not only the one it is measured against today (#1068
-// review, LOW-4). Narrowing its scope is part of the same follow-up as the
-// boxing above, since both land on this declaration together.
-#[allow(clippy::large_enum_variant)]
+// #1068 measured `Render` at 336 bytes (`tree` 144 + `panel` 144 + `hidden_on`
+// 24 + `effects` 24) against `Register`'s 120 — a 216-byte gap, crossing
+// clippy's `large_enum_variant` 200-byte default — and allowed the lint rather
+// than boxing `panel` there, since that field touches the SDK, the host and
+// seven plugin crates' test helpers. #1073 does that boxing: `panel:
+// Option<Box<Node>>` takes `Render` to 200 bytes (measured), closing the gap
+// to 80 and putting the enum back under the lint's default with no `#[allow]`
+// needed. See [`Render::panel`](PluginMsg::Render::panel) for why the field
+// itself is boxed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PluginMsg {
     /// First frame after dialing in: self-identify. The host validates
@@ -59,8 +40,16 @@ pub enum PluginMsg {
         /// `#[serde(default, skip_serializing_if = "Option::is_none")]` keeps a
         /// panel-less frame byte-identical on the wire and `PROTO_VERSION`
         /// unchanged.
+        ///
+        /// Boxed (#1073, #1068 review LOW-4): a bare `Option<Node>` reserves a
+        /// full `Node` (144 B) on **every** `Render` frame although most
+        /// plugins never carry a panel, and once `hidden_on` (#1050) joined
+        /// `tree` + `panel` the variant crossed clippy's `large_enum_variant`
+        /// threshold. `Box` is transparent to serde — the wire bytes are
+        /// unchanged, only the in-memory frame shrinks — so this is a pure
+        /// size fix; do not unbox it back to `Option<Node>`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        panel: Option<Node>,
+        panel: Option<Box<Node>>,
         /// The **connector names** (`"DP-1"`, `"eDP-1"`, `"HDMI-A-2"` — niri's
         /// and Wayland's own output names) of the monitors this frame's card
         /// must **not** be shown on (#1050).

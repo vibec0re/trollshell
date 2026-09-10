@@ -317,7 +317,9 @@ where
         &mut wr,
         &PluginMsg::Render {
             tree: last_view.tree.clone(),
-            panel: last_view.panel.clone(),
+            // #1073: the wire frame boxes `panel`; the SDK's own `View.panel`
+            // stays a bare `Option<Node>` (a plugin author never sees the box).
+            panel: last_view.panel.clone().map(Box::new),
             // #1050: the seed frame carries the per-screen verdict too. A plugin
             // whose first view is already "nothing to show on DP-2" must not
             // flash a chip there for the interval until its next render.
@@ -548,7 +550,7 @@ where
             }
             let frame = PluginMsg::Render {
                 tree: view.tree.clone(),
-                panel: view.panel.clone(),
+                panel: view.panel.clone().map(Box::new),
                 // #1050. `changed` above is a whole-`View` compare, so a frame
                 // whose *only* difference is the hidden-on set still sends —
                 // which is the entire point: a plugin that goes from "shown on
@@ -1533,7 +1535,7 @@ mod tests {
                 value,
                 step,
                 ..
-            }) = panel
+            }) = panel.as_deref()
             else {
                 panic!("the seed panel must be a Slider")
             };
@@ -1669,7 +1671,7 @@ mod tests {
                 "seed chip tree",
             );
             assert!(
-                matches!(panel, Some(Node::Label { ref text, .. }) if text == "closed"),
+                matches!(panel.as_deref(), Some(Node::Label { text, .. }) if text == "closed"),
                 "seed render carries the initial panel",
             );
 
@@ -1692,7 +1694,7 @@ mod tests {
                 "the chip tree is unchanged across the panel flip",
             );
             assert!(
-                matches!(panel, Some(Node::Label { ref text, .. }) if text == "open"),
+                matches!(panel.as_deref(), Some(Node::Label { text, .. }) if text == "open"),
                 "the render reflects the new panel",
             );
 

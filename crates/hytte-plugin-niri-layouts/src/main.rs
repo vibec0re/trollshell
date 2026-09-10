@@ -107,7 +107,7 @@ mod plugin;
 mod watch;
 
 use cli::{BIN, Invocation, USAGE};
-use plugin::{NiriLayouts, apply_and_report};
+use plugin::{NiriLayouts, apply_from_cli};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -120,26 +120,17 @@ fn main() -> ExitCode {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
-        // The standalone hat. Same `apply` the chip's click worker runs, so a
-        // keybind and a click cannot drift.
-        Ok(Invocation::Apply(layout)) => {
-            // `None` for the output (#1050): a keybind has no screen to be
-            // clicked on, so this hat keeps targeting the focused output —
-            // exactly what it did before the per-screen round.
-            match apply_and_report(&mut niri::SocketTransport, layout, None) {
-                Some(plugin::Msg::Failed(error)) => {
-                    // niri's own text, verbatim — the CLI has no toast to put it in.
-                    eprintln!("{BIN}: {error}");
-                    ExitCode::FAILURE
-                }
-                // `None` is the success path. `Visibility` is unreachable —
-                // `apply_and_report` only ever reports a refusal, and the chip's
-                // visibility is the watcher's message, which this hat never
-                // starts — but it is spelled out rather than wildcarded so a
-                // third `Msg` variant has to be decided here too.
-                None | Some(plugin::Msg::Visibility(_)) => ExitCode::SUCCESS,
+        // The standalone hat. Same `apply` the chip's click worker runs (via
+        // `apply_from_cli`, which is where the "a keybind names no screen"
+        // decision lives and is tested), so a keybind and a click cannot drift.
+        Ok(Invocation::Apply(layout)) => match apply_from_cli(&mut niri::SocketTransport, layout) {
+            // niri's own text, verbatim — the CLI has no toast to put it in.
+            Some(error) => {
+                eprintln!("{BIN}: {error}");
+                ExitCode::FAILURE
             }
-        }
+            None => ExitCode::SUCCESS,
+        },
         Err(error) => {
             eprintln!("{BIN}: {error}\n\n{USAGE}");
             ExitCode::FAILURE

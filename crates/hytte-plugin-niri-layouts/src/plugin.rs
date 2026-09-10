@@ -236,6 +236,27 @@ pub(crate) fn apply_and_report(
     }
 }
 
+/// The standalone hat's whole apply: [`apply_and_report`] against the
+/// **focused** output, reduced to the one error line the CLI prints.
+///
+/// The `None` screen is a decision, not a placeholder: a keybind has no screen
+/// to have been clicked on, so #1050's per-screen targeting does not apply and
+/// this hat keeps the focused-output behaviour it has always had.
+///
+/// Split out of `main` so that decision has a test — `main` dials a real
+/// `$NIRI_SOCKET` and cannot be driven by the fake, so a `main` that started
+/// naming a screen would otherwise be caught by nothing (found by mutation).
+pub(crate) fn apply_from_cli(transport: &mut impl Transport, layout: Layout) -> Option<String> {
+    match apply_and_report(transport, layout, None) {
+        Some(Msg::Failed(error)) => Some(error),
+        // `Visibility` is unreachable — `apply_and_report` only ever reports a
+        // refusal, and the chip's visibility is the watcher's message, which
+        // this hat never starts — but it is spelled out rather than wildcarded
+        // so a third `Msg` variant has to be decided here too.
+        None | Some(Msg::Visibility(_)) => None,
+    }
+}
+
 /// The watcher thread's end of **this session's** message lane.
 ///
 /// Both halves of [`watch::Verdicts`] answer the same question — is the
@@ -417,8 +438,8 @@ impl Plugin for NiriLayouts {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cmd, Msg, NiriLayouts, VisibilityLane, apply_and_report, button_id, chip, hidden, icon_id,
-        layout_for_node,
+        Cmd, Msg, NiriLayouts, VisibilityLane, apply_and_report, apply_from_cli, button_id, chip,
+        hidden, icon_id, layout_for_node,
     };
     use crate::layout::Layout;
     use crate::niri::fake::{self, Fake};
@@ -986,6 +1007,47 @@ mod tests {
             vec![(30, 50.0), (40, 50.0), (50, 50.0)],
             "DP-2's three columns — the focused screen's two windows (10, 20) \
              are what a dropped `on_output` would have resized"
+        );
+    }
+
+    /// The CLI hat names **no** screen and so targets the focused output —
+    /// unchanged by #1050, and now pinned.
+    ///
+    /// The `FocusedOutput` assertion is the load-bearing half: DP-1 *is* the
+    /// focused output in the fixture, so a `main` that started hard-coding
+    /// `Some("DP-1")` would resize the very same windows and only the missing
+    /// round trip would give it away (`niri::apply` skips it for a named
+    /// screen). Found by mutation — `main` dials a real socket, so nothing
+    /// covered this line before it moved here.
+    #[test]
+    fn the_cli_hat_names_no_screen_and_lays_out_the_focused_one() {
+        let mut niri = Fake::two_outputs();
+
+        let error = apply_from_cli(&mut niri, Layout::Split);
+
+        assert_eq!(error, None, "the fake accepts every action");
+        assert_eq!(
+            niri.widths(),
+            vec![(10, 50.0), (20, 50.0)],
+            "DP-1's two columns, not DP-2's three"
+        );
+        assert!(
+            niri.queries().iter().any(|q| q == "FocusedOutput"),
+            "a keybind has no screen, so the focused one has to be asked for: \
+             {:?}",
+            niri.queries()
+        );
+    }
+
+    /// …and niri's refusal comes back as the line the CLI prints.
+    #[test]
+    fn the_cli_hat_hands_back_niris_own_error_text() {
+        let mut niri = Fake::two_outputs();
+        niri.action_error = Some("no such window".to_owned());
+
+        assert_eq!(
+            apply_from_cli(&mut niri, Layout::Equal),
+            Some("no such window".to_owned())
         );
     }
 

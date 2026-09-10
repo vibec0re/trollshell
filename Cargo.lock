@@ -1255,6 +1255,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hytte-plugin-niri-layouts"
+version = "0.1.0"
+dependencies = [
+ "hytte-plugin",
+ "niri-ipc",
+ "serde_json",
+]
+
+[[package]]
 name = "hytte-plugin-pet"
 version = "0.1.0"
 dependencies = [

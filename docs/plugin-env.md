@@ -97,7 +97,7 @@ anyone else's. Check these on a fresh install:
 
 ## Bundled plugins
 
-Sections below follow `bundledPluginNames`' order in `flake.nix` (12 total).
+Sections below follow `bundledPluginNames`' order in `flake.nix` (13 total).
 
 ### audio-widget (`hytte-plugin-audio-widget`)
 
@@ -152,6 +152,18 @@ which is the `hytte-plugin-infobroker` daemon binary). That CLI reads
 <name>` mints and prints as an `export` line for `eval`; `hytte-infobroker
 get` then requires it be set (`cli.rs`). This is CLI-side, per-invocation
 state, not a plugin-launch knob.
+
+### niri-layouts (`hytte-plugin-niri-layouts`)
+
+No runtime knobs — the three layouts and their proportions are compiled in
+(`layout.rs::Layout::proportions`), and the compositor is located through
+`$NIRI_SOCKET`, which niri sets for every process in the session (standard
+session path, not a per-plugin knob).
+
+The same binary doubles as a CLI — `hytte-plugin-niri-layouts apply <equal |
+golden | split>` applies one layout and exits — which is what a niri `spawn`
+bind invokes. That path takes its layout as an argument, not from the
+environment, so `plugins.niri-layouts.env` has nothing to set either way.
 
 ### pet (`hytte-plugin-pet`)
 

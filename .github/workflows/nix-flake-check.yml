@@ -13,6 +13,13 @@ concurrency:
 jobs:
   flake-check:
     runs-on: ubuntu-latest
+    # Bounded on purpose (#1011): three times now `nix flake check` has gone
+    # silent after its last derivation finished — every check green, then
+    # nothing — and the third time nobody cancelled it, so GitHub's default
+    # 360-minute limit did, six hours later, leaving main without a verdict
+    # for two days. The measured band for a full run is 35-52 min, so 90 is
+    # headroom, not a squeeze.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
@@ -24,5 +31,18 @@ jobs:
       # hermetic internals test suite via doCheck). No binary cache is wired up,
       # so the first cold build of the GTK/crane closure is slow — add a Cachix
       # or FlakeHub cache step here to speed CI up if it becomes a bottleneck.
-      - run: nix flake check -L
+      # `timeout` (rather than only `timeout-minutes`) so a hang fails the
+      # step from *inside* the job, where we can still print the process tree:
+      # the open question in #1011 is whether the survivor is nix itself or a
+      # VM-test child holding the log pipe, and only a listing taken during
+      # the hang can answer it. 75 min leaves the job-level bound as the
+      # backstop for everything else.
+      - run: |
+          timeout 75m nix flake check -L || rc=$?
+          if [ "${rc:-0}" = 124 ]; then
+            echo '::error::nix flake check did not exit within 75 min (#1011); process tree follows'
+            ps auxf
+            exit 1
+          fi
+          exit "${rc:-0}"
 

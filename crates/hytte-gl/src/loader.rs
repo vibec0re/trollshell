@@ -224,22 +224,29 @@ fn required_symbols_present() -> bool {
 /// Idempotent: the first call does the work and every later one replays its
 /// verdict, so a second `GtkGLArea` realizing does not re-`dlopen` anything.
 pub(crate) fn load() -> Result<(), Error> {
-    static LOADED: OnceLock<Result<(), String>> = OnceLock::new();
-    LOADED
-        .get_or_init(load_once)
-        .clone()
-        .map_err(|message| Error::Load { message })
+    static LOADED: OnceLock<Result<&'static str, String>> = OnceLock::new();
+    match LOADED.get_or_init(load_once) {
+        Ok(_) => Ok(()),
+        Err(message) => Err(Error::Load {
+            message: message.clone(),
+        }),
+    }
 }
 
 /// The body [`load`] memoizes: the three sources of the module header, in
 /// order, with every failure kept so the error names each path that was tried.
-fn load_once() -> Result<(), String> {
+///
+/// `Ok` carries [`Source::describe`] for the route that won — the same string
+/// the `debug` line reports, and what lets the tests below assert *which*
+/// source answered rather than only that one did. Idempotent, so a test may
+/// call it directly without going through [`load`]'s memo.
+fn load_once() -> Result<&'static str, String> {
     let mut attempts = Vec::new();
 
     match glvnd() {
         Ok(source) => {
-            if let Some(done) = install(source, &mut attempts) {
-                return done;
+            if let Some(won) = install(source, &mut attempts) {
+                return Ok(won);
             }
         }
         Err(why) => attempts.push(format!("{GLVND_EGL_SONAME}: {why}")),
@@ -248,8 +255,8 @@ fn load_once() -> Result<(), String> {
     for soname in EPOXY_SONAMES {
         match open(Some(soname)) {
             Ok(library) => {
-                if let Some(done) = install(Source::Epoxy(library), &mut attempts) {
-                    return done;
+                if let Some(won) = install(Source::Epoxy(library), &mut attempts) {
+                    return Ok(won);
                 }
             }
             Err(why) => attempts.push(format!("{soname}: {why}")),
@@ -258,8 +265,8 @@ fn load_once() -> Result<(), String> {
 
     match open(None) {
         Ok(library) => {
-            if let Some(done) = install(Source::Plain(library), &mut attempts) {
-                return done;
+            if let Some(won) = install(Source::Plain(library), &mut attempts) {
+                return Ok(won);
             }
         }
         Err(why) => attempts.push(format!("process image: {why}")),
@@ -271,14 +278,14 @@ fn load_once() -> Result<(), String> {
 /// Point [`gl::load_with`] at `source` and check the entry points this crate
 /// needs actually resolved.
 ///
-/// `Some(Ok(()))` when this source is the one; `None` when it resolved too
+/// `Some(description)` when this source is the one; `None` when it resolved too
 /// little and the caller should try the next, with the reason pushed onto
 /// `attempts`.
-fn install(source: Source, attempts: &mut Vec<String>) -> Option<Result<(), String>> {
+fn install(source: Source, attempts: &mut Vec<String>) -> Option<&'static str> {
     gl::load_with(|symbol| source.resolve(symbol));
     if required_symbols_present() {
         tracing::debug!(source = source.describe(), "GL entry points resolved");
-        Some(Ok(()))
+        Some(source.describe())
     } else {
         attempts.push(format!(
             "{}: loaded, but the GL 3.2-era entry points this crate needs are absent",
@@ -328,7 +335,9 @@ fn open(soname: Option<&str>) -> Result<&'static libloading::Library, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EPOXY_SONAMES, GLVND_EGL_SONAME, GetProcAddress, Source, open};
+    use super::{
+        EPOXY_SONAMES, GLVND_EGL_SONAME, GetProcAddress, Source, install, load_once, open,
+    };
 
     /// Map GTK's GL closure into this test binary.
     ///
@@ -344,26 +353,36 @@ mod tests {
     /// into this crate as shipped, and it resolves no new package
     /// (`gdk4-sys 0.11.2` is already in `Cargo.lock` under `gtk4`).
     fn map_gtk_gl_closure() {
-        let _forces_the_gtk_link = gdk4_sys::gdk_gl_context_get_type as *const ();
+        std::hint::black_box(gdk4_sys::gdk_gl_context_get_type as *const ());
     }
 
-    /// **#1067.** The loader must resolve a real entry point from each source
-    /// it claims to support. Needs no GL context, no display and no driver:
-    /// `dlopen` + `dlsym` is all of it, and it would have been red from the day
-    /// this crate landed — the shipped loader asked every source for the plain
-    /// Khronos spellings, which none of them export, so the preem GL renderer
-    /// fell back to the CPU kit on every machine for the whole life of #893
-    /// stage B.
+    /// **#1067.** The loader must resolve real entry points on this platform.
+    /// Needs no GL context, no display and no driver: `dlopen` + `dlsym` is all
+    /// of it, and it would have been red from the day this crate landed — the
+    /// shipped loader asked every source for the plain Khronos spellings, which
+    /// none of them export, so `Gl::current()` always failed and the preem GL
+    /// renderer fell back to the CPU kit on every machine for the whole life of
+    /// #893 stage B.
     ///
     /// `glGetString` is the name asked for throughout: it is GL 1.0, so every
     /// implementation of every profile carries it, and nothing here calls it.
     ///
-    /// **Falsified** by reverting either source to the plain-name lookup
-    /// (`Source::Plain`) — which is what `origin/main` does for all three — or
-    /// by dropping the extra deref on the epoxy path, which the `.data`
-    /// assertion below catches without segfaulting a test binary.
+    /// **One test function on purpose.** Sections 2 and 3 both drive
+    /// [`gl::load_with`], which writes the `gl` crate's **process-global**
+    /// entry-point table; cargo runs `#[test]`s on parallel threads, so as
+    /// separate functions they would race each other over that table. Ordering
+    /// them here also leaves the table holding the *working* glvnd pointers
+    /// when the test returns rather than section 2's deliberate nulls.
+    ///
+    /// **Falsified** four ways, each of which reddens a different assertion:
+    /// reverting [`Source::resolve`] to the plain-name lookup for every variant
+    /// (what `origin/main` does); dropping the extra deref on the epoxy path
+    /// (caught by the `.data` comparison, in a test that only reads pointers,
+    /// instead of by a SIGSEGV in a draw); dropping the
+    /// [`required_symbols_present`] gate out of [`install`] (section 2);
+    /// rewiring [`load_once`] to a different source order (section 3).
     #[test]
-    fn each_source_resolves_an_entry_point_it_carries() {
+    fn the_loader_resolves_entry_points_on_this_platform() {
         map_gtk_gl_closure();
 
         // ---- 1. glvnd -------------------------------------------------------
@@ -421,7 +440,7 @@ mod tests {
              address of the variable itself (libloading's Symbol<T> derefs to the dlsym address)",
         );
 
-        // ---- 3. plain names -------------------------------------------------
+        // ---- 1c. plain names ------------------------------------------------
         // The shipped bug, pinned as a fact about this platform rather than a
         // guess: libepoxy exports no unprefixed `gl*` at all, so the route the
         // loader used to take for *every* source finds nothing here.
@@ -429,6 +448,36 @@ mod tests {
             Source::Plain(epoxy).resolve("glGetString").is_null(),
             "libepoxy is documented here as exporting only epoxy_gl* variables; a non-null plain \
              glGetString would mean this platform changed and the module header is stale",
+        );
+
+        // ---- 2. the gate ----------------------------------------------------
+        // `required_symbols_present` is what turns a source that resolved *too
+        // little* into a fallthrough instead of a table of null pointers a draw
+        // would call into. `Source::Plain(epoxy)` is a source that answers null
+        // for everything (asserted just above), so installing it must be
+        // refused — and the refusal must name the source, since that string is
+        // the whole of the `Error::Load` message anyone triages from.
+        let mut attempts = Vec::new();
+        assert!(
+            install(Source::Plain(epoxy), &mut attempts).is_none(),
+            "a source that resolves nothing must be refused, not installed",
+        );
+        assert!(
+            attempts
+                .last()
+                .is_some_and(|why| why.starts_with(Source::Plain(epoxy).describe())),
+            "the refusal must name which source it was: {attempts:?}",
+        );
+
+        // ---- 3. the whole chain ---------------------------------------------
+        // End-to-end, and the assertion #1067 is actually about: the shipped
+        // order must resolve on this platform, and glvnd must be what answers.
+        // `load_once` is idempotent and deliberately called instead of `load`,
+        // so this does not consume (or depend on) the process-wide memo.
+        assert_eq!(
+            load_once().as_deref(),
+            Ok(Source::Glvnd(get_proc_address).describe()),
+            "the loader must resolve, and route 1 (glvnd) must be the source that wins here",
         );
     }
 }

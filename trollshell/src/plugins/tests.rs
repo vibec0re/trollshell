@@ -1297,12 +1297,12 @@ async fn panel_render_populates_panels_mailbox() {
                 classes: vec![],
                 tooltip: None,
             },
-            panel: Some(wire::Node::Label {
+            panel: Some(Box::new(wire::Node::Label {
                 id: Some("panel".into()),
                 text: "panel body".into(),
                 classes: vec![],
                 tooltip: None,
-            }),
+            })),
             effects: vec![],
             hidden_on: Vec::new(),
         },

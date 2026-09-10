@@ -851,7 +851,12 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                             order,
                             generation,
                             tree,
-                            panel,
+                            // #1073: the wire frame boxes `panel` (a per-frame
+                            // envelope size fix); `SlotRender` — parked in a
+                            // coalescing mailbox, not a per-frame value — keeps
+                            // its own unboxed `Option<Node>`, so unbox here at
+                            // the one place the wire is decoded.
+                            panel: panel.map(|p| *p),
                             hidden_on,
                             grants,
                             outbound: out_tx.clone(),

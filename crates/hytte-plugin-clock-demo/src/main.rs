@@ -262,7 +262,7 @@ mod tests {
         let view = model.view();
         let render = PluginMsg::Render {
             tree: view.tree,
-            panel: view.panel,
+            panel: view.panel.map(Box::new),
             hidden_on: view.hidden_on,
             effects: vec![Effect::OpenPage(Page::PowerMenu)],
         };

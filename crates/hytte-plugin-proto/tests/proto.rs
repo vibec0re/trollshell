@@ -204,7 +204,7 @@ fn plugin_msgs_round_trip() {
     // A panel-bearing render is in the standard round-trip set too (#349 PR2).
     round_trip_plugin(&PluginMsg::Render {
         tree: sample_tree(),
-        panel: Some(sample_tree()),
+        panel: Some(Box::new(sample_tree())),
         effects: sample_effects(),
         hidden_on: Vec::new(),
     });
@@ -1355,12 +1355,12 @@ fn render_with_panel_round_trips() {
     // survives the round-trip alongside its chip tree and effects.
     let msg = PluginMsg::Render {
         tree: sample_tree(),
-        panel: Some(Node::Label {
+        panel: Some(Box::new(Node::Label {
             id: Some("panel-lbl".into()),
             text: "panel body".into(),
             classes: vec![],
             tooltip: None,
-        }),
+        })),
         effects: vec![Effect::OpenPage(Page::PluginSelf)],
         hidden_on: Vec::new(),
     };

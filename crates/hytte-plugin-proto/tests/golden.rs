@@ -933,7 +933,7 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
             "plugin_render_v1",
             Box::new(PluginMsg::Render {
                 tree: node_tree(),
-                panel: Some(panel_tree()),
+                panel: Some(Box::new(panel_tree())),
                 effects: effect_table(),
                 hidden_on: Vec::new(),
             }),

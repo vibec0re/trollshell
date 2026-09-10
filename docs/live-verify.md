@@ -1749,6 +1749,14 @@ session.
     TROLLSHELL_CORE_LEDS_STYLE is deprecated; set `style` in /home/annika/.config/trollshell/core-leds.toml — it accepts one of vfd/lcd/oled/crt
     ```
 
+    The vocabulary in that line is the **file**'s, which matters for exactly
+    one knob: start with `TROLLSHELL_CORE_LEDS_ROWS=rect` instead and the line
+    must offer `0 or "rect" for the automatic rectangle, or a row count from 1
+to 64` — the `0` included, because the file takes it and this line is the
+    only place on disk that says so until nix renders a base file. (The
+    _unusable_-variable line below is the other way round: it must **not**
+    offer a `0`, since the variable never took one.)
+
     Then edit `color` in the file and save: the colour must change live
     **while `style` stays OLED**
     (the variable stays pinned across reloads) and the deprecation line must
@@ -1772,9 +1780,12 @@ session.
     `style = "crt` with the closing quote missing, i.e. bytes that are not
     TOML. The panel must keep rendering the **last good** skin, not snap back
     to the default, and the journal gets one warning per save (not one per
-    poll). Repair the file and save: the panel picks it up again. Note this is
-    _only_ about bytes that are not TOML; a file that parses with one unusable
-    value is a different case, two bullets down.
+    poll) — leave the file broken for a minute with `journalctl -f` open and
+    confirm the line does **not** come back every ~3 s. The same holds for the
+    per-key line two bullets down: one per save, whichever kind of mistake it
+    was. Repair the file and save: the panel picks it up again. Note this
+    bullet is _only_ about bytes that are not TOML; a file that parses with one
+    unusable value is a different case, two bullets down.
   - **Deleting the file gives the defaults back.** With a working
     `core-leds.toml` applied, `rm` it. Within ~3 s the panel must return to the
     built-in look (VFD, heat, automatic rectangle, spare fill) — a delete is an
@@ -1802,10 +1813,13 @@ session.
 
     Not a whole-file failure that drops the panel to stock VFD with `style`
     silently gone. The same holds for `rows = 65`, `rows = true`, `rows = 4.0`,
-    `color = "puce"` — anything a known key holds that no parser takes. What is
-    still whole-file is a file that is not TOML _at all_ (an unterminated
-    string, or an integer too big for TOML's i64 like
-    `rows = 9223372036854775808`) — the "caught mid-edit" bullet above.
+    `color = "puce"` — anything a known key holds that no parser takes — and,
+    since #1040 T1, for a value of the wrong **type** on any key too: try
+    `style = 5` or `color = 0xff0000` (a hex colour _is_ a number, after all)
+    beside a good key and expect the same one line naming the one key, quoting
+    the value as TOML holds it. What is still whole-file is a file that is not
+    TOML _at all_ (an unterminated string, or an integer too big for TOML's i64
+    like `rows = 9223372036854775808`) — the "caught mid-edit" bullet above.
 
   - **The base layer.** Nix does not render a base file yet (out of #869's
     lane). To exercise the layer by hand, put a `core-leds.toml` under a

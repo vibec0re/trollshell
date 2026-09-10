@@ -35,7 +35,10 @@
 //! Every key is judged on its own in [`CoreLedsConfig::parsed`]: the keys that
 //! parse apply, each key that does not falls back to the built-in default with
 //! one warning naming it, and [`CoreLedsConfig::validate`] is `Infallible` so
-//! nothing in this schema can be a whole-file rejection (#1040 V1). What is
+//! nothing in this schema can be a whole-file rejection (#1040 V1). A wrong
+//! TOML **type** is the same kind of mistake and gets the same treatment —
+//! `style = 5` costs `style` and nothing else — which is why every schema
+//! field is a raw [`toml::Value`] and not even a `String` (#1040 T1). What is
 //! still whole-file is a layer that is not TOML **at all** — an unterminated
 //! string, an integer literal too large for TOML's `i64` — which at startup
 //! degrades to the built-in defaults with a loud `error!` and on a reload
@@ -44,7 +47,7 @@
 //! # Two spellings, one parser
 //!
 //! The file's values are spelt exactly as the environment variables accepted
-//! them — `rows` included, since [`Rows`] takes the word `"rect"` as readily as
+//! them — `rows` included, since the key takes the word `"rect"` as readily as
 //! the variable did. It additionally takes the TOML integer `0` for the same
 //! automatic rectangle, which is what [`CoreLedsConfig::DEFAULT_TOML`] states,
 //! and [`rows_spelling`] maps that back onto the variable's vocabulary so
@@ -213,43 +216,39 @@ fn parse_core_leds_fill(raw: &str) -> Result<Fill, &str> {
     }
 }
 
-/// The file's `rows` value in the environment variable's vocabulary: the
-/// integer `0` (and, through `#[serde(default)]`, an absent key) is `rect`,
-/// and a string is the variable's own spelling already.
+/// The raw spelling one key is judged in: a TOML string's own contents, and
+/// for **every other TOML type** its rendering — `5`, `true`, `4.0`, `[1]`.
+///
+/// This is the half of #1040 T1 that turns a wrong *type* into a per-key
+/// rejection instead of a whole-file one. Every field of [`CoreLedsConfig`] is
+/// a raw [`toml::Value`], so serde accepts whatever shape the file holds and
+/// the verdict lands here; a rendering no parser takes comes back as an
+/// [`InvalidValue`] naming the key and quoting the value, which is exactly the
+/// treatment `style = "plasma"` gets. Nothing about a value's type is
+/// special-cased, because to this schema nothing about it is special: a
+/// spelling either parses or it does not.
+fn spelling(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(text) => text.clone(),
+        // `toml::Value`'s `Display` *is* its TOML rendering, which is the whole
+        // reason the schema keeps values rather than strings: the diagnostic
+        // quotes back the bytes the reader is about to open.
+        other => other.to_string(),
+    }
+}
+
+/// [`spelling`] for `rows`, the one key whose file vocabulary has a word the
+/// variable's does not: the TOML integer `0` (and, through
+/// `#[serde(default)]`, an absent key) is `rect`.
 ///
 /// This is the *whole* translation between the two spellings, and it exists so
 /// [`parse_core_leds_rows`] stays the single judge of a row count. A negative
 /// integer renders as `-3` and is rejected by that parser, naming the value the
-/// user actually wrote.
-fn rows_spelling(rows: &Rows) -> String {
+/// user actually wrote; so does `true`, `4.0` or `[1]`, through [`spelling`].
+fn rows_spelling(rows: &toml::Value) -> String {
     match rows {
-        Rows::Count(0) => "rect".to_string(),
-        Rows::Count(n) => n.to_string(),
-        Rows::Word(word) => word.clone(),
-        // A value of neither TOML type — `rows = true`, `rows = 4.0`. Rendered
-        // as the TOML it is and handed to the same judge, which rejects it and
-        // names it; see [`Rows::Other`].
-        Rows::Other(value) => value.to_string(),
-    }
-}
-
-/// The same value **as the user wrote it in TOML**, for a diagnostic: an
-/// integer bare, a string quoted (#1040 F11).
-///
-/// [`InvalidValue`] is only ever built on the file path, so quoting is a
-/// straight improvement there — `style = "plasma"` is what the user has in
-/// front of them, `style = plasma` is not TOML at all. The environment path
-/// never produces one: an unusable variable gets
-/// [`crate::config::warn_unusable_env`], which quotes with backticks because a
-/// shell variable is not TOML either.
-fn rows_as_written(rows: &Rows) -> String {
-    match rows {
-        Rows::Count(n) => n.to_string(),
-        Rows::Word(word) => format!("{word:?}"),
-        // `toml::Value`'s `Display` *is* its TOML rendering — `true`, `4.0`,
-        // `[1]` — which is the whole reason the catch-all carries a
-        // `toml::Value` rather than a `serde::de::IgnoredAny`.
-        Rows::Other(value) => value.to_string(),
+        toml::Value::Integer(0) => "rect".to_string(),
+        other => spelling(other),
     }
 }
 
@@ -350,71 +349,53 @@ impl std::fmt::Display for InvalidValue {
 
 /// `core-leds.toml`, as written.
 ///
-/// Every key is the raw spelling rather than the parsed value, because
-/// [`Subsystem::validate`] has to be able to *report* an unrecognised one — a
-/// `DisplayStyle` field with a custom `Deserialize` would fail the whole load
-/// with serde's message instead, and #868's rule is that a known key with an
-/// unusable value is named, not guessed at.
+/// # Every field is a raw [`toml::Value`], and that is the template rule
+///
+/// Not the parsed value, and not even a `String`: whatever type a schema field
+/// has, **serde judges the value against it before any subsystem code runs,
+/// and serde's verdict is whole-file**. `subsystem::assemble` maps a type
+/// mismatch onto [`ConfigError::Schema`], which discards every other key in
+/// the file with it — the exact failure #1040 V1 was filed about, one layer
+/// further down.
+///
+/// A `String` field is *not* enough to escape that, which is what #1040 T1
+/// measured: `style = 5` beside a perfectly good `color = "rainbow"` failed
+/// the whole file with `invalid type: integer 5, expected a string`, and the
+/// panel dropped to built-in defaults with a line that named no key at all.
+/// `toml::Value` is the only field type that can hold every shape a TOML file
+/// can put there, so it is the only one that leaves serde with nothing to
+/// reject — after which [`Self::parsed`] is genuinely the single judge, and a
+/// wrong *type* is a per-key rejection quoting the value exactly like a wrong
+/// *value* (`a_wrong_typed_value_is_a_per_key_rejection_too`).
+///
+/// The residual whole-file cases are then exactly the ones where the file is
+/// **not TOML**: an unterminated string, and an integer literal too large for
+/// TOML's `i64` (`rows = 9223372036854775808`, a [`ConfigError::Parse`] from
+/// the TOML lexer). Neither ever reaches serde, let alone this type; both are
+/// tested (`a_file_that_is_not_toml_is_still_a_whole_file_error`).
+///
+/// So the rule a family-#2 author copies is one line — **type every schema
+/// field `toml::Value` and judge it in `parsed()`** — and "raw" in that
+/// sentence means `toml::Value`, not `String`. The cost is that the field type
+/// no longer documents the key's shape; the documentation of a key's shape is
+/// [`Self::DEFAULT_TOML`] and the [`Knob`] vocabulary, both of which the user
+/// actually reads, and neither of which a whole-file failure can be built out
+/// of.
 ///
 /// `#[serde(default)]` is on the **container**, so a key erased by an
 /// `_unset = ["style"]` marker in the overlay falls back to this type's
-/// documented default rather than to `String::default()` (which is `""`, a
-/// value no parser accepts). There is deliberately no `deny_unknown_fields`:
-/// merge rule 4 says an unknown key warns and is ignored, and
-/// [`subsystem::assemble`] is what implements that.
-// No `Eq`: [`Rows::Other`] carries a `toml::Value`, which can hold a float.
+/// documented default rather than to `toml::Value`'s own (which has none: it
+/// is the container default that makes the field optional at all). There is
+/// deliberately no `deny_unknown_fields`: merge rule 4 says an unknown key
+/// warns and is ignored, and [`subsystem::assemble`] is what implements that.
+// No `Eq`: a `toml::Value` can hold a float.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct CoreLedsConfig {
-    style: String,
-    color: String,
-    rows: Rows,
-    fill: String,
-}
-
-/// The TOML spellings the `rows` key accepts — **and every other one**, so
-/// that no `rows` value can take the file down with it.
-///
-/// `#[serde(untagged)]`, so `rows = 0` **and** `rows = "rect"` both
-/// deserialize and both reach [`parse_core_leds_rows`], which stays the single
-/// judge. That is not a convenience: `rect` is the word the deprecated
-/// `TROLLSHELL_CORE_LEDS_ROWS` accepted and the word the deprecation line walks
-/// a migrating user toward, so a file that rejected it broke #869's own
-/// contract.
-///
-/// # Why there is a catch-all variant
-///
-/// Every *other* key here is a `String`, so serde accepts whatever the user
-/// wrote and [`CoreLedsConfig::parsed`] judges it per key. `rows` is the one
-/// key with a non-string schema, and without [`Self::Other`] serde would
-/// decide its fate first: `rows = true`, `rows = 4.0`, `rows = [1]` all failed
-/// as a **whole-file** `ConfigError::Schema` before the subsystem saw a byte,
-/// taking every other key in the file down with the typo (#1040 V9). A
-/// catch-all restores the invariant the pilot is meant to demonstrate — *a bad
-/// value costs its own key and nothing else* — and it costs one variant.
-///
-/// The residual whole-file cases are now exactly the ones where the file is
-/// **not TOML**: an unterminated string, and an integer literal too large for
-/// TOML's `i64` (`rows = 9223372036854775808`, a `ConfigError::Parse` from the
-/// TOML lexer). Neither ever reaches serde, let alone this type; both are
-/// tested (`a_file_that_is_not_toml_is_still_a_whole_file_error`).
-///
-/// A family-#2 author copying this needs the rule, not the enum: **a schema
-/// field whose type is narrower than "any TOML scalar" hands its verdict to
-/// serde, and serde's verdict is whole-file.** Keep fields raw, or give them a
-/// catch-all.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
-pub enum Rows {
-    /// A TOML integer: `0` is the automatic rectangle, anything else is a row
-    /// count for [`parse_core_leds_rows`] to judge.
-    Count(i64),
-    /// A TOML string: the environment variable's own vocabulary, handed to
-    /// [`parse_core_leds_rows`] untouched.
-    Word(String),
-    /// Anything else the file said — kept as the TOML it was so the diagnostic
-    /// can quote it back, then rejected per key like any other bad value.
-    Other(toml::Value),
+    style: toml::Value,
+    color: toml::Value,
+    rows: toml::Value,
+    fill: toml::Value,
 }
 
 impl Default for CoreLedsConfig {
@@ -428,10 +409,10 @@ impl Default for CoreLedsConfig {
     /// itself stops parsing.
     fn default() -> Self {
         Self {
-            style: DisplayStyle::Vfd.name().to_string(),
-            color: ColorMap::Heat.name().to_string(),
-            rows: Rows::Count(0),
-            fill: "spare".to_string(),
+            style: DisplayStyle::Vfd.name().into(),
+            color: ColorMap::Heat.name().into(),
+            rows: toml::Value::Integer(0),
+            fill: "spare".into(),
         }
     }
 }
@@ -470,10 +451,11 @@ impl CoreLedsConfig {
     /// [`crate::config::rejected_value_message`] says in as many words.
     ///
     /// This is also the template half a family #2 copies, and the rule is
-    /// short: **keep every schema field raw and judge it here.** A field typed
-    /// as the parsed value hands its verdict to serde, and serde's verdict is
-    /// whole-file (see [`Rows::Other`] for the one key that needed a catch-all
-    /// to get out of that).
+    /// short: **type every schema field `toml::Value` and judge it here.** A
+    /// field typed as anything narrower — the parsed value, or even a
+    /// `String` — hands its verdict to serde for every value of the wrong
+    /// *type*, and serde's verdict is whole-file (#1040 T1; see
+    /// [`CoreLedsConfig`]'s own doc for the measurement).
     fn parsed(&self) -> (CoreLeds, Vec<InvalidValue>) {
         /// Take the parsed value, or record why it was rejected and take the
         /// built-in default for that key. A free `fn` rather than a closure
@@ -494,30 +476,40 @@ impl CoreLedsConfig {
 
         let mut rejected = Vec::new();
         let fallback = CoreLeds::default();
-        let rows = rows_spelling(&self.rows);
+        // The spelling each key is judged in. Every key is its raw value's
+        // ([`spelling`]); `rows` is the pilot's one translation point, where
+        // the TOML integer `0` becomes the variable's word `rect` (#1040 V4).
+        let (style, color, rows, fill) = (
+            spelling(&self.style),
+            spelling(&self.color),
+            rows_spelling(&self.rows),
+            spelling(&self.fill),
+        );
+        // Every rejection quotes `self.<key>` — the raw `toml::Value` — rather
+        // than the spelling the parser was handed: `rows = 0` is spelt `rect`
+        // going in, and echoing `rect` back at a user who wrote something else
+        // would name a value that is nowhere in their file. It is also what
+        // makes a wrong *type* read like any other bad value (#1040 T1):
+        // `style = 5` is reported as `style = 5`, not as a serde message about
+        // an integer where a string was expected.
         let leds = CoreLeds {
             style: keep(
-                parse_core_leds_style(&self.style).map_err(|bad| InvalidValue::of(&STYLE, bad)),
+                parse_core_leds_style(&style).map_err(|_| InvalidValue::of(&STYLE, &self.style)),
                 fallback.style,
                 &mut rejected,
             ),
             color: keep(
-                parse_core_leds_color(&self.color).map_err(|bad| InvalidValue::of(&COLOR, bad)),
+                parse_core_leds_color(&color).map_err(|_| InvalidValue::of(&COLOR, &self.color)),
                 fallback.color,
                 &mut rejected,
             ),
-            // The offending value is reported in the spelling the *file* uses,
-            // not the one the parser was handed: `rows = 0` is spelt `rect`
-            // going in, and echoing `rect` back at a user who wrote something
-            // else would name a value that is nowhere in their file.
             rows: keep(
-                parse_core_leds_rows(&rows)
-                    .map_err(|_| InvalidValue::written(&ROWS, &rows_as_written(&self.rows))),
+                parse_core_leds_rows(&rows).map_err(|_| InvalidValue::of(&ROWS, &self.rows)),
                 fallback.rows,
                 &mut rejected,
             ),
             fill: keep(
-                parse_core_leds_fill(&self.fill).map_err(|bad| InvalidValue::of(&FILL, bad)),
+                parse_core_leds_fill(&fill).map_err(|_| InvalidValue::of(&FILL, &self.fill)),
                 fallback.fill,
                 &mut rejected,
             ),
@@ -527,14 +519,28 @@ impl CoreLedsConfig {
 }
 
 impl InvalidValue {
-    /// The offending value of a **string** key, rendered as the quoted TOML
-    /// the user wrote.
-    fn of(knob: &Knob, value: &str) -> Self {
-        Self::written(knob, &format!("{value:?}"))
+    /// The offending value **as the user wrote it in TOML**: a string quoted,
+    /// an integer bare, a float/boolean/array/table exactly as TOML spells it
+    /// (#1040 F11/T1).
+    ///
+    /// One constructor for every key and every TOML type, because
+    /// `toml::Value`'s `Display` *is* the TOML rendering — so the line quotes
+    /// back what the file holds, whether the mistake was a wrong word
+    /// (`style = "plasma"`) or a wrong type (`style = 5`). It is the
+    /// **canonical** rendering rather than the source bytes, which shows on
+    /// two shapes: a hex integer comes back decimal (`0xff0000` → `16711680`)
+    /// and a date comes back quoted. Both are pinned in
+    /// `a_wrong_typed_value_is_a_per_key_rejection_too`. The environment path
+    /// never produces an [`InvalidValue`] at all: an unusable
+    /// variable gets [`crate::config::warn_unusable_env`], which quotes with
+    /// backticks because a shell variable is not TOML either.
+    fn of(knob: &Knob, value: &toml::Value) -> Self {
+        Self::written(knob, &value.to_string())
     }
 
-    /// The offending value already rendered as TOML — for `rows`, whose two
-    /// spellings quote differently ([`rows_as_written`]).
+    /// The offending value already rendered as TOML — the form a test states
+    /// as a literal, so the rendering itself is pinned rather than compared
+    /// against another call to [`Self::of`].
     fn written(knob: &Knob, value: &str) -> Self {
         Self {
             key: knob.key,
@@ -611,6 +617,37 @@ fill = "spare"
     /// is nothing the type system did not already catch"). A family #2 whose
     /// keys really do constrain each other should use a real error here; one
     /// whose keys are independent should copy this.
+    ///
+    /// # How a family #2 states a **cross-key** rule (#1040 T4)
+    ///
+    /// `Infallible` here is this subsystem's choice, not the template's: a
+    /// whole-file rejection is still available to any subsystem that needs
+    /// one, because `Subsystem::Error` is per-impl and `subsystem::assemble`
+    /// calls `validate()` unconditionally.
+    ///
+    /// The composition is the part worth writing down, because it looks like
+    /// it needs a second parser and does not. `validate(&self)` sees the
+    /// **raw** config while [`CoreLedsConfig::parsed`] produces the resolved
+    /// values — but `parsed` takes `&self`, so a cross-key rule is stated over
+    /// resolved values by calling it:
+    ///
+    /// ```text
+    /// type Error = MyError;
+    /// fn validate(&self) -> Result<(), MyError> {
+    ///     let (resolved, _rejected) = self.parsed();
+    ///     // …the cross-key rule, over resolved values: e.g. reject a
+    ///     // `min` above a `max`, which no single key can be judged on…
+    /// }
+    /// ```
+    ///
+    /// One parser still, and the per-key warnings still come out exactly once,
+    /// because they are emitted in [`load_layer`] rather than in `parsed` —
+    /// which is why `parsed` returns its rejections instead of logging them.
+    /// The `_rejected` half is deliberately available there too: a cross-key
+    /// rule that would be evaluated over a key that fell back to its built-in
+    /// default can say so rather than pretending the user asked for the
+    /// default. Weigh the whole-file cost before reaching for this: it reverts
+    /// every *other* key in the file, which is what V1 was filed about.
     type Error = std::convert::Infallible;
 
     /// See [`Self::Error`]: every value is judged per key in
@@ -801,7 +838,9 @@ fn stamps_of(paths: &[PathBuf]) -> Vec<Option<(SystemTime, u64)>> {
 /// The `Err` here is a file that is not usable **as a file**: not TOML, or a
 /// layer that exists and cannot be read. A known key holding a value nothing
 /// accepts is *not* one of those (#1040 V1) — it costs its own key, warns, and
-/// the rest of the file loads.
+/// the rest of the file loads. Neither is a known key holding a value of the
+/// wrong TOML *type* (#1040 T1): every schema field is a raw `toml::Value`, so
+/// there is no type for serde to reject.
 fn load_layer(paths: &[PathBuf]) -> Result<CoreLeds, ConfigError> {
     let loaded = subsystem::load_from::<CoreLedsConfig>(paths)?;
     let (leds, rejected) = loaded.config.parsed();
@@ -1082,7 +1121,7 @@ pub fn signal() -> impl Signal<Item = CoreLeds> {
 mod tests {
     use super::{
         COLOR, CONFIG_POLL_INTERVAL, CoreLeds, CoreLedsConfig, CoreLedsService, Deprecations, FILL,
-        InvalidValue, MAX_ROWS, Mutable, ROWS, Rows, STYLE, Service, Watcher, boot, initial_load,
+        InvalidValue, MAX_ROWS, Mutable, ROWS, STYLE, Service, Watcher, boot, initial_load,
         parse_core_leds_color, parse_core_leds_fill, parse_core_leds_rows, parse_core_leds_style,
         parse_hex_rgb, resolve, rows_spelling, watch,
     };
@@ -1220,7 +1259,7 @@ mod tests {
         assert_eq!(parse_core_leds_style("plasma"), Err("plasma"));
         assert_eq!(
             rejections(&with_style("plasma")),
-            [InvalidValue::of(&STYLE, "plasma")]
+            [InvalidValue::written(&STYLE, "\"plasma\"")]
         );
 
         assert_eq!(parse_core_leds_color("puce"), Err("puce"));
@@ -1229,14 +1268,14 @@ mod tests {
         assert_eq!(parse_core_leds_color("rgb"), Err("rgb"));
         assert_eq!(
             rejections(&with(|c| c.color = "puce".into())),
-            [InvalidValue::of(&COLOR, "puce")]
+            [InvalidValue::written(&COLOR, "\"puce\"")]
         );
 
         assert_eq!(parse_core_leds_rows("0"), Err("0"), "0 rows is a typo");
         assert_eq!(parse_core_leds_rows("-2"), Err("-2"));
         assert_eq!(parse_core_leds_rows("many"), Err("many"));
         assert_eq!(
-            rejections(&with(|c| c.rows = Rows::Count(-2))),
+            rejections(&with(|c| c.rows = toml::Value::Integer(-2))),
             [InvalidValue::written(&ROWS, "-2")],
             "a negative row count is rejected in the integer spelling too"
         );
@@ -1244,7 +1283,7 @@ mod tests {
         assert_eq!(parse_core_leds_fill("none"), Err("none"));
         assert_eq!(
             rejections(&with(|c| c.fill = "none".into())),
-            [InvalidValue::of(&FILL, "none")]
+            [InvalidValue::written(&FILL, "\"none\"")]
         );
     }
 
@@ -1270,7 +1309,7 @@ mod tests {
             Ok(Some(MAX_ROWS))
         );
         assert_eq!(
-            applied(&with(|c| c.rows = Rows::Count(cap))).rows,
+            applied(&with(|c| c.rows = toml::Value::Integer(cap))).rows,
             Some(MAX_ROWS)
         );
 
@@ -1279,7 +1318,7 @@ mod tests {
         let over = MAX_ROWS + 1;
         assert_eq!(parse_core_leds_rows(&over.to_string()), Err("65"));
         assert_eq!(
-            rejections(&with(|c| c.rows = Rows::Count(cap + 1))),
+            rejections(&with(|c| c.rows = toml::Value::Integer(cap + 1))),
             [InvalidValue::written(&ROWS, "65")]
         );
 
@@ -1289,19 +1328,19 @@ mod tests {
             assert_eq!(parse_core_leds_rows(absurd), Err(absurd), "{absurd} rows");
         }
         assert_eq!(
-            rejections(&with(|c| c.rows = Rows::Count(i64::MAX))),
+            rejections(&with(|c| c.rows = toml::Value::Integer(i64::MAX))),
             [InvalidValue::written(&ROWS, "9223372036854775807")]
         );
     }
 
     /// The rejection line a bad file value produces, **as a literal**.
     ///
-    /// Every other assertion about [`InvalidValue`] compares one
-    /// `InvalidValue::of` against another, which is the same green-and-blind
-    /// shape #1040 F4 caught in `deprecations()`: it cannot see the value being
-    /// rendered as `style = plasma` (not TOML) instead of `style = "plasma"`
-    /// (what is actually in the file), and it cannot see the vocabulary being
-    /// reworded out from under the sentence it has to read inside.
+    /// Every other assertion about [`InvalidValue`] states the *rendering* as a
+    /// literal but reads the vocabulary out of the [`Knob`]; only this one
+    /// spells the whole sentence out. Without it the wording would be asserted
+    /// against itself — the green-and-blind shape #1040 F4 caught in
+    /// `deprecations()` — and nothing would see the vocabulary reworded out
+    /// from under the sentence it has to read inside.
     ///
     /// **Red if the value stops being quoted as the TOML it was written as**,
     /// if the integer arm starts quoting, or if the sentence is reworded.
@@ -1313,13 +1352,13 @@ mod tests {
             "a string key's value is quoted — `style = plasma` is not TOML at all"
         );
         assert_eq!(
-            only_rejection(&with(|c| c.rows = Rows::Count(-2))).to_string(),
+            only_rejection(&with(|c| c.rows = toml::Value::Integer(-2))).to_string(),
             "rows = -2 is not valid; expected 0 or \"rect\" for the \
              automatic rectangle, or a row count from 1 to 64",
             "…while an integer key's is bare"
         );
         assert_eq!(
-            only_rejection(&with(|c| c.rows = Rows::Word("many".into()))).to_string(),
+            only_rejection(&with(|c| c.rows = toml::Value::String("many".into()))).to_string(),
             "rows = \"many\" is not valid; expected 0 or \"rect\" for the \
              automatic rectangle, or a row count from 1 to 64",
             "…and `rows`' string arm quotes, because that is what the file says"
@@ -1404,6 +1443,56 @@ mod tests {
         );
     }
 
+    /// …and the **deprecation** line carries the *file* vocabulary, which is
+    /// the other half of that split (#1040 T3).
+    ///
+    /// The test above covers the line an *unusable* variable produces. Nothing
+    /// covered the line a **usable** one produces: swapping
+    /// `knob.file_accepts` for `knob.env_accepts` at `env_key`'s announcing
+    /// call site left the suite green at 585 (mutation R12), because no capture
+    /// test set `TROLLSHELL_CORE_LEDS_ROWS` to a valid value — the other three
+    /// knobs are [`Knob::same`], so for them the swap is a no-op.
+    ///
+    /// What it silently drops is the `0` spelling, from the one line on disk
+    /// that teaches it: `DEFAULT_TOML` exists nowhere until nix renders a base
+    /// file, so the deprecation line — which is *about* the file — is where a
+    /// migrating user learns what the file takes. Measured, with
+    /// `TROLLSHELL_CORE_LEDS_ROWS=rect`:
+    ///
+    /// ```text
+    /// now:  … it accepts 0 or "rect" for the automatic rectangle, or a row count from 1 to 64
+    /// R12:  … it accepts rect for the automatic rectangle, or a row count from 1 to 64
+    /// ```
+    ///
+    /// **Red if the announcing call site takes the variable's vocabulary.**
+    #[test]
+    fn the_deprecation_line_teaches_the_file_spelling() {
+        let (captured, _guard) = capture();
+        let resolved = resolve(
+            CoreLeds::default(),
+            &env(&[("TROLLSHELL_CORE_LEDS_ROWS", "rect")]),
+            Deprecations::Announce,
+        );
+        assert_eq!(resolved.rows, None, "live control: the variable was read");
+
+        let line = warnings(&captured)
+            .into_iter()
+            .find(|w| w.starts_with("TROLLSHELL_CORE_LEDS_ROWS is deprecated"))
+            .expect("the deprecation line for rows");
+
+        // The `0` spelling, stated as the literal the file accepts — not
+        // `ROWS.file_accepts`, which would assert the constant against itself
+        // through the code path (the shape that made R12 green).
+        assert!(line.contains("0 or \"rect\""), "{line}");
+        assert!(
+            line.ends_with(
+                "— it accepts 0 or \"rect\" for the automatic rectangle, \
+                 or a row count from 1 to 64"
+            ),
+            "the whole vocabulary, verbatim: {line}"
+        );
+    }
+
     /// `rows = 0` is the file's spelling of the variable's `rect`, and the
     /// translation is the *only* difference between the two vocabularies.
     ///
@@ -1412,32 +1501,35 @@ mod tests {
     /// `the_documented_default_is_the_built_in_one` would go red with it.
     #[test]
     fn zero_rows_is_the_files_spelling_of_rect() {
-        assert_eq!(rows_spelling(&Rows::Count(0)), "rect");
-        assert_eq!(rows_spelling(&Rows::Count(4)), "4");
-        assert_eq!(rows_spelling(&Rows::Count(-2)), "-2");
-        assert_eq!(rows_spelling(&Rows::Word("rect".into())), "rect");
+        assert_eq!(rows_spelling(&toml::Value::Integer(0)), "rect");
+        assert_eq!(rows_spelling(&toml::Value::Integer(4)), "4");
+        assert_eq!(rows_spelling(&toml::Value::Integer(-2)), "-2");
+        assert_eq!(rows_spelling(&toml::Value::String("rect".into())), "rect");
 
         assert_eq!(
-            applied(&with(|c| c.rows = Rows::Count(0))).rows,
+            applied(&with(|c| c.rows = toml::Value::Integer(0))).rows,
             None,
             "0 is the automatic rectangle"
         );
-        assert_eq!(applied(&with(|c| c.rows = Rows::Count(3))).rows, Some(3));
+        assert_eq!(
+            applied(&with(|c| c.rows = toml::Value::Integer(3))).rows,
+            Some(3)
+        );
     }
 
     /// **`rows = "rect"` works in the file** — the word the deprecated variable
     /// took, and the word the deprecation line walks a migrating user toward
     /// (#1040 F5).
     ///
-    /// Before the untagged [`Rows`], it was a `ConfigError::Schema`: a
+    /// While `rows` was typed `i64`, it was a `ConfigError::Schema`: a
     /// **whole-file** failure that discarded every other key in the file and
     /// dropped the panel to built-in defaults over the most likely migration
-    /// typo there is. `rows = "4"` follows for free — the string arm is handed
+    /// typo there is. `rows = "4"` follows for free — a TOML string is handed
     /// straight to the same single judge — and a word the judge does not know
     /// comes back as a named per-key error rather than a serde message.
     ///
-    /// **Red if the `Word` arm is dropped**, or if `rows_spelling` stops
-    /// handing a string through untouched.
+    /// **Red if `rows` stops being a raw `toml::Value`**, or if [`spelling`]
+    /// stops handing a string's own contents through untouched.
     #[test]
     fn the_word_rect_is_a_file_spelling_too() {
         let rect = subsystem::assemble::<CoreLedsConfig>(&[(
@@ -1454,12 +1546,12 @@ mod tests {
         );
 
         assert_eq!(
-            applied(&with(|c| c.rows = Rows::Word("4".into()))).rows,
+            applied(&with(|c| c.rows = toml::Value::String("4".into()))).rows,
             Some(4),
             "the string arm goes through the same single judge"
         );
         assert_eq!(
-            rejections(&with(|c| c.rows = Rows::Word("many".into()))),
+            rejections(&with(|c| c.rows = toml::Value::String("many".into()))),
             [InvalidValue::written(&ROWS, "\"many\"")],
             "an unknown word is a named per-key error, not a serde type message"
         );
@@ -1511,16 +1603,17 @@ mod tests {
 
     /// A `rows` of the wrong *type* is a per-key rejection too (#1040 V9).
     ///
-    /// It used to be the one residual whole-file case: `serde` decided
+    /// It was the first residual whole-file case to be closed: `serde` decided
     /// `rows = true` inside its own deserializer, before any subsystem code
-    /// ran, so a `ConfigError::Schema` took the file with it. [`Rows::Other`]
-    /// is the catch-all that gives the judgement back to
-    /// [`CoreLedsConfig::parsed`], where it belongs — including `rows = 4.0`,
-    /// the plausible float typo, which the old carve-out's doc did not even
-    /// list.
+    /// ran, so a `ConfigError::Schema` took the file with it. Typing the field
+    /// `toml::Value` gives the judgement back to [`CoreLedsConfig::parsed`],
+    /// where it belongs — including `rows = 4.0`, the plausible float typo,
+    /// which the old `i64` field's doc did not even list. The sibling test
+    /// below does the same for the other three keys (#1040 T1).
     ///
-    /// **Red if `Rows::Other` is dropped**: every case below goes back to
-    /// being a `ConfigError::Schema` and `assemble` returns `Err`.
+    /// **Red if `rows` narrows back to a concrete type**: every case below
+    /// goes back to being a `ConfigError::Schema` and `assemble` returns
+    /// `Err`.
     #[test]
     fn a_rows_value_of_the_wrong_type_is_a_per_key_rejection() {
         for (body, written) in [
@@ -1541,6 +1634,105 @@ mod tests {
                 only_rejection(&loaded.config),
                 InvalidValue::written(&ROWS, written),
                 "{body:?}: named, and quoted as the TOML it was written as"
+            );
+        }
+    }
+
+    /// **A wrong TOML *type* on any key costs that key and nothing else**
+    /// (#1040 T1) — the same contract a wrong *value* has had since V1, and
+    /// the last thing standing between the tree's claims and the code.
+    ///
+    /// Measured on the previous head, through the production `initial_load`:
+    /// `style = 5` beside a perfectly good `color = "rainbow"` was
+    /// `Schema("invalid type: integer 5, expected a string in `style`")` — a
+    /// **whole-file** failure. The panel dropped to stock VFD/heat with the
+    /// good `color` silently gone, and the single journal line was `config
+    /// unusable; falling back to the built-in default`, naming no key at all.
+    /// That is exactly the V1 experience, and five statements in the tree (three
+    /// doc comments, the PR body, a `live-verify.md` bullet a human is asked to
+    /// check on glass) said the residual whole-file class was "a file that is
+    /// not TOML at all". This test is what makes them true.
+    ///
+    /// A `String` field was not enough, which is the template point worth
+    /// copying: a `String` *is* the raw spelling, and serde still rejects every
+    /// non-string value against it. `toml::Value` is the only field type that
+    /// accepts every shape a TOML file can put there — including the
+    /// datetime, which is the one TOML type no amount of scalar-shaped
+    /// `#[serde(untagged)]` catch-all deserializes reliably.
+    ///
+    /// The `color = 0xff0000` row is the realistic one: a hex colour *is* a
+    /// number, and TOML takes `0x…` as an integer.
+    ///
+    /// **Red if any schema field narrows to a concrete type** — `style: String`
+    /// alone turns the first three rows back into whole-file failures.
+    #[test]
+    fn a_wrong_typed_value_is_a_per_key_rejection_too() {
+        let rainbow = CoreLeds {
+            color: ColorMap::Rainbow,
+            ..CoreLeds::default()
+        };
+        let crt = CoreLeds {
+            style: DisplayStyle::Crt,
+            ..CoreLeds::default()
+        };
+        for (body, applies, rejected) in [
+            (
+                "style = 5\ncolor = \"rainbow\"\n",
+                rainbow,
+                InvalidValue::written(&STYLE, "5"),
+            ),
+            (
+                "style = true\ncolor = \"rainbow\"\n",
+                rainbow,
+                InvalidValue::written(&STYLE, "true"),
+            ),
+            (
+                "style = [1]\ncolor = \"rainbow\"\n",
+                rainbow,
+                InvalidValue::written(&STYLE, "[1]"),
+            ),
+            (
+                "fill = 1.5\ncolor = \"rainbow\"\n",
+                rainbow,
+                InvalidValue::written(&FILL, "1.5"),
+            ),
+            (
+                "color = 0xff0000\nstyle = \"crt\"\n",
+                crt,
+                // TOML's own rendering of what the file holds: the lexer
+                // takes `0xff0000` as the integer 16711680, and `Display` for
+                // a `toml::Value` is canonical TOML, not the source bytes.
+                InvalidValue::written(&COLOR, "16711680"),
+            ),
+            (
+                "color = 1979-05-27\nstyle = \"crt\"\n",
+                crt,
+                // A TOML date deserializes into the field like anything else —
+                // the point of the row — though `toml`'s own value `Display`
+                // renders it quoted, i.e. as the string it is not. Pinned as it
+                // behaves rather than wished into shape: the reader still sees
+                // the value they typed, and the alternative is this crate
+                // second-guessing `toml`'s rendering for one exotic type.
+                InvalidValue::written(&COLOR, "\"1979-05-27\""),
+            ),
+        ] {
+            let loaded =
+                subsystem::assemble::<CoreLedsConfig>(&[(PathBuf::from("/o.toml"), body.into())])
+                    .unwrap_or_else(|e| {
+                        panic!("{body:?} must not be a whole-file failure, got {e}")
+                    });
+
+            assert_eq!(
+                applied(&loaded.config),
+                applies,
+                "{body:?}: the key beside it applies, and only the bad key takes \
+                 the built-in default"
+            );
+            assert_eq!(
+                only_rejection(&loaded.config),
+                rejected,
+                "{body:?}: named, and quoted as the TOML the file holds — not a \
+                 serde message about a type"
             );
         }
     }
@@ -1857,6 +2049,33 @@ mod tests {
     /// #1020 asked for and what a shared mutex over every capture test would
     /// not give, since the poisoning thread need not be running a capture test
     /// at all.
+    ///
+    /// # This is the **weaker** of the tree's two mechanisms (#1040 T5)
+    ///
+    /// `hytte-config`'s `test_tracing::ensure_global_default` (#1043) installs
+    /// its `AlwaysInterested` as the process's **global default**, which does
+    /// strictly more than this: it registers a permanent `Dispatch` *and* makes
+    /// `dispatcher::get_default` resolve to `Interest::always()` on a thread
+    /// with no default of its own — so it also covers `Rebuilder::JustOne`'s
+    /// ambient fallback, the fast path this keepalive can only *switch off*
+    /// once a second `Dispatch` has registered. What this one buys instead is
+    /// the process's single global-default slot, which it leaves free.
+    ///
+    /// The residual here is therefore the window *before* the first
+    /// [`capture()`], where `has_just_one` is still its initial `true`. It
+    /// self-heals: both `Dispatch::new` calls inside that first `capture()`
+    /// rebuild every callsite registered up to that point, before any assertion
+    /// runs — measured at 0 failures in 40 full-binary runs, against 2 in 100
+    /// with the keepalive removed. Sufficient for this binary, not a shape to
+    /// copy blind.
+    ///
+    /// Neither mechanism can see the other (separate test binaries, each
+    /// `#[cfg(test)]`-confined to its own crate), and there is a **third** in
+    /// `hytte-reactive`'s `supervisor::install_error_counter`. Unifying them is
+    /// **#1044**: one `pub` helper behind a cargo feature that tries
+    /// `set_global_default` and falls back to parking a `Dispatch` — i.e.
+    /// #1043's shape with this one as its fallback, never panicking on a taken
+    /// slot. Do not hoist this copy; hoist that.
     fn keep_interest_alive() {
         static KEEPALIVE: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
 
@@ -2274,6 +2493,80 @@ mod tests {
             next.rows,
             CoreLeds::default().rows,
             "…while the typo alone falls back to the built-in default"
+        );
+    }
+
+    /// **One warning per save, not one per tick** (#1040 T2) — for the file
+    /// that is not TOML.
+    ///
+    /// The mechanism is `Watcher::poll`'s unconditional `self.stamps = now;`:
+    /// a layer whose stamp has been taken is not re-read until it moves again,
+    /// so a file left malformed is read *once*. Deleting that one line left the
+    /// whole suite green at 585 passed — the `(next != current)` dedup hides
+    /// the republish, so nothing observable moves and only the journal does.
+    /// Measured under R8: four polls, four warnings.
+    ///
+    /// In production that is a line every 3 s for the life of the shell, and
+    /// it contradicts two of this PR's own promises in as many words —
+    /// [`Watcher::poll`]'s doc ("once per edit rather than once per tick") and
+    /// `live-verify.md`'s "the journal gets one warning per save (not one per
+    /// poll)". It is also the single most-copied line in the file: `Watcher` is
+    /// the generic poller nine subsystems inherit, and V7 was fixed precisely
+    /// to stop a line repeating every three seconds.
+    ///
+    /// **Red if `poll` stops updating its stamps** (`left: 4, right: 1`).
+    #[test]
+    fn a_malformed_file_warns_once_per_save_not_once_per_tick() {
+        let mut overlay = Overlay::new();
+        overlay.write("style = \"lcd\"\n");
+        let mut watcher = watching(&overlay.layers());
+        let current = watcher.resolved(&no_env(), Deprecations::Silent);
+
+        // Not TOML at all: the `Err` arm of `poll`, which warns and keeps the
+        // last good file.
+        overlay.write("style = \"cr\n");
+        let (captured, _guard) = capture();
+        for _ in 0..4 {
+            let _ = watcher.poll(current, &no_env());
+        }
+
+        assert_eq!(
+            warnings(&captured).len(),
+            1,
+            "one line for the save, not one per poll: {:?}",
+            warnings(&captured)
+        );
+    }
+
+    /// The same, for the file that **is** TOML with one unusable value — the
+    /// per-key line #1040 V1 added (#1040 T2).
+    ///
+    /// A separate test because it travels a different arm of `poll`: this one
+    /// *succeeds*, updating `last_good` and republishing, and its warning comes
+    /// out of `load_layer` rather than out of `poll`'s `Err`. Both are gated by
+    /// the same stamp update, and a fix that only covered the malformed case
+    /// would leave the more likely one — a finished file with one typo in it —
+    /// talking forever.
+    ///
+    /// **Red if `poll` stops updating its stamps** (`left: 4, right: 1`).
+    #[test]
+    fn a_rejected_value_warns_once_per_save_not_once_per_tick() {
+        let mut overlay = Overlay::new();
+        overlay.write("style = \"lcd\"\n");
+        let mut watcher = watching(&overlay.layers());
+        let current = watcher.resolved(&no_env(), Deprecations::Silent);
+
+        overlay.write("style = \"crt\"\nrows = \"many\"\n");
+        let (captured, _guard) = capture();
+        for _ in 0..4 {
+            let _ = watcher.poll(current, &no_env());
+        }
+
+        assert_eq!(
+            warnings(&captured).len(),
+            1,
+            "one line for the save, not one per poll: {:?}",
+            warnings(&captured)
         );
     }
 
@@ -2776,6 +3069,6 @@ mod tests {
     }
 
     fn with_style(style: &str) -> CoreLedsConfig {
-        with(|c| c.style = style.to_string())
+        with(|c| c.style = style.into())
     }
 }

@@ -70,10 +70,11 @@ tokio = { workspace = true, features = [
 # ownership goes through `hytte_bus::own_name`, never a raw zbus connection —
 # same version/features as hytte-services' dep.
 zbus.workspace = true
-# `Rows::Other` keeps a rejected `rows` value as the TOML it was written as, so
-# the diagnostic can quote it back instead of the whole file failing serde
-# (#1040 V9). No new resolved package: `hytte-config` already links it, and
-# every layer this crate reads went through `toml` on the way in.
+# Every `core-leds.toml` schema field is a raw `toml::Value`, so serde can
+# never reject a known key's value — a wrong type is a per-key rejection that
+# quotes the value back, not a whole-file failure (#1040 V9/T1). No new
+# resolved package: `hytte-config` already links it, and every layer this crate
+# reads went through `toml` on the way in.
 toml.workspace = true
 tracing.workspace = true
 # Workspace `tracing-subscriber` sets `default-features = false` (what

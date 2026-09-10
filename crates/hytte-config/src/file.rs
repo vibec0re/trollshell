@@ -33,6 +33,8 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::xdg::Env;
+
 /// Directory (relative to `$HOME`) all trollshell config files live under.
 const CONFIG_SUBDIR: &str = ".config/trollshell";
 
@@ -127,10 +129,19 @@ pub enum Durability {
     FileOnly,
 }
 
-/// Absolute path to `~/.config/trollshell/<file>`. `None` if `$HOME` is unset.
+/// Absolute path to `~/.config/trollshell/<file>`. `None` if `$HOME` is
+/// unset, empty, or itself relative.
+///
+/// Goes through [`Env::home`] — the same gate [`crate::xdg`] applies to the
+/// layered config paths — rather than reading `$HOME` here a second time, so
+/// this older, pre-layering helper and `xdg` can't drift apart on what
+/// counts as a usable `$HOME` (#985 fixed `xdg`; #1009 is this module
+/// catching up to the same rule via the same method instead of a second
+/// copy of the check).
 #[must_use]
 pub fn path(file: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
+    let env = Env::from_process();
+    let home = env.home()?;
     Some(PathBuf::from(home).join(CONFIG_SUBDIR).join(file))
 }
 
@@ -224,16 +235,21 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
 /// [`Durability`].
 ///
 /// Any failure removes the temp file rather than leaving litter behind, and
-/// leaves the target untouched. Every returned error names the *resolved*
-/// `target`, not just the original `path` — for a symlinked `path` those can
-/// differ, and a caller logging `path.display()` alongside the error (e.g.
-/// [`write_path`]'s `warn!`) would otherwise have no way to tell which
-/// directory actually failed. The error's [`std::io::ErrorKind`] is
-/// preserved (only the message is rewritten), so a caller matching on it
-/// still can.
+/// leaves the target untouched. From the point `target` is resolved onward,
+/// every returned error names that *resolved* target, not just the original
+/// `path` — for a symlinked `path` those can differ, and a caller logging
+/// `path.display()` alongside the error (e.g. [`write_path`]'s `warn!`)
+/// would otherwise have no way to tell which directory actually failed. The
+/// error's [`std::io::ErrorKind`] is preserved (only the message is
+/// rewritten), so a caller matching on it still can. The `create_dir_all`
+/// step runs before `target` is resolved, so its error names `parent` — the
+/// original `path`'s directory — instead: a `path` component that already
+/// exists as a plain file surfaces as `<parent>: File exists (os error 17)`
+/// rather than a pathless one (review follow-up on #1000 / #1009).
 pub fn write_atomic(path: &Path, body: &str, durability: Durability) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", parent.display())))?;
     }
 
     // Resolve symlinks: `std::fs::write` wrote *through* a symlinked target, so
@@ -426,6 +442,76 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+
+    // ── `path()`'s `$HOME` resolution agrees with `xdg` (#1009) ────────────
+    //
+    // `temp_env` (already a dev-dependency for `places`' own `$HOME`-driven
+    // tests) serializes the mutation across the whole test binary and
+    // restores the previous value afterwards, so these can't race any other
+    // test that also touches `$HOME`.
+
+    /// An empty `$HOME` must not resolve to a path relative to the
+    /// process's working directory — the same failure #985 fixed in `xdg`,
+    /// which `path()` inherited because it read `$HOME` a second time
+    /// instead of going through [`Env::home`].
+    #[test]
+    fn path_rejects_an_empty_home() {
+        temp_env::with_var("HOME", Some(""), || {
+            assert_eq!(path("dnd.toml"), None);
+        });
+    }
+
+    /// A relative `$HOME` is exactly as dangerous as an empty one: it would
+    /// resolve against the process's working directory (`/` under a
+    /// systemd user unit) rather than the user's home.
+    #[test]
+    fn path_rejects_a_relative_home() {
+        temp_env::with_var("HOME", Some("relative-home"), || {
+            assert_eq!(path("dnd.toml"), None);
+        });
+    }
+
+    /// The ordinary case still works: an absolute `$HOME` resolves to
+    /// `$HOME/.config/trollshell/<file>`, exactly as before #1009.
+    #[test]
+    fn path_resolves_an_absolute_home() {
+        let dir = tempfile::tempdir().unwrap();
+        temp_env::with_var("HOME", Some(dir.path().to_str().unwrap()), || {
+            assert_eq!(
+                path("dnd.toml"),
+                Some(dir.path().join(".config/trollshell/dnd.toml"))
+            );
+        });
+    }
+
+    /// `file::path` and `xdg::Env::config_home` must agree on the same
+    /// `$HOME`: for every value tried, either both resolve to the same
+    /// directory or both refuse. Before #1009 this went red on the empty
+    /// and relative cases — `xdg` had already learned (#985) to reject
+    /// them, but `path()` still read `$HOME` on its own and accepted both,
+    /// resolving into the process's working directory while `xdg` reported
+    /// no config home at all.
+    #[test]
+    fn path_and_xdg_agree_on_the_same_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let absolute = dir.path().to_str().unwrap().to_string();
+
+        for home in ["", "relative-home", absolute.as_str()] {
+            temp_env::with_vars(
+                [("HOME", Some(home)), ("XDG_CONFIG_HOME", None::<&str>)],
+                || {
+                    let file_path = path("dnd.toml");
+                    let xdg_path = Env::from_process()
+                        .config_home()
+                        .map(|dir| dir.join(crate::xdg::APP_DIR).join("dnd.toml"));
+                    assert_eq!(
+                        file_path, xdg_path,
+                        "file::path and xdg::Env::config_home disagree for HOME={home:?}"
+                    );
+                },
+            );
+        }
+    }
 
     /// Every name in `dir`, sorted — used to prove no temp file survives.
     fn entries(dir: &Path) -> Vec<String> {
@@ -660,6 +746,37 @@ mod tests {
         assert!(
             !missing_dir.exists(),
             "the missing directory must not be created"
+        );
+    }
+
+    /// The one error raised before `target` is resolved — `create_dir_all`
+    /// on the original `path`'s parent — must name that parent too, or a
+    /// `path` component that already exists as a plain file reaches the
+    /// caller as a pathless `File exists (os error 17)` (#1009's second
+    /// item). The kind is preserved exactly as the later errors preserve it.
+    #[test]
+    fn a_plain_file_in_the_way_of_the_parent_names_that_parent_in_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("cfg");
+        std::fs::write(&plain, "not a directory\n").unwrap();
+        let path = plain.join("places.toml");
+
+        let err = write_atomic(&path, "new\n", Durability::FileOnly).unwrap_err();
+
+        let raw = std::fs::create_dir_all(&plain).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            raw.kind(),
+            "the kind must be the OS's own: {err}"
+        );
+        assert!(
+            err.to_string().contains(&plain.display().to_string()),
+            "error must name the parent that is in the way: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&plain).unwrap(),
+            "not a directory\n",
+            "the plain file must survive untouched"
         );
     }
 

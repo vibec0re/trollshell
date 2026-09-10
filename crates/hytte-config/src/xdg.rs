@@ -117,7 +117,12 @@ impl Env {
     /// just as dangerous: it would seed a relative overlay/state path
     /// exactly the way a relative `$XDG_CONFIG_HOME` used to (#985's third
     /// variable — the first two are `config_home`/`state_home` below).
-    fn home(&self) -> Option<&str> {
+    ///
+    /// `pub(crate)`, not private: [`crate::file::path`] resolves the older,
+    /// pre-layering `~/.config/trollshell/<file>` shape and goes through
+    /// this same method rather than re-reading `$HOME` itself, so the two
+    /// modules cannot disagree about what counts as a usable `$HOME` (#1009).
+    pub(crate) fn home(&self) -> Option<&str> {
         nonempty(self.home.as_ref()).filter(|h| is_absolute("HOME", h))
     }
 

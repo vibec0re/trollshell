@@ -60,6 +60,13 @@
 //! `ConfigError`: the rest of the file is fine, and the user gets a named,
 //! actionable line in the journal instead of a shell that will not start.
 //!
+//! A fourth shape is the same argument one level down, and the reason it needs
+//! its own check: `_unset = ["colr"]` is *well* formed, so the third check says
+//! nothing, and the marker is stripped before the schema is ever shown the
+//! table, so rule 4 structurally cannot report the name inside it as unknown
+//! either. [`crate::merge::inert_unset`] finds a name no layer sets and
+//! [`assemble`] warns, same split, same reason (#1008).
+//!
 //! # Why the writer patches instead of re-rendering
 //!
 //! Same reason as `places` (#703): once the control center can edit a file a
@@ -200,6 +207,13 @@ impl std::error::Error for ConfigError {}
 /// drift.
 const MALFORMED_UNSET_MESSAGE: &str = "_unset must be an array of key names; ignoring it";
 
+/// The one message an inert [`merge::UNSET_KEY`] name produces.
+///
+/// A `const` for the same anti-drift reason as [`MALFORMED_UNSET_MESSAGE`]: the
+/// tests select on it exactly, so the negative ones cannot go green-and-blind
+/// on a reworded string.
+const INERT_UNSET_MESSAGE: &str = "_unset names a key no config layer sets; it removes nothing";
+
 /// How a layer is named in a diagnostic. `None` is [`Subsystem::DEFAULT_TOML`],
 /// which is not a file — a complaint about *that* one is our bug, not the
 /// user's, and saying so is the difference between "go fix your config" and
@@ -209,6 +223,62 @@ fn layer_name(path: Option<&Path>) -> String {
         || "the built-in default".to_string(),
         |path| path.display().to_string(),
     )
+}
+
+/// A [`serde_ignored`] path as the dotted key path the rest of this module
+/// speaks in.
+///
+/// This is [`serde_ignored::Path`]'s own `Display`, with one difference: a hop
+/// through a **wrapper** — `Option`, a newtype struct, a newtype variant —
+/// contributes no segment. `Display` writes `?` for those, so a key the schema
+/// does not know inside a `core: Option<Core>` arrives as `core.?.mystery`
+/// while [`collect_paths`] and [`crate::merge::inert_unset`] produce
+/// `core.mystery`. That mismatch is not cosmetic: [`schema_paths`] subtracts
+/// one set from the other, so the user's own key inside an *optional* table
+/// failed to subtract, counted as schema-owned, and [`patch`]'s stale sweep
+/// deleted it.
+///
+/// It walks the enum rather than editing the rendered string precisely because
+/// `Display` renders a wrapper hop and a **user's map key spelled `"?"`**
+/// identically. Dropping `?` segments from the text folds that key to `""`,
+/// which does *not* collide with the `?` [`collect_paths`] produces for it —
+/// so instead of merely failing to remove the key, the sweep removes it,
+/// "deleting somebody's key on uncertain information", which [`schema_paths`]
+/// names as the one outcome this writer must never produce. Everything else,
+/// including how a parent contributes `{parent}.` unless it is the root, is
+/// [`serde_ignored`]'s rule, kept deliberately so the two spellings cannot
+/// drift apart on some other exotic key.
+fn dotted_key(path: &serde_ignored::Path<'_>) -> String {
+    match unwrapped(path) {
+        serde_ignored::Path::Seq { parent, index } => {
+            format!("{}{index}", parent_prefix(parent))
+        }
+        serde_ignored::Path::Map { parent, key } => format!("{}{key}", parent_prefix(parent)),
+        // `Root`, and the wrapper arms `unwrapped` has already peeled off.
+        _ => String::new(),
+    }
+}
+
+/// What a parent contributes in front of its child's segment: nothing at the
+/// root, its own path and a `.` otherwise — [`serde_ignored`]'s `Display` rule,
+/// asked *after* the wrappers are peeled so an `Option` hop cannot make an
+/// empty prefix look like a non-empty one.
+fn parent_prefix(parent: &serde_ignored::Path<'_>) -> String {
+    match unwrapped(parent) {
+        serde_ignored::Path::Root => String::new(),
+        other => format!("{}.", dotted_key(other)),
+    }
+}
+
+/// `path` with its wrapper hops peeled off. They say how the *type* is shaped —
+/// an `Option`, a newtype — and never name anything a user wrote.
+fn unwrapped<'a>(path: &'a serde_ignored::Path<'a>) -> &'a serde_ignored::Path<'a> {
+    match path {
+        serde_ignored::Path::Some { parent }
+        | serde_ignored::Path::NewtypeStruct { parent }
+        | serde_ignored::Path::NewtypeVariant { parent } => unwrapped(parent),
+        other => other,
+    }
 }
 
 /// Parse one layer body, naming the file in the error.
@@ -229,10 +299,17 @@ fn parse_layer(body: &str, path: Option<&Path>) -> Result<toml::Table, ConfigErr
 /// [`Subsystem::validate`] rejects the result. An *unknown* key is none of
 /// these — it is warned and reported in [`Loaded::unknown_keys`].
 pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>, ConfigError> {
-    let mut tables: Vec<(Option<&Path>, toml::Table)> = Vec::with_capacity(layers.len() + 1);
-    tables.push((None, parse_layer(S::DEFAULT_TOML, None)?));
+    // Kept as two parallel vectors rather than pairs: the diagnostics below
+    // need the file name beside each table, and `merge::inert_unset` needs the
+    // tables as one slice because its question — "does *any* layer set this
+    // key?" — is about the whole stack rather than about one layer at a time.
+    let mut paths: Vec<Option<&Path>> = Vec::with_capacity(layers.len() + 1);
+    let mut tables: Vec<toml::Table> = Vec::with_capacity(layers.len() + 1);
+    paths.push(None);
+    tables.push(parse_layer(S::DEFAULT_TOML, None)?);
     for (path, body) in layers {
-        tables.push((Some(path.as_path()), parse_layer(body, Some(path))?));
+        paths.push(Some(path.as_path()));
+        tables.push(parse_layer(body, Some(path))?);
     }
 
     // #988: a `_unset` the merge cannot honour is dropped either way, so it
@@ -241,7 +318,7 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
     // argue against for every other key shape. Per layer and before the merge,
     // because after it every marker is gone and there is nothing left to
     // attribute to a file.
-    for (path, table) in &tables {
+    for (path, table) in paths.iter().zip(&tables) {
         for bad in merge::malformed_unset(table) {
             tracing::warn!(
                 subsystem = S::NAME,
@@ -253,11 +330,25 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
         }
     }
 
-    let merged = merge::merge_all(tables.into_iter().map(|(_, table)| table));
+    // #1008: the same argument one level down. A *well-formed* marker naming a
+    // key nothing sets is the typo that actually costs the erasure, and it is
+    // the one shape neither the check above nor rule 4 below can see — the
+    // marker is stripped before the schema is shown the table, so the name
+    // inside it never reaches `serde_ignored`.
+    for inert in merge::inert_unset(&tables) {
+        tracing::warn!(
+            subsystem = S::NAME,
+            layer = %layer_name(paths[inert.layer]),
+            key = %inert.key,
+            "{INERT_UNSET_MESSAGE}"
+        );
+    }
+
+    let merged = merge::merge_all(tables);
 
     let mut unknown_keys = Vec::new();
     let config: S = serde_ignored::deserialize(merged.into_deserializer(), |path| {
-        unknown_keys.push(path.to_string());
+        unknown_keys.push(dotted_key(&path));
     })
     .map_err(|e| ConfigError::Schema(e.to_string()))?;
 
@@ -414,7 +505,7 @@ fn schema_paths<S: Subsystem>(have: &toml::Table) -> Option<BTreeSet<String>> {
 
     let mut ignored = BTreeSet::new();
     let parsed: Result<S, _> = serde_ignored::deserialize(probe.into_deserializer(), |p| {
-        ignored.insert(p.to_string());
+        ignored.insert(dotted_key(&p));
     });
     parsed.ok()?;
 
@@ -434,13 +525,128 @@ fn schema_paths<S: Subsystem>(have: &toml::Table) -> Option<BTreeSet<String>> {
 /// `places`' writer is pinned byte for byte by
 /// `tests/places_byte_identical.rs`, and sharing an implementation with a new
 /// generic one is exactly how that pin would start moving.
-fn set_value(table: &mut toml_edit::Table, key: &str, mut value: toml_edit::Value) {
-    value.decor_mut().set_prefix(" ");
-    value.decor_mut().set_suffix("");
-    if let Some(existing) = table.get_mut(key) {
-        *existing = toml_edit::Item::Value(value);
-    } else {
+///
+/// `table` is a [`toml_edit::TableLike`] rather than a [`toml_edit::Table`]
+/// because since #1008 [`patch`] recurses into inline tables too, and that is
+/// what the two decor rules here are about. Inside `{ a = 1 }` the space before
+/// the `}` is the **last value's own suffix**, and a fresh value's absent decor
+/// is what `toml_edit` fills in positionally, so:
+///
+/// * **Replacing** a value carries its suffix over unless that suffix holds a
+///   comment — forcing it empty would render `{ a = 2}`, and in a standard
+///   table the suffix is either empty already or the stale annotation this
+///   deliberately drops. One rule, both spellings: keep the spacing, drop the
+///   annotation.
+/// * **Appending** leaves the new value's decor alone, so it inherits the
+///   trailing `(" ", " ")` inside an inline table and the ordinary `(" ", "")`
+///   in a standard one — and clears the previous last value's suffix when that
+///   is pure whitespace, because it has just stopped being the last value and
+///   its space would otherwise render as `{ a = 1 , b = 2 }`. An inline table
+///   is the shape that has anything there; in a standard table the most that
+///   rule can match is trailing whitespace on a line, in a table this save is
+///   adding a key to anyway.
+fn set_value(table: &mut dyn toml_edit::TableLike, key: &str, mut value: toml_edit::Value) {
+    let Some(carried) = carried_suffix(table, key) else {
+        close_up_for_append(table);
         table.insert(key, toml_edit::Item::Value(value));
+        return;
+    };
+
+    value.decor_mut().set_prefix(" ");
+    value.decor_mut().set_suffix(carried);
+    // Assigning through the existing `Item` rather than re-inserting the key is
+    // what keeps the comment block above it; see this function's doc.
+    if let Some(item) = table.get_mut(key) {
+        *item = toml_edit::Item::Value(value);
+    }
+}
+
+/// What [`set_value`] should put back after the value at `key`, or `None` when
+/// there is no `key` here yet — which is how it tells an edit from an append.
+///
+/// `Some("")` covers both "nothing followed the old value" and "a comment did,
+/// and it described a value that is about to stop existing".
+fn carried_suffix(table: &dyn toml_edit::TableLike, key: &str) -> Option<String> {
+    let item = table.get(key)?;
+    Some(
+        item.as_value()
+            .and_then(|value| value.decor().suffix())
+            .and_then(toml_edit::RawString::as_str)
+            .filter(|raw| !raw.contains('#'))
+            .unwrap_or_default()
+            .to_owned(),
+    )
+}
+
+/// The last key of `table`, if the value under it carries a non-empty
+/// whitespace-only suffix: the space an inline table's final entry holds in
+/// front of its `}`.
+fn last_whitespace_suffixed_key(table: &dyn toml_edit::TableLike) -> Option<String> {
+    let (key, item) = table.iter().last()?;
+    let suffix = item
+        .as_value()?
+        .decor()
+        .suffix()
+        .and_then(toml_edit::RawString::as_str)?;
+    (!suffix.is_empty() && suffix.chars().all(char::is_whitespace)).then(|| key.to_owned())
+}
+
+/// Make room at the end of `table` for a key about to be appended: whatever is
+/// currently last stops being last, so the space it holds in front of an inline
+/// table's `}` has to go or it renders as `{ a = 1 , b = 2 }`.
+///
+/// Called from **both** append paths — [`set_value`] for a scalar and [`patch`]
+/// for a sub-table. Splitting them is what left `{ y = 4 , inner = { x = 7 } }`
+/// on the table path (found by #1016's review).
+fn close_up_for_append(table: &mut dyn toml_edit::TableLike) {
+    if let Some(last) = last_whitespace_suffixed_key(table)
+        && let Some(last_value) = table.get_mut(&last).and_then(toml_edit::Item::as_value_mut)
+    {
+        last_value.decor_mut().set_suffix("");
+    }
+}
+
+/// Remove `key`, handing the space it held in front of an inline table's `}` to
+/// whatever is last afterwards — the mirror of [`set_value`]'s carry-over rule,
+/// for the one path that takes a key away instead of rewriting one. Without it
+/// the sweep that #1008 shape 2 made reachable renders
+/// `core = { _unset = ["label"]}`.
+///
+/// Self-selecting on the removed value's own suffix: only an inline table
+/// normally has whitespace there, and a *comment* is never moved — it described
+/// the value that is going away, the same reasoning as [`set_value`]'s. The one
+/// thing it can also carry is trailing whitespace off a standard table's last
+/// line, on a line the same save is already editing the table around.
+fn remove_keeping_closing_space(table: &mut dyn toml_edit::TableLike, key: &str) {
+    let was_last = table.iter().last().is_some_and(|(last, _)| last == key);
+    let removed = table.remove(key);
+    if !was_last {
+        return;
+    }
+
+    let Some(space) = removed
+        .as_ref()
+        .and_then(toml_edit::Item::as_value)
+        .and_then(|value| value.decor().suffix())
+        .and_then(toml_edit::RawString::as_str)
+        .filter(|raw| !raw.is_empty() && raw.chars().all(char::is_whitespace))
+    else {
+        return;
+    };
+
+    let Some(new_last) = table.iter().last().map(|(last, _)| last.to_owned()) else {
+        return;
+    };
+    if let Some(value) = table
+        .get_mut(&new_last)
+        .and_then(toml_edit::Item::as_value_mut)
+        && value
+            .decor()
+            .suffix()
+            .and_then(toml_edit::RawString::as_str)
+            == Some("")
+    {
+        value.decor_mut().set_suffix(space);
     }
 }
 
@@ -475,13 +681,23 @@ fn to_edit(value: &toml::Value) -> toml_edit::Value {
 /// `have` is what the document currently parses to at this level, so an
 /// unchanged key can be recognised and left untouched — formatting, inline
 /// comment and all.
+///
+/// `doc` is a [`toml_edit::TableLike`], which is what makes the two levels
+/// below work on a table the user spelled `core = { … }` as well as on one they
+/// spelled `[core]`. Recursing into an inline table rather than replacing it is
+/// both halves of #1008 shape 1: the table keeps its spelling (the user's
+/// choice, not ours to normalise) and everything inside it that is not the
+/// schema's — a [`merge::UNSET_KEY`] marker, a hand-added key — keeps its
+/// bytes, the way it already did in a standard table.
 fn patch(
-    doc: &mut toml_edit::Table,
+    doc: &mut dyn toml_edit::TableLike,
     want: &toml::Table,
     have: &toml::Table,
     owned: Option<&BTreeSet<String>>,
     prefix: &str,
 ) {
+    let empty = toml::Table::new();
+
     // Keys the schema owns but the value no longer carries: an `Option` gone
     // to `None`. Everything else in the document — a hand-added annotation, an
     // unrelated table — is not ours to delete.
@@ -492,19 +708,64 @@ fn patch(
             .filter(|key| !want.contains_key(key) && owned.contains(&format!("{prefix}{key}")))
             .collect();
         for key in stale {
-            doc.remove(&key);
+            // A *table* the schema owns is not the same as its contents being
+            // ours (#1008 shape 2). Sweep it with an empty `want`, which
+            // removes the schema-owned keys inside it at every depth and
+            // leaves a marker, an unknown key or an unrelated sub-table where
+            // the user put them — comments and all. Only a table with nothing
+            // of theirs left in it goes whole, which is the ordinary case and
+            // the behaviour every other shape already had.
+            let emptied = match doc
+                .get_mut(&key)
+                .and_then(toml_edit::Item::as_table_like_mut)
+            {
+                Some(sub_doc) => {
+                    let sub_have = have
+                        .get(&key)
+                        .and_then(toml::Value::as_table)
+                        .unwrap_or(&empty);
+                    patch(
+                        sub_doc,
+                        &empty,
+                        sub_have,
+                        Some(owned),
+                        &format!("{prefix}{key}."),
+                    );
+                    sub_doc.is_empty()
+                }
+                // A scalar, or an array of tables: nothing to keep back.
+                None => true,
+            };
+            if emptied {
+                remove_keeping_closing_space(doc, &key);
+            }
         }
     }
 
     for (key, value) in want {
         if let toml::Value::Table(sub_want) = value {
-            if !doc.get(key).is_some_and(toml_edit::Item::is_table) {
-                doc.insert(key, toml_edit::Item::Table(toml_edit::Table::new()));
+            match doc.get(key).map(toml_edit::Item::is_table_like) {
+                Some(true) => {}
+                existing => {
+                    // A standard table inside a standard one, an inline table
+                    // inside an inline one: `TableLike::insert` converts on the
+                    // way in, so the new table is spelled the way its parent
+                    // is. When there was no key here at all this is an append
+                    // like any other, and takes the same fix-up — replacing a
+                    // key that *is* here is not, and must not touch a
+                    // neighbour's bytes.
+                    if existing.is_none() {
+                        close_up_for_append(doc);
+                    }
+                    doc.insert(key, toml_edit::Item::Table(toml_edit::Table::new()));
+                }
             }
-            let Some(sub_doc) = doc.get_mut(key).and_then(toml_edit::Item::as_table_mut) else {
+            let Some(sub_doc) = doc
+                .get_mut(key)
+                .and_then(toml_edit::Item::as_table_like_mut)
+            else {
                 continue;
             };
-            let empty = toml::Table::new();
             let sub_have = have
                 .get(key)
                 .and_then(toml::Value::as_table)
@@ -532,11 +793,11 @@ fn patch(
 /// only the keys whose value actually changed, plus schema-owned keys the
 /// value no longer carries.
 ///
-/// A [`crate::merge::UNSET_KEY`] marker survives a save **of the table it
-/// lives in**. Not because [`serde_ignored`] reports it as a key the schema
-/// does not know — it cannot, the merge eats the marker before the schema is
-/// ever shown the table — but because [`collect_paths`] excludes it by name,
-/// so the stale sweep never counts it as schema-owned (#990).
+/// A [`crate::merge::UNSET_KEY`] marker survives a save. Not because
+/// [`serde_ignored`] reports it as a key the schema does not know — it cannot,
+/// the merge eats the marker before the schema is ever shown the table — but
+/// because [`collect_paths`] excludes it by name, so the stale sweep never
+/// counts it as schema-owned (#990).
 ///
 /// It also stays *correct*, in both of the two cases there are. When the value
 /// still carries the key that was unset, the save writes it back explicitly
@@ -547,27 +808,56 @@ fn patch(
 /// erasure, and deleting it would silently restore the inherited value on the
 /// next load.
 ///
-/// **What that clause excludes, today.** The marker goes with its table
-/// whenever [`patch`] loses the table itself, which happens in two shapes —
-/// both pre-existing, both tracked by **#1008**, neither fixed here because
-/// the remedy is in [`patch`]'s recursion gate rather than in this seam:
+/// **The two shapes that used to lose it (#1008), and what they do now.** Both
+/// were about [`patch`] losing the *table* rather than the marker:
 ///
-/// 1. **The table spelled inline.** `patch` recurses only into
+/// 1. **The table spelled inline.** `patch` used to recurse only into
 ///    [`toml_edit::Item::is_table`], which is false for
-///    `core = { brightness = 7, _unset = ["label"] }`, so the inline table is
-///    replaced wholesale — taking the marker, and any key the schema does not
-///    know, with it. That second half predates #990: it is the older
-///    "unrelated keys survive" guarantee, and no fixture caught it because
-///    they all use standard tables.
+///    `core = { brightness = 7, _unset = ["label"], mystery = 42 }`, so the
+///    inline table was replaced wholesale — taking the marker, and any key the
+///    schema does not know, with it. That second half predated #990: it is the
+///    older "unrelated keys survive" guarantee, and no fixture caught it
+///    because they all use standard tables. It now recurses through
+///    [`toml_edit::Item::as_table_like_mut`] and patches the inline table in
+///    place. **The table stays inline**: how the user spells a table is theirs,
+///    and a writer whose whole argument is "do not rewrite bytes you were not
+///    asked to" has no business promoting it.
 /// 2. **A schema field of type `Option<Table>` gone to `None`.** The stale
-///    sweep matches the *table's* own path, which [`collect_paths`] correctly
-///    still inserts (the table is schema-owned even though the marker inside
-///    it is not), so `doc.remove` takes the whole `[core]` block.
+///    sweep matched the *table's* own path, which [`collect_paths`] correctly
+///    still inserts (the table is schema-owned even though the marker inside it
+///    is not), so `doc.remove` took the whole `[core]` block. It now sweeps the
+///    keys the schema owns *out of* that table — recursively — and keeps
+///    whatever is left: the marker, its comment, keys the schema does not know,
+///    unrelated sub-tables. **A table left holding only those stays**, header
+///    and all; a table left holding nothing is removed whole, which is the
+///    ordinary case and is what every other shape already did.
 ///
-/// `a_save_of_an_inline_table_loses_the_marker_and_unknown_keys_today` and
-/// `a_save_that_drops_an_optional_table_takes_the_marker_with_it_today` pin
-/// both shapes as they behave *now*, so the gap is visible rather than
-/// silent; #1008 flips them.
+/// The asymmetry in (2) is the point. "The schema owns this table" is a
+/// statement about the keys the schema put there, not a licence over the block
+/// the user typed around them — and the marker specifically must outlive the
+/// value it erases, or the erasure it holds is undone by the next save (#990).
+/// The cost of the choice is an empty-looking `[core]` left behind when the
+/// user's only remaining line is a marker; the cost of the other choice is
+/// silent data loss, so it is not close.
+///
+/// **What (2) preserves, precisely: the bytes, not the field's `None`.** The
+/// marker, its comment and the keys the schema does not know survive the save,
+/// and the keys the schema *does* own are gone and stay gone — that much is
+/// pinned. The `Option` field's own `None`-ness does **not** survive a reload:
+/// plain `serde` reads `Option<T>` as `None` only when the key is entirely
+/// absent, and keeping the table for the user's lines is exactly what stops it
+/// being absent. So `assemble` hands back `Some(<per-field defaults>)` — and
+/// per-*field* `#[serde(default)]` means the field type's default, not the
+/// struct's `Default` impl, so a save after that reload writes
+/// `brightness = 0, color = ""` into the file rather than the documented
+/// defaults. `an_erased_optional_table_kept_for_the_users_keys_reloads_as_some_defaults_today`
+/// pins that as it behaves now, honestly and without `#[ignore]`.
+///
+/// Fixing it is a **reader** question, not a writer one — "a table with no
+/// schema-owned key in it reads as absent for that layer" — which is why it is
+/// **#1025** and not a patch to this function. Until that lands, an
+/// `Option<Table>` field is a shape a subsystem author should reach for knowing
+/// this.
 ///
 /// # Errors
 /// [`ConfigError::Encode`] when `existing` is not valid TOML — refusing rather
@@ -1376,24 +1666,48 @@ kept = true
         assert_eq!(loaded.config.color, "amber", "and it removed nothing");
     }
 
-    // ── #1008: two shapes where `patch` still loses the marker ──────────────
+    // ── #1008: the two shapes where `patch` used to lose the marker ─────────
     //
-    // Both pin **today's** behaviour, honestly and without `#[ignore]`, so the
-    // gap `render_overlay`'s doc now names is visible in the suite rather than
-    // only in prose. #1008 flips both: the assertions below become the
-    // opposite, and these comments come out with them. Neither is a regression
-    // from #990 — `patch` is byte-identical to the pre-#990 tree.
+    // Both were about `patch` losing the *table*, not the marker: one spelled
+    // inline, one swept whole as a schema-owned `Option<Table>` gone to `None`.
+    // They replace the two "…_today" tests #1006 left pinning the old
+    // behaviour; `render_overlay`'s doc carries the full argument, including
+    // why a table left holding nothing but the user's own lines stays.
 
-    /// **#1008 shape 1, current behaviour.** [`patch`] recurses only into
-    /// [`toml_edit::Item::is_table`], which an *inline* table is not, so the
-    /// whole table is replaced by a fresh standard one — losing the marker and
-    /// every key the schema does not know along with it.
+    /// A subsystem whose table is optional, so a save can drop it entirely.
+    /// Shared by the sweep tests below.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct OptTable {
+        #[serde(default)]
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        core: Option<Core>,
+    }
+
+    impl Subsystem for OptTable {
+        const NAME: &'static str = "opt-table";
+        const DEFAULT_TOML: &'static str = "enabled = true\n";
+        type Error = std::convert::Infallible;
+        fn validate(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// **#1008 shape 1.** A table the user spelled inline is patched *in
+    /// place*: [`patch`] recurses through
+    /// [`toml_edit::Item::as_table_like_mut`], so the marker and every key the
+    /// schema does not know keep their bytes — and the table keeps its
+    /// spelling, which is the user's choice and not the writer's to normalise.
     ///
     /// The unknown-key half is the older guarantee
-    /// `a_save_preserves_keys_and_tables_the_schema_does_not_know` states;
-    /// that fixture only uses standard tables, which is why nothing caught it.
+    /// `a_save_preserves_keys_and_tables_the_schema_does_not_know` states; that
+    /// fixture only uses standard tables, which is why nothing caught it.
+    ///
+    /// Red if the recursion gate goes back to [`toml_edit::Item::is_table`]:
+    /// the inline table is replaced by a fresh standard one and both halves go
+    /// with it.
     #[test]
-    fn a_save_of_an_inline_table_loses_the_marker_and_unknown_keys_today() {
+    fn a_save_of_an_inline_table_keeps_the_marker_and_unknown_keys() {
         let existing = "core = { brightness = 7, _unset = [\"label\"], mystery = 42 }\n";
         let mut value = config_from(existing);
         value.core.brightness = 5;
@@ -1401,46 +1715,85 @@ kept = true
         let out = render_overlay(existing, &value).expect("renders");
 
         assert!(
-            !out.contains(merge::UNSET_KEY),
-            "#1008 will flip this to `contains`: {out}"
+            out.contains("_unset = [\"label\"]"),
+            "the marker is the user's, wherever the table is spelled: {out}"
         );
         assert!(
-            !out.contains("mystery"),
-            "#1008 will flip this too — an unknown key inside an inline table \
-             is swept with it: {out}"
+            out.contains("mystery = 42"),
+            "and so is a key the schema does not know: {out}"
+        );
+        assert!(
+            out.starts_with("core = {"),
+            "the table stays inline — the spelling is theirs: {out}"
+        );
+        assert!(
+            !out.contains("[core]"),
+            "…so it is never promoted to a standard table: {out}"
         );
         assert_eq!(
             config_from(&out).core.brightness,
             5,
-            "the save itself still takes, which is why this is quiet"
+            "and the save itself still takes"
+        );
+
+        // The whole rendering, so what a save through an inline table actually
+        // produces is written down rather than inferred from four `contains`.
+        // The three appended keys are the documented "a whole-value save pins
+        // every key" behaviour, and the spacing around them is `set_value`'s
+        // append rule: red if it stops clearing `mystery`'s trailing space,
+        // which would render `42 , color`.
+        assert_eq!(
+            out,
+            "core = { brightness = 5, _unset = [\"label\"], mystery = 42, \
+             color = \"amber\", palette = [\"amber\", \"rust\"] }\nenabled = true\n"
         );
     }
 
-    /// **#1008 shape 2, current behaviour.** A schema field of type
-    /// `Option<Table>` gone to `None` makes the stale sweep match the
-    /// *table's* path — which [`collect_paths`] rightly still inserts, the
-    /// table being schema-owned even though the marker inside it is not — so
-    /// `doc.remove` takes the block, the marker, its comment and the unknown
-    /// key together.
+    /// The fidelity half of shape 1, asserted on **bytes** rather than on
+    /// `contains`: a save through an inline table must move the one value that
+    /// changed and nothing else — not the comment above the key, not the one
+    /// beside the closing brace, not the spacing inside the braces.
+    ///
+    /// The edited key is deliberately the **last** one in the table, because
+    /// that space in front of the `}` is the previous value's own decor suffix:
+    /// red if `set_value` forces the suffix empty (`brightness = 7}`), red if
+    /// it stops normalising the prefix, and red if `patch` replaces the table.
     #[test]
-    fn a_save_that_drops_an_optional_table_takes_the_marker_with_it_today() {
-        #[derive(serde::Serialize, serde::Deserialize)]
-        struct OptTable {
-            #[serde(default)]
-            enabled: bool,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            core: Option<Core>,
-        }
+    fn a_save_through_an_inline_table_moves_one_value_and_no_other_byte() {
+        let existing = "# My LEDs.\nenabled = true\n\n\
+             # the strip, spelled inline on purpose\n\
+             core = { color = \"amber\", palette = [\"amber\", \"rust\"], mystery = 42, brightness = 3 } # hand-tuned\n";
 
-        impl Subsystem for OptTable {
-            const NAME: &'static str = "opt-table";
-            const DEFAULT_TOML: &'static str = "enabled = true\n";
-            type Error = std::convert::Infallible;
-            fn validate(&self) -> Result<(), Self::Error> {
-                Ok(())
-            }
-        }
+        assert_eq!(
+            render_overlay(existing, &config_from(existing)).expect("renders"),
+            existing,
+            "a no-op save must be a no-op here too, or the assertion below \
+             proves nothing about the edit"
+        );
 
+        let mut value = config_from(existing);
+        value.core.brightness = 7;
+
+        assert_eq!(
+            render_overlay(existing, &value).expect("renders"),
+            existing.replace("brightness = 3", "brightness = 7"),
+            "only the one key's bytes may move"
+        );
+    }
+
+    /// **#1008 shape 2.** A schema field of type `Option<Table>` gone to `None`
+    /// makes the stale sweep match the *table's* path — which [`collect_paths`]
+    /// rightly still inserts, the table being schema-owned even though what the
+    /// user wrote inside it is not. The sweep now recurses with an empty `want`
+    /// and removes the schema's keys out of the block, leaving the marker, the
+    /// comment above it, and the key the schema does not know.
+    ///
+    /// Red if the sweep goes back to `doc.remove`-ing the table item, and red
+    /// if `dotted_key` stops folding `serde_ignored`'s `?` wrapper segment —
+    /// without it `core.mystery` never subtracts out of the owned set and the
+    /// recursion deletes it key by key instead of taking it whole.
+    #[test]
+    fn a_save_that_drops_an_optional_table_keeps_what_the_schema_does_not_own() {
         let existing = "enabled = true\n\n[core]\n# do not inherit the base's label\n_unset = [\"label\"]\nmystery = 1\nbrightness = 7\n";
         let value = OptTable {
             enabled: true,
@@ -1450,9 +1803,391 @@ kept = true
         let out = render_overlay(existing, &value).expect("renders");
 
         assert_eq!(
-            out, "enabled = true\n",
-            "#1008 will flip this: today the whole block goes, marker, \
-             comment and unknown key with it"
+            out,
+            "enabled = true\n\n[core]\n# do not inherit the base's label\n_unset = [\"label\"]\nmystery = 1\n",
+            "the schema's `brightness` goes; the marker, its comment and the \
+             user's own key stay, in a block that is now theirs alone"
         );
+    }
+
+    /// The other half of that decision, and the reason it is not simply "never
+    /// remove a table": a block holding nothing but the schema's own keys still
+    /// goes whole, header comment and all. That is the ordinary `Option<Table>`
+    /// → `None` case and the behaviour every other shape already had.
+    ///
+    /// Red if the `emptied` check in the sweep goes away — an empty `[core]`
+    /// header is left behind on every such save.
+    #[test]
+    fn a_save_that_drops_an_optional_table_with_nothing_of_the_users_in_it_removes_the_block() {
+        let existing =
+            "enabled = true\n\n# the strip\n[core]\nbrightness = 7\npalette = [\"amber\"]\n";
+        let value = OptTable {
+            enabled: true,
+            core: None,
+        };
+
+        let out = render_overlay(existing, &value).expect("renders");
+
+        assert_eq!(
+            out, "enabled = true\n",
+            "nothing of the user's was in it, so the block goes whole"
+        );
+    }
+
+    /// `serde_ignored` spells the hop through an `Option` as a `?` segment, and
+    /// both dotted paths this module hands out are key names. The reporting
+    /// half is cosmetic; the [`schema_paths`] half is not — an unrecognised
+    /// path fails to subtract, so the writer counts the user's own key as
+    /// schema-owned and deletes it.
+    ///
+    /// Red if `dotted_key` stops folding the wrapper hop away: `unknown_keys`
+    /// reads `core.?.mystery` and the save eats `mystery`.
+    #[test]
+    fn an_unknown_key_inside_an_optional_table_is_named_and_kept() {
+        let existing = "enabled = true\n\n[core]\nmystery = 1\nbrightness = 7\n";
+
+        let loaded = assemble::<OptTable>(&layers(&[existing])).expect("assembles");
+        assert_eq!(
+            loaded.unknown_keys,
+            ["core.mystery"],
+            "a dotted key name, not serde_ignored's `core.?.mystery`"
+        );
+
+        let value = OptTable {
+            enabled: true,
+            core: None,
+        };
+        let out = render_overlay(existing, &value).expect("renders");
+        assert!(
+            out.contains("mystery = 1"),
+            "and a key the writer failed to recognise must never be deleted: {out}"
+        );
+    }
+
+    /// The other side of the same fold, and the reason [`dotted_key`] walks
+    /// [`serde_ignored::Path`] instead of editing its rendered string: a
+    /// *user's* key spelled `"?"` renders exactly like a wrapper hop. Dropping
+    /// `?` segments from the text folded it to `""`, which does not collide
+    /// with the `?` [`collect_paths`] produces for the same key, so it stayed
+    /// in the owned set and the stale sweep **deleted** it — the one outcome
+    /// [`schema_paths`]'s doc says this writer must never produce.
+    ///
+    /// At the root and at depth, because the fold hit them differently: at
+    /// depth `core.?` collapsed to `core`, naming a table the schema *owns*.
+    ///
+    /// The two costs are split into two tests deliberately — a single one would
+    /// panic on whichever assertion came first and leave the other unproven,
+    /// and it is the second that is the data loss. Both red on a `dotted_key`
+    /// that matches on `?` in a rendered string (found by #1016's review).
+    const WRAPPER_LOOKALIKE: [(&str, &str); 2] = [
+        (
+            "enabled = true\n\"?\" = 1\n\n[core]\ncolor = \"amber\"\nbrightness = 3\n",
+            "?",
+        ),
+        (
+            "enabled = true\n\n[core]\n\"?\" = 1\ncolor = \"amber\"\nbrightness = 3\n",
+            "core.?",
+        ),
+    ];
+
+    #[test]
+    fn a_key_spelled_like_a_wrapper_hop_is_reported_under_its_own_name() {
+        for (existing, expected) in WRAPPER_LOOKALIKE {
+            let loaded = assemble::<Leds>(&layers(&[existing])).expect("assembles");
+            assert_eq!(
+                loaded.unknown_keys,
+                [expected],
+                "a `?` a user typed is a key, not a wrapper hop: {existing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_spelled_like_a_wrapper_hop_survives_a_save() {
+        for (existing, _) in WRAPPER_LOOKALIKE {
+            let mut value = config_from(existing);
+            value.core.brightness = 5;
+
+            let out = render_overlay(existing, &value).expect("renders");
+
+            assert!(
+                out.contains("\"?\" = 1"),
+                "the writer must never delete a key it did not recognise: {out}"
+            );
+            assert!(
+                out.contains("brightness = 5"),
+                "and the save itself still takes: {out}"
+            );
+        }
+    }
+
+    // ── #1016 review: two bytes the inline paths still moved ────────────────
+
+    /// Appending a *sub-table* to an inline table went straight through
+    /// `TableLike::insert`, skipping the fix-up [`set_value`]'s append branch
+    /// does, and rendered `{ y = 4 , inner = { x = 7 } }`. Both paths now go
+    /// through [`close_up_for_append`].
+    ///
+    /// Red on the stray space if the call in [`patch`] goes away.
+    #[test]
+    fn appending_a_sub_table_to_an_inline_table_does_not_leave_a_stray_space() {
+        #[derive(Default, serde::Serialize, serde::Deserialize)]
+        struct Inner {
+            #[serde(default)]
+            x: u8,
+        }
+
+        #[derive(Default, serde::Serialize, serde::Deserialize)]
+        struct Outer {
+            #[serde(default)]
+            inner: Inner,
+            #[serde(default)]
+            y: u8,
+        }
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Nested {
+            #[serde(default)]
+            enabled: bool,
+            #[serde(default)]
+            core: Outer,
+        }
+
+        impl Subsystem for Nested {
+            const NAME: &'static str = "nested";
+            const DEFAULT_TOML: &'static str = "enabled = true\n";
+            type Error = std::convert::Infallible;
+            fn validate(&self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        let existing = "enabled = true\ncore = { y = 4 }\n";
+        let value = Nested {
+            enabled: true,
+            core: Outer {
+                inner: Inner { x: 7 },
+                y: 4,
+            },
+        };
+
+        let out = render_overlay(existing, &value).expect("renders");
+
+        assert_eq!(out, "enabled = true\ncore = { y = 4, inner = { x = 7 } }\n");
+        assert_eq!(
+            render_overlay(&out, &value).expect("renders again"),
+            out,
+            "and the result is a fixed point"
+        );
+    }
+
+    /// Removing the **last** entry of an inline table took the space in front
+    /// of the `}` with it, because that space was the removed value's own decor
+    /// suffix — `core = { _unset = ["label"]}`. [`remove_keeping_closing_space`]
+    /// hands it to whatever is last afterwards, mirroring [`set_value`]'s
+    /// carry-over rule.
+    ///
+    /// The mirror fixture (marker last, so the removed key is not) is in the
+    /// same test: it was already clean, and it is what hid the bug.
+    ///
+    /// Red on the missing space if the carry-over goes away.
+    #[test]
+    fn removing_the_last_entry_of_an_inline_table_keeps_its_closing_space() {
+        let value = OptTable {
+            enabled: true,
+            core: None,
+        };
+
+        for existing in [
+            "enabled = true\ncore = { _unset = [\"label\"], brightness = 7 }\n",
+            "enabled = true\ncore = { brightness = 7, _unset = [\"label\"] }\n",
+        ] {
+            assert_eq!(
+                render_overlay(existing, &value).expect("renders"),
+                "enabled = true\ncore = { _unset = [\"label\"] }\n",
+                "whichever end the schema's key sat at: {existing:?}"
+            );
+        }
+    }
+
+    /// **#1025, current behaviour.** What shape 2 preserves is the *bytes*, not
+    /// the field's `None`. Keeping the table for the user's marker is exactly
+    /// what stops the key being absent, and plain `serde` reads `Option<T>` as
+    /// `None` only when it is — so the reload after the save hands back
+    /// `Some(…)`, and because per-*field* `#[serde(default)]` uses the field
+    /// type's default rather than `Core`'s own `Default` impl, the values are
+    /// `0`/`""`/`[]` rather than the documented `3`/`"amber"`. The save after
+    /// *that* writes them into the file.
+    ///
+    /// Closing the loop is what makes this visible: every other round-trip test
+    /// here hand-builds the "after" value, so none of them ever asks what a
+    /// reload of what was just written actually says.
+    ///
+    /// #1025 flips this — a table with no schema-owned key in it reads as
+    /// absent for that layer — and the assertions below become `None` and a
+    /// fixed point. It is a reader rule, not a writer one, which is why it is
+    /// not fixed here. Red under exactly that mutation to `assemble`.
+    #[test]
+    fn an_erased_optional_table_kept_for_the_users_keys_reloads_as_some_defaults_today() {
+        let existing = "enabled = true\ncore = { _unset = [\"label\"], brightness = 7 }\n";
+
+        let erased = OptTable {
+            enabled: true,
+            core: None,
+        };
+        let saved = render_overlay(existing, &erased).expect("renders");
+        assert_eq!(
+            saved, "enabled = true\ncore = { _unset = [\"label\"] }\n",
+            "the bytes half holds: the marker stays, the schema's key goes"
+        );
+
+        let reloaded = assemble::<OptTable>(&layers(&[&saved]))
+            .expect("reloads")
+            .config;
+        let core = reloaded
+            .core
+            .as_ref()
+            .expect("#1025 will flip this to `None`: the table is still there");
+        assert_eq!(
+            (core.brightness, core.color.as_str(), core.palette.len()),
+            (0, "", 0),
+            "#1025 will flip this too — and note these are the *field* types' \
+             defaults, not Core::default()'s 3/\"amber\""
+        );
+
+        let again = render_overlay(&saved, &reloaded).expect("renders again");
+        assert_eq!(
+            again,
+            "enabled = true\ncore = { _unset = [\"label\"], brightness = 0, color = \"\", palette = [] }\n",
+            "#1025 will flip this to a fixed point; today the second save writes \
+             the degenerate values back"
+        );
+    }
+
+    // ── #1008: a marker that names nothing is said out loud ─────────────────
+
+    /// The inert-marker warnings, selected on the **exact** message, for the
+    /// same anti-drift reason [`unset_warnings`] is.
+    fn inert_warnings(captured: &Captured) -> Vec<CapturedEvent> {
+        captured
+            .events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::WARN && e.message == INERT_UNSET_MESSAGE)
+            .collect()
+    }
+
+    /// The typo that actually costs the erasure, and the one shape neither of
+    /// the other two checks can see: `_unset = ["colr"]` is well formed, so
+    /// #988 says nothing, and the marker is stripped before `serde_ignored`
+    /// runs, so rule 4 never gets shown the name inside it.
+    ///
+    /// The same marker carries a name that *is* set, which is both the live
+    /// control (a capture that observed nothing would fail the count) and the
+    /// noise guard: a marker naming a real key must draw no complaint.
+    ///
+    /// Red if the [`merge::inert_unset`] loop in [`assemble`] goes away.
+    #[test]
+    fn an_unset_marker_naming_a_key_no_layer_sets_is_warned_about() {
+        let (captured, _guard) = capture();
+
+        let loaded = assembled(&["[core]\n_unset = [\"colr\", \"color\"]\n"]);
+
+        let warnings = inert_warnings(&captured);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one name matches nothing, one warning: {warnings:#?}"
+        );
+        let fields = &warnings[0].fields;
+        assert_eq!(
+            fields.get("key").map(String::as_str),
+            Some("core.colr"),
+            "the key to go and correct, not the marker's own path: {fields:#?}"
+        );
+        assert_eq!(
+            fields.get("layer").map(String::as_str),
+            Some("/layer/0.toml"),
+            "the file the user can open: {fields:#?}"
+        );
+        assert_eq!(
+            fields.get("subsystem").map(String::as_str),
+            Some("core-leds")
+        );
+
+        assert_eq!(
+            loaded.config.core.color, "",
+            "`color` is a real key and really was erased, which is why it is \
+             the control rather than a second complaint"
+        );
+    }
+
+    /// The noise guard across layers: erasing a key a *lower* layer sets is the
+    /// whole point of the feature and must stay silent.
+    ///
+    /// The unknown key beside the marker is the live control, the shape
+    /// `a_well_formed_unset_marker_is_not_warned_about` established: an absence
+    /// measured against a capture that observed nothing is not an assertion.
+    ///
+    /// Red if `merge::inert_unset` stops collecting the key paths of the other
+    /// layers before deciding.
+    #[test]
+    fn an_unset_marker_that_erases_a_lower_layers_key_is_not_warned_about() {
+        let (captured, _guard) = capture();
+
+        let loaded = assembled(&[
+            "[core]\nlabel = \"old\"\n",
+            "[core]\n_unset = [\"label\"]\nnope = 1\n",
+        ]);
+
+        let events = captured.events();
+        assert!(
+            events.iter().any(|e| e.level == tracing::Level::WARN
+                && e.fields.get("key").map(String::as_str) == Some("core.nope")),
+            "the control event must land, or the absence below proves nothing: {events:#?}"
+        );
+        assert!(
+            inert_warnings(&captured).is_empty(),
+            "the marker names a key the base layer sets: {events:#?}"
+        );
+        assert_eq!(
+            loaded.config.core.label, None,
+            "…and it did erase it, which is what makes the silence correct"
+        );
+    }
+
+    /// The other arm of [`layer_name`] for this warning: a marker naming
+    /// nothing in [`Subsystem::DEFAULT_TOML`] is **our** typo, and the line has
+    /// to say so rather than send the user to a file they did not write.
+    #[test]
+    fn an_inert_marker_in_the_built_in_default_is_named_as_ours() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct InertDefault {
+            #[serde(default)]
+            color: String,
+        }
+
+        impl Subsystem for InertDefault {
+            const NAME: &'static str = "inert-default";
+            const DEFAULT_TOML: &'static str = "_unset = [\"colr\"]\ncolor = \"amber\"\n";
+            type Error = std::convert::Infallible;
+            fn validate(&self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        let (captured, _guard) = capture();
+
+        let loaded = assemble::<InertDefault>(&[]).expect("assembles");
+
+        let warnings = inert_warnings(&captured);
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        let fields = &warnings[0].fields;
+        assert_eq!(
+            fields.get("layer").map(String::as_str),
+            Some("the built-in default"),
+            "not a path — there is no file to send anyone to: {fields:#?}"
+        );
+        assert_eq!(fields.get("key").map(String::as_str), Some("colr"));
+        assert_eq!(loaded.config.color, "amber", "and it removed nothing");
     }
 }

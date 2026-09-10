@@ -55,7 +55,34 @@
 //! detection lives here, next to the code that honours the marker; the
 //! reporting lives there, where the file name is — the same split, for the
 //! same reason, as rule 4's unknown keys.
+//!
+//! # A marker that names nothing
+//!
+//! `_unset = ["colr"]` is the *other* obvious typo, and the one that actually
+//! costs the user their erasure: the shape is fine, so nothing above complains,
+//! it removes nothing, and it is not an unknown key either — the marker is
+//! stripped before the schema is ever shown the table, so rule 4 structurally
+//! cannot see the name inside it (#1008). [`inert_unset`] finds it and
+//! [`crate::subsystem::assemble`] warns about it, the same split of detection
+//! from attribution as above.
+//!
+//! The test is **no layer sets this key at all**, deliberately, rather than the
+//! narrower "the layers below this marker do not". Two ordinary patterns would
+//! be noise under the narrower one: unsetting and re-setting a key in the same
+//! overlay (documented above), and a marker in the bottom layer, where by
+//! construction there is nothing below. What is left is a name that no file in
+//! the search path — not the built-in default, not a base layer, not the
+//! overlay itself — ever writes, which is a name that cannot be doing anything
+//! for anyone.
+//!
+//! One false positive survives that, and it is the deliberate trade: a
+//! portable overlay unsetting a key only *some* machines' base layers set, and
+//! that [`crate::subsystem::Subsystem::DEFAULT_TOML`] does not document either.
+//! It is a `warn!` that changes no behaviour, and the alternative is silence on
+//! the likelier typo — the invisible failure this crate exists to argue
+//! against.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 /// Reserved key naming the keys to drop from the layer below.
@@ -208,6 +235,109 @@ fn collect_malformed(table: &toml::Table, prefix: &str, out: &mut Vec<MalformedU
         }
         if let toml::Value::Table(nested) = value {
             collect_malformed(nested, &format!("{prefix}{key}."), out);
+        }
+    }
+}
+
+/// A well-formed [`UNSET_KEY`] name that matches no key in any layer, so it
+/// erases nothing anywhere.
+///
+/// `#[non_exhaustive]` for the same reason [`MalformedUnset`] is: every
+/// construction site is in this crate, and a third field is plausible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InertUnset {
+    /// Index into the `layers` slice handed to [`inert_unset`] — the layer the
+    /// marker was written in. This module has never seen a file name; the
+    /// caller that has turns this back into one.
+    pub layer: usize,
+    /// Dotted path of the key the marker names, not of the marker itself:
+    /// `colr`, `core.colr`. It is the thing the user has to go and correct.
+    pub key: String,
+}
+
+impl fmt::Display for InertUnset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} is set by no layer, so unsetting it does nothing",
+            self.key
+        )
+    }
+}
+
+/// Every well-formed [`UNSET_KEY`] name across `layers` that names a key none
+/// of them sets — see the module docs for why the test spans *all* the layers
+/// rather than the ones below each marker.
+///
+/// Malformed markers are [`malformed_unset`]'s business and are skipped here: a
+/// marker that is not an array of names has no names to check, and a non-string
+/// element is not a name. Reporting both about the same marker would be two
+/// complaints for one typo.
+///
+/// Only tables are walked, and only table keys count as "set" — the same
+/// restriction, for the same reason, as [`malformed_unset`]: arrays replace
+/// whole, so a marker means nothing inside one and nothing inside one is
+/// addressable by a marker outside it.
+///
+/// [`InertUnset::key`] is a dotted path, with the quoted-key ambiguity
+/// [`malformed_unset`] documents; it is diagnostic-only in this direction too.
+#[must_use]
+pub fn inert_unset(layers: &[toml::Table]) -> Vec<InertUnset> {
+    let mut present = BTreeSet::new();
+    for layer in layers {
+        collect_key_paths(layer, "", &mut present);
+    }
+
+    let mut out = Vec::new();
+    for (layer, table) in layers.iter().enumerate() {
+        collect_inert(table, "", &present, layer, &mut out);
+    }
+    out
+}
+
+/// Every dotted key path in `table`, tables included, marker keys excluded —
+/// "what this layer sets". The marker itself is machinery, never a key a
+/// sibling marker could be naming.
+fn collect_key_paths(table: &toml::Table, prefix: &str, out: &mut BTreeSet<String>) {
+    for (key, value) in table {
+        if key == UNSET_KEY {
+            continue;
+        }
+        let path = format!("{prefix}{key}");
+        if let toml::Value::Table(nested) = value {
+            collect_key_paths(nested, &format!("{path}."), out);
+        }
+        out.insert(path);
+    }
+}
+
+fn collect_inert(
+    table: &toml::Table,
+    prefix: &str,
+    present: &BTreeSet<String>,
+    layer: usize,
+    out: &mut Vec<InertUnset>,
+) {
+    if let Some(names) = table.get(UNSET_KEY).and_then(toml::Value::as_array) {
+        // Deduped **within one marker**, and only there: `_unset = ["aa", "aa"]`
+        // is one mistake on one line and gets one warning. The same name in two
+        // different layers is two files to go and edit, so those stay separate.
+        let mut said = BTreeSet::new();
+        for name in names.iter().filter_map(toml::Value::as_str) {
+            let key = format!("{prefix}{name}");
+            if !present.contains(&key) && said.insert(key.clone()) {
+                out.push(InertUnset { layer, key });
+            }
+        }
+    }
+
+    for (key, value) in table {
+        if key == UNSET_KEY {
+            continue;
+        }
+        if let toml::Value::Table(nested) = value {
+            collect_inert(nested, &format!("{prefix}{key}."), present, layer, out);
         }
     }
 }
@@ -616,5 +746,132 @@ mod tests {
     #[test]
     fn a_marker_inside_an_array_element_is_not_reported() {
         assert!(malformed_unset(&table("[[entry]]\n_unset = 3\nname = \"A\"\n")).is_empty());
+    }
+
+    // ── #1008: a marker that names nothing ──────────────────────────────────
+
+    /// The typo that costs the erasure: well-formed, so #988 says nothing, and
+    /// stripped before the schema sees it, so rule 4 cannot say anything
+    /// either. Named by the path of the *key*, at depth, with the layer it was
+    /// written in — the caller turns that index back into a file name.
+    ///
+    /// Red if the `present.contains` test in `collect_inert` goes away
+    /// (`core.color` is reported too), and red if the recursion into nested
+    /// tables goes away (nothing is reported at all).
+    #[test]
+    fn a_marker_naming_a_key_no_layer_sets_is_reported_with_its_layer() {
+        let layers = [
+            table("[core]\ncolor = \"amber\"\n"),
+            table("[core]\n_unset = [\"colr\", \"color\"]\n"),
+        ];
+
+        assert_eq!(
+            inert_unset(&layers),
+            [InertUnset {
+                layer: 1,
+                key: "core.colr".into(),
+            }],
+            "only the name nothing sets; `color` is set one layer down"
+        );
+    }
+
+    /// The noise guard, and the reason the test spans every layer rather than
+    /// only the ones below the marker: a key set *above* the marker, or in the
+    /// marker's own table, is a documented pattern and must stay silent.
+    ///
+    /// Red if `collect_key_paths` is narrowed to the layers below each marker,
+    /// or if it stops walking nested tables.
+    #[test]
+    fn a_marker_is_silent_when_any_layer_sets_the_key_it_names() {
+        // Set in the same table as the marker (the "unset then set" pattern).
+        assert!(
+            inert_unset(&[table("_unset = [\"color\"]\ncolor = \"cyan\"\n")]).is_empty(),
+            "unset-then-set in one layer is documented, not a typo"
+        );
+
+        // Set only in a layer the merge applies *after* this one.
+        assert!(
+            inert_unset(&[
+                table("[core]\n_unset = [\"color\"]\n"),
+                table("[core]\ncolor = \"cyan\"\n"),
+            ])
+            .is_empty(),
+            "a key some other layer sets is a real key, wherever it sits"
+        );
+
+        // A whole table, which is a key path like any other (#987's N4 shape).
+        assert!(
+            inert_unset(&[table("[core]\nx = 1\n"), table("_unset = [\"core\"]\n")]).is_empty(),
+            "a marker may name a table, and a table is set"
+        );
+    }
+
+    /// One typo, one complaint. A marker #988 already reports has no names to
+    /// check (not an array) or a name that is not one (a non-string element),
+    /// so it must not draw a second, differently-worded warning here.
+    ///
+    /// Red if `collect_inert` stops filtering on `as_array`/`as_str`.
+    #[test]
+    fn a_malformed_marker_is_not_also_reported_as_naming_nothing() {
+        assert!(
+            inert_unset(&[table("_unset = \"colr\"\n")]).is_empty(),
+            "not an array: #988's business, and it has no names in it"
+        );
+        assert!(
+            inert_unset(&[table("_unset = [3]\n")]).is_empty(),
+            "not a name: #988's business too"
+        );
+    }
+
+    /// One line, one mistake, one complaint — signal-to-noise is the whole
+    /// justification for this check, so a name written twice in the same marker
+    /// must not warn twice. Across *layers* it still does: two files each carry
+    /// a line to go and fix.
+    ///
+    /// Red if the per-marker dedupe goes away (found by #1016's review).
+    #[test]
+    fn a_name_repeated_inside_one_marker_is_reported_once() {
+        assert_eq!(
+            inert_unset(&[table("_unset = [\"aa\", \"aa\", \"bb\"]\n")])
+                .iter()
+                .map(|i| i.key.as_str())
+                .collect::<Vec<_>>(),
+            ["aa", "bb"]
+        );
+
+        assert_eq!(
+            inert_unset(&[table("_unset = [\"aa\"]\n"), table("_unset = [\"aa\"]\n")])
+                .iter()
+                .map(|i| (i.layer, i.key.as_str()))
+                .collect::<Vec<_>>(),
+            [(0, "aa"), (1, "aa")],
+            "two layers is two files, so two lines in the journal"
+        );
+    }
+
+    /// The sentence a caller with no field-structured log can print, matching
+    /// [`MalformedUnset`]'s.
+    #[test]
+    fn an_inert_unset_says_what_is_wrong_in_one_line() {
+        assert_eq!(
+            InertUnset {
+                layer: 1,
+                key: "core.colr".into(),
+            }
+            .to_string(),
+            "core.colr is set by no layer, so unsetting it does nothing"
+        );
+    }
+
+    /// Every offender is reported, not just the first, and one marker's typo
+    /// does not mask its neighbour's.
+    #[test]
+    fn every_name_that_matches_nothing_is_reported() {
+        let out = inert_unset(&[table(
+            "_unset = [\"aa\", \"bb\"]\n\n[core]\n_unset = [\"cc\"]\nkept = 1\n",
+        )]);
+
+        let keys: Vec<&str> = out.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["aa", "bb", "core.cc"]);
     }
 }

@@ -567,9 +567,39 @@
                 # whichever `LaunchReport` fallback the sandbox produces
                 # (`NoSystemdRun` or `NoUserManager`).
                 export TROLLSHELL_REQUIRE_SYSTEMD_RUN=1
+                # #1080, on the GL env above: `preem_gl_diff` (the #893 stage B
+                # CPU/GL parity harness) runs through the same llvmpipe context
+                # as the three `hytte-ui` GL tests. Under llvmpipe every case
+                # has measured bit-exact since #1078 — `max |Δ| 0` of 255 on
+                # every channel, all twelve cases — so `TROLLSHELL_PARITY_EXACT=1`
+                # pins the harness to that zero for *this* run: a case that
+                # clears the on-glass ceiling (mean 2 / p99 8 / max 32, #893)
+                # but is not bit-exact still fails, named `FAIL(exact)`
+                # (`trollshell/examples/preem_gl_diff.rs`). The ceiling itself
+                # is untouched — a real driver still only has to clear it, not
+                # match llvmpipe byte for byte.
+                export TROLLSHELL_PARITY_EXACT=1
               '';
               checkPhaseCargoCommand = ''
                 xvfb-run -a cargo test --workspace --locked --features system-tests
+
+                # #1080: the CPU/GL parity harness (#893 stage B), built and run
+                # in the same phase and the same llvmpipe env as the GL-context
+                # tests above, so a shader or kit change that breaks parity
+                # ships red here instead of shipping silently until someone
+                # runs the `docs/live-verify.md` recipe by hand. Built as its
+                # own step (rather than relying on the preceding `cargo test`
+                # to have compiled it as a side effect) so a harness compile
+                # failure is attributed to this line, not buried in the test
+                # run's own output. `PREEM_GL_DIFF_OUT` is the harness's own
+                # override point (default `gates/`, the repo's scratch
+                # directory) — pointed at `$out/parity` so the per-case
+                # `.gl.ppm`/`.cpu.ppm`/`.delta.pgm` evidence lands in the
+                # check's own output and survives a green build (`result/parity`)
+                # and, via `nix build --keep-failed`, a red one too.
+                cargo build --locked -p trollshell --example preem_gl_diff
+                mkdir -p "$out/parity"
+                PREEM_GL_DIFF_OUT="$out/parity" xvfb-run -a cargo run --locked -p trollshell --example preem_gl_diff
               '';
             }
           );

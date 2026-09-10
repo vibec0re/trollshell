@@ -935,6 +935,16 @@ const LARGE_RESPONSE_ROWS: usize = 12_000;
 // time regardless.
 const _: () = assert!(10_000 < LARGE_RESPONSE_ROWS);
 
+// The other side of that bracket (#1074 review M3): the measured ~1 ms
+// crossing is ≈15 000 rows, so a threshold above it would be offloading only
+// responses that already cost more than the starvation budget this constant
+// exists to protect — the value would have stopped meaning what its doc says
+// it means. Together with the bound above, the threshold is pinned to
+// 10 001..=15 000; `tests::offload_branch_is_taken_exactly_at_the_threshold`
+// pins where inside that range it actually sits, since the const asserts alone
+// cannot tell 12 000 from 15 000.
+const _: () = assert!(LARGE_RESPONSE_ROWS <= 15_000);
+
 /// Cheap proxy for "how much JSON `encode_response` is about to render",
 /// computed without doing the encode: the summed length of `Response`'s
 /// variable-size fields. `ok`/`error`/`hint`/`token`/etc. are all O(1)
@@ -1359,7 +1369,8 @@ fn load_grants() -> GrantStore {
 /// inline for the same reason as this module's own `encode_response` — a
 /// per-click/per-request cost, not per-session-start, and out of #1059's
 /// lane — but #1065 closed both: `save` now serializes under `state`'s
-/// mutable borrow and hands the bytes to a detached `spawn_blocking` write
+/// mutable borrow and queues the bytes on the store's single-writer lane,
+/// whose task does the `spawn_blocking` write in submission order
 /// (see [`crate::grants::GrantStore::save`]), and `write_response` offloads
 /// `encode_response` past [`LARGE_RESPONSE_ROWS`] the same way.
 // One cohesive `select!` loop (accept / command / timeout) over the parked-request
@@ -1873,6 +1884,66 @@ mod tests {
              runtime's other tasks, so large responses are not actually encoded off-thread",
         );
         drain.await.expect("drain task must not panic");
+    }
+
+    /// #1074 review M3: the offload **branch** itself, observed rather than
+    /// assumed. The timer test above cannot see it — its fixture is
+    /// `(0..LARGE_RESPONSE_ROWS)`, so it takes the `spawn_blocking` arm by
+    /// construction whatever the constant says, and moving the constant (or
+    /// deleting the inline arm outright) left the whole suite green.
+    ///
+    /// The fixture sizes are **literals on purpose**. Deriving them from
+    /// `LARGE_RESPONSE_ROWS` is what made the constant unfalsifiable in the
+    /// first place; spelling 11 999 / 12 000 here means moving the threshold
+    /// anywhere inside the range the two `const _` asserts allow turns this
+    /// red, and the fix is to re-measure the crossing (that constant's doc has
+    /// the method) and update all three sites together.
+    ///
+    /// The injected encoder reports the thread it ran on: the caller's thread
+    /// below the threshold, one of the blocking pool's at it.
+    #[tokio::test]
+    async fn offload_branch_is_taken_exactly_at_the_threshold() {
+        for (rows, want_offthread) in [(11_999usize, false), (12_000usize, true)] {
+            let (mut server, mut client) =
+                UnixStream::pair().expect("a connected socketpair needs no listener at all");
+            let drain = tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let _ = client.read_to_end(&mut buf).await;
+            });
+            let resp = Response {
+                ok: true,
+                grants: Some(
+                    (0..rows)
+                        .map(|i| GrantOut {
+                            agent: format!("agent-{i:06}"),
+                            datasource: "departures".to_owned(),
+                            scope: "*".to_owned(),
+                            decision: "always".to_owned(),
+                        })
+                        .collect(),
+                ),
+                ..Response::default()
+            };
+
+            let here = std::thread::current().id();
+            let (tx, rx) = std::sync::mpsc::channel();
+            write_response_with_encoder(&mut server, resp, move |r| {
+                let _ = tx.send(std::thread::current().id());
+                encode_response(r)
+            })
+            .await;
+            drop(server); // lets the drain task observe EOF
+
+            let ran_on = rx.recv().expect("the encoder must have run exactly once");
+            assert_eq!(
+                ran_on != here,
+                want_offthread,
+                "rows={rows}: encoder ran off-thread = {}, wanted {want_offthread} \
+                 (LARGE_RESPONSE_ROWS = {LARGE_RESPONSE_ROWS})",
+                ran_on != here,
+            );
+            drain.await.expect("drain task must not panic");
+        }
     }
 
     #[test]

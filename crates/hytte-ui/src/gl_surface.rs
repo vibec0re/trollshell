@@ -1240,23 +1240,30 @@ mod imp {
         /// `GtkGLArea` creates its context in `realize`, same as the module
         /// docs say) without needing a live main loop.
         ///
-        /// `None` when this display cannot produce one. That is expected in
-        /// the `nix flake check` sandbox, which ships no mesa at all (see the
-        /// #893 design spec's "CI has no GL"); a local `xvfb-run` may or may
-        /// not have a software GL driver available either.
-        fn real_gl() -> Option<(gtk::Window, gtk::GLArea, hgl::Gl)> {
+        /// `Err` carries **which of the two exits fired**, because they are
+        /// different facts with different fixes and the skip message is the
+        /// only place anyone reads them. This used to be an `Option` and the
+        /// three skips below asserted a cause nobody had checked — *"no GL
+        /// context on this display, expected under the sandboxed runner, which
+        /// has no mesa"*. That was false in every environment it was run in:
+        /// GDK had a context, `area.error()` was `None`, and the skip was
+        /// `hgl::Gl::current()` failing because `hytte-gl`'s loader resolved
+        /// nothing (#1067). Naming the exit is what turns the next such
+        /// failure into a one-line issue.
+        fn real_gl() -> Result<(gtk::Window, gtk::GLArea, hgl::Gl), String> {
             let window = gtk::Window::new();
             let area = gtk::GLArea::new();
             area.set_allowed_apis(gdk::GLAPI::GLES);
             window.set_child(Some(&area));
             gtk::prelude::WidgetExt::realize(&window);
             area.realize();
-            if area.error().is_some() {
-                return None;
+            if let Some(error) = area.error() {
+                return Err(format!("GtkGLArea could not create a context: {error}"));
             }
             area.make_current();
-            let gl = hgl::Gl::current().ok()?;
-            Some((window, area, gl))
+            let gl = hgl::Gl::current()
+                .map_err(|error| format!("GDK made a context current, but {error}"))?;
+            Ok((window, area, gl))
         }
 
         /// **#979.** `ensure_resources` must rebuild — not reuse — when the
@@ -1271,13 +1278,14 @@ mod imp {
         /// final assertion goes red, seeing `1` program instead of `2`.
         #[gtk::test]
         fn a_program_change_at_a_constant_grid_rebuilds_resources() {
-            let Some((_window, _area, gl)) = real_gl() else {
-                eprintln!(
-                    "skipping a_program_change_at_a_constant_grid_rebuilds_resources: no GL \
-                     context on this display — expected under the sandboxed `nix flake check` \
-                     runner, which has no mesa in its closure"
-                );
-                return;
+            let (_window, _area, gl) = match real_gl() {
+                Ok(live) => live,
+                Err(why) => {
+                    eprintln!(
+                        "skipping a_program_change_at_a_constant_grid_rebuilds_resources: {why}"
+                    );
+                    return;
+                }
             };
 
             let one = GlPipeline {
@@ -1345,13 +1353,12 @@ mod imp {
             // Comfortably over any real driver's GL_MAX_TEXTURE_SIZE.
             const OVER: usize = 100_000;
 
-            let Some((_window, _area, gl)) = real_gl() else {
-                eprintln!(
-                    "skipping a_refused_length_maps_to_its_own_data_failure: no GL context on \
-                     this display — expected under the sandboxed `nix flake check` runner, \
-                     which has no mesa in its closure"
-                );
-                return;
+            let (_window, _area, gl) = match real_gl() {
+                Ok(live) => live,
+                Err(why) => {
+                    eprintln!("skipping a_refused_length_maps_to_its_own_data_failure: {why}");
+                    return;
+                }
             };
 
             let pipeline = GlPipeline {
@@ -1427,13 +1434,15 @@ mod imp {
             // current context via `hgl::Gl::current()`, and dropping the
             // handle does not un-current it — `_window`/`_area` are what keep
             // that alive.
-            let Some((_window, _area, _gl)) = real_gl() else {
-                eprintln!(
-                    "skipping draw_routes_a_refused_upload_into_its_own_warned_data_latch: no \
-                     GL context on this display — expected under the sandboxed `nix flake \
-                     check` runner, which has no mesa in its closure"
-                );
-                return;
+            let (_window, _area, _gl) = match real_gl() {
+                Ok(live) => live,
+                Err(why) => {
+                    eprintln!(
+                        "skipping draw_routes_a_refused_upload_into_its_own_warned_data_latch: \
+                         {why}"
+                    );
+                    return;
+                }
             };
 
             let pipeline = GlPipeline {

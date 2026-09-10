@@ -119,6 +119,16 @@ impl Plugin for Infobroker {
     /// the host is about to reject on its `IdGuard`. `serve` therefore probes
     /// the path for a live incumbent and stands down instead of unlinking it
     /// (#995) — do not reintroduce an unconditional bind here.
+    ///
+    /// This `tokio::spawn` puts `serve` on the SDK's **current-thread** runtime
+    /// (`hytte-plugin/src/runtime.rs`), which is the right shape — the broker
+    /// is this plugin session's I/O source, not a second daemon with its own
+    /// runtime the way `hytte-claude-bridge`'s HTTP listener is. The cost is
+    /// that any synchronous step inside `serve` holds the one thread there is
+    /// and stalls every timer on it, so `serve` runs its blocking work through
+    /// `spawn_blocking` (#1059) — see `broker::serve_with_grant_loader`. Keep
+    /// new blocking work in `serve` behind that same hop rather than moving
+    /// this spawn.
     fn sources(cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
         tokio::spawn(hytte_plugin_infobroker::serve(cmds, msg_tx));

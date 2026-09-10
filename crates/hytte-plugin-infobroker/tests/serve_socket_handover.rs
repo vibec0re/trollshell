@@ -5,7 +5,11 @@
 //! the decision with a local `owned` parameter, which cannot see whether
 //! `serve` actually threads the process-wide listener through at all.
 //!
-//! Both scenarios need a real second OS process, for two independent reasons:
+//! #1059 added scenario D on the same harness for a different `serve`-level
+//! property: that a synchronous step inside `serve` does not stop the
+//! current-thread runtime `serve` is spawned onto in production.
+//!
+//! Every scenario needs a real second OS process, for two independent reasons:
 //!
 //! - [`broker::SOCKET`] and [`broker::STOOD_DOWN`] are process-wide statics
 //!   (deliberately — see their doc comments in `src/broker.rs`), so two
@@ -27,12 +31,16 @@
 //! `trollshell/src/plugins/tests.rs` uses for
 //! `detached_launch_falls_back_without_a_user_manager`.
 
+use std::fmt::Write as _;
 use std::io::Read as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use hytte_plugin_infobroker::grants::{Grant, to_toml};
+use hytte_plugin_infobroker::broker::serve_with_grant_loader;
+use hytte_plugin_infobroker::grants::{Grant, GrantStore, to_toml};
 use hytte_plugin_infobroker::paths::{GRANTS_FILE, SOCKET_FILE, STATE_DIR};
 use hytte_plugin_infobroker::{BrokerMsg, BrokerSnapshot, Cmd, serve};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
@@ -122,9 +130,41 @@ const WRITE_PARK_GIVE_UP: Duration = Duration::from_secs(10);
 /// the two bounds while keeping mutation (c) RED and the suite green.
 const HUGE_GRANT_COUNT: usize = 8_000;
 
+/// Scenario D (#1059): how long the injected synchronous grant loader blocks.
+/// Twenty times [`STARVED_TIMER`], so the two arms of the mutation are never
+/// in doubt — on the fixed tree the timer fires at ~[`STARVED_TIMER`], on the
+/// mutated one it cannot fire before this elapses.
+const SLOW_LOAD: Duration = Duration::from_secs(2);
+
+/// Scenario D: the concurrent timer whose punctuality is the property under
+/// test — the stand-in for the broker's own `REQUEST_TIMEOUT` /
+/// `CONSENT_PARK_TIMEOUT` / `QUERY_PARK_TIMEOUT` bounds and the SDK's clock
+/// pump, all of which live on the same current-thread runtime as `serve`.
+const STARVED_TIMER: Duration = Duration::from_millis(100);
+
+/// Scenario D: how far past [`STARVED_TIMER`] the timer may land before the
+/// test calls it starved.
+///
+/// Measured on the fixed tree, 20 runs of this scenario under 64 CPU burners
+/// on 64 cores: the timer fired at 100.99–108.94 ms, i.e. an overshoot of
+/// 1.0–8.9 ms — comfortably inside the "~50 ms" #1059 asks for. This constant
+/// is nonetheless 150 ms, ~17× that worst observation, for the reason
+/// `HUGE_GRANT_COUNT`'s note gives: CI is `ubuntu-latest`'s 4 vCPU running
+/// this suite twice per `nix flake check` alongside two `nixosTest` VMs, where
+/// a thread wakeup is a great deal less punctual than it is here, and a
+/// wall-clock bound this test does not need to be tight is not worth a flake.
+/// It costs the mutation nothing: the discriminating value is [`SLOW_LOAD`] =
+/// 2 s, 8× this whole bound (measured under mutation (e): 2.000328324 s).
+///
+/// The wall-clock check is in any case the *second* assertion. The first —
+/// the loader must still be mid-flight when the timer fires — is a pure
+/// ordering property with no clock in it, and it is the one that cannot be
+/// satisfied by a slow-but-not-starved runtime.
+const STARVED_TIMER_SLACK: Duration = Duration::from_millis(150);
+
 // ── Shared harness ──────────────────────────────────────────────────────────
 
-/// #1024 review New-7: a byte cap alongside `tail_lines`' line cap. With the
+/// #1024 review New-7: a byte cap alongside the line cap. With the
 /// `{snap:?}`-formatted full-snapshot dumps gone (L3) nothing today emits a
 /// single line long enough to blow this up on its own, but capping only
 /// lines made that true by accident, not by construction — a future
@@ -132,39 +172,228 @@ const HUGE_GRANT_COUNT: usize = 8_000;
 /// line cap.
 const TAIL_MAX_BYTES: usize = 4096;
 
-/// The last `n` lines of `s`, further capped to at most [`TAIL_MAX_BYTES`],
-/// with a byte/line count header when either cap actually trims something.
-/// #1024 review L3: a failing scenario's child can legitimately print
-/// megabytes (a `{:?}`-formatted `BrokerSnapshot` holding `HUGE_GRANT_COUNT`
-/// grants used to do exactly that), and dumping all of it into a panic
-/// message is how one failing run put 6.6 MB into a CI log. The failure
-/// reason is almost always in the last handful of lines, not the middle.
-fn tail_lines(s: &str, n: usize) -> String {
-    let lines: Vec<&str> = s.lines().collect();
-    let by_lines = lines.len() > n;
-    let mut tail = if by_lines {
-        lines[lines.len() - n..].join("\n")
-    } else {
-        s.to_owned()
-    };
-    let by_bytes = tail.len() > TAIL_MAX_BYTES;
-    if by_bytes {
-        let mut start = tail.len() - TAIL_MAX_BYTES;
-        while !tail.is_char_boundary(start) {
-            start += 1;
+/// The head's own byte cap, the counterpart to [`TAIL_MAX_BYTES`] (#1059 item
+/// 2). Smaller because the head exists to carry a `_inner` test's panic
+/// message and its `assertion failed` block, not a transcript.
+const HEAD_MAX_BYTES: usize = 2048;
+
+/// How many of the FIRST lines of a child's captured output survive truncation
+/// (#1059 item 2). See [`head_and_tail`].
+const HEAD_LINES: usize = 10;
+
+/// How many of the LAST lines survive truncation. `HEAD_LINES + TAIL_LINES`
+/// is the 40 the pre-#1059 tail-only helper kept, so a short child's output
+/// is reported exactly as it was.
+const TAIL_LINES: usize = 30;
+
+/// Which end of a string a byte cap keeps.
+#[derive(Clone, Copy)]
+enum Keep {
+    /// Keep the first bytes, drop the rest (the head half).
+    Start,
+    /// Keep the last bytes, drop what precedes them (the tail half).
+    End,
+}
+
+/// At most `max` bytes of `s` taken from the end `keep` names, split on a char
+/// boundary, plus whether anything was actually dropped.
+fn clamp_bytes(s: &str, max: usize, keep: Keep) -> (&str, bool) {
+    if s.len() <= max {
+        return (s, false);
+    }
+    match keep {
+        Keep::Start => {
+            let mut end = max;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            (&s[..end], true)
         }
-        tail = tail[start..].to_owned();
+        Keep::End => {
+            let mut start = s.len() - max;
+            while !s.is_char_boundary(start) {
+                start += 1;
+            }
+            (&s[start..], true)
+        }
     }
-    if !by_lines && !by_bytes {
-        return tail;
+}
+
+/// The first [`HEAD_LINES`] and last [`TAIL_LINES`] lines of `s`, each further
+/// byte-capped ([`HEAD_MAX_BYTES`] / [`TAIL_MAX_BYTES`]), with a
+/// byte/line-count header and an explicit elision marker whenever anything is
+/// dropped. Returns `s` verbatim when nothing needs trimming.
+///
+/// #1024 review L3 (the tail half): a failing scenario's child can legitimately
+/// print megabytes (a `{:?}`-formatted `BrokerSnapshot` holding
+/// `HUGE_GRANT_COUNT` grants used to do exactly that), and dumping all of it
+/// into a panic message is how one failing run put 6.6 MB into a CI log.
+///
+/// #1059 item 2 (the head half): keeping *only* the tail loses the one line a
+/// red is diagnosed from as soon as backtraces are on. The devShell sets
+/// `RUST_BACKTRACE=1` (`nix/devshell.nix`), a panicking `_inner` test's
+/// backtrace is ~10 KB, and libtest prints the panic message *before* it —
+/// so the message fell off the front of a 40-line / 4 KiB tail and the
+/// developer got a stack of `core::panicking` frames with no reason attached
+/// (measured on the #1033 tree: `grep -c "another info broker"` over a
+/// deliberately reddened scenario B = 0 with backtraces on, 2 with them off).
+/// CI, which does not set the variable, never saw it — so this is a dev-loop
+/// fix, not a CI one.
+fn head_and_tail(s: &str) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let head_n = HEAD_LINES.min(lines.len());
+    let tail_n = TAIL_LINES.min(lines.len() - head_n);
+    let elided = lines.len() - head_n - tail_n;
+
+    let head_src = lines[..head_n].join("\n");
+    let tail_src = lines[lines.len() - tail_n..].join("\n");
+    let (head, head_cut) = clamp_bytes(&head_src, HEAD_MAX_BYTES, Keep::Start);
+    let (tail, tail_cut) = clamp_bytes(&tail_src, TAIL_MAX_BYTES, Keep::End);
+
+    if elided == 0 && !head_cut && !tail_cut {
+        return s.to_owned();
     }
-    format!(
-        "[{} bytes, {} lines total — showing last {} bytes]\n{}",
+    let mut out = format!(
+        "[{} bytes, {} lines total — showing the first {head_n} and last {tail_n} lines]\n",
         s.len(),
         lines.len(),
-        tail.len(),
-        tail,
-    )
+    );
+    out.push_str(head);
+    if head_cut {
+        out.push_str("\n… head truncated at a byte cap …");
+    }
+    if elided > 0 {
+        let noun = if elided == 1 { "line" } else { "lines" };
+        write!(out, "\n… {elided} {noun} elided …").expect("writing to a String cannot fail");
+    }
+    if tail_n > 0 {
+        out.push('\n');
+        if tail_cut {
+            out.push_str("… tail truncated at a byte cap …\n");
+        }
+        out.push_str(tail);
+    }
+    out
+}
+
+/// #1059 item 2, the property the head half exists for: a panic message that a
+/// long backtrace has pushed 197 lines from the end still reaches the panic
+/// text `run_inner` prints.
+///
+/// RED under the pre-#1059 helper (`tail_lines(s, 40)`, tail-only): line 3 of
+/// 200 is not in the last 40, so it could not appear in the output at all —
+/// which is exactly what `RUST_BACKTRACE=1` (set by `nix/devshell.nix`) did to
+/// every failing scenario in the dev loop.
+///
+/// Also RED under a head-only mutation (drop the tail half): the last line
+/// must still be there too.
+#[test]
+fn head_and_tail_keeps_a_panic_line_a_backtrace_pushed_off_the_end() {
+    const PANIC_LINE: &str =
+        "thread 'main' panicked at tests/serve_socket_handover.rs:1: another info broker";
+    let mut lines = vec![
+        "running 1 test".to_owned(),
+        String::new(),
+        PANIC_LINE.to_owned(),
+    ];
+    // The shape libtest prints *after* the message: ~10 KB of frames.
+    for i in 0..197 {
+        lines.push(format!(
+            "  {i:>3}: 0x00007f0000000000 - core::panicking::panic_fmt::h{i:016x}"
+        ));
+    }
+    let input = lines.join("\n");
+    assert_eq!(input.lines().count(), 200, "the fixture must be 200 lines");
+
+    let out = head_and_tail(&input);
+    assert!(
+        out.contains(PANIC_LINE),
+        "the panic line (line 3 of 200) must survive truncation — RED tail-only:\n{out}",
+    );
+    assert!(
+        out.contains(lines.last().expect("the fixture is non-empty").as_str()),
+        "the last line must survive too — RED head-only:\n{out}",
+    );
+    assert!(
+        !out.contains(lines[100].as_str()),
+        "the middle must genuinely be dropped, not merely reordered:\n{out}",
+    );
+    assert!(
+        out.contains("lines elided"),
+        "an elision must be announced, so nobody reads the join as contiguous output:\n{out}",
+    );
+    assert!(
+        out.len() < input.len(),
+        "truncation must actually shrink the output ({} vs {})",
+        out.len(),
+        input.len(),
+    );
+}
+
+/// #1033 third pass ("`tail_lines`' byte cap … has no test of its own"): one
+/// enormous line trips no line cap at all, so only a byte cap can hold it.
+/// A single line is entirely head (there are no lines left over for a tail),
+/// so this is the head cap's test. RED if the head [`clamp_bytes`] is dropped.
+#[test]
+fn head_and_tail_byte_caps_one_enormous_line() {
+    let huge = "x".repeat(HEAD_MAX_BYTES + TAIL_MAX_BYTES + 10_000);
+    let out = head_and_tail(&huge);
+    assert!(
+        out.len() < huge.len(),
+        "a single {}-byte line must still be capped ({} bytes out)",
+        huge.len(),
+        out.len(),
+    );
+    assert!(
+        out.contains("head truncated at a byte cap"),
+        "the head byte cap must announce itself:\n{out}",
+    );
+}
+
+/// The tail cap's own test, and the reason it is separate: the single-line
+/// fixture above leaves `tail_n == 0`, so it stays green with the tail
+/// [`clamp_bytes`] deleted outright (measured — mutation (i) passed 3/3 until
+/// this test existed). Only a fixture with an over-long line in *both* halves
+/// exercises the two caps independently.
+///
+/// RED if either [`clamp_bytes`] call is dropped.
+#[test]
+fn head_and_tail_byte_caps_each_half_independently() {
+    let mut lines = vec!["H".repeat(HEAD_MAX_BYTES + 1_000)];
+    for i in 1..49 {
+        lines.push(format!("filler line {i}"));
+    }
+    lines.push("T".repeat(TAIL_MAX_BYTES + 1_000));
+    let input = lines.join("\n");
+    assert_eq!(
+        input.lines().count(),
+        50,
+        "the fixture must exceed HEAD_LINES + TAIL_LINES so both halves are real",
+    );
+
+    let out = head_and_tail(&input);
+    assert!(
+        out.contains("head truncated at a byte cap"),
+        "the head half must be byte-capped:\n{}",
+        &out[..out.len().min(200)],
+    );
+    assert!(
+        out.contains("tail truncated at a byte cap"),
+        "the tail half must be byte-capped too — RED under mutation (i)",
+    );
+    assert!(
+        out.len() < HEAD_MAX_BYTES + TAIL_MAX_BYTES + 500,
+        "the two caps plus the header/markers must bound the whole output, got {} bytes",
+        out.len(),
+    );
+}
+
+/// Output short enough on both axes comes back byte-for-byte, with no header —
+/// the pre-#1059 helper's contract, preserved.
+#[test]
+fn head_and_tail_leaves_short_output_verbatim() {
+    let short = "running 1 test\nSCENARIO_OK whatever\ntest result: ok.";
+    assert_eq!(head_and_tail(short), short);
 }
 
 /// Re-execute this test binary, filtered to exactly `inner_test_name`, with
@@ -180,8 +409,8 @@ fn tail_lines(s: &str, n: usize) -> String {
 /// collecting after exit would deadlock if the child ever writes more than a
 /// pipe buffer's worth before this function notices it exited.
 ///
-/// Panics (with a trimmed tail of the child's stdout+stderr — see
-/// [`tail_lines`]) on a non-zero exit, so a mutation shows up as a named test
+/// Panics (with the head and tail of the child's stdout+stderr — see
+/// [`head_and_tail`]) on a non-zero exit, so a mutation shows up as a named test
 /// failure rather than a silent skip. Also asserts (#1024 review M1) that the
 /// child's stdout contains a [`SCENARIO_OK_PREFIX`] line naming this exact
 /// `inner_test_name` — printed only once the `_inner` test has run its real
@@ -263,14 +492,14 @@ fn run_inner(inner_test_name: &str, runtime_dir: &Path, state_dir: &Path) {
         !timed_out,
         "{inner_test_name} did not exit within {CHILD_GIVE_UP:?} and was killed.\n\
          --- stdout ---\n{}\n--- stderr ---\n{}",
-        tail_lines(&stdout, 40),
-        tail_lines(&stderr, 40),
+        head_and_tail(&stdout),
+        head_and_tail(&stderr),
     );
     assert!(
         status.success(),
         "{inner_test_name} failed.\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        tail_lines(&stdout, 40),
-        tail_lines(&stderr, 40),
+        head_and_tail(&stdout),
+        head_and_tail(&stderr),
     );
     let marker = format!("{SCENARIO_OK_PREFIX}{inner_test_name}");
     assert!(
@@ -280,8 +509,8 @@ fn run_inner(inner_test_name: &str, runtime_dir: &Path, state_dir: &Path) {
          name stale) or a marker env that never reached the child both make the scenario a \
          silent no-op with a green suite (#1024 review M1).\n\
          --- stdout ---\n{}\n--- stderr ---\n{}",
-        tail_lines(&stdout, 40),
-        tail_lines(&stderr, 40),
+        head_and_tail(&stdout),
+        head_and_tail(&stderr),
     );
 }
 
@@ -770,6 +999,25 @@ async fn a_client_that_never_reads_does_not_delay_the_next_sessions_seed_inner()
         "session 1 must bind cleanly: {:?}",
         snap1.notice,
     );
+    // #1064 review F1: nothing else pins `load_grants` to actually reading
+    // `grants.toml` — a loader that stops reading it (and returns an empty
+    // store) stayed green here before this assertion existed. Check both the
+    // count (the file really was read) and a known row (the bytes that came
+    // back are the ones `seed_large_grants` wrote, not just the right shape).
+    assert_eq!(
+        snap1.grants.len(),
+        HUGE_GRANT_COUNT,
+        "session 1 must actually honour the seeded grants.toml — RED under a \
+         `load_grants` that stops reading the file",
+    );
+    assert!(
+        snap1.grants.iter().any(|g| g.agent == "agent-000000"
+            && g.datasource == "departures"
+            && g.decision == "always"),
+        "the seeded grants must be the ones grants.toml actually holds, not just \
+         the right count: first = {:?}",
+        snap1.grants.first(),
+    );
 
     // A client connects, asks for the (huge, pre-seeded) grants list, and
     // then never reads the reply: `write_response` blocks on the client's
@@ -812,5 +1060,145 @@ async fn a_client_that_never_reads_does_not_delay_the_next_sessions_seed_inner()
     // #1024 review M1 — see the first scenario for why this line matters.
     // #1024 review New-5 — derived from this function's own name, matching
     // the outer test's derivation of the same name.
+    println!("{SCENARIO_OK_PREFIX}{}", this_fn_name!());
+}
+
+// ── Scenario D: a slow synchronous step must not stop the runtime's timers ──
+
+/// #1059 item 1: production runs `serve` under a plain `tokio::spawn` on the
+/// SDK's **current-thread** runtime (`src/plugin.rs`'s `sources()` →
+/// `hytte-plugin/src/runtime.rs`), so any synchronous step inside `serve`
+/// holds the only thread there is and stalls every timer on it — the broker's
+/// own request/consent/query bounds, the SDK's clock pump, and the SDK session
+/// loop, together. Measured on #1024's tree, with `GrantStore::load` parsing a
+/// large `grants.toml` inline: a 5 s `tokio::time::timeout` returning `Ok` at
+/// 7.310 s.
+///
+/// So this scenario drives `serve` exactly the way production does — a plain
+/// `tokio::spawn`, deliberately **not** [`spawn_serve`], which exists precisely
+/// to keep the other three scenarios off this thread — with a grant loader
+/// injected through `broker::serve_with_grant_loader` that blocks
+/// synchronously for [`SLOW_LOAD`], and asserts a concurrent [`STARVED_TIMER`]
+/// on the same runtime still fires on time.
+///
+/// RED under mutation (e) — `spawn_blocking(load_grants).await` in
+/// `serve_with_grant_loader` replaced by a plain `load_grants()` call: the
+/// timer then cannot be polled until the loader returns 2 s later, failing
+/// both the ordering assertion and the wall-clock bound.
+///
+/// It needs the re-exec harness for the same reason its siblings do: `serve`
+/// bails before it ever reaches the grant load when `XDG_RUNTIME_DIR` is
+/// unset, and `std::env::set_var` is `unsafe` (see the module doc).
+#[tokio::test]
+async fn a_slow_grant_load_does_not_stall_the_sessions_timers() {
+    // #1024 review New-6: see the sibling scenarios' identical guard.
+    if in_scenario_child() {
+        return;
+    }
+    let runtime_dir = tempfile::tempdir().expect("XDG_RUNTIME_DIR scratch dir");
+    let state_dir = tempfile::tempdir().expect("XDG_STATE_HOME scratch dir");
+    // #1024 review New-5: derived from this function's own name — see
+    // `this_fn_name!`'s doc.
+    let inner_name = format!("{}_inner", this_fn_name!());
+    run_inner(&inner_name, runtime_dir.path(), state_dir.path());
+}
+
+#[tokio::test]
+async fn a_slow_grant_load_does_not_stall_the_sessions_timers_inner() {
+    if !in_scenario_child() {
+        return;
+    }
+    let sock_path =
+        hytte_plugin_infobroker::paths::socket_path().expect("XDG_RUNTIME_DIR set by the harness");
+
+    // Two latches rather than one: `entered` proves `serve` actually reached
+    // the grant load (without it, a `serve` that returned early would make the
+    // punctuality assertions vacuously true), `left` is the ordering half of
+    // the property — the timer must fire while the loader is still running.
+    let entered = Arc::new(AtomicBool::new(false));
+    let left = Arc::new(AtomicBool::new(false));
+
+    let (cmds_tx, cmds_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<BrokerMsg>();
+    let loader_entered = Arc::clone(&entered);
+    let loader_left = Arc::clone(&left);
+    // A PLAIN `tokio::spawn` on this test's current-thread runtime — the
+    // production shape. Using `spawn_serve` here would move `serve` to the
+    // blocking pool and make the whole scenario pass unconditionally.
+    let session = tokio::spawn(serve_with_grant_loader(cmds_rx, out_tx, move || {
+        loader_entered.store(true, Ordering::SeqCst);
+        std::thread::sleep(SLOW_LOAD);
+        loader_left.store(true, Ordering::SeqCst);
+        GrantStore::from_grants(Vec::new())
+    }));
+
+    let started = Instant::now();
+    let fired = tokio::time::timeout(STARVED_TIMER, std::future::pending::<()>()).await;
+    let delay = started.elapsed();
+    // Printed, not just asserted: `--nocapture` is already on for every
+    // scenario child, and the whole point of the bounds below is a measured
+    // number, so a future retune of `STARVED_TIMER_SLACK` starts from a fresh
+    // observation rather than this comment.
+    println!(
+        "MEASURED a {STARVED_TIMER:?} timer fired after {delay:?} against a {SLOW_LOAD:?} load"
+    );
+    assert!(
+        fired.is_err(),
+        "a timeout over `pending` must elapse, never resolve — that would be the harness \
+         breaking, not the code under test",
+    );
+
+    assert!(
+        entered.load(Ordering::SeqCst),
+        "the injected loader had not started {delay:?} in, so this test cannot tell a punctual \
+         timer from a `serve` that never reached the grant load at all",
+    );
+    assert!(
+        !left.load(Ordering::SeqCst),
+        "the {STARVED_TIMER:?} timer fired only after the {SLOW_LOAD:?} loader had already \
+         finished ({delay:?} elapsed) — the two never overlapped, i.e. `serve` ran the loader \
+         on this very thread (RED under mutation (e): `spawn_blocking` removed)",
+    );
+    assert!(
+        delay < STARVED_TIMER + STARVED_TIMER_SLACK,
+        "a {STARVED_TIMER:?} timer took {delay:?} while `serve`'s {SLOW_LOAD:?} synchronous \
+         grant load ran on the same current-thread runtime — the load is starving the session's \
+         own timers (#1059)",
+    );
+
+    // The offload must not have cost the session anything: it still seeds the
+    // panel once the loader returns, and it really is serving.
+    let seed = tokio::time::timeout(SLOW_LOAD + GIVE_UP, recv_update(&mut out_rx))
+        .await
+        .expect("the session must still seed once the slow load finishes")
+        .expect("the lane produced a snapshot");
+    assert!(
+        left.load(Ordering::SeqCst),
+        "the seed must follow the loader, not race ahead of it — `serve` must still be using \
+         the store the loader handed back",
+    );
+    assert_eq!(
+        seed.notice, None,
+        "the session must bind cleanly: {:?}",
+        seed.notice,
+    );
+
+    let mut client = UnixStream::connect(&sock_path)
+        .await
+        .expect("connect to the session");
+    send_line(&mut client, r#"{"op":"grants"}"#).await;
+    let reply = read_line(&mut client)
+        .await
+        .expect("the session answers a real request");
+    assert!(
+        reply.contains("\"ok\":true"),
+        "the offloaded load must leave a fully working broker behind: {reply}",
+    );
+
+    drop(cmds_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), session).await;
+
+    // #1024 review M1 / New-5 — see the first scenario for why this line
+    // matters and why the name is derived rather than typed.
     println!("{SCENARIO_OK_PREFIX}{}", this_fn_name!());
 }

@@ -562,6 +562,18 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       `hytte-plugin-clock-demo`'s own frames, or any socket dump — rather than
       from a plugin's `update()`. A **drawer panel** click must carry no output
       at all; that is deliberate, not a miss.
+      **Hidden animation costs nothing (#1068 review, MEDIUM-1).** The scratch
+      plugin above with a **scrolling/animating** chip (`preem-demo`'s marquee,
+      or `caw`) hidden via `hidden_on` on one screen — confirm the hidden
+      screen's frame clock is not being kept armed on its account: with
+      `RUST_LOG=trollshell=debug` there should be no steady stream of preem
+      repaint activity for that plugin id while it's hidden there, and a
+      wakeup count on that output over a few seconds (the `perf`/wakeup method
+      #883/#926 used to measure the sidebar-closed and empty-region cases)
+      should read the same as with the plugin absent entirely, not the ~30
+      Hz/monitor a still-armed tick callback would cost. Re-show it (rename
+      `hidden_on` back to nothing that matches) and confirm the animation
+      resumes on that screen.
 
 ## Infobroker
 

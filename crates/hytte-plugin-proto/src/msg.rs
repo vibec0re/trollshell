@@ -33,7 +33,13 @@ use serde::{Deserialize, Serialize};
 // 200 B and the gap to 80 — serializing identically (`Box` is transparent to
 // serde, so no fixture moves). It is not done here because it changes a field
 // #1050 is not about, across the SDK, the host and seven plugin crates' test
-// helpers; it wants its own PR.
+// helpers — see the follow-up issue for that boxing.
+//
+// The `#[allow]` below sits on the whole enum rather than on `Render` (or its
+// `panel` field) alone, so it silences `large_enum_variant` for every variant
+// this enum ever gains, not only the one it is measured against today (#1068
+// review, LOW-4). Narrowing its scope is part of the same follow-up as the
+// boxing above, since both land on this declaration together.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PluginMsg {
@@ -154,7 +160,12 @@ pub enum HostMsg {
         /// process-wide value rather than a per-monitor one, so a panel event
         /// genuinely has no screen to name. Bar chips and sidebar cards always
         /// carry `Some`. A monitor with no connector name reported by GDK would
-        /// also produce `None`.
+        /// also produce `None` — `hytte-ui`'s `Monitor::connector` can hand back
+        /// `Some("")` on some drivers rather than `None` itself, and the host
+        /// folds that to `None` before it ever reaches a region (the
+        /// `trollshell::plugins::region::named_connector` helper every region
+        /// slot goes through, #1068 review LOW-3), so this promise holds for
+        /// the empty-string case too, not only GDK's own `None`.
         ///
         /// # Compat
         ///

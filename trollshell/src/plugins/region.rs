@@ -103,6 +103,26 @@ fn bar_right_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
     })
 }
 
+/// `Monitor::connector()`'s value, with an empty name folded to `None` (#1068
+/// review, LOW-3). Takes the already-read `Option<String>` rather than
+/// `&Monitor` so this stays a pure fold, testable without a live display.
+///
+/// `hytte_ui::Monitor::connector` documents that the name "may be empty on
+/// some drivers", but every consumer of a region's `connector` — this module's
+/// own doc on [`build_region`], and [`HostMsg::Event::output`]'s wire doc in
+/// `hytte-plugin-proto` — promises plugins a clean `None` for an unnamed
+/// monitor, the same "never hidden by name, no output on events" degrade a
+/// `None` from GDK itself gets. Passing `monitor.connector()` straight through
+/// would let `Some("")` slip past that contract: a plugin matching on
+/// `Some(name) => …, None => …` would take the `Some` branch for a name no
+/// compositor ever answers to, instead of falling back. `fullscreen::install`
+/// and `overlays::consent::install` already carry this exact filter for the
+/// same reason; this is the one helper the six [`build_region`] call sites
+/// below share instead of repeating it.
+fn named_connector(connector: Option<String>) -> Option<String> {
+    connector.filter(|c| !c.is_empty())
+}
+
 /// The [`Mount::SidebarLead`](hytte_plugin_proto::Mount::SidebarLead) **region** —
 /// a vertical container of N plugin cards. Built per monitor from
 /// `overlays::sidebar::build_card` and mounted at the very **top** of the sidebar,
@@ -114,7 +134,7 @@ pub fn sidebar_lead_slot(monitor: &Monitor) -> gtk::Widget {
         lead_render_signal(),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
-        monitor.connector(),
+        named_connector(monitor.connector()),
     )
 }
 
@@ -127,7 +147,7 @@ pub fn sidebar_top_slot(monitor: &Monitor) -> gtk::Widget {
         top_render_signal(),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
-        monitor.connector(),
+        named_connector(monitor.connector()),
     )
 }
 
@@ -139,7 +159,7 @@ pub fn sidebar_bottom_slot(monitor: &Monitor) -> gtk::Widget {
         bottom_render_signal(),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
-        monitor.connector(),
+        named_connector(monitor.connector()),
     )
 }
 
@@ -154,7 +174,7 @@ pub fn bar_left_slot(monitor: &Monitor) -> gtk::Widget {
         bar_left_render_signal(),
         gtk::Orientation::Horizontal,
         "ts-plugin-chip",
-        monitor.connector(),
+        named_connector(monitor.connector()),
     )
 }
 
@@ -166,7 +186,7 @@ pub fn bar_center_slot(monitor: &Monitor) -> gtk::Widget {
         bar_center_render_signal(),
         gtk::Orientation::Horizontal,
         "ts-plugin-chip",
-        monitor.connector(),
+        named_connector(monitor.connector()),
     )
 }
 
@@ -178,7 +198,7 @@ pub fn bar_right_slot(monitor: &Monitor) -> gtk::Widget {
         bar_right_render_signal(),
         gtk::Orientation::Horizontal,
         "ts-plugin-chip",
-        monitor.connector(),
+        named_connector(monitor.connector()),
     )
 }
 
@@ -258,10 +278,30 @@ fn build_region(
     // `Rc<Animator>`. The card roots the list does reach are *children* of the
     // container, and in GTK4 a parent refs its children and never the reverse,
     // so nothing here points back up.
+    //
+    // Filtered by `card.root.get_visible()` (#1050 / #1068 review, MEDIUM-1): a
+    // card's own visible flag is exactly [`reconcile_region`]'s [`card_shows_here`]
+    // verdict for *this* monitor — false when its tree is empty (#1042) **or**
+    // when this monitor is named in its `hidden_on` (#1050). Before this filter
+    // existed the two reasons agreed only by accident: an empty-tree card's
+    // `preem_scope` really has nothing registered to animate, so including it
+    // cost nothing, but a `hidden_on` card can carry a full, animating tree and
+    // still be hidden on exactly one monitor's copy — and that copy's region
+    // stays mapped whenever a sibling card is still showing, so the tick never
+    // gets the free "region collapsed → unmapped" break either. Un-filtered,
+    // that card's scope kept the hidden monitor's frame clock armed at the full
+    // display refresh for as long as it kept animating — measured 18 ticks over
+    // 300 ms next to a visible sibling, the ordinary bar/sidebar-region shape.
+    // `get_visible()` (not the ancestor-aware `is_visible()`) is deliberate: it
+    // reads this card's own flag regardless of whether `container` itself is
+    // mapped, which is irrelevant here — an unmapped container already breaks
+    // the tick through GTK's own gate in `Animator::ensure_armed`, so this only
+    // has to get the *membership* of an armed tick right.
     let animator = Animator::new(move || {
         cards
             .borrow()
             .iter()
+            .filter(|card| card.root.get_visible())
             .map(|card| card.preem_scope.clone())
             .collect()
     });
@@ -339,6 +379,13 @@ fn build_region(
         //
         // `container` is `bind`'s own closure parameter, not a captured clone —
         // the contract `nix/lint-bind-pins.py` scans this call site for.
+        //
+        // This is also the #1050 show-again edge for a card whose `hidden_on`
+        // just cleared: `reconcile_region` above already flipped its
+        // `root.set_visible(true)` before this call, so the (now filtered)
+        // scopes closure includes it again the moment this reads it — no
+        // separate re-arm path was needed. Pinned by
+        // `gtk_tests::a_card_hidden_on_this_output_does_not_keep_its_frame_clock_armed`.
         animator.ensure_armed(container);
     });
 
@@ -1238,8 +1285,8 @@ mod gtk_tests {
 
     use super::{
         Animator, MountedCard, Scope, SlotRender, build_panel_child, build_region,
-        drive_panel_child, forget_previous_panel_scope, preem_render, reconcile_region,
-        render_active_panel, unknown_connectors,
+        drive_panel_child, forget_previous_panel_scope, named_connector, preem_render,
+        reconcile_region, render_active_panel, unknown_connectors,
     };
     // The #921 releaser lives in `pump` (beside the animation driver whose
     // "still animating" predicate a leaked scope corrupts), but the mounts it has
@@ -1693,6 +1740,16 @@ mod gtk_tests {
     /// `!root_renders_nothing(&r.tree)` (i.e. dropping #1050's contribution to
     /// the collapse rule, keeping the card flag) turns the B-collapse assertion
     /// and the bar-group width red while every other test here stays green.
+    ///
+    /// The A-half assertion is deliberately **not** just `is_visible()` (#1068
+    /// review, INFO-6): a fresh `gtk::Box` is visible by default, so that alone
+    /// would pass even if `reconcile_region` never touched `a` at all — the
+    /// #851 lesson that a visibility flag proves nothing without also checking
+    /// the widget actually measures content. `get_visible()` (this widget's own
+    /// flag, `a` has no parent here to make `is_visible()`'s ancestor check mean
+    /// anything different) plus a non-zero measured width is what the B-side
+    /// discriminates against: B's card is real content too, hidden only by
+    /// #1050, so A showing the *same shape* of content is the actual claim.
     #[gtk::test]
     fn a_lone_hidden_card_collapses_only_the_region_on_that_output() {
         adw::init().expect("libadwaita init");
@@ -1715,8 +1772,13 @@ mod gtk_tests {
         reconcile_region(&b, &cards_b, &renders, "ts-plugin-chip", Some("B"));
 
         assert!(
-            a.is_visible(),
+            a.get_visible(),
             "A's region holds a card that still paints, so it must stay visible",
+        );
+        assert!(
+            a.measure(gtk::Orientation::Horizontal, -1).1 > 0,
+            "…and actually measure the card's content, not just carry a flag `reconcile_region` \
+             never touched — a fresh gtk::Box is visible by default",
         );
         assert!(
             !b.is_visible(),
@@ -2034,6 +2096,237 @@ mod gtk_tests {
             unknown_connectors(&[], &known).is_empty(),
             "an empty hidden_on has nothing to report",
         );
+    }
+
+    /// [`named_connector`] folds `Some("")` to `None`, the same way
+    /// `fullscreen::install`/`overlays::consent::install` already do for the
+    /// unnamed-monitor case some drivers hand GDK (#1068 review, LOW-3).
+    ///
+    /// Pure, so it stands in for a real unnamed `Monitor` — `hytte_ui::Monitor`
+    /// has no test constructor reachable from this crate, and Xvfb's own
+    /// monitor always reports a real connector name, so there is no way to
+    /// exercise the empty-string case through an actual `Monitor` here. The
+    /// fold itself is the whole fix, so testing it directly is not a downgrade
+    /// from an end-to-end check — nothing downstream of `build_region`'s
+    /// `connector: Option<String>` parameter can tell `named_connector`'s
+    /// `None` apart from a genuine `None` from GDK.
+    ///
+    /// **Deletion check:** dropping the `.filter(|c| !c.is_empty())` turns the
+    /// first assertion red (`left: Some(""), right: None`).
+    #[test]
+    fn named_connector_folds_an_empty_name_to_none() {
+        assert_eq!(named_connector(Some(String::new())), None);
+        assert_eq!(named_connector(None), None);
+        assert_eq!(
+            named_connector(Some("DP-2".to_owned())),
+            Some("DP-2".to_owned()),
+            "a real connector name must pass through unchanged",
+        );
+    }
+
+    /// End to end: a card on the `None` connector [`named_connector`] produces
+    /// for an unnamed monitor is never hidden by `hidden_on: [""]` — the exact
+    /// wire shape a plugin would have to send to name that monitor if the fold
+    /// above did not happen and `""` leaked through as a real connector value.
+    ///
+    /// Without the fold, an unnamed monitor's region would reconcile with
+    /// `connector = Some("")`, and [`hidden_on_this_output`] would match it
+    /// against a `hidden_on` entry of `""` — which is exactly the failure mode
+    /// LOW-3 named: a plugin sending `hidden_on: [""]` (however unlikely) would
+    /// hide on every unnamed screen, contradicting the documented "`None` is
+    /// never hidden by name" contract this same test pins from the other
+    /// side.
+    #[gtk::test]
+    fn an_unnamed_monitors_region_is_never_hidden_by_an_empty_hidden_on_entry() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+
+        // What `sidebar_lead_slot`/`bar_left_slot`/etc. would pass in for a
+        // monitor GDK reports an empty connector for.
+        let connector = named_connector(Some(String::new()));
+        assert_eq!(
+            connector, None,
+            "test setup: the unnamed monitor's connector"
+        );
+
+        reconcile_region(
+            &container,
+            &cards,
+            &[hidden_on_render("unnamed-target", &tx, &[""])],
+            "ts-plugin-chip",
+            connector.as_deref(),
+        );
+
+        assert!(
+            card_root(&cards, "unnamed-target").is_visible(),
+            "a None connector must never match a hidden_on entry, even the empty string one \
+             a plugin would have to send to name an unnamed screen",
+        );
+    }
+
+    /// [`log_hidden_on_change`] is a call site nothing in `gtk_tests` exercised
+    /// before this (#1068 review, LOW-2): `reconcile_region` calls it on every
+    /// card touched, both arms, but no test asserted what it logs. Deleting
+    /// the call from the reuse arm (`region.rs`) left the whole binary suite
+    /// green.
+    ///
+    /// Two things pinned, both from the function's own doc:
+    ///
+    /// - **keyed on the change edge**, not emitted per render — an identical
+    ///   repeat frame must log nothing, or "one `Vec<String>` comparison per
+    ///   card per frame in the steady state" is just a comment nobody checks;
+    /// - [`attached_connectors`]'s `None`-is-not-`Some(empty)` distinction is
+    ///   what keeps the "not attached" line honest: this test can't force a
+    ///   real `None` (a `#[gtk::test]` always has a display), but it *can*
+    ///   prove the live `Some(real_set)` branch tells a name that matches
+    ///   nothing real apart from one that matches this card's own connector —
+    ///   a subscriber that only ever saw `Some(HashSet::new())` (the failure
+    ///   mode the function's doc warns against: "an empty set would make
+    ///   every name unknown") would report *both* names as unknown, not just
+    ///   the bogus one, and this test's first assertion counts exactly two
+    ///   events, not three or four.
+    ///
+    /// Modeled on `shader_map::gtk_tests::counting_events` (#991's fix, and
+    /// its doc has the full explanation): `emit` runs once *outside*
+    /// `with_default` as a warm-up, purely to register `log_hidden_on_change`'s
+    /// two `tracing::debug!` callsites against *some* dispatch before the
+    /// counted subscriber installs. Without it, whichever `gtk_tests` test
+    /// libtest happens to schedule onto those callsites first — every other
+    /// test that calls `reconcile_region` also reaches them, with no
+    /// subscriber installed — could cache `Interest::never()` process-wide,
+    /// and this test would count 0 no matter what actually logged.
+    ///
+    /// **Deletion check:** removing `log_hidden_on_change(&card, render,
+    /// connector);` from the **new-card** arm turns the first assertion red
+    /// (`left: 0, right: 2`) — this card's first frame logs nothing at all.
+    /// Removing the **reuse** arm's copy instead leaves the first two
+    /// assertions green (calls 2 and 3 log nothing either way — an identical
+    /// repeat and an empty-`hidden_on` clear) and turns the fourth red
+    /// (`left: 2, right: 4`): the set returning goes silent, because the call
+    /// that would have re-logged it is gone.
+    #[gtk::test]
+    fn log_hidden_on_change_fires_once_per_change_edge_not_per_render() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+
+        // Deterministic regardless of what real monitors Xvfb reports: this
+        // name doubles as the region's own connector (so `hidden_on_this_output`
+        // matches it unconditionally) and as a name no real system is remotely
+        // likely to have, alongside a second name that is never anything but
+        // bogus. Both are checked against the *real* GDK monitor list by
+        // [`attached_connectors`] — nothing here mocks it.
+        let render_named = || {
+            hidden_on_render(
+                "log-target",
+                &tx,
+                &["log-target-output", "totally-bogus-connector-xyz-1068"],
+            )
+        };
+
+        // Warm-up (see doc): register both callsites on an unrelated
+        // container/cards pair, outside any installed subscriber.
+        reconcile_region(
+            &gtk::Box::new(gtk::Orientation::Horizontal, 0),
+            &Rc::new(RefCell::new(Vec::new())),
+            &[render_named()],
+            "ts-plugin-chip",
+            Some("log-target-output"),
+        );
+
+        const TARGET: &str = "trollshell::plugins::region";
+        struct Counting(std::sync::Arc<std::sync::atomic::AtomicU32>);
+        impl tracing::Subscriber for Counting {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                meta.target().starts_with(TARGET)
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+                tracing::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                if event.metadata().target().starts_with(TARGET) {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            fn enter(&self, _: &tracing::Id) {}
+            fn exit(&self, _: &tracing::Id) {}
+        }
+
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        tracing::subscriber::with_default(Counting(std::sync::Arc::clone(&count)), || {
+            // First frame: a genuine change from the seeded-empty `hidden_on`
+            // (the new-card arm) — both lines are true here, so both fire once.
+            reconcile_region(
+                &container,
+                &cards,
+                &[render_named()],
+                "ts-plugin-chip",
+                Some("log-target-output"),
+            );
+            assert_eq!(
+                count.load(std::sync::atomic::Ordering::Relaxed),
+                2,
+                "the first frame must log both lines: this monitor is named in hidden_on, \
+                 and the bogus name matches no attached monitor",
+            );
+
+            // Identical re-render: no change, so the function must return
+            // before touching `attached_connectors` at all.
+            reconcile_region(
+                &container,
+                &cards,
+                &[render_named()],
+                "ts-plugin-chip",
+                Some("log-target-output"),
+            );
+            assert_eq!(
+                count.load(std::sync::atomic::Ordering::Relaxed),
+                2,
+                "an identical repeat frame must log nothing more — this is what keying on \
+                 the change edge means",
+            );
+
+            // A real change (the set clears): a change edge with nothing
+            // worth reporting — neither line's condition holds for an empty
+            // `hidden_on`.
+            reconcile_region(
+                &container,
+                &cards,
+                &[render_with_tree(
+                    "log-target",
+                    &tx,
+                    row_with_label_tree("root", "l", "hi"),
+                )],
+                "ts-plugin-chip",
+                Some("log-target-output"),
+            );
+            assert_eq!(
+                count.load(std::sync::atomic::Ordering::Relaxed),
+                2,
+                "clearing hidden_on is a change with nothing to report, not a reason to log",
+            );
+
+            // And back again: the same two-name set returning is a *fresh*
+            // change edge, not a stale latch — both lines must fire again.
+            reconcile_region(
+                &container,
+                &cards,
+                &[render_named()],
+                "ts-plugin-chip",
+                Some("log-target-output"),
+            );
+            assert_eq!(
+                count.load(std::sync::atomic::Ordering::Relaxed),
+                4,
+                "the set returning is a new change edge and must log both lines again, not \
+                 stay silent because it logged the same values once before",
+            );
+        });
     }
 
     /// The other half of the #1039 toggle: a plugin that starts rendering
@@ -2357,6 +2650,7 @@ mod gtk_tests {
             &cards,
             &[render_with_tree("revealer", &tx, tree)],
             "ts-plugin-chip",
+            None,
         );
 
         assert!(
@@ -2403,6 +2697,7 @@ mod gtk_tests {
             &cards,
             &[render_with_tree("expander", &tx, tree)],
             "ts-plugin-chip",
+            None,
         );
 
         assert!(
@@ -2440,6 +2735,7 @@ mod gtk_tests {
             &cards,
             &[render_with_tree("revealer", &tx, tree)],
             "ts-plugin-chip",
+            None,
         );
 
         assert!(
@@ -2985,6 +3281,87 @@ mod gtk_tests {
             reshown > 0,
             "showing the mount again must re-arm it — a sidebar opening is not a mapping \
              pass, so `Animator::arm_on_map` is the only thing that can (got {reshown})",
+        );
+    }
+
+    /// A card hidden on **this** monitor by `hidden_on` (#1050) must not keep
+    /// this monitor's frame clock armed, even while a visible sibling keeps the
+    /// region itself mapped (#1068 review, MEDIUM-1).
+    ///
+    /// Before the fix, `Animator`'s scopes closure in `build_region` collected
+    /// every mounted card's scope unconditionally — so a card the #1050 rule
+    /// had set `root.set_visible(false)` on still counted as "something to
+    /// animate" as long as *any* sibling card in the same region was showing.
+    /// That never showed up in `a_lone_hidden_card_collapses_only_the_region_-
+    /// on_that_output`, because a *lone* hidden card collapses the whole region
+    /// to unmapped and the tick breaks for an unrelated reason (the mapped
+    /// gate). A hidden card next to a visible sibling is the ordinary bar/
+    /// sidebar-region shape, and it does not collapse anything — the region
+    /// stays mapped, and pre-fix, so did the hidden card's animation. Measured
+    /// pre-fix: 18 ticks/300 ms on the hidden output; 0 when the same hidden
+    /// card is alone in its region (the control that made this easy to miss).
+    ///
+    /// Driven by a real `GdkFrameClock`, the same shape as
+    /// `a_hidden_mount_stops_ticking_and_resumes_when_shown` — no ticking here
+    /// is GTK's own gate (mapped/realized), so only a real frame clock can
+    /// answer it.
+    ///
+    /// **Deletion check:** dropping the `.filter(|card| card.root.get_visible())`
+    /// from `build_region`'s scopes closure turns the first assertion red (a
+    /// full window's worth of ticks over 300 ms, ~18 at 60 Hz, where 0 is
+    /// expected).
+    #[gtk::test]
+    fn a_card_hidden_on_this_output_does_not_keep_its_frame_clock_armed() {
+        adw::init().expect("libadwaita init");
+        reset_animation_probes();
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let renders = Mutable::new(vec![
+            SlotRender {
+                hidden_on: vec!["B".to_owned()],
+                ..marquee_render_of("hidden-marquee", &tx, 20.0)
+            },
+            render_with_tree("sibling", &tx, row_with_label_tree("root", "l", "hi")),
+        ]);
+
+        let window = mount_region_on(&renders, Some("B"));
+        window.present();
+        pump_for(200);
+
+        let animators = live_animators();
+        assert_eq!(animators.len(), 1, "one mount, one animation driver");
+        let animator = &animators[0];
+        assert!(
+            region_of(&window).is_mapped(),
+            "the fixture must really be mapped — the visible sibling is what keeps the \
+             region up here, or the hidden half below is vacuous",
+        );
+
+        animator.reset_ticks();
+        pump_for(300);
+        let hidden = animator.ticks();
+        assert_eq!(
+            hidden, 0,
+            "a card hidden on THIS output must not keep this monitor's frame clock armed \
+             while a visible sibling keeps the region mapped (got {hidden} ticks)",
+        );
+
+        // Clear the hide: the marquee shows here too, and its animation must
+        // resume. The re-arm point (`region.rs`'s bind closure calls
+        // `animator.ensure_armed(container)` right after every reconcile) is
+        // unchanged by this fix — its scopes closure is the same one the tick
+        // reads, just filtered — so this pins that it still covers the
+        // show-again edge rather than assuming it from the fix alone.
+        renders.set(vec![
+            marquee_render_of("hidden-marquee", &tx, 20.0),
+            render_with_tree("sibling", &tx, row_with_label_tree("root", "l", "hi")),
+        ]);
+        pump();
+        animator.reset_ticks();
+        pump_for(300);
+        let reshown = animator.ticks();
+        assert!(
+            reshown > 0,
+            "re-showing the card on this output must resume ticking here (got {reshown})",
         );
     }
 

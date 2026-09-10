@@ -399,33 +399,56 @@ tested end to end against a fake `host.sock`
 (`crates/hytte-plugin-agents/tests/fake_socket.rs`), which proves the wire and
 the reducer but cannot prove the hive agrees.
 
-- [ ] **(#947 P1)** The card is framed and the rows are compact. Enable the
+- [ ] **(#947 P1)** The card is framed and the rows have room. Enable the
       plugin
       (`programs.trollshell.plugins.agents.package = trollshell.packages.${system}.hytte-plugin-agents;`),
-      open the sidebar, and confirm: a title row reading `Agents` on the left
-      and `up · N` on the right, inset from the card edge like `Tasks` is;
-      **one line per agent** — icon · name · state glyph · status · pause · ⓘ;
-      and the pet card still visible below on a hive the size of yours.
-      Hovering a row must show the agent's **full** status text, the ⓘ must
-      say "details", and the state glyph its state word. **Note:** the padding
+      open the sidebar, and confirm: a title row reading `AGENTS` on the left
+      and `up · N` plus a list button on the right, in the same all-caps
+      caption treatment and the same inset as the `TASKS` card above it; and
+      **two lines per agent** — line 1 icon · name · state glyph · pause ·
+      chevron, line 2 the harness's status text **in full**, dim. A status
+      long enough to be cut (past ~88 characters) must show the whole string
+      on hover. **Note:** the padding, the caption treatment, the list fill
       and the compact buttons are shell-side CSS
       (`assets/trollshell/style.css`), so they need a shell rebuild —
       restarting only the plugin picks up the node-tree half and leaves the
-      rows roomy.
+      rows flush and roomy.
+- [ ] **(#947 P1)** The details chevron unfolds **in place**. Click the
+      chevron at the right of a row and confirm that row grows a small block
+      underneath it — the flags that are on as chips, deployed sha, parent,
+      model, the agent page — and that the drawer does **not** open. Click a
+      second row's chevron and confirm the first closes (one at a time);
+      click the same one again and confirm it closes. The unfold must survive
+      a poll rather than snapping shut every two seconds.
+- [ ] **(#947 P1)** The drawer is reached from the **title row**. The list
+      button beside `up · N` opens the plugin's drawer page at the hive
+      overview — state, socket, last-poll age, dashboard, and the **full,
+      uncapped** roster. Clicking an agent's **name** on a card row opens that
+      agent's page in the same drawer (that is spec §6.3's primary click, and
+      P2 replaces it with the chat window). Nothing else on a row leaves the
+      sidebar.
+- [ ] **(#947 P1)** The agent page reads as a page, not a dump. With an agent
+      selected, confirm: a header with the runtime icon, the name at title
+      size, the state glyph and start/stop as round icon buttons with hover
+      text; the status line under it; **only the flags that are on** as chips
+      (a healthy agent shows none — no `failed no / paused no` rows); a
+      `deployment` group (sha, parent, model, status age) and a `links` group,
+      both in the shell's own boxed-list style; and `all agents` returning to
+      the overview. A roster long enough to overflow the drawer must scroll
+      **inside the page** rather than running off the bottom.
 - [ ] **(#947 P1)** Group expanders. With two or more `[display.*].project`
       values, each group is an expander with a `live/total` count; a group
       whose agents are **all stopped** starts collapsed. Clicking a header
       toggles it, and the choice must survive the next poll rather than
       springing back open.
-- [ ] **(#947 P1)** The card cannot bound its own height — the vocabulary has
-      no scrollable region (`Box { scroll: true }` is a scroll _event target_)
-      and GTK CSS has no `max-height` — so on a hive with more than 20 agents
-      confirm it draws 20 rows and a `+N more` line rather than growing
-      without limit. If you have fewer than 20, this is a read-only check of
-      the code path. **Belt-and-braces since #967**: the sidebar itself
-      scrolls now, so a long card no longer hides the pet card below it — the
-      cap is what stops a large hive turning the sidebar into one very long
-      scroll.
+- [ ] **(#947 P1)** On a hive with more than 20 agents the card draws 20 rows
+      and a `+N more — open the panel for the full roster` line rather than
+      growing without limit, and the panel's overview really does list all of
+      them. If you have fewer than 20, this is a read-only check of the code
+      path. The cap is **belt-and-braces since #967** — the sidebar scrolls, so
+      it is no longer what keeps the pet card reachable; what it bounds is how
+      much node tree a runaway hive makes the plugin serialise every two
+      seconds.
 - [ ] **(#947 P1)** The status line is the harness's own text. Have an agent
       call its `set_status` tool and confirm the row's second line changes to
       that string within one poll (2 s by default) — not "running". A stopped
@@ -456,13 +479,11 @@ the reducer but cannot prove the hive agrees.
       Note the known limitation to check against your taste: the poll parks
       while the sidebar is closed (spec §5.4), so no toast fires from a closed
       sidebar — if that is wrong, say so on #947 and it is a one-line change.
-- [ ] **(#947 P1)** The panel. Click an agent's name or edit button and confirm
-      the drawer shows that agent's flags, `deployed_sha`, parent, model, the
-      agent page URL the hive reports, the socket path in use, and a last-poll
-      age that advances. Start/stop from the panel must affect **only** that
-      agent — check `hivectl list-agents` before and after that nothing else
-      moved (the §11 rule-one footgun: an unscoped frame would have started the
-      whole hive, CI can only prove the bytes).
+- [ ] **(#947 P1)** Start / stop are scoped to one agent. From an agent's page
+      in the drawer, use the round start and stop buttons and check
+      `hivectl list-agents` before and after that **nothing else moved** (the
+      §11 rule-one footgun: an unscoped frame would have started the whole
+      hive; CI can only prove the bytes).
 - [ ] **(#947 P1)** No hive, no crash. Stop `hive-c0re` and confirm the card
       shows one "no hive" row with a reason, keeps its cadence, and recovers on
       its own when the daemon comes back — without restarting the plugin.

@@ -4,26 +4,24 @@ View {
             "agents-root",
         ),
         dir: Vertical,
-        spacing: 2,
+        spacing: 0,
         scroll: false,
         classes: [
             "ts-agents-card",
         ],
         children: [
-            Box {
+            Row {
                 id: None,
-                dir: Horizontal,
-                spacing: 6,
-                scroll: false,
                 classes: [
                     "ts-agents-title",
                 ],
+                spacing: 6,
                 children: [
                     Label {
                         id: None,
-                        text: "Agents",
+                        text: "AGENTS",
                         classes: [
-                            "heading",
+                            "ts-agents-heading",
                         ],
                         tooltip: None,
                     },
@@ -33,320 +31,374 @@ View {
                         text: "up · 3",
                         classes: [
                             "dim-label",
+                            "caption",
                             "numeric",
                         ],
                         tooltip: None,
                     },
+                    Button {
+                        id: "agents-overview",
+                        classes: [
+                            "flat",
+                            "ts-agent-btn",
+                        ],
+                        child: Icon {
+                            id: None,
+                            name: "view-list-symbolic",
+                            classes: [],
+                            tooltip: Some(
+                                "hive overview and the full roster",
+                            ),
+                        },
+                    },
                 ],
                 tooltip: None,
             },
-            Expander {
-                id: "group:nixos",
-                header: Box {
-                    id: None,
-                    dir: Horizontal,
-                    spacing: 6,
-                    scroll: false,
-                    classes: [
-                        "ts-agents-group",
-                    ],
-                    children: [
-                        Label {
-                            id: None,
-                            text: "nixos",
-                            classes: [
-                                "heading",
-                            ],
-                            tooltip: None,
-                        },
-                        Spacer,
-                        Label {
-                            id: None,
-                            text: "1/1",
-                            classes: [
-                                "dim-label",
-                                "numeric",
-                            ],
-                            tooltip: None,
-                        },
-                    ],
-                    tooltip: None,
-                },
+            ListBox {
+                id: None,
+                classes: [
+                    "boxed-list",
+                    "ts-agents-list",
+                ],
+                dense: true,
                 children: [
-                    Box {
-                        id: None,
-                        dir: Horizontal,
-                        spacing: 4,
-                        scroll: false,
-                        classes: [
-                            "ts-agent-row",
-                        ],
+                    Expander {
+                        id: "group:nixos",
+                        header: Row {
+                            id: None,
+                            classes: [
+                                "ts-agents-group",
+                            ],
+                            spacing: 6,
+                            children: [
+                                Label {
+                                    id: None,
+                                    text: "nixos",
+                                    classes: [
+                                        "heading",
+                                    ],
+                                    tooltip: None,
+                                },
+                                Spacer,
+                                Label {
+                                    id: None,
+                                    text: "1/1",
+                                    classes: [
+                                        "dim-label",
+                                        "caption",
+                                        "numeric",
+                                    ],
+                                    tooltip: None,
+                                },
+                            ],
+                            tooltip: None,
+                        },
                         children: [
-                            Icon {
+                            Box {
                                 id: None,
-                                name: "system-run-symbolic",
+                                dir: Vertical,
+                                spacing: 2,
+                                scroll: false,
                                 classes: [
-                                    "ts-agent-runtime",
+                                    "ts-agent-row",
+                                ],
+                                children: [
+                                    Row {
+                                        id: None,
+                                        classes: [
+                                            "ts-agent-head",
+                                        ],
+                                        spacing: 6,
+                                        children: [
+                                            Icon {
+                                                id: None,
+                                                name: "system-run-symbolic",
+                                                classes: [
+                                                    "ts-agent-runtime",
+                                                ],
+                                                tooltip: None,
+                                            },
+                                            Button {
+                                                id: "chat:nixos-choom",
+                                                classes: [
+                                                    "flat",
+                                                    "ts-agent-name",
+                                                ],
+                                                child: Text {
+                                                    id: None,
+                                                    text: "nixos-choom",
+                                                    max_width_chars: Some(
+                                                        20,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "heading",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "nixos-choom",
+                                                    ),
+                                                },
+                                            },
+                                            Icon {
+                                                id: None,
+                                                name: "media-playback-pause-symbolic",
+                                                classes: [
+                                                    "ts-agent-state",
+                                                    "dim-label",
+                                                ],
+                                                tooltip: Some(
+                                                    "paused",
+                                                ),
+                                            },
+                                            Spacer,
+                                            Icon {
+                                                id: None,
+                                                name: "software-update-available-symbolic",
+                                                classes: [
+                                                    "ts-agent-badge",
+                                                    "ts-agent-upd",
+                                                ],
+                                                tooltip: Some(
+                                                    "config commit pending — a rebuild would change this agent's locked rev",
+                                                ),
+                                            },
+                                            Button {
+                                                id: "pause:nixos-choom",
+                                                classes: [
+                                                    "flat",
+                                                    "ts-agent-btn",
+                                                ],
+                                                child: Icon {
+                                                    id: None,
+                                                    name: "media-playback-start-symbolic",
+                                                    classes: [],
+                                                    tooltip: Some(
+                                                        "resume this agent",
+                                                    ),
+                                                },
+                                            },
+                                            Button {
+                                                id: "details:nixos-choom",
+                                                classes: [
+                                                    "flat",
+                                                    "ts-agent-btn",
+                                                ],
+                                                child: Icon {
+                                                    id: None,
+                                                    name: "pan-end-symbolic",
+                                                    classes: [],
+                                                    tooltip: Some(
+                                                        "details",
+                                                    ),
+                                                },
+                                            },
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "paused",
+                                        max_width_chars: None,
+                                        ellipsize: false,
+                                        classes: [
+                                            "dim-label",
+                                            "caption",
+                                            "ts-agent-status",
+                                        ],
+                                        tooltip: None,
+                                    },
                                 ],
                                 tooltip: None,
                             },
-                            Button {
-                                id: "chat:nixos-choom",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-name",
-                                ],
-                                child: Text {
-                                    id: None,
-                                    text: "nixos-choom",
-                                    max_width_chars: Some(
-                                        14,
-                                    ),
-                                    ellipsize: true,
-                                    classes: [],
-                                },
-                            },
-                            Icon {
-                                id: None,
-                                name: "media-playback-pause-symbolic",
-                                classes: [
-                                    "ts-agent-state",
-                                    "dim-label",
-                                ],
-                                tooltip: Some(
-                                    "paused",
-                                ),
-                            },
-                            Text {
-                                id: None,
-                                text: "paused",
-                                max_width_chars: Some(
-                                    22,
-                                ),
-                                ellipsize: true,
-                                classes: [
-                                    "dim-label",
-                                ],
-                            },
-                            Spacer,
-                            Icon {
-                                id: None,
-                                name: "software-update-available-symbolic",
-                                classes: [
-                                    "ts-agent-badge",
-                                    "ts-agent-upd",
-                                ],
-                                tooltip: Some(
-                                    "config commit pending — a rebuild would change this agent's locked rev",
-                                ),
-                            },
-                            Button {
-                                id: "pause:nixos-choom",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-btn",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "media-playback-start-symbolic",
-                                    classes: [],
-                                    tooltip: Some(
-                                        "resume",
-                                    ),
-                                },
-                            },
-                            Button {
-                                id: "details:nixos-choom",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-btn",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "dialog-information-symbolic",
-                                    classes: [],
-                                    tooltip: Some(
-                                        "details",
-                                    ),
-                                },
-                            },
                         ],
-                        tooltip: Some(
-                            "nixos-choom\npaused",
-                        ),
-                    },
-                ],
-                expanded: true,
-                classes: [
-                    "ts-agents-group-row",
-                ],
-            },
-            Expander {
-                id: "group:viberoot",
-                header: Box {
-                    id: None,
-                    dir: Horizontal,
-                    spacing: 6,
-                    scroll: false,
-                    classes: [
-                        "ts-agents-group",
-                    ],
-                    children: [
-                        Label {
-                            id: None,
-                            text: "viberoot",
-                            classes: [
-                                "heading",
-                            ],
-                            tooltip: None,
-                        },
-                        Spacer,
-                        Label {
-                            id: None,
-                            text: "1/1",
-                            classes: [
-                                "dim-label",
-                                "numeric",
-                            ],
-                            tooltip: None,
-                        },
-                    ],
-                    tooltip: None,
-                },
-                children: [
-                    Box {
-                        id: None,
-                        dir: Horizontal,
-                        spacing: 4,
-                        scroll: false,
+                        expanded: true,
                         classes: [
-                            "ts-agent-row",
+                            "ts-agents-group-row",
                         ],
+                        tooltip: None,
+                    },
+                    Expander {
+                        id: "group:viberoot",
+                        header: Row {
+                            id: None,
+                            classes: [
+                                "ts-agents-group",
+                            ],
+                            spacing: 6,
+                            children: [
+                                Label {
+                                    id: None,
+                                    text: "viberoot",
+                                    classes: [
+                                        "heading",
+                                    ],
+                                    tooltip: None,
+                                },
+                                Spacer,
+                                Label {
+                                    id: None,
+                                    text: "1/1",
+                                    classes: [
+                                        "dim-label",
+                                        "caption",
+                                        "numeric",
+                                    ],
+                                    tooltip: None,
+                                },
+                            ],
+                            tooltip: None,
+                        },
                         children: [
-                            Icon {
+                            Box {
                                 id: None,
-                                name: "starred-symbolic",
+                                dir: Vertical,
+                                spacing: 2,
+                                scroll: false,
                                 classes: [
-                                    "ts-agent-runtime",
+                                    "ts-agent-row",
+                                ],
+                                children: [
+                                    Row {
+                                        id: None,
+                                        classes: [
+                                            "ts-agent-head",
+                                        ],
+                                        spacing: 6,
+                                        children: [
+                                            Icon {
+                                                id: None,
+                                                name: "starred-symbolic",
+                                                classes: [
+                                                    "ts-agent-runtime",
+                                                ],
+                                                tooltip: None,
+                                            },
+                                            Button {
+                                                id: "chat:trollshell-choom",
+                                                classes: [
+                                                    "flat",
+                                                    "ts-agent-name",
+                                                ],
+                                                child: Text {
+                                                    id: None,
+                                                    text: "choom",
+                                                    max_width_chars: Some(
+                                                        20,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "heading",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "choom",
+                                                    ),
+                                                },
+                                            },
+                                            Icon {
+                                                id: None,
+                                                name: "media-playback-start-symbolic",
+                                                classes: [
+                                                    "ts-agent-state",
+                                                    "accent",
+                                                ],
+                                                tooltip: Some(
+                                                    "running",
+                                                ),
+                                            },
+                                            Spacer,
+                                            Button {
+                                                id: "pause:trollshell-choom",
+                                                classes: [
+                                                    "flat",
+                                                    "ts-agent-btn",
+                                                ],
+                                                child: Icon {
+                                                    id: None,
+                                                    name: "media-playback-pause-symbolic",
+                                                    classes: [],
+                                                    tooltip: Some(
+                                                        "pause this agent",
+                                                    ),
+                                                },
+                                            },
+                                            Button {
+                                                id: "details:trollshell-choom",
+                                                classes: [
+                                                    "flat",
+                                                    "ts-agent-btn",
+                                                ],
+                                                child: Icon {
+                                                    id: None,
+                                                    name: "pan-end-symbolic",
+                                                    classes: [],
+                                                    tooltip: Some(
+                                                        "details",
+                                                    ),
+                                                },
+                                            },
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "reviewing PR #947",
+                                        max_width_chars: None,
+                                        ellipsize: false,
+                                        classes: [
+                                            "dim-label",
+                                            "caption",
+                                            "ts-agent-status",
+                                        ],
+                                        tooltip: None,
+                                    },
                                 ],
                                 tooltip: None,
                             },
-                            Button {
-                                id: "chat:trollshell-choom",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-name",
-                                ],
-                                child: Text {
-                                    id: None,
-                                    text: "choom",
-                                    max_width_chars: Some(
-                                        14,
-                                    ),
-                                    ellipsize: true,
-                                    classes: [],
-                                },
-                            },
-                            Icon {
-                                id: None,
-                                name: "media-playback-start-symbolic",
-                                classes: [
-                                    "ts-agent-state",
-                                    "accent",
-                                ],
-                                tooltip: Some(
-                                    "running",
-                                ),
-                            },
-                            Text {
-                                id: None,
-                                text: "reviewing PR #947",
-                                max_width_chars: Some(
-                                    22,
-                                ),
-                                ellipsize: true,
-                                classes: [
-                                    "dim-label",
-                                ],
-                            },
-                            Spacer,
-                            Button {
-                                id: "pause:trollshell-choom",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-btn",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "media-playback-pause-symbolic",
-                                    classes: [],
-                                    tooltip: Some(
-                                        "pause",
-                                    ),
-                                },
-                            },
-                            Button {
-                                id: "details:trollshell-choom",
-                                classes: [
-                                    "flat",
-                                    "ts-agent-btn",
-                                ],
-                                child: Icon {
-                                    id: None,
-                                    name: "dialog-information-symbolic",
-                                    classes: [],
-                                    tooltip: Some(
-                                        "details",
-                                    ),
-                                },
-                            },
                         ],
-                        tooltip: Some(
-                            "choom (trollshell-choom)\nreviewing PR #947",
-                        ),
+                        expanded: true,
+                        classes: [
+                            "ts-agents-group-row",
+                        ],
+                        tooltip: None,
                     },
-                ],
-                expanded: true,
-                classes: [
-                    "ts-agents-group-row",
-                ],
-            },
-            Expander {
-                id: "group:ungrouped",
-                header: Box {
-                    id: None,
-                    dir: Horizontal,
-                    spacing: 6,
-                    scroll: false,
-                    classes: [
-                        "ts-agents-group",
-                    ],
-                    children: [
-                        Label {
+                    Expander {
+                        id: "group:ungrouped",
+                        header: Row {
                             id: None,
-                            text: "ungrouped",
                             classes: [
-                                "heading",
+                                "ts-agents-group",
+                            ],
+                            spacing: 6,
+                            children: [
+                                Label {
+                                    id: None,
+                                    text: "ungrouped",
+                                    classes: [
+                                        "heading",
+                                    ],
+                                    tooltip: None,
+                                },
+                                Spacer,
+                                Label {
+                                    id: None,
+                                    text: "0/1",
+                                    classes: [
+                                        "dim-label",
+                                        "caption",
+                                        "numeric",
+                                    ],
+                                    tooltip: None,
+                                },
                             ],
                             tooltip: None,
                         },
-                        Spacer,
-                        Label {
-                            id: None,
-                            text: "0/1",
-                            classes: [
-                                "dim-label",
-                                "numeric",
-                            ],
-                            tooltip: None,
-                        },
-                    ],
-                    tooltip: None,
-                },
-                children: [],
-                expanded: false,
-                classes: [
-                    "ts-agents-group-row",
+                        children: [],
+                        expanded: false,
+                        classes: [
+                            "ts-agents-group-row",
+                        ],
+                        tooltip: None,
+                    },
                 ],
             },
         ],
@@ -358,106 +410,359 @@ View {
                 "agents-panel",
             ),
             dir: Vertical,
-            spacing: 4,
-            scroll: true,
+            spacing: 0,
+            scroll: false,
             classes: [
                 "ts-agents-panel",
             ],
             children: [
-                Label {
-                    id: None,
-                    text: "hive",
-                    classes: [
-                        "heading",
-                    ],
-                    tooltip: None,
-                },
                 Box {
                     id: None,
-                    dir: Horizontal,
-                    spacing: 6,
+                    dir: Vertical,
+                    spacing: 8,
                     scroll: false,
                     classes: [
-                        "ts-agent-detail",
+                        "ts-agents-panel-body",
                     ],
                     children: [
-                        Label {
+                        Box {
                             id: None,
-                            text: "state",
+                            dir: Vertical,
+                            spacing: 4,
+                            scroll: false,
                             classes: [
-                                "dim-label",
+                                "ts-agents-section",
+                            ],
+                            children: [
+                                Label {
+                                    id: None,
+                                    text: "hive",
+                                    classes: [
+                                        "heading",
+                                    ],
+                                    tooltip: None,
+                                },
+                                ListBox {
+                                    id: None,
+                                    classes: [
+                                        "boxed-list",
+                                        "ts-agents-panel-list",
+                                    ],
+                                    dense: false,
+                                    children: [
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Label {
+                                                    id: None,
+                                                    text: "state",
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "up — 3 agent(s)",
+                                                    max_width_chars: Some(
+                                                        28,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "caption",
+                                                        "numeric",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "up — 3 agent(s)",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Label {
+                                                    id: None,
+                                                    text: "socket",
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "/run/hyperhive/host.sock",
+                                                    max_width_chars: Some(
+                                                        28,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "caption",
+                                                        "numeric",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "/run/hyperhive/host.sock",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Label {
+                                                    id: None,
+                                                    text: "last poll",
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "just now",
+                                                    max_width_chars: Some(
+                                                        28,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "caption",
+                                                        "numeric",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "just now",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                    ],
+                                },
                             ],
                             tooltip: None,
                         },
-                        Spacer,
-                        Text {
+                        Box {
                             id: None,
-                            text: "up — 3 agent(s)",
-                            max_width_chars: None,
-                            ellipsize: true,
+                            dir: Vertical,
+                            spacing: 4,
+                            scroll: false,
                             classes: [
-                                "numeric",
+                                "ts-agents-section",
                             ],
-                        },
-                    ],
-                    tooltip: None,
-                },
-                Box {
-                    id: None,
-                    dir: Horizontal,
-                    spacing: 6,
-                    scroll: false,
-                    classes: [
-                        "ts-agent-detail",
-                    ],
-                    children: [
-                        Label {
-                            id: None,
-                            text: "socket",
-                            classes: [
-                                "dim-label",
+                            children: [
+                                Label {
+                                    id: None,
+                                    text: "roster",
+                                    classes: [
+                                        "heading",
+                                    ],
+                                    tooltip: None,
+                                },
+                                ListBox {
+                                    id: None,
+                                    classes: [
+                                        "boxed-list",
+                                        "ts-agents-panel-list",
+                                    ],
+                                    dense: false,
+                                    children: [
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Icon {
+                                                    id: None,
+                                                    name: "starred-symbolic",
+                                                    classes: [
+                                                        "ts-agent-runtime",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Button {
+                                                    id: "chat:trollshell-choom",
+                                                    classes: [
+                                                        "flat",
+                                                        "ts-agent-name",
+                                                    ],
+                                                    child: Label {
+                                                        id: None,
+                                                        text: "choom",
+                                                        classes: [],
+                                                        tooltip: None,
+                                                    },
+                                                },
+                                                Icon {
+                                                    id: None,
+                                                    name: "media-playback-start-symbolic",
+                                                    classes: [
+                                                        "ts-agent-state",
+                                                        "accent",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "running",
+                                                    ),
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "reviewing PR #947",
+                                                    max_width_chars: Some(
+                                                        34,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "reviewing PR #947",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Icon {
+                                                    id: None,
+                                                    name: "system-run-symbolic",
+                                                    classes: [
+                                                        "ts-agent-runtime",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Button {
+                                                    id: "chat:nixos-choom",
+                                                    classes: [
+                                                        "flat",
+                                                        "ts-agent-name",
+                                                    ],
+                                                    child: Label {
+                                                        id: None,
+                                                        text: "nixos-choom",
+                                                        classes: [],
+                                                        tooltip: None,
+                                                    },
+                                                },
+                                                Icon {
+                                                    id: None,
+                                                    name: "media-playback-pause-symbolic",
+                                                    classes: [
+                                                        "ts-agent-state",
+                                                        "dim-label",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "paused",
+                                                    ),
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "paused",
+                                                    max_width_chars: Some(
+                                                        34,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "paused",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Icon {
+                                                    id: None,
+                                                    name: "system-run-symbolic",
+                                                    classes: [
+                                                        "ts-agent-runtime",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Button {
+                                                    id: "chat:stray",
+                                                    classes: [
+                                                        "flat",
+                                                        "ts-agent-name",
+                                                    ],
+                                                    child: Label {
+                                                        id: None,
+                                                        text: "stray",
+                                                        classes: [],
+                                                        tooltip: None,
+                                                    },
+                                                },
+                                                Icon {
+                                                    id: None,
+                                                    name: "media-playback-stop-symbolic",
+                                                    classes: [
+                                                        "ts-agent-state",
+                                                        "dim-label",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "stopped",
+                                                    ),
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "stopped",
+                                                    max_width_chars: Some(
+                                                        34,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "stopped",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                    ],
+                                },
                             ],
                             tooltip: None,
-                        },
-                        Spacer,
-                        Text {
-                            id: None,
-                            text: "/run/hyperhive/host.sock",
-                            max_width_chars: None,
-                            ellipsize: true,
-                            classes: [
-                                "numeric",
-                            ],
-                        },
-                    ],
-                    tooltip: None,
-                },
-                Box {
-                    id: None,
-                    dir: Horizontal,
-                    spacing: 6,
-                    scroll: false,
-                    classes: [
-                        "ts-agent-detail",
-                    ],
-                    children: [
-                        Label {
-                            id: None,
-                            text: "last poll",
-                            classes: [
-                                "dim-label",
-                            ],
-                            tooltip: None,
-                        },
-                        Spacer,
-                        Text {
-                            id: None,
-                            text: "just now",
-                            max_width_chars: None,
-                            ellipsize: true,
-                            classes: [
-                                "numeric",
-                            ],
                         },
                     ],
                     tooltip: None,

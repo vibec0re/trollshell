@@ -602,39 +602,87 @@
     padding: 0.154em 0.615em;
 }
 
-/* The hyperhive agents card (#947). Two rules, both for the same reason: a
- * hive with a dozen agents has to fit a sidebar that cannot scroll.
+/* The hyperhive agents card (#947). The card is framed and paced like the
+ * `Tasks` card two slots above it, because @kaesaecracker's screenshots read it
+ * next to that one: every number below is copied from `.ts-sidebar-tasks` /
+ * `.ts-sidebar-cal-header` / `.ts-sidebar-tasks-list` rather than picked, so
+ * the two cards share a rhythm instead of merely both being cards.
  *
  * `.ts-plugin-card` deliberately ships no padding ("the plugin owns its own
- * inner spacing", #319), so without this the rows sit flush against the card
- * edge — which is how they read next to the inset `Tasks` card in
- * @kaesaecracker's screenshot. The plugin cannot express padding in the node
- * vocabulary, so it lands here.
+ * inner spacing", #319) and the node vocabulary cannot express padding, so the
+ * inset, the caption treatment and the list fill all land here.
  *
  * The buttons are the height driver: a default Adwaita button carries a
- * ~34 px min-height, and a row with two of them is a two-line row no matter
- * how little text it holds. `min-height: 0` plus tight padding lets the row
- * collapse to its text height. GTK CSS has no `max-height`, so the card's
- * overall bound is NOT here — it is the plugin's own row cap (`MAX_ROWS`).
+ * ~34 px min-height, so a row holding two of them is taller than the two lines
+ * of text it exists to show. `min-height: 0` plus tight padding lets each line
+ * be as tall as its own text. GTK CSS has no `max-height`, so the card's
+ * overall bound is NOT here — it is the plugin's own row cap (`MAX_ROWS`), and
+ * since #967 the sidebar itself scrolls.
  *
  * NOTE for anyone testing a plugin change: this file is shell-side, so it
  * takes effect only after the shell is rebuilt and restarted. Restarting the
  * plugin alone picks up the node-tree half and none of this. */
 .ts-agents-card {
-    padding: 0.615em 0.769em;
+    padding: 0.462em 0.769em 0.615em 0.769em;
 }
-.ts-agents-card button.ts-agent-btn {
+/* The card's title, in the same all-caps caption treatment `TASKS` and
+ * `UPCOMING` use — the label carries the margins, the row carries the gap to
+ * the list, exactly as `.ts-sidebar-tasks-header` does. */
+.ts-agents-heading {
+    color: alpha(white, 0.5);
+    font-size: 0.846em;
+    letter-spacing: 0.115em;
+    margin: 0.769em 0.308em 0.462em 0.308em;
+}
+.ts-agents-title {
+    margin-bottom: 0.308em;
+}
+/* The roster's own surface: the translucent fill `.ts-sidebar-tasks-list` gives
+ * the tasks list. More specific than (and later than) the
+ * `.ts-plugin-card list.boxed-list` flattening rule above, which is what would
+ * otherwise leave the roster painting flat on the card. */
+.ts-agents-card list.ts-agents-list {
+    background: alpha(white, 0.04);
+    border-radius: 0.615em;
+}
+/* Row padding is the plugin's to spend, because `ListBox { dense: true }` hands
+ * the height budget back by zeroing the auto-wrapper's floor (`.hytte-dense-row`
+ * in the library sheet). */
+.ts-agents-card .ts-agent-row {
+    padding: 0.308em 0.462em;
+}
+.ts-agents-card button.ts-agent-btn,
+.ts-agents-panel button.ts-agent-btn {
     min-height: 0;
     min-width: 0;
     padding: 0.077em 0.231em;
 }
 /* The name is a flat button so it can be clicked; it should read as the row's
  * label, not as a control sitting in a box. */
-.ts-agents-card button.ts-agent-name {
+.ts-agents-card button.ts-agent-name,
+.ts-agents-panel button.ts-agent-name {
     min-height: 0;
     padding: 0 0.154em;
     background: none;
     box-shadow: none;
+}
+/* Flag chips — only the flags that are ON are drawn, so the pill has to carry
+ * its own meaning. Same shape as `.ts-task-badge` / `.ts-net-pill`; the tint
+ * comes from the tone class the plugin sets beside this one (`error`,
+ * `warning`, `dim-label`, `.ts-agent-upd`) via `currentColor`. */
+.ts-agent-chip {
+    padding: 0.077em 0.462em;
+    border-radius: 9999px;
+    background: alpha(currentColor, 0.12);
+    font-weight: 600;
+}
+.ts-agent-upd {
+    color: @warning_color;
+}
+/* The in-place unfold sits under its row, indented past the runtime icon so it
+ * reads as belonging to the row above rather than as a new one. */
+.ts-agent-details {
+    margin: 0.154em 0 0.308em 1.538em;
 }
 
 /* Micro-terminal input (#369). The `hytte-plugin-terminal` plugin stacks a live

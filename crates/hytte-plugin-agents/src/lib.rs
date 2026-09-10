@@ -2,9 +2,12 @@
 //! (issue #947, phase P1; spec
 //! `docs/superpowers/specs/2026-09-07-agentic-desktop-design.md`).
 //!
-//! One row per hyperhive agent — `(icon) name (status-icon)` over
-//! `status (pause) (edit)`, grouped by multi-repo project — plus a drawer
-//! panel with the full flag set and per-agent start/stop. The hive is the
+//! One row per hyperhive agent — `(icon) name (status-icon) (pause)
+//! (chevron)` over the harness's own status line, grouped by multi-repo
+//! project, with the chevron unfolding that agent's details **inside the
+//! card** — plus a drawer page carrying the hive overview, the full roster and
+//! the selected agent's flags, deployment and per-agent start/stop. The hive
+//! is the
 //! backend; trollshell is a client, and the hive stays the single source of
 //! truth for agent state (the system-daemon-as-state-store rule,
 //! `docs/superpowers/specs/2026-04-24-hytte-trollshell-design.md:95`).

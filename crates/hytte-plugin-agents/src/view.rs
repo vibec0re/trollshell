@@ -1,63 +1,56 @@
 //! The node tree: the sidebar card (spec §6.1) and the drawer panel (§6.4).
 //!
-//! Every node used here already exists in the wire vocabulary — `Box`,
-//! `Label`, `Text`, `Icon`, `Button`, `Expander`, `Separator`, `Spacer`.
-//! **No proto change, no `VOCAB` bump.**
-//!
 //! There is no row-activate event (a list is selection-less), so every
 //! interaction is a `Button`, whose `id` is required and is the click target
 //! (`crates/hytte-plugin-proto/src/wire.rs:249-255`). That is why the agent's
 //! name is a button rather than a label.
 //!
-//! # Three host facts this file is built around
+//! # What this file is built around, as of #966/#969/#971
 //!
-//! Learned from @kaesaecracker's live screenshots against a 12-agent hive, and
-//! each one is why the obvious spelling is *not* what is written below:
+//! The first two rounds of @kaesaecracker's live screenshots turned up three
+//! host limits, and all three have since been **fixed on main**. This file is
+//! written against the fixed vocabulary; the history is kept only where it
+//! still explains a choice.
 //!
-//! 1. **`Node::Row` had no spacing** — the host built it as
-//!    `gtk::Box::new(Horizontal, 0)`, the gap hardcoded rather than a field,
-//!    so a `Row` of icon + label rendered them touching (`⚙argus`, in the
-//!    panel header). #969 gave `Row` a `spacing`, but this file still uses
-//!    `Box { dir: Horizontal, spacing }` throughout and `Row` appears
-//!    nowhere — because `Row` carries **no `tooltip`**, and the agent row's
-//!    whole point is that hovering it shows the untruncated status
-//!    ([`agent_row`]). A `Row` for the handful of rows that need no hover
-//!    would render identically to the `Box` they already are, at the cost of
-//!    two row kinds in one file.
-//! 2. **`ListBox` auto-wraps every child in a `GtkListBoxRow`**
-//!    (`widget_tree.rs:708-716`), which carried libadwaita's row min-height —
-//!    most of why twelve agents came to ~700 px. #969's `ListBox { dense }`
-//!    zeroes that wrapper. This card is still a plain vertical `Box`: it
-//!    needs no `.boxed-list` styling, and a dense `ListBox` would re-introduce
-//!    a wrapper widget for no gain the rows can show.
+//! 1. **[`Node::Row`] carries a `spacing`** (#966/#969), mapped straight onto
+//!    the backing `gtk::Box`. Before it, a `Row` of icon + label rendered them
+//!    touching (`⚙argus` in @kaesaecracker's panel screenshot) and this file
+//!    spelled every row as a horizontal `Box` instead. It no longer does: a
+//!    row is a `Row`, one spelling, and `Box` is left for the **vertical**
+//!    stacks (the card root, the two-line agent row, the inline details).
+//! 2. **[`Node::Text`] carries a `tooltip`** (#961/#971). That is what retired
+//!    the row-level tooltip: the untruncated status used to have nowhere to
+//!    live except the enclosing row's `Box`, which put one legend over every
+//!    glyph in the row. Now the string that got cut carries its own hover, and
+//!    the second line shows the harness's status **in full** anyway — the
+//!    ellipsis is the last resort for a status past [`STATUS_WRAP_MAX`], not
+//!    the normal case.
+//! 3. **[`Node::ListBox`] can be `dense`** (#966/#969). The host materializes a
+//!    `ListBox` as a real `GtkListBox`, which auto-wraps every child in a
+//!    `GtkListBoxRow` carrying libadwaita's row min-height — most of why twelve
+//!    agents came to ~700 px. `dense: true` marks those wrappers so the shipped
+//!    stylesheet zeroes their `min-height` and `padding`, handing the height
+//!    budget back to `.ts-agent-row`. The roster is therefore the `ListBox`
+//!    spec §6.1's mock always asked for.
 //!
-//!    (Both of those fields exist because of what these screenshots turned
-//!    up — #966 was filed off this file's findings and #969 implemented it.
-//!    They are recorded here as *history plus a current reason*, not as live
-//!    limitations, so the next plugin author is not misled either way.)
-//! 3. **`Box { scroll: true }` is a scroll *event target*, not a viewport.**
-//!    It attaches an `EventControllerScroll` that forwards deltas to the
-//!    plugin (`wire.rs:134-145`); the widget is a plain `gtk::Box` that
-//!    neither clips nor scrolls. GTK CSS has no `max-height` either, so when
-//!    this card was written there was **no** way for a plugin to bound its own
-//!    height — hence the bound it does have: one-line rows, collapsible
-//!    groups, and [`MAX_ROWS`].
+//! # Where the bounds are
 //!
-//!    **Both halves of that have since been fixed, and neither is undone
-//!    here.** #967 put the sidebar's card stack in a `gtk::ScrolledWindow`, so
-//!    a tall card no longer hides the cards below it; and #969 added
-//!    [`Node::Scrolled`] (`{ max_height, child }`), a real viewport a plugin
-//!    can ask for — the variant #966 opened precisely because `Box::scroll`
-//!    was mistaken for one here.
-//!
-//!    This card does **not** use `Scrolled` yet, on purpose. The sidebar is
-//!    already a scroller, so wrapping the roster in a second one nests
-//!    scroll-within-scroll, which is a feel question rather than a
-//!    correctness one and wants @kaesaecracker's eyes on the real thing
-//!    first. `MAX_ROWS` therefore stays as the bound, now belt-and-braces
-//!    rather than load-bearing. Swapping it for a `Scrolled { max_height }`
-//!    is the natural follow-up once the scrolled sidebar has been seen.
+//! - **The sidebar card does not bound itself.** #967 put the sidebar's card
+//!   stack in a `gtk::ScrolledWindow`, so a tall card no longer hides the cards
+//!   below it, and wrapping the roster in a second viewport would hide rows
+//!   behind an inner scrollbar inside a surface that already scrolls.
+//!   [`MAX_ROWS`] stays as belt and braces — see its own docs for what it is
+//!   actually bounding now.
+//! - **The drawer panel does bound itself**, with [`Node::Scrolled`] (#966/#969)
+//!   capped at [`PANEL_VIEWPORT_PX`]. The plugin drawer child is a plain
+//!   `gtk::Box` with no scroller of its own (`trollshell/src/plugins/region.rs`,
+//!   `build_panel_child`), so before this a panel taller than the drawer simply
+//!   ran off the bottom — and this round gives the overview the **full** roster,
+//!   which is exactly the content that gets long. `Scrolled` is a negotiated
+//!   variant, so the negotiation happens once in `plugin.rs` and arrives here as
+//!   [`PanelContext::viewport_px`] (`0` = the pre-#969 unbounded shape).
 
+use hytte_plugin::nodes;
 use hytte_plugin::proto::{Dir, Node};
 
 use crate::config::AgentsConfig;
@@ -72,21 +65,34 @@ pub const ROOT_ID: &str = "agents-root";
 pub const PANEL_ID: &str = "agents-panel";
 /// The panel's "back to the hive overview" button.
 pub const BACK_ID: &str = "agents-back";
+/// The card title row's button: open the drawer panel at the hive overview.
+///
+/// The drawer is now the **only** thing on the card that opens somewhere else,
+/// and it is reached from the card's own title rather than from a row —
+/// @kaesaecracker, [#963](https://github.com/vibec0re/trollshell/pull/963):
+/// "its very weird the panel opens in the top right after clicking bottom
+/// left". A row's own details unfold in place ([`ids::DETAILS`]); the panel is
+/// for the hive overview and the full roster, and its title-row button is where
+/// a jump-to-another-surface belongs.
+pub const OVERVIEW_ID: &str = "agents-overview";
 
 /// Button id prefixes. Each is `"<prefix><name>"`; the reducer strips the
 /// prefix and re-validates the remainder as an [`AgentName`] rather than
 /// trusting the round trip.
 pub mod ids {
-    /// The row's primary click — the agent's name.
+    /// The row's primary click — the agent's name. Opens the drawer panel on
+    /// that agent (spec §6.3's primary; P2 replaces it with the chat window).
     pub const CHAT: &str = "chat:";
     /// The row's pause/resume toggle.
     pub const PAUSE: &str = "pause:";
-    /// The row's **details** button (ⓘ).
+    /// The row's **details** disclosure.
     ///
     /// Was `edit:` until @kaesaecracker pointed out that a pen means *edit*
-    /// and this panel edits nothing — editing is P4/P5, and the panel is
-    /// read-only by design (spec §10: "v1 is read-only … it is what the hive
-    /// supports"). The glyph and the id now both say what the button does.
+    /// and this panel edits nothing (editing is P4/P5; spec §10: "v1 is
+    /// read-only … it is what the hive supports"). It then briefly opened the
+    /// drawer, which is what the second round of screenshots objected to.
+    /// It now unfolds the agent's details **inside the card**, where the click
+    /// happened, one agent at a time.
     pub const DETAILS: &str = "details:";
     /// The panel's per-agent start.
     pub const START: &str = "start:";
@@ -98,51 +104,91 @@ pub mod ids {
 
 /// The most agent rows the card will draw.
 ///
-/// The card cannot bound its own height — see fact 3 in the module docs — so
-/// the only real bound is rendering fewer rows. Twelve is
-/// @kaesaecracker's live hive and every one of hers is meant to be visible, so
-/// this sits comfortably above that while still capping a hive that grows: at
-/// roughly one text line per row, twenty rows plus the title is about the
-/// height of the sidebar's other three cards put together, and anything past
-/// it would push the pet card off-screen with no way to scroll back.
+/// **This is no longer a pixel budget.** It was one, when the sidebar could not
+/// scroll and a long card pushed the pet card off-screen with no way back; #967
+/// fixed that, and the rows have since gone from one line back to two, which
+/// would have halved a pixel-derived cap. What is left is the bound that does
+/// not depend on row height at all: a card renders a whole node tree on every
+/// poll and that tree is msgpack over a socket, so the cap is on **how much
+/// tree a runaway hive can make this plugin serialise every two seconds**, not
+/// on how tall it draws. Twenty is comfortably above @kaesaecracker's live
+/// twelve and still bounds a hive that grows an order of magnitude.
 ///
 /// Overflow is **stated, never silent**: the card draws a "+N more" line and
-/// the panel lists the full roster.
+/// the panel's overview lists the full roster, uncapped.
 pub const MAX_ROWS: usize = 20;
+
+/// The drawer panel's viewport cap, in pixels.
+///
+/// The plugin drawer child has no scroller of its own, so this is the panel's
+/// only bound. A child shorter than the cap is not stretched, so the number
+/// only ever matters for a panel that would otherwise overflow — which, with
+/// the full roster on the overview, is any hive past a handful of agents. 560
+/// is the shell's own historic drawer-card baseline (`modal.rs`'s
+/// `MIN_CARD_HEIGHT` lineage); a plugin cannot see the monitor, so it cannot
+/// derive the number the way the Stats page now does.
+pub const PANEL_VIEWPORT_PX: u16 = 560;
+
+/// How many characters of the agent's display name line 1 shows.
+const NAME_CHARS: i32 = 20;
+
+/// Past this many characters the status caption stops wrapping and ellipsizes.
+///
+/// The caption's job is to show the harness's line **in full** — that is the
+/// whole point of giving the row its second line back. Wrapping does that for
+/// anything a status realistically says; past this it would turn one row into
+/// five, so the tail moves to the hover instead.
+const STATUS_WRAP_MAX: usize = 88;
+
+/// The ellipsized width of a status past [`STATUS_WRAP_MAX`].
+const STATUS_CHARS: i32 = 34;
+
+/// The ellipsized width of a key/value line's value.
+const VALUE_CHARS: i32 = 28;
+
+fn cls(classes: &[&str]) -> Vec<String> {
+    classes.iter().map(|c| (*c).to_owned()).collect()
+}
 
 fn label(text: impl Into<String>, classes: &[&str]) -> Node {
     Node::Label {
         id: None,
         text: text.into(),
         tooltip: None,
-        classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+        classes: cls(classes),
     }
 }
 
-fn text(body: impl Into<String>, ellipsize: bool, classes: &[&str]) -> Node {
+/// A **wrapping** label: the whole string, on as many lines as it needs.
+fn wrapped(body: impl Into<String>, classes: &[&str]) -> Node {
     Node::Text {
         id: None,
         text: body.into(),
         max_width_chars: None,
-        ellipsize,
-        classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+        ellipsize: false,
+        tooltip: None,
+        classes: cls(classes),
     }
 }
 
-/// An ellipsizing single-line label capped at `chars`.
+/// An ellipsizing single-line label capped at `chars`, carrying its **own**
+/// full text as hover (#961/#971).
 ///
-/// The cap is what makes the ellipsis actually happen in a row that also
+/// The width cap is what makes the ellipsis actually happen in a row that also
 /// holds a [`Node::Spacer`]: without a natural-width bound the label asks for
 /// its full text and the spacer has nothing left to give, so the row grows
-/// instead of the text shrinking. `Text` carries no `tooltip` field, so the
-/// untruncated string lives on the enclosing row's `Box` — see [`agent_row`].
+/// instead of the text shrinking. The tooltip is set explicitly rather than
+/// left to the host's ellipsize default, so the falsification is local: delete
+/// it here and the assertion reds here.
 fn clipped(body: impl Into<String>, chars: i32, classes: &[&str]) -> Node {
+    let body = body.into();
     Node::Text {
         id: None,
-        text: body.into(),
+        text: body.clone(),
         max_width_chars: Some(chars),
         ellipsize: true,
-        classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+        tooltip: Some(body),
+        classes: cls(classes),
     }
 }
 
@@ -151,154 +197,277 @@ fn icon(name: impl Into<String>, classes: &[&str]) -> Node {
         id: None,
         name: name.into(),
         tooltip: None,
-        classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+        classes: cls(classes),
     }
 }
 
 /// An icon whose meaning is not obvious from the glyph, so it carries hover
-/// text (#957's `tooltip`, `crates/hytte-plugin-proto/src/wire.rs:244-252`).
+/// text (#957's `tooltip`).
 fn icon_titled(name: impl Into<String>, hover: impl Into<String>, classes: &[&str]) -> Node {
     Node::Icon {
         id: None,
         name: name.into(),
         tooltip: Some(hover.into()),
-        classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+        classes: cls(classes),
     }
 }
 
 fn button(id: impl Into<String>, classes: &[&str], child: Node) -> Node {
     Node::Button {
         id: id.into(),
-        classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+        classes: cls(classes),
         child: Box::new(child),
     }
 }
 
-/// A horizontal box **with a real gap**.
-///
-/// Deliberately not [`Node::Row`]: the host builds that as
-/// `gtk::Box::new(Horizontal, 0)` with the spacing hardcoded, so an icon and
-/// a label rendered as a `Row` come out touching (`⚙argus`). See fact 1 in
-/// the module docs.
-fn row(spacing: i32, classes: &[&str], children: Vec<Node>) -> Node {
-    row_titled(spacing, classes, None, children)
+/// A compact icon button — every unlabelled control on the card and in the
+/// panel header, each carrying the words its glyph does not.
+fn icon_button(id: impl Into<String>, glyph: &str, hover: &str, classes: &[&str]) -> Node {
+    button(id, classes, icon_titled(glyph, hover, &[]))
 }
 
-/// [`row`] plus hover text for the whole row — the only place an ellipsized
-/// `Text`'s full string can live, since `Text` has no `tooltip` of its own.
-fn row_titled(
-    spacing: i32,
-    classes: &[&str],
-    tooltip: Option<String>,
-    children: Vec<Node>,
-) -> Node {
+/// A horizontal [`Node::Row`] with a real gap (#966/#969).
+fn hrow(spacing: u16, classes: &[&str], children: Vec<Node>) -> Node {
+    let mut builder = nodes::row(children).spacing(spacing);
+    for class in classes {
+        builder = builder.class(*class);
+    }
+    builder.build()
+}
+
+/// A vertical stack. `Row` is horizontal-only, so the two-line agent row, the
+/// inline details and the card root are all `Box`es.
+fn vstack(spacing: i32, classes: &[&str], children: Vec<Node>) -> Node {
     Node::Box {
         id: None,
-        dir: Dir::Horizontal,
+        dir: Dir::Vertical,
         spacing,
         scroll: false,
-        tooltip,
-        classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+        tooltip: None,
+        classes: cls(classes),
         children,
     }
 }
 
-/// A single explanatory line — the shape every non-`Up` hive state renders.
-fn notice(icon_name: &str, body: &str, class: &str) -> Node {
-    row_titled(
+/// A dense list surface: the roster, and every key/value group in the panel.
+///
+/// `dense` zeroes the auto-wrapper's height floor so the row's own padding is
+/// the row's height; `boxed-list` is what the shell's stylesheet keys the
+/// hairline separators off.
+fn list(dense: bool, classes: &[&str], children: Vec<Node>) -> Node {
+    let mut builder = nodes::list(children).dense(dense).class("boxed-list");
+    for class in classes {
+        builder = builder.class(*class);
+    }
+    builder.build()
+}
+
+/// Wrap `child` in a bounded viewport, or hand it back bare.
+///
+/// `max_height` of `0` means unbounded — which is also what a host that never
+/// advertised `SCROLLED_VOCAB` gets, since the negotiation is resolved once in
+/// `plugin.rs` and arrives here as the number. Building the node
+/// **unnegotiated** here is correct precisely because that branch already
+/// happened; it is also what makes the viewport testable, since
+/// `nodes::scrolled(..).build()` consults a process-global that no test can set.
+fn viewport(max_height: u16, classes: &[&str], child: Node) -> Node {
+    if max_height == 0 {
+        return child;
+    }
+    let mut builder = nodes::scrolled(max_height, child);
+    for class in classes {
+        builder = builder.class(*class);
+    }
+    builder.build_unnegotiated()
+}
+
+/// One key/value line.
+fn detail(key: &str, value: &str) -> Node {
+    hrow(
         6,
-        &["ts-agents-notice"],
-        Some(body.to_owned()),
+        &["ts-agent-detail"],
         vec![
-            icon(icon_name, &["ts-agent-state", class]),
-            clipped(body, STATUS_CHARS, &["dim-label"]),
+            label(key, &["dim-label", "caption"]),
+            Node::Spacer,
+            clipped(value, VALUE_CHARS, &["caption", "numeric"]),
         ],
     )
 }
 
-/// How many characters of the harness's status line the row shows before
-/// ellipsizing. The rest is on the row's tooltip and in the panel.
-const STATUS_CHARS: i32 = 22;
+/// A titled group: a heading over a list surface.
+fn section(title: &str, body: Node) -> Node {
+    vstack(
+        4,
+        &["ts-agents-section"],
+        vec![label(title, &["heading"]), body],
+    )
+}
 
-/// How many characters of the agent's display name the row shows.
-const NAME_CHARS: i32 = 14;
-
-/// One agent, on **one line** (spec §6.1's two-line mock, compacted).
+/// A single explanatory line — the shape every non-`Up` hive state renders.
 ///
-/// The mock was two lines and that is what shipped first; against a real
-/// twelve-agent hive it came to roughly 700 px and pushed the pet card off a
-/// sidebar that cannot scroll. Same information, one line: the harness text
-/// moves inline and ellipsizes, and the **full, untruncated** string becomes
-/// the row's hover text — which is why the row is a `Box` and not a `Row`,
-/// since `Text` carries no `tooltip` of its own.
-fn agent_row(agent: &Agent, cfg: &AgentsConfig) -> Node {
+/// The reason **wraps** rather than ellipsizing: an unreachable hive's reason
+/// is the one string on the card that has to be read in full to be acted on
+/// ("permission denied — needs `hive-admin` group"), and it is one row, not
+/// twelve.
+fn notice(icon_name: &str, body: &str, tone: &str) -> Node {
+    hrow(
+        6,
+        &["ts-agents-notice"],
+        vec![
+            icon(icon_name, &["ts-agent-state", tone]),
+            wrapped(body, &["dim-label", "caption"]),
+        ],
+    )
+}
+
+/// The pause button's glyph and hover: what the click will **do**, which is the
+/// only reading that stays honest through the optimistic flip.
+fn pause_affordance(agent: &Agent) -> (&'static str, &'static str) {
+    if agent.paused() {
+        ("media-playback-start-symbolic", "resume this agent")
+    } else {
+        ("media-playback-pause-symbolic", "pause this agent")
+    }
+}
+
+/// The harness's status line, as line 2 of the row: **in full**, dim, wrapping.
+///
+/// Ellipsizing is the last resort ([`STATUS_WRAP_MAX`]), and when it happens the
+/// `Text` carries the whole string as its own hover.
+fn status_caption(agent: &Agent) -> Node {
+    let line = agent.status_line();
+    if line.chars().count() > STATUS_WRAP_MAX {
+        clipped(
+            line,
+            STATUS_CHARS,
+            &["dim-label", "caption", "ts-agent-status"],
+        )
+    } else {
+        wrapped(line, &["dim-label", "caption", "ts-agent-status"])
+    }
+}
+
+/// Only the flags that are **on**, as chips.
+///
+/// A key/value dump of five booleans says nothing when four of them are the
+/// default — `running yes / failed no / paused no / needs login no` is four
+/// lines that carry one bit between them. `running` is not here at all: it is
+/// the status glyph and the status line, both already on the row.
+fn flag_chips(agent: &Agent) -> Vec<Node> {
+    [
+        (agent.row.failed, "failed", "error"),
+        (agent.row.needs_login, "needs login", "warning"),
+        (agent.paused(), "paused", "dim-label"),
+        (agent.needs_update(), "needs update", UPDATE_BADGE_CLASS),
+    ]
+    .into_iter()
+    .filter(|(on, _, _)| *on)
+    .map(|(_, text, tone)| label(text, &["ts-agent-chip", "caption", tone]))
+    .collect()
+}
+
+/// The hive's own `deployed_sha`, clamped to 12 characters.
+///
+/// The wire doc says the field is already the first 12 (`hive-sh4re`), so this
+/// is belt and braces against a hive that ever sends the full 40 — a raw sha in
+/// a 320 px card is one string that would push everything else out.
+fn short_sha(agent: &Agent) -> Option<String> {
+    agent
+        .row
+        .deployed_sha
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(12).collect())
+}
+
+/// One agent, on **two compact lines** (spec §6.1's mock).
+///
+/// Line 1 is the identity and the controls; line 2 is the harness's own status,
+/// in full. The one-line row that shipped between the two screenshot rounds was
+/// an overcorrection for a sidebar that could not scroll (#967 fixed that) and
+/// is what @kaesaecracker read as "crammed".
+///
+/// `open` unfolds this agent's details underneath, in place.
+fn agent_row(agent: &Agent, cfg: &AgentsConfig, open: bool) -> Node {
     let name = agent.name.as_str();
     let status = agent.status();
+    let (pause_glyph, pause_hover) = pause_affordance(agent);
 
-    // Paused shows the resume glyph: the button's icon is what it will DO,
-    // which is the only reading that stays honest through the optimistic flip.
-    let (pause_icon, pause_hint) = if agent.paused() {
-        ("media-playback-start-symbolic", "resume")
-    } else {
-        ("media-playback-pause-symbolic", "pause")
-    };
-
-    let mut children = vec![
+    let mut head = vec![
         icon(cfg.icon_for(name), &["ts-agent-runtime"]),
         button(
             format!("{}{name}", ids::CHAT),
             &["flat", "ts-agent-name"],
-            // Clipped, not a bare `Label`: a `Label`.s natural width forces
-            // its container wider (the #281 sidebar blow-out), and an agent
-            // name may be up to 63 bytes.
-            clipped(cfg.label_for(name), NAME_CHARS, &[]),
+            // Clipped, not a bare `Label`: a `Label`'s natural width forces its
+            // container wider (the #281 sidebar blow-out), and an agent name may
+            // be up to 63 bytes.
+            clipped(cfg.label_for(name), NAME_CHARS, &["heading"]),
         ),
         icon_titled(
             status.icon(),
             status.text(),
             &["ts-agent-state", status.class()],
         ),
-        clipped(agent.status_line(), STATUS_CHARS, &["dim-label"]),
         Node::Spacer,
     ];
     if agent.needs_update() {
-        // Spec §6.2's badge row says "(tooltip only)" for its text, and until
-        // #958 the vocabulary had no tooltip to put it in. It does now.
-        children.push(icon_titled(
+        // Spec §6.2's badge row says "(tooltip only)" for its text.
+        head.push(icon_titled(
             UPDATE_BADGE_ICON,
             "config commit pending — a rebuild would change this agent's locked rev",
             &["ts-agent-badge", UPDATE_BADGE_CLASS],
         ));
     }
-    children.push(button(
+    head.push(icon_button(
         format!("{}{name}", ids::PAUSE),
+        pause_glyph,
+        pause_hover,
         &["flat", "ts-agent-btn"],
-        icon_titled(pause_icon, pause_hint, &[]),
     ));
-    children.push(button(
+    head.push(icon_button(
         format!("{}{name}", ids::DETAILS),
+        if open {
+            "pan-down-symbolic"
+        } else {
+            "pan-end-symbolic"
+        },
+        if open { "hide details" } else { "details" },
         &["flat", "ts-agent-btn"],
-        // ⓘ, not a pen: this panel edits nothing (spec §10, "v1 is
-        // read-only"), and a pen promised an edit that does not exist.
-        icon_titled("dialog-information-symbolic", "details", &[]),
     ));
 
-    row_titled(4, &["ts-agent-row"], Some(row_hover(agent, cfg)), children)
+    let mut children = vec![hrow(6, &["ts-agent-head"], head), status_caption(agent)];
+    if open {
+        children.push(details_block(agent));
+    }
+    vstack(2, &["ts-agent-row"], children)
 }
 
-/// The row's hover text: the display name, then the harness's status
-/// **in full** — the string the inline label had to cut.
-fn row_hover(agent: &Agent, cfg: &AgentsConfig) -> String {
-    let name = agent.name.as_str();
-    let label = cfg.label_for(name);
-    let mut hover = if label == name {
-        name.to_owned()
-    } else {
-        format!("{label} ({name})")
-    };
-    hover.push('\n');
-    hover.push_str(agent.status_line());
-    hover
+/// The in-place unfold: the row's own details, inside the card.
+///
+/// Deliberately a **summary**, not the panel: the flags that are on, the
+/// deployment triple, and the agent's page. The panel keeps the hive-level
+/// context (socket, poll age, dashboard) and the full roster.
+fn details_block(agent: &Agent) -> Node {
+    let mut children = Vec::new();
+    let chips = flag_chips(agent);
+    if !chips.is_empty() {
+        children.push(hrow(4, &["ts-agent-chips"], chips));
+    }
+    if let Some(sha) = short_sha(agent) {
+        children.push(detail("deployed", &sha));
+    }
+    children.push(detail(
+        "parent",
+        agent.row.parent.as_deref().unwrap_or("— (root)"),
+    ));
+    if let Some(model) = agent.row.active_model.as_deref() {
+        children.push(detail("model", model));
+    }
+    if let Some(url) = agent_url(agent) {
+        children.push(detail("agent page", url));
+    }
+    vstack(2, &["ts-agent-details"], children)
 }
 
 /// The card's one-line summary of the hive, right-pinned in the title row.
@@ -314,68 +483,81 @@ pub fn hive_summary(hive: &Hive) -> String {
     }
 }
 
-/// The sidebar card: a titled surface, then the rows.
+/// The sidebar card: a titled surface, then the roster as a dense list.
 ///
-/// The title is not decoration — without it the rows started straight under
-/// the neighbouring card with nothing saying what they were, which is the
-/// first thing @kaesaecracker's screenshot shows. `Tasks`, `Claude usage` and
-/// the built-ins all lead with a heading; this now matches. The host supplies
-/// the card surface itself (`.ts-plugin-card`, #319) and deliberately no
-/// padding, so the root carries `ts-agents-card` for its own inset.
+/// The title matches the `Tasks` card above it — the same all-caps caption
+/// class and the same header rhythm — so the two read as siblings rather than
+/// as a card and a pile of rows. The host supplies the card surface itself
+/// (`.ts-plugin-card`, #319) and deliberately no padding, so the root carries
+/// `ts-agents-card` for its own inset.
 #[must_use]
-pub fn card(hive: &Hive, cfg: &AgentsConfig, expanded: &ExpandedGroups) -> Node {
-    let mut children = vec![row(
+pub fn card(
+    hive: &Hive,
+    cfg: &AgentsConfig,
+    expanded: &ExpandedGroups,
+    opened: Option<&AgentName>,
+) -> Node {
+    let title = hrow(
         6,
         &["ts-agents-title"],
         vec![
-            label("Agents", &["heading"]),
+            label("AGENTS", &["ts-agents-heading"]),
             Node::Spacer,
-            label(hive_summary(hive), &["dim-label", "numeric"]),
+            label(hive_summary(hive), &["dim-label", "caption", "numeric"]),
+            icon_button(
+                OVERVIEW_ID,
+                "view-list-symbolic",
+                "hive overview and the full roster",
+                &["flat", "ts-agent-btn"],
+            ),
         ],
-    )];
+    );
 
-    match hive {
-        Hive::Connecting => children.push(notice(
+    let body = match hive {
+        Hive::Connecting => vec![notice(
             "content-loading-symbolic",
             "connecting…",
             "dim-label",
-        )),
+        )],
         Hive::Unreachable { reason } => {
-            children.push(notice("network-offline-symbolic", reason, "dim-label"));
+            vec![notice("network-offline-symbolic", reason, "dim-label")]
         }
         // Reachable, and saying no — a different problem from "no hive", so a
         // different icon (spec §5.3 covers only the unreachable case; this is
         // its reachable sibling).
-        Hive::Error { reason } => {
-            children.push(notice("dialog-error-symbolic", reason, "error"));
-        }
-        Hive::Incompatible(mismatch) => children.push(notice(
+        Hive::Error { reason } => vec![notice("dialog-error-symbolic", reason, "error")],
+        Hive::Incompatible(mismatch) => vec![notice(
             "dialog-warning-symbolic",
             &format!(
                 "hive protocol v{}, plugin speaks v{}",
                 mismatch.theirs, mismatch.ours
             ),
             "warning",
-        )),
+        )],
         Hive::Up { agents } if agents.is_empty() => {
-            children.push(notice("system-run-symbolic", "no agents", "dim-label"));
+            vec![notice("system-run-symbolic", "no agents", "dim-label")]
         }
-        Hive::Up { agents } => children.extend(roster(agents, cfg, expanded)),
-    }
+        Hive::Up { agents } => roster(agents, cfg, expanded, opened),
+    };
 
     Node::Box {
         id: Some(ROOT_ID.to_owned()),
         dir: Dir::Vertical,
-        spacing: 2,
+        spacing: 0,
         scroll: false,
         tooltip: None,
         classes: vec!["ts-agents-card".to_owned()],
-        children,
+        children: vec![title, list(true, &["ts-agents-list"], body)],
     }
 }
 
 /// The roster body: grouped rows, capped at [`MAX_ROWS`].
-fn roster(agents: &[Agent], cfg: &AgentsConfig, expanded: &ExpandedGroups) -> Vec<Node> {
+fn roster(
+    agents: &[Agent],
+    cfg: &AgentsConfig,
+    expanded: &ExpandedGroups,
+    opened: Option<&AgentName>,
+) -> Vec<Node> {
     let groups = group(agents, cfg);
     let headers = headers_wanted(&groups);
     let mut out = Vec::new();
@@ -387,7 +569,7 @@ fn roster(agents: &[Agent], cfg: &AgentsConfig, expanded: &ExpandedGroups) -> Ve
         // the budget and are not "skipped" either — they are one click away.
         let open = group_open(g, expanded);
         if headers && !open {
-            out.push(group_node(g, cfg, false, Vec::new()));
+            out.push(group_node(g, false, Vec::new()));
             continue;
         }
 
@@ -397,11 +579,15 @@ fn roster(agents: &[Agent], cfg: &AgentsConfig, expanded: &ExpandedGroups) -> Ve
                 skipped += 1;
                 continue;
             }
-            rows.push(agent_row(agent, cfg));
+            rows.push(agent_row(
+                agent,
+                cfg,
+                opened.is_some_and(|n| *n == agent.name),
+            ));
             drawn += 1;
         }
         if headers {
-            out.push(group_node(g, cfg, true, rows));
+            out.push(group_node(g, true, rows));
         } else {
             out.extend(rows);
         }
@@ -432,8 +618,7 @@ fn group_open(g: &Group<'_>, expanded: &ExpandedGroups) -> bool {
 }
 
 /// One project group as an `Expander` — header plus its rows.
-fn group_node(g: &Group<'_>, cfg: &AgentsConfig, open: bool, rows: Vec<Node>) -> Node {
-    let _ = cfg;
+fn group_node(g: &Group<'_>, open: bool, rows: Vec<Node>) -> Node {
     let live = g
         .agents
         .iter()
@@ -441,7 +626,7 @@ fn group_node(g: &Group<'_>, cfg: &AgentsConfig, open: bool, rows: Vec<Node>) ->
         .count();
     Node::Expander {
         id: format!("{}{}", ids::GROUP, g.header()),
-        header: Box::new(row(
+        header: Box::new(hrow(
             6,
             &["ts-agents-group"],
             vec![
@@ -449,18 +634,19 @@ fn group_node(g: &Group<'_>, cfg: &AgentsConfig, open: bool, rows: Vec<Node>) ->
                 Node::Spacer,
                 label(
                     format!("{live}/{}", g.agents.len()),
-                    &["dim-label", "numeric"],
+                    &["dim-label", "caption", "numeric"],
                 ),
             ],
         )),
         children: rows,
         expanded: open,
+        tooltip: None,
         classes: vec!["ts-agents-group-row".to_owned()],
     }
 }
 
 /// Everything the panel needs that the model does not carry: the clock, the
-/// socket in use, and when the last poll answered.
+/// socket in use, when the last poll answered, and the negotiated viewport.
 #[derive(Clone, Copy, Debug)]
 pub struct PanelContext<'a> {
     /// Unix seconds from the host's clock subscription, `0` before the first
@@ -472,6 +658,10 @@ pub struct PanelContext<'a> {
     pub socket: &'a str,
     /// The hive's `Urls` answer, when one has landed.
     pub urls: Option<&'a crate::hive::wire::HiveUrls>,
+    /// The panel viewport's cap in pixels, or `0` for unbounded — which is both
+    /// "no cap wanted" and "this host predates [`Node::Scrolled`]". The
+    /// negotiation happens once, in `plugin.rs`.
+    pub viewport_px: u16,
 }
 
 /// A coarse relative age. Minute granularity on purpose: a per-second string
@@ -500,25 +690,9 @@ pub fn parse_set_at(raw: &str) -> Option<i64> {
         .map(|dt| dt.timestamp())
 }
 
-fn detail(key: &str, value: &str) -> Node {
-    row(
-        6,
-        &["ts-agent-detail"],
-        vec![
-            label(key, &["dim-label"]),
-            Node::Spacer,
-            text(value, true, &["numeric"]),
-        ],
-    )
-}
-
-fn flag(key: &str, on: bool) -> Node {
-    detail(key, if on { "yes" } else { "no" })
-}
-
 /// The hive-level section every panel carries: reachability, the socket in
 /// use, and the last poll's age (spec §6.4).
-fn hive_section(hive: &Hive, ctx: PanelContext<'_>) -> Vec<Node> {
+fn hive_section(hive: &Hive, ctx: PanelContext<'_>) -> Node {
     let reachability = match hive {
         Hive::Connecting => "connecting…".to_owned(),
         Hive::Unreachable { reason } => format!("unreachable — {reason}"),
@@ -536,29 +710,148 @@ fn hive_section(hive: &Hive, ctx: PanelContext<'_>) -> Vec<Node> {
         Some(_) => "just now".to_owned(),
         None => "never".to_owned(),
     };
-    let mut section = vec![
-        label("hive", &["heading"]),
+    let mut rows = vec![
         detail("state", &reachability),
         detail("socket", ctx.socket),
         detail("last poll", &last_poll),
     ];
     // The dashboard root, when the hive says it is reachable from a browser.
-    // This is the only thing `Urls` is read for now that the agent page comes
-    // off the row itself (hyperhive#4073) — `HiveUrls::home` is `None` under
-    // exactly the same condition, so the two lines appear and vanish together.
-    if let Some(home) = ctx
-        .urls
+    if let Some(home) = hive_home(ctx) {
+        rows.push(detail("dashboard", home));
+    }
+    section("hive", list(false, &["ts-agents-panel-list"], rows))
+}
+
+/// The hive's dashboard root, when it has one.
+fn hive_home(ctx: PanelContext<'_>) -> Option<&str> {
+    ctx.urls
         .and_then(|u| u.home.as_deref())
         .map(str::trim)
         .filter(|h| !h.is_empty())
-    {
-        section.push(detail("dashboard", home));
+}
+
+/// One agent as a single line in the panel's full roster.
+fn panel_roster_row(agent: &Agent, cfg: &AgentsConfig) -> Node {
+    let name = agent.name.as_str();
+    let status = agent.status();
+    hrow(
+        6,
+        &["ts-agent-detail"],
+        vec![
+            icon(cfg.icon_for(name), &["ts-agent-runtime"]),
+            button(
+                format!("{}{name}", ids::CHAT),
+                &["flat", "ts-agent-name"],
+                label(cfg.label_for(name), &[]),
+            ),
+            icon_titled(
+                status.icon(),
+                status.text(),
+                &["ts-agent-state", status.class()],
+            ),
+            Node::Spacer,
+            clipped(agent.status_line(), STATUS_CHARS, &["dim-label", "caption"]),
+        ],
+    )
+}
+
+/// The selected agent's page: header, status, chips, deployment, links.
+fn agent_page(agent: &Agent, cfg: &AgentsConfig, ctx: PanelContext<'_>) -> Vec<Node> {
+    let name = agent.name.as_str();
+    let status = agent.status();
+    let mut out = Vec::new();
+
+    out.push(hrow(
+        8,
+        &["ts-agents-panel-head"],
+        vec![
+            icon(cfg.icon_for(name), &["ts-agent-runtime"]),
+            label(cfg.label_for(name), &["title-4"]),
+            icon_titled(
+                status.icon(),
+                status.text(),
+                &["ts-agent-state", status.class()],
+            ),
+            Node::Spacer,
+            // Spec §11 rule one: both frames are scoped to this one agent.
+            icon_button(
+                format!("{}{name}", ids::START),
+                "media-playback-start-symbolic",
+                "start this agent",
+                &["flat", "circular", "ts-agent-btn"],
+            ),
+            icon_button(
+                format!("{}{name}", ids::STOP),
+                "media-playback-stop-symbolic",
+                "stop this agent",
+                &["flat", "circular", "ts-agent-btn"],
+            ),
+        ],
+    ));
+    if cfg.label_for(name) != name {
+        out.push(wrapped(name, &["dim-label", "caption", "ts-mono"]));
     }
-    section
+    out.push(wrapped(agent.status_line(), &["dim-label"]));
+
+    let chips = flag_chips(agent);
+    if !chips.is_empty() {
+        out.push(hrow(4, &["ts-agent-chips"], chips));
+    }
+
+    let mut deployment = vec![detail(
+        "parent",
+        agent.row.parent.as_deref().unwrap_or("— (root)"),
+    )];
+    if let Some(sha) = short_sha(agent) {
+        deployment.insert(0, detail("deployed", &sha));
+    }
+    if let Some(model) = agent.row.active_model.as_deref() {
+        deployment.push(detail("model", model));
+    }
+    if let Some(at) = agent
+        .row
+        .status_set_at
+        .as_deref()
+        .and_then(parse_set_at)
+        .filter(|_| ctx.now_unix > 0)
+    {
+        deployment.push(detail("status set", &age(ctx.now_unix, at)));
+    }
+    out.push(section(
+        "deployment",
+        list(false, &["ts-agents-panel-list"], deployment),
+    ));
+
+    let mut links = Vec::new();
+    if let Some(url) = agent_url(agent) {
+        links.push(detail("agent page", url));
+    }
+    if let Some(home) = hive_home(ctx) {
+        links.push(detail("dashboard", home));
+    }
+    if !links.is_empty() {
+        out.push(section(
+            "links",
+            list(false, &["ts-agents-panel-list"], links),
+        ));
+    }
+
+    out.push(hrow(
+        6,
+        &["ts-agents-panel-actions"],
+        vec![
+            Node::Spacer,
+            button(BACK_ID, &["flat"], label("all agents", &[])),
+        ],
+    ));
+    out
 }
 
 /// The drawer panel (spec §6.4): the selected agent's full detail, or the hive
-/// overview when nothing is selected.
+/// overview **plus the full, uncapped roster** when nothing is selected.
+///
+/// The roster is what makes the card's `+N more — open the panel for the full
+/// roster` line true; before this round the panel showed no rows at all.
 #[must_use]
 pub fn panel(
     hive: &Hive,
@@ -569,101 +862,78 @@ pub fn panel(
     let mut children = Vec::new();
 
     if let Some(agent) = selected.and_then(|name| hive.agent(name)) {
-        let name = agent.name.as_str();
-        let status = agent.status();
-        // `<name> · <project>` — the title row @kaesaecracker's screenshot was
-        // missing, and with a real gap (the old `Row` hardcodes spacing 0,
-        // which is why it read as `⚙argus`).
-        let mut title = vec![
-            icon(cfg.icon_for(name), &["ts-agent-runtime"]),
-            label(cfg.label_for(name), &["title-4"]),
-        ];
-        if let Some(project) = cfg.project_for(name) {
-            title.push(label("·", &["dim-label"]));
-            title.push(label(project, &["dim-label"]));
-        }
-        title.push(Node::Spacer);
-        title.push(icon_titled(
-            status.icon(),
-            status.text(),
-            &["ts-agent-state", status.class()],
-        ));
-        children.push(row(6, &["ts-agents-panel-head"], title));
-        if cfg.label_for(name) != name {
-            children.push(detail("agent", name));
-        }
-        children.push(text(agent.status_line(), false, &["dim-label"]));
-        if let Some(at) = agent
-            .row
-            .status_set_at
-            .as_deref()
-            .and_then(parse_set_at)
-            .filter(|_| ctx.now_unix > 0)
-        {
-            children.push(detail("status set", &age(ctx.now_unix, at)));
-        }
-
-        children.push(label("flags", &["heading"]));
-        children.push(flag("running", agent.row.running));
-        children.push(flag("failed", agent.row.failed));
-        children.push(flag("paused", agent.paused()));
-        children.push(flag("needs login", agent.row.needs_login));
-        children.push(flag("needs update", agent.row.needs_update));
-        if let Some(sha) = agent.row.deployed_sha.as_deref() {
-            children.push(detail("deployed sha", sha));
-        }
-        children.push(detail(
-            "parent",
-            agent.row.parent.as_deref().unwrap_or("— (root)"),
-        ));
-        if let Some(model) = agent.row.active_model.as_deref() {
-            children.push(detail("model", model));
-        }
-        if let Some(url) = agent_url(agent) {
-            children.push(detail("agent page", url));
-        }
-
-        // Spec §11 rule one: both frames are scoped to this one agent.
-        children.push(row(
-            6,
-            &["ts-agents-panel-actions"],
-            vec![
-                button(
-                    format!("{}{name}", ids::START),
-                    &["flat"],
-                    label("start", &[]),
-                ),
-                button(
-                    format!("{}{name}", ids::STOP),
-                    &["flat"],
-                    label("stop", &[]),
-                ),
-                Node::Spacer,
-                button(BACK_ID, &["flat"], label("all agents", &[])),
-            ],
-        ));
-        children.push(Node::Separator {
-            classes: Vec::new(),
-        });
+        children.extend(agent_page(agent, cfg, ctx));
     }
 
-    children.extend(hive_section(hive, ctx));
+    children.push(hive_section(hive, ctx));
 
+    if selected.is_none() {
+        let agents = hive.agents();
+        if !agents.is_empty() {
+            children.push(section(
+                "roster",
+                list(
+                    false,
+                    &["ts-agents-panel-list"],
+                    agents
+                        .iter()
+                        .map(|a| panel_roster_row(a, cfg))
+                        .collect::<Vec<_>>(),
+                ),
+            ));
+        }
+    }
+
+    let body = vstack(8, &["ts-agents-panel-body"], children);
     Node::Box {
         id: Some(PANEL_ID.to_owned()),
         dir: Dir::Vertical,
-        spacing: 4,
-        scroll: true,
+        spacing: 0,
+        scroll: false,
         tooltip: None,
         classes: vec!["ts-agents-panel".to_owned()],
-        children,
+        children: vec![viewport(ctx.viewport_px, &["ts-agents-viewport"], body)],
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_ROWS, STATUS_CHARS, age, ids, parse_set_at};
+    use super::{
+        MAX_ROWS, PANEL_VIEWPORT_PX, STATUS_CHARS, STATUS_WRAP_MAX, age, ids, parse_set_at,
+    };
+    use crate::config::AgentsConfig;
+    use crate::hive::wire::AgentStatusRow;
+    use crate::model::{Agent, AgentName, ExpandedGroups, Hive};
     use hytte_plugin::proto::Node;
+
+    fn agent(name: &str, row: AgentStatusRow) -> Agent {
+        Agent {
+            name: AgentName::parse(name).expect("legal"),
+            row,
+            pending_paused: None,
+        }
+    }
+
+    fn running(name: &str, status: &str) -> Agent {
+        agent(
+            name,
+            AgentStatusRow {
+                name: name.to_owned(),
+                running: true,
+                status_text: Some(status.to_owned()),
+                ..AgentStatusRow::default()
+            },
+        )
+    }
+
+    fn card_of(agents: Vec<Agent>, opened: Option<&AgentName>) -> Node {
+        super::card(
+            &Hive::Up { agents },
+            &AgentsConfig::default(),
+            &ExpandedGroups::new(),
+            opened,
+        )
+    }
 
     #[test]
     fn ages_render_at_minute_granularity() {
@@ -694,256 +964,249 @@ mod tests {
         assert_eq!(parse_set_at("1757239200"), None);
     }
 
-    /// The row shows a truncated status but hovers the **full** one.
+    /// @kaesaecracker's "crammed": the row is **two lines**, and line 2 is the
+    /// harness's status **in full** — wrapping, not cut.
     ///
-    /// This is the whole reason the row is a `Box` rather than a `Row`:
-    /// `Node::Text` has no `tooltip` field, so the untruncated string has
-    /// nowhere else to live, and without it @kaesaecracker's
-    /// `idle — #4077 approved, watching for…` is simply unreadable.
-    ///
-    /// Falsification: pass `None` as `row_titled`'s tooltip in `agent_row`,
-    /// or drop `max_width_chars` from the status `Text`, and one of the two
-    /// assertions below goes red.
+    /// Falsification: swap `status_caption`'s wrapping arm for the ellipsizing
+    /// one (i.e. clip every status the way the one-line row did) and the
+    /// `ellipsize` assertion goes red.
     #[test]
-    fn a_row_clips_its_status_inline_and_hovers_it_in_full() {
-        use crate::config::AgentsConfig;
-        use crate::hive::wire::AgentStatusRow;
-        use crate::model::{Agent, AgentName, ExpandedGroups, Hive};
+    fn line_two_carries_the_whole_status_and_does_not_clip_it() {
+        // 63 chars — a realistic harness line, and the length that was being
+        // cut at 22 characters on the one-line row.
+        const LINE: &str = "idle — #4077 approved, watching for review assignments";
+        assert!(LINE.chars().count() <= STATUS_WRAP_MAX);
 
-        const LONG: &str =
-            "idle — #4077 approved, watching for new review assignments across the whole swarm";
-
-        let agent = Agent {
-            name: AgentName::parse("argus").expect("legal"),
-            row: AgentStatusRow {
-                name: "argus".to_owned(),
-                running: true,
-                status_text: Some(LONG.to_owned()),
-                ..AgentStatusRow::default()
-            },
-            pending_paused: None,
-        };
-        let tree = super::card(
-            &Hive::Up {
-                agents: vec![agent],
-            },
-            &AgentsConfig::default(),
-            &ExpandedGroups::new(),
-        );
-
-        // The inline label is the full string but ellipsized and width-capped,
-        // so GTK actually truncates it rather than widening the sidebar.
-        let status = find_text(&tree, LONG).expect("the status text renders");
-        assert!(status.0, "the inline status must ellipsize");
-        assert_eq!(
-            status.1,
-            Some(STATUS_CHARS),
-            "…and be width-capped, or the Spacer leaves it room to grow"
-        );
-
-        // The full string is reachable on hover, on the row's own Box.
-        let hovers = box_tooltips(&tree);
+        let tree = card_of(vec![running("argus", LINE)], None);
+        let status = find_text(&tree, LINE).expect("the status renders somewhere");
         assert!(
-            hovers.iter().any(|t| t.contains(LONG)),
-            "the untruncated status must be the row's hover text; got {hovers:?}"
+            !status.ellipsize,
+            "the status line must be shown in full, not ellipsized"
         );
+        assert_eq!(
+            status.max_width_chars, None,
+            "a width cap would truncate the line the row exists to show"
+        );
+        assert!(
+            status.classes.iter().any(|c| c == "ts-agent-status"),
+            "line 2 is the status caption: {:?}",
+            status.classes
+        );
+
+        // …and it really is a second line: the row is a vertical stack whose
+        // first child is the head row and whose second is that caption.
+        let row = find_class(&tree, "ts-agent-row").expect("the row renders");
+        let Node::Box { dir, children, .. } = &row else {
+            panic!("an agent row is a vertical stack, got {row:?}");
+        };
+        assert_eq!(*dir, hytte_plugin::proto::Dir::Vertical);
+        assert_eq!(children.len(), 2, "two lines, no unfold: {children:?}");
+    }
+
+    /// Past [`STATUS_WRAP_MAX`] the caption ellipsizes — and then the **`Text`
+    /// itself** carries the whole string as hover (#971), not the row.
+    ///
+    /// Falsification: drop the `tooltip: Some(body)` from `clipped` and the
+    /// hover assertion goes red; raise `STATUS_WRAP_MAX` past the fixture and
+    /// the `ellipsize` one does.
+    #[test]
+    fn an_absurdly_long_status_clips_and_hovers_itself_in_full() {
+        // No trailing whitespace: `Agent::status_line` trims, so a padded
+        // fixture would not be the string the tree actually carries.
+        let long = format!(
+            "idle — {}",
+            ["watching for review assignments"; 6].join(", ")
+        );
+        assert!(long.chars().count() > STATUS_WRAP_MAX);
+
+        let tree = card_of(vec![running("argus", &long)], None);
+        let status = find_text(&tree, &long).expect("the status renders");
+        assert!(status.ellipsize, "past the wrap budget it must ellipsize");
+        assert_eq!(status.max_width_chars, Some(STATUS_CHARS));
+        assert_eq!(
+            status.tooltip.as_deref(),
+            Some(long.as_str()),
+            "the cut string carries its own untruncated hover"
+        );
+    }
+
+    /// The details button unfolds **in place**: the row grows a third child
+    /// holding that agent's details, and no other row does.
+    ///
+    /// Falsification: drop the `if open { children.push(details_block(..)) }`
+    /// arm in `agent_row` and the first assertion goes red; ignore `opened` in
+    /// `roster` (pass `false` unconditionally) and it does too.
+    #[test]
+    fn the_open_row_unfolds_its_details_and_only_that_row() {
+        let agents = vec![running("argus", "idle"), running("bosun", "idle")];
+        let opened = AgentName::parse("argus").expect("legal");
+
+        let closed = card_of(agents.clone(), None);
+        assert_eq!(
+            count_class(&closed, "ts-agent-details"),
+            0,
+            "nothing is unfolded until a details click"
+        );
+
+        let open = card_of(agents, Some(&opened));
+        assert_eq!(
+            count_class(&open, "ts-agent-details"),
+            1,
+            "exactly one row unfolds — one agent open at a time"
+        );
+        // …and it is the *right* row: the unfolded block sits inside the row
+        // whose buttons address `argus`.
+        let row = rows_with_class(&open, "ts-agent-row")
+            .into_iter()
+            .find(|r| count_class(r, "ts-agent-details") == 1)
+            .expect("some row unfolded");
+        assert!(
+            button_ids(&row).iter().any(|id| id == "details:argus"),
+            "the unfolded row must be argus's: {:?}",
+            button_ids(&row)
+        );
+    }
+
+    /// The disclosure glyph says which way the click goes, and carries the
+    /// words the glyph does not.
+    ///
+    /// Falsification: make `agent_row` render one fixed chevron regardless of
+    /// `open` and this goes red.
+    #[test]
+    fn the_disclosure_glyph_flips_with_the_unfold() {
+        let name = AgentName::parse("argus").expect("legal");
+        let closed = card_of(vec![running("argus", "idle")], None);
+        let open = card_of(vec![running("argus", "idle")], Some(&name));
+
+        assert_eq!(
+            icon_hover(&closed, "pan-end-symbolic").as_deref(),
+            Some("details")
+        );
+        assert_eq!(
+            icon_hover(&open, "pan-down-symbolic").as_deref(),
+            Some("hide details")
+        );
+        assert!(
+            icon_hover(&open, "pan-end-symbolic").is_none(),
+            "an unfolded row must not still offer to unfold"
+        );
+    }
+
+    /// Only the flags that are **on** become chips; a clean agent gets none.
+    ///
+    /// Falsification: drop the `.filter(|(on, ..)| *on)` in `flag_chips` and
+    /// the clean-agent assertion goes red (four chips instead of zero).
+    #[test]
+    fn only_the_flags_that_are_on_become_chips() {
+        let name = AgentName::parse("argus").expect("legal");
+
+        let clean = card_of(vec![running("argus", "idle")], Some(&name));
+        assert_eq!(
+            chip_texts(&clean),
+            Vec::<String>::new(),
+            "a healthy agent's details say nothing about flags that are off"
+        );
+
+        let flagged = card_of(
+            vec![agent(
+                "argus",
+                AgentStatusRow {
+                    name: "argus".to_owned(),
+                    running: true,
+                    needs_login: true,
+                    needs_update: true,
+                    ..AgentStatusRow::default()
+                },
+            )],
+            Some(&name),
+        );
+        assert_eq!(chip_texts(&flagged), vec!["needs login", "needs update"]);
     }
 
     /// A hive bigger than the card can show draws [`MAX_ROWS`] rows and then
-    /// **says so** — the sidebar cannot scroll, so silently dropping the tail
-    /// would be indistinguishable from the agents not existing.
+    /// **says so** — silently dropping the tail would be indistinguishable from
+    /// the agents not existing.
     ///
     /// Falsification: remove the `drawn >= MAX_ROWS` guard in `roster` and the
     /// row count assertion goes red; remove the overflow `notice` and the
-    /// "+N more" assertion does.
+    /// "+N more" one does.
     #[test]
     fn a_hive_past_the_cap_draws_max_rows_and_says_how_many_it_hid() {
-        use crate::config::AgentsConfig;
-        use crate::hive::wire::AgentStatusRow;
-        use crate::model::{Agent, AgentName, ExpandedGroups, Hive};
-
         let agents: Vec<Agent> = (0..MAX_ROWS + 7)
-            .map(|i| {
-                let name = format!("agent-{i}");
-                Agent {
-                    name: AgentName::parse(&name).expect("legal"),
-                    row: AgentStatusRow {
-                        name,
-                        running: true,
-                        ..AgentStatusRow::default()
-                    },
-                    pending_paused: None,
-                }
-            })
+            .map(|i| running(&format!("agent-{i}"), "idle"))
             .collect();
 
-        let tree = super::card(
-            &Hive::Up { agents },
-            &AgentsConfig::default(),
-            &ExpandedGroups::new(),
+        let tree = card_of(agents, None);
+        assert_eq!(
+            count_class(&tree, "ts-agent-row"),
+            MAX_ROWS,
+            "the card must cap what it draws"
         );
-        let rendered = count_class(&tree, "ts-agent-row");
-        assert_eq!(rendered, MAX_ROWS, "the card must cap what it draws");
-
-        let hovers = box_tooltips(&tree);
         assert!(
-            hovers.iter().any(|t| t.contains("+7 more")),
-            "the hidden tail must be stated, not silent; got {hovers:?}"
+            texts(&tree).iter().any(|t| t.contains("+7 more")),
+            "the hidden tail must be stated, not silent; got {:?}",
+            texts(&tree)
         );
     }
 
-    /// `(ellipsize, max_width_chars)` of the first `Text` whose body is
-    /// `needle`.
-    fn find_text(node: &Node, needle: &str) -> Option<(bool, Option<i32>)> {
-        match node {
-            Node::Text {
-                text,
-                ellipsize,
-                max_width_chars,
-                ..
-            } if text == needle => Some((*ellipsize, *max_width_chars)),
-            Node::Box { children, .. }
-            | Node::Row { children, .. }
-            | Node::ListBox { children, .. } => children.iter().find_map(|c| find_text(c, needle)),
-            Node::Expander {
-                header, children, ..
-            } => find_text(header, needle)
-                .or_else(|| children.iter().find_map(|c| find_text(c, needle))),
-            Node::Button { child, .. } => find_text(child, needle),
-            _ => None,
-        }
-    }
-
-    /// Every `Box` tooltip in the tree.
-    fn box_tooltips(node: &Node) -> Vec<String> {
-        fn walk(node: &Node, out: &mut Vec<String>) {
-            match node {
-                Node::Box {
-                    tooltip, children, ..
-                } => {
-                    if let Some(t) = tooltip {
-                        out.push(t.clone());
-                    }
-                    for c in children {
-                        walk(c, out);
-                    }
-                }
-                Node::Row { children, .. } | Node::ListBox { children, .. } => {
-                    for c in children {
-                        walk(c, out);
-                    }
-                }
-                Node::Expander {
-                    header, children, ..
-                } => {
-                    walk(header, out);
-                    for c in children {
-                        walk(c, out);
-                    }
-                }
-                Node::Button { child, .. } => walk(child, out),
-                _ => {}
-            }
-        }
-        let mut out = Vec::new();
-        walk(node, &mut out);
-        out
-    }
-
-    /// How many nodes carry `class`.
-    fn count_class(node: &Node, class: &str) -> usize {
-        let hit = usize::from(match node {
-            Node::Box { classes, .. }
-            | Node::Row { classes, .. }
-            | Node::ListBox { classes, .. }
-            | Node::Expander { classes, .. } => classes.iter().any(|c| c == class),
-            _ => false,
-        });
-        let kids = match node {
-            Node::Box { children, .. }
-            | Node::Row { children, .. }
-            | Node::ListBox { children, .. } => {
-                children.iter().map(|c| count_class(c, class)).sum()
-            }
-            Node::Expander {
-                header, children, ..
-            } => {
-                count_class(header, class)
-                    + children
-                        .iter()
-                        .map(|c| count_class(c, class))
-                        .sum::<usize>()
-            }
-            Node::Button { child, .. } => count_class(child, class),
-            _ => 0,
-        };
-        hit + kids
-    }
-
-    /// Spec §6.2's badge is "(tooltip only)" — the glyph alone does not say
-    /// what `needs_update` means, and the row has no room for the words. Now
-    /// that #958 put a tooltip in the vocabulary, the badge and the state
-    /// glyph both carry one.
+    /// Whatever the card hides, the panel's overview shows — uncapped. That is
+    /// what makes the "+N more — open the panel for the full roster" line true.
     ///
-    /// Falsification: swap `icon_titled` back to `icon` for either and the
-    /// matching assertion goes red.
+    /// Falsification: drop the roster `section` from `panel` and this goes red.
     #[test]
-    fn the_unlabelled_glyphs_carry_hover_text() {
-        use crate::config::AgentsConfig;
-        use crate::hive::wire::AgentStatusRow;
-        use crate::model::{Agent, AgentName, Hive};
+    fn the_panel_overview_lists_every_agent_the_card_capped() {
+        let agents: Vec<Agent> = (0..MAX_ROWS + 7)
+            .map(|i| running(&format!("agent-{i}"), "idle"))
+            .collect();
+        let hive = Hive::Up { agents };
+        let panel = super::panel(&hive, &AgentsConfig::default(), None, ctx());
 
-        /// Every `Icon` in the tree, as `(name, tooltip)`.
-        fn icons(node: &Node, out: &mut Vec<(String, Option<String>)>) {
-            match node {
-                Node::Icon { name, tooltip, .. } => out.push((name.clone(), tooltip.clone())),
-                Node::Box { children, .. }
-                | Node::Row { children, .. }
-                | Node::ListBox { children, .. } => {
-                    for c in children {
-                        icons(c, out);
-                    }
-                }
-                Node::Button { child, .. } => icons(child, out),
-                _ => {}
+        let ids = button_ids(&panel);
+        for i in 0..MAX_ROWS + 7 {
+            let want = format!("chat:agent-{i}");
+            assert!(ids.contains(&want), "the panel roster must list {want}");
+        }
+    }
+
+    /// The panel bounds itself, because the plugin drawer child has no scroller
+    /// of its own. `0` — an old host, or no cap — is the bare tree.
+    ///
+    /// Falsification: return `child` unconditionally from `viewport` and the
+    /// first assertion goes red.
+    #[test]
+    fn the_panel_wraps_its_body_in_a_bounded_viewport() {
+        let hive = Hive::Up {
+            agents: vec![running("argus", "idle")],
+        };
+        let cfg = AgentsConfig::default();
+
+        let bounded = super::panel(&hive, &cfg, None, ctx());
+        let Node::Box { children, .. } = &bounded else {
+            panic!("the panel root is a Box");
+        };
+        match children.as_slice() {
+            [Node::Scrolled { max_height, .. }] => {
+                assert_eq!(*max_height, PANEL_VIEWPORT_PX);
             }
+            other => panic!("the panel body must sit in a viewport, got {other:?}"),
         }
 
-        let agent = Agent {
-            name: AgentName::parse("busy").expect("legal"),
-            row: AgentStatusRow {
-                name: "busy".to_owned(),
-                running: true,
-                needs_update: true,
-                ..AgentStatusRow::default()
+        let unbounded = super::panel(
+            &hive,
+            &cfg,
+            None,
+            super::PanelContext {
+                viewport_px: 0,
+                ..ctx()
             },
-            pending_paused: None,
+        );
+        let Node::Box { children, .. } = &unbounded else {
+            panic!("the panel root is a Box");
         };
-        let tree = super::card(
-            &Hive::Up {
-                agents: vec![agent],
-            },
-            &AgentsConfig::default(),
-            &crate::model::ExpandedGroups::new(),
-        );
-
-        let mut found = Vec::new();
-        icons(&tree, &mut found);
-
-        let badge = found
-            .iter()
-            .find(|(n, _)| n == crate::model::UPDATE_BADGE_ICON)
-            .expect("the update badge renders");
         assert!(
-            badge.1.as_deref().is_some_and(|t| t.contains("rebuild")),
-            "the badge's meaning lives in its tooltip: {badge:?}"
+            !matches!(children.as_slice(), [Node::Scrolled { .. }]),
+            "a host that cannot decode Scrolled gets the bare body"
         );
-
-        let state = found
-            .iter()
-            .find(|(n, _)| n == "media-playback-start-symbolic")
-            .expect("the running state glyph renders");
-        assert_eq!(state.1.as_deref(), Some("running"));
     }
 
     /// The id prefixes are the reducer's parsing contract; a colon terminator
@@ -961,5 +1224,169 @@ mod tests {
         ] {
             assert!(prefix.ends_with(':'), "{prefix}");
         }
+        // The two whole-id buttons are not prefixes and must not look like one,
+        // or `strip_prefix` would match them against an agent name.
+        for id in [super::BACK_ID, super::OVERVIEW_ID] {
+            assert!(!id.contains(':'), "{id}");
+        }
+    }
+
+    // ── tree walkers ─────────────────────────────────────────────────────────
+
+    fn ctx() -> super::PanelContext<'static> {
+        super::PanelContext {
+            now_unix: 1_788_785_100,
+            last_poll_unix: Some(1_788_785_040),
+            socket: "/run/hive/host.sock",
+            urls: None,
+            viewport_px: PANEL_VIEWPORT_PX,
+        }
+    }
+
+    /// The `Text` fields the layout assertions read.
+    struct TextNode {
+        ellipsize: bool,
+        max_width_chars: Option<i32>,
+        tooltip: Option<String>,
+        classes: Vec<String>,
+    }
+
+    /// Walk every node in `node`, applying `f` to each.
+    fn walk(node: &Node, f: &mut impl FnMut(&Node)) {
+        f(node);
+        match node {
+            Node::Box { children, .. }
+            | Node::Row { children, .. }
+            | Node::ListBox { children, .. } => {
+                for c in children {
+                    walk(c, f);
+                }
+            }
+            Node::Expander {
+                header, children, ..
+            } => {
+                walk(header, f);
+                for c in children {
+                    walk(c, f);
+                }
+            }
+            Node::Button { child, .. } | Node::Scrolled { child, .. } => walk(child, f),
+            _ => {}
+        }
+    }
+
+    fn find_text(node: &Node, needle: &str) -> Option<TextNode> {
+        let mut found = None;
+        walk(node, &mut |n| {
+            if let Node::Text {
+                text,
+                ellipsize,
+                max_width_chars,
+                tooltip,
+                classes,
+                ..
+            } = n
+                && text == needle
+                && found.is_none()
+            {
+                found = Some(TextNode {
+                    ellipsize: *ellipsize,
+                    max_width_chars: *max_width_chars,
+                    tooltip: tooltip.clone(),
+                    classes: classes.clone(),
+                });
+            }
+        });
+        found
+    }
+
+    /// Every `Label`/`Text` body in the tree.
+    fn texts(node: &Node) -> Vec<String> {
+        let mut out = Vec::new();
+        walk(node, &mut |n| match n {
+            Node::Label { text, .. } | Node::Text { text, .. } => out.push(text.clone()),
+            _ => {}
+        });
+        out
+    }
+
+    /// Every `Button` id in the tree.
+    fn button_ids(node: &Node) -> Vec<String> {
+        let mut out = Vec::new();
+        walk(node, &mut |n| {
+            if let Node::Button { id, .. } = n {
+                out.push(id.clone());
+            }
+        });
+        out
+    }
+
+    /// The tooltip on the first `Icon` named `glyph`.
+    fn icon_hover(node: &Node, glyph: &str) -> Option<String> {
+        let mut found = None;
+        walk(node, &mut |n| {
+            if let Node::Icon { name, tooltip, .. } = n
+                && name == glyph
+                && found.is_none()
+            {
+                found = tooltip.clone();
+            }
+        });
+        found
+    }
+
+    /// Every chip's text, in tree order.
+    fn chip_texts(node: &Node) -> Vec<String> {
+        let mut out = Vec::new();
+        walk(node, &mut |n| {
+            if let Node::Label { text, classes, .. } = n
+                && classes.iter().any(|c| c == "ts-agent-chip")
+            {
+                out.push(text.clone());
+            }
+        });
+        out
+    }
+
+    fn classes_of(node: &Node) -> &[String] {
+        match node {
+            Node::Box { classes, .. }
+            | Node::Row { classes, .. }
+            | Node::ListBox { classes, .. }
+            | Node::Expander { classes, .. }
+            | Node::Scrolled { classes, .. }
+            | Node::Label { classes, .. }
+            | Node::Text { classes, .. }
+            | Node::Icon { classes, .. }
+            | Node::Button { classes, .. } => classes,
+            _ => &[],
+        }
+    }
+
+    /// How many nodes carry `class`.
+    fn count_class(node: &Node, class: &str) -> usize {
+        let mut n = 0;
+        walk(node, &mut |node| {
+            if classes_of(node).iter().any(|c| c == class) {
+                n += 1;
+            }
+        });
+        n
+    }
+
+    /// Every node carrying `class`, cloned.
+    fn rows_with_class(node: &Node, class: &str) -> Vec<Node> {
+        let mut out = Vec::new();
+        walk(node, &mut |node| {
+            if classes_of(node).iter().any(|c| c == class) {
+                out.push(node.clone());
+            }
+        });
+        out
+    }
+
+    /// The first node carrying `class`.
+    fn find_class(node: &Node, class: &str) -> Option<Node> {
+        rows_with_class(node, class).into_iter().next()
     }
 }

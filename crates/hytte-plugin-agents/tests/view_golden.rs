@@ -157,6 +157,20 @@ fn scenarios() -> Vec<(&'static str, Agents)> {
                 },
             ))));
             m.update(Input::Event {
+                node: "chat:trollshell-choom".to_owned(),
+                kind: hytte_plugin::proto::EventKind::Click,
+            });
+            m
+        }),
+        // The same roster with one row's details unfolded **in the card** —
+        // @kaesaecracker's second round asked for the click to do something
+        // where it happened, and this pins what that looks like.
+        ("unfolded", {
+            let mut m = seed(GOLDEN_NOW);
+            m.update(Input::App(Msg::Status(Ok(roster(
+                "agent_status_grouped.json",
+            )))));
+            m.update(Input::Event {
                 node: "details:trollshell-choom".to_owned(),
                 kind: hytte_plugin::proto::EventKind::Click,
             });

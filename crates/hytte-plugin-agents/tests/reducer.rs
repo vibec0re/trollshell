@@ -60,6 +60,13 @@ fn lines(rx: &mut CmdReceiver<Cmd>) -> Vec<String> {
     out
 }
 
+/// The name of the row unfolded in the card, if any.
+fn opened(m: &Agents) -> Option<&str> {
+    m.opened
+        .as_ref()
+        .map(hytte_plugin_agents::model::AgentName::as_str)
+}
+
 /// Every command queued, including the visibility ones.
 fn cmds(rx: &mut CmdReceiver<Cmd>) -> Vec<Cmd> {
     let mut out = Vec::new();
@@ -313,37 +320,101 @@ fn the_primary_click_opens_the_panel_and_never_pauses_the_loop() {
     );
 }
 
-/// The edit button is the same read-only detail in P1 (real editing waits for
-/// #952) — and likewise sends no frame.
+/// The details button unfolds **in the card**, where the click happened
+/// (@kaesaecracker, #963: "its very weird the panel opens in the top right
+/// after clicking bottom left"). It opens no page, sends no frame, and a second
+/// click on the same row closes it again.
+///
+/// Falsification: point the `ids::DETAILS` arm back at `open_detail` and both
+/// the `Effect` assertion and the `opened` one go red.
 #[test]
-fn the_details_click_opens_the_panel_and_sends_no_frame() {
+fn the_details_click_unfolds_in_place_and_opens_no_page() {
     let (mut m, mut rx) = model();
     m.update(status(roster("agent_status_grouped.json")));
-    let fx = m.update(click("details:stray"));
-    assert_eq!(fx, vec![Effect::OpenPage(Page::PluginSelf)]);
-    assert!(lines(&mut rx).is_empty());
-    assert_eq!(
-        m.selected
-            .as_ref()
-            .map(hytte_plugin_agents::model::AgentName::as_str),
-        Some("stray")
-    );
 
-    m.update(click("agents-back"));
-    assert_eq!(m.selected, None);
+    let fx = m.update(click("details:stray"));
+    assert_eq!(fx, vec![], "the details unfold in place — nothing opens");
+    assert!(
+        lines(&mut rx).is_empty(),
+        "a disclosure asks the hive nothing"
+    );
+    assert_eq!(opened(&m), Some("stray"));
+    assert_eq!(m.selected, None, "unfolding is not selecting");
+
+    // A second click on the same row closes it.
+    m.update(click("details:stray"));
+    assert_eq!(opened(&m), None);
+}
+
+/// One agent open at a time: another row's disclosure **replaces** the open
+/// one rather than adding to it.
+///
+/// Falsification: make the `ids::DETAILS` arm insert into a set (or simply
+/// always `Some(name)` without the toggle) and one of the two assertions goes
+/// red.
+#[test]
+fn only_one_row_is_unfolded_at_a_time() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+
+    m.update(click("details:stray"));
+    assert_eq!(opened(&m), Some("stray"));
+    m.update(click("details:trollshell-choom"));
+    assert_eq!(
+        opened(&m),
+        Some("trollshell-choom"),
+        "a second row's disclosure replaces the first"
+    );
+}
+
+/// An unfold survives the poll cadence — otherwise a row the operator opened
+/// would snap shut every two seconds.
+///
+/// Falsification: clear `opened` unconditionally in `fold_status` and this goes
+/// red.
+#[test]
+fn an_unfolded_row_survives_the_next_poll() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    m.update(click("details:stray"));
+
+    m.update(status(roster("agent_status_grouped.json")));
+    assert_eq!(opened(&m), Some("stray"));
+}
+
+/// The card's title row is the one thing that jumps to the drawer, and it lands
+/// on the **hive overview**, not on whatever agent was last selected.
+///
+/// Falsification: drop the `view::OVERVIEW_ID` arm from `click` and this goes
+/// red.
+#[test]
+fn the_title_row_button_opens_the_drawer_at_the_hive_overview() {
+    let (mut m, mut rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    m.update(click("chat:stray"));
+    assert!(m.selected.is_some());
+
+    let fx = m.update(click("agents-overview"));
+    assert_eq!(fx, vec![Effect::OpenPage(Page::PluginSelf)]);
+    assert_eq!(m.selected, None, "the overview is not an agent's page");
+    assert!(lines(&mut rx).is_empty());
 }
 
 /// A selection whose agent leaves the roster falls back to the overview rather
-/// than pinning a panel to something that no longer exists.
+/// than pinning a panel to something that no longer exists — and an unfolded
+/// row that vanished stops being unfolded.
 #[test]
 fn a_selection_that_vanishes_falls_back_to_the_overview() {
     let (mut m, _rx) = model();
     m.update(status(roster("agent_status_grouped.json")));
+    m.update(click("chat:stray"));
     m.update(click("details:stray"));
     assert!(m.selected.is_some());
+    assert!(m.opened.is_some());
 
     m.update(status(roster("agent_status_precedence.json")));
     assert_eq!(m.selected, None);
+    assert_eq!(m.opened, None);
 }
 
 // ── the panel's start / stop ─────────────────────────────────────────────────

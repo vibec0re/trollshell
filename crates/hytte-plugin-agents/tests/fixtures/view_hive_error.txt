@@ -4,26 +4,24 @@ View {
             "agents-root",
         ),
         dir: Vertical,
-        spacing: 2,
+        spacing: 0,
         scroll: false,
         classes: [
             "ts-agents-card",
         ],
         children: [
-            Box {
+            Row {
                 id: None,
-                dir: Horizontal,
-                spacing: 6,
-                scroll: false,
                 classes: [
                     "ts-agents-title",
                 ],
+                spacing: 6,
                 children: [
                     Label {
                         id: None,
-                        text: "Agents",
+                        text: "AGENTS",
                         classes: [
-                            "heading",
+                            "ts-agents-heading",
                         ],
                         tooltip: None,
                     },
@@ -33,46 +31,68 @@ View {
                         text: "hive error",
                         classes: [
                             "dim-label",
+                            "caption",
                             "numeric",
                         ],
                         tooltip: None,
                     },
+                    Button {
+                        id: "agents-overview",
+                        classes: [
+                            "flat",
+                            "ts-agent-btn",
+                        ],
+                        child: Icon {
+                            id: None,
+                            name: "view-list-symbolic",
+                            classes: [],
+                            tooltip: Some(
+                                "hive overview and the full roster",
+                            ),
+                        },
+                    },
                 ],
                 tooltip: None,
             },
-            Box {
+            ListBox {
                 id: None,
-                dir: Horizontal,
-                spacing: 6,
-                scroll: false,
                 classes: [
-                    "ts-agents-notice",
+                    "boxed-list",
+                    "ts-agents-list",
                 ],
+                dense: true,
                 children: [
-                    Icon {
+                    Row {
                         id: None,
-                        name: "dialog-error-symbolic",
                         classes: [
-                            "ts-agent-state",
-                            "error",
+                            "ts-agents-notice",
+                        ],
+                        spacing: 6,
+                        children: [
+                            Icon {
+                                id: None,
+                                name: "dialog-error-symbolic",
+                                classes: [
+                                    "ts-agent-state",
+                                    "error",
+                                ],
+                                tooltip: None,
+                            },
+                            Text {
+                                id: None,
+                                text: "agent \"ghost\" is not managed by this hive",
+                                max_width_chars: None,
+                                ellipsize: false,
+                                classes: [
+                                    "dim-label",
+                                    "caption",
+                                ],
+                                tooltip: None,
+                            },
                         ],
                         tooltip: None,
                     },
-                    Text {
-                        id: None,
-                        text: "agent \"ghost\" is not managed by this hive",
-                        max_width_chars: Some(
-                            22,
-                        ),
-                        ellipsize: true,
-                        classes: [
-                            "dim-label",
-                        ],
-                    },
                 ],
-                tooltip: Some(
-                    "agent \"ghost\" is not managed by this hive",
-                ),
             },
         ],
         tooltip: None,
@@ -83,106 +103,155 @@ View {
                 "agents-panel",
             ),
             dir: Vertical,
-            spacing: 4,
-            scroll: true,
+            spacing: 0,
+            scroll: false,
             classes: [
                 "ts-agents-panel",
             ],
             children: [
-                Label {
-                    id: None,
-                    text: "hive",
-                    classes: [
-                        "heading",
-                    ],
-                    tooltip: None,
-                },
                 Box {
                     id: None,
-                    dir: Horizontal,
-                    spacing: 6,
+                    dir: Vertical,
+                    spacing: 8,
                     scroll: false,
                     classes: [
-                        "ts-agent-detail",
+                        "ts-agents-panel-body",
                     ],
                     children: [
-                        Label {
+                        Box {
                             id: None,
-                            text: "state",
+                            dir: Vertical,
+                            spacing: 4,
+                            scroll: false,
                             classes: [
-                                "dim-label",
+                                "ts-agents-section",
+                            ],
+                            children: [
+                                Label {
+                                    id: None,
+                                    text: "hive",
+                                    classes: [
+                                        "heading",
+                                    ],
+                                    tooltip: None,
+                                },
+                                ListBox {
+                                    id: None,
+                                    classes: [
+                                        "boxed-list",
+                                        "ts-agents-panel-list",
+                                    ],
+                                    dense: false,
+                                    children: [
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Label {
+                                                    id: None,
+                                                    text: "state",
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "reachable, but refused — agent \"ghost\" is not managed by this hive",
+                                                    max_width_chars: Some(
+                                                        28,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "caption",
+                                                        "numeric",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "reachable, but refused — agent \"ghost\" is not managed by this hive",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Label {
+                                                    id: None,
+                                                    text: "socket",
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "/run/hyperhive/host.sock",
+                                                    max_width_chars: Some(
+                                                        28,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "caption",
+                                                        "numeric",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "/run/hyperhive/host.sock",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Label {
+                                                    id: None,
+                                                    text: "last poll",
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "never",
+                                                    max_width_chars: Some(
+                                                        28,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "caption",
+                                                        "numeric",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "never",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                    ],
+                                },
                             ],
                             tooltip: None,
-                        },
-                        Spacer,
-                        Text {
-                            id: None,
-                            text: "reachable, but refused — agent \"ghost\" is not managed by this hive",
-                            max_width_chars: None,
-                            ellipsize: true,
-                            classes: [
-                                "numeric",
-                            ],
-                        },
-                    ],
-                    tooltip: None,
-                },
-                Box {
-                    id: None,
-                    dir: Horizontal,
-                    spacing: 6,
-                    scroll: false,
-                    classes: [
-                        "ts-agent-detail",
-                    ],
-                    children: [
-                        Label {
-                            id: None,
-                            text: "socket",
-                            classes: [
-                                "dim-label",
-                            ],
-                            tooltip: None,
-                        },
-                        Spacer,
-                        Text {
-                            id: None,
-                            text: "/run/hyperhive/host.sock",
-                            max_width_chars: None,
-                            ellipsize: true,
-                            classes: [
-                                "numeric",
-                            ],
-                        },
-                    ],
-                    tooltip: None,
-                },
-                Box {
-                    id: None,
-                    dir: Horizontal,
-                    spacing: 6,
-                    scroll: false,
-                    classes: [
-                        "ts-agent-detail",
-                    ],
-                    children: [
-                        Label {
-                            id: None,
-                            text: "last poll",
-                            classes: [
-                                "dim-label",
-                            ],
-                            tooltip: None,
-                        },
-                        Spacer,
-                        Text {
-                            id: None,
-                            text: "never",
-                            max_width_chars: None,
-                            ellipsize: true,
-                            classes: [
-                                "numeric",
-                            ],
                         },
                     ],
                     tooltip: None,

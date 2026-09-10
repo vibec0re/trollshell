@@ -553,6 +553,10 @@ fn parse_layer(body: &str, path: Option<&Path>) -> Result<toml::Table, ConfigErr
 /// body (**lowest precedence first**), merged, checked against the schema and
 /// validated. No I/O, so every rule above is unit-testable.
 ///
+/// Rule 2's reader-side corollary — a table carrying no key the schema owns
+/// reads as absent, so an `Option<Table>` over it is `None` (#1025) — is
+/// applied here, by [`read_merged`], which carries the argument.
+///
 /// # Errors
 /// [`ConfigError::Parse`] for a layer that is not TOML, [`ConfigError::Schema`]
 /// for a known key of the wrong type, [`ConfigError::Invalid`] when
@@ -616,13 +620,12 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
         );
     }
 
+    // #1025: asked of the raw layers, because it is the last place the answer
+    // exists — `merge_all` strips every marker on the way through.
+    let marked = merge::marked_tables(&tables);
     let merged = merge::merge_all(tables);
 
-    let mut unknown_keys = Vec::new();
-    let config: S = serde_ignored::deserialize(merged.into_deserializer(), |path| {
-        unknown_keys.push(dotted_key(&path));
-    })
-    .map_err(|e| ConfigError::Schema(e.to_string()))?;
+    let (config, unknown_keys) = read_merged::<S>(merged, &marked)?;
 
     // Rule 4: loud, but never fatal. A typo must be visible and must not take
     // the shell down.
@@ -643,6 +646,145 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
         sources: layers.iter().map(|(path, _)| path.clone()).collect(),
         unknown_keys,
     })
+}
+
+/// The merged table read as `S`, beside the dotted paths of the keys `S`'s
+/// schema does not know.
+///
+/// # Rule 2's reader-side corollary: a table with nothing of the schema's in it
+/// # reads as absent (#1025)
+///
+/// Since #1008 a save keeps a table the user has lines in — a
+/// [`merge::UNSET_KEY`] marker, a key the schema does not know — even when the
+/// schema's `Option<Table>` for it went to `None`; [`render_overlay`] carries
+/// the argument for why the bytes are theirs. The consequence on the way back
+/// in is this function's business: plain `serde` reads `Option<T>` as `None`
+/// only when the key is entirely **absent**, so the table those lines keep
+/// alive used to come back as `Some(<per-field defaults>)` — `brightness = 0`,
+/// `color = ""` — and the next save wrote the degenerate values into the file.
+/// A field's `None` has to round-trip, or an `Option<Table>` is a shape no
+/// subsystem can safely use.
+///
+/// So a table carrying **no key the schema owns** reads as absent. The two
+/// halves of "the user's lines" are exactly the two halves of that: a key the
+/// schema does not know is one `serde_ignored` reported, and a marker is
+/// [`merge::marked_tables`]'s answer, taken before the merge ate it.
+///
+/// **The one table this does *not* touch is an empty one nobody erased
+/// anything in.** `core = {}` and a bare `[core]` header are values the user
+/// typed, and a schema field of type [`toml::Value`] — the shape #1040 settled
+/// on, so that one bad key never takes its siblings down — accepts a table as
+/// a value like any other spelling. Dropping it here would take the key away
+/// from [`Subsystem::parsed`], whose whole job is to judge it out loud, and
+/// turn a visible "that is not a style" into a silent fallback. So an empty
+/// table counts as absent only when a marker was written in it, which is the
+/// erasure case (`_unset = ["brightness"]` inside `[core]` leaves the block
+/// with nothing of the schema's in it) and not the typed-it case.
+///
+/// # Why two passes
+///
+/// "Which keys does the schema own?" is a question only a deserialisation
+/// answers, and the answer is needed to decide what to drop — so the merged
+/// table is read once as it stands, pruned against that answer, and read again
+/// when the pruning actually removed something.
+///
+/// * [`Loaded::unknown_keys`] comes from the **first** pass, always. Pruning
+///   only removes keys, so the second pass cannot see one the first did not,
+///   and rule 4 must still name the key that made the table absent — it is the
+///   likeliest thing the user got wrong in that block.
+/// * A second pass that **fails** is the schema saying the table is not
+///   optional: a required field cannot read as absent, so the unpruned read
+///   stands. That is the only place the `Option`-ness of the field is
+///   observable at all from here, and it is observed by asking rather than by
+///   guessing.
+/// * A **first** pass that fails is reported as it always was. Without the
+///   ignored set there is no answer to "schema-owned", and inventing one would
+///   drop a table on uncertain information — the mirror of the rule
+///   [`schema_paths`] applies to removal on the writing side.
+///
+/// [`schema_paths`] deliberately keeps its own raw `serde_ignored` pass rather
+/// than coming through here: it wants the ignored set of the document *as
+/// written*, and a pruned pass would stop reporting the user's key inside a
+/// dropped table, which is precisely how [`patch`] would come to count it as
+/// schema-owned and delete it.
+fn read_merged<S: Subsystem>(
+    merged: toml::Table,
+    marked: &BTreeSet<String>,
+) -> Result<(S, Vec<String>), ConfigError> {
+    let mut pruned = merged.clone();
+
+    let mut unknown_keys = Vec::new();
+    let config: S = serde_ignored::deserialize(merged.into_deserializer(), |path| {
+        unknown_keys.push(dotted_key(&path));
+    })
+    .map_err(|e| ConfigError::Schema(e.to_string()))?;
+
+    let unknown: BTreeSet<&str> = unknown_keys.iter().map(String::as_str).collect();
+    let mut dropped = false;
+    drop_absent_tables(&mut pruned, "", &unknown, marked, &mut dropped);
+    if !dropped {
+        return Ok((config, unknown_keys));
+    }
+
+    let reread: Result<S, _> = serde_ignored::deserialize(pruned.into_deserializer(), |_| {});
+    Ok((reread.unwrap_or(config), unknown_keys))
+}
+
+/// Drop every table in `table` that carries no key the schema owns, deepest
+/// first, and report whether anything the schema owns is left in `table`
+/// itself.
+///
+/// Deepest first so the rule is a fixed point: a table whose only content is a
+/// sub-table that reads as absent carries nothing of the schema's either, and
+/// answering the parent before the child would leave it holding an empty block.
+///
+/// `unknown` is [`serde_ignored`]'s report over this same table, as
+/// [`dotted_key`] paths, so a key in it was one the schema never descended
+/// into — the whole key is the user's, table or not, and it is neither counted
+/// nor walked. Every other key **is** the schema's, and only a table can then
+/// still turn out to be absent.
+///
+/// The dotted paths carry [`schema_paths`]' quoted-key ambiguity: a key with a
+/// literal `.` in it reads like a nesting hop. The consequence here is a table
+/// not dropped rather than one wrongly dropped, and no schema in the workspace
+/// has such a key.
+fn drop_absent_tables(
+    table: &mut toml::Table,
+    prefix: &str,
+    unknown: &BTreeSet<&str>,
+    marked: &BTreeSet<String>,
+    dropped: &mut bool,
+) -> bool {
+    let mut owned = false;
+    let mut absent = Vec::new();
+
+    for (key, value) in table.iter_mut() {
+        let path = format!("{prefix}{key}");
+        if unknown.contains(path.as_str()) {
+            continue;
+        }
+        let toml::Value::Table(nested) = value else {
+            owned = true;
+            continue;
+        };
+        // Asked before the recursion: an erasure that emptied this block is
+        // what the marker records, while a block emptied by dropping the
+        // absent tables inside it was never a table the user typed empty.
+        let typed_empty = nested.is_empty() && !marked.contains(path.as_str());
+        let nested_owned =
+            drop_absent_tables(nested, &format!("{path}."), unknown, marked, dropped);
+        if nested_owned || typed_empty {
+            owned = true;
+        } else {
+            absent.push(key.clone());
+        }
+    }
+
+    for key in absent {
+        table.remove(&key);
+        *dropped = true;
+    }
+    owned
 }
 
 /// Read the layer files that exist, lowest precedence first.
@@ -1159,24 +1301,23 @@ fn patch(
 /// user's only remaining line is a marker; the cost of the other choice is
 /// silent data loss, so it is not close.
 ///
-/// **What (2) preserves, precisely: the bytes, not the field's `None`.** The
-/// marker, its comment and the keys the schema does not know survive the save,
-/// and the keys the schema *does* own are gone and stay gone — that much is
-/// pinned. The `Option` field's own `None`-ness does **not** survive a reload:
-/// plain `serde` reads `Option<T>` as `None` only when the key is entirely
-/// absent, and keeping the table for the user's lines is exactly what stops it
-/// being absent. So `assemble` hands back `Some(<per-field defaults>)` — and
-/// per-*field* `#[serde(default)]` means the field type's default, not the
-/// struct's `Default` impl, so a save after that reload writes
-/// `brightness = 0, color = ""` into the file rather than the documented
-/// defaults. `an_erased_optional_table_kept_for_the_users_keys_reloads_as_some_defaults_today`
-/// pins that as it behaves now, honestly and without `#[ignore]`.
+/// **What (2) preserves is the bytes; the field's `None` is the reader's half
+/// of the same guarantee.** The marker, its comment and the keys the schema
+/// does not know survive the save, and the keys the schema *does* own are gone
+/// and stay gone — that is this function's whole contribution. It is not
+/// enough on its own: plain `serde` reads `Option<T>` as `None` only when the
+/// key is entirely absent, so a table kept for the user's lines used to come
+/// back as `Some(<per-field defaults>)` — per-*field* `#[serde(default)]`, so
+/// the field types' defaults rather than the struct's `Default` impl — and the
+/// save after that reload wrote `brightness = 0, color = ""` into the file.
 ///
-/// Fixing it is a **reader** question, not a writer one — "a table with no
-/// schema-owned key in it reads as absent for that layer" — which is why it is
-/// **#1025** and not a patch to this function. Until that lands, an
-/// `Option<Table>` field is a shape a subsystem author should reach for knowing
-/// this.
+/// That was a **reader** hole, not a writer one, which is why the fix is
+/// [`read_merged`]'s rule (#1025) and not a patch here: a table carrying no
+/// key the schema owns reads as absent. With both halves in place a `None`
+/// round-trips — the second save of an erased table is byte-identical to the
+/// first, which
+/// `an_erased_optional_table_kept_for_the_users_keys_reloads_as_none` pins end
+/// to end.
 ///
 /// # Errors
 /// [`ConfigError::Encode`] when `existing` is not valid TOML — refusing rather
@@ -2073,6 +2214,38 @@ kept = true
         }
     }
 
+    /// A subsystem in the shape #1040 settled on: the field is a raw
+    /// [`toml::Value`], so **every** spelling deserialises and
+    /// [`Subsystem::parsed`] is the only judge of it. A table is one of those
+    /// spellings, which is what #1025's rule has to stay clear of.
+    ///
+    /// The default is a `#[serde(default)]` rather than a required key
+    /// deliberately: with the key required, dropping it would simply fail the
+    /// re-read and fall back, and a test over that could not tell a rule that
+    /// respects the field from one that does not.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct RawValue {
+        #[serde(default = "rect")]
+        style: toml::Value,
+    }
+
+    fn rect() -> toml::Value {
+        toml::Value::String("rect".into())
+    }
+
+    impl Subsystem for RawValue {
+        const NAME: &'static str = "raw-value";
+        const DEFAULT_TOML: &'static str = "style = \"rect\"\n";
+        type Error = std::convert::Infallible;
+        type Resolved = ();
+        fn parsed(&self) -> ((), Vec<InvalidValue>) {
+            ((), Vec::new())
+        }
+        fn validate(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
     /// **#1008 shape 1.** A table the user spelled inline is patched *in
     /// place*: [`patch`] recurses through
     /// [`toml_edit::Item::as_table_like_mut`], so the marker and every key the
@@ -2394,57 +2567,221 @@ kept = true
         }
     }
 
-    /// **#1025, current behaviour.** What shape 2 preserves is the *bytes*, not
-    /// the field's `None`. Keeping the table for the user's marker is exactly
-    /// what stops the key being absent, and plain `serde` reads `Option<T>` as
-    /// `None` only when it is — so the reload after the save hands back
-    /// `Some(…)`, and because per-*field* `#[serde(default)]` uses the field
-    /// type's default rather than `Core`'s own `Default` impl, the values are
-    /// `0`/`""`/`[]` rather than the documented `3`/`"amber"`. The save after
-    /// *that* writes them into the file.
-    ///
-    /// Closing the loop is what makes this visible: every other round-trip test
-    /// here hand-builds the "after" value, so none of them ever asks what a
-    /// reload of what was just written actually says.
-    ///
-    /// #1025 flips this — a table with no schema-owned key in it reads as
-    /// absent for that layer — and the assertions below become `None` and a
-    /// fixed point. It is a reader rule, not a writer one, which is why it is
-    /// not fixed here. Red under exactly that mutation to `assemble`.
-    #[test]
-    fn an_erased_optional_table_kept_for_the_users_keys_reloads_as_some_defaults_today() {
-        let existing = "enabled = true\ncore = { _unset = [\"label\"], brightness = 7 }\n";
+    // ── #1025: rule 2's reader-side corollary ───────────────────────────────
+    //
+    // The writer keeps a table the user has lines in (shape 2 above); the
+    // reader must not turn those lines into a struct full of defaults. The
+    // rule and every boundary it has are argued on `read_merged`.
 
+    /// **The load-bearing one (#1025).** Closes the loop `render_overlay`'s
+    /// two halves make between them: save → load → save → load, with the
+    /// schema's `Option<Table>` at `None` and the user's own two kinds of line
+    /// — a marker and a key the schema does not know — keeping the block alive
+    /// the whole way.
+    ///
+    /// Both halves are asserted at once because either alone is satisfiable by
+    /// something broken: a reader that dropped the user's lines would round-trip
+    /// a `None` fine (and lose their bytes), and #1016's writer round-trips the
+    /// bytes fine while handing back `Some(<per-field defaults>)`, which is the
+    /// hole this closes. The second save being *byte-identical* to the first is
+    /// what makes it a fixed point rather than a slow drift into
+    /// `brightness = 0, color = ""`.
+    ///
+    /// Every other round-trip test here hand-builds the "after" value, so none
+    /// of them ever asks what a reload of what was just written says. This one
+    /// only reloads.
+    ///
+    /// Red if [`drop_absent_tables`] stops firing: the reload is
+    /// `Some(0/""/[])` and the second save writes those three keys into the
+    /// file.
+    #[test]
+    fn an_erased_optional_table_kept_for_the_users_keys_reloads_as_none() {
+        let existing =
+            "enabled = true\ncore = { _unset = [\"label\"], brightness = 7, mystery = 1 }\n";
+
+        // The user turns the optional block off. #1008's half: the schema's own
+        // key goes, their marker and their key stay.
         let erased = OptTable {
             enabled: true,
             core: None,
         };
         let saved = render_overlay(existing, &erased).expect("renders");
         assert_eq!(
-            saved, "enabled = true\ncore = { _unset = [\"label\"] }\n",
-            "the bytes half holds: the marker stays, the schema's key goes"
+            saved, "enabled = true\ncore = { _unset = [\"label\"], mystery = 1 }\n",
+            "the bytes half: the marker and the unknown key stay, `brightness` goes"
         );
 
-        let reloaded = assemble::<OptTable>(&layers(&[&saved]))
+        // #1025's half, and the point of the whole issue.
+        let first = assemble::<OptTable>(&layers(&[&saved]))
             .expect("reloads")
             .config;
-        let core = reloaded
-            .core
-            .as_ref()
-            .expect("#1025 will flip this to `None`: the table is still there");
-        assert_eq!(
-            (core.brightness, core.color.as_str(), core.palette.len()),
-            (0, "", 0),
-            "#1025 will flip this too — and note these are the *field* types' \
-             defaults, not Core::default()'s 3/\"amber\""
+        assert!(
+            first.core.is_none(),
+            "the block holds nothing of the schema's, so the field it stands \
+             for is absent — not `Some` of the field types' defaults"
         );
 
-        let again = render_overlay(&saved, &reloaded).expect("renders again");
+        // A fixed point: saving what was just read changes no byte.
+        let again = render_overlay(&saved, &first).expect("renders again");
         assert_eq!(
-            again,
-            "enabled = true\ncore = { _unset = [\"label\"], brightness = 0, color = \"\", palette = [] }\n",
-            "#1025 will flip this to a fixed point; today the second save writes \
-             the degenerate values back"
+            again, saved,
+            "the second save must write nothing back into the block it left \
+             the user"
+        );
+
+        let second = assemble::<OptTable>(&layers(&[&again]))
+            .expect("reloads twice")
+            .config;
+        assert!(
+            second.core.is_none(),
+            "and it is still absent on the load after that"
+        );
+    }
+
+    /// The other side of the rule, and the reason it is stated over the keys
+    /// rather than over the *header*: one key of the schema's is enough to make
+    /// the table present, and the keys it does not carry come from where they
+    /// always did.
+    ///
+    /// Red if the rule fires on a table that has a schema-owned key in it.
+    #[test]
+    fn a_table_carrying_one_key_of_the_schemas_still_reads_as_some() {
+        let loaded = assemble::<OptTable>(&layers(&[
+            "enabled = true\n\n[core]\n_unset = [\"label\"]\nmystery = 1\nbrightness = 7\n",
+        ]))
+        .expect("assembles");
+
+        let core = loaded
+            .config
+            .core
+            .as_ref()
+            .expect("the schema owns `brightness`, and it is set in there");
+        assert_eq!(
+            (core.brightness, core.color.as_str(), core.palette.len()),
+            (7, "", 0),
+            "the one key the user set, and the field types' defaults for the \
+             rest — `OptTable`'s `DEFAULT_TOML` states none of them"
+        );
+        assert_eq!(
+            loaded.unknown_keys,
+            ["core.mystery"],
+            "and their own key is still named, in a table that stayed"
+        );
+    }
+
+    /// A marker that erases the last of the schema's keys out of a block leaves
+    /// nothing of the schema's in it, so the field it stands for is absent —
+    /// the same answer the round-trip above gets, reached by rule 1 instead of
+    /// by the writer.
+    ///
+    /// This is the shape that needs [`merge::marked_tables`]: `merge_into`
+    /// strips the marker, so what reaches the schema is a bare empty table and
+    /// the erasure is invisible by then.
+    ///
+    /// Red if `marked_tables` stops being consulted — the emptied block reads
+    /// as `Some(0/""/[])`, which is the base layer's `brightness = 3` erased
+    /// into a degenerate value rather than into absence.
+    #[test]
+    fn a_marker_that_empties_a_block_of_the_schemas_keys_makes_the_field_absent() {
+        let loaded = assemble::<OptTable>(&layers(&[
+            "enabled = true\n\n[core]\nbrightness = 3\n",
+            "[core]\n_unset = [\"brightness\"]\n",
+        ]))
+        .expect("assembles");
+
+        assert!(
+            loaded.config.core.is_none(),
+            "the overlay erased the only key the schema had in there: {:?}",
+            loaded.config.core
+        );
+    }
+
+    /// Rule 4 does not move: the key that made the table absent is exactly the
+    /// key the user most likely got wrong in that block, so it is still named,
+    /// still once, and still returned.
+    ///
+    /// The `enabled = false` beside it is the live control — a capture that
+    /// observed nothing would satisfy a `is_empty()` assertion just as well —
+    /// and it also pins that the rule takes the table without taking its
+    /// siblings.
+    ///
+    /// Red if `unknown_keys` is taken from the *pruned* pass: the key is gone
+    /// from the document by then, nothing is warned, and a settings UI has
+    /// nothing to show.
+    #[test]
+    fn a_table_holding_only_a_key_the_schema_does_not_know_is_absent_and_still_warned_about() {
+        let (captured, _guard) = capture();
+
+        let loaded = assemble::<OptTable>(&layers(&["enabled = false\n\n[core]\nmystery = 1\n"]))
+            .expect("assembles");
+
+        assert!(
+            loaded.config.core.is_none(),
+            "nothing of the schema's in it"
+        );
+        assert!(!loaded.config.enabled, "and the sibling key is untouched");
+        assert_eq!(
+            loaded.unknown_keys,
+            ["core.mystery"],
+            "still returned for a settings UI"
+        );
+
+        let named: Vec<_> = captured
+            .events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::WARN)
+            .filter(|e| e.fields.get("key").map(String::as_str) == Some("core.mystery"))
+            .collect();
+        assert_eq!(named.len(), 1, "warned exactly once: {named:#?}");
+    }
+
+    /// The boundary, and the reason the rule is not simply "an empty table is
+    /// absent": `core = {}` is a value the **user typed**, and a schema field
+    /// of type [`toml::Value`] — #1040's shape, so one bad key never takes its
+    /// siblings down — accepts a table as a spelling like any other. Taking it
+    /// away here would take it away from [`Subsystem::parsed`], whose whole job
+    /// is to say out loud that it is not a valid one.
+    ///
+    /// Red if the `typed_empty` carve-out goes: `style` is dropped, the field
+    /// falls back to its `serde` default, and the user's `{}` is judged by
+    /// nobody.
+    #[test]
+    fn a_table_the_user_typed_empty_is_still_the_schemas_to_judge() {
+        let loaded = assemble::<RawValue>(&layers(&["style = {}\n"])).expect("assembles");
+
+        assert_eq!(
+            loaded.config.style,
+            toml::Value::Table(toml::Table::new()),
+            "the spelling reaches the schema — `parsed` is the only judge of it"
+        );
+        assert!(
+            loaded.unknown_keys.is_empty(),
+            "and a `toml::Value` field knows no unknown keys: {:?}",
+            loaded.unknown_keys
+        );
+    }
+
+    /// What "absent" means for a table field that is **not** an `Option`, pinned
+    /// as a decision rather than left to be discovered: #866's rule 1, one level
+    /// up. An erased key falls back to the code default; a block with every one
+    /// of the schema's keys erased out of it falls back to the code default for
+    /// the *table*, which is `Core::default()` — the struct's own impl, not the
+    /// sum of the field defaults an empty table used to produce.
+    ///
+    /// The trade is deliberate. Erasing keys one at a time still gives the field
+    /// defaults (`an_unset_marker_naming_a_key_no_layer_sets_is_warned_about`
+    /// pins `color == ""`), so the two do differ at the edge where the last key
+    /// goes; the unambiguous shape for "this block may be absent" is an
+    /// `Option<Table>`, which is what #1025 exists to make usable.
+    #[test]
+    fn erasing_every_key_of_a_required_table_falls_back_to_its_own_default() {
+        let loaded = assembled(&["[core]\n_unset = [\"color\", \"brightness\", \"palette\"]\n"]);
+
+        assert_eq!(
+            loaded.config.core,
+            Core::default(),
+            "the code default for the table, reached honestly — not the base \
+             layer's values, which the marker really did erase"
         );
     }
 

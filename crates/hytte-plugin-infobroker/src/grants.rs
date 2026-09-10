@@ -1025,13 +1025,14 @@ mod tests {
     /// up separately**, neither collapsed into the other, must be written in
     /// submission order — and both must actually run.
     ///
-    /// The gap between the two saves is what separates them: the first save
-    /// is queued, the test then awaits long enough for the drain task to be
-    /// polled and to have started job 1's `spawn_blocking`, and only then
-    /// queues job 2. Job 1 is therefore no longer in the channel when the
-    /// coalescing `try_recv` loop runs, so both writers run and the order is
-    /// the lane's, not the pool's. Injected writers record their order and
-    /// their bytes, so a swap is visible as more than just the final content.
+    /// What separates the two saves is job 1's writer **signalling that it has
+    /// started** — not a fixed sleep, which under load could let job 2 be
+    /// queued before the drain task is first polled and put us back in the
+    /// coalescing case this test exists to escape. Once job 1 is out of the
+    /// channel and inside its `spawn_blocking`, the coalescing `try_recv` loop
+    /// cannot swallow it, so both writers run and the order is the lane's
+    /// rather than the pool's. Injected writers record their order, so a swap
+    /// is visible as more than just the final content.
     #[tokio::test]
     async fn two_uncoalesced_saves_are_written_in_order() {
         use std::sync::{Arc, Mutex};
@@ -1045,15 +1046,25 @@ mod tests {
 
         // Job 1 — a slow write, so the drain task is still inside it when
         // job 2 is queued and the coalescing loop cannot swallow job 1.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         store.grants.push(Grant::always("claude", "departures"));
         let first = Arc::clone(&order);
         store.save_with(move |p, t| {
+            started_tx.send(()).expect("the test outlives this writer");
             std::thread::sleep(std::time::Duration::from_millis(200));
             first.lock().expect("order lock").push("first");
             write_atomic(p, t)
         });
-        // Let the drain task pick job 1 up and get into its `spawn_blocking`.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait for job 1 to be *out of the channel and running*, so the
+        // coalescing loop cannot reach it — no fixed sleep to race under load.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while started_rx.try_recv().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first write never started — the drain task was never polled",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
 
         // Job 2 — the newer snapshot, queued while job 1 is mid-write.
         store.grants.clear();
@@ -1063,7 +1074,19 @@ mod tests {
             write_atomic(p, t)
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // Both writers must run; poll rather than sleep a fixed window, then
+        // settle briefly so a *third* (impossible) run would still be seen.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while order.lock().expect("order lock").len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {:?} ran within 10s — a queued job was coalesced away after the \
+                 drain task had already taken the one before it",
+                *order.lock().expect("order lock"),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(
             *order.lock().expect("order lock"),
             vec!["first", "second"],

@@ -1739,7 +1739,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Poisoned, _, _>(prd, pwr, never_shuts_down()), host);
+        let (result, ()) = tokio::join!(
+            session::<Poisoned, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok(), "Shutdown ends the session cleanly");
     }
 
@@ -1873,7 +1876,8 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Paneled, _, _>(prd, pwr, never_shuts_down()), host);
+        let (result, ()) =
+            tokio::join!(session::<Paneled, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok(), "Shutdown ends the session cleanly");
     }
 
@@ -1944,7 +1948,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<HiddenOn, _, _>(prd, pwr, never_shuts_down()), host);
+        let (result, ()) = tokio::join!(
+            session::<HiddenOn, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok(), "Shutdown ends the session cleanly");
     }
 
@@ -2042,7 +2049,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Attributed, _, _>(prd, pwr, never_shuts_down()), host);
+        let (result, ()) = tokio::join!(
+            session::<Attributed, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok(), "Shutdown ends the session cleanly");
     }
 
@@ -2117,7 +2127,8 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Ticker, _, _>(prd, pwr, never_shuts_down()), host);
+        let (result, ()) =
+            tokio::join!(session::<Ticker, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok());
     }
 
@@ -2150,7 +2161,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<FragileTicker, _, _>(prd, pwr, never_shuts_down()), host);
+        let (result, ()) = tokio::join!(
+            session::<FragileTicker, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok());
     }
 
@@ -2227,7 +2241,8 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Watcher, _, _>(prd, pwr, never_shuts_down()), host);
+        let (result, ()) =
+            tokio::join!(session::<Watcher, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok());
     }
 
@@ -2458,7 +2473,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Commander, _, _>(prd, pwr, never_shuts_down()), host);
+        let (result, ()) = tokio::join!(
+            session::<Commander, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok());
     }
 
@@ -2492,7 +2510,10 @@ mod tests {
                 send(&mut hwr, &HostMsg::Shutdown).await;
             };
 
-            let (result, ()) = tokio::join!(session::<Commander, _, _>(prd, pwr, never_shuts_down()), host);
+            let (result, ()) = tokio::join!(
+                session::<Commander, _, _>(prd, pwr, never_shuts_down()),
+                host
+            );
             assert!(
                 result.is_ok(),
                 "a fresh per-session command lane round-trips"
@@ -2547,10 +2568,8 @@ mod tests {
         // any further attempt parks forever.
         let mut pending = vec![p2, p1];
 
-        let dial_loop = reconnect_loop::<Echo, _, _, _, _>(
-            "echo-test",
-            never_shuts_down(),
-            move || {
+        let dial_loop =
+            reconnect_loop::<Echo, _, _, _, _>("echo-test", never_shuts_down(), move || {
                 let next = pending.pop();
                 async move {
                     match next {
@@ -2558,8 +2577,7 @@ mod tests {
                         None => std::future::pending().await,
                     }
                 }
-            },
-        );
+            });
 
         let host = async move {
             let (mut hrd1, mut hwr1) = tokio::io::split(h1);
@@ -2650,10 +2668,7 @@ mod tests {
                 eat_handshake(&mut hrd, "shutdown-order-test").await;
                 send(&mut hwr, &snapshot("10:00")).await;
                 assert!(
-                    matches!(
-                        next_plugin_frame(&mut hrd).await,
-                        PluginMsg::Render { .. }
-                    ),
+                    matches!(next_plugin_frame(&mut hrd).await, PluginMsg::Render { .. }),
                     "the update from before the signal must still render normally"
                 );
                 shutdown_tx.send(true).expect("receiver still alive");
@@ -2736,9 +2751,7 @@ mod tests {
             tokio::join!(session::<Hanger, _, _>(prd, pwr, shutdown_rx), host)
         })
         .await
-        .expect(
-            "session must return once the grace elapses, not hang on the stuck shutdown hook",
-        );
+        .expect("session must return once the grace elapses, not hang on the stuck shutdown hook");
         assert!(result.is_ok(), "the session still ends cleanly");
     }
 
@@ -2938,7 +2951,10 @@ mod tests {
         let (plugin_end, host_end) = duplex(64 * 1024);
         let (prd, pwr) = tokio::io::split(plugin_end);
         let (hrd, hwr) = tokio::io::split(host_end);
-        let (result, ()) = tokio::join!(session::<Scroller, _, _>(prd, pwr, never_shuts_down()), host(hrd, hwr));
+        let (result, ()) = tokio::join!(
+            session::<Scroller, _, _>(prd, pwr, never_shuts_down()),
+            host(hrd, hwr)
+        );
         result.expect("the host shut the session down cleanly");
     }
 
@@ -3217,7 +3233,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Linker<false>, _, _>(prd, pwr, never_shuts_down()), host);
+        let (result, ()) = tokio::join!(
+            session::<Linker<false>, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok());
     }
 
@@ -3253,7 +3272,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Linker<true>, _, _>(prd, pwr, never_shuts_down()), host);
+        let (result, ()) = tokio::join!(
+            session::<Linker<true>, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok());
     }
 
@@ -3324,7 +3346,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<SilentLinker, _, _>(prd, pwr, never_shuts_down()), host);
+        let (result, ()) = tokio::join!(
+            session::<SilentLinker, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok());
     }
 }

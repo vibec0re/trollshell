@@ -321,9 +321,45 @@ fn data_upload_key(state: &ShaderState) -> u64 {
 /// because the only test that observes that line needs a live driver and so
 /// runs nowhere. The seam was removed rather than tested: `upload_data`
 /// takes the latch, reports for itself, and hands back the texture to sample
-/// — `None` when there is none — which turns the caller's skip into a
-/// `let … else` the compiler enforces instead of a `return` that can be
-/// dropped (round 2's L2, #968 review L7).
+/// — `None` when there is none — which turns round 2's L2 (#968 review L7)
+/// from a `return` a caller can drop into a `let … else` whose `else` arm
+/// must diverge, so that exact one-line mistake no longer compiles.
+///
+/// **That was a property of this spelling, not of the type — and the first
+/// cut at saying so named the wrong counterexample** (PR #1031 third-pass
+/// review LOW 3, corrected by the PR #1048 fix round, MEDIUM 1). The
+/// original text here claimed `if upload_data(…).is_none() { }` still
+/// compiles and reinstates L7. Measured: it does not reach a green
+/// pipeline at all — `cargo clippy -p hytte-ui --all-targets --features
+/// system-tests -- -D warnings` rejects it outright
+/// (`clippy::needless_ifs`, an empty `if` branch), so that spelling is
+/// already caught by the gate this repository runs on every PR. The
+/// genuinely silent spelling is shorter: `let _ = upload_data(…);` compiles
+/// clean under both `cargo test` and that same clippy invocation, and
+/// reinstates L7 exactly as described — the frame draws with `u_data_size`
+/// describing a grid that was never bound, forever, because the shape is
+/// never advanced so the refusal repeats every frame.
+///
+/// **Why either drop spelling used to compile at all:** `draw`'s call site
+/// destructures `data: &mut hgl::Texture` out of `Resources` and passes it
+/// into this function; the `let Some(data) = upload_data(…) else { … }`
+/// there only *shadowed* that outer binding with the return value. Drop the
+/// `let … else` — via either spelling — and the outer `data` argument is
+/// still in scope, so `data.bind_unit(&gl, 0)` keeps compiling against the
+/// **previous** texture while `set_uniforms` publishes `u_data_size` for
+/// the **new** shape.
+///
+/// **Fixed at the call site, not here** (PR #1048 fix round, MEDIUM 1(b)):
+/// `draw` binds this function's return value as `sampled`, a name the
+/// outer scope has no binding for, rather than reusing `data`. Both drop
+/// spellings — `if upload_data(…).is_none() { }` and `let _ =
+/// upload_data(…);` — now fail with `error[E0425]: cannot find value
+/// `sampled` in this scope`, because neither one produces a `sampled` to
+/// draw with. The `let … else` shape at the call site was always the
+/// contract; renaming the binding is what finally makes dropping it a
+/// compile error instead of an unenforced convention. See `draw`'s call
+/// site (the `let Some(sampled) = upload_data(…) else { … }` line) for
+/// where that lives now.
 ///
 /// `hgl::Error` is plain data a test can construct by hand; only *producing*
 /// a genuine refusal — `hgl::Texture::new` really turning a grid down — needs
@@ -342,6 +378,40 @@ fn warn_on_data_upload_failure(
             DATA_UPLOAD_REFUSED
         );
     }
+}
+
+/// The whole refusal arm of `upload_data`'s reallocation: latch-and-log via
+/// [`warn_on_data_upload_failure`], plus the *state* half neither that
+/// function nor its own test touches — pulled out so the retry contract
+/// #977 exists for is observable with no GL context (PR #1031 third-pass
+/// review LOW 2). See `refusing_a_data_grid_does_not_advance_its_shape` for
+/// the test that drives this directly.
+///
+/// `data_shape` is threaded through and never written: that omission **is**
+/// the contract this pins. Advancing it here is the pre-#977 bug, restored
+/// verbatim — `upload_data`'s own comment at its call site explains why: a
+/// `Texture::new` that now fails honestly must leave the shape where it
+/// was, so the next frame retries the same allocation instead of sampling a
+/// texture with no storage behind it.
+///
+/// **`_data_shape` takes a shared reference, not `&mut`** (PR #1048 fix
+/// round, LOW 2): unlike `gl_surface`'s `refuse_data_strip` (whose
+/// `data_len` genuinely has to be `&mut` — it is the one place that zeros
+/// it), this function never writes `data_shape` at all, so the "does not
+/// advance" property does not have to rest on a test noticing a stray
+/// write — it is compiler-enforced. Advancing it here (the pre-#977 bug
+/// this function exists to keep from coming back) is now a compile error
+/// (E0594, "cannot assign to `*_data_shape`, which is behind a `&`
+/// reference"), not a red test.
+fn refuse_data_grid(
+    _data_shape: &(u32, u32, ShaderFormat),
+    data_source: &mut Option<Arc<[u8]>>,
+    warned: &RefCell<WarnLatch>,
+    state: &ShaderState,
+    error: &hgl::Error,
+) {
+    *data_source = None;
+    warn_on_data_upload_failure(warned, state, error);
 }
 
 /// The compiled-program cache: **one** program, keyed by its source.
@@ -520,8 +590,8 @@ mod imp {
     use super::{
         Arc, COMPILE_FAILURE_REFUSED, Cell, Failure, Instant, ProgramCache,
         RESOURCES_ALLOCATION_REFUSED, RefCell, SHADER_PREAMBLE, SHADER_VERT, ShaderState,
-        WarnLatch, abandon_gl, first_line, fit_rect, gdk, glib, source_key,
-        warn_on_data_upload_failure, would_upload, wrapped_seconds,
+        WarnLatch, abandon_gl, first_line, fit_rect, gdk, glib, refuse_data_grid, source_key,
+        would_upload, wrapped_seconds,
     };
     use crate::gl_surface::{GLSL_HEADER, GlValue};
     use gtk::prelude::*;
@@ -781,10 +851,20 @@ mod imp {
             // life of the surface.
             //
             // The latch goes *in* and the texture to sample comes back, so
-            // this arm has no `Result` to swallow and no `return` to forget:
-            // on a refusal there is nothing to bind and the `else` has to
-            // diverge (PR #1031 review H1/L2).
-            let Some(data) = upload_data(
+            // this arm has no `Result` to swallow (PR #1031 review H1/L2).
+            //
+            // **There *is* something to bind on a refusal — this outer
+            // `data: &mut hgl::Texture` argument** (PR #1048 fix round,
+            // LOW 3/MEDIUM 1): dropping the `let … else` below does not
+            // leave nothing to draw with, it leaves *this* texture, stale
+            // and mismatched with `state`'s shape. That is why the value
+            // below binds as `sampled`, a name this scope has no other
+            // binding for, rather than reusing `data` — dropping the
+            // `let … else` (by any spelling) then fails to compile instead
+            // of silently drawing the old texture. See
+            // `warn_on_data_upload_failure`'s doc (MEDIUM 1) for the two
+            // spellings that used to get past this before the rename.
+            let Some(sampled) = upload_data(
                 &gl,
                 data,
                 data_shape,
@@ -800,7 +880,7 @@ mod imp {
             };
             program.bind(&gl);
             self.set_uniforms(&gl, program, &state, viewport);
-            data.bind_unit(&gl, 0);
+            sampled.bind_unit(&gl, 0);
             program.set_int(&gl, "u_data", 0);
             // `Replace` is `glDisable(GL_BLEND)`: the shader's `fragColor` is
             // written verbatim into GTK's framebuffer, which GSK imports as
@@ -918,7 +998,7 @@ mod imp {
     /// Returns **the texture to sample**, or `None` if the driver refused the
     /// (re)allocation and this frame must be skipped — in which case the
     /// refusal has already been latched and logged, once per shape, through
-    /// [`super::warn_on_data_upload_failure`] (#977, #1023 item 1).
+    /// [`super::refuse_data_grid`] (#977, #1023 item 1).
     ///
     /// **Handing the texture back rather than an `Ok`/`Err` is the point**
     /// (PR #1031 review H1/L2): the caller cannot draw without the return
@@ -967,8 +1047,11 @@ mod imp {
                     // PR #1031 review H1 is that the caller cannot ignore
                     // this: it gets `None`, not an `Err` it may drop, and it
                     // needs the texture this returns in order to draw at all.
-                    *data_source = None;
-                    warn_on_data_upload_failure(warned, state, &error);
+                    // `data_shape` (`&mut`) coerces to the `&` this callee
+                    // takes: `refuse_data_grid` cannot write it, so it is
+                    // compiler-checked to leave it untouched (PR #1048 fix
+                    // round, LOW 2).
+                    refuse_data_grid(data_shape, data_source, warned, state, &error);
                     return None;
                 }
             };
@@ -1127,7 +1210,7 @@ mod tests {
         Arc, COMPILE_FAILURE_REFUSED, DATA_UPLOAD_REFUSED, ProgramCache,
         RESOURCES_ALLOCATION_REFUSED, RefCell, SHADER_PREAMBLE, SHADER_VERT, ShaderFormat,
         ShaderState, TIME_WRAP_SECS, WARNED_SOURCES, WarnLatch, data_key, first_line, hgl,
-        source_key, warn_on_data_upload_failure, would_upload, wrapped_seconds,
+        refuse_data_grid, source_key, warn_on_data_upload_failure, would_upload, wrapped_seconds,
     };
 
     /// A counting builder, standing in for `hgl::Program::compile`. The cache is
@@ -1848,6 +1931,51 @@ mod tests {
             2,
             "…and both shapes are latched, keyed by data_upload_key, so a later repeat of \
              either stays quiet",
+        );
+    }
+
+    /// **PR #1031 third-pass review LOW 2(b) (#1046).** The refusal arm's
+    /// *state* half, pinned with no GL context: on a refused reallocation
+    /// the shape must **not** advance, or the next frame skips the retry
+    /// and samples a texture with no storage behind it — the pre-#977 bug,
+    /// restored verbatim (`upload_data`'s own comment at its call site
+    /// explains why).
+    ///
+    /// **The shape assertion below is now a belt-and-braces check, not the
+    /// only line of defence** (PR #1048 fix round, LOW 2): since
+    /// [`refuse_data_grid`] takes `_data_shape` by `&`, not `&mut`, adding
+    /// `*data_shape = shape;` to it (the very assignment the `Ok` arm makes
+    /// two lines below the refusal in `upload_data`) no longer compiles at
+    /// all — `error[E0594]`, caught before `cargo test` ever runs, not
+    /// merely by it. What this test still exercises live is
+    /// `data_source.is_none()`, which the type system does not pin: nothing
+    /// stops `refuse_data_grid` from writing `Some(..)` back into
+    /// `data_source`, so that half remains a real, falsifiable assertion.
+    #[test]
+    fn refusing_a_data_grid_does_not_advance_its_shape() {
+        let data_shape = (4_u32, 4_u32, ShaderFormat::R8);
+        let mut data_source: Option<Arc<[u8]>> = Some(Arc::from(&[0u8; 4][..]));
+        let warned = RefCell::new(WarnLatch::default());
+        let state = state_with_data_size((8, 8));
+        let error = hgl::Error::TextureSize {
+            size: (8, 8),
+            limit: 4096,
+        };
+
+        refuse_data_grid(&data_shape, &mut data_source, &warned, &state, &error);
+
+        assert_eq!(
+            data_shape,
+            (4, 4, ShaderFormat::R8),
+            "a refused reallocation must not advance the shape — the next frame has to retry \
+             the same allocation, not sample a texture with no storage behind it (pre-#977 bug); \
+             compiler-enforced since PR #1048, so this assertion cannot go red without the \
+             function's own signature changing back to `&mut`",
+        );
+        assert!(
+            data_source.is_none(),
+            "the source must still be forgotten so a later successful upload is not skipped as \
+             an unchanged repeat",
         );
     }
 }

@@ -22,8 +22,9 @@
 //! #1008 the writer deliberately keeps a table the user has lines in — a
 //! marker, a key the schema does not know — even when the schema's own value
 //! went away, and a reader that turned those lines into defaults would write
-//! the defaults back on the next save. [`marked_tables`] is the only thing
-//! that rule needs from here.
+//! the defaults back on the next save. Nothing here is involved in it: the
+//! merged table is all it reads, and [`crate::subsystem::assemble`]'s own
+//! `read_merged` argues it in full.
 //!
 //! # "Absent is not null", in a format with no null
 //!
@@ -132,7 +133,10 @@ pub fn merge_into(base: &mut toml::Table, overlay: &toml::Table) {
             // some layer did — which is what lets rule 2's reader-side
             // corollary (#1025, module docs) be asked once of the merged table
             // rather than layer by layer, and lets a marker's erasure be
-            // honoured *before* it is asked.
+            // honoured *before* it is asked. The corollary reads nothing but
+            // the merged table: whether a block ended up empty because a marker
+            // emptied it or because the user typed it that way is a difference
+            // it deliberately does not consult (#1088 review, M2).
             (Some(toml::Value::Table(into)), toml::Value::Table(from)) => merge_into(into, from),
             // Everything else — scalars, arrays, and a table with nothing (or
             // a scalar) under it — replaces whole. An array is deliberately
@@ -354,55 +358,6 @@ fn collect_inert(
         }
         if let toml::Value::Table(nested) = value {
             collect_inert(nested, &format!("{prefix}{key}."), present, layer, out);
-        }
-    }
-}
-
-/// The dotted path of every table any of `layers` wrote an [`UNSET_KEY`]
-/// marker **in** — the root table spelled as the empty string.
-///
-/// The path of the *table*, not of the names inside the marker: the question
-/// is "did the user erase anything in this block", not "what did they erase".
-///
-/// Why a reader wants it, when nothing else in this module does. The marker
-/// never survives [`merge_into`] (module docs), so a table whose only line was
-/// a marker reaches the schema as an ordinary **empty** table —
-/// indistinguishable from one the user deliberately typed empty. Rule 2's
-/// reader-side corollary turns on exactly that difference: a block emptied by
-/// an erasure has nothing of the schema's left in it and reads as absent,
-/// while `core = {}` is a value the user wrote and is the schema's to judge.
-/// This is the last point at which the two are still distinguishable, so the
-/// answer is taken here and handed on.
-///
-/// Structural, deliberately: a **malformed** marker counts too. It erases
-/// nothing — [`malformed_unset`] says so out loud, and the load goes on with
-/// the inherited value — but the user did write an erasure there, and reading
-/// their block as a struct of defaults on top of that would be the second
-/// surprise in one file.
-#[must_use]
-pub fn marked_tables(layers: &[toml::Table]) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for layer in layers {
-        collect_marked(layer, "", &mut out);
-    }
-    out
-}
-
-fn collect_marked(table: &toml::Table, path: &str, out: &mut BTreeSet<String>) {
-    if table.contains_key(UNSET_KEY) {
-        out.insert(path.to_string());
-    }
-    for (key, value) in table {
-        if key == UNSET_KEY {
-            continue;
-        }
-        if let toml::Value::Table(nested) = value {
-            let child = if path.is_empty() {
-                key.clone()
-            } else {
-                format!("{path}.{key}")
-            };
-            collect_marked(nested, &child, out);
         }
     }
 }
@@ -938,44 +893,5 @@ mod tests {
 
         let keys: Vec<&str> = out.iter().map(|i| i.key.as_str()).collect();
         assert_eq!(keys, ["aa", "bb", "core.cc"]);
-    }
-
-    // ── #1025: which tables were erased in ──────────────────────────────────
-
-    /// The path of the **table the marker sits in**, at every depth and across
-    /// every layer, with the root spelled `""` — not the names inside it, which
-    /// is [`inert_unset`]'s question.
-    #[test]
-    fn marked_tables_names_the_block_a_marker_was_written_in_at_every_depth() {
-        let out = marked_tables(&[
-            table("_unset = [\"a\"]\n\n[core.inner]\n_unset = [\"b\"]\n"),
-            table("[other]\n_unset = [\"c\"]\nkept = 1\n"),
-        ]);
-
-        let paths: Vec<&str> = out.iter().map(String::as_str).collect();
-        assert_eq!(paths, ["", "core.inner", "other"]);
-    }
-
-    /// A table with no marker in it contributes nothing — including the table
-    /// on the way down to one that has.
-    #[test]
-    fn a_block_nobody_erased_anything_in_is_not_named() {
-        let out = marked_tables(&[table(
-            "[core]\nkept = 1\n\n[core.inner]\n_unset = [\"b\"]\n",
-        )]);
-
-        let paths: Vec<&str> = out.iter().map(String::as_str).collect();
-        assert_eq!(paths, ["core.inner"], "`core` itself has no marker in it");
-    }
-
-    /// A **malformed** marker counts too: it erases nothing, and
-    /// [`malformed_unset`] says so, but the user did write an erasure there —
-    /// which is the question this answers.
-    #[test]
-    fn a_malformed_marker_still_names_its_block() {
-        let out = marked_tables(&[table("[core]\n_unset = \"color\"\n")]);
-
-        let paths: Vec<&str> = out.iter().map(String::as_str).collect();
-        assert_eq!(paths, ["core"]);
     }
 }

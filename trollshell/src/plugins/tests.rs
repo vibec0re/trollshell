@@ -7096,7 +7096,7 @@ const LCD_ADMITTED_ROLE_INKS: [kit::Rgba; 6] = [
 
 /// Drops the memoized role colors (and the kit accent) when it falls out of
 /// scope — see [`role_ink_reset`].
-struct RoleInkReset;
+pub(super) struct RoleInkReset;
 
 impl Drop for RoleInkReset {
     fn drop(&mut self) {
@@ -7118,7 +7118,12 @@ impl Drop for RoleInkReset {
 /// `tint_in_process_surfaces(None)`), made order-proof: a guard restores on the
 /// unwind out of a failed assertion, where a trailing call would not, so one red
 /// test cannot cascade into the next one on the same thread.
-fn role_ink_reset() -> RoleInkReset {
+///
+/// `pub(super)`, matching [`preem_ink_lock`] (PR #1031 review N1): the same
+/// restore-on-unwind argument applies to `shader_map::tests`'s own accent
+/// test, which was using a bare trailing `tint_in_process_surfaces(None)`
+/// (no guard) until this fix round adopted this one there instead.
+pub(super) fn role_ink_reset() -> RoleInkReset {
     tint_in_process_surfaces(None);
     RoleInkReset
 }

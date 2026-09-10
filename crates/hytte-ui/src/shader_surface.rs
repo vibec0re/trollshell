@@ -107,6 +107,7 @@ use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
+use hytte_gl as hgl;
 
 use crate::gl_surface::{GLSL_HEADER, GlValue, abandon_gl, fit_rect};
 
@@ -226,6 +227,121 @@ fn source_key(fragment: &str) -> u64 {
     SHADER_PREAMBLE.hash(&mut hasher);
     fragment.hash(&mut hasher);
     hasher.finish()
+}
+
+/// The cache key for one refused data-texture allocation: a 64-bit hash of
+/// the grid's `(width, height, format)` (#1023 item 1).
+///
+/// Sibling of [`source_key`], for the same reason: `warned_data` moved from
+/// a bare `Cell<bool>` to a [`WarnLatch`] keyed by this, so a **second,
+/// differently shaped** refused grid earns its own journal line instead of
+/// being silenced by the first — exactly the bug `warned_compile`'s own doc
+/// already names, sixteen lines above where `warned_data` is declared
+/// (#1020 review, MEDIUM 1).
+fn data_key(width: u32, height: u32, format: ShaderFormat) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    width.hash(&mut hasher);
+    height.hash(&mut hasher);
+    format.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The line a driver-refused data upload writes to the journal (#1023 item
+/// 4).
+///
+/// Says the surface **keeps whatever it last successfully drew**, not that
+/// it "draws nothing" (#1020's own shipped wording, and #1020's review LOW
+/// 3): the early return below happens *before* `narrow_to_fit_rect`, the
+/// only thing that clears — GTK does not clear for us — so after one good
+/// frame a refused upload leaves that frame's picture on screen, frozen,
+/// rather than an empty rect.
+///
+/// This picks *reword* over *clear before returning*, the two remedies the
+/// review named, for two reasons. First, the previous frame's pixels are not
+/// wrong — only the *update* failed — so clearing would trade a stale-but-
+/// correct picture for a flash of nothing on every refused frame, worse for
+/// a plugin that sends one bad grid in twenty than for one that sends
+/// nothing but bad grids. Second, it is the arm-for-arm consistent choice:
+/// the compile-failure and `Ok(None)` arms above this one in `draw` already
+/// keep the last frame (true before this PR too, just undocumented), and
+/// clearing only the data-upload arm would make one of three sibling
+/// failure arms behave differently from the other two for no reason a
+/// plugin author could discover from the code.
+const DATA_UPLOAD_REFUSED: &str = "a plugin shader's data texture could not be allocated; this \
+    frame is skipped and the surface keeps whatever it last successfully drew (nothing, before \
+    the first successful frame) until the plugin sends a grid this driver will take (further \
+    occurrences of this exact shape are silenced)";
+
+/// The line a failed GL-object allocation writes to the journal.
+///
+/// Same reasoning as [`DATA_UPLOAD_REFUSED`] (PR #1031 review L2): this arm
+/// also returns before `narrow_to_fit_rect`, so it must not claim the widget
+/// "draws nothing" either — #1020 shipped it that way, next to the very
+/// message this fixes.
+const RESOURCES_ALLOCATION_REFUSED: &str = "a plugin shader surface could not allocate its GL \
+    objects; the surface keeps whatever it last successfully drew (nothing, before the first \
+    successful frame) (further occurrences are silenced)";
+
+/// The line a failed compile writes to the journal.
+///
+/// Same reasoning as [`DATA_UPLOAD_REFUSED`] (PR #1031 review L2).
+const COMPILE_FAILURE_REFUSED: &str = "a plugin's shader did not compile; the surface keeps \
+    whatever it last successfully drew (nothing, before the first successful frame) — further \
+    frames carrying this same source are silenced; run with RUST_LOG=hytte_ui=debug for the \
+    full driver log";
+
+/// The key `draw`'s data-upload arm claims `warned_data` with, over the
+/// state the call site actually reads.
+///
+/// Hoisted out of the call site (PR #1031 review M2) so the composition
+/// "`draw` feeds `ShaderState` into `data_key` with the right clamp, not a
+/// constant" is itself covered by a test — [`data_key`]'s own
+/// three-field test and [`WarnLatch::claim`]'s own keying test each cover
+/// half of this in isolation, and neither pins that `draw` calls either of
+/// them correctly.
+fn data_upload_key(state: &ShaderState) -> u64 {
+    data_key(
+        state.data_size.0.max(1),
+        state.data_size.1.max(1),
+        state.format,
+    )
+}
+
+/// Claim `latch` for `state`'s shape (via [`data_upload_key`]) and log
+/// [`DATA_UPLOAD_REFUSED`] once — the whole reporting half of a refused data
+/// upload, in one function a test can drive with no GL context (PR #1031
+/// review M2).
+///
+/// **Its only production caller is `imp::upload_data`'s own refusal arm, and
+/// it neither takes a `Result` nor returns a "skip" flag any more** (PR
+/// #1031 review H1). Both were degrees of freedom at `draw`'s call site, and
+/// the second-pass review measured what they cost: re-swallowing the error
+/// there — #1020's shipped silence, restored in one line — left `cargo
+/// test`, the `system-tests` bucket and `clippy -D warnings` all green,
+/// because the only test that observes that line needs a live driver and so
+/// runs nowhere. The seam was removed rather than tested: `upload_data`
+/// takes the latch, reports for itself, and hands back the texture to sample
+/// — `None` when there is none — which turns the caller's skip into a
+/// `let … else` the compiler enforces instead of a `return` that can be
+/// dropped (round 2's L2, #968 review L7).
+///
+/// `hgl::Error` is plain data a test can construct by hand; only *producing*
+/// a genuine refusal — `hgl::Texture::new` really turning a grid down — needs
+/// real GL.
+fn warn_on_data_upload_failure(
+    latch: &RefCell<WarnLatch>,
+    state: &ShaderState,
+    error: &hgl::Error,
+) {
+    if latch.borrow_mut().claim(data_upload_key(state)) {
+        tracing::warn!(
+            %error,
+            data_width = state.data_size.0,
+            data_height = state.data_size.1,
+            "{}",
+            DATA_UPLOAD_REFUSED
+        );
+    }
 }
 
 /// The compiled-program cache: **one** program, keyed by its source.
@@ -402,9 +518,10 @@ fn first_line(log: &str) -> &str {
 
 mod imp {
     use super::{
-        Arc, Cell, Failure, Instant, ProgramCache, RefCell, SHADER_PREAMBLE, SHADER_VERT,
-        ShaderState, WarnLatch, abandon_gl, first_line, fit_rect, gdk, glib, source_key,
-        would_upload, wrapped_seconds,
+        Arc, COMPILE_FAILURE_REFUSED, Cell, Failure, Instant, ProgramCache,
+        RESOURCES_ALLOCATION_REFUSED, RefCell, SHADER_PREAMBLE, SHADER_VERT, ShaderState,
+        WarnLatch, abandon_gl, first_line, fit_rect, gdk, glib, source_key,
+        warn_on_data_upload_failure, would_upload, wrapped_seconds,
     };
     use crate::gl_surface::{GLSL_HEADER, GlValue};
     use gtk::prelude::*;
@@ -447,18 +564,25 @@ mod imp {
         /// which is not keyed by anything a plugin controls — its own bool, so
         /// it cannot mask a compile failure or be masked by one.
         warned_resources: Cell<bool>,
-        /// One-shot latch for "the **data texture** could not be allocated"
-        /// (#977) — a driver refusing the grid the plugin asked for.
+        /// Journal latch for "the **data texture** could not be allocated"
+        /// (#977) — a driver refusing the grid the plugin asked for. **Keyed
+        /// by `(width, height, format)`** via [`data_key`] (#1023 item 1),
+        /// the same shape as [`warned_compile`] sixteen lines above — not a
+        /// bare `Cell<bool>` for the same reason: a plugin that sends a
+        /// driver-refused grid, then a good one, then a **different**
+        /// driver-refused grid must get a line for the second refusal too,
+        /// not permanent silence after the first (#1020 review, MEDIUM 1 —
+        /// this field shipped as a bare bool and was exactly that bug).
         ///
-        /// Its own bool for the same reason [`warned_resources`] is: it is a
-        /// different failure with a different fix (reshape the buffer) from
+        /// A separate latch from `warned_compile`, not merged into it: it is
+        /// a different failure with a different fix (reshape the buffer) from
         /// both the build failure above and the compile failure below, and a
         /// shared latch would let whichever fired first swallow the others.
-        /// Before this, a refused allocation returned `false` from
+        /// Before #977, a refused allocation returned `false` from
         /// `upload_data` and the frame was skipped in silence — every frame,
         /// for the life of the surface, with a black rect on screen and not one
         /// journal line anywhere in the process.
-        warned_data: Cell<bool>,
+        warned_data: RefCell<WarnLatch>,
     }
 
     #[glib::object_subclass]
@@ -571,11 +695,7 @@ mod imp {
                     Ok(resources) => *held = Some(resources),
                     Err(error) => {
                         if !self.warned_resources.replace(true) {
-                            tracing::warn!(
-                                %error,
-                                "a plugin shader surface could not allocate its GL objects; \
-                                 it draws nothing (further occurrences are silenced)"
-                            );
+                            tracing::warn!(%error, "{}", RESOURCES_ALLOCATION_REFUSED);
                         }
                         return;
                     }
@@ -597,9 +717,12 @@ mod imp {
             };
 
             // Compile once, keep the program: the whole point of the widget.
-            // A failure draws nothing and says so once — the host has already
-            // put the node's id and classes on screen, so what is left is an
-            // empty rect, which is the broken-widget placeholder's own look.
+            // A failure keeps whatever this surface last successfully drew
+            // (nothing, before the first successful frame) and says so once
+            // — on that first frame the host has already put the node's id
+            // and classes on screen, so what is left looks like the
+            // broken-widget placeholder even though this is a different
+            // mechanism from it.
             let program = match programs.ensure(&state.fragment, |body| {
                 // One `debug!` per **actual compile**, carrying the source key
                 // (#968 review L4): `docs/live-verify.md`'s "the same source
@@ -638,9 +761,8 @@ mod imp {
                         tracing::warn!(
                             driver = %detail,
                             source_key = key,
-                            "a plugin's shader did not compile; the widget draws nothing \
-                             (further frames carrying this same source are silenced — run \
-                             with RUST_LOG=hytte_ui=debug for the full driver log)"
+                            "{}",
+                            COMPILE_FAILURE_REFUSED
                         );
                     }
                     tracing::debug!(%error, source_key = key, "plugin shader compile failure, in full");
@@ -657,19 +779,21 @@ mod imp {
             // used to be indistinguishable, from outside the process, from a
             // shader that draws black: no error, no line, every frame, for the
             // life of the surface.
-            if let Err(error) = upload_data(&gl, data, data_shape, data_source, &state) {
-                if !self.warned_data.replace(true) {
-                    tracing::warn!(
-                        %error,
-                        data_width = state.data_size.0,
-                        data_height = state.data_size.1,
-                        "a plugin shader's data texture could not be allocated; the widget \
-                         draws nothing until the plugin sends a grid this driver will take \
-                         (further occurrences on this surface are silenced)"
-                    );
-                }
+            //
+            // The latch goes *in* and the texture to sample comes back, so
+            // this arm has no `Result` to swallow and no `return` to forget:
+            // on a refusal there is nothing to bind and the `else` has to
+            // diverge (PR #1031 review H1/L2).
+            let Some(data) = upload_data(
+                &gl,
+                data,
+                data_shape,
+                data_source,
+                &state,
+                &self.warned_data,
+            ) else {
                 return;
-            }
+            };
 
             let Some(viewport) = self.narrow_to_fit_rect(&gl) else {
                 return;
@@ -791,15 +915,25 @@ mod imp {
     /// `Resources`, so the compiled program borrowed out of the same struct
     /// stays live across it — see the destructuring in `draw`.
     ///
-    /// `Err` means **skip this frame**, and carries why so the caller can put
-    /// it in the journal once (#977); `Ok` means the texture matches `state`.
-    fn upload_data(
+    /// Returns **the texture to sample**, or `None` if the driver refused the
+    /// (re)allocation and this frame must be skipped — in which case the
+    /// refusal has already been latched and logged, once per shape, through
+    /// [`super::warn_on_data_upload_failure`] (#977, #1023 item 1).
+    ///
+    /// **Handing the texture back rather than an `Ok`/`Err` is the point**
+    /// (PR #1031 review H1/L2): the caller cannot draw without the return
+    /// value, so it cannot forget the skip, and taking `warned` as a
+    /// parameter leaves it no error to swallow. Both of those were one-line
+    /// mutations at `draw`'s call site that the entire gate stack passed,
+    /// because that line needs a live driver to reach.
+    fn upload_data<'t>(
         gl: &hgl::Gl,
-        data: &mut hgl::Texture,
+        data: &'t mut hgl::Texture,
         data_shape: &mut (u32, u32, super::ShaderFormat),
         data_source: &mut Option<Arc<[u8]>>,
         state: &ShaderState,
-    ) -> Result<(), hgl::Error> {
+        warned: &RefCell<WarnLatch>,
+    ) -> Option<&'t hgl::Texture> {
         let (w, h) = (state.data_size.0.max(1), state.data_size.1.max(1));
         let shape = (w, h, state.format);
         if *data_shape != shape {
@@ -829,9 +963,13 @@ mod imp {
                     // (`hytte-gl`'s `checked_extent` tests), the host-side
                     // refusal that stops most such grids ever arriving
                     // (`shader_map`'s per-axis cap), and this function's dedup
-                    // (`would_upload`'s own test).
+                    // (`would_upload`'s own test). What *is* structural since
+                    // PR #1031 review H1 is that the caller cannot ignore
+                    // this: it gets `None`, not an `Err` it may drop, and it
+                    // needs the texture this returns in order to draw at all.
                     *data_source = None;
-                    return Err(error);
+                    warn_on_data_upload_failure(warned, state, &error);
+                    return None;
                 }
             };
             *data = texture;
@@ -843,7 +981,7 @@ mod imp {
         // mapping pass this could never fire, and the whole data texture went to
         // the GPU on every render even when the bytes had not moved.
         if !would_upload(data_source.as_ref(), &state.data) {
-            return Ok(());
+            return Some(data);
         }
         match state.format {
             super::ShaderFormat::R8 | super::ShaderFormat::Rgba8 => {
@@ -863,7 +1001,7 @@ mod imp {
             }
         }
         *data_source = Some(Arc::clone(&state.data));
-        Ok(())
+        Some(data)
     }
 }
 
@@ -986,8 +1124,10 @@ impl Default for ShaderSurface {
 #[cfg(test)]
 mod tests {
     use super::{
-        Arc, ProgramCache, SHADER_PREAMBLE, SHADER_VERT, ShaderFormat, TIME_WRAP_SECS,
-        WARNED_SOURCES, WarnLatch, first_line, source_key, would_upload, wrapped_seconds,
+        Arc, COMPILE_FAILURE_REFUSED, DATA_UPLOAD_REFUSED, ProgramCache,
+        RESOURCES_ALLOCATION_REFUSED, RefCell, SHADER_PREAMBLE, SHADER_VERT, ShaderFormat,
+        ShaderState, TIME_WRAP_SECS, WARNED_SOURCES, WarnLatch, data_key, first_line, hgl,
+        source_key, warn_on_data_upload_failure, would_upload, wrapped_seconds,
     };
 
     /// A counting builder, standing in for `hgl::Program::compile`. The cache is
@@ -1459,5 +1599,255 @@ mod tests {
         let hour = Duration::from_secs_f64(TIME_WRAP_SECS);
         assert!(wrapped_seconds(hour).abs() < 1e-3);
         assert!((wrapped_seconds(hour + Duration::from_millis(250)) - 0.25).abs() < 1e-3);
+    }
+
+    // ── #1023 item 1: the data-upload latch is keyed, not a bare bool ───────
+
+    /// `data_key` really does key on every field it claims to — a collision
+    /// between two distinct shapes would silently reunite two latches that
+    /// should stay independent.
+    ///
+    /// **Falsified** by hashing only `width` (or only `height`, or dropping
+    /// `format`) in [`data_key`]: one of the `assert_ne!`s below goes red.
+    #[test]
+    fn data_key_distinguishes_width_height_and_format() {
+        let base = data_key(64, 64, ShaderFormat::R8);
+        assert_ne!(
+            base,
+            data_key(65, 64, ShaderFormat::R8),
+            "width must matter"
+        );
+        assert_ne!(
+            base,
+            data_key(64, 65, ShaderFormat::R8),
+            "height must matter"
+        );
+        assert_ne!(
+            base,
+            data_key(64, 64, ShaderFormat::Rgba8),
+            "format must matter",
+        );
+        assert_eq!(
+            base,
+            data_key(64, 64, ShaderFormat::R8),
+            "and it is deterministic",
+        );
+    }
+
+    /// **#1023 item 1 / #1020 review MEDIUM 1.** The data-upload journal
+    /// latch is keyed by shape, so a **second, differently shaped** refused
+    /// grid gets its own line instead of being swallowed by the first.
+    ///
+    /// Driven directly against [`WarnLatch::claim`] with [`data_key`]-shaped
+    /// keys — the same seam `the_compile_warning_latch_is_per_source_not_per_surface`
+    /// drives for `warned_compile` — because reaching the real call site
+    /// needs a GL context this crate's hermetic suite does not have; what is
+    /// under test here is the keying, which is exactly what the shipped bug
+    /// got wrong.
+    ///
+    /// **Falsified** by reverting `warned_data` to a bare `Cell<bool>` (i.e.
+    /// asking this test to drive `Cell<bool>::replace(true)` instead of
+    /// `WarnLatch::claim`): the "a second, DIFFERENT refused shape" assertion
+    /// goes red — that is the #1020-shipped behaviour this fixes.
+    #[test]
+    fn a_second_differently_shaped_refused_grid_still_gets_its_own_line() {
+        let mut latch = WarnLatch::default();
+
+        let a = data_key(64, 64, ShaderFormat::R8);
+        let b = data_key(128, 1, ShaderFormat::Rgba8);
+
+        assert!(latch.claim(a), "the first refused shape is reported");
+        for _ in 0..8 {
+            assert!(!latch.claim(a), "…and then goes quiet while it persists");
+        }
+        assert!(
+            latch.claim(b),
+            "a second, DIFFERENT refused shape must be reported, not swallowed \
+             (#1023 item 1; shipped as #1020's MEDIUM 1)",
+        );
+        assert!(!latch.claim(b), "…once");
+        assert!(!latch.claim(a), "and a, already reported, stays quiet");
+    }
+
+    // ── #1023 item 4: the refusal message describes what actually happens ──
+
+    /// The data-refusal message says the surface **keeps its last frame**,
+    /// not that it "draws nothing" — #1020's shipped wording, and #1020's
+    /// review LOW 3: the early return in `draw` happens before
+    /// `narrow_to_fit_rect`, the only thing that clears, so a refused upload
+    /// after at least one good frame leaves that frame on screen rather than
+    /// going blank.
+    ///
+    /// **Falsified** by reverting the message to #1020's "the widget draws
+    /// nothing until the plugin sends a grid this driver will take".
+    #[test]
+    fn the_data_refusal_message_says_the_last_frame_stays_not_that_nothing_draws() {
+        assert!(
+            DATA_UPLOAD_REFUSED.contains("keeps whatever it last successfully drew"),
+            "message must say the widget's last frame stays up: {DATA_UPLOAD_REFUSED:?}",
+        );
+        assert!(
+            !DATA_UPLOAD_REFUSED.contains("draws nothing"),
+            "must not claim the widget goes blank when the last frame is still showing: \
+             {DATA_UPLOAD_REFUSED:?}",
+        );
+    }
+
+    /// **PR #1031 review L2.** `draw`'s other two early-return arms —
+    /// resources-allocation failure and compile failure — return before
+    /// `narrow_to_fit_rect` exactly like the data-upload arm does, so
+    /// [`DATA_UPLOAD_REFUSED`]'s own reasoning for not claiming "draws
+    /// nothing" applies to them too. #1020 shipped both of them still
+    /// saying it, twenty-five and sixty lines from the site item 4 actually
+    /// fixed.
+    ///
+    /// **Falsified** by reverting either
+    /// [`RESOURCES_ALLOCATION_REFUSED`] or [`COMPILE_FAILURE_REFUSED`] to
+    /// #1020's wording ("… it draws nothing …" / "… the widget draws
+    /// nothing …").
+    #[test]
+    fn none_of_draws_three_early_return_messages_claim_the_widget_draws_nothing() {
+        for msg in [
+            DATA_UPLOAD_REFUSED,
+            RESOURCES_ALLOCATION_REFUSED,
+            COMPILE_FAILURE_REFUSED,
+        ] {
+            assert!(
+                !msg.contains("draws nothing"),
+                "none of draw()'s early-return arms may claim the widget draws nothing — \
+                 narrow_to_fit_rect (the only thing that clears) is never reached from any of \
+                 them (#1023 item 4; PR #1031 review L2): {msg:?}",
+            );
+            assert!(
+                msg.contains("keeps whatever it last successfully drew"),
+                "…and each should say what actually happens instead: {msg:?}",
+            );
+        }
+    }
+
+    // ── PR #1031 review M2: the key/warn composition, not just its halves ──
+
+    /// Count the `tracing` events this module emits while `emit` runs.
+    ///
+    /// A local twin of `gl_surface::tests::counting_events` /
+    /// `shader_map::tests::counting_events` — see either's longer doc for
+    /// why `tracing_core`'s per-callsite, process-wide `Interest` cache
+    /// makes this necessary at all.
+    ///
+    /// **The warm-up is unconditional, not conditional on today's test
+    /// roster** (PR #1031 review M1). It is true *right now* that nothing
+    /// else in this crate's suite reaches `hytte_ui::shader_surface`'s
+    /// `tracing::warn!` callsites — `draw` is their only production caller
+    /// and no test drives it, since this file has no `imp::tests`. That is
+    /// exactly the argument `gl_surface`'s twin made one round ago, and the
+    /// same round invalidated it by adding a `#[gtk::test]` that drives
+    /// `draw` on any machine with a driver: a subscriber-less first hit
+    /// caches `Interest::never()` for the callsite process-wide and blanks
+    /// the count here with `left: 0, right: 2` (#991/#1014/#1022). The
+    /// warm-up costs three lines and one silent `warn!`, and it makes the
+    /// helper correct regardless of what the next test in this file does.
+    fn counting_events(emit: impl FnOnce()) -> u32 {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        const TARGET: &str = "hytte_ui::shader_surface";
+        struct Counting(StdArc<AtomicU32>);
+        impl tracing::Subscriber for Counting {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                meta.target().starts_with(TARGET)
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+                tracing::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                if event.metadata().target().starts_with(TARGET) {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            fn enter(&self, _: &tracing::Id) {}
+            fn exit(&self, _: &tracing::Id) {}
+        }
+
+        // Warm-up: register this module's `warn!` callsites while no
+        // subscriber is installed, so the `Dispatch::new` below rebuilds
+        // their `Interest` against the counting one. See this function's doc.
+        warn_on_data_upload_failure(
+            &RefCell::new(WarnLatch::default()),
+            &state_with_data_size((0, 0)),
+            &hgl::Error::TextureSize {
+                size: (0, 0),
+                limit: 0,
+            },
+        );
+
+        let count = StdArc::new(AtomicU32::new(0));
+        tracing::subscriber::with_default(Counting(StdArc::clone(&count)), emit);
+        count.load(Ordering::Relaxed)
+    }
+
+    /// A minimal well-formed `ShaderState` for the composition test below.
+    fn state_with_data_size(data_size: (u32, u32)) -> ShaderState {
+        ShaderState {
+            fragment: Arc::from("void main() {}"),
+            data: Arc::from(&[0u8; 4][..]),
+            format: ShaderFormat::R8,
+            data_size,
+            scale: 1,
+            values: Vec::new(),
+        }
+    }
+
+    /// **PR #1031 review M2.** The refusal reaches `warned_data` and a real
+    /// journal line through [`warn_on_data_upload_failure`] — the exact
+    /// function `draw`'s data-upload arm calls, keyed by
+    /// [`data_upload_key`]'s translation of the real `ShaderState` the site
+    /// reads, not a constant and not `data_key`/`WarnLatch` exercised in
+    /// isolation by this file's other two tests.
+    ///
+    /// `hgl::Error` is constructed by hand rather than through a real
+    /// `Texture::new` refusal — the driver-refusal case itself still needs
+    /// real GL, but everything downstream of it, which is what item 1
+    /// actually fixed, does not, and this test needs no feature gate and no
+    /// display to run. Since the second fix round (review H1) this *is* the
+    /// whole reporting half: `upload_data` calls this and returns `None`, so
+    /// there is no `Result` and no skip-flag left at `draw`'s call site for
+    /// a one-line mutation to drop.
+    ///
+    /// **Falsified** by replacing [`data_upload_key`]'s body with a
+    /// constant (PR #1031 review's own mutation, translated to this now-
+    /// hoisted site — the original was `let key = 0_u64;` inline at the old
+    /// call site): the "a different shape must cost its own line" count
+    /// drops from 2 to 1. Also red on emptying this function's body.
+    #[test]
+    fn a_data_upload_failure_reaches_the_widgets_own_latch_and_journal_line() {
+        let latch = RefCell::new(WarnLatch::default());
+        let base = state_with_data_size((100_000, 1));
+        let different = state_with_data_size((100_001, 1));
+        let err = || hgl::Error::TextureSize {
+            size: (100_000, 1),
+            limit: 4096,
+        };
+
+        let emitted = counting_events(|| {
+            warn_on_data_upload_failure(&latch, &base, &err());
+            // A repeat of the SAME shape must not re-warn…
+            warn_on_data_upload_failure(&latch, &base, &err());
+            // …while a DIFFERENT one still earns its own line.
+            warn_on_data_upload_failure(&latch, &different, &err());
+        });
+        assert_eq!(
+            emitted, 2,
+            "a repeated refusal of the same shape must cost one journal line; a DIFFERENT \
+             refused shape must cost its own (#1023 item 1; PR #1031 review M2 — this drives \
+             the composition upload_data actually calls, not data_key/WarnLatch in isolation)",
+        );
+        assert_eq!(
+            latch.borrow().said.len(),
+            2,
+            "…and both shapes are latched, keyed by data_upload_key, so a later repeat of \
+             either stays quiet",
+        );
     }
 }

@@ -1263,6 +1263,50 @@ mod tests {
         );
     }
 
+    /// **`1×1` is accepted, on either axis of the shape check** (#1037
+    /// review, LOW-1) — the host mirror of the SDK's two positive assertions
+    /// in `the_sdk_refuses_a_zero_sided_grid_or_surface`
+    /// (`crates/hytte-plugin/src/shader.rs`): "1x1 grid over the default
+    /// 64x64 surface" and "1x1 surface over the default 1x1 grid". Neither
+    /// side had a host-side fixture proving `1` is the smallest *accepted*
+    /// side before #1037 — every existing test on this guard only ever
+    /// proved what gets refused.
+    ///
+    /// That gap matters because `refusal()`'s zero-side guard reads
+    /// `node.width == 0 || node.height == 0 || …` (`shader_map.rs:361`):
+    /// widening either surface disjunct from `== 0` to `<= 1` still refuses
+    /// every fixture `each_empty_grid_disjunct_is_refused_on_its_own` and
+    /// `a_zero_sided_node_is_refused` assert on (all of them are exactly `0`,
+    /// never `1`), so that widening shipped green everywhere else on this
+    /// guard.
+    ///
+    /// **Falsified** by widening `node.width == 0 || node.height == 0` to
+    /// `node.width <= 1 || node.height <= 1` in `refusal()`'s zero-side
+    /// guard: the `1x1 surface` assertion below goes red (refused instead of
+    /// accepted).
+    #[test]
+    fn a_1x1_grid_or_surface_is_accepted() {
+        // A 1×1 data grid (one R8 byte) over the default 144×48 surface.
+        let one_texel = [0u8];
+        let node = ok_node("void main() {}", &one_texel);
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            None,
+            "1x1 grid over a 144x48 surface",
+        );
+
+        // A 1×1 drawn surface over the default 4×1 data grid.
+        let strip = [0u8, 1, 2, 3];
+        let mut node = ok_node("void main() {}", &strip);
+        node.width = 1;
+        node.height = 1;
+        assert_eq!(
+            refusal(granted(), GlAvailability::Available, Arm::Gl, &node),
+            None,
+            "1x1 surface over a 4x1 grid",
+        );
+    }
+
     /// **The check order, where two refusals fire at once.** Mirrors the
     /// SDK's `empty_grid_sits_between_malformed_data_and_grid_too_large`
     /// (`crates/hytte-plugin/src/shader.rs`): `refusal()` is a chain of early

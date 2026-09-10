@@ -583,8 +583,6 @@ pub fn to_toml(grants: &[Grant]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write as _;
-
     use super::*;
 
     const SAMPLE: &str = "\
@@ -896,80 +894,87 @@ mod tests {
 
     /// The same inversion through the **public API only** — exactly what
     /// `apply_cmd` does for two `Cmd`s already buffered on the command lane:
-    /// no seam, no injected delay, the real `write_atomic`. Measured at
-    /// 16/100 on a 1-row table before the single-writer fix.
+    /// no seam, no injected delay, the real `write_atomic`. The reviewer
+    /// measured 16/100 this way on a 1-row table; the detached-save mutation
+    /// reproduces at 4–8/100 here.
     ///
-    /// The trials of one size run concurrently (each with its own store, dir
-    /// and file) rather than serially with a sleep each: it keeps the whole
-    /// test near a second instead of near a minute, and it makes the blocking
-    /// pool *busier*, which is the condition the inversion needs.
+    /// **One row, and one trial at a time, on purpose.** Both are load-bearing
+    /// for detection, and both were measured: batching the trials so the
+    /// blocking pool is busy takes the rate to *zero*, because the two writes
+    /// then each wait on a cold thread spawn in submission order — the
+    /// inversion needs a *warm idle* pool worker to steal the second write
+    /// while the first is still starting, which is what a serial trial leaves
+    /// behind. And the rate falls with table size (the reviewer's own table:
+    /// 16/100 at 1 row, 2/100 at 10, 0 at 200) because the `to_toml` that runs
+    /// synchronously under the borrow in the second `save` gives the first
+    /// write a head start. One row is both the highest-signal fixture and the
+    /// realistic size of a personal `grants.toml`.
     ///
-    /// Each file is seeded with a sentinel row that appears in neither
-    /// snapshot, so "no victim on disk" cannot be satisfied by a write that
-    /// never happened at all: phase 1 waits for every trial to leave the seed
-    /// (i.e. some snapshot landed), phase 2 then settles for a fixed window
-    /// so a *late* inverting write is caught rather than raced past.
+    /// Each file is seeded with a sentinel row that is in neither snapshot, so
+    /// "no victim on disk" can never be satisfied by a write that did not
+    /// happen at all; the settle between "a snapshot landed" and the verdict
+    /// is what makes the reading quiescent rather than a race against the
+    /// second write.
     #[tokio::test]
     async fn public_api_saves_never_land_out_of_order() {
         const TRIALS: usize = 100;
+        const ROWS: usize = 1;
         const SEED: &str = "[[grant]]\nagent = \"seed-sentinel\"\n\
                             datasource = \"departures\"\nscope = \"*\"\ndecision = \"deny\"\n";
-        const SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
 
-        let mut report = String::new();
-        let mut total = 0usize;
-        for rows in [1usize, 10, 200] {
-            let mut trials = Vec::with_capacity(TRIALS);
-            for _ in 0..TRIALS {
-                let dir = tempfile::tempdir().expect("tempdir");
-                let path = dir.path().join("grants.toml");
-                std::fs::write(&path, SEED).expect("seed");
-                let mut store = GrantStore::load(&path).expect("loads");
-                // Pre-populate without saving, so only the two calls below write.
-                store.grants = (0..rows)
-                    .map(|i| Grant::always(format!("agent-{i:05}"), "departures"))
-                    .collect();
+        let mut inversions = 0usize;
+        for _ in 0..TRIALS {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("grants.toml");
+            std::fs::write(&path, SEED).expect("seed");
+            let mut store = GrantStore::load(&path).expect("loads");
+            // Pre-populate without saving, so only the two calls below write.
+            store.grants = (0..ROWS)
+                .map(|i| Grant::always(format!("agent-{i:05}"), "departures"))
+                .collect();
 
-                store.grant_always("victim", "departures");
-                assert!(store.revoke("victim", "departures"));
-                // The store (and so the writer lane) stays alive, as it does
-                // in the broker, and so does the tempdir.
-                trials.push((dir, path, store));
-            }
+            store.grant_always("victim", "departures");
+            assert!(store.revoke("victim", "departures"));
 
-            // Phase 1 — every trial's write has landed (left the seed).
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            loop {
-                let landed = trials
-                    .iter()
-                    .filter(|(_, path, _)| {
-                        !on_disk(path).iter().any(|g| g.agent == "seed-sentinel")
-                    })
-                    .count();
-                if landed == TRIALS {
-                    break;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "{rows} rows: only {landed}/{TRIALS} saves ever reached disk",
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-            // Phase 2 — settle, so an inverting write that lands late is seen.
+            // Wait for *a* snapshot to land (the seed row is in neither, so
+            // this cannot be satisfied by a store that never wrote at all),
+            // then settle, so a *late* inverting write is seen rather than
+            // raced past.
+            await_landed(&path, "seed-sentinel", false).await.expect(
+                "neither save reached disk within 2s — this trial cannot tell \
+                         ordering from a store that never wrote at all",
+            );
             tokio::time::sleep(SETTLE).await;
-
-            let inversions = trials
-                .iter()
-                .filter(|(_, path, _)| on_disk(path).iter().any(|g| g.agent == "victim"))
-                .count();
-            total += inversions;
-            writeln!(report, "{rows} rows: {inversions}/{TRIALS} inverted")
-                .expect("writing to a String cannot fail");
+            // An inversion is permanent — nothing re-writes the file — so the
+            // deadline here separates "the older snapshot won" from "the
+            // newer one just hasn't been written yet on a loaded machine".
+            if await_landed(&path, "victim", false).await.is_err() {
+                inversions += 1;
+            }
         }
         assert_eq!(
-            total, 0,
-            "revoked grant survives on disk after the revoke:\n{report}"
+            inversions, 0,
+            "{inversions}/{TRIALS} revokes left the revoked grant on disk: an Allow and a \
+             Revoke applied back to back (what `apply_cmd` does for two `Cmd`s already \
+             buffered on the lane) completed out of order, and the pre-revoke snapshot \
+             stands — the grant comes back at the next broker restart",
         );
+    }
+
+    /// Poll `path` until `agent`'s presence in the on-disk snapshot is
+    /// `want`, or 2 s pass. `Err` means it never got there.
+    async fn await_landed(path: &Path, agent: &str, want: bool) -> Result<(), ()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if on_disk(path).iter().any(|g| g.agent == agent) == want {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
     }
 
     /// Read and parse `path`, treating an unreadable/unparseable file as

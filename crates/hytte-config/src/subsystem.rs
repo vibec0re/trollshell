@@ -840,6 +840,25 @@ fn patch(
 /// user's only remaining line is a marker; the cost of the other choice is
 /// silent data loss, so it is not close.
 ///
+/// **What (2) preserves, precisely: the bytes, not the field's `None`.** The
+/// marker, its comment and the keys the schema does not know survive the save,
+/// and the keys the schema *does* own are gone and stay gone — that much is
+/// pinned. The `Option` field's own `None`-ness does **not** survive a reload:
+/// plain `serde` reads `Option<T>` as `None` only when the key is entirely
+/// absent, and keeping the table for the user's lines is exactly what stops it
+/// being absent. So `assemble` hands back `Some(<per-field defaults>)` — and
+/// per-*field* `#[serde(default)]` means the field type's default, not the
+/// struct's `Default` impl, so a save after that reload writes
+/// `brightness = 0, color = ""` into the file rather than the documented
+/// defaults. `an_erased_optional_table_kept_for_the_users_keys_reloads_as_some_defaults_today`
+/// pins that as it behaves now, honestly and without `#[ignore]`.
+///
+/// Fixing it is a **reader** question, not a writer one — "a table with no
+/// schema-owned key in it reads as absent for that layer" — which is why it is
+/// **#1025** and not a patch to this function. Until that lands, an
+/// `Option<Table>` field is a shape a subsystem author should reach for knowing
+/// this.
+///
 /// # Errors
 /// [`ConfigError::Encode`] when `existing` is not valid TOML — refusing rather
 /// than replacing bytes we cannot account for — or when `value` does not
@@ -1989,6 +2008,60 @@ kept = true
                 "whichever end the schema's key sat at: {existing:?}"
             );
         }
+    }
+
+    /// **#1025, current behaviour.** What shape 2 preserves is the *bytes*, not
+    /// the field's `None`. Keeping the table for the user's marker is exactly
+    /// what stops the key being absent, and plain `serde` reads `Option<T>` as
+    /// `None` only when it is — so the reload after the save hands back
+    /// `Some(…)`, and because per-*field* `#[serde(default)]` uses the field
+    /// type's default rather than `Core`'s own `Default` impl, the values are
+    /// `0`/`""`/`[]` rather than the documented `3`/`"amber"`. The save after
+    /// *that* writes them into the file.
+    ///
+    /// Closing the loop is what makes this visible: every other round-trip test
+    /// here hand-builds the "after" value, so none of them ever asks what a
+    /// reload of what was just written actually says.
+    ///
+    /// #1025 flips this — a table with no schema-owned key in it reads as
+    /// absent for that layer — and the assertions below become `None` and a
+    /// fixed point. It is a reader rule, not a writer one, which is why it is
+    /// not fixed here. Red under exactly that mutation to `assemble`.
+    #[test]
+    fn an_erased_optional_table_kept_for_the_users_keys_reloads_as_some_defaults_today() {
+        let existing = "enabled = true\ncore = { _unset = [\"label\"], brightness = 7 }\n";
+
+        let erased = OptTable {
+            enabled: true,
+            core: None,
+        };
+        let saved = render_overlay(existing, &erased).expect("renders");
+        assert_eq!(
+            saved, "enabled = true\ncore = { _unset = [\"label\"] }\n",
+            "the bytes half holds: the marker stays, the schema's key goes"
+        );
+
+        let reloaded = assemble::<OptTable>(&layers(&[&saved]))
+            .expect("reloads")
+            .config;
+        let core = reloaded
+            .core
+            .as_ref()
+            .expect("#1025 will flip this to `None`: the table is still there");
+        assert_eq!(
+            (core.brightness, core.color.as_str(), core.palette.len()),
+            (0, "", 0),
+            "#1025 will flip this too — and note these are the *field* types' \
+             defaults, not Core::default()'s 3/\"amber\""
+        );
+
+        let again = render_overlay(&saved, &reloaded).expect("renders again");
+        assert_eq!(
+            again,
+            "enabled = true\ncore = { _unset = [\"label\"], brightness = 0, color = \"\", palette = [] }\n",
+            "#1025 will flip this to a fixed point; today the second save writes \
+             the degenerate values back"
+        );
     }
 
     // ── #1008: a marker that names nothing is said out loud ─────────────────

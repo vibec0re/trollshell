@@ -323,24 +323,31 @@ fn build_region(
 /// siblings only exist inside a container, never at its root.
 ///
 /// `Revealer` and `Expander` are the other deliberate non-recursion, on top of
-/// the leaf carve-out above: both are single-mandatory-child variants exactly
-/// like `Scrolled`, but neither gets a recursing arm here, so
-/// `Revealer { open: true, child: Row { children: vec![] } }` and
-/// `Expander { children: vec![], .. }` both fall through to `_ => false` no
-/// matter what their child(ren) contain — see [`gtk_tests`]'s
-/// `an_open_revealer_over_an_empty_child_is_not_hidden` and
+/// the leaf carve-out above. `Revealer` **is** a single-mandatory-child
+/// variant exactly like `Scrolled`; `Expander` is a different shape — it
+/// carries both a `header` node and a `children` list, not one mandatory
+/// child (#1051 review, INFO-1, correcting an earlier revision of this doc
+/// that described it as `Scrolled`-shaped). Neither gets a recursing arm
+/// here, so `Revealer { open: true, child: Row { children: vec![] } }` and
+/// `Expander { header: Row { children: vec![] }, children: vec![], .. }`
+/// both fall through to `_ => false` no matter what their header/child(ren)
+/// contain — see [`gtk_tests`]'s `an_open_revealer_over_an_empty_child_is_not_hidden`,
+/// `a_closed_revealer_over_an_empty_child_is_not_hidden`, and
 /// `an_expander_with_no_children_is_not_hidden`, which pin exactly this. A
 /// *closed* `Revealer` needs the non-recursion: GTK is mid-collapse-animation,
 /// and cutting its allocation out from under a transition it's still running
 /// would visibly jump, so the root must stay laid out even over an empty
 /// child regardless of what's inside it. An *open* `Revealer` has no such
 /// excuse — nothing is animating — and neither does `Expander`, whose header
-/// button paints unconditionally. Both are a remaining "renders nothing but
-/// nubs" spelling the #1039/#1042 sweep didn't close. Left alone rather than
-/// fixed: no in-tree plugin renders an open `Revealer` or an `Expander` over
-/// empty content today, and closing it would mean reasoning about `open`/
-/// `expanded` here, not just adding a recursing arm like `Scrolled`'s
-/// (#1042 review, informational).
+/// button paints unconditionally regardless of what its `header` node
+/// contains — the disclosure chevron is appended to the header box after it,
+/// unconditionally (`crates/hytte-ui/src/widget_tree.rs`'s `Node::Expander`
+/// arm). Both are a remaining "renders nothing but nubs" spelling the
+/// #1039/#1042 sweep didn't close. Left alone rather than fixed: no in-tree
+/// plugin renders an open or closed `Revealer`, or an `Expander`, over empty
+/// content today, and closing it would mean reasoning about `open`/`expanded`
+/// here, not just adding a recursing arm like `Scrolled`'s (#1042 review,
+/// informational).
 ///
 /// Decided off the **wire** node the plugin actually sent, not the mapped
 /// `hytte_ui::Node` [`to_ui_node`] produces: the mapper can drop content under
@@ -1305,14 +1312,24 @@ mod gtk_tests {
     /// left hidden by a stale flag.
     ///
     /// **Deletion check:** inverting the assignment (`!root_renders_nothing(…)`
-    /// swapped to `root_renders_nothing(…)`) turns this test red — and, since
-    /// that test's fixture now has a busy sibling,
-    /// [`an_empty_tree_root_hides_the_card_and_contributes_no_width`] goes red
-    /// too (its own `is_visible()` assertion fails, because the empty card now
-    /// shows and the busy one hides). An earlier version of this doc claimed
-    /// the other test stayed **green** under the same mutation; measured, it
-    /// doesn't — coverage here is better than that claim, not worse, but the
-    /// claim itself was wrong and is corrected (#1042 review, LOW-2).
+    /// swapped to `root_renders_nothing(…)`) turns this test red — and it is
+    /// far from alone: `has_content` backs every card's own visibility flag,
+    /// so measured, this one-line inversion reddens 8 of this module's 40
+    /// `#[gtk::test]`s, this one included (`32 passed; 8 failed`) —
+    /// [`an_empty_tree_root_hides_the_card_and_contributes_no_width`] among
+    /// them (its own `is_visible()` assertion fails, because the empty card
+    /// now shows and the busy one hides), but also every other test that
+    /// asserts a real-content card is visible or an empty-tree/`Spacer`/
+    /// `Revealer`/`Expander` one is not (`a_leaf_root_with_empty_text_is_not_hidden`,
+    /// `a_nested_container_root_with_real_content_is_not_hidden`,
+    /// `an_expander_with_no_children_is_not_hidden`,
+    /// `an_open_revealer_over_an_empty_child_is_not_hidden`,
+    /// `a_closed_revealer_over_an_empty_child_is_not_hidden`, and
+    /// `one_plugins_empty_tree_does_not_affect_a_sibling_cards_visibility`).
+    /// An earlier version of this doc claimed only one other test went red;
+    /// measured, coverage here is far broader than that claim, not narrower,
+    /// but the claim itself was wrong and is corrected (#1042 review, LOW-2;
+    /// re-measured and the exact count named per #1051 review, INFO-2).
     #[gtk::test]
     fn a_later_render_with_content_shows_the_card_again() {
         adw::init().expect("libadwaita init");
@@ -1615,11 +1632,19 @@ mod gtk_tests {
     /// #1051: same deliberate non-recursion as
     /// [`an_open_revealer_over_an_empty_child_is_not_hidden`], for `Expander` —
     /// its header always paints a button (with a disclosure chevron)
-    /// regardless of `children`, so an expander with none is not hidden
-    /// either. Pinned for the same reason.
+    /// regardless of `header`/`children`, so an expander with an EMPTY header
+    /// and no children is still not hidden. Pinned for the same reason.
     ///
-    /// **Not a deletion check.** Mutation: adding a
-    /// `wire::Node::Expander { children, .. } if children.is_empty() => true`
+    /// **Not a deletion check.** The header below is deliberately an empty
+    /// container, not the non-empty `Label` an earlier revision of this test
+    /// used (#1051 review, LOW-1): with a non-empty header, this test stayed
+    /// green even against a realistic fix that mirrors `Scrolled` and
+    /// recurses into BOTH `header` and `children` — that arm short-circuits
+    /// on the non-empty header alone, so only a strawman arm that ignores
+    /// `header` entirely (`wire::Node::Expander { children, .. } if
+    /// children.is_empty() => true`) was ever caught. With an empty header,
+    /// mutation: adding a `wire::Node::Expander { header, children, .. } =>
+    /// root_renders_nothing(header) && children.iter().all(root_renders_nothing)`
     /// arm turns this red.
     #[gtk::test]
     fn an_expander_with_no_children_is_not_hidden() {
@@ -1630,7 +1655,7 @@ mod gtk_tests {
 
         let tree = wire::Node::Expander {
             id: "root".to_owned(),
-            header: Box::new(leaf_label_tree("header", "hi")),
+            header: Box::new(empty_row_tree("header")),
             children: vec![],
             expanded: true,
             classes: vec![],
@@ -1645,8 +1670,45 @@ mod gtk_tests {
 
         assert!(
             cards.borrow()[0].root.is_visible(),
-            "an Expander with no children still paints its header button — current \
-             behaviour, pinned so changing it is a deliberate decision",
+            "an Expander with an empty header and no children still paints its header \
+             button — current behaviour, pinned so changing it is a deliberate decision",
+        );
+    }
+
+    /// #1051 review, LOW-2: the doc above states a *closed* `Revealer` needs
+    /// its own non-recursion — GTK is mid-collapse-animation, and cutting its
+    /// allocation out from under a transition it's still running would
+    /// visibly jump — but only the *open* case
+    /// ([`an_open_revealer_over_an_empty_child_is_not_hidden`]) had a test.
+    /// Pins the closed case too, so the doc's claim is backed by a test.
+    ///
+    /// **Not a deletion check** — there's nothing to delete; this pins
+    /// current behaviour, like its open-`Revealer` sibling. Mutation: adding
+    /// a `wire::Node::Revealer { open: false, child, .. } =>
+    /// root_renders_nothing(child)` arm turns this red.
+    #[gtk::test]
+    fn a_closed_revealer_over_an_empty_child_is_not_hidden() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let tree = wire::Node::Revealer {
+            id: Some("root".to_owned()),
+            open: false,
+            child: Box::new(empty_row_tree("inner")),
+        };
+        reconcile_region(
+            &container,
+            &cards,
+            &[render_with_tree("revealer", &tx, tree)],
+            "ts-plugin-chip",
+        );
+
+        assert!(
+            cards.borrow()[0].root.is_visible(),
+            "a closed Revealer over an empty child stays laid out — current behaviour \
+             (mid-collapse-animation), pinned so changing it is a deliberate decision",
         );
     }
 

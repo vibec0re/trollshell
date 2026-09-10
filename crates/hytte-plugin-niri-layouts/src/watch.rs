@@ -531,7 +531,7 @@ pub(crate) struct SocketEvents {
     /// The line being assembled. **Not cleared between polls**: a timed-out
     /// `read_line` keeps whatever bytes had already arrived appended here, and
     /// dropping them would corrupt the next event rather than lose an idle tick.
-    line: String,
+    line: Vec<u8>,
 }
 
 impl SocketEvents {
@@ -582,7 +582,7 @@ impl SocketEvents {
             .map_err(|e| format!("cannot arm the read timeout: {e}"))?;
         Ok(Self {
             reader,
-            line: String::new(),
+            line: Vec::new(),
         })
     }
 }
@@ -598,16 +598,16 @@ fn timed_out(e: &io::Error) -> bool {
 
 impl EventSource for SocketEvents {
     fn next_event(&mut self) -> Incoming {
-        match self.reader.read_line(&mut self.line) {
+        match self.reader.read_until(b'\n', &mut self.line) {
             Ok(0) => Incoming::Ended("niri closed the event stream".to_owned()),
             Ok(_) => {
-                if !self.line.ends_with('\n') {
-                    // `read_line` only returns `Ok` without the delimiter at end
-                    // of stream, so this is a truncated final event.
+                if !self.line.ends_with(b"\n") {
+                    // `read_until` only returns `Ok` without the delimiter at
+                    // end of stream, so this is a truncated final event.
                     return Incoming::Ended("niri closed the event stream mid-event".to_owned());
                 }
                 let line = std::mem::take(&mut self.line);
-                match serde_json::from_str::<Event>(&line) {
+                match serde_json::from_slice::<Event>(&line) {
                     Ok(event) => Incoming::Event(Box::new(event)),
                     Err(e) => Incoming::Ended(format!("cannot decode a niri event: {e}")),
                 }
@@ -621,12 +621,12 @@ impl EventSource for SocketEvents {
 #[cfg(test)]
 mod tests {
     use super::{
-        BACKOFF_CEILING, Backend, EventSource, Incoming, MIN_WINDOWS, POLL_INTERVAL, SocketBackend,
-        SocketEvents, Verdicts, Watch, backoff, drive,
+        BACKOFF_CEILING, Backend, EventSource, HANDSHAKE_TIMEOUT, Incoming, MIN_WINDOWS,
+        POLL_INTERVAL, SocketBackend, SocketEvents, Verdicts, Watch, backoff, drive,
     };
     use niri_ipc::{Event, Window, WindowLayout, Workspace};
     use std::collections::VecDeque;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
@@ -1468,6 +1468,75 @@ mod tests {
         niri.join().expect("the fake niri thread");
     }
 
+    /// A read timeout landing **inside** a multi-byte UTF-8 character must not
+    /// drop the connection (#1053, #1038 review LOW-9).
+    ///
+    /// [`BufReader::read_line`] validates UTF-8 on every call and silently
+    /// truncates a partial sequence at the end of what it just read — so the
+    /// sibling test above, which cuts on an ASCII boundary, only pins half the
+    /// invariant. [`SocketEvents`] reads bytes (`read_until`/`from_slice`)
+    /// precisely so a split like this one is invisible to it: the buffer holds
+    /// raw bytes across the tick, and the whole line is decoded only once it is
+    /// complete.
+    #[test]
+    fn an_event_split_inside_a_utf8_char_still_decodes() {
+        let mut w = window(7, Some(1));
+        w.title = Some("caf\u{e9} \u{2014} Mozilla Firefox".to_owned());
+        let json =
+            serde_json::to_string(&Event::WindowOpenedOrChanged { window: w }).expect("encode");
+        // Between the two bytes of 'é' — cutting here is the whole point.
+        let cut = json.find('\u{e9}').expect("the accent is in the title") + 1;
+        let mut bytes = json.into_bytes();
+        bytes.push(b'\n');
+        let tail = bytes.split_off(cut);
+        let head = bytes;
+
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+
+        let niri = std::thread::spawn(move || {
+            let mut reader = BufReader::new(theirs.try_clone().expect("clone"));
+            let mut request = String::new();
+            reader.read_line(&mut request).expect("a request line");
+            let mut writer = &theirs;
+            writer
+                .write_all(b"{\"Ok\":\"Handled\"}\n")
+                .expect("the reply");
+            // Half of 'é', then a silence longer than one poll tick, then the
+            // rest of the event.
+            writer.write_all(&head).expect("the first half, cut mid-é");
+            std::thread::sleep(POLL_INTERVAL * 2);
+            writer.write_all(&tail).expect("the second half");
+            std::thread::sleep(POLL_INTERVAL);
+        });
+
+        let mut events = SocketEvents::over(ours).expect("the handshake completes");
+        let mut ticks = 0;
+        let decoded = loop {
+            match events.next_event() {
+                Incoming::Idle => {
+                    ticks += 1;
+                    assert!(ticks < 20, "the second half never arrived");
+                }
+                other => break other,
+            }
+        };
+
+        assert!(ticks >= 1, "the split has to straddle at least one tick");
+        match decoded {
+            Incoming::Event(e) => match *e {
+                Event::WindowOpenedOrChanged { window } => assert_eq!(
+                    window.title.as_deref(),
+                    Some("caf\u{e9} \u{2014} Mozilla Firefox"),
+                    "the title must survive whole, not truncated at the split"
+                ),
+                other => panic!("wrong event: {other:?}"),
+            },
+            other => panic!("the halves were reassembled, not dropped: {other:?}"),
+        }
+
+        niri.join().expect("the fake niri thread");
+    }
+
     // ── the hand-rolled framing (#1038) ──────────────────────────────────────
 
     /// The bytes this module puts on `$NIRI_SOCKET`, pinned as **literals**
@@ -1528,6 +1597,150 @@ mod tests {
                      hangs off this tick",
         );
         assert!(idled, "a timed-out read is an idle tick, not a dead stream");
+
+        niri.join().expect("the fake niri thread");
+    }
+
+    // ── three delete-green framing mechanisms (#1053, #1038 review LOW-10) ───
+    //
+    // The review found these survived deletion with the suite still green:
+    // the handshake timeout, the write half-close, and the truncated-tail
+    // guard. One test each, each red when its mechanism is removed.
+
+    /// The handshake timeout (`watch.rs`'s [`HANDSHAKE_TIMEOUT`]): a niri that
+    /// accepts the connection and then never answers `EventStream` is exactly
+    /// the "wedged, not busy" case the timeout exists for. Without it,
+    /// [`SocketEvents::over`] would park in `read_line` forever — the same
+    /// thread leak HIGH-2 fixed for a dead *session*, but for a dead *dial*.
+    ///
+    /// Run over a channel with a bounded `recv_timeout` rather than a bare
+    /// call: if the timeout is deleted, `over` really does hang, and this
+    /// must fail the one test that says so instead of hanging the whole
+    /// binary.
+    #[test]
+    fn a_niri_that_never_answers_the_handshake_times_out() {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+
+        // Hold the peer open well past the deadline (rather than dropping it
+        // immediately) so a missing timeout would see a live, silent socket —
+        // not an EOF standing in for one.
+        std::thread::spawn(move || {
+            std::thread::sleep(HANDSHAKE_TIMEOUT * 4);
+            drop(theirs);
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Deliberately not joined: if the mechanism is gone this thread parks
+        // forever, and it must not take the test binary down with it.
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let result = SocketEvents::over(ours);
+            let _ = tx.send((result.is_err(), started.elapsed()));
+        });
+
+        let (failed, elapsed) = rx
+            .recv_timeout(HANDSHAKE_TIMEOUT * 2)
+            .expect("the handshake must give up within HANDSHAKE_TIMEOUT, not park forever");
+
+        assert!(failed, "no reply ever comes, so the handshake must fail");
+        assert!(
+            elapsed < HANDSHAKE_TIMEOUT * 2,
+            "gave up after {elapsed:?}, past the {HANDSHAKE_TIMEOUT:?} deadline plus margin"
+        );
+    }
+
+    /// The write half-close after the handshake: [`SocketEvents`] never writes
+    /// to niri again once it starts streaming, and shutting down the write
+    /// side lets niri reap that half of the connection rather than holding it
+    /// open forever expecting more requests.
+    #[test]
+    fn the_handshake_half_closes_the_write_side() {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let niri = std::thread::spawn(move || {
+            // Bounded, so a missing half-close times out here instead of
+            // blocking this thread (and the test) forever.
+            theirs
+                .set_read_timeout(Some(POLL_INTERVAL * 4))
+                .expect("arm a bounded read");
+            let mut request = String::new();
+            {
+                let mut reader = BufReader::new(&theirs);
+                reader.read_line(&mut request).expect("a request line");
+            }
+            let mut writer = &theirs;
+            writer
+                .write_all(b"{\"Ok\":\"Handled\"}\n")
+                .expect("the reply");
+
+            // A real half-close delivers EOF (`Ok(0)`) here; a missing one
+            // blocks until the bounded timeout above fires and errors instead.
+            let mut buf = [0_u8; 8];
+            let outcome: std::io::Result<bool> = (&theirs).read(&mut buf).map(|n| n == 0);
+            let _ = tx.send(outcome);
+        });
+
+        // Held alive for the whole test: dropping it would close `ours`
+        // outright, which would deliver the peer its own EOF regardless of
+        // whether the half-close under test ever ran.
+        let _events = SocketEvents::over(ours).expect("the handshake completes");
+
+        let saw_eof = rx
+            .recv_timeout(POLL_INTERVAL * 8)
+            .expect("the peer thread must report back")
+            .expect("the read must not itself error out (a missing half-close times out)");
+        assert!(
+            saw_eof,
+            "the write half must be closed so niri sees EOF, not silence"
+        );
+
+        niri.join().expect("the fake niri thread");
+    }
+
+    /// The truncated-tail guard: a stream that ends mid-line — a complete,
+    /// individually-valid JSON value, but with no trailing newline because the
+    /// connection died right after — must not be decoded as a real event. The
+    /// framing contract is one JSON value per *line*; without the guard,
+    /// `serde_json` happily parses the bytes anyway, since a JSON object needs
+    /// no trailing separator to be complete.
+    #[test]
+    fn a_stream_that_ends_mid_line_is_not_parsed_as_an_event() {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+
+        let niri = std::thread::spawn(move || {
+            let mut reader = BufReader::new(theirs.try_clone().expect("clone"));
+            let mut request = String::new();
+            reader.read_line(&mut request).expect("a request line");
+            let mut writer = &theirs;
+            writer
+                .write_all(b"{\"Ok\":\"Handled\"}\n")
+                .expect("the reply");
+            // A complete JSON value, but no trailing newline — then the
+            // connection closes (both `theirs` and its clone drop here).
+            writer
+                .write_all(b"{\"WindowClosed\":{\"id\":7}}")
+                .expect("the body, no newline");
+        });
+
+        let mut events = SocketEvents::over(ours).expect("the handshake completes");
+        let mut ticks = 0;
+        let outcome = loop {
+            match events.next_event() {
+                Incoming::Idle => {
+                    ticks += 1;
+                    assert!(ticks < 20, "the tail never arrived");
+                }
+                other => break other,
+            }
+        };
+
+        assert!(
+            matches!(outcome, Incoming::Ended(_)),
+            "a stream that ends before its trailing newline must not be read \
+             as a completed event, even though the bytes alone would parse: \
+             {outcome:?}"
+        );
 
         niri.join().expect("the fake niri thread");
     }

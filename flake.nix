@@ -478,6 +478,8 @@
               # inherited by the child process either way.
               preCheck = ''
                 export HOME="$(mktemp -d)"
+                export XDG_DATA_DIRS="${pkgs.adwaita-icon-theme}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+                export TROLLSHELL_REQUIRE_ICON_THEME=1
               '';
               checkPhaseCargoCommand = ''
                 xvfb-run -a cargo test --workspace --locked --features system-tests

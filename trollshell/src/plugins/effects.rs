@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use hytte::gtk::gio;
 use hytte::services::{mpris, niri, notifications, pipewire, systemd};
 use hytte_plugin_proto::{
     AudioAction, Effect, EffectOutcome, HostMsg, MediaAction, NiriAction, Page,
@@ -26,7 +27,9 @@ use super::datasource::DatasourceRouter;
 /// (→ a spawned `argv`, its outcome routed back as [`HostMsg::EffectResult`], #510 —
 /// or, with `detached: true`, a program handed to the systemd user manager so it
 /// outlives the shell, #953), [`Effect::RequestConsent`] (→ the interactive consent
-/// overlay, #487) and the two datasource legs (#509).
+/// overlay, #487), the two datasource legs (#509) and [`Effect::OpenUri`] (→ the
+/// desktop's default handler for a host-validated `http`/`https`/`file` URI, its
+/// outcome routed back like `RunCommand`'s, #1045).
 ///
 /// The match is **exhaustive over the effect vocabulary** — there is no catch-all
 /// (#648). The three compositor/media/audio variants were declared, cap-gated and
@@ -46,9 +49,10 @@ use super::datasource::DatasourceRouter;
 ///
 /// `outbound` is the producing connection's host→plugin channel, used by the
 /// **two-way** effects to route a reply back to this plugin: the human's decision
-/// for [`Effect::RequestConsent`] as a [`HostMsg::ConsentDecision`] (#487), and the
-/// command outcome for [`Effect::RunCommand`] as a [`HostMsg::EffectResult`] (#510).
-/// The one-way effects ignore it.
+/// for [`Effect::RequestConsent`] as a [`HostMsg::ConsentDecision`] (#487), the
+/// command outcome for [`Effect::RunCommand`] as a [`HostMsg::EffectResult`] (#510),
+/// and the launch-or-refusal verdict for [`Effect::OpenUri`] as the same
+/// [`HostMsg::EffectResult`] (#1045). The one-way effects ignore it.
 ///
 /// `datasource` is the host's cross-connection [`DatasourceRouter`] (#509): unlike
 /// the two-way effects above (whose reply routes back to the *same* connection via
@@ -254,6 +258,20 @@ pub(super) fn broker_effect(
             // was routed to — `plugin_id` is that identity check.
             tracing::info!(plugin = %plugin_id, request_id = *request_id, "plugin effect: DatasourceResult");
             datasource.deliver_result(*request_id, plugin_id.to_owned(), outcome.clone());
+        }
+        Effect::OpenUri { id, uri } => {
+            // #1045: hand the URI to the desktop's default handler, the same
+            // call the shell's own screenshot/recording toasts use. Reaching
+            // here means the plugin holds `Capability::OpenUri` — a narrower
+            // grant than `RunCommand`, which is the whole point of the variant:
+            // #963's agents card could show a URL but not open it without
+            // asking for arbitrary argv execution.
+            //
+            // Unlike `RunCommand` this is NOT offloaded to the tokio runtime.
+            // `launch_default_for_uri` is a GLib call, and the broker is already
+            // on the GTK main thread — which is exactly where `main.rs`'s Open
+            // actions make the same call. Only the reply hops to the runtime.
+            broker_open_uri(plugin_id, *id, uri, outbound);
         }
     }
 }
@@ -557,6 +575,237 @@ fn command_outcome(success: bool, stdout: &[u8]) -> EffectOutcome {
         ok: success,
         output,
     }
+}
+
+// ── OpenUri (#1045) ──────────────────────────────────────────────────────────
+//
+// "Open this link" used to mean `Effect::RunCommand`, i.e. arbitrary argv as the
+// user, because that was the only effect that could start anything. #963's
+// agents card is what made the cost visible: it renders an `agent page https://…`
+// row, and turning that row into a button would have cost the plugin the
+// highest-trust capability in the vocabulary for a job the desktop already does.
+//
+// So the host takes the URI instead of a command line. The plugin names a
+// destination, the host validates its scheme, and `gio::AppInfo::launch_default_for_uri`
+// — the same call `main.rs`'s screenshot/recording Open actions use — resolves
+// the handler. There is no argv anywhere on this path.
+
+/// The URI schemes the host will open for a plugin (#1045).
+///
+/// Deliberately short. `http`/`https` is the motivating case (#963's agent page)
+/// and `file` is the one the shell itself already opens for its own toasts. Every
+/// other scheme is refused rather than passed through, so `Capability::OpenUri`
+/// means what its name says and cannot be re-aimed at some unrelated protocol
+/// handler.
+///
+/// This is **host policy, not wire vocabulary** — widening it (Annika flagged
+/// `mailto:` as an open question on #1045) is a change here alone, with no proto
+/// bump and no plugin rebuild.
+const ALLOWED_URI_SCHEMES: [&str; 3] = ["http", "https", "file"];
+
+/// Cap on a plugin-supplied URI (bytes, #1045). Far above any real link; it
+/// exists so a runaway plugin cannot push a multi-megabyte string (the frame cap
+/// is 16 MiB) through a `tracing` line and into the journal.
+const MAX_URI_BYTES: usize = 4096;
+
+/// Why the host refused to open a plugin-supplied URI (#1045). Carried into the
+/// [`EffectOutcome::output`] the plugin gets back, so a refusal is something it
+/// can toast rather than a click that silently does nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum UriRefusal {
+    /// Empty, or whitespace only.
+    Empty,
+    /// Longer than [`MAX_URI_BYTES`].
+    TooLong(usize),
+    /// Contains an ASCII control character (a newline, or — the reason this is
+    /// checked at all rather than left to GLib — an interior NUL, which cannot
+    /// survive the `&str` → C string conversion the launcher does).
+    Control,
+    /// No RFC 3986 scheme at all (`example.com/x`, `://x`, `1http:x`).
+    NoScheme,
+    /// A well-formed scheme outside [`ALLOWED_URI_SCHEMES`].
+    Scheme(String),
+}
+
+impl UriRefusal {
+    /// The human-readable reason, returned to the plugin as
+    /// [`EffectOutcome::output`] and logged with the refusal.
+    fn reason(&self) -> String {
+        let allowed = ALLOWED_URI_SCHEMES.join("/");
+        match self {
+            UriRefusal::Empty => "refused: empty URI".to_owned(),
+            UriRefusal::TooLong(len) => {
+                format!("refused: URI is {len} B, over the {MAX_URI_BYTES} B cap")
+            }
+            UriRefusal::Control => {
+                "refused: URI contains a control character".to_owned()
+            }
+            UriRefusal::NoScheme => {
+                format!("refused: no URI scheme ({allowed} only)")
+            }
+            UriRefusal::Scheme(scheme) => {
+                format!("refused: scheme \"{scheme}\" is not openable ({allowed} only)")
+            }
+        }
+    }
+}
+
+/// The RFC 3986 scheme of `uri`, or `None` if it has none.
+///
+/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` followed by `:`. Written
+/// out rather than `uri.split(':').next()` because that would call the `"  https"`
+/// in a leading-whitespace string, or the `"1"` in `1http:x`, a scheme — and a
+/// permissive parser in front of an allow-list is how an allow-list gets bypassed.
+fn uri_scheme(uri: &str) -> Option<&str> {
+    let (scheme, _rest) = uri.split_once(':')?;
+    let mut chars = scheme.chars();
+    if !chars.next()?.is_ascii_alphabetic() {
+        return None;
+    }
+    chars
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        .then_some(scheme)
+}
+
+/// The host's policy on a plugin-supplied URI (#1045): `Ok(scheme)` for one it
+/// will open, `Err(refusal)` otherwise.
+///
+/// Pure, so the whole table — including the cases that would otherwise need a
+/// browser to observe — is unit-testable. Scheme comparison is
+/// ASCII-case-insensitive because RFC 3986 says schemes are (`HTTPS://x` is the
+/// same destination as `https://x`); everything else about the URI is left to
+/// the handler, since the host has no better idea than the desktop does what a
+/// valid path or query looks like.
+pub(super) fn check_uri(uri: &str) -> Result<&str, UriRefusal> {
+    if uri.trim().is_empty() {
+        return Err(UriRefusal::Empty);
+    }
+    if uri.len() > MAX_URI_BYTES {
+        return Err(UriRefusal::TooLong(uri.len()));
+    }
+    if uri.chars().any(char::is_control) {
+        return Err(UriRefusal::Control);
+    }
+    let Some(scheme) = uri_scheme(uri) else {
+        return Err(UriRefusal::NoScheme);
+    };
+    if ALLOWED_URI_SCHEMES
+        .iter()
+        .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+    {
+        Ok(scheme)
+    } else {
+        Err(UriRefusal::Scheme(scheme.to_owned()))
+    }
+}
+
+/// Validate a plugin-supplied URI and, if it passes, open it with `launch` —
+/// returning the [`EffectOutcome`] the plugin gets back either way (#1045).
+///
+/// The launcher is a parameter for the same reason
+/// [`start_detached_with`]'s program is (#964 item 3): the real one starts a
+/// **browser**, so a test that drove the production path would either open one
+/// or have to be gated out of the hermetic suite. Here a test passes a recording
+/// stub and asserts on the outcome; production passes
+/// [`launch_default_for_uri`]. Unlike the `#[cfg(test)]`-compiled-out
+/// [`launch_detached`], nothing about this path is skipped under test — the
+/// validation, the log line and the outcome mapping are the same code in both
+/// builds, and only the final GLib call differs.
+///
+/// A refusal is logged at **warn** (the plugin asked for something the host will
+/// not do) and a launch failure too (no handler registered, portal error); a
+/// success is `info`, matching every other brokered effect.
+pub(super) fn open_uri_outcome(
+    plugin_id: &str,
+    id: u64,
+    uri: &str,
+    launch: impl FnOnce(&str) -> Result<(), String>,
+) -> EffectOutcome {
+    let scheme = match check_uri(uri) {
+        Ok(scheme) => scheme,
+        Err(refusal) => {
+            let reason = refusal.reason();
+            // The URI is plugin-controlled, so it is logged truncated (a
+            // refusal is exactly the case where it might be junk) and never
+            // interpolated into the audit line, which carries only the effect
+            // kind and the correlation id.
+            tracing::warn!(
+                plugin = %plugin_id, id,
+                uri = %truncate_on_char_boundary(uri, 256),
+                %reason,
+                "plugin effect: OpenUri refused",
+            );
+            return EffectOutcome {
+                ok: false,
+                output: Some(reason),
+            };
+        }
+    };
+    tracing::info!(plugin = %plugin_id, id, %scheme, "plugin effect: OpenUri");
+    match launch(uri) {
+        Ok(()) => EffectOutcome {
+            ok: true,
+            output: None,
+        },
+        Err(e) => {
+            tracing::warn!(
+                plugin = %plugin_id, id, %scheme, error = %e,
+                "plugin effect: OpenUri failed to launch a handler",
+            );
+            EffectOutcome {
+                ok: false,
+                output: Some(format!("launch failed: {e}")),
+            }
+        }
+    }
+}
+
+/// Hand `uri` to the desktop's default handler — the production launcher behind
+/// [`open_uri_outcome`] (#1045).
+///
+/// `gio::AppInfo::launch_default_for_uri` over shelling out to `xdg-open`, for
+/// the reason [`crate::main`]'s `open_screenshot` gives: the same
+/// desktop-portal-backed resolution with no subprocess of our own. Must run on
+/// the GTK main thread, which is where [`broker_effect`] already is.
+fn launch_default_for_uri(uri: &str) -> Result<(), String> {
+    gio::AppInfo::launch_default_for_uri(uri, gio::AppLaunchContext::NONE)
+        .map_err(|e| e.to_string())
+}
+
+/// Broker one [`Effect::OpenUri`] (#1045): validate + launch on this (GTK)
+/// thread, then route the outcome back to the plugin as
+/// [`HostMsg::EffectResult`] keyed by `id`.
+fn broker_open_uri(plugin_id: &str, id: u64, uri: &str, outbound: &mpsc::Sender<HostMsg>) {
+    let outcome = open_uri_outcome(plugin_id, id, uri, launch_default_for_uri);
+    reply_effect_result(plugin_id, id, outcome, outbound.clone());
+}
+
+/// Send one [`EffectOutcome`] back to the originating plugin as
+/// [`HostMsg::EffectResult`], from the **GTK main thread** (#1045).
+///
+/// [`run_command`] can `send().await` inline because it is already inside a
+/// spawned task; the `OpenUri` arm is not, so the send is what hops to the
+/// runtime here. It is a `send().await` and not the consent overlay's
+/// `try_send`: this is a one-shot reply a plugin may be waiting on to toast a
+/// refusal, so it should wait for outbound capacity rather than be dropped on a
+/// momentarily full channel. It only fails once the connection's writer is gone,
+/// at which point the plugin is already leaving.
+fn reply_effect_result(
+    plugin_id: &str,
+    id: u64,
+    outcome: EffectOutcome,
+    outbound: mpsc::Sender<HostMsg>,
+) {
+    let plugin_id = plugin_id.to_owned();
+    hytte::reactive::runtime::handle().spawn(async move {
+        if outbound
+            .send(HostMsg::EffectResult { id, outcome })
+            .await
+            .is_err()
+        {
+            tracing::debug!(plugin = %plugin_id, id, "plugin gone before OpenUri result; dropped");
+        }
+    });
 }
 
 // ── Detached launch (#953) ───────────────────────────────────────────────────
@@ -1291,6 +1540,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::RequestConsent { .. } => "RequestConsent",
         Effect::DatasourceQuery { .. } => "DatasourceQuery",
         Effect::DatasourceResult { .. } => "DatasourceResult",
+        Effect::OpenUri { .. } => "OpenUri",
     }
 }
 
@@ -1387,7 +1637,9 @@ pub(super) fn record_audit(
 /// fire-and-forget effects, which have nothing to correlate.
 fn audit_effect_id(effect: &Effect) -> Option<u64> {
     match effect {
-        Effect::RunCommand { id, .. } => Some(*id),
+        // The two effects whose outcome comes back as a `HostMsg::EffectResult`
+        // keyed by this token (#953 M1, #1045).
+        Effect::RunCommand { id, .. } | Effect::OpenUri { id, .. } => Some(*id),
         _ => None,
     }
 }

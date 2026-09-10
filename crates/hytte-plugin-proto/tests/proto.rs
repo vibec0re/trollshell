@@ -7,7 +7,8 @@ use hytte_plugin_proto::{
     DEFAULT_SLIDER_STEP_FRACTION, DatasourceError, DatasourceOutcome, Dir, Effect, EffectOutcome,
     EventKind, HostMsg, LedStripConfig, LedStripState, LogLevel, MAX_FRAME_LEN,
     MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Manifest, MediaAction, Mount, NiriAction, Node,
-    PROTO_VERSION, Page, PluginMsg, PreemWidget, ProtoError, ProvidedDatasource, SCROLLED_VOCAB,
+    OPEN_URI_VOCAB, PROTO_VERSION, Page, PluginMsg, PreemWidget, ProtoError, ProvidedDatasource,
+    SCROLLED_VOCAB,
     SHADER_VOCAB, ShaderData, SliderFloats, StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL,
     decode, decode_body, encode, encode_body, sane_fraction, sane_slider_floats,
 };
@@ -2885,30 +2886,38 @@ fn the_shader_generation_bumps_the_census_only() {
 /// #966's generation is **4**, it bumps the census `VOCAB`, and it leaves
 /// `VOCAB_UNCONDITIONAL` alone — #882's rule, applied a third time.
 ///
-/// The equality `VOCAB == SCROLLED_VOCAB` is the "newest variant" pin that used
-/// to live on `SHADER_VOCAB`: appending the next wire variant moves it here, and
-/// forgetting to bump `VOCAB` with it turns this red.
-///
 /// **Falsified** by bumping `VOCAB_UNCONDITIONAL` to 4 as well (the third
 /// assertion goes red, and with it every older shell's acceptance of a rebuilt
 /// plugin), or by leaving `VOCAB` at 3 (the second).
 #[test]
 fn the_viewport_generation_bumps_the_census_only() {
     assert_eq!(SCROLLED_VOCAB, 4, "#966 is generation 4");
-    assert_eq!(
-        VOCAB, SCROLLED_VOCAB,
-        "the census reaches the newest variant"
-    );
+    // `>=`, not `==`: #1045's open-a-link intent is generation 5, so the
+    // "newest variant" pin this test used to carry now lives on
+    // `the_open_uri_generation_bumps_the_census_only` — appending the variant
+    // after that one moves it again.
+    const {
+        assert!(
+            VOCAB >= SCROLLED_VOCAB,
+            "the census must still cover the viewport generation",
+        );
+    }
     assert_eq!(
         VOCAB_UNCONDITIONAL, 1,
         "a negotiated variant does not move the unconditional ceiling",
     );
 
     let m = Manifest::new("agents", Mount::SidebarTop);
-    assert_eq!(
-        m.negotiated_vocab(VOCAB),
-        SCROLLED_VOCAB,
+    // `>=` for the same reason as above: a host advertising today's census
+    // negotiates generation 5, which still unlocks viewports.
+    assert!(
+        m.negotiated_vocab(VOCAB) >= SCROLLED_VOCAB,
         "a host advertising the census negotiates the viewport generation",
+    );
+    assert_eq!(
+        m.negotiated_vocab(SCROLLED_VOCAB),
+        SCROLLED_VOCAB,
+        "…and a host advertising exactly generation 4 negotiates exactly it",
     );
     assert!(
         m.negotiated_vocab(VOCAB_UNCONDITIONAL) < SCROLLED_VOCAB,
@@ -2945,4 +2954,181 @@ fn the_shader_capability_is_an_ordinary_manifest_capability() {
         "declaring the cap does not move the stamped generation",
     );
     back.check_vocab().expect("still clears a same-vocab host");
+}
+
+// ── OpenUri effect + capability (#1045) ──────────────────────────────────────
+
+#[test]
+fn open_uri_round_trips_and_is_name_tagged() {
+    let effect = Effect::open_uri(14, "https://pr1ma.darkest.space/agents/argus");
+    assert_eq!(
+        effect,
+        Effect::OpenUri {
+            id: 14,
+            uri: "https://pr1ma.darkest.space/agents/argus".into(),
+        },
+        "Effect::open_uri is the constructor for the variant",
+    );
+    let body = encode_body(&effect);
+    assert!(
+        contains(&body, b"OpenUri"),
+        "externally tagged by variant name",
+    );
+    assert!(contains(&body, b"uri"), "the destination is a named field");
+    let decoded: Effect = decode_body(&body).expect("decode OpenUri");
+    assert_eq!(decoded, effect);
+}
+
+/// The direction that decides the `VOCAB` question (#1045).
+///
+/// An unknown **field** is skipped — that is why `Node::Row`'s `tooltip` and
+/// `RunCommand`'s `detached` needed no bump (see the tests above). An unknown
+/// **variant** is not: `rmp-serde` fails the whole body, which on a live socket
+/// is a dropped frame and, with an SDK that redials, the #437 crash-loop. This
+/// pins that difference rather than asserting it in a doc comment.
+///
+/// **Falsified** by giving `Effect` a `#[serde(other)]` catch-all: the first
+/// assertion would then decode instead of erroring.
+#[test]
+fn an_older_host_cannot_decode_an_open_uri_at_all() {
+    // The pre-#1045 effect vocabulary, as an older host's decoder sees it. Only
+    // the variants this test needs — an unknown *variant* is rejected on the
+    // tag, so the rest of the set makes no difference to the outcome.
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    enum EffectOld {
+        Notify { summary: String, body: String },
+    }
+
+    let body = encode_body(&Effect::open_uri(1, "https://example.invalid/"));
+    let err = decode_body::<EffectOld>(&body)
+        .expect_err("a pre-#1045 host cannot decode an appended variant");
+    assert!(
+        matches!(err, ProtoError::Decode(_)),
+        "the whole frame fails to decode; it is not skipped: {err:?}",
+    );
+
+    // The control: an effect that existed before #1045 still decodes on that
+    // same old decoder, so the failure above is about the new *variant* and not
+    // about the mirror enum being wrong.
+    let old_body = encode_body(&Effect::Notify {
+        summary: "Timer done".into(),
+        body: "25:00 timer finished".into(),
+    });
+    let old: EffectOld = decode_body(&old_body).expect("a pre-#1045 effect still decodes");
+    assert_eq!(
+        old,
+        EffectOld::Notify {
+            summary: "Timer done".into(),
+            body: "25:00 timer finished".into(),
+        },
+    );
+}
+
+/// #1045's generation is **5**, it bumps the census `VOCAB`, and it leaves
+/// `VOCAB_UNCONDITIONAL` alone — the same outcome as #882/#893/#966, reached by
+/// a different argument.
+///
+/// The three before it are safe because the plugin waits for a `Hello`. This one
+/// is safe because the *capability* gates it: an effect only rides the wire from
+/// a plugin whose manifest declared the gating cap, and `Capability::OpenUri` is
+/// itself undecodable on a pre-#1045 host, so that plugin never gets past
+/// `Register` — pinned by `an_older_host_cannot_decode_an_open_uri_capability`
+/// below. Bumping the unconditional ceiling would not save that plugin; it would
+/// only add a handshake refusal for every plugin rebuilt on this SDK that never
+/// opens a link.
+///
+/// The equality `VOCAB == OPEN_URI_VOCAB` is the "newest variant" pin that used
+/// to live on `SCROLLED_VOCAB`: appending the next wire variant moves it here,
+/// and forgetting to bump `VOCAB` with it turns this red.
+///
+/// **Falsified** by bumping `VOCAB_UNCONDITIONAL` to 5 as well (the third
+/// assertion goes red, and with it every older shell's acceptance of a rebuilt
+/// plugin), or by leaving `VOCAB` at 4 (the second).
+#[test]
+fn the_open_uri_generation_bumps_the_census_only() {
+    assert_eq!(OPEN_URI_VOCAB, 5, "#1045 is generation 5");
+    assert_eq!(
+        VOCAB, OPEN_URI_VOCAB,
+        "the census reaches the newest variant"
+    );
+    assert_eq!(
+        VOCAB_UNCONDITIONAL, 1,
+        "an appended variant does not move the unconditional ceiling",
+    );
+
+    let m = Manifest::new("agents", Mount::SidebarTop);
+    assert_eq!(
+        m.vocab, VOCAB_UNCONDITIONAL,
+        "the stamped generation an old host exact-checks did not move",
+    );
+    m.check_vocab()
+        .expect("a plugin rebuilt on this SDK still clears a same-vocab host");
+    // The generation before this one: a #966-era shell speaks viewports and not
+    // this, and the arithmetic says so with no special case.
+    assert!(
+        m.negotiated_vocab(SCROLLED_VOCAB) < OPEN_URI_VOCAB,
+        "a #966-era host negotiates below the open-a-link generation",
+    );
+    assert_eq!(
+        m.negotiated_vocab(VOCAB),
+        OPEN_URI_VOCAB,
+        "…and a host advertising the census negotiates exactly it",
+    );
+}
+
+/// `Capability::OpenUri` parses out of a manifest like the fourteen before it —
+/// an ordinary externally-tagged capability, tagged by its bare name, that does
+/// not move the generation the manifest stamps.
+#[test]
+fn the_open_uri_capability_is_an_ordinary_manifest_capability() {
+    let mut m = Manifest::new("agents", Mount::SidebarTop);
+    m.capabilities = vec![Capability::Notify, Capability::OpenUri];
+    let body = encode_body(&m);
+    assert!(contains(&body, b"OpenUri"), "tagged by variant name");
+    let back: Manifest = decode_body(&body).expect("decode a manifest declaring OpenUri");
+    assert_eq!(
+        back.capabilities,
+        vec![Capability::Notify, Capability::OpenUri],
+        "the declared caps round-trip in order",
+    );
+    assert_eq!(
+        back.vocab, VOCAB_UNCONDITIONAL,
+        "declaring the cap does not move the stamped generation",
+    );
+    back.check_vocab().expect("still clears a same-vocab host");
+}
+
+/// The other half of the census-only argument (#1045): the capability a plugin
+/// must declare to emit `OpenUri` at all is *itself* a variant a pre-#1045 host
+/// cannot decode, so the whole `Register` frame fails there — the connection is
+/// refused at the handshake, before any render frame carrying the effect could
+/// be sent. That is why the effect can be emitted unprompted without moving
+/// `VOCAB_UNCONDITIONAL`.
+#[test]
+fn an_older_host_cannot_decode_an_open_uri_capability() {
+    // A pre-#1045 host's capability vocabulary, as its decoder sees it.
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    enum CapabilityOld {
+        Notify,
+    }
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    struct ManifestOld {
+        capabilities: Vec<CapabilityOld>,
+    }
+
+    let mut m = Manifest::new("agents", Mount::SidebarTop);
+    m.capabilities = vec![Capability::Notify, Capability::OpenUri];
+    let err = decode_body::<ManifestOld>(&encode_body(&m))
+        .expect_err("a pre-#1045 host cannot decode the appended capability");
+    assert!(
+        matches!(err, ProtoError::Decode(_)),
+        "the Register frame fails to decode: {err:?}",
+    );
+
+    // Control: the same manifest without the new cap decodes on that same old
+    // decoder, so the failure above is the capability and not the mirror struct.
+    m.capabilities = vec![Capability::Notify];
+    let old: ManifestOld =
+        decode_body(&encode_body(&m)).expect("a manifest without the new cap still decodes");
+    assert_eq!(old.capabilities, vec![CapabilityOld::Notify]);
 }

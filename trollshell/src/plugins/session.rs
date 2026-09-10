@@ -344,6 +344,9 @@ pub(super) fn effect_capability(effect: &Effect) -> Capability {
         Effect::DatasourceQuery { .. } => Capability::DatasourceQuery,
         // #509: the provider side — answering a forwarded query.
         Effect::DatasourceResult { .. } => Capability::DatasourceProvider,
+        // #1045: opening a link is its own, narrower grant than `RunCommand` —
+        // the plugin names a destination, never a program.
+        Effect::OpenUri { .. } => Capability::OpenUri,
     }
 }
 

@@ -110,6 +110,18 @@ pub enum StateKey {
 /// boundary, which settles that the same-user socket *is* the boundary). Its
 /// real weight is that both spawn modes — attached and detached (#953) — ride
 /// it, and the audit log records which.
+///
+/// The **trust order** the docs below use, loosest first: the surfaces that only
+/// paint or nudge ([`OpenPage`](Capability::OpenPage),
+/// [`RaiseOsd`](Capability::RaiseOsd), [`Notify`](Capability::Notify)), then the
+/// ones that drive a host subsystem the user already owns
+/// ([`Niri`](Capability::Niri), [`Media`](Capability::Media),
+/// [`Audio`](Capability::Audio)), then [`OpenUri`](Capability::OpenUri) — which
+/// starts a program, but only the one the *desktop* picked for a host-validated
+/// scheme — and finally [`RunCommand`](Capability::RunCommand), which names the
+/// program itself. Declaration order in this enum is append-only (it is the
+/// wire's, and appending keeps every existing name's meaning), so the ordering
+/// lives here rather than in the variant sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Capability {
     /// Open drawer pages ([`Effect::OpenPage`](crate::effect::Effect::OpenPage)).
@@ -206,6 +218,28 @@ pub enum Capability {
     /// capability appended before it, and stated on
     /// [`Node::Shader`](crate::wire::Node::Shader).
     Shader,
+    /// Open a URI with the desktop's default handler
+    /// ([`Effect::OpenUri`](crate::effect::Effect::OpenUri), #1045).
+    ///
+    /// In the enum-level trust order this sits **between**
+    /// [`Notify`](Capability::Notify) and
+    /// [`RunCommand`](Capability::RunCommand), and it exists precisely to give a
+    /// plugin something in that gap. Before it, "open this link" meant
+    /// [`RunCommand`](Capability::RunCommand) — arbitrary argv as the user — for
+    /// a card whose only other needs were its own panel and a toast (#963's
+    /// agents card, which rendered a URL nobody could follow because it would
+    /// not take that grant). This one names no program: the plugin hands over a
+    /// string, the host refuses any scheme outside `http`/`https`/`file`, and
+    /// the *desktop's* default handler decides what opens.
+    ///
+    /// Auto-granted from the manifest and audit-logged like the rest — it is not
+    /// a second gate on top of the socket (see the enum docs and #893's route-0
+    /// note), it is a **narrower** thing to ask for. Declaring it costs
+    /// compatibility with a pre-#1045 host, which cannot decode the variant and
+    /// drops the connection at `Register`; see
+    /// [`OPEN_URI_VOCAB`](crate::effect::OPEN_URI_VOCAB), where that fact is also
+    /// what keeps [`VOCAB_UNCONDITIONAL`](crate::VOCAB_UNCONDITIONAL) still.
+    OpenUri,
 }
 
 /// Where a plugin's view mounts in the shell. Wire-side vocabulary the host

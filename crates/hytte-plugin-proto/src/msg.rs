@@ -13,6 +13,28 @@ use crate::wire::{EventKind, Node, NodeId};
 use serde::{Deserialize, Serialize};
 
 /// Plugin → host frames.
+// `clippy::large_enum_variant`, tripped by #1050's 24-byte `hidden_on`:
+// `Render` is 336 bytes (`tree` 144 + `panel` 144 + `hidden_on` 24 + `effects`
+// 24) against `Register`'s 120, and the 216-byte gap just crosses the lint's
+// 200-byte default — it was 192 before this field.
+//
+// Allowed rather than boxed, because the lint's cost model does not apply to
+// this type. `PluginMsg` is a **per-frame envelope**: `codec::read_frame`
+// deserializes exactly one, the reader loop destructures it immediately, and
+// nothing in the workspace stores it — there is no `Vec<PluginMsg>`, no
+// `mpsc` channel of them, no queue (the only `Vec<PluginMsg>` anywhere is a
+// two-element golden-fixture table). So the "largest variant" cost is one
+// stack move per frame, not per-element bloat across a collection.
+//
+// The fix the lint suggests is nevertheless a real (small) improvement, and is
+// named here so it is a decision rather than an oversight: `panel:
+// Option<Node>` reserves a full `Node` (144 B) on **every** frame although most
+// plugins never render a panel, and `Option<Box<Node>>` would take `Render` to
+// 200 B and the gap to 80 — serializing identically (`Box` is transparent to
+// serde, so no fixture moves). It is not done here because it changes a field
+// #1050 is not about, across the SDK, the host and seven plugin crates' test
+// helpers; it wants its own PR.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PluginMsg {
     /// First frame after dialing in: self-identify. The host validates

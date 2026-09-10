@@ -492,7 +492,7 @@ fn attached_connectors() -> Option<HashSet<String>> {
         display
             .monitors()
             .into_iter()
-            .filter_map(|m| m.ok())
+            .filter_map(Result::ok)
             .filter_map(|obj| obj.downcast::<gtk::gdk::Monitor>().ok())
             .filter_map(|m| m.connector().map(|s| s.to_string()))
             .collect(),
@@ -1773,7 +1773,7 @@ mod gtk_tests {
             card_root(&cards, "layouts").is_visible(),
             "an empty hidden_on must re-show the card on B",
         );
-        assert!(b.is_visible(), "…and un-collapse B's region along with it",);
+        assert!(b.is_visible(), "…and un-collapse B's region along with it");
     }
 
     /// A connector that matches no monitor hides nothing — the documented wire

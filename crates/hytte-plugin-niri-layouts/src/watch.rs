@@ -36,11 +36,14 @@
 //!
 //! Two consequences worth stating:
 //!
-//! - **A workspace with `output: None` is counted nowhere.** niri reports that
-//!   for a workspace whose monitor is disconnected, and there is no screen to
-//!   show a chip on, so its windows can raise no output's count. They come back
-//!   the moment niri reattaches the workspace to a connector and re-sends the
-//!   list.
+//! - **A workspace with `output: None` is counted nowhere.** niri-ipc 26.4.0
+//!   is narrow about when that happens: the field "can be `None` if **no**
+//!   outputs are currently connected" — the whole-desktop case (every screen
+//!   asleep or unplugged), not one monitor of several going away. Unplugging
+//!   one of two re-homes its workspaces to the survivor and never reaches this
+//!   branch; the connector simply changes. Either way there is no screen to
+//!   show a chip on, so such a workspace's windows raise no output's count, and
+//!   they start counting again on the `WorkspacesChanged` that names an output.
 //! - **`WorkspaceActivated`'s `focused` flag no longer matters.** niri's own
 //!   docs: the event means the workspace is now active *on its output*, and all
 //!   others on that output are not; `focused` says whether it also took
@@ -234,9 +237,11 @@ pub(crate) struct Verdict {
 /// needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Slot {
-    /// The connector this workspace lives on. `None` is niri's own answer for a
-    /// workspace whose output is disconnected — such a workspace is counted
-    /// nowhere (module docs).
+    /// The connector this workspace lives on. `None` is what niri reports when
+    /// **no outputs are connected at all** (niri-ipc 26.4.0: "Can be `None` if
+    /// no outputs are currently connected") — not when one monitor of several
+    /// goes away, which re-homes its workspaces to a survivor instead. Such a
+    /// workspace is counted nowhere (module docs).
     output: Option<String>,
     /// Whether it is the workspace currently visible on that output. Exactly
     /// one per output, per niri's contract.
@@ -351,10 +356,11 @@ impl Watch {
     /// place this module sees a connector name at all; an output with no
     /// workspaces on it does not exist as far as niri is concerned.
     ///
-    /// Windows on a workspace niri reports with `output: None` (a disconnected
-    /// monitor) raise no count — there is no screen for them to show a chip on.
-    /// So are windows on a workspace that is not the active one on its output:
-    /// that is the whole point of the rule.
+    /// Windows on a workspace niri reports with `output: None` (no outputs
+    /// connected at all — see [`Slot::output`]) raise no count: there is no
+    /// screen for them to show a chip on. Neither do windows on a workspace
+    /// that is not the active one on its output — that is the whole point of
+    /// the rule.
     fn window_counts(&self) -> BTreeMap<&str, usize> {
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for slot in self.workspaces.values() {

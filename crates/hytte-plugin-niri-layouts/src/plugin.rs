@@ -210,30 +210,44 @@ pub(crate) fn apply_and_report(
 ) -> Option<Msg> {
     match niri::apply(transport, layout, on_output) {
         Ok(0) => {
-            // The one debug line the no-op case gets. stderr, which systemd
-            // routes to the journal for a plugin unit and to the terminal for
-            // the CLI hat. It names the screen when there was one, because
-            // "nothing to do" on a two-monitor desktop is otherwise ambiguous
-            // about *which* workspace was empty (#1050).
-            eprintln!(
-                "[{PLUGIN_ID}] {}: no tiled columns on {}, nothing to do",
-                layout.id(),
-                on_output.map_or_else(
-                    || "the focused workspace".to_owned(),
-                    |name| format!("{name}'s active workspace"),
-                )
-            );
+            transport.log(&nothing_to_do_diagnostic(layout, on_output));
             None
         }
         Ok(columns) => {
-            eprintln!(
+            transport.log(&format!(
                 "[{PLUGIN_ID}] {}: set {columns} column width(s)",
                 layout.id()
-            );
+            ));
             None
         }
         Err(error) => Some(Msg::Failed(error)),
     }
+}
+
+/// The one line the no-op case gets — the only feedback a human ever gets when
+/// a click lands on a screen niri no longer has a workspace for.
+///
+/// It names the screen when there was one, because "nothing to do" on a
+/// two-monitor desktop is otherwise ambiguous about *which* workspace was empty
+/// (#1050).
+///
+/// Built here rather than inline, and delivered through
+/// [`Transport::log`](crate::niri::Transport::log) rather than `eprintln!`
+/// (#1083 review, LOW-2): the log seam is what [`crate::niri::fake::Fake`]
+/// captures, so this line has a test instead of being the only diagnostic in
+/// the call path with no seam — its sibling in
+/// [`crate::niri::apply`] already goes the same way. In production both land on
+/// stderr, which systemd routes to the journal for a plugin unit and to the
+/// terminal for the CLI hat.
+fn nothing_to_do_diagnostic(layout: Layout, on_output: Option<&str>) -> String {
+    format!(
+        "[{PLUGIN_ID}] {}: no tiled columns on {}, nothing to do",
+        layout.id(),
+        on_output.map_or_else(
+            || "the focused workspace".to_owned(),
+            |name| format!("{name}'s active workspace"),
+        )
+    )
 }
 
 /// The standalone hat's whole apply: [`apply_and_report`] against the
@@ -412,16 +426,29 @@ impl Plugin for NiriLayouts {
     /// The chip, hidden on the screens that do not want it (#1050) — or the
     /// collapsed tree, when no screen does.
     ///
-    /// Two branches rather than "always `chip()`, hide it on the screens below
-    /// the threshold", although the second reads simpler. The host's #1042
-    /// region-collapse rule keys off a card that renders **nothing**, and that
-    /// is what removes the `.ts-plugin-chip` pill's padding and its bar-group
-    /// `spacing` gap. A `chip()` with every attached connector in `hidden_on`
-    /// is invisible on each screen but is not an empty tree, so the shell would
-    /// keep a few pixels of translucent pill everywhere — exactly the residual
-    /// [`hidden`] documents, and the regression #1042 fixed. So: while any
-    /// screen shows the chip, `hidden_on` hides it on the rest; when none does,
-    /// the plugin collapses the way it always did.
+    /// Two branches rather than "always `chip()`, hide it on every screen below
+    /// the threshold", although the second reads simpler. Two reasons, and
+    /// neither is the one you might expect — the host routes **both** the
+    /// card's own `set_visible` and the region-collapse rule through a single
+    /// `card_shows_here` predicate that already includes `hidden_on`
+    /// (`trollshell/src/plugins/region.rs`, #1068), so a fully-hidden `chip()`
+    /// would leave no pill and no `spacing` sliver either. The reasons that do
+    /// hold are:
+    ///
+    /// 1. **This plugin cannot enumerate the screens.** It knows only the
+    ///    connectors niri named in its workspace list. "Hide on every attached
+    ///    connector" is not a sentence it can say: the attached set is GDK's,
+    ///    it lives in the host, and the two can differ across a hot-plug.
+    /// 2. **A monitor GDK reports no connector for would keep the chip.**
+    ///    `hidden_on_this_output` returns `false` for a `None` connector — the
+    ///    deliberate safe direction, since showing an unwanted chip beats
+    ///    hiding a wanted one. Under the hide-everywhere approach such a screen
+    ///    would go on showing a chip nothing wants; the collapsed tree renders
+    ///    nothing, which hides it there too. That is a real correctness
+    ///    difference, and it is the one worth remembering.
+    ///
+    /// So: while any screen shows the chip, `hidden_on` hides it on the rest;
+    /// when none does, the plugin collapses the way it always did.
     ///
     /// The `hidden_on` list is deliberately **not** carried on the collapsed
     /// branch: an empty tree is already invisible everywhere, and naming
@@ -807,10 +834,11 @@ mod tests {
     /// With no screen above the threshold the plugin collapses **the way it
     /// always did** — an empty tree, and no `hidden_on` at all.
     ///
-    /// Not "the chip, hidden on every connector": that is invisible per screen
-    /// but is not an empty tree, so the host's #1042 region-collapse rule would
-    /// not fire and every screen would keep the `.ts-plugin-chip` pill's
-    /// padding and its bar-group spacing gap.
+    /// Not "the chip, hidden on every connector" — see [`NiriLayouts::view`]
+    /// for why. This test encodes the plugin-local half of that: a plugin that
+    /// cannot enumerate the attached screens has no way to write the list, so
+    /// the empty tree is the only thing it *can* say when the answer is "not
+    /// anywhere".
     #[test]
     fn no_screen_wanting_the_chip_collapses_to_the_empty_tree() {
         let (tx, _rx) = cmd_channel();
@@ -1156,6 +1184,43 @@ mod tests {
             apply_and_report(&mut niri, Layout::Equal, None),
             None,
             "a no-op gets a log line, not a toast"
+        );
+        // The log line, verbatim — written out rather than built from
+        // `nothing_to_do_diagnostic`, which would assert the function against
+        // itself. Nothing else in the suite reads this path's output.
+        assert_eq!(
+            niri.logs,
+            vec![
+                "[niri-layouts] equal: no tiled columns on the focused workspace, nothing to do"
+                    .to_owned()
+            ],
+            "the unattributed case still says 'the focused workspace'"
+        );
+    }
+
+    /// The no-op line names the **screen** when the click named one (#1050).
+    ///
+    /// This is the only feedback a human gets when a click lands on a screen
+    /// niri no longer has a workspace for — the exact hot-plug race
+    /// `niri::apply` documents. It went through `eprintln!` until #1083's
+    /// review (LOW-2), where nothing could see it: `apply_and_report` returns
+    /// `None` on this path, so hard-coding the message left the suite green.
+    #[test]
+    fn the_no_op_line_names_the_screen_the_click_came_from() {
+        let mut niri = Fake::two_outputs();
+
+        assert_eq!(
+            apply_and_report(&mut niri, Layout::Split, Some("DP-99")),
+            None,
+            "a screen niri does not know is a no-op, not a toast"
+        );
+        assert_eq!(
+            niri.logs,
+            vec![
+                "[niri-layouts] split: no tiled columns on DP-99's active workspace, nothing to do"
+                    .to_owned()
+            ],
+            "\"nothing to do\" on a two-monitor desktop has to say which screen"
         );
     }
 }

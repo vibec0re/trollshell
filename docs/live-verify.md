@@ -542,52 +542,88 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       (`>= 2560` → 75/25), not the golden cut. If that reads wrong on real
       glass, say so on #1052 rather than changing `GOLDEN_BREAKPOINT`
       yourself — Annika hasn't picked a side of that boundary yet.
-- [ ] **(#1050)** Per-screen chip visibility, **host arm** — needs two
-      monitors; on one screen every leg below is vacuously true.
-      **What this half does and does not do.** This PR puts the two fields on
-      the wire (`Render.hidden_on`, `Event.output`) and teaches the host to act
-      on them; **no shipped plugin emits `hidden_on` yet**, so the visible
-      symptom Annika reported (the niri-layouts chip on monitor B following
-      monitor A's window count) is _unchanged_ until the plugin round lands.
-      What can be checked here is that nothing regressed and that the host
-      honours the fields when something sends them.
-      **Regression legs (do these now):** with the usual plugin set enabled on
-      two monitors, every chip and sidebar card should still appear on **both**
-      screens exactly as before, clicks should still work on both, and the #1039
-      empty-tree hide should still hide a chip on both. A chip that vanishes
-      from one screen after this change is the bug.
-      **Positive legs (need a plugin that emits the field).** The quickest probe
-      is a scratch plugin — take `hytte-plugin-clock-demo`, add
-      `.hidden_on(["<the connector of one of your screens>"])` to its `view()`
-      (`niri msg outputs` prints the connector names), and run it. Then: the
-      chip should be absent from **that** screen and present on the other; the
-      bar group on the hidden screen should close up with **no gap** where the
-      chip was (the #1039 promise, now per screen — look at the spacing between
-      its neighbours, not just for the pill); and the other screen's bar must be
-      untouched. Change the name to one that matches nothing (`DP-99`, or a
-      typo like `DP1`) and the chip should come back on **both** screens —
-      with `RUST_LOG=trollshell=debug` the journal should carry one
-      `plugin hidden_on names outputs that are not attached` line naming it.
-      Unplug/replug or re-arrange the monitors while a chip is hidden and
-      confirm the right screen still hides it after the bars rebuild.
-      **`Event.output`:** click the chip on each screen and confirm the plugin
-      receives the connector of the screen you clicked. The Rust SDK does not
-      surface it yet (see `Input::Event`'s doc), so read it off the wire — e.g.
-      `hytte-plugin-clock-demo`'s own frames, or any socket dump — rather than
-      from a plugin's `update()`. A **drawer panel** click must carry no output
-      at all; that is deliberate, not a miss.
-      **Hidden animation costs nothing (#1068 review, MEDIUM-1).** The scratch
-      plugin above with a **scrolling/animating** chip (`preem-demo`'s marquee,
-      or `caw`) hidden via `hidden_on` on one screen — confirm the hidden
-      screen's frame clock is not being kept armed on its account: with
+- [ ] **(#1050)** Per-screen chip visibility and per-screen clicks — needs two
+      monitors for legs 1–7 and 9; on one screen those are vacuously true, and
+      leg 8 is the one-screen case (which is the everyday one).
+      **What ships, and what you need.** #1068 put the two fields on the wire
+      (`Render.hidden_on`, `Event.output`) and taught the host to act on them;
+      the plugin round taught `hytte-plugin-niri-layouts` to emit them. So this
+      is walkable with the **shipped** plugin set — enable `niri-layouts` and
+      no scratch plugin is needed (the last leg is the one exception).
+      `niri msg outputs` prints the connector names the legs below refer to.
+      **Regression legs (the host arm, do these first):** with the usual plugin
+      set enabled on two monitors, every _other_ chip and sidebar card should
+      still appear on **both** screens exactly as before, clicks should still
+      work on both, and the #1039 empty-tree hide should still hide a chip on
+      both. Any chip except the layouts one vanishing from one screen is a bug.
+      **1. Per-screen visibility.** Put ≥ 2 windows on the active workspace of
+      screen A and ≤ 1 on screen B's. The layouts chip must appear on **A
+      only**. Before the plugin round both screens followed whichever screen
+      held keyboard focus — that is the symptom Annika reported.
+      **2. The gap, not just the pill.** On the screen where the chip is
+      hidden, look at the _spacing between its bar neighbours_, not only for
+      the absent pill: the group must close up with no sliver left behind.
+      **3. A click acts on the screen it came from.** With the chip up on both
+      screens, click one of the three glyphs on **screen B's** chip. B's
+      workspace must re-lay out and A's must not move — **whichever screen
+      holds keyboard focus**. Focus A and click B: that is the discriminator,
+      and it is the whole of `Event.output`.
+      **4. Per-screen workspace switching.** Change workspace on B alone. Only
+      B's chip may appear or disappear; A's must not flicker.
+      **5. The keybind is unchanged.** `hytte-plugin-niri-layouts apply equal`
+      from a niri bind (or a terminal) still targets the **focused** output — a
+      keybind has no screen to have been clicked on. Run it with focus on each
+      screen in turn and confirm each lays out its own.
+      **6. Unplug/replug.** Unplug a monitor while the chip is up, then replug
+      it: no blink, no stale chip, and the chip settles on whichever screens
+      qualify once the bars rebuild. A sub-second wrong-screen flash right
+      after a hot-plug is expected (#1083 review INFO-4) — GDK can add the
+      monitor before niri's workspace list reaches the plugin. It must
+      self-correct on the next verdict, not persist.
+      **7. Both screens below the threshold.** Drop _both_ screens to ≤ 1
+      window. The pill **and** its bar-group gap must vanish on **both**. This
+      is the collapsed-tree branch — a different code path from legs 1–2, and
+      nothing else on this list walks it.
+      **8. The single-screen everyday case.** With one monitor (or one
+      disabled), the chip must behave exactly as it did before #1050: appear at
+      two windows, hide at one, click to lay out. A single-screen frame is
+      byte-identical on the wire (nothing is ever below threshold _and_ shown
+      elsewhere), so this is the worst thing to regress and no two-screen leg
+      covers it.
+      **9. One journal read.** With `RUST_LOG=trollshell=debug` and the chip
+      hidden on B the journal must carry exactly one
+      `plugin card hidden on this output (#1050)` line naming B, and **zero**
+      `plugin hidden_on names outputs that are not attached` lines. That
+      second half is five seconds of work and the only empirical check of the
+      assumption below.
+      **Optional, if the two screens differ in logical width (#1052):** click
+      **golden** on the _narrower_ screen while the wider one holds keyboard
+      focus, and confirm the pair comes from the **clicked** screen (61.8/38.2
+      below 2560 logical px, 75/25 at or above). It is the one leg where
+      targeting the wrong screen produces visibly different _numbers_ rather
+      than merely the wrong monitor moving.
+      **Load-bearing assumption, uncited (#1083 review INFO-1):** this whole
+      feature rests on niri's `Workspace.output` string and GDK's
+      `monitor.connector()` string being the same namespace, and the host
+      compares them byte-exactly with no normalisation. niri-ipc documents the
+      field only as the "Name of the output" and **guarantees no such
+      equality** — it holds because niri names the `wl_output` after the DRM
+      connector and GDK4-Wayland reports that. If the two ever diverged the
+      only symptom would be _the chip never hides_, which is why leg 9 is on
+      this list.
+      **Hidden animation costs nothing (#1068 review, MEDIUM-1).** This one
+      still needs a scratch plugin, because it wants an _animating_ chip hidden
+      by `hidden_on` and the layouts chip is three static icons: take
+      `hytte-plugin-preem-demo` (marquee) or `hytte-plugin-caw`, add
+      `.hidden_on(["<one of your connectors>"])` to its `view()`, and confirm
+      the hidden screen's frame clock is not kept armed on its account — with
       `RUST_LOG=trollshell=debug` there should be no steady stream of preem
-      repaint activity for that plugin id while it's hidden there, and a
+      repaint activity for that plugin id while it is hidden there, and a
       wakeup count on that output over a few seconds (the `perf`/wakeup method
-      #883/#926 used to measure the sidebar-closed and empty-region cases)
-      should read the same as with the plugin absent entirely, not the ~30
-      Hz/monitor a still-armed tick callback would cost. Re-show it (rename
-      `hidden_on` back to nothing that matches) and confirm the animation
-      resumes on that screen.
+      #883/#926 used for the sidebar-closed and empty-region cases) should read
+      the same as with the plugin absent entirely, not the ~30 Hz/monitor a
+      still-armed tick callback would cost. Re-show it (drop the `hidden_on`
+      call) and confirm the animation resumes on that screen.
 
 ## Infobroker
 

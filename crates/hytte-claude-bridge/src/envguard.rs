@@ -6,14 +6,24 @@
 //! # Why this fails closed instead of scrubbing
 //!
 //! The design calls for these variables to be **scrubbed from the child
-//! environment**. Two constraints in this tree make that unreachable from
-//! inside the process:
+//! environment**. `std::env::remove_var` is `unsafe` under edition 2024, and
+//! this workspace is `unsafe_code = "forbid"` (only `hytte-ecal` overrides it,
+//! for FFI), so an unset-style scrub is unreachable from inside the process
+//! regardless of what `hive_claude::Config` exposes.
 //!
-//! - `std::env::remove_var` is `unsafe` under edition 2024, and this workspace
-//!   is `unsafe_code = "forbid"` (only `hytte-ecal` overrides it, for FFI).
-//! - `hive_claude::Config` exposes no environment hook — its driver builds the
-//!   `tokio::process::Command` itself, so there is no `env_remove` seam for a
-//!   consumer to reach. (Worth an upstream ask; not worth a shim script here.)
+//! Since hive-claude 0.1.1, `Config` does carry an environment hook —
+//! `Config::env`, spliced into the child via `cmd.envs(...)` — so scrubbing
+//! in-process is no longer architecturally impossible. It stays external by
+//! choice, not necessity: (a) the nix side already renders every
+//! [`REDIRECT_VARS`] entry as an empty value (below), and (b) the driver
+//! applies `Config::env` *after* it sets `CLAUDE_CONFIG_DIR` from
+//! `Config::claude_config_dir`, so a same-named `Config::env` entry would
+//! silently win over that field — a trap for whoever populates `env` first.
+//! `Config::env` is also override-only (there is no `env_remove`
+//! equivalent) and, today, unreachable from outside this crate: the two
+//! in-crate sites that build a `Config` — `main.rs:239` and `bridge.rs:443`
+//! — both leave it empty, and `Config` has no `Deserialize` derive, so no
+//! plugin can reach the field either.
 //!
 //! So the scrub happens where it *can* happen — the home-manager module's
 //! rendered plugin entry (`nix/hm-module.nix`), which renders every

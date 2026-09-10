@@ -144,8 +144,8 @@ Beyond the package build's `doCheck`, the flake's `checks` output
   its `preCheck` exports the software-GL env plus `TROLLSHELL_REQUIRE_GL=1`,
   so the three GL-context tests in `hytte-ui` (`gl_surface.rs`) actually run
   under a real `GdkGLContext` there instead of skipping — `TROLLSHELL_REQUIRE_GL=1`
-  turns a skip into a failure the way `TROLLSHELL_REQUIRE_ICON_THEME` already
-  does for the icon-theme test above.
+  turns a skip into a failure the same way `flake.nix`'s `preCheck` already
+  uses `TROLLSHELL_REQUIRE_ICON_THEME` to do that for the icon-theme test.
 
 ### Lint — strict, treat as the gate
 

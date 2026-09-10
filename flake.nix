@@ -385,9 +385,12 @@
           #
           # Nothing else looks inside those files. They are `include_str!`'d
           # `&'static str`s until a *driver* compiles them, and no check here
-          # has one — `system-tests` runs `xvfb-run` in a sandbox with no
-          # `/dev/dri` and no mesa in the closure. So without this a typo'd
-          # identifier ships green and surfaces as a blank chip on glass.
+          # does — `system-tests` gained a software GL driver (llvmpipe, via
+          # `mesa`, #1036) so its own GL-context tests now run for real, but
+          # those tests exercise only inline dummy shaders defined in the test
+          # module, never these actual `preem_gl`/shader-widget source files.
+          # So without this a typo'd identifier ships green and surfaces as a
+          # blank chip on glass.
           #
           # The design spec's CI table named **naga** for this row. Measured, it
           # cannot do the job: naga 26's GLSL frontend rejects the entire ES
@@ -450,9 +453,10 @@
               # `GdkGLContext` under `xvfb-run`, so they run instead of
               # skipping. Verified in the #1036 spike
               # (https://github.com/vibec0re/trollshell/issues/1036#issuecomment-5620514934):
-              # 51 of `mesa`'s 60 closure paths are already pulled in by
-              # bindgen's clang/llvm dep, so the marginal closure delta is
-              # ~274 MiB, not the full ~1057 MiB `mesa` closure.
+              # 54 of `mesa`'s 60 closure paths are already pulled in by
+              # bindgen's clang/llvm dep (the shared bulk is `llvm-21.1.8-lib`),
+              # so the marginal closure delta is 6 new paths / ~274 MiB, not
+              # the full ~1057 MiB `mesa` closure.
               nativeCheckInputs = [
                 pkgs.dbus
                 pkgs.xvfb-run
@@ -489,16 +493,20 @@
                 export HOME="$(mktemp -d)"
                 export XDG_DATA_DIRS="${pkgs.adwaita-icon-theme}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
                 export TROLLSHELL_REQUIRE_ICON_THEME=1
-                # llvmpipe (#1036): all four are load-bearing (spike comment
-                # above) — `__EGL_VENDOR_LIBRARY_FILENAMES` especially, since
-                # glvnd's default vendor dirs
+                # llvmpipe (#1036): `__EGL_VENDOR_LIBRARY_FILENAMES` is the
+                # load-bearing one — glvnd's default vendor dirs
                 # (`/usr/share/glvnd/egl_vendor.d`,
                 # `/run/opengl-driver/share/…`) don't exist in the sandbox, so
                 # without it `eglInitialize` finds no vendor and the three
                 # GL-context tests in `hytte-ui` (`gl_surface.rs`) skip.
+                # `LIBGL_DRIVERS_PATH` points llvmpipe at its own `swrast_dri.so`.
+                # Deliberately NOT exporting `LD_LIBRARY_PATH="${pkgs.mesa}/lib"`
+                # here: `libEGL_mesa.so.0`'s own RUNPATH already carries
+                # `${pkgs.mesa}/lib` absolutely, so it isn't load-bearing —
+                # confirmed by re-running the three tests under llvmpipe
+                # without it (exit 0, still 3/3 pass; PR #1077 review LOW-5).
                 export LIBGL_ALWAYS_SOFTWARE=1
                 export LIBGL_DRIVERS_PATH="${pkgs.mesa}/lib/dri"
-                export LD_LIBRARY_PATH="${pkgs.mesa}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
                 export __EGL_VENDOR_LIBRARY_FILENAMES="${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json"
                 # A skip is indistinguishable from a pass in captured output
                 # (same reasoning as `TROLLSHELL_REQUIRE_ICON_THEME` above):

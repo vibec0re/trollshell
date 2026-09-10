@@ -155,7 +155,9 @@ View {
                             Text {
                                 id: None,
                                 text: "working on task 0 of a rather long description",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -260,7 +262,9 @@ View {
                             Text {
                                 id: None,
                                 text: "working on task 1 of a rather long description",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -365,7 +369,9 @@ View {
                             Text {
                                 id: None,
                                 text: "working on task 2 of a rather long description",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -470,7 +476,9 @@ View {
                             Text {
                                 id: None,
                                 text: "working on task 3 of a rather long description",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -575,7 +583,9 @@ View {
                             Text {
                                 id: None,
                                 text: "working on task 4 of a rather long description",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -680,7 +690,9 @@ View {
                             Text {
                                 id: None,
                                 text: "working on task 5 of a rather long description",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -785,7 +797,9 @@ View {
                             Text {
                                 id: None,
                                 text: "working on task 6 of a rather long description",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -890,7 +904,9 @@ View {
                             Text {
                                 id: None,
                                 text: "working on task 7 of a rather long description",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -995,7 +1011,9 @@ View {
                             Text {
                                 id: None,
                                 text: "working on task 8 of a rather long description",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -1100,7 +1118,9 @@ View {
                             Text {
                                 id: None,
                                 text: "working on task 9 of a rather long description",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -1205,7 +1225,9 @@ View {
                             Text {
                                 id: None,
                                 text: "working on task 10 of a rather long description",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -1310,7 +1332,9 @@ View {
                             Text {
                                 id: None,
                                 text: "working on task 11 of a rather long description",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",

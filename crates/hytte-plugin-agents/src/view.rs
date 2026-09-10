@@ -45,8 +45,9 @@
 //!   capped at [`PANEL_VIEWPORT_PX`]. The plugin drawer child is a plain
 //!   `gtk::Box` with no scroller of its own (`trollshell/src/plugins/region.rs`,
 //!   `build_panel_child`), so before this a panel taller than the drawer simply
-//!   ran off the bottom — and this round gives the overview the **full** roster,
-//!   which is exactly the content that gets long. `Scrolled` is a negotiated
+//!   ran off the bottom — and the overview carries a roster, which is exactly
+//!   the content that gets long. Its own row cap is [`PANEL_MAX_ROWS`], which
+//!   bounds the **frame** rather than the pixels; [`MAX_ROWS`] bounds the card. `Scrolled` is a negotiated
 //!   variant, so the negotiation happens once in `plugin.rs` and arrives here as
 //!   [`PanelContext::viewport_px`] (`0` = the pre-#969 unbounded shape).
 
@@ -115,7 +116,7 @@ pub mod ids {
 /// twelve and still bounds a hive that grows an order of magnitude.
 ///
 /// Overflow is **stated, never silent**: the card draws a "+N more" line and
-/// the panel's overview lists the full roster, uncapped.
+/// the panel's overview lists up to [`PANEL_MAX_ROWS`] of them.
 pub const MAX_ROWS: usize = 20;
 
 /// The drawer panel's viewport cap, in pixels.
@@ -157,6 +158,56 @@ const STATUS_CHARS: i32 = 34;
 /// The ellipsized width of a key/value line's value.
 const VALUE_CHARS: i32 = 28;
 
+/// The wrap width of the **card's** free-text lines (a state notice's reason,
+/// and the agent row's status caption).
+///
+/// The card sits inside the sidebar's `AdwClamp(320)`, so these would wrap
+/// anyway; the cap is here so the two surfaces are bounded by the same rule
+/// rather than one of them by an ancestor that happens to exist.
+const CARD_TEXT_CHARS: i32 = 34;
+
+/// The wrap width of the panel's free-text lines (the hive name under a renamed
+/// header, and the agent's status).
+///
+/// **The drawer has nothing else bounding it.** The sidebar card is inside
+/// `AdwClamp(320)` (`trollshell/src/overlays/sidebar.rs`), which is why a
+/// wrapping `Text` wraps *there*; the plugin drawer child is two bare
+/// `gtk::Box`es (`trollshell/src/plugins/region.rs`, `build_panel_child`), the
+/// page's `AdwClamp` is never applied to a plugin panel, and the drawer's
+/// `set_size_request` is a **minimum**. [`Node::Scrolled`] does not help either
+/// — the host gives it `PolicyType::Never` horizontally, which propagates the
+/// child's natural width unchanged. So a `Text` with no `max_width_chars`
+/// reports its whole string as its natural width and *widens the drawer*: the
+/// #281 blow-out, one surface over.
+const PANEL_TEXT_CHARS: i32 = 56;
+
+/// The ellipsized width of a project group's header.
+///
+/// `[display.<name>].project` is operator-typed and unbounded; the card's
+/// `AdwClamp` stops it widening the sidebar but would clip it rather than
+/// ellipsize, so it says nothing about what got cut.
+const GROUP_CHARS: i32 = 22;
+
+/// The most rows the **panel's** roster draws.
+///
+/// One paragraph for both caps, because they bound different things and #963's
+/// review was right that quoting one justification for both is not honest:
+///
+/// - [`MAX_ROWS`] (20) bounds the **card**, which is 320 px of a sidebar that
+///   holds three other cards. Its job is legibility; overflow says `+N more`
+///   and points at this roster.
+/// - This one bounds the **frame**. The card tree and the panel tree ship
+///   together on every render, and the host truncates any tree past
+///   `MAX_NODES_PER_TREE = 4096`
+///   (`crates/hytte-plugin-proto/src/wire.rs`) keeping the prefix, with one
+///   `tracing::warn!` per plugin per shell run — i.e. a silently short roster
+///   on exactly the runaway hive the bound exists for. At ~7 nodes per
+///   [`panel_roster_row`] that ceiling is around 580 rows, so 200 sits well
+///   under it with the rest of the page's nodes to spare, and far enough above
+///   any real hive that the `+N more` line is a statement about the hive rather
+///   than about this plugin.
+pub const PANEL_MAX_ROWS: usize = 200;
+
 fn cls(classes: &[&str]) -> Vec<String> {
     classes.iter().map(|c| (*c).to_owned()).collect()
 }
@@ -170,12 +221,18 @@ fn label(text: impl Into<String>, classes: &[&str]) -> Node {
     }
 }
 
-/// A **wrapping** label: the whole string, on as many lines as it needs.
-fn wrapped(body: impl Into<String>, classes: &[&str]) -> Node {
+/// A **wrapping** label: the whole string, on as many lines as it needs, wrapped
+/// at `chars` rather than at whatever its container happens to be.
+///
+/// The width is not optional. A `Text` with `max_width_chars: None` wraps only
+/// where an ancestor constrains it, and on the drawer page nothing does — see
+/// [`PANEL_TEXT_CHARS`]. Passing the cap explicitly is what keeps the two
+/// surfaces from silently behaving differently.
+fn wrapped(body: impl Into<String>, chars: i32, classes: &[&str]) -> Node {
     Node::Text {
         id: None,
         text: body.into(),
-        max_width_chars: None,
+        max_width_chars: Some(chars),
         ellipsize: false,
         tooltip: None,
         classes: cls(classes),
@@ -361,7 +418,7 @@ fn notice(icon_name: &str, body: &str, tone: &str) -> Node {
         &["ts-agents-notice"],
         vec![
             icon(icon_name, &["ts-agent-state", tone]),
-            wrapped(body, &["dim-label", "caption"]),
+            wrapped(body, CARD_TEXT_CHARS, &["dim-label", "caption"]),
         ],
     )
 }
@@ -389,7 +446,11 @@ fn status_caption(agent: &Agent) -> Node {
             &["dim-label", "caption", "ts-agent-status"],
         )
     } else {
-        wrapped(line, &["dim-label", "caption", "ts-agent-status"])
+        wrapped(
+            line,
+            CARD_TEXT_CHARS,
+            &["dim-label", "caption", "ts-agent-status"],
+        )
     }
 }
 
@@ -668,8 +729,27 @@ fn group_open(g: &Group<'_>, expanded: &ExpandedGroups) -> bool {
         .unwrap_or_else(|| g.agents.iter().any(|a| a.status() != Status::Stopped))
 }
 
-/// One project group as an `Expander` — header plus its rows.
+/// One project group as an `Expander` — header plus its rows, the rows in a
+/// **nested list of their own**.
+///
+/// The nesting is not decoration, it is what keeps the two roster paths looking
+/// alike (#963 review, LOW-1). GTK auto-wraps each *direct* child of a
+/// `GtkListBox` in a `GtkListBoxRow`, and that wrapper is what `boxed-list`'s
+/// hairline separators key off. An `Expander` is one such child no matter how
+/// many agents it reveals, so with a `[display.*].project` set the outer list
+/// would draw one separator per **group** and none between the rows inside it —
+/// the same twelve agents rendering two different ways depending on a config
+/// key. Giving the expander's body its own dense `ListBox` restores the
+/// per-row separator, and leaves the outer wrapper separating groups, which is
+/// the distinction that should be visible.
 fn group_node(g: &Group<'_>, open: bool, rows: Vec<Node>) -> Node {
+    // An empty body would otherwise emit a list with no children, which paints
+    // a stray surface under a collapsed header.
+    let body = if rows.is_empty() {
+        Vec::new()
+    } else {
+        vec![list(true, &["ts-agents-group-list"], rows)]
+    };
     let live = g
         .agents
         .iter()
@@ -681,7 +761,9 @@ fn group_node(g: &Group<'_>, open: bool, rows: Vec<Node>) -> Node {
             6,
             &["ts-agents-group"],
             vec![
-                label(g.header(), &["heading"]),
+                // `[display.<name>].project` is operator-typed and unbounded;
+                // a `Label` would clip without saying so (#963 review, LOW-5).
+                clipped(g.header(), GROUP_CHARS, &["heading"]),
                 Node::Spacer,
                 label(
                     format!("{live}/{}", g.agents.len()),
@@ -689,7 +771,7 @@ fn group_node(g: &Group<'_>, open: bool, rows: Vec<Node>) -> Node {
                 ),
             ],
         )),
-        children: rows,
+        children: body,
         expanded: open,
         tooltip: None,
         classes: vec!["ts-agents-group-row".to_owned()],
@@ -821,7 +903,17 @@ fn agent_page(agent: &Agent, cfg: &AgentsConfig, ctx: PanelContext<'_>) -> Vec<N
         &["ts-agents-panel-head"],
         vec![
             icon(cfg.icon_for(name), &["ts-agent-runtime"]),
-            label(cfg.label_for(name), &["title-4"]),
+            // Bounded, and a `Text` rather than a `Label`: a `Label` neither
+            // wraps nor ellipsizes, so a 63-byte agent name (legal on the wire)
+            // reports its whole self as the header's natural width and widens
+            // the drawer — see [`PANEL_TEXT_CHARS`]. The card guarded this from
+            // the start (#281); the panel header did not until #963's review.
+            clipped_titled(
+                cfg.label_for(name),
+                PANEL_NAME_CHARS,
+                name_hover(name, cfg),
+                &["title-4"],
+            ),
             icon_titled(
                 status.icon(),
                 status.text(),
@@ -844,9 +936,17 @@ fn agent_page(agent: &Agent, cfg: &AgentsConfig, ctx: PanelContext<'_>) -> Vec<N
         ],
     ));
     if cfg.label_for(name) != name {
-        out.push(wrapped(name, &["dim-label", "caption", "ts-mono"]));
+        out.push(wrapped(
+            name,
+            PANEL_TEXT_CHARS,
+            &["dim-label", "caption", "ts-mono"],
+        ));
     }
-    out.push(wrapped(agent.status_line(), &["dim-label"]));
+    out.push(wrapped(
+        agent.status_line(),
+        PANEL_TEXT_CHARS,
+        &["dim-label"],
+    ));
 
     let chips = flag_chips(agent);
     if !chips.is_empty() {
@@ -891,22 +991,32 @@ fn agent_page(agent: &Agent, cfg: &AgentsConfig, ctx: PanelContext<'_>) -> Vec<N
         ));
     }
 
-    out.push(hrow(
+    out
+}
+
+/// The "all agents" row — the panel's only way to drop a selection.
+///
+/// Lives here rather than at the end of [`agent_page`] because it has to be
+/// emitted for a selection the roster **cannot resolve** too, which is exactly
+/// the case that has no agent page: see [`panel`].
+fn back_row() -> Node {
+    hrow(
         6,
         &["ts-agents-panel-actions"],
         vec![
             Node::Spacer,
             button(BACK_ID, &["flat"], label("all agents", &[])),
         ],
-    ));
-    out
+    )
 }
 
 /// The drawer panel (spec §6.4): the selected agent's full detail, or the hive
-/// overview **plus the full, uncapped roster** when nothing is selected.
+/// overview plus the roster when no agent page is shown.
 ///
 /// The roster is what makes the card's `+N more — open the panel for the full
-/// roster` line true; before this round the panel showed no rows at all.
+/// roster` line true; before #963's UI round the panel showed no rows at all. It
+/// is capped at [`PANEL_MAX_ROWS`] rather than uncapped — see that constant for
+/// why the two caps exist and bound different things.
 #[must_use]
 pub fn panel(
     hive: &Hive,
@@ -914,19 +1024,43 @@ pub fn panel(
     selected: Option<&AgentName>,
     ctx: PanelContext<'_>,
 ) -> Node {
+    // **Resolve once, then gate on the resolution.** `selected.is_some()` and
+    // `hive.agent(selected)` are not complements: a selection whose lookup
+    // fails — every render while the hive is `Unreachable` / `Error` /
+    // `Connecting`, and the one render after an agent leaves the roster — used
+    // to satisfy neither branch, so the page rendered the hive section and
+    // nothing else: no agent page, no links, no roster, and no way back,
+    // because the "all agents" button lived inside the agent page (#963
+    // review, MED-1). `docs/live-verify.md`'s own "stop `hive-c0re`" step walks
+    // straight into it.
+    let shown = selected.and_then(|name| hive.agent(name));
     let mut children = Vec::new();
 
-    if let Some(agent) = selected.and_then(|name| hive.agent(name)) {
+    if let Some(agent) = shown {
         children.extend(agent_page(agent, cfg, ctx));
+    } else if let Some(name) = selected {
+        // Say why the page is not here, rather than silently showing the
+        // overview under a title the operator did not ask for.
+        children.push(notice(
+            "dialog-information-symbolic",
+            &format!(
+                "{} is not in the hive's current roster",
+                cfg.label_for(name.as_str())
+            ),
+            "dim-label",
+        ));
+    }
+    if selected.is_some() {
+        children.push(back_row());
     }
 
     children.push(hive_section(hive, ctx));
 
     // The overview's own links group. The selected-agent page emits its own
     // (agent page + dashboard), so this is the branch that keeps the dashboard
-    // reachable when nothing is selected — without either panel showing it
+    // reachable when no agent page is shown — without either panel showing it
     // twice.
-    if selected.is_none()
+    if shown.is_none()
         && let Some(home) = hive_home(ctx)
     {
         children.push(section(
@@ -939,19 +1073,31 @@ pub fn panel(
         ));
     }
 
-    if selected.is_none() {
+    if shown.is_none() {
         let agents = hive.agents();
         if !agents.is_empty() {
+            let drawn = agents.len().min(PANEL_MAX_ROWS);
+            let mut rows: Vec<Node> = agents
+                .iter()
+                .take(PANEL_MAX_ROWS)
+                .map(|a| panel_roster_row(a, cfg))
+                .collect();
+            // Stated, never silent — the same rule the card's overflow follows,
+            // and the reason the panel is no longer described as "uncapped"
+            // (#963 review, LOW-3).
+            if agents.len() > drawn {
+                rows.push(notice(
+                    "view-more-symbolic",
+                    &format!(
+                        "+{} more — the hive is larger than this page draws",
+                        agents.len() - drawn
+                    ),
+                    "dim-label",
+                ));
+            }
             children.push(section(
                 "roster",
-                list(
-                    false,
-                    &["ts-agents-panel-list"],
-                    agents
-                        .iter()
-                        .map(|a| panel_roster_row(a, cfg))
-                        .collect::<Vec<_>>(),
-                ),
+                list(false, &["ts-agents-panel-list"], rows),
             ));
         }
     }
@@ -971,7 +1117,8 @@ pub fn panel(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ROWS, PANEL_VIEWPORT_PX, STATUS_CHARS, STATUS_WRAP_MAX, age, ids, parse_set_at,
+        MAX_ROWS, PANEL_MAX_ROWS, PANEL_VIEWPORT_PX, STATUS_CHARS, STATUS_WRAP_MAX, age, ids,
+        parse_set_at,
     };
     use crate::config::AgentsConfig;
     use crate::hive::wire::AgentStatusRow;
@@ -1055,9 +1202,16 @@ mod tests {
             !status.ellipsize,
             "the status line must be shown in full, not ellipsized"
         );
+        // A **wrap** width, not a truncation: with `ellipsize: false` the host
+        // sets `set_wrap(true)`, so `max_width_chars` caps the label's natural
+        // width and the text flows onto more lines rather than being cut. It
+        // was `None` until #963's review, which is the same absent bound MED-2
+        // found widening the drawer one surface over — the string is shown in
+        // full either way, but only this way without pushing its container.
         assert_eq!(
-            status.max_width_chars, None,
-            "a width cap would truncate the line the row exists to show"
+            status.max_width_chars,
+            Some(super::CARD_TEXT_CHARS),
+            "line 2 must cap its natural width while still showing everything"
         );
         assert!(
             status.classes.iter().any(|c| c == "ts-agent-status"),
@@ -1221,7 +1375,8 @@ mod tests {
         );
     }
 
-    /// Whatever the card hides, the panel's overview shows — uncapped. That is
+    /// Whatever the card hides, the panel's overview shows (up to its own, far
+    /// higher cap). That is
     /// what makes the "+N more — open the panel for the full roster" line true.
     ///
     /// Falsification: drop the roster `section` from `panel` and this goes red.
@@ -1293,6 +1448,244 @@ mod tests {
                 .as_deref(),
             Some("argus")
         );
+    }
+
+    /// A selection the roster cannot resolve must not strand the panel.
+    ///
+    /// `selected.is_some()` and `hive.agent(selected)` are not complements, and
+    /// before #963's review neither branch ran when they disagreed: the page
+    /// rendered the hive section and nothing else — no agent page, no roster,
+    /// and no way back, because `BACK_ID` lived inside the agent page. That is
+    /// every render while the hive is down, which is exactly what
+    /// `docs/live-verify.md`'s "stop `hive-c0re`" step does.
+    ///
+    /// Falsification: gate the overview on `selected.is_none()` again, or move
+    /// `back_row()` back inside `agent_page`, and this goes red.
+    #[test]
+    fn an_unresolvable_selection_falls_back_to_the_overview_with_a_way_out() {
+        let cfg = AgentsConfig::default();
+        let name = AgentName::parse("argus").expect("legal");
+        let back = super::BACK_ID.to_owned();
+
+        // Every render while the hive is unreachable.
+        let down = super::panel(
+            &Hive::Unreachable {
+                reason: "connection refused".to_owned(),
+            },
+            &cfg,
+            Some(&name),
+            ctx(),
+        );
+        assert!(
+            button_ids(&down).contains(&back),
+            "a selection with no page still needs a way out; got {:?}",
+            button_ids(&down)
+        );
+        assert!(
+            texts(&down)
+                .iter()
+                .any(|t| t.contains("not in the hive's current roster")),
+            "…and it must say why the page is missing: {:?}",
+            texts(&down)
+        );
+
+        // A live hive that no longer has the agent still lists the ones it has.
+        let moved_on = super::panel(
+            &Hive::Up {
+                agents: vec![running("bosun", "idle")],
+            },
+            &cfg,
+            Some(&name),
+            ctx(),
+        );
+        let ids = button_ids(&moved_on);
+        assert!(ids.contains(&back));
+        assert!(
+            ids.contains(&"chat:bosun".to_owned()),
+            "the overview's roster must render when the selection cannot: {ids:?}"
+        );
+
+        // …and a selection that *does* resolve still gets its page instead.
+        let resolved = super::panel(
+            &Hive::Up {
+                agents: vec![running("argus", "idle")],
+            },
+            &cfg,
+            Some(&name),
+            ctx(),
+        );
+        let ids = button_ids(&resolved);
+        assert!(ids.contains(&"start:argus".to_owned()), "{ids:?}");
+        assert!(ids.contains(&back));
+        assert!(
+            !ids.contains(&"chat:argus".to_owned()),
+            "the agent page replaces the roster, it does not double it: {ids:?}"
+        );
+    }
+
+    /// Nothing either surface renders reports an **unbounded natural width**.
+    ///
+    /// The card is inside the sidebar's `AdwClamp(320)`, so a wrapping label
+    /// wraps there; the drawer page has no such ancestor — `build_panel_child`
+    /// is two bare `gtk::Box`es, the drawer's `set_size_request` is a *minimum*,
+    /// and `Node::Scrolled` is `PolicyType::Never` horizontally, so it
+    /// propagates the child's natural width unchanged. A `Text` with no
+    /// `max_width_chars`, or any `Label` at all, therefore widens the whole
+    /// drawer: the #281 blow-out one surface over (#963 review, MED-2/LOW-5).
+    ///
+    /// Falsification: drop the cap from either `wrapped` call in `agent_page`,
+    /// swap the panel header back to `label(…, &["title-4"])`, or make the
+    /// group header a plain `label` again, and this goes red.
+    #[test]
+    fn no_free_text_reports_an_unbounded_width_on_either_surface() {
+        // 63 bytes — `AgentName::MAX_LEN`, and legal on the wire.
+        let long_name = "a".repeat(63);
+        let long_status = ["watching for review assignments"; 7].join(", ");
+        let long_url = format!("https://hive.local/agent/{long_name}/");
+        let long_project = "p".repeat(80);
+
+        let mut cfg = AgentsConfig::default();
+        cfg.display.insert(
+            long_name.clone(),
+            crate::config::Display {
+                label: Some(format!("{long_name}-renamed")),
+                icon: None,
+                project: Some(long_project.clone()),
+            },
+        );
+        // A second project so the group headers are not suppressed.
+        cfg.display.insert(
+            "bosun".to_owned(),
+            crate::config::Display {
+                label: None,
+                icon: None,
+                project: Some("other".to_owned()),
+            },
+        );
+
+        let hive = Hive::Up {
+            agents: vec![
+                agent(
+                    &long_name,
+                    AgentStatusRow {
+                        name: long_name.clone(),
+                        running: true,
+                        status_text: Some(long_status.clone()),
+                        url: Some(long_url.clone()),
+                        deployed_sha: Some("0123456789abcdef0123".to_owned()),
+                        ..AgentStatusRow::default()
+                    },
+                ),
+                running("bosun", "idle"),
+            ],
+        };
+        let selected = AgentName::parse(&long_name).expect("63 bytes is legal");
+
+        let surfaces = [
+            (
+                "card",
+                super::card(&hive, &cfg, &ExpandedGroups::new(), Some(&selected)),
+            ),
+            (
+                "panel/agent",
+                super::panel(&hive, &cfg, Some(&selected), ctx()),
+            ),
+            ("panel/overview", super::panel(&hive, &cfg, None, ctx())),
+        ];
+
+        for (where_, tree) in &surfaces {
+            let loose = unbounded_texts(tree);
+            assert!(
+                loose.is_empty(),
+                "{where_}: every Text must cap its natural width; loose: {loose:?}"
+            );
+            // A `Label` neither wraps nor ellipsizes at all, so no *dynamic*
+            // string may be rendered as one. The short constants (`hive`,
+            // `deployed`, `all agents`, the chips) are fine and stay `Label`s.
+            for dynamic in [&long_name, &long_status, &long_url, &long_project] {
+                assert!(
+                    !label_texts(tree).iter().any(|t| t.contains(dynamic)),
+                    "{where_}: {dynamic:?} is rendered as an unwrappable Label"
+                );
+            }
+        }
+    }
+
+    /// The panel's roster is capped too, and states its overflow — the card's
+    /// `+N more` points here, so "here" must not be the unbounded half of the
+    /// same argument (#963 review, LOW-3).
+    ///
+    /// Falsification: drop the `.take(PANEL_MAX_ROWS)` and the row-count
+    /// assertion goes red; drop the overflow `notice` and the other one does.
+    #[test]
+    fn the_panel_roster_is_capped_and_says_how_many_it_hid() {
+        let agents: Vec<Agent> = (0..PANEL_MAX_ROWS + 3)
+            .map(|i| running(&format!("agent-{i}"), "idle"))
+            .collect();
+        let tree = super::panel(&Hive::Up { agents }, &AgentsConfig::default(), None, ctx());
+
+        let drawn = button_ids(&tree)
+            .iter()
+            .filter(|id| id.starts_with(ids::CHAT))
+            .count();
+        assert_eq!(drawn, PANEL_MAX_ROWS, "the panel roster must cap too");
+        assert!(
+            texts(&tree).iter().any(|t| t.contains("+3 more")),
+            "the hidden tail must be stated: {:?}",
+            texts(&tree)
+        );
+    }
+
+    /// A group's rows sit in a **nested list of their own**, so grouped and
+    /// ungrouped rosters draw the same per-row separators.
+    ///
+    /// GTK wraps each *direct* `ListBox` child in the `GtkListBoxRow` that
+    /// `boxed-list`'s hairlines key off, and an `Expander` is one such child no
+    /// matter how many agents it reveals — so without the nesting the same
+    /// twelve agents separate per-row or per-group depending on whether a
+    /// `[display.*].project` is set (#963 review, LOW-1).
+    ///
+    /// Falsification: hand `group_node` the rows directly as `children` and
+    /// this goes red.
+    #[test]
+    fn a_groups_rows_sit_in_a_nested_list_of_their_own() {
+        let mut cfg = AgentsConfig::default();
+        for (agent, project) in [("argus", "viberoot"), ("bosun", "nixos")] {
+            cfg.display.insert(
+                agent.to_owned(),
+                crate::config::Display {
+                    label: None,
+                    icon: None,
+                    project: Some(project.to_owned()),
+                },
+            );
+        }
+        let tree = super::card(
+            &Hive::Up {
+                agents: vec![running("argus", "idle"), running("bosun", "idle")],
+            },
+            &cfg,
+            &ExpandedGroups::new(),
+            None,
+        );
+
+        let mut expanders = 0usize;
+        walk(&tree, &mut |node| {
+            if let Node::Expander { children, .. } = node {
+                expanders += 1;
+                match children.as_slice() {
+                    [Node::ListBox { classes, dense, .. }] => {
+                        assert!(*dense, "a group's list is dense like the outer one");
+                        assert!(
+                            classes.iter().any(|c| c == "ts-agents-group-list"),
+                            "{classes:?}"
+                        );
+                    }
+                    other => panic!("a group's body must be one nested list, got {other:?}"),
+                }
+            }
+        });
+        assert_eq!(expanders, 2, "two projects, two expanders");
     }
 
     /// The hive's dashboard root appears **once** on a panel, not once per
@@ -1459,6 +1852,38 @@ mod tests {
             }
         });
         found
+    }
+
+    /// Every `Text` in the tree that caps neither its width nor its flow — i.e.
+    /// every one whose natural width is its whole string.
+    fn unbounded_texts(node: &Node) -> Vec<String> {
+        let mut out = Vec::new();
+        walk(node, &mut |n| {
+            if let Node::Text {
+                text,
+                max_width_chars,
+                ellipsize,
+                ..
+            } = n
+                && max_width_chars.is_none()
+                && !*ellipsize
+            {
+                out.push(text.clone());
+            }
+        });
+        out
+    }
+
+    /// Every `Label` body in the tree — the variant that neither wraps nor
+    /// ellipsizes, so only short constants may be one.
+    fn label_texts(node: &Node) -> Vec<String> {
+        let mut out = Vec::new();
+        walk(node, &mut |n| {
+            if let Node::Label { text, .. } = n {
+                out.push(text.clone());
+            }
+        });
+        out
     }
 
     /// Every `Label`/`Text` body in the tree.

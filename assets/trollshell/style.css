@@ -638,12 +638,22 @@
     margin-bottom: 0.308em;
 }
 /* The roster's own surface: the translucent fill `.ts-sidebar-tasks-list` gives
- * the tasks list. More specific than (and later than) the
- * `.ts-plugin-card list.boxed-list` flattening rule above, which is what would
- * otherwise leave the roster painting flat on the card. */
-.ts-agents-card list.ts-agents-list {
+ * the tasks list. It has to out-rank the `.ts-plugin-card list.boxed-list`
+ * flattening rule above, which would otherwise leave the roster painting flat
+ * on the card — and it does so on **specificity**, deliberately: the ancestor
+ * `.ts-plugin-card` makes this (0,3,1) against that rule's (0,2,1). Winning on
+ * source order alone would have been silently undone by any later
+ * `.ts-plugin-card`-scoped rule, and nothing in CI looks at rendered colour. */
+.ts-plugin-card .ts-agents-card list.ts-agents-list {
     background: alpha(white, 0.04);
     border-radius: 0.615em;
+}
+/* A group's rows get their own nested list so they keep per-row separators
+ * (see `group_node`); it must NOT paint a second surface on top of the outer
+ * one, so it stays flat and only the separators carry over. */
+.ts-agents-card list.ts-agents-group-list {
+    background: transparent;
+    border-radius: 0;
 }
 /* Row padding is the plugin's to spend, because `ListBox { dense: true }` hands
  * the height budget back by zeroing the auto-wrapper's floor (`.hytte-dense-row`
@@ -672,19 +682,26 @@
 /* Flag chips — only the flags that are ON are drawn, so the pill has to carry
  * its own meaning. Same shape as `.ts-task-badge` / `.ts-net-pill`; the tint
  * comes from the tone class the plugin sets beside this one (`error`,
- * `warning`, `dim-label`, `.ts-agent-upd`) via `currentColor`. */
-.ts-agent-chip {
+ * `warning`, `dim-label`, `.ts-agent-upd`) via `currentColor`.
+ *
+ * Scoped to this plugin's two roots like every other rule in this block:
+ * `.ts-plugin-card` and `.ts-plugin-panel` are shared by every plugin, so an
+ * unscoped `.ts-agent-*` here would be a class any other plugin could collide
+ * with by accident (#963 review, NIT). */
+.ts-agents-card .ts-agent-chip,
+.ts-agents-panel .ts-agent-chip {
     padding: 0.077em 0.462em;
     border-radius: 9999px;
     background: alpha(currentColor, 0.12);
     font-weight: 600;
 }
-.ts-agent-upd {
+.ts-agents-card .ts-agent-upd,
+.ts-agents-panel .ts-agent-upd {
     color: @warning_color;
 }
 /* The in-place unfold sits under its row, indented past the runtime icon so it
  * reads as belonging to the row above rather than as a new one. */
-.ts-agent-details {
+.ts-agents-card .ts-agent-details {
     margin: 0.154em 0 0.308em 1.538em;
 }
 

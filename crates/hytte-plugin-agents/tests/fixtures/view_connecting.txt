@@ -81,7 +81,9 @@ View {
                             Text {
                                 id: None,
                                 text: "connecting…",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",

@@ -155,7 +155,9 @@ View {
                             Text {
                                 id: None,
                                 text: "failed",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -260,7 +262,9 @@ View {
                             Text {
                                 id: None,
                                 text: "needs login",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -365,7 +369,9 @@ View {
                             Text {
                                 id: None,
                                 text: "paused",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -481,7 +487,9 @@ View {
                             Text {
                                 id: None,
                                 text: "stopped",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -586,7 +594,9 @@ View {
                             Text {
                                 id: None,
                                 text: "running the P1 gate",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",

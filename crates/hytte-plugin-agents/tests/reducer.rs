@@ -382,6 +382,28 @@ fn an_unfolded_row_survives_the_next_poll() {
     assert_eq!(opened(&m), Some("stray"));
 }
 
+/// `agents-back` — the panel's "all agents" button — clears the selection.
+///
+/// It is the only way out of an agent page, and since #963's review it is also
+/// what rescues a selection the roster cannot resolve (a hive that went down
+/// with an agent page open), so it needs coverage of its own rather than
+/// riding along inside another test's tail.
+///
+/// Falsification: drop the `node == view::BACK_ID` arm from `click` and this
+/// goes red.
+#[test]
+fn the_all_agents_button_clears_the_selection() {
+    let (mut m, mut rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    m.update(click("chat:stray"));
+    assert!(m.selected.is_some());
+
+    let fx = m.update(click("agents-back"));
+    assert_eq!(fx, vec![], "going back opens nothing; it is already open");
+    assert_eq!(m.selected, None);
+    assert!(lines(&mut rx).is_empty(), "and asks the hive nothing");
+}
+
 /// The card's title row is the one thing that jumps to the drawer, and it lands
 /// on the **hive overview**, not on whatever agent was last selected.
 ///

@@ -155,7 +155,9 @@ View {
                             Text {
                                 id: None,
                                 text: "reviewing PR #947",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -271,7 +273,9 @@ View {
                             Text {
                                 id: None,
                                 text: "paused",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -376,7 +380,9 @@ View {
                             Text {
                                 id: None,
                                 text: "stopped",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -429,13 +435,19 @@ View {
                                     ],
                                     tooltip: None,
                                 },
-                                Label {
+                                Text {
                                     id: None,
                                     text: "trollshell-choom",
+                                    max_width_chars: Some(
+                                        32,
+                                    ),
+                                    ellipsize: true,
                                     classes: [
                                         "title-4",
                                     ],
-                                    tooltip: None,
+                                    tooltip: Some(
+                                        "trollshell-choom",
+                                    ),
                                 },
                                 Icon {
                                     id: None,
@@ -487,7 +499,9 @@ View {
                         Text {
                             id: None,
                             text: "reviewing PR #947",
-                            max_width_chars: None,
+                            max_width_chars: Some(
+                                56,
+                            ),
                             ellipsize: false,
                             classes: [
                                 "dim-label",

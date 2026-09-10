@@ -155,7 +155,9 @@ View {
                             Text {
                                 id: None,
                                 text: "reviewing PR #947",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -423,7 +425,9 @@ View {
                             Text {
                                 id: None,
                                 text: "paused",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",
@@ -528,7 +532,9 @@ View {
                             Text {
                                 id: None,
                                 text: "stopped",
-                                max_width_chars: None,
+                                max_width_chars: Some(
+                                    34,
+                                ),
                                 ellipsize: false,
                                 classes: [
                                     "dim-label",

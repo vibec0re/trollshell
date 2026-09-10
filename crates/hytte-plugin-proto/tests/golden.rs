@@ -42,7 +42,7 @@
 //! the wire break this suite exists to catch.
 //!
 //! One diff shape *is* explainable and looks alarming: appending the **16th**
-//! [`Capability`] crosses MessagePack's `fixarray` limit (15), so the capability
+//! [`Capability`] crosses `MessagePack`'s `fixarray` limit (15), so the capability
 //! array header in `manifest_full_v1` and `plugin_register_v1` goes from one
 //! byte (`0x9f`) to three (`dc 00 10`) and **every byte after it shifts**. The
 //! same applies to any list here that grows past 15. Nothing is broken (both

@@ -3173,7 +3173,7 @@ fn an_undeclared_open_uri_still_registers_on_an_old_host() {
         #[serde(default)]
         vocab: u16,
     }
-    #[derive(serde::Deserialize, Debug)]
+    #[derive(serde::Deserialize, PartialEq, Debug)]
     enum EffectOld {
         Notify { summary: String, body: String },
     }
@@ -3216,11 +3216,19 @@ fn an_undeclared_open_uri_still_registers_on_an_old_host() {
         summary: "Timer done".into(),
         body: "25:00 timer finished".into(),
     };
-    decode_body::<EffectOld>(&encode_body(&benign))
+    let decoded: EffectOld = decode_body(&encode_body(&benign))
         .expect("a pre-#1045 effect in the same frame position still decodes");
+    assert_eq!(
+        decoded,
+        EffectOld::Notify {
+            summary: "Timer done".into(),
+            body: "25:00 timer finished".into(),
+        },
+        "…and decodes to the same thing, so the mirror enum is right",
+    );
 }
 
-/// `Capability` is **one variant away from a MessagePack width crossing**
+/// `Capability` is **one variant away from a `MessagePack` width crossing**
 /// (#1045, review F4).
 ///
 /// `rmp-serde` encodes a 15-element `Vec` with a one-byte `fixarray` header

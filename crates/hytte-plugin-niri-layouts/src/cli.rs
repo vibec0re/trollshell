@@ -31,7 +31,7 @@ Counts are COLUMNS, not windows: niri widths are per column, so a stacked
 column of three windows is one column.
 
 As a niri bind (etc/niri/binds.kdl):
-    Mod+Shift+E { spawn \"hytte-plugin-niri-layouts\" \"apply\" \"equal\"; }";
+    Mod+Alt+E { spawn \"hytte-plugin-niri-layouts\" \"apply\" \"equal\"; }";
 
 /// What the command line asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

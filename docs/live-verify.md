@@ -393,8 +393,8 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       chip. Then `systemctl --user restart niri` (or restart the compositor how
       you normally would) and confirm the chip comes back without restarting the
       plugin, and does not blink off and on if you land on the same workspace.
-      **Restart the shell, not the plugin** (`systemctl --user restart
-    trollshell`) two or three times, then check the plugin's own unit:
+      **Restart the shell, not the plugin** two or three times
+      (`systemctl --user restart trollshell`) and check the plugin's unit:
       `systemctl --user status trollshell-plugin-niri-layouts` should still show
       one process and, if you look, one `niri-layouts-watch` thread — not one per
       restart (that leak is what #1038's review found). The chip should be back

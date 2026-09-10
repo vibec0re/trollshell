@@ -621,8 +621,8 @@ impl EventSource for SocketEvents {
 #[cfg(test)]
 mod tests {
     use super::{
-        BACKOFF_CEILING, Backend, EventSource, Incoming, MIN_WINDOWS, POLL_INTERVAL, SocketEvents,
-        Watch, backoff, drive,
+        BACKOFF_CEILING, Backend, EventSource, Incoming, MIN_WINDOWS, POLL_INTERVAL, SocketBackend,
+        SocketEvents, Verdicts, Watch, backoff, drive,
     };
     use niri_ipc::{Event, Window, WindowLayout, Workspace};
     use std::collections::VecDeque;
@@ -1381,6 +1381,91 @@ mod tests {
              {:?}",
             script.logs
         );
+    }
+
+    /// The **real** backend's wait, which the scripted one above stands in for
+    /// everywhere else: a 30 s backoff must not hold the thread for 30 s after
+    /// the session ends, so it is slept in [`POLL_INTERVAL`] slices with the
+    /// lane checked between them.
+    #[test]
+    fn the_real_backend_stops_waiting_out_a_backoff_once_the_session_is_over() {
+        /// A lane whose receiver is already gone.
+        struct Gone;
+        impl Verdicts for Gone {
+            fn send(&mut self, _visible: bool) -> bool {
+                false
+            }
+            fn open(&self) -> bool {
+                false
+            }
+        }
+
+        let mut backend = SocketBackend { verdicts: Gone };
+        let started = std::time::Instant::now();
+
+        let carry_on = backend.wait(BACKOFF_CEILING);
+
+        assert!(
+            !carry_on,
+            "a dead lane ends the loop rather than reconnecting"
+        );
+        assert!(
+            started.elapsed() < BACKOFF_CEILING / 4,
+            "it returned after {:?} — a single long park would have held the \
+             thread for the whole ceiling",
+            started.elapsed()
+        );
+    }
+
+    /// An event split across a timeout tick still decodes.
+    ///
+    /// This is the invariant that makes the read timeout safe at all: a
+    /// `read_line` that times out mid-line keeps the bytes it already read
+    /// appended to the buffer, so [`SocketEvents`] must **not** clear it between
+    /// polls. Clearing it would turn every tick that lands mid-event into a
+    /// decode failure — i.e. a dropped niri connection — under exactly the load
+    /// (a burst of events) where the chip most needs to be right.
+    #[test]
+    fn an_event_split_across_a_timeout_tick_still_decodes() {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+
+        let niri = std::thread::spawn(move || {
+            let mut reader = BufReader::new(theirs.try_clone().expect("clone"));
+            let mut request = String::new();
+            reader.read_line(&mut request).expect("a request line");
+            let mut writer = &theirs;
+            writer
+                .write_all(b"{\"Ok\":\"Handled\"}\n")
+                .expect("the reply");
+            // Half an event, then a silence longer than one poll tick, then the
+            // rest of it.
+            writer
+                .write_all(b"{\"WindowClosed\":{\"id\":")
+                .expect("half an event");
+            std::thread::sleep(POLL_INTERVAL * 2);
+            writer.write_all(b"7}}\n").expect("the other half");
+            std::thread::sleep(POLL_INTERVAL);
+        });
+
+        let mut events = SocketEvents::over(ours).expect("the handshake completes");
+        let mut ticks = 0;
+        let decoded = loop {
+            match events.next_event() {
+                Incoming::Idle => {
+                    ticks += 1;
+                    assert!(ticks < 20, "the second half never arrived");
+                }
+                other => break other,
+            }
+        };
+
+        assert!(ticks >= 1, "the split has to straddle at least one tick");
+        assert!(
+            matches!(&decoded, Incoming::Event(e) if matches!(**e, Event::WindowClosed { id: 7 })),
+            "the halves were reassembled, not dropped: {decoded:?}"
+        );
+
+        niri.join().expect("the fake niri thread");
     }
 
     // ── the hand-rolled framing (#1038) ──────────────────────────────────────

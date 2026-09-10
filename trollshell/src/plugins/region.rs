@@ -17,7 +17,7 @@ use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, glib, prelude::*};
 use hytte::reactive::registry;
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode, NodeId, Reconciler};
-use hytte_plugin_proto::HostMsg;
+use hytte_plugin_proto::{HostMsg, wire};
 use tokio::sync::mpsc;
 
 use super::preem_render::{self, Scope};
@@ -295,6 +295,40 @@ fn build_region(
     container.upcast()
 }
 
+/// Whether `node`'s root renders **nothing** — a `Box`/`Row`/`ListBox` with an
+/// empty `children` list, or a `Scrolled` whose bounded child recurses to the
+/// same (#1039).
+///
+/// A plugin's card/pill root (`.ts-plugin-card`/`.ts-plugin-chip`) paints its
+/// own background and, for a chip, its own padding — independently of whether
+/// the tree mounted inside it has any content. `view()` returning an empty
+/// container is a plugin's only way to say "nothing to show right now" (#1019's
+/// "hide until more than one window"), so the host has to notice that shape and
+/// hide the card itself; otherwise a "hidden" chip still leaves a small rounded
+/// nub in the bar.
+///
+/// Deliberately narrow: a **leaf** node (`Label` with empty text, `Icon`, …) is
+/// never "empty" this way, even though it may draw nothing visible either —
+/// that is a different plugin-authoring question this issue does not own, and
+/// widening it would hide, say, a legitimately blank `Label` a plugin uses as a
+/// spacer. Decided off the **wire** node the plugin actually sent, not the
+/// mapped `hytte_ui::Node` [`to_ui_node`] produces: the mapper can drop content
+/// under [`MAX_NODES_PER_TREE`]/[`MAX_TREE_DEPTH`]
+/// (`super::wire_map`), and a card whose plugin asked for content but got
+/// throttled must stay visible (with its degradation warning), not disappear.
+///
+/// [`MAX_NODES_PER_TREE`]: hytte_plugin_proto::wire::MAX_NODES_PER_TREE
+/// [`MAX_TREE_DEPTH`]: hytte_plugin_proto::wire::MAX_TREE_DEPTH
+fn root_renders_nothing(node: &wire::Node) -> bool {
+    match node {
+        wire::Node::Box { children, .. }
+        | wire::Node::Row { children, .. }
+        | wire::Node::ListBox { children, .. } => children.is_empty(),
+        wire::Node::Scrolled { child, .. } => root_renders_nothing(child),
+        _ => false,
+    }
+}
+
 /// Reconcile a mount region's child cards against the latest sorted plugin
 /// render list. Adds a card + reconciler for a newly-joined plugin, updates &
 /// reorders existing cards, and removes cards whose plugin left — each keyed by
@@ -346,11 +380,20 @@ fn reconcile_region(
     for render in renders {
         let preem_scope = Scope::card(&render.plugin_id);
         let ui_tree = to_ui_node(&preem_scope, render.grants, &render.tree);
+        // #1039: render nothing → occupy nothing. Set on the card's own root,
+        // never the region `container` — that stays governed solely by
+        // `!renders.is_empty()` above, so a region with one (empty-tree) plugin
+        // still counts as "occupied" for the region-level hide, matching the
+        // pre-#1039 contract every other call site of that flag already relies
+        // on. Applies to both card shapes (`ts-plugin-card` sidebar,
+        // `ts-plugin-chip` bar) since both go through this one loop.
+        let has_content = !root_renders_nothing(&render.tree);
         if let Some(idx) = cards.iter().position(|c| c.plugin_id == render.plugin_id) {
             let card = &mut cards[idx];
             // Swap in the live connection's outbound, then re-render its tree.
             *card.outbound.borrow_mut() = Some(render.outbound.clone());
             card.reconciler.render(&ui_tree);
+            card.root.set_visible(has_content);
             container.reorder_child_after(&card.root, prev.as_ref());
             prev = Some(card.root.clone().upcast());
         } else {
@@ -373,6 +416,7 @@ fn reconcile_region(
                 }
             });
             reconciler.render(&ui_tree);
+            root.set_visible(has_content);
             container.insert_child_after(&root, prev.as_ref());
             prev = Some(root.clone().upcast());
             cards.push(MountedCard {
@@ -1017,6 +1061,230 @@ mod gtk_tests {
             grants: Grants::none(),
             outbound: tx.clone(),
         }
+    }
+
+    /// [`render_of`], but with an arbitrary `tree` — for the #1039 empty-root
+    /// coverage below, where the tree shape under test is the whole point.
+    fn render_with_tree(
+        plugin_id: &str,
+        tx: &mpsc::Sender<HostMsg>,
+        tree: wire::Node,
+    ) -> SlotRender {
+        SlotRender {
+            tree,
+            ..render_of(plugin_id, tx)
+        }
+    }
+
+    /// A childless `Row` — what #1019's niri-layouts chip (and any plugin
+    /// answering "nothing to show right now") renders as its root.
+    fn empty_row_tree(id: &str) -> wire::Node {
+        wire::Node::Row {
+            id: Some(id.to_owned()),
+            classes: vec![],
+            spacing: 0,
+            children: vec![],
+            tooltip: None,
+        }
+    }
+
+    /// A `Row` with one `Label` child — the same root shape as
+    /// [`empty_row_tree`], but with content, so re-rendering one into the other
+    /// on the same id exercises the reuse path rather than a rebuild.
+    fn row_with_label_tree(id: &str, child_id: &str, text: &str) -> wire::Node {
+        wire::Node::Row {
+            id: Some(id.to_owned()),
+            classes: vec![],
+            spacing: 0,
+            children: vec![wire::Node::Label {
+                id: Some(child_id.to_owned()),
+                text: text.to_owned(),
+                classes: vec![],
+                tooltip: None,
+            }],
+            tooltip: None,
+        }
+    }
+
+    /// A bare `Label` as the tree **root** — a leaf, not a container. Used to
+    /// prove the empty-root hide is scoped to containers: a leaf never
+    /// qualifies, even with blank text.
+    fn leaf_label_tree(id: &str, text: &str) -> wire::Node {
+        wire::Node::Label {
+            id: Some(id.to_owned()),
+            text: text.to_owned(),
+            classes: vec![],
+            tooltip: None,
+        }
+    }
+
+    /// A plugin that renders an empty container root gets its card/pill hidden,
+    /// not just its content — otherwise the pill's own background (and, for a
+    /// chip, its padding) still paints a nub with nothing in it (#1039).
+    ///
+    /// Proven two ways, per the #851 lesson that `is_visible()` alone does not
+    /// mean "not on screen": the flag itself, **and** the width the region
+    /// container actually measures with the card mounted — matched against the
+    /// same region holding nothing at all, so a `set_visible(false)` widget
+    /// that GTK still counted toward the row's size would be caught even though
+    /// the flag alone reads correctly.
+    ///
+    /// **Deletion check:** replacing `root_renders_nothing(&render.tree)` with
+    /// `false` (i.e. never hiding) turns both assertions red.
+    #[gtk::test]
+    fn an_empty_tree_root_hides_the_card_and_contributes_no_width() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+
+        // Baseline: what the region measures with nothing mounted in it.
+        let width_with_nothing_mounted = container.measure(gtk::Orientation::Horizontal, -1).1;
+
+        reconcile_region(
+            &container,
+            &cards,
+            &[render_with_tree("empty", &tx, empty_row_tree("root"))],
+            "ts-plugin-chip",
+        );
+
+        let card_root = cards.borrow()[0].root.clone();
+        assert!(
+            !card_root.is_visible(),
+            "an empty-tree root must hide the card, not just render nothing inside it",
+        );
+        let width_with_empty_card = container.measure(gtk::Orientation::Horizontal, -1).1;
+        assert_eq!(
+            width_with_empty_card, width_with_nothing_mounted,
+            "a hidden empty-tree card must contribute exactly as much width as no card at \
+             all — got {width_with_empty_card}px vs {width_with_nothing_mounted}px with \
+             nothing mounted; a widget GTK still measures despite `is_visible() == false` \
+             would leave the pill's padding as a nub on the bar",
+        );
+    }
+
+    /// The other half of the #1039 toggle: a plugin that starts rendering
+    /// content again after an empty frame gets its card shown, with width, not
+    /// left hidden by a stale flag.
+    ///
+    /// **Deletion check:** inverting the assignment (`!root_renders_nothing(…)`
+    /// swapped to `root_renders_nothing(…)`) turns this test red while leaving
+    /// [`an_empty_tree_root_hides_the_card_and_contributes_no_width`] green —
+    /// the two together are what pin the direction of the flag, not just its
+    /// existence.
+    #[gtk::test]
+    fn a_later_render_with_content_shows_the_card_again() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+
+        reconcile_region(
+            &container,
+            &cards,
+            &[render_with_tree("toggle", &tx, empty_row_tree("root"))],
+            "ts-plugin-chip",
+        );
+        assert!(
+            !cards.borrow()[0].root.is_visible(),
+            "test setup: the plugin's first frame is an empty root",
+        );
+
+        reconcile_region(
+            &container,
+            &cards,
+            &[render_with_tree(
+                "toggle",
+                &tx,
+                row_with_label_tree("root", "label", "hi"),
+            )],
+            "ts-plugin-chip",
+        );
+
+        let card_root = cards.borrow()[0].root.clone();
+        assert!(
+            card_root.is_visible(),
+            "a plugin that renders content again must have its card shown",
+        );
+        assert!(
+            card_root.measure(gtk::Orientation::Horizontal, -1).1 > 0,
+            "a shown card with a label inside it must contribute non-zero width",
+        );
+    }
+
+    /// A leaf node (`Label`, `Icon`, …) is never "empty" by the #1039 rule, even
+    /// with blank text — only a childless *container* root triggers the hide.
+    /// Widening the check to leaves would hide a plugin's deliberately blank
+    /// `Label` used as a spacer, which is a different (and legitimate) shape.
+    ///
+    /// **Deletion check:** adding a `wire::Node::Label { text, .. } if
+    /// text.is_empty()` arm to [`root_renders_nothing`] turns this red.
+    #[gtk::test]
+    fn a_leaf_root_with_empty_text_is_not_hidden() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+
+        reconcile_region(
+            &container,
+            &cards,
+            &[render_with_tree("leaf", &tx, leaf_label_tree("root", ""))],
+            "ts-plugin-chip",
+        );
+
+        assert!(
+            cards.borrow()[0].root.is_visible(),
+            "a bare leaf root (Label with empty text) must not be hidden by the \
+             empty-container rule",
+        );
+    }
+
+    /// One plugin rendering an empty root must not affect a sibling's card in
+    /// the same region — the per-plugin removal semantics [`reconcile_region`]
+    /// already documents for join/leave apply here too.
+    ///
+    /// **Deletion check:** hoisting `has_content` out of the per-`render` loop
+    /// (computing it once from the first render and applying it to every card)
+    /// turns this red.
+    #[gtk::test]
+    fn one_plugins_empty_tree_does_not_affect_a_sibling_cards_visibility() {
+        adw::init().expect("libadwaita init");
+        let (tx, _rx) = mpsc::channel::<HostMsg>(4);
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let cards: Rc<RefCell<Vec<MountedCard>>> = Rc::new(RefCell::new(Vec::new()));
+
+        reconcile_region(
+            &container,
+            &cards,
+            &[
+                render_with_tree("empty", &tx, empty_row_tree("root")),
+                render_with_tree("busy", &tx, row_with_label_tree("root", "label", "hi")),
+            ],
+            "ts-plugin-chip",
+        );
+
+        let cards = cards.borrow();
+        let empty_card = cards
+            .iter()
+            .find(|c| c.plugin_id == "empty")
+            .expect("the empty plugin's card must still be mounted");
+        let busy_card = cards
+            .iter()
+            .find(|c| c.plugin_id == "busy")
+            .expect("the busy plugin's card must still be mounted");
+        assert!(
+            !empty_card.root.is_visible(),
+            "the empty plugin's card must be hidden",
+        );
+        assert!(
+            busy_card.root.is_visible(),
+            "a sibling plugin's card must be unaffected by another plugin's empty tree",
+        );
+        assert!(
+            busy_card.root.measure(gtk::Orientation::Horizontal, -1).1 > 0,
+            "the unaffected sibling must still contribute width",
+        );
     }
 
     /// A card leaving its region releases its preem renderer instances.

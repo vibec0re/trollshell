@@ -1178,6 +1178,7 @@ dependencies = [
 name = "hytte-gl"
 version = "0.1.0"
 dependencies = [
+ "gdk4-sys",
  "gl",
  "libloading",
  "tracing",

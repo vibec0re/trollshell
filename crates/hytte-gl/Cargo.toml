@@ -16,9 +16,24 @@ description = "The workspace's OpenGL island: safe RAII wrappers over the `gl` c
 # `loader` module for how the pointers are resolved.
 gl = "0.14.0"
 # Also already in `Cargo.lock` (via `clang-sys`, the bindgen consumer). Used to
-# `dlopen` libepoxy by soname, which GTK has already loaded — see `loader`.
+# `dlopen` glvnd's libEGL and libepoxy by soname, both of which GTK has already
+# loaded — see `loader`.
 libloading = "0.8.9"
 tracing.workspace = true
+
+[dev-dependencies]
+# **Tests only, and only for its link line.** This crate stays GTK-free as
+# shipped; nothing here calls a GDK function. The loader reaches its sources by
+# soname, which resolves only in a process that has already mapped them — GTK's
+# job in the shell, and nothing at all in a bare `hytte-gl` test binary, whose
+# `RUNPATH` carries neither libepoxy nor libEGL (measured: every `dlopen`
+# returns "cannot open shared object file"). Referencing one `gdk4-sys` entry
+# point from the test puts `-lgtk-4` on the test binary's link line, which
+# brings `libepoxy.so.0` and (via `libgstgl-1.0.so.0`) `libEGL.so.1` in as
+# `DT_NEEDED` — the exact condition `loader` is written for, with no display,
+# no driver and no GL context. Resolves **no** new package: `gdk4-sys 0.11.2`
+# is already in `Cargo.lock` under `gtk4`. See `loader`'s tests (#1067).
+gdk4-sys = "0.11.2"
 
 # This crate can't use `[lints] workspace = true` — it is the workspace's
 # **second** `unsafe_code` island (after `hytte-ecal`), and workspace-lints

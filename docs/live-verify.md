@@ -1331,30 +1331,44 @@ session.
       rasterisation per tick remains. Nothing should look different on
       screen — same picture, same pixels; this PR moves ownership only,
       never a byte of content.
-- [ ] **(#893 stage B / #886 / #863)** **`Scope` renders on a `GtkGLArea`, and
-      it is on by default.** Nothing in this entry can be gated in CI:
-      `nix flake check`'s system-tests bucket runs `xvfb-run` in a sandbox with
-      no `/dev/dri` and no mesa in the closure, so the shell's GL path never
-      executes there. What CI _does_ hold is the arm selection, the uniform
-      table, the animation state machine and the reconciler's node handling —
-      everything up to the draw call. The draw is yours.
-  1. **GL is the default, and the picture is right.** Start the shell with no
-     `TROLLSHELL_PREEM_RENDERER` set and open `hytte-plugin-preem-demo`'s card.
-     The scope must look like the scope did: same graticule, same beam, same
-     phosphor trail length, same skin colours. A gamma-shifted or washed-out
-     trace means the `GtkGLArea` framebuffer is being treated as linear where
-     `PixelSurface`'s texture was sRGB — the one colour-space question this
-     design could not settle from the sources.
+- [ ] **(#893 stage B / #886 / #863)** **`Scope` renders on a `GtkGLArea` —
+      opt-in via `TROLLSHELL_PREEM_RENDERER=gl` while #1072 is open.** #1067
+      got the GL loader actually resolving entry points for the first time,
+      and the day it did, `preem_gl_diff` reported 12/12 cases over the parity
+      ceiling with no classification yet of whether that is the shader math or
+      the harness's own assumptions — so #1072 flipped the shipped default to
+      **CPU** (`hytte_gl`'s loader route never runs unless something opts into
+      GL) rather than switch every preem chip's renderer on glass with no
+      parity evidence behind it. `TROLLSHELL_PREEM_RENDERER=gl` opts in; the
+      PR that closes #1072 makes GL the default again. Nothing in this entry
+      can be gated in CI: `nix flake check`'s system-tests bucket runs
+      `xvfb-run` in a sandbox with no `/dev/dri` and no mesa in the closure, so
+      the shell's GL path never executes there. What CI _does_ hold is the arm
+      selection, the uniform table, the animation state machine and the
+      reconciler's node handling — everything up to the draw call. The draw is
+      yours.
+  1. **The GL arm's picture is right.** Start the shell with
+     `TROLLSHELL_PREEM_RENDERER=gl` in the unit's environment and open
+     `hytte-plugin-preem-demo`'s card. The scope must look like the scope did:
+     same graticule, same beam, same phosphor trail length, same skin colours.
+     A gamma-shifted or washed-out trace means the `GtkGLArea` framebuffer is
+     being treated as linear where `PixelSurface`'s texture was sRGB — the one
+     colour-space question this design could not settle from the sources.
+     `RUST_LOG=hytte_gl=debug journalctl --user -u trollshell | grep 'resolved'`
+     names which loader route won (glvnd or libepoxy, #1067);
      `journalctl --user -u trollshell | grep -i 'GlSurface\|GL context'` should
-     be silent; a line there names the fallback that fired.
-  2. **The kill switch restores today's frames.** Restart with
-     `TROLLSHELL_PREEM_RENDERER=cpu` and confirm the scope still draws — and
-     draws the _same_ picture. That identity is byte-checked in CI
+     otherwise be silent — a line there names the fallback that fired. This is
+     also where #1072's actual parity question gets answered: does the picture
+     genuinely match, or is `preem_gl_diff`'s 12/12 finding visible here too?
+  2. **The default (unset) is what ships, and it is the CPU kit.** Restart
+     with no `TROLLSHELL_PREEM_RENDERER` set (or explicitly `=cpu`, kept as the
+     redundant spelling) and confirm the scope draws — and draws the CPU kit's
+     own picture. That identity is byte-checked in CI
      (`the_cpu_arm_still_emits_the_kits_own_bytes_as_a_pixels_node`, plus every
      existing `*_renders_at_parity_with_the_kit` test, which all run on the CPU
-     arm by default). What only glass can confirm is that the switch is
-     actually _read_: the variable is consumed once at the first `Scope` build,
-     so it has to be in the unit's environment, not just your shell's.
+     arm by default). What only glass can confirm is that opting in is
+     actually _read_: the variable is consumed once at the first `Scope`
+     build, so it has to be in the unit's environment, not just your shell's.
   3. **A bar's worth of scopes.**
      `cargo run -p hytte-ui --example gl_probe -- --layer --areas 8` (stage A's
      probe, on layer-shell): **jank 0**, and p95 within 0.5 ms of the 16.67 ms

@@ -85,10 +85,17 @@ Stage B has to. Three options, weighed honestly:
 `hytte-gl` stays GTK-free and deliberately small: compile a program, upload a
 uniform or a 1-D data texture, bind an FBO, draw a quad or a point array, swap a
 ping-pong pair, read back for the parity harness. Handles are RAII and `!Send`.
-Function pointers come from `libloading::Library::new("libepoxy.so.0")` — GTK has
-libepoxy loaded already, so `dlopen` by soname returns the loaded handle rather
-than searching. **Verify that on glass**; the fallback is a build-time path from
-`pkg-config`.
+Function pointers come from glvnd's `eglGetProcAddress` first (`dlopen("libEGL.so.1")`
+— GTK's own GStreamer media backend has it loaded already, so `dlopen` by soname
+returns the loaded handle rather than searching), with
+`libloading::Library::new("libepoxy.so.0")`'s `epoxy_<name>` variables as the
+fallback for a process where glvnd is not mapped. **Verified on glass (#1067):**
+the plan as originally written above does not work — libepoxy exports the
+`epoxy_gl*` family as data symbols holding function pointers, not as the plain
+`gl*` functions `gl::load_with` asks for, so resolving straight through
+`libepoxy.so.0` found nothing on every measured NixOS machine and the GL
+renderer silently stayed on the CPU kit for the whole life of this stage; see
+`crates/hytte-gl/src/loader.rs`'s module header for the full account.
 
 ## PR 1: the seam
 

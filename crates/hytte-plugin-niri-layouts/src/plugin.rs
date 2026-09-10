@@ -421,7 +421,7 @@ mod tests {
         layout_for_node,
     };
     use crate::layout::Layout;
-    use crate::niri::fake::Fake;
+    use crate::niri::fake::{self, Fake};
     use crate::watch::{self, Verdicts};
     use hytte_plugin::proto::{Capability, Effect, EventKind, Mount, Node};
     use hytte_plugin::{CmdReceiver, Input, Plugin, cmd_channel};
@@ -963,6 +963,29 @@ mod tests {
                 summary: "niri layout failed".to_owned(),
                 body: "no such window".to_owned(),
             }]
+        );
+    }
+
+    /// The worker's own seam carries the screen through to `niri::apply`
+    /// (#1050).
+    ///
+    /// Added because a mutation found the gap: `apply_and_report` could pass
+    /// `None` down and every test stayed green — the click test above stops at
+    /// the queued `Cmd`, and `niri::apply`'s own per-screen tests call it
+    /// directly. This is the one line between them, and it is the line the
+    /// worker task actually runs.
+    #[test]
+    fn the_worker_seam_hands_the_screen_to_niri_apply() {
+        let mut niri = Fake::two_outputs();
+
+        let report = apply_and_report(&mut niri, Layout::Split, Some(fake::OTHER_OUTPUT));
+
+        assert_eq!(report, None, "a successful apply reports nothing to toast");
+        assert_eq!(
+            niri.widths(),
+            vec![(30, 50.0), (40, 50.0), (50, 50.0)],
+            "DP-2's three columns — the focused screen's two windows (10, 20) \
+             are what a dropped `on_output` would have resized"
         );
     }
 

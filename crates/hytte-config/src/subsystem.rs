@@ -1495,23 +1495,156 @@ kept = true
         }
     }
 
+    /// Fire every `warn!` callsite the tests below observe through
+    /// [`capture`] — once, with **no** subscriber installed on this thread or
+    /// anywhere else in the process — purely to force each one into
+    /// `tracing-core`'s global callsite registry before `capture` constructs
+    /// its own `Dispatch`. Whatever `Interest` these throwaway hits land on is
+    /// irrelevant, which is the whole point: see `capture`'s doc for why.
+    ///
+    /// Three today: [`MALFORMED_UNSET_MESSAGE`] (a `_unset` that isn't an
+    /// array of strings), [`INERT_UNSET_MESSAGE`] (a well-formed `_unset`
+    /// naming a key nothing sets), and rule 4's "unknown key in config;
+    /// ignoring it". A new `warn!`/`debug!` in [`assemble`] that a test
+    /// starts asserting on through `capture` needs a line here too, or it
+    /// inherits the same 2 % flake this function exists to close (#1022).
+    ///
+    /// Same fix as #1020's `counting_events`
+    /// (`trollshell/src/plugins/shader_map.rs`) and #1032's
+    /// `warm_up_callsites` (`crates/hytte-services/src/hooks.rs`) — read
+    /// either's doc comment for the full `tracing-core` mechanism. This one
+    /// matches #1020's shape rather than #1032's: `assemble` is a pure,
+    /// in-memory, synchronous function with no I/O to amortise, so it warms
+    /// up on every `capture()` call rather than once behind a `OnceCell` —
+    /// #1032 only needed that gate because its subject (`hooks::run_inner`)
+    /// spawns a real subprocess per branch.
+    fn warm_up_callsites() {
+        let _ = assembled(&["[core]\n_unset = \"color\"\n"]);
+        let _ = assembled(&["[core]\n_unset = [\"colr\"]\n"]);
+        let _ = assembled(&["[core]\ncolour = \"cyan\"\n"]);
+    }
+
+    /// # Why a callsite can go silently unobserved (#1022)
+    ///
+    /// `tracing-core` caches a callsite's `Interest` **process-wide** the
+    /// first time it fires. If that first-ever fire lands on a thread with no
+    /// subscriber installed — anywhere in the binary, not necessarily this
+    /// test — the callsite is cached `Interest::never()` for the rest of the
+    /// process, and it stays that way: once a callsite is *registered*, a
+    /// later hit only re-reads the cached value rather than recomputing it.
+    /// `an_unknown_key_is_reported_and_does_not_fail_the_load` (below) is
+    /// exactly such a thread — it calls `assembled` with no `capture()`
+    /// guard, and if libtest schedules it as one of the first hits ever on
+    /// the "unknown key" callsite, it can poison the very callsite several of
+    /// the negative tests below use as their live control.
+    ///
+    /// [`warm_up_callsites`] closes this by making sure every callsite this
+    /// module's tests observe is already *registered* (in whatever interest
+    /// state) before this function constructs its own `Dispatch`:
+    /// `Dispatch::new`'s construction (`tracing_core::callsite::register_dispatch`)
+    /// unconditionally walks the *entire* callsite registry and rebuilds
+    /// every already-registered callsite's interest against the full set of
+    /// currently-live dispatchers — not the narrower "just this thread's
+    /// default" shortcut a first-ever registration can take. Since the only
+    /// `Subscriber` this module ever constructs is [`Captured`], which is
+    /// unconditionally `enabled`, that rebuild can only ever land on
+    /// `Interest::always()` for these callsites, no matter which thread races
+    /// which. This is the same reasoning #1020's `counting_events` and
+    /// #1032's `warm_up_callsites` rely on.
+    ///
+    /// This **replaces** the previous `rebuild_interest_cache()` "belt and
+    /// braces" call rather than keeping it alongside: that call had the exact
+    /// same `Rebuilder::JustOne` blind spot as the bug it was insuring
+    /// against (it can only rebuild interest for callsites already in the
+    /// registry, and it runs on *this* thread after `set_default` — no help
+    /// if a sibling thread poisons the callsite in between, or already did so
+    /// before this function ever ran). Warming the callsites up first and
+    /// then relying on `Dispatch::new`'s own unconditional full-registry
+    /// rebuild closes both gaps; a second manual rebuild afterward would
+    /// recompute the same already-correct answer.
     fn capture() -> (Captured, tracing::dispatcher::DefaultGuard) {
+        warm_up_callsites();
         let captured = Captured::default();
         let guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(captured.clone()));
-        // Belt and braces, kept deliberately. The hazard is real — with zero
-        // live dispatchers `tracing-core` caches a callsite's interest as
-        // `never` for the whole binary (`callsite.rs`'s
-        // `interest.unwrap_or_else(Interest::never)`) — but `Dispatch::new`
-        // above already closes it: constructing a `Dispatch` registers it and
-        // rebuilds interest for every registered callsite over the live list.
-        // What this call covers is the narrower `Rebuilder::JustOne` path,
-        // where with a single live dispatcher the rebuild degrades to
-        // "whatever *this* thread's default is" — genuinely thread-sensitive,
-        // and one line to insure against. It can only widen interest here
-        // (`Captured::enabled` is unconditionally true), so it cannot poison a
-        // sibling test.
-        tracing::callsite::rebuild_interest_cache();
         (captured, guard)
+    }
+
+    /// A callsite touched on a bare thread with **no** subscriber, *before*
+    /// this process has ever constructed a `Dispatch`, must still be observed
+    /// once one exists — the property [`warm_up_callsites`] leans on.
+    ///
+    /// The callsite here is private to this test (its own `tracing::warn!`
+    /// invocation, at its own source line — the macro's `static` is keyed by
+    /// source location, so no other test in the binary can have registered
+    /// it first), which is what makes "before any `Dispatch` exists" a
+    /// condition this test can actually construct rather than hope for.
+    ///
+    /// # Why this is guaranteed, not just observed (verified against the
+    /// pinned `tracing-core = 0.1.36` source)
+    ///
+    /// A `Dispatch`'s construction (`tracing_core::callsite::register_dispatch`,
+    /// called from `Dispatch::new`) unconditionally walks the *entire*
+    /// callsite registry and rebuilds every already-registered callsite's
+    /// interest against the full, current set of live dispatchers — a
+    /// `Rebuilder::Write` pass over the whole `LOCKED_DISPATCHERS` vec, never
+    /// the narrower `Rebuilder::JustOne` shortcut a callsite's own *first*
+    /// registration can take (`DISPATCHERS.rebuilder()`, used by both
+    /// `DefaultCallsite::register` and the standalone
+    /// `rebuild_interest_cache()`, degrades to "whatever the registering
+    /// thread's own ambient default is" whenever at most one `Dispatch` has
+    /// ever existed in the process so far — the actual #1022 hazard). A
+    /// callsite that is already *registered* — regardless of what interest
+    /// it happens to be cached with — before a `Dispatch::new` call is
+    /// therefore guaranteed correct immediately after it, because that
+    /// unconditional full rebuild fixes it.
+    ///
+    /// This is exactly why [`warm_up_callsites`] fires
+    /// [`MALFORMED_UNSET_MESSAGE`]'s, [`INERT_UNSET_MESSAGE`]'s and the
+    /// unknown-key callsites *before* `capture` constructs its own
+    /// `Dispatch`, rather than relying on `rebuild_interest_cache()`
+    /// afterward (the previous "belt and braces" call, removed): whatever
+    /// state those callsites are in — untouched, or already poisoned by an
+    /// unguarded sibling test racing them, such as
+    /// `an_unknown_key_is_reported_and_does_not_fail_the_load` below —
+    /// `capture`'s own `Dispatch::new` is what makes them correct, and it can
+    /// only do that for callsites the warm-up has already put in the
+    /// registry.
+    ///
+    /// A callsite touched for the *first* time only **after** a `Dispatch`
+    /// already exists is the complementary, dangerous case — the
+    /// `Rebuilder::JustOne` shortcut above, asking a bare thread with no
+    /// subscriber. That shape reproduces #1022 directly and reliably (20/20
+    /// runs of the whole binary in isolation, 12/15 embedded in the full
+    /// suite — see the PR body), but it is **not** committed here: a
+    /// dedicated callsite only this test ever touches makes it a coin flip
+    /// on process-wide `Dispatch` timing on every single run, which is a new
+    /// standalone flake in the same family, not a regression test. It was
+    /// run as a falsification (mutate, observe red, revert — `git status`
+    /// clean afterward), the same way #1020's and #1032's PRs falsify their
+    /// own fixes, not kept as code.
+    #[test]
+    fn a_callsite_touched_before_the_dispatch_exists_is_observed_after_one_is_installed() {
+        fn fire() {
+            tracing::warn!(marker = "1022-before", "1022 poison probe");
+        }
+
+        // Touched on a bare thread, with no subscriber anywhere in its
+        // stack, before this process has ever constructed a `Dispatch`.
+        std::thread::spawn(fire).join().expect("bare thread");
+
+        let captured = Captured::default();
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(captured.clone()));
+
+        fire();
+        assert!(
+            captured
+                .events()
+                .iter()
+                .any(|e| e.fields.get("marker").map(String::as_str) == Some("1022-before")),
+            "a callsite registered before any Dispatch existed must be \
+             observed once one is installed: Dispatch::new's construction \
+             rebuilds every already-registered callsite unconditionally"
+        );
     }
 
     /// The malformed-marker warnings, selected on the **exact** message rather

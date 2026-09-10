@@ -1746,10 +1746,9 @@ mod tests {
     fn five_refused_frames_emit_one_event() {
         let data = [0u8; 4];
         let node = ok_node("void main() {}", &data);
-        let scope = Scope::detached("shader-warn-once-events");
-        let emitted = counting_events(|| {
+        let emitted = counting_events("shader-warn-once-events", |scope| {
             for _ in 0..5 {
-                let _ = map_shader(&scope, Grants::none(), &node);
+                let _ = map_shader(scope, Grants::none(), &node);
             }
         });
         assert_eq!(
@@ -1803,14 +1802,13 @@ mod tests {
         let data = [0u8; 4];
         let big = ok_node(&over, &data);
         let fine = ok_node("void main() {}", &data);
-        let scope = Scope::detached("shader-two-refusal-kinds");
 
-        let emitted = counting_events(|| {
+        let emitted = counting_events("shader-two-refusal-kinds", |scope| {
             // A plugin ships one over-cap source at startup…
-            let _ = map_shader(&scope, granted(), &big);
+            let _ = map_shader(scope, granted(), &big);
             // …and, later in the same run, the session stops running shaders.
             with_cpu_kill_switch(|| {
-                let _ = map_shader(&scope, granted(), &fine);
+                let _ = map_shader(scope, granted(), &fine);
             });
         });
         assert_eq!(
@@ -1819,14 +1817,52 @@ mod tests {
         );
     }
 
-    /// Count the `tracing` events this module emits while `body` runs.
+    /// Count the `tracing` events this module emits when `emit` runs under a
+    /// scope of this helper's choosing.
     ///
     /// Lifted out of [`five_refused_frames_emit_one_event`] so #981's test can
     /// count the same way rather than carrying a second copy of the subscriber.
     /// Thread-local (`with_default` sets *this* thread's dispatcher), so a
     /// sibling test emitting the same callsite on another thread cannot be
     /// counted here.
-    fn counting_events(body: impl FnOnce()) -> u32 {
+    ///
+    /// # Why `emit` is called **twice**, and why that is the whole point
+    ///
+    /// `tracing` caches an `Interest` **per callsite, process-wide**, and the
+    /// cache is only recomputed when a callsite is first registered or when a
+    /// `Dispatch` is registered. `tracing_core`'s registration path takes a
+    /// short cut whenever at most one `Dispatch` is currently live
+    /// (`Dispatchers::rebuilder` → `Rebuilder::JustOne` →
+    /// `dispatcher::get_default`), which resolves to **the registering
+    /// thread's** subscriber. So the first thread ever to reach one of
+    /// [`warn`]'s `tracing::warn!` callsites decides that callsite's interest
+    /// for the rest of the process — and this module has three tests that
+    /// reach them with **no** subscriber installed
+    /// (`a_refused_shader_renders_the_placeholder_and_warns_once`,
+    /// `map_shader_reads_the_kill_switch_and_not_only_the_gl_latch`, and
+    /// `plugins::tests::an_ungranted_shader_degrades_without_taking_its_siblings`),
+    /// any of which libtest may schedule concurrently with this one. If one of
+    /// them registers the callsite while this helper's subscriber is installed,
+    /// it caches `Interest::never()` and the count reads **0**.
+    ///
+    /// Measured, on this branch: 1 failure in 250 under-load runs of
+    /// `five_refused_frames_emit_one_event`, `left: 0, right: 1` — the same
+    /// family as #974/#991's flake and #1014's, reached through the *capture*
+    /// layer rather than the latch.
+    ///
+    /// The fix needs no lock and no discipline from any other test, because
+    /// `with_default` registers a `Dispatch`, and **registering a dispatch
+    /// rebuilds the interest of every callsite already in the registry** —
+    /// computed over the live dispatchers, which now include this subscriber.
+    /// So: run `emit` once *outside* the subscriber under a throwaway scope,
+    /// purely to force its callsites into the registry (whatever interest they
+    /// land on is irrelevant), then install the subscriber — whose registration
+    /// rebuilds them against itself — and run `emit` again, counted. Nothing is
+    /// registered during the counted run, so there is nothing left to race.
+    ///
+    /// The warm-up cannot silence the counted run: [`warn`]'s latch is keyed by
+    /// `(Scope, Warned)` and the two runs get two different scopes.
+    fn counting_events(label: &str, emit: impl Fn(&Scope)) -> u32 {
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1850,8 +1886,13 @@ mod tests {
             fn exit(&self, _: &tracing::Id) {}
         }
 
+        // Warm-up: registers every callsite `emit` touches, under its own
+        // scope so the counted run's latch is untouched.
+        emit(&Scope::detached(&format!("{label}-callsite-warmup")));
+
         let count = StdArc::new(AtomicU32::new(0));
-        tracing::subscriber::with_default(Counting(StdArc::clone(&count)), body);
+        let counted = Scope::detached(label);
+        tracing::subscriber::with_default(Counting(StdArc::clone(&count)), || emit(&counted));
         count.load(Ordering::Relaxed)
     }
 }

@@ -2104,10 +2104,9 @@ fn capped_hidden_on_counting_warnings(entries: Vec<String>) -> (Vec<String>, u32
     let _ = capped_hidden_on("warmup", entries.clone());
 
     let count = StdArc::new(AtomicU32::new(0));
-    let result =
-        tracing::subscriber::with_default(Counting(StdArc::clone(&count)), || {
-            capped_hidden_on("p", entries)
-        });
+    let result = tracing::subscriber::with_default(Counting(StdArc::clone(&count)), || {
+        capped_hidden_on("p", entries)
+    });
     (result, count.load(Ordering::Relaxed))
 }
 
@@ -2124,7 +2123,10 @@ fn hidden_on_over_the_entry_cap_becomes_empty_and_warns() {
     assert_eq!(entries.len(), MAX_HIDDEN_ON_ENTRIES + 1);
 
     let (kept, warnings) = capped_hidden_on_counting_warnings(entries);
-    assert!(kept.is_empty(), "one entry over the cap empties the whole set");
+    assert!(
+        kept.is_empty(),
+        "one entry over the cap empties the whole set"
+    );
     assert_eq!(warnings, 1, "exactly one warning for the violation");
 }
 

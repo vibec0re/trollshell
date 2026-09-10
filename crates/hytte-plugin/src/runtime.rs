@@ -1175,11 +1175,12 @@ mod tests {
         }
 
         fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
-            if let Input::Event { node, kind } = input {
-                if node == "linker-btn" && matches!(kind, EventKind::Click) {
-                    self.clicks += 1;
-                    return vec![Effect::open_uri(self.clicks, "https://example.invalid/")];
-                }
+            if let Input::Event { node, kind } = input
+                && node == "linker-btn"
+                && matches!(kind, EventKind::Click)
+            {
+                self.clicks += 1;
+                return vec![Effect::open_uri(self.clicks, "https://example.invalid/")];
             }
             Vec::new()
         }

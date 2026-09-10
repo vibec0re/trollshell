@@ -226,7 +226,10 @@ pub(super) fn capped_hidden_on(plugin_id: &str, hidden_on: Vec<String>) -> Vec<S
         );
         return Vec::new();
     }
-    if let Some(over) = hidden_on.iter().find(|name| name.len() > MAX_HIDDEN_ON_NAME_BYTES) {
+    if let Some(over) = hidden_on
+        .iter()
+        .find(|name| name.len() > MAX_HIDDEN_ON_NAME_BYTES)
+    {
         tracing::warn!(
             plugin = %plugin_id,
             len = over.len(),

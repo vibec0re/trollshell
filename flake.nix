@@ -528,11 +528,15 @@
                 # `detached_launch_falls_back_without_a_user_manager`'s own
                 # "is systemd-run on PATH at all" probe must find it here — a
                 # miss would mean this check's `nativeCheckInputs` regressed,
-                # and a silent skip would hide exactly that. Its two siblings
+                # and a silent skip would hide exactly that. This variable's
+                # reach is that one `assert!` — its two siblings
                 # (`detached_launch_returns_at_once_…`,
                 # `two_launches_with_one_effect_id_both_start`) have no skip
-                # branch to gate: they accept either `LaunchReport` shape, so
-                # they run unconditionally once `systemd-run` exists at all.
+                # branch to gate: they run and pass regardless of whether
+                # `systemd-run` is on `$PATH` at all, since
+                # `assert_launched_then_clean_up` accepts and classifies
+                # whichever `LaunchReport` fallback the sandbox produces
+                # (`NoSystemdRun` or `NoUserManager`).
                 export TROLLSHELL_REQUIRE_SYSTEMD_RUN=1
               '';
               checkPhaseCargoCommand = ''

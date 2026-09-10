@@ -8399,14 +8399,15 @@ async fn attached_run_command_still_awaits_the_program_and_routes_its_exit_statu
 /// await the program — `--wait` on the systemd path, `kill_on_drop` on the
 /// fallback — turns the assertions red.
 ///
-/// **In `checks.system-tests` (#1082):** the sandbox has `systemd-run` on
-/// `$PATH` (`pkgs.systemd`, added there for this issue) but no `systemd --user`
-/// manager and no session bus — so `systemd-run` runs, fails to connect
-/// ("Failed to connect to user scope bus …"), `classify_systemd_run_failure`
-/// reads that as [`FallbackReason::NoUserManager`], and the launch takes the
-/// direct-spawn fallback. `assert_launched_then_clean_up` accepts either
-/// [`LaunchReport`] shape, so this test needs no gate of its own — it exercises
-/// the *fallback* path unconditionally there, never the unit path.
+/// **In `checks.system-tests` (#1082):** this test neither gates nor asserts
+/// which [`LaunchReport`] shape it gets — `assert_launched_then_clean_up`
+/// accepts either — so it needs no gate of its own, but a passing run here
+/// only proves *some* launch path worked, not which one; cargo's captured
+/// output for a passing test can't distinguish that.
+/// `detached_launch_falls_back_without_a_user_manager_inner`'s hard
+/// `assert_eq!(reason, FallbackReason::NoUserManager)` is the test that
+/// actually proves the sandbox has no `systemd --user` manager — see its doc
+/// comment for that proof.
 #[cfg(feature = "system-tests")]
 #[tokio::test]
 async fn detached_launch_returns_at_once_and_the_program_outlives_the_call() {
@@ -8436,10 +8437,13 @@ async fn detached_launch_returns_at_once_and_the_program_outlives_the_call() {
 /// uniqueness. Before the fix the second got systemd's `Unit … was already
 /// loaded or has a fragment file` while the first was still running.
 ///
-/// **In `checks.system-tests` (#1082):** as with its sibling above, the
-/// sandbox has no user manager, so both launches take the direct-spawn
-/// fallback — still two distinct pids, so the uniqueness assertions hold with
-/// no manager in the loop at all.
+/// **In `checks.system-tests` (#1082):** as with its sibling above, this test
+/// accepts whichever [`LaunchReport`] fallback each launch takes and doesn't
+/// itself prove which one the sandbox produced —
+/// `detached_launch_falls_back_without_a_user_manager_inner`'s hard-asserted
+/// `NoUserManager` reason is that proof. The uniqueness assertions here
+/// (distinct unit names, distinct `LaunchReport`s) hold regardless of which
+/// fallback fires.
 #[cfg(feature = "system-tests")]
 #[tokio::test]
 async fn two_launches_with_one_effect_id_both_start() {
@@ -8520,11 +8524,14 @@ async fn systemd_run_on_path_or_skip(test_name: &str) -> bool {
 /// applied by re-executing *this test binary* on the inner test below. That is
 /// also exactly the shape the reviewer used to falsify the first cut.
 ///
-/// **In `checks.system-tests` (#1082):** this is literally the sandbox's own
-/// case — `systemd-run` is on `$PATH` (`pkgs.systemd`), but there is no
-/// `systemd --user` manager and no session bus, which is exactly the
-/// `NoUserManager` shape this test drives on purpose (via the scrubbed
-/// re-exec below) rather than getting for free. It runs and passes there.
+/// **In `checks.system-tests` (#1082):** `systemd-run` is on `$PATH` there
+/// (`pkgs.systemd`), but the sandbox already has no `systemd --user` manager
+/// and no session bus, so the scrubbed re-exec below (which forces exactly
+/// that shape) has nothing left to remove — the ambient environment already
+/// is the `NoUserManager` case. It runs unconditionally, and its inner test's
+/// hard `assert_eq!(reason, FallbackReason::NoUserManager)` is what actually
+/// proves the sandbox's shape: a bare passing `cargo test` line can't show
+/// which branch a test took, but this one hard-asserts the specific reason.
 #[cfg(feature = "system-tests")]
 #[tokio::test]
 async fn detached_launch_falls_back_without_a_user_manager() {
@@ -8629,16 +8636,34 @@ async fn assert_launched_then_clean_up(report: &LaunchReport) {
     match report {
         LaunchReport::Unit(unit) => {
             eprintln!("detached launch took the systemd-run path: {unit}");
-            let state = tokio::process::Command::new("systemctl")
-                .args(["--user", "is-active", unit])
-                .output()
-                .await
-                .expect("systemctl --user is-active");
-            let state = String::from_utf8_lossy(&state.stdout).trim().to_owned();
-            let _ = tokio::process::Command::new("systemctl")
-                .args(["--user", "stop", unit])
-                .output()
-                .await;
+            // Bounded at the same 10s as the launch call itself
+            // (`LAUNCH_CALL_TIMEOUT`, effects.rs:1093): this arm only runs
+            // where a real `systemd --user` manager answered `systemd-run`
+            // (#1082 puts `systemd-run` on the `system-tests` sandbox's
+            // `$PATH`, but that sandbox has no manager, so today this is a
+            // developer-box path — CI could still reach it if a runner ever
+            // exposes one). An unbounded `systemctl` here would turn a stuck
+            // call into the outer CI timeout (#1011's shape, ~75 minutes)
+            // instead of a fast, named red.
+            let is_active = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::process::Command::new("systemctl")
+                    .args(["--user", "is-active", unit])
+                    .output(),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("systemctl --user is-active {unit} timed out after 10s"))
+            .expect("systemctl --user is-active");
+            let state = String::from_utf8_lossy(&is_active.stdout).trim().to_owned();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::process::Command::new("systemctl")
+                    .args(["--user", "stop", unit])
+                    .output(),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("systemctl --user stop {unit} timed out after 10s"))
+            .ok();
             assert_eq!(
                 state, "active",
                 "the launched program must still be running after the effect returned",

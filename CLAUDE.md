@@ -146,6 +146,15 @@ Beyond the package build's `doCheck`, the flake's `checks` output
   under a real `GdkGLContext` there instead of skipping — `TROLLSHELL_REQUIRE_GL=1`
   turns a skip into a failure the same way `flake.nix`'s `preCheck` already
   uses `TROLLSHELL_REQUIRE_ICON_THEME` to do that for the icon-theme test.
+  Since #1082, the same closure also carries `pkgs.systemd` (marginal cost: 1
+  new store path, `systemd-*-dev`, ~263 KiB — the full `systemd` runtime
+  containing `systemd-run` was already pulled in transitively by pipewire/
+  evolution-data-server/gtk4) so `systemd-run` is on `$PATH` for the plugin
+  host's detached-launch tests (`trollshell/src/plugins/tests.rs`), and
+  `TROLLSHELL_REQUIRE_SYSTEMD_RUN=1` turns a missing `systemd-run` there into
+  a failure the same way, gating the one test that has a skip branch
+  (`detached_launch_falls_back_without_a_user_manager`) — its siblings accept
+  either `LaunchReport` fallback and need no gate.
 
 ### Lint — strict, treat as the gate
 

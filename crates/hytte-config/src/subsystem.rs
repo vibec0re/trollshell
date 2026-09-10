@@ -706,6 +706,17 @@ const REQUIRED_TABLE_MESSAGE: &str = "table has no key this schema owns, but the
 /// `#[serde(default)]` [`toml::Value`] field loads perfectly well without its
 /// key. Only the shape of the field separates them, so that is what is asked.
 ///
+/// **A map is outside the rule; its entries are not** (#1088 review, LOW-1).
+/// `core = {}` on a `BTreeMap<String, Core>` field stays an empty map, because
+/// the map itself swallows the table — but each *entry* of it is a struct the
+/// schema walks, so `[core.a]` with nothing of `Core`'s in it reads as absent
+/// and the entry goes. For a struct field, "absent" is a shape the schema
+/// declared; a map key is the user's own content and has no `None` to
+/// round-trip into, so the two are not the same question. No `Subsystem` in
+/// this workspace has a map-typed field, which is the only reason this is
+/// written down rather than fixed: the first author to type one should decide
+/// it deliberately.
+///
 /// # Passes
 ///
 /// The document is read once as it stands, and once more per candidate:
@@ -720,6 +731,13 @@ const REQUIRED_TABLE_MESSAGE: &str = "table has no key this schema owns, but the
 ///   [`schema_paths`] applies to removal on the writing side.
 /// * The config handed back is the one that came out of the last accepted
 ///   candidate, so it always matches the document as it finally stands.
+///
+/// The walk is **greedy, not a search**: a candidate the schema refuses is
+/// recorded, which makes the table above it owned, so an outer table that could
+/// have been dropped whole is never tried. That is `main`'s answer for the
+/// shape anyway (`[a.b]` where `b` is required inside an optional `a` reads as
+/// `Some`), and the refusal is warned about, so it is visible rather than
+/// merely conservative.
 ///
 /// [`schema_paths`] deliberately keeps its own raw `serde_ignored` pass rather
 /// than coming through here: it wants the ignored set of the document *as
@@ -760,7 +778,16 @@ fn read_merged<S: Subsystem>(merged: toml::Table) -> Result<(S, Vec<String>), Co
             break;
         };
         let Some(table) = take_at(&mut doc, &path) else {
-            break;
+            // The one way this happens is a schema key with a literal `.` in
+            // its name, which [`split_path`] reads as a nesting hop and cannot
+            // resolve. Recorded as required and skipped, **not** broken out of:
+            // a `break` here abandoned the rule for the whole document, so an
+            // unrelated sibling flipped a legitimately absent `Option<Table>`
+            // back to `Some(<field defaults>)` — H1's shape, in the one path
+            // "a table not dropped" was supposed to describe (#1088 review,
+            // LOW-2). Recording it is what makes the skip terminate.
+            required.insert(path);
+            continue;
         };
         match reads_as::<S>(&doc) {
             Ok(next) => config = next,
@@ -848,7 +875,17 @@ fn absent_tables<S: Subsystem>(
 ///
 /// **Every uncertain answer is `false`**, and false is the conservative one: it
 /// keeps the table, which is what the reader did before #1025. A schema that
-/// refuses the plant outright (`deny_unknown_fields`) is one such answer.
+/// refuses the plant outright (`deny_unknown_fields`) is one such answer, as is
+/// a map that accepts the plant without reporting it.
+///
+/// **Cost, so nobody puts this on a hot path** (#1088 review, NIT-1). One
+/// document clone plus one full `serde_ignored` pass, and [`read_merged`]
+/// recomputes its candidate list every round — so `n` still-empty tables cost
+/// about `n²/2` of these, not `n` (measured end to end: 40 empty tables,
+/// 26.7 ms). It is not a live cost: `assemble` runs per *save*, not per poll
+/// (`watch::Watcher::poll` returns before loading when no stamp moved), and a
+/// flat schema never reaches the loop at all. Memoising per path would make it
+/// linear the day a document with dozens of empty tables exists.
 fn schema_descends<S: Subsystem>(doc: &toml::Table, path: &str) -> bool {
     let mut probe = doc.clone();
     let Some((parent, leaf)) = split_path(&mut probe, path) else {
@@ -2410,6 +2447,54 @@ kept = true
         }
     }
 
+    /// `Leds`' table, with the block left **out** of `DEFAULT_TOML` — so a
+    /// typed-empty `[core]` reaches the schema as an empty table instead of
+    /// merging with the default's keys. The only fixture here that can show
+    /// what a typed-empty block does to a non-`Option` table field.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Defaulted {
+        #[serde(default)]
+        core: Core,
+    }
+
+    impl Subsystem for Defaulted {
+        const NAME: &'static str = "defaulted";
+        const DEFAULT_TOML: &'static str = "";
+        type Error = std::convert::Infallible;
+        type Resolved = ();
+        fn parsed(&self) -> ((), Vec<InvalidValue>) {
+            ((), Vec::new())
+        }
+        fn validate(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// A schema key with a literal `.` in its name, beside an ordinary
+    /// `Option<Table>`. The dotted name is indistinguishable from a nesting hop
+    /// in the paths this module speaks in, so the table behind it can never be
+    /// resolved — and the sibling must not pay for that (#1088 review, LOW-2).
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct DottedName {
+        #[serde(default, rename = "a.b", skip_serializing_if = "Option::is_none")]
+        dotted: Option<Core>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        core: Option<Core>,
+    }
+
+    impl Subsystem for DottedName {
+        const NAME: &'static str = "dotted-name";
+        const DEFAULT_TOML: &'static str = "";
+        type Error = std::convert::Infallible;
+        type Resolved = ();
+        fn parsed(&self) -> ((), Vec<InvalidValue>) {
+            ((), Vec::new())
+        }
+        fn validate(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
     /// The shape the **house recipe** mandates (`trollshell/src/config/mod.rs`):
     /// `#[serde(default)]` on the *container*, one hand-written `Default`, so
     /// the table's own default and the sum of its field defaults are the same
@@ -3095,6 +3180,39 @@ kept = true
         }
     }
 
+    /// The same rule for the *other* way a candidate can fail to be decided
+    /// (#1088 review, LOW-2): a schema key with a literal `.` in its name makes
+    /// a path this module cannot resolve, so that table is simply never
+    /// dropped. That is the documented fail-safe direction — but it has to cost
+    /// only itself, exactly like a required sibling does.
+    ///
+    /// The two rows differ only in whether the unresolvable table is there at
+    /// all, and `core`'s answer must not move between them.
+    ///
+    /// Red if the unresolvable path goes back to breaking out of the loop: the
+    /// second row reads `Some(0/""/[])` — H1's shape again, in the one path the
+    /// paths' own doc calls harmless.
+    #[test]
+    fn a_key_this_module_cannot_address_costs_only_itself() {
+        for (what, dotted) in [
+            ("no dotted name in the document", ""),
+            (
+                "one that cannot be addressed",
+                "\"a.b\" = { mystery = 1 }\n",
+            ),
+        ] {
+            let loaded =
+                assemble::<DottedName>(&layers(&[&format!("{dotted}[core]\nmystery = 1\n")]))
+                    .expect("assembles");
+
+            assert!(
+                loaded.config.core.is_none(),
+                "`core` is absent either way — {what}: {:?}",
+                loaded.config.core
+            );
+        }
+    }
+
     /// A table the schema **requires** cannot read as absent, and the way that
     /// is settled is by asking rather than by guessing: nothing visible from
     /// [`read_merged`] says whether a field is an `Option`, so the rule is
@@ -3188,9 +3306,15 @@ kept = true
 
     /// **What "absent" means for a table field that is not an `Option`, and
     /// where it is observable at all** (#1088 review, L1). #866's rule 1, one
-    /// level up: an erased key falls back to the code default, and a block with
-    /// every one of the schema's keys erased out of it falls back to the code
-    /// default for the *table*.
+    /// level up: an erased key falls back to the code default, and a block left
+    /// with none of the schema's keys in it falls back to the code default for
+    /// the *table*.
+    ///
+    /// "Left with none" covers both ways of getting there — every key erased
+    /// out of it, and a block the user simply **typed empty** (#1088 review,
+    /// NIT-2). The second row below is the erasure; a bare `[core]` lands in
+    /// exactly the same place, which is why the sentence is about the block's
+    /// contents rather than about the marker.
     ///
     /// For a schema written to the **house recipe** — `#[serde(default)]` on
     /// the container, one hand-written `Default`
@@ -3229,6 +3353,21 @@ kept = true
             all_three.config.core.color, two_of_three.config.core.color,
             "and this is the whole discontinuity, in the one schema shape that \
              can show it"
+        );
+
+        // The other way into the same place (#1088 review, NIT-2). `Leds`
+        // cannot show it — its `DEFAULT_TOML` writes `[core]`, so a typed-empty
+        // overlay block merges with the default's keys and is never empty —
+        // which is what `Defaulted` is for.
+        let typed_empty = assemble::<Defaulted>(&layers(&["[core]\n"]))
+            .expect("assembles")
+            .config;
+        assert_eq!(
+            typed_empty.core,
+            Core::default(),
+            "typing the block empty lands where erasing every key out of it \
+             does; the rule is about what is left in the block, not about how \
+             it got that way"
         );
     }
 

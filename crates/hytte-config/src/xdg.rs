@@ -41,7 +41,7 @@
 //! environment at all, and the free functions at the bottom of this module are
 //! its one-line wrappers.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Directory, under each XDG base, that every trollshell file lives in.
 pub const APP_DIR: &str = "trollshell";
@@ -75,6 +75,26 @@ fn nonempty(value: Option<&String>) -> Option<&str> {
     value.map(String::as_str).filter(|v| !v.is_empty())
 }
 
+/// `true` if `value` is an absolute path; `false` (after a `warn!` naming
+/// `variable`) otherwise.
+///
+/// The XDG base directory spec requires a relative `$XDG_CONFIG_HOME` /
+/// `$XDG_CONFIG_DIRS` / `$XDG_STATE_HOME` entry to be treated as invalid and
+/// ignored — accepting one would silently resolve config against the
+/// process's *working directory* instead of the user's home (#985), the same
+/// danger the module doc above already calls out for the empty-string case.
+/// `$HOME` itself goes through the same gate even though it isn't one of the
+/// XDG variables: it seeds the default for two of them, so a relative
+/// `$HOME` is exactly as dangerous — see [`Env::home`].
+fn is_absolute(variable: &str, value: &str) -> bool {
+    if Path::new(value).is_absolute() {
+        true
+    } else {
+        tracing::warn!(variable, value, "ignoring relative XDG path");
+        false
+    }
+}
+
 impl Env {
     /// Read the live process environment. The **only** function in this module
     /// that does; everything else is a pure method on the result.
@@ -89,35 +109,78 @@ impl Env {
         }
     }
 
+    /// `$HOME`, treated as unset (`None`) if it's empty or relative — the
+    /// same rule every other variable in this module gets.
+    ///
+    /// `$HOME` isn't itself an XDG variable, but it seeds the default for
+    /// both `$XDG_CONFIG_HOME` and `$XDG_STATE_HOME`, so a relative one is
+    /// just as dangerous: it would seed a relative overlay/state path
+    /// exactly the way a relative `$XDG_CONFIG_HOME` used to (#985's third
+    /// variable — the first two are `config_home`/`state_home` below).
+    fn home(&self) -> Option<&str> {
+        nonempty(self.home.as_ref()).filter(|h| is_absolute("HOME", h))
+    }
+
     /// `$XDG_CONFIG_HOME`, else `$HOME/.config`. `None` when neither is set.
+    ///
+    /// A relative `$XDG_CONFIG_HOME` (or `$HOME`, via [`Env::home`]) is
+    /// invalid per spec and falls back to the default the same as an unset
+    /// one (#985).
     #[must_use]
     pub fn config_home(&self) -> Option<PathBuf> {
-        nonempty(self.config_home.as_ref()).map_or_else(
-            || nonempty(self.home.as_ref()).map(|h| PathBuf::from(h).join(".config")),
-            |dir| Some(PathBuf::from(dir)),
-        )
+        nonempty(self.config_home.as_ref())
+            .filter(|dir| is_absolute("XDG_CONFIG_HOME", dir))
+            .map_or_else(
+                || self.home().map(|h| PathBuf::from(h).join(".config")),
+                |dir| Some(PathBuf::from(dir)),
+            )
     }
 
     /// `$XDG_STATE_HOME`, else `$HOME/.local/state`. `None` when neither is set.
+    ///
+    /// A relative `$XDG_STATE_HOME` (or `$HOME`, via [`Env::home`]) is
+    /// invalid per spec and falls back to the default the same as an unset
+    /// one (#985).
     #[must_use]
     pub fn state_home(&self) -> Option<PathBuf> {
-        nonempty(self.state_home.as_ref()).map_or_else(
-            || nonempty(self.home.as_ref()).map(|h| PathBuf::from(h).join(".local").join("state")),
-            |dir| Some(PathBuf::from(dir)),
-        )
+        nonempty(self.state_home.as_ref())
+            .filter(|dir| is_absolute("XDG_STATE_HOME", dir))
+            .map_or_else(
+                || {
+                    self.home()
+                        .map(|h| PathBuf::from(h).join(".local").join("state"))
+                },
+                |dir| Some(PathBuf::from(dir)),
+            )
     }
 
     /// `$XDG_CONFIG_DIRS`, split on `:`, **most important first** — i.e. still
     /// in the spec's own order. Empty entries are dropped (a `::` or a leading
-    /// colon would otherwise name the working directory).
+    /// colon would otherwise name the working directory), and so is any entry
+    /// that is not an absolute path (#985) — the spec treats a relative
+    /// `XDG_CONFIG_DIRS` entry as invalid, and the danger is the same one
+    /// blank entries guard against.
+    ///
+    /// If every entry is dropped this way — an all-relative or all-blank
+    /// `$XDG_CONFIG_DIRS` — the result falls back to
+    /// [`DEFAULT_CONFIG_DIRS`] rather than an empty search path: the
+    /// nix-written base layer must not silently vanish just because the rest
+    /// of the variable was garbage, the same principle behind treating an
+    /// empty variable as unset.
     #[must_use]
     pub fn config_dirs(&self) -> Vec<PathBuf> {
-        nonempty(self.config_dirs.as_ref())
+        let dirs: Vec<PathBuf> = nonempty(self.config_dirs.as_ref())
             .unwrap_or(DEFAULT_CONFIG_DIRS)
             .split(':')
             .filter(|d| !d.is_empty())
+            .filter(|d| is_absolute("XDG_CONFIG_DIRS", d))
             .map(PathBuf::from)
-            .collect()
+            .collect();
+        if dirs.is_empty() {
+            vec![PathBuf::from(DEFAULT_CONFIG_DIRS)]
+        } else {
+            dirs
+        }
     }
 
     /// Every `<subsystem>.toml` layer, **lowest precedence first**: the
@@ -315,6 +378,36 @@ mod tests {
         );
     }
 
+    /// A relative value is invalid per the XDG spec and must be treated the
+    /// same as unset — not resolved against the process's working directory,
+    /// which is what a naive `PathBuf::from` would do. The relative sibling
+    /// of [`empty_variables_are_treated_as_unset`].
+    #[test]
+    fn relative_variables_are_treated_as_unset() {
+        let env = Env {
+            home: Some("/home/annika".into()),
+            config_home: Some("relative/path".into()),
+            config_dirs: Some("etc/xdg:/etc/xdg".into()),
+            state_home: Some("relative/state".into()),
+        };
+
+        assert_eq!(
+            env.config_home(),
+            Some(PathBuf::from("/home/annika/.config")),
+            "a relative XDG_CONFIG_HOME must fall back to $HOME/.config"
+        );
+        assert_eq!(
+            strs(&env.config_dirs()),
+            ["/etc/xdg"],
+            "the relative XDG_CONFIG_DIRS entry must be dropped, keeping only the absolute one"
+        );
+        assert_eq!(
+            env.state_home(),
+            Some(PathBuf::from("/home/annika/.local/state")),
+            "a relative XDG_STATE_HOME must fall back to $HOME/.local/state"
+        );
+    }
+
     /// A stray `::` or trailing colon must not name the process's working
     /// directory as a config source.
     #[test]
@@ -332,6 +425,44 @@ mod tests {
                 "/home/annika/.config/trollshell/caw.toml",
             ]
         );
+    }
+
+    /// `$HOME` itself must be absolute too — it seeds the default for both
+    /// `$XDG_CONFIG_HOME` and `$XDG_STATE_HOME`, and a relative one would
+    /// silently produce a relative overlay/state path exactly the way a
+    /// relative `$XDG_CONFIG_HOME` used to (#985's third variable, review
+    /// follow-up).
+    #[test]
+    fn a_relative_home_does_not_seed_a_relative_default() {
+        let env = Env {
+            home: Some("relative-home".into()),
+            ..Env::default()
+        };
+
+        assert_eq!(
+            env.config_home(),
+            None,
+            "no absolute $HOME to build the default $XDG_CONFIG_HOME from"
+        );
+        assert_eq!(
+            env.state_home(),
+            None,
+            "no absolute $HOME to build the default $XDG_STATE_HOME from"
+        );
+    }
+
+    /// If every `$XDG_CONFIG_DIRS` entry is relative, the nix-written base
+    /// layer must not silently disappear — the search path falls back to
+    /// the documented default the same as an unset variable would (review
+    /// follow-up on #985).
+    #[test]
+    fn an_entirely_relative_config_dirs_falls_back_to_the_default() {
+        let env = Env {
+            config_dirs: Some("relative/one:relative/two".into()),
+            ..env()
+        };
+
+        assert_eq!(strs(&env.config_dirs()), ["/etc/xdg"]);
     }
 
     /// No `$HOME` and no `$XDG_CONFIG_HOME`: there is still a base to read,

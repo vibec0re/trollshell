@@ -1952,7 +1952,10 @@ mod tests {
 
         let over_base = subsystem::assemble::<CoreLedsConfig>(&[
             (PathBuf::from("/base.toml"), "style = \"crt\"\n".into()),
-            (PathBuf::from("/overlay.toml"), "_unset = [\"style\"]\n".into()),
+            (
+                PathBuf::from("/overlay.toml"),
+                "_unset = [\"style\"]\n".into(),
+            ),
         ])
         .expect("assembles");
         assert_eq!(

@@ -209,7 +209,7 @@ impl<S: Subsystem> Watcher<S> {
     /// defaults back without hand-restoring every key.
     pub fn poll(
         &mut self,
-        current: S::Resolved,
+        current: &S::Resolved,
         lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Option<S::Resolved> {
         let now = stamps_of(&self.paths);
@@ -230,7 +230,7 @@ impl<S: Subsystem> Watcher<S> {
         // Silent: the environment has not changed, and this runs every few
         // seconds for the life of the shell.
         let next = self.resolved(lookup, Deprecations::Silent);
-        (next != current).then_some(next)
+        (next != *current).then_some(next)
     }
 }
 
@@ -279,7 +279,7 @@ pub async fn poll_loop<S: Subsystem>(
 ) {
     loop {
         tokio::time::sleep(interval).await;
-        if let Some(next) = watcher.poll(values.get_cloned(), &*lookup) {
+        if let Some(next) = watcher.poll(&values.get_cloned(), &*lookup) {
             tracing::info!(subsystem = S::NAME, "config changed; reloaded");
             values.set(next);
         }
@@ -393,7 +393,7 @@ mod tests {
 
         assert_eq!(*watcher.last_good(), 2, "the load read the pre-edit file");
         assert_eq!(
-            watcher.poll(2, &no_env()),
+            watcher.poll(&2, &no_env()),
             Some(7),
             "…and the edit made during the load is picked up, not baselined away"
         );
@@ -408,12 +408,12 @@ mod tests {
         let (current, mut watcher) = boot::<Dial>(&file.layers(), &no_env());
         assert_eq!(current, 3);
 
-        assert_eq!(watcher.poll(current, &no_env()), None, "nothing moved");
+        assert_eq!(watcher.poll(&current, &no_env()), None, "nothing moved");
 
         // The stamp moves, the value does not.
         file.write("level = 3 # same value, new bytes\n");
         assert_eq!(
-            watcher.poll(current, &no_env()),
+            watcher.poll(&current, &no_env()),
             None,
             "a reload that changes nothing must not republish"
         );
@@ -433,7 +433,7 @@ mod tests {
 
         file.write_in_the_same_granule("level = 4 # nudged\n");
 
-        assert_eq!(watcher.poll(current, &no_env()), Some(4));
+        assert_eq!(watcher.poll(&current, &no_env()), Some(4));
     }
 
     /// …and the honest limit of the same mechanism, stated rather than implied:
@@ -456,7 +456,7 @@ mod tests {
         file.write_in_the_same_granule("level = 4\n");
 
         assert_eq!(
-            watcher.poll(current, &no_env()),
+            watcher.poll(&current, &no_env()),
             None,
             "stat-polling cannot see this, and does not claim to"
         );
@@ -481,13 +481,13 @@ mod tests {
         file.write("level = \"unterminated\n");
 
         assert_eq!(
-            watcher.poll(current, &no_env()),
+            watcher.poll(&current, &no_env()),
             None,
             "nothing republished"
         );
         assert_eq!(*watcher.last_good(), 5, "the last good layer is kept");
         for _ in 0..3 {
-            assert_eq!(watcher.poll(current, &no_env()), None);
+            assert_eq!(watcher.poll(&current, &no_env()), None);
         }
         let warned = captured.warnings();
         assert_eq!(
@@ -511,7 +511,7 @@ mod tests {
         file.delete();
 
         assert_eq!(
-            watcher.poll(current, &no_env()),
+            watcher.poll(&current, &no_env()),
             Some(1),
             "back to DEFAULT_TOML's value"
         );
@@ -537,7 +537,7 @@ mod tests {
 
         base.write("level = 6\n");
 
-        assert_eq!(watcher.poll(current, &no_env()), Some(6));
+        assert_eq!(watcher.poll(&current, &no_env()), Some(6));
     }
 
     /// [`boot`] seeds the watcher with the **file layer**, not the resolved
@@ -583,7 +583,7 @@ mod tests {
         file.write("level = 4\n");
 
         assert_eq!(
-            watcher.poll(resolved, &lookup),
+            watcher.poll(&resolved, &lookup),
             None,
             "the variable still pins the value, so nothing republishes"
         );

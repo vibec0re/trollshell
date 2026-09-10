@@ -1821,16 +1821,16 @@ mod tests {
         assert_eq!(current.style, DisplayStyle::Lcd);
 
         // Unmoved mtime → nothing to do.
-        assert_eq!(watcher.poll(current, &no_env()), None);
+        assert_eq!(watcher.poll(&current, &no_env()), None);
 
         overlay.write("style = \"crt\"\ncolor = \"rainbow\"\n");
-        let next = watcher.poll(current, &no_env()).expect("changed → reload");
+        let next = watcher.poll(&current, &no_env()).expect("changed → reload");
 
         assert_eq!(next.style, DisplayStyle::Crt);
         assert_eq!(next.color, ColorMap::Rainbow);
         // A touch that changes nothing must not churn the signal.
         overlay.write("style = \"crt\"\ncolor = \"rainbow\"\n");
-        assert_eq!(watcher.poll(next, &no_env()), None);
+        assert_eq!(watcher.poll(&next, &no_env()), None);
     }
 
     /// A file that appears *after* startup is a change too — the overlay is
@@ -1847,7 +1847,7 @@ mod tests {
         );
 
         overlay.write("fill = \"blank\"\n");
-        let next = watcher.poll(current, &no_env()).expect("created → reload");
+        let next = watcher.poll(&current, &no_env()).expect("created → reload");
 
         assert_eq!(next.fill, Fill::Blank);
     }
@@ -1874,7 +1874,7 @@ mod tests {
         // Not TOML at all.
         overlay.write("style = \"crt\n");
         assert_eq!(
-            watcher.poll(good, &no_env()),
+            watcher.poll(&good, &no_env()),
             None,
             "a parse error must publish nothing"
         );
@@ -1882,7 +1882,7 @@ mod tests {
 
         // …and a repaired file is picked up again.
         overlay.write("style = \"oled\"\n");
-        let next = watcher.poll(good, &no_env()).expect("repaired → reload");
+        let next = watcher.poll(&good, &no_env()).expect("repaired → reload");
         assert_eq!(next.style, DisplayStyle::Oled);
     }
 
@@ -1905,7 +1905,7 @@ mod tests {
 
         overlay.write("style = \"crt\"\ncolor = \"rainbow\"\nrows = \"many\"\n");
         let next = watcher
-            .poll(good, &no_env())
+            .poll(&good, &no_env())
             .expect("the good keys in the save must reach the panel");
 
         assert_eq!(next.color, ColorMap::Rainbow, "the key beside the typo");
@@ -1948,7 +1948,7 @@ mod tests {
         overlay.write("style = \"cr\n");
         let (captured, _guard) = capture();
         for _ in 0..4 {
-            let _ = watcher.poll(current, &no_env());
+            let _ = watcher.poll(&current, &no_env());
         }
 
         assert_eq!(
@@ -1980,7 +1980,7 @@ mod tests {
         overlay.write("style = \"crt\"\nrows = \"many\"\n");
         let (captured, _guard) = capture();
         for _ in 0..4 {
-            let _ = watcher.poll(current, &no_env());
+            let _ = watcher.poll(&current, &no_env());
         }
 
         assert_eq!(
@@ -2007,7 +2007,7 @@ mod tests {
         assert_eq!(current.style, DisplayStyle::Crt);
 
         overlay.write("style = \"lcd\"\ncolor = \"rainbow\"\n");
-        let next = watcher.poll(current, &pinned).expect("changed → reload");
+        let next = watcher.poll(&current, &pinned).expect("changed → reload");
 
         assert_eq!(
             next.style,
@@ -2039,7 +2039,7 @@ mod tests {
 
         let (captured, _guard) = capture();
         overlay.write("color = \"rainbow\"\n");
-        let next = watcher.poll(current, &pinned).expect("changed → reload");
+        let next = watcher.poll(&current, &pinned).expect("changed → reload");
 
         assert_eq!(
             next.color,
@@ -2081,7 +2081,7 @@ mod tests {
 
         let (captured, _guard) = capture();
         overlay.write("color = \"rainbow\"\n");
-        let next = watcher.poll(current, &broken).expect("changed → reload");
+        let next = watcher.poll(&current, &broken).expect("changed → reload");
 
         assert_eq!(
             next.color,
@@ -2225,7 +2225,7 @@ mod tests {
         assert_eq!(current.style, DisplayStyle::Crt);
 
         overlay.delete();
-        let next = watcher.poll(current, &no_env()).expect("deleted → reload");
+        let next = watcher.poll(&current, &no_env()).expect("deleted → reload");
 
         assert_eq!(
             next,
@@ -2250,7 +2250,7 @@ mod tests {
         let mut watcher = watching(&overlay.layers());
 
         assert_eq!(
-            watcher.poll(CoreLeds::default(), &no_env()),
+            watcher.poll(&CoreLeds::default(), &no_env()),
             None,
             "nothing has moved since construction, so there is nothing to republish"
         );
@@ -2281,7 +2281,7 @@ mod tests {
         // byte count, which is the half the length in the stamp can see.
         overlay.write_in_the_same_granule("style = \"crt\"\ncolor = \"rainbow\"\n");
         let next = watcher
-            .poll(current, &no_env())
+            .poll(&current, &no_env())
             .expect("a same-granule save must not be invisible");
 
         assert_eq!(next.style, DisplayStyle::Crt);
@@ -2330,7 +2330,7 @@ mod tests {
             "live control: the load really did happen before the save"
         );
         assert_eq!(
-            watcher.poll(published, &no_env()).map(|leds| leds.style),
+            watcher.poll(&published, &no_env()).map(|leds| leds.style),
             Some(DisplayStyle::Crt),
             "the save must reach the panel on the next poll, not never"
         );
@@ -2421,7 +2421,7 @@ mod tests {
 
         base.write("style = \"crt\"\nfill = \"spare\"\ncolor = \"rainbow\"\n");
         let next = watcher
-            .poll(current, &no_env())
+            .poll(&current, &no_env())
             .expect("a base-layer edit is a change too");
 
         assert_eq!(next.color, ColorMap::Rainbow, "the base's new key applies");

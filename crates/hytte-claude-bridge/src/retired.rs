@@ -178,7 +178,14 @@ impl Entry {
 /// written by a build with a larger capacity (or edited by hand) cannot hand
 /// back more than the live map would hold. The **last** `cap` entries survive,
 /// matching the oldest-first eviction the file is written in.
+///
+/// Also sweeps [`sweep_stale_temp_files`] — this is the state directory's one
+/// natural per-boot visit (`Titles::persisted` calls this once, at startup),
+/// so it is the site that catches a `.{FILE}.*.tmp` a prior run's [`save`]
+/// left behind (#997) without adding a second boot-time pass over the
+/// directory.
 pub fn load(path: &Path, cap: usize) -> Vec<(Key, String)> {
+    sweep_stale_temp_files(path);
     let Some(bytes) = read_bounded(path) else {
         return Vec::new();
     };
@@ -329,6 +336,95 @@ pub fn save(path: &Path, entries: &[(Key, &str)]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     outcome
+}
+
+/// Remove any `.{FILE}.*.tmp` siblings of `path` — [`tmp_path`]'s naming
+/// convention — left behind by a [`save`] that never reached its `rename`
+/// (#997).
+///
+/// [`save`] only unlinks its own temp file on the `Err` return path
+/// (`swap()` failing partway through). A SIGKILL, an OOM kill, or a power cut
+/// between `File::create` and `rename` skips that cleanup entirely, and
+/// because [`tmp_path`] mixes the pid with a monotonic ticket, the leaked
+/// name can never collide with a later write and so is never overwritten
+/// either — it would sit in `CLAUDE_BRIDGE_STATE_DIR` forever, which is also
+/// the `claude` child's cwd, so the litter accumulates exactly where Claude
+/// Code's project scan looks.
+///
+/// A listing or unlink failure is `warn!`-logged and otherwise ignored —
+/// this runs once per boot from [`load`], and a cache sweep must never be
+/// the reason startup fails. A missing directory (first boot) is not even
+/// worth a warning.
+///
+/// # A second, concurrent instance
+///
+/// This sweep has no liveness check against the pid embedded in a temp
+/// file's own name, so a second bridge booting inside the same few-
+/// microsecond window as a live [`save`]'s `File::create`-to-`rename` gap can
+/// sweep that *other*, still-live instance's own temp file out from under it
+/// — `nix/module-common.nix` already documents running two bridges at once as
+/// a user error (the second fails to bind the port), but nothing stops this
+/// sweep from running before that failure surfaces. Measured, not assumed,
+/// to degrade safely rather than lose data: the live writer's `rename` then
+/// returns `NotFound`, `save`'s error path is already a no-op unlink plus an
+/// `Err`, and `session.rs`'s `persist()` turns that `Err` into a `warn!` and
+/// keeps going — the *previous*, still-whole file is left untouched, and the
+/// retirement stays correct in memory until the next successful write heals
+/// the file. The cost is the #855 symptom (one visibly failed turn) only if
+/// the bridge restarts inside that same narrow window. A `/proc/<pid>`
+/// liveness check on the name's embedded pid would close this outright; not
+/// done here because the window this closes is microseconds wide on a write
+/// that happens about once per context window.
+fn sweep_stale_temp_files(path: &Path) {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let prefix = format!(".{name}.");
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "could not list the state dir to sweep stale retired-session temp files",
+                );
+            }
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            // Not valid UTF-8, so it cannot be a name this bridge minted —
+            // tmp_path only ever writes ASCII.
+            continue;
+        };
+        if !file_name.starts_with(&prefix)
+            || !Path::new(file_name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+        {
+            continue;
+        }
+        let stale = dir.join(file_name);
+        match std::fs::remove_file(&stale) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %stale.display(),
+                    "swept a stale retired-session temp file left by an interrupted write",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %stale.display(),
+                    error = %e,
+                    "could not remove a stale retired-session temp file",
+                );
+            }
+        }
+    }
 }
 
 /// A temp file beside `path`, on the target's own filesystem — `rename(2)` is
@@ -582,5 +678,47 @@ mod tests {
         save(&path(&dir), &[]).expect("a writable tempdir");
         assert!(load(&path(&dir), CAP).is_empty());
         assert!(path(&dir).exists());
+    }
+
+    /// #997: a temp file left behind by a `save` that never reached its
+    /// `rename` — the shape a SIGKILL or power cut between `File::create` and
+    /// `rename` leaves — is swept away the next time `load` runs (once per
+    /// boot, from `Titles::persisted`).
+    #[test]
+    fn a_stale_temp_file_is_swept_by_load() {
+        let dir = dir();
+        let stale = dir.path().join(".retired-sessions.json.13.4.tmp");
+        std::fs::write(&stale, "{not even valid json").expect("a writable tempdir");
+        assert!(stale.exists(), "test setup");
+
+        load(&path(&dir), CAP);
+
+        assert!(
+            !stale.exists(),
+            "the stale temp file should have been swept"
+        );
+    }
+
+    /// The sweep is scoped to this file's own temp-name shape — it must not
+    /// reach for anything else that happens to sit beside it, including a
+    /// human's unrelated dotfile or a temp file for a different store.
+    #[test]
+    fn a_non_matching_file_is_left_alone() {
+        let dir = dir();
+        let unrelated = [
+            dir.path().join("notes.txt"),
+            dir.path().join(".unrelated-file.json.1.1.tmp"),
+            dir.path().join("retired-sessions.json.1.1.tmp"), // no leading dot
+            dir.path().join(".retired-sessions.json.1.1.tmp.bak"), // wrong suffix
+        ];
+        for f in &unrelated {
+            std::fs::write(f, "keep me").expect("a writable tempdir");
+        }
+
+        load(&path(&dir), CAP);
+
+        for f in &unrelated {
+            assert!(f.exists(), "{f:?} should not have been swept");
+        }
     }
 }

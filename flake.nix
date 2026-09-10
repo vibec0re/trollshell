@@ -627,16 +627,28 @@
                   # credential (#752). The `api` half of this invariant has its
                   # own fixture, hm-module-claude-bridge-api below.
                   && b.secrets == [ ]
-                  # THE BILLING SCRUB (#866). The retired unit's
-                  # `UnsetEnvironment=` is re-expressed as four EMPTY env values,
-                  # which is what stops an inherited ANTHROPIC_API_KEY from
-                  # restart-looping the bridge in the default mode. Losing these
-                  # is a silent regression that only bites the users who happen
-                  # to export one, so it is asserted by content.
+                  # THE BILLING/REDIRECT SCRUB (#866, extended #994). The
+                  # retired unit's `UnsetEnvironment=` is re-expressed as EMPTY
+                  # env values, which is what stops an inherited
+                  # ANTHROPIC_API_KEY — or a stray ANTHROPIC_BASE_URL — from
+                  # restart-looping the bridge, or silently redirecting it, in
+                  # the default mode. Losing any of these is a silent
+                  # regression that only bites the users who happen to export
+                  # one, so each is asserted by content.
                   && b.env.ANTHROPIC_API_KEY == ""
                   && b.env.ANTHROPIC_AUTH_TOKEN == ""
+                  && b.env.CLAUDE_CODE_OAUTH_TOKEN == ""
                   && b.env.CLAUDE_CODE_USE_BEDROCK == ""
-                  && b.env.CLAUDE_CODE_USE_VERTEX == "";
+                  && b.env.CLAUDE_CODE_USE_VERTEX == ""
+                  && b.env.CLAUDE_CODE_USE_FOUNDRY == ""
+                  && b.env.ANTHROPIC_BASE_URL == ""
+                  && b.env.ANTHROPIC_BEDROCK_BASE_URL == ""
+                  && b.env.ANTHROPIC_VERTEX_BASE_URL == ""
+                  && b.env.ANTHROPIC_FOUNDRY_BASE_URL == ""
+                  && b.env.ANTHROPIC_FOUNDRY_RESOURCE == ""
+                  && b.env.ANTHROPIC_FOUNDRY_AUTH_TOKEN == ""
+                  && b.env.ANTHROPIC_FOUNDRY_API_KEY == ""
+                  && b.env.ANTHROPIC_CUSTOM_HEADERS == "";
                 assert units ? trollshell-pet-brain;
                 # `builtins.toString` because home-manager's unitOption merge
                 # hands some of these back list-wrapped (ExecStart below is

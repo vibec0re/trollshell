@@ -9,7 +9,8 @@
 //!
 //! - **No arguments** → an ordinary out-of-process trollshell widget plugin: a
 //!   [`Mount::BarRight`](hytte_plugin::proto::Mount::BarRight) chip of three
-//!   glyph buttons, one per layout. See [`plugin`].
+//!   Adwaita symbolic buttons, one per layout, shown only while the focused
+//!   workspace holds more than one window. See [`plugin`] and [`watch`].
 //! - **`apply <equal|golden|split>`** → apply that layout and exit, so the very
 //!   same binary is a niri `spawn` bind with no shell involved:
 //!
@@ -44,7 +45,7 @@
 //! | layout | proportion per column |
 //! | --- | --- |
 //! | `equal` | `1/n` each (so `n = 1` is full width) |
-//! | `golden` | first `0.618`, **every other one** `0.382` |
+//! | `golden` | first `0.7`, **every other one** `0.3` |
 //! | `split` | `0.5` for every column |
 //!
 //! Those are **fractions**, which is the unit [`layout`] thinks in. niri's
@@ -58,31 +59,39 @@
 //!
 //! The triage on #1019 put three questions to Annika and built its own defaults
 //! meanwhile; she answered all three ("scroll off to the side / n1 / preem"),
-//! and this is what each became:
+//! then looked at the result on glass and sent it back for a second round
+//! (2026-09-10). What stands after both:
 //!
-//! - **Golden reads as A**: the first column takes 61.8 % and every column after
-//!   it takes 38.2 %, so a third and later column *scroll off to the right* —
-//!   which is what the issue's `[====] [==] ( .... ) [==]` sketch draws.
+//! - **Golden reads as A**: the first column takes its share and every column
+//!   after it takes the narrow one, so a third and later column *scroll off to
+//!   the right* — which is what the issue's `[====] [==] ( .... ) [==]` sketch
+//!   draws. The **shares are 70/30**, not the 61.8/38.2 the first cut derived
+//!   from φ: "Golden: mhm looks off. maybe better `[ ~70% ] [ ~30% ]`".
 //!   [`Layout::proportions`](layout::Layout::proportions) is the only place any
 //!   proportion is decided.
 //! - **Three inline glyph buttons** on the chip, not one chip opening a panel.
 //!   [`plugin`]'s `chip()` is the only place the arrangement lives; the button
 //!   ids `update` keys off would carry over to a panel unchanged.
-//! - **Drawn with the preem kit** rather than with Adwaita symbolic icons: each
-//!   button holds a small [`LedMatrix`](hytte_plugin::preem::LedMatrix) panel
-//!   whose lit columns *are* the layout — three equal bars, one wide bar then a
-//!   narrow one, two halves — rasterised into the `Node::Pixels` the host
-//!   already accepts as a `Node::Button` child (`hytte-plugin-timer`'s
-//!   seven-segment bar chip is the same shape). The skin's ink is the kit's,
-//!   accent-tinted by the SDK; this crate names no colour.
+//! - **Adwaita symbolic icons**, not the preem pictograms round 1 built:
+//!   "Using preem for icons ultra gonk idé typ. Was misunderstanding in the
+//!   first place. […] Looks shit. Adwaita icons fine." Her original "preem <3"
+//!   was agreement with the *column-counting* answer, not a request to
+//!   rasterise the glyphs. [`Layout::icon`](layout::Layout::icon) holds the
+//!   three names and the reason for each.
+//! - **The chip hides below two windows**: "Only show when more than 1 window
+//!   in workspace." There is no host niri state topic, so [`watch`] keeps the
+//!   count itself off a second `$NIRI_SOCKET` connection.
 //!
 //! Counting **columns rather than windows** was the third question as the triage
-//! asked it, and stands as written.
+//! asked it, and stands as written — note that it is deliberately *not* the same
+//! count as [`watch`]'s: a stacked column of two windows is one column to
+//! [`layout::plan`] and two windows to the visibility rule.
 
 mod cli;
 mod layout;
 mod niri;
 mod plugin;
+mod watch;
 
 use cli::{BIN, Invocation, USAGE};
 use plugin::{NiriLayouts, apply_and_report};
@@ -102,12 +111,17 @@ fn main() -> ExitCode {
         // keybind and a click cannot drift.
         Ok(Invocation::Apply(layout)) => {
             match apply_and_report(&mut niri::SocketTransport, layout) {
-                None => ExitCode::SUCCESS,
                 Some(plugin::Msg::Failed(error)) => {
                     // niri's own text, verbatim — the CLI has no toast to put it in.
                     eprintln!("{BIN}: {error}");
                     ExitCode::FAILURE
                 }
+                // `None` is the success path. `Visible` is unreachable —
+                // `apply_and_report` only ever reports a refusal, and the chip's
+                // visibility is the watcher's message, which this hat never
+                // starts — but it is spelled out rather than wildcarded so a
+                // third `Msg` variant has to be decided here too.
+                None | Some(plugin::Msg::Visible(_)) => ExitCode::SUCCESS,
             }
         }
         Err(error) => {

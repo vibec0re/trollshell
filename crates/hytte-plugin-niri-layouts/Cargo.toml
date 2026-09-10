@@ -33,7 +33,7 @@ hytte-plugin = { path = "../hytte-plugin" }
 niri-ipc.workspace = true
 
 [dev-dependencies]
-# One test serialises a `Request` and asserts the literal bytes niri's own
+# Two tests serialise a `Request` and assert the literal bytes niri's own
 # `niri msg action set-window-width --id N 50%` writes, so the percentage unit
 # is pinned at the wire rather than at a Rust enum (#1026 review, HIGH-1).
 # `niri-ipc` already depends on it, so this adds no resolved package.

@@ -313,9 +313,18 @@ mod tests {
         assert_eq!(applied, 3);
         assert_eq!(
             niri.widths(),
-            vec![(10, 61.8), (20, 38.2), (30, 38.2)],
-            "golden's wide column is 61.8 % of the working area, not 0.618 %"
+            vec![(10, 70.0), (20, 30.0), (30, 30.0)],
+            "golden's wide column is 70 % of the working area, not 0.7 %"
         );
+    }
+
+    /// The serialised actions of one `apply`, in send order.
+    fn wire_bytes(niri: &Fake) -> Vec<String> {
+        niri.seen
+            .iter()
+            .filter(|r| matches!(r, Request::Action(_)))
+            .map(|r| serde_json::to_string(r).expect("a Request serialises"))
+            .collect()
     }
 
     /// The unit pinned at the **bytes**, not at a Rust enum: this is the exact
@@ -326,15 +335,8 @@ mod tests {
 
         apply(&mut niri, Layout::Split).expect("the fake answers everything");
 
-        let actions: Vec<String> = niri
-            .seen
-            .iter()
-            .filter(|r| matches!(r, Request::Action(_)))
-            .map(|r| serde_json::to_string(r).expect("a Request serialises"))
-            .collect();
-
         assert_eq!(
-            actions,
+            wire_bytes(&niri),
             vec![
                 r#"{"Action":{"SetWindowWidth":{"id":10,"change":{"SetProportion":50.0}}}}"#
                     .to_owned(),
@@ -342,6 +344,37 @@ mod tests {
                     .to_owned(),
             ],
             "these are the bytes `niri msg action set-window-width --id N 50%` writes"
+        );
+    }
+
+    /// Golden's two numbers, at the bytes, as literals (#1019 round 2).
+    ///
+    /// Written out rather than built from `GOLDEN_MAJOR * 100.0` for the reason
+    /// the header above gives, and for a second one: `0.7_f64 * 100.0` is not
+    /// *obviously* `70.0` — it is only exactly 70 because the rounding lands
+    /// there, and 61.8 stayed `61.8` for the same non-obvious reason. Spelling
+    /// the bytes is what proves it rather than assuming it; a change that made
+    /// the product `70.00000000000001` would serialise those digits and fail
+    /// here, where a `(id, f64)` comparison against the same expression would
+    /// not.
+    #[test]
+    fn golden_serialises_to_seventy_then_thirty_percent() {
+        let mut niri = Fake::with(vec![tile(10, 1), tile(20, 2), tile(30, 3)]);
+
+        apply(&mut niri, Layout::Golden).expect("the fake answers everything");
+
+        assert_eq!(
+            wire_bytes(&niri),
+            vec![
+                r#"{"Action":{"SetWindowWidth":{"id":10,"change":{"SetProportion":70.0}}}}"#
+                    .to_owned(),
+                r#"{"Action":{"SetWindowWidth":{"id":20,"change":{"SetProportion":30.0}}}}"#
+                    .to_owned(),
+                r#"{"Action":{"SetWindowWidth":{"id":30,"change":{"SetProportion":30.0}}}}"#
+                    .to_owned(),
+            ],
+            "these are the bytes `niri msg action set-window-width --id N 70%` \
+             (then 30%, then 30%) writes"
         );
     }
 

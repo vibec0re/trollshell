@@ -24,7 +24,7 @@ USAGE:
     hytte-plugin-niri-layouts --help          this text
 
     <layout>: equal  — every column the same width, 1/n each
-              golden — first column 61.8 %, every other column 38.2 %
+              golden — first column 70 %, every other column 30 %
               split  — every column 50 %
 
 Counts are COLUMNS, not windows: niri widths are per column, so a stacked

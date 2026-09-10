@@ -70,6 +70,22 @@
 //! has already superseded — the latch is legitimately spent by then, so it is
 //! not there to help.
 //!
+//! # Transitions-only logging (#1017)
+//!
+//! [`on_poll_result`]'s `Err` arm used to log `"ListPlugins failed"`
+//! unconditionally — one line every [`PLUGIN_POLL_INTERVAL`] for the whole
+//! time the shell is down, the one poller `#1002`/`#1015` (the connection
+//! banner, the revision footer, and the AI Keys tab) left unconverted. It now
+//! remembers the last *applied* poll's failure state
+//! ([`PluginsState::last_failing`]) and logs only on a down→up or up→down
+//! edge (`crate::log_transition`, `crate::LogTransition` — lifted out of
+//! `ai_keys_tab`'s original private copy so this reuses the actual helper
+//! rather than a third hand-copy), matching `main.rs`'s `ShellProbeUi` and
+//! `ai_keys_tab`'s own guard. A stale, out-of-order completion (#983) is
+//! still dropped **before** this runs — [`PollGenerations::accept`] gates the
+//! whole of [`on_poll_result`], transition logging included, so a superseded
+//! result cannot flip `last_failing` on its way out.
+//!
 //! # `AdwBreakpointBin`, on contract (#856)
 //!
 //! #856 recorded what using that widget *off* contract costs: it warns once per
@@ -94,7 +110,9 @@ use adw::prelude::*;
 use gtk::glib;
 use hytte_bus::RetryPolicy;
 
-use crate::{CONTROL_IFACE, CONTROL_NAME, CONTROL_PATH, spawn_on_runtime};
+use crate::{
+    CONTROL_IFACE, CONTROL_NAME, CONTROL_PATH, LogTransition, log_transition, spawn_on_runtime,
+};
 
 // ── Plugins tab (#348) · runtime overlay (#423) · drill-down (#887) ──────────
 
@@ -389,6 +407,12 @@ struct PluginsState {
     /// or the `row-selected(None)` that removing rows emits — doesn't run the
     /// user-driven selection path and, with it, disturb navigation.
     selecting: Rc<Cell<bool>>,
+    /// Whether the most recently *applied* poll's outcome was a failure —
+    /// `None` before the first completion. Drives transitions-only logging
+    /// (#1017, mirrors `ai_keys_tab`'s field of the same name/shape): a run
+    /// of identical outcomes logs once, not once per poll — see
+    /// [`on_poll_result`].
+    last_failing: Rc<Cell<Option<bool>>>,
 }
 
 /// [`PluginsState`] with its widget handles held **weakly** — what the
@@ -425,6 +449,7 @@ struct WeakPluginsState {
     pending: Rc<RefCell<Option<PendingToggle>>>,
     syncing: Rc<Cell<bool>>,
     selecting: Rc<Cell<bool>>,
+    last_failing: Rc<Cell<Option<bool>>>,
 }
 
 /// [`PluginDetail`]'s widgets, weakly — see [`WeakPluginsState`].
@@ -462,6 +487,7 @@ impl PluginsState {
             pending: self.pending.clone(),
             syncing: self.syncing.clone(),
             selecting: self.selecting.clone(),
+            last_failing: self.last_failing.clone(),
         }
     }
 }
@@ -494,6 +520,7 @@ impl WeakPluginsState {
             pending: self.pending.clone(),
             syncing: self.syncing.clone(),
             selecting: self.selecting.clone(),
+            last_failing: self.last_failing.clone(),
         })
     }
 }
@@ -602,6 +629,7 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
         pending: Rc::new(RefCell::new(None)),
         syncing: Rc::new(Cell::new(false)),
         selecting: Rc::new(Cell::new(false)),
+        last_failing: Rc::new(Cell::new(None)),
     };
 
     connect_selection(&state);
@@ -900,6 +928,14 @@ fn refresh_plugins(state: &PluginsState) {
 /// from it, and letting it through would replace a live list with the
 /// "Unavailable" placeholder — parking the selection and blanking the
 /// snapshot — a second after a newer poll proved the shell is answering fine.
+///
+/// Logs on transitions only (#1017, `crate::log_transition` — see the module
+/// doc's "Transitions-only logging" section): a run of identical outcomes
+/// (`Err` or `Ok`) writes one journal line, not one per
+/// [`PLUGIN_POLL_INTERVAL`] tick. The transition check runs *after* the
+/// generation gate above, so a stale, out-of-order completion (#983) cannot
+/// flip [`PluginsState::last_failing`] on its way out — it never reaches this
+/// point.
 fn on_poll_result(state: &PluginsState, generation: u64, res: PollResult) {
     if !state.polls.accept(generation) {
         tracing::debug!(
@@ -908,6 +944,17 @@ fn on_poll_result(state: &PluginsState, generation: u64, res: PollResult) {
             "dropping an out-of-order plugin poll"
         );
         return;
+    }
+    let is_err = res.is_err();
+    let previous = state.last_failing.replace(Some(is_err));
+    match log_transition(previous, is_err) {
+        LogTransition::Failed => {
+            if let Err(err) = &res {
+                tracing::info!(%err, "ListPlugins failed");
+            }
+        }
+        LogTransition::Recovered => tracing::info!("ListPlugins recovered"),
+        LogTransition::None => {}
     }
     match res {
         Ok((units, states)) if !units.is_empty() => {
@@ -933,8 +980,7 @@ fn on_poll_result(state: &PluginsState, generation: u64, res: PollResult) {
             "No plugins installed",
             "Install a trollshell-plugin unit to manage it here.",
         ),
-        Err(err) => {
-            tracing::info!(%err, "ListPlugins failed");
+        Err(_) => {
             set_placeholder(
                 state,
                 PluginsView::Unavailable,
@@ -1863,6 +1909,7 @@ mod gtk_tests {
         PluginsState, PollResult, apply_plugins, build_tab, on_poll_result, on_toggle_result,
         refresh_detail,
     };
+    use crate::test_support::captured_logs;
 
     /// Run the GTK main loop until it has nothing left to dispatch, so a queued
     /// resize/allocation actually happens.
@@ -3424,5 +3471,164 @@ mod gtk_tests {
         );
 
         dismiss(&window);
+    }
+
+    // ── Transitions-only logging (#1017) ────────────────────────────────────
+    //
+    // Driven through `on_poll_result` with a real `tracing` subscriber, so
+    // these pin the *journal*, not just the state `log_transition`'s own
+    // hermetic tests in `main.rs` already cover — a mutation that computes
+    // the right `LogTransition` but forgets to act on it (or acts on the
+    // wrong arm) is invisible to those.
+
+    /// Run `body` with an `INFO` subscriber installed for this thread, and
+    /// return the lines it emitted mentioning `"ListPlugins"`.
+    ///
+    /// Wraps `crate::test_support::captured_logs` — the capture plumbing
+    /// itself (was this file's own `CapturedLog`, byte-identical to
+    /// `main.rs`'s and `ai_keys_tab`'s copies) is shared since the #1017
+    /// review (LOW 3); this file's own addition is the `"ListPlugins"`
+    /// filter, so the pure-`log_transition` tests in `main.rs` and this
+    /// file's own poll-ordering tests never show up as noise.
+    ///
+    /// No callsite warm-up needed (the #1017 review, LOW 4, corrected an
+    /// earlier version of this doc comment that claimed one was): `#[gtk::test]`
+    /// expands to `gtk::test_synced`, which serialises every test body in
+    /// this binary onto one `glib::ThreadPool::exclusive(1)` thread — so the
+    /// sibling `poll_err()`/`poll_ok(…)` calls this comment used to worry
+    /// about racing are never concurrent with this test, only prior on the
+    /// same thread — and `tracing_core::callsite::register_dispatch` rebuilds
+    /// every already-registered callsite's `Interest` against the new
+    /// `Dispatch` each time `captured_logs` installs one, so a callsite any
+    /// earlier test poisoned is repaired before `body` runs anyway (see PR
+    /// #1032's review, and `shader_map::tests::counting_events` in
+    /// `trollshell/src/plugins/shader_map.rs` for the citations). Verified: a
+    /// 100-run campaign of this crate's `system-tests` binary under
+    /// `xvfb-run`, no warm-up, 0 failures.
+    fn captured_transition_logs(body: impl FnOnce()) -> Vec<String> {
+        captured_logs(body)
+            .into_iter()
+            .filter(|line| line.contains("ListPlugins"))
+            .collect()
+    }
+
+    /// The defect's shape, and #1017's whole point: N consecutive failing
+    /// polls must write **one** `"ListPlugins failed"` line, not N.
+    ///
+    /// Falsified by deleting the `log_transition`/`last_failing` guard in
+    /// `on_poll_result` (reverting its `Err` arm to an unconditional
+    /// `tracing::info!`): every failing poll then logs, and this fails with
+    /// `left: 5, right: 1`.
+    #[gtk::test]
+    fn n_failing_polls_emit_exactly_one_failed_line() {
+        adw::init().expect("libadwaita init");
+        let (_bin, state) = build_tab();
+
+        let lines = captured_transition_logs(|| {
+            for _ in 0..5 {
+                let generation = state.polls.issue();
+                on_poll_result(&state, generation, poll_err());
+            }
+        });
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "five failing polls in a row must write one journal line, not five: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("ListPlugins failed"),
+            "the one line must be the failure, not something else: {lines:?}"
+        );
+    }
+
+    /// down → up → down: two `"ListPlugins failed"` lines (one per down
+    /// edge) and one `"ListPlugins recovered"` line (the single up edge),
+    /// with every repeated poll in between staying silent.
+    ///
+    /// Falsified the same way as the test above, and separately by a
+    /// mutation that folds `LogTransition::Recovered` into `::None` in
+    /// `log_transition` (the recovered count drops to 0) or that logs
+    /// `"ListPlugins failed"` unconditionally on every `Err` regardless of
+    /// `previous` (the failed count rises to 4).
+    #[gtk::test]
+    fn down_up_down_logs_two_failures_and_one_recovery() {
+        adw::init().expect("libadwaita init");
+        let (_bin, state) = build_tab();
+
+        let lines = captured_transition_logs(|| {
+            // Down (the very first poll ever): 1 failed line.
+            on_poll_result(&state, state.polls.issue(), poll_err());
+            // Still down: silence.
+            on_poll_result(&state, state.polls.issue(), poll_err());
+            // Up: 1 recovered line.
+            on_poll_result(&state, state.polls.issue(), poll_ok(&["clock"], "active"));
+            // Still up: silence.
+            on_poll_result(&state, state.polls.issue(), poll_ok(&["clock"], "active"));
+            // Down again: 1 more failed line.
+            on_poll_result(&state, state.polls.issue(), poll_err());
+            // Still down: silence.
+            on_poll_result(&state, state.polls.issue(), poll_err());
+        });
+
+        let failed = lines
+            .iter()
+            .filter(|line| line.contains("ListPlugins failed"))
+            .count();
+        let recovered = lines
+            .iter()
+            .filter(|line| line.contains("ListPlugins recovered"))
+            .count();
+        assert_eq!(failed, 2, "one line per down edge: {lines:?}");
+        assert_eq!(recovered, 1, "one line for the single up edge: {lines:?}");
+        assert_eq!(lines.len(), 3, "…and nothing else: {lines:?}");
+    }
+
+    /// The ordinary case — the control-center opened while the shell is up —
+    /// must write nothing at all. Neither test above starts from a success,
+    /// so a mutation that only fires on the first-ever *successful* poll (an
+    /// extra `LogTransition::None if previous.is_none()` arm emitting
+    /// "`ListPlugins` recovered") survives the whole suite. Supplied by the
+    /// adversarial review of `232a8a2` (#1035, MED 2).
+    #[gtk::test]
+    fn a_first_poll_that_succeeds_is_silent() {
+        adw::init().expect("libadwaita init");
+        let (_bin, state) = build_tab();
+
+        let lines = captured_transition_logs(|| {
+            on_poll_result(&state, state.polls.issue(), poll_ok(&["clock"], "active"));
+            on_poll_result(&state, state.polls.issue(), poll_ok(&["clock"], "active"));
+        });
+
+        assert!(
+            lines.is_empty(),
+            "a shell that is up when the window opens must write no line at all: {lines:?}"
+        );
+    }
+
+    /// A stale, out-of-order completion (#983) must not reach the transition
+    /// guard — the claim `on_poll_result`'s own doc and the module doc both
+    /// make, which no test above exercises: hoisting the transition block
+    /// above `PollGenerations::accept` leaves the suite green while a
+    /// superseded poll writes a `ListPlugins failed` line the newest poll has
+    /// already disproved. Supplied by the adversarial review of `232a8a2`
+    /// (#1035, MED 1).
+    #[gtk::test]
+    fn a_stale_failure_writes_no_journal_line() {
+        adw::init().expect("libadwaita init");
+        let (_bin, state) = build_tab();
+
+        let stale = state.polls.issue();
+        let newest = state.polls.issue();
+
+        let lines = captured_transition_logs(|| {
+            on_poll_result(&state, newest, poll_ok(&["clock"], "active"));
+            on_poll_result(&state, stale, poll_err());
+        });
+
+        assert!(
+            lines.is_empty(),
+            "a superseded poll must be dropped before the transition guard: {lines:?}"
+        );
     }
 }

@@ -2111,15 +2111,36 @@ session.
       seconds, and the shell coming back must log exactly one
       `ListAiKeys recovered` line — transitions only, same as #989's banner.
       Grepping unqualified will also catch the Plugins tab's own
-      `ListPlugins failed`, which has **no** transitions guard and so logs
-      every ~2 s while the shell is down — a pre-existing gap, not this
-      entry's regression, but easy to misread as one if you don't filter for
-      `ListAiKeys`. Finally,
+      `ListPlugins failed`/`ListPlugins recovered` lines — since #1017 that
+      poller got the same transitions guard, so an unfiltered grep now shows
+      one line per outage from _each_ tab rather than a `ListPlugins` flood
+      to filter past. Finally,
       with the shell running, **set or clear a key from the tab** right as a
       shell restart could plausibly land a reachability-triggered read at the
       same instant (restart the shell, then immediately click Apply/Clear) —
       the row must settle on what you asked for, never blink back to the
       pre-change value a moment after.
+- [ ] **(#1017)** The **Plugins** tab's own `ListPlugins` poll gets the same
+      transitions-only guard #989/#1003 already gave the banner and the AI
+      Keys tab — it was the one poller left logging on every 2 s tick. Stop
+      the shell (`systemctl --user stop trollshell`), then open the
+      control-center **while it is down**: watching the app's own output
+      (launched by hand or from the launcher, so `info!` lines land on its
+      terminal, not `journalctl`), there must be **exactly one**
+      `ListPlugins failed` line, then silence across every subsequent 2 s
+      tick for as long as the shell stays down — not one line per tick.
+      Start the shell again: within ~2 s there must be **one**
+      `ListPlugins recovered` line, and then silence again while it stays up.
+      Finally, stop the control-center, start the shell first, and **then**
+      open the control-center (the ordinary case — a healthy session): the
+      first poll succeeds, and there must be **no** `ListPlugins` line at
+      all, not even a spurious "recovered" on the very first tick. All three
+      are pinned hermetically by `plugins_tab::gtk_tests`
+      (`n_failing_polls_emit_exactly_one_failed_line`,
+      `down_up_down_logs_two_failures_and_one_recovery`,
+      `a_first_poll_that_succeeds_is_silent`) against a real `tracing`
+      subscriber; this bullet is the on-machine confirmation the #1035 PR
+      body flagged as not yet run.
 
 ## Documentation site (GitHub Pages)
 

@@ -6,29 +6,80 @@
 //! socket, or an env var. [`niri::apply`](crate::niri::apply) is the only thing
 //! that talks to niri, and it does nothing this module has not decided.
 
-use niri_ipc::{Window, Workspace};
+use niri_ipc::{Output, Window, Workspace};
 use std::collections::BTreeMap;
 
-/// The wide column's share under [`Layout::Golden`] — **75 %**.
+/// The output-width breakpoint between [`Layout::Golden`]'s two pairs
+/// (#1052).
+///
+/// **Logical** pixels — the same unit niri's own `LogicalOutput::width`
+/// already reports, i.e. *after* the output's scale factor is applied, so a
+/// 5120×1440 output running at 2x HiDPI counts as 2560 px wide here, not
+/// 5120. See [`golden_pair`], the one function that reads this constant.
+pub(crate) const GOLDEN_BREAKPOINT: u32 = 2560;
+
+/// The wide column's share under [`Layout::Golden`] on an output **at or
+/// above** [`GOLDEN_BREAKPOINT`] logical px — **75 %**.
 ///
 /// Not 1/φ (0.618) any more. The layout keeps the name, but the number is
 /// Annika's, measured on her own glass against the first cut: "Golden: mhm
 /// looks off. maybe bettter `[ ~70% ] [ ~30% ]`. Typ ratio 0.4", then, on the
 /// round that carried 70/30 — "hmm no choom was thinking more like 75 : 25 I
 /// guess", `[ wide 75% ] [ narrow ]` (#1019, 2026-09-10). 0.618/0.382 left the
-/// narrow column too wide to read as a sidekick; **0.75/0.25** is the number
-/// she settled on, and a measured preference beats a derivation from φ.
-pub(crate) const GOLDEN_MAJOR: f64 = 0.75;
+/// narrow column too wide to read as a sidekick *on her ultrawide*; **0.75 /
+/// 0.25** is the number she settled on there, and a measured preference beats
+/// a derivation from φ — but only on a screen wide enough to spare the room
+/// (see [`GOLDEN_NARROW_MAJOR`], #1052).
+pub(crate) const GOLDEN_WIDE_MAJOR: f64 = 0.75;
 
-/// Every other column's share under [`Layout::Golden`] — **25 %**.
+/// Every other column's share under [`Layout::Golden`] on a wide output —
+/// **25 %**.
 ///
-/// Deliberately `1 - GOLDEN_MAJOR` written out rather than computed: the two
-/// are what niri is asked for, and spelling both makes the pair greppable
-/// against the tooltip, the usage text and the wire-byte test that pin them.
-pub(crate) const GOLDEN_MINOR: f64 = 0.25;
+/// Deliberately `1 - GOLDEN_WIDE_MAJOR` written out rather than computed: the
+/// two are what niri is asked for, and spelling both makes the pair
+/// greppable against the tooltip, the usage text and the wire-byte test that
+/// pin them.
+pub(crate) const GOLDEN_WIDE_MINOR: f64 = 0.25;
+
+/// The wide column's share under [`Layout::Golden`] on an output **narrower
+/// than** [`GOLDEN_BREAKPOINT`] logical px — the golden ratio itself,
+/// **61.8 %** (#1052).
+///
+/// This is where the layout's name came from before #1019's second round
+/// replaced it everywhere with [`GOLDEN_WIDE_MAJOR`]/[`GOLDEN_WIDE_MINOR`]
+/// for Annika's ultrawide. A 25 % narrow column is fine at 2560 px and wider,
+/// but on a 1920- or 2560-wide laptop screen it leaves too little room to
+/// use the narrow column for anything — "Can we make this adaptive?" (#1052,
+/// 2026-09-10) — so a screen below the breakpoint gets the golden cut back.
+pub(crate) const GOLDEN_NARROW_MAJOR: f64 = 0.618;
+
+/// Every other column's share under [`Layout::Golden`] on a narrow output —
+/// **38.2 %**. Written out rather than `1 - GOLDEN_NARROW_MAJOR` for the same
+/// reason [`GOLDEN_WIDE_MINOR`] is.
+pub(crate) const GOLDEN_NARROW_MINOR: f64 = 0.382;
 
 /// Every column's share under [`Layout::Split`].
 pub(crate) const SPLIT_SHARE: f64 = 0.5;
+
+/// The `(major, minor)` fractions [`Layout::Golden`] uses for a target output
+/// whose logical width is `logical_width` px.
+///
+/// `None` covers both ways the width can be unknown: the target workspace's
+/// output isn't in the `Outputs` niri reported, or it is but carries no
+/// `logical` geometry at all (a disabled or otherwise headless output).
+///
+/// One breakpoint, [`GOLDEN_BREAKPOINT`]: at or above it, the wide pair
+/// Annika measured on her ultrawide; below it, the golden ratio cut, so a
+/// narrow column stays wide enough to use (#1052). An unknown width defaults
+/// to the wide pair — the behaviour every build before #1052 already had —
+/// rather than guessing a screen is small; [`crate::niri::apply`] logs when
+/// that happens.
+pub(crate) fn golden_pair(logical_width: Option<u32>) -> (f64, f64) {
+    match logical_width {
+        Some(width) if width < GOLDEN_BREAKPOINT => (GOLDEN_NARROW_MAJOR, GOLDEN_NARROW_MINOR),
+        _ => (GOLDEN_WIDE_MAJOR, GOLDEN_WIDE_MINOR),
+    }
+}
 
 /// One of the three arrangements the chip and the CLI both offer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,8 +87,11 @@ pub(crate) enum Layout {
     /// Every column the same width: `1/n` each (so `n = 1` is a full-width
     /// column).
     Equal,
-    /// The leftmost column wide (75 %), every other one narrow (25 %) — issue
-    /// #1019's `[========] [====] ( .... ) [====]` sketch.
+    /// The leftmost column wide, every other one narrow — issue #1019's
+    /// `[========] [====] ( .... ) [====]` sketch. The exact split is
+    /// picked per apply from the target output's logical width: 75 % / 25 %
+    /// at or above [`GOLDEN_BREAKPOINT`] px, the golden ratio cut (61.8 % /
+    /// 38.2 %) below it — see [`golden_pair`] (#1052).
     Golden,
     /// Every column half the working area, whatever `n` is.
     ///
@@ -86,8 +140,9 @@ impl Layout {
     ///   theme has no "n equal columns" glyph at all; equal tiles is the
     ///   closest thing it says.
     /// - `golden` → **`sidebar-show-right-symbolic`**: a frame split into a
-    ///   wide left area and a narrow right panel. That *is* the layout —
-    ///   [`GOLDEN_MAJOR`] left, [`GOLDEN_MINOR`] right — and it is the only
+    ///   wide left area and a narrow right panel. That *is* the layout — a
+    ///   wide left column, a narrow right one, whichever of
+    ///   [`golden_pair`]'s two pairs the screen picks — and it is the only
     ///   asymmetric split in the theme that leans the right way (its mirror,
     ///   `sidebar-show-symbolic`, puts the narrow panel on the left).
     /// - `split` → **`view-dual-symbolic`**: a frame divided into two equal
@@ -108,71 +163,124 @@ impl Layout {
     /// load-bearing case"), so this hangs on the icon itself and GTK's
     /// deepest-widget-first hover resolution puts it under the pointer; see
     /// `plugin::layout_button`.
+    ///
+    /// `Golden`'s legend names **both** [`golden_pair`] pairs and the
+    /// breakpoint between them (#1052) rather than the one that happens to
+    /// apply on the screen it's hovered on: the tooltip is a static string
+    /// built with no niri round trip (`--help`, in `cli`, has the identical
+    /// constraint — it never dials the socket either), so it documents the
+    /// rule instead of a live answer.
     pub(crate) fn tooltip(self) -> &'static str {
         match self {
             Self::Equal => "Equal columns — every column the same width",
-            Self::Golden => "Golden — first column 75 %, the rest 25 %",
+            Self::Golden => {
+                "Golden — first column 75 %, the rest 25 % on screens \
+                 2560 px wide or more; 61.8 % / 38.2 % (the golden cut) narrower"
+            }
             Self::Split => "Split — every column 50 %",
         }
     }
 
     /// The proportion for each of `columns` columns, left to right.
     ///
+    /// `golden` is the `(major, minor)` pair [`Layout::Golden`] uses for this
+    /// call — see [`golden_pair`], which [`crate::niri::apply`] resolves from
+    /// the target output's logical width before calling this. `Equal` and
+    /// `Split` ignore it entirely, so any pair is fine when one of those is
+    /// what's being asked for; call sites that don't care pass
+    /// `golden_pair(None)`, the default wide pair.
+    ///
     /// **This is the one function to edit** if issue #1019's question 1 is
-    /// answered "B" (the narrow columns *share* the remaining 25 % so
+    /// answered "B" (the narrow columns *share* the remaining minor share so
     /// everything stays on screen) rather than the "A" reading built here: swap
-    /// the `Golden` arm's `GOLDEN_MINOR` for
-    /// `GOLDEN_MINOR / (columns - 1) as f64` and nothing else moves — not the
-    /// planner, not the chip, not the CLI.
+    /// the `Golden` arm's `minor` for `minor / (columns - 1) as f64` and
+    /// nothing else moves — not the planner, not the chip, not the CLI.
     ///
     /// `columns == 0` yields no proportions (and [`plan`] therefore sends
     /// nothing).
     ///
     /// **`columns == 1` is deliberately not special-cased.** `Equal` gives a
-    /// lone column the full `1.0`, but `Golden` gives it `0.75` and `Split`
-    /// gives it `0.5` — i.e. clicking either on a single window *narrows* it.
-    /// That is the layouts working, not a bug to round away: each button says
-    /// "make the screen this shape", and pre-setting the main column to 75 %
-    /// (or half) is how you make room for the window you are about to open.
-    /// `Split` narrowing a lone window is also literally what #1019 asked for
-    /// ("split: all windows have width 50%"). Raised as a NIT on the #1026
-    /// review and kept, on purpose.
+    /// lone column the full `1.0`, but `Golden` gives it its major share and
+    /// `Split` gives it `0.5` — i.e. clicking either on a single window
+    /// *narrows* it. That is the layouts working, not a bug to round away:
+    /// each button says "make the screen this shape", and pre-setting the
+    /// main column to its share (or half) is how you make room for the
+    /// window you are about to open. `Split` narrowing a lone window is also
+    /// literally what #1019 asked for ("split: all windows have width 50%").
+    /// Raised as a NIT on the #1026 review and kept, on purpose.
     // A column count past f64's exact-integer range would need 2^53 windows
     // open; the cast is exact for every n a compositor can produce.
     #[allow(clippy::cast_precision_loss)]
-    pub(crate) fn proportions(self, columns: usize) -> Vec<f64> {
+    pub(crate) fn proportions(self, columns: usize, golden: (f64, f64)) -> Vec<f64> {
         if columns == 0 {
             return Vec::new();
         }
         match self {
             Self::Equal => vec![1.0 / columns as f64; columns],
             Self::Split => vec![SPLIT_SHARE; columns],
-            Self::Golden => std::iter::once(GOLDEN_MAJOR)
-                .chain(std::iter::repeat_n(GOLDEN_MINOR, columns - 1))
-                .collect(),
+            Self::Golden => {
+                let (major, minor) = golden;
+                std::iter::once(major)
+                    .chain(std::iter::repeat_n(minor, columns - 1))
+                    .collect()
+            }
         }
     }
 }
 
-/// The id of the workspace `layout` should act on: the **active** workspace of
-/// the **focused output**.
+/// The workspace `layout` should act on: the **active** workspace of the
+/// **focused output**.
 ///
 /// With no focused output (niri reports `FocusedOutput: None` when nothing is
 /// connected) this falls back to the globally focused workspace, which is the
 /// only other defensible reading of "the current desktop"; with neither, there
 /// is nothing to lay out.
-fn target_workspace(workspaces: &[Workspace], focused_output: Option<&str>) -> Option<u64> {
-    let found = match focused_output {
+fn target_workspace<'a>(
+    workspaces: &'a [Workspace],
+    focused_output: Option<&str>,
+) -> Option<&'a Workspace> {
+    match focused_output {
         Some(output) => workspaces
             .iter()
             .find(|w| w.is_active && w.output.as_deref() == Some(output)),
         None => workspaces.iter().find(|w| w.is_focused),
-    };
-    found.map(|w| w.id)
+    }
+}
+
+/// The **output name** of the workspace [`plan`] would act on (#1052) — see
+/// [`target_workspace`] for the targeting rule. `None` when there is nothing
+/// to act on, or the target workspace itself reports no output (a
+/// disconnected monitor).
+///
+/// [`crate::niri::apply`] calls this to resolve [`Layout::Golden`]'s pair
+/// ([`golden_pair`]) *before* calling [`plan`], off the exact same targeting
+/// rule `plan` uses internally — the two can never pick different
+/// workspaces.
+pub(crate) fn target_output_name<'a>(
+    workspaces: &'a [Workspace],
+    focused_output: Option<&str>,
+) -> Option<&'a str> {
+    target_workspace(workspaces, focused_output).and_then(|w| w.output.as_deref())
+}
+
+/// The logical width (px) of the output named `name` in `outputs`, or `None`
+/// if no output has that name or it reports no logical geometry at all (a
+/// disabled or headless output) — see [`golden_pair`] (#1052).
+pub(crate) fn logical_width_of(outputs: &[Output], name: &str) -> Option<u32> {
+    outputs
+        .iter()
+        .find(|output| output.name == name)
+        .and_then(|output| output.logical.as_ref())
+        .map(|logical| logical.width)
 }
 
 /// The `SetWindowWidth` requests `layout` implies, as `(window id, proportion)`
 /// pairs in **left-to-right column order**.
+///
+/// `golden` is the `(major, minor)` pair to use if `layout` is
+/// [`Layout::Golden`] — resolved by the caller via [`target_output_name`],
+/// [`logical_width_of`] and [`golden_pair`] (#1052); every other layout
+/// ignores it.
 ///
 /// The rules, all of which the tests pin:
 ///
@@ -193,15 +301,17 @@ pub(crate) fn plan(
     workspaces: &[Workspace],
     focused_output: Option<&str>,
     layout: Layout,
+    golden: (f64, f64),
 ) -> Vec<(u64, f64)> {
     let Some(workspace) = target_workspace(workspaces, focused_output) else {
         return Vec::new();
     };
+    let workspace_id = workspace.id;
 
     // column index → (tile index, window id) of that column's first tile.
     let mut columns: BTreeMap<usize, (usize, u64)> = BTreeMap::new();
     for window in windows {
-        if window.workspace_id != Some(workspace) || window.is_floating {
+        if window.workspace_id != Some(workspace_id) || window.is_floating {
             continue;
         }
         let Some((column, tile)) = window.layout.pos_in_scrolling_layout else {
@@ -218,7 +328,7 @@ pub(crate) fn plan(
             .or_insert(candidate);
     }
 
-    let proportions = layout.proportions(columns.len());
+    let proportions = layout.proportions(columns.len(), golden);
     columns
         .into_values()
         .zip(proportions)
@@ -228,11 +338,42 @@ pub(crate) fn plan(
 
 #[cfg(test)]
 mod tests {
-    use super::{GOLDEN_MAJOR, GOLDEN_MINOR, Layout, plan};
-    use niri_ipc::{Window, WindowLayout, Workspace};
+    use super::{
+        GOLDEN_BREAKPOINT, GOLDEN_NARROW_MAJOR, GOLDEN_NARROW_MINOR, GOLDEN_WIDE_MAJOR,
+        GOLDEN_WIDE_MINOR, Layout, golden_pair, logical_width_of, plan, target_output_name,
+    };
+    use niri_ipc::{LogicalOutput, Output, Transform, Window, WindowLayout, Workspace};
 
     const OUTPUT: &str = "DP-1";
     const OTHER_OUTPUT: &str = "HDMI-A-1";
+
+    /// The default pair, for `plan`/`proportions` calls in tests that aren't
+    /// about the Golden width breakpoint at all.
+    const DEFAULT_GOLDEN: (f64, f64) = (GOLDEN_WIDE_MAJOR, GOLDEN_WIDE_MINOR);
+
+    /// A connected output reporting `width` logical px (#1052).
+    fn output_with_logical_width(name: &str, width: u32) -> Output {
+        Output {
+            name: name.to_owned(),
+            make: "test".to_owned(),
+            model: "test".to_owned(),
+            serial: None,
+            physical_size: None,
+            modes: Vec::new(),
+            current_mode: None,
+            is_custom_mode: false,
+            vrr_supported: false,
+            vrr_enabled: false,
+            logical: Some(LogicalOutput {
+                x: 0,
+                y: 0,
+                width,
+                height: 1080,
+                scale: 1.0,
+                transform: Transform::Normal,
+            }),
+        }
+    }
 
     fn workspace(id: u64, output: &str, is_active: bool) -> Workspace {
         Workspace {
@@ -297,7 +438,7 @@ mod tests {
         // niri's list order.
         let windows = vec![tile(30, 1, 3, 1), tile(10, 1, 1, 1), tile(20, 1, 2, 1)];
 
-        let got = plan(&windows, &ws, Some(OUTPUT), Layout::Equal);
+        let got = plan(&windows, &ws, Some(OUTPUT), Layout::Equal, DEFAULT_GOLDEN);
 
         assert_eq!(ids(&got), vec![10, 20, 30], "left-to-right by column index");
     }
@@ -313,7 +454,7 @@ mod tests {
             tile(20, 1, 2, 1),
         ];
 
-        let got = plan(&windows, &ws, Some(OUTPUT), Layout::Equal);
+        let got = plan(&windows, &ws, Some(OUTPUT), Layout::Equal, DEFAULT_GOLDEN);
 
         assert_eq!(
             ids(&got),
@@ -336,11 +477,23 @@ mod tests {
         let backwards = vec![tile(11, 1, 1, 1), tile(77, 1, 1, 1)];
 
         assert_eq!(
-            ids(&plan(&forwards, &ws, Some(OUTPUT), Layout::Equal)),
+            ids(&plan(
+                &forwards,
+                &ws,
+                Some(OUTPUT),
+                Layout::Equal,
+                DEFAULT_GOLDEN
+            )),
             vec![11]
         );
         assert_eq!(
-            ids(&plan(&backwards, &ws, Some(OUTPUT), Layout::Equal)),
+            ids(&plan(
+                &backwards,
+                &ws,
+                Some(OUTPUT),
+                Layout::Equal,
+                DEFAULT_GOLDEN
+            )),
             vec![11]
         );
     }
@@ -367,7 +520,7 @@ mod tests {
             tile(20, 1, 2, 1),
         ];
 
-        let got = plan(&windows, &ws, Some(OUTPUT), Layout::Equal);
+        let got = plan(&windows, &ws, Some(OUTPUT), Layout::Equal, DEFAULT_GOLDEN);
 
         assert_eq!(ids(&got), vec![10, 20], "only tiled, positioned windows");
         assert_eq!(
@@ -408,7 +561,7 @@ mod tests {
             tile(40, 4, 4, 1),
         ];
 
-        let got = plan(&windows, &ws, Some(OUTPUT), Layout::Equal);
+        let got = plan(&windows, &ws, Some(OUTPUT), Layout::Equal, DEFAULT_GOLDEN);
 
         assert_eq!(
             ids(&got),
@@ -424,7 +577,7 @@ mod tests {
         ws[1].is_focused = false;
         let windows = vec![tile(10, 1, 1, 1), tile(30, 3, 1, 1)];
 
-        let got = plan(&windows, &ws, None, Layout::Equal);
+        let got = plan(&windows, &ws, None, Layout::Equal, DEFAULT_GOLDEN);
 
         assert_eq!(ids(&got), vec![10]);
     }
@@ -434,7 +587,7 @@ mod tests {
         let ws = vec![workspace(1, OUTPUT, true)];
         let windows = vec![tile(10, 1, 1, 1)];
 
-        assert!(plan(&windows, &ws, Some("eDP-1"), Layout::Equal).is_empty());
+        assert!(plan(&windows, &ws, Some("eDP-1"), Layout::Equal, DEFAULT_GOLDEN).is_empty());
     }
 
     #[test]
@@ -442,41 +595,79 @@ mod tests {
         let ws = vec![workspace(1, OUTPUT, true)];
 
         assert!(
-            plan(&[], &ws, Some(OUTPUT), Layout::Golden).is_empty(),
+            plan(&[], &ws, Some(OUTPUT), Layout::Golden, DEFAULT_GOLDEN).is_empty(),
             "an empty workspace"
         );
         assert!(
-            plan(&[floating(90, 1)], &ws, Some(OUTPUT), Layout::Golden).is_empty(),
+            plan(
+                &[floating(90, 1)],
+                &ws,
+                Some(OUTPUT),
+                Layout::Golden,
+                DEFAULT_GOLDEN
+            )
+            .is_empty(),
             "a workspace holding only floaters"
         );
     }
 
     #[test]
     fn equal_splits_the_working_area_evenly() {
-        assert_eq!(Layout::Equal.proportions(1), vec![1.0]);
-        assert_eq!(Layout::Equal.proportions(2), vec![0.5, 0.5]);
-        assert_eq!(Layout::Equal.proportions(4), vec![0.25, 0.25, 0.25, 0.25]);
+        assert_eq!(Layout::Equal.proportions(1, DEFAULT_GOLDEN), vec![1.0]);
+        assert_eq!(Layout::Equal.proportions(2, DEFAULT_GOLDEN), vec![0.5, 0.5]);
+        assert_eq!(
+            Layout::Equal.proportions(4, DEFAULT_GOLDEN),
+            vec![0.25, 0.25, 0.25, 0.25]
+        );
     }
 
     #[test]
     fn split_is_half_for_every_column() {
-        assert_eq!(Layout::Split.proportions(1), vec![0.5]);
-        assert_eq!(Layout::Split.proportions(3), vec![0.5, 0.5, 0.5]);
+        assert_eq!(Layout::Split.proportions(1, DEFAULT_GOLDEN), vec![0.5]);
+        assert_eq!(
+            Layout::Split.proportions(3, DEFAULT_GOLDEN),
+            vec![0.5, 0.5, 0.5]
+        );
     }
 
     #[test]
-    fn golden_is_wide_first_then_narrow_rest() {
-        // Reading A of #1019 question 1: the first column takes 75 % and every
-        // other column takes 25 %, so the tail scrolls off to the right.
-        assert_eq!(Layout::Golden.proportions(1), vec![GOLDEN_MAJOR]);
+    fn golden_is_wide_first_then_narrow_rest_with_the_wide_pair() {
+        // Reading A of #1019 question 1: the first column takes the major
+        // share and every other column takes the minor one, so the tail
+        // scrolls off to the right. Exercised here with the wide (>= 2560 px)
+        // pair; `golden_is_wide_first_then_narrow_rest_with_the_narrow_pair`
+        // below is the same shape with the golden cut (#1052).
+        let wide = (GOLDEN_WIDE_MAJOR, GOLDEN_WIDE_MINOR);
+        assert_eq!(Layout::Golden.proportions(1, wide), vec![GOLDEN_WIDE_MAJOR]);
         assert_eq!(
-            Layout::Golden.proportions(2),
-            vec![GOLDEN_MAJOR, GOLDEN_MINOR]
+            Layout::Golden.proportions(2, wide),
+            vec![GOLDEN_WIDE_MAJOR, GOLDEN_WIDE_MINOR]
         );
         assert_eq!(
-            Layout::Golden.proportions(4),
-            vec![GOLDEN_MAJOR, GOLDEN_MINOR, GOLDEN_MINOR, GOLDEN_MINOR],
+            Layout::Golden.proportions(4, wide),
+            vec![
+                GOLDEN_WIDE_MAJOR,
+                GOLDEN_WIDE_MINOR,
+                GOLDEN_WIDE_MINOR,
+                GOLDEN_WIDE_MINOR
+            ],
             "every column after the first is the same narrow share (reading A)"
+        );
+    }
+
+    /// Same shape as the wide-pair test above, with the golden cut instead —
+    /// `Layout::proportions` itself doesn't know about the width breakpoint,
+    /// only about whichever pair it's handed (#1052).
+    #[test]
+    fn golden_is_wide_first_then_narrow_rest_with_the_narrow_pair() {
+        let narrow = (GOLDEN_NARROW_MAJOR, GOLDEN_NARROW_MINOR);
+        assert_eq!(
+            Layout::Golden.proportions(3, narrow),
+            vec![
+                GOLDEN_NARROW_MAJOR,
+                GOLDEN_NARROW_MINOR,
+                GOLDEN_NARROW_MINOR
+            ]
         );
     }
 
@@ -484,7 +675,7 @@ mod tests {
     fn zero_columns_yields_no_proportions_for_any_layout() {
         for layout in Layout::ALL {
             assert!(
-                layout.proportions(0).is_empty(),
+                layout.proportions(0, DEFAULT_GOLDEN).is_empty(),
                 "{} must plan nothing for an empty workspace",
                 layout.id()
             );
@@ -495,7 +686,12 @@ mod tests {
     fn every_layout_yields_exactly_one_proportion_per_column() {
         for layout in Layout::ALL {
             for n in 1_usize..=6 {
-                assert_eq!(layout.proportions(n).len(), n, "{} at n = {n}", layout.id());
+                assert_eq!(
+                    layout.proportions(n, DEFAULT_GOLDEN).len(),
+                    n,
+                    "{} at n = {n}",
+                    layout.id()
+                );
             }
         }
     }
@@ -546,8 +742,8 @@ mod tests {
         assert_eq!(Layout::Split.icon(), "view-dual-symbolic");
     }
 
-    /// Golden's two shares, pinned as **literal fractions** rather than read
-    /// back out of [`GOLDEN_MAJOR`] / [`GOLDEN_MINOR`].
+    /// Golden's wide-pair shares, pinned as **literal fractions** rather than
+    /// read back out of [`GOLDEN_WIDE_MAJOR`] / [`GOLDEN_WIDE_MINOR`].
     ///
     /// Comparing a constant to itself pins nothing: the 61.8/38.2 this replaced
     /// would have survived every other test in this file unchanged, and so
@@ -557,14 +753,28 @@ mod tests {
     /// **wire** unit is pinned separately, in `niri`'s byte test — this is the
     /// domain fraction only.
     #[test]
-    fn golden_is_seventy_five_twenty_five_in_fractions() {
+    fn golden_wide_pair_is_seventy_five_twenty_five_in_fractions() {
         assert!(
-            (GOLDEN_MAJOR - 0.75).abs() < f64::EPSILON,
-            "the wide column is 0.75 of the working area, got {GOLDEN_MAJOR}"
+            (GOLDEN_WIDE_MAJOR - 0.75).abs() < f64::EPSILON,
+            "the wide column is 0.75 of the working area, got {GOLDEN_WIDE_MAJOR}"
         );
         assert!(
-            (GOLDEN_MINOR - 0.25).abs() < f64::EPSILON,
-            "and every other column 0.25, got {GOLDEN_MINOR}"
+            (GOLDEN_WIDE_MINOR - 0.25).abs() < f64::EPSILON,
+            "and every other column 0.25, got {GOLDEN_WIDE_MINOR}"
+        );
+    }
+
+    /// The golden-cut pair's fractions, same pinning as the wide pair above —
+    /// this is the number #1052 brings back for screens under the breakpoint.
+    #[test]
+    fn golden_narrow_pair_is_the_golden_ratio_in_fractions() {
+        assert!(
+            (GOLDEN_NARROW_MAJOR - 0.618).abs() < f64::EPSILON,
+            "the wide column of the golden cut is 0.618, got {GOLDEN_NARROW_MAJOR}"
+        );
+        assert!(
+            (GOLDEN_NARROW_MINOR - 0.382).abs() < f64::EPSILON,
+            "and the narrow one 0.382, got {GOLDEN_NARROW_MINOR}"
         );
     }
 
@@ -578,28 +788,159 @@ mod tests {
     /// differ at `n = 2`, this is the test that says so out loud.
     #[test]
     fn equal_and_split_coincide_at_two_columns() {
-        assert_eq!(Layout::Equal.proportions(2), Layout::Split.proportions(2));
+        assert_eq!(
+            Layout::Equal.proportions(2, DEFAULT_GOLDEN),
+            Layout::Split.proportions(2, DEFAULT_GOLDEN)
+        );
         assert_ne!(
-            Layout::Equal.proportions(3),
-            Layout::Split.proportions(3),
+            Layout::Equal.proportions(3, DEFAULT_GOLDEN),
+            Layout::Split.proportions(3, DEFAULT_GOLDEN),
             "…and only at two: a third column separates them again"
         );
     }
 
     /// The tooltips are the only words the chip has, so they must say the
     /// numbers the code actually sends — a legend claiming 70 % over a 75 %
-    /// layout is worse than none.
+    /// layout is worse than none. Golden's now names **both** pairs and the
+    /// breakpoint between them (#1052), since the tooltip can't know live
+    /// which one applies (see [`Layout::tooltip`]'s doc).
     #[test]
     fn every_tooltip_states_its_own_percentages() {
+        let golden = Layout::Golden.tooltip();
         assert!(
-            Layout::Golden.tooltip().contains("75 %") && Layout::Golden.tooltip().contains("25 %"),
-            "got {:?}",
-            Layout::Golden.tooltip()
+            golden.contains("75 %") && golden.contains("25 %"),
+            "the wide pair: got {golden:?}"
+        );
+        assert!(
+            golden.contains("61.8 %") && golden.contains("38.2 %"),
+            "the golden cut: got {golden:?}"
+        );
+        assert!(
+            golden.contains("2560"),
+            "and the breakpoint that picks between them: got {golden:?}"
         );
         assert!(
             Layout::Split.tooltip().contains("50 %"),
             "got {:?}",
             Layout::Split.tooltip()
         );
+    }
+
+    // ── The width → pair decision (#1052) ───────────────────────────────────
+
+    /// The decision table straight from the triage: 2559 gets the golden cut,
+    /// 2560 gets the wide pair, and an unresolvable width defaults to the wide
+    /// pair too (not the golden cut) — the behaviour every build before #1052
+    /// already had.
+    #[test]
+    fn golden_pair_picks_by_the_breakpoint() {
+        assert_eq!(
+            golden_pair(Some(2559)),
+            (GOLDEN_NARROW_MAJOR, GOLDEN_NARROW_MINOR),
+            "2559 logical px, one short of the breakpoint, gets the golden cut"
+        );
+        assert_eq!(
+            golden_pair(Some(2560)),
+            (GOLDEN_WIDE_MAJOR, GOLDEN_WIDE_MINOR),
+            "2560 logical px exactly gets the wide pair"
+        );
+        assert_eq!(
+            golden_pair(None),
+            (GOLDEN_WIDE_MAJOR, GOLDEN_WIDE_MINOR),
+            "an unresolvable width defaults to the wide pair, not the golden cut"
+        );
+    }
+
+    /// A width far on either side of the breakpoint, so a mutation that only
+    /// breaks near the boundary (rather than flipping the comparison outright)
+    /// still has a chance to be caught.
+    #[test]
+    fn golden_pair_is_consistent_well_away_from_the_breakpoint() {
+        assert_eq!(
+            golden_pair(Some(1920)),
+            (GOLDEN_NARROW_MAJOR, GOLDEN_NARROW_MINOR)
+        );
+        assert_eq!(
+            golden_pair(Some(3440)),
+            (GOLDEN_WIDE_MAJOR, GOLDEN_WIDE_MINOR)
+        );
+    }
+
+    /// [`GOLDEN_BREAKPOINT`] itself, so a change to the constant is a
+    /// deliberate edit here too, not a silent drift.
+    #[test]
+    fn the_breakpoint_is_twenty_five_sixty() {
+        assert_eq!(GOLDEN_BREAKPOINT, 2560);
+    }
+
+    // ── Resolving the target output (#1052) ─────────────────────────────────
+
+    #[test]
+    fn target_output_name_is_the_focused_outputs_active_workspace() {
+        let ws = vec![workspace(1, OUTPUT, true), workspace(2, OTHER_OUTPUT, true)];
+
+        assert_eq!(target_output_name(&ws, Some(OUTPUT)), Some(OUTPUT));
+        assert_eq!(
+            target_output_name(&ws, Some(OTHER_OUTPUT)),
+            Some(OTHER_OUTPUT)
+        );
+    }
+
+    #[test]
+    fn target_output_name_falls_back_like_plan_does() {
+        let mut ws = vec![workspace(1, OUTPUT, true), workspace(3, OTHER_OUTPUT, true)];
+        ws[1].is_focused = false;
+
+        assert_eq!(
+            target_output_name(&ws, None),
+            Some(OUTPUT),
+            "no focused output: falls back to the focused workspace, same as `plan`"
+        );
+    }
+
+    #[test]
+    fn target_output_name_is_none_with_nothing_to_target() {
+        let ws = vec![workspace(1, OUTPUT, true)];
+        assert_eq!(target_output_name(&ws, Some("eDP-1")), None);
+        assert_eq!(target_output_name(&[], Some(OUTPUT)), None);
+    }
+
+    #[test]
+    fn target_output_name_is_none_for_a_disconnected_target_workspace() {
+        let mut orphaned = workspace(1, OUTPUT, true);
+        orphaned.output = None;
+        let ws = vec![orphaned];
+
+        assert_eq!(
+            target_output_name(&ws, Some(OUTPUT)),
+            None,
+            "the target workspace itself reports no output"
+        );
+    }
+
+    #[test]
+    fn logical_width_of_finds_the_named_output() {
+        let outputs = vec![
+            output_with_logical_width(OUTPUT, 1920),
+            output_with_logical_width(OTHER_OUTPUT, 3440),
+        ];
+
+        assert_eq!(logical_width_of(&outputs, OUTPUT), Some(1920));
+        assert_eq!(logical_width_of(&outputs, OTHER_OUTPUT), Some(3440));
+    }
+
+    #[test]
+    fn logical_width_of_is_none_for_an_unknown_name() {
+        let outputs = vec![output_with_logical_width(OUTPUT, 1920)];
+        assert_eq!(logical_width_of(&outputs, "eDP-1"), None);
+        assert_eq!(logical_width_of(&[], OUTPUT), None);
+    }
+
+    #[test]
+    fn logical_width_of_is_none_without_logical_geometry() {
+        let mut headless = output_with_logical_width(OUTPUT, 1920);
+        headless.logical = None;
+
+        assert_eq!(logical_width_of(&[headless], OUTPUT), None);
     }
 }

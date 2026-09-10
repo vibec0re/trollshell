@@ -3,16 +3,19 @@
 //!
 //! [`apply`] is the single entry point both hats use — the chip's click worker
 //! and the CLI's `apply` subcommand — so the two can never drift. It fetches the
-//! three snapshots [`plan`](crate::layout::plan) needs, then sends one
-//! `SetWindowWidth` per column. All the deciding lives in
-//! [`layout`](crate::layout); this module only moves bytes.
+//! four snapshots [`plan`](crate::layout::plan) and [`Layout::Golden`]'s pair
+//! resolution need — windows, workspaces, outputs, and the focused output —
+//! then sends one `SetWindowWidth` per column. All the deciding lives in
+//! [`layout`](crate::layout); this module only moves bytes (plus one debug
+//! line, #1052, for when the width resolution comes back empty).
 //!
 //! The [`Transport`] indirection is what makes the whole path testable: the
 //! tests below drive [`apply`] against a scripted fake and never open a socket.
 
 use crate::layout::{self, Layout};
+use crate::plugin::PLUGIN_ID;
 use niri_ipc::socket::Socket;
-use niri_ipc::{Action, Reply, Request, Response, SizeChange, Window, Workspace};
+use niri_ipc::{Action, Output, Reply, Request, Response, SizeChange, Window, Workspace};
 
 /// One niri request, one niri reply.
 ///
@@ -55,12 +58,30 @@ fn ask(transport: &mut impl Transport, request: Request) -> Result<Response, Str
 /// niri's own text for the first request that failed; nothing is retried and no
 /// widths are rolled back, because a partially applied layout is still a
 /// coherent one and the next click fixes it.
+///
+/// Always fetches `Outputs` (#1052), even for `equal`/`split`, which never
+/// look at it: `apply` doesn't special-case the layout when asking niri, only
+/// when deciding what to do with the answer, so the two hats' requests stay
+/// identical regardless of which button was pressed.
 pub(crate) fn apply(transport: &mut impl Transport, layout: Layout) -> Result<usize, String> {
     let windows = windows(transport)?;
     let workspaces = workspaces(transport)?;
+    let outputs = outputs(transport)?;
     let output = focused_output(transport)?;
 
-    let plan = layout::plan(&windows, &workspaces, output.as_deref(), layout);
+    let target_output = layout::target_output_name(&workspaces, output.as_deref());
+    let logical_width = target_output.and_then(|name| layout::logical_width_of(&outputs, name));
+    if layout == Layout::Golden && logical_width.is_none() {
+        eprintln!(
+            "[{PLUGIN_ID}] golden: no logical width for the target output{}; \
+             defaulting to the >= {}px pair (75 % / 25 %)",
+            target_output.map_or_else(String::new, |name| format!(" ({name})")),
+            layout::GOLDEN_BREAKPOINT,
+        );
+    }
+    let golden = layout::golden_pair(logical_width);
+
+    let plan = layout::plan(&windows, &workspaces, output.as_deref(), layout, golden);
     for &(id, proportion) in &plan {
         ask(
             transport,
@@ -106,6 +127,16 @@ fn workspaces(transport: &mut impl Transport) -> Result<Vec<Workspace>, String> 
     }
 }
 
+/// Every connected output — the map niri's `Outputs` request replies with,
+/// flattened to a `Vec` since [`layout::logical_width_of`] just looks one up
+/// by name (#1052).
+fn outputs(transport: &mut impl Transport) -> Result<Vec<Output>, String> {
+    match ask(transport, Request::Outputs)? {
+        Response::Outputs(outputs) => Ok(outputs.into_values().collect()),
+        other => Err(unexpected("Outputs", &other)),
+    }
+}
+
 /// The focused output's connector name, or `None` when niri reports no focused
 /// output (see [`layout::plan`]'s fallback).
 fn focused_output(transport: &mut impl Transport) -> Result<Option<String>, String> {
@@ -126,8 +157,10 @@ fn unexpected(request: &str, response: &Response) -> String {
 pub(crate) mod fake {
     use super::Transport;
     use niri_ipc::{
-        Action, Output, Reply, Request, Response, SizeChange, Window, WindowLayout, Workspace,
+        Action, LogicalOutput, Output, Reply, Request, Response, SizeChange, Transform, Window,
+        WindowLayout, Workspace,
     };
+    use std::collections::HashMap;
 
     pub(crate) const OUTPUT: &str = "DP-1";
 
@@ -182,11 +215,33 @@ pub(crate) mod fake {
         }
     }
 
-    /// Answers the three queries from canned state and records every request.
+    /// [`output`] with a logical geometry reporting `width` px (#1052) —
+    /// height and scale are arbitrary but plausible, since nothing here reads
+    /// them.
+    pub(crate) fn output_with_logical_width(width: u32) -> Output {
+        Output {
+            logical: Some(LogicalOutput {
+                x: 0,
+                y: 0,
+                width,
+                height: 1080,
+                scale: 1.0,
+                transform: Transform::Normal,
+            }),
+            ..output()
+        }
+    }
+
+    /// Answers the four queries from canned state and records every request.
     pub(crate) struct Fake {
         pub(crate) windows: Vec<Window>,
         pub(crate) workspaces: Vec<Workspace>,
         pub(crate) focused_output: Option<Output>,
+        /// Every output the `Outputs` request would list, keyed by name
+        /// (#1052). Defaults to one entry for [`OUTPUT`] with no logical
+        /// geometry, which resolves to `golden_pair`'s default (wide) pair —
+        /// the same 75/25 every test before #1052 already expected.
+        pub(crate) outputs: HashMap<String, Output>,
         /// Fail the next `Action` the way niri itself would: an inner `Err`
         /// carrying niri's own text.
         pub(crate) action_error: Option<String>,
@@ -201,6 +256,7 @@ pub(crate) mod fake {
                 windows,
                 workspaces: vec![workspace()],
                 focused_output: Some(output()),
+                outputs: HashMap::from([(OUTPUT.to_owned(), output())]),
                 action_error: None,
                 transport_error: None,
                 seen: Vec::new(),
@@ -210,6 +266,15 @@ pub(crate) mod fake {
         /// Two tiled columns on the focused workspace — the happy default.
         pub(crate) fn two_columns() -> Self {
             Self::with(vec![tile(10, 1), tile(20, 2)])
+        }
+
+        /// [`Self::with`], with [`OUTPUT`]'s logical width set to `width` px
+        /// (#1052) — the fixture the Golden breakpoint tests build on.
+        pub(crate) fn with_output_width(windows: Vec<Window>, width: u32) -> Self {
+            let mut fake = Self::with(windows);
+            fake.outputs
+                .insert(OUTPUT.to_owned(), output_with_logical_width(width));
+            fake
         }
 
         /// The `(id, proportion)` pairs the fake was actually asked to set.
@@ -245,6 +310,7 @@ pub(crate) mod fake {
             Ok(match request {
                 Request::Windows => Ok(Response::Windows(self.windows.clone())),
                 Request::Workspaces => Ok(Response::Workspaces(self.workspaces.clone())),
+                Request::Outputs => Ok(Response::Outputs(self.outputs.clone())),
                 Request::FocusedOutput => Ok(Response::FocusedOutput(self.focused_output.clone())),
                 Request::Action(_) => match self.action_error.take() {
                     Some(msg) => Err(msg),
@@ -266,7 +332,7 @@ mod tests {
     // ── The wire unit ────────────────────────────────────────────────────────
     //
     // Every expectation below is a **literal percentage**, deliberately not
-    // derived from this crate's `GOLDEN_MAJOR` / `SPLIT_SHARE` / `1.0 / n`.
+    // derived from this crate's `GOLDEN_WIDE_MAJOR` / `SPLIT_SHARE` / `1.0 / n`.
     // Comparing the wire back to the constants it came from is a closed loop —
     // it pins *a* number without ever stating what niri means by it, and it is
     // how this crate shipped 0.5 % where it meant 50 % (#1026 review, HIGH-1).
@@ -347,16 +413,21 @@ mod tests {
         );
     }
 
-    /// Golden's two numbers, at the bytes, as literals (#1019 round 2).
+    /// Golden's two wide-pair numbers, at the bytes, as literals (#1019 round
+    /// 2). The default `Fake` output reports no logical geometry, which is
+    /// exactly the "unknown width" case [`crate::layout::golden_pair`]
+    /// defaults to the wide pair for (#1052) — see
+    /// `golden_narrow_serialises_to_sixty_one_point_eight_then_thirty_eight_point_two_percent`
+    /// for the same pinning on a narrow output.
     ///
-    /// Written out rather than built from `GOLDEN_MAJOR * 100.0` for the reason
-    /// the header above gives, and for a second one: `0.75_f64 * 100.0` is not
-    /// *obviously* `75.0` — it is only exactly 75 because the rounding lands
-    /// there, and 61.8 stayed `61.8` for the same non-obvious reason. Spelling
-    /// the bytes is what proves it rather than assuming it; a change that made
-    /// the product `75.00000000000001` would serialise those digits and fail
-    /// here, where a `(id, f64)` comparison against the same expression would
-    /// not.
+    /// Written out rather than built from `GOLDEN_WIDE_MAJOR * 100.0` for the
+    /// reason the header above gives, and for a second one: `0.75_f64 * 100.0`
+    /// is not *obviously* `75.0` — it is only exactly 75 because the rounding
+    /// lands there, and 61.8 stayed `61.8` for the same non-obvious reason.
+    /// Spelling the bytes is what proves it rather than assuming it; a change
+    /// that made the product `75.00000000000001` would serialise those digits
+    /// and fail here, where a `(id, f64)` comparison against the same
+    /// expression would not.
     #[test]
     fn golden_serialises_to_seventy_five_then_twenty_five_percent() {
         let mut niri = Fake::with(vec![tile(10, 1), tile(20, 2), tile(30, 3)]);
@@ -378,8 +449,32 @@ mod tests {
         );
     }
 
+    /// The golden cut's two numbers, at the bytes, as literals (#1052) — the
+    /// same pinning as the wide pair above, on an output narrower than
+    /// [`crate::layout::GOLDEN_BREAKPOINT`].
     #[test]
-    fn queries_all_three_snapshots_before_acting() {
+    fn golden_narrow_serialises_to_sixty_one_point_eight_then_thirty_eight_point_two_percent() {
+        let mut niri = Fake::with_output_width(vec![tile(10, 1), tile(20, 2), tile(30, 3)], 1920);
+
+        apply(&mut niri, Layout::Golden).expect("the fake answers everything");
+
+        assert_eq!(
+            wire_bytes(&niri),
+            vec![
+                r#"{"Action":{"SetWindowWidth":{"id":10,"change":{"SetProportion":61.8}}}}"#
+                    .to_owned(),
+                r#"{"Action":{"SetWindowWidth":{"id":20,"change":{"SetProportion":38.2}}}}"#
+                    .to_owned(),
+                r#"{"Action":{"SetWindowWidth":{"id":30,"change":{"SetProportion":38.2}}}}"#
+                    .to_owned(),
+            ],
+            "these are the bytes `niri msg action set-window-width --id N 61.8%` \
+             (then 38.2%, then 38.2%) writes on a 1920 px-wide output"
+        );
+    }
+
+    #[test]
+    fn queries_all_four_snapshots_before_acting() {
         let mut niri = Fake::with(vec![tile(10, 1)]);
 
         apply(&mut niri, Layout::Equal).expect("the fake answers everything");
@@ -389,9 +484,85 @@ mod tests {
             vec![
                 "Windows".to_owned(),
                 "Workspaces".to_owned(),
+                "Outputs".to_owned(),
                 "FocusedOutput".to_owned()
             ],
-            "the plan needs all three, and asks for them before it sends anything"
+            "the plan needs all four (#1052 adds Outputs), and asks for them \
+             before it sends anything — even for `equal`, which never reads it"
+        );
+    }
+
+    // ── The width-based Golden pair (#1052) ─────────────────────────────────
+
+    #[test]
+    fn golden_uses_the_wide_pair_at_or_above_the_breakpoint() {
+        let mut niri = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 3440);
+
+        apply(&mut niri, Layout::Golden).expect("the fake answers everything");
+
+        assert_eq!(
+            niri.widths(),
+            vec![(10, 75.0), (20, 25.0)],
+            "3440 logical px is >= 2560, so it gets the wide pair"
+        );
+    }
+
+    #[test]
+    fn golden_uses_the_golden_cut_below_the_breakpoint() {
+        let mut niri = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 1920);
+
+        apply(&mut niri, Layout::Golden).expect("the fake answers everything");
+
+        assert_eq!(
+            niri.widths(),
+            vec![(10, 61.8), (20, 38.2)],
+            "1920 logical px is < 2560, so it gets the golden ratio cut"
+        );
+    }
+
+    /// Only Golden's pair depends on the output width — `equal` and `split`
+    /// must send the exact same widths on a narrow output as on a wide one.
+    #[test]
+    fn equal_and_split_ignore_the_output_width() {
+        let mut narrow = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 1920);
+        let mut wide = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 3440);
+
+        apply(&mut narrow, Layout::Equal).expect("narrow, equal");
+        apply(&mut wide, Layout::Equal).expect("wide, equal");
+        assert_eq!(narrow.widths(), wide.widths());
+
+        let mut narrow = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 1920);
+        let mut wide = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 3440);
+        apply(&mut narrow, Layout::Split).expect("narrow, split");
+        apply(&mut wide, Layout::Split).expect("wide, split");
+        assert_eq!(narrow.widths(), wide.widths());
+    }
+
+    /// "Missing output" (#1052): the target output isn't in what `Outputs`
+    /// reported at all — as opposed to being reported with no logical
+    /// geometry, which `golden_serialises_to_seventy_five_then_twenty_five_percent`
+    /// already covers via the default `Fake`.
+    #[test]
+    fn golden_falls_back_to_the_wide_pair_when_the_output_is_missing_entirely() {
+        let mut niri = Fake::two_columns();
+        niri.outputs.clear();
+
+        let applied = apply(&mut niri, Layout::Golden).expect("querying still works");
+
+        assert_eq!(applied, 2);
+        assert_eq!(niri.widths(), vec![(10, 75.0), (20, 25.0)]);
+    }
+
+    #[test]
+    fn golden_asks_outputs_exactly_once_per_apply() {
+        let mut niri = Fake::with_output_width(vec![tile(10, 1), tile(20, 2), tile(30, 3)], 1920);
+
+        apply(&mut niri, Layout::Golden).expect("the fake answers everything");
+
+        assert_eq!(
+            niri.queries().iter().filter(|q| *q == "Outputs").count(),
+            1,
+            "one Outputs request per apply, not one per column"
         );
     }
 

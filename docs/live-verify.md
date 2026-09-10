@@ -375,7 +375,11 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       (golden: a wide area with a narrow right panel), `view-dual-symbolic`
       (split) — and **not** an `image-missing` box, and not the preem LED panels
       #1026 shipped (round 2 replaced those). Hovering a glyph should show its
-      legend, and the golden one should read "first column 75 %, the rest 25 %".
+      legend, and the golden one should read "first column 75 %, the rest 25 %
+      on screens 2560 px wide or more; 61.8 % / 38.2 % (the golden cut)
+      narrower" (#1052 — the tooltip names both pairs and the breakpoint since
+      it can't dial niri to say which one applies to the screen it's hovered
+      on).
       (**`equal` and `split` are the same plan at exactly two columns** — halves
       either way; they differ from a third column on. Deliberate, but say so if
       two identical-looking buttons read badly on glass.)
@@ -432,6 +436,25 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       (`trollshell/src/plugins/region.rs`'s `gtk_tests`); this entry only
       confirms it reads right on real glass, since niri-layouts' own empty-root
       trigger (#1038) has no niri session to test against in CI.
+- [ ] **(#1052)** Golden's adaptive pair — needs two outputs of different
+      logical widths straddling 2560 px (an ultrawide/external monitor plus a
+      laptop panel works; `kanshi`/`niri msg output <name> scale <n>` can also
+      push a HiDPI panel's _logical_ width across the line without new
+      hardware). On the **wide** output (>= 2560 logical px) click `golden` on
+      a three-column workspace and confirm the same 75 %/25 %/25 % split
+      #1019 already shipped. Focus the **narrow** output's workspace instead
+      and click `golden` there: the columns should land at **61.8 %/38.2
+      %/38.2 %**, not 75/25 — this is the whole point, a narrow column that is
+      still usable rather than a sliver. The decision follows the **focused
+      workspace's own output**, not whichever monitor the shell started on:
+      switch focus between the two outputs and click `golden` on each without
+      restarting anything, and confirm each pick tracks its own screen.
+      Unplug the external monitor (or otherwise leave only a headless/no-info
+      output) and click `golden` again: it should fall back to the wide pair
+      (75/25) and the journal should carry one `golden: no logical width …`
+      debug line explaining why, not a crash or a silent 61.8/38.2. The CLI
+      hat picks up the same rule: `hytte-plugin-niri-layouts apply golden` run
+      from a terminal on each output should match its chip's split exactly.
 
 ## Infobroker
 

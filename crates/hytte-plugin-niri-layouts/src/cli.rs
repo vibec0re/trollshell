@@ -24,7 +24,10 @@ USAGE:
     hytte-plugin-niri-layouts --help          this text
 
     <layout>: equal  — every column the same width, 1/n each
-              golden — first column 75 %, every other column 25 %
+              golden — first column 75 %, every other column 25 %, on the
+                       target output's screen at 2560 logical px wide or
+                       more; 61.8 % / 38.2 % (the golden cut) narrower than
+                       that (#1052)
               split  — every column 50 %
 
 Counts are COLUMNS, not windows: niri widths are per column, so a stacked
@@ -149,5 +152,22 @@ mod tests {
         }
         assert!(USAGE.contains("apply"), "the CLI hat");
         assert!(USAGE.contains("widget plugin"), "the plugin hat");
+    }
+
+    /// `--help` never dials niri (see `Invocation::Help` in `main`), so it
+    /// can't report which pair actually applies on the screen it's run on —
+    /// it documents the rule instead, both pairs and the breakpoint between
+    /// them (#1052).
+    #[test]
+    fn the_usage_text_names_both_golden_pairs_and_the_breakpoint() {
+        assert!(
+            USAGE.contains("75 %") && USAGE.contains("25 %"),
+            "the wide pair"
+        );
+        assert!(
+            USAGE.contains("61.8 %") && USAGE.contains("38.2 %"),
+            "the golden cut"
+        );
+        assert!(USAGE.contains("2560"), "the breakpoint between them");
     }
 }

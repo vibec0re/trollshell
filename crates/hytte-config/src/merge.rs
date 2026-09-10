@@ -320,9 +320,13 @@ fn collect_inert(
     out: &mut Vec<InertUnset>,
 ) {
     if let Some(names) = table.get(UNSET_KEY).and_then(toml::Value::as_array) {
+        // Deduped **within one marker**, and only there: `_unset = ["aa", "aa"]`
+        // is one mistake on one line and gets one warning. The same name in two
+        // different layers is two files to go and edit, so those stay separate.
+        let mut said = BTreeSet::new();
         for name in names.iter().filter_map(toml::Value::as_str) {
             let key = format!("{prefix}{name}");
-            if !present.contains(&key) {
+            if !present.contains(&key) && said.insert(key.clone()) {
                 out.push(InertUnset { layer, key });
             }
         }
@@ -816,6 +820,32 @@ mod tests {
         assert!(
             inert_unset(&[table("_unset = [3]\n")]).is_empty(),
             "not a name: #988's business too"
+        );
+    }
+
+    /// One line, one mistake, one complaint — signal-to-noise is the whole
+    /// justification for this check, so a name written twice in the same marker
+    /// must not warn twice. Across *layers* it still does: two files each carry
+    /// a line to go and fix.
+    ///
+    /// Red if the per-marker dedupe goes away (found by #1016's review).
+    #[test]
+    fn a_name_repeated_inside_one_marker_is_reported_once() {
+        assert_eq!(
+            inert_unset(&[table("_unset = [\"aa\", \"aa\", \"bb\"]\n")])
+                .iter()
+                .map(|i| i.key.as_str())
+                .collect::<Vec<_>>(),
+            ["aa", "bb"]
+        );
+
+        assert_eq!(
+            inert_unset(&[table("_unset = [\"aa\"]\n"), table("_unset = [\"aa\"]\n")])
+                .iter()
+                .map(|i| (i.layer, i.key.as_str()))
+                .collect::<Vec<_>>(),
+            [(0, "aa"), (1, "aa")],
+            "two layers is two files, so two lines in the journal"
         );
     }
 

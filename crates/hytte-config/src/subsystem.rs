@@ -228,28 +228,57 @@ fn layer_name(path: Option<&Path>) -> String {
 /// A [`serde_ignored`] path as the dotted key path the rest of this module
 /// speaks in.
 ///
-/// `serde_ignored` spells every hop through a wrapper — `Option`, a newtype
-/// struct, a newtype variant — as a `?` segment, so a key the schema does not
-/// know inside a `core: Option<Core>` arrives as `core.?.mystery` while
-/// [`collect_paths`] and [`crate::merge::inert_unset`] produce `core.mystery`.
-/// Left as-is that mismatch is not cosmetic: [`schema_paths`] subtracts one set
-/// from the other, so the user's own key inside an *optional* table failed to
-/// subtract and [`patch`]'s stale sweep deleted it (found while fixing #1008
-/// shape 2, where the sweep now recurses into such a table instead of removing
-/// it whole, and would otherwise have emptied it key by key).
+/// This is [`serde_ignored::Path`]'s own `Display`, with one difference: a hop
+/// through a **wrapper** — `Option`, a newtype struct, a newtype variant —
+/// contributes no segment. `Display` writes `?` for those, so a key the schema
+/// does not know inside a `core: Option<Core>` arrives as `core.?.mystery`
+/// while [`collect_paths`] and [`crate::merge::inert_unset`] produce
+/// `core.mystery`. That mismatch is not cosmetic: [`schema_paths`] subtracts
+/// one set from the other, so the user's own key inside an *optional* table
+/// failed to subtract, counted as schema-owned, and [`patch`]'s stale sweep
+/// deleted it.
 ///
-/// A TOML key that is literally `?` would be folded away here. It has to be a
-/// quoted key to exist at all, no schema in the workspace has one, and the
-/// consequence is a key not removed rather than a key wrongly removed — the
-/// same direction, for the same reason, as [`collect_paths`]'s dotted-key note.
-fn dotted_key(path: &str) -> String {
-    if !path.contains('?') {
-        return path.to_owned();
+/// It walks the enum rather than editing the rendered string precisely because
+/// `Display` renders a wrapper hop and a **user's map key spelled `"?"`**
+/// identically. Dropping `?` segments from the text folds that key to `""`,
+/// which does *not* collide with the `?` [`collect_paths`] produces for it —
+/// so instead of merely failing to remove the key, the sweep removes it,
+/// "deleting somebody's key on uncertain information", which [`schema_paths`]
+/// names as the one outcome this writer must never produce. Everything else,
+/// including how a parent contributes `{parent}.` unless it is the root, is
+/// [`serde_ignored`]'s rule, kept deliberately so the two spellings cannot
+/// drift apart on some other exotic key.
+fn dotted_key(path: &serde_ignored::Path<'_>) -> String {
+    match unwrapped(path) {
+        serde_ignored::Path::Seq { parent, index } => {
+            format!("{}{index}", parent_prefix(parent))
+        }
+        serde_ignored::Path::Map { parent, key } => format!("{}{key}", parent_prefix(parent)),
+        // `Root`, and the wrapper arms `unwrapped` has already peeled off.
+        _ => String::new(),
     }
-    path.split('.')
-        .filter(|segment| *segment != "?")
-        .collect::<Vec<_>>()
-        .join(".")
+}
+
+/// What a parent contributes in front of its child's segment: nothing at the
+/// root, its own path and a `.` otherwise — [`serde_ignored`]'s `Display` rule,
+/// asked *after* the wrappers are peeled so an `Option` hop cannot make an
+/// empty prefix look like a non-empty one.
+fn parent_prefix(parent: &serde_ignored::Path<'_>) -> String {
+    match unwrapped(parent) {
+        serde_ignored::Path::Root => String::new(),
+        other => format!("{}.", dotted_key(other)),
+    }
+}
+
+/// `path` with its wrapper hops peeled off. They say how the *type* is shaped —
+/// an `Option`, a newtype — and never name anything a user wrote.
+fn unwrapped<'a>(path: &'a serde_ignored::Path<'a>) -> &'a serde_ignored::Path<'a> {
+    match path {
+        serde_ignored::Path::Some { parent }
+        | serde_ignored::Path::NewtypeStruct { parent }
+        | serde_ignored::Path::NewtypeVariant { parent } => unwrapped(parent),
+        other => other,
+    }
 }
 
 /// Parse one layer body, naming the file in the error.
@@ -319,7 +348,7 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
 
     let mut unknown_keys = Vec::new();
     let config: S = serde_ignored::deserialize(merged.into_deserializer(), |path| {
-        unknown_keys.push(dotted_key(&path.to_string()));
+        unknown_keys.push(dotted_key(&path));
     })
     .map_err(|e| ConfigError::Schema(e.to_string()))?;
 
@@ -476,7 +505,7 @@ fn schema_paths<S: Subsystem>(have: &toml::Table) -> Option<BTreeSet<String>> {
 
     let mut ignored = BTreeSet::new();
     let parsed: Result<S, _> = serde_ignored::deserialize(probe.into_deserializer(), |p| {
-        ignored.insert(dotted_key(&p.to_string()));
+        ignored.insert(dotted_key(&p));
     });
     parsed.ok()?;
 
@@ -518,11 +547,7 @@ fn schema_paths<S: Subsystem>(have: &toml::Table) -> Option<BTreeSet<String>> {
 ///   adding a key to anyway.
 fn set_value(table: &mut dyn toml_edit::TableLike, key: &str, mut value: toml_edit::Value) {
     let Some(carried) = carried_suffix(table, key) else {
-        if let Some(last) = last_whitespace_suffixed_key(table)
-            && let Some(last_value) = table.get_mut(&last).and_then(toml_edit::Item::as_value_mut)
-        {
-            last_value.decor_mut().set_suffix("");
-        }
+        close_up_for_append(table);
         table.insert(key, toml_edit::Item::Value(value));
         return;
     };
@@ -564,6 +589,65 @@ fn last_whitespace_suffixed_key(table: &dyn toml_edit::TableLike) -> Option<Stri
         .suffix()
         .and_then(toml_edit::RawString::as_str)?;
     (!suffix.is_empty() && suffix.chars().all(char::is_whitespace)).then(|| key.to_owned())
+}
+
+/// Make room at the end of `table` for a key about to be appended: whatever is
+/// currently last stops being last, so the space it holds in front of an inline
+/// table's `}` has to go or it renders as `{ a = 1 , b = 2 }`.
+///
+/// Called from **both** append paths — [`set_value`] for a scalar and [`patch`]
+/// for a sub-table. Splitting them is what left `{ y = 4 , inner = { x = 7 } }`
+/// on the table path (found by #1016's review).
+fn close_up_for_append(table: &mut dyn toml_edit::TableLike) {
+    if let Some(last) = last_whitespace_suffixed_key(table)
+        && let Some(last_value) = table.get_mut(&last).and_then(toml_edit::Item::as_value_mut)
+    {
+        last_value.decor_mut().set_suffix("");
+    }
+}
+
+/// Remove `key`, handing the space it held in front of an inline table's `}` to
+/// whatever is last afterwards — the mirror of [`set_value`]'s carry-over rule,
+/// for the one path that takes a key away instead of rewriting one. Without it
+/// the sweep that #1008 shape 2 made reachable renders
+/// `core = { _unset = ["label"]}`.
+///
+/// Self-selecting on the removed value's own suffix: only an inline table
+/// normally has whitespace there, and a *comment* is never moved — it described
+/// the value that is going away, the same reasoning as [`set_value`]'s. The one
+/// thing it can also carry is trailing whitespace off a standard table's last
+/// line, on a line the same save is already editing the table around.
+fn remove_keeping_closing_space(table: &mut dyn toml_edit::TableLike, key: &str) {
+    let was_last = table.iter().last().is_some_and(|(last, _)| last == key);
+    let removed = table.remove(key);
+    if !was_last {
+        return;
+    }
+
+    let Some(space) = removed
+        .as_ref()
+        .and_then(toml_edit::Item::as_value)
+        .and_then(|value| value.decor().suffix())
+        .and_then(toml_edit::RawString::as_str)
+        .filter(|raw| !raw.is_empty() && raw.chars().all(char::is_whitespace))
+    else {
+        return;
+    };
+
+    let Some(new_last) = table.iter().last().map(|(last, _)| last.to_owned()) else {
+        return;
+    };
+    if let Some(value) = table
+        .get_mut(&new_last)
+        .and_then(toml_edit::Item::as_value_mut)
+        && value
+            .decor()
+            .suffix()
+            .and_then(toml_edit::RawString::as_str)
+            == Some("")
+    {
+        value.decor_mut().set_suffix(space);
+    }
 }
 
 /// `toml::Value` as a `toml_edit::Value`.
@@ -653,18 +737,28 @@ fn patch(
                 None => true,
             };
             if emptied {
-                doc.remove(&key);
+                remove_keeping_closing_space(doc, &key);
             }
         }
     }
 
     for (key, value) in want {
         if let toml::Value::Table(sub_want) = value {
-            if !doc.get(key).is_some_and(toml_edit::Item::is_table_like) {
-                // A standard table inside a standard one, an inline table
-                // inside an inline one: `TableLike::insert` converts on the way
-                // in, so the new table is spelled the way its parent is.
-                doc.insert(key, toml_edit::Item::Table(toml_edit::Table::new()));
+            match doc.get(key).map(toml_edit::Item::is_table_like) {
+                Some(true) => {}
+                existing => {
+                    // A standard table inside a standard one, an inline table
+                    // inside an inline one: `TableLike::insert` converts on the
+                    // way in, so the new table is spelled the way its parent
+                    // is. When there was no key here at all this is an append
+                    // like any other, and takes the same fix-up — replacing a
+                    // key that *is* here is not, and must not touch a
+                    // neighbour's bytes.
+                    if existing.is_none() {
+                        close_up_for_append(doc);
+                    }
+                    doc.insert(key, toml_edit::Item::Table(toml_edit::Table::new()));
+                }
             }
             let Some(sub_doc) = doc
                 .get_mut(key)
@@ -1727,8 +1821,8 @@ kept = true
     /// path fails to subtract, so the writer counts the user's own key as
     /// schema-owned and deletes it.
     ///
-    /// Red if `dotted_key` stops folding `?` away: `unknown_keys` reads
-    /// `core.?.mystery` and the save eats `mystery`.
+    /// Red if `dotted_key` stops folding the wrapper hop away: `unknown_keys`
+    /// reads `core.?.mystery` and the save eats `mystery`.
     #[test]
     fn an_unknown_key_inside_an_optional_table_is_named_and_kept() {
         let existing = "enabled = true\n\n[core]\nmystery = 1\nbrightness = 7\n";
@@ -1749,6 +1843,136 @@ kept = true
             out.contains("mystery = 1"),
             "and a key the writer failed to recognise must never be deleted: {out}"
         );
+    }
+
+    /// The other side of the same fold, and the reason [`dotted_key`] walks
+    /// [`serde_ignored::Path`] instead of editing its rendered string: a
+    /// *user's* key spelled `"?"` renders exactly like a wrapper hop. Dropping
+    /// `?` segments from the text folded it to `""`, which does not collide
+    /// with the `?` [`collect_paths`] produces for the same key, so it stayed
+    /// in the owned set and the stale sweep **deleted** it — the one outcome
+    /// [`schema_paths`]'s doc says this writer must never produce.
+    ///
+    /// At the root and at depth in one test, because the fold hit them
+    /// differently: at depth `core.?` collapsed to `core`, naming a table the
+    /// schema owns. Both red on a `dotted_key` that matches on `?` in a string
+    /// (found by #1016's review).
+    #[test]
+    fn a_key_spelled_like_a_wrapper_hop_is_named_and_kept() {
+        for (existing, expected) in [
+            (
+                "enabled = true\n\"?\" = 1\n\n[core]\ncolor = \"amber\"\nbrightness = 3\n",
+                "?",
+            ),
+            (
+                "enabled = true\n\n[core]\n\"?\" = 1\ncolor = \"amber\"\nbrightness = 3\n",
+                "core.?",
+            ),
+        ] {
+            let loaded = assemble::<Leds>(&layers(&[existing])).expect("assembles");
+            assert_eq!(
+                loaded.unknown_keys,
+                [expected],
+                "a `?` a user typed is a key, not a wrapper hop: {existing:?}"
+            );
+
+            let mut value = loaded.config;
+            value.core.brightness = 5;
+            let out = render_overlay(existing, &value).expect("renders");
+            assert!(
+                out.contains("\"?\" = 1"),
+                "…so the save must not delete it: {out}"
+            );
+        }
+    }
+
+    // ── #1016 review: two bytes the inline paths still moved ────────────────
+
+    /// Appending a *sub-table* to an inline table went straight through
+    /// `TableLike::insert`, skipping the fix-up [`set_value`]'s append branch
+    /// does, and rendered `{ y = 4 , inner = { x = 7 } }`. Both paths now go
+    /// through [`close_up_for_append`].
+    ///
+    /// Red on the stray space if the call in [`patch`] goes away.
+    #[test]
+    fn appending_a_sub_table_to_an_inline_table_does_not_leave_a_stray_space() {
+        #[derive(Default, serde::Serialize, serde::Deserialize)]
+        struct Inner {
+            #[serde(default)]
+            x: u8,
+        }
+
+        #[derive(Default, serde::Serialize, serde::Deserialize)]
+        struct Outer {
+            #[serde(default)]
+            inner: Inner,
+            #[serde(default)]
+            y: u8,
+        }
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Nested {
+            #[serde(default)]
+            enabled: bool,
+            #[serde(default)]
+            core: Outer,
+        }
+
+        impl Subsystem for Nested {
+            const NAME: &'static str = "nested";
+            const DEFAULT_TOML: &'static str = "enabled = true\n";
+            type Error = std::convert::Infallible;
+            fn validate(&self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+
+        let existing = "enabled = true\ncore = { y = 4 }\n";
+        let value = Nested {
+            enabled: true,
+            core: Outer {
+                inner: Inner { x: 7 },
+                y: 4,
+            },
+        };
+
+        let out = render_overlay(existing, &value).expect("renders");
+
+        assert_eq!(out, "enabled = true\ncore = { y = 4, inner = { x = 7 } }\n");
+        assert_eq!(
+            render_overlay(&out, &value).expect("renders again"),
+            out,
+            "and the result is a fixed point"
+        );
+    }
+
+    /// Removing the **last** entry of an inline table took the space in front
+    /// of the `}` with it, because that space was the removed value's own decor
+    /// suffix — `core = { _unset = ["label"]}`. [`remove_keeping_closing_space`]
+    /// hands it to whatever is last afterwards, mirroring [`set_value`]'s
+    /// carry-over rule.
+    ///
+    /// The mirror fixture (marker last, so the removed key is not) is in the
+    /// same test: it was already clean, and it is what hid the bug.
+    ///
+    /// Red on the missing space if the carry-over goes away.
+    #[test]
+    fn removing_the_last_entry_of_an_inline_table_keeps_its_closing_space() {
+        let value = OptTable {
+            enabled: true,
+            core: None,
+        };
+
+        for existing in [
+            "enabled = true\ncore = { _unset = [\"label\"], brightness = 7 }\n",
+            "enabled = true\ncore = { brightness = 7, _unset = [\"label\"] }\n",
+        ] {
+            assert_eq!(
+                render_overlay(existing, &value).expect("renders"),
+                "enabled = true\ncore = { _unset = [\"label\"] }\n",
+                "whichever end the schema's key sat at: {existing:?}"
+            );
+        }
     }
 
     // ── #1008: a marker that names nothing is said out loud ─────────────────

@@ -362,6 +362,19 @@ struct SlotRender {
     /// A `SlotRender` parked in the dedicated `panels` mailbox always carries
     /// `Some`.
     panel: Option<wire::Node>,
+    /// The connector names this frame's card is **hidden** on (#1050), straight
+    /// off the wire's [`PluginMsg::Render::hidden_on`].
+    ///
+    /// The render list is shared across monitors — one mailbox, one reconciler
+    /// per monitor over the same `Vec<SlotRender>` — so this is the one field
+    /// each monitor's reconciler reads *differently*: [`region`] hides the card
+    /// exactly on the monitors named here, and counts it as absent when deciding
+    /// whether that monitor's region collapses. Empty (the default, and what a
+    /// pre-#1050 frame decodes to) = shown on every monitor, which is what the
+    /// mirroring did unconditionally before.
+    ///
+    /// [`PluginMsg::Render::hidden_on`]: hytte_plugin_proto::PluginMsg::Render::hidden_on
+    hidden_on: Vec<String>,
     /// What the producing connection's manifest asked for, as far as the
     /// *mapping pass* is concerned (#893: whether it may render a
     /// [`wire::Node::Shader`]).

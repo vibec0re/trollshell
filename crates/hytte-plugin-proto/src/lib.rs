@@ -19,6 +19,28 @@
 //!   plugin's own schedule (host state change, timer, external fetch), plus logs
 //!   and liveness. The host reconciles `tree` into GTK and brokers `effects`.
 //!
+//! # Multi-monitor: one tree, mirrored — visibility per screen (#1050)
+//!
+//! A plugin renders **one** view. The host mounts it once per monitor (one
+//! render mailbox, one reconciler per monitor over the same list), so a chip
+//! appears on every screen's bar without the plugin knowing how many screens
+//! exist. That mirroring is the model, and it is not negotiable per-frame: the
+//! wire has no way to send monitor B a *different tree* from monitor A.
+//!
+//! What it does have, since #1050, is a pair of fields for the cases where
+//! screens genuinely differ:
+//!
+//! - [`Render.hidden_on`](PluginMsg::Render::hidden_on) — plugin → host: the
+//!   connector names this frame's card is **hidden** on. Same tree everywhere,
+//!   different visibility per screen.
+//! - [`Event.output`](HostMsg::Event::output) — host → plugin: which monitor's
+//!   copy of the card the interaction came from, so an action can target *that*
+//!   screen rather than whichever output happens to hold keyboard focus.
+//!
+//! Both are defaulted fields, so a plugin that ignores them behaves exactly as
+//! it did before, and a frame that does not use them is byte-identical on the
+//! wire.
+//!
 //! # Transport & topology
 //!
 //! The host **listens** on one same-user-only socket,
@@ -113,6 +135,20 @@
 //! `HostMsg` push — is already covered by the #305 opt-in, but bumping [`VOCAB`]
 //! for it too keeps the counter a faithful census of the whole vocabulary and
 //! costs nothing.)
+//!
+//! **A defaulted *field* is not a variant, and does not move the counter.** The
+//! whole hazard above is that `rmp-serde` cannot decode an unknown *variant
+//! tag*: it fails the entire body, killing the frame and (with a redialling
+//! SDK) the session. An unknown *field key* in a named map is simply
+//! **skipped** — that asymmetry is precisely what the "named-field encoding is
+//! pinned" rule exists to buy. So a `#[serde(default)]` field added to an
+//! existing struct/variant ([`panel`](msg::PluginMsg::Render::panel),
+//! [`RunCommand.detached`](effect::Effect::RunCommand),
+//! [`Render.hidden_on`](msg::PluginMsg::Render::hidden_on) and
+//! [`Event.output`](msg::HostMsg::Event::output), #1050) is invisible to an
+//! older peer by construction, needs no opt-in gate, and bumping [`VOCAB`] for
+//! it would do nothing but refuse handshakes that would have worked. Do not
+//! bump it for a field.
 //!
 //! ### A *negotiated* variant degrades instead of being refused (#882)
 //!

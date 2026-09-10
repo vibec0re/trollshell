@@ -319,14 +319,17 @@ pub(super) fn tick_decision(scopes: &[Scope], frame_time_us: i64) -> Tick {
 /// cases this issue exists to fix.
 ///
 /// So the mapped check is written out here, in the tick closure, on the widget
-/// GTK hands back. Three of the four hiding mechanisms then stop for the right
-/// reason and the fourth stops for GTK's:
+/// GTK hands back. Four of the five hiding mechanisms below then stop for a
+/// reason this module owns (the `is_mapped` break, or — since #1068's
+/// MEDIUM-1 — the scopes closure filtering a hidden card out of the set even
+/// while its region stays mapped) and the fifth stops for GTK's:
 ///
 /// | hidden how | what GTK does | ticks? |
 /// |---|---|---|
 /// | drawer closed (`modal.rs` hides the **toplevel**) | unmap, no unrealize | no — the `is_mapped` break |
 /// | sidebar closed (a `GtkRevealer`'s `child_visible`) | unmap only | no — the `is_mapped` break |
-/// | region empty (`set_visible(false)`) | unmap only | no — and its scope set is empty anyway |
+/// | whole region empty (every card's `root.set_visible(false)`, so `container.set_visible(false)` too) | unmap only | no — the `is_mapped` break, and the scope set is empty anyway |
+/// | one card hidden here (#1042's empty-tree rule, or #1050's `hidden_on`) next to a still-shown sibling | container stays **mapped** | no — `region.rs`'s scopes closure filters on `card.root.get_visible()` (#1068 review, MEDIUM-1), so a hidden card's scope drops out of the set even though the region it sits in is genuinely still up and the `is_mapped` gate above does not fire |
 /// | output unplugged (window destroyed) | `destroy_tick_callbacks` | no — GTK removes the callback |
 ///
 /// The break is paired with a `connect_map` re-arm on each mount (`region.rs`),

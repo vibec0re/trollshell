@@ -568,7 +568,7 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
     // `SidebarTop` region (below) cannot. This is where the weather card lives
     // now (#290 migrated it out-of-process; see `trollshell-plugin-weather`).
     // Empty until a plugin dials in.
-    card.append(&crate::plugins::sidebar_lead_slot());
+    card.append(&crate::plugins::sidebar_lead_slot(monitor));
 
     card.append(&crate::widgets::calendar::widget(monitor));
     card.append(&crate::widgets::tasks::widget(monitor));
@@ -577,7 +577,7 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
     // widget-plugin cards (#274), sorted by each plugin's manifest `order`.
     // Reconciled *after* the built-in cards but above the flex gap (plugins must
     // not shove calendar/tasks down). Empty until a plugin dials in.
-    card.append(&crate::plugins::sidebar_top_slot());
+    card.append(&crate::plugins::sidebar_top_slot(monitor));
 
     // Flex gap: eats whatever vertical space the calendar + tasks
     // didn't claim, so the bottom plugin region settles against the
@@ -597,7 +597,7 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
     // Plugin mount: `Mount::SidebarBottom` — the bottom plugin *region* (#274),
     // reconciled below everything. This is where the departures board lives
     // now (#289 migrated it out-of-process; see `trollshell-plugin-departures`).
-    card.append(&crate::plugins::sidebar_bottom_slot());
+    card.append(&crate::plugins::sidebar_bottom_slot(monitor));
     card
 }
 

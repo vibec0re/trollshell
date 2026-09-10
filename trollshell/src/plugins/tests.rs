@@ -581,6 +581,7 @@ fn render_of(
         panel: None,
         grants: Grants::none(),
         outbound: tx.clone(),
+        hidden_on: Vec::new(),
     }
 }
 
@@ -1163,6 +1164,7 @@ async fn bar_mount_render_reaches_bar_region() {
             // dedicated panels mailbox (#349 PR2) must stay empty.
             panel: None,
             effects: vec![],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -1197,6 +1199,64 @@ async fn bar_mount_render_reaches_bar_region() {
     assert!(
         panels.lock_ref().is_empty(),
         "a panel-less render never touches the panels mailbox (#349 PR2)"
+    );
+}
+
+/// #1050: a frame's `hidden_on` must survive the wire → [`SlotRender`] hop the
+/// reader task performs, unaltered and in order.
+///
+/// Everything else that tests per-screen visibility (`region.rs`'s `gtk_tests`)
+/// builds its `SlotRender`s **by hand**, so all of it stays green against a host
+/// that decodes the field and then quietly drops it on the way to the mailbox —
+/// which is the whole feature failing, silently, on real glass. Nothing else in
+/// the suite covers this hop; the mutation campaign for the host arm found it
+/// exactly this way (M17 was green before this test existed).
+///
+/// Order and duplicates are asserted as-received rather than as a set: the wire
+/// contract is an exact list, and a host that sorted or de-duplicated it would
+/// be changing what the plugin said.
+#[tokio::test]
+async fn hidden_on_survives_the_wire_into_the_render_mailbox() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let bar_center = ctx.bar_center.clone();
+
+    let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+    let (_prd, mut pwr) = plugin_end.into_split();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Register {
+            manifest: Manifest::new("perscreen", Mount::BarCenter),
+        },
+    )
+    .await
+    .expect("send Register");
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Render {
+            tree: wire::Node::Label {
+                id: Some("t".into()),
+                text: "chip".into(),
+                classes: vec![],
+                tooltip: None,
+            },
+            panel: None,
+            hidden_on: vec!["HDMI-A-1".into(), "DP-2".into()],
+            effects: vec![],
+        },
+    )
+    .await
+    .expect("send Render");
+
+    let cards = wait_for_region(&bar_center).await;
+    assert_eq!(
+        cards[0].hidden_on,
+        vec!["HDMI-A-1".to_owned(), "DP-2".to_owned()],
+        "the per-screen verdict must reach the mailbox verbatim — the per-monitor \
+         reconcilers read it from here and nowhere else",
     );
 }
 
@@ -1243,6 +1303,7 @@ async fn panel_render_populates_panels_mailbox() {
                 tooltip: None,
             }),
             effects: vec![],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -1280,6 +1341,7 @@ async fn panel_render_populates_panels_mailbox() {
             },
             panel: None,
             effects: vec![],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -2241,6 +2303,7 @@ async fn duplicate_id_connection_is_rejected_end_to_end() {
             },
             panel: None,
             effects: vec![],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -2382,6 +2445,7 @@ async fn newer_vocab_register_is_rejected_and_equal_vocab_is_accepted() {
             },
             panel: None,
             effects: vec![],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -2433,6 +2497,7 @@ async fn ungranted_effect_never_reaches_the_broker() {
             },
             panel: None,
             effects: vec![Effect::OpenPage(Page::PowerMenu)],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -2474,6 +2539,7 @@ async fn granted_effect_reaches_the_broker() {
             },
             panel: None,
             effects: vec![Effect::OpenPage(Page::PowerMenu)],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -2836,6 +2902,7 @@ async fn provider_manifest_registers_a_routable_datasource() {
             },
             panel: None,
             effects: vec![],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -2893,6 +2960,7 @@ async fn provides_without_capability_is_not_registered() {
             },
             panel: None,
             effects: vec![],
+            hidden_on: Vec::new(),
         },
     )
     .await

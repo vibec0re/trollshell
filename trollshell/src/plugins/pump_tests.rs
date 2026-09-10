@@ -99,6 +99,7 @@ fn slot(plugin_id: &str, tree: wire::Node, tx: &mpsc::Sender<HostMsg>) -> SlotRe
         panel: None,
         grants: Grants::none(),
         outbound: tx.clone(),
+        hidden_on: Vec::new(),
     }
 }
 

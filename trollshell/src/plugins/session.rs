@@ -737,6 +737,7 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                 Ok(PluginMsg::Render {
                     tree,
                     panel,
+                    hidden_on,
                     effects,
                 }) => {
                     // #436: drop any effect whose capability the plugin never
@@ -763,6 +764,13 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                             generation,
                             tree,
                             panel,
+                            // #1050: carried through untouched — the host does
+                            // not validate connector names here (nor could it
+                            // usefully: this task has no monitor list, and an
+                            // output that is currently off is a legitimate
+                            // thing to name). Each monitor's reconciler decides
+                            // whether the name is *its* name.
+                            hidden_on,
                             grants,
                             outbound: out_tx.clone(),
                         },

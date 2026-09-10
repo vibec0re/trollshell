@@ -256,6 +256,10 @@ where
         &PluginMsg::Render {
             tree: last_view.tree.clone(),
             panel: last_view.panel.clone(),
+            // #1050: the seed frame carries the per-screen verdict too. A plugin
+            // whose first view is already "nothing to show on DP-2" must not
+            // flash a chip there for the interval until its next render.
+            hidden_on: last_view.hidden_on.clone(),
             effects: Vec::new(),
         },
     )
@@ -300,7 +304,11 @@ where
         let step = tokio::select! {
             frame = rx.recv() => match frame {
                 Some(Ok(HostMsg::StateSnapshot { snapshot })) => Step::Update(Input::Snapshot(snapshot)),
-                Some(Ok(HostMsg::Event { node, kind })) => Step::Update(Input::Event { node, kind }),
+                // `output` (#1050, the monitor whose card produced this) is
+                // decoded and deliberately dropped: `Input::Event` cannot grow a
+                // field without breaking every plugin's match arm, so surfacing
+                // it rides #1050's plugin arm. See the doc on `Input::Event`.
+                Some(Ok(HostMsg::Event { node, kind, output: _ })) => Step::Update(Input::Event { node, kind }),
                 Some(Ok(HostMsg::EffectResult { id, outcome })) => {
                     Step::Update(Input::EffectResult { id, outcome })
                 }
@@ -435,6 +443,12 @@ where
             let frame = PluginMsg::Render {
                 tree: view.tree.clone(),
                 panel: view.panel.clone(),
+                // #1050. `changed` above is a whole-`View` compare, so a frame
+                // whose *only* difference is the hidden-on set still sends —
+                // which is the entire point: a plugin that goes from "shown on
+                // both screens" to "hidden on DP-2" typically renders the very
+                // same tree, and dedup on `(tree, panel)` alone would swallow it.
+                hidden_on: view.hidden_on.clone(),
                 effects,
             };
             if let Err(e) = write_frame(&mut wr, &frame).await {
@@ -910,6 +924,46 @@ mod tests {
         }
     }
 
+    /// Constant chip tree **and** constant panel, but the `View`'s `hidden_on`
+    /// flips on a slot-visibility toggle (#1050). The per-screen verdict is the
+    /// one thing a plugin routinely changes *without* changing what it draws —
+    /// #1019's chip renders the identical three icons whether or not the active
+    /// workspace on some output has two windows — so if dedup did not cover it,
+    /// the frame that hides the chip would be the frame that gets swallowed.
+    struct HiddenOn {
+        hide: bool,
+    }
+
+    impl Plugin for HiddenOn {
+        type Msg = std::convert::Infallible;
+        type Cmd = std::convert::Infallible;
+
+        fn manifest() -> Manifest {
+            Manifest::new("hidden-on-test", Mount::BarCenter)
+        }
+
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+            Self { hide: false }
+        }
+
+        fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
+            if let Input::SlotVisible(v) = input {
+                self.hide = v;
+            }
+            Vec::new()
+        }
+
+        fn view(&self) -> View {
+            let v = View::new(Node::Label {
+                id: Some("hidden-on-chip".to_owned()),
+                text: "chip".to_owned(),
+                classes: Vec::new(),
+                tooltip: None,
+            });
+            if self.hide { v.hidden_on(["DP-2"]) } else { v }
+        }
+    }
+
     /// A minimal I/O "task" for [`Commander`]: it *is* the sources stream —
     /// each command drained from the [`CmdReceiver`] is turned into an app
     /// message. Stands in for a real plugin's socket/HTTP task, which likewise
@@ -1351,6 +1405,7 @@ mod tests {
                 tree,
                 panel,
                 effects,
+                ..
             } = next_plugin_frame(&mut hrd).await
             else {
                 panic!("third frame must be the seed Render");
@@ -1373,6 +1428,7 @@ mod tests {
                 tree,
                 panel,
                 effects,
+                ..
             } = next_plugin_frame(&mut hrd).await
             else {
                 panic!("a panel change alone must re-render");
@@ -1407,6 +1463,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hidden_on_change_alone_forces_a_render() {
+        // #1050: the per-screen verdict is part of the `View`, so a change to it
+        // alone must still emit a `Render` — and an identical view must still be
+        // deduped. Exactly the #349 argument for `panel`, and worth its own test
+        // because this is the field a real plugin changes *most* often without
+        // changing its tree.
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            let PluginMsg::Register { .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("first frame must be Register");
+            };
+            let PluginMsg::Log { .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("second frame must be the greeting Log");
+            };
+            let PluginMsg::Render { hidden_on, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("third frame must be the seed Render");
+            };
+            assert!(
+                hidden_on.is_empty(),
+                "the seed view is hidden nowhere, and an empty set stays off the wire",
+            );
+
+            // Flip the verdict while the chip tree stays byte-identical.
+            send(&mut hwr, &HostMsg::SlotVisibility { visible: true }).await;
+            // Bounded, for [`next_render`]'s reason: the exact bug this test
+            // exists to catch — a `View` change that never reaches the wire —
+            // makes the awaited frame *not arrive at all*, and an unbounded read
+            // then hangs the suite rather than naming itself. Measured: a
+            // no-op `View::hidden_on` builder hung `cargo test` past 10 min
+            // before this bound; with it, the same mutation fails in 5 s.
+            let PluginMsg::Render {
+                tree, hidden_on, ..
+            } = tokio::time::timeout(Duration::from_secs(5), next_plugin_frame(&mut hrd))
+                .await
+                .expect("a hidden_on change alone must re-render (within 5 s)")
+            else {
+                panic!("a hidden_on change alone must produce a Render frame");
+            };
+            assert!(
+                matches!(tree, Node::Label { ref text, .. } if text == "chip"),
+                "the chip tree is unchanged across the flip — the change is the verdict",
+            );
+            assert_eq!(
+                hidden_on,
+                vec!["DP-2".to_owned()],
+                "the render carries the new per-screen verdict",
+            );
+
+            // The same visibility again → identical view → deduped. The Ping is
+            // the sync barrier: the next frame must be its Pong.
+            send(&mut hwr, &HostMsg::SlotVisibility { visible: true }).await;
+            send(&mut hwr, &HostMsg::Ping { seq: 5 }).await;
+            assert!(
+                matches!(
+                    next_plugin_frame(&mut hrd).await,
+                    PluginMsg::Pong { seq: 5 }
+                ),
+                "an identical view (hidden_on included) must be deduped",
+            );
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<HiddenOn, _, _>(prd, pwr), host);
+        assert!(result.is_ok(), "Shutdown ends the session cleanly");
+    }
+
+    #[tokio::test]
     async fn effects_force_a_send_even_with_unchanged_tree() {
         let (plugin_end, host_end) = duplex(64 * 1024);
         let (prd, pwr) = tokio::io::split(plugin_end);
@@ -1420,6 +1547,7 @@ mod tests {
                 &HostMsg::Event {
                     node: "echo-btn".to_owned(),
                     kind: EventKind::Click,
+                    output: None,
                 },
             )
             .await;
@@ -1450,6 +1578,7 @@ mod tests {
                 &HostMsg::Event {
                     node: "not-ours".to_owned(),
                     kind: EventKind::Click,
+                    output: None,
                 },
             )
             .await;
@@ -1828,6 +1957,7 @@ mod tests {
                 &HostMsg::Event {
                     node: "cmd-btn".to_owned(),
                     kind: EventKind::Click,
+                    output: None,
                 },
             )
             .await;
@@ -1869,6 +1999,7 @@ mod tests {
                     &HostMsg::Event {
                         node: "cmd-btn".to_owned(),
                         kind: EventKind::Click,
+                        output: None,
                     },
                 )
                 .await;
@@ -1905,6 +2036,7 @@ mod tests {
                 &HostMsg::Event {
                     node: "echo-btn".to_owned(),
                     kind: EventKind::Click,
+                    output: None,
                 },
             )
             .await;

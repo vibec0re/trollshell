@@ -282,7 +282,7 @@ mod tests {
     };
     use crate::layout::{Layout, PICTOGRAM_COLS, PICTOGRAM_ROWS};
     use crate::niri::fake::Fake;
-    use hytte_plugin::preem::LedMatrix;
+    use hytte_plugin::preem::{DisplayStyle, LedMatrix};
     use hytte_plugin::proto::{Capability, Effect, EventKind, Mount, Node};
     use hytte_plugin::{CmdReceiver, Input, Plugin, cmd_channel};
 
@@ -384,7 +384,10 @@ mod tests {
         for _ in 0..PICTOGRAM_ROWS {
             levels.extend_from_slice(&ROW);
         }
-        let expected = LedMatrix::new(SKIN, PICTOGRAM_COLS, PICTOGRAM_ROWS)
+        // The skin is spelled out rather than read from `SKIN`, so this pins the
+        // *choice* too: with `SKIN` on both sides, swapping the skin would move
+        // the expectation along with the code and pass silently.
+        let expected = LedMatrix::new(DisplayStyle::Vfd, PICTOGRAM_COLS, PICTOGRAM_ROWS)
             .render(&levels)
             .into_node(Some(&pictogram_id(Layout::Split)), Vec::new());
 

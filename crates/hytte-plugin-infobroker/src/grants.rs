@@ -101,6 +101,18 @@ type WriteJob = (
     Box<dyn FnOnce(&Path, &str) -> std::io::Result<()> + Send>,
 );
 
+/// A store's writer lane: the sender [`save_with`](GrantStore::save_with)
+/// queues jobs on, plus the [`JoinHandle`](tokio::task::JoinHandle) of the
+/// task [`spawn_writer`] spawned to drain them. Bundled together (rather than
+/// just the sender, pre-#1079) so [`GrantStore::drain`] can await the task's
+/// own completion — including whatever write it is in the middle of via
+/// `spawn_blocking` — not just close the channel and hope.
+#[derive(Debug)]
+struct WriterLane {
+    tx: UnboundedSender<WriteJob>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 /// The in-memory grant set plus the file it persists to. Construct via
 /// [`GrantStore::load`] (disk) or [`GrantStore::from_grants`] (tests).
 #[derive(Debug)]
@@ -114,7 +126,7 @@ pub struct GrantStore {
     /// set in the constructors because `save` takes `&self` and because a
     /// store is routinely built off the runtime (`load_grants` runs inside
     /// `spawn_blocking`), where there is no handle to spawn from yet.
-    writer: OnceLock<UnboundedSender<WriteJob>>,
+    writer: OnceLock<WriterLane>,
 }
 
 impl GrantStore {
@@ -378,13 +390,47 @@ impl GrantStore {
             write_inline(&path, &text, writer);
             return;
         };
-        let queue = self
+        let lane = self
             .writer
             .get_or_init(|| spawn_writer(&handle, path.clone()));
-        if let Err(SendError((text, writer))) = queue.send((text, Box::new(writer))) {
+        if let Err(SendError((text, writer))) = lane.tx.send((text, Box::new(writer))) {
             // The drain task is gone — its runtime is shutting down. Losing a
             // grant change is worse than blocking this thread for one write.
             write_inline(&path, &text, writer);
+        }
+    }
+
+    /// Close the writer lane and wait for its task to finish — including
+    /// whatever write it is in the middle of via `spawn_blocking` — so a
+    /// snapshot still queued when this is called is guaranteed on disk before
+    /// it returns (#1079). This is the piece `hytte_plugin::run`'s shutdown
+    /// hook (SIGTERM/SIGINT) exists to reach: the SDK's session loop never
+    /// drops the tokio runtime on its own (`run<P>() -> !` — see #1074's own
+    /// note on `spawn_writer`), so in ordinary operation a queued write always
+    /// gets its turn regardless of `drain`. What `run<P>()` **does** now do
+    /// on a shutdown signal is call this (via the plugin's own `shutdown`
+    /// hook) *before* the process exits — closing the one window where the
+    /// runtime goes away with a write still only sitting in the channel (the
+    /// #1074 re-review's M8 finding: `Runtime::drop` cancels the drain task
+    /// mid-flight, measured landing in 39.5 µs with the write never issued).
+    ///
+    /// Dropping the sender half of the lane (`tx`) doesn't discard anything
+    /// already queued — `spawn_writer`'s loop drains its buffer before
+    /// `recv` reports the channel closed, exactly as it already does for an
+    /// ordinary session teardown — so the only new behaviour here is
+    /// *waiting* for that drain to actually finish instead of racing it
+    /// against the runtime disappearing.
+    ///
+    /// A no-op if `save` never spawned the lane (nothing was ever queued).
+    /// Idempotent: `writer` is empty on a second call, so it returns
+    /// immediately rather than awaiting `None`.
+    pub async fn drain(&mut self) {
+        let Some(lane) = self.writer.take() else {
+            return;
+        };
+        drop(lane.tx);
+        if lane.task.await.is_err() {
+            log("writer task panicked during drain");
         }
     }
 }
@@ -430,11 +476,13 @@ where
 /// blocking-pool thread parked in `blocking_recv` is never woken by
 /// shutdown, so the alternative deadlocks). Production never pays it:
 /// `hytte_plugin::run<P>() -> !` `block_on`s a diverging loop, so the SDK
-/// runtime is not dropped at all — the reachable half of this class is
-/// `SIGTERM`, tracked with the SDK exit hook in #1079.
-fn spawn_writer(handle: &tokio::runtime::Handle, path: PathBuf) -> UnboundedSender<WriteJob> {
+/// runtime is not dropped at all while a session is live — the reachable
+/// half of this class is `SIGTERM`/`SIGINT`, closed by #1079's SDK exit hook
+/// awaiting [`GrantStore::drain`] before the process (and with it, the
+/// runtime) actually goes away.
+fn spawn_writer(handle: &tokio::runtime::Handle, path: PathBuf) -> WriterLane {
     let (tx, mut rx) = unbounded_channel::<WriteJob>();
-    handle.spawn(async move {
+    let task = handle.spawn(async move {
         while let Some(mut job) = rx.recv().await {
             // Latest-wins coalescing over whatever is already queued.
             while let Ok(newer) = rx.try_recv() {
@@ -452,7 +500,7 @@ fn spawn_writer(handle: &tokio::runtime::Handle, path: PathBuf) -> UnboundedSend
             }
         }
     });
-    tx
+    WriterLane { tx, task }
 }
 
 /// `[infobroker]`-prefixed eprintln, matching `broker::tracing_eprintln`'s
@@ -603,13 +651,18 @@ const STALE_TMP_AGE: Duration = Duration::from_mins(1);
 /// Delete `path`'s stale `.<file>.<pid>.<ticket>.tmp` siblings (#1074 review
 /// M5).
 ///
-/// `hytte_plugin::run() -> !` never returns and neither the SDK nor this crate
-/// installs a signal handler, so a `systemctl stop` landing inside a write
-/// window leaves the temp file behind with nothing to clean it up — one
-/// orphan per unlucky stop, accumulating in the state dir forever. Sweeping at
-/// store open is the cheap half of the answer; the *lost write* half is an
-/// SDK-wide question — every plugin that persists state has the same window —
-/// tracked in #1079 rather than bolted into this one crate.
+/// Before #1079, `hytte_plugin::run() -> !` never returned and neither the
+/// SDK nor this crate installed a signal handler, so a `systemctl stop`
+/// landing inside a write window left the temp file behind with nothing to
+/// clean it up — one orphan per unlucky stop, accumulating in the state dir
+/// forever. This sweep at store open was the cheap half of the answer; the
+/// *lost write* half was an SDK-wide question — every plugin that persists
+/// state has the same window — and #1079 closed it with the SDK's shutdown
+/// hook (`Plugin::shutdown`) plus [`GrantStore::drain`] here. This sweep stays
+/// regardless: the hook's own grace can still be cut short (a wedged write, a
+/// slow disk past [`STALE_TMP_AGE`]), and `SIGKILL` past `TimeoutStopSec`
+/// skips the hook entirely, so an orphaned temp is still possible — just far
+/// rarer than "every stop".
 ///
 /// Only files this module could itself have written are candidates: the name
 /// must match `.<file>.<pid>.<ticket>.tmp` **exactly**, both middle fields
@@ -967,6 +1020,44 @@ mod tests {
             "the 100ms timer fired at {elapsed:?} — the injected 2s writer stalled this \
              runtime's other tasks, so `save` is not actually off-thread",
         );
+    }
+
+    /// #1079: `drain` is the fix for the #1074 review M8 finding — a
+    /// `Runtime::drop` cancels the writer lane's spawned task with a queued
+    /// write unwritten (measured there at 39.5 µs, before the write even
+    /// reaches its own `spawn_blocking`). Queuing a save and then `drain`ing
+    /// (rather than just dropping the store) must leave the write provably on
+    /// disk with no settle sleep and no poll — `drain` returning is the
+    /// signal. This is the SDK shutdown hook's use case in miniature: the
+    /// hook awaits exactly this before the process exits.
+    #[tokio::test]
+    async fn drain_flushes_a_queued_write_before_returning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("grants.toml");
+        let mut store = GrantStore::load(&path).expect("loads the empty seed");
+
+        store.grant_always("claude", "departures"); // queues a save on the writer lane
+        store.drain().await;
+
+        let reloaded = GrantStore::load(&path).expect("drain must leave a well-formed file");
+        assert_eq!(
+            reloaded.grants(),
+            &[Grant::always("claude", "departures")],
+            "drain must leave the queued write on disk, not just close the lane"
+        );
+    }
+
+    /// A `drain` with nothing ever queued (no `save` ever spawned the lane)
+    /// is a no-op — it must not hang awaiting a task that was never spawned.
+    #[tokio::test]
+    async fn drain_with_nothing_queued_is_a_no_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("grants.toml");
+        let mut store = GrantStore::load(&path).expect("loads the empty seed");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), store.drain())
+            .await
+            .expect("drain with no writer lane must return promptly, not hang");
     }
 
     /// #1074 review M1, with the writer seam: two `save`s issued back to back

@@ -36,11 +36,28 @@ use hytte_plugin_infobroker::broker::{
     DatasourceView, GrantView, Outcome, PendingView, QueryOutcome, QueryRequest, TokenView,
 };
 use hytte_plugin_infobroker::wire::CalendarEntry;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Stable plugin id — the host's mount-slot key, the audit-log subject, and the
 /// notification app name.
 const PLUGIN_ID: &str = "infobroker";
+
+std::thread_local! {
+    /// Bridges [`Infobroker::init`] to [`Infobroker::sources`] — the shutdown
+    /// half of the `#1079` handshake (see [`Infobroker::shutdown`]'s doc).
+    /// The `Plugin::sources` signature takes only the command receiver, with
+    /// no way to reach `self`, so there is no other way to hand it the
+    /// receiver `init` just created; the SDK's `session()` calls `init` then
+    /// `sources` back to back on the very same thread within one session
+    /// (`hytte-plugin/src/runtime.rs`), which is exactly the precedent
+    /// `hytte_plugin::display`'s own `NEGOTIATED` thread-local already relies
+    /// on for the same reason. `sources` `.take()`s it the moment it reads it,
+    /// so a stray second call
+    /// (there is at most one per session) degrades to no shutdown-drain
+    /// wiring rather than reusing a stale receiver.
+    static SHUTDOWN_RX: std::cell::RefCell<Option<oneshot::Receiver<oneshot::Sender<()>>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 // Node ids. The chip button opens the panel; the per-row allow/revoke buttons
 // carry the row index (resolved against the model snapshot in `update`).
@@ -60,6 +77,14 @@ struct Infobroker {
     /// domain-StateKeys design.
     locked: bool,
     cmd_tx: CmdSender<Cmd>,
+    /// The shutdown-drain handshake's request half (#1079): `send`ing an ack
+    /// channel on this asks the broker task (`sources`'s spawned
+    /// `broker::serve_with_shutdown`) to drain the grant store and reply on
+    /// it once that finishes — see [`Plugin::shutdown`]. `None` once used (or
+    /// if `sources` never ran) so a second `shutdown` call — the SDK only
+    /// calls it once, but nothing enforces that at this layer — is a no-op
+    /// rather than sending into an already-torn-down receiver.
+    shutdown_req: Option<oneshot::Sender<oneshot::Sender<()>>>,
 }
 
 impl Plugin for Infobroker {
@@ -100,11 +125,18 @@ impl Plugin for Infobroker {
     }
 
     fn init(cmds: CmdSender<Self::Cmd>) -> Self {
+        // #1079: mint the shutdown-drain handshake's pair now, keep the
+        // request half on the model, and stash the other half where `sources`
+        // (called next, same thread, same session — see `SHUTDOWN_RX`'s doc)
+        // can hand it to the broker task it is about to spawn.
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        SHUTDOWN_RX.with_borrow_mut(|cell| *cell = Some(shutdown_rx));
         Self {
             snapshot: BrokerSnapshot::default(),
             now_unix: 0,
             locked: false,
             cmd_tx: cmds,
+            shutdown_req: Some(shutdown_tx),
         }
     }
 
@@ -129,9 +161,28 @@ impl Plugin for Infobroker {
     /// `spawn_blocking` (#1059) — see `broker::serve_with_grant_loader`. Keep
     /// new blocking work in `serve` behind that same hop rather than moving
     /// this spawn.
+    ///
+    /// #1079: spawns `broker::serve_with_shutdown` instead of plain `serve`
+    /// whenever `init` (this same session, this same thread — see
+    /// `SHUTDOWN_RX`'s doc) left a receiver waiting, wiring the broker task to
+    /// [`Infobroker::shutdown`]'s drain request. The `None` arm (the
+    /// thread-local wasn't populated — not reachable from a real session, but
+    /// cheap to fall back from) keeps the plain, undrained `serve` rather than
+    /// failing the session over it.
     fn sources(cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-        tokio::spawn(hytte_plugin_infobroker::serve(cmds, msg_tx));
+        match SHUTDOWN_RX.with_borrow_mut(Option::take) {
+            Some(shutdown_rx) => {
+                tokio::spawn(hytte_plugin_infobroker::broker::serve_with_shutdown(
+                    cmds,
+                    msg_tx,
+                    shutdown_rx,
+                ));
+            }
+            None => {
+                tokio::spawn(hytte_plugin_infobroker::serve(cmds, msg_tx));
+            }
+        }
         Some(Box::pin(UnboundedReceiverStream::new(msg_rx)))
     }
 
@@ -234,6 +285,27 @@ impl Plugin for Infobroker {
 
     fn view(&self) -> View {
         View::new(self.chip()).panel(self.panel())
+    }
+
+    /// #1079: ask the broker task to drain the grant store's writer lane
+    /// (`GrantStore::drain`, via `broker::serve_with_shutdown`'s shutdown
+    /// arm) and wait for its ack before returning, so a queued grant change
+    /// (an `Allow`/`Revoke` click applied just before the SDK noticed
+    /// `SIGTERM`) is provably on disk before the process exits — the exact
+    /// case #1074's re-review measured as lost otherwise (`Runtime::drop`
+    /// cancelling the drain task in 39.5 µs). Runs under the SDK's own grace
+    /// period, so a wedged broker task cannot hang the process past that.
+    ///
+    /// A no-op if `sources` never ran (`shutdown_req` stays `None`) or if
+    /// this already ran once this session.
+    async fn shutdown(&mut self) {
+        let Some(req) = self.shutdown_req.take() else {
+            return;
+        };
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if req.send(ack_tx).is_ok() {
+            let _ = ack_rx.await;
+        }
     }
 }
 
@@ -738,6 +810,12 @@ mod tests {
                 now_unix: 1_750_000_000,
                 locked: false,
                 cmd_tx: tx,
+                // These plain-`#[test]`s build the model directly, bypassing
+                // `init`/`sources` (and the thread-local handshake between
+                // them) entirely — so there is no shutdown-drain wiring to
+                // give it here. `Infobroker::shutdown`'s own no-op-on-`None`
+                // path is exactly what makes that safe.
+                shutdown_req: None,
             },
             rx,
         )

@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::Utc;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::grants::{Decision, GrantStore};
 use crate::paths;
@@ -1113,6 +1113,24 @@ fn send_update(
     let _ = out.send(BrokerMsg::Update { snapshot, toast });
 }
 
+/// [`serve_inner`]'s shutdown arm (#1079), normalized to one future: `Some`
+/// when the SDK's shutdown hook asks this session to drain the grant store
+/// (the payload is the ack sender to reply on once that is done), forever
+/// pending when there is no shutdown wiring at all — plain `serve`/
+/// `serve_with_grant_loader` and every existing test that calls them
+/// directly — so that `select!` branch simply never fires there rather than
+/// needing its own `if` guard. A `shutdown` that resolves to `Err` (the
+/// sender dropped without ever asking — an ordinary session end) also maps to
+/// `None`: only a genuine ask should end up looking like one.
+async fn recv_shutdown(
+    shutdown: &mut Option<oneshot::Receiver<oneshot::Sender<()>>>,
+) -> Option<oneshot::Sender<()>> {
+    match shutdown {
+        Some(rx) => rx.await.ok(),
+        None => std::future::pending().await,
+    }
+}
+
 /// Sleep until the nearest parked deadline, or forever when nothing is parked —
 /// the timeout arm of [`serve`]'s `select!`.
 async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
@@ -1322,11 +1340,62 @@ fn load_grants() -> GrantStore {
     )
 }
 
-/// [`serve`], with the synchronous grant-load step supplied by the caller.
-/// `serve` *is* `serve_with_grant_loader(cmds, out, load_grants)`; everything
-/// [`serve`]'s doc says applies here unchanged.
+/// [`serve`], with the synchronous grant-load step supplied by the caller —
+/// see [`serve_inner`] (this function's whole body, `shutdown: None`) for why
+/// the seam is public and what it guards against. `serve` *is*
+/// `serve_with_grant_loader(cmds, out, load_grants)`; everything [`serve`]'s
+/// doc says applies here unchanged.
+#[doc(hidden)]
+pub async fn serve_with_grant_loader<L>(
+    cmds: mpsc::UnboundedReceiver<Cmd>,
+    out: mpsc::UnboundedSender<BrokerMsg>,
+    load_grants: L,
+) where
+    L: FnOnce() -> GrantStore + Send + 'static,
+{
+    serve_inner(cmds, out, load_grants, None).await;
+}
+
+/// Like [`serve`], but wired to the SDK's shutdown hook (#1079, the
+/// `hytte-plugin-infobroker` **binary**'s `Infobroker::shutdown` in
+/// `src/plugin.rs`): `shutdown` is a oneshot whose payload is itself an ack
+/// sender — the caller `send`s an ack channel on it to *request* the drain,
+/// and this loop `send`s back on that ack once [`GrantStore::drain`]
+/// (including its in-flight `spawn_blocking`) has actually finished, then
+/// ends the session rather than continuing to serve. `#[doc(hidden)]` rather
+/// than `pub(crate)`: `src/plugin.rs` is a separate bin crate over this same
+/// package's library (same shape as `serve`/`serve_with_grant_loader`), so it
+/// needs real `pub` visibility — this is still not a seam anything outside
+/// that one caller should reach for, and this library stays SDK-free either
+/// way (`shutdown` is an ordinary `tokio::sync::oneshot` pair, nothing
+/// SDK-shaped).
+#[doc(hidden)]
+pub async fn serve_with_shutdown(
+    cmds: mpsc::UnboundedReceiver<Cmd>,
+    out: mpsc::UnboundedSender<BrokerMsg>,
+    shutdown: oneshot::Receiver<oneshot::Sender<()>>,
+) {
+    serve_inner(cmds, out, load_grants, Some(shutdown)).await;
+}
+
+/// [`serve`]'s doc, unabridged: `serve` is `serve_with_grant_loader(cmds, out,
+/// load_grants)` is `serve_inner(cmds, out, load_grants, None)`, and
+/// [`serve_with_shutdown`] is the same body with a live shutdown channel.
+/// Split out of the public `serve_with_grant_loader` name (#1079) so adding
+/// the shutdown wiring didn't have to touch that function's signature or its
+/// existing external callers (`tests/serve_socket_handover.rs` included).
 ///
-/// # Why the seam is public (#1059)
+/// A session without a socket **still runs**: it seeds the panel (with a
+/// [`BrokerSnapshot::notice`] saying why it is not serving) and keeps draining
+/// the command lane. Returning early instead left the duplicate's chip painting
+/// a default snapshot with dead buttons.
+///
+/// SDK-free: `cmds`/`out` are plain tokio channels (the plugin passes the SDK's
+/// per-session lane ends, which are exactly these types), so this whole module
+/// never links the plugin runtime — `shutdown` is the same story, an ordinary
+/// `tokio::sync::oneshot` pair rather than anything SDK-shaped.
+///
+/// # Why the grant-loader seam is public (#1059)
 ///
 /// The property this parameter exists to test is "a slow synchronous step
 /// inside `serve` does not stop the runtime's timers", and it is invisible
@@ -1373,15 +1442,16 @@ fn load_grants() -> GrantStore {
 /// whose task does the `spawn_blocking` write in submission order
 /// (see [`crate::grants::GrantStore::save`]), and `write_response` offloads
 /// `encode_response` past [`LARGE_RESPONSE_ROWS`] the same way.
-// One cohesive `select!` loop (accept / command / timeout) over the parked-request
-// state (consent + query maps); splitting its arms into helpers would scatter that
-// shared state for no readability gain — same stance as the host's `handle_conn`.
+// One cohesive `select!` loop (accept / command / shutdown / timeout) over the
+// parked-request state (consent + query maps); splitting its arms into helpers
+// would scatter that shared state for no readability gain — same stance as
+// the host's `handle_conn`.
 #[allow(clippy::too_many_lines)]
-#[doc(hidden)]
-pub async fn serve_with_grant_loader<L>(
+async fn serve_inner<L>(
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
     out: mpsc::UnboundedSender<BrokerMsg>,
     load_grants: L,
+    mut shutdown: Option<oneshot::Receiver<oneshot::Sender<()>>>,
 ) where
     L: FnOnce() -> GrantStore + Send + 'static,
 {
@@ -1503,6 +1573,20 @@ pub async fn serve_with_grant_loader<L>(
                         // else: a late/unknown result (already timed out) — ignore.
                     }
                 }
+            }
+            // #1079: the SDK's shutdown hook asking this session to drain the
+            // grant store before the process exits — see `recv_shutdown`.
+            // `Some` only for a genuine ask (the ack sender); an ordinary
+            // session end (the model dropping its `shutdown_req` sender
+            // without ever calling `shutdown`) resolves to `None`, which the
+            // `Some(ack) = …` pattern guard disables rather than treats as a
+            // shutdown — the `cmd = cmds.recv()` arm above already handles
+            // that ordinary teardown, and it is listed first (`biased`) so it
+            // wins the tie when both channels close in the same moment.
+            Some(ack) = recv_shutdown(&mut shutdown) => {
+                state.grants.drain().await;
+                let _ = ack.send(());
+                break;
             }
             accepted = accept_or_park(listener) => {
                 match accepted {

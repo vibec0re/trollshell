@@ -86,9 +86,11 @@ impl Layout {
         }
     }
 
-    /// The button's hover text. An icon carries no words at all, so this is the
-    /// only thing that says what the glyph does — the load-bearing tooltip case
-    /// the proto's `Node::Icon` documents.
+    /// The button's hover text — the only words the chip has.
+    ///
+    /// A pictogram says nothing on its own, and neither the `Node::Button` nor
+    /// the `Node::Pixels` it wraps can carry a tooltip, so this hangs on the
+    /// `Node::Box` between them; see `plugin::layout_button`.
     pub(crate) fn tooltip(self) -> &'static str {
         match self {
             Self::Equal => "Equal columns — every column the same width",

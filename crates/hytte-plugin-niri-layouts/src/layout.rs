@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 ///
 /// **Logical** pixels — the same unit niri's own `LogicalOutput::width`
 /// already reports, i.e. *after* the output's scale factor is applied, so a
-/// 5120×1440 output running at 2x HiDPI counts as 2560 px wide here, not
+/// 5120×1440 output running at 2x `HiDPI` counts as 2560 px wide here, not
 /// 5120. See [`golden_pair`], the one function that reads this constant.
 pub(crate) const GOLDEN_BREAKPOINT: u32 = 2560;
 

@@ -401,7 +401,8 @@ impl Overlay {
 
     /// Write `body` **without** moving the mtime — the same-granule save an
     /// mtime-only watcher misses forever (#1040 F8), and the reason the stamp
-    /// is a `(mtime, len)` pair rather than an mtime.
+    /// is a `(mtime, content hash)` pair rather than an mtime alone (#1081
+    /// M5; a `(mtime, len)` pair before it).
     ///
     /// # Panics
     /// If the file cannot be written or its mtime set.

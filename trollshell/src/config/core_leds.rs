@@ -62,14 +62,18 @@
 //!
 //! # Live reload
 //!
-//! [`watch::Watcher`] polls every layer's change stamp on
-//! [`watch::POLL_INTERVAL`] — a single `stat` per layer per tick, re-reading
-//! only when a stamp actually moves. A reload of a layer that is not TOML keeps
-//! the last good file layer and warns; a deleted layer falls back to the layer
-//! below it (and, with nothing left, to the built-in defaults); a reload never
-//! re-announces a deprecated variable, and the variable keeps winning across
-//! reloads. See [`hytte_config::subsystem::watch`] for the three orderings that
-//! make that true.
+//! [`watch::Watcher`] polls every layer's change stamp on [`CONFIG_POLL_INTERVAL`]
+//! on AC power, [`BATTERY_CONFIG_POLL_INTERVAL`] on battery (#1041/#1081) — a
+//! `(mtime, content hash)` read per layer per tick (`watch`'s own doc explains
+//! why a hash rather than a bare `stat`), re-parsing only when a stamp actually
+//! moves. A reload of a layer that is not TOML keeps the last good file layer
+//! and warns; a deleted layer falls back to the layer below it (and, with
+//! nothing left, to the built-in defaults); a reload never re-announces a
+//! deprecated variable, and the variable keeps winning across reloads. See
+//! [`hytte_config::subsystem::watch`] for the three orderings that make that
+//! true, and for the generic `CadenceSource`/`wait_cadence` mechanism this
+//! subsystem's battery split rides — everything below is this subsystem's own
+//! half: mapping "on battery or not" to a `Duration`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -78,10 +82,88 @@ use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::prelude::Service;
 use hytte::reactive::{registry, spawn_supervised};
 use hytte_config::subsystem::env::{self, Deprecations, EnvKnob};
-use hytte_config::subsystem::watch::{self, EnvLookup};
+use hytte_config::subsystem::watch::{self, CadenceSource, EnvLookup};
 use hytte_config::subsystem::{InvalidValue, Subsystem, keep, spelling};
 use hytte_config::xdg;
 use hytte_preem::{ColorMap, DisplayStyle, Fill};
+
+// ── Battery-aware reload cadence (#1041/#1081) ───────────────────────────────
+
+/// How often the running shell re-checks the config layers on AC power.
+/// `hytte_config::subsystem::watch::POLL_INTERVAL` — `places.toml`'s own AC
+/// cadence — restated as a local name so [`cadence`] reads as this
+/// subsystem's own choice rather than a reach into `watch`'s internals.
+const CONFIG_POLL_INTERVAL: Duration = watch::POLL_INTERVAL;
+
+/// Re-check cadence on battery power (#1041): five times the AC interval.
+///
+/// `places.toml`'s own `BATTERY_CONFIG_POLL_INTERVAL` stretches by only 3x
+/// (#505) because a *location* change is the thing it is racing to notice. A
+/// hand edit to `core-leds.toml` is rarer still — it is look-and-feel
+/// fiddling, not something that changes underneath you — so a wider stretch
+/// costs nothing in felt responsiveness: 15 s to notice a saved file is still
+/// "a live reload, no restart", the promise this module's own doc makes.
+///
+/// This does **not** change how often the loop wakes — `watch::wait_cadence`
+/// steps in 1 s (`RECHECK`) ticks regardless of the target, so the process
+/// wakes at 1 Hz on AC or battery alike. What it stretches is how often that
+/// wake actually **reads and hashes** the layer files (`watch::stamp`): from
+/// every ~3 s to every ~15 s, and each read is small — at most two layers,
+/// each a `core-leds.toml`-sized file (comfortably under 4.6 KiB) — for a
+/// file that, in the overwhelmingly common case, never changes for the life
+/// of the session.
+const BATTERY_CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Battery-aware poll cadence: [`BATTERY_CONFIG_POLL_INTERVAL`] while on
+/// battery power, else [`CONFIG_POLL_INTERVAL`]. Pure so the on-battery →
+/// interval mapping is unit-testable without a real `UPower` — mirrors
+/// `hytte_services::places::cadence` exactly.
+fn cadence(on_battery: bool) -> Duration {
+    if on_battery {
+        BATTERY_CONFIG_POLL_INTERVAL
+    } else {
+        CONFIG_POLL_INTERVAL
+    }
+}
+
+/// Best-effort on-battery snapshot for the production call site.
+///
+/// A private wrapper around [`hytte::services::upower::on_battery_now`],
+/// mirroring the shape every in-crate `hytte-services` poller already uses
+/// (`places`, `wifiscan`, `netconn`, `app_usage` each have their own private
+/// `fn on_battery() -> bool` over `upower::on_battery_snapshot`) — this is the
+/// same one-line wrapper, just calling the cross-crate `pub` accessor #1041
+/// added instead of the in-crate `pub(crate)` one, since `core_leds` lives in
+/// the `trollshell` binary rather than in `hytte-services` itself. See that
+/// accessor's doc for the full contract (degrades to AC — normal cadence —
+/// whenever the true state isn't known, never to the slow one).
+fn on_battery() -> bool {
+    hytte::services::upower::on_battery_now()
+}
+
+/// How the watcher reads the current battery state (#1041).
+///
+/// A boxed `Fn` rather than a direct call to [`self::on_battery`], the same
+/// reason [`EnvLookup`] is injected: a test drives a fake power state instead
+/// of the real (or absent) `UPower` daemon.
+type BatterySource = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Build a [`hytte_config::subsystem::watch::CadenceSource`] from a
+/// battery-state source.
+///
+/// The composition is its own function, rather than inlined at the one
+/// production call site, so it has its own test
+/// (`the_cadence_source_follows_an_injected_battery_flag`, #1041): the closure
+/// this returns calls `on_battery` **every time it is called**, not once at
+/// construction, which is what lets a live power-state flip reach a poll
+/// that's already mid-wait (`watch::wait_cadence`'s whole reason to re-check
+/// rather than sleep the target in one shot). A mutation that captured
+/// `on_battery()`'s value here instead of inside the closure — "ignore the
+/// signal" — would still pass every other test in this module and only shows
+/// up as a poller stuck at whatever cadence was true at startup.
+fn battery_cadence_source(on_battery: BatterySource) -> CadenceSource {
+    std::sync::Arc::new(move || cadence(on_battery()))
+}
 
 // ── The resolved dressing ────────────────────────────────────────────────────
 
@@ -542,19 +624,23 @@ pub struct CoreLedsHandles {
 /// the announcing resolution entirely, left the suite green. Nobody would ever
 /// have heard a deprecation line again and CI would not have noticed.
 ///
-/// Holding `paths`, `lookup` and `interval` as fields means a test constructs
-/// this over a scratch overlay and a fake environment and then calls the
-/// **real** `start`. What is left unpinned is [`service`]'s three argument
-/// expressions — deliberately, and that is as thin as this can get without
-/// `set_var`: they are `xdg::config_layers`, `env::process_env` and one `const`,
-/// each covered on its own elsewhere.
+/// Holding `paths`, `lookup` and `on_battery` as fields means a test
+/// constructs this over a scratch overlay and a fake environment and then
+/// calls the **real** `start`. What is left unpinned is [`service`]'s three
+/// argument expressions — deliberately, and that is as thin as this can get
+/// without `set_var`: they are `xdg::config_layers`, `env::process_env` and
+/// [`self::on_battery`], each covered on its own elsewhere.
 pub struct CoreLedsService {
     /// Layer paths, lowest precedence first.
     paths: Vec<PathBuf>,
     /// How a deprecated variable is read.
     lookup: EnvLookup,
-    /// How often the poller re-stats the layers.
-    interval: Duration,
+    /// How the poller reads the current battery state (#1041) — turned into a
+    /// `CadenceSource` by [`battery_cadence_source`] in [`Self::start`], not
+    /// stored as one directly, so this field stays the thing a test actually
+    /// wants to inject (a battery flag, the same shape `lookup` is an
+    /// environment).
+    on_battery: BatterySource,
 }
 
 impl Service for CoreLedsService {
@@ -567,11 +653,19 @@ impl Service for CoreLedsService {
         let (resolved, watcher) = watch::boot::<CoreLedsConfig>(&self.paths, &*self.lookup);
         let leds = Mutable::new(resolved);
         let Self {
-            lookup, interval, ..
+            lookup, on_battery, ..
         } = self;
+        let cadence = battery_cadence_source(on_battery);
         spawn_supervised("core-leds", {
             let leds = leds.clone();
-            move || watch::poll_loop(leds.clone(), watcher.clone(), lookup.clone(), interval)
+            move || {
+                watch::poll_loop(
+                    leds.clone(),
+                    watcher.clone(),
+                    lookup.clone(),
+                    cadence.clone(),
+                )
+            }
         });
         CoreLedsHandles { leds }
     }
@@ -581,7 +675,7 @@ pub fn service() -> CoreLedsService {
     CoreLedsService {
         paths: xdg::config_layers(CoreLedsConfig::NAME),
         lookup: std::sync::Arc::new(env::process_env),
-        interval: watch::POLL_INTERVAL,
+        on_battery: std::sync::Arc::new(on_battery),
     }
 }
 
@@ -598,9 +692,10 @@ pub fn signal() -> impl Signal<Item = CoreLeds> {
 #[cfg(test)]
 mod tests {
     use super::{
-        COLOR, CoreLeds, CoreLedsConfig, CoreLedsService, FILL, MAX_ROWS, Mutable, ROWS, STYLE,
-        Service, parse_core_leds_color, parse_core_leds_fill, parse_core_leds_rows,
-        parse_core_leds_style, parse_hex_rgb, rows_spelling,
+        BATTERY_CONFIG_POLL_INTERVAL, COLOR, CONFIG_POLL_INTERVAL, CoreLeds, CoreLedsConfig,
+        CoreLedsService, FILL, MAX_ROWS, ROWS, STYLE, Service, battery_cadence_source, cadence,
+        parse_core_leds_color, parse_core_leds_fill, parse_core_leds_rows, parse_core_leds_style,
+        parse_hex_rgb, rows_spelling,
     };
     use hytte_config::subsystem::env::{self, Deprecations, EnvKnob};
     use hytte_config::subsystem::watch;
@@ -635,16 +730,6 @@ mod tests {
         announce: Deprecations,
     ) -> CoreLeds {
         CoreLedsConfig::resolve(layered, lookup, announce)
-    }
-
-    /// [`watch::poll_loop`] at this subsystem.
-    async fn watch_loop(
-        leds: Mutable<CoreLeds>,
-        watcher: Watcher,
-        lookup: watch::EnvLookup,
-        interval: Duration,
-    ) {
-        watch::poll_loop::<CoreLedsConfig>(leds, watcher, lookup, interval).await;
     }
 
     /// An environment that is not the process's: the injection point every
@@ -1787,26 +1872,21 @@ mod tests {
         boot(paths, &no_env()).1
     }
 
-    /// A [`CoreLedsService`] over a scratch overlay and a fake environment,
-    /// polling at `interval` — so [`Service::start`], the function the process
+    /// A [`CoreLedsService`] over a scratch overlay, a fake environment and an
+    /// injected battery flag — so [`Service::start`], the function the process
     /// actually runs, is the thing under test rather than a copy of it
-    /// (#1040 V3).
+    /// (#1040 V3, battery flag added #1041).
     fn service_over(
         paths: Vec<PathBuf>,
         lookup: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
-        interval: Duration,
+        on_battery: impl Fn() -> bool + Send + Sync + 'static,
     ) -> CoreLedsService {
         CoreLedsService {
             paths,
             lookup: std::sync::Arc::new(lookup),
-            interval,
+            on_battery: std::sync::Arc::new(on_battery),
         }
     }
-
-    /// An interval no test waits for: for the `start`-level tests, whose
-    /// subject is the synchronous half and whose spawned poller must stay out
-    /// of the way.
-    const NEVER: Duration = Duration::from_hours(1);
 
     /// The payoff: an edit while the shell runs re-resolves without a restart.
     ///
@@ -2181,10 +2261,14 @@ mod tests {
     fn the_service_start_loads_once_and_announces_once() {
         let mut overlay = overlay();
         overlay.write("colour = \"rainbow\"\nstyle = \"crt\"\n");
+        // AC (`|| false`) → CONFIG_POLL_INTERVAL (3 s), already far longer
+        // than the synchronous assertions below need — no separate "never"
+        // escape hatch required now that the wait is battery-driven rather
+        // than a bare `interval` field (#1041).
         let service = service_over(
             overlay.layers(),
             env(&[("TROLLSHELL_CORE_LEDS_FILL", "blank")]),
-            NEVER,
+            || false,
         );
 
         let (captured, _guard) = capture();
@@ -2336,64 +2420,14 @@ mod tests {
         );
     }
 
-    /// **The watcher [`boot`] built is the one [`watch`] polls** — the loop
-    /// itself, driven for real (#1040 V3, mutation Z1).
-    ///
-    /// `watch` is production code with no other coverage: every other reload
-    /// test calls [`Watcher::poll`] by hand. A `watch` that rebuilt its own
-    /// watcher (F1's exact defect, moved one function along) would re-load,
-    /// double every diagnostic, re-open V2's race at full width — and, because
-    /// it would rebuild from `xdg::config_layers`, watch the *process's* real
-    /// layers instead of the ones it was handed, which is what this notices.
-    ///
-    /// Driven on the shared runtime at a 10 ms cadence rather than the
-    /// production three seconds, which is why `watch` takes its interval as a
-    /// parameter.
-    #[test]
-    fn the_watch_loop_republishes_the_watcher_it_was_given() {
-        let mut overlay = overlay();
-        overlay.write("style = \"lcd\"\n");
-        let (resolved, watcher) = boot(&overlay.layers(), &no_env());
-        let leds = Mutable::new(resolved);
-        assert_eq!(leds.get().style, DisplayStyle::Lcd, "live control");
-
-        overlay.write("style = \"crt\"\ncolor = \"rainbow\"\n");
-
-        let seen = hytte::reactive::runtime::handle().block_on({
-            let leds = leds.clone();
-            async move {
-                let watching = watch_loop(
-                    leds.clone(),
-                    watcher,
-                    std::sync::Arc::new(no_env()),
-                    Duration::from_millis(10),
-                );
-                tokio::select! {
-                    () = watching => false,
-                    republished = settles(&leds, DisplayStyle::Crt) => republished,
-                }
-            }
-        });
-
-        assert!(
-            seen,
-            "the save must reach the Mutable through the loop, got {:?}",
-            leds.get()
-        );
-        assert_eq!(leds.get().color, ColorMap::Rainbow, "…whole, not partly");
-    }
-
-    /// Wait (up to ~3 s) for `leds` to carry `want`, so the loop test has a
-    /// bound instead of a fixed sleep.
-    async fn settles(leds: &Mutable<CoreLeds>, want: DisplayStyle) -> bool {
-        for _ in 0..600 {
-            if leds.get().style == want {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        false
-    }
+    // `the_watch_loop_republishes_the_watcher_it_was_given` (driving
+    // `watch::poll_loop` for real, at a fast injected cadence) moved to
+    // `hytte_config::subsystem::watch`'s own tests
+    // (`a_fast_cadence_source_drives_the_loop`) when #1081's cadence work
+    // landed on top of #1044's hoist: `poll_loop` is generic mechanism now,
+    // not this subsystem's own function, so it is tested where it lives. This
+    // subsystem's own coverage is the battery *mapping* — see
+    // `cadence_is_config_poll_interval_on_ac` and its neighbours further down.
 
     /// **Two layers really are watched** — an edit to the *base* reloads live
     /// too, not just an edit to the overlay (#1040 V8).
@@ -2479,6 +2513,68 @@ mod tests {
     #[test]
     fn the_poll_interval_is_a_few_seconds() {
         assert_eq!(watch::POLL_INTERVAL, Duration::from_secs(3));
+    }
+
+    // ── Battery-aware cadence (#1041/#1081) ─────────────────────────────────
+    //
+    // `watch::poll_loop`'s own loop mechanics (the `CadenceSource`/
+    // `wait_cadence` recheck stepping) are tested generically in
+    // `hytte_config::subsystem::watch`. What is left here is this subsystem's
+    // own half: mapping "on battery or not" to a `Duration`, and wiring that
+    // mapping into the `CadenceSource` `Service::start` hands `poll_loop`.
+
+    #[test]
+    fn cadence_is_config_poll_interval_on_ac() {
+        assert_eq!(cadence(false), CONFIG_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn cadence_stretches_on_battery() {
+        assert_eq!(cadence(true), BATTERY_CONFIG_POLL_INTERVAL);
+        assert!(BATTERY_CONFIG_POLL_INTERVAL > CONFIG_POLL_INTERVAL);
+    }
+
+    /// The documented number, pinned as a literal — `cadence_stretches_on_battery`'s
+    /// `>` comparison alone would stay green against a mutation that widened
+    /// the constant to something still bigger than 3 s, and
+    /// `docs/live-verify.md` tells a human to expect **15 s**, not merely
+    /// "longer than 3 s".
+    #[test]
+    fn the_battery_poll_interval_is_fifteen_seconds() {
+        assert_eq!(BATTERY_CONFIG_POLL_INTERVAL, Duration::from_secs(15));
+    }
+
+    /// **The watcher's cadence signal switches with the battery signal**,
+    /// live — not once at construction.
+    ///
+    /// `battery_cadence_source` is what turns [`CoreLedsService`]'s injected
+    /// `on_battery` field into the `CadenceSource` `watch::poll_loop`'s loop
+    /// actually polls, and the whole point is that it re-reads the flag on
+    /// every call rather than snapshotting it when the closure is built. This
+    /// drives the same `AtomicBool` a real
+    /// `hytte::services::upower::on_battery_now` caller would see change under
+    /// it mid-session, and checks both readings through the one source
+    /// [`Service::start`] hands `poll_loop`.
+    ///
+    /// **Red if the signal is ignored** — a mutation that captured
+    /// `on_battery()`'s value once outside the returned closure would pass
+    /// the first assertion and fail the second, since flipping the flag
+    /// afterwards would have no effect.
+    #[test]
+    fn the_cadence_source_follows_an_injected_battery_flag() {
+        let on_battery = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let source = battery_cadence_source({
+            let on_battery = on_battery.clone();
+            std::sync::Arc::new(move || on_battery.load(std::sync::atomic::Ordering::Relaxed))
+        });
+
+        assert_eq!(source(), CONFIG_POLL_INTERVAL, "AC to start");
+        on_battery.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            source(),
+            BATTERY_CONFIG_POLL_INTERVAL,
+            "…and the source re-reads the flag live, not once"
+        );
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────

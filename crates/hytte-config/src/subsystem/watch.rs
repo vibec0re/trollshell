@@ -38,36 +38,34 @@
 //!
 //! # What a stamp is, and what it is not
 //!
-//! [`Stamp`] is `(mtime, len)`. An mtime-only stamp misses an edit saved inside
-//! the same mtime granule as the poll's own `stat`, and misses it
-//! **permanently** — the stamp is updated unconditionally, so the movement is
-//! never seen again. Linux's ext4/btrfs/tmpfs carry nanoseconds, so on the
-//! overlay the window is theoretical, and a coarse-granularity filesystem (a
-//! network mount, a FAT stick someone points `XDG_CONFIG_DIRS` at) is the
-//! obvious exception. A length is a cheap discriminator on the same `stat`
-//! call, not a second syscall, and it catches the overwhelmingly common shape
-//! of a same-granule edit (a value getting longer or shorter).
+//! [`Stamp`] is `(mtime, content hash)` (#1081 M5; `(mtime, len)` before it).
+//! An mtime-only stamp misses an edit saved inside the same mtime granule as
+//! the poll's own read, and misses it **permanently** — the stamp is updated
+//! unconditionally, so the movement is never seen again. Linux's
+//! ext4/btrfs/tmpfs carry nanoseconds, so on a hand-edited overlay the window
+//! is theoretical, and a coarse-granularity filesystem (a network mount, a
+//! FAT stick someone points `XDG_CONFIG_DIRS` at) is the obvious exception.
 //!
 //! **The `$XDG_CONFIG_DIRS` base layer is not the theoretical case, and once
-//! nix renders one it is the normal one.** Every file in the nix store carries
-//! the constant mtime `1970-01-01 00:00:01`, so for a store-backed base layer
-//! the mtime is *never* a discriminator and `len` is the only one — and the
-//! worked example of a missable edit above (`style = "vfd"` → `style = "lcd"`)
-//! is byte-identical in length. home-manager mitigates it in practice, since
-//! each rebuild renders a **new store path** and the layer file is a different
-//! inode rather than an edited one, but nothing here relies on that.
+//! nix renders one it is the normal one.** Every file in the nix store
+//! carries the constant mtime `1970-01-01 00:00:01`, so for a store-backed
+//! base layer the mtime is *never* a discriminator — measured across this
+//! store while #1081 was in review. A byte **length** alone is not enough
+//! either: the worked example of a missable edit, `style = "vfd"` → `style =
+//! "lcd"`, is byte-identical in length, and that is exactly the shape a
+//! `core-leds.toml`-style option's own values take (`"spare"` → `"blank"` is
+//! the other one). A content hash catches both — mtime-frozen or not,
+//! same-length or not, any byte that changes moves it — which is why [`stamp`]
+//! reads the whole file rather than a bare `stat`: one extra read, negligible
+//! for a config file this size, in exchange for the base layer being able to
+//! reload live at all.
 //!
-//! It is **not** a hash: two edits that land in one granule *and* keep the byte
-//! count identical are still missed, which is the honest limit of stat-polling
-//! and the reason a real watch (inotify) — or a cheap content hash for the base
-//! layer — is the eventual answer rather than a finer stamp. That fix is
-//! **#1081's**, not this module's history: #1081 is the PR that renders the nix
-//! base layer and its review is where the constant-mtime measurement was made.
-//! It belongs here because after #1044's hoist `stamp` below is the single
-//! implementation nine subsystems inherit — `core_leds.rs` has none of its own
-//! any more — so #1081 should be rebased over this and land its fix at this
-//! function. `places`' own `ConfigWatcher` predates all of it and is
-//! mtime-only.
+//! The residual, honest limit: two edits landing in one granule that also
+//! **hash** identically (a content collision, not a length one) are still
+//! missed — astronomically unlikely for the small TOML files this crate
+//! reads, not mathematically impossible, and a real watch (inotify) remains
+//! the eventual answer for that residue. `places`' own `ConfigWatcher`
+//! predates all of it and is mtime-only.
 
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -79,22 +77,22 @@ use futures_signals::signal::Mutable;
 use super::env::Deprecations;
 use super::{Subsystem, initial_load, load_layer};
 
-/// How often a running shell re-checks its config layers. Each tick is one
-/// `stat` per layer (two, normally: the nix base and the overlay) on a cached
-/// inode, so it stays snappy while you edit at no measurable idle cost; the
-/// files are only re-read when a stamp actually moves.
+/// How often a running shell re-checks its config layers, absent a
+/// battery-aware [`CadenceSource`] (i.e. what [`constant`] gives back). Each
+/// tick is one read per layer (two, normally: the nix base and the overlay),
+/// so it stays snappy while you edit at no measurable idle cost; the files
+/// are only re-parsed when a stamp actually moves.
 ///
 /// `places.toml`'s AC cadence (`hytte_services::places::CONFIG_POLL_INTERVAL`).
-/// It does *not* slow down on battery the way places does since #505: that
-/// needs `upower::on_battery_snapshot`, which is `pub(crate)` to
-/// `hytte-services` and so unreachable from here. Noted rather than worked
-/// around — widening it is a `hytte-services` change and belongs to whichever
-/// subsystem migration first needs it.
+/// A subsystem that wants a battery-aware split (`trollshell::config::
+/// core_leds` is the first, #1041/#1081) builds its own [`CadenceSource`]
+/// instead of using [`constant`] with this value directly — see that type's
+/// doc.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-/// A layer's change stamp — its last-modified time **and** its length — or
-/// `None` when the layer does not exist (the normal case for an overlay) or
-/// cannot be stat'd. See the module doc for why the length is not decoration.
+/// A layer's change stamp — its last-modified time **and a content hash** —
+/// or `None` when the layer does not exist (the normal case for an overlay)
+/// or cannot be read. See the module doc for why a hash, not a length.
 pub type Stamp = Option<(SystemTime, u64)>;
 
 /// How a subsystem's deprecated environment variables are read.
@@ -105,19 +103,75 @@ pub type Stamp = Option<(SystemTime, u64)>;
 /// read it would depend on the developer's shell.
 pub type EnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+/// How often [`poll_loop`] re-checks its layers, re-read on **every**
+/// [`RECHECK`] tick rather than fixed once at the start of a wait.
+///
+/// A boxed `Fn` rather than a bare `Duration` so a subsystem's cadence can
+/// depend on live state — `core_leds`' battery split is the reason this
+/// exists (#1041/#1081): a laptop unplugging mid-wait has to be able to
+/// shorten a wait already in progress, not just the next one. [`constant`]
+/// is the escape hatch for every subsystem that does not need this at all.
+pub type CadenceSource = Arc<dyn Fn() -> Duration + Send + Sync>;
+
+/// A [`CadenceSource`] that never changes — what every subsystem used before
+/// #1081, and what one with no battery-aware (or otherwise live-varying)
+/// split still wants. `constant(POLL_INTERVAL)` is the literal old behaviour.
+#[must_use]
+pub fn constant(interval: Duration) -> CadenceSource {
+    Arc::new(move || interval)
+}
+
+/// How often [`poll_loop`]'s wait re-checks its [`CadenceSource`] against
+/// elapsed wait time. A mid-wait cadence change (a laptop unplugging, say)
+/// shortens or lengthens the *remaining* wait instead of only taking effect
+/// on the next cycle — the same idiom `hytte_services::places::RECHECK` and
+/// `wifiscan::RECHECK` use for their own battery splits.
+const RECHECK: Duration = Duration::from_secs(1);
+
+/// Wait out the current cadence, re-checking `cadence` every [`RECHECK`].
+///
+/// `cadence` is called on **every** recheck, not once at the top — that is
+/// the entire point of taking a [`CadenceSource`] instead of a `Duration`,
+/// and it is what lets a test (or a real battery-state flip) shorten a wait
+/// already in progress rather than only the next one.
+async fn wait_cadence(cadence: &(dyn Fn() -> Duration + Send + Sync)) {
+    let mut waited = Duration::ZERO;
+    loop {
+        let target = cadence();
+        if waited >= target {
+            return;
+        }
+        let step = RECHECK.min(target.saturating_sub(waited));
+        tokio::time::sleep(step).await;
+        waited += step;
+    }
+}
+
 /// One layer's [`Stamp`].
 ///
 /// The single implementation nine subsystems inherit, and therefore where a
-/// real change-detection fix lands. See the module doc for what `(mtime, len)`
-/// can and cannot see — in particular that a nix-store base layer's mtime is
-/// the constant `1970-01-01 00:00:01`, so for that layer the length is the only
-/// discriminator (#1081).
+/// real change-detection fix lands (#1081 M5). See the module doc for what
+/// `(mtime, hash)` can and cannot see — in particular that a nix-store base
+/// layer's mtime is the constant `1970-01-01 00:00:01`, so for that layer the
+/// hash is the *only* discriminator.
+///
+/// Reads the whole file rather than a bare `stat` — the one extra cost, and
+/// negligible for the small TOML files every subsystem here reads.
+/// `std::collections::hash_map::DefaultHasher` is deliberately not a
+/// cryptographic hash: its output is explicitly unspecified across Rust
+/// releases, which is fine here because the only thing a stamp is ever
+/// compared against is another stamp read by this **same process**
+/// (`Watcher::poll`'s `now == self.stamps`), never persisted or compared
+/// cross-process.
 fn stamp(path: &Path) -> Stamp {
     let meta = std::fs::metadata(path).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&bytes, &mut hasher);
+    Some((meta.modified().ok()?, std::hash::Hasher::finish(&hasher)))
 }
 
-/// Every layer's [`stamp`], in path order — one `stat` per layer.
+/// Every layer's [`stamp`], in path order — one read per layer.
 ///
 /// **Every** layer, not just the overlay: a nix rebuild moves the base file,
 /// and a shell that only watched the top layer would show a stale base until
@@ -282,7 +336,7 @@ pub fn boot<S: Subsystem>(
 }
 
 /// Poll the layers and republish on a real change, so an edit reaches the shell
-/// within `interval` without a restart.
+/// within the current cadence without a restart.
 ///
 /// Takes the [`Watcher`] rather than building one: [`boot`] already stamped and
 /// loaded, in that order, and re-doing either here would put back the double
@@ -290,17 +344,23 @@ pub fn boot<S: Subsystem>(
 /// `Clone`, which is what lets this ride a supervisor's `Fn` factory — a
 /// restart resumes from the same baseline instead of re-stamping.
 ///
-/// `lookup` and `interval` are parameters for the same reason `paths` is one:
+/// `lookup` and `cadence` are parameters for the same reason `paths` is one:
 /// the loop is then drivable in a test at a cadence a test can wait for, and
 /// the subsystem's `Service` is the single place production values are chosen.
+///
+/// `cadence` is a [`CadenceSource`] rather than a bare `Duration` (#1081):
+/// most subsystems have no reason to vary it and pass [`constant`], but
+/// `core_leds`' battery-aware split needs the *current* power state read live
+/// on every recheck, not a value frozen at the call site — see
+/// [`wait_cadence`], which is what actually re-reads it.
 pub async fn poll_loop<S: Subsystem>(
     values: Mutable<S::Resolved>,
     mut watcher: Watcher<S>,
     lookup: EnvLookup,
-    interval: Duration,
+    cadence: CadenceSource,
 ) {
     loop {
-        tokio::time::sleep(interval).await;
+        wait_cadence(&*cadence).await;
         if let Some(next) = watcher.poll(&values.get_cloned(), &*lookup) {
             tracing::info!(subsystem = S::NAME, "config changed; reloaded");
             values.set(next);
@@ -310,11 +370,13 @@ pub async fn poll_loop<S: Subsystem>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Watcher, boot};
+    use super::{CadenceSource, Watcher, boot, constant, poll_loop, wait_cadence};
     use crate::subsystem::env::{self, Deprecations, EnvKnob};
     use crate::subsystem::{InvalidValue, Subsystem, keep, spelling};
     use crate::test_support::{Overlay, capture};
+    use futures_signals::signal::Mutable;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     const LEVEL: EnvKnob = EnvKnob::same("HYTTE_TEST_DIAL_LEVEL", "level", "a level from 0 to 9");
 
@@ -491,10 +553,10 @@ mod tests {
         );
     }
 
-    /// The change stamp is `(mtime, len)`, so a save inside the poll's own mtime
-    /// granule is still seen.
+    /// The change stamp is `(mtime, content hash)`, so a save inside the
+    /// poll's own mtime granule is still seen.
     ///
-    /// **Red if `stamp` drops the length** (#1040 F8, mutation N4). An
+    /// **Red if `stamp` stops hashing content** (#1040 F8, mutation N4). An
     /// mtime-only stamp misses this edit *permanently*, because the stamp is
     /// updated unconditionally and the movement is never seen again.
     #[test]
@@ -508,29 +570,28 @@ mod tests {
         assert_eq!(watcher.poll(&current, &no_env()), Some(4));
     }
 
-    /// …and the honest limit of the same mechanism, stated rather than implied:
-    /// an edit that lands in one mtime granule **and** keeps the byte count
-    /// identical is still missed, forever. A `(mtime, len)` pair is a cheap
-    /// discriminator on the same `stat`, not a hash; closing this case wants a
-    /// real watch (inotify), which is why the module doc says so instead of
-    /// pretending the pair is complete.
+    /// The case a byte **length** could never have caught, and the one #1081's
+    /// review measured against a nix-rendered base layer: `"level = 1\n"` →
+    /// `"level = 4\n"` is the same 10 bytes, in the same mtime granule, and
+    /// every file the nix store renders carries a *permanently* frozen mtime
+    /// besides — so for that layer a length-based stamp would never see this
+    /// edit at all, ever, not just late.
     ///
-    /// It is pinned so the limit is a decision somebody made rather than a
-    /// surprise somebody hits: a fix that closed it would redden this test and
-    /// have to say why.
+    /// **Red if `stamp` goes back to `(mtime, len)`** — this is the exact case
+    /// the hash fix exists for; see the module doc.
     #[test]
-    fn an_edit_of_the_same_length_in_the_same_granule_is_the_honest_limit() {
+    fn a_same_length_edit_inside_one_mtime_granule_is_still_seen() {
         let mut file = overlay();
         file.write("level = 1\n");
         let (current, mut watcher) = boot::<Dial>(&file.layers(), &no_env());
 
-        // Same byte count, same mtime granule.
+        // Same byte count (10, both lines), same mtime granule.
         file.write_in_the_same_granule("level = 4\n");
 
         assert_eq!(
             watcher.poll(&current, &no_env()),
-            None,
-            "stat-polling cannot see this, and does not claim to"
+            Some(4),
+            "a content hash catches a same-length edit a byte count alone cannot"
         );
     }
 
@@ -702,5 +763,101 @@ mod tests {
     #[test]
     fn the_poll_interval_is_a_few_seconds() {
         assert_eq!(super::POLL_INTERVAL, std::time::Duration::from_secs(3));
+    }
+
+    // ── The loop mechanics (#1081, hoisted out of the core-leds pilot's own
+    // ── `watch`/`wait_cadence` when core_leds.rs's cadence work landed on top
+    // ── of #1044's hoist) ────────────────────────────────────────────────────
+
+    /// **The watcher [`boot`] built is the one [`poll_loop`] polls** — the loop
+    /// itself, driven for real (#1040 V3, mutation Z1; #1081 review M3).
+    ///
+    /// `poll_loop` is production code with no other coverage: every other
+    /// reload test calls [`Watcher::poll`] by hand. Driven at a 10 ms
+    /// [`CadenceSource`] rather than the production few seconds, which is why
+    /// `poll_loop` takes its cadence as a parameter.
+    ///
+    /// The `settles` budget below is 1 s, deliberately **not** 3 s
+    /// (`POLL_INTERVAL`): #1081's review measured that a budget equal to the
+    /// real interval lets a mutation that makes the loop ignore its injected
+    /// `CadenceSource` (and fall back to `POLL_INTERVAL`) pass 3/3 runs anyway,
+    /// decided by scheduler jitter rather than by this assertion.
+    #[tokio::test]
+    async fn a_fast_cadence_source_drives_the_loop() {
+        let mut file = overlay();
+        file.write("level = 1\n");
+        let (resolved, watcher) = boot::<Dial>(&file.layers(), &no_env());
+        let values = Mutable::new(resolved);
+        assert_eq!(values.get(), 1, "live control");
+
+        file.write("level = 9\n");
+
+        let seen = tokio::select! {
+            () = poll_loop(values.clone(), watcher, std::sync::Arc::new(no_env()), constant(Duration::from_millis(10))) => false,
+            reached = settles(&values, 9) => reached,
+        };
+
+        assert!(
+            seen,
+            "the save must reach the Mutable through the loop, got {:?}",
+            values.get()
+        );
+    }
+
+    /// Wait (up to ~1 s) for `values` to carry `want`. Deliberately well under
+    /// [`POLL_INTERVAL`] (3 s) rather than merely "generous" — see
+    /// `a_fast_cadence_source_drives_the_loop`'s doc for the mutation this
+    /// budget exists to catch.
+    async fn settles(values: &Mutable<u8>, want: u8) -> bool {
+        for _ in 0..200 {
+            if values.get() == want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    /// **A cadence change mid-wait is actually observed**, not just read once
+    /// at the top of the loop (#1081 review M2). Starts the source at 10 s —
+    /// far longer than this test would wait out on its own — then flips it to
+    /// 50 ms after 200 ms, well inside the first [`RECHECK`] tick. A
+    /// `wait_cadence` that genuinely re-checks returns close to one `RECHECK`
+    /// tick after the flip; one that reads the target once at the start blocks
+    /// for the full original 10 s.
+    ///
+    /// **Red against mutation R1** (review #1081): replacing the whole loop
+    /// body with a single `tokio::time::sleep(cadence()).await` — deleting
+    /// `RECHECK`, the stepping, and the re-read — reads 10 s once and never
+    /// sees the flip, so this test's `elapsed < Duration::from_secs(3)`
+    /// assertion fails (it actually finishes around 10 s later).
+    #[tokio::test]
+    async fn a_cadence_flip_mid_wait_shortens_the_remaining_wait() {
+        let flipped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let source: CadenceSource = {
+            let flipped = flipped.clone();
+            std::sync::Arc::new(move || {
+                if flipped.load(std::sync::atomic::Ordering::Relaxed) {
+                    Duration::from_millis(50)
+                } else {
+                    Duration::from_secs(10)
+                }
+            })
+        };
+
+        let start = std::time::Instant::now();
+        let flip = flipped.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            flip.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        wait_cadence(&*source).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "a cadence flip 200 ms into a 10 s wait must shorten it to about \
+             one RECHECK tick, got {elapsed:?}"
+        );
     }
 }

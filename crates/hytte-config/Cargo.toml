@@ -54,3 +54,12 @@ tempfile.workspace = true
 # against a tempdir; `temp_env` serializes that mutation across tests and puts
 # it back (`std::env::set_var` is `unsafe`, which this workspace forbids).
 temp-env = "0.3.6"
+# `subsystem::watch`'s own tests (#1081): the main `tokio` dependency above is
+# `features = ["time"]` only — this crate starts no runtime of its own, so
+# nothing in it can actually drive an `.await`. Cargo unifies feature sets
+# across dev-dependencies and the same crate's main dependency, so adding
+# `rt`/`macros` here (test-only) is what lets `#[tokio::test]` build and run a
+# `poll_loop`/`wait_cadence` test — and it changes nothing about what a
+# consumer's non-test build links, since dev-dependencies never apply outside
+# `cargo test`.
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

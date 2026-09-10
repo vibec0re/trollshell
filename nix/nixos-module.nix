@@ -50,6 +50,27 @@ let
       enabled = plugin.enable;
     }) cfg.plugins;
   };
+
+  # Base-layer config files (#866/#868, #1041): each
+  # `programs.trollshell.config.<subsystem>` attrset renders to
+  # `<subsystem>.toml` — one store-path file per subsystem that declares at
+  # least one non-null field, `null`s filtered out first (TOML has no null,
+  # and an omitted key here just means "no opinion", left to the layer
+  # below). Mirrors `nix/hm-module.nix`'s `configFiles` exactly — keep the two
+  # in sync — except this module writes straight into `/etc/xdg` below
+  # (`environment.etc`) rather than splicing a store path onto
+  # `XDG_CONFIG_DIRS`: `/etc/xdg` is already the default base entry
+  # `crates/hytte-config/src/xdg.rs` falls back to when the variable is
+  # unset, and this module (unlike home-manager) actually owns `/etc`.
+  configFiles = lib.filterAttrs (_: v: v != null) (
+    lib.mapAttrs (
+      name: value:
+      let
+        filtered = lib.filterAttrs (_: v: v != null) value;
+      in
+      if filtered == { } then null else (pkgs.formats.toml { }).generate "${name}.toml" filtered
+    ) cfg.config
+  );
 in
 {
   _file = "nix/nixos-module.nix";
@@ -201,6 +222,24 @@ in
       # you actually run the shell.
       (lib.mkIf (cfg.plugins != { }) {
         environment.etc."xdg/trollshell/plugins.json".text = pluginsState;
+      })
+
+      # Base-layer config files (#866/#868, #1041): `configFiles` above, one
+      # `environment.etc` entry per subsystem that declared at least one
+      # non-null field, under the SAME /etc/xdg tree plugins.json uses — the
+      # default `$XDG_CONFIG_DIRS` base entry `hytte-config`'s layering
+      # already searches, so no session variable is needed here (contrast
+      # `nix/hm-module.nix`, which has no `/etc` to write into and instead
+      # splices a store path onto XDG_CONFIG_DIRS). Unlike plugins.json's
+      # first-existing-file-wins shadowing, a per-user home-manager
+      # `core-leds.toml` overlay does not shadow this file at all — the two
+      # are genuinely merged (`hytte_config::merge`), lowest precedence
+      # first, so a NixOS-wide base and a home-manager base can both
+      # contribute keys to the same subsystem.
+      (lib.mkIf (configFiles != { }) {
+        environment.etc = lib.mapAttrs' (
+          name: file: lib.nameValuePair "xdg/trollshell/${name}.toml" { source = file; }
+        ) configFiles;
       })
 
       # Night light (#657): see nlConfigured above. Assert rather than let the

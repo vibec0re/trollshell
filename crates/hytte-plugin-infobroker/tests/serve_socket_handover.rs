@@ -143,16 +143,24 @@ const SLOW_LOAD: Duration = Duration::from_secs(2);
 const STARVED_TIMER: Duration = Duration::from_millis(100);
 
 /// Scenario D: how far past [`STARVED_TIMER`] the timer may land before the
-/// test calls it starved. #1059 asks for "~50 ms"; measured on the fixed tree
-/// the overshoot is single-digit milliseconds (see the PR body), and the
-/// deliberately looser bound here is the same call `HUGE_GRANT_COUNT`'s note
-/// makes about `ubuntu-latest`'s 4 vCPU under a `nix flake check` that also
-/// runs two `nixosTest` VMs — it costs the mutation nothing, because the
-/// discriminating value is [`SLOW_LOAD`] = 2 s, 4× this whole bound. The
-/// wall-clock check is in any case the *second* assertion; the first one
-/// (the loader must still be mid-flight when the timer fires) is an ordering
-/// property with no clock in it at all.
-const STARVED_TIMER_SLACK: Duration = Duration::from_millis(400);
+/// test calls it starved.
+///
+/// Measured on the fixed tree, 20 runs of this scenario under 64 CPU burners
+/// on 64 cores: the timer fired at 100.99–108.94 ms, i.e. an overshoot of
+/// 1.0–8.9 ms — comfortably inside the "~50 ms" #1059 asks for. This constant
+/// is nonetheless 150 ms, ~17× that worst observation, for the reason
+/// `HUGE_GRANT_COUNT`'s note gives: CI is `ubuntu-latest`'s 4 vCPU running
+/// this suite twice per `nix flake check` alongside two `nixosTest` VMs, where
+/// a thread wakeup is a great deal less punctual than it is here, and a
+/// wall-clock bound this test does not need to be tight is not worth a flake.
+/// It costs the mutation nothing: the discriminating value is [`SLOW_LOAD`] =
+/// 2 s, 8× this whole bound (measured under mutation (e): 2.000328324 s).
+///
+/// The wall-clock check is in any case the *second* assertion. The first —
+/// the loader must still be mid-flight when the timer fires — is a pure
+/// ordering property with no clock in it, and it is the one that cannot be
+/// satisfied by a slow-but-not-starved runtime.
+const STARVED_TIMER_SLACK: Duration = Duration::from_millis(150);
 
 // ── Shared harness ──────────────────────────────────────────────────────────
 

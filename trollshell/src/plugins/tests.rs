@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
 use hytte_plugin_proto::{
-    AudioAction, Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, EffectOutcome,
-    HostMsg, Manifest, MediaAction, Mount, NiriAction, NowPlaying, Page, PluginMsg,
-    ProvidedDatasource, StateKey, VOCAB, preem as vocab, read_frame, wire, write_frame,
+    Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, EffectOutcome, HostMsg,
+    Manifest, Mount, NiriAction, NowPlaying, Page, PluginMsg, ProvidedDatasource, StateKey, VOCAB,
+    preem as vocab, read_frame, wire, write_frame,
 };
 use hytte_preem as kit;
 use tokio::net::UnixStream;
@@ -40,8 +40,9 @@ use super::pump::{
 };
 use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
-    EFFECT_BURST, EffectRateLimiter, IdGuard, OUTBOUND_CAPACITY, REGISTER_TIMEOUT,
-    effect_capability, enforce_capabilities, handle_conn, push_gate, state_key_capability,
+    EFFECT_BURST, EffectRateLimiter, HiddenOnViolation, IdGuard, MAX_HIDDEN_ON_ENTRIES,
+    MAX_HIDDEN_ON_NAME_BYTES, OUTBOUND_CAPACITY, REGISTER_TIMEOUT, capped_hidden_on,
+    enforce_capabilities, handle_conn, push_gate, state_key_capability,
 };
 use super::shader_map::{self, Grants};
 use super::wire_map::{clamp_pixels_scale, pixels_len_ok, to_ui_node, to_wire_event};
@@ -1982,89 +1983,17 @@ fn duplicate_id_claim_rejected_until_released() {
     );
 }
 
-/// #436 item 3: every [`Effect`] maps to exactly the [`Capability`] its wire
-/// docs name, so enforcement gates each effect on the cap a plugin must
-/// declare to use it. Exhaustive over the effect vocabulary.
-#[test]
-fn effect_capability_maps_each_effect() {
-    assert_eq!(
-        effect_capability(&Effect::OpenPage(Page::Media)),
-        Capability::OpenPage,
-    );
-    assert_eq!(
-        effect_capability(&Effect::Niri(NiriAction::FocusWorkspace { id: 1 })),
-        Capability::Niri,
-    );
-    assert_eq!(
-        effect_capability(&Effect::Media(MediaAction::PlayPause)),
-        Capability::Media,
-    );
-    assert_eq!(
-        effect_capability(&Effect::Audio(AudioAction::ToggleMute)),
-        Capability::Audio,
-    );
-    assert_eq!(
-        effect_capability(&Effect::RunCommand {
-            id: 0,
-            argv: vec![],
-            detached: false,
-        }),
-        Capability::RunCommand,
-    );
-    // #953: the detached spawn mode rides the *same* capability — a plugin that
-    // may run an arbitrary argv can already launch a detacher of its own, so a
-    // second cap would name a boundary that isn't there.
-    assert_eq!(
-        effect_capability(&Effect::RunCommand {
-            id: 0,
-            argv: vec![],
-            detached: true,
-        }),
-        Capability::RunCommand,
-    );
-    assert_eq!(
-        effect_capability(&Effect::RaiseOsd {
-            title: String::new(),
-            body: String::new(),
-            icon: None,
-        }),
-        Capability::RaiseOsd,
-    );
-    assert_eq!(
-        effect_capability(&Effect::Notify {
-            summary: String::new(),
-            body: String::new(),
-        }),
-        Capability::Notify,
-    );
-    assert_eq!(
-        effect_capability(&Effect::RequestConsent {
-            request_id: 1,
-            agent: String::new(),
-            datasource: String::new(),
-            scope: String::new(),
-            detail: String::new(),
-        }),
-        Capability::Consent,
-    );
-    // #1045: opening a link is its OWN capability, not a corner of
-    // `RunCommand`. That is the entire point of the variant — a plugin that
-    // may open a link must not thereby be able to run a program.
-    assert_eq!(
-        effect_capability(&Effect::open_uri(1, "https://example.invalid/")),
-        Capability::OpenUri,
-    );
-}
-
 /// #1045: the enforcement seam treats `OpenUri` like every other effect — an
 /// un-capped one is dropped in the reader, exactly as an un-capped
 /// `RunCommand` is — and, the half that matters for the trust argument, the two
 /// capabilities do **not** substitute for one another in either direction.
 ///
 /// **Falsified** by deleting the `Effect::OpenUri` arm from
-/// `session::effect_capability` (the match is exhaustive, so it cannot be
-/// deleted — it can only be *mis-mapped*, e.g. to `Capability::RunCommand`,
-/// which turns the second and third assertions red).
+/// [`Effect::required_capability`](hytte_plugin_proto::Effect::required_capability)
+/// (the match is exhaustive, so it cannot be deleted — it can only be
+/// *mis-mapped*, e.g. to `Capability::RunCommand`, which turns the second and
+/// third assertions red; that mapping's own exhaustive test lives in
+/// `hytte-plugin-proto`, #1058).
 #[test]
 fn enforce_capabilities_drops_an_uncapped_open_uri() {
     let open = Effect::open_uri(3, "https://pr1ma.darkest.space/agents/argus");
@@ -2124,6 +2053,175 @@ fn enforce_capabilities_drops_ungranted_effects() {
     assert!(
         enforce_capabilities(&[], "p", vec![Effect::OpenPage(Page::Power)]).is_empty(),
         "a plugin that declared no caps gets every effect dropped",
+    );
+}
+
+// ── #1058: the `Render.hidden_on` shape cap ──────────────────────────────────
+//
+// PR #1068 shipped `hidden_on: Vec<String>` with no length cap of its own; a
+// misbehaving plugin could otherwise make `SlotRender` retain (and every
+// monitor's reconciler re-compare and `clone_from`) a multi-megabyte connector
+// list on every frame — the decode itself is separately bounded by the 16 MiB
+// frame limit (review LOW-2). `capped_hidden_on` is the decode/route-time
+// guard: at most `MAX_HIDDEN_ON_ENTRIES` names, each at most
+// `MAX_HIDDEN_ON_NAME_BYTES`. A violation is not fatal — it degrades to the
+// empty set (the card shows on every screen, #1050's own safe default).
+//
+// `capped_hidden_on` is pure (review MEDIUM-2/MEDIUM-4, #1058 fix round): it
+// returns the violation instead of calling `tracing::warn!` itself, so the
+// "one warning per connection per violation kind" property is a plain
+// return-value assertion — no tracing subscriber, hand-rolled or otherwise,
+// needed to pin it.
+
+/// One entry over [`MAX_HIDDEN_ON_ENTRIES`] degrades the whole set to empty
+/// and reports the violation exactly once, even across repeated frames from
+/// the same connection.
+///
+/// **Falsified** by dropping the entry-count check from `capped_hidden_on`
+/// (the first assertion reds — 65 names come straight through), or by
+/// dropping the `violated.insert(..)` gate so every call reports (the third
+/// assertion reds — the second frame reports again).
+#[test]
+fn hidden_on_over_the_entry_cap_becomes_empty_and_warns_once() {
+    let entries: Vec<String> = (0..=MAX_HIDDEN_ON_ENTRIES)
+        .map(|i| format!("out{i}"))
+        .collect();
+    assert_eq!(entries.len(), MAX_HIDDEN_ON_ENTRIES + 1);
+
+    let mut violated = HashSet::new();
+    let (kept, violation) = capped_hidden_on(entries.clone(), &mut violated);
+    assert!(
+        kept.is_empty(),
+        "one entry over the cap empties the whole set"
+    );
+    assert!(
+        matches!(violation, Some((HiddenOnViolation::TooManyEntries, _))),
+        "the first violating frame must report it: {violation:?}",
+    );
+
+    // Same connection, same violation, next frame: the cap still applies, but
+    // the report does not repeat.
+    let (kept_again, violation_again) = capped_hidden_on(entries, &mut violated);
+    assert!(kept_again.is_empty(), "the cap keeps applying every frame");
+    assert!(
+        violation_again.is_none(),
+        "a second frame from the same violation kind must not report again: {violation_again:?}",
+    );
+}
+
+/// One connector name over [`MAX_HIDDEN_ON_NAME_BYTES`] degrades the whole set
+/// to empty and reports the violation, even when the entry count itself is
+/// fine — a distinct latch slot from the entry-count cap, so tripping this one
+/// after already tripping that one still reports.
+///
+/// **Falsified** by dropping the per-name length check from
+/// `capped_hidden_on` (the first assertion reds — the oversized name comes
+/// through unchanged).
+#[test]
+fn hidden_on_with_a_name_over_the_byte_cap_becomes_empty_and_warns() {
+    let over_name = "x".repeat(MAX_HIDDEN_ON_NAME_BYTES + 1);
+    let entries = vec!["DP-1".to_owned(), over_name];
+
+    let mut violated = HashSet::new();
+    // Trip the OTHER cap first, to prove the two slots are independent.
+    let many: Vec<String> = (0..=MAX_HIDDEN_ON_ENTRIES)
+        .map(|i| format!("o{i}"))
+        .collect();
+    let (_, first) = capped_hidden_on(many, &mut violated);
+    assert!(matches!(
+        first,
+        Some((HiddenOnViolation::TooManyEntries, _))
+    ));
+
+    let (kept, violation) = capped_hidden_on(entries, &mut violated);
+    assert!(
+        kept.is_empty(),
+        "one oversized name empties the whole set, not just that entry",
+    );
+    assert!(
+        matches!(violation, Some((HiddenOnViolation::NameTooLong, _))),
+        "a different violation kind must still report, even with the other kind \
+         already latched: {violation:?}",
+    );
+}
+
+/// Right at both caps — [`MAX_HIDDEN_ON_ENTRIES`] entries, each exactly
+/// [`MAX_HIDDEN_ON_NAME_BYTES`] bytes — passes through byte-for-byte, in
+/// order, with no violation reported. The positive control for the two tests
+/// above: it proves the cap is inclusive (`>`, not `>=`) rather than
+/// accidentally rejecting a legitimately-sized frame.
+#[test]
+fn hidden_on_at_the_cap_passes_through_unchanged() {
+    let entries: Vec<String> = std::iter::repeat_with(|| "x".repeat(MAX_HIDDEN_ON_NAME_BYTES))
+        .take(MAX_HIDDEN_ON_ENTRIES)
+        .collect();
+    assert_eq!(entries.len(), MAX_HIDDEN_ON_ENTRIES);
+    assert!(entries.iter().all(|e| e.len() == MAX_HIDDEN_ON_NAME_BYTES));
+
+    let mut violated = HashSet::new();
+    let (kept, violation) = capped_hidden_on(entries.clone(), &mut violated);
+    assert_eq!(kept, entries, "at-cap input passes through unchanged");
+    assert!(
+        violation.is_none(),
+        "no violation for an in-bounds frame: {violation:?}",
+    );
+}
+
+/// MEDIUM-1 (#1058 fix round): the cap's only production call site
+/// (`handle_conn`'s reader loop) is exercised end to end, not just the pure
+/// function — a 65-entry `hidden_on` sent over a real socketpair connection
+/// must reach the mounted card's `SlotRender.hidden_on` **empty**, mirroring
+/// `hidden_on_survives_the_wire_into_the_render_mailbox`'s in-bounds
+/// counterpart above.
+///
+/// **Falsified** by replacing `capped_hidden_on(hidden_on, &mut
+/// hidden_on_warned)` with a bare `hidden_on` at the route call site — this
+/// test reds (the mounted card keeps all 65 entries) while the rest of
+/// `cargo test -p trollshell` stays green, which is exactly the gap the
+/// review measured.
+#[tokio::test]
+async fn an_over_cap_hidden_on_reaches_the_mailbox_empty() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let bar_center = ctx.bar_center.clone();
+
+    let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+    let (_prd, mut pwr) = plugin_end.into_split();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Register {
+            manifest: Manifest::new("hidden-on-flood", Mount::BarCenter),
+        },
+    )
+    .await
+    .expect("send Register");
+    let over_cap: Vec<String> = (0..=MAX_HIDDEN_ON_ENTRIES)
+        .map(|i| format!("o{i}"))
+        .collect();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Render {
+            tree: wire::Node::Label {
+                id: Some("t".into()),
+                text: "chip".into(),
+                classes: vec![],
+                tooltip: None,
+            },
+            panel: None,
+            hidden_on: over_cap,
+            effects: vec![],
+        },
+    )
+    .await
+    .expect("send Render");
+
+    let cards = wait_for_region(&bar_center).await;
+    assert!(
+        cards[0].hidden_on.is_empty(),
+        "an over-cap hidden_on must reach the mailbox empty, not the raw 65 entries",
     );
 }
 
@@ -2564,27 +2662,10 @@ async fn recv_queue(rx: &mut mpsc::Receiver<HostMsg>) -> HostMsg {
         .expect("the queue is open")
 }
 
-/// The requester/provider capability each datasource effect requires — the
-/// exhaustive `effect_capability` mapping for the two #509 variants.
-#[test]
-fn effect_capability_maps_datasource_effects() {
-    assert_eq!(
-        effect_capability(&Effect::DatasourceQuery {
-            request_id: 0,
-            provider: String::new(),
-            scope: String::new(),
-            params: String::new(),
-        }),
-        Capability::DatasourceQuery,
-    );
-    assert_eq!(
-        effect_capability(&Effect::DatasourceResult {
-            request_id: 0,
-            outcome: DatasourceOutcome::Ready(String::new()),
-        }),
-        Capability::DatasourceProvider,
-    );
-}
+// The requester/provider capability each datasource effect requires is
+// covered by `hytte-plugin-proto`'s own exhaustive
+// `required_capability_maps_every_effect` test (#1058); no host-side
+// duplicate here any more.
 
 /// #509 capability enforcement: a `DatasourceQuery` needs `DatasourceQuery`, a
 /// `DatasourceResult` needs `DatasourceProvider` — each is dropped without its own

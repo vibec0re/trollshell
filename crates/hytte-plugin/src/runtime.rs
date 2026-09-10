@@ -7,8 +7,8 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use hytte_plugin_proto::{
-    HostMsg, LogLevel, PluginMsg, ProtoError, StateKey, VOCAB_UNCONDITIONAL, read_frame,
-    socket_path, write_frame,
+    Capability, Effect, HostMsg, LogLevel, PluginMsg, ProtoError, StateKey, VOCAB_UNCONDITIONAL,
+    read_frame, socket_path, write_frame,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
@@ -63,6 +63,68 @@ fn sanitise_view(view: &mut View) {
     if let Some(panel) = view.panel.as_mut() {
         panel.clamp_in_place();
     }
+}
+
+/// Drop any effect whose required [`Capability`] this manifest didn't declare,
+/// before it ever reaches the wire (#1058). The host already enforces this at
+/// `session::enforce_capabilities` — this is the SDK-side mirror, using the
+/// same [`Effect::required_capability`] mapping so the two cannot drift — and
+/// it closes a gap that used to cost more than a dropped effect: on a **current**
+/// host an undeclared emit is silently dropped anyway, but on a host older than
+/// the capability's own generation (`Shader` #893, `OpenUri` #1045, …)
+/// `Register` decodes fine and the first render frame carrying the effect does
+/// not, which is the #437 crash-loop. Catching it here means the mistake is
+/// named on every host, not just an old one.
+///
+/// Not a `debug_assert!`: that would kill a release plugin outright over a
+/// typo in a manifest. A warn-and-drop matches the host's own posture — the
+/// plugin's own log is the signal, and a stray click silently does nothing
+/// rather than the process dying.
+///
+/// Returns the survivors plus one diagnostic message per **newly** ungranted
+/// effect kind this session (review HIGH-1, #1058 fix round): this fn is pure
+/// and does no I/O, so it cannot itself put the message anywhere an author
+/// would see it. The caller is responsible for surfacing every returned
+/// message — both a [`PluginMsg::Log`] frame to the host (which routes it
+/// through its own `tracing::warn!`, reaching every host including one older
+/// than the dropped effect's own capability generation) and an `eprintln!`
+/// to the plugin's own stderr, matching every other author-facing diagnostic
+/// this runtime emits (`run`'s connect/redial/session-end lines). A bare
+/// `tracing::warn!` here would reach nobody: no plugin binary installs a
+/// `tracing` subscriber, and dropping the effect **before** the wire means
+/// the host-side diagnostics that used to fire for this exact mistake
+/// (`session::enforce_capabilities`'s warn, its audit record, the violation
+/// counter the control-center Plugins tab shows) go silent too — the
+/// `PluginMsg::Log` frame is what keeps at least one of those alive.
+///
+/// `warned` tracks which effect *kinds* (by [`std::mem::Discriminant`], not
+/// value — two `OpenUri` effects with different URIs are the same kind) have
+/// already produced a message this session, so a plugin looping on a bad
+/// click is named once, not once per frame.
+fn drop_ungranted_effects(
+    effects: Vec<Effect>,
+    granted: &[Capability],
+    warned: &mut std::collections::HashSet<std::mem::Discriminant<Effect>>,
+) -> (Vec<Effect>, Vec<String>) {
+    let mut messages = Vec::new();
+    let kept = effects
+        .into_iter()
+        .filter(|effect| {
+            let Some(cap) = effect.required_capability() else {
+                return true;
+            };
+            if granted.contains(&cap) {
+                return true;
+            }
+            if warned.insert(std::mem::discriminant(effect)) {
+                messages.push(format!(
+                    "effect {effect:?} requires capability {cap:?}, which this manifest didn't declare; dropped"
+                ));
+            }
+            false
+        })
+        .collect();
+    (kept, messages)
 }
 
 /// Minimum interval between full `view()` recomputation + dedup + `write_frame`
@@ -275,6 +337,14 @@ where
     let mut next_send_allowed = tokio::time::Instant::now();
     let mut pending = false;
 
+    // #1058: which effect *kinds* have already warned this session about a
+    // missing capability, so a plugin looping on a bad click logs once, not
+    // once per frame. `negotiation.capabilities` is the manifest's own grant
+    // set — cloned before `Register` moved the original — so this reads the
+    // exact list the host will enforce against.
+    let mut capability_warned: std::collections::HashSet<std::mem::Discriminant<Effect>> =
+        std::collections::HashSet::new();
+
     // `read_frame` is cancel-safe only at frame boundaries, so it must not
     // race in a `select!` arm (the losing future would drop mid-frame and
     // desync the stream). A reader task owns the read half and forwards whole
@@ -300,7 +370,7 @@ where
     let mut src = P::sources(cmd_rx).unwrap_or_else(|| Box::pin(tokio_stream::pending()));
     let mut src_done = false;
 
-    let result = loop {
+    let result = 'session: loop {
         let step = tokio::select! {
             frame = rx.recv() => match frame {
                 Some(Ok(HostMsg::StateSnapshot { snapshot })) => Step::Update(Input::Snapshot(snapshot)),
@@ -439,9 +509,43 @@ where
         // render frame), or the view changed AND the cap interval has elapsed
         // since the last send. A change within the interval is deferred: `pending`
         // arms the flush deadline (`next_send_allowed`) that delivers the
-        // coalesced trailing frame.
+        // coalesced trailing frame. Decided on the effects `update` actually
+        // returned, BEFORE the #1058 capability guard strips any — a step whose
+        // only output was an ungranted effect must still put a frame on the
+        // wire (review LOW-1): the host's own `runtime_render` (rendering flag,
+        // `last_seen`, the control-center's violation count) only refreshes
+        // when a frame arrives, and an all-dropped batch is not a reason to
+        // withhold one — it is exactly the "effects turned out empty" case
+        // `model.update` returning `Vec::new()` already takes this same path
+        // for.
         let send = !effects.is_empty() || (changed && now >= next_send_allowed);
         if send {
+            // #1058: drop anything the manifest didn't declare the capability
+            // for, right before framing — see `drop_ungranted_effects`. Every
+            // returned message must be surfaced twice: a `PluginMsg::Log` so
+            // the *host* names the mistake (review HIGH-1 — a bare
+            // `tracing::warn!` here reaches no plugin process, since none
+            // installs a subscriber, and dropping the effect before the wire
+            // silences the host-side warn/audit/violation-count this exact
+            // mistake used to produce), and `eprintln!` for the plugin's own
+            // stderr, matching every other author-facing line this runtime
+            // emits.
+            let (effects, warnings) =
+                drop_ungranted_effects(effects, &negotiation.capabilities, &mut capability_warned);
+            for msg in warnings {
+                eprintln!("[{plugin_id}] {msg}");
+                if let Err(e) = write_frame(
+                    &mut wr,
+                    &PluginMsg::Log {
+                        level: LogLevel::Warn,
+                        msg,
+                    },
+                )
+                .await
+                {
+                    break 'session Err(e);
+                }
+            }
             let frame = PluginMsg::Render {
                 tree: view.tree.clone(),
                 panel: view.panel.clone(),
@@ -454,7 +558,7 @@ where
                 effects,
             };
             if let Err(e) = write_frame(&mut wr, &frame).await {
-                break Err(e);
+                break 'session Err(e);
             }
             last_view = view;
             next_send_allowed = now + VIEW_MIN_INTERVAL;
@@ -563,9 +667,10 @@ mod tests {
     use hytte_plugin_proto::preem::PREEM_VOCAB;
     use hytte_plugin_proto::{
         AudioSpectrum, Capability, ClockState, ConsentDecision, Effect, EffectOutcome, EventKind,
-        HostMsg, Manifest, Mount, Node, Page, PluginMsg, SPECTRUM_BINS, StateKey, StateSnapshot,
-        VOCAB, VOCAB_UNCONDITIONAL, read_frame, write_frame,
+        HostMsg, LogLevel, Manifest, Mount, Node, Page, PluginMsg, SPECTRUM_BINS, StateKey,
+        StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, read_frame, write_frame,
     };
+    use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use std::time::Duration;
@@ -1131,6 +1236,103 @@ mod tests {
             Node::Label {
                 id: None,
                 text: format!("{:.2}", self.peak),
+                classes: Vec::new(),
+                tooltip: None,
+            }
+            .into()
+        }
+    }
+
+    /// #1058: emits `Effect::open_uri` on **every** click, and bumps its own
+    /// view text on every click too — so a click always changes `tree`, and a
+    /// dropped effect can never masquerade as "no frame sent" (the capability
+    /// guard and the render-dedup/effects-force-a-send rule stay independently
+    /// observable). `GRANTED` selects whether the manifest declares
+    /// [`Capability::OpenUri`] at all; everything else about the two
+    /// instantiations is identical.
+    struct Linker<const GRANTED: bool> {
+        clicks: u64,
+    }
+
+    impl<const GRANTED: bool> Plugin for Linker<GRANTED> {
+        type Msg = std::convert::Infallible;
+        type Cmd = std::convert::Infallible;
+
+        fn manifest() -> Manifest {
+            let mut m = Manifest::new("linker-test", Mount::SidebarTop);
+            if GRANTED {
+                m.capabilities = vec![Capability::OpenUri];
+            }
+            m
+        }
+
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+            Self { clicks: 0 }
+        }
+
+        fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
+            // `, ..` (#1058 review MEDIUM-3): #1083 adds `output` to
+            // `Input::Event` and marks it `#[non_exhaustive]`, editing every
+            // *existing* `Input::Event { node, kind }` arm in the tree to
+            // match — but it cannot edit this one, since it doesn't exist on
+            // whichever branch it was authored from. Legal today (the variant
+            // isn't `#[non_exhaustive]` yet) and forward-compatible with that
+            // PR, whichever of the two merges second.
+            if let Input::Event { node, kind, .. } = input
+                && node == "linker-btn"
+                && matches!(kind, EventKind::Click)
+            {
+                self.clicks += 1;
+                return vec![Effect::open_uri(self.clicks, "https://example.invalid/")];
+            }
+            Vec::new()
+        }
+
+        fn view(&self) -> View {
+            Node::Label {
+                id: Some("linker-lbl".to_owned()),
+                text: format!("clicks={}", self.clicks),
+                classes: Vec::new(),
+                tooltip: None,
+            }
+            .into()
+        }
+    }
+
+    /// #1058 review LOW-1: emits an ungranted effect on click but its view
+    /// **never changes** — deliberately unlike `Linker`, whose view text
+    /// bumps on every click and so would still force a send even if the
+    /// capability guard's placement regressed. Isolates "does an all-dropped
+    /// effects step still put a frame on the wire" from "did the view
+    /// change", which `Linker`'s own tests cannot.
+    struct SilentLinker;
+
+    impl Plugin for SilentLinker {
+        type Msg = std::convert::Infallible;
+        type Cmd = std::convert::Infallible;
+
+        fn manifest() -> Manifest {
+            Manifest::new("silent-linker-test", Mount::SidebarTop) // no capabilities
+        }
+
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+            Self
+        }
+
+        fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
+            if let Input::Event { node, kind, .. } = input
+                && node == "silent-btn"
+                && matches!(kind, EventKind::Click)
+            {
+                return vec![Effect::open_uri(1, "https://example.invalid/")];
+            }
+            Vec::new()
+        }
+
+        fn view(&self) -> View {
+            Node::Label {
+                id: Some("silent-lbl".to_owned()),
+                text: "constant".to_owned(),
                 classes: Vec::new(),
                 tooltip: None,
             }
@@ -2499,5 +2701,210 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         })
         .await;
+    }
+
+    // ── #1058: SDK-side capability guard ─────────────────────────────────────
+    //
+    // `drop_ungranted_effects` mirrors the host's own `session::
+    // enforce_capabilities` (proto's `Effect::required_capability` is the one
+    // mapping both call), so an author's own log names an undeclared effect
+    // before an old host's decode failure does. `Linker<GRANTED>` bumps its
+    // view text on *every* click, so a dropped effect never masquerades as "no
+    // frame sent" — the guard and the render-dedup/effects-force-a-send rule
+    // stay independently observable.
+    //
+    // The mismatch is asserted on the wire itself — a `PluginMsg::Log{Warn}`
+    // frame — rather than by installing a `tracing` subscriber (review
+    // HIGH-1/MEDIUM-4, #1058 fix round): the guard no longer calls
+    // `tracing::warn!` at all (nothing in this SDK does; no plugin process
+    // installs a subscriber, so it reached nobody), and a hand-rolled
+    // `Counting` subscriber here would have been the fifth copy of a shape
+    // #1044 is retiring elsewhere. Reading the actual frame is also a
+    // strictly stronger assertion: it pins what the host receives, not what a
+    // test-only observer sees.
+
+    /// A manifest that never declares [`Capability::OpenUri`], but whose
+    /// `update` emits `Effect::open_uri` on every click, gets that effect
+    /// dropped before it reaches the wire — but the frame still goes out
+    /// (the click also changes the view text), and the mismatch is named
+    /// **once for the whole session**, not once per frame: the first click's
+    /// `Log{Warn}` frame precedes its `Render`; the second click produces
+    /// only a `Render` (nothing else queued ahead of the `Pong` that follows).
+    ///
+    /// **Falsified** by deleting the [`super::drop_ungranted_effects`] call
+    /// from the session loop (both effects reappear and no `Log` frame ever
+    /// arrives), by deleting just the `Log`-frame `write_frame` call (the
+    /// first assertion turns red — a `Render` arrives where a `Log` was
+    /// expected), or by moving the `warned.insert(..)` check so it re-warns
+    /// every frame (a second `Log` frame arrives where the `Pong` was
+    /// expected).
+    #[tokio::test]
+    async fn an_undeclared_effect_is_dropped_and_warns_once_per_session() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            eat_handshake(&mut hrd, "linker-test").await;
+
+            let click = HostMsg::Event {
+                node: "linker-btn".to_owned(),
+                kind: EventKind::Click,
+                output: None,
+            };
+
+            // First click: the drop is visible on the wire ahead of the
+            // Render it also produces.
+            send(&mut hwr, &click).await;
+            let PluginMsg::Log { level, msg } = next_plugin_frame(&mut hrd).await else {
+                panic!("the first undeclared effect must warn via a Log frame");
+            };
+            assert_eq!(level, LogLevel::Warn);
+            assert!(
+                msg.contains("OpenUri") && msg.contains("capability"),
+                "the message should name the effect and the missing capability: {msg}",
+            );
+            let PluginMsg::Render { effects, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("a click that changes the view must still produce a Render frame");
+            };
+            assert!(
+                effects.is_empty(),
+                "the undeclared OpenUri effect must be dropped"
+            );
+
+            // Second click, same effect kind: the drop repeats, the warning
+            // does not.
+            send(&mut hwr, &click).await;
+            let PluginMsg::Render { effects, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("a click that changes the view must still produce a Render frame");
+            };
+            assert!(
+                effects.is_empty(),
+                "the undeclared OpenUri effect must be dropped again",
+            );
+
+            // And nothing is queued behind it either: a liveness round-trip
+            // proves no extra Log frame is waiting.
+            send(&mut hwr, &HostMsg::Ping { seq: 7 }).await;
+            assert!(
+                matches!(
+                    next_plugin_frame(&mut hrd).await,
+                    PluginMsg::Pong { seq: 7 }
+                ),
+                "no second Log frame may be queued after the second click",
+            );
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<Linker<false>, _, _>(prd, pwr), host);
+        assert!(result.is_ok());
+    }
+
+    /// The mirror case: a manifest that DOES declare [`Capability::OpenUri`]
+    /// gets the effect through untouched, with no `Log` frame at all.
+    #[tokio::test]
+    async fn a_declared_effect_is_framed() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            eat_handshake(&mut hrd, "linker-test").await;
+
+            send(
+                &mut hwr,
+                &HostMsg::Event {
+                    node: "linker-btn".to_owned(),
+                    kind: EventKind::Click,
+                    output: None,
+                },
+            )
+            .await;
+            let PluginMsg::Render { effects, .. } = next_plugin_frame(&mut hrd).await else {
+                panic!("a click must produce a Render frame");
+            };
+            assert_eq!(
+                effects,
+                vec![Effect::open_uri(1, "https://example.invalid/")],
+                "a declared capability lets its effect through unchanged",
+            );
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<Linker<true>, _, _>(prd, pwr), host);
+        assert!(result.is_ok());
+    }
+
+    /// #1058 review LOW-1: a step whose only output was an ungranted effect
+    /// must still put a frame on the wire — the host's own `runtime_render`
+    /// (the control-center's "rendering"/`last_seen` freshness signal) only
+    /// refreshes when a frame arrives, and an all-dropped batch is not a
+    /// reason to withhold one. `SilentLinker`'s view never changes, so
+    /// `changed` alone can never explain a send here — only the pre-guard
+    /// effects presence can.
+    ///
+    /// **Falsified** by deciding `send` on the post-guard (filtered) effects
+    /// instead of the effects `update` actually returned: with
+    /// `SilentLinker`'s view held constant, `send` then evaluates to `false`
+    /// for this click, so **neither** the `Log` nor the `Render` frame is
+    /// ever put on the wire — both reads below time out and this test reds
+    /// in seconds.
+    ///
+    /// Both reads are bounded (#1058 fix-round verification, LOW-1 finding):
+    /// a plain, unbounded `next_plugin_frame` doesn't fail under that
+    /// mutation, it **hangs** — the host future awaits a frame that is never
+    /// sent, so `tokio::join!` never completes, and in CI that's a job
+    /// burned to its own workflow timeout (#1011's shape) rather than a red
+    /// test. Bounding matches [`next_render`]'s own reasoning and the
+    /// `hidden_on`-flip test a few sessions up in this file.
+    #[tokio::test]
+    async fn an_all_dropped_step_still_sends_a_frame() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            eat_handshake(&mut hrd, "silent-linker-test").await;
+
+            send(
+                &mut hwr,
+                &HostMsg::Event {
+                    node: "silent-btn".to_owned(),
+                    kind: EventKind::Click,
+                    output: None,
+                },
+            )
+            .await;
+            // The click's effect is ungranted, so a `Log{Warn}` frame
+            // precedes the `Render` — not what this test is pinning; skip it.
+            let PluginMsg::Log { .. } =
+                tokio::time::timeout(Duration::from_secs(5), next_plugin_frame(&mut hrd))
+                    .await
+                    .expect("the ungranted effect must warn via a Log frame (within 5 s)")
+            else {
+                panic!("the ungranted effect must still warn via a Log frame");
+            };
+            let PluginMsg::Render { effects, .. } =
+                tokio::time::timeout(Duration::from_secs(5), next_plugin_frame(&mut hrd))
+                    .await
+                    .expect(
+                        "an all-dropped-effects step must still produce a Render frame \
+                         (within 5 s), even though the view itself never changes",
+                    )
+            else {
+                panic!(
+                    "an all-dropped-effects step must still produce a Render frame, \
+                     even though the view itself never changes"
+                );
+            };
+            assert!(effects.is_empty(), "the ungranted effect is still dropped");
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<SilentLinker, _, _>(prd, pwr), host);
+        assert!(result.is_ok());
     }
 }

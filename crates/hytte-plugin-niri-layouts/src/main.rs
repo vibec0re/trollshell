@@ -45,7 +45,7 @@
 //! | layout | proportion per column |
 //! | --- | --- |
 //! | `equal` | `1/n` each (so `n = 1` is full width) |
-//! | `golden` | first `0.75`, **every other one** `0.25` |
+//! | `golden` | first `0.75`, **every other one** `0.25` — or `0.618` / `0.382` (the golden ratio) on a screen narrower than 2560 logical px (#1052) |
 //! | `split` | `0.5` for every column |
 //!
 //! Those are **fractions**, which is the unit [`layout`] thinks in. niri's
@@ -65,11 +65,17 @@
 //! - **Golden reads as A**: the first column takes its share and every column
 //!   after it takes the narrow one, so a third and later column *scroll off to
 //!   the right* — which is what the issue's `[====] [==] ( .... ) [==]` sketch
-//!   draws. The **shares are 75/25**, not the 61.8/38.2 the first cut derived
-//!   from φ and not the 70/30 the round after it carried for a day: "hmm no
-//!   choom was thinking more like 75 : 25 I guess", `[ wide 75% ] [ narrow ]`.
+//!   draws. The **shares are 75/25** on Annika's ultrawide, not the 61.8/38.2
+//!   the first cut derived from φ and not the 70/30 the round after it carried
+//!   for a day: "hmm no choom was thinking more like 75 : 25 I guess",
+//!   `[ wide 75% ] [ narrow ]`.
 //!   [`Layout::proportions`](layout::Layout::proportions) is the only place any
-//!   proportion is decided.
+//!   proportion is decided **for a given pair**; [`layout::golden_pair`] is the
+//!   only place that pair is picked. #1052 (2026-09-10, "Can we make this
+//!   adaptive?") restored 61.8/38.2 for screens under 2560 logical px, since
+//!   the flat 75/25 left the narrow column too cramped to use on a laptop or
+//!   1080p/1440p monitor — the number is per-screen, not a single global
+//!   answer any more.
 //! - **Three inline glyph buttons** on the chip, not one chip opening a panel.
 //!   [`plugin`]'s `chip()` is the only place the arrangement lives; the button
 //!   ids `update` keys off would carry over to a panel unchanged.

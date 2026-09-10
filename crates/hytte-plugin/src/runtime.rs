@@ -2728,9 +2728,19 @@ mod tests {
     /// effects presence can.
     ///
     /// **Falsified** by deciding `send` on the post-guard (filtered) effects
-    /// instead of the effects `update` actually returned (this test reds — a
-    /// `Pong` arrives where the expected `Render` was, because no frame was
-    /// ever sent for the click).
+    /// instead of the effects `update` actually returned: with
+    /// `SilentLinker`'s view held constant, `send` then evaluates to `false`
+    /// for this click, so **neither** the `Log` nor the `Render` frame is
+    /// ever put on the wire — both reads below time out and this test reds
+    /// in seconds.
+    ///
+    /// Both reads are bounded (#1058 fix-round verification, LOW-1 finding):
+    /// a plain, unbounded `next_plugin_frame` doesn't fail under that
+    /// mutation, it **hangs** — the host future awaits a frame that is never
+    /// sent, so `tokio::join!` never completes, and in CI that's a job
+    /// burned to its own workflow timeout (#1011's shape) rather than a red
+    /// test. Bounding matches [`next_render`]'s own reasoning and the
+    /// `hidden_on`-flip test a few sessions up in this file.
     #[tokio::test]
     async fn an_all_dropped_step_still_sends_a_frame() {
         let (plugin_end, host_end) = duplex(64 * 1024);
@@ -2751,10 +2761,21 @@ mod tests {
             .await;
             // The click's effect is ungranted, so a `Log{Warn}` frame
             // precedes the `Render` — not what this test is pinning; skip it.
-            let PluginMsg::Log { .. } = next_plugin_frame(&mut hrd).await else {
+            let PluginMsg::Log { .. } =
+                tokio::time::timeout(Duration::from_secs(5), next_plugin_frame(&mut hrd))
+                    .await
+                    .expect("the ungranted effect must warn via a Log frame (within 5 s)")
+            else {
                 panic!("the ungranted effect must still warn via a Log frame");
             };
-            let PluginMsg::Render { effects, .. } = next_plugin_frame(&mut hrd).await else {
+            let PluginMsg::Render { effects, .. } =
+                tokio::time::timeout(Duration::from_secs(5), next_plugin_frame(&mut hrd))
+                    .await
+                    .expect(
+                        "an all-dropped-effects step must still produce a Render frame \
+                         (within 5 s), even though the view itself never changes",
+                    )
+            else {
                 panic!(
                     "an all-dropped-effects step must still produce a Render frame, \
                      even though the view itself never changes"

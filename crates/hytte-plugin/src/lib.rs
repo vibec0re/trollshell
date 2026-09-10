@@ -66,8 +66,10 @@
 //! **Since #1058 the runtime also checks this client-side**, using the same
 //! [`Effect::required_capability`](proto::Effect::required_capability) mapping
 //! the host enforces: an emitted effect the manifest didn't grant is dropped
-//! with a `warn!` in the *plugin's own log*, once per effect kind per session,
-//! before it ever reaches the wire — so an author sees their own mistake rather
+//! before it ever reaches the wire, once per effect kind per session — named
+//! with an `eprintln!` to the plugin's own stderr *and* a
+//! [`PluginMsg::Log`](proto::PluginMsg::Log) frame to the host (which routes
+//! it through its own journal), so an author sees their own mistake rather
 //! than a click that silently does nothing. **Getting that pairing wrong still
 //! costs more than the dropped effect** for a capability whose generation an
 //! older shell predates — `Shader` (#893), `OpenUri` (#1045) — declaring it is

@@ -1853,35 +1853,51 @@ kept = true
     /// in the owned set and the stale sweep **deleted** it — the one outcome
     /// [`schema_paths`]'s doc says this writer must never produce.
     ///
-    /// At the root and at depth in one test, because the fold hit them
-    /// differently: at depth `core.?` collapsed to `core`, naming a table the
-    /// schema owns. Both red on a `dotted_key` that matches on `?` in a string
-    /// (found by #1016's review).
+    /// At the root and at depth, because the fold hit them differently: at
+    /// depth `core.?` collapsed to `core`, naming a table the schema *owns*.
+    ///
+    /// The two costs are split into two tests deliberately — a single one would
+    /// panic on whichever assertion came first and leave the other unproven,
+    /// and it is the second that is the data loss. Both red on a `dotted_key`
+    /// that matches on `?` in a rendered string (found by #1016's review).
+    const WRAPPER_LOOKALIKE: [(&str, &str); 2] = [
+        (
+            "enabled = true\n\"?\" = 1\n\n[core]\ncolor = \"amber\"\nbrightness = 3\n",
+            "?",
+        ),
+        (
+            "enabled = true\n\n[core]\n\"?\" = 1\ncolor = \"amber\"\nbrightness = 3\n",
+            "core.?",
+        ),
+    ];
+
     #[test]
-    fn a_key_spelled_like_a_wrapper_hop_is_named_and_kept() {
-        for (existing, expected) in [
-            (
-                "enabled = true\n\"?\" = 1\n\n[core]\ncolor = \"amber\"\nbrightness = 3\n",
-                "?",
-            ),
-            (
-                "enabled = true\n\n[core]\n\"?\" = 1\ncolor = \"amber\"\nbrightness = 3\n",
-                "core.?",
-            ),
-        ] {
+    fn a_key_spelled_like_a_wrapper_hop_is_reported_under_its_own_name() {
+        for (existing, expected) in WRAPPER_LOOKALIKE {
             let loaded = assemble::<Leds>(&layers(&[existing])).expect("assembles");
             assert_eq!(
                 loaded.unknown_keys,
                 [expected],
                 "a `?` a user typed is a key, not a wrapper hop: {existing:?}"
             );
+        }
+    }
 
-            let mut value = loaded.config;
+    #[test]
+    fn a_key_spelled_like_a_wrapper_hop_survives_a_save() {
+        for (existing, _) in WRAPPER_LOOKALIKE {
+            let mut value = config_from(existing);
             value.core.brightness = 5;
+
             let out = render_overlay(existing, &value).expect("renders");
+
             assert!(
                 out.contains("\"?\" = 1"),
-                "…so the save must not delete it: {out}"
+                "the writer must never delete a key it did not recognise: {out}"
+            );
+            assert!(
+                out.contains("brightness = 5"),
+                "and the save itself still takes: {out}"
             );
         }
     }

@@ -819,6 +819,20 @@ mod tests {
         );
     }
 
+    /// The sentence a caller with no field-structured log can print, matching
+    /// [`MalformedUnset`]'s.
+    #[test]
+    fn an_inert_unset_says_what_is_wrong_in_one_line() {
+        assert_eq!(
+            InertUnset {
+                layer: 1,
+                key: "core.colr".into(),
+            }
+            .to_string(),
+            "core.colr is set by no layer, so unsetting it does nothing"
+        );
+    }
+
     /// Every offender is reported, not just the first, and one marker's typo
     /// does not mask its neighbour's.
     #[test]

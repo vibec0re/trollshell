@@ -1788,10 +1788,90 @@ mod tests {
     /// `JustOne` path, which is thread-sensitive. It can only *widen* interest
     /// (`enabled` is unconditionally true), so it cannot poison a sibling.
     fn capture() -> (Captured, tracing::dispatcher::DefaultGuard) {
+        keep_interest_alive();
         let captured = Captured::default();
         let guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(captured.clone()));
         tracing::callsite::rebuild_interest_cache();
         (captured, guard)
+    }
+
+    /// A `Dispatch` that stays registered for the life of the test binary and
+    /// is interested in everything — the thing that makes every capture in
+    /// this file deterministic.
+    ///
+    /// # The flake, and why `rebuild_interest_cache` alone does not close it
+    ///
+    /// `tracing-core` caches each callsite's `Interest` process-wide and
+    /// rebuilds it through `callsite::Rebuilder`. That rebuilder has a fast
+    /// path (`tracing-core-0.1.36/src/callsite.rs:544-573`): while
+    /// `has_just_one` is set — one live registered `Dispatch`, which is the
+    /// steady state of a test binary where captures come and go — it does
+    /// **not** iterate the registered dispatchers at all. It calls
+    /// `dispatcher::get_default`, i.e. *the rebuilding thread's own default*.
+    /// A sibling test thread that has no default and first touches one of
+    /// these callsites therefore registers it against `NoSubscriber`, whose
+    /// `register_callsite` is `Interest::never()` — cached globally, so the
+    /// `warn!` short-circuits and a capture on another thread observes
+    /// nothing.
+    ///
+    /// Measured on this branch: **14 / 30** full `--features system-tests`
+    /// runs failed `a_bad_value_leaves_every_other_key_applied` with
+    /// `left: []`, with `rebuild_interest_cache()` in place and with the
+    /// #1020 warm-up (touch the callsites before installing the subscriber)
+    /// in place. Both are insurance against a race they cannot win: the
+    /// poisoning thread is not this one, and it acts after the rebuild.
+    ///
+    /// # Why a keepalive does close it
+    ///
+    /// `has_just_one` is recomputed only inside `register_dispatch`, as
+    /// `dispatchers.len() <= 1` after pruning dead ones (`:551-558`). A
+    /// dispatch that never dies means the next registration always counts
+    /// **two**, so the fast path is switched off for the rest of the process
+    /// and every later rebuild — from any thread, with or without a default —
+    /// iterates the live dispatchers, which always include this one. Its
+    /// `register_callsite` is `Interest::always()`, and `Interest::and`
+    /// (`subscriber.rs:658-664`) degrades a disagreement to `sometimes`, never
+    /// to `never` — so a callsite can only ever end up `always` or
+    /// `sometimes`, and `sometimes` consults the *emitting* thread's
+    /// subscriber, which is the capture.
+    ///
+    /// It can only widen interest, exactly like the `rebuild_interest_cache()`
+    /// above it: it enables nothing, records nothing, and is never any
+    /// thread's default. The cost is that `warn!` macros build their event on
+    /// threads with no subscriber and hand it to `NoSubscriber` — invisible,
+    /// and confined to this test binary.
+    ///
+    /// No lock, and no discipline required from any other test — which is what
+    /// #1020 asked for and what a shared mutex over every capture test would
+    /// not give, since the poisoning thread need not be running a capture test
+    /// at all.
+    fn keep_interest_alive() {
+        static KEEPALIVE: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+
+        struct AlwaysInterested;
+        impl tracing::Subscriber for AlwaysInterested {
+            fn register_callsite(
+                &self,
+                _: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::always()
+            }
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        // `Dispatch::new` is what registers it; the `OnceLock` holds the only
+        // strong reference, so the registrar's `Weak` never dies.
+        KEEPALIVE.get_or_init(|| tracing::Dispatch::new(AlwaysInterested));
     }
 
     /// The deprecation lines, selected on the **exact** rendered message. A
@@ -2051,8 +2131,8 @@ mod tests {
     /// The production function itself since #1040 V3 — it used to be a
     /// hand-rolled replica of it, which is exactly why mutations to the real
     /// one survived.
-    fn watching(paths: Vec<PathBuf>) -> Watcher {
-        boot(&paths, &no_env()).1
+    fn watching(paths: &[PathBuf]) -> Watcher {
+        boot(paths, &no_env()).1
     }
 
     /// A [`CoreLedsService`] over a scratch overlay and a fake environment,
@@ -2074,7 +2154,7 @@ mod tests {
     /// An interval no test waits for: for the `start`-level tests, whose
     /// subject is the synchronous half and whose spawned poller must stay out
     /// of the way.
-    const NEVER: Duration = Duration::from_secs(3600);
+    const NEVER: Duration = Duration::from_hours(1);
 
     /// The payoff: an edit while the shell runs re-resolves without a restart.
     ///
@@ -2084,7 +2164,7 @@ mod tests {
     fn a_changed_file_is_picked_up() {
         let mut overlay = Overlay::new();
         overlay.write("style = \"lcd\"\n");
-        let mut watcher = watching(overlay.layers());
+        let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&no_env(), Deprecations::Silent);
         assert_eq!(current.style, DisplayStyle::Lcd);
 
@@ -2106,7 +2186,7 @@ mod tests {
     #[test]
     fn a_newly_created_file_is_picked_up() {
         let mut overlay = Overlay::new();
-        let mut watcher = watching(overlay.layers());
+        let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&no_env(), Deprecations::Silent);
         assert_eq!(
             current,
@@ -2135,7 +2215,7 @@ mod tests {
     fn a_file_caught_mid_edit_keeps_the_last_good_config() {
         let mut overlay = Overlay::new();
         overlay.write("style = \"crt\"\n");
-        let mut watcher = watching(overlay.layers());
+        let mut watcher = watching(&overlay.layers());
         let good = watcher.resolved(&no_env(), Deprecations::Silent);
         assert_eq!(good.style, DisplayStyle::Crt);
 
@@ -2168,7 +2248,7 @@ mod tests {
     fn a_bad_value_reloads_the_keys_beside_it() {
         let mut overlay = Overlay::new();
         overlay.write("style = \"crt\"\n");
-        let mut watcher = watching(overlay.layers());
+        let mut watcher = watching(&overlay.layers());
         let good = watcher.resolved(&no_env(), Deprecations::Silent);
 
         overlay.write("style = \"crt\"\ncolor = \"rainbow\"\nrows = \"many\"\n");
@@ -2196,7 +2276,7 @@ mod tests {
         let pinned = env(&[("TROLLSHELL_CORE_LEDS_STYLE", "crt")]);
         let mut overlay = Overlay::new();
         overlay.write("style = \"vfd\"\ncolor = \"heat\"\n");
-        let mut watcher = watching(overlay.layers());
+        let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&pinned, Deprecations::Silent);
         assert_eq!(current.style, DisplayStyle::Crt);
 
@@ -2228,7 +2308,7 @@ mod tests {
         let pinned = env(&[("TROLLSHELL_CORE_LEDS_STYLE", "crt")]);
         let mut overlay = Overlay::new();
         overlay.write("color = \"heat\"\n");
-        let mut watcher = watching(overlay.layers());
+        let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&pinned, Deprecations::Announce);
 
         let (captured, _guard) = capture();
@@ -2270,7 +2350,7 @@ mod tests {
         let broken = env(&[("TROLLSHELL_CORE_LEDS_STYLE", "plasma")]);
         let mut overlay = Overlay::new();
         overlay.write("color = \"heat\"\n");
-        let mut watcher = watching(overlay.layers());
+        let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&broken, Deprecations::Announce);
 
         let (captured, _guard) = capture();
@@ -2414,7 +2494,7 @@ mod tests {
     fn a_deleted_file_falls_back_to_the_defaults() {
         let mut overlay = Overlay::new();
         overlay.write("style = \"crt\"\ncolor = \"rainbow\"\n");
-        let mut watcher = watching(overlay.layers());
+        let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&no_env(), Deprecations::Silent);
         assert_eq!(current.style, DisplayStyle::Crt);
 
@@ -2441,7 +2521,7 @@ mod tests {
     fn a_watcher_starts_from_now() {
         let mut overlay = Overlay::new();
         overlay.write("style = \"lcd\"\n");
-        let mut watcher = watching(overlay.layers());
+        let mut watcher = watching(&overlay.layers());
 
         assert_eq!(
             watcher.poll(CoreLeds::default(), &no_env()),
@@ -2467,7 +2547,7 @@ mod tests {
     fn an_edit_inside_one_mtime_granule_is_still_seen() {
         let mut overlay = Overlay::new();
         overlay.write("style = \"lcd\"\n");
-        let mut watcher = watching(overlay.layers());
+        let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&no_env(), Deprecations::Silent);
         assert_eq!(current.style, DisplayStyle::Lcd);
 
@@ -2593,7 +2673,7 @@ mod tests {
         overlay.write("style = \"lcd\"\n");
         let layers = vec![base.path.clone(), overlay.path.clone()];
 
-        let mut watcher = watching(layers);
+        let mut watcher = watching(&layers);
         let current = watcher.resolved(&no_env(), Deprecations::Silent);
         assert_eq!(current.style, DisplayStyle::Lcd, "the overlay wins");
         assert_eq!(

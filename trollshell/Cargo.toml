@@ -32,7 +32,13 @@ hytte = { path = "../crates/hytte" }
 # *not* reached through a `hytte` re-export: the umbrella re-exports the four
 # runtime crates, and this is a leaf both the shell and a settings app link
 # directly.
-hytte-config = { path = "../crates/hytte-config" }
+#
+# `watch` is the live-reload half (#1044): the layer poller that turns a saved
+# edit into a re-dressed panel. It is a feature rather than a default because
+# it pulls tokio + futures-signals into what is otherwise a GTK-free, runtime-
+# free leaf, and the other consumer of that leaf — `trollshell-control-center`
+# — must not grow a runtime it never drives.
+hytte-config = { path = "../crates/hytte-config", features = ["watch"] }
 # Plugin host transport (#35 PR 2): the GTK-free wire protocol + its tokio
 # framing helpers. GTK/adw/futures-signals still go through `hytte`'s
 # re-exports; tokio + the proto crate aren't re-exported, so they're direct.
@@ -92,6 +98,13 @@ tracing-subscriber = { workspace = true, default-features = true, features = [
 # dev-dependency: the binary reaches GL only through `hytte-ui`'s `GlSurface`,
 # and links no GL crate of its own.
 hytte-gl = { path = "../crates/hytte-gl" }
+# The shared test plumbing (#1044): the process-wide tracing global default
+# that #1022 needs, the capture harness the config tests assert through, and
+# the scratch-overlay helper the live-reload tests drive. A **dev**-dependency
+# on purpose — the feature must never reach the shipped binary, and this is
+# what keeps `set_global_default` out of it. Same path as the normal
+# dependency above; cargo unifies the two for the test build only.
+hytte-config = { path = "../crates/hytte-config", features = ["test-support"] }
 # Host-side plugin-session tests (#305): `#[tokio::test]` needs `macros`, and the
 # "no visibility frame arrives" assertions need `time` (`tokio::time::timeout`).
 # `test-util` drives the paused-clock handshake-timeout test (#435). net/rt/sync

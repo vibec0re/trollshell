@@ -681,13 +681,19 @@ mod tests {
     }
 
     /// Same invariant, but with two *different* widths in play so a
-    /// wrong-output resolution actually diverges from the right one — the
-    /// single-output fixture above can't tell "resolved through the right
-    /// name" apart from "resolved through the wrong one" when there is only
-    /// one name to resolve. Deterministic now that [`outputs`] keeps the
-    /// niri-shaped `HashMap` rather than a flattened, arbitrarily-ordered
-    /// `Vec` (#1056 review, NIT-2) — the reviewer measured the equivalent
-    /// `Vec`-backed check catching a wrong-output mutant only 1 run in 6.
+    /// wrong-**name** resolution (M7-shaped: resolving off `output` instead
+    /// of `target_output_name`) actually diverges from the right answer —
+    /// the single-output fixture above can't tell "resolved through the
+    /// right name" apart from "resolved through the wrong one" when both
+    /// names map to the same width. This is deterministic regardless of
+    /// [`outputs`]'s `HashMap`-vs-`Vec` shape (#1056 review, NIT-2): a
+    /// keyed lookup by the *correct* name doesn't care what order the
+    /// output map iterates in. NIT-2 buys something narrower but real — a
+    /// mutant that also drops the name comparison (e.g. "take any output")
+    /// stays only probabilistically caught, because it inherits whatever
+    /// order the map's own randomised hasher produces; keying by name at
+    /// least removes the *assumption* that the map key and `Output.name`
+    /// never diverge, and the O(n) scan.
     #[test]
     fn golden_resolves_the_width_through_the_focused_workspaces_own_output_with_two_outputs() {
         let mut niri = Fake::two_columns();

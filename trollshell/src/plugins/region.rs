@@ -2208,6 +2208,29 @@ mod gtk_tests {
     /// that would have re-logged it is gone.
     #[gtk::test]
     fn log_hidden_on_change_fires_once_per_change_edge_not_per_render() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        const TARGET: &str = "trollshell::plugins::region";
+        struct Counting(Arc<AtomicU32>);
+        impl tracing::Subscriber for Counting {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                meta.target().starts_with(TARGET)
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+                tracing::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                if event.metadata().target().starts_with(TARGET) {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            fn enter(&self, _: &tracing::Id) {}
+            fn exit(&self, _: &tracing::Id) {}
+        }
+
         adw::init().expect("libadwaita init");
         let (tx, _rx) = mpsc::channel::<HostMsg>(4);
         let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -2237,28 +2260,8 @@ mod gtk_tests {
             Some("log-target-output"),
         );
 
-        const TARGET: &str = "trollshell::plugins::region";
-        struct Counting(std::sync::Arc<std::sync::atomic::AtomicU32>);
-        impl tracing::Subscriber for Counting {
-            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
-                meta.target().starts_with(TARGET)
-            }
-            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
-                tracing::Id::from_u64(1)
-            }
-            fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
-            fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
-            fn event(&self, event: &tracing::Event<'_>) {
-                if event.metadata().target().starts_with(TARGET) {
-                    self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            fn enter(&self, _: &tracing::Id) {}
-            fn exit(&self, _: &tracing::Id) {}
-        }
-
-        let count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        tracing::subscriber::with_default(Counting(std::sync::Arc::clone(&count)), || {
+        let count = Arc::new(AtomicU32::new(0));
+        tracing::subscriber::with_default(Counting(Arc::clone(&count)), || {
             // First frame: a genuine change from the seeded-empty `hidden_on`
             // (the new-card arm) — both lines are true here, so both fire once.
             reconcile_region(
@@ -2269,7 +2272,7 @@ mod gtk_tests {
                 Some("log-target-output"),
             );
             assert_eq!(
-                count.load(std::sync::atomic::Ordering::Relaxed),
+                count.load(Ordering::Relaxed),
                 2,
                 "the first frame must log both lines: this monitor is named in hidden_on, \
                  and the bogus name matches no attached monitor",
@@ -2285,7 +2288,7 @@ mod gtk_tests {
                 Some("log-target-output"),
             );
             assert_eq!(
-                count.load(std::sync::atomic::Ordering::Relaxed),
+                count.load(Ordering::Relaxed),
                 2,
                 "an identical repeat frame must log nothing more — this is what keying on \
                  the change edge means",
@@ -2306,7 +2309,7 @@ mod gtk_tests {
                 Some("log-target-output"),
             );
             assert_eq!(
-                count.load(std::sync::atomic::Ordering::Relaxed),
+                count.load(Ordering::Relaxed),
                 2,
                 "clearing hidden_on is a change with nothing to report, not a reason to log",
             );
@@ -2321,7 +2324,7 @@ mod gtk_tests {
                 Some("log-target-output"),
             );
             assert_eq!(
-                count.load(std::sync::atomic::Ordering::Relaxed),
+                count.load(Ordering::Relaxed),
                 4,
                 "the set returning is a new change edge and must log both lines again, not \
                  stay silent because it logged the same values once before",

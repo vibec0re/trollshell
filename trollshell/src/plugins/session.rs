@@ -200,12 +200,30 @@ const EFFECT_REFILL_PER_SEC: f64 = 1.0;
 /// "generous but bounded, not tight" posture as the shader node's
 /// [`MAX_SHADER_SOURCE_BYTES`](hytte_plugin_proto::MAX_SHADER_SOURCE_BYTES) /
 /// [`MAX_SHADER_DATA_BYTES`](hytte_plugin_proto::MAX_SHADER_DATA_BYTES).
+///
+/// This bounds **retention**, not the decode-time allocation: `read_frame`
+/// has already materialized the whole `Vec<String>` off the wire by the time
+/// [`capped_hidden_on`] runs (`read_frame` itself is bounded by the 16 MiB
+/// frame limit). What the cap actually saves is what [`SlotRender`] stores
+/// long-term and what every monitor's reconciler re-compares and
+/// `clone_from`s each frame (review LOW-2).
 pub(super) const MAX_HIDDEN_ON_ENTRIES: usize = 64;
 
 /// Max bytes in one `hidden_on` connector name. A real Wayland/DRM connector
 /// name (`"DP-2"`, `"HDMI-A-1"`, …) is a handful of ASCII bytes; 64 is
 /// generous headroom, not a tight fit.
 pub(super) const MAX_HIDDEN_ON_NAME_BYTES: usize = 64;
+
+/// Which shape violation [`capped_hidden_on`] latches (#1058 review MEDIUM-2):
+/// a `hidden_on` set is either over the entry-count cap or carries an
+/// oversized name — kept as separate slots, mirroring `preem_render::Warned`'s
+/// one-slot-per-diagnostic shape, so a set that trips one after already
+/// tripping the other still gets both messages once each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum HiddenOnViolation {
+    TooManyEntries,
+    NameTooLong,
+}
 
 /// Enforce the [`MAX_HIDDEN_ON_ENTRIES`] / [`MAX_HIDDEN_ON_NAME_BYTES`] shape
 /// cap on a decoded `Render.hidden_on` (#1058). Unlike [`enforce_capabilities`]
@@ -214,31 +232,48 @@ pub(super) const MAX_HIDDEN_ON_NAME_BYTES: usize = 64;
 /// good. It degrades to the empty set instead: no `hidden_on` means the card
 /// shows on every screen (#1050's own baseline), which is always a safe
 /// default, so an oversized set costs the plugin its per-screen hiding for
-/// that one frame rather than the whole render. One `warn!` names the plugin
-/// and the offending count/length.
-pub(super) fn capped_hidden_on(plugin_id: &str, hidden_on: Vec<String>) -> Vec<String> {
+/// that one frame rather than the whole render.
+///
+/// Pure — it does no logging itself, returning the survivors plus at most one
+/// `(HiddenOnViolation, message)` pair for the caller to warn with. This is
+/// deliberate (review MEDIUM-2): a plugin's `hidden_on` set does not change
+/// frame to frame, so an over-cap set is over-cap on **every** frame for the
+/// life of the connection — at the SDK's own ~30 Hz view-rate cap, an
+/// unlatched warning would be ~30 journal lines a second, forever, matching
+/// exactly the reasoning `shader_map::warn`'s latch documents for the shader
+/// caps. `violated` is the per-connection latch (owned by the caller, reset
+/// on reconnect — the same shape as `enforce_capabilities`'s
+/// `capability_warned` in `hytte-plugin`), so the message comes back only the
+/// first time a given kind is violated this connection; every frame after
+/// that still gets the empty set, just silently.
+pub(super) fn capped_hidden_on(
+    hidden_on: Vec<String>,
+    violated: &mut std::collections::HashSet<HiddenOnViolation>,
+) -> (Vec<String>, Option<(HiddenOnViolation, String)>) {
     if hidden_on.len() > MAX_HIDDEN_ON_ENTRIES {
-        tracing::warn!(
-            plugin = %plugin_id,
-            entries = hidden_on.len(),
-            cap = MAX_HIDDEN_ON_ENTRIES,
-            "Render.hidden_on carries more connector names than the cap; treating it as empty (card shows on every screen)",
+        let entries = hidden_on.len();
+        let msg = format!(
+            "Render.hidden_on carries {entries} connector names, over the {MAX_HIDDEN_ON_ENTRIES} cap; treating it as empty (card shows on every screen)"
         );
-        return Vec::new();
+        let violation = violated
+            .insert(HiddenOnViolation::TooManyEntries)
+            .then_some((HiddenOnViolation::TooManyEntries, msg));
+        return (Vec::new(), violation);
     }
     if let Some(over) = hidden_on
         .iter()
         .find(|name| name.len() > MAX_HIDDEN_ON_NAME_BYTES)
     {
-        tracing::warn!(
-            plugin = %plugin_id,
-            len = over.len(),
-            cap = MAX_HIDDEN_ON_NAME_BYTES,
-            "Render.hidden_on carries a connector name over the cap; treating the set as empty (card shows on every screen)",
+        let len = over.len();
+        let msg = format!(
+            "Render.hidden_on carries a connector name {len} bytes long, over the {MAX_HIDDEN_ON_NAME_BYTES} cap; treating the set as empty (card shows on every screen)"
         );
-        return Vec::new();
+        let violation = violated
+            .insert(HiddenOnViolation::NameTooLong)
+            .then_some((HiddenOnViolation::NameTooLong, msg));
+        return (Vec::new(), violation);
     }
-    hidden_on
+    (hidden_on, None)
 }
 
 /// Whether a non-blocking outbound push should keep its producer task running.
@@ -764,6 +799,12 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // cancel, so no partial read is lost mid-stream.
     let pong_seen = AtomicBool::new(false);
     let mut effect_rl = EffectRateLimiter::new();
+    // #1058 review MEDIUM-2: per-connection latch for `capped_hidden_on`'s two
+    // violation kinds, mirroring `effect_rl`'s per-connection scope (and the
+    // SDK's own `capability_warned`) — reset on every reconnect, so a
+    // long-lived misconfiguration is named once per connection, not once per
+    // frame.
+    let mut hidden_on_warned = HashSet::new();
     let reader = async {
         loop {
             match read_frame::<PluginMsg, _>(&mut rd).await {
@@ -788,6 +829,21 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                     let dropped =
                         u32::try_from(requested.saturating_sub(kept.len())).unwrap_or(u32::MAX);
                     super::runtime_render(&ctx.runtime, &plugin_id, dropped);
+                    // #1050: connector *names* are not validated here (nor
+                    // could they usefully be: this task has no monitor list,
+                    // and an output that is currently off is a legitimate
+                    // thing to name — each monitor's reconciler decides
+                    // whether a name is *its* name). The *shape* — how many
+                    // entries, how long each one is — is capped by
+                    // `capped_hidden_on` (#1058), since that bound has
+                    // nothing to do with which monitors exist. The cap is
+                    // pure (review MEDIUM-2); this is where its one warning
+                    // per connection per violation kind actually fires.
+                    let (hidden_on, violation) =
+                        capped_hidden_on(hidden_on, &mut hidden_on_warned);
+                    if let Some((_, msg)) = violation {
+                        tracing::warn!(plugin = %plugin_id, "{msg}");
+                    }
                     route_render(
                         ctx,
                         mount,
@@ -797,16 +853,7 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                             generation,
                             tree,
                             panel,
-                            // #1050: connector *names* are not validated here
-                            // (nor could they usefully be: this task has no
-                            // monitor list, and an output that is currently
-                            // off is a legitimate thing to name — each
-                            // monitor's reconciler decides whether a name is
-                            // *its* name). The *shape* — how many entries, how
-                            // long each one is — is capped by
-                            // `capped_hidden_on` (#1058), since that bound has
-                            // nothing to do with which monitors exist.
-                            hidden_on: capped_hidden_on(&plugin_id, hidden_on),
+                            hidden_on,
                             grants,
                             outbound: out_tx.clone(),
                         },

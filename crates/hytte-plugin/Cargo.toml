@@ -21,9 +21,6 @@ hytte-plugin-proto = { path = "../hytte-plugin-proto", features = ["tokio"] }
 # depends on `hytte-plugin` alone and every `hytte_plugin::preem::…` path it
 # already wrote keeps resolving.
 hytte-preem = { path = "../hytte-preem" }
-# `warn!` for the capability guard (#1058): a plugin author's own log should
-# name a manifest/effect mismatch, not just the host's.
-tracing = { workspace = true }
 tokio = { workspace = true, default-features = false, features = [
   "rt",
   "macros",

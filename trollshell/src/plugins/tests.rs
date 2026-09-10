@@ -40,9 +40,9 @@ use super::pump::{
 };
 use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
-    EFFECT_BURST, EffectRateLimiter, IdGuard, MAX_HIDDEN_ON_ENTRIES, MAX_HIDDEN_ON_NAME_BYTES,
-    OUTBOUND_CAPACITY, REGISTER_TIMEOUT, capped_hidden_on, enforce_capabilities, handle_conn,
-    push_gate, state_key_capability,
+    EFFECT_BURST, EffectRateLimiter, HiddenOnViolation, IdGuard, MAX_HIDDEN_ON_ENTRIES,
+    MAX_HIDDEN_ON_NAME_BYTES, OUTBOUND_CAPACITY, REGISTER_TIMEOUT, capped_hidden_on,
+    enforce_capabilities, handle_conn, push_gate, state_key_capability,
 };
 use super::shader_map::{self, Grants};
 use super::wire_map::{clamp_pixels_scale, pixels_len_ok, to_ui_node, to_wire_event};
@@ -2058,102 +2058,96 @@ fn enforce_capabilities_drops_ungranted_effects() {
 
 // ── #1058: the `Render.hidden_on` shape cap ──────────────────────────────────
 //
-// PR #1068 shipped `hidden_on: Vec<String>` with no length cap of its own —
-// bounded only by the 16 MiB frame limit — so a misbehaving plugin could post
-// a multi-megabyte connector list on every frame. `capped_hidden_on` is the
-// decode/route-time guard: at most `MAX_HIDDEN_ON_ENTRIES` names, each at
-// most `MAX_HIDDEN_ON_NAME_BYTES`. A violation is not fatal — it degrades to
-// the empty set (the card shows on every screen, #1050's own safe default),
-// with one `warn!` naming the plugin and the offending count/length.
-
-/// Counts `tracing::warn!` events from [`capped_hidden_on`] while it runs
-/// once, using the same warm-up-then-count shape as `shader_map`'s
-/// `counting_events` helper (#1058): the first thread to reach a
-/// `tracing::warn!` call site with no subscriber installed decides that
-/// callsite's `Interest` for the rest of the process, and libtest runs this
-/// file's tests concurrently. A warm-up call outside any subscriber (its
-/// result is discarded) forces the callsite into the registry under whatever
-/// interest exists then; installing the counting subscriber for the counted
-/// call **rebuilds** every already-registered callsite's interest against the
-/// now-live dispatchers, so nothing is left to race during the counted call
-/// itself.
-fn capped_hidden_on_counting_warnings(entries: Vec<String>) -> (Vec<String>, u32) {
-    use std::sync::Arc as StdArc;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    const TARGET: &str = "trollshell::plugins::session";
-    struct Counting(StdArc<AtomicU32>);
-    impl tracing::Subscriber for Counting {
-        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
-            meta.target().starts_with(TARGET)
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
-            tracing::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            if event.metadata().target().starts_with(TARGET) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        fn enter(&self, _: &tracing::Id) {}
-        fn exit(&self, _: &tracing::Id) {}
-    }
-
-    let _ = capped_hidden_on("warmup", entries.clone());
-
-    let count = StdArc::new(AtomicU32::new(0));
-    let result = tracing::subscriber::with_default(Counting(StdArc::clone(&count)), || {
-        capped_hidden_on("p", entries)
-    });
-    (result, count.load(Ordering::Relaxed))
-}
+// PR #1068 shipped `hidden_on: Vec<String>` with no length cap of its own; a
+// misbehaving plugin could otherwise make `SlotRender` retain (and every
+// monitor's reconciler re-compare and `clone_from`) a multi-megabyte connector
+// list on every frame — the decode itself is separately bounded by the 16 MiB
+// frame limit (review LOW-2). `capped_hidden_on` is the decode/route-time
+// guard: at most `MAX_HIDDEN_ON_ENTRIES` names, each at most
+// `MAX_HIDDEN_ON_NAME_BYTES`. A violation is not fatal — it degrades to the
+// empty set (the card shows on every screen, #1050's own safe default).
+//
+// `capped_hidden_on` is pure (review MEDIUM-2/MEDIUM-4, #1058 fix round): it
+// returns the violation instead of calling `tracing::warn!` itself, so the
+// "one warning per connection per violation kind" property is a plain
+// return-value assertion — no tracing subscriber, hand-rolled or otherwise,
+// needed to pin it.
 
 /// One entry over [`MAX_HIDDEN_ON_ENTRIES`] degrades the whole set to empty
-/// and warns exactly once.
+/// and reports the violation exactly once, even across repeated frames from
+/// the same connection.
 ///
 /// **Falsified** by dropping the entry-count check from `capped_hidden_on`
-/// (this test reds — the 65 names come straight through).
+/// (the first assertion reds — 65 names come straight through), or by
+/// dropping the `violated.insert(..)` gate so every call reports (the third
+/// assertion reds — the second frame reports again).
 #[test]
-fn hidden_on_over_the_entry_cap_becomes_empty_and_warns() {
+fn hidden_on_over_the_entry_cap_becomes_empty_and_warns_once() {
     let entries: Vec<String> = (0..=MAX_HIDDEN_ON_ENTRIES)
         .map(|i| format!("out{i}"))
         .collect();
     assert_eq!(entries.len(), MAX_HIDDEN_ON_ENTRIES + 1);
 
-    let (kept, warnings) = capped_hidden_on_counting_warnings(entries);
+    let mut violated = HashSet::new();
+    let (kept, violation) = capped_hidden_on(entries.clone(), &mut violated);
     assert!(
         kept.is_empty(),
         "one entry over the cap empties the whole set"
     );
-    assert_eq!(warnings, 1, "exactly one warning for the violation");
+    assert!(
+        matches!(violation, Some((HiddenOnViolation::TooManyEntries, _))),
+        "the first violating frame must report it: {violation:?}",
+    );
+
+    // Same connection, same violation, next frame: the cap still applies, but
+    // the report does not repeat.
+    let (kept_again, violation_again) = capped_hidden_on(entries, &mut violated);
+    assert!(kept_again.is_empty(), "the cap keeps applying every frame");
+    assert!(
+        violation_again.is_none(),
+        "a second frame from the same violation kind must not report again: {violation_again:?}",
+    );
 }
 
 /// One connector name over [`MAX_HIDDEN_ON_NAME_BYTES`] degrades the whole set
-/// to empty and warns exactly once, even when the entry count itself is fine.
+/// to empty and reports the violation, even when the entry count itself is
+/// fine — a distinct latch slot from the entry-count cap, so tripping this one
+/// after already tripping that one still reports.
 ///
 /// **Falsified** by dropping the per-name length check from
-/// `capped_hidden_on` (this test reds — the oversized name comes through
-/// unchanged).
+/// `capped_hidden_on` (the first assertion reds — the oversized name comes
+/// through unchanged).
 #[test]
 fn hidden_on_with_a_name_over_the_byte_cap_becomes_empty_and_warns() {
     let over_name = "x".repeat(MAX_HIDDEN_ON_NAME_BYTES + 1);
     let entries = vec!["DP-1".to_owned(), over_name];
 
-    let (kept, warnings) = capped_hidden_on_counting_warnings(entries);
+    let mut violated = HashSet::new();
+    // Trip the OTHER cap first, to prove the two slots are independent.
+    let many: Vec<String> = (0..=MAX_HIDDEN_ON_ENTRIES).map(|i| format!("o{i}")).collect();
+    let (_, first) = capped_hidden_on(many, &mut violated);
+    assert!(matches!(
+        first,
+        Some((HiddenOnViolation::TooManyEntries, _))
+    ));
+
+    let (kept, violation) = capped_hidden_on(entries, &mut violated);
     assert!(
         kept.is_empty(),
         "one oversized name empties the whole set, not just that entry",
     );
-    assert_eq!(warnings, 1, "exactly one warning for the violation");
+    assert!(
+        matches!(violation, Some((HiddenOnViolation::NameTooLong, _))),
+        "a different violation kind must still report, even with the other kind \
+         already latched: {violation:?}",
+    );
 }
 
 /// Right at both caps — [`MAX_HIDDEN_ON_ENTRIES`] entries, each exactly
 /// [`MAX_HIDDEN_ON_NAME_BYTES`] bytes — passes through byte-for-byte, in
-/// order, with no warning. The positive control for the two tests above: it
-/// proves the cap is inclusive (`>`, not `>=`) rather than accidentally
-/// rejecting a legitimately-sized frame.
+/// order, with no violation reported. The positive control for the two tests
+/// above: it proves the cap is inclusive (`>`, not `>=`) rather than
+/// accidentally rejecting a legitimately-sized frame.
 #[test]
 fn hidden_on_at_the_cap_passes_through_unchanged() {
     let entries: Vec<String> = std::iter::repeat_with(|| "x".repeat(MAX_HIDDEN_ON_NAME_BYTES))
@@ -2162,9 +2156,69 @@ fn hidden_on_at_the_cap_passes_through_unchanged() {
     assert_eq!(entries.len(), MAX_HIDDEN_ON_ENTRIES);
     assert!(entries.iter().all(|e| e.len() == MAX_HIDDEN_ON_NAME_BYTES));
 
-    let (kept, warnings) = capped_hidden_on_counting_warnings(entries.clone());
+    let mut violated = HashSet::new();
+    let (kept, violation) = capped_hidden_on(entries.clone(), &mut violated);
     assert_eq!(kept, entries, "at-cap input passes through unchanged");
-    assert_eq!(warnings, 0, "no warning for an in-bounds frame");
+    assert!(
+        violation.is_none(),
+        "no violation for an in-bounds frame: {violation:?}",
+    );
+}
+
+/// MEDIUM-1 (#1058 fix round): the cap's only production call site
+/// (`handle_conn`'s reader loop) is exercised end to end, not just the pure
+/// function — a 65-entry `hidden_on` sent over a real socketpair connection
+/// must reach the mounted card's `SlotRender.hidden_on` **empty**, mirroring
+/// `hidden_on_survives_the_wire_into_the_render_mailbox`'s in-bounds
+/// counterpart above.
+///
+/// **Falsified** by replacing `capped_hidden_on(hidden_on, &mut
+/// hidden_on_warned)` with a bare `hidden_on` at the route call site — this
+/// test reds (the mounted card keeps all 65 entries) while the rest of
+/// `cargo test -p trollshell` stays green, which is exactly the gap the
+/// review measured.
+#[tokio::test]
+async fn an_over_cap_hidden_on_reaches_the_mailbox_empty() {
+    let (_clock_tx, clock_rx) = watch::channel(None);
+    let (_vis_tx, vis_rx) = watch::channel(false);
+    let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+    let bar_center = ctx.bar_center.clone();
+
+    let (host_end, plugin_end) = UnixStream::pair().expect("socketpair");
+    tokio::spawn(async move { handle_conn(host_end, &ctx).await });
+
+    let (_prd, mut pwr) = plugin_end.into_split();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Register {
+            manifest: Manifest::new("hidden-on-flood", Mount::BarCenter),
+        },
+    )
+    .await
+    .expect("send Register");
+    let over_cap: Vec<String> = (0..=MAX_HIDDEN_ON_ENTRIES).map(|i| format!("o{i}")).collect();
+    write_frame(
+        &mut pwr,
+        &PluginMsg::Render {
+            tree: wire::Node::Label {
+                id: Some("t".into()),
+                text: "chip".into(),
+                classes: vec![],
+                tooltip: None,
+            },
+            panel: None,
+            hidden_on: over_cap,
+            effects: vec![],
+        },
+    )
+    .await
+    .expect("send Render");
+
+    let cards = wait_for_region(&bar_center).await;
+    assert!(
+        cards[0].hidden_on.is_empty(),
+        "an over-cap hidden_on must reach the mailbox empty, not the raw 65 entries",
+    );
 }
 
 // ── #484/#528 domain pushes: gating + projections ────────────────────────────

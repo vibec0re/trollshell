@@ -1016,6 +1016,47 @@ mod tests {
         );
     }
 
+    /// The rejection line a bad file value produces, **as a literal**.
+    ///
+    /// Every other assertion about [`InvalidValue`] compares one
+    /// `InvalidValue::of` against another, which is the same green-and-blind
+    /// shape #1040 F4 caught in `deprecations()`: it cannot see the value being
+    /// rendered as `style = plasma` (not TOML) instead of `style = "plasma"`
+    /// (what is actually in the file), and it cannot see the vocabulary being
+    /// reworded out from under the sentence it has to read inside.
+    ///
+    /// **Red if the value stops being quoted as the TOML it was written as**,
+    /// if the integer arm starts quoting, or if the sentence is reworded.
+    #[test]
+    fn a_rejected_value_is_reported_as_the_toml_it_was_written_as() {
+        assert_eq!(
+            with_style("plasma")
+                .validate()
+                .expect_err("plasma is not a skin")
+                .to_string(),
+            "style = \"plasma\" is not valid; expected one of vfd/lcd/oled/crt",
+            "a string key's value is quoted — `style = plasma` is not TOML at all"
+        );
+        assert_eq!(
+            with(|c| c.rows = Rows::Count(-2))
+                .validate()
+                .expect_err("-2 is not a row count")
+                .to_string(),
+            "rows = -2 is not valid; expected \"rect\" (or 0) for the automatic \
+             rectangle, or a row count from 1 to 64",
+            "…while an integer key's is bare"
+        );
+        assert_eq!(
+            with(|c| c.rows = Rows::Word("many".into()))
+                .validate()
+                .expect_err("many is not a row count")
+                .to_string(),
+            "rows = \"many\" is not valid; expected \"rect\" (or 0) for the automatic \
+             rectangle, or a row count from 1 to 64",
+            "…and `rows`' string arm quotes, because that is what the file says"
+        );
+    }
+
     /// The cap the diagnostic quotes is the cap the parser enforces.
     ///
     /// `ROWS.expected` spells the bound out for the reader ("a row count from

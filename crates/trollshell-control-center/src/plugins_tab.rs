@@ -70,6 +70,22 @@
 //! has already superseded — the latch is legitimately spent by then, so it is
 //! not there to help.
 //!
+//! # Transitions-only logging (#1017)
+//!
+//! [`on_poll_result`]'s `Err` arm used to log `"ListPlugins failed"`
+//! unconditionally — one line every [`PLUGIN_POLL_INTERVAL`] for the whole
+//! time the shell is down, the one poller `#1002`/`#1015` (the connection
+//! banner, the revision footer, and the AI Keys tab) left unconverted. It now
+//! remembers the last *applied* poll's failure state
+//! ([`PluginsState::last_failing`]) and logs only on a down→up or up→down
+//! edge (`crate::log_transition`, `crate::LogTransition` — lifted out of
+//! `ai_keys_tab`'s original private copy so this reuses the actual helper
+//! rather than a third hand-copy), matching `main.rs`'s `ShellProbeUi` and
+//! `ai_keys_tab`'s own guard. A stale, out-of-order completion (#983) is
+//! still dropped **before** this runs — [`PollGenerations::accept`] gates the
+//! whole of [`on_poll_result`], transition logging included, so a superseded
+//! result cannot flip `last_failing` on its way out.
+//!
 //! # `AdwBreakpointBin`, on contract (#856)
 //!
 //! #856 recorded what using that widget *off* contract costs: it warns once per
@@ -94,7 +110,9 @@ use adw::prelude::*;
 use gtk::glib;
 use hytte_bus::RetryPolicy;
 
-use crate::{CONTROL_IFACE, CONTROL_NAME, CONTROL_PATH, spawn_on_runtime};
+use crate::{
+    CONTROL_IFACE, CONTROL_NAME, CONTROL_PATH, LogTransition, log_transition, spawn_on_runtime,
+};
 
 // ── Plugins tab (#348) · runtime overlay (#423) · drill-down (#887) ──────────
 
@@ -389,6 +407,12 @@ struct PluginsState {
     /// or the `row-selected(None)` that removing rows emits — doesn't run the
     /// user-driven selection path and, with it, disturb navigation.
     selecting: Rc<Cell<bool>>,
+    /// Whether the most recently *applied* poll's outcome was a failure —
+    /// `None` before the first completion. Drives transitions-only logging
+    /// (#1017, mirrors `ai_keys_tab`'s field of the same name/shape): a run
+    /// of identical outcomes logs once, not once per poll — see
+    /// [`on_poll_result`].
+    last_failing: Rc<Cell<Option<bool>>>,
 }
 
 /// [`PluginsState`] with its widget handles held **weakly** — what the
@@ -425,6 +449,7 @@ struct WeakPluginsState {
     pending: Rc<RefCell<Option<PendingToggle>>>,
     syncing: Rc<Cell<bool>>,
     selecting: Rc<Cell<bool>>,
+    last_failing: Rc<Cell<Option<bool>>>,
 }
 
 /// [`PluginDetail`]'s widgets, weakly — see [`WeakPluginsState`].
@@ -462,6 +487,7 @@ impl PluginsState {
             pending: self.pending.clone(),
             syncing: self.syncing.clone(),
             selecting: self.selecting.clone(),
+            last_failing: self.last_failing.clone(),
         }
     }
 }
@@ -494,6 +520,7 @@ impl WeakPluginsState {
             pending: self.pending.clone(),
             syncing: self.syncing.clone(),
             selecting: self.selecting.clone(),
+            last_failing: self.last_failing.clone(),
         })
     }
 }
@@ -602,6 +629,7 @@ fn build_tab() -> (adw::BreakpointBin, PluginsState) {
         pending: Rc::new(RefCell::new(None)),
         syncing: Rc::new(Cell::new(false)),
         selecting: Rc::new(Cell::new(false)),
+        last_failing: Rc::new(Cell::new(None)),
     };
 
     connect_selection(&state);
@@ -900,6 +928,14 @@ fn refresh_plugins(state: &PluginsState) {
 /// from it, and letting it through would replace a live list with the
 /// "Unavailable" placeholder — parking the selection and blanking the
 /// snapshot — a second after a newer poll proved the shell is answering fine.
+///
+/// Logs on transitions only (#1017, `crate::log_transition` — see the module
+/// doc's "Transitions-only logging" section): a run of identical outcomes
+/// (`Err` or `Ok`) writes one journal line, not one per
+/// [`PLUGIN_POLL_INTERVAL`] tick. The transition check runs *after* the
+/// generation gate above, so a stale, out-of-order completion (#983) cannot
+/// flip [`PluginsState::last_failing`] on its way out — it never reaches this
+/// point.
 fn on_poll_result(state: &PluginsState, generation: u64, res: PollResult) {
     if !state.polls.accept(generation) {
         tracing::debug!(
@@ -908,6 +944,17 @@ fn on_poll_result(state: &PluginsState, generation: u64, res: PollResult) {
             "dropping an out-of-order plugin poll"
         );
         return;
+    }
+    let is_err = res.is_err();
+    let previous = state.last_failing.replace(Some(is_err));
+    match log_transition(previous, is_err) {
+        LogTransition::Failed => {
+            if let Err(err) = &res {
+                tracing::info!(%err, "ListPlugins failed");
+            }
+        }
+        LogTransition::Recovered => tracing::info!("ListPlugins recovered"),
+        LogTransition::None => {}
     }
     match res {
         Ok((units, states)) if !units.is_empty() => {
@@ -933,8 +980,7 @@ fn on_poll_result(state: &PluginsState, generation: u64, res: PollResult) {
             "No plugins installed",
             "Install a trollshell-plugin unit to manage it here.",
         ),
-        Err(err) => {
-            tracing::info!(%err, "ListPlugins failed");
+        Err(_) => {
             set_placeholder(
                 state,
                 PluginsView::Unavailable,
@@ -1853,6 +1899,8 @@ mod tests {
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use std::collections::HashMap;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use adw::prelude::*;
@@ -3424,5 +3472,165 @@ mod gtk_tests {
         );
 
         dismiss(&window);
+    }
+
+    // ── Transitions-only logging (#1017) ────────────────────────────────────
+    //
+    // Driven through `on_poll_result` with a real `tracing` subscriber, so
+    // these pin the *journal*, not just the state `log_transition`'s own
+    // hermetic tests in `main.rs` already cover — a mutation that computes
+    // the right `LogTransition` but forgets to act on it (or acts on the
+    // wrong arm) is invisible to those.
+
+    /// A `tracing` writer that collects every emitted line in memory, so a
+    /// test can count log lines rather than infer them from state.
+    ///
+    /// A local copy of `main.rs`'s `CapturedLog` — kept independent rather
+    /// than exported across a `pub(crate)` boundary for ~15 lines, the same
+    /// call this file's own `PollGenerations` doc makes against
+    /// `ai_keys_tab`'s copy.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture buffer is never held across a panic")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` with an `INFO` subscriber installed for this thread, and
+    /// return the lines it emitted mentioning `"ListPlugins"`.
+    ///
+    /// **Pre-registers both transition callsites first** (#1022/#1028 — see
+    /// `shader_map::tests::counting_events` in
+    /// `trollshell/src/plugins/shader_map.rs` for the full mechanism, and
+    /// `MEMORY.md`'s "tracing callsite Interest poisoning in tests"). `tracing`
+    /// caches an `Interest` per callsite, process-wide, decided by whichever
+    /// thread reaches it *first*; this file's own poll-ordering tests already
+    /// drive `on_poll_result` with `poll_err()`/`poll_ok(…)` on other threads
+    /// with **no** subscriber installed, and `cargo test` runs test functions
+    /// concurrently by default. If one of them reaches the "ListPlugins
+    /// failed" or "ListPlugins recovered" callsite first, `tracing-core`'s
+    /// fast path can cache `Interest::never()` for it — a cache that then
+    /// sticks for the rest of the process, and every count below silently
+    /// reads back `0`.
+    ///
+    /// The fix needs no lock and no discipline from any other test: running
+    /// `body`'s callsites once on a throwaway state, *before* this helper's
+    /// own subscriber goes live, forces both callsites into the global
+    /// registry (whatever interest they land on there is irrelevant);
+    /// installing the subscriber immediately after **rebuilds** the interest
+    /// of every already-registered callsite against the now-live dispatcher,
+    /// so the counted run that follows is not racing anything. The warm-up
+    /// cannot pollute the counted run's own count: it runs against a
+    /// throwaway `PluginsState`/buffer that the counted run never reads.
+    fn captured_transition_logs(body: impl FnOnce()) -> Vec<String> {
+        let (_warmup_bin, warmup) = build_tab();
+        on_poll_result(&warmup, warmup.polls.issue(), poll_err());
+        on_poll_result(&warmup, warmup.polls.issue(), poll_ok(&["clock"], "active"));
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturedLog(buffer.clone()))
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            body();
+        }
+        let bytes = buffer.lock().expect("no panic while capturing").clone();
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter(|line| line.contains("ListPlugins"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The defect's shape, and #1017's whole point: N consecutive failing
+    /// polls must write **one** `"ListPlugins failed"` line, not N.
+    ///
+    /// Falsified by deleting the `log_transition`/`last_failing` guard in
+    /// `on_poll_result` (reverting its `Err` arm to an unconditional
+    /// `tracing::info!`): every failing poll then logs, and this fails with
+    /// `left: 5, right: 1`.
+    #[gtk::test]
+    fn n_failing_polls_emit_exactly_one_failed_line() {
+        adw::init().expect("libadwaita init");
+        let (_bin, state) = build_tab();
+
+        let lines = captured_transition_logs(|| {
+            for _ in 0..5 {
+                let generation = state.polls.issue();
+                on_poll_result(&state, generation, poll_err());
+            }
+        });
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "five failing polls in a row must write one journal line, not five: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("ListPlugins failed"),
+            "the one line must be the failure, not something else: {lines:?}"
+        );
+    }
+
+    /// down → up → down: two `"ListPlugins failed"` lines (one per down
+    /// edge) and one `"ListPlugins recovered"` line (the single up edge),
+    /// with every repeated poll in between staying silent.
+    ///
+    /// Falsified the same way as the test above, and separately by a
+    /// mutation that folds `LogTransition::Recovered` into `::None` in
+    /// `log_transition` (the recovered count drops to 0) or that logs
+    /// `"ListPlugins failed"` unconditionally on every `Err` regardless of
+    /// `previous` (the failed count rises to 4).
+    #[gtk::test]
+    fn down_up_down_logs_two_failures_and_one_recovery() {
+        adw::init().expect("libadwaita init");
+        let (_bin, state) = build_tab();
+
+        let lines = captured_transition_logs(|| {
+            // Down (the very first poll ever): 1 failed line.
+            on_poll_result(&state, state.polls.issue(), poll_err());
+            // Still down: silence.
+            on_poll_result(&state, state.polls.issue(), poll_err());
+            // Up: 1 recovered line.
+            on_poll_result(&state, state.polls.issue(), poll_ok(&["clock"], "active"));
+            // Still up: silence.
+            on_poll_result(&state, state.polls.issue(), poll_ok(&["clock"], "active"));
+            // Down again: 1 more failed line.
+            on_poll_result(&state, state.polls.issue(), poll_err());
+            // Still down: silence.
+            on_poll_result(&state, state.polls.issue(), poll_err());
+        });
+
+        let failed = lines
+            .iter()
+            .filter(|line| line.contains("ListPlugins failed"))
+            .count();
+        let recovered = lines
+            .iter()
+            .filter(|line| line.contains("ListPlugins recovered"))
+            .count();
+        assert_eq!(failed, 2, "one line per down edge: {lines:?}");
+        assert_eq!(recovered, 1, "one line for the single up edge: {lines:?}");
+        assert_eq!(lines.len(), 3, "…and nothing else: {lines:?}");
     }
 }

@@ -562,6 +562,53 @@ impl ShellProbeUi {
     }
 }
 
+/// What (if anything) a transitions-only poller should log when its latest
+/// outcome (`is_err`) is compared against `previous` — the last **applied**
+/// outcome, `None` before the first completion (#1017).
+///
+/// Lifted out of `ai_keys_tab`'s original private copy (#1015) so a third
+/// poller — the Plugins tab's own `ListPlugins` poll (#1017) — imports the
+/// actual helper instead of hand-copying the same ten lines a second time.
+/// `ai_keys_tab` keeps its own copy rather than being retrofitted onto this
+/// one: that file is out of #1017's lane, and its own `PollGenerations` doc
+/// already argues that duplicating a small, independently-falsifiable type
+/// per tab is the right call for *that* mechanism — this is the same shape,
+/// made reusable so the next caller imports it rather than writing a fourth.
+///
+/// Pure so the rule is unit-tested with no display server and no `tracing`
+/// subscriber (see `banner_message_tests` below). `ShellProbeUi::apply`
+/// above predates this and keeps its own inline, message-*text*-keyed
+/// version (`shown`): this is deliberately coarser, asking only Ok-vs-Err —
+/// the same simplification `ShellProbeUi::reachable`'s own field doc makes
+/// for why a failure-*reason* change alone isn't worth a second log line to
+/// a consumer that only cares whether the endpoint answers at all.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LogTransition {
+    /// Same outcome as last time (or the very first poll succeeded) —
+    /// nothing to say.
+    None,
+    /// A run of successes (or the very first poll) just started failing.
+    Failed,
+    /// A run of failures just started succeeding again.
+    Recovered,
+}
+
+/// See [`LogTransition`]'s doc for the shape and why this is shared.
+pub(crate) fn log_transition(previous: Option<bool>, is_err: bool) -> LogTransition {
+    if previous == Some(is_err) {
+        return LogTransition::None;
+    }
+    if is_err {
+        LogTransition::Failed
+    } else if previous == Some(true) {
+        LogTransition::Recovered
+    } else {
+        // The very first poll ever, and it succeeded: matches the pre-#1017
+        // behaviour of never logging a bare success.
+        LogTransition::None
+    }
+}
+
 /// Format the connection banner's text from a [`probe_shell`] outcome. `None`
 /// means "hide the banner" (the shell answered); `Some` carries the text to
 /// show.
@@ -692,8 +739,8 @@ mod tests {
     use tracing_subscriber::filter::LevelFilter;
 
     use super::{
-        DEFAULT_LOG_LEVEL, build_env_filter, format_banner_message, format_revision_footer,
-        is_shell_not_running, should_probe_revision,
+        DEFAULT_LOG_LEVEL, LogTransition, build_env_filter, format_banner_message,
+        format_revision_footer, is_shell_not_running, log_transition, should_probe_revision,
     };
 
     // #780: with `RUST_LOG` unset, the effective filter must default to
@@ -896,6 +943,39 @@ mod tests {
         let up: Result<(String, String), hytte_bus::BusError> =
             Ok(("pong".to_owned(), "0.1.0".to_owned()));
         assert!(should_probe_revision(&up));
+    }
+
+    // ── Transitions-only logging (#1017, shared with `plugins_tab`) ─────────
+
+    #[test]
+    fn a_fresh_poller_failing_for_the_first_time_is_logged() {
+        assert_eq!(log_transition(None, true), LogTransition::Failed);
+    }
+
+    #[test]
+    fn a_fresh_poller_succeeding_for_the_first_time_is_quiet() {
+        // Matches the pre-#1017 behaviour: a bare success was never logged.
+        assert_eq!(log_transition(None, false), LogTransition::None);
+    }
+
+    #[test]
+    fn a_repeated_failure_is_not_logged_again() {
+        assert_eq!(log_transition(Some(true), true), LogTransition::None);
+    }
+
+    #[test]
+    fn a_repeated_success_is_not_logged_again() {
+        assert_eq!(log_transition(Some(false), false), LogTransition::None);
+    }
+
+    #[test]
+    fn recovering_from_a_failure_is_logged() {
+        assert_eq!(log_transition(Some(true), false), LogTransition::Recovered);
+    }
+
+    #[test]
+    fn a_success_going_to_failure_is_logged() {
+        assert_eq!(log_transition(Some(false), true), LogTransition::Failed);
     }
 }
 

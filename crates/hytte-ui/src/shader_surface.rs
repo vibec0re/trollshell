@@ -447,6 +447,18 @@ mod imp {
         /// which is not keyed by anything a plugin controls — its own bool, so
         /// it cannot mask a compile failure or be masked by one.
         warned_resources: Cell<bool>,
+        /// One-shot latch for "the **data texture** could not be allocated"
+        /// (#977) — a driver refusing the grid the plugin asked for.
+        ///
+        /// Its own bool for the same reason [`warned_resources`] is: it is a
+        /// different failure with a different fix (reshape the buffer) from
+        /// both the build failure above and the compile failure below, and a
+        /// shared latch would let whichever fired first swallow the others.
+        /// Before this, a refused allocation returned `false` from
+        /// `upload_data` and the frame was skipped in silence — every frame,
+        /// for the life of the surface, with a black rect on screen and not one
+        /// journal line anywhere in the process.
+        warned_data: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -640,7 +652,22 @@ mod imp {
             // grid is no longer the one `state.data_size` describes — so the
             // frame is skipped rather than drawn with `u_data_size` lying about
             // what `u_data` holds (#968 review L7). The next frame retries.
-            if !upload_data(&gl, data, data_shape, data_source, &state) {
+            //
+            // …and it says so once (#977). A grid the driver will not allocate
+            // used to be indistinguishable, from outside the process, from a
+            // shader that draws black: no error, no line, every frame, for the
+            // life of the surface.
+            if let Err(error) = upload_data(&gl, data, data_shape, data_source, &state) {
+                if !self.warned_data.replace(true) {
+                    tracing::warn!(
+                        %error,
+                        data_width = state.data_size.0,
+                        data_height = state.data_size.1,
+                        "a plugin shader's data texture could not be allocated; the widget \
+                         draws nothing until the plugin sends a grid this driver will take \
+                         (further occurrences on this surface are silenced)"
+                    );
+                }
                 return;
             }
 
@@ -763,34 +790,49 @@ mod imp {
     /// A free function over the three fields it touches rather than a method on
     /// `Resources`, so the compiled program borrowed out of the same struct
     /// stays live across it — see the destructuring in `draw`.
+    ///
+    /// `Err` means **skip this frame**, and carries why so the caller can put
+    /// it in the journal once (#977); `Ok` means the texture matches `state`.
     fn upload_data(
         gl: &hgl::Gl,
         data: &mut hgl::Texture,
         data_shape: &mut (u32, u32, super::ShaderFormat),
         data_source: &mut Option<Arc<[u8]>>,
         state: &ShaderState,
-    ) -> bool {
+    ) -> Result<(), hgl::Error> {
         let (w, h) = (state.data_size.0.max(1), state.data_size.1.max(1));
         let shape = (w, h, state.format);
         if *data_shape != shape {
-            let Ok(texture) = hgl::Texture::new(gl, state.format.as_gl(), w, h) else {
-                // **The frame is skipped, not drawn.** The old texture is still
-                // bound and still holds the *old* grid, while `set_uniforms`
-                // would publish `u_data_size` from the new `state` — one frame
-                // sampled against a size that does not describe what is bound
-                // (#968 review L7). Nothing is left inconsistent: the shape is
-                // not advanced, so the next frame retries the allocation.
-                //
-                // **Uncovered, stated rather than implied.** Reaching this arm
-                // needs `Texture::new` to fail, which needs a live context that
-                // refuses an allocation — CI has no GL at all, so there is no
-                // hermetic way in. The same honest gap #954 recorded for
-                // `fresh_last_drawn`'s call site. What *is* covered is the
-                // decision the caller makes with the `false` (it returns before
-                // `set_uniforms`), by reading, and the rest of this function's
-                // dedup, by `would_upload`'s own test.
-                *data_source = None;
-                return false;
+            let texture = match hgl::Texture::new(gl, state.format.as_gl(), w, h) {
+                Ok(texture) => texture,
+                Err(error) => {
+                    // **The frame is skipped, not drawn.** The old texture is
+                    // still bound and still holds the *old* grid, while
+                    // `set_uniforms` would publish `u_data_size` from the new
+                    // `state` — one frame sampled against a size that does not
+                    // describe what is bound (#968 review L7). Nothing is left
+                    // inconsistent: the shape is not advanced, so the next
+                    // frame retries the allocation.
+                    //
+                    // Before #977 this arm was unreachable for the case that
+                    // matters: `Texture::new` never asked the driver, so a
+                    // `glTexStorage2D` that failed with `GL_INVALID_VALUE`
+                    // still returned `Ok` and the shape *was* advanced, onto a
+                    // texture with no storage. Now it fails honestly, the
+                    // retry is real, and the caller writes one line.
+                    //
+                    // **Still uncovered on the GL side, stated rather than
+                    // implied.** Reaching it needs a live context that refuses
+                    // an allocation, and CI has no GL at all — the same honest
+                    // gap #954 recorded for `fresh_last_drawn`'s call site.
+                    // What *is* covered is the extent decision itself
+                    // (`hytte-gl`'s `checked_extent` tests), the host-side
+                    // refusal that stops most such grids ever arriving
+                    // (`shader_map`'s per-axis cap), and this function's dedup
+                    // (`would_upload`'s own test).
+                    *data_source = None;
+                    return Err(error);
+                }
             };
             *data = texture;
             *data_shape = shape;
@@ -801,7 +843,7 @@ mod imp {
         // mapping pass this could never fire, and the whole data texture went to
         // the GPU on every render even when the bytes had not moved.
         if !would_upload(data_source.as_ref(), &state.data) {
-            return true;
+            return Ok(());
         }
         match state.format {
             super::ShaderFormat::R8 | super::ShaderFormat::Rgba8 => {
@@ -821,7 +863,7 @@ mod imp {
             }
         }
         *data_source = Some(Arc::clone(&state.data));
-        true
+        Ok(())
     }
 }
 

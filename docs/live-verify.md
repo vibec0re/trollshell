@@ -1162,8 +1162,9 @@ session.
       plugin ships a fragment body plus a data buffer; the shell compiles the
       body once and per frame re-uploads only the buffer. Everything up to the
       draw call is gated in CI — the wire round-trip, the capability check, the
-      two size caps, the program-reuse rule, the six reconciler sites, and the
-      demo's own shader body compiled by `nix/lint-glsl.py`. The draw, again, is
+      two size caps, the per-axis grid cap (#977), the kill-switch refusal
+      (#978), the program-reuse rule, the six reconciler sites, and the demo's
+      own shader body compiled by `nix/lint-glsl.py`. The draw, again, is
       yours.
   1. **It animates on glass.** Open `hytte-plugin-preem-demo`'s card: directly
      under the `Scope` there is now a second tile of the same shape, drawn by
@@ -1193,10 +1194,17 @@ session.
   4. **The same source does not recompile.** With the tile running, watch
      `RUST_LOG=hytte_ui=debug journalctl --user -u trollshell -f`. Every actual
      compile emits **one** `compiling a plugin shader` line carrying a
-     `source_key`, so the evidence is countable rather than an absence: across
-     thousands of frames of an unchanged shader there must be exactly **one**,
-     and editing the body and restarting the plugin must produce exactly one
-     more, with a _different_ key. The tile must not flicker as frames arrive,
+     `source_key`, so the evidence is countable rather than an absence. The unit
+     is **one per surface**, not one per shell: the program cache "lives on the
+     instance and dies with it" (`shader_surface.rs`), and `build_node` mounts
+     one `ShaderSurface` per monitor, so a healthy two-monitor shell prints
+     **two** and each unmap/remap of the tile adds one more. What must not
+     happen is a line per _frame_: across thousands of frames of an unchanged
+     shader the count must not move at all, and editing the body and restarting
+     the plugin must add exactly one per live surface, with a _different_ key.
+     (This check asked for "exactly one" across the whole shell until #978
+     re-read it; on a two-monitor session that gate failed on a correct shell.)
+     The tile must not flicker as frames arrive,
      and the beam must not jump back to the left edge — a rebuilt widget
      restarts `u_time`, which is what that would look like. The hermetic half is
      `the_same_source_is_compiled_once` in
@@ -1217,7 +1225,11 @@ session.
      shader host) named as the upgrade if a plugin is ever not trusted. The same
      goes for a **failed** context: the latch is sticky for the process and the
      shader widget has no CPU arm, so every shader stays a placeholder until the
-     shell restarts (`Refusal::NoGl` says why).
+     shell restarts (`Refusal::NoGl` says why). Since #981 that line has its own
+     warn-once slot (`Warned::ShaderNoGpu`), so an earlier plugin-side refusal
+     can no longer swallow it — before that, one plugin shipping one over-cap
+     source at startup spent the slot for the shell's whole run and a context
+     failure an hour later wrote nothing at all.
   7. **Alpha is premultiplied — the one contract clause no test can reach.**
      Everything else on this page is either gated hermetically or visible in the
      demo; this is neither, because `spectrum.frag` is opaque. Replace its body
@@ -1239,6 +1251,42 @@ session.
      Stated plainly: this was read off GDK's memory format
      (`GDK_MEMORY_DEFAULT`), not off a screen. It is the claim in this PR with
      the least evidence behind it.
+
+  8. **(#978)** **The kill switch turns plugin shaders off too.** This is the
+     one item on this page that #893's own list carried and the page then lost:
+     the spec calls `TROLLSHELL_PREEM_RENDERER=cpu` "the kill switch, forcing
+     CPU regardless of GL availability", and until #978 the one widget in the
+     shell running a _plugin's_ GPU code was the one widget that ignored it.
+     Restart the shell with `TROLLSHELL_PREEM_RENDERER=cpu` in the **unit's**
+     environment (`systemctl --user edit trollshell`, not your login shell — the
+     variable is read once, at the first `Scope` build) and open the
+     preem-demo card. The `Scope` chip must still draw, on the CPU kit
+     (that is check 2 of the entry above). The spectrum tile directly under it
+     must be **empty** — the broken-widget placeholder — and
+     `journalctl --user -u trollshell | grep -i 'kill switch'` must carry
+     exactly one line naming `TROLLSHELL_PREEM_RENDERER`. The negative half is
+     the part only glass can show:
+     `RUST_LOG=hytte_ui=debug journalctl --user -u trollshell | grep 'compiling a plugin shader'`
+     must be **empty** — no `GtkGLArea`, no GLES context, no plugin GLSL
+     compiled anywhere in the process. Unset it and restart: the tile comes
+     back and the line reappears.
+  9. **(#977)** **A data grid too wide for the GPU is refused, loudly.** Only
+     glass has a driver. Patch the demo plugin to send a 1-D grid over the
+     per-axis cap — in `crates/hytte-plugin-preem-demo`, set the shader node's
+     `data_width` to `32768` with a matching `vec![0u8; 32768]` `R8` buffer
+     (32 KiB, three orders of magnitude _under_ the 4 MiB byte cap, which is the
+     whole point) — then `cargo build -p hytte-plugin-preem-demo` and restart
+     just that plugin. The tile must go empty and
+     `journalctl --user -u trollshell | grep -i 'per-axis cap'` must carry one
+     line naming `data_width=32768` and `cap=4096`. Before #977 this was the
+     silent case: every host check passed, `glTexStorage2D` failed with
+     `GL_INVALID_VALUE`, `Texture::new` returned `Ok` on a texture with no
+     storage, and the widget sampled black for its whole life with **zero**
+     journal lines. To see the second half — the driver check rather than the
+     host cap — raise `MAX_SHADER_DATA_EXTENT` past your part's
+     `GL_MAX_TEXTURE_SIZE` (`glxinfo -l | grep GL_MAX_TEXTURE_SIZE`, typically 16384) and repeat with a grid between the two: the line then comes from
+     `hytte-ui` instead, saying the data texture could not be allocated and
+     carrying the driver's own limit. Put both back afterwards.
 
 ## Screen recording
 

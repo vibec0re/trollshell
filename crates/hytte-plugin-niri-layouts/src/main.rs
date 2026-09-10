@@ -9,8 +9,9 @@
 //!
 //! - **No arguments** → an ordinary out-of-process trollshell widget plugin: a
 //!   [`Mount::BarRight`](hytte_plugin::proto::Mount::BarRight) chip of three
-//!   Adwaita symbolic buttons, one per layout, shown only while the focused
-//!   workspace holds more than one window. See [`plugin`] and [`watch`].
+//!   Adwaita symbolic buttons, one per layout, shown **on each screen** only
+//!   while that screen's active workspace holds more than one window (#1050).
+//!   See [`plugin`] and [`watch`].
 //! - **`apply <equal|golden|split>`** → apply that layout and exit, so the very
 //!   same binary is a niri `spawn` bind with no shell involved:
 //!
@@ -35,7 +36,9 @@
 //! window is `n = 2`. (Issue #1019 question 3; this is the answer built here.)
 //!
 //! Windows are grouped by `Window.layout.pos_in_scrolling_layout` on the active
-//! workspace of the focused output. Floating windows are skipped, and so is
+//! workspace of the **target** output — the screen whose chip was clicked
+//! (#1050), or the focused one for a keybind, which is the only target the CLI
+//! hat has. Floating windows are skipped, and so is
 //! anything with no position in the scrolling layout — which is how a
 //! fullscreen window reports itself. Each column gets one request, addressed to
 //! its first tile, left to right. No tiled columns → no requests at all.
@@ -87,7 +90,10 @@
 //!   three names and the reason for each.
 //! - **The chip hides below two windows**: "Only show when more than 1 window
 //!   in workspace." There is no host niri state topic, so [`watch`] keeps the
-//!   count itself off a second `$NIRI_SOCKET` connection.
+//!   count itself off a second `$NIRI_SOCKET` connection — **per output**
+//!   since #1050, so screen B's chip follows screen B's workspace rather than
+//!   whichever screen holds keyboard focus. `View::hidden_on` carries that to
+//!   the host, and a click carries its own screen back.
 //!
 //! Counting **columns rather than windows** was the third question as the triage
 //! asked it, and stands as written — note that it is deliberately *not* the same
@@ -101,7 +107,7 @@ mod plugin;
 mod watch;
 
 use cli::{BIN, Invocation, USAGE};
-use plugin::{NiriLayouts, apply_and_report};
+use plugin::{NiriLayouts, apply_from_cli};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -114,23 +120,17 @@ fn main() -> ExitCode {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
-        // The standalone hat. Same `apply` the chip's click worker runs, so a
-        // keybind and a click cannot drift.
-        Ok(Invocation::Apply(layout)) => {
-            match apply_and_report(&mut niri::SocketTransport, layout) {
-                Some(plugin::Msg::Failed(error)) => {
-                    // niri's own text, verbatim — the CLI has no toast to put it in.
-                    eprintln!("{BIN}: {error}");
-                    ExitCode::FAILURE
-                }
-                // `None` is the success path. `Visible` is unreachable —
-                // `apply_and_report` only ever reports a refusal, and the chip's
-                // visibility is the watcher's message, which this hat never
-                // starts — but it is spelled out rather than wildcarded so a
-                // third `Msg` variant has to be decided here too.
-                None | Some(plugin::Msg::Visible(_)) => ExitCode::SUCCESS,
+        // The standalone hat. Same `apply` the chip's click worker runs (via
+        // `apply_from_cli`, which is where the "a keybind names no screen"
+        // decision lives and is tested), so a keybind and a click cannot drift.
+        Ok(Invocation::Apply(layout)) => match apply_from_cli(&mut niri::SocketTransport, layout) {
+            // niri's own text, verbatim — the CLI has no toast to put it in.
+            Some(error) => {
+                eprintln!("{BIN}: {error}");
+                ExitCode::FAILURE
             }
-        }
+            None => ExitCode::SUCCESS,
+        },
         Err(error) => {
             eprintln!("{BIN}: {error}\n\n{USAGE}");
             ExitCode::FAILURE

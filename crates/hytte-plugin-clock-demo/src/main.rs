@@ -94,7 +94,7 @@ impl Plugin for ClockDemo {
             // Our only interactive node is the button; a click asks the host
             // to open the power menu. The effect rides exactly one render
             // frame, so a clock tick never re-fires it.
-            Input::Event { node, kind } => {
+            Input::Event { node, kind, .. } => {
                 if node == CLOCK_BTN && matches!(kind, EventKind::Click) {
                     vec![Effect::OpenPage(Page::PowerMenu)]
                 } else {
@@ -235,10 +235,7 @@ mod tests {
     #[test]
     fn button_click_emits_open_power_menu_effect() {
         let mut model = fresh();
-        let effects = model.update(Input::Event {
-            node: CLOCK_BTN.to_owned(),
-            kind: EventKind::Click,
-        });
+        let effects = model.update(Input::event(CLOCK_BTN, EventKind::Click));
         assert_eq!(effects, vec![Effect::OpenPage(Page::PowerMenu)]);
     }
 
@@ -246,10 +243,7 @@ mod tests {
     #[test]
     fn click_on_unknown_node_is_ignored() {
         let mut model = fresh();
-        let effects = model.update(Input::Event {
-            node: "not-ours".to_owned(),
-            kind: EventKind::Click,
-        });
+        let effects = model.update(Input::event("not-ours", EventKind::Click));
         assert!(effects.is_empty());
     }
 

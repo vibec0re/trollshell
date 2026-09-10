@@ -1,5 +1,6 @@
-//! The widget hat: a three-button bar chip of Adwaita symbolic icons, shown
-//! only while the focused workspace holds more than one window.
+//! The widget hat: a three-button bar chip of Adwaita symbolic icons, shown on
+//! each screen only while **that screen's** active workspace holds more than
+//! one window.
 //!
 //! The chip is a `Row` of three `Button`s, each holding one
 //! [`Node::Icon`] whose glyph is the layout it applies. #1026 drew those three
@@ -14,21 +15,34 @@
 //! case" for a tooltip — so the legend hangs directly on the glyph. The
 //! intermediate `Node::Box` #1026 needed for that is gone with the pictograms.
 //!
-//! # Showing and hiding
+//! # Showing and hiding — per screen (#1050)
 //!
 //! "Only show when more than 1 window in workspace" (#1019). No host state
 //! topic carries that — [`StateKey`](hytte_plugin::proto::StateKey) knows
 //! nothing about niri — so [`crate::watch`] answers it in-process off a second
-//! niri connection and pushes a [`Msg::Visible`] whenever the answer flips.
-//! [`Plugin::view`] is then a two-way branch: the chip, or [`hidden`], an empty
-//! `Row` under the same root id so the host reuses the widget instead of
-//! rebuilding it.
+//! niri connection and pushes a [`Msg::Visibility`] whenever the answer flips.
+//!
+//! The answer is **one verdict per output**, not one global bool. A plugin
+//! renders one tree and the host mirrors it onto every monitor, so before #1050
+//! the chip on screen B followed screen A's window count — which is what Annika
+//! hit on glass. [`View::hidden_on`](hytte_plugin::View::hidden_on) (the host
+//! arm, #1068) is the lever: same tree everywhere, hidden on the screens whose
+//! active workspace is below the threshold. [`Plugin::view`] is still a two-way
+//! branch, and the second branch is still [`hidden`] — see its doc for why an
+//! all-screens-hidden `chip()` is *not* the same thing.
+//!
+//! The other half is the click: an event carries the connector of the screen it
+//! came from, and [`crate::niri::apply`] lays out **that** screen's active
+//! workspace. An event the host could not attribute (`output: None` — the
+//! drawer panel) falls back to the focused workspace, which is what the CLI hat
+//! gets too.
 //!
 //! **The chip starts hidden**, and stays hidden if niri is unreachable. That is
-//! deliberate: the model's initial `visible: false` and [`crate::watch::Watch`]'s
-//! initial verdict agree, so the very first frame the host renders is the same
-//! one the first event would produce, and a plugin session started outside a
-//! niri session shows nothing rather than a chip whose every click toasts.
+//! deliberate: the model's initial [`watch::Verdict::default`] and
+//! [`crate::watch::Watch`]'s initial verdict agree, so the very first frame the
+//! host renders is the same one the first event would produce, and a plugin
+//! session started outside a niri session shows nothing rather than a chip
+//! whose every click toasts.
 //!
 //! # Why the work happens on the command lane
 //!
@@ -72,9 +86,17 @@ fn icon_id(layout: Layout) -> String {
 }
 
 /// One click's worth of work, handed to the worker task.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Cmd {
-    Apply(Layout),
+    Apply {
+        layout: Layout,
+        /// The screen the click came from (#1050) — the connector name the host
+        /// stamped on the event. `None` = act on the focused output, which is
+        /// what an unattributable event (the drawer panel) and the CLI hat both
+        /// mean. Owned rather than borrowed because it crosses onto the
+        /// blocking pool.
+        output: Option<String>,
+    },
 }
 
 /// What this plugin's own sources send back.
@@ -83,16 +105,18 @@ pub(crate) enum Msg {
     /// niri refused an apply; its own text, for the one toast. A *successful*
     /// apply is visible on screen, so a toast for it would be noise.
     Failed(String),
-    /// The focused workspace crossed the show/hide threshold (#1019). Only ever
-    /// sent on a change — see [`watch::Watch::observe`].
-    Visible(bool),
+    /// Some output's active workspace crossed the show/hide threshold
+    /// (#1019/#1050). Only ever sent on a change — see
+    /// [`watch::Watch::observe`].
+    Visibility(watch::Verdict),
 }
 
 pub(crate) struct NiriLayouts {
     cmds: CmdSender<Cmd>,
-    /// Whether the focused workspace holds more than one window. Starts
-    /// `false`; see the module docs on why hidden is the right initial state.
-    visible: bool,
+    /// Which screens the chip belongs on, per [`watch`]. Starts at
+    /// [`Default`](watch::Verdict) — hidden everywhere; see the module docs on
+    /// why hidden is the right initial state.
+    visibility: watch::Verdict,
 }
 
 /// The button id for `layout`.
@@ -179,26 +203,71 @@ fn hidden() -> Node {
 ///
 /// Split out of the worker task so the click → apply → toast path is testable
 /// against a fake niri, with no runtime and no socket.
-pub(crate) fn apply_and_report(transport: &mut impl Transport, layout: Layout) -> Option<Msg> {
-    match niri::apply(transport, layout) {
+pub(crate) fn apply_and_report(
+    transport: &mut impl Transport,
+    layout: Layout,
+    on_output: Option<&str>,
+) -> Option<Msg> {
+    match niri::apply(transport, layout, on_output) {
         Ok(0) => {
-            // The one debug line the no-op case gets. stderr, which systemd
-            // routes to the journal for a plugin unit and to the terminal for
-            // the CLI hat.
-            eprintln!(
-                "[{PLUGIN_ID}] {}: no tiled columns on the focused workspace, nothing to do",
-                layout.id()
-            );
+            transport.log(&nothing_to_do_diagnostic(layout, on_output));
             None
         }
         Ok(columns) => {
-            eprintln!(
+            transport.log(&format!(
                 "[{PLUGIN_ID}] {}: set {columns} column width(s)",
                 layout.id()
-            );
+            ));
             None
         }
         Err(error) => Some(Msg::Failed(error)),
+    }
+}
+
+/// The one line the no-op case gets — the only feedback a human ever gets when
+/// a click lands on a screen niri no longer has a workspace for.
+///
+/// It names the screen when there was one, because "nothing to do" on a
+/// two-monitor desktop is otherwise ambiguous about *which* workspace was empty
+/// (#1050).
+///
+/// Built here rather than inline, and delivered through
+/// [`Transport::log`](crate::niri::Transport::log) rather than `eprintln!`
+/// (#1083 review, LOW-2): the log seam is what [`crate::niri::fake::Fake`]
+/// captures, so this line has a test instead of being the only diagnostic in
+/// the call path with no seam — its sibling in
+/// [`crate::niri::apply`] already goes the same way. In production both land on
+/// stderr, which systemd routes to the journal for a plugin unit and to the
+/// terminal for the CLI hat.
+fn nothing_to_do_diagnostic(layout: Layout, on_output: Option<&str>) -> String {
+    format!(
+        "[{PLUGIN_ID}] {}: no tiled columns on {}, nothing to do",
+        layout.id(),
+        on_output.map_or_else(
+            || "the focused workspace".to_owned(),
+            |name| format!("{name}'s active workspace"),
+        )
+    )
+}
+
+/// The standalone hat's whole apply: [`apply_and_report`] against the
+/// **focused** output, reduced to the one error line the CLI prints.
+///
+/// The `None` screen is a decision, not a placeholder: a keybind has no screen
+/// to have been clicked on, so #1050's per-screen targeting does not apply and
+/// this hat keeps the focused-output behaviour it has always had.
+///
+/// Split out of `main` so that decision has a test — `main` dials a real
+/// `$NIRI_SOCKET` and cannot be driven by the fake, so a `main` that started
+/// naming a screen would otherwise be caught by nothing (found by mutation).
+pub(crate) fn apply_from_cli(transport: &mut impl Transport, layout: Layout) -> Option<String> {
+    match apply_and_report(transport, layout, None) {
+        Some(Msg::Failed(error)) => Some(error),
+        // `Visibility` is unreachable — `apply_and_report` only ever reports a
+        // refusal, and the chip's visibility is the watcher's message, which
+        // this hat never starts — but it is spelled out rather than wildcarded
+        // so a third `Msg` variant has to be decided here too.
+        None | Some(Msg::Visibility(_)) => None,
     }
 }
 
@@ -212,8 +281,8 @@ pub(crate) fn apply_and_report(transport: &mut impl Transport, layout: Layout) -
 struct VisibilityLane(hytte_plugin::tokio::sync::mpsc::UnboundedSender<Msg>);
 
 impl watch::Verdicts for VisibilityLane {
-    fn send(&mut self, visible: bool) -> bool {
-        self.0.send(Msg::Visible(visible)).is_ok()
+    fn send(&mut self, verdict: watch::Verdict) -> bool {
+        self.0.send(Msg::Visibility(verdict)).is_ok()
     }
 
     fn open(&self) -> bool {
@@ -248,7 +317,7 @@ impl Plugin for NiriLayouts {
     fn init(cmds: CmdSender<Self::Cmd>) -> Self {
         Self {
             cmds,
-            visible: false,
+            visibility: watch::Verdict::default(),
         }
     }
 
@@ -288,14 +357,14 @@ impl Plugin for NiriLayouts {
             while let Some(cmd) = cmds.recv().await {
                 // Destructured on its own line, not folded into the `while let`
                 // pattern: a second `Cmd` variant must be a compile error here,
-                // where `while let Some(Cmd::Apply(..))` would instead treat it
-                // as a non-match and silently end the worker for the session.
-                let Cmd::Apply(layout) = cmd;
+                // where `while let Some(Cmd::Apply { .. })` would instead treat
+                // it as a non-match and silently end the worker for the session.
+                let Cmd::Apply { layout, output } = cmd;
                 // `Socket::send` is blocking std I/O, so it goes to the blocking
                 // pool rather than stalling the SDK's current-thread runtime
                 // (which is also servicing the host socket).
                 let outcome = hytte_plugin::tokio::task::spawn_blocking(move || {
-                    apply_and_report(&mut SocketTransport, layout)
+                    apply_and_report(&mut SocketTransport, layout, output.as_deref())
                 })
                 .await;
                 let report = match outcome {
@@ -315,22 +384,28 @@ impl Plugin for NiriLayouts {
 
     fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
         match input {
-            Input::Event { node, kind } => {
+            // `output` is the screen this click came from (#1050) — carried
+            // straight down to the worker, which hands it to `niri::apply` so
+            // the layout lands on *that* monitor's active workspace. `None`
+            // (the drawer panel) keeps the pre-#1050 focused-output behaviour.
+            Input::Event {
+                node, kind, output, ..
+            } => {
                 if matches!(kind, EventKind::Click)
                     && let Some(layout) = layout_for_node(&node)
                 {
                     // Err only once the session is tearing down, in which case
                     // the worker is gone and there is nothing to apply to.
-                    let _ = self.cmds.send(Cmd::Apply(layout));
+                    let _ = self.cmds.send(Cmd::Apply { layout, output });
                 }
                 Vec::new()
             }
             Input::App(Msg::Failed(error)) => vec![failure_toast(error)],
-            // The whole of the show/hide rule, host-side: fold it into the
+            // The whole of the show/hide rule, per screen: fold it into the
             // model and let `view` project it. No effect — the host re-renders
             // off the returned tree.
-            Input::App(Msg::Visible(visible)) => {
-                self.visible = visible;
+            Input::App(Msg::Visibility(verdict)) => {
+                self.visibility = verdict;
                 Vec::new()
             }
             // No host state is subscribed and no host effect is brokered, so
@@ -348,22 +423,53 @@ impl Plugin for NiriLayouts {
         }
     }
 
+    /// The chip, hidden on the screens that do not want it (#1050) — or the
+    /// collapsed tree, when no screen does.
+    ///
+    /// Two branches rather than "always `chip()`, hide it on every screen below
+    /// the threshold", although the second reads simpler. Two reasons, and
+    /// neither is the one you might expect — the host routes **both** the
+    /// card's own `set_visible` and the region-collapse rule through a single
+    /// `card_shows_here` predicate that already includes `hidden_on`
+    /// (`trollshell/src/plugins/region.rs`, #1068), so a fully-hidden `chip()`
+    /// would leave no pill and no `spacing` sliver either. The reasons that do
+    /// hold are:
+    ///
+    /// 1. **This plugin cannot enumerate the screens.** It knows only the
+    ///    connectors niri named in its workspace list. "Hide on every attached
+    ///    connector" is not a sentence it can say: the attached set is GDK's,
+    ///    it lives in the host, and the two can differ across a hot-plug.
+    /// 2. **A monitor GDK reports no connector for would keep the chip.**
+    ///    `hidden_on_this_output` returns `false` for a `None` connector — the
+    ///    deliberate safe direction, since showing an unwanted chip beats
+    ///    hiding a wanted one. Under the hide-everywhere approach such a screen
+    ///    would go on showing a chip nothing wants; the collapsed tree renders
+    ///    nothing, which hides it there too. That is a real correctness
+    ///    difference, and it is the one worth remembering.
+    ///
+    /// So: while any screen shows the chip, `hidden_on` hides it on the rest;
+    /// when none does, the plugin collapses the way it always did.
+    ///
+    /// The `hidden_on` list is deliberately **not** carried on the collapsed
+    /// branch: an empty tree is already invisible everywhere, and naming
+    /// screens on it would put bytes on the wire that decide nothing.
     fn view(&self) -> View {
-        // Bound rather than folded into one expression: `if a { x } else { y }
-        // .into()` binds the method call to the else-arm, not to the `if`.
-        let tree = if self.visible { chip() } else { hidden() };
-        tree.into()
+        if self.visibility.shows_anywhere {
+            View::new(chip()).hidden_on(self.visibility.hidden_on.clone())
+        } else {
+            hidden().into()
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Cmd, Msg, NiriLayouts, VisibilityLane, apply_and_report, button_id, chip, hidden, icon_id,
-        layout_for_node,
+        Cmd, Msg, NiriLayouts, VisibilityLane, apply_and_report, apply_from_cli, button_id, chip,
+        hidden, icon_id, layout_for_node,
     };
     use crate::layout::Layout;
-    use crate::niri::fake::Fake;
+    use crate::niri::fake::{self, Fake};
     use crate::watch::{self, Verdicts};
     use hytte_plugin::proto::{Capability, Effect, EventKind, Mount, Node};
     use hytte_plugin::{CmdReceiver, Input, Plugin, cmd_channel};
@@ -398,11 +504,26 @@ mod tests {
         (id.as_deref(), name.as_str(), tooltip.as_deref())
     }
 
-    /// A plugin whose visibility watcher has already said "yes".
+    /// A verdict with the chip up, hidden on `hidden_on` (#1050).
+    fn showing(hidden_on: &[&str]) -> watch::Verdict {
+        watch::Verdict {
+            hidden_on: hidden_on.iter().map(|s| (*s).to_owned()).collect(),
+            shows_anywhere: true,
+        }
+    }
+
+    /// The verdict for "no screen wants the chip" — [`watch::Verdict`]'s
+    /// default, and the model's own initial state.
+    fn nowhere() -> watch::Verdict {
+        watch::Verdict::default()
+    }
+
+    /// A plugin whose visibility watcher has already said "yes, on every
+    /// attached screen".
     fn shown() -> (NiriLayouts, CmdReceiver<Cmd>) {
         let (tx, rx) = cmd_channel();
         let mut plugin = NiriLayouts::init(tx);
-        plugin.update(Input::App(Msg::Visible(true)));
+        plugin.update(Input::App(Msg::Visibility(showing(&[]))));
         (plugin, rx)
     }
 
@@ -651,12 +772,12 @@ mod tests {
         let (tx, _rx) = cmd_channel();
         let mut plugin = NiriLayouts::init(tx);
 
-        let effects = plugin.update(Input::App(Msg::Visible(true)));
+        let effects = plugin.update(Input::App(Msg::Visibility(showing(&[]))));
         assert!(effects.is_empty(), "visibility is a render, not an effect");
         let shown = plugin.view().tree;
         assert_eq!(shown, chip(), "two windows: the chip is back");
 
-        plugin.update(Input::App(Msg::Visible(false)));
+        plugin.update(Input::App(Msg::Visibility(nowhere())));
         let gone = plugin.view().tree;
         assert_eq!(gone, hidden(), "back down to one window");
         // Stated against the *other* branch, not only against `hidden()`: with
@@ -668,6 +789,85 @@ mod tests {
             panic!("still a Row");
         };
         assert!(children.is_empty(), "and the hidden one holds no buttons");
+    }
+
+    /// #1050's visibility half: one tree, hidden on the screens whose active
+    /// workspace is below the threshold.
+    #[test]
+    fn a_mixed_verdict_renders_the_chip_hidden_on_the_quiet_screens() {
+        let (tx, _rx) = cmd_channel();
+        let mut plugin = NiriLayouts::init(tx);
+
+        plugin.update(Input::App(Msg::Visibility(showing(&["DP-2"]))));
+
+        let view = plugin.view();
+        assert_eq!(
+            view.tree,
+            chip(),
+            "the tree is the same everywhere — `hidden_on` is the only \
+             per-screen lever the wire has"
+        );
+        assert_eq!(
+            view.hidden_on,
+            vec!["DP-2".to_owned()],
+            "…and it names the screen whose workspace is quiet, verbatim"
+        );
+    }
+
+    /// The list is projected from the model, not accumulated: a screen that
+    /// filled up again leaves `hidden_on` on the very next render.
+    #[test]
+    fn a_screen_that_fills_up_drops_out_of_hidden_on() {
+        let (tx, _rx) = cmd_channel();
+        let mut plugin = NiriLayouts::init(tx);
+        plugin.update(Input::App(Msg::Visibility(showing(&["DP-1", "DP-2"]))));
+
+        plugin.update(Input::App(Msg::Visibility(showing(&["DP-2"]))));
+
+        assert_eq!(
+            plugin.view().hidden_on,
+            vec!["DP-2".to_owned()],
+            "DP-1 must not be left behind from the previous verdict"
+        );
+    }
+
+    /// With no screen above the threshold the plugin collapses **the way it
+    /// always did** — an empty tree, and no `hidden_on` at all.
+    ///
+    /// Not "the chip, hidden on every connector" — see [`NiriLayouts::view`]
+    /// for why. This test encodes the plugin-local half of that: a plugin that
+    /// cannot enumerate the attached screens has no way to write the list, so
+    /// the empty tree is the only thing it *can* say when the answer is "not
+    /// anywhere".
+    #[test]
+    fn no_screen_wanting_the_chip_collapses_to_the_empty_tree() {
+        let (tx, _rx) = cmd_channel();
+        let mut plugin = NiriLayouts::init(tx);
+        plugin.update(Input::App(Msg::Visibility(showing(&["DP-1"]))));
+
+        plugin.update(Input::App(Msg::Visibility(nowhere())));
+
+        let view = plugin.view();
+        assert_eq!(view.tree, hidden(), "#1042's collapse rule needs this");
+        assert!(
+            view.hidden_on.is_empty(),
+            "an empty tree is invisible everywhere on its own; naming screens \
+             on it would put bytes on the wire that decide nothing: {:?}",
+            view.hidden_on
+        );
+    }
+
+    /// The seed frame — before the watcher has said anything — is the collapsed
+    /// one, on every screen.
+    #[test]
+    fn the_first_frame_hides_the_chip_everywhere() {
+        let (tx, _rx) = cmd_channel();
+        let plugin = NiriLayouts::init(tx);
+
+        let view = plugin.view();
+
+        assert_eq!(view.tree, hidden());
+        assert!(view.hidden_on.is_empty());
     }
 
     /// The chip must survive a failure toast: a niri that refuses an apply says
@@ -686,24 +886,66 @@ mod tests {
         let (mut plugin, mut rx) = shown();
 
         for layout in Layout::ALL {
-            let effects = plugin.update(Input::Event {
-                node: button_id(layout),
-                kind: EventKind::Click,
-            });
+            let effects = plugin.update(Input::event(button_id(layout), EventKind::Click));
 
             assert!(effects.is_empty(), "the work is queued, not effected");
-            assert_eq!(drain(&mut rx), vec![Cmd::Apply(layout)]);
+            assert_eq!(
+                drain(&mut rx),
+                vec![Cmd::Apply {
+                    layout,
+                    output: None
+                }]
+            );
         }
+    }
+
+    /// #1050's click half: the connector the host stamped on the event rides
+    /// down to the worker, so the layout lands on the screen that was clicked.
+    #[test]
+    fn a_click_carries_the_screen_it_came_from_down_to_the_worker() {
+        let (mut plugin, mut rx) = shown();
+
+        plugin.update(Input::event_on(
+            button_id(Layout::Golden),
+            EventKind::Click,
+            Some("DP-2".to_owned()),
+        ));
+
+        assert_eq!(
+            drain(&mut rx),
+            vec![Cmd::Apply {
+                layout: Layout::Golden,
+                output: Some("DP-2".to_owned()),
+            }],
+            "the worker must be told which screen, or it falls back to the \
+             focused one — which is #1050 itself"
+        );
+    }
+
+    /// …and an event the host could not attribute (`output: None` — the drawer
+    /// panel) queues the fallback, rather than a screen invented here.
+    #[test]
+    fn an_unattributable_click_queues_no_screen_at_all() {
+        let (mut plugin, mut rx) = shown();
+
+        plugin.update(Input::event(button_id(Layout::Equal), EventKind::Click));
+
+        assert_eq!(
+            drain(&mut rx),
+            vec![Cmd::Apply {
+                layout: Layout::Equal,
+                output: None,
+            }],
+            "`None` means *not attributable*, and stays `None` all the way to \
+             `niri::apply`'s focused-output fallback"
+        );
     }
 
     #[test]
     fn a_click_on_an_unknown_node_queues_nothing() {
         let (mut plugin, mut rx) = shown();
 
-        plugin.update(Input::Event {
-            node: "niri-layouts".to_owned(),
-            kind: EventKind::Click,
-        });
+        plugin.update(Input::event("niri-layouts", EventKind::Click));
 
         assert!(drain(&mut rx).is_empty());
     }
@@ -712,10 +954,10 @@ mod tests {
     fn a_non_click_event_on_a_button_queues_nothing() {
         let (mut plugin, mut rx) = shown();
 
-        plugin.update(Input::Event {
-            node: button_id(Layout::Golden),
-            kind: EventKind::Scroll { dx: 0.0, dy: 1.0 },
-        });
+        plugin.update(Input::event(
+            button_id(Layout::Golden),
+            EventKind::Scroll { dx: 0.0, dy: 1.0 },
+        ));
 
         assert!(drain(&mut rx).is_empty(), "only a click applies a layout");
     }
@@ -747,16 +989,19 @@ mod tests {
         niri.action_error = Some("no such window".to_owned());
 
         // 1. The click queues the layout…
-        plugin.update(Input::Event {
-            node: button_id(Layout::Golden),
-            kind: EventKind::Click,
-        });
+        plugin.update(Input::event(button_id(Layout::Golden), EventKind::Click));
         let queued = drain(&mut rx);
-        assert_eq!(queued, vec![Cmd::Apply(Layout::Golden)]);
+        assert_eq!(
+            queued,
+            vec![Cmd::Apply {
+                layout: Layout::Golden,
+                output: None
+            }]
+        );
 
         // 2. …the worker body applies it and reports the failure…
-        let Cmd::Apply(layout) = queued[0];
-        let report = apply_and_report(&mut niri, layout);
+        let Cmd::Apply { layout, output } = &queued[0];
+        let report = apply_and_report(&mut niri, *layout, output.as_deref());
         assert_eq!(report, Some(Msg::Failed("no such window".to_owned())));
 
         // 3. …and folding that back in yields exactly one toast with niri's text.
@@ -767,6 +1012,70 @@ mod tests {
                 summary: "niri layout failed".to_owned(),
                 body: "no such window".to_owned(),
             }]
+        );
+    }
+
+    /// The worker's own seam carries the screen through to `niri::apply`
+    /// (#1050).
+    ///
+    /// Added because a mutation found the gap: `apply_and_report` could pass
+    /// `None` down and every test stayed green — the click test above stops at
+    /// the queued `Cmd`, and `niri::apply`'s own per-screen tests call it
+    /// directly. This is the one line between them, and it is the line the
+    /// worker task actually runs.
+    #[test]
+    fn the_worker_seam_hands_the_screen_to_niri_apply() {
+        let mut niri = Fake::two_outputs();
+
+        let report = apply_and_report(&mut niri, Layout::Split, Some(fake::OTHER_OUTPUT));
+
+        assert_eq!(report, None, "a successful apply reports nothing to toast");
+        assert_eq!(
+            niri.widths(),
+            vec![(30, 50.0), (40, 50.0), (50, 50.0)],
+            "DP-2's three columns — the focused screen's two windows (10, 20) \
+             are what a dropped `on_output` would have resized"
+        );
+    }
+
+    /// The CLI hat names **no** screen and so targets the focused output —
+    /// unchanged by #1050, and now pinned.
+    ///
+    /// The `FocusedOutput` assertion is the load-bearing half: DP-1 *is* the
+    /// focused output in the fixture, so a `main` that started hard-coding
+    /// `Some("DP-1")` would resize the very same windows and only the missing
+    /// round trip would give it away (`niri::apply` skips it for a named
+    /// screen). Found by mutation — `main` dials a real socket, so nothing
+    /// covered this line before it moved here.
+    #[test]
+    fn the_cli_hat_names_no_screen_and_lays_out_the_focused_one() {
+        let mut niri = Fake::two_outputs();
+
+        let error = apply_from_cli(&mut niri, Layout::Split);
+
+        assert_eq!(error, None, "the fake accepts every action");
+        assert_eq!(
+            niri.widths(),
+            vec![(10, 50.0), (20, 50.0)],
+            "DP-1's two columns, not DP-2's three"
+        );
+        assert!(
+            niri.queries().iter().any(|q| q == "FocusedOutput"),
+            "a keybind has no screen, so the focused one has to be asked for: \
+             {:?}",
+            niri.queries()
+        );
+    }
+
+    /// …and niri's refusal comes back as the line the CLI prints.
+    #[test]
+    fn the_cli_hat_hands_back_niris_own_error_text() {
+        let mut niri = Fake::two_outputs();
+        niri.action_error = Some("no such window".to_owned());
+
+        assert_eq!(
+            apply_from_cli(&mut niri, Layout::Equal),
+            Some("no such window".to_owned())
         );
     }
 
@@ -784,24 +1093,28 @@ mod tests {
         panic!("{what}");
     }
 
-    /// The lane the watcher thread sends on: it carries `Msg::Visible`, and a
-    /// dropped receiver — the end of a session — is reported both ways.
+    /// The lane the watcher thread sends on: it carries `Msg::Visibility`, and
+    /// a dropped receiver — the end of a session — is reported both ways.
     #[test]
     fn the_visibility_lane_carries_verdicts_and_reports_a_dropped_receiver() {
         let (tx, mut rx) = hytte_plugin::tokio::sync::mpsc::unbounded_channel();
         let mut lane = VisibilityLane(tx);
 
-        assert!(lane.send(true), "an open lane takes the verdict");
+        assert!(
+            lane.send(showing(&["DP-2"])),
+            "an open lane takes the verdict"
+        );
         assert!(lane.open());
         assert_eq!(
             rx.try_recv().ok(),
-            Some(Msg::Visible(true)),
-            "…and it arrives as the message `update` folds into `visible`"
+            Some(Msg::Visibility(showing(&["DP-2"]))),
+            "…and it arrives whole — the hidden-on list included, which is the \
+             only thing that distinguishes one screen's answer from another's"
         );
 
         drop(rx);
         assert!(
-            !lane.send(false),
+            !lane.send(nowhere()),
             "a dropped receiver is the shutdown signal `watch::run` returns on"
         );
         assert!(
@@ -854,7 +1167,7 @@ mod tests {
     fn a_successful_apply_reports_nothing_to_the_session() {
         let mut niri = Fake::two_columns();
 
-        assert_eq!(apply_and_report(&mut niri, Layout::Split), None);
+        assert_eq!(apply_and_report(&mut niri, Layout::Split, None), None);
         assert_eq!(
             niri.widths(),
             vec![(10, 50.0), (20, 50.0)],
@@ -868,9 +1181,46 @@ mod tests {
         let mut niri = Fake::with(Vec::new());
 
         assert_eq!(
-            apply_and_report(&mut niri, Layout::Equal),
+            apply_and_report(&mut niri, Layout::Equal, None),
             None,
             "a no-op gets a log line, not a toast"
+        );
+        // The log line, verbatim — written out rather than built from
+        // `nothing_to_do_diagnostic`, which would assert the function against
+        // itself. Nothing else in the suite reads this path's output.
+        assert_eq!(
+            niri.logs,
+            vec![
+                "[niri-layouts] equal: no tiled columns on the focused workspace, nothing to do"
+                    .to_owned()
+            ],
+            "the unattributed case still says 'the focused workspace'"
+        );
+    }
+
+    /// The no-op line names the **screen** when the click named one (#1050).
+    ///
+    /// This is the only feedback a human gets when a click lands on a screen
+    /// niri no longer has a workspace for — the exact hot-plug race
+    /// `niri::apply` documents. It went through `eprintln!` until #1083's
+    /// review (LOW-2), where nothing could see it: `apply_and_report` returns
+    /// `None` on this path, so hard-coding the message left the suite green.
+    #[test]
+    fn the_no_op_line_names_the_screen_the_click_came_from() {
+        let mut niri = Fake::two_outputs();
+
+        assert_eq!(
+            apply_and_report(&mut niri, Layout::Split, Some("DP-99")),
+            None,
+            "a screen niri does not know is a no-op, not a toast"
+        );
+        assert_eq!(
+            niri.logs,
+            vec![
+                "[niri-layouts] split: no tiled columns on DP-99's active workspace, nothing to do"
+                    .to_owned()
+            ],
+            "\"nothing to do\" on a two-monitor desktop has to say which screen"
         );
     }
 }

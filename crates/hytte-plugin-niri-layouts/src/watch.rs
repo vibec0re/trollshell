@@ -1,12 +1,12 @@
-//! "Does the focused workspace hold more than one window?" — tracked in this
-//! process, off a second niri connection.
+//! "Does the active workspace on **this** screen hold more than one window?" —
+//! tracked per output, in this process, off a second niri connection.
 //!
 //! Annika's third ask on #1019 (2026-09-10) is "Only show when more than 1
 //! window in workspace". The host has **no niri state topic** to subscribe to:
 //! [`StateKey`](hytte_plugin::proto::StateKey) covers `Clock`, `SlotVisible`,
 //! `Accent`, `AudioSpectrum` and friends, and nothing about windows or
 //! workspaces. So the plugin answers the question itself, the same way it
-//! already answers "which columns are on the focused workspace" — by talking to
+//! already answers "which columns are on this screen's workspace" — by talking to
 //! `$NIRI_SOCKET`.
 //!
 //! # Why a second connection
@@ -18,6 +18,39 @@
 //! connection of its own that nothing else writes to. That is exactly the split
 //! the shell itself runs (`hytte-services`' `niri.rs`: a long-lived listener
 //! plus a fresh socket per command).
+//!
+//! # One answer per screen (#1050)
+//!
+//! The verdict used to be a single `bool` off the **focused** workspace, and
+//! the host mirrors one tree onto every monitor, so screen B's chip showed
+//! screen A's answer — which is what Annika hit on glass (#1050). niri already
+//! carries the fix: every [`Workspace`](niri_ipc::Workspace) reports its
+//! `output` and whether it `is_active` **on that output**, so the fold keeps
+//! *every* output's active workspace and counts windows on each. The result is
+//! a [`Verdict`]: the connectors whose active workspace is below
+//! [`MIN_WINDOWS`], plus whether any output is above it at all.
+//!
+//! [`crate::plugin`] turns that into `View::hidden_on`, which is the only
+//! per-screen lever the wire has (#1068) — same tree everywhere, different
+//! visibility.
+//!
+//! Two consequences worth stating:
+//!
+//! - **A workspace with `output: None` is counted nowhere.** niri-ipc 26.4.0
+//!   is narrow about when that happens: the field "can be `None` if **no**
+//!   outputs are currently connected" — the whole-desktop case (every screen
+//!   asleep or unplugged), not one monitor of several going away. Unplugging
+//!   one of two re-homes its workspaces to the survivor and never reaches this
+//!   branch; the connector simply changes. Either way there is no screen to
+//!   show a chip on, so such a workspace's windows raise no output's count, and
+//!   they start counting again on the `WorkspacesChanged` that names an output.
+//! - **`WorkspaceActivated`'s `focused` flag no longer matters.** niri's own
+//!   docs: the event means the workspace is now active *on its output*, and all
+//!   others on that output are not; `focused` says whether it also took
+//!   keyboard focus. The old fold looked at nothing else, so a workspace switch
+//!   on the second monitor moved the one global answer. Per-output, the flag is
+//!   irrelevant — [`Watch::activate`] deactivates the siblings on the same
+//!   output and leaves every other output alone.
 //!
 //! # The shape
 //!
@@ -80,16 +113,18 @@
 
 use niri_ipc::socket::SOCKET_PATH_ENV;
 use niri_ipc::{Event, Reply, Request, Response};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-/// How many windows the focused workspace needs before the chip appears.
+/// How many windows an output's **active** workspace needs before the chip
+/// appears on that screen.
 ///
-/// "more than 1" (#1019) — so two.
+/// "more than 1" (#1019) — so two. Applied per output since #1050; see the
+/// module docs.
 pub(crate) const MIN_WINDOWS: usize = 2;
 
 /// The first reconnect delay, and the base the doubling starts from.
@@ -172,27 +207,71 @@ impl Drop for Live {
     }
 }
 
+/// The show/hide answer for **every screen at once** (#1050).
+///
+/// Two fields rather than one map because the two questions the plugin asks are
+/// different: `hidden_on` is the wire value
+/// ([`View::hidden_on`](hytte_plugin::View::hidden_on)) and `shows_anywhere`
+/// decides which *tree* is rendered at all. They cannot be derived from each
+/// other — an empty `hidden_on` means "nothing to hide", which is true both
+/// when every screen shows the chip and when niri has told us about no outputs
+/// yet.
+///
+/// [`Default`] is the pre-niri state: nothing hidden, nothing shown — the chip
+/// is absent everywhere, which is what [`Watch`]'s own doc promises and what
+/// [`crate::plugin::NiriLayouts`]'s initial model draws.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Verdict {
+    /// The connector names whose active workspace holds fewer than
+    /// [`MIN_WINDOWS`] windows — **sorted**, because this value is also the
+    /// dedup key: [`Watch::observe`] only emits when the verdict *changes*, and
+    /// two runs of the same fold that differed only in `HashMap` iteration
+    /// order would emit a spurious change on every niri event.
+    pub(crate) hidden_on: Vec<String>,
+    /// Whether at least one output's active workspace is at or above
+    /// [`MIN_WINDOWS`] — i.e. whether the chip is worth rendering at all.
+    pub(crate) shows_anywhere: bool,
+}
+
+/// What niri says about one workspace, reduced to the two facts the verdict
+/// needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Slot {
+    /// The connector this workspace lives on. `None` is what niri reports when
+    /// **no outputs are connected at all** (niri-ipc 26.4.0: "Can be `None` if
+    /// no outputs are currently connected") — not when one monitor of several
+    /// goes away, which re-homes its workspaces to a survivor instead. Such a
+    /// workspace is counted nowhere (module docs).
+    output: Option<String>,
+    /// Whether it is the workspace currently visible on that output. Exactly
+    /// one per output, per niri's contract.
+    is_active: bool,
+}
+
 /// The compositor state the show/hide verdict is a function of, plus the last
 /// verdict emitted.
 ///
-/// Starts **empty**, which reads as hidden: a plugin that has not heard from
-/// niri yet must not flash a chip it may be about to take away. That matches
-/// [`crate::plugin::NiriLayouts`]'s own initial model, so the first frame the
-/// host ever renders and this struct agree without either being told.
+/// Starts **empty**, which reads as hidden everywhere: a plugin that has not
+/// heard from niri yet must not flash a chip it may be about to take away. That
+/// matches [`crate::plugin::NiriLayouts`]'s own initial model, so the first
+/// frame the host ever renders and this struct agree without either being told.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Watch {
     /// Window id → the workspace niri says it is on (`None` when niri reports
     /// none). Every window, tiled or floating — see the module docs.
     windows: HashMap<u64, Option<u64>>,
-    /// The single focused workspace, or `None` before the first snapshot.
-    focused: Option<u64>,
+    /// Workspace id → its output and whether it is active there (#1050). This
+    /// replaced a single `focused: Option<u64>`: the verdict is per screen now,
+    /// so which workspace holds *keyboard focus* is not a fact this module
+    /// needs at all.
+    workspaces: HashMap<u64, Slot>,
     /// Whether the opening `WorkspacesChanged` of this connection has landed.
     seen_workspaces: bool,
     /// Whether the opening `WindowsChanged` of this connection has landed.
     seen_windows: bool,
-    /// The last verdict [`Watch::observe`] handed out. `false` because the chip
-    /// starts hidden.
-    emitted: bool,
+    /// The last verdict [`Watch::observe`] handed out. Empty because the chip
+    /// starts hidden everywhere.
+    emitted: Verdict,
 }
 
 impl Watch {
@@ -213,14 +292,14 @@ impl Watch {
     /// moment is exactly what made a niri restart blink the chip off and back
     /// on, which is what [`Watch::forget_compositor_state`] promises it will
     /// not do.
-    pub(crate) fn observe(&mut self, event: Event) -> Option<bool> {
+    pub(crate) fn observe(&mut self, event: Event) -> Option<Verdict> {
         self.apply(event);
         if !self.snapshot_complete() {
             return None;
         }
-        let verdict = self.visible();
+        let verdict = self.verdict();
         (verdict != self.emitted).then(|| {
-            self.emitted = verdict;
+            self.emitted.clone_from(&verdict);
             verdict
         })
     }
@@ -232,21 +311,75 @@ impl Watch {
     }
 
     /// The verdict as it stands, whether or not it just changed.
-    pub(crate) fn visible(&self) -> bool {
-        self.window_count() >= MIN_WINDOWS
+    ///
+    /// Reads straight off [`Watch::window_counts`], so the two can never
+    /// disagree about which screens are below the threshold.
+    pub(crate) fn verdict(&self) -> Verdict {
+        let mut hidden_on = Vec::new();
+        let mut shows_anywhere = false;
+        for (output, count) in self.window_counts() {
+            if count >= MIN_WINDOWS {
+                shows_anywhere = true;
+            } else {
+                hidden_on.push(output.to_owned());
+            }
+        }
+        // **Normalised**: `hidden_on` only means anything while something is
+        // shown. With no output above the threshold the plugin renders the
+        // collapsed tree, which is invisible on every screen by itself
+        // (`plugin::view`), so naming screens there would put bytes on the wire
+        // that decide nothing — and it would make "hidden everywhere" a
+        // *different value* on a one- and a two-monitor desktop, so merely
+        // connecting to niri would look like a verdict change and wake the
+        // session loop for a frame the SDK then dedups away.
+        if !shows_anywhere {
+            hidden_on.clear();
+        }
+        Verdict {
+            hidden_on,
+            shows_anywhere,
+        }
     }
 
-    /// Windows on the focused workspace. `0` while no workspace is focused —
-    /// which is also what niri reports on a fresh session before the first
-    /// `WorkspacesChanged`.
-    pub(crate) fn window_count(&self) -> usize {
-        let Some(focused) = self.focused else {
-            return 0;
-        };
-        self.windows
-            .values()
-            .filter(|workspace| **workspace == Some(focused))
-            .count()
+    /// Windows on each output's **active** workspace, keyed by connector name.
+    ///
+    /// A [`BTreeMap`] rather than a `HashMap` on purpose: the key order *is*
+    /// [`Verdict::hidden_on`]'s order, and that vec is compared against the
+    /// previous one to decide whether anything changed — a nondeterministic
+    /// order would emit a "change" on every niri event and re-render the chip
+    /// hundreds of times a drag.
+    ///
+    /// Every output niri named gets an entry, **including one whose active
+    /// workspace is empty**: a screen missing from the map would be a screen
+    /// missing from `hidden_on`, i.e. a chip that stays visible on an empty
+    /// desktop. Outputs are learnt from the workspace list, which is the only
+    /// place this module sees a connector name at all; an output with no
+    /// workspaces on it does not exist as far as niri is concerned.
+    ///
+    /// Windows on a workspace niri reports with `output: None` (no outputs
+    /// connected at all — see [`Slot::output`]) raise no count: there is no
+    /// screen for them to show a chip on. Neither do windows on a workspace
+    /// that is not the active one on its output — that is the whole point of
+    /// the rule.
+    fn window_counts(&self) -> BTreeMap<&str, usize> {
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for slot in self.workspaces.values() {
+            if let Some(output) = slot.output.as_deref() {
+                counts.entry(output).or_default();
+            }
+        }
+        for workspace in self.windows.values() {
+            let Some(slot) = workspace.and_then(|id| self.workspaces.get(&id)) else {
+                continue;
+            };
+            let Some(output) = slot.output.as_deref() else {
+                continue;
+            };
+            if slot.is_active {
+                *counts.entry(output).or_default() += 1;
+            }
+        }
+        counts
     }
 
     /// Drop everything niri told us, keeping the last emitted verdict.
@@ -263,31 +396,41 @@ impl Watch {
     /// windows" moment between the new stream's first event and its second.
     fn forget_compositor_state(&mut self) {
         self.windows.clear();
-        self.focused = None;
+        self.workspaces.clear();
         self.seen_workspaces = false;
         self.seen_windows = false;
     }
 
     /// The fold itself. Five of niri 26.4's twenty-odd events move this state;
     /// the rest (keyboard layouts, casts, screenshots, urgency, focus, overview)
-    /// cannot change how many windows sit on the focused workspace.
+    /// cannot change how many windows sit on any output's active workspace.
     fn apply(&mut self, event: Event) {
         match event {
-            // The full workspace list — this is where the focused workspace
-            // comes from on connect, and after any workspace add/remove/move.
+            // The full workspace list — this is where the outputs, and which
+            // workspace is active on each, come from on connect and after any
+            // workspace add/remove/move. "This configuration completely
+            // replaces the previous configuration", so replace.
             Event::WorkspacesChanged { workspaces } => {
-                self.focused = workspaces.iter().find(|w| w.is_focused).map(|w| w.id);
+                self.workspaces = workspaces
+                    .into_iter()
+                    .map(|w| {
+                        (
+                            w.id,
+                            Slot {
+                                output: w.output,
+                                is_active: w.is_active,
+                            },
+                        )
+                    })
+                    .collect();
                 self.seen_workspaces = true;
             }
-            // A workspace became *active on its output*, which is not the same
-            // as focused: niri's own docs say so, and sets `focused` only when
-            // it is. Switching workspaces on a second monitor must not move the
-            // chip's answer.
-            Event::WorkspaceActivated { id, focused } => {
-                if focused {
-                    self.focused = Some(id);
-                }
-            }
+            // A workspace became *active on its output* — which is exactly the
+            // question this module asks now, so the `focused` flag is ignored:
+            // before #1050 it was the only thing read here, and that is why
+            // switching workspaces on the second monitor moved the one global
+            // answer instead of that monitor's own.
+            Event::WorkspaceActivated { id, .. } => self.activate(id),
             // "This configuration completely replaces the previous
             // configuration" (niri's own wording), so replace rather than merge:
             // a window missing from the list was closed.
@@ -307,6 +450,29 @@ impl Watch {
                 self.windows.remove(&id);
             }
             _ => {}
+        }
+    }
+
+    /// Make workspace `id` the active one **on its own output**, and no other
+    /// output's.
+    ///
+    /// niri's contract for `WorkspaceActivated`: "all other workspaces on the
+    /// same output become inactive". Deactivating every workspace instead — the
+    /// obvious one-liner — would blank the other monitor's count until its own
+    /// next event, i.e. reintroduce #1050 through the back door.
+    ///
+    /// An `id` this fold has never seen is **ignored**, not inserted: its
+    /// output is unknown, so there is neither a set of siblings to deactivate
+    /// nor a screen it could contribute a count to. `WorkspacesChanged` is what
+    /// introduces a workspace, and niri sends one whenever the set changes.
+    fn activate(&mut self, id: u64) {
+        let Some(output) = self.workspaces.get(&id).map(|slot| slot.output.clone()) else {
+            return;
+        };
+        for (&other, slot) in &mut self.workspaces {
+            if slot.output == output {
+                slot.is_active = other == id;
+            }
         }
     }
 }
@@ -360,7 +526,7 @@ pub(crate) trait EventSource {
 /// been dropped, i.e. the session this watcher was spawned for is over.
 pub(crate) trait Verdicts {
     /// Deliver a verdict. `false` = the receiver is gone.
-    fn send(&mut self, visible: bool) -> bool;
+    fn send(&mut self, verdict: Verdict) -> bool;
     /// Is the receiver still there? Asked between events, so an idle niri does
     /// not delay the shutdown.
     fn open(&self) -> bool;
@@ -379,7 +545,7 @@ trait Backend {
     /// Dial niri and complete the `EventStream` handshake, or say why not.
     fn connect(&mut self) -> Result<Self::Source, String>;
     /// Hand a verdict to the session; `false` = the session is over.
-    fn emit(&mut self, visible: bool) -> bool;
+    fn emit(&mut self, verdict: Verdict) -> bool;
     /// Whether the session is still there.
     fn alive(&self) -> bool;
     /// Wait out a backoff delay; `false` = the session ended while waiting.
@@ -433,9 +599,9 @@ fn drive<B: Backend>(prefix: &str, backend: &mut B) {
                 } else {
                     warned = true;
                     backend.log(&format!(
-                        "[{prefix}] WARNING: cannot watch niri for the focused workspace's \
-                         window count ({why}) — the layout chip stays hidden until this \
-                         succeeds"
+                        "[{prefix}] WARNING: cannot watch niri for each output's active \
+                         workspace window count ({why}) — the layout chip stays hidden on \
+                         every screen until this succeeds"
                     ));
                 }
                 // `backoff(attempt)` *then* the increment, so the first retry is
@@ -506,8 +672,8 @@ impl<V: Verdicts> Backend for SocketBackend<V> {
         SocketEvents::connect()
     }
 
-    fn emit(&mut self, visible: bool) -> bool {
-        self.verdicts.send(visible)
+    fn emit(&mut self, verdict: Verdict) -> bool {
+        self.verdicts.send(verdict)
     }
 
     fn alive(&self) -> bool {
@@ -721,8 +887,8 @@ impl EventSource for SocketEvents {
 mod tests {
     use super::{
         BACKOFF_CEILING, Backend, EventSource, HANDSHAKE_TIMEOUT, Incoming, MIN_WINDOWS,
-        POLL_INTERVAL, SocketBackend, SocketEvents, Stopped, Verdicts, Watch, backoff, drive,
-        stream_once,
+        POLL_INTERVAL, SocketBackend, SocketEvents, Stopped, Verdict, Verdicts, Watch, backoff,
+        drive, stream_once,
     };
     use niri_ipc::{Event, Window, WindowLayout, Workspace};
     use std::collections::VecDeque;
@@ -730,15 +896,30 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
+    /// The single screen every pre-#1050 test in this file implicitly assumed.
+    const ONE_SCREEN: &str = "DP-1";
+    /// The second screen the per-output tests add.
+    const OTHER_SCREEN: &str = "DP-2";
+
     fn workspace(id: u64, is_focused: bool) -> Workspace {
+        workspace_on(id, ONE_SCREEN, is_focused)
+    }
+
+    /// A workspace on `output`, active there iff `is_active`.
+    ///
+    /// `is_focused` and `is_active` are deliberately the same argument for the
+    /// single-screen helper above: on a one-monitor desktop the active
+    /// workspace *is* the focused one, and the fold reads only `is_active`
+    /// now (#1050).
+    fn workspace_on(id: u64, output: &str, is_active: bool) -> Workspace {
         Workspace {
             id,
             idx: 1,
             name: None,
-            output: Some("DP-1".to_owned()),
+            output: Some(output.to_owned()),
             is_urgent: false,
-            is_active: true,
-            is_focused,
+            is_active,
+            is_focused: is_active,
             active_window_id: None,
         }
     }
@@ -768,26 +949,85 @@ mod tests {
         Event::WindowsChanged { windows }
     }
 
-    fn workspaces_changed(focused: u64) -> Event {
+    /// One screen, three workspaces on it, `active` the one that is visible.
+    ///
+    /// The `active + 1` sibling exists so an activation test has a workspace to
+    /// switch **to**: since #1050 a `WorkspaceActivated` for an id the fold has
+    /// never seen is ignored (its output is unknown), so a fixture that listed
+    /// only the active one would make every switch a no-op.
+    fn workspaces_changed(active: u64) -> Event {
         Event::WorkspacesChanged {
-            workspaces: vec![workspace(focused, true), workspace(focused + 100, false)],
+            workspaces: vec![
+                workspace(active, true),
+                workspace(active + 1, false),
+                workspace(active + 100, false),
+            ],
+        }
+    }
+
+    /// Two screens' worth of workspaces: `DP-1` showing `dp1`, `DP-2` showing
+    /// `dp2`, each with one idle sibling so an activation has somewhere to go.
+    fn two_screens(dp1: u64, dp2: u64) -> Event {
+        Event::WorkspacesChanged {
+            workspaces: vec![
+                workspace_on(dp1, ONE_SCREEN, true),
+                workspace_on(dp1 + 1, ONE_SCREEN, false),
+                workspace_on(dp2, OTHER_SCREEN, true),
+                workspace_on(dp2 + 1, OTHER_SCREEN, false),
+            ],
         }
     }
 
     /// Fold a whole burst and collect every verdict it emitted.
-    fn observe_all(watch: &mut Watch, events: Vec<Event>) -> Vec<bool> {
+    fn observe_all(watch: &mut Watch, events: Vec<Event>) -> Vec<Verdict> {
         events
             .into_iter()
             .filter_map(|event| watch.observe(event))
             .collect()
     }
 
+    /// The verdict "the chip is up, and nothing is hiding it" — a one-screen
+    /// desktop over the threshold.
+    fn up() -> Verdict {
+        Verdict {
+            hidden_on: Vec::new(),
+            shows_anywhere: true,
+        }
+    }
+
+    /// The verdict "no screen wants the chip". Identical to
+    /// [`Verdict::default`] by construction — see the normalisation note on
+    /// [`Watch::verdict`] — which is exactly why a fresh watch says nothing
+    /// when its first complete snapshot is an empty desktop.
+    fn nowhere() -> Verdict {
+        Verdict::default()
+    }
+
+    /// Whether the chip is drawn on `output`, read off the **verdict** rather
+    /// than the raw counts — so a `verdict()` that mislabels a screen fails
+    /// these too, not just a miscount.
+    fn shows_on(watch: &Watch, output: &str) -> bool {
+        let verdict = watch.verdict();
+        verdict.shows_anywhere && !verdict.hidden_on.iter().any(|name| name == output)
+    }
+
+    /// Windows on `output`'s active workspace. `0` for a screen niri has not
+    /// mentioned.
+    fn count_on(watch: &Watch, output: &str) -> usize {
+        watch.window_counts().get(output).copied().unwrap_or(0)
+    }
+
     #[test]
     fn a_fresh_watch_is_hidden_and_says_nothing() {
         let watch = Watch::default();
 
-        assert!(!watch.visible(), "the chip starts hidden");
-        assert_eq!(watch.window_count(), 0, "nothing known about niri yet");
+        assert_eq!(watch.verdict(), nowhere(), "the chip starts hidden");
+        assert!(!shows_on(&watch, ONE_SCREEN));
+        assert_eq!(
+            count_on(&watch, ONE_SCREEN),
+            0,
+            "nothing known about niri yet"
+        );
     }
 
     /// The whole rule in one test: one window is hidden, the second reveals.
@@ -803,7 +1043,7 @@ mod tests {
             ],
         );
         assert!(emitted.is_empty(), "one window stays hidden, silently");
-        assert_eq!(watch.window_count(), 1);
+        assert_eq!(count_on(&watch, ONE_SCREEN), 1);
 
         let emitted = observe_all(
             &mut watch,
@@ -811,8 +1051,8 @@ mod tests {
                 window: window(20, Some(1)),
             }],
         );
-        assert_eq!(emitted, vec![true], "the second window reveals the chip");
-        assert!(watch.visible());
+        assert_eq!(emitted, vec![up()], "the second window reveals the chip");
+        assert!(shows_on(&watch, ONE_SCREEN));
     }
 
     #[test]
@@ -825,12 +1065,12 @@ mod tests {
                 windows_changed(vec![window(10, Some(1)), window(20, Some(1))]),
             ],
         );
-        assert!(watch.visible(), "two windows: shown");
+        assert!(shows_on(&watch, ONE_SCREEN), "two windows: shown");
 
         let emitted = observe_all(&mut watch, vec![Event::WindowClosed { id: 20 }]);
 
-        assert_eq!(emitted, vec![false]);
-        assert!(!watch.visible());
+        assert_eq!(emitted, vec![nowhere()]);
+        assert!(!shows_on(&watch, ONE_SCREEN));
     }
 
     /// A stacked column of two windows is **two windows** — Annika's literal
@@ -849,7 +1089,7 @@ mod tests {
             vec![workspaces_changed(1), windows_changed(vec![lower, upper])],
         );
 
-        assert_eq!(emitted, vec![true], "one column, two windows, chip shown");
+        assert_eq!(emitted, vec![up()], "one column, two windows, chip shown");
     }
 
     /// A floating window is a window. The chip is a *visibility* rule, not a
@@ -869,7 +1109,7 @@ mod tests {
             ],
         );
 
-        assert_eq!(emitted, vec![true]);
+        assert_eq!(emitted, vec![up()]);
     }
 
     #[test]
@@ -890,8 +1130,11 @@ mod tests {
             ],
         );
 
-        assert!(emitted.is_empty(), "the focused workspace holds one window");
-        assert_eq!(watch.window_count(), 1);
+        assert!(
+            emitted.is_empty(),
+            "DP-1's active workspace holds one window"
+        );
+        assert_eq!(count_on(&watch, ONE_SCREEN), 1);
     }
 
     /// Switching to a busier workspace reveals the chip without a single window
@@ -910,7 +1153,10 @@ mod tests {
                 ]),
             ],
         );
-        assert!(!watch.visible(), "workspace 1 holds one window");
+        assert!(
+            !shows_on(&watch, ONE_SCREEN),
+            "workspace 1 holds one window"
+        );
 
         let emitted = observe_all(
             &mut watch,
@@ -920,14 +1166,18 @@ mod tests {
             }],
         );
 
-        assert_eq!(emitted, vec![true], "workspace 2 holds two");
+        assert_eq!(emitted, vec![up()], "workspace 2 holds two");
     }
 
-    /// `WorkspaceActivated { focused: false }` is "active on *its* output", not
-    /// "focused" — niri says so in the event's own docs. A second monitor
-    /// changing workspace must not move this chip.
+    /// `WorkspaceActivated`'s `focused` flag is **not** read (#1050).
+    ///
+    /// niri's own docs: the event means the workspace is now active on its
+    /// output; `focused` merely adds "and it took keyboard focus". The pre-#1050
+    /// fold read *only* the flag, which is why switching workspaces on the
+    /// second monitor moved the one global answer — the bug this issue is. On
+    /// this screen, an activation without focus is a real change and must land.
     #[test]
-    fn an_activation_that_is_not_a_focus_change_is_ignored() {
+    fn an_activation_without_focus_still_re_decides_its_own_screen() {
         let mut watch = Watch::default();
         observe_all(
             &mut watch,
@@ -940,6 +1190,10 @@ mod tests {
                 ]),
             ],
         );
+        assert!(
+            !shows_on(&watch, ONE_SCREEN),
+            "workspace 1 holds one window"
+        );
 
         let emitted = observe_all(
             &mut watch,
@@ -949,8 +1203,288 @@ mod tests {
             }],
         );
 
-        assert!(emitted.is_empty(), "the focused workspace did not change");
-        assert_eq!(watch.window_count(), 1, "still workspace 1's one window");
+        assert_eq!(
+            emitted,
+            vec![up()],
+            "workspace 2 is what DP-1 shows now, focused or not"
+        );
+        assert_eq!(count_on(&watch, ONE_SCREEN), 2);
+    }
+
+    /// An activation for a workspace the fold has never heard of is ignored,
+    /// not invented: its output is unknown, so there is neither a set of
+    /// siblings to deactivate nor a screen it could raise a count on.
+    #[test]
+    fn an_activation_for_an_unknown_workspace_changes_nothing() {
+        let mut watch = Watch::default();
+        observe_all(
+            &mut watch,
+            vec![
+                workspaces_changed(1),
+                windows_changed(vec![window(10, Some(1)), window(20, Some(1))]),
+            ],
+        );
+        assert!(shows_on(&watch, ONE_SCREEN));
+
+        let emitted = observe_all(
+            &mut watch,
+            vec![Event::WorkspaceActivated {
+                id: 9_999,
+                focused: true,
+            }],
+        );
+
+        assert!(emitted.is_empty(), "got {emitted:?}");
+        assert_eq!(
+            count_on(&watch, ONE_SCREEN),
+            2,
+            "DP-1's own active workspace must not be deactivated by an id that \
+             belongs to no output we know"
+        );
+    }
+
+    // ── One verdict per screen (#1050) ──────────────────────────────────────
+
+    /// The bug, as a test: DP-1 is busy and DP-2 is not, so the chip belongs on
+    /// DP-1 and nowhere else. Before #1050 the whole verdict was one bool off
+    /// the *focused* workspace, and DP-2's chip followed DP-1's count.
+    #[test]
+    fn a_busy_screen_shows_while_a_quiet_one_is_named_in_hidden_on() {
+        let mut watch = Watch::default();
+
+        let emitted = observe_all(
+            &mut watch,
+            vec![
+                two_screens(1, 10),
+                windows_changed(vec![
+                    window(100, Some(1)),
+                    window(200, Some(1)),
+                    window(300, Some(1)),
+                    window(400, Some(10)),
+                ]),
+            ],
+        );
+
+        assert_eq!(
+            emitted,
+            vec![Verdict {
+                hidden_on: vec![OTHER_SCREEN.to_owned()],
+                shows_anywhere: true,
+            }],
+            "DP-1 has three windows, DP-2 has one"
+        );
+        assert!(shows_on(&watch, ONE_SCREEN));
+        assert!(!shows_on(&watch, OTHER_SCREEN));
+        assert_eq!(count_on(&watch, ONE_SCREEN), 3);
+        assert_eq!(count_on(&watch, OTHER_SCREEN), 1);
+    }
+
+    /// Both screens below the threshold collapse to the same "nowhere" verdict
+    /// a one-monitor desktop produces — **with an empty `hidden_on`**, because
+    /// the plugin renders the empty tree there and #1042's region-collapse rule
+    /// needs that (see `plugin::view`).
+    #[test]
+    fn both_screens_below_the_threshold_hide_everywhere_and_name_no_one() {
+        let mut watch = Watch::default();
+
+        let emitted = observe_all(
+            &mut watch,
+            vec![
+                two_screens(1, 10),
+                windows_changed(vec![window(100, Some(1)), window(400, Some(10))]),
+            ],
+        );
+
+        assert!(
+            emitted.is_empty(),
+            "identical to the initial verdict, so nothing to say: {emitted:?}"
+        );
+        assert_eq!(watch.verdict(), nowhere());
+    }
+
+    /// The verdict follows **that screen's** active workspace: switching DP-2
+    /// onto a busy workspace reveals DP-2's chip and leaves DP-1's answer
+    /// exactly where it was.
+    #[test]
+    fn activating_a_busy_workspace_on_the_second_screen_reveals_only_that_chip() {
+        let mut watch = Watch::default();
+        observe_all(
+            &mut watch,
+            vec![
+                two_screens(1, 10),
+                windows_changed(vec![
+                    window(100, Some(1)),
+                    window(200, Some(1)),
+                    // DP-2 shows workspace 10 (empty); workspace 11 holds two.
+                    window(400, Some(11)),
+                    window(500, Some(11)),
+                ]),
+            ],
+        );
+        assert_eq!(
+            watch.verdict(),
+            Verdict {
+                hidden_on: vec![OTHER_SCREEN.to_owned()],
+                shows_anywhere: true,
+            },
+            "precondition: only DP-1 shows"
+        );
+
+        let emitted = observe_all(
+            &mut watch,
+            vec![Event::WorkspaceActivated {
+                id: 11,
+                focused: false,
+            }],
+        );
+
+        assert_eq!(
+            emitted,
+            vec![Verdict {
+                hidden_on: Vec::new(),
+                shows_anywhere: true,
+            }],
+            "DP-2 caught up; DP-1 never moved"
+        );
+        assert!(shows_on(&watch, ONE_SCREEN));
+        assert!(shows_on(&watch, OTHER_SCREEN));
+    }
+
+    /// Activating on one output must not deactivate the *other* output's
+    /// workspace — the one-line "mark every other workspace inactive" is wrong
+    /// and would blank DP-1's count until its own next event.
+    #[test]
+    fn an_activation_on_one_screen_leaves_the_other_screens_answer_alone() {
+        let mut watch = Watch::default();
+        observe_all(
+            &mut watch,
+            vec![
+                two_screens(1, 10),
+                windows_changed(vec![
+                    window(100, Some(1)),
+                    window(200, Some(1)),
+                    window(400, Some(10)),
+                    window(500, Some(10)),
+                ]),
+            ],
+        );
+        assert!(shows_on(&watch, ONE_SCREEN) && shows_on(&watch, OTHER_SCREEN));
+
+        // DP-2 switches to its empty sibling.
+        let emitted = observe_all(
+            &mut watch,
+            vec![Event::WorkspaceActivated {
+                id: 11,
+                focused: true,
+            }],
+        );
+
+        assert_eq!(
+            emitted,
+            vec![Verdict {
+                hidden_on: vec![OTHER_SCREEN.to_owned()],
+                shows_anywhere: true,
+            }]
+        );
+        assert_eq!(
+            count_on(&watch, ONE_SCREEN),
+            2,
+            "DP-1's two windows are still on DP-1's active workspace"
+        );
+    }
+
+    /// `hidden_on` is **sorted**, whatever order niri lists the outputs in.
+    ///
+    /// Not cosmetic: the vec is the dedup key, so an order that depended on
+    /// `HashMap` iteration would report a "change" on events that changed
+    /// nothing and re-render the chip through every drag.
+    #[test]
+    fn hidden_on_is_sorted_however_niri_orders_the_outputs() {
+        let mut watch = Watch::default();
+
+        observe_all(
+            &mut watch,
+            vec![
+                Event::WorkspacesChanged {
+                    workspaces: vec![
+                        workspace_on(1, "DP-9", true),
+                        workspace_on(2, "eDP-1", true),
+                        workspace_on(3, "DP-1", true),
+                        workspace_on(4, "HDMI-A-2", true),
+                    ],
+                },
+                // Only DP-1 is busy; the other three are named, in order.
+                windows_changed(vec![window(10, Some(3)), window(20, Some(3))]),
+            ],
+        );
+
+        assert_eq!(
+            watch.verdict().hidden_on,
+            vec!["DP-9".to_owned(), "HDMI-A-2".to_owned(), "eDP-1".to_owned()],
+            "byte order, from the BTreeMap the counts are collected into"
+        );
+    }
+
+    /// A workspace niri reports with no output (its monitor is unplugged) can
+    /// raise no screen's count — there is no screen to show a chip on.
+    #[test]
+    fn windows_on_an_outputless_workspace_show_nowhere() {
+        let mut watch = Watch::default();
+
+        let emitted = observe_all(
+            &mut watch,
+            vec![
+                Event::WorkspacesChanged {
+                    workspaces: vec![
+                        workspace_on(1, ONE_SCREEN, true),
+                        Workspace {
+                            output: None,
+                            ..workspace_on(2, ONE_SCREEN, true)
+                        },
+                    ],
+                },
+                windows_changed(vec![
+                    window(10, Some(1)),
+                    window(20, Some(2)),
+                    window(30, Some(2)),
+                ]),
+            ],
+        );
+
+        assert!(
+            emitted.is_empty(),
+            "DP-1 holds one window and the orphaned pair belongs nowhere: \
+             {emitted:?}"
+        );
+        assert_eq!(count_on(&watch, ONE_SCREEN), 1);
+        assert_eq!(watch.verdict(), nowhere());
+    }
+
+    /// An output whose active workspace is *empty* must be **named** in
+    /// `hidden_on`, not merely absent from the counts — a screen missing from
+    /// the list is a screen the host leaves the chip on.
+    #[test]
+    fn an_empty_screen_is_named_rather_than_omitted() {
+        let mut watch = Watch::default();
+
+        observe_all(
+            &mut watch,
+            vec![
+                two_screens(1, 10),
+                // Nothing at all on DP-2's active workspace.
+                windows_changed(vec![window(100, Some(1)), window(200, Some(1))]),
+            ],
+        );
+
+        assert_eq!(
+            watch.verdict(),
+            Verdict {
+                hidden_on: vec![OTHER_SCREEN.to_owned()],
+                shows_anywhere: true,
+            },
+            "zero windows still has to say 'hide me here'"
+        );
+        assert_eq!(count_on(&watch, OTHER_SCREEN), 0);
     }
 
     /// The reason [`Watch::observe`] returns an `Option` at all: niri is chatty.
@@ -983,7 +1517,7 @@ mod tests {
             emitted.is_empty(),
             "three windows and two are both 'shown', so nothing to say: {emitted:?}"
         );
-        assert!(watch.visible());
+        assert!(shows_on(&watch, ONE_SCREEN));
     }
 
     /// Every event the fold ignores, fed to a watch that would otherwise be on
@@ -1021,7 +1555,7 @@ mod tests {
         );
 
         assert!(emitted.is_empty(), "got {emitted:?}");
-        assert_eq!(watch.window_count(), 1);
+        assert_eq!(count_on(&watch, ONE_SCREEN), 1);
     }
 
     /// A window moved to another workspace arrives as `WindowOpenedOrChanged`
@@ -1037,7 +1571,7 @@ mod tests {
                 windows_changed(vec![window(10, Some(1)), window(20, Some(1))]),
             ],
         );
-        assert!(watch.visible());
+        assert!(shows_on(&watch, ONE_SCREEN));
 
         let emitted = observe_all(
             &mut watch,
@@ -1046,8 +1580,12 @@ mod tests {
             }],
         );
 
-        assert_eq!(emitted, vec![false], "it left, so we are back to one");
-        assert_eq!(watch.window_count(), 1, "and it is not double-counted");
+        assert_eq!(emitted, vec![nowhere()], "it left, so we are back to one");
+        assert_eq!(
+            count_on(&watch, ONE_SCREEN),
+            1,
+            "and it is not double-counted"
+        );
     }
 
     /// `WindowsChanged` replaces; it must not merge into what was there.
@@ -1064,8 +1602,8 @@ mod tests {
 
         let emitted = observe_all(&mut watch, vec![windows_changed(vec![window(30, Some(1))])]);
 
-        assert_eq!(emitted, vec![false], "the old two are gone, not kept");
-        assert_eq!(watch.window_count(), 1);
+        assert_eq!(emitted, vec![nowhere()], "the old two are gone, not kept");
+        assert_eq!(count_on(&watch, ONE_SCREEN), 1);
     }
 
     /// A reconnect drops niri's ids (they mean nothing across a restart) but
@@ -1081,10 +1619,14 @@ mod tests {
                 windows_changed(vec![window(10, Some(1)), window(20, Some(1))]),
             ],
         );
-        assert!(watch.visible());
+        assert!(shows_on(&watch, ONE_SCREEN));
 
         watch.forget_compositor_state();
-        assert_eq!(watch.window_count(), 0, "niri's ids are meaningless now");
+        assert_eq!(
+            count_on(&watch, ONE_SCREEN),
+            0,
+            "niri's ids are meaningless now"
+        );
 
         // The same shape comes back under fresh ids: no flip, so nothing is
         // said and the chip never blinks.
@@ -1109,7 +1651,7 @@ mod tests {
                 windows_changed(vec![window(90, Some(9))]),
             ],
         );
-        assert_eq!(emitted, vec![false]);
+        assert_eq!(emitted, vec![nowhere()]);
     }
 
     /// A **half-arrived** opening snapshot must say nothing — in either order.
@@ -1136,7 +1678,7 @@ mod tests {
                     windows_changed(vec![window(10, Some(1)), window(20, Some(1))]),
                 ],
             );
-            assert!(watch.visible(), "precondition: the chip is up");
+            assert!(shows_on(&watch, ONE_SCREEN), "precondition: the chip is up");
             watch.forget_compositor_state();
             watch
         }
@@ -1188,7 +1730,7 @@ mod tests {
                     windows_changed(vec![window(70, Some(7))]),
                 ]
             ),
-            vec![false],
+            vec![nowhere()],
             "one window on the new snapshot: hide, exactly once"
         );
     }
@@ -1277,7 +1819,7 @@ mod tests {
         /// Trips loudly if `drive` never returns, so a missing exit path is a
         /// failing test rather than a hanging one.
         budget: usize,
-        emitted: Vec<bool>,
+        emitted: Vec<Verdict>,
         waits: Vec<Duration>,
         logs: Vec<String>,
     }
@@ -1330,8 +1872,8 @@ mod tests {
             }
         }
 
-        fn emit(&mut self, visible: bool) -> bool {
-            self.emitted.push(visible);
+        fn emit(&mut self, verdict: Verdict) -> bool {
+            self.emitted.push(verdict);
             self.accepts
         }
 
@@ -1358,8 +1900,8 @@ mod tests {
     /// Two connections back to back over a two-window workspace. Between them
     /// `drive` re-primes the fold; without that the second connection's
     /// `WorkspacesChanged` is judged against the *first* connection's window map
-    /// — no window on the new focused workspace — and emits `false` a
-    /// millisecond before `WindowsChanged` emits `true` again. The `Watch`-level
+    /// — no window on the new active workspace — and emits a hide a
+    /// millisecond before `WindowsChanged` shows it again. The `Watch`-level
     /// tests cannot see this: they call `forget_compositor_state` themselves.
     #[test]
     fn a_reconnect_primes_the_fold_so_the_chip_never_blinks() {
@@ -1372,7 +1914,7 @@ mod tests {
 
         assert_eq!(
             script.emitted,
-            vec![true],
+            vec![up()],
             "the chip goes up once and stays up across the reconnect"
         );
     }
@@ -1413,7 +1955,7 @@ mod tests {
 
         assert_eq!(
             script.emitted,
-            vec![true],
+            vec![up()],
             "it stops at the first undeliverable verdict"
         );
         assert!(
@@ -1492,7 +2034,7 @@ mod tests {
         /// A lane whose receiver is already gone.
         struct Gone;
         impl Verdicts for Gone {
-            fn send(&mut self, _visible: bool) -> bool {
+            fn send(&mut self, _verdict: Verdict) -> bool {
                 false
             }
             fn open(&self) -> bool {
@@ -1954,7 +2496,7 @@ mod tests {
                     .take()
                     .ok_or_else(|| "connect called twice".to_owned())
             }
-            fn emit(&mut self, _visible: bool) -> bool {
+            fn emit(&mut self, _verdict: Verdict) -> bool {
                 true
             }
             fn alive(&self) -> bool {

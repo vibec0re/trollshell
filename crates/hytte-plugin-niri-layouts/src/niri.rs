@@ -3,9 +3,10 @@
 //!
 //! [`apply`] is the single entry point both hats use — the chip's click worker
 //! and the CLI's `apply` subcommand — so the two can never drift. It fetches the
-//! four snapshots [`plan`](crate::layout::plan) and [`Layout::Golden`]'s pair
-//! resolution need — windows, workspaces, outputs, and the focused output —
-//! then sends one `SetWindowWidth` per column. All the deciding lives in
+//! snapshots [`plan`](crate::layout::plan) and [`Layout::Golden`]'s pair
+//! resolution need — windows, workspaces, outputs, and (only when the caller
+//! did not name a screen itself, #1050) the focused output — then sends one
+//! `SetWindowWidth` per column. All the deciding lives in
 //! [`layout`](crate::layout); this module only moves bytes (plus one debug
 //! line, #1052, for when the width resolution comes back empty).
 //!
@@ -67,9 +68,30 @@ fn ask(transport: &mut impl Transport, request: Request) -> Result<Response, Str
     transport.send(request)?
 }
 
-/// Apply `layout` to the focused workspace's columns.
+/// Apply `layout` to the columns of the active workspace on `on_output` — or,
+/// when `on_output` is `None`, on niri's focused output.
 ///
-/// Returns how many columns were resized — `Ok(0)` means the focused workspace
+/// `on_output` is #1050's other half: the chip is mirrored onto every monitor,
+/// so a click carries the connector name of the screen it came from
+/// ([`Input::Event::output`](hytte_plugin::Input::Event::output)) and the
+/// layout is applied **there**, not on whichever screen happens to hold
+/// keyboard focus. `None` means *not attributable* — the CLI hat, which has no
+/// screen, and the drawer panel, which the host cannot attribute — and falls
+/// back to the focused output, which is exactly what every build before #1050
+/// did.
+///
+/// The `FocusedOutput` round trip is **skipped** when `on_output` names a
+/// screen: its answer would be discarded, and one fewer unix-socket round trip
+/// per click is worth the two request shapes.
+/// [`target_workspace`](crate::layout) treats both the same way — a connector
+/// name selects that output's `is_active` workspace either way — so the
+/// planner cannot tell which arm produced it.
+///
+/// A connector niri has no workspace on (a screen that has since gone away)
+/// resolves to no target workspace, so the apply is `Ok(0)`: a no-op with the
+/// usual debug line, never a layout applied to the wrong screen.
+///
+/// Returns how many columns were resized — `Ok(0)` means the target workspace
 /// held no tiled columns, which is a no-op and not an error. `Err` carries
 /// niri's own text for the first request that failed; nothing is retried and no
 /// widths are rolled back, because a partially applied layout is still a
@@ -79,11 +101,18 @@ fn ask(transport: &mut impl Transport, request: Request) -> Result<Response, Str
 /// look at it: `apply` doesn't special-case the layout when asking niri, only
 /// when deciding what to do with the answer, so the two hats' requests stay
 /// identical regardless of which button was pressed.
-pub(crate) fn apply(transport: &mut impl Transport, layout: Layout) -> Result<usize, String> {
+pub(crate) fn apply(
+    transport: &mut impl Transport,
+    layout: Layout,
+    on_output: Option<&str>,
+) -> Result<usize, String> {
     let windows = windows(transport)?;
     let workspaces = workspaces(transport)?;
     let outputs = outputs(transport)?;
-    let output = focused_output(transport)?;
+    let output = match on_output {
+        Some(named) => Some(named.to_owned()),
+        None => focused_output(transport)?,
+    };
 
     let target_output = layout::target_output_name(&workspaces, output.as_deref());
     let logical_width = target_output.and_then(|name| layout::logical_width_of(&outputs, name));
@@ -192,28 +221,44 @@ pub(crate) mod fake {
     use std::collections::HashMap;
 
     pub(crate) const OUTPUT: &str = "DP-1";
+    /// The second screen the #1050 tests add — the one a click can name.
+    pub(crate) const OTHER_OUTPUT: &str = "DP-2";
 
     pub(crate) fn workspace() -> Workspace {
+        workspace_on(1, OUTPUT, true)
+    }
+
+    /// A workspace that is **active on `output`**, focused iff `is_focused`.
+    ///
+    /// The two flags are separate here (unlike `watch`'s fixture, which has one
+    /// screen) precisely because #1050 turns on their difference: the clicked
+    /// screen's workspace is active there and usually *not* the focused one.
+    pub(crate) fn workspace_on(id: u64, output: &str, is_focused: bool) -> Workspace {
         Workspace {
-            id: 1,
+            id,
             idx: 1,
             name: None,
-            output: Some(OUTPUT.to_owned()),
+            output: Some(output.to_owned()),
             is_urgent: false,
             is_active: true,
-            is_focused: true,
+            is_focused,
             active_window_id: None,
         }
     }
 
     /// A tiled window alone in column `column` of workspace 1.
     pub(crate) fn tile(id: u64, column: usize) -> Window {
+        tile_on(id, 1, column)
+    }
+
+    /// A tiled window alone in column `column` of workspace `workspace`.
+    pub(crate) fn tile_on(id: u64, workspace: u64, column: usize) -> Window {
         Window {
             id,
             title: None,
             app_id: None,
             pid: None,
-            workspace_id: Some(1),
+            workspace_id: Some(workspace),
             is_focused: false,
             is_floating: false,
             is_urgent: false,
@@ -241,6 +286,24 @@ pub(crate) mod fake {
             vrr_supported: false,
             vrr_enabled: false,
             logical: None,
+        }
+    }
+
+    /// [`OTHER_OUTPUT`]'s entry in the `Outputs` reply.
+    pub(crate) fn other_output() -> Output {
+        Output {
+            name: OTHER_OUTPUT.to_owned(),
+            ..output()
+        }
+    }
+
+    /// [`other_output`] with a logical geometry reporting `width` px — the
+    /// second-screen twin of [`output_with_logical_width`], so a #1050 test can
+    /// give the two monitors different widths.
+    pub(crate) fn other_output_with_logical_width(width: u32) -> Output {
+        Output {
+            name: OTHER_OUTPUT.to_owned(),
+            ..output_with_logical_width(width)
         }
     }
 
@@ -300,6 +363,29 @@ pub(crate) mod fake {
         /// Two tiled columns on the focused workspace — the happy default.
         pub(crate) fn two_columns() -> Self {
             Self::with(vec![tile(10, 1), tile(20, 2)])
+        }
+
+        /// A two-monitor desktop (#1050): `DP-1` focused with **two** columns
+        /// (windows 10, 20), `DP-2` unfocused with **three** (30, 40, 50).
+        ///
+        /// The column counts differ and the window ids do not overlap, so which
+        /// screen an apply targeted is legible from the `SetWindowWidth` ids
+        /// alone — no proportion arithmetic, and no way for a "targets the
+        /// focused output" regression to look the same as a correct answer.
+        pub(crate) fn two_outputs() -> Self {
+            let mut fake = Self::with(vec![
+                tile_on(10, 1, 1),
+                tile_on(20, 1, 2),
+                tile_on(30, 2, 1),
+                tile_on(40, 2, 2),
+                tile_on(50, 2, 3),
+            ]);
+            fake.workspaces = vec![
+                workspace_on(1, OUTPUT, true),
+                workspace_on(2, OTHER_OUTPUT, false),
+            ];
+            fake.outputs.insert(OTHER_OUTPUT.to_owned(), other_output());
+            fake
         }
 
         /// [`Self::with`], with [`OUTPUT`]'s logical width set to `width` px
@@ -386,7 +472,7 @@ mod tests {
     fn split_asks_for_fifty_percent_per_column_not_half_a_percent() {
         let mut niri = Fake::with(vec![tile(10, 1), tile(20, 2), tile(30, 3)]);
 
-        let applied = apply(&mut niri, Layout::Split).expect("the fake answers everything");
+        let applied = apply(&mut niri, Layout::Split, None).expect("the fake answers everything");
 
         assert_eq!(applied, 3);
         assert_eq!(
@@ -400,7 +486,7 @@ mod tests {
     fn equal_over_four_columns_asks_for_twenty_five_percent_each() {
         let mut niri = Fake::with(vec![tile(10, 1), tile(20, 2), tile(30, 3), tile(40, 4)]);
 
-        apply(&mut niri, Layout::Equal).expect("the fake answers everything");
+        apply(&mut niri, Layout::Equal, None).expect("the fake answers everything");
 
         assert_eq!(
             niri.widths(),
@@ -413,7 +499,7 @@ mod tests {
     fn sends_one_set_width_per_column_left_to_right() {
         let mut niri = Fake::with(vec![tile(10, 1), tile(20, 2), tile(30, 3)]);
 
-        let applied = apply(&mut niri, Layout::Golden).expect("the fake answers everything");
+        let applied = apply(&mut niri, Layout::Golden, None).expect("the fake answers everything");
 
         assert_eq!(applied, 3);
         assert_eq!(
@@ -438,7 +524,7 @@ mod tests {
     fn the_request_serialises_to_niris_own_percentage_bytes() {
         let mut niri = Fake::two_columns();
 
-        apply(&mut niri, Layout::Split).expect("the fake answers everything");
+        apply(&mut niri, Layout::Split, None).expect("the fake answers everything");
 
         assert_eq!(
             wire_bytes(&niri),
@@ -471,7 +557,7 @@ mod tests {
     fn golden_serialises_to_seventy_five_then_twenty_five_percent() {
         let mut niri = Fake::with(vec![tile(10, 1), tile(20, 2), tile(30, 3)]);
 
-        apply(&mut niri, Layout::Golden).expect("the fake answers everything");
+        apply(&mut niri, Layout::Golden, None).expect("the fake answers everything");
 
         assert_eq!(
             wire_bytes(&niri),
@@ -495,7 +581,7 @@ mod tests {
     fn golden_narrow_serialises_to_sixty_one_point_eight_then_thirty_eight_point_two_percent() {
         let mut niri = Fake::with_output_width(vec![tile(10, 1), tile(20, 2), tile(30, 3)], 1920);
 
-        apply(&mut niri, Layout::Golden).expect("the fake answers everything");
+        apply(&mut niri, Layout::Golden, None).expect("the fake answers everything");
 
         assert_eq!(
             wire_bytes(&niri),
@@ -516,7 +602,7 @@ mod tests {
     fn queries_all_four_snapshots_before_acting() {
         let mut niri = Fake::with(vec![tile(10, 1)]);
 
-        apply(&mut niri, Layout::Equal).expect("the fake answers everything");
+        apply(&mut niri, Layout::Equal, None).expect("the fake answers everything");
 
         // Asserted against the **raw, unfiltered** `seen` log rather than
         // `niri.queries()` (#1056 review, NIT-1): `queries()` filters actions
@@ -539,13 +625,116 @@ mod tests {
         );
     }
 
+    // ── The clicked screen (#1050) ──────────────────────────────────────────
+
+    /// The whole point of `Event.output`: a click on DP-2's copy of the chip
+    /// lays out **DP-2's** active workspace, not the focused one.
+    ///
+    /// DP-1 is the focused output and holds windows 10/20; DP-2 holds 30/40/50.
+    /// A regression that ignored the argument would resize 10 and 20 — the ids
+    /// are what makes "wrong screen" and "right screen" different answers
+    /// rather than the same proportions on different windows.
+    #[test]
+    fn a_named_output_lays_out_that_screens_active_workspace() {
+        let mut niri = Fake::two_outputs();
+
+        let applied = apply(&mut niri, Layout::Split, Some(fake::OTHER_OUTPUT))
+            .expect("the fake answers everything");
+
+        assert_eq!(applied, 3, "DP-2's workspace has three columns");
+        assert_eq!(
+            niri.widths(),
+            vec![(30, 50.0), (40, 50.0), (50, 50.0)],
+            "DP-2's own windows, not the focused screen's"
+        );
+    }
+
+    /// …and `None` — the CLI hat, and an event the host could not attribute —
+    /// keeps the pre-#1050 behaviour exactly: the focused output.
+    #[test]
+    fn no_named_output_falls_back_to_the_focused_one() {
+        let mut niri = Fake::two_outputs();
+
+        let applied = apply(&mut niri, Layout::Split, None).expect("the fake answers everything");
+
+        assert_eq!(applied, 2, "DP-1 is focused and has two columns");
+        assert_eq!(niri.widths(), vec![(10, 50.0), (20, 50.0)]);
+    }
+
+    /// A named screen makes the `FocusedOutput` round trip pointless, so it is
+    /// not sent — one fewer unix-socket connect per click.
+    #[test]
+    fn a_named_output_skips_the_focused_output_round_trip() {
+        let mut niri = Fake::two_outputs();
+
+        apply(&mut niri, Layout::Equal, Some(fake::OTHER_OUTPUT))
+            .expect("the fake answers everything");
+
+        assert_eq!(
+            niri.queries(),
+            vec![
+                "Windows".to_owned(),
+                "Workspaces".to_owned(),
+                "Outputs".to_owned()
+            ],
+            "the answer would have been discarded"
+        );
+    }
+
+    /// A connector niri has no workspace on — a screen unplugged between the
+    /// render and the click — resolves to no target workspace, so nothing is
+    /// resized. Never "fall back to the focused screen", which would lay out a
+    /// monitor the human was not pointing at.
+    #[test]
+    fn a_connector_niri_does_not_know_lays_out_nothing() {
+        let mut niri = Fake::two_outputs();
+
+        let applied =
+            apply(&mut niri, Layout::Split, Some("DP-99")).expect("the fake answers everything");
+
+        assert_eq!(applied, 0);
+        assert!(
+            niri.widths().is_empty(),
+            "no screen was named, so no screen is resized: {:?}",
+            niri.widths()
+        );
+    }
+
+    /// Golden's per-screen pair (#1052) is resolved off the **clicked** screen
+    /// too, not the focused one: the width lookup goes through the same target
+    /// workspace the planner uses.
+    #[test]
+    fn golden_resolves_its_pair_from_the_clicked_screens_width() {
+        let mut niri = Fake::two_outputs();
+        // A wide focused screen and a narrow second one — so the two arms give
+        // visibly different numbers.
+        niri.outputs.insert(
+            fake::OUTPUT.to_owned(),
+            fake::output_with_logical_width(3440),
+        );
+        niri.outputs.insert(
+            fake::OTHER_OUTPUT.to_owned(),
+            fake::other_output_with_logical_width(1920),
+        );
+
+        apply(&mut niri, Layout::Golden, Some(fake::OTHER_OUTPUT))
+            .expect("the fake answers everything");
+
+        assert_eq!(
+            niri.widths(),
+            vec![(30, 61.8), (40, 38.2), (50, 38.2)],
+            "1920 px is below the breakpoint, so the clicked screen gets the \
+             golden cut — the focused screen's 3440 px must not decide it"
+        );
+    }
+
     // ── The width-based Golden pair (#1052) ─────────────────────────────────
 
     #[test]
     fn golden_uses_the_wide_pair_at_or_above_the_breakpoint() {
         let mut niri = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 3440);
 
-        apply(&mut niri, Layout::Golden).expect("the fake answers everything");
+        apply(&mut niri, Layout::Golden, None).expect("the fake answers everything");
 
         assert_eq!(
             niri.widths(),
@@ -558,7 +747,7 @@ mod tests {
     fn golden_uses_the_golden_cut_below_the_breakpoint() {
         let mut niri = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 1920);
 
-        apply(&mut niri, Layout::Golden).expect("the fake answers everything");
+        apply(&mut niri, Layout::Golden, None).expect("the fake answers everything");
 
         assert_eq!(
             niri.widths(),
@@ -574,8 +763,8 @@ mod tests {
         let mut narrow = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 1920);
         let mut wide = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 3440);
 
-        apply(&mut narrow, Layout::Equal).expect("narrow, equal");
-        apply(&mut wide, Layout::Equal).expect("wide, equal");
+        apply(&mut narrow, Layout::Equal, None).expect("narrow, equal");
+        apply(&mut wide, Layout::Equal, None).expect("wide, equal");
         assert_eq!(narrow.widths(), wide.widths());
         // Pinned against the literal too (#1056 review, NIT-3): comparing
         // narrow against wide alone would also pass if both were wrong in the
@@ -590,8 +779,8 @@ mod tests {
 
         let mut narrow = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 1920);
         let mut wide = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 3440);
-        apply(&mut narrow, Layout::Split).expect("narrow, split");
-        apply(&mut wide, Layout::Split).expect("wide, split");
+        apply(&mut narrow, Layout::Split, None).expect("narrow, split");
+        apply(&mut wide, Layout::Split, None).expect("wide, split");
         assert_eq!(narrow.widths(), wide.widths());
         assert_eq!(
             narrow.widths(),
@@ -609,7 +798,7 @@ mod tests {
         let mut niri = Fake::two_columns();
         niri.outputs.clear();
 
-        let applied = apply(&mut niri, Layout::Golden).expect("querying still works");
+        let applied = apply(&mut niri, Layout::Golden, None).expect("querying still works");
 
         assert_eq!(applied, 2);
         assert_eq!(niri.widths(), vec![(10, 75.0), (20, 25.0)]);
@@ -626,7 +815,7 @@ mod tests {
         let mut niri = Fake::two_columns();
         niri.outputs.clear();
 
-        apply(&mut niri, Layout::Golden).expect("querying still works");
+        apply(&mut niri, Layout::Golden, None).expect("querying still works");
 
         assert_eq!(
             niri.logs,
@@ -640,7 +829,7 @@ mod tests {
     fn golden_asks_outputs_exactly_once_per_apply() {
         let mut niri = Fake::with_output_width(vec![tile(10, 1), tile(20, 2), tile(30, 3)], 1920);
 
-        apply(&mut niri, Layout::Golden).expect("the fake answers everything");
+        apply(&mut niri, Layout::Golden, None).expect("the fake answers everything");
 
         assert_eq!(
             niri.queries().iter().filter(|q| *q == "Outputs").count(),
@@ -671,7 +860,7 @@ mod tests {
         let mut niri = Fake::with_output_width(vec![tile(10, 1), tile(20, 2)], 1920);
         niri.focused_output = None;
 
-        apply(&mut niri, Layout::Golden).expect("the fallback path");
+        apply(&mut niri, Layout::Golden, None).expect("the fallback path");
 
         assert_eq!(
             niri.widths(),
@@ -705,7 +894,7 @@ mod tests {
             ("HDMI-A-1".to_owned(), fake::output_with_logical_width(3440)),
         ]);
 
-        apply(&mut niri, Layout::Golden).expect("the fake answers everything");
+        apply(&mut niri, Layout::Golden, None).expect("the fake answers everything");
 
         assert_eq!(
             niri.widths(),
@@ -718,7 +907,7 @@ mod tests {
     fn an_empty_workspace_sends_no_action_at_all() {
         let mut niri = Fake::with(Vec::new());
 
-        let applied = apply(&mut niri, Layout::Split).expect("querying still works");
+        let applied = apply(&mut niri, Layout::Split, None).expect("querying still works");
 
         assert_eq!(applied, 0, "reported as a no-op, not an error");
         assert!(niri.widths().is_empty(), "and nothing was sent");
@@ -729,7 +918,7 @@ mod tests {
         let mut niri = Fake::two_columns();
         niri.action_error = Some("unknown action SetWindowWidth".to_owned());
 
-        let err = apply(&mut niri, Layout::Equal).expect_err("niri refused the first action");
+        let err = apply(&mut niri, Layout::Equal, None).expect_err("niri refused the first action");
 
         assert_eq!(err, "unknown action SetWindowWidth");
         assert_eq!(
@@ -744,7 +933,7 @@ mod tests {
         let mut niri = Fake::with(vec![tile(10, 1)]);
         niri.transport_error = Some("cannot reach niri over $NIRI_SOCKET: no such file".to_owned());
 
-        let err = apply(&mut niri, Layout::Equal).expect_err("the socket is gone");
+        let err = apply(&mut niri, Layout::Equal, None).expect_err("the socket is gone");
 
         assert!(err.contains("$NIRI_SOCKET"), "got {err:?}");
     }
@@ -760,7 +949,8 @@ mod tests {
             fn log(&mut self, _line: &str) {}
         }
 
-        let err = apply(&mut Confused, Layout::Equal).expect_err("Handled is not a window list");
+        let err =
+            apply(&mut Confused, Layout::Equal, None).expect_err("Handled is not a window list");
 
         assert!(err.contains("Windows"), "got {err:?}");
     }
@@ -770,7 +960,7 @@ mod tests {
         let mut niri = Fake::two_columns();
         niri.focused_output = None;
 
-        let applied = apply(&mut niri, Layout::Split).expect("the fallback path");
+        let applied = apply(&mut niri, Layout::Split, None).expect("the fallback path");
 
         assert_eq!(applied, 2);
         assert_eq!(niri.widths(), vec![(10, 50.0), (20, 50.0)]);

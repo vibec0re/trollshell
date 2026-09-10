@@ -191,6 +191,7 @@ impl Plugin for BarClock {
             Input::Event {
                 node,
                 kind: EventKind::Click,
+                ..
             } if node == BTN_ID => vec![Effect::OpenPage(Page::PluginSelf)],
             // Any other interaction, effect result, or sidebar-visibility push
             // (#288) is a no-op that never touches the view.
@@ -413,19 +414,13 @@ mod tests {
         model.update(clock_snapshot("2026-07-11T15:49:00+02:00", 1_752_241_740));
 
         // A click on the chip button yields exactly the PluginSelf open effect.
-        let effects = model.update(Input::Event {
-            node: "bar-clock-demo-btn".to_owned(),
-            kind: EventKind::Click,
-        });
+        let effects = model.update(Input::event("bar-clock-demo-btn", EventKind::Click));
         assert_eq!(effects, vec![Effect::OpenPage(Page::PluginSelf)]);
 
         // A click on some other node (or non-click) opens nothing.
         assert!(
             model
-                .update(Input::Event {
-                    node: "somewhere-else".to_owned(),
-                    kind: EventKind::Click,
-                })
+                .update(Input::event("somewhere-else", EventKind::Click))
                 .is_empty(),
             "only the chip button opens the panel",
         );

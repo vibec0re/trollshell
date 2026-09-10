@@ -258,7 +258,9 @@ impl Plugin for Usage {
             }
             // A card click opens the plugin's own detail panel (#349). Only the
             // configured card is a button, so this never fires in empty-state.
-            Input::Event { node, kind } if node == CARD_BTN && matches!(kind, EventKind::Click) => {
+            Input::Event { node, kind, .. }
+                if node == CARD_BTN && matches!(kind, EventKind::Click) =>
+            {
                 return vec![Effect::OpenPage(Page::PluginSelf)];
             }
             // Foreign events, snapshots, effect results, audio (and any future
@@ -689,20 +691,14 @@ mod tests {
     #[test]
     fn clicking_the_card_opens_the_panel() {
         let (mut m, _rx) = model(configured(ready(1.0), Some(30.0)));
-        let fx = m.update(Input::Event {
-            node: CARD_BTN.to_owned(),
-            kind: EventKind::Click,
-        });
+        let fx = m.update(Input::event(CARD_BTN, EventKind::Click));
         assert_eq!(fx, vec![Effect::OpenPage(Page::PluginSelf)]);
     }
 
     #[test]
     fn a_foreign_click_does_nothing() {
         let (mut m, _rx) = model(configured(ready(1.0), Some(30.0)));
-        let fx = m.update(Input::Event {
-            node: "not-ours".to_owned(),
-            kind: EventKind::Click,
-        });
+        let fx = m.update(Input::event("not-ours", EventKind::Click));
         assert!(fx.is_empty());
     }
 

@@ -633,7 +633,7 @@ impl Plugin for PreemDemo {
                 self.marquee.set_scroll_dots(self.marquee_offset());
             }
             // Tapping the clock advances the skin rotation by one.
-            Input::Event { node, kind } => {
+            Input::Event { node, kind, .. } => {
                 if node == CYCLE_BTN && matches!(kind, EventKind::Click) {
                     self.style_bump = self.style_bump.wrapping_add(1);
                     let style = self.style();
@@ -882,10 +882,7 @@ mod tests {
         assert_ne!(m.style(), base, "the rotation advances every slot");
         m.unix -= STYLE_SECS;
         assert_eq!(m.style(), base);
-        let fx = m.update(Input::Event {
-            node: CYCLE_BTN.to_owned(),
-            kind: EventKind::Click,
-        });
+        let fx = m.update(Input::event(CYCLE_BTN, EventKind::Click));
         assert!(fx.is_empty(), "the demo asks nothing of the shell");
         assert_ne!(m.style(), base, "a tap advances the skin");
         // One slot per style = a full lap through StyleName::ALL. Off the
@@ -923,10 +920,7 @@ mod tests {
     fn foreign_clicks_are_ignored() {
         let mut m = fresh();
         let before = m.view();
-        let fx = m.update(Input::Event {
-            node: "not-ours".to_owned(),
-            kind: EventKind::Click,
-        });
+        let fx = m.update(Input::event("not-ours", EventKind::Click));
         assert!(fx.is_empty());
         assert!(m.view() == before, "the tree is unchanged");
     }
@@ -1114,10 +1108,7 @@ mod tests {
         assert!(m.view() == m.view(), "view is pure");
         let a = m.style();
         let before = m.view();
-        let _ = m.update(Input::Event {
-            node: CYCLE_BTN.to_owned(),
-            kind: EventKind::Click,
-        });
+        let _ = m.update(Input::event(CYCLE_BTN, EventKind::Click));
         assert_ne!(m.style(), a);
         assert!(m.view() != before, "a new skin renders a new card");
     }

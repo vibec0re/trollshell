@@ -176,7 +176,7 @@ impl Plugin for Terminal {
     /// shell.
     fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
         match input {
-            Input::Event { node, kind } => {
+            Input::Event { node, kind, .. } => {
                 if node == ENTRY_ID
                     && let EventKind::Submitted { text } = kind
                 {
@@ -243,12 +243,12 @@ mod tests {
     }
 
     fn submit(text: &str) -> Input<std::convert::Infallible> {
-        Input::Event {
-            node: ENTRY_ID.to_owned(),
-            kind: EventKind::Submitted {
+        Input::event(
+            ENTRY_ID,
+            EventKind::Submitted {
                 text: text.to_owned(),
             },
-        }
+        )
     }
 
     /// Find the single `Entry` node in a view tree.
@@ -353,12 +353,12 @@ mod tests {
     fn foreign_events_are_ignored() {
         let mut m = fresh();
         let before = m.history.clone();
-        let fx = m.update(Input::Event {
-            node: "not-ours".to_owned(),
-            kind: EventKind::Submitted {
+        let fx = m.update(Input::event(
+            "not-ours",
+            EventKind::Submitted {
                 text: "boom".to_owned(),
             },
-        });
+        ));
         assert!(fx.is_empty());
         assert_eq!(m.history, before, "a foreign submit is ignored");
     }

@@ -239,7 +239,7 @@
 //!     expanded: room.open,
 //!     classes: vec![],
 //! }
-//! // In `update`, on Input::Event { node, kind: Click } where node == "room:…":
+//! // In `update`, on Input::Event { node, kind: Click, .. } where node == "room:…":
 //! //     toggle that room's `open`, return the new model → the host re-renders.
 //! ```
 //!
@@ -548,29 +548,95 @@ pub enum Input<M> {
     Snapshot(StateSnapshot),
     /// A user interaction on one of the plugin's rendered nodes.
     ///
-    /// # The wire carries an `output`; this variant does not yet surface it
+    /// # Match it with `..`; build it with [`event`](Input::event)
     ///
-    /// Since #1050 the host stamps every card event with the connector name of
-    /// the monitor whose copy produced it
-    /// ([`HostMsg::Event.output`](proto::HostMsg::Event::output)), so a plugin
-    /// can act on *the screen that was clicked* rather than whichever output
-    /// holds keyboard focus. The runtime decodes that frame and currently drops
-    /// the field on the floor here.
+    /// The variant is `#[non_exhaustive]`, so outside `hytte-plugin` it can be
+    /// neither matched without a trailing `..` — `Input::Event { node, kind,
+    /// .. }` — nor constructed with struct syntax. Use
+    /// [`Input::event`](Input::event) / [`Input::event_on`](Input::event_on)
+    /// instead.
     ///
-    /// That is a deliberate hold, not an oversight. Adding a third field to
-    /// this struct variant is a **source-breaking change for every plugin in
-    /// the tree**: `Input::Event { node, kind }` appears as an exhaustive match
-    /// arm in fourteen plugin crates, and each would need `, ..` (plus every
-    /// test that *constructs* the variant would need `output: None`). That is a
-    /// flag day, and it belongs in the round that has a consumer for the value
-    /// — #1050's plugin arm — not in the host arm that merely puts it on the
-    /// wire. A non-Rust plugin can read the field today; a Rust one gets it the
-    /// day this variant grows the field.
+    /// That is not decoration. [`output`](Input::Event::output) landed in
+    /// #1050 as a third field, and adding a field to a struct variant is a
+    /// source break for every plugin in the tree: the arm appears in thirteen
+    /// plugin crates, each of which had to be edited. The attribute is what
+    /// makes that the **last** such sweep — a fourth field can be added without
+    /// touching a single plugin, because every arm already ends in `..` and
+    /// every construction already goes through a constructor that can default
+    /// it. #1068 deferred the field precisely so this flag day would be paid
+    /// once, in the round that has a consumer for the value; this is that
+    /// round.
+    ///
+    /// # The attribute is load-bearing, and this pins it
+    ///
+    /// Within this crate a `#[non_exhaustive]` variant is an ordinary one, so
+    /// no unit test here can see the attribute at all — and the plugin crates
+    /// cannot either: they check that today's arms *compile*, which they would
+    /// go on doing if the attribute vanished. A **doctest**, though, compiles
+    /// as its own crate linked against `hytte-plugin`, which is exactly the
+    /// vantage point where the attribute bites.
+    ///
+    /// Struct-literal construction from outside the crate must not compile:
+    ///
+    /// ```compile_fail,E0639
+    /// use hytte_plugin::{Input, proto::EventKind};
+    /// let _: Input<()> = Input::Event {
+    ///     node: "btn".to_owned(),
+    ///     kind: EventKind::Click,
+    ///     output: None,
+    /// };
+    /// ```
+    ///
+    /// …and neither must an exhaustive match without `..`:
+    ///
+    /// ```compile_fail,E0638
+    /// use hytte_plugin::{Input, proto::EventKind};
+    /// let input: Input<()> = Input::event("btn", EventKind::Click);
+    /// if let Input::Event { node, kind, output } = input {
+    ///     let _ = (node, kind, output);
+    /// }
+    /// ```
+    ///
+    /// The constructors are the supported way in, and they compile:
+    ///
+    /// ```
+    /// use hytte_plugin::{Input, proto::EventKind};
+    /// let _: Input<()> = Input::event("btn", EventKind::Click);
+    /// let _: Input<()> =
+    ///     Input::event_on("btn", EventKind::Click, Some("DP-2".to_owned()));
+    /// ```
+    ///
+    /// The `E0639`/`E0638` codes are pinned in the fences so neither block can
+    /// pass for an unrelated compile error.
+    #[non_exhaustive]
     Event {
         /// The interacted node, by the id the plugin assigned in its view.
         node: NodeId,
         /// What happened (click / scroll / slider move / entry submit).
         kind: EventKind,
+        /// The **connector name** of the monitor whose copy of the mirrored
+        /// card produced this interaction (#1050) — `"DP-1"`, `"eDP-1"`,
+        /// `"HDMI-A-2"`, as niri and Wayland spell them. The plugin-side face
+        /// of [`HostMsg::Event.output`](proto::HostMsg::Event::output).
+        ///
+        /// One tree is mirrored onto every screen, so a click used to be
+        /// un-attributable: a plugin acting on "the screen the user clicked on"
+        /// had to guess, and the only proxy available — whichever output holds
+        /// keyboard focus — is a different thing (#1019's layouts chip laid out
+        /// the focused workspace, not the workspace on the screen whose chip was
+        /// pressed). `Some(connector)` names the screen for real.
+        ///
+        /// **`None` means the host could not attribute the event to a screen —
+        /// never "the primary monitor".** Treat it as unknown and fall back to
+        /// whatever the plugin did before #1050. The host sends it from exactly
+        /// one place today: the drawer **panel**, whose page stack is built
+        /// with no monitor in scope. Bar chips and sidebar cards always carry
+        /// `Some`.
+        ///
+        /// Pair it with [`View::hidden_on`], the other half of the per-screen
+        /// story: `hidden_on` decides *where the card is*, `output` decides
+        /// *which screen a click on it meant*.
+        output: Option<String>,
     },
     /// The outcome of a brokered
     /// [`Effect::RunCommand`](proto::Effect::RunCommand) or
@@ -719,6 +785,38 @@ pub enum Input<M> {
     },
     /// A message from the plugin's own [`sources`](Plugin::sources) stream.
     App(M),
+}
+
+impl<M> Input<M> {
+    /// An [`Input::Event`] that names no screen — the constructor a unit test
+    /// reaches for.
+    ///
+    /// [`Input::Event`] is `#[non_exhaustive]`, so a plugin crate cannot write
+    /// the struct literal; this and [`event_on`](Input::event_on) are how one
+    /// is built from outside `hytte-plugin`. `output` is `None`, which is what
+    /// a drawer-panel event carries on the wire and what every plugin saw
+    /// before #1050 — so a test written against this constructor is asserting
+    /// the *fallback* path. Reach for [`event_on`](Input::event_on) to pin the
+    /// per-screen one.
+    #[must_use]
+    pub fn event(node: impl Into<String>, kind: EventKind) -> Self {
+        Self::event_on(node, kind, None)
+    }
+
+    /// An [`Input::Event`] attributed to `output` — the monitor whose copy of
+    /// the mirrored card produced it (#1050).
+    ///
+    /// `Some(connector)` names the screen; `None` means *not attributable*,
+    /// never "the primary monitor" — see
+    /// [`Input::Event::output`](Input::Event::output).
+    #[must_use]
+    pub fn event_on(node: impl Into<String>, kind: EventKind, output: Option<String>) -> Self {
+        Self::Event {
+            node: node.into(),
+            kind,
+            output,
+        }
+    }
 }
 
 /// One projection of the model — everything [`Plugin::view`] renders: the

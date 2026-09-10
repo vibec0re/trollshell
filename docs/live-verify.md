@@ -108,9 +108,13 @@ range above is a floor, not a ceiling.
       socket over"_ (or the older _"already has a live listener"_ line, if it
       won the lock but found a pre-#996 incumbent) and **never** _"plugin host
       listening"_. Then the harder one: `systemctl --user stop trollshell` and
-      race two starts off one barrier —
-      `for i in 1 2; do (sleep 1; cargo run -p trollshell) & done` — and check
-      `ss -xl | grep -c plugin.sock` reports **1**, with
+      race two starts off one barrier. **Build first, then race the built
+      binary** — two concurrent `cargo run`s cannot race, they serialise on
+      cargo's package-cache/build-directory lock (the second prints _"Blocking
+      waiting for file lock on package cache"_ and only starts once the first
+      has already bound):
+      `cargo build -p trollshell && (./target/debug/trollshell & ./target/debug/trollshell & wait)`
+      — and check `ss -xl | grep -c plugin.sock` reports **1**, with
       `stat -c %i "$XDG_RUNTIME_DIR/trollshell/plugin.sock"` matching the
       process that logged "plugin host listening". The lock file lives beside
       it at `plugin.sock.lock` — 0-byte, `0600`, and never unlinked;
@@ -126,8 +130,22 @@ range above is a floor, not a ceiling.
       and **not** once per ≤5 s redial; the inode unchanged;
       `ss -xl | grep -c hytte-infobroker` still **1**, and
       `hytte-infobroker get departures` still working with a valid token
-      throughout. Then stop the incumbent, leaving the stale socket file, and
-      restart it: it must reclaim the path rather than refuse.
+      throughout, and the **duplicate's own panel** carrying the one-line
+      _"Not serving: another info broker already owns …"_ notice under its
+      title (the chip is not silently empty). Then stop the incumbent, leaving
+      the stale socket file, and restart it: it must reclaim the path rather
+      than refuse.
+- [ ] **(#995 / the session handover)** A restart _during an in-flight request_
+      must not make the broker stand down against itself. Park a connection on
+      the broker and send nothing (`nc -U "$XDG_RUNTIME_DIR/hytte-infobroker.sock"`,
+      leave it open), then `systemctl --user restart trollshell` within the 5 s
+      request timeout. Expect: **no** _"already has a live broker listening"_
+      line, `stat -c %i` on the socket **unchanged** across the restart (the
+      process keeps the listener it bound — it is not rebound per session),
+      `hytte-infobroker get departures` answering straight through, and the
+      panel's Revoke/Allow buttons still live afterwards. Before the fix this
+      sequence left the broker permanently socket-less with an empty panel and
+      a misleading duplicate warning, recoverable only by another restart.
 - [ ] **(#544)** A plugin granted `Capability::RunCommand` emits
       `Effect::RunCommand` → the host spawns the argv and the plugin gets back
       an `EffectResult` with the exit status + captured stdout. A missing

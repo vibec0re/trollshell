@@ -251,7 +251,10 @@ and refuses any effect whose capability wasn't granted.
 > (2026-09-07T10:02Z — _"hmm ok if this adds nothing then let's not
 > overcomplicate things ❤️"_) and #956 recorded on the preem-GL spec, applied
 > here where it actually belongs; #956 amended that spec and left this one
-> asserting the opposite.
+> asserting the opposite. **"Route 0" here is that spec's heading sense — the
+> socket's file mode _is_ the boundary — and not the `SO_PEERCRED` provenance
+> check that first carried the label on #956 and was declined; nothing in this
+> amendment endorses re-deriving the peer's identity.**
 >
 > - **The gate is the socket's file mode, not a capability tier.** The host
 >   socket lives under `$XDG_RUNTIME_DIR`, with the host setting its directory

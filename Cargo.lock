@@ -1154,10 +1154,12 @@ dependencies = [
 name = "hytte-config"
 version = "0.1.0"
 dependencies = [
+ "futures-signals",
  "serde",
  "serde_ignored",
  "temp-env",
  "tempfile",
+ "tokio",
  "toml",
  "toml_edit",
  "tracing",
@@ -1346,6 +1348,7 @@ dependencies = [
  "futures-signals",
  "futures-util",
  "gtk4",
+ "hytte-config",
  "tokio",
  "tracing",
 ]

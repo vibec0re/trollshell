@@ -30,6 +30,15 @@ tracing.workspace = true
 
 [dev-dependencies]
 futures-executor.workspace = true
+# The shared tracing test plumbing (#1044). `supervisor`'s tests need a
+# **process-global** subscriber — the callsite `Interest` cache that decides
+# whether their `error!` runs at all is itself process-global — and this crate
+# held the third copy of that mechanism, in the `.expect()`-inside-`call_once`
+# shape #1043's review removed elsewhere (31 of 32 failures read "Once
+# poisoned" instead of the cause). A dev-dependency only, and no new resolved
+# package: `hytte-config` is a workspace path member with no runtime link from
+# here.
+hytte-config = { path = "../hytte-config", features = ["test-support"] }
 # Workspace `futures-util` sets `default-features = false` (what hytte-bus/
 # hytte-services' main dependency needs); widen back to the full default set
 # here, matching this crate's original bare `"0.3.32"` dev-dependency.

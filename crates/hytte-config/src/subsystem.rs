@@ -10,19 +10,39 @@
 //! and the writer.
 //!
 //! ```no_run
-//! use hytte_config::subsystem::{Subsystem, load_or_default};
+//! use hytte_config::subsystem::{InvalidValue, Subsystem, keep, load_or_default, spelling};
+//! use hytte_config::subsystem::env::EnvKnob;
 //!
+//! // Every field is a raw `toml::Value` — anything narrower hands the verdict
+//! // to serde, and serde's verdict is whole-file (#1040 T1).
 //! #[derive(serde::Serialize, serde::Deserialize)]
+//! #[serde(default)]
 //! struct CoreLeds {
-//!     #[serde(default)]
-//!     color: String,
+//!     color: toml::Value,
 //! }
+//!
+//! impl Default for CoreLeds {
+//!     fn default() -> Self { Self { color: "amber".into() } }
+//! }
+//!
+//! const COLOR: EnvKnob = EnvKnob::same("TROLLSHELL_LED_COLOR", "color", "a CSS colour name");
 //!
 //! impl Subsystem for CoreLeds {
 //!     const NAME: &'static str = "core-leds";
 //!     const DEFAULT_TOML: &'static str = "# the core LED strip\ncolor = \"amber\"\n";
 //!     type Error = std::convert::Infallible;
+//!     type Resolved = String;
 //!     fn validate(&self) -> Result<(), Self::Error> { Ok(()) }
+//!     fn parsed(&self) -> (String, Vec<InvalidValue>) {
+//!         let mut rejected = Vec::new();
+//!         let raw = spelling(&self.color);
+//!         let color = keep(
+//!             (!raw.is_empty()).then_some(raw).ok_or_else(|| InvalidValue::of(&COLOR, &self.color)),
+//!             String::default(),
+//!             &mut rejected,
+//!         );
+//!         (color, rejected)
+//!     }
 //! }
 //!
 //! let leds: Option<CoreLeds> = load_or_default::<CoreLeds>();
@@ -90,6 +110,10 @@ use serde::de::IntoDeserializer as _;
 use crate::file::{self, Durability};
 use crate::{merge, xdg};
 
+pub mod env;
+#[cfg(feature = "watch")]
+pub mod watch;
+
 /// What a subsystem declares to get the reader, the validator and the writer.
 pub trait Subsystem: serde::de::DeserializeOwned {
     /// File stem: the config is `<NAME>.toml` in each layer, and the state
@@ -110,15 +134,251 @@ pub trait Subsystem: serde::de::DeserializeOwned {
     /// there is nothing the type system did not already catch.
     type Error: std::fmt::Display;
 
+    /// The **resolved** form of this config: what the rest of the shell
+    /// consumes, after every raw spelling has been judged.
+    ///
+    /// Separate from `Self` because the two have different jobs. `Self` is the
+    /// file as written, and every field of it should be a raw
+    /// [`toml::Value`] — anything narrower, a `String` included, hands the
+    /// verdict to serde, and serde's verdict is **whole-file** (#1040 T1).
+    /// `Resolved` is the parsed value, where a key is a `DisplayStyle` or a
+    /// `Duration` rather than a spelling.
+    ///
+    /// `Default` is required because a load that fails outright degrades to it
+    /// ([`initial_load`]) and because a *single* rejected key falls back to its
+    /// own default ([`keep`]). `PartialEq` is what lets `watch::Watcher::poll`
+    /// republish only on a real change. `Send + Sync + 'static` is what lets a
+    /// `Mutable<Self::Resolved>` cross onto the runtime — required
+    /// unconditionally, rather than only under the `watch` feature, so that
+    /// enabling live reload can never turn into a trait-bound error in a
+    /// subsystem that compiled fine without it.
+    type Resolved: Clone + Default + PartialEq + Send + Sync + 'static;
+
     /// Semantic checks the schema cannot express — the equivalent of
     /// `places::validate`'s latitude bounds and duplicate names.
     ///
     /// Runs after deserialisation on load, and again before a save, so a
     /// config that would be rejected on read is never written.
     ///
+    /// A failure here is a **whole-file** rejection: [`assemble`] maps it onto
+    /// [`ConfigError::Invalid`], the load returns no config at all, and the
+    /// caller degrades to the built-in defaults or keeps the last good file.
+    /// That is the right contract for keys that genuinely constrain each other
+    /// and the wrong one for independent look-and-feel values — one typo would
+    /// revert every other key (#1040 V1). Per-key judgement belongs in
+    /// [`Self::parsed`], and `Infallible` is then the honest `Error`.
+    ///
+    /// # How a cross-key rule composes without a second parser (#1040 T4)
+    ///
+    /// `validate` sees the **raw** config while [`Self::parsed`] produces the
+    /// resolved values — but `parsed` takes `&self`, so the rule is stated over
+    /// resolved values by calling it:
+    ///
+    /// ```text
+    /// type Error = MyError;
+    /// fn validate(&self) -> Result<(), MyError> {
+    ///     let (resolved, _rejected) = self.parsed();
+    ///     // …the cross-key rule: e.g. reject a `min` above a `max`, which no
+    ///     // single key can be judged on…
+    /// }
+    /// ```
+    ///
+    /// One parser still, and the per-key warnings still come out exactly once,
+    /// because they are emitted in [`load_layer`] rather than in `parsed` —
+    /// which is why `parsed` returns its rejections instead of logging them.
+    /// The `_rejected` half is deliberately available there too: a rule
+    /// evaluated over a key that fell back to its built-in default can say so
+    /// rather than pretending the user asked for the default.
+    ///
     /// # Errors
     /// Whatever the subsystem considers unusable.
     fn validate(&self) -> Result<(), Self::Error>;
+
+    /// The file's raw spellings as [`Self::Resolved`], beside **every** key
+    /// that did not parse.
+    ///
+    /// The single judge: nothing else may turn a spelling into a value, which
+    /// is what keeps "what the file rejects" and "what the deprecated variable
+    /// rejects" from drifting.
+    ///
+    /// # A bad value costs its own key, and only its own key (#1040 V1)
+    ///
+    /// This returns a value **and** a list, not a `Result`, and that is the
+    /// whole shape of the rule. An implementation that `?`s on the first bad
+    /// key and hands the error to [`Self::validate`] gets a *message* naming
+    /// one key and an *effect* that drops all of them. Use [`spelling`] per key
+    /// and [`keep`] per key, and write no `?`.
+    ///
+    /// The per-key fallback is the **built-in default** for that key, not the
+    /// merged layer underneath it: [`crate::merge`] merges the layers before
+    /// anything is parsed, so by the time a value is judged there is no
+    /// provenance left to fall back through. [`rejected_value_message`] says so
+    /// in as many words.
+    fn parsed(&self) -> (Self::Resolved, Vec<InvalidValue>);
+
+    /// The environment layered over `layered`, key by key — the merged file
+    /// value is the fallback for every knob the environment does not carry.
+    ///
+    /// One [`env::key`] call per migrated variable, so a set variable wins and
+    /// announces once and an unusable one costs exactly one line. See
+    /// [`env`]'s module doc for why this is a hand-written fan-out rather than
+    /// a table of homogeneous triples.
+    ///
+    /// The default is "there is no environment to layer" — the right answer for
+    /// any subsystem that was never spelt as `TROLLSHELL_*` variables, and the
+    /// reason a new family declares nothing here. `lookup` is injected rather
+    /// than read from the process: `unsafe_code = "forbid"` rules out
+    /// `std::env::set_var` (an `unsafe fn` in edition 2024), so a test that
+    /// drove the real environment could not exist at all.
+    #[must_use]
+    fn resolve(
+        layered: Self::Resolved,
+        _lookup: &dyn Fn(&str) -> Option<String>,
+        _announce: env::Deprecations,
+    ) -> Self::Resolved {
+        layered
+    }
+}
+
+// ── Per-key tolerance: a bad value costs its own key ─────────────────────────
+
+/// Why a config value was rejected.
+///
+/// Carries the key, the spelling the user wrote and the vocabulary that was
+/// expected, so the journal line is actionable without opening the source.
+///
+/// `value` is the value **as TOML** — quoted for a string key, bare for an
+/// integer one — so the line quotes back exactly the bytes in the file the
+/// reader is about to open (#1040 F11/T1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidValue {
+    key: &'static str,
+    value: String,
+    expected: &'static str,
+}
+
+impl InvalidValue {
+    /// The offending value **as the user wrote it in TOML**: a string quoted,
+    /// an integer bare, a float/boolean/array/table exactly as TOML spells it
+    /// (#1040 F11/T1).
+    ///
+    /// One constructor for every key and every TOML type, because
+    /// [`toml::Value`]'s `Display` *is* the TOML rendering — so the line quotes
+    /// back what the file holds, whether the mistake was a wrong word or a wrong
+    /// type. It is the **canonical** rendering rather than the source bytes,
+    /// which shows on a hex integer: it comes back decimal (`0xff0000` →
+    /// `16711680`). A TOML date comes back quoted too, but that is **not**
+    /// `Display`'s doing — `toml::Value::Datetime`'s own `Display` is unquoted,
+    /// measured — it is [`assemble`]'s `IntoDeserializer` round-trip that erases
+    /// the date to a `String` before this constructor ever sees it (#1040 fix
+    /// round 4 F3).
+    ///
+    /// The environment path never produces an `InvalidValue` at all: an unusable
+    /// variable gets [`env::warn_unusable_env`], which quotes with backticks
+    /// because a shell variable is not TOML either.
+    #[must_use]
+    pub fn of(knob: &env::EnvKnob, value: &toml::Value) -> Self {
+        Self::written(knob, &value.to_string())
+    }
+
+    /// The offending value already rendered as TOML — the form a test states as
+    /// a literal, so the rendering itself is pinned rather than compared against
+    /// another call to [`Self::of`] (#1040 mutation N6, which was green until
+    /// this existed).
+    #[must_use]
+    pub fn written(knob: &env::EnvKnob, value: &str) -> Self {
+        Self {
+            key: knob.key,
+            value: value.to_string(),
+            // The *file* vocabulary: this diagnostic is only ever produced on
+            // the file path, and the two can differ (#1040 V4).
+            expected: knob.file_accepts,
+        }
+    }
+
+    /// The key that was rejected — what [`load_layer`]'s journal line names.
+    #[must_use]
+    pub fn key(&self) -> &'static str {
+        self.key
+    }
+}
+
+impl std::fmt::Display for InvalidValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            key,
+            value,
+            expected,
+        } = self;
+        write!(f, "{key} = {value} is not valid; expected {expected}")
+    }
+}
+
+/// The raw spelling one key is judged in: a TOML string's own contents, and for
+/// **every other TOML type** its rendering — `5`, `true`, `4.0`, `[1]`.
+///
+/// This is the half of #1040 T1 that turns a wrong *type* into a per-key
+/// rejection instead of a whole-file one. When every schema field is a raw
+/// [`toml::Value`], serde accepts whatever shape the file holds and the verdict
+/// lands here; a rendering no parser takes comes back as an [`InvalidValue`]
+/// naming the key and quoting the value, which is exactly the treatment a wrong
+/// *word* gets. Nothing about a value's type is special-cased, because to a
+/// schema nothing about it is special: a spelling either parses or it does not.
+#[must_use]
+pub fn spelling(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(text) => text.clone(),
+        // `toml::Value`'s `Display` *is* its TOML rendering, which is the whole
+        // reason a schema keeps values rather than strings: the diagnostic
+        // quotes back the bytes the reader is about to open.
+        other => other.to_string(),
+    }
+}
+
+/// Take the parsed value, or record why it was rejected and take the built-in
+/// default for that key.
+///
+/// The one statement [`Subsystem::parsed`] repeats per key, and the reason it
+/// can be written with no `?` in it. A free `fn` rather than a closure because a
+/// subsystem uses it at as many different `T`s as it has keys.
+pub fn keep<T>(result: Result<T, InvalidValue>, default: T, rejected: &mut Vec<InvalidValue>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(invalid) => {
+            rejected.push(invalid);
+            default
+        }
+    }
+}
+
+/// The **one** line a rejected value for a *known file key* produces.
+///
+/// #1040 V1 is why it exists: a bad value no longer takes the whole file down,
+/// so the reader has to be told which key was dropped **and** what happened to
+/// it. `invalid` is [`InvalidValue`]'s own rendering of "what you wrote, and
+/// what was expected"; this adds the consequence.
+///
+/// "the built-in default" rather than "the layer below" is precise, not vague:
+/// the layers are merged *before* anything is parsed, so by the time a value is
+/// judged there is no provenance left to fall back through. The key falls all
+/// the way to [`Subsystem::DEFAULT_TOML`]'s value, which is what the sentence
+/// says.
+#[must_use]
+pub fn rejected_value_message(invalid: &str) -> String {
+    format!("{invalid} — ignoring this key and using the built-in default")
+}
+
+/// Warn that one **file key** held a value nothing accepts, and that the
+/// built-in default is being used for it.
+///
+/// One line per rejected key, emitted where the file is loaded — so a file with
+/// two typos says two things and a file with none says nothing. The *rest* of
+/// the file still applies, which is the whole reason this line exists (#1040
+/// V1): before it, a single bad value was a whole-file [`ConfigError::Invalid`]
+/// and the reader got one message naming one key while every *other* key
+/// silently reverted too.
+pub fn warn_rejected_value(subsystem: &str, key: &str, invalid: &str) {
+    tracing::warn!(subsystem, key, "{}", rejected_value_message(invalid));
 }
 
 /// A loaded subsystem config, plus what the load learned on the way.
@@ -301,16 +561,16 @@ fn parse_layer(body: &str, path: Option<&Path>) -> Result<toml::Table, ConfigErr
 pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>, ConfigError> {
     // #1022: several tests below call `assemble` directly — bypassing both
     // `capture` and the `assembled` test helper, the two call sites named in
-    // `crate::test_tracing`'s own doc — because they assert on something
+    // `crate::test_support`'s own doc — because they assert on something
     // other than a `warn!` (an error variant, a key name, a round-tripped
     // byte string) and never needed a capture. They can still race a
     // *shared* callsite's first-ever registration against a
     // `capture()`-using test (every `tracing::warn!` in this generic function
     // is one `static` shared by every `S`, not one per monomorphization —
-    // see `crate::test_tracing`'s doc). Compiled out entirely outside
+    // see `crate::test_support`'s doc). Compiled out entirely outside
     // `cargo test`, so this is invisible to `load`'s real, non-test callers.
     #[cfg(test)]
-    crate::test_tracing::ensure_global_default();
+    crate::test_support::ensure_global_default();
     // Kept as two parallel vectors rather than pairs: the diagnostics below
     // need the file name beside each table, and `merge::inert_unset` needs the
     // tables as one slice because its question — "does *any* layer set this
@@ -454,6 +714,53 @@ pub fn load_or_default<S: Subsystem>() -> Option<S> {
                     None
                 }
             }
+        }
+    }
+}
+
+/// The merged file layer as [`Subsystem::Resolved`], with every rejected key
+/// reported and defaulted — **no environment**.
+///
+/// The `Err` here is a file that is not usable **as a file**: not TOML, or a
+/// layer that exists and cannot be read. A known key holding a value nothing
+/// accepts is *not* one of those (#1040 V1) — it costs its own key, warns, and
+/// the rest of the file loads. Neither is a known key holding a value of the
+/// wrong TOML *type* (#1040 T1), as long as the schema field is a raw
+/// [`toml::Value`] and so leaves serde nothing to reject.
+///
+/// This is where the per-key warnings are emitted, rather than in
+/// [`Subsystem::parsed`], so a subsystem may call `parsed` freely from
+/// [`Subsystem::validate`] without doubling every line.
+///
+/// # Errors
+/// As [`load_from`].
+pub fn load_layer<S: Subsystem>(paths: &[PathBuf]) -> Result<S::Resolved, ConfigError> {
+    let loaded = load_from::<S>(paths)?;
+    let (resolved, rejected) = loaded.config.parsed();
+    for invalid in &rejected {
+        warn_rejected_value(S::NAME, invalid.key(), &invalid.to_string());
+    }
+    Ok(resolved)
+}
+
+/// [`load_layer`], degrading to `S::Resolved::default()` with a loud `error!`.
+///
+/// The **one** load in a subsystem's process lifetime, handed to
+/// `watch::Watcher::stamping_before` so the stamp is taken first. A failure is
+/// survivable by design — [`load_or_default`]'s policy applied to explicit
+/// paths — because a config file nobody can parse must be visible in the journal
+/// and must not stop the shell from starting.
+#[must_use]
+pub fn initial_load<S: Subsystem>(paths: &[PathBuf]) -> S::Resolved {
+    match load_layer::<S>(paths) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!(
+                subsystem = S::NAME,
+                error = %e,
+                "config unusable; falling back to the built-in default"
+            );
+            S::Resolved::default()
         }
     }
 }
@@ -994,6 +1301,10 @@ mod tests {
         const NAME: &'static str = "core-leds";
         const DEFAULT_TOML: &'static str = DEFAULT;
         type Error = TooBright;
+        type Resolved = ();
+        fn parsed(&self) -> ((), Vec<InvalidValue>) {
+            ((), Vec::new())
+        }
         fn validate(&self) -> Result<(), Self::Error> {
             if self.core.brightness > 8 {
                 return Err(TooBright(self.core.brightness));
@@ -1025,14 +1336,14 @@ palette = ["amber", "rust"]
             .collect()
     }
 
-    /// Calls [`crate::test_tracing::ensure_global_default`] before touching
+    /// Calls [`crate::test_support::ensure_global_default`] before touching
     /// `assemble` at all — this is the *other* required call site (see
-    /// `capture`'s doc and `crate::test_tracing`'s): several tests call
+    /// `capture`'s doc and `crate::test_support`'s): several tests call
     /// `assembled` directly, with no [`capture`] guard, so the global default
     /// has to be reachable from here too, or those tests are exactly the
     /// subscriber-less thread #1022 is about.
     fn assembled(bodies: &[&str]) -> Loaded<Leds> {
-        crate::test_tracing::ensure_global_default();
+        crate::test_support::ensure_global_default();
         assemble::<Leds>(&layers(bodies)).expect("assembles")
     }
 
@@ -1287,6 +1598,10 @@ kept = true
             const NAME: &'static str = "strict";
             const DEFAULT_TOML: &'static str = "name = \"default\"\n";
             type Error = std::convert::Infallible;
+            type Resolved = ();
+            fn parsed(&self) -> ((), Vec<InvalidValue>) {
+                ((), Vec::new())
+            }
             fn validate(&self) -> Result<(), Self::Error> {
                 Ok(())
             }
@@ -1434,105 +1749,11 @@ kept = true
 
     // ── #988: a marker the merge cannot honour is said out loud ─────────────
 
-    /// Captured `tracing` events, in the shape `hytte-services`' `hooks` tests
-    /// use: a shared buffer, a field visitor, and a thread-local
-    /// [`tracing::dispatcher::set_default`] guard so one test's subscriber
-    /// cannot leak into another's.
-    ///
-    /// Hand-rolled over [`tracing::Subscriber`] rather than assembled from
-    /// `tracing_subscriber`'s `Registry` + `Layer`, which is what `hooks` does:
-    /// this crate is the GTK-free leaf whose whole point is a short dependency
-    /// list (`serde`, `serde_ignored`, `toml`, `toml_edit`, `tracing`), and a
-    /// capture that only ever needs `event` does not justify widening it.
-    #[derive(Clone, Default)]
-    struct Captured {
-        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
-    }
-
-    #[derive(Clone, Debug)]
-    struct CapturedEvent {
-        level: tracing::Level,
-        message: String,
-        fields: std::collections::HashMap<String, String>,
-    }
-
-    impl Captured {
-        fn events(&self) -> Vec<CapturedEvent> {
-            self.events.lock().expect("not poisoned").clone()
-        }
-    }
-
-    impl tracing::Subscriber for Captured {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut visitor = FieldVisitor::default();
-            event.record(&mut visitor);
-            self.events
-                .lock()
-                .expect("not poisoned")
-                .push(CapturedEvent {
-                    level: *event.metadata().level(),
-                    message: visitor.message,
-                    fields: visitor.fields,
-                });
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
-    #[derive(Default)]
-    struct FieldVisitor {
-        message: String,
-        fields: std::collections::HashMap<String, String>,
-    }
-
-    impl tracing::field::Visit for FieldVisitor {
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "message" {
-                self.message = value.to_string();
-            } else {
-                self.fields
-                    .insert(field.name().to_string(), value.to_string());
-            }
-        }
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            // `%` sigils and the message itself arrive here; the wrappers
-            // `tracing` uses render their `Display` form through `Debug`.
-            let rendered = format!("{value:?}");
-            if field.name() == "message" {
-                self.message = rendered;
-            } else {
-                self.fields.insert(field.name().to_string(), rendered);
-            }
-        }
-    }
-
-    /// Installs a capturing [`tracing::Subscriber`] as this thread's ambient
-    /// default and returns a handle to the events it records
-    /// ([`Captured::events`]) plus the [`tracing::dispatcher::DefaultGuard`]
-    /// that keeps it installed for the scope of the caller (drop the guard,
-    /// or let it fall out of scope, to uninstall).
-    ///
-    /// Also calls [`crate::test_tracing::ensure_global_default`] first: see
-    /// that module's doc for the mechanism this exists to close (#1022) — in
-    /// short, without a permanently-registered global default, a callsite
-    /// first touched on a subscriber-less thread anywhere in this binary can
-    /// cache `Interest::never()` for the rest of the process, which would
-    /// make this very capture blind to a `warn!`/`error!` it should have
-    /// seen, depending on unrelated test scheduling.
-    fn capture() -> (Captured, tracing::dispatcher::DefaultGuard) {
-        crate::test_tracing::ensure_global_default();
-        let captured = Captured::default();
-        let guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(captured.clone()));
-        (captured, guard)
-    }
+    // The capture harness itself now lives in `crate::test_support` (#1044):
+    // this module's copy and the trollshell config tests' copy were the same
+    // 100 lines twice over, and they had already drifted — one kept the
+    // structured fields, the other threw them away (#1040 V10).
+    use crate::test_support::{Captured, CapturedEvent, capture};
 
     /// The global default from #1022's fix must reach a thread that never
     /// calls [`capture`] or [`assembled`] at all — exactly the shape
@@ -1552,7 +1773,7 @@ kept = true
     /// pre-#1022 shape of this test called `capture` *after* the bare touch,
     /// which just re-exercises `Dispatch::new`'s unconditional full-registry
     /// rebuild — a real, still-true property, but not the one this fix adds,
-    /// and it would pass even with [`crate::test_tracing::ensure_global_default`]
+    /// and it would pass even with [`crate::test_support::ensure_global_default`]
     /// deleted (I checked: it did, 0 of the mutation's failures were this
     /// test).
     ///
@@ -1568,7 +1789,7 @@ kept = true
     /// race here is the *fold* over that full list: it can only land on
     /// `never()` if every entry says `never()`, and our permanently-registered
     /// global always says `always()`, so the folded result can't be
-    /// `never()` either. See [`crate::test_tracing`]'s doc for the fold rule
+    /// `never()` either. See [`crate::test_support`]'s doc for the fold rule
     /// and for `a_bare_thread_touching_a_callsite_while_only_the_global_is_live`,
     /// the sibling test below that exercises the actual `JustOne` path this
     /// test's own assertion used to (wrongly) credit.
@@ -1586,7 +1807,7 @@ kept = true
         // Guarantee the global default is live before anything below runs —
         // exactly what every real `capture`/`assembled` call already does; a
         // test doesn't get to assume some *other* test won that race first.
-        crate::test_tracing::ensure_global_default();
+        crate::test_support::ensure_global_default();
 
         // Install the capturing `Dispatch` *before* the callsite below has
         // ever been touched by anyone — its own construction has nothing
@@ -1629,10 +1850,10 @@ kept = true
     /// `ensure_global_default`'s body disabled, the callsite would cache
     /// `never()` on the bare touch, but `capture`'s own subsequent
     /// `Dispatch::new` unconditionally rebuilds every already-registered
-    /// callsite (see `crate::test_tracing`'s doc) and would rescue it anyway
+    /// callsite (see `crate::test_support`'s doc) and would rescue it anyway
     /// — the same pre-existing mechanism that makes the *other* test's old,
     /// deleted ordering non-discriminating. What this test isolates instead
-    /// is [`crate::test_tracing::AlwaysInterested`]'s `register_callsite`
+    /// is [`crate::test_support::AlwaysInterested`]'s `register_callsite`
     /// actually being consulted on the `JustOne` path: swap it for a
     /// subscriber whose `register_callsite` returns anything other than
     /// `Interest::always()` and this is the test that is supposed to notice.
@@ -1642,7 +1863,7 @@ kept = true
             tracing::warn!(marker = "1043-justone", "JustOne-path probe");
         }
 
-        crate::test_tracing::ensure_global_default();
+        crate::test_support::ensure_global_default();
 
         // Only the permanent global is live at this point (in isolation —
         // see the doc above on why this can't be guaranteed under the
@@ -1795,6 +2016,10 @@ kept = true
             const NAME: &'static str = "bad-default";
             const DEFAULT_TOML: &'static str = "_unset = \"color\"\ncolor = \"amber\"\n";
             type Error = std::convert::Infallible;
+            type Resolved = ();
+            fn parsed(&self) -> ((), Vec<InvalidValue>) {
+                ((), Vec::new())
+            }
             fn validate(&self) -> Result<(), Self::Error> {
                 Ok(())
             }
@@ -1839,6 +2064,10 @@ kept = true
         const NAME: &'static str = "opt-table";
         const DEFAULT_TOML: &'static str = "enabled = true\n";
         type Error = std::convert::Infallible;
+        type Resolved = ();
+        fn parsed(&self) -> ((), Vec<InvalidValue>) {
+            ((), Vec::new())
+        }
         fn validate(&self) -> Result<(), Self::Error> {
             Ok(())
         }
@@ -2108,6 +2337,10 @@ kept = true
             const NAME: &'static str = "nested";
             const DEFAULT_TOML: &'static str = "enabled = true\n";
             type Error = std::convert::Infallible;
+            type Resolved = ();
+            fn parsed(&self) -> ((), Vec<InvalidValue>) {
+                ((), Vec::new())
+            }
             fn validate(&self) -> Result<(), Self::Error> {
                 Ok(())
             }
@@ -2321,6 +2554,10 @@ kept = true
             const NAME: &'static str = "inert-default";
             const DEFAULT_TOML: &'static str = "_unset = [\"colr\"]\ncolor = \"amber\"\n";
             type Error = std::convert::Infallible;
+            type Resolved = ();
+            fn parsed(&self) -> ((), Vec<InvalidValue>) {
+                ((), Vec::new())
+            }
             fn validate(&self) -> Result<(), Self::Error> {
                 Ok(())
             }
@@ -2340,5 +2577,225 @@ kept = true
         );
         assert_eq!(fields.get("key").map(String::as_str), Some("colr"));
         assert_eq!(loaded.config.color, "amber", "and it removed nothing");
+    }
+
+    // ── #1040 V1: a bad value costs its own key ─────────────────────────────
+
+    const STYLE: env::EnvKnob = env::EnvKnob::same(
+        "TROLLSHELL_CORE_LEDS_STYLE",
+        "style",
+        "one of vfd/lcd/oled/crt",
+    );
+    const ROWS: env::EnvKnob = env::EnvKnob {
+        var: "TROLLSHELL_CORE_LEDS_ROWS",
+        key: "rows",
+        env_accepts: "rect, or a row count",
+        file_accepts: "0 or \"rect\", or a row count",
+    };
+
+    /// The rejected-file-value sentence, as a literal.
+    ///
+    /// The consequence clause is the load-bearing half: #1040 V1 was a PR that
+    /// *said* a bad value left the rest of the file applied while the code
+    /// dropped the whole file, and a human reading the journal has no way to
+    /// tell the two apart except by what this line claims. Building the
+    /// expectation from [`rejected_value_message`] would assert it against
+    /// itself; `docs/live-verify.md` quotes it verbatim (#1040 mutation N9).
+    #[test]
+    fn the_rejected_value_sentence_is_this_exact_sentence() {
+        assert_eq!(
+            rejected_value_message("rows = \"many\" is not valid; expected a row count"),
+            "rows = \"many\" is not valid; expected a row count \
+             — ignoring this key and using the built-in default"
+        );
+    }
+
+    /// [`InvalidValue`]'s own sentence, as a literal, and the **file**
+    /// vocabulary in it (#1040 V4 — the diagnostic is only ever produced on the
+    /// file path).
+    #[test]
+    fn the_invalid_value_sentence_is_this_exact_sentence() {
+        assert_eq!(
+            InvalidValue::written(&ROWS, "\"many\"").to_string(),
+            "rows = \"many\" is not valid; expected 0 or \"rect\", or a row count"
+        );
+    }
+
+    /// A value is quoted back **as TOML**: a string quoted, an integer bare, a
+    /// hex integer in its canonical decimal rendering.
+    ///
+    /// **Red if `InvalidValue::of` stops going through `toml::Value`'s
+    /// `Display`** (#1040 F11/T1, mutation N6 — which was green until the
+    /// rendering was pinned against literals rather than against another call
+    /// to `of`).
+    #[test]
+    fn a_rejected_value_is_quoted_back_as_the_toml_it_was_written_as() {
+        let cases: [(toml::Value, &str); 5] = [
+            ("plasma".into(), "\"plasma\""),
+            (5.into(), "5"),
+            (true.into(), "true"),
+            (1.5.into(), "1.5"),
+            (0xff_0000.into(), "16711680"),
+        ];
+        for (value, written) in cases {
+            assert_eq!(
+                InvalidValue::of(&STYLE, &value),
+                InvalidValue::written(&STYLE, written),
+                "{value} must be quoted back as {written}"
+            );
+        }
+    }
+
+    /// [`spelling`] is a string's *contents* and every other type's TOML
+    /// rendering — the half of #1040 T1 that turns a wrong type into a per-key
+    /// rejection rather than a whole-file one.
+    #[test]
+    fn a_spelling_is_the_string_itself_or_the_toml_rendering() {
+        assert_eq!(
+            spelling(&toml::Value::from("vfd")),
+            "vfd",
+            "no added quotes"
+        );
+        assert_eq!(spelling(&toml::Value::from(5)), "5");
+        assert_eq!(spelling(&toml::Value::from(true)), "true");
+        assert_eq!(spelling(&toml::Value::from(vec![1])), "[1]");
+    }
+
+    /// [`keep`] takes the value when there is one and records the rejection —
+    /// **and takes that key's own default** — when there is not. One key's
+    /// mistake, one key's cost (#1040 mutation R11).
+    #[test]
+    fn keep_records_a_rejection_and_defaults_only_that_key() {
+        let mut rejected = Vec::new();
+
+        let good = keep(Ok::<u8, InvalidValue>(7), 0, &mut rejected);
+        let bad = keep(
+            Err(InvalidValue::written(&ROWS, "\"many\"")),
+            3,
+            &mut rejected,
+        );
+
+        assert_eq!(good, 7, "a parsed value is taken as-is");
+        assert_eq!(bad, 3, "…and a rejected one falls to the default handed in");
+        assert_eq!(rejected, vec![InvalidValue::written(&ROWS, "\"many\"")]);
+    }
+
+    // ── #1040 V1: the journal line the loader emits per rejected key ────────
+
+    const LEVEL: env::EnvKnob = env::EnvKnob::same(
+        "TROLLSHELL_TEST_PAIR_LEVEL",
+        "level",
+        "a level from 0 to 255",
+    );
+    const LABEL: env::EnvKnob =
+        env::EnvKnob::same("TROLLSHELL_TEST_PAIR_LABEL", "label", "a non-empty label");
+
+    /// A two-key schema whose values are judged per key — the smallest thing
+    /// that can show "one key's mistake, one key's cost".
+    ///
+    /// Both fields are raw `toml::Value` (the #1040 T1 rule), so `level =
+    /// "many"` is a perfectly **well-typed** TOML string that serde has no
+    /// reason to reject: the verdict is [`Subsystem::parsed`]'s, which is
+    /// exactly the path [`load_layer`] emits a line for.
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(default)]
+    struct Pair {
+        level: toml::Value,
+        label: toml::Value,
+    }
+
+    impl Default for Pair {
+        fn default() -> Self {
+            Self {
+                level: toml::Value::Integer(1),
+                label: "hi".into(),
+            }
+        }
+    }
+
+    impl Subsystem for Pair {
+        const NAME: &'static str = "pair";
+        const DEFAULT_TOML: &'static str = "level = 1\nlabel = \"hi\"\n";
+        type Error = std::convert::Infallible;
+        type Resolved = (u8, String);
+
+        fn validate(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn parsed(&self) -> ((u8, String), Vec<InvalidValue>) {
+            let mut rejected = Vec::new();
+            let level = keep(
+                spelling(&self.level)
+                    .parse::<u8>()
+                    .map_err(|_| InvalidValue::of(&LEVEL, &self.level)),
+                1,
+                &mut rejected,
+            );
+            let raw = spelling(&self.label);
+            let label = keep(
+                if raw.is_empty() {
+                    Err(InvalidValue::of(&LABEL, &self.label))
+                } else {
+                    Ok(raw)
+                },
+                "hi".to_string(),
+                &mut rejected,
+            );
+            ((level, label), rejected)
+        }
+    }
+
+    /// A **well-typed** value that the subsystem's own parser turns down costs
+    /// its own key, warns **once**, and leaves every other key applied.
+    ///
+    /// This is #1040 V1's whole behaviour, asserted at the place the journal
+    /// line is actually produced — [`load_layer`], the generic loader every
+    /// subsystem inherits. Before PR #1085's review (F2) the only test of that
+    /// emission lived in the `core-leds` pilot, so deleting the `warn!` loop
+    /// (mutation MUT-B) left `hytte-config` green at 162 while the mechanism
+    /// family #2 is told it gets for free was gone.
+    ///
+    /// **Red if the emission loop goes** (no line), **if it stops naming the
+    /// key** (the rendered sentence is compared whole), or **if a rejection
+    /// takes the file down with it** (`label` would not be `"desk"`).
+    #[test]
+    fn a_rejected_but_well_typed_value_warns_once_and_leaves_the_other_key_applied() {
+        let mut file = crate::test_support::Overlay::new(Pair::NAME);
+        file.write("level = \"many\"\nlabel = \"desk\"\n");
+        let (captured, _guard) = capture();
+
+        let resolved = load_layer::<Pair>(&file.layers()).expect("the file is TOML");
+
+        assert_eq!(
+            resolved,
+            (1, "desk".to_string()),
+            "the bad key takes its built-in default and the good one still applies"
+        );
+        let warned = captured.warnings();
+        assert_eq!(
+            warned.len(),
+            1,
+            "one line, for the one bad key: {warned:#?}"
+        );
+        assert_eq!(
+            warned[0],
+            rejected_value_message(&InvalidValue::written(&LEVEL, "\"many\"").to_string()),
+            "…naming the key, quoting the TOML, and stating the consequence"
+        );
+    }
+
+    /// A file with **no** mistake in it says nothing — the negative that makes
+    /// "one line per rejected key" mean something.
+    #[test]
+    fn a_file_with_nothing_wrong_in_it_warns_about_nothing() {
+        let mut file = crate::test_support::Overlay::new(Pair::NAME);
+        file.write("level = 4\nlabel = \"desk\"\n");
+        let (captured, _guard) = capture();
+
+        let resolved = load_layer::<Pair>(&file.layers()).expect("the file is TOML");
+
+        assert_eq!(resolved, (4, "desk".to_string()));
+        assert_eq!(captured.warnings(), Vec::<String>::new());
     }
 }

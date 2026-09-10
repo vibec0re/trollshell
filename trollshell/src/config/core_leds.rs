@@ -2,19 +2,25 @@
 //! dressed, and the **first live subsystem** of the #866/#868 config layering
 //! (#869).
 //!
-//! # Why this one is the pilot
+//! # Why this one was the pilot
 //!
 //! Four knobs, brand new, entirely self-contained, and actively being fiddled
 //! with — so the payoff of a file over an environment variable (edit, save,
 //! watch the panel re-skin; no shell restart) is felt on the first try. Small
-//! enough to throw away and redo if the shape turns out wrong, which is the
+//! enough to throw away and redo if the shape turned out wrong, which is the
 //! point of piloting before committing the other ~9 subsystems.
+//!
+//! The shape did not turn out wrong, and #1044 hoisted every generic piece of
+//! it into `hytte_config::subsystem` — the per-key tolerance, the environment
+//! overlay and its three sentences, the layer poller, the test harnesses. What
+//! is left in this file is the schema, the documented default, the four
+//! parsers, the knob table and the service wiring: the parts a family #2 has to
+//! write for itself, and nothing else.
 //!
 //! # Resolution order, per key
 //!
 //! 1. the **environment variable**, when it is set *and* parses — with one
-//!    deprecation warning at startup naming the file key it moves to
-//!    ([`Deprecations`]);
+//!    deprecation warning at startup ([`Deprecations`]);
 //! 2. the **config layers**: `$XDG_CONFIG_DIRS/trollshell/core-leds.toml`
 //!    (nix's base) then `$XDG_CONFIG_HOME/trollshell/core-leds.toml` (yours),
 //!    merged by [`hytte_config::merge`]'s four rules;
@@ -22,13 +28,10 @@
 //!    which is the bottom merge layer, so a missing file behaves exactly like
 //!    an unset variable did and says nothing about it.
 //!
-//! A **set but unparseable** variable keeps the pre-#869 behaviour: one
-//! `warn!` naming the accepted values, then fall through to the layer below.
-//! It does not win, and it does not take anything down. Exactly one line, not
-//! two — the deprecation announcement is made only for a value that parsed,
-//! and the unusable-value line names the key and the file itself. Both lines
-//! are startup-only: a process's environment is fixed at `exec`, so a reload
-//! has nothing new to say about one.
+//! A **set but unparseable** variable keeps the pre-#869 behaviour: one `warn!`
+//! naming the accepted values, then fall through to the layer below. Exactly
+//! one line, not two, and both lines are startup-only — see
+//! [`hytte_config::subsystem::env`] for why.
 //!
 //! # A bad *value* costs its own key, and only its own key
 //!
@@ -37,12 +40,12 @@
 //! one warning naming it, and [`CoreLedsConfig::validate`] is `Infallible` so
 //! nothing in this schema can be a whole-file rejection (#1040 V1). A wrong
 //! TOML **type** is the same kind of mistake and gets the same treatment —
-//! `style = 5` costs `style` and nothing else — which is why every schema
-//! field is a raw [`toml::Value`] and not even a `String` (#1040 T1). What is
-//! still whole-file is a layer that is not TOML **at all** — an unterminated
-//! string, an integer literal too large for TOML's `i64` — which at startup
-//! degrades to the built-in defaults with a loud `error!` and on a reload
-//! keeps the last good file.
+//! `style = 5` costs `style` and nothing else — which is why every schema field
+//! is a raw [`toml::Value`] and not even a `String` (#1040 T1). What is still
+//! whole-file is a layer that is not TOML **at all** — an unterminated string,
+//! an integer literal too large for TOML's `i64` — which at startup degrades to
+//! the built-in defaults with a loud `error!` and on a reload keeps the last
+//! good file.
 //!
 //! # Two spellings, one parser
 //!
@@ -54,44 +57,39 @@
 //! **one** parser decides both — [`CoreLedsConfig::parsed`] is the only path
 //! from raw spelling to [`CoreLeds`], so "what the file rejects" and "what the
 //! variable rejects" cannot drift. The one deliberate divergence is that `0`,
-//! which the variable never took, so the two vocabularies are stated
-//! separately on the [`Knob`] (#1040 V4).
+//! which the variable never took, so the two vocabularies are stated separately
+//! on the [`EnvKnob`] (#1040 V4).
 //!
 //! # Live reload
 //!
-//! [`Watcher`] polls every layer's [`stamp`] on [`CONFIG_POLL_INTERVAL`] — the
-//! `places.toml` idiom (`hytte_services::places::watch_config`), a single
-//! `stat` per layer per tick, re-reading only when a stamp actually moves. A
-//! reload of a layer that is not TOML **keeps the last good file layer** and
-//! warns; a deleted layer falls back to the layer below it (and, with nothing
-//! left, to the built-in defaults); a reload never re-announces a deprecated
-//! variable, and the variable keeps winning across reloads.
-//!
-//! The config is stamped and then loaded **once** per process, in [`boot`];
-//! the watcher does neither. Two loads at startup would double every
-//! diagnostic, and stamping *after* the load loses an edit made in between
-//! permanently — see [`Watcher::stamping_before`].
+//! [`watch::Watcher`] polls every layer's change stamp on
+//! [`watch::POLL_INTERVAL`] — a single `stat` per layer per tick, re-reading
+//! only when a stamp actually moves. A reload of a layer that is not TOML keeps
+//! the last good file layer and warns; a deleted layer falls back to the layer
+//! below it (and, with nothing left, to the built-in defaults); a reload never
+//! re-announces a deprecated variable, and the variable keeps winning across
+//! reloads. See [`hytte_config::subsystem::watch`] for the three orderings that
+//! make that true.
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::path::PathBuf;
+use std::time::Duration;
 
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::prelude::Service;
 use hytte::reactive::{registry, spawn_supervised};
-use hytte_config::subsystem::{self, ConfigError, Subsystem};
+use hytte_config::subsystem::env::{self, Deprecations, EnvKnob};
+use hytte_config::subsystem::watch::{self, EnvLookup};
+use hytte_config::subsystem::{InvalidValue, Subsystem, keep, spelling};
 use hytte_config::xdg;
 use hytte_preem::{ColorMap, DisplayStyle, Fill};
-
-use super::{warn_deprecated_env, warn_rejected_value, warn_unusable_env};
 
 // ── The resolved dressing ────────────────────────────────────────────────────
 
 /// How the per-core LED panel is dressed (#857).
 ///
 /// The resolved, parsed form — what the rasteriser consumes.
-/// [`CoreLedsConfig`] is the *file* form, whose keys are raw strings and
-/// integers so an unrecognised value can be reported rather than silently
-/// substituted.
+/// [`CoreLedsConfig`] is the *file* form, whose keys are raw `toml::Value`s so
+/// an unrecognised value can be reported rather than silently substituted.
 ///
 /// The skin and the colour map are **independent axes** (see the `hytte-preem`
 /// `color_map` docs): `style = "crt"` with `color = "heat"` gives heat-mapped
@@ -159,8 +157,8 @@ fn parse_hex_rgb(raw: &str) -> Option<ColorMap> {
 
 /// The largest row count a pin may ask for.
 ///
-/// Sized off what the panel can physically show, not off a round number. A
-/// lamp row costs `CELL + GAP` = 11 buffer px (`hytte_preem::led_matrix`), the
+/// Sized off what the panel can physically show, not off a round number. A lamp
+/// row costs `CELL + GAP` = 11 buffer px (`hytte_preem::led_matrix`), the
 /// panel's on-screen budget is `stats::CORE_PANEL_MAX_H` = 104 logical px and
 /// the upscale factor never goes below 1× — so **9** rows already fill the
 /// budget box, and past that every extra row is letterboxed back down and
@@ -169,10 +167,10 @@ fn parse_hex_rgb(raw: &str) -> Option<ColorMap> {
 /// `⌈√cores / 2⌉` rows, which is 4 on a 64-thread box, 12 at 512 and **32** on
 /// a hypothetical 4096-thread one.
 ///
-/// 64 is therefore twice the most any real machine's automatic shape would
-/// want and seven times what the budget box can render at 1× — deliberately
-/// generous, because a pinned row count is the user's call to make even when
-/// it is a *worse* shape than the automatic one. What it is not is unbounded:
+/// 64 is therefore twice the most any real machine's automatic shape would want
+/// and seven times what the budget box can render at 1× — deliberately
+/// generous, because a pinned row count is the user's call to make even when it
+/// is a *worse* shape than the automatic one. What it is not is unbounded:
 /// `rows = 10000000` asks for a 7 GB frame (an allocation abort inside the
 /// `bind` apply closure on the GTK main thread) and `rows = 9223372036854775807`
 /// overflows `LedMatrix::height()`. Since #869 that value arrives from a file
@@ -188,15 +186,15 @@ const MAX_ROWS: usize = 64;
 /// This is the **single judge** of a row count: the file's integer spelling is
 /// rendered back into this vocabulary by [`rows_spelling`] before it gets here,
 /// so the cap and the rejections apply identically to
-/// `TROLLSHELL_CORE_LEDS_ROWS` and to `rows =` in the file. That is the
-/// property the pilot exists to prove, used.
+/// `TROLLSHELL_CORE_LEDS_ROWS` and to `rows =` in the file. That is the property
+/// the pilot exists to prove, used.
 ///
 /// `rect` is Annika's word for it from #857, and since her second pass on the
 /// same issue ("rectangle for led view would be still more preem tho") it now
-/// keeps its promise: the automatic shape is `LedMatrix::wide`'s wide
-/// rectangle rather than the near-square panel #861 shipped. Still automatic
-/// rather than a pinned default row count, because a fixed `rows = 4` reads
-/// well at 64 cores and absurdly at 4.
+/// keeps its promise: the automatic shape is `LedMatrix::wide`'s wide rectangle
+/// rather than the near-square panel #861 shipped. Still automatic rather than a
+/// pinned default row count, because a fixed `rows = 4` reads well at 64 cores
+/// and absurdly at 4.
 fn parse_core_leds_rows(raw: &str) -> Result<Option<usize>, &str> {
     if raw == "rect" {
         return Ok(None);
@@ -213,27 +211,6 @@ fn parse_core_leds_fill(raw: &str) -> Result<Fill, &str> {
         "spare" => Ok(Fill::Spare),
         "blank" => Ok(Fill::Blank),
         other => Err(other),
-    }
-}
-
-/// The raw spelling one key is judged in: a TOML string's own contents, and
-/// for **every other TOML type** its rendering — `5`, `true`, `4.0`, `[1]`.
-///
-/// This is the half of #1040 T1 that turns a wrong *type* into a per-key
-/// rejection instead of a whole-file one. Every field of [`CoreLedsConfig`] is
-/// a raw [`toml::Value`], so serde accepts whatever shape the file holds and
-/// the verdict lands here; a rendering no parser takes comes back as an
-/// [`InvalidValue`] naming the key and quoting the value, which is exactly the
-/// treatment `style = "plasma"` gets. Nothing about a value's type is
-/// special-cased, because to this schema nothing about it is special: a
-/// spelling either parses or it does not.
-fn spelling(value: &toml::Value) -> String {
-    match value {
-        toml::Value::String(text) => text.clone(),
-        // `toml::Value`'s `Display` *is* its TOML rendering, which is the whole
-        // reason the schema keeps values rather than strings: the diagnostic
-        // quotes back the bytes the reader is about to open.
-        other => other.to_string(),
     }
 }
 
@@ -254,59 +231,17 @@ fn rows_spelling(rows: &toml::Value) -> String {
 
 // ── The knob table ───────────────────────────────────────────────────────────
 
-/// One migrated knob: the environment variable that used to carry it, the
-/// config key that carries it now, and the vocabulary both accept.
-///
-/// A table rather than four ad-hoc string literals because every message about
-/// a knob — the deprecation line, the unrecognised-value warning, the
-/// validation error — has to name the same three things, and the next nine
-/// subsystems copy this shape.
-struct Knob {
-    /// The deprecated environment variable.
-    var: &'static str,
-    /// The `core-leds.toml` key it moved to.
-    key: &'static str,
-    /// What the **variable** accepts, phrased to read after "expected" in
-    /// [`crate::config::unusable_env_message`].
-    env_accepts: &'static str,
-    /// What the **file key** accepts, phrased to read after "it accepts" in
-    /// [`crate::config::deprecation_message`] and after "expected" in
-    /// [`InvalidValue`]'s.
-    ///
-    /// Separate from [`Self::env_accepts`] for one key only, and #1040 V4 is
-    /// why it has to be: `rows` is the pilot's single translation point
-    /// between the two vocabularies (TOML's `0` is the file's spelling of the
-    /// word `rect`, and the variable never took a `0`), so one shared string
-    /// made the *variable*'s own line self-contradictory —
-    /// "`0` … is not valid; expected "rect" (or 0)". Where the two agree,
-    /// [`Knob::same`] states the vocabulary once.
-    file_accepts: &'static str,
-}
-
-impl Knob {
-    /// A knob whose file spelling and variable spelling are identical — the
-    /// normal case, and the one a family-#2 author should expect to be in.
-    const fn same(var: &'static str, key: &'static str, accepts: &'static str) -> Self {
-        Self {
-            var,
-            key,
-            env_accepts: accepts,
-            file_accepts: accepts,
-        }
-    }
-}
-
-const STYLE: Knob = Knob::same(
+const STYLE: EnvKnob = EnvKnob::same(
     "TROLLSHELL_CORE_LEDS_STYLE",
     "style",
     "one of vfd/lcd/oled/crt",
 );
-const COLOR: Knob = Knob::same(
+const COLOR: EnvKnob = EnvKnob::same(
     "TROLLSHELL_CORE_LEDS_COLOR",
     "color",
     "one of style/rainbow/transpride/heat, or an #rrggbb literal",
 );
-const ROWS: Knob = Knob {
+const ROWS: EnvKnob = EnvKnob {
     var: "TROLLSHELL_CORE_LEDS_ROWS",
     key: "rows",
     // The variable never took a `0` — `TROLLSHELL_CORE_LEDS_ROWS=0` is
@@ -317,51 +252,24 @@ const ROWS: Knob = Knob {
     // until nix renders a base file, exists nowhere on disk (#1040 F5).
     file_accepts: "0 or \"rect\" for the automatic rectangle, or a row count from 1 to 64",
 };
-const FILL: Knob = Knob::same("TROLLSHELL_CORE_LEDS_FILL", "fill", "one of spare/blank");
+const FILL: EnvKnob = EnvKnob::same("TROLLSHELL_CORE_LEDS_FILL", "fill", "one of spare/blank");
 
 // ── The file schema ──────────────────────────────────────────────────────────
-
-/// Why a `core-leds.toml` value was rejected.
-///
-/// Carries the key, the spelling the user wrote and the vocabulary that was
-/// expected, so the journal line is actionable without opening the source.
-///
-/// `value` is the value **as TOML** — quoted for a string key, bare for an
-/// integer one — so the line quotes back exactly the bytes in the file the
-/// reader is about to open (#1040 F11).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InvalidValue {
-    key: &'static str,
-    value: String,
-    expected: &'static str,
-}
-
-impl std::fmt::Display for InvalidValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            key,
-            value,
-            expected,
-        } = self;
-        write!(f, "{key} = {value} is not valid; expected {expected}")
-    }
-}
 
 /// `core-leds.toml`, as written.
 ///
 /// # Every field is a raw [`toml::Value`], and that is the template rule
 ///
 /// Not the parsed value, and not even a `String`: whatever type a schema field
-/// has, **serde judges the value against it before any subsystem code runs,
-/// and serde's verdict is whole-file**. `subsystem::assemble` maps a type
-/// mismatch onto [`ConfigError::Schema`], which discards every other key in
-/// the file with it — the exact failure #1040 V1 was filed about, one layer
-/// further down.
+/// has, **serde judges the value against it before any subsystem code runs, and
+/// serde's verdict is whole-file**. `subsystem::assemble` maps a type mismatch
+/// onto `ConfigError::Schema`, which discards every other key in the file with
+/// it — the exact failure #1040 V1 was filed about, one layer further down.
 ///
 /// A `String` field is *not* enough to escape that, which is what #1040 T1
-/// measured: `style = 5` beside a perfectly good `color = "rainbow"` failed
-/// the whole file with `invalid type: integer 5, expected a string`, and the
-/// panel dropped to built-in defaults with a line that named no key at all.
+/// measured: `style = 5` beside a perfectly good `color = "rainbow"` failed the
+/// whole file with `invalid type: integer 5, expected a string`, and the panel
+/// dropped to built-in defaults with a line that named no key at all.
 /// `toml::Value` is the only field type that can hold every shape a TOML file
 /// can put there, so it is the only one that leaves serde with nothing to
 /// reject — after which [`Self::parsed`] is genuinely the single judge, and a
@@ -370,24 +278,24 @@ impl std::fmt::Display for InvalidValue {
 ///
 /// The residual whole-file cases are then exactly the ones where the file is
 /// **not TOML**: an unterminated string, and an integer literal too large for
-/// TOML's `i64` (`rows = 9223372036854775808`, a [`ConfigError::Parse`] from
-/// the TOML lexer). Neither ever reaches serde, let alone this type; both are
-/// tested (`a_file_that_is_not_toml_is_still_a_whole_file_error`).
+/// TOML's `i64` (`rows = 9223372036854775808`, a `ConfigError::Parse` from the
+/// TOML lexer). Neither ever reaches serde, let alone this type; both are tested
+/// (`a_file_that_is_not_toml_is_still_a_whole_file_error`).
 ///
-/// So the rule a family-#2 author copies is one line — **type every schema
-/// field `toml::Value` and judge it in `parsed()`** — and "raw" in that
-/// sentence means `toml::Value`, not `String`. The cost is that the field type
-/// no longer documents the key's shape; the documentation of a key's shape is
-/// [`Self::DEFAULT_TOML`] and the [`Knob`] vocabulary, both of which the user
+/// So the rule a family-#2 author copies is one line — **type every schema field
+/// `toml::Value` and judge it in `parsed()`** — and "raw" in that sentence means
+/// `toml::Value`, not `String`. The cost is that the field type no longer
+/// documents the key's shape; the documentation of a key's shape is
+/// [`Self::DEFAULT_TOML`] and the [`EnvKnob`] vocabulary, both of which the user
 /// actually reads, and neither of which a whole-file failure can be built out
 /// of.
 ///
 /// `#[serde(default)]` is on the **container**, so a key erased by an
 /// `_unset = ["style"]` marker in the overlay falls back to this type's
-/// documented default rather than to `toml::Value`'s own (which has none: it
-/// is the container default that makes the field optional at all). There is
-/// deliberately no `deny_unknown_fields`: merge rule 4 says an unknown key
-/// warns and is ignored, and [`subsystem::assemble`] is what implements that.
+/// documented default rather than to `toml::Value`'s own (which has none: it is
+/// the container default that makes the field optional at all). There is
+/// deliberately no `deny_unknown_fields`: merge rule 4 says an unknown key warns
+/// and is ignored, and `subsystem::assemble` is what implements that.
 // No `Eq`: a `toml::Value` can hold a float.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -402,156 +310,17 @@ impl Default for CoreLedsConfig {
     /// The documented default in Rust form.
     ///
     /// Pinned equal to [`Self::DEFAULT_TOML`]'s parse *and* to
-    /// [`CoreLeds::default`] by `the_documented_default_is_the_built_in_one`,
-    /// so this cannot drift from either. It exists as a Rust value because
-    /// `#[serde(default)]` needs one and because the resolver needs a
-    /// panic-free fallback for the (our-bug) case where the built-in TOML
-    /// itself stops parsing.
+    /// [`CoreLeds::default`] by `the_documented_default_is_the_built_in_one`, so
+    /// this cannot drift from either. It exists as a Rust value because
+    /// `#[serde(default)]` needs one and because the resolver needs a panic-free
+    /// fallback for the (our-bug) case where the built-in TOML itself stops
+    /// parsing.
     fn default() -> Self {
         Self {
             style: DisplayStyle::Vfd.name().into(),
             color: ColorMap::Heat.name().into(),
             rows: toml::Value::Integer(0),
             fill: "spare".into(),
-        }
-    }
-}
-
-impl CoreLedsConfig {
-    /// The file's raw spellings as the resolved [`CoreLeds`], beside **every**
-    /// key that did not parse.
-    ///
-    /// The one path from spelling to value: the resolver is this call with the
-    /// environment layered on top, and nothing else may parse a
-    /// `core-leds.toml` value.
-    ///
-    /// # A bad value costs its own key, and only its own key (#1040 V1)
-    ///
-    /// This returns a `CoreLeds` **and** a list, not a `Result`, and that is
-    /// the whole shape of the fix. It used to `?` on the first bad key and
-    /// hand the error to [`Subsystem::validate`], where
-    /// `hytte_config::subsystem::assemble` turns any validation failure into a
-    /// whole-file `ConfigError::Invalid`. The *message* named one key; the
-    /// *effect* dropped all four. A file saying
-    ///
-    /// ```toml
-    /// style = "crt"
-    /// rows  = "many"
-    /// ```
-    ///
-    /// rendered the stock VFD panel with `style` silently gone, while the
-    /// journal talked only about `rows` — the reader's three good keys looked
-    /// ignored for no reason. Now `style` applies, `rows` falls back to the
-    /// built-in default, and exactly one line names `rows`.
-    ///
-    /// The per-key fallback is the **built-in default** for that key, not the
-    /// merged layer underneath it: [`hytte_config::merge`] merges the layers
-    /// before anything is parsed, so by the time a value is judged there is no
-    /// provenance left to fall back through. That is what
-    /// [`crate::config::rejected_value_message`] says in as many words.
-    ///
-    /// This is also the template half a family #2 copies, and the rule is
-    /// short: **type every schema field `toml::Value` and judge it here.** A
-    /// field typed as anything narrower — the parsed value, or even a
-    /// `String` — hands its verdict to serde for every value of the wrong
-    /// *type*, and serde's verdict is whole-file (#1040 T1; see
-    /// [`CoreLedsConfig`]'s own doc for the measurement).
-    fn parsed(&self) -> (CoreLeds, Vec<InvalidValue>) {
-        /// Take the parsed value, or record why it was rejected and take the
-        /// built-in default for that key. A free `fn` rather than a closure
-        /// because it is used at four different `T`s.
-        fn keep<T>(
-            result: Result<T, InvalidValue>,
-            default: T,
-            rejected: &mut Vec<InvalidValue>,
-        ) -> T {
-            match result {
-                Ok(value) => value,
-                Err(invalid) => {
-                    rejected.push(invalid);
-                    default
-                }
-            }
-        }
-
-        let mut rejected = Vec::new();
-        let fallback = CoreLeds::default();
-        // The spelling each key is judged in. Every key is its raw value's
-        // ([`spelling`]); `rows` is the pilot's one translation point, where
-        // the TOML integer `0` becomes the variable's word `rect` (#1040 V4).
-        let (style, color, rows, fill) = (
-            spelling(&self.style),
-            spelling(&self.color),
-            rows_spelling(&self.rows),
-            spelling(&self.fill),
-        );
-        // Every rejection quotes `self.<key>` — the raw `toml::Value` — rather
-        // than the spelling the parser was handed: `rows = 0` is spelt `rect`
-        // going in, and echoing `rect` back at a user who wrote something else
-        // would name a value that is nowhere in their file. It is also what
-        // makes a wrong *type* read like any other bad value (#1040 T1):
-        // `style = 5` is reported as `style = 5`, not as a serde message about
-        // an integer where a string was expected.
-        let leds = CoreLeds {
-            style: keep(
-                parse_core_leds_style(&style).map_err(|_| InvalidValue::of(&STYLE, &self.style)),
-                fallback.style,
-                &mut rejected,
-            ),
-            color: keep(
-                parse_core_leds_color(&color).map_err(|_| InvalidValue::of(&COLOR, &self.color)),
-                fallback.color,
-                &mut rejected,
-            ),
-            rows: keep(
-                parse_core_leds_rows(&rows).map_err(|_| InvalidValue::of(&ROWS, &self.rows)),
-                fallback.rows,
-                &mut rejected,
-            ),
-            fill: keep(
-                parse_core_leds_fill(&fill).map_err(|_| InvalidValue::of(&FILL, &self.fill)),
-                fallback.fill,
-                &mut rejected,
-            ),
-        };
-        (leds, rejected)
-    }
-}
-
-impl InvalidValue {
-    /// The offending value **as the user wrote it in TOML**: a string quoted,
-    /// an integer bare, a float/boolean/array/table exactly as TOML spells it
-    /// (#1040 F11/T1).
-    ///
-    /// One constructor for every key and every TOML type, because
-    /// `toml::Value`'s `Display` *is* the TOML rendering — so the line quotes
-    /// back what the file holds, whether the mistake was a wrong word
-    /// (`style = "plasma"`) or a wrong type (`style = 5`). It is the
-    /// **canonical** rendering rather than the source bytes, which shows on a
-    /// hex integer: it comes back decimal (`0xff0000` → `16711680`), pinned in
-    /// `a_wrong_typed_value_is_a_per_key_rejection_too`. A TOML date comes
-    /// back quoted too, but that is **not** `Display`'s doing —
-    /// `toml::Value::Datetime`'s own `Display` is unquoted, measured — it is
-    /// `assemble`'s `IntoDeserializer` round-trip that erases the date to a
-    /// `String` before this constructor ever sees it (#1040 fix round 4 F3;
-    /// see `a_toml_date_arrives_as_a_string_not_a_datetime`). The environment path
-    /// never produces an [`InvalidValue`] at all: an unusable
-    /// variable gets [`crate::config::warn_unusable_env`], which quotes with
-    /// backticks because a shell variable is not TOML either.
-    fn of(knob: &Knob, value: &toml::Value) -> Self {
-        Self::written(knob, &value.to_string())
-    }
-
-    /// The offending value already rendered as TOML — the form a test states
-    /// as a literal, so the rendering itself is pinned rather than compared
-    /// against another call to [`Self::of`].
-    fn written(knob: &Knob, value: &str) -> Self {
-        Self {
-            key: knob.key,
-            value: value.to_string(),
-            // The *file* vocabulary: this diagnostic is only ever produced on
-            // the file path, and for `rows` the two differ (#1040 V4).
-            expected: knob.file_accepts,
         }
     }
 }
@@ -610,435 +379,149 @@ fill = "spare"
     /// `hytte_config::subsystem::assemble` maps any `validate` error onto
     /// `ConfigError::Invalid`, which is a **whole-file** rejection — the load
     /// returns no config at all and the caller falls back to the built-in
-    /// defaults (at startup) or keeps the last good file (on a reload). That
-    /// is the right contract for a config whose keys are interdependent, and
-    /// the wrong one for this pilot, whose four knobs are independent
-    /// look-and-feel values: one typo would revert the other three (#1040 V1).
+    /// defaults (at startup) or keeps the last good file (on a reload). That is
+    /// the right contract for a config whose keys are interdependent, and the
+    /// wrong one for this pilot, whose four knobs are independent look-and-feel
+    /// values: one typo would revert the other three (#1040 V1).
     ///
-    /// So the judgement moves into [`CoreLedsConfig::parsed`], which reports
-    /// every bad key and defaults *that key* — and `Infallible` is then the
-    /// honest `Error`, exactly as this trait's own doc suggests ("when there
-    /// is nothing the type system did not already catch"). A family #2 whose
-    /// keys really do constrain each other should use a real error here; one
-    /// whose keys are independent should copy this.
-    ///
-    /// # How a family #2 states a **cross-key** rule (#1040 T4)
-    ///
-    /// `Infallible` here is this subsystem's choice, not the template's: a
-    /// whole-file rejection is still available to any subsystem that needs
-    /// one, because `Subsystem::Error` is per-impl and `subsystem::assemble`
-    /// calls `validate()` unconditionally.
-    ///
-    /// The composition is the part worth writing down, because it looks like
-    /// it needs a second parser and does not. `validate(&self)` sees the
-    /// **raw** config while [`CoreLedsConfig::parsed`] produces the resolved
-    /// values — but `parsed` takes `&self`, so a cross-key rule is stated over
-    /// resolved values by calling it:
-    ///
-    /// ```text
-    /// type Error = MyError;
-    /// fn validate(&self) -> Result<(), MyError> {
-    ///     let (resolved, _rejected) = self.parsed();
-    ///     // …the cross-key rule, over resolved values: e.g. reject a
-    ///     // `min` above a `max`, which no single key can be judged on…
-    /// }
-    /// ```
-    ///
-    /// One parser still, and the per-key warnings still come out exactly once,
-    /// because they are emitted in [`load_layer`] rather than in `parsed` —
-    /// which is why `parsed` returns its rejections instead of logging them.
-    /// The `_rejected` half is deliberately available there too: a cross-key
-    /// rule that would be evaluated over a key that fell back to its built-in
-    /// default can say so rather than pretending the user asked for the
-    /// default. Weigh the whole-file cost before reaching for this: it reverts
-    /// every *other* key in the file, which is what V1 was filed about.
+    /// So the judgement moves into [`Self::parsed`], which reports every bad key
+    /// and defaults *that key* — and `Infallible` is then the honest `Error`,
+    /// exactly as the trait's own doc suggests ("when there is nothing the type
+    /// system did not already catch"). A family #2 whose keys really do
+    /// constrain each other should use a real error here; one whose keys are
+    /// independent should copy this. `Subsystem::validate`'s doc carries the
+    /// worked example of the first shape (#1040 T4).
     type Error = std::convert::Infallible;
 
-    /// See [`Self::Error`]: every value is judged per key in
-    /// [`CoreLedsConfig::parsed`], so there is nothing left for the whole-file
-    /// gate to reject.
+    type Resolved = CoreLeds;
+
+    /// See [`Self::Error`]: every value is judged per key in [`Self::parsed`],
+    /// so there is nothing left for the whole-file gate to reject.
     fn validate(&self) -> Result<(), Self::Error> {
         Ok(())
     }
-}
 
-// ── Resolution: the environment over the file, per key ───────────────────────
-
-/// Whether this resolution is the startup one (which announces every
-/// deprecated variable that is set) or a reload (which announces nothing).
-///
-/// An explicit parameter rather than a `Once` latch: the once-ness is then a
-/// property of the two call sites — `start` announces, [`watch`] does not —
-/// which a test can drive directly, instead of process-global state that the
-/// second test in a binary can no longer observe.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Deprecations {
-    /// Warn once per set variable, naming the file key it moves to.
-    Announce,
-    /// Say nothing: this environment was already announced at startup.
-    Silent,
-}
-
-/// Resolve one knob: the environment variable if it is set, otherwise
-/// `fallback` (the merged file value).
-///
-/// A set variable **wins**, and warns that it is deprecated. A set variable
-/// that does not parse warns about the value and falls through to `fallback` —
-/// the pre-#869 behaviour, except that "the layer below" is now the config
-/// file rather than the hard-coded default.
-///
-/// **One warning, not two** (#1040 F9). The announcement is made *after* the
-/// parse and only for a value that actually parsed: a set-but-unusable variable
-/// gets [`crate::config::warn_unusable_env`] instead, a single line that
-/// already names the key and the file the value should move to. Announcing
-/// first would have handed the reader two half instructions for one mistake.
-fn env_key<'a, T>(
-    knob: &Knob,
-    raw: Option<&'a str>,
-    parse: impl FnOnce(&'a str) -> Result<T, &'a str>,
-    fallback: T,
-    announce: Deprecations,
-) -> T {
-    let Some(raw) = raw else { return fallback };
-    match parse(raw) {
-        Ok(value) => {
-            if announce == Deprecations::Announce {
-                // The *file* vocabulary: this line's job is to tell the reader
-                // what to type in the file it names.
-                warn_deprecated_env(CoreLedsConfig::NAME, knob.var, knob.key, knob.file_accepts);
-            }
-            value
-        }
-        Err(bad) => {
-            // Gated on `announce` exactly like the line above (#1040 V7).
-            // The earlier reading — "an unusable variable is still unusable
-            // after a reload, so this is a fact rather than an announcement" —
-            // was true and still produced a line every three seconds for the
-            // life of the shell. A process's environment is fixed at `exec`
-            // (nothing here calls `set_var`; it is an `unsafe fn`), so the
-            // repeat could never carry news, and `live-verify.md` promises the
-            // reader **exactly one**.
-            if announce == Deprecations::Announce {
-                // The *variable* vocabulary: this line is about what the
-                // variable would have had to say, and for `rows` the file
-                // accepts a spelling the variable never did (#1040 V4).
-                warn_unusable_env(
-                    CoreLedsConfig::NAME,
-                    knob.var,
-                    bad,
-                    knob.key,
-                    knob.env_accepts,
-                );
-            }
-            fallback
-        }
-    }
-}
-
-/// The environment layered over `layered`, key by key — the merged file value
-/// is the fallback for every knob the environment does not carry.
-///
-/// `lookup` is injected rather than read from the process: `unsafe_code =
-/// "forbid"` rules out `std::env::set_var` (it is an `unsafe fn` in edition
-/// 2024), so a test that drove the real environment could not exist at all,
-/// and one that read it would depend on the developer's shell.
-fn resolve(
-    layered: CoreLeds,
-    lookup: &dyn Fn(&str) -> Option<String>,
-    announce: Deprecations,
-) -> CoreLeds {
-    let (style, color, rows, fill) = (
-        lookup(STYLE.var),
-        lookup(COLOR.var),
-        lookup(ROWS.var),
-        lookup(FILL.var),
-    );
-    CoreLeds {
-        style: env_key(
-            &STYLE,
-            style.as_deref(),
-            parse_core_leds_style,
-            layered.style,
-            announce,
-        ),
-        color: env_key(
-            &COLOR,
-            color.as_deref(),
-            parse_core_leds_color,
-            layered.color,
-            announce,
-        ),
-        rows: env_key(
-            &ROWS,
-            rows.as_deref(),
-            parse_core_leds_rows,
-            layered.rows,
-            announce,
-        ),
-        fill: env_key(
-            &FILL,
-            fill.as_deref(),
-            parse_core_leds_fill,
-            layered.fill,
-            announce,
-        ),
-    }
-}
-
-/// The process environment, for the production call sites.
-fn process_env(name: &str) -> Option<String> {
-    std::env::var(name).ok()
-}
-
-// ── Live reload ──────────────────────────────────────────────────────────────
-
-/// How often the running shell re-checks the config layers. Each tick is one
-/// `stat` per layer (two, normally: the nix base and the overlay) on a cached
-/// inode, so it stays snappy while you edit at no measurable idle cost; the
-/// files are only re-read when a stamp actually moves.
-///
-/// `places.toml`'s AC cadence (`hytte_services::places::CONFIG_POLL_INTERVAL`).
-/// It does *not* slow down on battery the way places does since #505: that
-/// needs `upower::on_battery_snapshot`, which is `pub(crate)` to
-/// `hytte-services` and so unreachable from the binary. Noted rather than
-/// worked around — widening it is a `hytte-services` change and belongs to
-/// whichever subsystem migration first needs it.
-const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(3);
-
-/// A layer's change stamp — its last-modified time **and** its length — or
-/// `None` when it does not exist (the normal case for the overlay) or cannot
-/// be stat'd.
-///
-/// The length is not decoration (#1040 F8). An mtime-only stamp misses an edit
-/// saved inside the same mtime granule as the poll's own `stat`, and misses it
-/// **permanently**: the stamp is updated unconditionally, so the movement is
-/// never seen again and the panel stays one save stale until the *next* edit.
-/// Linux's ext4/btrfs/tmpfs carry nanoseconds, so on this shell's own machine
-/// the window is theoretical — but the poller is the piece nine more subsystems
-/// copy, and a coarse-granularity filesystem (a network mount, a FAT-formatted
-/// stick someone points `XDG_CONFIG_DIRS` at) is not exotic. `places`'
-/// `ConfigWatcher` predates this and is mtime-only; its test overlay sets the
-/// mtime by hand precisely because of the same window.
-///
-/// A length is a cheap discriminator on the same `stat` call, not a second
-/// syscall, and it catches the overwhelmingly common shape of a same-granule
-/// edit (a value getting longer or shorter). It is not a hash: two edits that
-/// land in one granule *and* keep the byte count identical are still missed,
-/// which is the honest limit of stat-polling and the reason a real watch
-/// (inotify) is the eventual answer rather than a finer stamp.
-fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
-}
-
-/// Every layer's [`stamp`], in path order — one `stat` per layer.
-fn stamps_of(paths: &[PathBuf]) -> Vec<Option<(SystemTime, u64)>> {
-    paths.iter().map(|p| stamp(p)).collect()
-}
-
-/// The merged file layer, with every rejected key reported and defaulted — no
-/// environment.
-///
-/// The `Err` here is a file that is not usable **as a file**: not TOML, or a
-/// layer that exists and cannot be read. A known key holding a value nothing
-/// accepts is *not* one of those (#1040 V1) — it costs its own key, warns, and
-/// the rest of the file loads. Neither is a known key holding a value of the
-/// wrong TOML *type* (#1040 T1): every schema field is a raw `toml::Value`, so
-/// there is no type for serde to reject.
-fn load_layer(paths: &[PathBuf]) -> Result<CoreLeds, ConfigError> {
-    let loaded = subsystem::load_from::<CoreLedsConfig>(paths)?;
-    let (leds, rejected) = loaded.config.parsed();
-    for invalid in &rejected {
-        warn_rejected_value(CoreLedsConfig::NAME, invalid.key, &invalid.to_string());
-    }
-    Ok(leds)
-}
-
-/// Watches every `core-leds.toml` layer for live reload by polling their
-/// mtimes, in the shape `hytte_config::places::ConfigWatcher` established.
-///
-/// Holds the last file layer that loaded cleanly, which is what a malformed
-/// save keeps: the panel goes on rendering the last good skin rather than
-/// snapping back to the built-in default the moment a hand edit is mid-word.
-#[derive(Clone)]
-struct Watcher {
-    paths: Vec<PathBuf>,
-    stamps: Vec<Option<(SystemTime, u64)>>,
-    last_good: CoreLeds,
-}
-
-impl Watcher {
-    /// **Stamp `paths`, then read them with `load`** — in that order, which is
-    /// the entire contract of this constructor.
+    /// The file's raw spellings as the resolved [`CoreLeds`], beside **every**
+    /// key that did not parse.
     ///
-    /// The one load is `load`'s, and it is a parameter rather than a call to
-    /// [`initial_load`] for two reasons. The first is #1040 F1: the constructor
-    /// used to load *by itself* while `start` had already loaded, so one typo
-    /// produced two `unknown key` warnings and one broken file two `config
-    /// unusable` errors. The second is that the ordering is otherwise a rule
-    /// nothing enforces — two statements in a caller, swappable without a
-    /// single test noticing (measured: mutation V2a green against a test that
-    /// had inlined the two lines itself). With the load handed in, the order
-    /// lives *here*, in one place, and a test can hand in a `load` that edits
-    /// the file on its way out and watch the next poll either see it or lose
-    /// it.
+    /// The one path from spelling to value: [`Self::resolve`] is this call with
+    /// the environment layered on top, and nothing else may parse a
+    /// `core-leds.toml` value.
     ///
-    /// The order matters because the baseline has to predate the value. Stamp
-    /// first and an edit landing in the window is read by this very load, with
-    /// a stamp that predates it — so the next [`Self::poll`] sees the stamp
-    /// move and re-reads, and the edit is one tick late at worst. Stamp *after*
-    /// and the baseline already includes an edit the published value does not,
-    /// and because `poll` updates its stamps unconditionally that edit is
-    /// missed **forever**. Measured on the previous head: file said `crt`,
-    /// panel said `lcd`, three polls, nothing.
+    /// # A bad value costs its own key, and only its own key (#1040 V1)
     ///
-    /// A supervised restart of [`watch`] resumes from the same baseline — the
-    /// watcher is `Clone` and the factory hands out a copy — so an edit made
-    /// during a panic-and-restart is picked up by the next poll rather than
-    /// silently baselined away. `places::ConfigWatcher::new` splits the load
-    /// out the same way; the stamp ordering is this pilot's addition.
-    fn stamping_before(paths: Vec<PathBuf>, load: impl FnOnce(&[PathBuf]) -> CoreLeds) -> Self {
-        let stamps = stamps_of(&paths);
-        let last_good = load(&paths);
-        Self {
-            paths,
-            stamps,
-            last_good,
-        }
+    /// This returns a `CoreLeds` **and** a list, not a `Result`. It used to `?`
+    /// on the first bad key and hand the error to [`Self::validate`], where
+    /// `hytte_config::subsystem::assemble` turns any validation failure into a
+    /// whole-file `ConfigError::Invalid`. The *message* named one key; the
+    /// *effect* dropped all four. A file saying
+    ///
+    /// ```toml
+    /// style = "crt"
+    /// rows  = "many"
+    /// ```
+    ///
+    /// rendered the stock VFD panel with `style` silently gone, while the
+    /// journal talked only about `rows` — the reader's three good keys looked
+    /// ignored for no reason. Now `style` applies, `rows` falls back to the
+    /// built-in default, and exactly one line names `rows`.
+    fn parsed(&self) -> (CoreLeds, Vec<InvalidValue>) {
+        let mut rejected = Vec::new();
+        let fallback = CoreLeds::default();
+        // The spelling each key is judged in. Every key is its raw value's
+        // (`spelling`); `rows` is the pilot's one translation point, where the
+        // TOML integer `0` becomes the variable's word `rect` (#1040 V4).
+        let (style, color, rows, fill) = (
+            spelling(&self.style),
+            spelling(&self.color),
+            rows_spelling(&self.rows),
+            spelling(&self.fill),
+        );
+        // Every rejection quotes `self.<key>` — the raw `toml::Value` — rather
+        // than the spelling the parser was handed: `rows = 0` is spelt `rect`
+        // going in, and echoing `rect` back at a user who wrote something else
+        // would name a value that is nowhere in their file. It is also what
+        // makes a wrong *type* read like any other bad value (#1040 T1):
+        // `style = 5` is reported as `style = 5`, not as a serde message about
+        // an integer where a string was expected.
+        let leds = CoreLeds {
+            style: keep(
+                parse_core_leds_style(&style).map_err(|_| InvalidValue::of(&STYLE, &self.style)),
+                fallback.style,
+                &mut rejected,
+            ),
+            color: keep(
+                parse_core_leds_color(&color).map_err(|_| InvalidValue::of(&COLOR, &self.color)),
+                fallback.color,
+                &mut rejected,
+            ),
+            rows: keep(
+                parse_core_leds_rows(&rows).map_err(|_| InvalidValue::of(&ROWS, &self.rows)),
+                fallback.rows,
+                &mut rejected,
+            ),
+            fill: keep(
+                parse_core_leds_fill(&fill).map_err(|_| InvalidValue::of(&FILL, &self.fill)),
+                fallback.fill,
+                &mut rejected,
+            ),
+        };
+        (leds, rejected)
     }
 
-    /// The dressing this environment and the current file layers resolve to.
-    fn resolved(
-        &self,
+    /// The environment layered over `layered`, key by key — the merged file
+    /// value is the fallback for every knob the environment does not carry.
+    ///
+    /// Four [`env::key`] calls, one per knob, which is the whole fan-out a
+    /// family #2 writes: the four parsers return four different types, so a
+    /// homogeneous table of `(var, key, parser)` triples cannot express them
+    /// (see [`env`]'s module doc for the decision).
+    fn resolve(
+        layered: CoreLeds,
         lookup: &dyn Fn(&str) -> Option<String>,
         announce: Deprecations,
     ) -> CoreLeds {
-        resolve(self.last_good, lookup, announce)
-    }
-
-    /// Reload and return the fresh dressing when some layer's mtime has moved
-    /// *and* the result differs from `current`; otherwise `None`.
-    ///
-    /// A layer that stops **parsing as TOML** keeps [`Self::last_good`] and
-    /// warns — once per edit rather than once per tick, because the stamp is
-    /// taken before the load, so a file left malformed is not re-read until it
-    /// is saved again. That is the mid-word save: half a string typed, the
-    /// panel should not flicker.
-    ///
-    /// A layer that parses but holds a value nothing accepts is a *different*
-    /// case since #1040 V1 and is **not** an error: the good keys apply, the
-    /// bad key takes the built-in default, and one warning names it. The
-    /// asymmetry is deliberate — `style = "cr` is a file caught mid-edit,
-    /// `style = "crt"` beside `rows = "many"` is a finished file with one
-    /// mistake in it, and reverting the other three keys to punish the fourth
-    /// is what V1 was filed about.
-    ///
-    /// A layer that is **deleted** is a different case and is deliberately not
-    /// treated as an error (#1040 F7): its stamp goes to `None`, the load
-    /// succeeds over the layers that remain, and the panel goes back to the
-    /// built-in defaults. Deleting a config file is an intent — "I want the
-    /// stock look back" — not a mistake, and it is the only way to get the
-    /// defaults back without hand-restoring every key. `live-verify.md` says so
-    /// too; `a_deleted_file_falls_back_to_the_defaults` pins it.
-    fn poll(
-        &mut self,
-        current: CoreLeds,
-        lookup: &dyn Fn(&str) -> Option<String>,
-    ) -> Option<CoreLeds> {
-        let now = stamps_of(&self.paths);
-        if now == self.stamps {
-            return None;
-        }
-        self.stamps = now;
-        match load_layer(&self.paths) {
-            Ok(config) => self.last_good = config,
-            Err(e) => tracing::warn!(
-                subsystem = CoreLedsConfig::NAME,
-                error = %e,
-                "config changed but is unusable; keeping the last good one"
+        let (style, color, rows, fill) = (
+            lookup(STYLE.var),
+            lookup(COLOR.var),
+            lookup(ROWS.var),
+            lookup(FILL.var),
+        );
+        CoreLeds {
+            style: env::key(
+                Self::NAME,
+                &STYLE,
+                style.as_deref(),
+                parse_core_leds_style,
+                layered.style,
+                announce,
+            ),
+            color: env::key(
+                Self::NAME,
+                &COLOR,
+                color.as_deref(),
+                parse_core_leds_color,
+                layered.color,
+                announce,
+            ),
+            rows: env::key(
+                Self::NAME,
+                &ROWS,
+                rows.as_deref(),
+                parse_core_leds_rows,
+                layered.rows,
+                announce,
+            ),
+            fill: env::key(
+                Self::NAME,
+                &FILL,
+                fill.as_deref(),
+                parse_core_leds_fill,
+                layered.fill,
+                announce,
             ),
         }
-        // Silent: the environment has not changed, and this runs every few
-        // seconds for the life of the shell.
-        let next = self.resolved(lookup, Deprecations::Silent);
-        (next != current).then_some(next)
     }
-}
-
-/// Poll the layers and republish on a real change, so an edit reaches the
-/// panel within `interval` without restarting the shell.
-///
-/// Takes the [`Watcher`] rather than building one: [`boot`] already stamped
-/// and loaded, in that order, and re-doing either here would put back the
-/// double diagnostic (#1040 F1) and the lost-edit window (#1040 V2). The
-/// watcher is `Clone`, which is what lets this ride `spawn_supervised`'s `Fn`
-/// factory — a restart resumes from the same baseline instead of re-stamping.
-///
-/// `lookup` and `interval` are parameters for the same reason `paths` is one:
-/// the loop is then drivable in a test at a cadence a test can wait for, and
-/// [`CoreLedsService`] is the single place production values are chosen.
-async fn watch(
-    leds: Mutable<CoreLeds>,
-    mut watcher: Watcher,
-    lookup: EnvLookup,
-    interval: Duration,
-) {
-    loop {
-        tokio::time::sleep(interval).await;
-        if let Some(next) = watcher.poll(leds.get(), &*lookup) {
-            tracing::info!(subsystem = CoreLedsConfig::NAME, "config changed; reloaded");
-            leds.set(next);
-        }
-    }
-}
-
-/// The merged file layer, or the built-in default with a loud `error!`.
-///
-/// The **one** load in the process's life. A failure is survivable by design —
-/// [`subsystem::load_or_default`]'s policy applied to explicit paths — because
-/// a config file nobody can parse must be visible in the journal and must not
-/// stop the shell from starting.
-fn initial_load(paths: &[PathBuf]) -> CoreLeds {
-    match load_layer(paths) {
-        Ok(config) => config,
-        Err(e) => {
-            tracing::error!(
-                subsystem = CoreLedsConfig::NAME,
-                error = %e,
-                "config unusable; falling back to the built-in default"
-            );
-            CoreLeds::default()
-        }
-    }
-}
-
-/// The process's **one** startup sequence: stamp the layers, load them once,
-/// resolve the environment over them announcing every deprecated variable that
-/// is set, and hand back the dressing to publish beside the poller that will
-/// keep it fresh.
-///
-/// # Stamp, then load (#1040 V2)
-///
-/// The ordering lives in [`Watcher::stamping_before`] rather than in two
-/// statements here, which is the point: as two statements it was a rule
-/// nothing enforced, and a mutation that swapped them left the suite green.
-/// There is no re-read loop on purpose — erring toward "poll again" is free,
-/// and a stat-read-stat retry would only narrow a window that is already
-/// harmless in that direction.
-///
-/// The watcher is seeded with the **file layer**, not the resolved dressing:
-/// resolving is where the environment wins, and seeding with a value the
-/// environment already overrode would make the file's own value unrecoverable
-/// on the first reload.
-///
-/// This is the only place in production that passes
-/// [`Deprecations::Announce`], and it takes `paths`/`lookup` rather than
-/// reaching for the process so the real call site is drivable in a test
-/// (#1040 F3/V3).
-fn boot(paths: &[PathBuf], lookup: &dyn Fn(&str) -> Option<String>) -> (CoreLeds, Watcher) {
-    let watcher = Watcher::stamping_before(paths.to_vec(), initial_load);
-    let resolved = resolve(watcher.last_good, lookup, Deprecations::Announce);
-    (resolved, watcher)
 }
 
 // ── The service ──────────────────────────────────────────────────────────────
@@ -1048,14 +531,6 @@ pub struct CoreLedsHandles {
     leds: Mutable<CoreLeds>,
 }
 
-/// How a knob's deprecated environment variable is read.
-///
-/// A boxed `Fn` rather than a direct `std::env::var`, because `unsafe_code =
-/// "forbid"` rules out `std::env::set_var` (an `unsafe fn` in edition 2024): a
-/// test that drove the real environment could not exist at all, and one that
-/// read it would depend on the developer's shell.
-type EnvLookup = std::sync::Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
-
 /// The `core-leds.toml` service: one startup load, one announcing resolution,
 /// and a supervised poller.
 ///
@@ -1063,22 +538,22 @@ type EnvLookup = std::sync::Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 ///
 /// [`Service::start`] is what the process actually runs, and until #1040 V3 it
 /// was the one function here with **zero** coverage — every test drove a
-/// hand-rolled replica of it, so mutations that made `start` load twice, or
-/// skip the announcing resolution entirely, left the suite green. Nobody would
-/// ever have heard a deprecation line again and CI would not have noticed.
+/// hand-rolled replica of it, so mutations that made `start` load twice, or skip
+/// the announcing resolution entirely, left the suite green. Nobody would ever
+/// have heard a deprecation line again and CI would not have noticed.
 ///
 /// Holding `paths`, `lookup` and `interval` as fields means a test constructs
 /// this over a scratch overlay and a fake environment and then calls the
 /// **real** `start`. What is left unpinned is [`service`]'s three argument
 /// expressions — deliberately, and that is as thin as this can get without
-/// `set_var`: they are `xdg::config_layers`, `process_env` and one `const`,
+/// `set_var`: they are `xdg::config_layers`, `env::process_env` and one `const`,
 /// each covered on its own elsewhere.
 pub struct CoreLedsService {
     /// Layer paths, lowest precedence first.
     paths: Vec<PathBuf>,
     /// How a deprecated variable is read.
     lookup: EnvLookup,
-    /// How often [`watch`] re-stats the layers.
+    /// How often the poller re-stats the layers.
     interval: Duration,
 }
 
@@ -1089,14 +564,14 @@ impl Service for CoreLedsService {
         // One stamp, one load, one announcing resolution — all inside `boot`,
         // in that order. Nothing here chooses a `Deprecations` or a stamp
         // ordering, so this call site cannot get either wrong.
-        let (resolved, watcher) = boot(&self.paths, &*self.lookup);
+        let (resolved, watcher) = watch::boot::<CoreLedsConfig>(&self.paths, &*self.lookup);
         let leds = Mutable::new(resolved);
         let Self {
             lookup, interval, ..
         } = self;
         spawn_supervised("core-leds", {
             let leds = leds.clone();
-            move || watch(leds.clone(), watcher.clone(), lookup.clone(), interval)
+            move || watch::poll_loop(leds.clone(), watcher.clone(), lookup.clone(), interval)
         });
         CoreLedsHandles { leds }
     }
@@ -1105,8 +580,8 @@ impl Service for CoreLedsService {
 pub fn service() -> CoreLedsService {
     CoreLedsService {
         paths: xdg::config_layers(CoreLedsConfig::NAME),
-        lookup: std::sync::Arc::new(process_env),
-        interval: CONFIG_POLL_INTERVAL,
+        lookup: std::sync::Arc::new(env::process_env),
+        interval: watch::POLL_INTERVAL,
     }
 }
 
@@ -1120,20 +595,57 @@ pub fn signal() -> impl Signal<Item = CoreLeds> {
             .signal()
     })
 }
-
 #[cfg(test)]
 mod tests {
     use super::{
-        COLOR, CONFIG_POLL_INTERVAL, CoreLeds, CoreLedsConfig, CoreLedsService, Deprecations, FILL,
-        InvalidValue, MAX_ROWS, Mutable, ROWS, STYLE, Service, Watcher, boot, initial_load,
-        parse_core_leds_color, parse_core_leds_fill, parse_core_leds_rows, parse_core_leds_style,
-        parse_hex_rgb, resolve, rows_spelling, watch,
+        COLOR, CoreLeds, CoreLedsConfig, CoreLedsService, FILL, MAX_ROWS, Mutable, ROWS, STYLE,
+        Service, parse_core_leds_color, parse_core_leds_fill, parse_core_leds_rows,
+        parse_core_leds_style, parse_hex_rgb, rows_spelling,
     };
-    use hytte_config::subsystem::{self, Subsystem};
+    use hytte_config::subsystem::env::{self, Deprecations, EnvKnob};
+    use hytte_config::subsystem::watch;
+    use hytte_config::subsystem::{self, InvalidValue, Subsystem};
+    use hytte_config::test_support::Overlay;
     use hytte_preem::{ColorMap, DisplayStyle, Fill};
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
+
+    /// This subsystem's watcher — the generic `hytte_config` one at `S =
+    /// CoreLedsConfig`. Aliased so every test below reads exactly as it did
+    /// before #1044 hoisted the type out of this file.
+    type Watcher = watch::Watcher<CoreLedsConfig>;
+
+    /// [`watch::boot`] at this subsystem — stamp, load once, resolve
+    /// announcing.
+    fn boot(paths: &[PathBuf], lookup: &dyn Fn(&str) -> Option<String>) -> (CoreLeds, Watcher) {
+        watch::boot::<CoreLedsConfig>(paths, lookup)
+    }
+
+    /// [`subsystem::initial_load`] at this subsystem.
+    fn initial_load(paths: &[PathBuf]) -> CoreLeds {
+        subsystem::initial_load::<CoreLedsConfig>(paths)
+    }
+
+    /// [`Subsystem::resolve`] at this subsystem — the environment layered over
+    /// a merged file value.
+    fn resolve(
+        layered: CoreLeds,
+        lookup: &dyn Fn(&str) -> Option<String>,
+        announce: Deprecations,
+    ) -> CoreLeds {
+        CoreLedsConfig::resolve(layered, lookup, announce)
+    }
+
+    /// [`watch::poll_loop`] at this subsystem.
+    async fn watch_loop(
+        leds: Mutable<CoreLeds>,
+        watcher: Watcher,
+        lookup: watch::EnvLookup,
+        interval: Duration,
+    ) {
+        watch::poll_loop::<CoreLedsConfig>(leds, watcher, lookup, interval).await;
+    }
 
     /// An environment that is not the process's: the injection point every
     /// resolution test drives, since `std::env::set_var` is an `unsafe fn` and
@@ -1621,7 +1133,7 @@ mod tests {
     /// stops being `Infallible`, which is the same defect one level up.
     #[test]
     fn a_bad_value_leaves_every_other_key_applied() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("style = \"crt\"\ncolor = \"rainbow\"\nrows = \"many\"\n");
 
         let (captured, _guard) = capture();
@@ -2053,212 +1565,14 @@ mod tests {
     }
 
     // ── The deprecation warning ─────────────────────────────────────────────
-
-    /// Captured `tracing` events, in the shape `hytte_config::subsystem`'s own
-    /// tests use: a shared buffer, a field visitor, and a thread-local
-    /// `set_default` guard so one test's subscriber cannot leak into another's.
-    #[derive(Clone, Default)]
-    struct Captured {
-        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
-    }
-
-    #[derive(Clone, Debug)]
-    struct CapturedEvent {
-        level: tracing::Level,
-        message: String,
-        /// Everything but the message, rendered.
-        ///
-        /// Kept rather than dropped since #1040 V10: the PR advertises that
-        /// these lines carry `subsystem`/`var`/`key`/`accepts`/`file` "for
-        /// anything that wants to filter on them", and this file's copy of the
-        /// harness used to throw them away — so nothing asserted a single one
-        /// and the claim was unfalsifiable. `hytte-config`'s copy always kept
-        /// them; the divergence is what #1044's hoist has to reconcile.
-        fields: HashMap<String, String>,
-    }
-
-    impl Captured {
-        fn events(&self) -> Vec<CapturedEvent> {
-            self.events.lock().expect("not poisoned").clone()
-        }
-    }
-
-    impl tracing::Subscriber for Captured {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut visitor = FieldVisitor::default();
-            event.record(&mut visitor);
-            self.events
-                .lock()
-                .expect("not poisoned")
-                .push(CapturedEvent {
-                    level: *event.metadata().level(),
-                    message: visitor.message,
-                    fields: visitor.fields,
-                });
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
-    #[derive(Default)]
-    struct FieldVisitor {
-        message: String,
-        fields: HashMap<String, String>,
-    }
-
-    impl tracing::field::Visit for FieldVisitor {
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "message" {
-                self.message = value.to_string();
-            } else {
-                self.fields
-                    .insert(field.name().to_string(), value.to_string());
-            }
-        }
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            // The message itself arrives here: `tracing` renders format args
-            // through `Debug`, and `Arguments`' `Debug` is its `Display`. So
-            // do `%` sigils, whose wrapper renders `Display` through `Debug`.
-            let rendered = format!("{value:?}");
-            if field.name() == "message" {
-                self.message = rendered;
-            } else {
-                self.fields.insert(field.name().to_string(), rendered);
-            }
-        }
-    }
-
-    /// Install `Captured` as this thread's subscriber, and rebuild the
-    /// callsite interest cache.
-    ///
-    /// The rebuild is the repo's known `tracing` trap, not decoration: with
-    /// zero live dispatchers `tracing-core` caches a callsite's interest as
-    /// `never` for the whole binary, so a `warn!` first reached by some other
-    /// test would be invisible here forever. `Dispatch::new` already rebuilds
-    /// over the registered list; this covers the single-live-dispatcher
-    /// `JustOne` path, which is thread-sensitive. It can only *widen* interest
-    /// (`enabled` is unconditionally true), so it cannot poison a sibling.
-    fn capture() -> (Captured, tracing::dispatcher::DefaultGuard) {
-        keep_interest_alive();
-        let captured = Captured::default();
-        let guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(captured.clone()));
-        tracing::callsite::rebuild_interest_cache();
-        (captured, guard)
-    }
-
-    /// A `Dispatch` that stays registered for the life of the test binary and
-    /// is interested in everything — the thing that makes every capture in
-    /// this file deterministic.
-    ///
-    /// # The flake, and why `rebuild_interest_cache` alone does not close it
-    ///
-    /// `tracing-core` caches each callsite's `Interest` process-wide and
-    /// rebuilds it through `callsite::Rebuilder`. That rebuilder has a fast
-    /// path (`tracing-core-0.1.36/src/callsite.rs:544-573`): while
-    /// `has_just_one` is set — one live registered `Dispatch`, which is the
-    /// steady state of a test binary where captures come and go — it does
-    /// **not** iterate the registered dispatchers at all. It calls
-    /// `dispatcher::get_default`, i.e. *the rebuilding thread's own default*.
-    /// A sibling test thread that has no default and first touches one of
-    /// these callsites therefore registers it against `NoSubscriber`, whose
-    /// `register_callsite` is `Interest::never()` — cached globally, so the
-    /// `warn!` short-circuits and a capture on another thread observes
-    /// nothing.
-    ///
-    /// Measured on this branch: **14 / 30** full `--features system-tests`
-    /// runs failed `a_bad_value_leaves_every_other_key_applied` with
-    /// `left: []`, with `rebuild_interest_cache()` in place and with the
-    /// #1020 warm-up (touch the callsites before installing the subscriber)
-    /// in place. Both are insurance against a race they cannot win: the
-    /// poisoning thread is not this one, and it acts after the rebuild.
-    ///
-    /// # Why a keepalive does close it
-    ///
-    /// `has_just_one` is recomputed only inside `register_dispatch`, as
-    /// `dispatchers.len() <= 1` after pruning dead ones (`:551-558`). A
-    /// dispatch that never dies means the next registration always counts
-    /// **two**, so the fast path is switched off for the rest of the process
-    /// and every later rebuild — from any thread, with or without a default —
-    /// iterates the live dispatchers, which always include this one. Its
-    /// `register_callsite` is `Interest::always()`, and `Interest::and`
-    /// (`subscriber.rs:658-664`) degrades a disagreement to `sometimes`, never
-    /// to `never` — so a callsite can only ever end up `always` or
-    /// `sometimes`, and `sometimes` consults the *emitting* thread's
-    /// subscriber, which is the capture.
-    ///
-    /// It can only widen interest, exactly like the `rebuild_interest_cache()`
-    /// above it: it enables nothing, records nothing, and is never any
-    /// thread's default. The cost is that `warn!` macros build their event on
-    /// threads with no subscriber and hand it to `NoSubscriber` — invisible,
-    /// and confined to this test binary.
-    ///
-    /// No lock, and no discipline required from any other test — which is what
-    /// #1020 asked for and what a shared mutex over every capture test would
-    /// not give, since the poisoning thread need not be running a capture test
-    /// at all.
-    ///
-    /// # This is the **weaker** of the tree's two mechanisms (#1040 T5)
-    ///
-    /// `hytte-config`'s `test_tracing::ensure_global_default` (#1043) installs
-    /// its `AlwaysInterested` as the process's **global default**, which does
-    /// strictly more than this: it registers a permanent `Dispatch` *and* makes
-    /// `dispatcher::get_default` resolve to `Interest::always()` on a thread
-    /// with no default of its own — so it also covers `Rebuilder::JustOne`'s
-    /// ambient fallback, the fast path this keepalive can only *switch off*
-    /// once a second `Dispatch` has registered. What this one buys instead is
-    /// the process's single global-default slot, which it leaves free.
-    ///
-    /// The residual here is therefore the window *before* the first
-    /// [`capture()`], where `has_just_one` is still its initial `true`. It
-    /// self-heals: both `Dispatch::new` calls inside that first `capture()`
-    /// rebuild every callsite registered up to that point, before any assertion
-    /// runs — measured at 0 failures in 40 full-binary runs, against 2 in 100
-    /// with the keepalive removed. Sufficient for this binary, not a shape to
-    /// copy blind.
-    ///
-    /// Neither mechanism can see the other (separate test binaries, each
-    /// `#[cfg(test)]`-confined to its own crate), and there is a **third** in
-    /// `hytte-reactive`'s `supervisor::install_error_counter`. Unifying them is
-    /// **#1044**: one `pub` helper behind a cargo feature that tries
-    /// `set_global_default` and falls back to parking a `Dispatch` — i.e.
-    /// #1043's shape with this one as its fallback, never panicking on a taken
-    /// slot. Do not hoist this copy; hoist that.
-    fn keep_interest_alive() {
-        static KEEPALIVE: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
-
-        struct AlwaysInterested;
-        impl tracing::Subscriber for AlwaysInterested {
-            fn register_callsite(
-                &self,
-                _: &'static tracing::Metadata<'static>,
-            ) -> tracing::subscriber::Interest {
-                tracing::subscriber::Interest::always()
-            }
-            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-                true
-            }
-            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                tracing::span::Id::from_u64(1)
-            }
-            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-            fn event(&self, _: &tracing::Event<'_>) {}
-            fn enter(&self, _: &tracing::span::Id) {}
-            fn exit(&self, _: &tracing::span::Id) {}
-        }
-
-        // `Dispatch::new` is what registers it; the `OnceLock` holds the only
-        // strong reference, so the registrar's `Weak` never dies.
-        KEEPALIVE.get_or_init(|| tracing::Dispatch::new(AlwaysInterested));
-    }
+    // The capture harness is `hytte_config::test_support` since #1044. It was a
+    // third verbatim copy of the same 100 lines — and had already drifted from
+    // `hytte-config`'s, which kept the structured fields this one threw away
+    // (#1040 V10). Its `capture()` installs the process-wide global default
+    // (#1043's shape) with this file's keepalive `Dispatch` as the
+    // never-panicking fallback, so the mechanism here is strictly stronger than
+    // what it replaces — see that module's doc for the measurement.
+    use hytte_config::test_support::{Captured, capture};
 
     /// The deprecation lines, selected on the **exact** rendered message. A
     /// `contains("deprecated")` filter would turn green-and-blind the day the
@@ -2283,11 +1597,11 @@ mod tests {
     /// The *sentence* is pinned against a literal in `config::tests`; here the
     /// job is only to select the line out of a capture, which needs whatever
     /// path this machine resolves.
-    fn announced(knob: &super::Knob) -> String {
-        crate::config::deprecation_message(
+    fn announced(knob: &EnvKnob) -> String {
+        env::deprecation_message(
             knob.var,
             knob.key,
-            &crate::config::overlay_display(CoreLedsConfig::NAME),
+            &env::overlay_display(CoreLedsConfig::NAME),
             knob.file_accepts,
         )
     }
@@ -2440,7 +1754,7 @@ mod tests {
         let (resolved, watcher) = boot(&[], &env(&[("TROLLSHELL_CORE_LEDS_STYLE", "crt")]));
 
         assert_eq!(
-            watcher.last_good,
+            *watcher.last_good(),
             CoreLeds::default(),
             "live control: with no layers the file half is the documented default"
         );
@@ -2455,61 +1769,13 @@ mod tests {
     // ── Live reload ─────────────────────────────────────────────────────────
 
     /// A scratch overlay whose mtime the test controls.
-    struct Overlay {
-        _dir: tempfile::TempDir,
-        path: PathBuf,
-        stamp: u64,
-    }
-
-    impl Overlay {
-        fn new() -> Self {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let path = dir.path().join("core-leds.toml");
-            Self {
-                _dir: dir,
-                path,
-                stamp: 0,
-            }
-        }
-
-        /// Write `body` and move the mtime forward by a whole second.
-        ///
-        /// Set explicitly rather than trusted to the filesystem: a
-        /// sub-millisecond test would otherwise rewrite a file inside one
-        /// mtime granule and the watcher would correctly see no change.
-        fn write(&mut self, body: &str) {
-            self.put(body);
-            self.stamp += 1;
-            self.touch();
-        }
-
-        /// Write `body` **without** moving the mtime — the same-granule save
-        /// an mtime-only watcher misses forever (#1040 F8).
-        fn write_in_the_same_granule(&self, body: &str) {
-            self.put(body);
-            self.touch();
-        }
-
-        fn put(&self, body: &str) {
-            std::fs::write(&self.path, body).expect("write");
-        }
-
-        fn touch(&self) {
-            let file = std::fs::File::options()
-                .write(true)
-                .open(&self.path)
-                .expect("open");
-            file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(self.stamp))
-                .expect("set mtime");
-        }
-
-        fn delete(&self) {
-            std::fs::remove_file(&self.path).expect("delete");
-        }
-
-        fn layers(&self) -> Vec<PathBuf> {
-            vec![self.path.clone()]
-        }
+    ///
+    /// The harness itself is `hytte_config::test_support::Overlay` since #1044:
+    /// the tempdir + explicit-mtime + `write_in_the_same_granule` shape is the
+    /// second-largest generic test asset the pilot grew, and family #2 should
+    /// not rewrite it. This wrapper only supplies the file stem.
+    fn overlay() -> Overlay {
+        Overlay::new(CoreLedsConfig::NAME)
     }
 
     /// The watcher [`boot`] hands back for `paths`, with no environment.
@@ -2548,30 +1814,30 @@ mod tests {
     /// load, or drop the `self.last_good = config` assignment).
     #[test]
     fn a_changed_file_is_picked_up() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("style = \"lcd\"\n");
         let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&no_env(), Deprecations::Silent);
         assert_eq!(current.style, DisplayStyle::Lcd);
 
         // Unmoved mtime → nothing to do.
-        assert_eq!(watcher.poll(current, &no_env()), None);
+        assert_eq!(watcher.poll(&current, &no_env()), None);
 
         overlay.write("style = \"crt\"\ncolor = \"rainbow\"\n");
-        let next = watcher.poll(current, &no_env()).expect("changed → reload");
+        let next = watcher.poll(&current, &no_env()).expect("changed → reload");
 
         assert_eq!(next.style, DisplayStyle::Crt);
         assert_eq!(next.color, ColorMap::Rainbow);
         // A touch that changes nothing must not churn the signal.
         overlay.write("style = \"crt\"\ncolor = \"rainbow\"\n");
-        assert_eq!(watcher.poll(next, &no_env()), None);
+        assert_eq!(watcher.poll(&next, &no_env()), None);
     }
 
     /// A file that appears *after* startup is a change too — the overlay is
     /// absent on a fresh install, so `None → Some(mtime)` has to count.
     #[test]
     fn a_newly_created_file_is_picked_up() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&no_env(), Deprecations::Silent);
         assert_eq!(
@@ -2581,7 +1847,7 @@ mod tests {
         );
 
         overlay.write("fill = \"blank\"\n");
-        let next = watcher.poll(current, &no_env()).expect("created → reload");
+        let next = watcher.poll(&current, &no_env()).expect("created → reload");
 
         assert_eq!(next.fill, Fill::Blank);
     }
@@ -2599,7 +1865,7 @@ mod tests {
     /// **Red if the `Err` arm of `Watcher::poll` overwrites `last_good`.**
     #[test]
     fn a_file_caught_mid_edit_keeps_the_last_good_config() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("style = \"crt\"\n");
         let mut watcher = watching(&overlay.layers());
         let good = watcher.resolved(&no_env(), Deprecations::Silent);
@@ -2608,7 +1874,7 @@ mod tests {
         // Not TOML at all.
         overlay.write("style = \"crt\n");
         assert_eq!(
-            watcher.poll(good, &no_env()),
+            watcher.poll(&good, &no_env()),
             None,
             "a parse error must publish nothing"
         );
@@ -2616,7 +1882,7 @@ mod tests {
 
         // …and a repaired file is picked up again.
         overlay.write("style = \"oled\"\n");
-        let next = watcher.poll(good, &no_env()).expect("repaired → reload");
+        let next = watcher.poll(&good, &no_env()).expect("repaired → reload");
         assert_eq!(next.style, DisplayStyle::Oled);
     }
 
@@ -2632,14 +1898,14 @@ mod tests {
     /// `poll` then returns `None` and the panel keeps the old colour.
     #[test]
     fn a_bad_value_reloads_the_keys_beside_it() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("style = \"crt\"\n");
         let mut watcher = watching(&overlay.layers());
         let good = watcher.resolved(&no_env(), Deprecations::Silent);
 
         overlay.write("style = \"crt\"\ncolor = \"rainbow\"\nrows = \"many\"\n");
         let next = watcher
-            .poll(good, &no_env())
+            .poll(&good, &no_env())
             .expect("the good keys in the save must reach the panel");
 
         assert_eq!(next.color, ColorMap::Rainbow, "the key beside the typo");
@@ -2672,7 +1938,7 @@ mod tests {
     /// **Red if `poll` stops updating its stamps** (`left: 4, right: 1`).
     #[test]
     fn a_malformed_file_warns_once_per_save_not_once_per_tick() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("style = \"lcd\"\n");
         let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&no_env(), Deprecations::Silent);
@@ -2682,7 +1948,7 @@ mod tests {
         overlay.write("style = \"cr\n");
         let (captured, _guard) = capture();
         for _ in 0..4 {
-            let _ = watcher.poll(current, &no_env());
+            let _ = watcher.poll(&current, &no_env());
         }
 
         assert_eq!(
@@ -2706,7 +1972,7 @@ mod tests {
     /// **Red if `poll` stops updating its stamps** (`left: 4, right: 1`).
     #[test]
     fn a_rejected_value_warns_once_per_save_not_once_per_tick() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("style = \"lcd\"\n");
         let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&no_env(), Deprecations::Silent);
@@ -2714,7 +1980,7 @@ mod tests {
         overlay.write("style = \"crt\"\nrows = \"many\"\n");
         let (captured, _guard) = capture();
         for _ in 0..4 {
-            let _ = watcher.poll(current, &no_env());
+            let _ = watcher.poll(&current, &no_env());
         }
 
         assert_eq!(
@@ -2734,14 +2000,14 @@ mod tests {
     #[test]
     fn an_env_pinned_key_survives_a_reload() {
         let pinned = env(&[("TROLLSHELL_CORE_LEDS_STYLE", "crt")]);
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("style = \"vfd\"\ncolor = \"heat\"\n");
         let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&pinned, Deprecations::Silent);
         assert_eq!(current.style, DisplayStyle::Crt);
 
         overlay.write("style = \"lcd\"\ncolor = \"rainbow\"\n");
-        let next = watcher.poll(current, &pinned).expect("changed → reload");
+        let next = watcher.poll(&current, &pinned).expect("changed → reload");
 
         assert_eq!(
             next.style,
@@ -2766,14 +2032,14 @@ mod tests {
     #[test]
     fn a_reload_does_not_re_announce_a_pinned_variable() {
         let pinned = env(&[("TROLLSHELL_CORE_LEDS_STYLE", "crt")]);
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("color = \"heat\"\n");
         let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&pinned, Deprecations::Announce);
 
         let (captured, _guard) = capture();
         overlay.write("color = \"rainbow\"\n");
-        let next = watcher.poll(current, &pinned).expect("changed → reload");
+        let next = watcher.poll(&current, &pinned).expect("changed → reload");
 
         assert_eq!(
             next.color,
@@ -2808,14 +2074,14 @@ mod tests {
     #[test]
     fn a_reload_does_not_repeat_the_unusable_variable_line() {
         let broken = env(&[("TROLLSHELL_CORE_LEDS_STYLE", "plasma")]);
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("color = \"heat\"\n");
         let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&broken, Deprecations::Announce);
 
         let (captured, _guard) = capture();
         overlay.write("color = \"rainbow\"\n");
-        let next = watcher.poll(current, &broken).expect("changed → reload");
+        let next = watcher.poll(&current, &broken).expect("changed → reload");
 
         assert_eq!(
             next.color,
@@ -2859,7 +2125,7 @@ mod tests {
     /// `Watcher::stamping_before` goes back to loading twice.
     #[test]
     fn a_startup_loads_the_config_exactly_once() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("colour = \"rainbow\"\nstyle = \"crt\"\n");
 
         let (captured, _guard) = capture();
@@ -2871,7 +2137,7 @@ mod tests {
             "one unknown key, one warning — live-verify.md promises exactly this"
         );
         assert_eq!(
-            watcher.last_good.style,
+            watcher.last_good().style,
             DisplayStyle::Crt,
             "live control: the load under observation actually happened"
         );
@@ -2880,7 +2146,7 @@ mod tests {
     /// The same, for the error half: a file nothing can parse says so **once**.
     #[test]
     fn a_startup_reports_an_unusable_file_exactly_once() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("style = \"crt\n");
 
         let (captured, _guard) = capture();
@@ -2892,7 +2158,7 @@ mod tests {
             "one broken file, one error"
         );
         assert_eq!(
-            watcher.last_good,
+            *watcher.last_good(),
             CoreLeds::default(),
             "…and it degrades to the built-in default rather than taking the shell down"
         );
@@ -2913,7 +2179,7 @@ mod tests {
     /// **Red if `start` loads twice, announces twice, or stops announcing.**
     #[test]
     fn the_service_start_loads_once_and_announces_once() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("colour = \"rainbow\"\nstyle = \"crt\"\n");
         let service = service_over(
             overlay.layers(),
@@ -2952,14 +2218,14 @@ mod tests {
     /// intent. Documented on [`Watcher::poll`] and in `live-verify.md`.
     #[test]
     fn a_deleted_file_falls_back_to_the_defaults() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("style = \"crt\"\ncolor = \"rainbow\"\n");
         let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&no_env(), Deprecations::Silent);
         assert_eq!(current.style, DisplayStyle::Crt);
 
         overlay.delete();
-        let next = watcher.poll(current, &no_env()).expect("deleted → reload");
+        let next = watcher.poll(&current, &no_env()).expect("deleted → reload");
 
         assert_eq!(
             next,
@@ -2979,12 +2245,12 @@ mod tests {
     /// file, this stayed green, which is why X5 survived the first round.
     #[test]
     fn a_watcher_starts_from_now() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("style = \"lcd\"\n");
         let mut watcher = watching(&overlay.layers());
 
         assert_eq!(
-            watcher.poll(CoreLeds::default(), &no_env()),
+            watcher.poll(&CoreLeds::default(), &no_env()),
             None,
             "nothing has moved since construction, so there is nothing to republish"
         );
@@ -3005,7 +2271,7 @@ mod tests {
     /// **Red if [`stamp`](super::stamp) drops the length.**
     #[test]
     fn an_edit_inside_one_mtime_granule_is_still_seen() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("style = \"lcd\"\n");
         let mut watcher = watching(&overlay.layers());
         let current = watcher.resolved(&no_env(), Deprecations::Silent);
@@ -3015,7 +2281,7 @@ mod tests {
         // byte count, which is the half the length in the stamp can see.
         overlay.write_in_the_same_granule("style = \"crt\"\ncolor = \"rainbow\"\n");
         let next = watcher
-            .poll(current, &no_env())
+            .poll(&current, &no_env())
             .expect("a same-granule save must not be invisible");
 
         assert_eq!(next.style, DisplayStyle::Crt);
@@ -3045,7 +2311,7 @@ mod tests {
     /// asserted nothing about the code; mutation V2a was green against it.
     #[test]
     fn an_edit_landing_after_the_load_is_not_lost() {
-        let overlay = std::cell::RefCell::new(Overlay::new());
+        let overlay = std::cell::RefCell::new(overlay());
         overlay.borrow_mut().write("style = \"lcd\"\n");
         let paths = overlay.borrow().layers();
 
@@ -3064,7 +2330,7 @@ mod tests {
             "live control: the load really did happen before the save"
         );
         assert_eq!(
-            watcher.poll(published, &no_env()).map(|leds| leds.style),
+            watcher.poll(&published, &no_env()).map(|leds| leds.style),
             Some(DisplayStyle::Crt),
             "the save must reach the panel on the next poll, not never"
         );
@@ -3085,7 +2351,7 @@ mod tests {
     /// parameter.
     #[test]
     fn the_watch_loop_republishes_the_watcher_it_was_given() {
-        let mut overlay = Overlay::new();
+        let mut overlay = overlay();
         overlay.write("style = \"lcd\"\n");
         let (resolved, watcher) = boot(&overlay.layers(), &no_env());
         let leds = Mutable::new(resolved);
@@ -3096,7 +2362,7 @@ mod tests {
         let seen = hytte::reactive::runtime::handle().block_on({
             let leds = leds.clone();
             async move {
-                let watching = watch(
+                let watching = watch_loop(
                     leds.clone(),
                     watcher,
                     std::sync::Arc::new(no_env()),
@@ -3138,11 +2404,11 @@ mod tests {
     /// base layer needs no restart either.
     #[test]
     fn an_edit_to_the_base_layer_reloads_too() {
-        let mut base = Overlay::new();
-        let mut overlay = Overlay::new();
+        let mut base = overlay();
+        let mut overlay = overlay();
         base.write("style = \"crt\"\nfill = \"blank\"\n");
         overlay.write("style = \"lcd\"\n");
-        let layers = vec![base.path.clone(), overlay.path.clone()];
+        let layers = vec![base.path().to_path_buf(), overlay.path().to_path_buf()];
 
         let mut watcher = watching(&layers);
         let current = watcher.resolved(&no_env(), Deprecations::Silent);
@@ -3155,7 +2421,7 @@ mod tests {
 
         base.write("style = \"crt\"\nfill = \"spare\"\ncolor = \"rainbow\"\n");
         let next = watcher
-            .poll(current, &no_env())
+            .poll(&current, &no_env())
             .expect("a base-layer edit is a change too");
 
         assert_eq!(next.color, ColorMap::Rainbow, "the base's new key applies");
@@ -3204,7 +2470,7 @@ mod tests {
         );
         assert_eq!(
             event.fields.get("file").map(String::as_str),
-            Some(crate::config::overlay_display(CoreLedsConfig::NAME).as_str())
+            Some(env::overlay_display(CoreLedsConfig::NAME).as_str())
         );
     }
 
@@ -3212,7 +2478,7 @@ mod tests {
     /// feels live rather than eventual.
     #[test]
     fn the_poll_interval_is_a_few_seconds() {
-        assert_eq!(CONFIG_POLL_INTERVAL, Duration::from_secs(3));
+        assert_eq!(watch::POLL_INTERVAL, Duration::from_secs(3));
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────

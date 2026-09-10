@@ -625,7 +625,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::{Mutex, OnceLock, PoisonError};
 
     /// A zero-delay backoff, so the retry-path tests are fast and
     /// timing-independent.
@@ -732,12 +732,66 @@ mod tests {
     /// global subscriber exists: whichever subscriber-less thread reaches that
     /// callsite first pins its process-global `Interest` to `never`, and the
     /// log-asserting tests then read 0 no matter what they do afterwards.
+    ///
+    /// # Why this goes through `hytte-config`, and why the assert is out here
+    ///
+    /// This was the tree's **third** copy of the same `tracing` fix and the
+    /// worst-behaved of them (#1040 T5 → #1044): the `.expect()` lived *inside*
+    /// `call_once`, so the one time a foreign global won the race the `Once`
+    /// was left poisoned and every *other* test in the run failed with
+    /// "Once instance has previously been poisoned" instead of the one message
+    /// that explains anything — measured at 31 of 32 failures on the shape
+    /// #1043's review removed from `hytte-config`.
+    ///
+    /// [`install_global_default`](hytte_config::test_support::install_global_default)
+    /// never panics: it registers the dispatcher (which is the half that keeps
+    /// callsite `Interest` alive regardless) and reports whether it also won the
+    /// process's single global-default slot. The outcome is memoised in a
+    /// `OnceLock` whose value every caller reads, so the `assert!` below runs on
+    /// **every** call rather than only the one that ran the closure, and a lost
+    /// race names its real cause instead of a poisoned latch.
+    ///
+    /// The assert stays, unlike `hytte-config`'s own caller: [`ErrorCounter`]
+    /// has to actually *receive* the events, and
+    /// [`Installed::Registered`](hytte_config::test_support::Installed::Registered)
+    /// means it is registered but is nobody's default — a state in which
+    /// [`logged_errors`] would read 0 for reasons that have nothing to do with
+    /// the supervisor.
+    ///
+    /// # What can take the slot in *this* binary, now that one thing can
+    ///
+    /// The slot is singular and this module claims it. Until #1044 nothing else
+    /// in this crate or its dev-dependencies could reach `set_global_default`
+    /// at all; that is no longer true — the `test-support` dev-dependency makes
+    /// [`hytte_config::test_support::capture`] reachable from this binary, and
+    /// `capture` installs `AlwaysInterested` as the global on its way past
+    /// (PR #1085 review, F4). Nothing here calls it today, so this is latent
+    /// rather than a bug, but the failure mode is scheduling-dependent and
+    /// blames the wrong thing: one sibling test reaching `capture()` first wins
+    /// the slot, `ErrorCounter` comes back `Registered`, and **all eleven**
+    /// tests in this module trip this assert.
+    ///
+    /// So: **a test in this module must not call `capture()`.** There is no way
+    /// to have two global defaults, and `ErrorCounter` is this binary's, chosen
+    /// because the cache that decides whether the supervisor's `error!` runs at
+    /// all is itself process-global (see the note above [`CAPTURE_TAGS`]). A
+    /// test here that wants to assert on a log line adds a tag to
+    /// [`CAPTURE_TAGS`] and reads it back through [`logged_errors`]; a test that
+    /// genuinely needs a thread-local `Captured` has to make `ErrorCounter`
+    /// forward to it, not install a second global.
     fn install_error_counter() {
-        static INSTALLED: Once = Once::new();
-        INSTALLED.call_once(|| {
-            tracing::subscriber::set_global_default(ErrorCounter)
-                .expect("nothing else installs a global subscriber in this test binary");
-        });
+        static INSTALLED: OnceLock<hytte_config::test_support::Installed> = OnceLock::new();
+        let outcome = *INSTALLED
+            .get_or_init(|| hytte_config::test_support::install_global_default(ErrorCounter));
+        assert_eq!(
+            outcome,
+            hytte_config::test_support::Installed::GlobalDefault,
+            "another global default was installed first, so ErrorCounter receives \
+             nothing and every log assertion in this module would read 0 — in \
+             this binary the one other thing that takes the slot is \
+             hytte_config::test_support::capture(), which no test in this \
+             module may call (see install_error_counter's doc)"
+        );
     }
 
     /// How many `ERROR` events from this module have carried `tag`.

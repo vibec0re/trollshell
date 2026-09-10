@@ -10,13 +10,42 @@ description = "GTK-free user-config layer: atomic ~/.config/trollshell writes an
 [lints]
 workspace = true
 
+[features]
+# `subsystem::watch` — the layer poller that turns a saved edit into a live
+# reload (#1044, hoisted out of the core-leds pilot). Off by default because it
+# is the only part of this crate that needs an async runtime and a reactive
+# handle, and `trollshell-control-center` links this crate for its Places tab
+# with no runtime of its own to speak of: making tokio + futures-signals
+# unconditional would grow a settings app a runtime it never drives. The shell's
+# dependency line enables it; the control center's does not.
+watch = ["dep:futures-signals", "dep:tokio"]
+# `test_support` — the process-wide tracing global default (#1022/#1043), the
+# capture harness and the scratch-overlay helper. A cargo feature rather than
+# `#[cfg(test)]` because `#[cfg(test)]` is per-crate: hytte-config, trollshell
+# and hytte-reactive had each grown their own copy of the same `tracing`
+# callsite fix, two of them weaker than the third (#1040 T5). Enabled through a
+# **dev**-dependency only, so no shipped binary carries a `set_global_default`.
+test-support = ["dep:tempfile"]
+
 [dependencies]
+# `watch` only: the poll loop sleeps on tokio's timer and publishes into a
+# `futures_signals::Mutable`. Neither is a new resolved package — the shell
+# already links both — and neither reaches the control center, whose dependency
+# on this crate leaves the feature off.
+futures-signals = { workspace = true, optional = true }
 serde.workspace = true
 serde_ignored.workspace = true
+# `test-support` only: `Overlay`'s scratch directory. Already this crate's
+# dev-dependency below, so enabling the feature adds no resolved package — it
+# only makes the same crate reachable from a *dependent's* test binary.
+tempfile = { workspace = true, optional = true }
 toml.workspace = true
 # The write half. See `places::render_places` for why a save patches the
 # parsed document instead of re-rendering it (#640).
 toml_edit.workspace = true
+# `watch` only: `tokio::time::sleep` in the poll loop. `time` alone — this crate
+# starts no runtime and owns no task; `hytte-reactive` does both.
+tokio = { workspace = true, features = ["time"], optional = true }
 tracing.workspace = true
 
 [dev-dependencies]

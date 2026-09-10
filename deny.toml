@@ -45,9 +45,10 @@ allow = [
 
 # Per-crate carve-outs for licenses that aren't allow-listed globally.
 exceptions = [
-  # niri-ipc (hytte-services' Niri IPC client) is GPL-3.0-or-later — niri's own
-  # license. Scoped here rather than a blanket GPL allow so a future dependency
-  # can't pick up copyleft terms silently.
+  # niri-ipc is GPL-3.0-or-later — niri's own license. Scoped here rather than a
+  # blanket GPL allow so a future dependency can't pick up copyleft terms
+  # silently. Keyed per *crate*, not per consumer, so it already covered
+  # `hytte-plugin-niri-layouts` becoming the second reader (#1019) with no edit.
   { allow = ["GPL-3.0-or-later"], crate = "niri-ipc" },
 ]
 

@@ -109,8 +109,17 @@ impl Layout {
     /// planner, not the chip, not the CLI.
     ///
     /// `columns == 0` yields no proportions (and [`plan`] therefore sends
-    /// nothing); `columns == 1` yields one, which for `Equal` is a full-width
-    /// `1.0`.
+    /// nothing).
+    ///
+    /// **`columns == 1` is deliberately not special-cased.** `Equal` gives a
+    /// lone column the full `1.0`, but `Golden` gives it `0.618` and `Split`
+    /// gives it `0.5` — i.e. clicking either on a single window *narrows* it.
+    /// That is the layouts working, not a bug to round away: each button says
+    /// "make the screen this shape", and pre-setting the main column to 61.8 %
+    /// (or half) is how you make room for the window you are about to open.
+    /// `Split` narrowing a lone window is also literally what #1019 asked for
+    /// ("split: all windows have width 50%"). Raised as a NIT on the #1026
+    /// review and kept, on purpose.
     // A column count past f64's exact-integer range would need 2^53 windows
     // open; the cast is exact for every n a compositor can produce.
     #[allow(clippy::cast_precision_loss)]
@@ -328,9 +337,15 @@ mod tests {
         // against a planner that no longer skips anything.
         let mut floater = floating(90, 1);
         floater.layout.pos_in_scrolling_layout = Some((3, 1));
+        // A window on no workspace at all — `workspace_id: None` never equals
+        // `Some(target)`, so it is skipped for the same reason a foreign one is.
+        // Given a column of its own so dropping the guard moves `n`.
+        let mut homeless = tile(92, 1, 4, 1);
+        homeless.workspace_id = None;
         let windows = vec![
             floater,
             fullscreen(91, 1),
+            homeless,
             tile(10, 1, 1, 1),
             tile(20, 1, 2, 1),
         ];
@@ -354,12 +369,27 @@ mod tests {
         // reason as the test above: with all three in column 1 they would
         // collapse onto one entry and a planner that had stopped filtering by
         // workspace would produce an identical plan.
+        //
+        // Workspace 4 is active but sits on **no output at all** (a disconnected
+        // monitor): `output: None` never equals `Some(focused)`, so it must not
+        // be picked as the target either.
+        let mut orphaned = workspace(4, OUTPUT, true);
+        orphaned.output = None;
+        // Orphaned first on purpose: it is also `is_active`, so a target rule
+        // that stopped comparing the output would pick *it* rather than
+        // workspace 1, and this test would move.
         let ws = vec![
+            orphaned,
             workspace(1, OUTPUT, true),
             workspace(2, OUTPUT, false),
             workspace(3, OTHER_OUTPUT, true),
         ];
-        let windows = vec![tile(10, 1, 1, 1), tile(20, 2, 2, 1), tile(30, 3, 3, 1)];
+        let windows = vec![
+            tile(10, 1, 1, 1),
+            tile(20, 2, 2, 1),
+            tile(30, 3, 3, 1),
+            tile(40, 4, 4, 1),
+        ];
 
         let got = plan(&windows, &ws, Some(OUTPUT), Layout::Equal);
 

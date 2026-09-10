@@ -124,7 +124,14 @@ httparse = "1.10"
 # Default features only: `clap` and `json-schema` stay off, so the resolved
 # graph is exactly what the shell already locks and #1019 added no package.
 # GPL-3.0-or-later (niri's own license), carved out per-crate in `deny.toml`.
-niri-ipc = "26.4.0"
+#
+# `=` rather than a caret, on the crate's own instruction: niri-ipc follows the
+# niri version and is explicitly **not** Rust-semver-stable — "expect new struct
+# fields and enum variants to be added in patch version bumps", and its docs
+# spell the requirement `niri-ipc = "=26.4.0"`. The lockfile pinned it in
+# practice before; this makes `cargo update` respect it too, which matters more
+# now that a second crate reads the same structs.
+niri-ipc = "=26.4.0"
 # Secret Service (gnome-keyring/libsecret) client for the AI-key store (#392),
 # used only by the `trollshell` binary's `secrets.rs`. Pure-Rust (RustCrypto via
 # `native_crypto`, no native `libsecret` link → no nix buildInputs change) and

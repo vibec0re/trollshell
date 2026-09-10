@@ -52,9 +52,15 @@ binds {
     // Column layouts (#1019) — the same binary that paints the bar chip also
     // applies one layout and exits, so these are plain `spawn`s with no shell,
     // no D-Bus and no running plugin involved: it reads $NIRI_SOCKET itself.
-    // Counts are COLUMNS, not windows (a stacked column has one width). The
-    // three chords are a suggestion — nothing in trollshell reserves them.
-    Mod+Shift+E hotkey-overlay-title="Layout: equal columns" { spawn "hytte-plugin-niri-layouts" "apply" "equal"; }
-    Mod+Shift+G hotkey-overlay-title="Layout: golden" { spawn "hytte-plugin-niri-layouts" "apply" "golden"; }
-    Mod+Shift+S hotkey-overlay-title="Layout: split" { spawn "hytte-plugin-niri-layouts" "apply" "split"; }
+    // Counts are COLUMNS, not windows (a stacked column has one width).
+    //
+    // Mod+Alt is used by nothing in niri 26.04's default config, so these three
+    // are safe to merge into a stock `binds { }` block. That is worth checking
+    // before you change them: niri treats a duplicate chord as a **hard config
+    // error** ("duplicate keybind later defined here") rather than last-wins, so
+    // a colliding chord costs you the whole config, not just the bind. Mod+Shift+E
+    // in particular is niri's stock `quit`.
+    Mod+Alt+E hotkey-overlay-title="Layout: equal columns" { spawn "hytte-plugin-niri-layouts" "apply" "equal"; }
+    Mod+Alt+G hotkey-overlay-title="Layout: golden" { spawn "hytte-plugin-niri-layouts" "apply" "golden"; }
+    Mod+Alt+S hotkey-overlay-title="Layout: split" { spawn "hytte-plugin-niri-layouts" "apply" "split"; }
 }

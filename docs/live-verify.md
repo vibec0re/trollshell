@@ -318,11 +318,17 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
 - [ ] **(#1019)** Niri layouts — nothing about this plugin can be verified
       without a live niri session, so all three legs are live-only. **The
       chip:** on a workspace with three tiled columns, click each of the three
-      glyph buttons on the bar (`equal` / `golden` / `split`, left to right) and
+      buttons on the bar (`equal` / `golden` / `split`, left to right) and
       watch the columns resize — `equal` to a third each, `golden` to a wide
       first column with two narrow ones after it, `split` to half the working
-      area each (so the third scrolls off). Hovering each glyph should show its
-      legend. **Stacked columns count once:** stack three windows into one
+      area each (so the third scrolls off). Each button should show a **preem
+      LED panel** (VFD skin, accent-tinted like the timer's seven-segment chip)
+      whose lit columns draw the layout — `▮ ▮ ▮`, `▮▮▮ ▮`, `▮▮ ▮▮` — at the
+      same height as the timer chip beside it, not an Adwaita glyph and not an
+      `image-missing` box. Hovering a panel should show its legend (the tooltip
+      lives on the box between the button and the panel, since neither a
+      `Button` nor a `Pixels` node can carry one). **Stacked columns count
+      once:** stack three windows into one
       column beside a single other window and click `split` — you should get
       **two** half-width columns, not four quarter-width ones. **The CLI:**
       from a terminal in the session, `hytte-plugin-niri-layouts apply golden`

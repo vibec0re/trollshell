@@ -39,31 +39,36 @@
 //! fullscreen window reports itself. Each column gets one request, addressed to
 //! its first tile, left to right. No tiled columns → no requests at all.
 //!
-//! # The three layouts, and which #1019 question each answers
+//! # The three layouts, and the three answers
 //!
-//! | layout | proportion per column | question |
-//! | --- | --- | --- |
-//! | `equal` | `1/n` each (so `n = 1` is full width) | — |
-//! | `golden` | first `0.618`, **every other one** `0.382` | **Q1, reading A** |
-//! | `split` | `0.5` for every column | — |
+//! | layout | proportion per column |
+//! | --- | --- |
+//! | `equal` | `1/n` each (so `n = 1` is full width) |
+//! | `golden` | first `0.618`, **every other one** `0.382` |
+//! | `split` | `0.5` for every column |
 //!
-//! **Q1 (golden)** is answered with reading **A**: the first column takes 61.8 %
-//! and every column after it takes 38.2 %, so a third and later column scroll
-//! off to the right — which is what the issue's `[====] [==] ( .... ) [==]`
-//! sketch draws. Reading B (the narrow columns *share* the remaining 38.2 % so
-//! everything stays on screen) is a one-line change to
-//! [`Layout::proportions`](layout::Layout::proportions), which is the only place
-//! any proportion is decided.
+//! The triage on #1019 put three questions to Annika and built its own defaults
+//! meanwhile; she answered all three ("scroll off to the side / n1 / preem"),
+//! and this is what each became:
 //!
-//! **Q2 (chip shape)** is answered with three inline glyph buttons, per the
-//! triage. A single chip opening a panel would be a change to
-//! [`plugin`]'s `chip()` alone; the button ids `update` keys off would carry
-//! over unchanged.
+//! - **Golden reads as A**: the first column takes 61.8 % and every column after
+//!   it takes 38.2 %, so a third and later column *scroll off to the right* —
+//!   which is what the issue's `[====] [==] ( .... ) [==]` sketch draws.
+//!   [`Layout::proportions`](layout::Layout::proportions) is the only place any
+//!   proportion is decided.
+//! - **Three inline glyph buttons** on the chip, not one chip opening a panel.
+//!   [`plugin`]'s `chip()` is the only place the arrangement lives; the button
+//!   ids `update` keys off would carry over to a panel unchanged.
+//! - **Drawn with the preem kit** rather than with Adwaita symbolic icons: each
+//!   button holds a small [`LedMatrix`](hytte_plugin::preem::LedMatrix) panel
+//!   whose lit columns *are* the layout — three equal bars, one wide bar then a
+//!   narrow one, two halves — rasterised into the `Node::Pixels` the host
+//!   already accepts as a `Node::Button` child (`hytte-plugin-timer`'s
+//!   seven-segment bar chip is the same shape). The skin's ink is the kit's,
+//!   accent-tinted by the SDK; this crate names no colour.
 //!
-//! **Q3 (stacked columns)** is answered "columns", as above.
-//!
-//! None of the three is settled by Annika yet — each is built as the triage's
-//! stated default, and each is deliberately confined to one function.
+//! Counting **columns rather than windows** was the third question as the triage
+//! asked it, and stands as written.
 
 mod cli;
 mod layout;

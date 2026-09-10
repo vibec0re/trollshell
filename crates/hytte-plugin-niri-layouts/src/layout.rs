@@ -19,6 +19,20 @@ pub(crate) const GOLDEN_MINOR: f64 = 0.382;
 /// Every column's share under [`Layout::Split`].
 pub(crate) const SPLIT_SHARE: f64 = 0.5;
 
+/// Columns in a layout pictogram's LED grid — five is the narrowest grid that
+/// can say all three shapes with a blank column between runs: `▮ ▮ ▮`,
+/// `▮▮▮ ▮`, `▮▮ ▮▮`.
+pub(crate) const PICTOGRAM_COLS: usize = 5;
+
+/// Rows in a layout pictogram's LED grid. Six lands the rendered buffer on
+/// **71 px** tall (the kit's fixed `PAD`/`CELL`/`GAP` lattice), which is the
+/// height the bar's existing preem chips already are — `hytte-plugin-timer`'s
+/// and `hytte-plugin-bar-clock-demo`'s seven-segment readouts are 70 px
+/// (`DIGIT_H` 54 + 2 × `PAD` 8). Picked to match them rather than chosen for
+/// its own sake; see #313's lesson, quoted in the kit's `led_matrix` docs, on
+/// why the buffer size *is* the size.
+pub(crate) const PICTOGRAM_ROWS: usize = 6;
+
 /// One of the three arrangements the chip and the CLI both offer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Layout {
@@ -50,18 +64,25 @@ impl Layout {
         Self::ALL.into_iter().find(|l| l.id() == id)
     }
 
-    /// The Adwaita symbolic icon the chip's button wears. All three exist in
-    /// adwaita-icon-theme 50 (the one the devShell puts on `XDG_DATA_DIRS`);
-    /// an unresolvable name would render as `image-missing`, silently.
-    pub(crate) fn icon(self) -> &'static str {
+    /// The **lit columns** of this layout's pictogram, left to right.
+    ///
+    /// Each entry is a column index into a [`PICTOGRAM_COLS`]-wide LED grid; a
+    /// lit column is lit for its whole height, so a run of adjacent entries
+    /// reads as one wide bar and a lone entry as a narrow one. The unlit column
+    /// between two runs is what separates them — a blank cell is a whole cell
+    /// plus two gaps of dark field, against the single gap between lamps inside
+    /// a run.
+    ///
+    /// The pictograms say the same thing [`proportions`](Self::proportions)
+    /// does: three equal bars, one wide bar then a narrow one, two halves.
+    pub(crate) fn pictogram_columns(self) -> &'static [usize] {
         match self {
-            // Four equal cells — "everything the same size".
-            Self::Equal => "view-grid-symbolic",
-            // A wide main area with one narrow panel on the right: the exact
-            // silhouette of the golden reading this ships (see `proportions`).
-            Self::Golden => "sidebar-show-right-symbolic",
-            // Two equal halves.
-            Self::Split => "view-dual-symbolic",
+            // │ ▮ ▮ ▮ │ — three bars of equal width.
+            Self::Equal => &[0, 2, 4],
+            // │ ▮▮▮ ▮ │ — one wide bar, then the narrow rest.
+            Self::Golden => &[0, 1, 2, 4],
+            // │ ▮▮ ▮▮ │ — two halves.
+            Self::Split => &[0, 1, 3, 4],
         }
     }
 
@@ -179,7 +200,7 @@ pub(crate) fn plan(
 
 #[cfg(test)]
 mod tests {
-    use super::{GOLDEN_MAJOR, GOLDEN_MINOR, Layout, plan};
+    use super::{GOLDEN_MAJOR, GOLDEN_MINOR, Layout, PICTOGRAM_COLS, plan};
     use niri_ipc::{Window, WindowLayout, Workspace};
 
     const OUTPUT: &str = "DP-1";
@@ -441,24 +462,64 @@ mod tests {
     }
 
     #[test]
-    fn every_layout_has_a_distinct_icon_and_a_non_empty_tooltip() {
-        let mut icons: Vec<&str> = Layout::ALL.iter().map(|l| l.icon()).collect();
-        icons.sort_unstable();
-        icons.dedup();
-        assert_eq!(icons.len(), 3, "three glyphs, not one repeated");
+    fn every_layout_has_a_distinct_pictogram_and_a_non_empty_tooltip() {
+        let mut shapes: Vec<&[usize]> = Layout::ALL.iter().map(|l| l.pictogram_columns()).collect();
+        shapes.sort_unstable();
+        shapes.dedup();
+        assert_eq!(shapes.len(), 3, "three shapes, not one repeated");
         for layout in Layout::ALL {
+            let columns = layout.pictogram_columns();
+            assert!(!columns.is_empty(), "{} lights nothing", layout.id());
             assert!(
-                layout.icon().ends_with("-symbolic"),
-                "{} wants a symbolic icon",
+                columns.iter().all(|&c| c < PICTOGRAM_COLS),
+                "{} lights a column outside the grid: {columns:?}",
+                layout.id()
+            );
+            assert!(
+                columns.windows(2).all(|w| w[0] < w[1]),
+                "{} lists its columns out of order or twice: {columns:?}",
                 layout.id()
             );
             // A blank or whitespace-only tooltip arms nothing at all host-side,
-            // which would leave the glyph unexplained.
+            // which would leave the pictogram unexplained.
             assert!(
                 !layout.tooltip().trim().is_empty(),
                 "{} needs a legend",
                 layout.id()
             );
         }
+    }
+
+    /// The pictograms are the [`Layout::proportions`] rules drawn: the number of
+    /// **runs** of adjacent lit columns is the number of distinct widths the
+    /// layout hands out, and their relative lengths are the ordering.
+    #[test]
+    fn the_pictograms_say_what_the_proportions_do() {
+        fn runs(columns: &[usize]) -> Vec<usize> {
+            let mut out: Vec<usize> = Vec::new();
+            for (i, &c) in columns.iter().enumerate() {
+                if i > 0 && c == columns[i - 1] + 1 {
+                    *out.last_mut().expect("a run was started") += 1;
+                } else {
+                    out.push(1);
+                }
+            }
+            out
+        }
+
+        assert_eq!(
+            runs(Layout::Equal.pictogram_columns()),
+            vec![1, 1, 1],
+            "equal draws three bars of one width"
+        );
+        let golden = runs(Layout::Golden.pictogram_columns());
+        assert_eq!(golden.len(), 2, "golden draws a wide bar and a narrow one");
+        assert!(
+            golden[0] > golden[1],
+            "and the WIDE one comes first (reading A): {golden:?}"
+        );
+        let split = runs(Layout::Split.pictogram_columns());
+        assert_eq!(split.len(), 2, "split draws two bars");
+        assert_eq!(split[0], split[1], "of equal width: {split:?}");
     }
 }

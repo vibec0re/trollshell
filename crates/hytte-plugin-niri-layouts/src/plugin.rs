@@ -1,9 +1,16 @@
-//! The widget hat: a three-button bar chip.
+//! The widget hat: a three-button bar chip, drawn with the preem kit.
 //!
-//! The chip is a `Row` of three `Button`s, each wrapping a symbolic `Icon` that
-//! carries the layout's legend as its tooltip (`Node::Button` has no tooltip
-//! field; `Node::Icon` does, and GTK resolves a hover against the deepest widget
-//! under the pointer, so the icon's legend is what the button shows).
+//! The chip is a `Row` of three `Button`s, each holding a small
+//! [`LedMatrix`] panel whose lit columns *are* the layout it applies (Annika's
+//! answer to #1019's third question: "preem"). A panel carries no words, so a
+//! `Node::Box` sits between the button and the panel purely to hold the
+//! tooltip — see [`layout_button`].
+//!
+//! A rasterised kit widget is a `Node::Pixels`, and the host builds a
+//! `Node::Button`'s child through the same recursion it builds every other node
+//! with, so a button can wrap one: `hytte-plugin-timer`'s bar chip is exactly
+//! this shape already (a clickable seven-segment `Pixels` strip), which is why
+//! the click id stays on the button rather than needing a row-level fallback.
 //!
 //! # Why the work happens on the command lane
 //!
@@ -22,9 +29,10 @@
 //! runtime dedups identical trees but force-sends a frame that carries effects,
 //! so the failure toast still lands.
 
-use crate::layout::Layout;
+use crate::layout::{Layout, PICTOGRAM_COLS, PICTOGRAM_ROWS};
 use crate::niri::{self, SocketTransport, Transport};
-use hytte_plugin::proto::{Capability, Effect, EventKind, Manifest, Mount, Node};
+use hytte_plugin::preem::{DisplayStyle, LedMatrix};
+use hytte_plugin::proto::{Capability, Dir, Effect, EventKind, Manifest, Mount, Node};
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View, nodes};
 
 /// The mount-slot key, the audit-log subject, and the stderr log prefix.
@@ -37,8 +45,23 @@ const ROOT_ID: &str = "niri-layouts";
 /// [`layout_for_node`] is a `strip_prefix` and the two can never disagree.
 const BUTTON_PREFIX: &str = "niri-layouts-";
 
-/// Inter-button gap, in pixels. Three 16 px glyphs sit too close at `0`.
+/// Inter-button gap, in pixels. The pictograms carry the kit's own bezel
+/// padding, so this only needs to keep two panels from touching.
 const BUTTON_SPACING: u16 = 2;
+
+/// The skin the pictograms render in.
+///
+/// The same one both existing bar chips use, and for the reason
+/// `hytte-plugin-timer` states: "the near-black VFD field reads well as a small
+/// bar chip". Its lit ink is accent-tinted by the SDK (#376), so the panels
+/// follow the desktop accent without this plugin naming a colour.
+const SKIN: DisplayStyle = DisplayStyle::Vfd;
+
+/// The node id of `layout`'s pictogram — distinct per layout so a re-render
+/// swaps the texture in place instead of rebuilding the surface.
+fn pictogram_id(layout: Layout) -> String {
+    format!("{BUTTON_PREFIX}{}-pictogram", layout.id())
+}
 
 /// One click's worth of work, handed to the worker task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +91,40 @@ fn layout_for_node(node: &str) -> Option<Layout> {
     node.strip_prefix(BUTTON_PREFIX).and_then(Layout::from_id)
 }
 
-/// One button: an id'd [`Node::Button`] wrapping a tooltipped symbolic icon.
+/// One layout drawn with the preem kit: an [`LedMatrix`] panel whose lit
+/// columns are [`Layout::pictogram_columns`], rasterised to a
+/// [`Node::Pixels`](hytte_plugin::proto::Node::Pixels) by
+/// [`Frame::into_node`](hytte_plugin::preem::Frame::into_node).
+///
+/// A lit column is lit for its whole height, so the panel reads as bars: the
+/// kit's own `GAP` separates the lamps inside a bar, and a blank column (a
+/// whole cell plus two gaps) separates one bar from the next.
+///
+/// Colours are entirely the kit's: [`LedMatrix::render`] floods the skin's field
+/// and composites the lit lamps in the skin's ink, which the SDK has already
+/// accent-tinted for this session (#376). Nothing here names a colour.
+fn pictogram(layout: Layout) -> Node {
+    let panel = LedMatrix::new(SKIN, PICTOGRAM_COLS, PICTOGRAM_ROWS);
+    let mut levels = vec![0.0_f32; PICTOGRAM_COLS * PICTOGRAM_ROWS];
+    for row in 0..PICTOGRAM_ROWS {
+        for &column in layout.pictogram_columns() {
+            // Row-major, as `render` documents its `levels`.
+            levels[row * PICTOGRAM_COLS + column] = 1.0;
+        }
+    }
+    panel
+        .render(&levels)
+        .into_node(Some(&pictogram_id(layout)), Vec::new())
+}
+
+/// One button: an id'd [`Node::Button`] wrapping the layout's preem pictogram.
+///
+/// The intermediate [`Node::Box`] exists **only to carry the tooltip**: neither
+/// `Button` nor `Pixels` has a `tooltip` field (seven of the eighteen wire
+/// variants do, and those two are not among them), and a pictogram carries no
+/// words at all. GTK resolves a hover against the deepest widget under the
+/// pointer and walks up until one answers, so the box's legend is what a hover
+/// over the panel shows.
 ///
 /// `flat` is the stock libadwaita token a bar chip's inline buttons wear; a
 /// plugin cannot ship CSS of its own, and the host already wraps a bar mount in
@@ -77,10 +133,13 @@ fn layout_button(layout: Layout) -> Node {
     Node::Button {
         id: button_id(layout),
         classes: vec!["flat".to_owned()],
-        child: Box::new(Node::Icon {
+        child: Box::new(Node::Box {
             id: None,
-            name: layout.icon().to_owned(),
+            dir: Dir::Horizontal,
+            spacing: 0,
+            scroll: false,
             classes: Vec::new(),
+            children: vec![pictogram(layout)],
             tooltip: Some(layout.tooltip().to_owned()),
         }),
     }
@@ -217,14 +276,19 @@ impl Plugin for NiriLayouts {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cmd, Msg, NiriLayouts, apply_and_report, button_id, chip, layout_for_node};
-    use crate::layout::Layout;
+    use super::{
+        Cmd, Msg, NiriLayouts, SKIN, apply_and_report, button_id, chip, layout_for_node,
+        pictogram_id,
+    };
+    use crate::layout::{Layout, PICTOGRAM_COLS, PICTOGRAM_ROWS};
     use crate::niri::fake::Fake;
+    use hytte_plugin::preem::LedMatrix;
     use hytte_plugin::proto::{Capability, Effect, EventKind, Mount, Node};
     use hytte_plugin::{CmdReceiver, Input, Plugin, cmd_channel};
 
-    /// The chip's three buttons, in render order, as `(id, icon, tooltip)`.
-    fn buttons() -> Vec<(String, String, Option<String>)> {
+    /// The chip's three buttons, in render order, as
+    /// `(button id, tooltip, pictogram node)`.
+    fn buttons() -> Vec<(String, Option<String>, Node)> {
         let Node::Row { children, .. } = chip() else {
             panic!("the chip is a Row");
         };
@@ -234,10 +298,16 @@ mod tests {
                 let Node::Button { id, child, .. } = child else {
                     panic!("every chip child is a Button");
                 };
-                let Node::Icon { name, tooltip, .. } = *child else {
-                    panic!("every button wraps an Icon");
+                let Node::Box {
+                    tooltip,
+                    mut children,
+                    ..
+                } = *child
+                else {
+                    panic!("every button wraps its pictogram in a tooltip Box");
                 };
-                (id, name, tooltip)
+                assert_eq!(children.len(), 1, "the box holds exactly the pictogram");
+                (id, tooltip, children.remove(0))
             })
             .collect()
     }
@@ -251,18 +321,99 @@ mod tests {
     }
 
     #[test]
-    fn the_chip_is_three_icon_buttons_in_layout_order() {
+    fn the_chip_is_three_pictogram_buttons_in_layout_order() {
         let buttons = buttons();
 
         assert_eq!(buttons.len(), 3, "three inline glyph buttons (#1019 Q2)");
-        for (button, layout) in buttons.iter().zip(Layout::ALL) {
-            assert_eq!(button.0, button_id(layout), "id");
-            assert_eq!(button.1, layout.icon(), "icon");
+        for ((id, tooltip, pictogram), layout) in buttons.iter().zip(Layout::ALL) {
+            assert_eq!(*id, button_id(layout), "click target");
             assert_eq!(
-                button.2.as_deref(),
+                tooltip.as_deref(),
                 Some(layout.tooltip()),
-                "the glyph's only words"
+                "the pictogram's only words"
             );
+            let Node::Pixels {
+                id: pixels_id,
+                width,
+                height,
+                data,
+                scale,
+                ..
+            } = pictogram
+            else {
+                panic!("the pictogram is a preem-rasterised Pixels node");
+            };
+            assert_eq!(pixels_id.as_deref(), Some(pictogram_id(layout).as_str()));
+            assert_eq!(
+                *scale, 1,
+                "the kit bakes its own resolution into the buffer"
+            );
+            assert_eq!(
+                data.len(),
+                (*width as usize) * (*height as usize) * 4,
+                "the host's RGBA invariant"
+            );
+        }
+    }
+
+    /// The buffer is the kit's own lattice at the row/column count chosen to
+    /// land on the height the bar's existing preem chips already are.
+    #[test]
+    fn the_pictogram_is_the_kits_lattice_at_the_existing_bar_chip_height() {
+        let panel = LedMatrix::new(SKIN, PICTOGRAM_COLS, PICTOGRAM_ROWS);
+        let (_, _, pictogram) = buttons().remove(0);
+        let Node::Pixels { width, height, .. } = pictogram else {
+            panic!("a Pixels node");
+        };
+
+        assert_eq!(width as usize, panel.width(), "the kit owns the width");
+        assert_eq!(height as usize, panel.height(), "and the height");
+        // Pinned, not derived: 71 px is within a pixel of the 70 px seven-segment
+        // readouts hytte-plugin-timer and hytte-plugin-bar-clock-demo already put
+        // on the bar. Changing PICTOGRAM_ROWS should be a deliberate act.
+        assert_eq!(height, 71, "the bar-chip height this was sized to");
+    }
+
+    /// Pinned against a **hand-written** grid rather than against the same loop
+    /// `pictogram` runs, so a transposed row/column index cannot pass.
+    #[test]
+    fn a_pictogram_is_the_hand_drawn_panel_for_its_columns() {
+        // split = ▮▮ ▮▮ — columns 0, 1 and 3, 4 lit, every row.
+        const ROW: [f32; PICTOGRAM_COLS] = [1.0, 1.0, 0.0, 1.0, 1.0];
+        let mut levels: Vec<f32> = Vec::new();
+        for _ in 0..PICTOGRAM_ROWS {
+            levels.extend_from_slice(&ROW);
+        }
+        let expected = LedMatrix::new(SKIN, PICTOGRAM_COLS, PICTOGRAM_ROWS)
+            .render(&levels)
+            .into_node(Some(&pictogram_id(Layout::Split)), Vec::new());
+
+        let got = buttons()
+            .into_iter()
+            .find(|(id, _, _)| *id == button_id(Layout::Split))
+            .expect("split has a button")
+            .2;
+
+        assert!(
+            got == expected,
+            "split's panel is not the one its columns draw"
+        );
+    }
+
+    #[test]
+    fn the_three_pictograms_are_visibly_different() {
+        let buffers: Vec<Vec<u8>> = buttons()
+            .into_iter()
+            .map(|(_, _, pictogram)| match pictogram {
+                Node::Pixels { data, .. } => data,
+                other => panic!("expected Pixels, got {other:?}"),
+            })
+            .collect();
+
+        for (i, a) in buffers.iter().enumerate() {
+            for b in buffers.iter().skip(i + 1) {
+                assert_ne!(a, b, "two layouts drew the same panel");
+            }
         }
     }
 
@@ -274,6 +425,13 @@ mod tests {
         assert_eq!(layout_for_node("niri-layouts"), None, "the root is inert");
         assert_eq!(layout_for_node("niri-layouts-fibonacci"), None);
         assert_eq!(layout_for_node("equal"), None, "the prefix is required");
+        for layout in Layout::ALL {
+            assert_eq!(
+                layout_for_node(&pictogram_id(layout)),
+                None,
+                "the pictogram's own id is not a click target"
+            );
+        }
     }
 
     #[test]

@@ -289,7 +289,9 @@ impl Plugin for Weather {
             // Fire-and-forget: a card click is plugin I/O (a refresh), not a
             // shell effect, so the view and the effect batch are both unchanged.
             // `send` errs only mid-teardown — safe to drop.
-            Input::Event { node, kind, .. } if node == CARD_BTN && matches!(kind, EventKind::Click) => {
+            Input::Event { node, kind, .. }
+                if node == CARD_BTN && matches!(kind, EventKind::Click) =>
+            {
                 let _ = self.cmd_tx.send(WeatherCmd::RefreshNow);
             }
             // #509: answer a `weather` datasource query from the current reading

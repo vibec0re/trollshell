@@ -258,7 +258,9 @@ impl Plugin for Usage {
             }
             // A card click opens the plugin's own detail panel (#349). Only the
             // configured card is a button, so this never fires in empty-state.
-            Input::Event { node, kind, .. } if node == CARD_BTN && matches!(kind, EventKind::Click) => {
+            Input::Event { node, kind, .. }
+                if node == CARD_BTN && matches!(kind, EventKind::Click) =>
+            {
                 return vec![Effect::OpenPage(Page::PluginSelf)];
             }
             // Foreign events, snapshots, effect results, audio (and any future

@@ -1013,12 +1013,15 @@ mod tests {
         // The displays are click-inert…
         assert!(
             m.update(Input::event(super::SCOPE_ID, EventKind::Click))
-            .is_empty(),
+                .is_empty(),
             "a click on the scope asks for nothing"
         );
         // …and a non-click event on a button is not a press.
         assert!(
-            m.update(Input::event(PLAY_ID, EventKind::Scroll { dx: 0.0, dy: 1.0 }))
+            m.update(Input::event(
+                PLAY_ID,
+                EventKind::Scroll { dx: 0.0, dy: 1.0 }
+            ))
             .is_empty(),
             "scrolling the play button is not a press"
         );

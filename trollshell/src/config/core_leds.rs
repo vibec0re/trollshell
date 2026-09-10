@@ -102,8 +102,14 @@ const CONFIG_POLL_INTERVAL: Duration = watch::POLL_INTERVAL;
 /// hand edit to `core-leds.toml` is rarer still — it is look-and-feel
 /// fiddling, not something that changes underneath you — so a wider stretch
 /// costs nothing in felt responsiveness: 15 s to notice a saved file is still
-/// "a live reload, no restart", the promise this module's own doc makes,
-/// while more than halving the idle wakeups a laptop takes on battery for a
+/// "a live reload, no restart", the promise this module's own doc makes.
+///
+/// This does **not** change how often the loop wakes — `watch::wait_cadence`
+/// steps in 1 s (`RECHECK`) ticks regardless of the target, so the process
+/// wakes at 1 Hz on AC or battery alike. What it stretches is how often that
+/// wake actually **reads and hashes** the layer files (`watch::stamp`): from
+/// every ~3 s to every ~15 s, and each read is small — at most two layers,
+/// each a `core-leds.toml`-sized file (comfortably under 4.6 KiB) — for a
 /// file that, in the overwhelmingly common case, never changes for the life
 /// of the session.
 const BATTERY_CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(15);

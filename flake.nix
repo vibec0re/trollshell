@@ -1080,31 +1080,35 @@
               # both the embedded quotes and the key.
               environment = cfg.systemd.user.services.trollshell.Service.Environment;
               xdgEntry = pkgs.lib.findFirst (e: pkgs.lib.hasPrefix "\"XDG_CONFIG_DIRS=" e) null environment;
-              xdgValue = pkgs.lib.removeSuffix "\"" (pkgs.lib.removePrefix "\"XDG_CONFIG_DIRS=" xdgEntry);
+              # `assert` lives on `xdgValue` itself, the first thing that would
+              # otherwise try (and fail, less legibly) to coerce a `null`
+              # `xdgEntry` to a string — not on a separate `probe` binding
+              # nobody downstream forces. The build script below interpolates
+              # `${renderedFile}` directly, which is derived from `xdgValue`,
+              # so this assert sits on the actual path evaluation takes; a
+              # `probe`-shaped wrapper that nothing references is dead (a
+              # mutation dropping `configDirsUnitEnvironment` still reds, just
+              # via Nix's own "cannot coerce null to a string" instead of this
+              # message — measured in review).
+              xdgValue =
+                assert xdgEntry != null;
+                pkgs.lib.removeSuffix "\"" (pkgs.lib.removePrefix "\"XDG_CONFIG_DIRS=" xdgEntry);
               # The leading entry is `configBase` (nix/hm-module.nix): a
               # store path is never a mid-list entry, so splitting on ":" and
               # taking the head is exactly what the shell's own
               # `xdg::config_dirs` parse does.
               base = builtins.head (pkgs.lib.splitString ":" xdgValue);
               renderedFile = "${base}/trollshell/core-leds.toml";
-              probe =
-                assert xdgEntry != null;
-                renderedFile;
             in
-            pkgs.runCommand "trollshell-hm-module-core-leds-check"
-              {
-                nativeBuildInputs = [ pkgs.python3 ];
-                inherit probe;
-              }
-              ''
-                python3 -c '
-                import tomllib
-                with open("${renderedFile}", "rb") as f:
-                    data = tomllib.load(f)
-                assert data == {"style": "lcd", "rows": "rect"}, data
-                '
-                touch $out
-              '';
+            pkgs.runCommand "trollshell-hm-module-core-leds-check" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+              python3 -c '
+              import tomllib
+              with open("${renderedFile}", "rb") as f:
+                  data = tomllib.load(f)
+              assert data == {"style": "lcd", "rows": "rect"}, data
+              '
+              touch $out
+            '';
 
           # #1081 review H1, other half: `xdg.systemDirs.config` is a shared
           # home-manager option — a user (or another module) setting it

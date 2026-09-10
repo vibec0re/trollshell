@@ -537,7 +537,7 @@ impl Plugin for AudioWidget {
             // state either: the effect goes to the player, and the glyph
             // follows on the next `NowPlaying` push, so the button can never
             // disagree with the player.
-            Input::Event { node, kind } => {
+            Input::Event { node, kind, .. } => {
                 if matches!(kind, EventKind::Click)
                     && let Some(action) = transport_action(&node)
                 {
@@ -1007,27 +1007,18 @@ mod tests {
             (PLAY_ID, MediaAction::PlayPause),
             (NEXT_ID, MediaAction::Next),
         ] {
-            let fx = m.update(Input::Event {
-                node: id.to_owned(),
-                kind: EventKind::Click,
-            });
+            let fx = m.update(Input::event(id, EventKind::Click));
             assert_eq!(fx, vec![Effect::Media(action)], "{id} drives {action:?}");
         }
         // The displays are click-inert…
         assert!(
-            m.update(Input::Event {
-                node: super::SCOPE_ID.to_owned(),
-                kind: EventKind::Click,
-            })
+            m.update(Input::event(super::SCOPE_ID, EventKind::Click))
             .is_empty(),
             "a click on the scope asks for nothing"
         );
         // …and a non-click event on a button is not a press.
         assert!(
-            m.update(Input::Event {
-                node: PLAY_ID.to_owned(),
-                kind: EventKind::Scroll { dx: 0.0, dy: 1.0 },
-            })
+            m.update(Input::event(PLAY_ID, EventKind::Scroll { dx: 0.0, dy: 1.0 }))
             .is_empty(),
             "scrolling the play button is not a press"
         );
@@ -1045,10 +1036,7 @@ mod tests {
         m.update(track("Chrome Rain", "Choom", true));
         assert_eq!(m.play_icon(), ICON_PAUSE, "a playing track offers pause");
         // Clicking play-pause changes nothing on its own — the player answers.
-        let _ = m.update(Input::Event {
-            node: PLAY_ID.to_owned(),
-            kind: EventKind::Click,
-        });
+        let _ = m.update(Input::event(PLAY_ID, EventKind::Click));
         assert_eq!(
             m.play_icon(),
             ICON_PAUSE,

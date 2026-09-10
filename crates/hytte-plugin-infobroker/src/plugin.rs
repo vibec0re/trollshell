@@ -225,7 +225,7 @@ impl Plugin for Infobroker {
                 });
                 Vec::new()
             }
-            Input::Event { node, kind } => self.on_event(&node, &kind),
+            Input::Event { node, kind, .. } => self.on_event(&node, &kind),
             // No RunCommand / spectrum / now-playing (unsubscribed) / bar-chip
             // visibility handling needed.
             _ => Vec::new(),
@@ -947,10 +947,7 @@ mod tests {
     #[test]
     fn a_chip_click_through_update_opens_the_panel() {
         let (mut m, _rx) = model();
-        let fx = m.update(Input::Event {
-            node: CHIP_ID.to_owned(),
-            kind: EventKind::Click,
-        });
+        let fx = m.update(Input::event(CHIP_ID, EventKind::Click));
         assert_eq!(fx, vec![Effect::OpenPage(Page::PluginSelf)]);
     }
 

@@ -314,7 +314,7 @@ impl Plugin for Timer {
     fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
         match input {
             Input::App(TimerMsg::Tick) => self.tick(),
-            Input::Event { node, kind } => self.on_event(&node, &kind),
+            Input::Event { node, kind, .. } => self.on_event(&node, &kind),
             // No host state is subscribed and no command is issued, so the
             // snapshot / effect-result / visibility pushes are all no-ops. The
             // countdown keeps ticking whether or not the chip is on screen.
@@ -423,19 +423,16 @@ mod tests {
     }
 
     fn click(node: &str) -> Input<super::TimerMsg> {
-        Input::Event {
-            node: node.to_owned(),
-            kind: EventKind::Click,
-        }
+        Input::event(node, EventKind::Click)
     }
 
     fn submit(node: &str, text: &str) -> Input<super::TimerMsg> {
-        Input::Event {
-            node: node.to_owned(),
-            kind: EventKind::Submitted {
+        Input::event(
+            node.to_owned(),
+            EventKind::Submitted {
                 text: text.to_owned(),
             },
-        }
+        )
     }
 
     fn tick(model: &mut Timer) -> Vec<Effect> {

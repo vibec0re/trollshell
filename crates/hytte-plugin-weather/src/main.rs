@@ -289,7 +289,7 @@ impl Plugin for Weather {
             // Fire-and-forget: a card click is plugin I/O (a refresh), not a
             // shell effect, so the view and the effect batch are both unchanged.
             // `send` errs only mid-teardown — safe to drop.
-            Input::Event { node, kind } if node == CARD_BTN && matches!(kind, EventKind::Click) => {
+            Input::Event { node, kind, .. } if node == CARD_BTN && matches!(kind, EventKind::Click) => {
                 let _ = self.cmd_tx.send(WeatherCmd::RefreshNow);
             }
             // #509: answer a `weather` datasource query from the current reading
@@ -797,10 +797,7 @@ mod tests {
     #[test]
     fn clicking_the_card_requests_a_refresh() {
         let (mut m, mut rx) = model();
-        let fx = m.update(Input::Event {
-            node: CARD_BTN.to_owned(),
-            kind: EventKind::Click,
-        });
+        let fx = m.update(Input::event(CARD_BTN, EventKind::Click));
         assert!(fx.is_empty(), "a refresh is plugin I/O, not a shell effect");
         assert!(
             matches!(rx.try_recv(), Ok(WeatherCmd::RefreshNow)),
@@ -811,10 +808,7 @@ mod tests {
     #[test]
     fn clicking_a_foreign_node_requests_nothing() {
         let (mut m, mut rx) = model();
-        let fx = m.update(Input::Event {
-            node: "not-ours".to_owned(),
-            kind: EventKind::Click,
-        });
+        let fx = m.update(Input::event("not-ours", EventKind::Click));
         assert!(fx.is_empty());
         assert!(rx.try_recv().is_err(), "foreign clicks are ignored");
     }

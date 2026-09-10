@@ -315,7 +315,7 @@ impl Plugin for NiriLayouts {
 
     fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
         match input {
-            Input::Event { node, kind } => {
+            Input::Event { node, kind, .. } => {
                 if matches!(kind, EventKind::Click)
                     && let Some(layout) = layout_for_node(&node)
                 {
@@ -686,10 +686,7 @@ mod tests {
         let (mut plugin, mut rx) = shown();
 
         for layout in Layout::ALL {
-            let effects = plugin.update(Input::Event {
-                node: button_id(layout),
-                kind: EventKind::Click,
-            });
+            let effects = plugin.update(Input::event(button_id(layout), EventKind::Click));
 
             assert!(effects.is_empty(), "the work is queued, not effected");
             assert_eq!(drain(&mut rx), vec![Cmd::Apply(layout)]);
@@ -700,10 +697,7 @@ mod tests {
     fn a_click_on_an_unknown_node_queues_nothing() {
         let (mut plugin, mut rx) = shown();
 
-        plugin.update(Input::Event {
-            node: "niri-layouts".to_owned(),
-            kind: EventKind::Click,
-        });
+        plugin.update(Input::event("niri-layouts", EventKind::Click));
 
         assert!(drain(&mut rx).is_empty());
     }
@@ -712,10 +706,7 @@ mod tests {
     fn a_non_click_event_on_a_button_queues_nothing() {
         let (mut plugin, mut rx) = shown();
 
-        plugin.update(Input::Event {
-            node: button_id(Layout::Golden),
-            kind: EventKind::Scroll { dx: 0.0, dy: 1.0 },
-        });
+        plugin.update(Input::event(button_id(Layout::Golden), EventKind::Scroll { dx: 0.0, dy: 1.0 }));
 
         assert!(drain(&mut rx).is_empty(), "only a click applies a layout");
     }
@@ -747,10 +738,7 @@ mod tests {
         niri.action_error = Some("no such window".to_owned());
 
         // 1. The click queues the layout…
-        plugin.update(Input::Event {
-            node: button_id(Layout::Golden),
-            kind: EventKind::Click,
-        });
+        plugin.update(Input::event(button_id(Layout::Golden), EventKind::Click));
         let queued = drain(&mut rx);
         assert_eq!(queued, vec![Cmd::Apply(Layout::Golden)]);
 

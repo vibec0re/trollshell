@@ -354,7 +354,7 @@ impl Plugin for Caw {
                     body: text,
                 }];
             }
-            Input::Event { node, kind } => {
+            Input::Event { node, kind, .. } => {
                 if node == FACE_ID && matches!(kind, EventKind::Click) {
                     self.poke();
                 }
@@ -607,10 +607,7 @@ mod tests {
             text: NEWS.to_owned(),
             at_unix: now(),
         }));
-        let fx = c.update(Input::Event {
-            node: FACE_ID.to_owned(),
-            kind: EventKind::Click,
-        });
+        let fx = c.update(Input::event(FACE_ID, EventKind::Click));
         assert!(fx.is_empty(), "the ack is silent — no second toast");
         assert!(c.briefing.is_none(), "poked = read");
         // The poke reaction shows, and after it expires she's back to normal.

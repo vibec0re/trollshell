@@ -304,11 +304,13 @@ where
         let step = tokio::select! {
             frame = rx.recv() => match frame {
                 Some(Ok(HostMsg::StateSnapshot { snapshot })) => Step::Update(Input::Snapshot(snapshot)),
-                // `output` (#1050, the monitor whose card produced this) is
-                // decoded and deliberately dropped: `Input::Event` cannot grow a
-                // field without breaking every plugin's match arm, so surfacing
-                // it rides #1050's plugin arm. See the doc on `Input::Event`.
-                Some(Ok(HostMsg::Event { node, kind, output: _ })) => Step::Update(Input::Event { node, kind }),
+                // `output` (#1050, the monitor whose copy of the mirrored card
+                // produced this) is carried through verbatim — including its
+                // `None`, which means *not attributable* and must not be turned
+                // into a guess here. See the doc on `Input::Event::output`.
+                Some(Ok(HostMsg::Event { node, kind, output })) => {
+                    Step::Update(Input::Event { node, kind, output })
+                }
                 Some(Ok(HostMsg::EffectResult { id, outcome })) => {
                     Step::Update(Input::EffectResult { id, outcome })
                 }
@@ -614,7 +616,7 @@ mod tests {
                     }
                     Vec::new()
                 }
-                Input::Event { node, kind } => {
+                Input::Event { node, kind, .. } => {
                     if node == "echo-btn" && matches!(kind, EventKind::Click) {
                         vec![Effect::OpenPage(Page::PowerMenu)]
                     } else {
@@ -964,6 +966,55 @@ mod tests {
         }
     }
 
+    /// Renders whichever screen the last click came from (#1050) — the fixture
+    /// for "the wire's `output` reaches `update`".
+    ///
+    /// It has to *draw* the value rather than merely store it, because a
+    /// `Render` frame is the only thing the socketpair harness can observe: a
+    /// runtime that decoded `output` and then dropped it on the way into
+    /// `Input::Event` — which is exactly what #1068 shipped — is invisible to
+    /// every other test in this file, since none of them projects it.
+    struct Attributed {
+        last: String,
+    }
+
+    /// What [`Attributed`] draws for an event that named no screen. Spelled
+    /// out so the assertion distinguishes "carried `None`" from "carried
+    /// nothing at all"/"never got the event".
+    const NO_OUTPUT: &str = "<none>";
+
+    impl Plugin for Attributed {
+        type Msg = std::convert::Infallible;
+        type Cmd = std::convert::Infallible;
+
+        fn manifest() -> Manifest {
+            Manifest::new("attributed-test", Mount::BarRight)
+        }
+
+        fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+            Self {
+                last: "seed".to_owned(),
+            }
+        }
+
+        fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
+            if let Input::Event { output, .. } = input {
+                self.last = output.unwrap_or_else(|| NO_OUTPUT.to_owned());
+            }
+            Vec::new()
+        }
+
+        fn view(&self) -> View {
+            Node::Label {
+                id: Some("attributed-lbl".to_owned()),
+                text: self.last.clone(),
+                classes: Vec::new(),
+                tooltip: None,
+            }
+            .into()
+        }
+    }
+
     /// A minimal I/O "task" for [`Commander`]: it *is* the sources stream —
     /// each command drained from the [`CmdReceiver`] is turned into an app
     /// message. Stands in for a real plugin's socket/HTTP task, which likewise
@@ -1015,7 +1066,7 @@ mod tests {
 
         fn update(&mut self, input: Input<Self::Msg>) -> Vec<Effect> {
             match input {
-                Input::Event { node, kind } => {
+                Input::Event { node, kind, .. } => {
                     if node == "cmd-btn" && matches!(kind, EventKind::Click) {
                         // Fire-and-forget onto the plugin's own I/O side; the
                         // click alone changes neither the view nor the effects.
@@ -1562,6 +1613,73 @@ mod tests {
 
         let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
         assert!(result.is_ok());
+    }
+
+    /// The label text of a `Render` frame's tree — the one thing
+    /// [`Attributed`] projects.
+    fn rendered_text(frame: PluginMsg) -> String {
+        let PluginMsg::Render { tree, .. } = frame else {
+            panic!("expected a Render frame, got {frame:?}");
+        };
+        match tree {
+            Node::Label { text, .. } => text,
+            other => panic!("expected a Label, got {other:?}"),
+        }
+    }
+
+    /// #1050: the wire's `Event.output` reaches `Input::Event.output` verbatim —
+    /// `Some(connector)` as itself, `None` as `None`.
+    ///
+    /// Both halves matter. The `Some` half is the feature; the `None` half is
+    /// the promise that the runtime does not invent a screen for an event the
+    /// host could not attribute (the drawer panel), which is what
+    /// `Input::Event::output` documents and what a plugin's fallback path is
+    /// keyed on.
+    #[tokio::test]
+    async fn the_events_output_reaches_update_verbatim() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, mut hwr) = tokio::io::split(host_end);
+
+        let host = async move {
+            eat_handshake(&mut hrd, "attributed-test").await;
+
+            send(
+                &mut hwr,
+                &HostMsg::Event {
+                    node: "attributed-lbl".to_owned(),
+                    kind: EventKind::Click,
+                    output: Some("DP-2".to_owned()),
+                },
+            )
+            .await;
+            assert_eq!(
+                rendered_text(next_plugin_frame(&mut hrd).await),
+                "DP-2",
+                "the connector the host stamped must arrive at `update` unchanged"
+            );
+
+            send(
+                &mut hwr,
+                &HostMsg::Event {
+                    node: "attributed-lbl".to_owned(),
+                    kind: EventKind::Click,
+                    output: None,
+                },
+            )
+            .await;
+            assert_eq!(
+                rendered_text(next_plugin_frame(&mut hrd).await),
+                NO_OUTPUT,
+                "an unattributable event stays `None` — the runtime must not \
+                 substitute a screen of its own"
+            );
+
+            send(&mut hwr, &HostMsg::Shutdown).await;
+        };
+
+        let (result, ()) = tokio::join!(session::<Attributed, _, _>(prd, pwr), host);
+        assert!(result.is_ok(), "Shutdown ends the session cleanly");
     }
 
     #[tokio::test]

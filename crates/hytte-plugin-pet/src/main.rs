@@ -285,7 +285,7 @@ impl Plugin for Pet {
                     self.hour = h;
                 }
             }
-            Input::Event { node, kind } => {
+            Input::Event { node, kind, .. } => {
                 if node == FACE_ID && matches!(kind, EventKind::Click) {
                     self.poke();
                 }
@@ -423,10 +423,7 @@ mod tests {
     #[test]
     fn poke_requests_a_thought_and_looks_pensive() {
         let (mut p, mut rx) = pet();
-        let fx = p.update(Input::Event {
-            node: FACE_ID.to_owned(),
-            kind: EventKind::Click,
-        });
+        let fx = p.update(Input::event(FACE_ID, EventKind::Click));
         assert!(fx.is_empty(), "the pet asks nothing of the shell");
         let req = rx.try_recv().expect("a brain request");
         assert_eq!(req.kind, ThinkKind::Poke);
@@ -628,10 +625,7 @@ mod tests {
     #[test]
     fn foreign_nodes_do_not_poke() {
         let (mut p, mut rx) = pet();
-        let _ = p.update(Input::Event {
-            node: "not-the-pet".to_owned(),
-            kind: EventKind::Click,
-        });
+        let _ = p.update(Input::event("not-the-pet", EventKind::Click));
         assert!(rx.try_recv().is_err());
         assert_eq!(p.recent_pokes, 0);
     }

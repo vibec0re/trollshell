@@ -442,7 +442,7 @@ impl Plugin for Board {
             // A tap on a departure row's arm Button (#236): its id is
             // `arm:<trip_id>`. A click toggles that train armed/disarmed; the
             // nudge itself only ever fires from a clock tick, never from the tap.
-            Input::Event { node, kind } => {
+            Input::Event { node, kind, .. } => {
                 if kind == EventKind::Click
                     && let Some(trip_id) = node.strip_prefix("arm:")
                 {
@@ -1298,10 +1298,7 @@ mod tests {
         let mut r = sample_row("S9", "Spandau", actual, walk);
         r.trip_id = "trip-armed".to_owned();
         board.update(Input::App(BoardMsg::Fetched(Ok(vec![r]))));
-        board.update(Input::Event {
-            node: "arm:trip-armed".to_owned(),
-            kind: EventKind::Click,
-        });
+        board.update(Input::event("arm:trip-armed", EventKind::Click));
         board
     }
 
@@ -1314,10 +1311,7 @@ mod tests {
             "arming seeds the slack baseline from the live row"
         );
         // A second tap on the same row disarms.
-        let fx = board.update(Input::Event {
-            node: "arm:trip-armed".to_owned(),
-            kind: EventKind::Click,
-        });
+        let fx = board.update(Input::event("arm:trip-armed", EventKind::Click));
         assert!(fx.is_empty(), "toggling asks the shell for nothing");
         assert_eq!(board.armed, None);
         assert_eq!(board.armed_prev_slack, None);

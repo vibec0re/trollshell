@@ -283,6 +283,11 @@ pub struct BrokerSnapshot {
     /// Newest first.
     pub audit: Vec<AuditView>,
     pub datasources: Vec<DatasourceView>,
+    /// A one-line reason this broker is **not** serving its socket, rendered at
+    /// the top of the panel. `None` in the normal case. Without it a stood-down
+    /// duplicate (#995) painted a panel indistinguishable from an idle broker
+    /// and the only explanation was one stderr line in that unit's journal.
+    pub notice: Option<String>,
 }
 
 // ── The panel command lane + the outbound message ─────────────────────────────
@@ -424,6 +429,9 @@ struct BrokerState {
     /// (#484). `get calendar` serves this — the broker can't read EDS itself, so
     /// the live copy *is* the datasource. Empty until the first push lands.
     calendar: Vec<CalendarEntry>,
+    /// Set when this session has no socket of its own (#995): every snapshot
+    /// carries the explanation up to the panel, for the session's whole life.
+    notice: Option<String>,
 }
 
 /// The current wall clock in unix seconds.
@@ -438,6 +446,7 @@ impl BrokerState {
             tokens: TokenStore::default(),
             audit: VecDeque::with_capacity(AUDIT_CAP),
             calendar: Vec::new(),
+            notice: None,
         }
     }
 
@@ -534,6 +543,7 @@ impl BrokerState {
             tokens,
             audit,
             datasources,
+            notice: self.notice.clone(),
         }
     }
 
@@ -985,10 +995,46 @@ async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
 
 // ── The socket server ─────────────────────────────────────────────────────────
 
-/// Set the first time [`serve`] stands down for a live incumbent (#995), so the
-/// explanation is logged once per process instead of once per SDK redial
-/// (≤5 s apart, forever, for as long as the duplicate runs).
+/// The socket this **process** owns, bound at most once and kept for the
+/// process's whole life (#995 follow-up).
+///
+/// Two jobs, and both are the fix for the same bug. [`serve`] runs once per SDK
+/// *session*, and a host restart ends session N and starts session N+1 after
+/// `BACKOFF_BASE` = 100 ms — while session N's `serve` can still be parked
+/// inside `handle_conn` for up to `REQUEST_TIMEOUT` = 5 s, listener still open.
+/// A per-session bind therefore had the new session probing its **own
+/// predecessor's** listener, concluding "another broker is live", and standing
+/// down for the rest of the process — killing the socket, the panel and the
+/// command lane on an ordinary `systemctl --user restart trollshell`.
+///
+/// So: the listener lives here rather than in a session, and a session that
+/// already finds one **reuses it without probing** — a process never probes
+/// against itself. And the `Mutex` is held for `serve`'s whole body, which
+/// orders the two overlapping sessions: N+1 waits for N to finish before it
+/// touches the socket, instead of the two racing over one listener. The socket
+/// therefore stays up across the handover, where it used to be rebound (and
+/// briefly refused) on every session.
+static SOCKET: tokio::sync::Mutex<Option<UnixListener>> = tokio::sync::Mutex::const_new(None);
+
+/// Set while [`serve`] is standing down for a *foreign* live broker (#995), so
+/// the explanation is logged once per stand-down streak instead of once per SDK
+/// redial (≤5 s apart, forever, for as long as the duplicate runs). Cleared
+/// again by a successful bind ([`clear_stand_down`]), so a later genuine
+/// duplicate is not silenced by an earlier episode.
 static STOOD_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Whether this stand-down should log: true exactly once per streak. Takes the
+/// latch as an argument so the decision is testable without touching the
+/// process-wide [`STOOD_DOWN`].
+fn stand_down_once(latch: &AtomicBool) -> bool {
+    !latch.swap(true, Ordering::Relaxed)
+}
+
+/// Reset the [`stand_down_once`] latch — called on a successful bind, so the
+/// *next* stand-down streak explains itself again.
+fn clear_stand_down(latch: &AtomicBool) {
+    latch.store(false, Ordering::Relaxed);
+}
 
 /// Probe whether a live broker already owns the socket (#995). The plugin-side
 /// twin of the host's `trollshell::plugins::listener::socket_in_use`: a
@@ -1041,15 +1087,81 @@ async fn bind_socket(path: &Path) -> std::io::Result<BindOutcome> {
     Ok(BindOutcome::Bound(listener))
 }
 
+/// What one session's attempt to take the broker socket produced.
+#[derive(Debug, PartialEq, Eq)]
+enum SocketClaim {
+    /// This process serves the socket — it bound it just now.
+    Bound,
+    /// This process already owned the socket from an earlier session and keeps
+    /// it. **No probe was made**: a process must never probe its own listener
+    /// (see [`SOCKET`]).
+    Kept,
+    /// A *foreign* live broker answers on the path. This session serves no
+    /// socket — but it still runs, so the panel and the command lane live.
+    StoodDown,
+}
+
+/// Take the broker socket for one session, given the socket this process
+/// already owns (`owned`, normally [`SOCKET`]'s contents).
+///
+/// The order matters and is the whole fix: **own first, probe second**. If
+/// `owned` already holds a listener this session simply keeps it
+/// ([`SocketClaim::Kept`]) — the previous session's listener is this process's
+/// listener, and probing it would be probing ourselves. Only a process with no
+/// listener at all probes, and only *that* probe can legitimately find a
+/// foreign incumbent.
+async fn take_socket(
+    path: &Path,
+    owned: &mut Option<UnixListener>,
+) -> std::io::Result<SocketClaim> {
+    if owned.is_some() {
+        return Ok(SocketClaim::Kept);
+    }
+    match bind_socket(path).await? {
+        BindOutcome::Bound(listener) => {
+            *owned = Some(listener);
+            Ok(SocketClaim::Bound)
+        }
+        BindOutcome::StoodDown => Ok(SocketClaim::StoodDown),
+    }
+}
+
+/// The accept arm of [`serve`]'s `select!`: a real `accept()` when this session
+/// owns the socket, and a future that never resolves when it does not — the
+/// same "park forever" shape as [`wait_for_deadline`]`(None)`.
+///
+/// A session without a socket used to `return` outright, which also dropped the
+/// command receiver and skipped the seed snapshot: the duplicate's panel stayed
+/// empty and its buttons dead, with the reason only in the journal. Parking
+/// this one arm keeps every other lane alive.
+async fn accept_or_park(
+    listener: Option<&UnixListener>,
+) -> std::io::Result<(UnixStream, tokio::net::unix::SocketAddr)> {
+    match listener {
+        Some(l) => l.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Run the broker: load the durable grants, take the socket, then loop serving
 /// client connections and panel commands until the command lane closes (the
-/// plugin session tearing down — the socket is rebound fresh on the next
-/// session, which is what drops in-memory tokens on a shell restart).
+/// plugin session tearing down). The `BrokerState` — and so every in-memory
+/// token — is built fresh here, which is what drops session tokens on a shell
+/// restart; the *socket* is not, see [`SOCKET`].
 ///
-/// "Take", not "bind": if a live broker already answers on the path this
-/// returns immediately without a listener (#995), because this function runs
-/// from `sources()` before the host has accepted the session and so also runs
-/// in a duplicate process the host is about to reject.
+/// "Take", not "bind", in two senses (#995). A session that finds this process
+/// already owns the socket keeps it and never probes — probing would mean
+/// probing our own previous session's listener, which is exactly the
+/// false-positive stand-down that killed the panel on a host restart. And a
+/// process with no socket that finds a *foreign* live broker stands down
+/// instead of unlinking it, because this function runs from `sources()` before
+/// the host has accepted the session and so also runs in a duplicate the host
+/// is about to reject.
+///
+/// A session without a socket **still runs**: it seeds the panel (with a
+/// [`BrokerSnapshot::notice`] saying why it is not serving) and keeps draining
+/// the command lane. Returning early instead left the duplicate's chip painting
+/// a default snapshot with dead buttons.
 ///
 /// SDK-free: `cmds`/`out` are plain tokio channels (the plugin passes the SDK's
 /// per-session lane ends, which are exactly these types), so this whole module
@@ -1078,31 +1190,54 @@ pub async fn serve(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: mpsc::UnboundedS
     );
     let mut state = BrokerState::new(grants);
 
-    let listener = match bind_socket(&sock).await {
-        Ok(BindOutcome::Bound(l)) => l,
-        Ok(BindOutcome::StoodDown) => {
-            // #995: another broker is live on the path. Standing down means
-            // this session simply has no socket server — the SDK keeps the
-            // plugin alive and redials at ≤5 s, so warn ONCE per process
-            // rather than once per redial.
-            if !STOOD_DOWN.swap(true, Ordering::Relaxed) {
+    // Hold the process's socket for this session's whole body: that is what
+    // orders an outgoing session against the incoming one (see `SOCKET`), and
+    // what lets `accept()` borrow the listener out of the guard.
+    let mut socket = SOCKET.lock().await;
+    match take_socket(&sock, &mut socket).await {
+        Ok(SocketClaim::Bound) => {
+            clear_stand_down(&STOOD_DOWN);
+            tracing_eprintln(&format!("listening on {}", sock.display()));
+        }
+        Ok(SocketClaim::Kept) => {
+            // The listener this process bound in an earlier session. Nothing to
+            // probe, nothing to rebind — the socket never went down.
+            clear_stand_down(&STOOD_DOWN);
+        }
+        Ok(SocketClaim::StoodDown) => {
+            // #995: a *foreign* broker is live on the path. Standing down means
+            // this session has no socket server — but it keeps running, so the
+            // panel says why and the command lane stays alive. The SDK redials
+            // at ≤5 s, so log ONCE per streak rather than once per redial.
+            if stand_down_once(&STOOD_DOWN) {
                 tracing_eprintln(&format!(
                     "{} already has a live broker listening; standing down rather than \
                      unlinking it (another hytte-plugin-infobroker is running — stop it, or \
-                     stop this one). Further stand-downs this process are silent.",
+                     stop this one). Further stand-downs are silent until this one binds.",
                     sock.display()
                 ));
             }
-            return;
+            state.notice = Some(format!(
+                "Not serving: another info broker already owns {}. Stop the other one \
+                 (or this one) — grants and sessions shown here are the ones this process \
+                 has, which is nothing.",
+                sock.display()
+            ));
         }
         Err(e) => {
+            // The bind itself failed (a permission/EADDRINUSE surprise). Same
+            // deal: no socket, but the session lives and the panel says so.
             tracing_eprintln(&format!("failed to bind {}: {e}", sock.display()));
-            return;
+            state.notice = Some(format!(
+                "Not serving: binding {} failed ({e}).",
+                sock.display()
+            ));
         }
-    };
-    tracing_eprintln(&format!("listening on {}", sock.display()));
+    }
+    let listener = socket.as_ref();
 
-    // Seed the panel with the current grants/status before any request.
+    // Seed the panel with the current grants/status before any request — and,
+    // when there is no socket, with the reason.
     send_update(&out, state.snapshot(now_unix()), None);
 
     // Parked consent requests (#487 phase 1b), keyed by the request_id the broker
@@ -1156,7 +1291,7 @@ pub async fn serve(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: mpsc::UnboundedS
                     }
                 }
             }
-            accepted = listener.accept() => {
+            accepted = accept_or_park(listener) => {
                 match accepted {
                     Ok((stream, _addr)) => match state.handle_conn(stream).await {
                         ConnResult::Answered { toast } => {
@@ -1299,6 +1434,92 @@ mod tests {
                 BindOutcome::Bound(_)
             ),
             "a stale socket is reclaimed",
+        );
+    }
+
+    /// #995 follow-up: a **second session of the same process** must keep the
+    /// socket its predecessor bound, not probe it.
+    ///
+    /// The sequence is the one a `systemctl --user restart trollshell` produces
+    /// and it is not rare: the SDK ends session N, waits `BACKOFF_BASE` = 100 ms,
+    /// redials and calls `sources()` → a fresh `serve` — while session N's
+    /// `serve` can still be parked in `handle_conn` for up to `REQUEST_TIMEOUT`
+    /// = 5 s with its listener open. Probing there answers "live" against **our
+    /// own listener**, and the old code took that as a duplicate: it stood down,
+    /// returned before the seed `send_update`, dropped the new session's command
+    /// receiver, and logged "another hytte-plugin-infobroker is running" when
+    /// there was exactly one. Only another restart recovered it.
+    ///
+    /// So the claim is decided by ownership *before* any probe: with a listener
+    /// already owned the answer is [`SocketClaim::Kept`], the inode is untouched
+    /// and clients keep being served straight through the handover.
+    #[tokio::test]
+    async fn a_second_session_keeps_the_process_listener_instead_of_probing_itself() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hytte-infobroker.sock");
+        // Stands in for the process-wide `SOCKET`, so the test drives the real
+        // decision without touching a static shared with the other tests.
+        let mut owned: Option<UnixListener> = None;
+
+        // Session 1 binds.
+        assert_eq!(
+            take_socket(&path, &mut owned).await.expect("first take"),
+            SocketClaim::Bound,
+            "an unowned, unclaimed path is bound",
+        );
+        let inode = std::fs::metadata(&path).expect("socket exists").ino();
+        assert!(owned.is_some(), "the process now owns the listener");
+
+        // Session 1 has ended, but its listener is still open (its `handle_conn`
+        // is parked) — so the path IS live. Session 2 starts inside that window.
+        assert!(
+            socket_in_use(&path).await,
+            "precondition: the predecessor's listener still answers, which is what \
+             the old code misread as a foreign duplicate",
+        );
+        assert_eq!(
+            take_socket(&path, &mut owned).await.expect("second take"),
+            SocketClaim::Kept,
+            "a session must not stand down against its own process's listener",
+        );
+        assert_eq!(
+            std::fs::metadata(&path).expect("socket still exists").ino(),
+            inode,
+            "the handover neither unlinks nor rebinds the socket",
+        );
+
+        // ...and the socket never went down across the handover.
+        let listener = owned.as_ref().expect("the process still owns the listener");
+        let (client, accepted) = tokio::join!(UnixStream::connect(&path), listener.accept());
+        client.expect("a client can dial straight through the session handover");
+        accepted.expect("the dial lands on the kept listener");
+    }
+
+    /// The stand-down log latch (#995): one line per stand-down *streak*, not
+    /// one per ≤5 s SDK redial — and a successful bind rearms it, so a later
+    /// genuine duplicate still explains itself instead of being silenced by an
+    /// earlier episode. Takes its own latch, so it never races the process-wide
+    /// `STOOD_DOWN` with the tests running in parallel.
+    #[test]
+    fn the_stand_down_line_is_logged_once_per_streak_and_rearms_on_a_bind() {
+        let latch = AtomicBool::new(false);
+
+        assert!(
+            stand_down_once(&latch),
+            "the first stand-down explains itself"
+        );
+        assert!(
+            !stand_down_once(&latch),
+            "the redials behind it are silent — the SDK retries every ≤5 s forever",
+        );
+        assert!(!stand_down_once(&latch), "...and stay silent");
+
+        clear_stand_down(&latch);
+        assert!(
+            stand_down_once(&latch),
+            "a successful bind rearms the line, so a later real duplicate is not silenced",
         );
     }
 

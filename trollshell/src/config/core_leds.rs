@@ -344,8 +344,8 @@ color = "heat"
 
 # Rows in the lamp matrix. 0 is the automatic wide rectangle, picked from the
 # core count (16x4 on a 64-thread box, 4x1 at 4 cores) — this is the shape the
-# retired TROLLSHELL_CORE_LEDS_ROWS spelt "rect". Any positive number pins the
-# row count instead and the columns fall out of it.
+# deprecated TROLLSHELL_CORE_LEDS_ROWS spells "rect". Any positive number pins
+# the row count instead and the columns fall out of it.
 rows = 0
 
 # What a ragged last row's leftover slots look like. Only visible when the row
@@ -413,14 +413,15 @@ fn env_key<'a, T>(
     }
 }
 
-/// The environment layered over `file`, key by key.
+/// The environment layered over `layered`, key by key — the merged file value
+/// is the fallback for every knob the environment does not carry.
 ///
 /// `lookup` is injected rather than read from the process: `unsafe_code =
 /// "forbid"` rules out `std::env::set_var` (it is an `unsafe fn` in edition
 /// 2024), so a test that drove the real environment could not exist at all,
 /// and one that read it would depend on the developer's shell.
 fn resolve(
-    file: CoreLeds,
+    layered: CoreLeds,
     lookup: &impl Fn(&str) -> Option<String>,
     announce: Deprecations,
 ) -> CoreLeds {
@@ -435,28 +436,28 @@ fn resolve(
             &STYLE,
             style.as_deref(),
             parse_core_leds_style,
-            file.style,
+            layered.style,
             announce,
         ),
         color: env_key(
             &COLOR,
             color.as_deref(),
             parse_core_leds_color,
-            file.color,
+            layered.color,
             announce,
         ),
         rows: env_key(
             &ROWS,
             rows.as_deref(),
             parse_core_leds_rows,
-            file.rows,
+            layered.rows,
             announce,
         ),
         fill: env_key(
             &FILL,
             fill.as_deref(),
             parse_core_leds_fill,
-            file.fill,
+            layered.fill,
             announce,
         ),
     }

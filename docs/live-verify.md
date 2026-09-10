@@ -1647,8 +1647,12 @@ session.
     scanline comb and curved-glass vignette — both at once, not one instead of
     the other. That composition is the whole design claim of #857 and the
     single most valuable thing to eyeball.
-  - Sweep the four knobs (each takes effect on shell restart; an unrecognized
-    value logs one `tracing::warn` and falls back):
+  - Sweep the four knobs. **Since #869 these live in
+    `~/.config/trollshell/core-leds.toml`** (`style` / `color` / `rows` /
+    `fill`), where an edit takes effect **live** — see the #869 entry below.
+    The four variables below still work and still win, but each now logs one
+    deprecation line at startup naming the file key it moves to; an
+    unrecognized value logs one `tracing::warn` and falls through to the file:
     - `TROLLSHELL_CORE_LEDS_STYLE` = `vfd` (default) / `lcd` / `oled` / `crt`
     - `TROLLSHELL_CORE_LEDS_COLOR` = `heat` (default) / `style` / `rainbow` /
       `transpride` / `#rrggbb`. `style` should give the plain single-ink panel
@@ -1703,6 +1707,60 @@ session.
   - `TROLLSHELL_CORE_LEDS_ROWS=8` still overrides the automatic shape (and on
     a 64-core box gives back roughly #861's square). `=rect` or unset is the
     new rectangle.
+- [ ] **(#869)** **`core-leds.toml` — the config-file pilot.** Phase 1 of
+      #866: the LED panel's four knobs are the first subsystem read through
+      the #868 layering, and the first thing in the shell you can edit in a
+      file and see change without restarting. Everything below wants a live
+      shell; nothing about it can be judged headlessly.
+  - **The payoff, in one move.** With the shell running and the Stats drawer
+    open, create `~/.config/trollshell/core-leds.toml` containing
+    `style = "crt"` and save. Within ~3 s the panel should re-skin to the CRT
+    tube — scanlines and vignette — with **no restart**. Change it to
+    `color = "transpride"`, save, watch the lamps re-band. This is the whole
+    point of the phase; if it needs a restart, the pilot failed.
+  - **A missing file is silent.** With no `core-leds.toml` anywhere, the panel
+    must look exactly as it did before #869 (VFD skin, heat map, automatic
+    rectangle, spare fill) and the journal must carry **no** config warning at
+    all. First run must not complain about an absent config.
+  - **The documented default reads well.** Nothing writes your overlay yet
+    (seeding it on a first save is #888's business), so the commented default
+    lives in `CoreLedsConfig::DEFAULT_TOML` in
+    `trollshell/src/config/core_leds.rs` — copy it into your overlay as a
+    starting point and check that the comments actually tell you what to type,
+    since that block is the only place a key is explained.
+  - **The environment still wins, once, loudly.** Start the shell with
+    `TROLLSHELL_CORE_LEDS_STYLE=oled` while `core-leds.toml` says
+    `style = "crt"`. Expect an OLED panel (the variable wins), and **exactly
+    one** journal line of this shape — with the real resolved path in it, not
+    a literal `~`:
+
+    ```text
+    TROLLSHELL_CORE_LEDS_STYLE is deprecated; set `style` in /home/annika/.config/trollshell/core-leds.toml
+    ```
+
+    Then edit `color` in the file and save: the colour must change live
+    **while `style` stays OLED**
+    (the variable stays pinned across reloads) and the deprecation line must
+    **not** repeat. A line every few seconds means the reload is announcing.
+
+  - **A malformed file keeps the last good skin.** With the shell running and
+    a working `core-leds.toml`, save a deliberately broken one (`style = "crt`
+    — unterminated string, or `style = "plasma"` — a value no parser accepts).
+    The panel must keep rendering the **last good** skin, not snap back to the
+    default, and the journal gets one warning per save (not one per poll).
+    Repair the file and save: the panel picks it up again.
+  - **An unknown key is loud and harmless.** Add `colour = "rainbow"` (British
+    spelling) alongside a valid `style`. Expect one `unknown key in config`
+    warning naming `colour`, the panel unchanged in colour, and the `style`
+    beside it still applied.
+  - **The base layer.** Nix does not render a base file yet (out of #869's
+    lane). To exercise the layer by hand, put a `core-leds.toml` under a
+    directory on `XDG_CONFIG_DIRS` (e.g.
+    `XDG_CONFIG_DIRS=/tmp/base:$XDG_CONFIG_DIRS` with
+    `/tmp/base/trollshell/core-leds.toml`), restart, and confirm your
+    `$XDG_CONFIG_HOME` overlay beats it key by key while a key only the base
+    states still applies.
+
 - [ ] **(#862)** **Accent tracking for the shell's own preem surfaces** — the
       Stats drawer's per-core LED panel is rasterised in-process, and until
       #864 nothing called `hytte_preem::set_accent`, so it drew with the kit

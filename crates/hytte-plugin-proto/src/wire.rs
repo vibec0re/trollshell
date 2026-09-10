@@ -1228,10 +1228,14 @@ pub const MAX_SHADER_DATA_BYTES: usize = 4 * 1024 * 1024;
 /// exactly [`MAX_SHADER_DATA_BYTES`] — so the two caps do not squeeze each
 /// other; they bound different mistakes.
 ///
-/// Host-side only, like the tree-shape caps below: the proto decodes a node, it
-/// never allocates a texture. A tighter documented bound on an existing optional
-/// field is a host refusal, not a wire change — no [`VOCAB`](crate::VOCAB) or
-/// `PROTO_VERSION` bump.
+/// Enforced on **both** sides, like [`MAX_SHADER_DATA_BYTES`]: the
+/// `hytte-plugin` SDK's builder refuses to construct an over-extent node
+/// (#1021), and the host refuses to draw one it did receive (broken-widget
+/// placeholder plus one warning) — an SDK-built plugin is not the only thing
+/// that can dial the socket. The proto itself does not check it: decoding a
+/// node never allocates a texture, so a tighter documented bound on an
+/// existing optional field is a host (and SDK) refusal, not a wire change —
+/// no [`VOCAB`](crate::VOCAB) or `PROTO_VERSION` bump.
 pub const MAX_SHADER_DATA_EXTENT: u32 = 4096;
 
 // ── tree-shape caps (#901) ───────────────────────────────────────────────────

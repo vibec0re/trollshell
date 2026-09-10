@@ -1268,6 +1268,7 @@ fn load_grants() -> GrantStore {
 // state (consent + query maps); splitting its arms into helpers would scatter that
 // shared state for no readability gain — same stance as the host's `handle_conn`.
 #[allow(clippy::too_many_lines)]
+#[doc(hidden)]
 pub async fn serve_with_grant_loader<L>(
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
     out: mpsc::UnboundedSender<BrokerMsg>,

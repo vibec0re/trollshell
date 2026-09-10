@@ -263,7 +263,8 @@ fn head_and_tail(s: &str) -> String {
         out.push_str("\n… head truncated at a byte cap …");
     }
     if elided > 0 {
-        write!(out, "\n… {elided} lines elided …").expect("writing to a String cannot fail");
+        let noun = if elided == 1 { "line" } else { "lines" };
+        write!(out, "\n… {elided} {noun} elided …").expect("writing to a String cannot fail");
     }
     if tail_n > 0 {
         out.push('\n');
@@ -997,6 +998,25 @@ async fn a_client_that_never_reads_does_not_delay_the_next_sessions_seed_inner()
         snap1.notice, None,
         "session 1 must bind cleanly: {:?}",
         snap1.notice,
+    );
+    // #1064 review F1: nothing else pins `load_grants` to actually reading
+    // `grants.toml` — a loader that stops reading it (and returns an empty
+    // store) stayed green here before this assertion existed. Check both the
+    // count (the file really was read) and a known row (the bytes that came
+    // back are the ones `seed_large_grants` wrote, not just the right shape).
+    assert_eq!(
+        snap1.grants.len(),
+        HUGE_GRANT_COUNT,
+        "session 1 must actually honour the seeded grants.toml — RED under a \
+         `load_grants` that stops reading the file",
+    );
+    assert!(
+        snap1.grants.iter().any(|g| g.agent == "agent-000000"
+            && g.datasource == "departures"
+            && g.decision == "always"),
+        "the seeded grants must be the ones grants.toml actually holds, not just \
+         the right count: first = {:?}",
+        snap1.grants.first(),
     );
 
     // A client connects, asks for the (huge, pre-seeded) grants list, and

@@ -1899,8 +1899,6 @@ mod tests {
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use std::collections::HashMap;
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use adw::prelude::*;
@@ -1911,6 +1909,7 @@ mod gtk_tests {
         PluginsState, PollResult, apply_plugins, build_tab, on_poll_result, on_toggle_result,
         refresh_detail,
     };
+    use crate::test_support::captured_logs;
 
     /// Run the GTK main loop until it has nothing left to dispatch, so a queued
     /// resize/allocation actually happens.
@@ -3482,83 +3481,34 @@ mod gtk_tests {
     // the right `LogTransition` but forgets to act on it (or acts on the
     // wrong arm) is invisible to those.
 
-    /// A `tracing` writer that collects every emitted line in memory, so a
-    /// test can count log lines rather than infer them from state.
-    ///
-    /// A local copy of `main.rs`'s `CapturedLog` — kept independent rather
-    /// than exported across a `pub(crate)` boundary for ~15 lines, the same
-    /// call this file's own `PollGenerations` doc makes against
-    /// `ai_keys_tab`'s copy.
-    #[derive(Clone, Default)]
-    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for CapturedLog {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("the capture buffer is never held across a panic")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     /// Run `body` with an `INFO` subscriber installed for this thread, and
     /// return the lines it emitted mentioning `"ListPlugins"`.
     ///
-    /// **Pre-registers both transition callsites first** (#1022/#1028 — see
-    /// `shader_map::tests::counting_events` in
-    /// `trollshell/src/plugins/shader_map.rs` for the full mechanism, and
-    /// `MEMORY.md`'s "tracing callsite Interest poisoning in tests"). `tracing`
-    /// caches an `Interest` per callsite, process-wide, decided by whichever
-    /// thread reaches it *first*; this file's own poll-ordering tests already
-    /// drive `on_poll_result` with `poll_err()`/`poll_ok(…)` on other threads
-    /// with **no** subscriber installed, and `cargo test` runs test functions
-    /// concurrently by default. If one of them reaches the "`ListPlugins`
-    /// failed" or "`ListPlugins` recovered" callsite first, `tracing-core`'s
-    /// fast path can cache `Interest::never()` for it — a cache that then
-    /// sticks for the rest of the process, and every count below silently
-    /// reads back `0`.
+    /// Wraps `crate::test_support::captured_logs` — the capture plumbing
+    /// itself (was this file's own `CapturedLog`, byte-identical to
+    /// `main.rs`'s and `ai_keys_tab`'s copies) is shared since the #1017
+    /// review (LOW 3); this file's own addition is the `"ListPlugins"`
+    /// filter, so the pure-`log_transition` tests in `main.rs` and this
+    /// file's own poll-ordering tests never show up as noise.
     ///
-    /// The fix needs no lock and no discipline from any other test: running
-    /// `body`'s callsites once on a throwaway state, *before* this helper's
-    /// own subscriber goes live, forces both callsites into the global
-    /// registry (whatever interest they land on there is irrelevant);
-    /// installing the subscriber immediately after **rebuilds** the interest
-    /// of every already-registered callsite against the now-live dispatcher,
-    /// so the counted run that follows is not racing anything. The warm-up
-    /// cannot pollute the counted run's own count: it runs against a
-    /// throwaway `PluginsState`/buffer that the counted run never reads.
+    /// No callsite warm-up needed (the #1017 review, LOW 4, corrected an
+    /// earlier version of this doc comment that claimed one was): `#[gtk::test]`
+    /// expands to `gtk::test_synced`, which serialises every test body in
+    /// this binary onto one `glib::ThreadPool::exclusive(1)` thread — so the
+    /// sibling `poll_err()`/`poll_ok(…)` calls this comment used to worry
+    /// about racing are never concurrent with this test, only prior on the
+    /// same thread — and `tracing_core::callsite::register_dispatch` rebuilds
+    /// every already-registered callsite's `Interest` against the new
+    /// `Dispatch` each time `captured_logs` installs one, so a callsite any
+    /// earlier test poisoned is repaired before `body` runs anyway (see PR
+    /// #1032's review, and `shader_map::tests::counting_events` in
+    /// `trollshell/src/plugins/shader_map.rs` for the citations). Verified: a
+    /// 100-run campaign of this crate's `system-tests` binary under
+    /// `xvfb-run`, no warm-up, 0 failures.
     fn captured_transition_logs(body: impl FnOnce()) -> Vec<String> {
-        let (_warmup_bin, warmup) = build_tab();
-        on_poll_result(&warmup, warmup.polls.issue(), poll_err());
-        on_poll_result(&warmup, warmup.polls.issue(), poll_ok(&["clock"], "active"));
-
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(CapturedLog(buffer.clone()))
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            body();
-        }
-        let bytes = buffer.lock().expect("no panic while capturing").clone();
-        String::from_utf8_lossy(&bytes)
-            .lines()
+        captured_logs(body)
+            .into_iter()
             .filter(|line| line.contains("ListPlugins"))
-            .map(str::to_owned)
             .collect()
     }
 
@@ -3632,5 +3582,53 @@ mod gtk_tests {
         assert_eq!(failed, 2, "one line per down edge: {lines:?}");
         assert_eq!(recovered, 1, "one line for the single up edge: {lines:?}");
         assert_eq!(lines.len(), 3, "…and nothing else: {lines:?}");
+    }
+
+    /// The ordinary case — the control-center opened while the shell is up —
+    /// must write nothing at all. Neither test above starts from a success,
+    /// so a mutation that only fires on the first-ever *successful* poll (an
+    /// extra `LogTransition::None if previous.is_none()` arm emitting
+    /// "ListPlugins recovered") survives the whole suite. Supplied by the
+    /// adversarial review of `232a8a2` (#1035, MED 2).
+    #[gtk::test]
+    fn a_first_poll_that_succeeds_is_silent() {
+        adw::init().expect("libadwaita init");
+        let (_bin, state) = build_tab();
+
+        let lines = captured_transition_logs(|| {
+            on_poll_result(&state, state.polls.issue(), poll_ok(&["clock"], "active"));
+            on_poll_result(&state, state.polls.issue(), poll_ok(&["clock"], "active"));
+        });
+
+        assert!(
+            lines.is_empty(),
+            "a shell that is up when the window opens must write no line at all: {lines:?}"
+        );
+    }
+
+    /// A stale, out-of-order completion (#983) must not reach the transition
+    /// guard — the claim `on_poll_result`'s own doc and the module doc both
+    /// make, which no test above exercises: hoisting the transition block
+    /// above `PollGenerations::accept` leaves the suite green while a
+    /// superseded poll writes a `ListPlugins failed` line the newest poll has
+    /// already disproved. Supplied by the adversarial review of `232a8a2`
+    /// (#1035, MED 1).
+    #[gtk::test]
+    fn a_stale_failure_writes_no_journal_line() {
+        adw::init().expect("libadwaita init");
+        let (_bin, state) = build_tab();
+
+        let stale = state.polls.issue();
+        let newest = state.polls.issue();
+
+        let lines = captured_transition_logs(|| {
+            on_poll_result(&state, newest, poll_ok(&["clock"], "active"));
+            on_poll_result(&state, stale, poll_err());
+        });
+
+        assert!(
+            lines.is_empty(),
+            "a superseded poll must be dropped before the transition guard: {lines:?}"
+        );
     }
 }

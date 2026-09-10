@@ -67,8 +67,8 @@
 //! is dropped whole (the exact discipline [`crate::plugins_tab`]'s #983 fix
 //! uses, now protecting Apply/Clear against a transition-triggered read rather
 //! than against a removed timer's tick). [`apply_ai_status`] logs on
-//! transitions only ([`log_transition`]), mirroring `ShellProbeUi::shown` in
-//! `main.rs`.
+//! transitions only ([`log_transition`]) — `main.rs`'s shared helper (#1017
+//! review, LOW 3: this tab held its own byte-identical copy until then).
 
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -78,7 +78,9 @@ use std::time::Duration;
 use adw::prelude::*;
 use hytte_bus::RetryPolicy;
 
-use crate::{CONTROL_IFACE, CONTROL_NAME, CONTROL_PATH, spawn_on_runtime};
+use crate::{
+    CONTROL_IFACE, CONTROL_NAME, CONTROL_PATH, LogTransition, log_transition, spawn_on_runtime,
+};
 
 /// The LLM providers the AI Keys tab manages, `(slot, label, help)`. The `slot`
 /// is the provider name the shell stores the key under and injects as
@@ -356,41 +358,6 @@ fn on_ai_status_result(
     apply_ai_status(state, res);
 }
 
-/// What (if anything) a poll outcome transitioning from `previous` (the last
-/// *applied* poll's failure state — `None` before the first) to `is_err`
-/// should log.
-///
-/// Pure so the transitions-only rule is unit-tested without a display server —
-/// mirrors `main.rs`'s split of `should_probe_revision`/`format_banner_message`
-/// out of `ShellProbeUi::apply`. [`apply_ai_status`]'s widget mutations are
-/// pinned separately in `gtk_tests`, which is the only place the rows can be
-/// asserted at all.
-#[derive(Debug, PartialEq, Eq)]
-enum LogTransition {
-    /// Same outcome as last time (or the very first poll succeeded) — nothing
-    /// to say.
-    None,
-    /// A run of successes (or the very first poll) just started failing.
-    Failed,
-    /// A run of failures just started succeeding again.
-    Recovered,
-}
-
-fn log_transition(previous: Option<bool>, is_err: bool) -> LogTransition {
-    if previous == Some(is_err) {
-        return LogTransition::None;
-    }
-    if is_err {
-        LogTransition::Failed
-    } else if previous == Some(true) {
-        LogTransition::Recovered
-    } else {
-        // The very first poll ever, and it succeeded: matches the pre-#1003
-        // behaviour of never logging a bare success.
-        LogTransition::None
-    }
-}
-
 /// Reflect one `ListAiKeys` outcome into the rows, logging on transitions only
 /// ([`log_transition`]) rather than on every applied read.
 fn apply_ai_status(state: &AiKeysState, res: Result<Vec<String>, hytte_bus::BusError>) {
@@ -465,7 +432,7 @@ async fn clear_ai_key(slot: String) -> Result<(), hytte_bus::BusError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogTransition, PollGenerations, log_transition};
+    use super::PollGenerations;
 
     // ── Poll ordering (#1003) ────────────────────────────────────────────────
 
@@ -517,38 +484,16 @@ mod tests {
         assert!(!polls.accept(only), "the same generation must apply once");
     }
 
-    // ── Transitions-only logging (#1003) ─────────────────────────────────────
-
-    #[test]
-    fn a_fresh_tab_failing_for_the_first_time_is_logged() {
-        assert_eq!(log_transition(None, true), LogTransition::Failed);
-    }
-
-    #[test]
-    fn a_fresh_tab_succeeding_for_the_first_time_is_quiet() {
-        // Matches the pre-#1003 behaviour: a bare success was never logged.
-        assert_eq!(log_transition(None, false), LogTransition::None);
-    }
-
-    #[test]
-    fn a_repeated_failure_is_not_logged_again() {
-        assert_eq!(log_transition(Some(true), true), LogTransition::None);
-    }
-
-    #[test]
-    fn a_repeated_success_is_not_logged_again() {
-        assert_eq!(log_transition(Some(false), false), LogTransition::None);
-    }
-
-    #[test]
-    fn recovering_from_a_failure_is_logged() {
-        assert_eq!(log_transition(Some(true), false), LogTransition::Recovered);
-    }
-
-    #[test]
-    fn regressing_after_a_success_is_logged() {
-        assert_eq!(log_transition(Some(false), true), LogTransition::Failed);
-    }
+    // Transitions-only logging (#1003) used to have its own `LogTransition`/
+    // `log_transition` copy pinned right here; the #1017 review (LOW 3) found
+    // it byte-identical to `main.rs`'s and this tab now imports that shared
+    // definition instead (see the module doc and `apply_ai_status`). The rule
+    // itself is pinned once, hermetically, by `main.rs`'s own `mod tests`
+    // ("Transitions-only logging (#1017, shared with `plugins_tab`)"); this
+    // tab's wiring onto that rule is what
+    // `gtk_tests::ai_keys_status_logs_transitions_not_every_change` below
+    // still pins end-to-end, against a real `tracing` subscriber and real
+    // rows.
 }
 
 /// The AI Keys tab's widget-level behaviour (#1003).
@@ -561,12 +506,10 @@ mod tests {
 /// `tests` above.
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
-
     use adw::prelude::*;
 
     use super::{AiKeysState, on_ai_status_result, on_shell_reachable_change};
+    use crate::test_support::captured_logs;
 
     /// Build a fabricated tab state for the given slots — no `build_page`, no
     /// `Control` traffic, just the widgets [`super::apply_ai_status`] writes
@@ -887,51 +830,6 @@ mod gtk_tests {
             }),
             revision: None,
         }
-    }
-
-    /// A `tracing` writer that collects every emitted line in memory, so a
-    /// test can count log lines rather than infer them from state. Mirrors
-    /// `main.rs`'s `CapturedLog`.
-    #[derive(Clone)]
-    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for CapturedLog {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("the capture buffer is never held across a panic")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn captured_logs(body: impl FnOnce()) -> Vec<String> {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(CapturedLog(buffer.clone()))
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            body();
-        }
-        let bytes = buffer.lock().expect("no panic while capturing").clone();
-        String::from_utf8_lossy(&bytes)
-            .lines()
-            .map(str::to_owned)
-            .collect()
     }
 
     /// The tab logs on **transitions**, not on every applied read — the same

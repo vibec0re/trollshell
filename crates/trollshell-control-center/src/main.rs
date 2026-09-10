@@ -49,6 +49,8 @@ use hytte_bus::RetryPolicy;
 mod ai_keys_tab;
 mod places_tab;
 mod plugins_tab;
+#[cfg(all(test, feature = "system-tests"))]
+mod test_support;
 
 /// Distinct app-id — this is its own application, not the shell.
 const APP_ID: &str = "mov.vibec0re.trollshell.ControlCenter";
@@ -569,11 +571,12 @@ impl ShellProbeUi {
 /// Lifted out of `ai_keys_tab`'s original private copy (#1015) so a third
 /// poller — the Plugins tab's own `ListPlugins` poll (#1017) — imports the
 /// actual helper instead of hand-copying the same ten lines a second time.
-/// `ai_keys_tab` keeps its own copy rather than being retrofitted onto this
-/// one: that file is out of #1017's lane, and its own `PollGenerations` doc
-/// already argues that duplicating a small, independently-falsifiable type
-/// per tab is the right call for *that* mechanism — this is the same shape,
-/// made reusable so the next caller imports it rather than writing a fourth.
+/// The #1017 review (LOW 3) caught that first cut leaving `ai_keys_tab` on
+/// its own byte-identical copy — a consolidation that named itself as one but
+/// wasn't — so `ai_keys_tab` now imports this definition too; both tabs'
+/// `gtk_tests` keep their own journal-capturing integration test (the "second
+/// caller" and "third caller" each still get their own falsifiable wiring
+/// check, just against the one shared rule rather than a hand-copy of it).
 ///
 /// Pure so the rule is unit-tested with no display server and no `tracing`
 /// subscriber (see `banner_message_tests` below). `ShellProbeUi::apply`
@@ -990,9 +993,7 @@ mod tests {
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use std::cell::RefCell;
-    use std::io::Write;
     use std::rc::Rc;
-    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use gtk::glib;
@@ -1000,6 +1001,7 @@ mod gtk_tests {
     use super::{
         CONNECTING_BANNER, ShellProbe, ShellProbeUi, build_revision_footer, install_shell_probe,
     };
+    use crate::test_support::captured_logs;
 
     const NOT_RUNNING: &str = "trollshell is not running — start the shell to manage it";
     const UNAVAILABLE_FOOTER: &str = "Shell revision: unavailable (trollshell not running)";
@@ -1025,59 +1027,6 @@ mod gtk_tests {
             }),
             revision: None,
         }
-    }
-
-    /// A `tracing` writer that collects every emitted line in memory, so a
-    /// test can count log lines rather than infer them from state.
-    ///
-    /// Hand-rolled rather than reached for from `tracing-subscriber`'s test
-    /// helpers because `TestWriter` goes to the captured stdout, which a test
-    /// cannot read back.
-    #[derive(Clone)]
-    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for CapturedLog {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("the capture buffer is never held across a panic")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// Run `body` with an `INFO` subscriber installed for this thread, and
-    /// return the lines it emitted.
-    ///
-    /// `set_default` is thread-local, so this neither needs nor disturbs a
-    /// global subscriber, and `#[gtk::test]` runs the body on the same thread.
-    fn captured_logs(body: impl FnOnce()) -> Vec<String> {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(CapturedLog(buffer.clone()))
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            body();
-        }
-        let bytes = buffer.lock().expect("no panic while capturing").clone();
-        String::from_utf8_lossy(&bytes)
-            .lines()
-            .map(str::to_owned)
-            .collect()
     }
 
     /// The banner and footer as `build_window` wires them, plus the probe

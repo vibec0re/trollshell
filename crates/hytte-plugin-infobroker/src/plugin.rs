@@ -113,6 +113,12 @@ impl Plugin for Infobroker {
     /// on this stream. Created per session; a disconnect drops it (rebinding the
     /// socket fresh on reconnect — which is what drops in-memory tokens on a
     /// shell restart, per the design).
+    ///
+    /// The SDK calls this **after** it writes `Register` but **before** it reads
+    /// any host frame, so it also runs in a duplicate process whose registration
+    /// the host is about to reject on its `IdGuard`. `serve` therefore probes
+    /// the path for a live incumbent and stands down instead of unlinking it
+    /// (#995) — do not reintroduce an unconditional bind here.
     fn sources(cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
         tokio::spawn(hytte_plugin_infobroker::serve(cmds, msg_tx));
@@ -405,8 +411,13 @@ impl Infobroker {
 
         // Assemble: the panel title, then each section preceded by a divider so
         // the sections read as distinct groups (and the title is set off from the
-        // first one).
+        // first one). A `notice` — this process is not serving the socket, e.g.
+        // a duplicate that stood down (#995) — rides directly under the title,
+        // ahead of everything, because it explains why the rest is empty.
         let mut children = vec![label("Info broker", &["title-4"])];
+        if let Some(notice) = &self.snapshot.notice {
+            children.push(notice_line(notice));
+        }
         for s in sections {
             children.push(divider());
             children.push(s);
@@ -444,6 +455,21 @@ fn muted_text(text: &str) -> Node {
         max_width_chars: None,
         ellipsize: false,
         classes: vec!["dim-label".to_owned()],
+        tooltip: None,
+    }
+}
+
+/// A wrapping, **warning**-styled line for a
+/// [`BrokerSnapshot::notice`](hytte_plugin_infobroker::broker::BrokerSnapshot::notice):
+/// this broker is not serving its socket (#995). Louder than [`muted_text`] on
+/// purpose — an empty panel with no explanation reads as an idle broker.
+fn notice_line(text: &str) -> Node {
+    Node::Text {
+        id: None,
+        text: text.to_owned(),
+        max_width_chars: None,
+        ellipsize: false,
+        classes: vec!["warning".to_owned()],
         tooltip: None,
     }
 }
@@ -1067,6 +1093,41 @@ mod tests {
         assert!(
             matches!(&children[2], Node::Box { .. }),
             "each section is a grouped vertical box"
+        );
+    }
+
+    /// #995: a broker that is **not serving** — a duplicate that stood down
+    /// against a live incumbent — says so on the panel, directly under the
+    /// title. Without this the duplicate painted a default snapshot: an empty
+    /// panel that reads exactly like an idle broker, with the only explanation
+    /// one stderr line in that unit's journal.
+    #[test]
+    fn a_broker_that_is_not_serving_explains_itself_on_the_panel() {
+        let (mut m, _rx) = model();
+        let notice = "Not serving: another info broker already owns /run/user/1000/x.sock.";
+
+        // The ordinary case says nothing.
+        assert!(
+            !panel_mentions(&m.panel(), notice),
+            "a serving broker shows no notice"
+        );
+
+        m.snapshot = BrokerSnapshot {
+            notice: Some(notice.to_owned()),
+            ..BrokerSnapshot::default()
+        };
+        let panel = m.panel();
+        assert!(
+            panel_mentions(&panel, notice),
+            "a stood-down broker renders the reason it is empty"
+        );
+        let Node::Box { children, .. } = &panel else {
+            panic!("panel root is a Box");
+        };
+        assert!(
+            matches!(&children[1], Node::Text { text, classes, .. }
+                if text == notice && classes.iter().any(|c| c == "warning")),
+            "the notice rides directly under the title, styled as a warning",
         );
     }
 

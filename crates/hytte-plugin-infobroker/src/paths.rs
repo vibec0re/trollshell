@@ -4,8 +4,9 @@
 //! plugin (server) and the [`crate`]'s CLI derive them identically:
 //!
 //! - **the broker socket** — `$XDG_RUNTIME_DIR/`[`SOCKET_FILE`], the boring
-//!   JSON-lines endpoint the CLI dials (same-user-only, `0600`, unlinked before
-//!   bind exactly like the host's own plugin socket);
+//!   JSON-lines endpoint the CLI dials (same-user-only, `0600`; a *stale*
+//!   socket is unlinked before bind, a *live* one is left alone and the
+//!   newcomer stands down — the same shape as the host's own plugin socket);
 //! - **the grant store** — `$XDG_STATE_HOME/`[`STATE_DIR`]`/`[`GRANTS_FILE`]
 //!   (falling back to `~/.local/state/…`), the durable half;
 //! - tokens are in-memory only (see [`crate::tokens`]) — no path.

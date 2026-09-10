@@ -286,9 +286,10 @@ fn throttle_effects(
 //
 // Three Register/lifecycle guards so the blessed dev workflow (a `cargo run`
 // beside the deployed user service) can't corrupt the live shell: the host
-// won't steal a live sibling's socket (`socket_in_use`, applied in `listen`),
-// one id owns at most one live connection ([`IdGuard`]), and an effect a plugin
-// didn't request the capability for is dropped ([`enforce_capabilities`]).
+// takes the socket rather than seizing it (`listener::take_socket` — an
+// exclusive lock, then the `socket_in_use` probe, #996/#436), one id owns at
+// most one live connection ([`IdGuard`]), and an effect a plugin didn't request
+// the capability for is dropped ([`enforce_capabilities`]).
 
 /// RAII claim on a plugin id within one host's live-id set (#436). Held for a
 /// connection's lifetime and released on drop (teardown), so a legitimate
@@ -393,13 +394,25 @@ pub(super) fn push_gate(manifest: &Manifest, key: StateKey) -> bool {
 }
 
 /// Drop any effect whose required [`Capability`] the plugin didn't declare in
-/// its manifest (#436). Host-side capability enforcement: the manifest's
-/// `capabilities` are the grant set, and an effect requesting an ungranted cap
-/// is skipped with a warn rather than brokered — making the manifest's
-/// documented "the host auto-grants from the manifest" model actually true
+/// its manifest (#436). The manifest's `capabilities` are the grant set — every
+/// one of them auto-granted, verbatim, at `Register` — and an effect requesting
+/// a cap the plugin didn't declare is skipped with a warn rather than brokered
 /// (before this, any connected same-user process could emit `Notify`/`RaiseOsd`/
 /// `OpenPage` without requesting the cap). Runs in the reader **before** the rate
 /// cap so an ungranted flood costs no [`EffectRateLimiter`] tokens.
+///
+/// **This is not a trust boundary, and #436 didn't make one** (#998). What it
+/// enforces is *declaration*: a plugin stays inside the surface it asked for,
+/// and the audit log names a real grant set. It does not gate a
+/// higher-trust cap behind anything — a manifest that declares
+/// [`Capability::RunCommand`] is granted argv execution, because the boundary
+/// is the socket itself: `$XDG_RUNTIME_DIR`, `0700` dir, `0600` socket,
+/// same-user-only by spec, and a same-uid process that can open it could
+/// `systemd-run --user` its own plugin unit anyway. That is route 0, the model
+/// Annika settled on #893/#956; the frontend-B spec's older "keep `RunCommand`
+/// a separately-granted, higher-trust cap" line described a second gate that
+/// was never built, and this comment used to claim #436 had made the
+/// *documented* model true when it made the weaker one true.
 pub(super) fn enforce_capabilities(
     granted: &[Capability],
     plugin_id: &str,

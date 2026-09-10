@@ -51,3 +51,9 @@ tokio = { version = "1.40", default-features = false, features = [
   "time",
   "sync",
 ] }
+
+[dev-dependencies]
+# #995's `bind_socket` test binds a real `UnixListener` in a scratch dir;
+# tempfile gives it one (and cleans it up). Already a workspace dependency and
+# already a dev-dependency of six other members — no new resolved package.
+tempfile.workspace = true

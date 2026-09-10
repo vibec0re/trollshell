@@ -240,8 +240,10 @@ settled the boundary on
 [#893](https://github.com/vibec0re/trollshell/issues/893#issuecomment-5568936135)
 (2026-09-07T10:02Z): _"hmm ok if this adds nothing then let's not overcomplicate
 things ❤️"_, declining a provenance check (`SO_PEERCRED` → cgroup → unit name,
-first proposed under the name "route 0") as re-deriving what the socket's file
-mode already guarantees. Tree-owned shaders (#954, on main) are gated in CI by
+first proposed under that same name) as re-deriving what the socket's file mode
+already guarantees. **"Route 0" therefore means exactly one thing from here on
+— the heading's sense, the socket's file mode as the boundary — and never the
+provenance check that first carried the label and was declined.** Tree-owned shaders (#954, on main) are gated in CI by
 `glslangValidator` instead — a flake check (`nix/lint-glsl.py`), zero
 `Cargo.lock` cost; see the `glsl` bullet in this repo's `CLAUDE.md` CI section.
 

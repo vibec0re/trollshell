@@ -67,7 +67,7 @@
 //! The config is stamped and then loaded **once** per process, in [`boot`];
 //! the watcher does neither. Two loads at startup would double every
 //! diagnostic, and stamping *after* the load loses an edit made in between
-//! permanently — see [`Watcher::observing`].
+//! permanently — see [`Watcher::stamping_before`].
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -825,38 +825,38 @@ struct Watcher {
 }
 
 impl Watcher {
-    /// Watch `paths` from the baseline `stamps`, seeded with the file layer
-    /// `last_good` that the caller has already loaded.
+    /// **Stamp `paths`, then read them with `load`** — in that order, which is
+    /// the entire contract of this constructor.
     ///
-    /// **Neither stamps nor loads** — it takes both from the caller, and both
-    /// halves of that are load-bearing.
+    /// The one load is `load`'s, and it is a parameter rather than a call to
+    /// [`initial_load`] for two reasons. The first is #1040 F1: the constructor
+    /// used to load *by itself* while `start` had already loaded, so one typo
+    /// produced two `unknown key` warnings and one broken file two `config
+    /// unusable` errors. The second is that the ordering is otherwise a rule
+    /// nothing enforces — two statements in a caller, swappable without a
+    /// single test noticing (measured: mutation V2a green against a test that
+    /// had inlined the two lines itself). With the load handed in, the order
+    /// lives *here*, in one place, and a test can hand in a `load` that edits
+    /// the file on its way out and watch the next poll either see it or lose
+    /// it.
     ///
-    /// *Not loading* is #1040 F1: before it, `start` loaded and then handed
-    /// `watch` a constructor that loaded *again*, so one typo produced two
-    /// `unknown key` warnings and one broken file two `config unusable`
-    /// errors.
+    /// The order matters because the baseline has to predate the value. Stamp
+    /// first and an edit landing in the window is read by this very load, with
+    /// a stamp that predates it — so the next [`Self::poll`] sees the stamp
+    /// move and re-reads, and the edit is one tick late at worst. Stamp *after*
+    /// and the baseline already includes an edit the published value does not,
+    /// and because `poll` updates its stamps unconditionally that edit is
+    /// missed **forever**. Measured on the previous head: file said `crt`,
+    /// panel said `lcd`, three polls, nothing.
     ///
-    /// *Not stamping* is #1040 V2, and it is the half that fixing F1 left
-    /// behind. Whoever takes the baseline has to take it **before** the load,
-    /// or an edit landing in between is baselined into the stamps while the
-    /// published value predates it — and, because [`Self::poll`] updates its
-    /// stamps unconditionally, that edit is then missed *forever*, not merely
-    /// late. Splitting the load out of the constructor moved the window rather
-    /// than closing it (the stamp still happened after the load, just on the
-    /// runtime worker that first polled the spawned task); taking both here as
-    /// parameters means [`boot`] can order them correctly and there is no
-    /// second place that could get it wrong.
-    ///
-    /// A supervised restart of [`watch`] resumes from this same baseline — the
+    /// A supervised restart of [`watch`] resumes from the same baseline — the
     /// watcher is `Clone` and the factory hands out a copy — so an edit made
     /// during a panic-and-restart is picked up by the next poll rather than
     /// silently baselined away. `places::ConfigWatcher::new` splits the load
     /// out the same way; the stamp ordering is this pilot's addition.
-    fn observing(
-        paths: Vec<PathBuf>,
-        stamps: Vec<Option<(SystemTime, u64)>>,
-        last_good: CoreLeds,
-    ) -> Self {
+    fn stamping_before(paths: Vec<PathBuf>, load: impl FnOnce(&[PathBuf]) -> CoreLeds) -> Self {
+        let stamps = stamps_of(&paths);
+        let last_good = load(&paths);
         Self {
             paths,
             stamps,
@@ -974,18 +974,14 @@ fn initial_load(paths: &[PathBuf]) -> CoreLeds {
 /// is set, and hand back the dressing to publish beside the poller that will
 /// keep it fresh.
 ///
-/// # The order of the first two lines is the fix (#1040 V2)
+/// # Stamp, then load (#1040 V2)
 ///
-/// **Stamp, then load.** An edit that lands in between is then read by *this*
-/// load with a stamp that predates it, so the next [`Watcher::poll`] sees the
-/// stamp move and re-reads — the edit arrives one tick late, at worst.
-/// Loading first and stamping after inverts that: the poller's baseline
-/// already includes the edit while the published value does not, and since
-/// `poll` updates its stamps unconditionally the edit is lost **permanently**.
-/// Measured on the previous head: file said `crt`, panel said `lcd`, three
-/// polls, nothing. There is no re-read loop here on purpose — erring toward
-/// "poll again" is free, and a stat-read-stat retry would only narrow a window
-/// that is already harmless in this direction.
+/// The ordering lives in [`Watcher::stamping_before`] rather than in two
+/// statements here, which is the point: as two statements it was a rule
+/// nothing enforced, and a mutation that swapped them left the suite green.
+/// There is no re-read loop on purpose — erring toward "poll again" is free,
+/// and a stat-read-stat retry would only narrow a window that is already
+/// harmless in that direction.
 ///
 /// The watcher is seeded with the **file layer**, not the resolved dressing:
 /// resolving is where the environment wins, and seeding with a value the
@@ -997,13 +993,9 @@ fn initial_load(paths: &[PathBuf]) -> CoreLeds {
 /// reaching for the process so the real call site is drivable in a test
 /// (#1040 F3/V3).
 fn boot(paths: &[PathBuf], lookup: &dyn Fn(&str) -> Option<String>) -> (CoreLeds, Watcher) {
-    let stamps = stamps_of(paths);
-    let layered = initial_load(paths);
-    let resolved = resolve(layered, lookup, Deprecations::Announce);
-    (
-        resolved,
-        Watcher::observing(paths.to_vec(), stamps, layered),
-    )
+    let watcher = Watcher::stamping_before(paths.to_vec(), initial_load);
+    let resolved = resolve(watcher.last_good, lookup, Deprecations::Announce);
+    (resolved, watcher)
 }
 
 // ── The service ──────────────────────────────────────────────────────────────
@@ -1092,7 +1084,7 @@ mod tests {
         COLOR, CONFIG_POLL_INTERVAL, CoreLeds, CoreLedsConfig, CoreLedsService, Deprecations, FILL,
         InvalidValue, MAX_ROWS, Mutable, ROWS, Rows, STYLE, Service, Watcher, boot, initial_load,
         parse_core_leds_color, parse_core_leds_fill, parse_core_leds_rows, parse_core_leds_style,
-        parse_hex_rgb, resolve, rows_spelling, stamps_of, watch,
+        parse_hex_rgb, resolve, rows_spelling, watch,
     };
     use hytte_config::subsystem::{self, Subsystem};
     use hytte_preem::{ColorMap, DisplayStyle, Fill};
@@ -2396,7 +2388,7 @@ mod tests {
     /// leaving the published value one save stale.
     ///
     /// **Red if anything on the startup path loads twice** — in particular if
-    /// `Watcher::observing` goes back to loading instead of taking a seed.
+    /// `Watcher::stamping_before` goes back to loading twice.
     #[test]
     fn a_startup_loads_the_config_exactly_once() {
         let mut overlay = Overlay::new();
@@ -2562,40 +2554,51 @@ mod tests {
         assert_eq!(next.color, ColorMap::Rainbow);
     }
 
-    /// **An edit made between the stamp and the load is not lost** (#1040 V2).
+    /// **An edit made after the load is not lost** (#1040 V2).
     ///
-    /// The window is real and was measured on the previous head: `boot`
-    /// published at T1, the spawned poller stamped at T2 when a runtime worker
-    /// first polled the task, and a save landing in between was baselined into
-    /// the poller's stamps while the published value predated it. Because
-    /// [`Watcher::poll`] updates its stamps unconditionally, that save was
-    /// then missed **forever** — file said `crt`, panel said `lcd`, three
-    /// polls, nothing.
+    /// The window is real and was measured on the previous head: the shell
+    /// loaded and published at T1, the spawned poller stamped at T2 when a
+    /// runtime worker first polled the task, and a save landing in between was
+    /// baselined into the poller's stamps while the published value predated
+    /// it. Because [`Watcher::poll`] updates its stamps unconditionally, that
+    /// save was then missed **forever** — file said `crt`, panel said `lcd`,
+    /// three polls, nothing.
     ///
-    /// The race is simulated rather than raced: the save is injected exactly
-    /// where the window is, between the two halves of `boot`. That is what
-    /// makes the assertion deterministic *and* what makes the mutation
-    /// meaningful — with the two lines swapped back (stamp after load) the
-    /// baseline includes the edit, `poll` returns `None`, and this goes red.
+    /// Deterministic rather than raced, and driven through the **production**
+    /// constructor rather than a copy of it: the save is the last thing the
+    /// injected `load` does, so it lands strictly after the read. With the
+    /// stamp taken first (as [`Watcher::stamping_before`] does) the baseline
+    /// predates the save, the next poll sees it and republishes. With the
+    /// stamp taken after the load — the two lines swapped, which is all the
+    /// bug ever was — the baseline already includes it, `poll` returns `None`,
+    /// and the panel keeps `lcd` for the life of the shell.
+    ///
+    /// An earlier version of this test inlined those two lines itself and so
+    /// asserted nothing about the code; mutation V2a was green against it.
     #[test]
-    fn an_edit_between_the_stamp_and_the_load_is_not_lost() {
-        let mut overlay = Overlay::new();
-        overlay.write("style = \"lcd\"\n");
+    fn an_edit_landing_after_the_load_is_not_lost() {
+        let overlay = std::cell::RefCell::new(Overlay::new());
+        overlay.borrow_mut().write("style = \"lcd\"\n");
+        let paths = overlay.borrow().layers();
 
-        // `boot`, hand-inlined so the save can land in the gap. The order of
-        // these two lines is the fix; everything else here is scaffolding.
-        let stamps = stamps_of(&overlay.layers());
-        overlay.write("style = \"crt\"\n");
-        let layered = initial_load(&overlay.layers());
-        let mut watcher = Watcher::observing(overlay.layers(), stamps, layered);
+        let mut watcher = Watcher::stamping_before(paths, |paths| {
+            let leds = initial_load(paths);
+            // Strictly after the read, strictly before the caller sees the
+            // watcher: the window V2 is about.
+            overlay.borrow_mut().write("style = \"crt\"\n");
+            leds
+        });
 
         let published = watcher.resolved(&no_env(), Deprecations::Silent);
-        let next = watcher.poll(published, &no_env());
-
         assert_eq!(
-            next.or(Some(published)).map(|leds| leds.style),
+            published.style,
+            DisplayStyle::Lcd,
+            "live control: the load really did happen before the save"
+        );
+        assert_eq!(
+            watcher.poll(published, &no_env()).map(|leds| leds.style),
             Some(DisplayStyle::Crt),
-            "the save in the window must reach the panel, by this poll at the latest"
+            "the save must reach the panel on the next poll, not never"
         );
     }
 

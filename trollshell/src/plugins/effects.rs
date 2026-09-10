@@ -618,7 +618,7 @@ pub(super) enum UriRefusal {
     /// Longer than [`MAX_URI_BYTES`].
     TooLong(usize),
     /// Contains an ASCII control character (a newline, or — the reason this is
-    /// checked at all rather than left to GLib — an interior NUL, which cannot
+    /// checked at all rather than left to `GLib` — an interior NUL, which cannot
     /// survive the `&str` → C string conversion the launcher does).
     Control,
     /// No RFC 3986 scheme at all (`example.com/x`, `://x`, `1http:x`).
@@ -708,7 +708,7 @@ pub(super) fn check_uri(uri: &str) -> Result<&str, UriRefusal> {
 /// [`launch_default_for_uri`]. Unlike the `#[cfg(test)]`-compiled-out
 /// [`launch_detached`], nothing about this path is skipped under test — the
 /// validation, the log line and the outcome mapping are the same code in both
-/// builds, and only the final GLib call differs.
+/// builds, and only the final `GLib` call differs.
 ///
 /// A refusal is logged at **warn** (the plugin asked for something the host will
 /// not do) and a launch failure too (no handler registered, portal error); a

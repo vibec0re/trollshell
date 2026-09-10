@@ -591,15 +591,47 @@
                 # own step (rather than relying on the preceding `cargo test`
                 # to have compiled it as a side effect) so a harness compile
                 # failure is attributed to this line, not buried in the test
-                # run's own output. `PREEM_GL_DIFF_OUT` is the harness's own
-                # override point (default `gates/`, the repo's scratch
-                # directory) — pointed at `$out/parity` so the per-case
-                # `.gl.ppm`/`.cpu.ppm`/`.delta.pgm` evidence lands in the
-                # check's own output and survives a green build (`result/parity`)
-                # and, via `nix build --keep-failed`, a red one too.
-                cargo build --locked -p trollshell --example preem_gl_diff
+                # run's own output.
+                #
+                # `--workspace --features system-tests`, matching the `cargo
+                # test` invocation above byte for byte, and deliberately not
+                # `-p trollshell`: `hytte-ui`/`hytte-services`/`hytte-bus`/
+                # `hytte-reactive` all carry their own `system-tests` feature,
+                # which `--workspace` activates on every member that defines
+                # it the same way the preceding `cargo test` did — `-p
+                # trollshell` would only turn it on for `trollshell` itself,
+                # leaving every dependency at a *different* (default) feature
+                # set than what `cargo test` just built, and cargo would
+                # recompile the whole graph a second time to reconcile them.
+                # Measured in the sandbox: an earlier version of this line used
+                # `-p trollshell` (no `--workspace`), and gtk4/hytte-*/
+                # trollshell's own lib all rebuilt from scratch under the
+                # mismatched feature set — an extra 1 minute 38 seconds
+                # (`Finished … target(s) in 1m 38s`) that `--workspace` above
+                # avoids entirely.
+                #
+                # `cargo run` has no `--workspace` (only `-p`), so run the
+                # produced binary directly instead — the same `find … -print
+                # -quit` idiom `nix/package.nix`'s `postInstall` uses to
+                # harvest the `probe`/`wifi_probe` examples, for the same
+                # reason (`-quit` avoids a `find | head` pipeline racing
+                # stdenv's `set -eu -o pipefail`, and it doesn't assume
+                # `CARGO_TARGET_DIR`).
+                #
+                # `PREEM_GL_DIFF_OUT` is the harness's own override point
+                # (default `gates/`, the repo's scratch directory) — pointed at
+                # `$out/parity` so the per-case `.gl.ppm`/`.cpu.ppm`/
+                # `.delta.pgm` evidence lands in the check's own output and
+                # survives a green build (`result/parity`) and, via
+                # `nix build --keep-failed`, a red one too.
+                cargo build --workspace --locked --features system-tests --example preem_gl_diff
+                exampleBin="$(find "''${CARGO_TARGET_DIR:-target}" -type f -name preem_gl_diff -path '*/examples/*' -print -quit)"
+                if [ -z "$exampleBin" ]; then
+                  echo "ERROR: example binary 'preem_gl_diff' was not built." >&2
+                  exit 1
+                fi
                 mkdir -p "$out/parity"
-                PREEM_GL_DIFF_OUT="$out/parity" xvfb-run -a cargo run --locked -p trollshell --example preem_gl_diff
+                PREEM_GL_DIFF_OUT="$out/parity" xvfb-run -a "$exampleBin"
               '';
             }
           );

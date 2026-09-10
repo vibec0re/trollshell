@@ -87,6 +87,7 @@ use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
+use hytte_gl as hgl;
 
 /// Most step passes one `render` will replay, however far behind it is.
 ///
@@ -496,34 +497,70 @@ impl WarnLatch {
     }
 }
 
+/// A failed data-strip reallocation, carrying the length it failed at so the
+/// caller can latch its journal line **per length** (#1023 item 3).
+///
+/// Mirrors `shader_surface::Failure`: [`imp::Resources::upload_data`] used to
+/// swallow this error entirely (`let Ok(texture) = … else { … return; }`,
+/// no log, no latch) — the sibling of `shader_surface`'s own MEDIUM 1
+/// (#1020 review LOW 2). #977 widened what the underlying
+/// `hgl::Texture::new` call can fail with from an unreachable `Extent` to
+/// a real `TextureSize`/`Storage`, so this call site can now fail for a
+/// genuine reason and used to say nothing at all when it did.
+///
+/// Top-level rather than nested in `imp` (moved there in PR #1031's fix
+/// round, review M3) so [`warn_on_data_failure`]'s own hermetic test — a
+/// sibling of `imp::tests`, not a descendant of it — can construct one by
+/// hand without a GL context.
+struct DataFailure {
+    /// What the driver said.
+    error: hgl::Error,
+    /// The data length `Texture::new` was asked to allocate for.
+    len: u32,
+}
+
+/// Claim `latch` and log a refused data-strip allocation, if `result` is an
+/// `Err` — the whole body of `imp::GlSurface::draw`'s data-upload arm,
+/// hoisted out so the composition **"`draw`'s `Err` actually reaches
+/// `warned_data` and a real journal line"** is itself covered by a test that
+/// needs no GL context (PR #1031 review M3).
+///
+/// Before this, two things stood between the fix and its test: the
+/// GL-gated test built its own throwaway `WarnLatch` instead of driving the
+/// widget's own `warned_data`, and neither test observed `draw`'s call site
+/// at all — re-swallowing the `Err` there (`let _ =
+/// resources.upload_data(…);`, deleting this whole block) left the suite
+/// green. `DataFailure` is plain data, so a test can construct one by hand
+/// and call this function directly; only *producing* a genuine one — proving
+/// `Texture::new` really refuses an over-limit allocation — still needs a
+/// live driver (`imp::tests::a_refused_length_maps_to_its_own_data_failure`,
+/// gated on `system-tests`).
+fn warn_on_data_failure(latch: &RefCell<WarnLatch>, result: Result<(), DataFailure>) {
+    let Err(DataFailure { error, len }) = result else {
+        return;
+    };
+    if latch.borrow_mut().claim(u64::from(len)) {
+        tracing::warn!(
+            %error,
+            len,
+            "a GL surface's data strip could not be (re)allocated; this frame's data \
+             upload is skipped and the strip reads as empty (u_data_len = 0) until a length \
+             this driver will take arrives (further occurrences of this length are silenced)"
+        );
+    }
+}
+
 mod imp {
     use super::{
-        GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline, GlProgram, GlTarget, GlUniforms,
-        GlValue, PROGRAMS, SAMPLER_NAMES, WarnLatch, abandon_gl, fit_rect, fresh_last_drawn, gdk,
-        glib, resources_reusable, steps_owed,
+        DataFailure, GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline, GlProgram,
+        GlTarget, GlUniforms, GlValue, PROGRAMS, SAMPLER_NAMES, WarnLatch, abandon_gl, fit_rect,
+        fresh_last_drawn, gdk, glib, resources_reusable, steps_owed, warn_on_data_failure,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
     use hytte_gl as hgl;
     use std::cell::{Cell, RefCell};
     use std::sync::Arc;
-
-    /// A failed data-strip reallocation, carrying the length it failed at so
-    /// the caller can latch its journal line **per length** (#1023 item 3).
-    ///
-    /// Mirrors `shader_surface::Failure`: [`Resources::upload_data`] used to
-    /// swallow this error entirely (`let Ok(texture) = … else { … return; }`,
-    /// no log, no latch) — the sibling of `shader_surface`'s own MEDIUM 1
-    /// (#1020 review LOW 2). #977 widened what the underlying
-    /// `hgl::Texture::new` call can fail with from an unreachable `Extent` to
-    /// a real `TextureSize`/`Storage`, so this call site can now fail for a
-    /// genuine reason and used to say nothing at all when it did.
-    struct DataFailure {
-        /// What the driver said.
-        error: hgl::Error,
-        /// The data length `Texture::new` was asked to allocate for.
-        len: u32,
-    }
 
     /// The GL objects one surface owns, all created against its own context.
     ///
@@ -732,17 +769,10 @@ mod imp {
             let Some(resources) = held.as_mut() else {
                 return;
             };
-            if let Err(DataFailure { error, len }) = resources.upload_data(&gl, state.data.as_ref())
-                && self.warned_data.borrow_mut().claim(u64::from(len))
-            {
-                tracing::warn!(
-                    %error,
-                    len,
-                    "a GL surface's data strip could not be (re)allocated; this frame's data \
-                     upload is skipped and the strip keeps whatever it last held (further \
-                     occurrences of this length are silenced)"
-                );
-            }
+            warn_on_data_failure(
+                &self.warned_data,
+                resources.upload_data(&gl, state.data.as_ref()),
+            );
 
             // The idempotence rule, decided by `steps_owed` — see there.
             let (steps, reset) = steps_owed(self.last_drawn.get(), state.step_seq);
@@ -1083,7 +1113,7 @@ mod imp {
     mod tests {
         use super::{
             Arc, DataFailure, GlBlend, GlDraw, GlPass, GlPipeline, GlProgram, GlSurface, GlTarget,
-            Resources, WarnLatch, gdk, hgl,
+            Resources, gdk, hgl,
         };
         use gtk::prelude::*;
 
@@ -1192,9 +1222,16 @@ mod imp {
             );
         }
 
-        /// **#1023 item 3.** A data strip the driver refuses to allocate logs
-        /// once per *length*, not once per frame — and a second, differently
-        /// sized refusal still gets its own line.
+        /// **#1023 item 3 / PR #1031 review M3.** `Resources::upload_data`
+        /// maps a driver-refused allocation to `Err(DataFailure)` carrying
+        /// the length that failed — the one half of the fix that genuinely
+        /// needs a live driver. The other half — that `draw()`'s caller
+        /// turns that `Err` into a latched journal line through the
+        /// widget's own `warned_data` — is covered hermetically, with no GL
+        /// context at all, by `warn_on_data_failure`'s own test in this
+        /// file's outer `#[cfg(test)] mod tests`: this test's job is only to
+        /// prove the `Result` this function hands that one is the real
+        /// thing.
         ///
         /// A length far over any real `GL_MAX_TEXTURE_SIZE` (the GLES 3.x
         /// floor is 2048; even a high-end desktop part tops out at 16384 or
@@ -1205,54 +1242,51 @@ mod imp {
         /// on.
         ///
         /// **Falsified** by reverting `Resources::upload_data` to swallow the
-        /// error (no `Result`), or by keying the caller's latch on nothing
-        /// (a bare `Cell<bool>`): either collapses the "two different
-        /// lengths" count from 2 to 1.
+        /// error (no `Result`): both assertions below panic on `Ok`.
         #[gtk::test]
-        fn a_refused_data_strip_warns_once_per_length() {
+        fn a_refused_length_maps_to_its_own_data_failure() {
             // Comfortably over any real driver's GL_MAX_TEXTURE_SIZE.
             const OVER: usize = 100_000;
 
             let Some((_window, _area, gl)) = real_gl() else {
                 eprintln!(
-                    "skipping a_refused_data_strip_warns_once_per_length: no GL context on \
+                    "skipping a_refused_length_maps_to_its_own_data_failure: no GL context on \
                      this display — expected under the sandboxed `nix flake check` runner, \
                      which has no mesa in its closure"
                 );
                 return;
             };
 
-            let one = GlPipeline {
+            let pipeline = GlPipeline {
                 aux: 0,
                 step: &[],
-                frame: &ONE_PASS,
+                frame: &[],
             };
             let program = GlProgram("gl_surface_test.data_strip");
-            let mut resources =
-                Resources::build(&gl, &one, program, (4, 4)).expect("a small grid always builds");
-
-            let mut latch = WarnLatch::default();
-            let mut warn = |data: &Arc<[f32]>| match resources.upload_data(&gl, Some(data)) {
-                Ok(()) => false,
-                Err(DataFailure { len, .. }) => latch.claim(u64::from(len)),
-            };
+            let mut resources = Resources::build(&gl, &pipeline, program, (4, 4))
+                .expect("a small grid always builds");
 
             let a: Arc<[f32]> = Arc::from(vec![0.0_f32; OVER]);
-            assert!(warn(&a), "the first refused length is reported");
-            for _ in 0..4 {
-                // A fresh `Arc` each time — `upload_data`'s `Arc::ptr_eq` fast
-                // path must not be what is suppressing the repeats.
-                let repeat: Arc<[f32]> = Arc::from(vec![0.0_f32; OVER]);
-                assert!(!warn(&repeat), "…and then goes quiet while it persists");
+            match resources.upload_data(&gl, Some(&a)) {
+                Err(DataFailure { len, .. }) => {
+                    assert_eq!(len, u32::try_from(OVER).unwrap(), "the length that failed");
+                }
+                Ok(()) => panic!("a {OVER}-texel strip must be refused on any real driver"),
             }
 
+            // A second, DIFFERENT over-limit length maps to ITS OWN length —
+            // not a stale one left over from the first refusal.
             let b: Arc<[f32]> = Arc::from(vec![0.0_f32; OVER + 1]);
-            assert!(
-                warn(&b),
-                "a second, DIFFERENT refused length must be reported, not swallowed \
-                 (#1023 item 3)",
-            );
-            assert!(!warn(&b), "…once");
+            match resources.upload_data(&gl, Some(&b)) {
+                Err(DataFailure { len, .. }) => {
+                    assert_eq!(
+                        len,
+                        u32::try_from(OVER + 1).unwrap(),
+                        "the length that failed"
+                    );
+                }
+                Ok(()) => panic!("a {} -texel strip must be refused too", OVER + 1),
+            }
         }
     }
 }
@@ -1321,9 +1355,11 @@ impl Default for GlSurface {
 #[cfg(test)]
 mod tests {
     use super::{
-        GlProgram, GlUniforms, GlValue, MAX_STEPS_PER_RENDER, WarnLatch, abandon_gl, fit_rect,
-        fresh_last_drawn, gl_abandoned, resources_reusable, steps_owed,
+        DataFailure, GlProgram, GlUniforms, GlValue, MAX_STEPS_PER_RENDER, WarnLatch, abandon_gl,
+        fit_rect, fresh_last_drawn, gl_abandoned, hgl, resources_reusable, steps_owed,
+        warn_on_data_failure,
     };
+    use std::cell::RefCell;
     use std::sync::Arc;
 
     /// **The idempotence rule** (#893's "the draw must be idempotent"), which
@@ -1518,8 +1554,14 @@ mod tests {
     /// a second, differently sized refusal is not swallowed by the first —
     /// hermetic, driving `WarnLatch::claim` directly with the same shape of
     /// keys `Resources::upload_data`'s caller feeds it (`u64::from(len)`).
-    /// The GL-backed end-to-end proof, over a real driver refusal, lives next
-    /// to `Resources::upload_data` itself in `imp::tests` (needs a context
+    ///
+    /// This pins the keying primitive alone; `warn_on_data_failure_reaches_the_latch_and_warns_once_per_length`
+    /// below pins the composition — that `draw()`'s actual call site
+    /// reaches this latch and a real journal line, not a copy built for the
+    /// test's convenience (PR #1031 review M3). The GL-backed proof that a
+    /// real driver refusal produces the `Err` in the first place lives next
+    /// to `Resources::upload_data` itself in `imp::tests`
+    /// (`a_refused_length_maps_to_its_own_data_failure`, needs a context
     /// this crate's hermetic suite does not have).
     ///
     /// **Falsified** by reverting `imp::GlSurface::warned_data` to a bare
@@ -1542,5 +1584,94 @@ mod tests {
         );
         assert!(!latch.claim(b), "…once");
         assert!(!latch.claim(a), "and a, already reported, stays quiet");
+    }
+
+    /// Count the `tracing` events this module emits while `emit` runs.
+    ///
+    /// `tracing_core` caches an `Interest` per callsite, process-wide,
+    /// decided by whichever thread reaches it first — the same reason
+    /// `shader_map::tests::counting_events` (`trollshell`) exists in the
+    /// longer form; this crate cannot depend on that one, so it is
+    /// duplicated rather than shared. No warm-up phase here: nothing else in
+    /// this crate's test suite reaches `hytte_ui::gl_surface`'s
+    /// `tracing::warn!` callsites (the only other consumer,
+    /// `imp::tests::a_refused_length_maps_to_its_own_data_failure`, is a
+    /// separate, `system-tests`-gated binary target and asserts on
+    /// `Resources::upload_data`'s return value directly, never reaching
+    /// `warn_on_data_failure` at all) — so there is no sibling test that
+    /// could register this callsite's `Interest` first.
+    fn counting_events(emit: impl FnOnce()) -> u32 {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        const TARGET: &str = "hytte_ui::gl_surface";
+        struct Counting(StdArc<AtomicU32>);
+        impl tracing::Subscriber for Counting {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                meta.target().starts_with(TARGET)
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+                tracing::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                if event.metadata().target().starts_with(TARGET) {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            fn enter(&self, _: &tracing::Id) {}
+            fn exit(&self, _: &tracing::Id) {}
+        }
+
+        let count = StdArc::new(AtomicU32::new(0));
+        tracing::subscriber::with_default(Counting(StdArc::clone(&count)), emit);
+        count.load(Ordering::Relaxed)
+    }
+
+    /// **PR #1031 review M3.** The refusal reaches `warned_data` and a real
+    /// journal line — through [`warn_on_data_failure`], the exact function
+    /// `imp::GlSurface::draw` calls, not a standalone `WarnLatch` built
+    /// alongside it for the test's own convenience.
+    ///
+    /// `DataFailure` is constructed by hand rather than through a real
+    /// `Texture::new` refusal: the driver-refusal case itself still needs
+    /// real GL (`imp::tests::a_refused_length_maps_to_its_own_data_failure`,
+    /// gated on `system-tests` + a live driver, which this sandbox does not
+    /// have) — but everything downstream of that `Result`, which is what
+    /// item 3 actually fixed, does not, and this test needs no feature gate
+    /// and no display to run.
+    ///
+    /// **Falsified** (PR #1031 review, mutation 6) by re-swallowing the
+    /// error at `draw`'s call site instead of calling this function (`let _
+    /// = resources.upload_data(…);`, deleting the whole
+    /// `warn_on_data_failure` call): the review measured the prior version
+    /// of this test staying green under exactly that mutation, because it
+    /// drove a fresh local `WarnLatch` the mutated call site never touches.
+    #[test]
+    fn warn_on_data_failure_reaches_the_latch_and_warns_once_per_length() {
+        let latch = RefCell::new(WarnLatch::default());
+        let refusal = |len: u32| DataFailure {
+            error: hgl::Error::TextureSize {
+                size: (len, 1),
+                limit: 4096,
+            },
+            len,
+        };
+
+        let emitted = counting_events(|| {
+            warn_on_data_failure(&latch, Err(refusal(100_000)));
+            // A repeat of the SAME length must not re-warn.
+            warn_on_data_failure(&latch, Err(refusal(100_000)));
+            // A DIFFERENT length must still get its own line.
+            warn_on_data_failure(&latch, Err(refusal(100_001)));
+            // The happy path must never warn at all.
+            warn_on_data_failure(&latch, Ok(()));
+        });
+        assert_eq!(
+            emitted, 2,
+            "a repeated refusal of the same length must cost one journal line; a different \
+             refused length must cost its own; a success must cost none",
+        );
     }
 }

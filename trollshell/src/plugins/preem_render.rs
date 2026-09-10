@@ -965,6 +965,16 @@ thread_local! {
 /// nothing else — that is what makes the test counter this bumps a count of
 /// journal lines rather than a count of claims. Claiming the latch without
 /// emitting would silence the diagnostic forever and make the counter lie.
+///
+/// **Not the only per-scope, one-shot diagnostic latch in the tree.**
+/// `shader_map::warn_once_grid_too_large` follows this exact contract shape
+/// (`if warn_once_grid_too_large(scope) { tracing::warn!(…) }`) for
+/// `shader_map::Refusal::GridTooLarge` specifically, entirely outside this
+/// function and outside [`WARN_COUNTS`]/[`WARN_COUNTS_BY_SCOPE`] — `Warned`
+/// was out of bits for a ninth diagnostic (#981; #1023 item 2). The test
+/// counters below therefore do not see that one refusal's line even though
+/// `Refusal::slot()` classifies it under [`Warned::ShaderCap`]; see
+/// [`warnings_for`]'s own doc (PR #1031 review L1).
 pub(super) fn warn_once(scope: &Scope, what: Warned) -> bool {
     let bit = what.bit();
     let claimed = WARNED.with_borrow_mut(|warned| {
@@ -2817,6 +2827,17 @@ pub(super) fn warnings(what: Warned) -> u32 {
 /// same [`Warned`] slot under a different scope on a different thread (#974):
 /// the count is keyed by the same `(Scope, Warned)` pair the latch itself
 /// checks, so a test observes only claims its own scope made.
+///
+/// **One documented gap** (PR #1031 review L1): `shader_map`'s
+/// `Refusal::GridTooLarge` is classified under [`Warned::ShaderCap`] by
+/// `Refusal::slot()`, but is gated by its own latch
+/// (`shader_map::WARNED_GRID_TOO_LARGE`) entirely outside this accounting —
+/// see [`warn_once`]'s own doc for why (#1023 item 2). So
+/// `warnings_for(scope, Warned::ShaderCap)` reads `0` for a tree that
+/// received only a `GridTooLarge` line, where every *other* refusal
+/// `warn_once` gates would read `1`. A caller that specifically wants to
+/// observe `GridTooLarge` cannot use this function; there is currently no
+/// test-counter equivalent for it.
 #[cfg(test)]
 pub(super) fn warnings_for(scope: &Scope, what: Warned) -> u32 {
     WARN_COUNTS_BY_SCOPE.with_borrow(|counts| {

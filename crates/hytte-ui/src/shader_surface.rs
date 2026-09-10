@@ -107,6 +107,7 @@ use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
+use hytte_gl as hgl;
 
 use crate::gl_surface::{GLSL_HEADER, GlValue, abandon_gl, fit_rect};
 
@@ -270,6 +271,71 @@ const DATA_UPLOAD_REFUSED: &str = "a plugin shader's data texture could not be a
     frame is skipped and the surface keeps whatever it last successfully drew (nothing, before \
     the first successful frame) until the plugin sends a grid this driver will take (further \
     occurrences of this exact shape are silenced)";
+
+/// The line a failed GL-object allocation writes to the journal.
+///
+/// Same reasoning as [`DATA_UPLOAD_REFUSED`] (PR #1031 review L2): this arm
+/// also returns before `narrow_to_fit_rect`, so it must not claim the widget
+/// "draws nothing" either — #1020 shipped it that way, next to the very
+/// message this fixes.
+const RESOURCES_ALLOCATION_REFUSED: &str = "a plugin shader surface could not allocate its GL \
+    objects; the surface keeps whatever it last successfully drew (nothing, before the first \
+    successful frame) (further occurrences are silenced)";
+
+/// The line a failed compile writes to the journal.
+///
+/// Same reasoning as [`DATA_UPLOAD_REFUSED`] (PR #1031 review L2).
+const COMPILE_FAILURE_REFUSED: &str = "a plugin's shader did not compile; the surface keeps \
+    whatever it last successfully drew (nothing, before the first successful frame) — further \
+    frames carrying this same source are silenced; run with RUST_LOG=hytte_ui=debug for the \
+    full driver log";
+
+/// The key `draw`'s data-upload arm claims `warned_data` with, over the
+/// state the call site actually reads.
+///
+/// Hoisted out of the call site (PR #1031 review M2) so the composition
+/// "`draw` feeds `ShaderState` into `data_key` with the right clamp, not a
+/// constant" is itself covered by a test — [`data_key`]'s own
+/// three-field test and [`WarnLatch::claim`]'s own keying test each cover
+/// half of this in isolation, and neither pins that `draw` calls either of
+/// them correctly.
+fn data_upload_key(state: &ShaderState) -> u64 {
+    data_key(
+        state.data_size.0.max(1),
+        state.data_size.1.max(1),
+        state.format,
+    )
+}
+
+/// Claim `latch` and log [`DATA_UPLOAD_REFUSED`] if `result` is an `Err`,
+/// keyed by `state`'s shape via [`data_upload_key`]. Returns whether the
+/// caller should skip the rest of this frame (always `true` on `Err`).
+///
+/// Split out of `draw` so the composition — "`draw`'s `Err` actually reaches
+/// `warned_data` and a real journal line" — is itself covered by a test that
+/// needs no GL context (PR #1031 review M2): the driver refusal itself
+/// still needs real GL (`upload_data` calling `hgl::Texture::new`), but
+/// everything downstream of that `Result` does not, and `hgl::Error` is
+/// plain data a test can construct by hand.
+fn warn_on_data_upload_failure(
+    latch: &RefCell<WarnLatch>,
+    state: &ShaderState,
+    result: Result<(), hgl::Error>,
+) -> bool {
+    let Err(error) = result else {
+        return false;
+    };
+    if latch.borrow_mut().claim(data_upload_key(state)) {
+        tracing::warn!(
+            %error,
+            data_width = state.data_size.0,
+            data_height = state.data_size.1,
+            "{}",
+            DATA_UPLOAD_REFUSED
+        );
+    }
+    true
+}
 
 /// The compiled-program cache: **one** program, keyed by its source.
 ///
@@ -445,9 +511,10 @@ fn first_line(log: &str) -> &str {
 
 mod imp {
     use super::{
-        Arc, Cell, DATA_UPLOAD_REFUSED, Failure, Instant, ProgramCache, RefCell, SHADER_PREAMBLE,
-        SHADER_VERT, ShaderState, WarnLatch, abandon_gl, data_key, first_line, fit_rect, gdk, glib,
-        source_key, would_upload, wrapped_seconds,
+        Arc, COMPILE_FAILURE_REFUSED, Cell, Failure, Instant, ProgramCache,
+        RESOURCES_ALLOCATION_REFUSED, RefCell, SHADER_PREAMBLE, SHADER_VERT, ShaderState,
+        WarnLatch, abandon_gl, first_line, fit_rect, gdk, glib, source_key,
+        warn_on_data_upload_failure, would_upload, wrapped_seconds,
     };
     use crate::gl_surface::{GLSL_HEADER, GlValue};
     use gtk::prelude::*;
@@ -621,11 +688,7 @@ mod imp {
                     Ok(resources) => *held = Some(resources),
                     Err(error) => {
                         if !self.warned_resources.replace(true) {
-                            tracing::warn!(
-                                %error,
-                                "a plugin shader surface could not allocate its GL objects; \
-                                 it draws nothing (further occurrences are silenced)"
-                            );
+                            tracing::warn!(%error, "{}", RESOURCES_ALLOCATION_REFUSED);
                         }
                         return;
                     }
@@ -647,9 +710,12 @@ mod imp {
             };
 
             // Compile once, keep the program: the whole point of the widget.
-            // A failure draws nothing and says so once — the host has already
-            // put the node's id and classes on screen, so what is left is an
-            // empty rect, which is the broken-widget placeholder's own look.
+            // A failure keeps whatever this surface last successfully drew
+            // (nothing, before the first successful frame) and says so once
+            // — on that first frame the host has already put the node's id
+            // and classes on screen, so what is left looks like the
+            // broken-widget placeholder even though this is a different
+            // mechanism from it.
             let program = match programs.ensure(&state.fragment, |body| {
                 // One `debug!` per **actual compile**, carrying the source key
                 // (#968 review L4): `docs/live-verify.md`'s "the same source
@@ -688,9 +754,8 @@ mod imp {
                         tracing::warn!(
                             driver = %detail,
                             source_key = key,
-                            "a plugin's shader did not compile; the widget draws nothing \
-                             (further frames carrying this same source are silenced — run \
-                             with RUST_LOG=hytte_ui=debug for the full driver log)"
+                            "{}",
+                            COMPILE_FAILURE_REFUSED
                         );
                     }
                     tracing::debug!(%error, source_key = key, "plugin shader compile failure, in full");
@@ -707,15 +772,11 @@ mod imp {
             // used to be indistinguishable, from outside the process, from a
             // shader that draws black: no error, no line, every frame, for the
             // life of the surface.
-            if let Err(error) = upload_data(&gl, data, data_shape, data_source, &state) {
-                let key = data_key(
-                    state.data_size.0.max(1),
-                    state.data_size.1.max(1),
-                    state.format,
-                );
-                if self.warned_data.borrow_mut().claim(key) {
-                    tracing::warn!(%error, data_width = state.data_size.0, data_height = state.data_size.1, "{}", DATA_UPLOAD_REFUSED);
-                }
+            if warn_on_data_upload_failure(
+                &self.warned_data,
+                &state,
+                upload_data(&gl, data, data_shape, data_source, &state),
+            ) {
                 return;
             }
 
@@ -1034,9 +1095,10 @@ impl Default for ShaderSurface {
 #[cfg(test)]
 mod tests {
     use super::{
-        Arc, DATA_UPLOAD_REFUSED, ProgramCache, SHADER_PREAMBLE, SHADER_VERT, ShaderFormat,
-        TIME_WRAP_SECS, WARNED_SOURCES, WarnLatch, data_key, first_line, source_key, would_upload,
-        wrapped_seconds,
+        Arc, COMPILE_FAILURE_REFUSED, DATA_UPLOAD_REFUSED, ProgramCache,
+        RESOURCES_ALLOCATION_REFUSED, RefCell, SHADER_PREAMBLE, SHADER_VERT, ShaderFormat,
+        ShaderState, TIME_WRAP_SECS, WARNED_SOURCES, WarnLatch, data_key, first_line, hgl,
+        source_key, warn_on_data_upload_failure, would_upload, wrapped_seconds,
     };
 
     /// A counting builder, standing in for `hgl::Program::compile`. The cache is
@@ -1599,6 +1661,144 @@ mod tests {
             !DATA_UPLOAD_REFUSED.contains("draws nothing"),
             "must not claim the widget goes blank when the last frame is still showing: \
              {DATA_UPLOAD_REFUSED:?}",
+        );
+    }
+
+    /// **PR #1031 review L2.** `draw`'s other two early-return arms —
+    /// resources-allocation failure and compile failure — return before
+    /// `narrow_to_fit_rect` exactly like the data-upload arm does, so
+    /// [`DATA_UPLOAD_REFUSED`]'s own reasoning for not claiming "draws
+    /// nothing" applies to them too. #1020 shipped both of them still
+    /// saying it, twenty-five and sixty lines from the site item 4 actually
+    /// fixed.
+    ///
+    /// **Falsified** by reverting either
+    /// [`RESOURCES_ALLOCATION_REFUSED`] or [`COMPILE_FAILURE_REFUSED`] to
+    /// #1020's wording ("… it draws nothing …" / "… the widget draws
+    /// nothing …").
+    #[test]
+    fn none_of_draws_three_early_return_messages_claim_the_widget_draws_nothing() {
+        for msg in [
+            DATA_UPLOAD_REFUSED,
+            RESOURCES_ALLOCATION_REFUSED,
+            COMPILE_FAILURE_REFUSED,
+        ] {
+            assert!(
+                !msg.contains("draws nothing"),
+                "none of draw()'s early-return arms may claim the widget draws nothing — \
+                 narrow_to_fit_rect (the only thing that clears) is never reached from any of \
+                 them (#1023 item 4; PR #1031 review L2): {msg:?}",
+            );
+            assert!(
+                msg.contains("keeps whatever it last successfully drew"),
+                "…and each should say what actually happens instead: {msg:?}",
+            );
+        }
+    }
+
+    // ── PR #1031 review M2: the key/warn composition, not just its halves ──
+
+    /// Count the `tracing` events this module emits while `emit` runs.
+    ///
+    /// A local twin of `gl_surface::tests::counting_events` /
+    /// `shader_map::tests::counting_events` — see either's longer doc for
+    /// why `tracing_core`'s per-callsite, process-wide `Interest` cache
+    /// makes this necessary at all. No warm-up phase: nothing else in this
+    /// crate's test suite reaches `hytte_ui::shader_surface`'s
+    /// `tracing::warn!` callsites (`draw` is the only production caller,
+    /// and no test — hermetic or `system-tests`-gated — drives `draw`
+    /// itself; every existing test here reaches the extracted pure
+    /// functions directly), so there is no sibling test that could win the
+    /// race to register one first.
+    fn counting_events(emit: impl FnOnce()) -> u32 {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        const TARGET: &str = "hytte_ui::shader_surface";
+        struct Counting(StdArc<AtomicU32>);
+        impl tracing::Subscriber for Counting {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                meta.target().starts_with(TARGET)
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+                tracing::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                if event.metadata().target().starts_with(TARGET) {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            fn enter(&self, _: &tracing::Id) {}
+            fn exit(&self, _: &tracing::Id) {}
+        }
+
+        let count = StdArc::new(AtomicU32::new(0));
+        tracing::subscriber::with_default(Counting(StdArc::clone(&count)), emit);
+        count.load(Ordering::Relaxed)
+    }
+
+    /// A minimal well-formed `ShaderState` for the composition test below.
+    fn state_with_data_size(data_size: (u32, u32)) -> ShaderState {
+        ShaderState {
+            fragment: Arc::from("void main() {}"),
+            data: Arc::from(&[0u8; 4][..]),
+            format: ShaderFormat::R8,
+            data_size,
+            scale: 1,
+            values: Vec::new(),
+        }
+    }
+
+    /// **PR #1031 review M2.** The refusal reaches `warned_data` and a real
+    /// journal line through [`warn_on_data_upload_failure`] — the exact
+    /// function `draw`'s data-upload arm calls, keyed by
+    /// [`data_upload_key`]'s translation of the real `ShaderState` the site
+    /// reads, not a constant and not `data_key`/`WarnLatch` exercised in
+    /// isolation by this file's other two tests.
+    ///
+    /// `hgl::Error` is constructed by hand rather than through a real
+    /// `Texture::new` refusal — the driver-refusal case itself still needs
+    /// real GL, but everything downstream of that `Result`, which is what
+    /// item 1 actually fixed, does not, and this test needs no feature gate
+    /// and no display to run.
+    ///
+    /// **Falsified** by replacing [`data_upload_key`]'s body with a
+    /// constant (PR #1031 review's own mutation, translated to this now-
+    /// hoisted site — the original was `let key = 0_u64;` inline at the old
+    /// call site): the "a different shape must cost its own line" count
+    /// drops from 2 to 1.
+    #[test]
+    fn a_data_upload_failure_reaches_the_widgets_own_latch_and_journal_line() {
+        let latch = RefCell::new(WarnLatch::default());
+        let base = state_with_data_size((100_000, 1));
+        let different = state_with_data_size((100_001, 1));
+        let err = || hgl::Error::TextureSize {
+            size: (100_000, 1),
+            limit: 4096,
+        };
+
+        let emitted = counting_events(|| {
+            assert!(
+                warn_on_data_upload_failure(&latch, &base, Err(err())),
+                "an Err must signal skip-this-frame",
+            );
+            assert!(
+                warn_on_data_upload_failure(&latch, &base, Err(err())),
+                "…still signals skip on a repeat, even while the line itself is silenced",
+            );
+            assert!(warn_on_data_upload_failure(&latch, &different, Err(err())));
+            assert!(
+                !warn_on_data_upload_failure(&latch, &base, Ok(())),
+                "the happy path must never signal skip, and must never warn",
+            );
+        });
+        assert_eq!(
+            emitted, 2,
+            "a repeated refusal of the same shape must cost one journal line; a DIFFERENT \
+             refused shape must cost its own (#1023 item 1; PR #1031 review M2 — this drives \
+             the composition draw() actually calls, not data_key/WarnLatch in isolation)",
         );
     }
 }

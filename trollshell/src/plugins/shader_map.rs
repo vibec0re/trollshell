@@ -613,8 +613,24 @@ thread_local! {
 /// Claim the [`Refusal::GridTooLarge`] latch for `scope`: `true` the first
 /// time it is asked for, `false` for the rest of the shell's run. See
 /// [`WARNED_GRID_TOO_LARGE`].
+///
+/// **Borrow-only on the hot path** (PR #1031 review M1): `contains` first,
+/// and pay for `scope.clone()` — a heap allocation, `Scope` being `{ plugin:
+/// String, role: Role }` — only on the insert that actually latches
+/// something. `warn()` runs once per refused node per mapping pass per
+/// monitor, so a naive `warned.insert(scope.clone())` would have cloned on
+/// every one of those, including the overwhelming majority that latch
+/// nothing — precisely the cost `preem_render::WARNED`'s own doc rejects a
+/// `HashSet<(Scope, Warned)>` for for the same reason (#901): "the map
+/// clones the `Scope` only on the insert that actually latches something."
 fn warn_once_grid_too_large(scope: &Scope) -> bool {
-    WARNED_GRID_TOO_LARGE.with_borrow_mut(|warned| warned.insert(scope.clone()))
+    WARNED_GRID_TOO_LARGE.with_borrow_mut(|warned| {
+        if warned.contains(scope) {
+            return false;
+        }
+        warned.insert(scope.clone());
+        true
+    })
 }
 
 /// One journal line per refusal *kind* per plugin tree, for the life of the
@@ -801,12 +817,13 @@ fn rgba(color: kit::Rgba) -> GlValue {
 mod tests {
     use super::{
         Arc, GlAvailability, Grants, MAX_SHADER_DATA_BYTES, MAX_SHADER_DATA_EXTENT,
-        MAX_SHADER_SOURCE_BYTES, Refusal, ShaderData, ShaderNode, ShaderState, Warned, begin_pass,
-        cached_states, end_pass, forget_scope, map_shader, refusal, theme_values,
+        MAX_SHADER_SOURCE_BYTES, Refusal, ShaderData, ShaderNode, ShaderState,
+        WARNED_GRID_TOO_LARGE, Warned, begin_pass, cached_states, end_pass, forget_scope,
+        map_shader, refusal, theme_values, warn_once_grid_too_large,
     };
     use crate::plugins::preem_gl::{Arm, with_cpu_kill_switch};
     use crate::plugins::preem_render::{self, Scope};
-    use crate::plugins::tests::preem_ink_lock;
+    use crate::plugins::tests::{preem_ink_lock, role_ink_reset};
     use hytte::ui::Node as UiNode;
 
     /// A well-formed node: a 4-texel `R8` strip on a 144×48 surface.
@@ -1634,18 +1651,27 @@ mod tests {
     /// all — it moves the same global the two writers in `plugins::tests` move,
     /// and restores `None` before returning, exactly as they do.
     ///
+    /// The accent reset itself goes through [`role_ink_reset`] (PR #1031
+    /// review N1) rather than a bare trailing
+    /// `tint_in_process_surfaces(None)`: a guard restores on the unwind out
+    /// of a failed assertion, where a trailing call would not, so a panic
+    /// partway through this test cannot leak the tinted accent into every
+    /// later test on this thread — [`preem_ink_lock`]'s own doc names that
+    /// exact failure mode (`PoisonError::into_inner` swallows the
+    /// poisoning) as the reason the lock alone is not enough.
+    ///
     /// **Falsified** by dropping `held.values == values` from [`shared_state`]'s
     /// hit predicate: the second assertion goes red (the state is shared across
     /// an accent change), and a live re-tint stops reaching the screen.
     #[test]
     fn the_accent_is_part_of_the_cache_key() {
         let _ink = preem_ink_lock();
+        let _ink_reset = role_ink_reset();
         let data = [3u8; 8];
         let node = ok_node("void main() { fragColor = u_accent; }", &data);
         let scope = Scope::detached("shader-accent-key");
         forget_scope(&scope);
 
-        crate::plugins::pump::tint_in_process_surfaces(None);
         let plain = mapped_state(&scope, &node);
         let again = mapped_state(&scope, &node);
         assert!(
@@ -1671,7 +1697,6 @@ mod tests {
              compares and what made the flake a *count* rather than a wrong picture",
         );
 
-        crate::plugins::pump::tint_in_process_surfaces(None);
         forget_scope(&scope);
     }
 
@@ -1912,6 +1937,38 @@ mod tests {
         );
     }
 
+    /// **PR #1031 review M1.** Repeated probes of an already-latched scope
+    /// must not grow [`WARNED_GRID_TOO_LARGE`] — the outcome the
+    /// borrow-only `contains` check before the cloning `insert` exists to
+    /// produce. `warn()` runs once per refused node per mapping pass per
+    /// monitor, so an N-node over-cap tree asks this "no" N times a pass;
+    /// this pins that asking "no" repeatedly costs no growth.
+    ///
+    /// A counter on a test-only global allocator would additionally prove
+    /// the *clone itself* stops happening on a hit, but the review judged
+    /// that overkill for a two-line fix — this is the cheaper invariant it
+    /// asked for instead.
+    #[test]
+    fn repeated_grid_too_large_probes_of_one_scope_do_not_grow_the_latch() {
+        let scope = Scope::detached("shader-grid-too-large-probe-cost");
+        assert!(warn_once_grid_too_large(&scope), "the first probe latches");
+        for _ in 0..50 {
+            assert!(
+                !warn_once_grid_too_large(&scope),
+                "a repeat probe of the same scope must latch nothing",
+            );
+        }
+        WARNED_GRID_TOO_LARGE.with_borrow(|warned| {
+            assert_eq!(
+                warned.len(),
+                1,
+                "51 probes of one scope must leave exactly one entry — libtest gives this test \
+                 its own thread, so nothing else running concurrently can have touched this \
+                 thread-local",
+            );
+        });
+    }
+
     /// Count the `tracing` events this module emits when `emit` runs under a
     /// scope of this helper's choosing.
     ///
@@ -1955,8 +2012,12 @@ mod tests {
     /// rebuilds them against itself — and run `emit` again, counted. Nothing is
     /// registered during the counted run, so there is nothing left to race.
     ///
-    /// The warm-up cannot silence the counted run: [`warn`]'s latch is keyed by
-    /// `(Scope, Warned)` and the two runs get two different scopes.
+    /// The warm-up cannot silence the counted run: every latch [`warn`] can
+    /// claim is keyed by `Scope` — `(Scope, Warned)` for the five refusals
+    /// still gated by [`preem_render::warn_once`], and `Scope` alone for
+    /// [`WARNED_GRID_TOO_LARGE`] (#1023 item 2, PR #1031 review N3, added
+    /// after this doc was first written) — and the two runs get two
+    /// different scopes either way.
     fn counting_events(label: &str, emit: impl Fn(&Scope)) -> u32 {
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicU32, Ordering};

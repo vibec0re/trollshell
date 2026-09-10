@@ -2054,6 +2054,41 @@ session.
       A single stale-looking blink of the switch or the status word is the
       defect; before #983 it was reproducible whenever one `ListPlugins`
       round trip overran the next tick.
+- [ ] **(#1003)** The **AI Keys** tab follows the shell too — it was the one
+      tab #989/#983 left probed once at window build. Unlike the banner and
+      the Plugins tab, this one carries **no timer of its own**: it re-reads
+      only when `main.rs`'s shell probe reports a reachability change, so
+      what to watch for is tied to shell start/stop, not to a fixed cadence.
+      Stop the shell with `systemctl --user stop trollshell`, then **open the
+      control-center while it is down** — the ordinary order after login. The
+      AI Keys tab shows "Unavailable" on every row, as before. Now, **without
+      reopening the tab**, start the shell again (with a key already stored
+      from an earlier run, or set one now over `busctl` and the tab once it
+      recovers): within ~2 s (the shell probe's own cadence) the rows must
+      **flip on their own** to "Key stored"/"No key set", with no need to
+      switch away to Plugins and back. Then stop the shell again with the tab
+      still open: the rows must return to "Unavailable" within ~2 s — this
+      direction costs no `ListAiKeys` call at all (the probe already knows
+      the shell is gone), so it should if anything be _faster_ than the
+      up-direction. Repeat the start/stop a couple of times — it must track
+      every time, matching whatever the Plugins tab shows at the same moment.
+      Also check the control-center's own output (it is normally launched by
+      hand or from the launcher rather than as a systemd user unit, so its
+      `info!` lines land on its terminal, not `journalctl`) — grep
+      specifically for `ListAiKeys`: while the shell is down there must be
+      one `ListAiKeys failed` line per outage, not one every couple of
+      seconds, and the shell coming back must log exactly one
+      `ListAiKeys recovered` line — transitions only, same as #989's banner.
+      Grepping unqualified will also catch the Plugins tab's own
+      `ListPlugins failed`, which has **no** transitions guard and so logs
+      every ~2 s while the shell is down — a pre-existing gap, not this
+      entry's regression, but easy to misread as one if you don't filter for
+      `ListAiKeys`. Finally,
+      with the shell running, **set or clear a key from the tab** right as a
+      shell restart could plausibly land a reachability-triggered read at the
+      same instant (restart the shell, then immediately click Apply/Clear) —
+      the row must settle on what you asked for, never blink back to the
+      pre-change value a moment after.
 
 ## Documentation site (GitHub Pages)
 

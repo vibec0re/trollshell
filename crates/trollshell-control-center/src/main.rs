@@ -22,10 +22,15 @@
 //! one tab that does **not** go through `Control`: it reads and writes the file
 //! directly, so it keeps working while the shell is down. The **Plugins** tab
 //! (#348) lists each `trollshell-plugin-<id>` systemd **user** unit with a
-//! switch that starts/enables or stops/disables it. The **AI Keys** tab (#392)
-//! stores the LLM-backed plugins' API keys in the login keyring
-//! (gnome-keyring/libsecret) — never on disk — and rotates them. Those
-//! round-trip over `Control`. There is deliberately **no Display tab**: #393
+//! switch that starts/enables or stops/disables it. The **AI Keys** tab
+//! ([`ai_keys_tab`], #392) stores the LLM-backed plugins' API keys in the
+//! login keyring (gnome-keyring/libsecret) — never on disk — and rotates
+//! them. Those round-trip over `Control`, and since #1003 its status also
+//! re-reads on a shell-reachability transition rather than once at window
+//! build — deliberately **not** a timer of its own, since `ListAiKeys` reaches
+//! a prompt-capable keyring open on the shell side no periodic caller may
+//! touch; see that module's doc for the full story. There is deliberately
+//! **no Display tab**: #393
 //! re-scoped display management away from a bespoke control-center page and
 //! onto `org.gnome.Mutter.DisplayConfig`, a shim over niri-ipc
 //! (`crates/hytte-services/src/display_config.rs`) that lets
@@ -41,6 +46,7 @@ use adw::prelude::*;
 use gtk::glib;
 use hytte_bus::RetryPolicy;
 
+mod ai_keys_tab;
 mod places_tab;
 mod plugins_tab;
 
@@ -81,6 +87,14 @@ const CONNECTING_BANNER: &str = "Connecting to trollshell…";
 /// "unavailable" for the rest of the session while the Plugins tab listed
 /// live plugins underneath, and a shell that died mid-session never brought
 /// the banner back at all.
+///
+/// Private again as of #1003: an earlier revision of that fix also read this
+/// from [`ai_keys_tab`], giving that tab its own 2 s `ListAiKeys` timer. An
+/// adversarial review found that timer reached a prompt-capable keyring open
+/// on the shell side that must never be called periodically (see
+/// `ai_keys_tab`'s module doc), so the tab now reacts to [`ShellProbeUi`]'s
+/// reachability transitions instead of polling on any interval of its own —
+/// it no longer needs this constant at all.
 const SHELL_PROBE_INTERVAL: Duration = plugins_tab::PLUGIN_POLL_INTERVAL;
 
 /// Builds the `EnvFilter` that gates the global `tracing` subscriber.
@@ -136,8 +150,11 @@ fn build_window(app: &adw::Application) {
         "mark-location-symbolic",
     );
     // The AI Keys tab (#392): store/rotate the LLM-backed plugins' API keys in
-    // the login keyring, round-tripped over Control.
-    let ai_keys_page = build_ai_keys_page();
+    // the login keyring, round-tripped over Control. Since #1003 it re-reads
+    // on a shell-reachability transition (wired below, once `probe` exists)
+    // rather than once at window build, and installs no timer of its own —
+    // see `ai_keys_tab`'s module doc for why.
+    let (ai_keys_page, notify_shell_reachable_change) = ai_keys_tab::build_page();
     stack.add_titled_with_icon(
         &ai_keys_page,
         Some("ai-keys"),
@@ -181,14 +198,23 @@ fn build_window(app: &adw::Application) {
     // on `SHELL_PROBE_INTERVAL` for as long as the window lives, so a shell
     // that starts after the control-center clears the banner and one that dies
     // mid-session brings it back — both directions out of
-    // `format_banner_message`'s existing `None`/`Some` contract.
+    // `format_banner_message`'s existing `None`/`Some` contract. Since #1003
+    // the AI Keys tab rides the same probe rather than polling on its own: the
+    // listener is registered *before* the first `poll()` so that first
+    // outcome reaches it too — `build_page` does NOT also read at build time
+    // (a second-round review finding: `reachable` starts `None`, so this
+    // first probe is unconditionally a transition and a second, build-time
+    // read would just double the keyring traffic at every window open; see
+    // `ai_keys_tab`'s module doc and `build_page`'s own comment).
     let probe = ShellProbeUi::new(&banner, &revision_label);
+    probe.set_reachable_listener(notify_shell_reachable_change);
     probe.poll();
     let shell_poll = install_shell_probe(&probe, SHELL_PROBE_INTERVAL);
 
     // The poll timers are scoped to this window: drop them on close so a
     // dismissed window stops polling `Control` (Plugins, and since #989 the
-    // banner/footer probe) and stat'ing `places.toml` (Places), and a re-launch
+    // banner/footer probe — which, since #1003, is also the AI Keys tab's only
+    // source of re-reads) and stat'ing `places.toml` (Places), and a re-launch
     // while another window is still resident can't leave the first window's
     // timers double-polling behind it (#542). Wrapped in a cell + `.take()` so
     // the one-shot removal is clean under the `Fn` close handler.
@@ -361,6 +387,10 @@ impl Drop for InFlightSlot {
     }
 }
 
+/// A single `main.rs`-owned subscriber to [`ShellProbeUi`]'s reachability
+/// transitions (#1003) — see `reachable_listener`'s field doc.
+type ReachableListener = Rc<RefCell<Option<Box<dyn Fn(bool)>>>>;
+
 /// The banner + footer pair, and the bookkeeping that lets them be re-probed
 /// on a timer instead of once at window build (#989).
 ///
@@ -397,6 +427,24 @@ struct ShellProbeUi {
     /// would leave them all green. `the_probe_re_runs_on_its_interval` watches
     /// this instead. One `Cell` increment every [`SHELL_PROBE_INTERVAL`].
     ticks: Rc<Cell<u32>>,
+    /// The shell's reachability (`probe.connection.is_ok()`) as of the last
+    /// *applied* probe, `None` before the first (#1003).
+    ///
+    /// Deliberately coarser than `shown` above: `shown` tracks the rendered
+    /// banner *text*, so two different failures (`ServiceUnknown` then a
+    /// plain `Timeout`, say) are two transitions — the banner's wording
+    /// changed and that is worth a log line. `reachable` only asks Ok-vs-Err,
+    /// so that same pair is *one* state as far as `reachable_listener` below
+    /// is concerned — a subscriber like `ai_keys_tab` cares whether the
+    /// endpoint answers at all, not which sentence explains why it doesn't.
+    reachable: Rc<Cell<Option<bool>>>,
+    /// Notified with the shell's new reachability whenever `reachable`
+    /// changes (#1003) — see [`set_reachable_listener`](Self::set_reachable_listener).
+    /// `ai_keys_tab::build_page`'s callback is the one subscriber today,
+    /// replacing that tab's own periodic `ListAiKeys` clock: see its module
+    /// doc for why a poll cadence of its own reached a prompt-capable keyring
+    /// path nothing periodic may touch.
+    reachable_listener: ReachableListener,
 }
 
 impl ShellProbeUi {
@@ -411,7 +459,21 @@ impl ShellProbeUi {
             in_flight: Rc::new(Cell::new(false)),
             shown: Rc::new(RefCell::new(shown)),
             ticks: Rc::new(Cell::new(0)),
+            reachable: Rc::new(Cell::new(None)),
+            reachable_listener: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// Register `listener` to be called with the shell's reachability
+    /// whenever it changes, the very first applied probe's outcome included
+    /// (#1003). Call this before the first [`poll`](Self::poll) if that first
+    /// delivery matters to the caller — `build_window` does.
+    ///
+    /// Replaces any previously registered listener; today there is only ever
+    /// one caller (`build_window`, for `ai_keys_tab`), so this is a plain
+    /// setter rather than a list of subscribers.
+    fn set_reachable_listener(&self, listener: impl Fn(bool) + 'static) {
+        *self.reachable_listener.borrow_mut() = Some(Box::new(listener));
     }
 
     /// Claim the single in-flight slot for this tick, or `None` because a
@@ -470,6 +532,19 @@ impl ShellProbeUi {
                 }
             }
         }
+        // #1003: a coarser transition than `shown` above — see `reachable`'s
+        // field doc for why a failure-reason change alone must not fire this.
+        // Checked unconditionally, not folded into the `shown` branch above:
+        // `shown`'s very first value is seeded from what's already on screen
+        // (`new`), so it can start non-`None` and suppress that first log
+        // line, but `reachable` always starts at `None` and so always
+        // delivers the first probe's outcome to a fresh listener.
+        let reachable = probe.connection.is_ok();
+        if self.reachable.replace(Some(reachable)) != Some(reachable)
+            && let Some(listener) = self.reachable_listener.borrow().as_ref()
+        {
+            listener(reachable);
+        }
         match &message {
             Some(text) => {
                 self.banner.set_title(text);
@@ -485,174 +560,6 @@ impl ShellProbeUi {
         self.revision
             .set_text(&format_revision_footer(version, probe.revision.as_deref()));
     }
-}
-
-// ── AI Keys tab (#392) ─────────────────────────────────────────────────────
-
-/// The LLM providers the AI Keys tab manages, `(slot, label, help)`. The `slot`
-/// is the provider name the shell stores the key under and injects as
-/// `<SLOT>_API_KEY` at plugin launch — for `openrouter` that's
-/// `OPENROUTER_API_KEY`, exactly what the pet and caw plugins read. Add a row
-/// here to surface a new provider.
-const KNOWN_AI_PROVIDERS: &[(&str, &str, &str)] = &[(
-    "openrouter",
-    "OpenRouter",
-    "Cloud LLM used by the pet and caw plugins. Create a key at openrouter.ai.",
-)];
-
-/// Build the **AI Keys** tab: one password-entry row per known provider. Each
-/// row stores a key in the shell's keyring (`SetAiKey` over `Control`) and shows
-/// whether a key is currently stored (`ListAiKeys`) — the value itself is never
-/// read back. The apply button sets/updates the key (wiping the entry after, so
-/// the plaintext isn't retained in the widget); the trash button clears it. When
-/// the shell isn't running the calls fail and the rows show "Unavailable".
-fn build_ai_keys_page() -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::new();
-    let group = adw::PreferencesGroup::builder()
-        .title("AI provider keys")
-        .description(
-            "API keys for the LLM-backed plugins, stored in your login keyring \
-             (gnome-keyring/libsecret) — never on disk or in config. A key is \
-             injected only into the plugins that declare it, and changing one \
-             relaunches those plugins.",
-        )
-        .build();
-
-    // (slot, entry, status label, clear button) per provider while building.
-    let mut built = Vec::new();
-    for (slot, label, help) in KNOWN_AI_PROVIDERS {
-        let entry = adw::PasswordEntryRow::builder()
-            .title(*label)
-            .show_apply_button(true)
-            .build();
-        entry.set_tooltip_text(Some(help));
-
-        let status_lbl = gtk::Label::new(Some("…"));
-        status_lbl.add_css_class("dim-label");
-        let clear_btn = gtk::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .tooltip_text("Clear the stored key")
-            .valign(gtk::Align::Center)
-            .sensitive(false)
-            .build();
-        clear_btn.add_css_class("flat");
-        entry.add_suffix(&status_lbl);
-        entry.add_suffix(&clear_btn);
-
-        group.add(&entry);
-        built.push((*slot, entry, status_lbl, clear_btn));
-    }
-    page.add(&group);
-
-    // Immutable shared (slot, status label, clear button) list for the refresh.
-    let status: Rc<Vec<(String, gtk::Label, gtk::Button)>> = Rc::new(
-        built
-            .iter()
-            .map(|(slot, _entry, lbl, btn)| ((*slot).to_owned(), lbl.clone(), btn.clone()))
-            .collect(),
-    );
-
-    for (slot, entry, _lbl, clear_btn) in built {
-        // Apply → SetAiKey, then wipe the entry (don't keep the plaintext) and
-        // re-read the stored-key status.
-        {
-            let (slot, status) = (slot.to_owned(), status.clone());
-            entry.connect_apply(move |e| {
-                let value = e.text().to_string();
-                if value.is_empty() {
-                    return;
-                }
-                let (e, slot, status) = (e.clone(), slot.clone(), status.clone());
-                spawn_on_runtime(set_ai_key(slot, value), move |res| {
-                    if let Err(err) = res {
-                        tracing::info!(%err, "SetAiKey failed");
-                    }
-                    e.set_text("");
-                    refresh_ai_status(&status);
-                });
-            });
-        }
-        // Clear → ClearAiKey, then re-read the status.
-        {
-            let (slot, status) = (slot.to_owned(), status.clone());
-            clear_btn.connect_clicked(move |_| {
-                let (slot, status) = (slot.clone(), status.clone());
-                spawn_on_runtime(clear_ai_key(slot), move |res| {
-                    if let Err(err) = res {
-                        tracing::info!(%err, "ClearAiKey failed");
-                    }
-                    refresh_ai_status(&status);
-                });
-            });
-        }
-    }
-
-    refresh_ai_status(&status);
-    page
-}
-
-/// Re-read which providers have a stored key (`ListAiKeys`) and reflect it into
-/// each row's status label + clear-button sensitivity. On failure (shell not
-/// running) every row shows "Unavailable".
-fn refresh_ai_status(rows: &Rc<Vec<(String, gtk::Label, gtk::Button)>>) {
-    let rows = rows.clone();
-    spawn_on_runtime(list_ai_keys(), move |res| match res {
-        Ok(slots) => {
-            let set: std::collections::HashSet<String> = slots.into_iter().collect();
-            for (slot, lbl, btn) in rows.iter() {
-                let has = set.contains(slot);
-                lbl.set_text(if has { "Key stored" } else { "No key set" });
-                btn.set_sensitive(has);
-            }
-        }
-        Err(err) => {
-            tracing::info!(%err, "ListAiKeys failed");
-            for (_slot, lbl, btn) in rows.iter() {
-                lbl.set_text("Unavailable");
-                btn.set_sensitive(false);
-            }
-        }
-    });
-}
-
-/// `ListAiKeys` → the provider slots that currently have a stored key. Values
-/// are never returned.
-async fn list_ai_keys() -> Result<Vec<String>, hytte_bus::BusError> {
-    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
-        .at_path(CONTROL_PATH)
-        .iface(CONTROL_IFACE)
-        .method("ListAiKeys")
-        .timeout(Duration::from_secs(3))
-        .retry(RetryPolicy::Never)
-        .send::<Vec<String>>()
-        .await
-}
-
-/// `SetAiKey(slot, value)`: store `value` as the key for `slot` in the shell's
-/// keyring (which then relaunches the plugins that use it).
-async fn set_ai_key(slot: String, value: String) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
-        .at_path(CONTROL_PATH)
-        .iface(CONTROL_IFACE)
-        .method("SetAiKey")
-        .args((slot, value))
-        .timeout(Duration::from_secs(5))
-        .retry(RetryPolicy::Never)
-        .send::<()>()
-        .await
-}
-
-/// `ClearAiKey(slot)`: delete the stored key for `slot`.
-async fn clear_ai_key(slot: String) -> Result<(), hytte_bus::BusError> {
-    hytte_bus::call(hytte_bus::BusKind::Session, CONTROL_NAME)
-        .at_path(CONTROL_PATH)
-        .iface(CONTROL_IFACE)
-        .method("ClearAiKey")
-        .args((slot,))
-        .timeout(Duration::from_secs(5))
-        .retry(RetryPolicy::Never)
-        .send::<()>()
-        .await
 }
 
 /// Format the connection banner's text from a [`probe_shell`] outcome. `None`
@@ -1002,7 +909,9 @@ mod tests {
 /// what #989 broke.
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
+    use std::cell::RefCell;
     use std::io::Write;
+    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -1361,6 +1270,82 @@ mod gtk_tests {
         assert!(
             ticks >= 3,
             "the probe must keep re-running on its interval; it fired {ticks} time(s)"
+        );
+    }
+
+    // ── The reachability listener (#1003) ────────────────────────────────────
+
+    /// The mechanism that replaced `ai_keys_tab`'s own 2 s timer: a listener
+    /// registered via `set_reachable_listener` must fire exactly on a genuine
+    /// Ok↔Err transition — the first applied probe's outcome included — and
+    /// stay quiet both on a repeat of the same outcome and on an error whose
+    /// *text* changes but whose reachability doesn't (the coarsening
+    /// `reachable`'s field doc calls out).
+    ///
+    /// Falsified by commenting out the `listener(reachable)` call in `apply`:
+    /// every assertion below fails on an empty `events` vec — with no
+    /// periodic timer left in `ai_keys_tab`, this is now the *only* path that
+    /// can ever re-read `ListAiKeys`, so a silent listener silently
+    /// reintroduces #1003 in full.
+    #[gtk::test]
+    fn the_reachable_listener_fires_only_on_a_reachability_transition() {
+        adw::init().expect("libadwaita init");
+        let (_banner, _label, ui) = probe_ui();
+        let events: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
+        {
+            let events = events.clone();
+            ui.set_reachable_listener(move |reachable| events.borrow_mut().push(reachable));
+        }
+
+        ui.apply(&not_running());
+        assert_eq!(
+            *events.borrow(),
+            vec![false],
+            "the first applied probe's outcome must reach a listener registered before it"
+        );
+
+        ui.apply(&not_running());
+        assert_eq!(
+            *events.borrow(),
+            vec![false],
+            "an unchanged outcome must not fire the listener again"
+        );
+
+        // A different failure *reason* — the banner's `shown` text would
+        // change here, but reachability itself does not, and this must stay
+        // quiet (the coarsening is deliberate, not a gap).
+        ui.apply(&ShellProbe {
+            connection: Err(hytte_bus::BusError::Permanent {
+                reason: "not authorised".to_owned(),
+                dbus_name: Some("org.freedesktop.DBus.Error.AccessDenied".to_owned()),
+            }),
+            revision: None,
+        });
+        assert_eq!(
+            *events.borrow(),
+            vec![false],
+            "an error-text change alone must not fire the reachability listener"
+        );
+
+        ui.apply(&connected());
+        assert_eq!(
+            *events.borrow(),
+            vec![false, true],
+            "the shell coming up must fire the listener"
+        );
+
+        ui.apply(&connected());
+        assert_eq!(
+            *events.borrow(),
+            vec![false, true],
+            "an unchanged reachable outcome must not fire the listener again"
+        );
+
+        ui.apply(&not_running());
+        assert_eq!(
+            *events.borrow(),
+            vec![false, true, false],
+            "the shell going down must fire the listener too"
         );
     }
 }

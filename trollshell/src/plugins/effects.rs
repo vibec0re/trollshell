@@ -39,7 +39,7 @@ use super::datasource::DatasourceRouter;
 /// `warn!("unsupported in v1")`, which the plugin author never sees; the way that
 /// class of gap stops recurring is for a new [`Effect`] variant to be a compile
 /// error here, exactly as it already is in [`effect_kind`] and
-/// [`effect_capability`](super::session::effect_capability).
+/// [`Effect::required_capability`](hytte_plugin_proto::Effect::required_capability).
 ///
 /// Capability enforcement happens
 /// **upstream** of here, per connection: [`super::session::enforce_capabilities`]
@@ -1758,7 +1758,7 @@ impl AuditDecision {
 
 /// The short, stable audit name for an effect kind (#510). Exhaustive over the
 /// effect vocabulary so a new variant is a compile error here, mirroring
-/// [`effect_capability`](super::session::effect_capability).
+/// [`Effect::required_capability`](hytte_plugin_proto::Effect::required_capability).
 ///
 /// [`Effect::RunCommand`]'s two spawn modes get **two names** (#953). They share
 /// one capability, so [`AuditDecision`] can't tell them apart — but they differ

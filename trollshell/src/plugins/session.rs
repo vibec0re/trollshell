@@ -193,6 +193,51 @@ pub(super) const EFFECT_BURST: u32 = 8;
 /// toast broker; user-driven effects (a click → `OpenPage`) never approach it.
 const EFFECT_REFILL_PER_SEC: f64 = 1.0;
 
+/// Max connector names a single [`PluginMsg::Render`]'s `hidden_on` may carry
+/// (#1058, from PR #1068's review: the field shipped with no length cap at
+/// all, bounded only by the 16 MiB frame limit). A real machine has a handful
+/// of outputs; 64 is generous headroom over any plausible fan-out, the same
+/// "generous but bounded, not tight" posture as the shader node's
+/// [`MAX_SHADER_SOURCE_BYTES`](hytte_plugin_proto::MAX_SHADER_SOURCE_BYTES) /
+/// [`MAX_SHADER_DATA_BYTES`](hytte_plugin_proto::MAX_SHADER_DATA_BYTES).
+pub(super) const MAX_HIDDEN_ON_ENTRIES: usize = 64;
+
+/// Max bytes in one `hidden_on` connector name. A real Wayland/DRM connector
+/// name (`"DP-2"`, `"HDMI-A-1"`, …) is a handful of ASCII bytes; 64 is
+/// generous headroom, not a tight fit.
+pub(super) const MAX_HIDDEN_ON_NAME_BYTES: usize = 64;
+
+/// Enforce the [`MAX_HIDDEN_ON_ENTRIES`] / [`MAX_HIDDEN_ON_NAME_BYTES`] shape
+/// cap on a decoded `Render.hidden_on` (#1058). Unlike [`enforce_capabilities`]
+/// this isn't a declaration check, and a violation is not a reason to drop the
+/// connection or the frame — `tree`/`panel`/`effects` are still perfectly
+/// good. It degrades to the empty set instead: no `hidden_on` means the card
+/// shows on every screen (#1050's own baseline), which is always a safe
+/// default, so an oversized set costs the plugin its per-screen hiding for
+/// that one frame rather than the whole render. One `warn!` names the plugin
+/// and the offending count/length.
+pub(super) fn capped_hidden_on(plugin_id: &str, hidden_on: Vec<String>) -> Vec<String> {
+    if hidden_on.len() > MAX_HIDDEN_ON_ENTRIES {
+        tracing::warn!(
+            plugin = %plugin_id,
+            entries = hidden_on.len(),
+            cap = MAX_HIDDEN_ON_ENTRIES,
+            "Render.hidden_on carries more connector names than the cap; treating it as empty (card shows on every screen)",
+        );
+        return Vec::new();
+    }
+    if let Some(over) = hidden_on.iter().find(|name| name.len() > MAX_HIDDEN_ON_NAME_BYTES) {
+        tracing::warn!(
+            plugin = %plugin_id,
+            len = over.len(),
+            cap = MAX_HIDDEN_ON_NAME_BYTES,
+            "Render.hidden_on carries a connector name over the cap; treating the set as empty (card shows on every screen)",
+        );
+        return Vec::new();
+    }
+    hidden_on
+}
+
 /// Whether a non-blocking outbound push should keep its producer task running.
 enum Push {
     /// The frame was sent, or dropped because the queue was momentarily full —
@@ -327,35 +372,12 @@ impl Drop for IdGuard {
     }
 }
 
-/// The [`Capability`] a given [`Effect`] requires. Exhaustive over the effect
-/// vocabulary so adding an effect variant is a compile error here (it must
-/// declare which cap gates it), mirroring the wire↔host mapping tables below.
-pub(super) fn effect_capability(effect: &Effect) -> Capability {
-    match effect {
-        Effect::OpenPage(_) => Capability::OpenPage,
-        Effect::Niri(_) => Capability::Niri,
-        Effect::Media(_) => Capability::Media,
-        Effect::Audio(_) => Capability::Audio,
-        Effect::RunCommand { .. } => Capability::RunCommand,
-        Effect::RaiseOsd { .. } => Capability::RaiseOsd,
-        Effect::Notify { .. } => Capability::Notify,
-        Effect::RequestConsent { .. } => Capability::Consent,
-        // #509: the requester side of the datasource protocol.
-        Effect::DatasourceQuery { .. } => Capability::DatasourceQuery,
-        // #509: the provider side — answering a forwarded query.
-        Effect::DatasourceResult { .. } => Capability::DatasourceProvider,
-        // #1045: opening a link is its own, narrower grant than `RunCommand` —
-        // the plugin names a destination, never a program.
-        Effect::OpenUri { .. } => Capability::OpenUri,
-    }
-}
-
 /// The [`Capability`] a domain [`StateKey`] push additionally requires (#484/#528),
 /// or `None` for an *ambient* key whose subscription alone is the opt-in
 /// (`Clock`/`SlotVisible`/`Accent`/`AudioSpectrum`). Exhaustive over the key
 /// vocabulary so adding a `StateKey` is a compile error here until it declares
 /// whether — and behind which capability — it is gated (the same compiler-forced
-/// mapping as [`effect_capability`], per #495). The domain keys carry personal /
+/// mapping shape as [`Effect::required_capability`], per #495). The domain keys carry personal /
 /// privacy-relevant data, so the host requires the capability **on top of** the
 /// subscription — a subscribe-only plugin is refused the push (see [`push_gate`]).
 pub(super) fn state_key_capability(key: StateKey) -> Option<Capability> {
@@ -404,6 +426,12 @@ pub(super) fn push_gate(manifest: &Manifest, key: StateKey) -> bool {
 /// `OpenPage` without requesting the cap). Runs in the reader **before** the rate
 /// cap so an ungranted flood costs no [`EffectRateLimiter`] tokens.
 ///
+/// The per-effect mapping is [`Effect::required_capability`] (#1058) — exported
+/// from the proto crate so this and `hytte-plugin`'s own SDK-side guard read the
+/// same table rather than two hand-kept copies that could drift. An effect with
+/// no `required_capability` (`None`) needs no declaration and is never dropped
+/// here.
+///
 /// **This is not a trust boundary, and #436 didn't make one** (#998). What it
 /// enforces is *declaration*: a plugin stays inside the surface it asked for,
 /// and the audit log names a real grant set. It does not gate a
@@ -424,7 +452,9 @@ pub(super) fn enforce_capabilities(
     effects
         .into_iter()
         .filter(|effect| {
-            let cap = effect_capability(effect);
+            let Some(cap) = effect.required_capability() else {
+                return true;
+            };
             if granted.contains(&cap) {
                 true
             } else {
@@ -764,13 +794,16 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                             generation,
                             tree,
                             panel,
-                            // #1050: carried through untouched — the host does
-                            // not validate connector names here (nor could it
-                            // usefully: this task has no monitor list, and an
-                            // output that is currently off is a legitimate
-                            // thing to name). Each monitor's reconciler decides
-                            // whether the name is *its* name.
-                            hidden_on,
+                            // #1050: connector *names* are not validated here
+                            // (nor could they usefully be: this task has no
+                            // monitor list, and an output that is currently
+                            // off is a legitimate thing to name — each
+                            // monitor's reconciler decides whether a name is
+                            // *its* name). The *shape* — how many entries, how
+                            // long each one is — is capped by
+                            // `capped_hidden_on` (#1058), since that bound has
+                            // nothing to do with which monitors exist.
+                            hidden_on: capped_hidden_on(&plugin_id, hidden_on),
                             grants,
                             outbound: out_tx.clone(),
                         },

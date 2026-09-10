@@ -7,6 +7,7 @@
 //! command surfaces; the host maps them (PR 2) — this crate stays GTK-free and
 //! host-free.
 
+use crate::manifest::Capability;
 use serde::{Deserialize, Serialize};
 
 /// A drawer page the host can open. Wire-side mirror of the host's
@@ -377,6 +378,135 @@ impl Effect {
             uri: uri.into(),
         }
     }
+
+    /// The [`Capability`] a plugin must have declared to emit this effect, or
+    /// `None` for an effect that needs none (#1058).
+    ///
+    /// **The one mapping, exported.** Before this, the host's
+    /// `session::enforce_capabilities` held the only copy of this match, and
+    /// nothing on the SDK side used the same table — a drift risk the doc
+    /// comment on every [`Effect`] variant above (each names its own gating
+    /// capability) already made a promise this fn now keeps mechanically. Both
+    /// the host and `hytte-plugin`'s own session loop (#1058) call this rather
+    /// than keep a private copy, so the two enforcement points cannot
+    /// disagree about which effect needs which capability.
+    ///
+    /// Exhaustive over the effect vocabulary — appending an [`Effect`] variant
+    /// is a compile error here until it declares whether, and behind which
+    /// capability, it is gated. See `required_capability_maps_every_effect`
+    /// for the test that walks every variant.
+    #[must_use]
+    pub fn required_capability(&self) -> Option<Capability> {
+        match self {
+            Effect::OpenPage(_) => Some(Capability::OpenPage),
+            Effect::Niri(_) => Some(Capability::Niri),
+            Effect::Media(_) => Some(Capability::Media),
+            Effect::Audio(_) => Some(Capability::Audio),
+            Effect::RunCommand { .. } => Some(Capability::RunCommand),
+            Effect::RaiseOsd { .. } => Some(Capability::RaiseOsd),
+            Effect::Notify { .. } => Some(Capability::Notify),
+            Effect::RequestConsent { .. } => Some(Capability::Consent),
+            // #509: the requester side of the datasource protocol.
+            Effect::DatasourceQuery { .. } => Some(Capability::DatasourceQuery),
+            // #509: the provider side — answering a forwarded query.
+            Effect::DatasourceResult { .. } => Some(Capability::DatasourceProvider),
+            // #1045: opening a link is its own, narrower grant than
+            // `RunCommand` — the plugin names a destination, never a program.
+            Effect::OpenUri { .. } => Some(Capability::OpenUri),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AudioAction, Effect, MediaAction, NiriAction, Page};
+    use crate::manifest::Capability;
+
+    /// #1058: every [`Effect`] variant maps to exactly the [`Capability`] its
+    /// own doc comment names. Exhaustive (the match in
+    /// [`Effect::required_capability`] has no catch-all), so a new variant
+    /// fails to compile here until it is mapped — the same guarantee the host
+    /// used to hold alone in `session::effect_capability`.
+    #[test]
+    fn required_capability_maps_every_effect() {
+        assert_eq!(
+            Effect::OpenPage(Page::Media).required_capability(),
+            Some(Capability::OpenPage),
+        );
+        assert_eq!(
+            Effect::Niri(NiriAction::FocusWorkspace { id: 1 }).required_capability(),
+            Some(Capability::Niri),
+        );
+        assert_eq!(
+            Effect::Media(MediaAction::PlayPause).required_capability(),
+            Some(Capability::Media),
+        );
+        assert_eq!(
+            Effect::Audio(AudioAction::ToggleMute).required_capability(),
+            Some(Capability::Audio),
+        );
+        assert_eq!(
+            Effect::run_command(0, vec![]).required_capability(),
+            Some(Capability::RunCommand),
+        );
+        // #953: the detached spawn mode rides the *same* capability.
+        assert_eq!(
+            Effect::launch(0, vec![]).required_capability(),
+            Some(Capability::RunCommand),
+        );
+        assert_eq!(
+            Effect::RaiseOsd {
+                title: String::new(),
+                body: String::new(),
+                icon: None,
+            }
+            .required_capability(),
+            Some(Capability::RaiseOsd),
+        );
+        assert_eq!(
+            Effect::Notify {
+                summary: String::new(),
+                body: String::new(),
+            }
+            .required_capability(),
+            Some(Capability::Notify),
+        );
+        assert_eq!(
+            Effect::RequestConsent {
+                request_id: 1,
+                agent: String::new(),
+                datasource: String::new(),
+                scope: String::new(),
+                detail: String::new(),
+            }
+            .required_capability(),
+            Some(Capability::Consent),
+        );
+        assert_eq!(
+            Effect::DatasourceQuery {
+                request_id: 1,
+                provider: String::new(),
+                scope: String::new(),
+                params: String::new(),
+            }
+            .required_capability(),
+            Some(Capability::DatasourceQuery),
+        );
+        assert_eq!(
+            Effect::DatasourceResult {
+                request_id: 1,
+                outcome: super::DatasourceOutcome::Ready(String::new()),
+            }
+            .required_capability(),
+            Some(Capability::DatasourceProvider),
+        );
+        // #1045: opening a link is its OWN capability, not a corner of
+        // `RunCommand` — the entire point of the variant.
+        assert_eq!(
+            Effect::open_uri(1, "https://example.invalid/").required_capability(),
+            Some(Capability::OpenUri),
+        );
+    }
 }
 
 /// The [`VOCAB`](crate::VOCAB) generation that carries the open-a-link intent
@@ -410,17 +540,28 @@ impl Effect {
 /// connection is dropped at the handshake, loudly, before any render frame
 /// carrying an `OpenUri` could be sent.
 ///
-/// **That condition is a plugin-authoring property, not a wire property**, and
-/// nothing enforces it: the SDK does not gate which effects an author may emit
-/// (`hytte-plugin`'s crate docs say so), so a plugin can emit `OpenUri` while
-/// forgetting `Capability::OpenUri` in its manifest. Such a plugin is already
+/// **That condition is a plugin-authoring property, not a wire property.**
+/// Before #1058 nothing enforced it at all: the wire itself lets any connected
+/// process emit any effect regardless of its manifest, and a plugin could emit
+/// `OpenUri` while forgetting `Capability::OpenUri`. Such a plugin is already
 /// broken against a #1045 host — the effect is dropped with a warn and **no
 /// [`EffectOutcome`] ever comes back**, so a click silently does nothing — and
 /// against a pre-#1045 host it is broken worse: its `Register` *succeeds* (the
 /// manifest carries no unknown variant and still stamps generation
 /// [`VOCAB_UNCONDITIONAL`](crate::VOCAB_UNCONDITIONAL)), and the first render
 /// frame carrying the effect fails to decode, which with a redialing SDK is the
-/// #437 crash-loop. Pinned by `an_undeclared_open_uri_still_registers_on_an_old_host`.
+/// #437 crash-loop. Pinned by `an_undeclared_open_uri_still_registers_on_an_old_host`
+/// (a raw-wire test that bypasses the SDK entirely, so it stays true regardless
+/// of the guard below).
+///
+/// **Since #1058**, `hytte-plugin`'s own session loop closes this for any
+/// plugin built on the Rust SDK: [`Effect::required_capability`] is the same
+/// mapping the host enforces, exported so the two cannot drift, and the SDK
+/// drops an effect the manifest didn't grant the capability for — with a warn
+/// in the *plugin's own log* — before it ever reaches the wire. That leaves the
+/// residual named above only for a plugin that speaks the wire protocol
+/// directly (a non-Rust plugin, or one that bypasses this crate's runtime),
+/// which is why the ceiling argument below still stands on its own.
 ///
 /// Moving the ceiling to 5 *would* convert that into a loud handshake refusal —
 /// and would also refuse every **other** plugin rebuilt on this SDK against

@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
 use hytte_plugin_proto::{
-    AudioAction, Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, EffectOutcome,
-    HostMsg, Manifest, MediaAction, Mount, NiriAction, NowPlaying, Page, PluginMsg,
-    ProvidedDatasource, StateKey, VOCAB, preem as vocab, read_frame, wire, write_frame,
+    Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, EffectOutcome, HostMsg,
+    Manifest, Mount, NiriAction, NowPlaying, Page, PluginMsg, ProvidedDatasource, StateKey, VOCAB,
+    preem as vocab, read_frame, wire, write_frame,
 };
 use hytte_preem as kit;
 use tokio::net::UnixStream;
@@ -40,8 +40,9 @@ use super::pump::{
 };
 use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
-    EFFECT_BURST, EffectRateLimiter, IdGuard, OUTBOUND_CAPACITY, REGISTER_TIMEOUT,
-    effect_capability, enforce_capabilities, handle_conn, push_gate, state_key_capability,
+    EFFECT_BURST, EffectRateLimiter, IdGuard, MAX_HIDDEN_ON_ENTRIES, MAX_HIDDEN_ON_NAME_BYTES,
+    OUTBOUND_CAPACITY, REGISTER_TIMEOUT, capped_hidden_on, enforce_capabilities, handle_conn,
+    push_gate, state_key_capability,
 };
 use super::shader_map::{self, Grants};
 use super::wire_map::{clamp_pixels_scale, pixels_len_ok, to_ui_node, to_wire_event};
@@ -1982,89 +1983,17 @@ fn duplicate_id_claim_rejected_until_released() {
     );
 }
 
-/// #436 item 3: every [`Effect`] maps to exactly the [`Capability`] its wire
-/// docs name, so enforcement gates each effect on the cap a plugin must
-/// declare to use it. Exhaustive over the effect vocabulary.
-#[test]
-fn effect_capability_maps_each_effect() {
-    assert_eq!(
-        effect_capability(&Effect::OpenPage(Page::Media)),
-        Capability::OpenPage,
-    );
-    assert_eq!(
-        effect_capability(&Effect::Niri(NiriAction::FocusWorkspace { id: 1 })),
-        Capability::Niri,
-    );
-    assert_eq!(
-        effect_capability(&Effect::Media(MediaAction::PlayPause)),
-        Capability::Media,
-    );
-    assert_eq!(
-        effect_capability(&Effect::Audio(AudioAction::ToggleMute)),
-        Capability::Audio,
-    );
-    assert_eq!(
-        effect_capability(&Effect::RunCommand {
-            id: 0,
-            argv: vec![],
-            detached: false,
-        }),
-        Capability::RunCommand,
-    );
-    // #953: the detached spawn mode rides the *same* capability — a plugin that
-    // may run an arbitrary argv can already launch a detacher of its own, so a
-    // second cap would name a boundary that isn't there.
-    assert_eq!(
-        effect_capability(&Effect::RunCommand {
-            id: 0,
-            argv: vec![],
-            detached: true,
-        }),
-        Capability::RunCommand,
-    );
-    assert_eq!(
-        effect_capability(&Effect::RaiseOsd {
-            title: String::new(),
-            body: String::new(),
-            icon: None,
-        }),
-        Capability::RaiseOsd,
-    );
-    assert_eq!(
-        effect_capability(&Effect::Notify {
-            summary: String::new(),
-            body: String::new(),
-        }),
-        Capability::Notify,
-    );
-    assert_eq!(
-        effect_capability(&Effect::RequestConsent {
-            request_id: 1,
-            agent: String::new(),
-            datasource: String::new(),
-            scope: String::new(),
-            detail: String::new(),
-        }),
-        Capability::Consent,
-    );
-    // #1045: opening a link is its OWN capability, not a corner of
-    // `RunCommand`. That is the entire point of the variant — a plugin that
-    // may open a link must not thereby be able to run a program.
-    assert_eq!(
-        effect_capability(&Effect::open_uri(1, "https://example.invalid/")),
-        Capability::OpenUri,
-    );
-}
-
 /// #1045: the enforcement seam treats `OpenUri` like every other effect — an
 /// un-capped one is dropped in the reader, exactly as an un-capped
 /// `RunCommand` is — and, the half that matters for the trust argument, the two
 /// capabilities do **not** substitute for one another in either direction.
 ///
 /// **Falsified** by deleting the `Effect::OpenUri` arm from
-/// `session::effect_capability` (the match is exhaustive, so it cannot be
-/// deleted — it can only be *mis-mapped*, e.g. to `Capability::RunCommand`,
-/// which turns the second and third assertions red).
+/// [`Effect::required_capability`](hytte_plugin_proto::Effect::required_capability)
+/// (the match is exhaustive, so it cannot be deleted — it can only be
+/// *mis-mapped*, e.g. to `Capability::RunCommand`, which turns the second and
+/// third assertions red; that mapping's own exhaustive test lives in
+/// `hytte-plugin-proto`, #1058).
 #[test]
 fn enforce_capabilities_drops_an_uncapped_open_uri() {
     let open = Effect::open_uri(3, "https://pr1ma.darkest.space/agents/argus");
@@ -2125,6 +2054,115 @@ fn enforce_capabilities_drops_ungranted_effects() {
         enforce_capabilities(&[], "p", vec![Effect::OpenPage(Page::Power)]).is_empty(),
         "a plugin that declared no caps gets every effect dropped",
     );
+}
+
+// ── #1058: the `Render.hidden_on` shape cap ──────────────────────────────────
+//
+// PR #1068 shipped `hidden_on: Vec<String>` with no length cap of its own —
+// bounded only by the 16 MiB frame limit — so a misbehaving plugin could post
+// a multi-megabyte connector list on every frame. `capped_hidden_on` is the
+// decode/route-time guard: at most `MAX_HIDDEN_ON_ENTRIES` names, each at
+// most `MAX_HIDDEN_ON_NAME_BYTES`. A violation is not fatal — it degrades to
+// the empty set (the card shows on every screen, #1050's own safe default),
+// with one `warn!` naming the plugin and the offending count/length.
+
+/// Counts `tracing::warn!` events from [`capped_hidden_on`] while it runs
+/// once, using the same warm-up-then-count shape as `shader_map`'s
+/// `counting_events` helper (#1058): the first thread to reach a
+/// `tracing::warn!` call site with no subscriber installed decides that
+/// callsite's `Interest` for the rest of the process, and libtest runs this
+/// file's tests concurrently. A warm-up call outside any subscriber (its
+/// result is discarded) forces the callsite into the registry under whatever
+/// interest exists then; installing the counting subscriber for the counted
+/// call **rebuilds** every already-registered callsite's interest against the
+/// now-live dispatchers, so nothing is left to race during the counted call
+/// itself.
+fn capped_hidden_on_counting_warnings(entries: Vec<String>) -> (Vec<String>, u32) {
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const TARGET: &str = "trollshell::plugins::session";
+    struct Counting(StdArc<AtomicU32>);
+    impl tracing::Subscriber for Counting {
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            meta.target().starts_with(TARGET)
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target().starts_with(TARGET) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _: &tracing::Id) {}
+        fn exit(&self, _: &tracing::Id) {}
+    }
+
+    let _ = capped_hidden_on("warmup", entries.clone());
+
+    let count = StdArc::new(AtomicU32::new(0));
+    let result =
+        tracing::subscriber::with_default(Counting(StdArc::clone(&count)), || {
+            capped_hidden_on("p", entries)
+        });
+    (result, count.load(Ordering::Relaxed))
+}
+
+/// One entry over [`MAX_HIDDEN_ON_ENTRIES`] degrades the whole set to empty
+/// and warns exactly once.
+///
+/// **Falsified** by dropping the entry-count check from `capped_hidden_on`
+/// (this test reds — the 65 names come straight through).
+#[test]
+fn hidden_on_over_the_entry_cap_becomes_empty_and_warns() {
+    let entries: Vec<String> = (0..=MAX_HIDDEN_ON_ENTRIES)
+        .map(|i| format!("out{i}"))
+        .collect();
+    assert_eq!(entries.len(), MAX_HIDDEN_ON_ENTRIES + 1);
+
+    let (kept, warnings) = capped_hidden_on_counting_warnings(entries);
+    assert!(kept.is_empty(), "one entry over the cap empties the whole set");
+    assert_eq!(warnings, 1, "exactly one warning for the violation");
+}
+
+/// One connector name over [`MAX_HIDDEN_ON_NAME_BYTES`] degrades the whole set
+/// to empty and warns exactly once, even when the entry count itself is fine.
+///
+/// **Falsified** by dropping the per-name length check from
+/// `capped_hidden_on` (this test reds — the oversized name comes through
+/// unchanged).
+#[test]
+fn hidden_on_with_a_name_over_the_byte_cap_becomes_empty_and_warns() {
+    let over_name = "x".repeat(MAX_HIDDEN_ON_NAME_BYTES + 1);
+    let entries = vec!["DP-1".to_owned(), over_name];
+
+    let (kept, warnings) = capped_hidden_on_counting_warnings(entries);
+    assert!(
+        kept.is_empty(),
+        "one oversized name empties the whole set, not just that entry",
+    );
+    assert_eq!(warnings, 1, "exactly one warning for the violation");
+}
+
+/// Right at both caps — [`MAX_HIDDEN_ON_ENTRIES`] entries, each exactly
+/// [`MAX_HIDDEN_ON_NAME_BYTES`] bytes — passes through byte-for-byte, in
+/// order, with no warning. The positive control for the two tests above: it
+/// proves the cap is inclusive (`>`, not `>=`) rather than accidentally
+/// rejecting a legitimately-sized frame.
+#[test]
+fn hidden_on_at_the_cap_passes_through_unchanged() {
+    let entries: Vec<String> = std::iter::repeat_with(|| "x".repeat(MAX_HIDDEN_ON_NAME_BYTES))
+        .take(MAX_HIDDEN_ON_ENTRIES)
+        .collect();
+    assert_eq!(entries.len(), MAX_HIDDEN_ON_ENTRIES);
+    assert!(entries.iter().all(|e| e.len() == MAX_HIDDEN_ON_NAME_BYTES));
+
+    let (kept, warnings) = capped_hidden_on_counting_warnings(entries.clone());
+    assert_eq!(kept, entries, "at-cap input passes through unchanged");
+    assert_eq!(warnings, 0, "no warning for an in-bounds frame");
 }
 
 // ── #484/#528 domain pushes: gating + projections ────────────────────────────
@@ -2564,27 +2602,10 @@ async fn recv_queue(rx: &mut mpsc::Receiver<HostMsg>) -> HostMsg {
         .expect("the queue is open")
 }
 
-/// The requester/provider capability each datasource effect requires — the
-/// exhaustive `effect_capability` mapping for the two #509 variants.
-#[test]
-fn effect_capability_maps_datasource_effects() {
-    assert_eq!(
-        effect_capability(&Effect::DatasourceQuery {
-            request_id: 0,
-            provider: String::new(),
-            scope: String::new(),
-            params: String::new(),
-        }),
-        Capability::DatasourceQuery,
-    );
-    assert_eq!(
-        effect_capability(&Effect::DatasourceResult {
-            request_id: 0,
-            outcome: DatasourceOutcome::Ready(String::new()),
-        }),
-        Capability::DatasourceProvider,
-    );
-}
+// The requester/provider capability each datasource effect requires is
+// covered by `hytte-plugin-proto`'s own exhaustive
+// `required_capability_maps_every_effect` test (#1058); no host-side
+// duplicate here any more.
 
 /// #509 capability enforcement: a `DatasourceQuery` needs `DatasourceQuery`, a
 /// `DatasourceResult` needs `DatasourceProvider` — each is dropped without its own

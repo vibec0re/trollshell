@@ -2246,6 +2246,29 @@ kept = true
         }
     }
 
+    /// A subsystem whose table is **required**: no `Option`, no
+    /// `#[serde(default)]` on the field, so "absent" is not something this
+    /// schema can be told. The one shape that makes the re-read in
+    /// [`read_merged`] fail, which is how a field's optionality gets observed
+    /// at all from there.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct NeedsTable {
+        core: Core,
+    }
+
+    impl Subsystem for NeedsTable {
+        const NAME: &'static str = "needs-table";
+        const DEFAULT_TOML: &'static str = "[core]\n";
+        type Error = std::convert::Infallible;
+        type Resolved = ();
+        fn parsed(&self) -> ((), Vec<InvalidValue>) {
+            ((), Vec::new())
+        }
+        fn validate(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
     /// **#1008 shape 1.** A table the user spelled inline is patched *in
     /// place*: [`patch`] recurses through
     /// [`toml_edit::Item::as_table_like_mut`], so the marker and every key the
@@ -2758,6 +2781,35 @@ kept = true
             loaded.unknown_keys.is_empty(),
             "and a `toml::Value` field knows no unknown keys: {:?}",
             loaded.unknown_keys
+        );
+    }
+
+    /// A table the schema **requires** cannot read as absent, and the way that
+    /// is settled is by asking rather than by guessing: nothing visible from
+    /// [`read_merged`] says whether a field is an `Option`, so the rule is
+    /// applied and the re-read is what refuses it. The load then stands on the
+    /// unpruned pass, exactly as it did before #1025.
+    ///
+    /// Red if the re-read's failure stops being a fallback — the load fails
+    /// with serde's `missing field core`, and a schema with a required table
+    /// and one stray key in it becomes unloadable.
+    #[test]
+    fn a_table_the_schema_requires_is_not_dropped_out_from_under_it() {
+        let loaded =
+            assemble::<NeedsTable>(&layers(&["[core]\nmystery = 1\n"])).expect("still assembles");
+
+        assert_eq!(
+            (
+                loaded.config.core.brightness,
+                loaded.config.core.color.as_str()
+            ),
+            (0, ""),
+            "the unpruned read, field defaults and all"
+        );
+        assert_eq!(
+            loaded.unknown_keys,
+            ["core.mystery"],
+            "and their key is still named"
         );
     }
 

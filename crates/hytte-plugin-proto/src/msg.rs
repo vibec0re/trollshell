@@ -13,6 +13,9 @@ use crate::wire::{EventKind, Node, NodeId};
 use serde::{Deserialize, Serialize};
 
 /// Plugin → host frames.
+///
+/// `Render.panel` is boxed to keep this enum under clippy's
+/// `large_enum_variant` threshold — see that field's own doc for why.
 // #1068 measured `Render` at 336 bytes (`tree` 144 + `panel` 144 + `hidden_on`
 // 24 + `effects` 24) against `Register`'s 120 — a 216-byte gap, crossing
 // clippy's `large_enum_variant` 200-byte default — and allowed the lint rather
@@ -20,8 +23,7 @@ use serde::{Deserialize, Serialize};
 // seven plugin crates' test helpers. #1073 does that boxing: `panel:
 // Option<Box<Node>>` takes `Render` to 200 bytes (measured), closing the gap
 // to 80 and putting the enum back under the lint's default with no `#[allow]`
-// needed. See [`Render::panel`](PluginMsg::Render::panel) for why the field
-// itself is boxed.
+// needed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PluginMsg {
     /// First frame after dialing in: self-identify. The host validates
@@ -46,8 +48,17 @@ pub enum PluginMsg {
         /// plugins never carry a panel, and once `hidden_on` (#1050) joined
         /// `tree` + `panel` the variant crossed clippy's `large_enum_variant`
         /// threshold. `Box` is transparent to serde — the wire bytes are
-        /// unchanged, only the in-memory frame shrinks — so this is a pure
-        /// size fix; do not unbox it back to `Option<Node>`.
+        /// unchanged, only the in-memory frame shrinks. The trade is not free
+        /// in both directions, though: for `panel: None` (most plugins, most
+        /// frames) nothing is allocated and the frame simply shrinks, but a
+        /// panel-*bearing* frame now pays two small heap allocations and
+        /// `Node` copies per frame — one boxing it on the SDK's way out, one
+        /// unboxing it on the host's way in (`session.rs`'s `panel.map(|p| *p)`).
+        /// That cost is noise next to the render mailbox's own full
+        /// `SlotRender` clone on every panel-bearing frame (`session.rs`'s
+        /// `route_render`), so it is not a reason to change this — but do not
+        /// unbox `panel` back to `Option<Node>`, or `large_enum_variant`
+        /// returns (see [`PluginMsg`]'s own doc).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         panel: Option<Box<Node>>,
         /// The **connector names** (`"DP-1"`, `"eDP-1"`, `"HDMI-A-2"` — niri's
@@ -113,6 +124,14 @@ pub enum PluginMsg {
     /// Liveness reply to a [`HostMsg::Ping`], echoing its `seq`.
     Pong { seq: u64 },
 }
+
+// #1073 review LOW-3: `large_enum_variant` only ever sees the *gap* to the
+// next-largest variant (today `Register`'s `Manifest`, 120 bytes), not "is
+// `panel` boxed" — so if `Manifest` ever grows past 136 bytes, an unboxed
+// `panel` would sit at a gap ≤ 200 and slip the lint silently while this
+// module's doc still says don't unbox it. This pins the actual invariant the
+// doc asserts, independent of what `Register`'s payload happens to weigh.
+const _: () = assert!(std::mem::size_of::<PluginMsg>() <= 200);
 
 /// Host → plugin frames.
 ///

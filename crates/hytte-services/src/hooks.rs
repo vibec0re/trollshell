@@ -298,86 +298,23 @@ mod tests {
         cap.events.lock().unwrap().clone()
     }
 
-    /// Fire every `tracing` callsite `run_inner` can reach, exactly once
-    /// for the whole test binary, with no capture subscriber active on any
-    /// other thread racing it — see [`capture`] and #1028 mechanism 2 /
-    /// #1020's `counting_events` (`trollshell/src/plugins/shader_map.rs`,
-    /// read its doc comment for the full mechanism).
-    ///
-    /// `tracing-core` caches a callsite's `Interest` **process-wide** the
-    /// first time it fires. If that first fire lands while no subscriber is
-    /// registered anywhere in the process, the callsite is cached
-    /// `Interest::never()` for the rest of the binary, and a later
-    /// `set_default` in some other test never sees it — `capture()` here
-    /// did not pre-register the callsites the way `counting_events` does,
-    /// which is the second candidate mechanism the issue names alongside
-    /// the fixed-sleep timing bug.
-    ///
-    /// Gated by a `OnceCell` rather than re-run per test (unlike
-    /// `counting_events`, which re-warms on every call because its subject
-    /// is a cheap pure function): `run_inner` does real I/O — spawning a
-    /// subprocess per branch — so warming it up once for the whole binary,
-    /// with every concurrent test thread's first `capture()` call awaiting
-    /// the SAME init rather than racing into it, is both cheaper and more
-    /// deterministic than a per-call warm-up would be here. It must run
-    /// from the very first `capture()` call in the binary (not lazily on
-    /// first use of some particular event) precisely because "first ever
-    /// touch, no subscriber" is the failure mode being closed.
-    async fn warm_up_callsites() {
-        static WARM: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-        WARM.get_or_init(|| async {
-            // Piggyback on the enclosing `TestHome::with` that every caller
-            // of `capture()` is already inside by the time it calls this —
-            // `$HOME` is already a live scratch dir, so writing a few more
-            // "warmup-*" scripts into it (distinct event names, so they
-            // cannot collide with any real test's "theme-changed" script)
-            // needs no second `temp_env::async_with_vars` layer.
-            let Some(home) = std::env::var_os("HOME") else {
-                return;
-            };
-            let hooks_dir = PathBuf::from(home).join(".config/trollshell/hooks");
-            std::fs::create_dir_all(&hooks_dir).unwrap();
-            let write = |name: &str, body: &str, mode: u32| {
-                use std::os::unix::fs::PermissionsExt;
-                let path = hooks_dir.join(name);
-                std::fs::write(&path, body).unwrap();
-                let mut perms = std::fs::metadata(&path).unwrap().permissions();
-                perms.set_mode(mode);
-                std::fs::set_permissions(&path, perms).unwrap();
-            };
-
-            // debug!("hooks: no script configured") — no file for this event.
-            super::run("warmup-missing", &[]);
-            // warn!("hooks: script not executable")
-            write("warmup-noexec", "#!/bin/sh\nexit 0\n", 0o644);
-            super::run("warmup-noexec", &[]);
-            // info!("hooks: ran") + info!(.., "hooks: stdout") + info!(.., "hooks: stderr")
-            write(
-                "warmup-ok",
-                "#!/bin/sh\necho out\necho err 1>&2\nexit 0\n",
-                0o755,
-            );
-            super::run("warmup-ok", &[]);
-            // warn!("hooks: script failed")
-            write("warmup-fail", "#!/bin/sh\nexit 3\n", 0o755);
-            super::run("warmup-fail", &[]);
-            // warn!("hooks: script timed out, killing")
-            write("warmup-hang", "#!/bin/sh\nsleep 30\n", 0o755);
-            super::run("warmup-hang", &[]);
-
-            // These all run fire-and-forget on spawned tasks. Give the
-            // slowest of them (the timeout branch, bounded by
-            // `HOOK_TIMEOUT`) generous real time to actually reach its
-            // `tracing` call before returning — this only needs to happen
-            // here overwhelmingly reliably, not provably, same as
-            // `counting_events`'s measured (not proven) 0/40.
-            tokio::time::sleep(super::HOOK_TIMEOUT + std::time::Duration::from_millis(200)).await;
-        })
-        .await;
-    }
-
+    /// No callsite warm-up here (see #1028 fix-round review, PR #1032): in
+    /// `tracing-core` 0.1.36, `Dispatch::new` (`src/dispatcher.rs:479`)
+    /// calls `callsite::register_dispatch`, which ends in
+    /// `CALLSITES.rebuild_interest(dispatchers)` (`src/callsite.rs:484-487`)
+    /// — a rebuild over *every already-registered* callsite against every
+    /// live dispatcher. `capture()` below constructs a fresh `Dispatch::new`
+    /// on every call, which un-poisons any callsite a prior test cached
+    /// `Interest::never()` for. There is no subscriber-less first fire to
+    /// guard against in this harness: `spawn_task` (`hooks.rs:35`) prefers
+    /// `Handle::try_current()`, which inside `#[tokio::test(flavor =
+    /// "current_thread")]` is the test's own runtime, so `run_inner` always
+    /// runs on the thread whose thread-local default is already the
+    /// capture dispatch. A prior revision of this file warmed up the
+    /// callsites anyway; measured to be a no-op (250-run full-binary
+    /// campaign, 0 failures) and, worse, itself the exact "subscriber-less
+    /// first fire" its own doc comment warned about — removed.
     pub(super) async fn capture() -> (Captured, tracing::dispatcher::DefaultGuard) {
-        warm_up_callsites().await;
         let cap = Captured::default();
         let dispatch = tracing::Dispatch::new(Registry::default().with(cap.clone()));
         let guard = tracing::dispatcher::set_default(&dispatch);
@@ -393,13 +330,16 @@ mod tests {
             super::run("theme-changed", &[]);
 
             wait_for(&cap, "an INFO 'ran' event", |e| {
-                e.level == tracing::Level::INFO && e.message.contains("ran")
+                e.level == tracing::Level::INFO
+                    && e.message.contains("ran")
+                    && e.fields.get("event").is_some_and(|s| s == "theme-changed")
             })
             .await;
 
             wait_for(&cap, "an INFO event with stdout=hi", |e| {
                 e.level == tracing::Level::INFO
                     && e.fields.get("stdout").is_some_and(|s| s.contains("hi"))
+                    && e.fields.get("event").is_some_and(|s| s == "theme-changed")
             })
             .await;
         })
@@ -419,13 +359,19 @@ mod tests {
             super::run("theme-changed", &[]);
 
             let events = wait_for(&cap, "a WARN 'script failed' event", |e| {
-                e.level == tracing::Level::WARN && e.message.contains("failed")
+                e.level == tracing::Level::WARN
+                    && e.message.contains("failed")
+                    && e.fields.get("event").is_some_and(|s| s == "theme-changed")
             })
             .await;
 
             let warn = events
                 .iter()
-                .find(|e| e.level == tracing::Level::WARN && e.message.contains("failed"))
+                .find(|e| {
+                    e.level == tracing::Level::WARN
+                        && e.message.contains("failed")
+                        && e.fields.get("event").is_some_and(|s| s == "theme-changed")
+                })
                 .expect("wait_for guarantees a matching WARN event is present");
             assert!(
                 warn.fields
@@ -453,10 +399,23 @@ mod tests {
 
             super::run("theme-changed", &[]);
 
-            wait_for(&cap, "a WARN 'not executable' event", |e| {
-                e.level == tracing::Level::WARN && e.message.contains("not executable")
+            let events = wait_for(&cap, "a WARN 'not executable' event", |e| {
+                e.level == tracing::Level::WARN
+                    && e.message.contains("not executable")
+                    && e.fields.get("event").is_some_and(|s| s == "theme-changed")
             })
             .await;
+
+            // The WARN above proves the rejection branch ran, but that
+            // alone doesn't rule out some other branch *also* spawning the
+            // script — assert that at the event level too: no INFO "ran"
+            // for this event is present in the capture.
+            assert!(
+                !events.iter().any(|e| e.level == tracing::Level::INFO
+                    && e.message.contains("ran")
+                    && e.fields.get("event").is_some_and(|s| s == "theme-changed")),
+                "expected no INFO 'ran' event for theme-changed, got: {events:#?}",
+            );
 
             // Not vacuous: the positive wait above already established the
             // script was rejected before this negative check runs.
@@ -475,7 +434,9 @@ mod tests {
             super::run("theme-changed", &[]);
 
             wait_for(&cap, "a WARN 'timed out' event", |e| {
-                e.level == tracing::Level::WARN && e.message.contains("timed out")
+                e.level == tracing::Level::WARN
+                    && e.message.contains("timed out")
+                    && e.fields.get("event").is_some_and(|s| s == "theme-changed")
             })
             .await;
 
@@ -497,7 +458,9 @@ mod tests {
             super::run("theme-changed", &[]);
 
             let events = wait_for(&cap, "a DEBUG 'no script' event", |e| {
-                e.level == tracing::Level::DEBUG && e.message.contains("no script")
+                e.level == tracing::Level::DEBUG
+                    && e.message.contains("no script")
+                    && e.fields.get("event").is_some_and(|s| s == "theme-changed")
             })
             .await;
 
@@ -524,8 +487,12 @@ mod tests {
 
             super::run("theme-changed", &[("TROLLSHELL_THEME", "dark")]);
 
+            // Poll the content, not the inode: the shell's `>` redirect
+            // does `open(O_CREAT|O_TRUNC)` before `printf` writes, so
+            // `sentinel.exists()` goes true while the file is still empty
+            // — polling existence alone can observe that partial state.
             poll_until(
-                || sentinel.exists(),
+                || std::fs::read_to_string(&sentinel).is_ok_and(|s| !s.is_empty()),
                 || format!("waiting for the script to write {}", sentinel.display()),
             )
             .await;

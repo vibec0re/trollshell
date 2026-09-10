@@ -1190,17 +1190,20 @@ async fn accept_or_park(
 /// SDK-free: `cmds`/`out` are plain tokio channels (the plugin passes the SDK's
 /// per-session lane ends, which are exactly these types), so this whole module
 /// never links the plugin runtime.
-// One cohesive `select!` loop (accept / command / timeout) over the parked-request
-// state (consent + query maps); splitting its arms into helpers would scatter that
-// shared state for no readability gain — same stance as the host's `handle_conn`.
-#[allow(clippy::too_many_lines)]
-pub async fn serve(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: mpsc::UnboundedSender<BrokerMsg>) {
-    let Some(sock) = paths::socket_path() else {
-        tracing_eprintln("XDG_RUNTIME_DIR unset; broker socket not created");
-        return;
-    };
+pub async fn serve(cmds: mpsc::UnboundedReceiver<Cmd>, out: mpsc::UnboundedSender<BrokerMsg>) {
+    serve_with_grant_loader(cmds, out, load_grants).await;
+}
 
-    let grants = paths::grants_path().map_or_else(
+/// Read and parse the durable grant store for one session: `grants.toml` when
+/// there is a state dir to hold it, an empty in-memory store when there is not
+/// (no `HOME`/`XDG_STATE_HOME`) or when the file on disk is unreadable.
+///
+/// **Wholly synchronous** — a `std::fs::read_to_string` plus a TOML parse, with
+/// no `.await` anywhere inside it — which is the entire reason
+/// [`serve_with_grant_loader`] hands it to `tokio::task::spawn_blocking`
+/// instead of calling it inline (#1059).
+fn load_grants() -> GrantStore {
+    paths::grants_path().map_or_else(
         || {
             tracing_eprintln("no HOME/XDG_STATE_HOME; grants are in-memory only this session");
             GrantStore::from_grants(Vec::new())
@@ -1211,7 +1214,83 @@ pub async fn serve(mut cmds: mpsc::UnboundedReceiver<Cmd>, out: mpsc::UnboundedS
                 GrantStore::from_grants(Vec::new())
             })
         },
-    );
+    )
+}
+
+/// [`serve`], with the synchronous grant-load step supplied by the caller.
+/// `serve` *is* `serve_with_grant_loader(cmds, out, load_grants)`; everything
+/// [`serve`]'s doc says applies here unchanged.
+///
+/// # Why the seam is public (#1059)
+///
+/// The property this parameter exists to test is "a slow synchronous step
+/// inside `serve` does not stop the runtime's timers", and it is invisible
+/// unless the step is slow. Production's step is fast unless the user's
+/// `grants.toml` is enormous, and a test cannot make it slow without writing
+/// hundreds of megabytes; nor can an integration test point `grants_path()` at
+/// a scratch file in-process, because `std::env::set_var` is `unsafe` in
+/// edition 2024 and this workspace `forbid`s `unsafe_code` (see
+/// `tests/serve_socket_handover.rs`'s module doc). So the loader is injected,
+/// and `tests/serve_socket_handover.rs`'s scenario D injects one that blocks
+/// for two seconds and then asserts a concurrent 100 ms timer still fired on
+/// time.
+///
+/// # The starvation this guards against
+///
+/// `serve` runs from [`crate::plugin`]'s `sources()` under a plain
+/// `tokio::spawn` on the SDK's **current-thread** runtime
+/// (`hytte-plugin/src/runtime.rs`), which is deliberate — the broker is one
+/// plugin session's I/O source, not a second daemon (contrast
+/// `hytte-claude-bridge`, whose HTTP listener owns its own multi-thread
+/// runtime because its clients are *other* plugins). On a current-thread
+/// runtime a synchronous step holds the only thread there is, so while it runs
+/// nothing else on that runtime is polled: the broker's own `REQUEST_TIMEOUT`
+/// / `CONSENT_PARK_TIMEOUT` / `QUERY_PARK_TIMEOUT` bounds, the SDK's clock
+/// pump and the SDK's session loop all stall together. Measured on #1024's
+/// tree: a 5 s `tokio::time::timeout` returning `Ok` at 7.310 s, because the
+/// inline `GrantStore::load` had the thread for the intervening seconds.
+///
+/// `spawn_blocking` moves exactly that step to tokio's blocking pool (already
+/// a dependency-level given — the `rt` feature this crate enables provides
+/// both `spawn` and `spawn_blocking`), leaving the session's own thread free
+/// to keep polling. It is the *step* that moves, not the runtime: `serve`
+/// itself stays on the SDK's current-thread runtime, so the socket, the
+/// listener and every parked request keep living exactly where they did.
+///
+/// The remaining synchronous work in this module is deliberately left inline
+/// and is a different class: `bind_socket`'s `remove_file`/`bind`/
+/// `set_permissions` are three syscalls on a tmpfs, not an unbounded parse,
+/// and `GrantStore::save` (reached from `apply_cmd`/`apply_consent`) borrows
+/// `state` mutably so it cannot cross a `spawn_blocking` boundary without
+/// restructuring `grants.rs` — out of #1059's lane, and a per-click cost
+/// rather than the per-session-start one measured here.
+// One cohesive `select!` loop (accept / command / timeout) over the parked-request
+// state (consent + query maps); splitting its arms into helpers would scatter that
+// shared state for no readability gain — same stance as the host's `handle_conn`.
+#[allow(clippy::too_many_lines)]
+pub async fn serve_with_grant_loader<L>(
+    mut cmds: mpsc::UnboundedReceiver<Cmd>,
+    out: mpsc::UnboundedSender<BrokerMsg>,
+    load_grants: L,
+) where
+    L: FnOnce() -> GrantStore + Send + 'static,
+{
+    let Some(sock) = paths::socket_path() else {
+        tracing_eprintln("XDG_RUNTIME_DIR unset; broker socket not created");
+        return;
+    };
+
+    // #1059: off the session's own thread — see this function's doc comment.
+    // A panicking loader is a bug in the loader, not a reason to take the
+    // broker down with it: log it and serve with an empty store, the same
+    // fallback an unreadable `grants.toml` already gets.
+    let grants = match tokio::task::spawn_blocking(load_grants).await {
+        Ok(grants) => grants,
+        Err(e) => {
+            tracing_eprintln(&format!("grant load failed ({e}); starting empty"));
+            GrantStore::from_grants(Vec::new())
+        }
+    };
     let mut state = BrokerState::new(grants);
 
     // Hold the process's socket for this session's whole body: that is what
@@ -1564,9 +1643,18 @@ mod tests {
     /// which measured 2.82–3.46 s wall under ~2x CPU oversubscription against
     /// a 4 s ceiling (`WRITE_RESPONSE_TIMEOUT` + 2 s) — survived 100/100
     /// whole-binary runs there, but on a margin note, not a repro. `10_000`
-    /// rows (~95 KB, still >2× the default UDS buffers) keeps the write
+    /// rows (~811 KiB, still >2× the default UDS buffer) keeps the write
     /// genuinely blocking (still RED with the timeout deleted) while cutting
     /// the encode cost this bound has to absorb.
+    ///
+    /// #1033 third pass / #1059 item 3: that figure read "~95 KB" until now
+    /// and was wrong by 8.5×. Each row encodes to exactly 82 bytes
+    /// (`{"agent":"agent-000000","datasource":"departures","scope":"*",
+    /// "decision":"always"}`) plus its separating comma, so 10 000 of them are
+    /// ~830 000 B ≈ 811 KiB — ~3.9× one `wmem_default`/`rmem_default`
+    /// (212 992 B on a typical kernel) and ~1.95× the send+receive pair. The
+    /// ">2×" claim the wrong number was attached to happens to survive the
+    /// correction; the number itself did not.
     #[tokio::test]
     async fn write_response_gives_up_on_a_client_that_never_reads() {
         let (mut server, _client_that_never_reads) =

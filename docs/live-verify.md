@@ -1378,33 +1378,39 @@ session.
      idle baseline. The number to beat is stage A's `gl-x3` layer result,
      16.77 ms. `--areas 3` was all stage A measured, so this is the
      extrapolation being checked rather than re-confirmed.
-  4. **The parity numbers, on your driver.** `cargo run -p trollshell --example
-preem_gl_diff` prints a per-channel mean / p99 / max against the CPU kit
-     for each skin at three points in the fade, plus a per-column peak-row
-     structural check, the worst pixel's coordinates and channel, an
-     edge/field/lit region split, and three netpbm images per case under
-     `gates/` (`pnmtopng` them to look). The ceiling is **mean ≤ 2 / p99 ≤ 8 /
-     max ≤ 32** of 255 (#893, Annika's answer 4). Under llvmpipe every case
-     reads **0 / 0 / 0** — the span-quad design does hold, exactly — so on real
-     hardware anything above zero is worth reading rather than shrugging at,
-     and the region split says which of #1072's four buckets it is: only on
-     edges is rasterisation coverage, flat across the field is gamma/sRGB, in
-     the lit interior is shader math. It runs headless too, which is how the
-     #1072 numbers were taken:
-     `sh
+  4. **The parity numbers, on your driver.** `preem_gl_diff` prints a
+     per-channel mean / p99 / max against the CPU kit for each skin at three
+     points in the fade, plus a per-column peak-row structural check, the worst
+     pixel's coordinates and channel, an edge/field/lit region split, and three
+     netpbm images per case under `gates/` (`pnmtopng` them to look). The
+     ceiling is **mean ≤ 2 / p99 ≤ 8 / max ≤ 32** of 255 (#893, Annika's
+     answer 4). Under llvmpipe every case reads **0 / 0 / 0** — the span-quad
+     design does hold, exactly — so on real hardware anything above zero is
+     worth reading rather than shrugging at, and the region split says which of
+     #1072's four buckets it is: only on edges is rasterisation coverage, flat
+     across the field is gamma/sRGB, in the lit interior is shader math. It
+     runs headless too, which is how the #1072 numbers were taken:
+
+     ```sh
      nix develop --command bash -c '
        MESA=$(nix build nixpkgs#mesa --no-link --print-out-paths)
-       export LIBGL_ALWAYS_SOFTWARE=1 LIBGL_DRIVERS_PATH="$MESA/lib" \
-              LD_LIBRARY_PATH="$MESA/lib:$LD_LIBRARY_PATH" GDK_BACKEND=x11 \
+       export LIBGL_ALWAYS_SOFTWARE=1 GDK_BACKEND=x11 \
+              LD_LIBRARY_PATH="$MESA/lib:$LD_LIBRARY_PATH" \
               __EGL_VENDOR_LIBRARY_FILENAMES="$MESA/share/glvnd/egl_vendor.d/50_mesa.json"
        xvfb-run -a cargo run -p trollshell --example preem_gl_diff'
-     `
-     (`LIBGL_DRIVERS_PATH` wants `$MESA/lib/dri`; the four variables are the
-     #1036 spike's recipe and all of them are load-bearing.) Exit status is the
-     verdict — it is `1` on any failure, including the one that matters most,
-     `FAIL(nothing)`: a GL arm that drew literally nothing, which every other
-     check in the harness passes straight through and which a dark skin hides
-     inside the ceiling.
+     ```
+
+     `__EGL_VENDOR_LIBRARY_FILENAMES` is the one that is definitely
+     load-bearing: glvnd's default vendor directories are
+     `/usr/share/glvnd/egl_vendor.d` and `/run/opengl-driver/share/…`, neither
+     of which exists in a nix sandbox, so without it `eglInitialize` finds no
+     vendor at all (the #1036 spike's finding). `LIBGL_DRIVERS_PATH` was in the
+     spike's recipe and is **not** kept here — #1072's review ran it as
+     `$MESA/lib`, as `$MESA/lib/dri` and omitted entirely, and all three pass;
+     it is the GLX-era knob and EGL resolves without it. The other three have
+     not been bisected individually. Exit status is the verdict — it is `1` on
+     any failure, including `FAIL(nothing)`: a GL arm that drew literally
+     nothing, which the deltas alone cannot catch against a dark skin.
   5. **CPU and GL side by side.** Two shells cannot share the session, so do it
      in sequence on the same preem-demo card and compare screenshots — or put a
      GL scope next to a CPU-only kit widget (the gauge, which has no GL arm in

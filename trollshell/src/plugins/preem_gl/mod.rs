@@ -279,7 +279,55 @@ pub(super) fn install() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Arm, RENDERER_ENV, arm_from_env, shader_arm, with_cpu_kill_switch};
+    use super::{
+        Arm, RENDERER_ENV, arm, arm_from_env, shader_arm, with_cpu_kill_switch, with_gl_arm,
+    };
+
+    /// **A failed GL context beats the switch, and keeps beating it** — the one
+    /// branch that stands between a session with broken GL and a blank chip.
+    ///
+    /// It is not new code; what #1072 changed is what rests on it. While the
+    /// shipped default was CPU, a regression in this branch was **masked**:
+    /// [`configured_arm`](super::configured_arm) answered `Cpu` anyway, so a
+    /// session whose context failed still got the kit by the other route. With
+    /// GL the default again, `if gl_abandoned() { return Arm::Cpu; }` is the
+    /// only thing left — and #1072's review found it was the one decision in
+    /// this module with no test at all (the four here drove `arm_from_env` and
+    /// `shader_arm`; none drove [`arm`]).
+    ///
+    /// Driven through the **real** latch, not a fake: `hytte-ui`'s `abandon_gl`
+    /// is documented as exactly this seam — "a display server with no GL is not
+    /// something a hermetic test can arrange, but 'behave as if the context had
+    /// failed' is exactly one call". `plugins::tests` already reaches for it
+    /// the same way. The latch is a thread-local that never clears, so this
+    /// test's own thread is the blast radius, and the first assertion is the
+    /// premise that says so out loud rather than passing vacuously if a future
+    /// harness ever reused threads.
+    ///
+    /// **Falsified** by deleting the `gl_abandoned` branch from [`arm`]: the
+    /// second assertion reports `Gl`.
+    #[test]
+    fn an_abandoned_context_forces_the_cpu_arm_over_the_configured_gl_default() {
+        assert!(
+            !hytte::ui::gl_surface::gl_abandoned(),
+            "the premise: a fresh test thread has not abandoned GL",
+        );
+        with_gl_arm(|| {
+            assert_eq!(arm(), Arm::Gl, "the premise: the switch says GL");
+
+            hytte::ui::gl_surface::abandon_gl("no GL in this test");
+
+            assert_eq!(
+                arm(),
+                Arm::Cpu,
+                "a context that failed wins over the switch",
+            );
+            // Sticky, and that is the property a *session* depends on: the
+            // fallback has to hold for every later mount, not just the one
+            // that observed the failure.
+            assert_eq!(arm(), Arm::Cpu, "…and keeps winning on the next mount");
+        });
+    }
 
     /// The shader path's test default is **GL**, and [`with_cpu_kill_switch`]
     /// is the seam that turns it off and puts it back.

@@ -96,15 +96,24 @@ pub(crate) enum Verdict {
     Pass,
     /// **Every compared pixel is `0, 0, 0`** — the GL arm drew nothing at all.
     ///
-    /// Split out of [`Self::UndrawnFramebuffer`] for #1070's review finding M2
+    /// The failure shape #1070's review finding M2 named
     /// (<https://github.com/vibec0re/trollshell/pull/1070#issuecomment-5621283282>):
     /// a glvnd stub for an unimplemented entry point returns `0` without
     /// trapping, so a wrong dispatch table degrades to an empty compile log or
     /// a no-op texture allocation — a **silent black chip**, with no GL error,
-    /// no `GLArea::error()` and a live context. That is the single most
-    /// dangerous thing this harness can be handed, because on a dark skin the
-    /// per-channel deltas against it are small: it has to be named, and it has
-    /// to be a failure.
+    /// no `GLArea::error()` and a live context.
+    ///
+    /// **This is a split of [`Self::UndrawnFramebuffer`], not new coverage, and
+    /// the distinction matters to anyone editing [`Stats::verdict`].** An
+    /// all-zero readback is a strict subset of "one flat colour", and `uniform`
+    /// was already checked ahead of the ceiling before #1072, so M2's "a case,
+    /// not a pass" was satisfied without this variant — measured: deleting the
+    /// `all_zero` branch reports `UndrawnFramebuffer`, not `PASS`. What this
+    /// adds is the *diagnosis*, which is worth having, because "the GL arm drew
+    /// nothing" and "the GL arm drew a flat colour" send a reader to different
+    /// bugs. What it does **not** do is make the `uniform` branch redundant:
+    /// remove that one believing this covers its ground and a flat *non-black*
+    /// framebuffer starts reporting `PASS`.
     RendersNothing,
     /// The readback is a single flat colour, so nothing was drawn — see
     /// [`Stats::uniform`].
@@ -316,9 +325,17 @@ pub(crate) fn compare(gl: &[u8], reference: &[u8], layout: Layout) -> Stats {
                 let delta = g[channel].abs_diff(c[channel]);
                 bucket.push(delta);
                 // `>` and not `>=`, so the worst pixel reported is the *first*
-                // one at that magnitude in row-major order — a stable
-                // coordinate to paste into a transcript rather than whichever
-                // tie the loop happened to end on.
+                // one at that magnitude in this loop's own **column-major**
+                // order (x outer, then y, then R/G/B) — a stable coordinate to
+                // paste into a transcript rather than whichever tie the loop
+                // happened to end on.
+                //
+                // Column-major is structural, not a choice: the per-column peak
+                // rows above accumulate across the inner loop, so `x` has to be
+                // the outer one. The comment here said "row-major" until #1072's
+                // review measured otherwise; the test below now pins the order
+                // it actually walks, because that order *is* the coordinate a
+                // transcript gets triaged from.
                 if worst.is_none_or(|held| delta > held.delta) {
                     worst = Some(WorstPixel {
                         x,
@@ -576,19 +593,23 @@ mod tests {
     /// A glvnd stub for an unimplemented entry point returns `0` without
     /// trapping, so a wrong dispatch table degrades to an empty compile log or
     /// a no-op texture allocation: a black chip with a live context, no
-    /// `GLArea::error()` and a clean `glGetError`. Every other guard in the
-    /// harness passes straight through it.
+    /// `GLArea::error()` and a clean `glGetError`.
     ///
-    /// The mutation the brief asks for is the assertion itself: hand `compare`
-    /// an **all-black GL output** and the verdict must be red. It is red twice
-    /// over here — against a bright reference (where the deltas alone would
-    /// have caught it) and against a *dark* one, where they would not: the
-    /// second frame differs from black by 2/255, comfortably inside every one
-    /// of mean, p99 and max, so without this check a renderer that drew
-    /// literally nothing would report `PASS`.
+    /// The dark half below is the load-bearing one: its reference differs from
+    /// black by 2/255, which sits inside every one of mean, p99 and max — so
+    /// **the deltas do not catch it**, and the test asserts that before
+    /// asserting the verdict. What does catch it is the flat-frame family of
+    /// guards, and this test pins *which member* answers: `RendersNothing`,
+    /// not `UndrawnFramebuffer`.
     ///
     /// **Falsified** by dropping the `all_zero` branch from `verdict()`: the
-    /// dark half below reports `PASS`.
+    /// dark half then reports `UndrawnFramebuffer`. Measured, and worth being
+    /// precise about, because #1072's first draft of this doc claimed it would
+    /// report `PASS` and #1072's review showed otherwise — `all_zero` is a
+    /// strict subset of `uniform`, and `uniform` was already checked ahead of
+    /// the ceiling on `main`. The variant buys the diagnosis, not the catch.
+    /// The mutation that *does* produce `PASS` here is dropping the `uniform`
+    /// branch **and** the `all_zero` one; either alone still reds.
     #[test]
     fn an_all_black_gl_output_is_a_failure_even_against_a_dark_reference() {
         let (w, h) = (16, 8);
@@ -598,8 +619,10 @@ mod tests {
         assert!(bright.all_zero, "every compared pixel is 0,0,0");
         assert_eq!(bright.verdict(), Verdict::RendersNothing);
 
-        // The dangerous half: a nearly-black reference. Nothing but `all_zero`
-        // separates "drew the dark skin correctly" from "drew nothing".
+        // The dangerous half: a nearly-black reference, where the *deltas*
+        // cannot tell "drew the dark skin correctly" from "drew nothing" —
+        // only the flat-frame guards can, and `all_zero` is which of them
+        // answers.
         let dark = compare(&black, &frame(w, h, |_, _| [2, 1, 2]), layout(w, h));
         assert!(
             dark.worst_mean() <= CEILING_MEAN
@@ -624,9 +647,9 @@ mod tests {
     /// The worst pixel is reported with its coordinates, its channel and both
     /// arms' colours — the readout that makes a classification possible.
     ///
-    /// **Falsified** by taking `>=` instead of `>` in `compare`'s worst-pixel
-    /// branch (the coordinates then move to the last tie rather than the
-    /// first), or by dropping the branch entirely (`worst` is `None`).
+    /// **Falsified** by dropping the worst-pixel branch from `compare`
+    /// (`worst` is `None`), or by reporting the wrong member of the pair — see
+    /// the tie test below, which is the half that pins *which* pixel.
     #[test]
     fn the_worst_pixel_is_located_with_its_channel_and_both_colours() {
         let (w, h) = (16, 8);
@@ -648,6 +671,50 @@ mod tests {
         assert!(
             compare(&[], &cpu, layout(0, 0)).worst.is_none(),
             "…and an empty comparison has none"
+        );
+    }
+
+    /// **A tie reports the first pixel in the scan's own order**, and that
+    /// order is column-major (x outer).
+    ///
+    /// #1072's review measured the previous version of this claim and it did
+    /// not hold: the doc said `>=` for `>` would move the coordinates "to the
+    /// last tie rather than the first", but the fixture planted a *unique*
+    /// maximum, so there was no tie for the mutation to move and all 22 tests
+    /// stayed green. A falsification note that survives its own mutation is
+    /// worse than none. This one plants a real tie.
+    ///
+    /// Two pixels, same `|Δ|`, chosen so the two candidate scan orders
+    /// disagree about which comes first: `(2, 5)` wins column-major (smaller
+    /// `x`), `(9, 1)` wins row-major (smaller `y`). So the assertion pins the
+    /// tie-break *and* the traversal at once — which matters because the
+    /// reported coordinate is what a transcript gets triaged from, and an
+    /// unstable one sends the reader to the wrong pixel.
+    ///
+    /// **Falsified**, measured, two ways: `delta > held.delta` → `>=` in
+    /// `compare` reports `(9, 1)`; swapping `compare`'s loop nesting to y-outer
+    /// reports `(9, 1)` as well.
+    #[test]
+    fn a_tie_reports_the_first_pixel_the_column_major_scan_reaches() {
+        let (w, h) = (16, 8);
+        let cpu = frame(w, h, |_, _| [10, 20, 30]);
+        // `(2, 5)` is first by column; `(9, 1)` is first by row. Same delta.
+        let gl = flipped(w, h, |x, y| {
+            if (x, y) == (2, 5) || (x, y) == (9, 1) {
+                [10, 20, 130]
+            } else {
+                [10, 20, 30]
+            }
+        });
+        let worst = compare(&gl, &cpu, layout(w, h))
+            .worst
+            .expect("two candidates, one report");
+        assert_eq!(worst.delta, 100, "the premise: the two are tied");
+        assert_eq!(
+            (worst.x, worst.y),
+            (2, 5),
+            "column-major reaches (2, 5) first; row-major would say (9, 1), \
+             and `>=` would say (9, 1) too",
         );
     }
 

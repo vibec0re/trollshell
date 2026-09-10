@@ -111,7 +111,7 @@ gtk = { version = "0.11.2", package = "gtk4" }
 # Apache-2.0 with a committed LICENSE; combining it into this MPL-2.0 tree is
 # what MPL-2.0's "Larger Work" clause contemplates, and Apache-2.0's
 # NOTICE-propagation clause doesn't bite (there is no NOTICE file).
-hive-claude = "0.1.0"
+hive-claude = "0.1.1"
 # Already in `Cargo.lock` transitively (via `ureq-proto`), so `hytte-claude-
 # bridge` promoting it to a direct dependency adds no new resolved package —
 # which is precisely why the bridge hand-rolls its one HTTP route instead of

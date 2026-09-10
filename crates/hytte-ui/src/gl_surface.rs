@@ -1266,6 +1266,34 @@ mod imp {
             Ok((window, area, gl))
         }
 
+        /// `real_gl()`, but honours `TROLLSHELL_REQUIRE_GL` the way
+        /// `TROLLSHELL_REQUIRE_ICON_THEME` gates
+        /// `every_icon_name_exists_in_the_adwaita_theme_on_the_search_path`
+        /// (`hytte-plugin-niri-layouts/src/plugin.rs`): a skip is
+        /// indistinguishable from a pass in captured output, so the build that
+        /// means this to gate (CI's `system-tests` check, since #1036) sets
+        /// `TROLLSHELL_REQUIRE_GL=1` and a missing/refused context then
+        /// **fails**, naming the reason `real_gl()` measured, rather than
+        /// skipping quietly. Without it (a bare `cargo test` outside that
+        /// check) it still skips — failing a run that could never have
+        /// answered the question helps nobody.
+        fn real_gl_or_skip(test_name: &str) -> Option<(gtk::Window, gtk::GLArea, hgl::Gl)> {
+            match real_gl() {
+                Ok(live) => Some(live),
+                Err(why) => {
+                    let required =
+                        std::env::var_os("TROLLSHELL_REQUIRE_GL").is_some_and(|want| want == "1");
+                    assert!(
+                        !required,
+                        "TROLLSHELL_REQUIRE_GL=1, but no GL context is available for \
+                         {test_name}: {why}"
+                    );
+                    eprintln!("SKIPPED {test_name}: {why}");
+                    None
+                }
+            }
+        }
+
         /// **#979.** `ensure_resources` must rebuild — not reuse — when the
         /// program changes at a constant grid. Registers two pipelines that
         /// compile a different number of programs, builds `Resources` for the
@@ -1278,14 +1306,10 @@ mod imp {
         /// final assertion goes red, seeing `1` program instead of `2`.
         #[gtk::test]
         fn a_program_change_at_a_constant_grid_rebuilds_resources() {
-            let (_window, _area, gl) = match real_gl() {
-                Ok(live) => live,
-                Err(why) => {
-                    eprintln!(
-                        "skipping a_program_change_at_a_constant_grid_rebuilds_resources: {why}"
-                    );
-                    return;
-                }
+            let Some((_window, _area, gl)) =
+                real_gl_or_skip("a_program_change_at_a_constant_grid_rebuilds_resources")
+            else {
+                return;
             };
 
             let one = GlPipeline {
@@ -1353,12 +1377,10 @@ mod imp {
             // Comfortably over any real driver's GL_MAX_TEXTURE_SIZE.
             const OVER: usize = 100_000;
 
-            let (_window, _area, gl) = match real_gl() {
-                Ok(live) => live,
-                Err(why) => {
-                    eprintln!("skipping a_refused_length_maps_to_its_own_data_failure: {why}");
-                    return;
-                }
+            let Some((_window, _area, gl)) =
+                real_gl_or_skip("a_refused_length_maps_to_its_own_data_failure")
+            else {
+                return;
             };
 
             let pipeline = GlPipeline {
@@ -1434,15 +1456,10 @@ mod imp {
             // current context via `hgl::Gl::current()`, and dropping the
             // handle does not un-current it — `_window`/`_area` are what keep
             // that alive.
-            let (_window, _area, _gl) = match real_gl() {
-                Ok(live) => live,
-                Err(why) => {
-                    eprintln!(
-                        "skipping draw_routes_a_refused_upload_into_its_own_warned_data_latch: \
-                         {why}"
-                    );
-                    return;
-                }
+            let Some((_window, _area, _gl)) =
+                real_gl_or_skip("draw_routes_a_refused_upload_into_its_own_warned_data_latch")
+            else {
+                return;
             };
 
             let pipeline = GlPipeline {

@@ -140,6 +140,12 @@ Beyond the package build's `doCheck`, the flake's `checks` output
   `crates/hytte-ui/src/shader_surface.rs`, so a change to the published uniform
   contract changes what CI validates in the same commit. A plugin's _runtime_
   source is deliberately not validated anywhere; see the trust boundary below.
+- Since #1036, the `system-tests` check's closure carries `mesa` (llvmpipe) and
+  its `preCheck` exports the software-GL env plus `TROLLSHELL_REQUIRE_GL=1`,
+  so the three GL-context tests in `hytte-ui` (`gl_surface.rs`) actually run
+  under a real `GdkGLContext` there instead of skipping — `TROLLSHELL_REQUIRE_GL=1`
+  turns a skip into a failure the way `TROLLSHELL_REQUIRE_ICON_THEME` already
+  does for the icon-theme test above.
 
 ### Lint — strict, treat as the gate
 

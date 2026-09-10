@@ -445,9 +445,18 @@
             // {
               pnameSuffix = "-system-tests";
               cargoArtifacts = trollshell.passthru.cargoArtifacts;
+              # `mesa` (llvmpipe) since #1036: gives the three GL-context
+              # tests in `hytte-ui` (`gl_surface.rs`) a real, software
+              # `GdkGLContext` under `xvfb-run`, so they run instead of
+              # skipping. Verified in the #1036 spike
+              # (https://github.com/vibec0re/trollshell/issues/1036#issuecomment-5620514934):
+              # 51 of `mesa`'s 60 closure paths are already pulled in by
+              # bindgen's clang/llvm dep, so the marginal closure delta is
+              # ~274 MiB, not the full ~1057 MiB `mesa` closure.
               nativeCheckInputs = [
                 pkgs.dbus
                 pkgs.xvfb-run
+                pkgs.mesa
               ];
               doCheck = true;
               # Leaf/terminal check: nothing consumes its target dir. crane
@@ -480,6 +489,22 @@
                 export HOME="$(mktemp -d)"
                 export XDG_DATA_DIRS="${pkgs.adwaita-icon-theme}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
                 export TROLLSHELL_REQUIRE_ICON_THEME=1
+                # llvmpipe (#1036): all four are load-bearing (spike comment
+                # above) — `__EGL_VENDOR_LIBRARY_FILENAMES` especially, since
+                # glvnd's default vendor dirs
+                # (`/usr/share/glvnd/egl_vendor.d`,
+                # `/run/opengl-driver/share/…`) don't exist in the sandbox, so
+                # without it `eglInitialize` finds no vendor and the three
+                # GL-context tests in `hytte-ui` (`gl_surface.rs`) skip.
+                export LIBGL_ALWAYS_SOFTWARE=1
+                export LIBGL_DRIVERS_PATH="${pkgs.mesa}/lib/dri"
+                export LD_LIBRARY_PATH="${pkgs.mesa}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+                export __EGL_VENDOR_LIBRARY_FILENAMES="${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json"
+                # A skip is indistinguishable from a pass in captured output
+                # (same reasoning as `TROLLSHELL_REQUIRE_ICON_THEME` above):
+                # this build means the three tests to run for real, so a
+                # missing/refused GL context must fail the check, not skip it.
+                export TROLLSHELL_REQUIRE_GL=1
               '';
               checkPhaseCargoCommand = ''
                 xvfb-run -a cargo test --workspace --locked --features system-tests

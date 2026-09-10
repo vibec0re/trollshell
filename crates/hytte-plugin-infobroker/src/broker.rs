@@ -881,14 +881,38 @@ fn tracing_eprintln(msg: &str) {
     eprintln!("[infobroker] {msg}");
 }
 
-/// Write one response line (JSON + `\n`) to a client stream, best-effort.
+/// How long [`write_response`] will try to hand a response to a client before
+/// giving up and dropping the connection instead of blocking its caller (and,
+/// since #995, the process-wide [`SOCKET`] guard `serve` holds for its whole
+/// body) forever.
+///
+/// Deliberately shorter than [`REQUEST_TIMEOUT`]: a slow-to-*send* peer might
+/// just be a human on the other end of `nc -U`, but a peer that already has
+/// bytes sitting in its kernel receive buffer and simply never drains them is
+/// unambiguously wedged, not merely slow, so it gets less grace. Response
+/// sizes are far under a UDS socket buffer today (#1004 review, N4), so this
+/// is a backstop against a hostile/broken client, not a knob anyone should
+/// expect to actually hit in production.
+const WRITE_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Write one response line (JSON + `\n`) to a client stream, best-effort —
+/// bounded by [`WRITE_RESPONSE_TIMEOUT`] so a client that connects and never
+/// reads cannot park `serve`'s caller (and the process-wide [`SOCKET`] mutex
+/// it holds) indefinitely.
 async fn write_response(stream: &mut UnixStream, response: &Response) {
     let mut out = encode_response(response);
     out.push('\n');
-    if let Err(e) = stream.write_all(out.as_bytes()).await {
-        tracing_eprintln(&format!("writing response failed: {e}"));
+    let write = async {
+        stream.write_all(out.as_bytes()).await?;
+        stream.flush().await
+    };
+    match tokio::time::timeout(WRITE_RESPONSE_TIMEOUT, write).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing_eprintln(&format!("writing response failed: {e}")),
+        Err(_) => tracing_eprintln(&format!(
+            "writing response timed out after {WRITE_RESPONSE_TIMEOUT:?}; dropping the connection"
+        )),
     }
-    let _ = stream.flush().await;
 }
 
 // ── Consent parking (#487 phase 1b) ───────────────────────────────────────────
@@ -1520,6 +1544,77 @@ mod tests {
         assert!(
             stand_down_once(&latch),
             "a successful bind rearms the line, so a later real duplicate is not silenced",
+        );
+    }
+
+    /// #1024 N3/N4: `write_response` must not park its caller forever when the
+    /// peer never reads. `UnixStream::pair()` gives a connected pair with no
+    /// listener/socket file involved; the response is built oversized on
+    /// purpose (thousands of grant rows — hundreds of KB of JSON) so the
+    /// write genuinely fills the kernel buffer and blocks, rather than landing
+    /// entirely in slack and returning instantly regardless of the bound.
+    ///
+    /// The outer `tokio::time::timeout` turns "the internal bound was deleted"
+    /// into a failing assertion instead of a test binary that hangs forever.
+    ///
+    /// #1024 review New-2: `started` is taken before `write_response`, and
+    /// `encode_response` runs *inside* it (before the write, and before the
+    /// 2 s block can even begin), so the row count feeds this test's upper
+    /// bound too, not just how hard the write blocks. Was `100_000` rows,
+    /// which measured 2.82–3.46 s wall under ~2x CPU oversubscription against
+    /// a 4 s ceiling (`WRITE_RESPONSE_TIMEOUT` + 2 s) — survived 100/100
+    /// whole-binary runs there, but on a margin note, not a repro. `10_000`
+    /// rows (~95 KB, still >2× the default UDS buffers) keeps the write
+    /// genuinely blocking (still RED with the timeout deleted) while cutting
+    /// the encode cost this bound has to absorb.
+    #[tokio::test]
+    async fn write_response_gives_up_on_a_client_that_never_reads() {
+        let (mut server, _client_that_never_reads) =
+            UnixStream::pair().expect("a connected socketpair needs no listener at all");
+
+        let huge = Response {
+            ok: true,
+            grants: Some(
+                (0..10_000)
+                    .map(|i| GrantOut {
+                        agent: format!("agent-{i:06}"),
+                        datasource: "departures".to_owned(),
+                        scope: "*".to_owned(),
+                        decision: "always".to_owned(),
+                    })
+                    .collect(),
+            ),
+            ..Response::default()
+        };
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            WRITE_RESPONSE_TIMEOUT + std::time::Duration::from_secs(5),
+            write_response(&mut server, &huge),
+        )
+        .await
+        .expect(
+            "write_response must give up on its own within its bound, not hang until this \
+             test's outer safety net — RED if the internal timeout is removed",
+        );
+        assert!(
+            started.elapsed() < WRITE_RESPONSE_TIMEOUT + std::time::Duration::from_secs(2),
+            "write_response returned, but not within its own bound (took {:?}) — the write may \
+             not actually have blocked; widen the payload if this becomes flaky",
+            started.elapsed(),
+        );
+        // #1024 review L1: the write is only meaningful proof of the bound if
+        // it actually blocked long enough to hit it. Without this lower
+        // bound, a payload too small to fill the kernel buffer (or the
+        // internal timeout wrapper deleted outright — see mutation E) both
+        // return near-instantly and the test above stays green either way.
+        assert!(
+            started.elapsed() >= WRITE_RESPONSE_TIMEOUT,
+            "write_response returned in {:?}, before its own timeout ({WRITE_RESPONSE_TIMEOUT:?}) \
+             could have fired — the write may never have actually blocked, so this test cannot \
+             tell \"correctly bounded\" from \"never blocked at all\"; widen the payload if this \
+             fires without a mutation",
+            started.elapsed(),
         );
     }
 

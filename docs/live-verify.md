@@ -364,8 +364,8 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       workspace with three tiled columns, click each of the three
       buttons on the bar (`equal` / `golden` / `split`, left to right) and check
       the columns land on the **stated widths**, not merely that they moved —
-      `equal` a third of the screen each, `golden` a first column at **70 %** of
-      the screen with **30 %** ones after it, `split` half the screen each (so
+      `equal` a third of the screen each, `golden` a first column at **75 %** of
+      the screen with **25 %** ones after it, `split` half the screen each (so
       the third scrolls off). Measuring the width is the point: `SetProportion` is a
       percentage, and the pre-review build sent fractions, which niri clamped to
       each window's **minimum width** — every button "resized the columns" while
@@ -375,7 +375,10 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       (golden: a wide area with a narrow right panel), `view-dual-symbolic`
       (split) — and **not** an `image-missing` box, and not the preem LED panels
       #1026 shipped (round 2 replaced those). Hovering a glyph should show its
-      legend, and the golden one should read "first column 70 %, the rest 30 %".
+      legend, and the golden one should read "first column 75 %, the rest 25 %".
+      (**`equal` and `split` are the same plan at exactly two columns** — halves
+      either way; they differ from a third column on. Deliberate, but say so if
+      two identical-looking buttons read badly on glass.)
       **Stacked columns count once:** stack three windows into one
       column beside a single other window and click `split` — you should get
       **two** half-width columns, not four quarter-width ones.
@@ -390,6 +393,17 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       chip. Then `systemctl --user restart niri` (or restart the compositor how
       you normally would) and confirm the chip comes back without restarting the
       plugin, and does not blink off and on if you land on the same workspace.
+      **Restart the shell, not the plugin** (`systemctl --user restart
+    trollshell`) two or three times, then check the plugin's own unit:
+      `systemctl --user status trollshell-plugin-niri-layouts` should still show
+      one process and, if you look, one `niri-layouts-watch` thread — not one per
+      restart (that leak is what #1038's review found). The chip should be back
+      and correct after each restart. With niri unreachable
+      (`env -u NIRI_SOCKET`, or the plugin started before niri) the journal
+      should carry exactly **one** `WARNING: cannot watch niri …` line per
+      outage, saying the chip stays hidden — that line is the only signal that
+      an absent niri, rather than a one-window workspace, is why the chip is
+      gone.
       Known cosmetic residual to look for and report: while hidden, the plugin
       renders an empty tree but the shell still draws its own `.ts-plugin-chip`
       pill, so a few pixels of translucent rounded background may remain where

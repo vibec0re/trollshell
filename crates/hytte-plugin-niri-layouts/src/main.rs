@@ -45,7 +45,7 @@
 //! | layout | proportion per column |
 //! | --- | --- |
 //! | `equal` | `1/n` each (so `n = 1` is full width) |
-//! | `golden` | first `0.7`, **every other one** `0.3` |
+//! | `golden` | first `0.75`, **every other one** `0.25` |
 //! | `split` | `0.5` for every column |
 //!
 //! Those are **fractions**, which is the unit [`layout`] thinks in. niri's
@@ -65,8 +65,9 @@
 //! - **Golden reads as A**: the first column takes its share and every column
 //!   after it takes the narrow one, so a third and later column *scroll off to
 //!   the right* — which is what the issue's `[====] [==] ( .... ) [==]` sketch
-//!   draws. The **shares are 70/30**, not the 61.8/38.2 the first cut derived
-//!   from φ: "Golden: mhm looks off. maybe better `[ ~70% ] [ ~30% ]`".
+//!   draws. The **shares are 75/25**, not the 61.8/38.2 the first cut derived
+//!   from φ and not the 70/30 the round after it carried for a day: "hmm no
+//!   choom was thinking more like 75 : 25 I guess", `[ wide 75% ] [ narrow ]`.
 //!   [`Layout::proportions`](layout::Layout::proportions) is the only place any
 //!   proportion is decided.
 //! - **Three inline glyph buttons** on the chip, not one chip opening a panel.

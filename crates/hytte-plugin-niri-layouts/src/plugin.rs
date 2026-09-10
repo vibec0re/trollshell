@@ -111,7 +111,8 @@ fn layout_for_node(node: &str) -> Option<Layout> {
 /// The name is resolved against the *shell's* `GtkIconTheme`, so an unknown one
 /// renders as `image-missing` rather than failing anything — which is why
 /// [`Layout::icon`]'s three are pinned as literals and checked against the
-/// Adwaita theme on `$XDG_DATA_DIRS` by the tests below.
+/// Adwaita theme on `$XDG_DATA_DIRS` by the tests below, in the devShell and in
+/// the package build's check phase (see that test for where, exactly).
 ///
 /// No `classes`: the glyph inherits the bar's foreground, which is what every
 /// other symbolic in the bar does.
@@ -201,6 +202,25 @@ pub(crate) fn apply_and_report(transport: &mut impl Transport, layout: Layout) -
     }
 }
 
+/// The watcher thread's end of **this session's** message lane.
+///
+/// Both halves of [`watch::Verdicts`] answer the same question — is the
+/// receiver still there — because that is the only shutdown signal the SDK
+/// offers (see [`watch`]'s lifetime docs): `send` answers it as a side effect of
+/// delivering a verdict, `open` answers it while niri is quiet and there is
+/// nothing to deliver.
+struct VisibilityLane(hytte_plugin::tokio::sync::mpsc::UnboundedSender<Msg>);
+
+impl watch::Verdicts for VisibilityLane {
+    fn send(&mut self, visible: bool) -> bool {
+        self.0.send(Msg::Visible(visible)).is_ok()
+    }
+
+    fn open(&self) -> bool {
+        !self.0.is_closed()
+    }
+}
+
 /// The toast a [`Msg::Failed`] becomes.
 fn failure_toast(error: String) -> Effect {
     Effect::Notify {
@@ -236,20 +256,28 @@ impl Plugin for NiriLayouts {
         let (msg_tx, msg_rx) = hytte_plugin::tokio::sync::mpsc::unbounded_channel();
 
         // The visibility watcher (#1019 round 2): its own OS thread, not a
-        // runtime task. `Socket::read_events` hands back a *blocking* closure
-        // that parks until niri says something, which is neither an async task
-        // nor the short burst `spawn_blocking`'s pool is sized for. An
+        // runtime task. The niri event-stream read is blocking std I/O that
+        // parks until niri says something, which is neither an async task nor
+        // the short burst `spawn_blocking`'s pool is sized for. An
         // `UnboundedSender` is `Send`, so it feeds the same message lane the
         // click worker below does.
+        //
+        // **It belongs to this session, not to this process** (#1038 review,
+        // HIGH-2). The SDK calls `sources` from inside `session()`, and
+        // `reconnect_loop` re-enters that after every host `Shutdown` — and the
+        // plugin unit is `PartOf=graphical-session.target`, so `systemctl --user
+        // restart trollshell` reconnects this process rather than restarting it.
+        // A watcher that ran forever would therefore leave one detached thread
+        // and one live niri event stream behind per shell restart. The SDK
+        // offers no cancellation handle to hang the exit off, so the shutdown
+        // signal is this very channel: the runtime owns it for exactly one
+        // session, `VisibilityLane` reports the receiver going away, and
+        // `watch::run` returns on it — within one poll tick, measured by
+        // `sources_spawns_one_watcher_thread_and_it_exits_when_its_session_does`.
         let watch_tx = msg_tx.clone();
         if let Err(e) = std::thread::Builder::new()
             .name("niri-layouts-watch".to_owned())
-            .spawn(move || {
-                watch::run(PLUGIN_ID, |visible| {
-                    // Err only once the session is tearing down.
-                    let _ = watch_tx.send(Msg::Visible(visible));
-                });
-            })
+            .spawn(move || watch::run(PLUGIN_ID, VisibilityLane(watch_tx)))
         {
             // A thread that will not start is not worth killing the session
             // over: the chip simply stays hidden, and the CLI hat is untouched.
@@ -331,14 +359,17 @@ impl Plugin for NiriLayouts {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cmd, Msg, NiriLayouts, apply_and_report, button_id, chip, hidden, icon_id, layout_for_node,
+        Cmd, Msg, NiriLayouts, VisibilityLane, apply_and_report, button_id, chip, hidden, icon_id,
+        layout_for_node,
     };
     use crate::layout::Layout;
     use crate::niri::fake::Fake;
+    use crate::watch::{self, Verdicts};
     use hytte_plugin::proto::{Capability, Effect, EventKind, Mount, Node};
     use hytte_plugin::{CmdReceiver, Input, Plugin, cmd_channel};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     /// The chip's three buttons, in render order, as `(button id, icon node)`.
     fn buttons() -> Vec<(String, Node)> {
@@ -449,13 +480,37 @@ mod tests {
     ///
     /// A name the theme has never heard of does not fail anything at runtime: it
     /// renders as `image-missing`, silently, on Annika's bar. This is the only
-    /// gate between a typo and that. It is deliberately not `#[ignore]`d: it
-    /// runs in the devShell and under `nix flake check`, and skips loudly
-    /// wherever no theme is installed (the crane build's sandbox, say) rather
-    /// than failing a build that could never have answered the question.
+    /// gate between a typo and that.
+    ///
+    /// **Where it actually gates**, corrected (#1038 review, MED-4 — the claim
+    /// here used to be false): the devShell, whose `XDG_DATA_DIRS` carries the
+    /// theme by hand (`nix/devshell.nix`), and the package build's check phase,
+    /// whose `preCheck` now exports the same thing (`nix/package.nix`) — so
+    /// every `nix build .#trollshell` (and every package slice, and `nix flake
+    /// check`, which builds them) runs it for real. nixpkgs puts **no** icon
+    /// theme on a build's `XDG_DATA_DIRS` of its own accord, which is why it was
+    /// silently skipping in both CI paths before. `checks.system-tests` sets its
+    /// own `preCheck` and so still skips it; that is one line in `flake.nix`,
+    /// outside this crate.
+    ///
+    /// A skip is indistinguishable from a pass in captured output, so the build
+    /// that means this to gate says so with `TROLLSHELL_REQUIRE_ICON_THEME=1`
+    /// and a missing theme then **fails** rather than skips. Without it (a bare
+    /// `cargo test` outside the devShell) it still skips: failing a run that
+    /// could never have answered the question helps nobody.
     #[test]
     fn every_icon_name_exists_in_the_adwaita_theme_on_the_search_path() {
+        let required =
+            std::env::var_os("TROLLSHELL_REQUIRE_ICON_THEME").is_some_and(|want| want == "1");
         let Some(names) = adwaita_icon_names() else {
+            assert!(
+                !required,
+                "TROLLSHELL_REQUIRE_ICON_THEME=1, but no icons/Adwaita is on \
+                 $XDG_DATA_DIRS ({:?}) — the build that set that meant to check \
+                 the three icon names for real, so skipping here is itself the \
+                 bug",
+                std::env::var_os("XDG_DATA_DIRS")
+            );
             eprintln!(
                 "SKIPPED: no icons/Adwaita on $XDG_DATA_DIRS — run this inside \
                  the devShell to check the three icon names for real"
@@ -710,6 +765,86 @@ mod tests {
                 summary: "niri layout failed".to_owned(),
                 body: "no such window".to_owned(),
             }]
+        );
+    }
+
+    // ── The watcher's lifetime (#1038 review, HIGH-2) ───────────────────────
+
+    /// Poll `done` until it holds, or fail after five seconds.
+    fn wait_until(mut done: impl FnMut() -> bool, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if done() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("{what}");
+    }
+
+    /// The lane the watcher thread sends on: it carries `Msg::Visible`, and a
+    /// dropped receiver — the end of a session — is reported both ways.
+    #[test]
+    fn the_visibility_lane_carries_verdicts_and_reports_a_dropped_receiver() {
+        let (tx, mut rx) = hytte_plugin::tokio::sync::mpsc::unbounded_channel();
+        let mut lane = VisibilityLane(tx);
+
+        assert!(lane.send(true), "an open lane takes the verdict");
+        assert!(lane.open());
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(Msg::Visible(true)),
+            "…and it arrives as the message `update` folds into `visible`"
+        );
+
+        drop(rx);
+        assert!(
+            !lane.send(false),
+            "a dropped receiver is the shutdown signal `watch::run` returns on"
+        );
+        assert!(
+            !lane.open(),
+            "…and it is legible without having to send anything, which is what a \
+             quiet niri needs"
+        );
+    }
+
+    /// `sources` starts exactly one watcher thread, and that thread **ends with
+    /// its session**.
+    ///
+    /// Both halves matter and both were green under a mutation before this
+    /// existed: deleting the spawn shipped a chip that never appears (the
+    /// review's M17), and the shipped `loop {}` leaked one thread plus one live
+    /// niri event stream per shell restart, since the SDK calls `sources` once
+    /// per *session* and a plugin unit outlives `systemctl --user restart
+    /// trollshell`.
+    ///
+    /// The drop below is exactly what the SDK does: `session()` owns the message
+    /// stream, so it drops when the session ends.
+    #[test]
+    fn sources_spawns_one_watcher_thread_and_it_exits_when_its_session_does() {
+        let rt = hytte_plugin::tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the source tasks");
+        let _entered = rt.enter();
+        let (cmd_tx, cmd_rx) = cmd_channel();
+        let before = watch::live_watchers();
+
+        let stream = NiriLayouts::sources(cmd_rx).expect("this plugin has sources");
+
+        wait_until(
+            || watch::live_watchers() == before + 1,
+            "sources() never started the niri watcher — the chip would never appear",
+        );
+
+        drop(stream);
+        drop(cmd_tx);
+
+        wait_until(
+            || watch::live_watchers() == before,
+            "the watcher thread outlived the session that spawned it — one leaked \
+             thread and one live niri event stream per shell restart",
         );
     }
 

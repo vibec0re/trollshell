@@ -9,22 +9,23 @@
 use niri_ipc::{Window, Workspace};
 use std::collections::BTreeMap;
 
-/// The wide column's share under [`Layout::Golden`] — **70 %**.
+/// The wide column's share under [`Layout::Golden`] — **75 %**.
 ///
 /// Not 1/φ (0.618) any more. The layout keeps the name, but the number is
 /// Annika's, measured on her own glass against the first cut: "Golden: mhm
-/// looks off. maybe better `[ ~70% ] [ ~30% ]`. Typ ratio 0.4" (#1019,
-/// 2026-09-10). 0.618/0.382 left the narrow column too wide to read as a
-/// sidekick; 0.7/0.3 is what she wants, and a *measured* preference beats a
-/// derivation from φ.
-pub(crate) const GOLDEN_MAJOR: f64 = 0.70;
+/// looks off. maybe bettter `[ ~70% ] [ ~30% ]`. Typ ratio 0.4", then, on the
+/// round that carried 70/30 — "hmm no choom was thinking more like 75 : 25 I
+/// guess", `[ wide 75% ] [ narrow ]` (#1019, 2026-09-10). 0.618/0.382 left the
+/// narrow column too wide to read as a sidekick; **0.75/0.25** is the number
+/// she settled on, and a measured preference beats a derivation from φ.
+pub(crate) const GOLDEN_MAJOR: f64 = 0.75;
 
-/// Every other column's share under [`Layout::Golden`] — **30 %**.
+/// Every other column's share under [`Layout::Golden`] — **25 %**.
 ///
 /// Deliberately `1 - GOLDEN_MAJOR` written out rather than computed: the two
 /// are what niri is asked for, and spelling both makes the pair greppable
 /// against the tooltip, the usage text and the wire-byte test that pin them.
-pub(crate) const GOLDEN_MINOR: f64 = 0.30;
+pub(crate) const GOLDEN_MINOR: f64 = 0.25;
 
 /// Every column's share under [`Layout::Split`].
 pub(crate) const SPLIT_SHARE: f64 = 0.5;
@@ -35,10 +36,19 @@ pub(crate) enum Layout {
     /// Every column the same width: `1/n` each (so `n = 1` is a full-width
     /// column).
     Equal,
-    /// The leftmost column wide (70 %), every other one narrow (30 %) — issue
+    /// The leftmost column wide (75 %), every other one narrow (25 %) — issue
     /// #1019's `[========] [====] ( .... ) [====]` sketch.
     Golden,
     /// Every column half the working area, whatever `n` is.
+    ///
+    /// **At two columns this is the same plan as [`Layout::Equal`]** — `[0.5,
+    /// 0.5]`, byte for byte — and two windows is exactly the count the chip
+    /// first appears at (#1038 review, LOW-5). Both buttons stay: the
+    /// coincidence is only at `n = 2`, and they diverge the moment a third
+    /// column opens (`equal` gives thirds, `split` keeps halves and lets the
+    /// third scroll off). The tooltips say what each one does rather than
+    /// claiming they differ; `equal_and_split_coincide_at_two_columns` pins the
+    /// overlap so it is a known property rather than a surprise.
     Split,
 }
 
@@ -101,7 +111,7 @@ impl Layout {
     pub(crate) fn tooltip(self) -> &'static str {
         match self {
             Self::Equal => "Equal columns — every column the same width",
-            Self::Golden => "Golden — first column 70 %, the rest 30 %",
+            Self::Golden => "Golden — first column 75 %, the rest 25 %",
             Self::Split => "Split — every column 50 %",
         }
     }
@@ -109,7 +119,7 @@ impl Layout {
     /// The proportion for each of `columns` columns, left to right.
     ///
     /// **This is the one function to edit** if issue #1019's question 1 is
-    /// answered "B" (the narrow columns *share* the remaining 30 % so
+    /// answered "B" (the narrow columns *share* the remaining 25 % so
     /// everything stays on screen) rather than the "A" reading built here: swap
     /// the `Golden` arm's `GOLDEN_MINOR` for
     /// `GOLDEN_MINOR / (columns - 1) as f64` and nothing else moves — not the
@@ -119,10 +129,10 @@ impl Layout {
     /// nothing).
     ///
     /// **`columns == 1` is deliberately not special-cased.** `Equal` gives a
-    /// lone column the full `1.0`, but `Golden` gives it `0.7` and `Split`
+    /// lone column the full `1.0`, but `Golden` gives it `0.75` and `Split`
     /// gives it `0.5` — i.e. clicking either on a single window *narrows* it.
     /// That is the layouts working, not a bug to round away: each button says
-    /// "make the screen this shape", and pre-setting the main column to 70 %
+    /// "make the screen this shape", and pre-setting the main column to 75 %
     /// (or half) is how you make room for the window you are about to open.
     /// `Split` narrowing a lone window is also literally what #1019 asked for
     /// ("split: all windows have width 50%"). Raised as a NIT on the #1026
@@ -456,8 +466,8 @@ mod tests {
 
     #[test]
     fn golden_is_wide_first_then_narrow_rest() {
-        // Reading A of #1019 question 1: the first column takes 70 % and every
-        // other column takes 30 %, so the tail scrolls off to the right.
+        // Reading A of #1019 question 1: the first column takes 75 % and every
+        // other column takes 25 %, so the tail scrolls off to the right.
         assert_eq!(Layout::Golden.proportions(1), vec![GOLDEN_MAJOR]);
         assert_eq!(
             Layout::Golden.proportions(2),
@@ -540,29 +550,49 @@ mod tests {
     /// back out of [`GOLDEN_MAJOR`] / [`GOLDEN_MINOR`].
     ///
     /// Comparing a constant to itself pins nothing: the 61.8/38.2 this replaced
-    /// would have survived every other test in this file unchanged. 70/30 is
-    /// the number Annika measured on glass (#1019, 2026-09-10), so it is
-    /// written out at both ends. The **wire** unit is pinned separately, in
-    /// `niri`'s byte test — this is the domain fraction only.
+    /// would have survived every other test in this file unchanged, and so
+    /// would the 70/30 that replaced *that* for a day. 75/25 is the number
+    /// Annika settled on ("hmm no choom was thinking more like 75 : 25 I
+    /// guess", #1019, 2026-09-10), so it is written out at both ends. The
+    /// **wire** unit is pinned separately, in `niri`'s byte test — this is the
+    /// domain fraction only.
     #[test]
-    fn golden_is_seventy_thirty_in_fractions() {
+    fn golden_is_seventy_five_twenty_five_in_fractions() {
         assert!(
-            (GOLDEN_MAJOR - 0.7).abs() < f64::EPSILON,
-            "the wide column is 0.7 of the working area, got {GOLDEN_MAJOR}"
+            (GOLDEN_MAJOR - 0.75).abs() < f64::EPSILON,
+            "the wide column is 0.75 of the working area, got {GOLDEN_MAJOR}"
         );
         assert!(
-            (GOLDEN_MINOR - 0.3).abs() < f64::EPSILON,
-            "and every other column 0.3, got {GOLDEN_MINOR}"
+            (GOLDEN_MINOR - 0.25).abs() < f64::EPSILON,
+            "and every other column 0.25, got {GOLDEN_MINOR}"
+        );
+    }
+
+    /// `equal` and `split` are the **same plan** at two columns, which is the
+    /// count the chip first appears at (#1038 review, LOW-5).
+    ///
+    /// Pinned rather than fixed: keeping all three buttons is the call (they
+    /// diverge at three columns, and Annika asked for the chip at more than one
+    /// window, not for three distinct plans at exactly two). This test is here
+    /// so the overlap is a documented property — if a later round wants them to
+    /// differ at `n = 2`, this is the test that says so out loud.
+    #[test]
+    fn equal_and_split_coincide_at_two_columns() {
+        assert_eq!(Layout::Equal.proportions(2), Layout::Split.proportions(2));
+        assert_ne!(
+            Layout::Equal.proportions(3),
+            Layout::Split.proportions(3),
+            "…and only at two: a third column separates them again"
         );
     }
 
     /// The tooltips are the only words the chip has, so they must say the
-    /// numbers the code actually sends — a legend claiming 61.8 % over a 70 %
+    /// numbers the code actually sends — a legend claiming 70 % over a 75 %
     /// layout is worse than none.
     #[test]
     fn every_tooltip_states_its_own_percentages() {
         assert!(
-            Layout::Golden.tooltip().contains("70 %") && Layout::Golden.tooltip().contains("30 %"),
+            Layout::Golden.tooltip().contains("75 %") && Layout::Golden.tooltip().contains("25 %"),
             "got {:?}",
             Layout::Golden.tooltip()
         );

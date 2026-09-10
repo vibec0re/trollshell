@@ -313,8 +313,8 @@ mod tests {
         assert_eq!(applied, 3);
         assert_eq!(
             niri.widths(),
-            vec![(10, 70.0), (20, 30.0), (30, 30.0)],
-            "golden's wide column is 70 % of the working area, not 0.7 %"
+            vec![(10, 75.0), (20, 25.0), (30, 25.0)],
+            "golden's wide column is 75 % of the working area, not 0.75 %"
         );
     }
 
@@ -350,15 +350,15 @@ mod tests {
     /// Golden's two numbers, at the bytes, as literals (#1019 round 2).
     ///
     /// Written out rather than built from `GOLDEN_MAJOR * 100.0` for the reason
-    /// the header above gives, and for a second one: `0.7_f64 * 100.0` is not
-    /// *obviously* `70.0` — it is only exactly 70 because the rounding lands
+    /// the header above gives, and for a second one: `0.75_f64 * 100.0` is not
+    /// *obviously* `75.0` — it is only exactly 75 because the rounding lands
     /// there, and 61.8 stayed `61.8` for the same non-obvious reason. Spelling
     /// the bytes is what proves it rather than assuming it; a change that made
-    /// the product `70.00000000000001` would serialise those digits and fail
+    /// the product `75.00000000000001` would serialise those digits and fail
     /// here, where a `(id, f64)` comparison against the same expression would
     /// not.
     #[test]
-    fn golden_serialises_to_seventy_then_thirty_percent() {
+    fn golden_serialises_to_seventy_five_then_twenty_five_percent() {
         let mut niri = Fake::with(vec![tile(10, 1), tile(20, 2), tile(30, 3)]);
 
         apply(&mut niri, Layout::Golden).expect("the fake answers everything");
@@ -366,15 +366,15 @@ mod tests {
         assert_eq!(
             wire_bytes(&niri),
             vec![
-                r#"{"Action":{"SetWindowWidth":{"id":10,"change":{"SetProportion":70.0}}}}"#
+                r#"{"Action":{"SetWindowWidth":{"id":10,"change":{"SetProportion":75.0}}}}"#
                     .to_owned(),
-                r#"{"Action":{"SetWindowWidth":{"id":20,"change":{"SetProportion":30.0}}}}"#
+                r#"{"Action":{"SetWindowWidth":{"id":20,"change":{"SetProportion":25.0}}}}"#
                     .to_owned(),
-                r#"{"Action":{"SetWindowWidth":{"id":30,"change":{"SetProportion":30.0}}}}"#
+                r#"{"Action":{"SetWindowWidth":{"id":30,"change":{"SetProportion":25.0}}}}"#
                     .to_owned(),
             ],
-            "these are the bytes `niri msg action set-window-width --id N 70%` \
-             (then 30%, then 30%) writes"
+            "these are the bytes `niri msg action set-window-width --id N 75%` \
+             (then 25%, then 25%) writes"
         );
     }
 

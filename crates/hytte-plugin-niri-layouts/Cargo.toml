@@ -31,10 +31,11 @@ hytte-plugin = { path = "../hytte-plugin" }
 # shared with `hytte-services`' shell-side client, which is why #1019 promoted
 # it to `[workspace.dependencies]` (#453); it adds no resolved package.
 niri-ipc.workspace = true
-
-[dev-dependencies]
-# Two tests serialise a `Request` and assert the literal bytes niri's own
-# `niri msg action set-window-width --id N 50%` writes, so the percentage unit
-# is pinned at the wire rather than at a Rust enum (#1026 review, HIGH-1).
-# `niri-ipc` already depends on it, so this adds no resolved package.
+# niri's IPC is one JSON value per line, and `watch.rs` frames the `EventStream`
+# handshake itself rather than through `niri_ipc::socket::Socket` — that type
+# consumes itself into a closure over a private `BufReader`, leaving no way to
+# arm the read timeout the watcher's shutdown path needs (#1038 review, HIGH-2).
+# Also used by the tests that pin the wire bytes as literals (#1026 review,
+# HIGH-1). `niri-ipc` already depends on it, so this adds no resolved package
+# and no `Cargo.lock` line.
 serde_json.workspace = true

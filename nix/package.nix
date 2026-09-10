@@ -307,6 +307,33 @@ let
         done
       '';
 
+      # The check phase's icon-theme environment (#1038 review, MED-4).
+      #
+      # `hytte-plugin-niri-layouts` resolves its three Adwaita symbolic names
+      # against the theme on `$XDG_DATA_DIRS` — the only gate between a typo and
+      # an `image-missing` box on the bar, since a themed icon name is just a
+      # string on the plugin wire and nothing else in the tree ever looks at it.
+      # nixpkgs puts **no** icon theme on a build's `XDG_DATA_DIRS` of its own
+      # accord (measured: it holds one unrelated `patchelf` share and nothing
+      # else), so that test was silently *skipping* here while its doc comment
+      # claimed it gated CI. `adwaita-icon-theme` is already in `buildInputs`
+      # above, so exporting its share costs nothing.
+      #
+      # `TROLLSHELL_REQUIRE_ICON_THEME=1` closes the other half: with it set, a
+      # theme that is still not visible **fails** the test instead of skipping
+      # it, so this env can never rot back into a silent no-op — a skip in
+      # captured `cargo test` output is indistinguishable from a pass.
+      #
+      # Deliberately on this derivation rather than in `commonArgs`: the deps
+      # stage (`buildDepsOnly`) hashes `commonArgs`, and adding an env var there
+      # would invalidate the external-dependency cache for a variable no
+      # dependency reads. `checks.system-tests` (flake.nix) sets its own
+      # `preCheck` and so does not inherit this either way.
+      preCheck = ''
+        export XDG_DATA_DIRS="${adwaita-icon-theme}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+        export TROLLSHELL_REQUIRE_ICON_THEME=1
+      '';
+
       passthru = {
         inherit cargoArtifacts commonArgs;
         devInputs = { inherit nativeBuildInputs buildInputs; };

@@ -672,44 +672,80 @@ mod tests {
     ///
     /// niri opens an `EventStream` with a burst, and between its two halves the
     /// state momentarily reads "zero windows on no workspace". Emitting there is
-    /// what made a reconnect blink; this is the rule that stops it, stated
-    /// on its own rather than only as a side effect of the reconnect test.
+    /// what made a reconnect blink the chip off and back on.
+    ///
+    /// It has to be tested **from a shown chip**, which is the only state where
+    /// the bug is observable: on a *fresh* watch the half-arrived answer
+    /// ("hidden") happens to equal the initial one, so the change-only gate
+    /// masks the missing guard. Measured — a from-`default()` version of this
+    /// test stayed green with `snapshot_complete` deleted, which is what the
+    /// first draft of it did.
     #[test]
     fn half_an_opening_snapshot_emits_nothing_whichever_half_lands_first() {
+        /// A watch that has already shown the chip and then lost its niri.
+        fn reconnecting() -> Watch {
+            let mut watch = Watch::default();
+            observe_all(
+                &mut watch,
+                vec![
+                    workspaces_changed(1),
+                    windows_changed(vec![window(10, Some(1)), window(20, Some(1))]),
+                ],
+            );
+            assert!(watch.visible(), "precondition: the chip is up");
+            watch.forget_compositor_state();
+            watch
+        }
+
         // Workspaces first, windows still to come.
-        let mut watch = Watch::default();
+        let mut watch = reconnecting();
         assert!(
-            observe_all(&mut watch, vec![workspaces_changed(1)]).is_empty(),
-            "no window list yet"
+            observe_all(&mut watch, vec![workspaces_changed(7)]).is_empty(),
+            "no window list yet — claiming 'hidden' here is the blink"
         );
-        assert_eq!(
+        assert!(
             observe_all(
                 &mut watch,
                 vec![windows_changed(vec![
-                    window(10, Some(1)),
-                    window(20, Some(1))
+                    window(70, Some(7)),
+                    window(80, Some(7))
                 ])]
-            ),
-            vec![true],
-            "the snapshot completes and the verdict lands once"
+            )
+            .is_empty(),
+            "and the completed snapshot agrees with what was already shown"
         );
 
         // Windows first, workspaces still to come.
-        let mut watch = Watch::default();
+        let mut watch = reconnecting();
         assert!(
             observe_all(
                 &mut watch,
                 vec![windows_changed(vec![
-                    window(10, Some(1)),
-                    window(20, Some(1))
+                    window(70, Some(7)),
+                    window(80, Some(7))
                 ])]
             )
             .is_empty(),
             "nothing is focused yet, so nothing may be claimed"
         );
+        assert!(
+            observe_all(&mut watch, vec![workspaces_changed(7)]).is_empty(),
+            "same verdict, still nothing to say"
+        );
+
+        // …and the guard only *defers* the answer, it never swallows one: a
+        // snapshot that really did change the verdict still lands.
+        let mut watch = reconnecting();
         assert_eq!(
-            observe_all(&mut watch, vec![workspaces_changed(1)]),
-            vec![true]
+            observe_all(
+                &mut watch,
+                vec![
+                    workspaces_changed(7),
+                    windows_changed(vec![window(70, Some(7))]),
+                ]
+            ),
+            vec![false],
+            "one window on the new snapshot: hide, exactly once"
         );
     }
 

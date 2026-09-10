@@ -596,10 +596,21 @@ mod tests {
 
         let effects = plugin.update(Input::App(Msg::Visible(true)));
         assert!(effects.is_empty(), "visibility is a render, not an effect");
-        assert_eq!(plugin.view().tree, chip(), "two windows: the chip is back");
+        let shown = plugin.view().tree;
+        assert_eq!(shown, chip(), "two windows: the chip is back");
 
         plugin.update(Input::App(Msg::Visible(false)));
-        assert_eq!(plugin.view().tree, hidden(), "back down to one window");
+        let gone = plugin.view().tree;
+        assert_eq!(gone, hidden(), "back down to one window");
+        // Stated against the *other* branch, not only against `hidden()`: with
+        // both sides read out of this module, a `hidden()` that quietly returned
+        // the chip would satisfy every assertion above. Measured — mutating it
+        // that way left this test green until this line was added.
+        assert_ne!(gone, shown, "the two branches must be different trees");
+        let Node::Row { children, .. } = gone else {
+            panic!("still a Row");
+        };
+        assert!(children.is_empty(), "and the hidden one holds no buttons");
     }
 
     /// The chip must survive a failure toast: a niri that refuses an apply says

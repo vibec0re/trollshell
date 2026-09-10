@@ -44,6 +44,32 @@
 //! (#195: the host persists nothing, the plugin's transient UI state is
 //! re-derivable) applied symmetrically to the plugin side.
 //!
+//! # Process shutdown (#1079)
+//!
+//! Don't confuse this with the per-session "Shutdown ≡ disconnect" above,
+//! which the *host* sends and which the runtime answers by redialing —
+//! [`run`] never exits over it. This section is the other lifecycle
+//! entirely: the *process* exiting, which only happens when the launcher
+//! (`systemd-run --user`, `trollshell/src/plugin_launcher.rs`) stops the
+//! plugin's transient unit, sending `SIGTERM` (or `SIGINT` under a manual
+//! `Ctrl-C`).
+//!
+//! [`run`] installs a listener for both signals. On the first one it flips a
+//! shutdown flag; the session loop finishes whatever frame is already in
+//! flight (it does not abort mid-write), then, instead of redialing, calls
+//! [`Plugin::shutdown`] — a bounded chance, not a blocking one, to flush
+//! whatever a plugin persists (a grant store's queued write, a timer's saved
+//! state, a fetch cache): the hook runs under a 2 s inner grace, cut off with
+//! a warning if it overruns, and the process exits 0 either way. A signal
+//! arriving before any session ever connected (still dialing, or sleeping
+//! out the reconnect backoff) skips straight to exit — no session, so no
+//! model to flush and [`sources`](Plugin::sources) is never called. Systemd's
+//! own `TimeoutStopSec` on the unit is the *outer* bound: if a stuck hook (or
+//! a stuck in-flight frame) still hasn't let the process exit by then,
+//! systemd escalates to `SIGKILL`, past anything this runtime can do about
+//! it. A plugin with nothing to flush needs no code at all — the default
+//! [`Plugin::shutdown`] is a no-op, so the process still exits promptly.
+//!
 //! # Self-driven re-renders
 //!
 //! A plugin that re-renders on its own schedule (a timer, an external fetch)
@@ -428,6 +454,7 @@
 //! a blank explicit tooltip **suppresses** the `Text` default rather than
 //! falling back to it — which is what makes it an opt-out rather than a no-op.
 
+use std::future::Future;
 use std::time::Duration;
 
 use hytte_plugin_proto::{
@@ -973,6 +1000,23 @@ pub trait Plugin: Sized {
     /// one `Render` frame. A chip/card-only plugin returns `node.into()`; see
     /// the crate-level *Opening your own panel* section for the paneled shape.
     fn view(&self) -> View;
+
+    /// Flush pending state before the process exits (#1079): called once,
+    /// after the session loop finishes whatever frame was already in flight,
+    /// when [`run`] notices `SIGTERM`/`SIGINT` — see the crate-level
+    /// *Shutdown* section for the full lifecycle and the grace period this
+    /// runs under. The default implementation does nothing, so a plugin with
+    /// no durable state to flush needs no change at all; one that persists
+    /// something (a grant store, a timer's saved state, a fetch cache) awaits
+    /// its own writer here instead of racing the process exit against it.
+    ///
+    /// Written as `-> impl Future` rather than `async fn` so the signature
+    /// carries no implicit `Send`/`Sync` leakage (`clippy`/rustc's
+    /// `async_fn_in_trait` lint) — an ordinary `async fn shutdown(&mut self)
+    /// { … }` body in an implementation still satisfies this.
+    fn shutdown(&mut self) -> impl Future<Output = ()> {
+        async {}
+    }
 }
 
 #[cfg(test)]

@@ -28,6 +28,10 @@ tokio = { workspace = true, default-features = false, features = [
   "io-util",
   "time",
   "sync",
+  # `run`'s SIGTERM/SIGINT listener (#1079) — already enabled workspace-wide
+  # by `hytte-services` (root `Cargo.toml`'s `[workspace.dependencies]`
+  # comment on feature unification), so this adds no new resolved package.
+  "signal",
 ] }
 # `Stream` + `StreamExt::next` for the plugin's own `sources()` messages, and
 # `pending()` to normalize the no-sources case. `time` powers `tick_stream`'s

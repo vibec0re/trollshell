@@ -80,6 +80,19 @@
 //! Measured under llvmpipe on 2026-09-10 (Mesa 26.2.2, GLES 3.2), every one of
 //! the twelve cases came out **bit-exact**: max |Δ| 0 of 255 on R, G and B.
 //! Treat any non-zero number from this harness as real.
+//!
+//! # `TROLLSHELL_PARITY_EXACT` — the 0-pinned assertion (#1080)
+//!
+//! The ceiling (mean ≤ 2 / p99 ≤ 8 / max ≤ 32) exists for driver portability —
+//! it is deliberately loose enough to survive a different GPU's rounding. It
+//! does **not** protect the bit-exactness this file measured under llvmpipe
+//! (#1078's review, INFO-1): a 1–6/255 regression on every channel still
+//! reports `PASS`. With `TROLLSHELL_PARITY_EXACT=1` set, a case that is inside
+//! the ceiling but not bit-exact (`max |Δ| > 0` on any channel) fails anyway,
+//! named `FAIL(exact)`. This is meant for the sandboxed `system-tests` check
+//! (`flake.nix`), where the driver is pinned to Mesa llvmpipe and 0 is the
+//! only value that has ever been measured — it is **not** set when running
+//! this by hand against real glass, where the ceiling is the real contract.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -136,11 +149,18 @@ fn main() -> glib::ExitCode {
         parity::CEILING_P99,
         parity::CEILING_MAX,
     );
+    let exact = parity_exact();
+    if exact {
+        println!(
+            "TROLLSHELL_PARITY_EXACT=1: any case with a non-zero delta on any \
+             channel fails as FAIL(exact), even inside the ceiling above"
+        );
+    }
 
     let app = gtk::Application::builder()
         .application_id("mov.vibec0re.trollshell.preem-gl-diff")
         .build();
-    app.connect_activate(move |app| activate(app, &skins));
+    app.connect_activate(move |app| activate(app, &skins, exact));
     let status = app.run_with_args::<&str>(&[]);
     // **The verdict is ours, not `GApplication`'s.** `run_with_args` returns the
     // application's exit status, which nothing in this program sets, so a
@@ -152,6 +172,15 @@ fn main() -> glib::ExitCode {
         return glib::ExitCode::FAILURE;
     }
     status
+}
+
+/// Whether `TROLLSHELL_PARITY_EXACT=1` is set — see the module docs.
+///
+/// Same convention as `TROLLSHELL_REQUIRE_GL`/`TROLLSHELL_REQUIRE_ICON_THEME`
+/// (`crates/hytte-ui/src/gl_surface.rs`): only the exact string `"1"` turns it
+/// on, so `=0`/`=true`/unset all leave the ceiling as the sole verdict.
+fn parity_exact() -> bool {
+    std::env::var_os("TROLLSHELL_PARITY_EXACT").is_some_and(|want| want == "1")
 }
 
 /// `--skins vfd,lcd,oled,crt` (default: all four).
@@ -237,7 +266,7 @@ fn out_dir() -> std::path::PathBuf {
     )
 }
 
-fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle]) {
+fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
     // The same registration `plugins::install` does in the shell, with the same
     // pipeline constant — the harness drives the shipping pipeline, not a copy.
     hytte::ui::gl_surface::register(program::SCOPE, program::SCOPE_PIPELINE);
@@ -285,6 +314,7 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle]) {
     let runner = Rc::new(Runner {
         cases,
         evidence,
+        exact,
         index: std::cell::Cell::new(0),
         phase: std::cell::Cell::new(0),
         failures: std::cell::Cell::new(0),
@@ -303,6 +333,9 @@ struct Runner {
     cases: Vec<Case>,
     /// Where [`write_evidence`] puts its images.
     evidence: std::path::PathBuf,
+    /// `TROLLSHELL_PARITY_EXACT=1` (see [`parity_exact`]) — read once here so
+    /// every case's [`measure`] call sees the same value.
+    exact: bool,
     /// The case being driven.
     index: std::cell::Cell<usize>,
     /// Which tick within that case — see [`Runner::step`]'s phases.
@@ -353,7 +386,7 @@ impl Runner {
                 let held = self.first.borrow_mut().take();
                 let passed = match (held, capture(area, &label)) {
                     (Some(a), Ok(b)) if a.raw == b.raw && a.alloc == b.alloc => {
-                        measure(case, &b, &self.evidence)
+                        measure(case, &b, &self.evidence, self.exact)
                     }
                     (Some(_), Ok(_)) => {
                         // Two renders of one state disagreed, so whatever the
@@ -514,7 +547,7 @@ fn capture(area: &GlSurface, label: &str) -> Result<Capture, String> {
 /// Build the CPU reference, compare, print the per-channel deltas and the
 /// worst pixel, and write the evidence images. Returns whether the case passed
 /// — see [`parity::Verdict`] for the five ways it can fail.
-fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path) -> bool {
+fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool) -> bool {
     let label = label(case);
 
     // The CPU reference: the same batches through the kit.
@@ -590,7 +623,29 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path) -> bool {
     print_regions(&deltas, &reference);
     write_evidence(evidence, &label, shot, layout, &reference, &deltas);
 
-    verdict.is_pass()
+    // #1080's 0-pinned assertion (#1078 review, INFO-1): the ceiling is loose
+    // on purpose, for a driver this harness has never measured. Under
+    // llvmpipe every case has come out bit-exact, so with
+    // `TROLLSHELL_PARITY_EXACT=1` a case that clears the ceiling but is not
+    // bit-exact is *still* a failure — named separately from `verdict`'s own
+    // labels so a transcript can tell "outside the ceiling" from "inside the
+    // ceiling, but not the zero this sandbox is pinned to" at a glance. `max
+    // == 0.0` on every channel is equivalent to "every compared pixel had
+    // `|Δ| == 0`", since mean/p99 are drawn from that same non-negative
+    // distribution and cannot exceed its max.
+    let bit_exact = stats.channels.iter().all(|c| c.max == 0.0);
+    if exact && verdict.is_pass() && !bit_exact {
+        println!(
+            "FAIL(exact) {label}: TROLLSHELL_PARITY_EXACT=1 — inside the ceiling \
+             but not bit-exact (worst channel mean {:.3} p99 {:.0} max {:.0} of \
+             255), and llvmpipe has never measured anything but 0",
+            stats.worst_mean(),
+            stats.worst_p99(),
+            stats.worst_max(),
+        );
+    }
+
+    verdict.is_pass() && (!exact || bit_exact)
 }
 
 /// The classification aid, and the reason a transcript from this harness can be

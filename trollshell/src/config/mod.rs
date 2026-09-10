@@ -33,6 +33,48 @@
 //! `$XDG_STATE_HOME` ([`hytte_config::state`]) and is written by the shell,
 //! never by hand. `core-leds.toml` is pure config: no state, no secret.
 //!
+//! # How the next subsystem is declared (the pilot's shape, in ten steps)
+//!
+//! `core_leds.rs` is the worked example for every step below; read it
+//! alongside this list rather than instead of it (#1040 fix round 4 F4).
+//!
+//! 1. `pub mod <name>;` here; one file `config/<name>.rs`.
+//! 2. `struct <Name>Config` — **every field a raw `toml::Value`**,
+//!    `#[serde(default)]` on the *container*, and a hand-written `Default`
+//!    pinned equal to `DEFAULT_TOML`. Anything narrower — a `String`
+//!    included — hands the verdict to serde, and serde's verdict is
+//!    whole-file (#1040 T1).
+//! 3. `impl Subsystem`: `NAME` (kebab-case — the *config file's* stem,
+//!    `core-leds.toml`, not the `.rs` module's), a **commented**
+//!    `DEFAULT_TOML` (the only place a key is documented until nix renders a
+//!    base file), and `type Error = Infallible` unless the keys genuinely
+//!    constrain each other — `CoreLedsConfig::validate`'s doc shows how a
+//!    cross-key rule composes without a second parser.
+//! 4. One `const Knob` per migrated variable: `Knob::same(var, key, accepts)`,
+//!    or the four-field form where the file spelling and the variable
+//!    spelling differ.
+//! 5. `fn parsed(&self) -> (Resolved, Vec<InvalidValue>)` — the **single**
+//!    judge (`Resolved` is the subsystem's own resolved-value type;
+//!    `core_leds`'s is `CoreLeds`): `spelling()` per key, `keep()` per key,
+//!    and no `?`, so a bad key costs its own key and nothing else.
+//! 6. `fn resolve(layered, lookup, announce)` — one `env_key` call per knob,
+//!    so a set variable wins and announces once and an unusable one costs
+//!    exactly one line. `lookup` is injected: `std::env::set_var` is
+//!    `unsafe` and this workspace forbids `unsafe_code`, so nothing else
+//!    could drive it in a test anyway.
+//! 7. `fn boot(paths, lookup)` — `Watcher::stamping_before(paths,
+//!    initial_load)`, then one `Deprecations::Announce` resolution. The
+//!    process's only load; the stamp-before-load order lives in the
+//!    constructor so no call site can get it wrong.
+//! 8. `impl Service` — `start` calls `boot`, then `spawn_supervised` over
+//!    `watch`. Hold `paths`/`lookup`/`interval` as fields on the `Service`
+//!    struct itself, so `start` is what a test drives rather than a replica
+//!    of it.
+//! 9. `.with(config::<name>::service())` in `main.rs`, plus a `signal()`
+//!    accessor that `.expect()`s the registration.
+//! 10. A `docs/live-verify.md` block: none of the reload behaviour is
+//!     verifiable on CI.
+//!
 //! # The deprecation window
 //!
 //! #866 settled three steps, and the pilot is step 2 for its four variables:

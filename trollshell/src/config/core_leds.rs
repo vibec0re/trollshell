@@ -527,10 +527,14 @@ impl InvalidValue {
     /// `toml::Value`'s `Display` *is* the TOML rendering — so the line quotes
     /// back what the file holds, whether the mistake was a wrong word
     /// (`style = "plasma"`) or a wrong type (`style = 5`). It is the
-    /// **canonical** rendering rather than the source bytes, which shows on
-    /// two shapes: a hex integer comes back decimal (`0xff0000` → `16711680`)
-    /// and a date comes back quoted. Both are pinned in
-    /// `a_wrong_typed_value_is_a_per_key_rejection_too`. The environment path
+    /// **canonical** rendering rather than the source bytes, which shows on a
+    /// hex integer: it comes back decimal (`0xff0000` → `16711680`), pinned in
+    /// `a_wrong_typed_value_is_a_per_key_rejection_too`. A TOML date comes
+    /// back quoted too, but that is **not** `Display`'s doing —
+    /// `toml::Value::Datetime`'s own `Display` is unquoted, measured — it is
+    /// `assemble`'s `IntoDeserializer` round-trip that erases the date to a
+    /// `String` before this constructor ever sees it (#1040 fix round 4 F3;
+    /// see `a_toml_date_arrives_as_a_string_not_a_datetime`). The environment path
     /// never produces an [`InvalidValue`] at all: an unusable
     /// variable gets [`crate::config::warn_unusable_env`], which quotes with
     /// backticks because a shell variable is not TOML either.
@@ -1229,6 +1233,52 @@ mod tests {
         assert_eq!(back.config, CoreLedsConfig::default());
     }
 
+    /// A table-valued key is a per-key rejection on the way **in** (#1040
+    /// T1) — and on the way back **out**, today, it costs that key its
+    /// documented comment block: `subsystem::patch` promotes a table `want`
+    /// to a standard `[key]` table, which drops the key's prefix decor.
+    /// Nothing saves a `CoreLedsConfig` yet; #888's forms will.
+    ///
+    /// **Pinned as it behaves, not as it should** — this is #1040 fix round
+    /// 4's F2, and the real fix is `hytte_config`'s (#1044/#888): `patch`
+    /// should write a table `want` over a non-table `have` as an inline
+    /// value in place, preserving decor and position, the way it already
+    /// renders a `toml::Value::Table` as an `InlineTable`
+    /// (`subsystem.rs:681-687`). **Delete this test the day that lands** —
+    /// it goes red the moment the comment count stops dropping.
+    #[test]
+    fn a_table_valued_key_loads_per_key_but_loses_its_comments_on_save_today() {
+        let comments = |s: &str| s.lines().filter(|l| l.starts_with('#')).count();
+
+        let loaded = subsystem::assemble::<CoreLedsConfig>(&[(
+            PathBuf::from("/o.toml"),
+            "color = { r = 255, g = 0, b = 0 }\nstyle = \"crt\"\n".into(),
+        )])
+        .expect("a table-valued key must not be a whole-file failure");
+        assert_eq!(applied(&loaded.config).style, DisplayStyle::Crt);
+        let saved = subsystem::render_overlay(CoreLedsConfig::DEFAULT_TOML, &loaded.config)
+            .expect("renders");
+        assert_eq!(
+            (comments(CoreLedsConfig::DEFAULT_TOML), comments(&saved)),
+            (36, 29),
+            "a table-valued key costs its comment block on save, today"
+        );
+
+        // The control, so this cannot go green by the writer breaking outright.
+        let scalar = subsystem::assemble::<CoreLedsConfig>(&[(
+            PathBuf::from("/o.toml"),
+            "color = 0xff0000\nstyle = \"crt\"\n".into(),
+        )])
+        .expect("loads");
+        let kept = subsystem::render_overlay(CoreLedsConfig::DEFAULT_TOML, &scalar.config)
+            .expect("renders");
+        assert_eq!(
+            comments(&kept),
+            36,
+            "a scalar of the wrong type keeps every comment"
+        );
+    }
+
     // ── The two spellings agree ─────────────────────────────────────────────
 
     /// Every value the knobs accept, in both spellings, and every value they
@@ -1655,13 +1705,20 @@ mod tests {
     ///
     /// A `String` field was not enough, which is the template point worth
     /// copying: a `String` *is* the raw spelling, and serde still rejects every
-    /// non-string value against it. `toml::Value` is the only field type that
-    /// accepts every shape a TOML file can put there — including the
-    /// datetime, which is the one TOML type no amount of scalar-shaped
-    /// `#[serde(untagged)]` catch-all deserializes reliably.
+    /// non-string value against it. `toml::Value` is the field type to reach
+    /// for **not** because a hand-written `#[serde(untagged)]` catch-all
+    /// cannot be made to accept every shape — measured (#1040 fix round 4
+    /// F3), it can, datetime included, once it goes through the same
+    /// `IntoDeserializer` round-trip `assemble` uses — but because
+    /// `toml::Value` is strictly more general and leaves serde nothing to
+    /// judge: one type, not an enum whose variant order some future TOML
+    /// shape could still pick wrong.
     ///
     /// The `color = 0xff0000` row is the realistic one: a hex colour *is* a
-    /// number, and TOML takes `0x…` as an integer.
+    /// number, and TOML takes `0x…` as an integer. The `color = 1979-05-27`
+    /// row is the one to read carefully — see
+    /// `a_toml_date_arrives_as_a_string_not_a_datetime` for why it applies as
+    /// the *string* `"1979-05-27"`, not a `toml::Value::Datetime`.
     ///
     /// **Red if any schema field narrows to a concrete type** — `style: String`
     /// alone turns the first three rows back into whole-file failures.
@@ -1707,12 +1764,15 @@ mod tests {
             (
                 "color = 1979-05-27\nstyle = \"crt\"\n",
                 crt,
-                // A TOML date deserializes into the field like anything else —
-                // the point of the row — though `toml`'s own value `Display`
-                // renders it quoted, i.e. as the string it is not. Pinned as it
-                // behaves rather than wished into shape: the reader still sees
-                // the value they typed, and the alternative is this crate
-                // second-guessing `toml`'s rendering for one exotic type.
+                // Not `Display` quoting a date (`toml::Value::Datetime`'s own
+                // `Display` is unquoted, measured) — it is `assemble`'s
+                // `IntoDeserializer` round-trip that erases the date to a
+                // `String` before `parsed()` ever runs, so the field holds
+                // the *string* `"1979-05-27"` by the time this constructor
+                // sees it (#1040 fix round 4 F3). Pinned as it behaves rather
+                // than wished into shape:
+                // `a_toml_date_arrives_as_a_string_not_a_datetime` names the
+                // mechanism, and the reader still sees the value they typed.
                 InvalidValue::written(&COLOR, "\"1979-05-27\""),
             ),
         ] {
@@ -1735,6 +1795,52 @@ mod tests {
                  serde message about a type"
             );
         }
+    }
+
+    /// A TOML **date** does not reach a `toml::Value` field as a date
+    /// (#1040 fix round 4 F3): `assemble`'s `IntoDeserializer` round-trip
+    /// erases it to a `String` before [`CoreLedsConfig::parsed`] ever runs.
+    /// `toml::Value::Datetime`'s own `Display` is *unquoted* — measured below
+    /// — so the quoting in `a_wrong_typed_value_is_a_per_key_rejection_too`'s
+    /// date row is the string's, not `Display`'s.
+    ///
+    /// Inert here — nothing in this schema takes a date — but a family #2
+    /// with a genuine date key inherits the erasure, including a save that
+    /// writes `key = "2026-01-01"` where the file said `key = 2026-01-01`,
+    /// until #1044 fixes it.
+    ///
+    /// **Red if the erasure is ever closed** (e.g. `assemble` switches to a
+    /// deserializer that preserves `toml::Value::Datetime` through the merge)
+    /// — which is the day this test, and the doc sentences it backs, should
+    /// be deleted rather than "fixed".
+    #[test]
+    fn a_toml_date_arrives_as_a_string_not_a_datetime() {
+        let raw: toml::Table = "color = 1979-05-27\n".parse().expect("parses");
+        assert!(
+            matches!(raw.get("color"), Some(toml::Value::Datetime(_))),
+            "the file holds a date"
+        );
+        assert_eq!(
+            toml::Value::Datetime("1979-05-27".parse().expect("valid date")).to_string(),
+            "1979-05-27",
+            "toml::Value::Datetime's own Display is unquoted"
+        );
+
+        let loaded = subsystem::assemble::<CoreLedsConfig>(&[(
+            PathBuf::from("/o.toml"),
+            "color = 1979-05-27\nstyle = \"crt\"\n".into(),
+        )])
+        .expect("a date must not be a whole-file failure");
+        assert_eq!(
+            only_rejection(&loaded.config),
+            InvalidValue::written(&COLOR, "\"1979-05-27\""),
+            "the erasure happened before this constructor ever ran"
+        );
+        assert_eq!(
+            applied(&loaded.config).style,
+            DisplayStyle::Crt,
+            "live control: the key beside it survived"
+        );
     }
 
     /// The residual whole-file cases, **tested rather than pretended away**:
@@ -1810,6 +1916,52 @@ mod tests {
             ColorMap::Heat,
             "and a key no file states comes from DEFAULT_TOML"
         );
+    }
+
+    /// `_unset = ["style"]` is advertised at `DEFAULT_TOML`'s own top comment
+    /// and by #868's merge rule 1 erases whatever a lower layer set — never
+    /// exercised by a test on this schema until now (#1040 fix round 4 nit).
+    ///
+    /// Three shapes: alone, beside a sibling key that *is* set in the same
+    /// layer, and over a base layer that set the erased key — in every case
+    /// the key falls to `CoreLedsConfig`'s own `Default`, not to
+    /// `toml::Value`'s (which has none), and with **zero** rejections and
+    /// **zero** unknown keys, since `_unset` is a merge-time marker stripped
+    /// before the schema ever sees the table.
+    #[test]
+    fn unset_erases_the_inherited_key_and_falls_to_the_built_in_default() {
+        let alone = subsystem::assemble::<CoreLedsConfig>(&[(
+            PathBuf::from("/o.toml"),
+            "_unset = [\"style\"]\n".into(),
+        )])
+        .expect("assembles");
+        assert_eq!(applied(&alone.config).style, DisplayStyle::Vfd);
+        assert_eq!(applied(&alone.config).color, ColorMap::Heat);
+        assert!(alone.unknown_keys.is_empty());
+        assert!(rejections(&alone.config).is_empty());
+
+        let beside = subsystem::assemble::<CoreLedsConfig>(&[(
+            PathBuf::from("/o.toml"),
+            "_unset = [\"style\"]\ncolor = \"rainbow\"\n".into(),
+        )])
+        .expect("assembles");
+        assert_eq!(applied(&beside.config).style, DisplayStyle::Vfd);
+        assert_eq!(applied(&beside.config).color, ColorMap::Rainbow);
+        assert!(beside.unknown_keys.is_empty());
+        assert!(rejections(&beside.config).is_empty());
+
+        let over_base = subsystem::assemble::<CoreLedsConfig>(&[
+            (PathBuf::from("/base.toml"), "style = \"crt\"\n".into()),
+            (PathBuf::from("/overlay.toml"), "_unset = [\"style\"]\n".into()),
+        ])
+        .expect("assembles");
+        assert_eq!(
+            applied(&over_base.config).style,
+            DisplayStyle::Vfd,
+            "erases the base layer's value too, not just DEFAULT_TOML's"
+        );
+        assert!(over_base.unknown_keys.is_empty());
+        assert!(rejections(&over_base.config).is_empty());
     }
 
     /// `#rrggbb`: with or without the hash, either case, and nothing else — a

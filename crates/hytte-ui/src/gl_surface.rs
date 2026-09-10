@@ -1942,7 +1942,10 @@ mod tests {
         // `WARNED_LENGTHS` further distinct lengths evict `a` from the FIFO.
         for n in 0..WARNED_LENGTHS {
             let key = (200_000 + n) as u64;
-            assert!(latch.claim(key), "each new distinct length is reported once");
+            assert!(
+                latch.claim(key),
+                "each new distinct length is reported once"
+            );
         }
 
         assert!(

@@ -1158,8 +1158,7 @@ mod tests {
         Arc, COMPILE_FAILURE_REFUSED, DATA_UPLOAD_REFUSED, ProgramCache,
         RESOURCES_ALLOCATION_REFUSED, RefCell, SHADER_PREAMBLE, SHADER_VERT, ShaderFormat,
         ShaderState, TIME_WRAP_SECS, WARNED_SOURCES, WarnLatch, data_key, first_line, hgl,
-        refuse_data_strip, source_key, warn_on_data_upload_failure, would_upload,
-        wrapped_seconds,
+        refuse_data_strip, source_key, warn_on_data_upload_failure, would_upload, wrapped_seconds,
     };
 
     /// A counting builder, standing in for `hgl::Program::compile`. The cache is

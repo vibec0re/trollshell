@@ -78,7 +78,13 @@ pub trait Conversation {
 /// The subscription path: a persisted, title-addressed `hive-claude` session.
 #[derive(Debug)]
 pub struct Subscription {
-    config: Config,
+    /// Boxed because `hive-claude` 0.1.1 added a `Config::env` field (#1054),
+    /// which pushed `Backend::Subscription(Subscription)` over
+    /// `clippy::large_enum_variant`'s threshold against `Backend::Reprompt`'s
+    /// far smaller variant — the same class of growth `Engine::Cli` below was
+    /// already boxed against for `hive-claude` 0.1.0. One `Subscription`
+    /// exists per process, so the indirection costs nothing that matters.
+    config: Box<Config>,
     /// Serialises same-title turns (#693).
     ///
     /// Claude Code does **not** serialise two concurrent `--resume`s of one
@@ -95,7 +101,7 @@ impl Subscription {
     #[must_use]
     pub fn new(config: Config) -> Self {
         Self {
-            config,
+            config: Box::new(config),
             turns: TitleLocks::default(),
         }
     }

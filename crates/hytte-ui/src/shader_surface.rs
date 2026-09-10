@@ -307,24 +307,32 @@ fn data_upload_key(state: &ShaderState) -> u64 {
     )
 }
 
-/// Claim `latch` and log [`DATA_UPLOAD_REFUSED`] if `result` is an `Err`,
-/// keyed by `state`'s shape via [`data_upload_key`]. Returns whether the
-/// caller should skip the rest of this frame (always `true` on `Err`).
+/// Claim `latch` for `state`'s shape (via [`data_upload_key`]) and log
+/// [`DATA_UPLOAD_REFUSED`] once — the whole reporting half of a refused data
+/// upload, in one function a test can drive with no GL context (PR #1031
+/// review M2).
 ///
-/// Split out of `draw` so the composition — "`draw`'s `Err` actually reaches
-/// `warned_data` and a real journal line" — is itself covered by a test that
-/// needs no GL context (PR #1031 review M2): the driver refusal itself
-/// still needs real GL (`upload_data` calling `hgl::Texture::new`), but
-/// everything downstream of that `Result` does not, and `hgl::Error` is
-/// plain data a test can construct by hand.
+/// **Its only production caller is `imp::upload_data`'s own refusal arm, and
+/// it neither takes a `Result` nor returns a "skip" flag any more** (PR
+/// #1031 review H1). Both were degrees of freedom at `draw`'s call site, and
+/// the second-pass review measured what they cost: re-swallowing the error
+/// there — #1020's shipped silence, restored in one line — left `cargo
+/// test`, the `system-tests` bucket and `clippy -D warnings` all green,
+/// because the only test that observes that line needs a live driver and so
+/// runs nowhere. The seam was removed rather than tested: `upload_data`
+/// takes the latch, reports for itself, and hands back the texture to sample
+/// — `None` when there is none — which turns the caller's skip into a
+/// `let … else` the compiler enforces instead of a `return` that can be
+/// dropped (round 2's L2, #968 review L7).
+///
+/// `hgl::Error` is plain data a test can construct by hand; only *producing*
+/// a genuine refusal — `hgl::Texture::new` really turning a grid down — needs
+/// real GL.
 fn warn_on_data_upload_failure(
     latch: &RefCell<WarnLatch>,
     state: &ShaderState,
-    result: Result<(), hgl::Error>,
-) -> bool {
-    let Err(error) = result else {
-        return false;
-    };
+    error: &hgl::Error,
+) {
     if latch.borrow_mut().claim(data_upload_key(state)) {
         tracing::warn!(
             %error,
@@ -334,7 +342,6 @@ fn warn_on_data_upload_failure(
             DATA_UPLOAD_REFUSED
         );
     }
-    true
 }
 
 /// The compiled-program cache: **one** program, keyed by its source.
@@ -772,13 +779,21 @@ mod imp {
             // used to be indistinguishable, from outside the process, from a
             // shader that draws black: no error, no line, every frame, for the
             // life of the surface.
-            if warn_on_data_upload_failure(
-                &self.warned_data,
+            //
+            // The latch goes *in* and the texture to sample comes back, so
+            // this arm has no `Result` to swallow and no `return` to forget:
+            // on a refusal there is nothing to bind and the `else` has to
+            // diverge (PR #1031 review H1/L2).
+            let Some(data) = upload_data(
+                &gl,
+                data,
+                data_shape,
+                data_source,
                 &state,
-                upload_data(&gl, data, data_shape, data_source, &state),
-            ) {
+                &self.warned_data,
+            ) else {
                 return;
-            }
+            };
 
             let Some(viewport) = self.narrow_to_fit_rect(&gl) else {
                 return;
@@ -900,15 +915,25 @@ mod imp {
     /// `Resources`, so the compiled program borrowed out of the same struct
     /// stays live across it — see the destructuring in `draw`.
     ///
-    /// `Err` means **skip this frame**, and carries why so the caller can put
-    /// it in the journal once (#977); `Ok` means the texture matches `state`.
-    fn upload_data(
+    /// Returns **the texture to sample**, or `None` if the driver refused the
+    /// (re)allocation and this frame must be skipped — in which case the
+    /// refusal has already been latched and logged, once per shape, through
+    /// [`super::warn_on_data_upload_failure`] (#977, #1023 item 1).
+    ///
+    /// **Handing the texture back rather than an `Ok`/`Err` is the point**
+    /// (PR #1031 review H1/L2): the caller cannot draw without the return
+    /// value, so it cannot forget the skip, and taking `warned` as a
+    /// parameter leaves it no error to swallow. Both of those were one-line
+    /// mutations at `draw`'s call site that the entire gate stack passed,
+    /// because that line needs a live driver to reach.
+    fn upload_data<'t>(
         gl: &hgl::Gl,
-        data: &mut hgl::Texture,
+        data: &'t mut hgl::Texture,
         data_shape: &mut (u32, u32, super::ShaderFormat),
         data_source: &mut Option<Arc<[u8]>>,
         state: &ShaderState,
-    ) -> Result<(), hgl::Error> {
+        warned: &RefCell<WarnLatch>,
+    ) -> Option<&'t hgl::Texture> {
         let (w, h) = (state.data_size.0.max(1), state.data_size.1.max(1));
         let shape = (w, h, state.format);
         if *data_shape != shape {
@@ -938,9 +963,13 @@ mod imp {
                     // (`hytte-gl`'s `checked_extent` tests), the host-side
                     // refusal that stops most such grids ever arriving
                     // (`shader_map`'s per-axis cap), and this function's dedup
-                    // (`would_upload`'s own test).
+                    // (`would_upload`'s own test). What *is* structural since
+                    // PR #1031 review H1 is that the caller cannot ignore
+                    // this: it gets `None`, not an `Err` it may drop, and it
+                    // needs the texture this returns in order to draw at all.
                     *data_source = None;
-                    return Err(error);
+                    warn_on_data_upload_failure(warned, state, &error);
+                    return None;
                 }
             };
             *data = texture;
@@ -952,7 +981,7 @@ mod imp {
         // mapping pass this could never fire, and the whole data texture went to
         // the GPU on every render even when the bytes had not moved.
         if !would_upload(data_source.as_ref(), &state.data) {
-            return Ok(());
+            return Some(data);
         }
         match state.format {
             super::ShaderFormat::R8 | super::ShaderFormat::Rgba8 => {
@@ -972,7 +1001,7 @@ mod imp {
             }
         }
         *data_source = Some(Arc::clone(&state.data));
-        Ok(())
+        Some(data)
     }
 }
 
@@ -1703,13 +1732,20 @@ mod tests {
     /// A local twin of `gl_surface::tests::counting_events` /
     /// `shader_map::tests::counting_events` — see either's longer doc for
     /// why `tracing_core`'s per-callsite, process-wide `Interest` cache
-    /// makes this necessary at all. No warm-up phase: nothing else in this
-    /// crate's test suite reaches `hytte_ui::shader_surface`'s
-    /// `tracing::warn!` callsites (`draw` is the only production caller,
-    /// and no test — hermetic or `system-tests`-gated — drives `draw`
-    /// itself; every existing test here reaches the extracted pure
-    /// functions directly), so there is no sibling test that could win the
-    /// race to register one first.
+    /// makes this necessary at all.
+    ///
+    /// **The warm-up is unconditional, not conditional on today's test
+    /// roster** (PR #1031 review M1). It is true *right now* that nothing
+    /// else in this crate's suite reaches `hytte_ui::shader_surface`'s
+    /// `tracing::warn!` callsites — `draw` is their only production caller
+    /// and no test drives it, since this file has no `imp::tests`. That is
+    /// exactly the argument `gl_surface`'s twin made one round ago, and the
+    /// same round invalidated it by adding a `#[gtk::test]` that drives
+    /// `draw` on any machine with a driver: a subscriber-less first hit
+    /// caches `Interest::never()` for the callsite process-wide and blanks
+    /// the count here with `left: 0, right: 2` (#991/#1014/#1022). The
+    /// warm-up costs three lines and one silent `warn!`, and it makes the
+    /// helper correct regardless of what the next test in this file does.
     fn counting_events(emit: impl FnOnce()) -> u32 {
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1733,6 +1769,18 @@ mod tests {
             fn enter(&self, _: &tracing::Id) {}
             fn exit(&self, _: &tracing::Id) {}
         }
+
+        // Warm-up: register this module's `warn!` callsites while no
+        // subscriber is installed, so the `Dispatch::new` below rebuilds
+        // their `Interest` against the counting one. See this function's doc.
+        warn_on_data_upload_failure(
+            &RefCell::new(WarnLatch::default()),
+            &state_with_data_size((0, 0)),
+            &hgl::Error::TextureSize {
+                size: (0, 0),
+                limit: 0,
+            },
+        );
 
         let count = StdArc::new(AtomicU32::new(0));
         tracing::subscriber::with_default(Counting(StdArc::clone(&count)), emit);
@@ -1760,15 +1808,18 @@ mod tests {
     ///
     /// `hgl::Error` is constructed by hand rather than through a real
     /// `Texture::new` refusal — the driver-refusal case itself still needs
-    /// real GL, but everything downstream of that `Result`, which is what
-    /// item 1 actually fixed, does not, and this test needs no feature gate
-    /// and no display to run.
+    /// real GL, but everything downstream of it, which is what item 1
+    /// actually fixed, does not, and this test needs no feature gate and no
+    /// display to run. Since the second fix round (review H1) this *is* the
+    /// whole reporting half: `upload_data` calls this and returns `None`, so
+    /// there is no `Result` and no skip-flag left at `draw`'s call site for
+    /// a one-line mutation to drop.
     ///
     /// **Falsified** by replacing [`data_upload_key`]'s body with a
     /// constant (PR #1031 review's own mutation, translated to this now-
     /// hoisted site — the original was `let key = 0_u64;` inline at the old
     /// call site): the "a different shape must cost its own line" count
-    /// drops from 2 to 1.
+    /// drops from 2 to 1. Also red on emptying this function's body.
     #[test]
     fn a_data_upload_failure_reaches_the_widgets_own_latch_and_journal_line() {
         let latch = RefCell::new(WarnLatch::default());
@@ -1780,25 +1831,23 @@ mod tests {
         };
 
         let emitted = counting_events(|| {
-            assert!(
-                warn_on_data_upload_failure(&latch, &base, Err(err())),
-                "an Err must signal skip-this-frame",
-            );
-            assert!(
-                warn_on_data_upload_failure(&latch, &base, Err(err())),
-                "…still signals skip on a repeat, even while the line itself is silenced",
-            );
-            assert!(warn_on_data_upload_failure(&latch, &different, Err(err())));
-            assert!(
-                !warn_on_data_upload_failure(&latch, &base, Ok(())),
-                "the happy path must never signal skip, and must never warn",
-            );
+            warn_on_data_upload_failure(&latch, &base, &err());
+            // A repeat of the SAME shape must not re-warn…
+            warn_on_data_upload_failure(&latch, &base, &err());
+            // …while a DIFFERENT one still earns its own line.
+            warn_on_data_upload_failure(&latch, &different, &err());
         });
         assert_eq!(
             emitted, 2,
             "a repeated refusal of the same shape must cost one journal line; a DIFFERENT \
              refused shape must cost its own (#1023 item 1; PR #1031 review M2 — this drives \
-             the composition draw() actually calls, not data_key/WarnLatch in isolation)",
+             the composition upload_data actually calls, not data_key/WarnLatch in isolation)",
+        );
+        assert_eq!(
+            latch.borrow().said.len(),
+            2,
+            "…and both shapes are latched, keyed by data_upload_key, so a later repeat of \
+             either stays quiet",
         );
     }
 }

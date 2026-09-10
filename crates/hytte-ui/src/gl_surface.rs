@@ -300,8 +300,9 @@ thread_local! {
 ///
 /// Call once per program at host startup, on the GTK main thread, before any
 /// [`Node::GlSurface`](crate::widget_tree::Node::GlSurface) naming it is
-/// reconciled. A surface whose program is unregistered draws nothing and says
-/// so once, rather than failing the render.
+/// reconciled. A surface whose program is unregistered keeps whatever it last
+/// successfully drew and says so once (see [`PROGRAM_UNREGISTERED_REFUSED`]),
+/// rather than failing the render.
 pub fn register(program: GlProgram, pipeline: GlPipeline) {
     PROGRAMS.with_borrow_mut(|programs| programs.insert(program, pipeline));
 }
@@ -519,27 +520,34 @@ struct DataFailure {
     len: u32,
 }
 
-/// Claim `latch` and log a refused data-strip allocation, if `result` is an
-/// `Err` — the whole body of `imp::GlSurface::draw`'s data-upload arm,
-/// hoisted out so the composition **"`draw`'s `Err` actually reaches
-/// `warned_data` and a real journal line"** is itself covered by a test that
-/// needs no GL context (PR #1031 review M3).
+/// Claim `latch` for `failure`'s length and log it once — the whole
+/// reporting half of a refused data-strip (re)allocation, in one function a
+/// test can drive with no GL context (PR #1031 review M3).
 ///
-/// Before this, two things stood between the fix and its test: the
-/// GL-gated test built its own throwaway `WarnLatch` instead of driving the
-/// widget's own `warned_data`, and neither test observed `draw`'s call site
-/// at all — re-swallowing the `Err` there (`let _ =
-/// resources.upload_data(…);`, deleting this whole block) left the suite
-/// green. `DataFailure` is plain data, so a test can construct one by hand
-/// and call this function directly; only *producing* a genuine one — proving
-/// `Texture::new` really refuses an over-limit allocation — still needs a
-/// live driver (`imp::tests::a_refused_length_maps_to_its_own_data_failure`,
+/// **Its only production caller is
+/// [`imp::Resources::upload_data`](imp)'s own refusal arm**, which is the
+/// point: the second-pass review (PR #1031 review H1) measured that while
+/// `upload_data` handed a `Result` *back to `draw`*, the shipped bug could be
+/// reinstated in one line at that call site — `let _ =
+/// resources.upload_data(…);` — with `cargo test`, the `system-tests`
+/// bucket and `clippy -D warnings` all green, because the only test that
+/// observed the call site needs a live driver and therefore runs nowhere.
+/// So the seam was removed rather than tested: `upload_data` takes the latch
+/// and reports for itself, `draw` gets no `Result`, and there is no longer a
+/// spelling of "drop the error" available at the call site (remedy (a) of
+/// that finding). What is left at the call site is *which* latch is passed,
+/// and passing anything but the widget's own `warned_data` makes that field
+/// unread — `dead_code`, which is a `-D warnings` gate.
+///
+/// `DataFailure` is plain data, so a test constructs one by hand and calls
+/// this function with exactly the arguments the refusal arm passes; only
+/// *producing* a genuine one — proving `Texture::new` really refuses an
+/// over-limit allocation, and that `upload_data` routes it here — still needs
+/// a live driver (`imp::tests::a_refused_length_maps_to_its_own_data_failure`,
 /// gated on `system-tests`).
-fn warn_on_data_failure(latch: &RefCell<WarnLatch>, result: Result<(), DataFailure>) {
-    let Err(DataFailure { error, len }) = result else {
-        return;
-    };
-    if latch.borrow_mut().claim(u64::from(len)) {
+fn warn_on_data_failure(latch: &RefCell<WarnLatch>, failure: &DataFailure) {
+    let DataFailure { error, len } = failure;
+    if latch.borrow_mut().claim(u64::from(*len)) {
         tracing::warn!(%error, len, "{}", DATA_STRIP_REFUSED);
     }
 }
@@ -560,11 +568,34 @@ const DATA_STRIP_REFUSED: &str = "a GL surface's data strip could not be (re)all
     frame's data upload is skipped and the strip reads as empty (u_data_len = 0) until a length \
     this driver will take arrives (further occurrences of this length are silenced)";
 
+/// The line an unregistered program name writes to the journal.
+///
+/// Says the surface **keeps whatever it last successfully drew**, not that it
+/// "draws nothing" (PR #1031 review L1, the `gl_surface` half of round 1's
+/// L2): this is an early return out of `draw`, and the only thing that clears
+/// is `Resources::run`'s [`GlTarget::Screen`] arm — *"GTK does not clear for
+/// us"* — which this arm never reaches. A surface that drew fine and is then
+/// re-pointed by `set_state` at a name no host registered keeps the old
+/// picture frozen on screen; saying it "draws nothing" sends a reader looking
+/// for a blank rect that is not there.
+const PROGRAM_UNREGISTERED_REFUSED: &str = "no GL pipeline registered under that name; the \
+    surface keeps whatever it last successfully drew (nothing, before the first successful \
+    frame)";
+
+/// The line a pipeline that will not build writes to the journal.
+///
+/// Same reasoning as [`PROGRAM_UNREGISTERED_REFUSED`]: `ensure_resources`
+/// returns `false`, `draw` gives up on that, and neither reaches a clear.
+const PIPELINE_BUILD_REFUSED: &str = "a GL pipeline could not be built; the surface keeps \
+    whatever it last successfully drew (nothing, before the first successful frame) (further \
+    occurrences are silenced)";
+
 mod imp {
     use super::{
         DataFailure, GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline, GlProgram,
-        GlTarget, GlUniforms, GlValue, PROGRAMS, SAMPLER_NAMES, WarnLatch, abandon_gl, fit_rect,
-        fresh_last_drawn, gdk, glib, resources_reusable, steps_owed, warn_on_data_failure,
+        GlTarget, GlUniforms, GlValue, PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED,
+        PROGRAMS, SAMPLER_NAMES, WarnLatch, abandon_gl, fit_rect, fresh_last_drawn, gdk, glib,
+        resources_reusable, steps_owed, warn_on_data_failure,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
@@ -753,10 +784,7 @@ mod imp {
             let Some(pipeline) = PROGRAMS.with_borrow(|programs| programs.get(&program).copied())
             else {
                 if !self.warned_unregistered.replace(true) {
-                    tracing::warn!(
-                        program = program.0,
-                        "no GL pipeline registered under that name; the surface draws nothing"
-                    );
+                    tracing::warn!(program = program.0, "{}", PROGRAM_UNREGISTERED_REFUSED);
                 }
                 return;
             };
@@ -779,10 +807,13 @@ mod imp {
             let Some(resources) = held.as_mut() else {
                 return;
             };
-            warn_on_data_failure(
-                &self.warned_data,
-                resources.upload_data(&gl, state.data.as_ref()),
-            );
+            // The latch goes *in*; nothing comes back. `upload_data` used to
+            // hand its `Result` up to here, and re-swallowing it at this one
+            // line reinstated the shipped bug with every gate green (PR #1031
+            // review H1) — the only test that observes this line needs a live
+            // driver and runs in no environment this repo has. There is now
+            // no `Result` here to drop; see `warn_on_data_failure`.
+            resources.upload_data(&gl, state.data.as_ref(), &self.warned_data);
 
             // The idempotence rule, decided by `steps_owed` — see there.
             let (steps, reset) = steps_owed(self.last_drawn.get(), state.step_seq);
@@ -835,11 +866,7 @@ mod imp {
                 }
                 Err(error) => {
                     if !self.warned_build.replace(true) {
-                        tracing::warn!(
-                            %error,
-                            "a GL pipeline could not be built; the surface draws nothing \
-                             (further occurrences are silenced)"
-                        );
+                        tracing::warn!(%error, "{}", PIPELINE_BUILD_REFUSED);
                     }
                     self.resources.replace(None);
                     false
@@ -915,31 +942,43 @@ mod imp {
         }
 
         /// Re-upload the data strip if it is not the allocation we already
-        /// hold.
+        /// hold, reporting a driver refusal into `warned` on the way out
+        /// (#1023 item 3).
         ///
-        /// # Errors
+        /// **`warned` is a parameter, and there is no `Result`, deliberately**
+        /// (PR #1031 review H1). This used to return
+        /// `Result<(), DataFailure>` for `draw` to route into the widget's
+        /// `warned_data`; that call site is unreachable without a live GL
+        /// driver, so every gate this repository runs stayed green when the
+        /// error was re-swallowed there — the exact bug #1023 item 3 fixed.
+        /// Taking the latch instead removes the seam rather than testing it:
+        /// the refusal arm below is the only place the `Err` exists, and it
+        /// hands it straight to [`super::warn_on_data_failure`], which has its
+        /// own hermetic test.
         ///
-        /// [`DataFailure`] if the driver refused the (re)allocation (#1023
-        /// item 3) — `self.data_len` is reset to `0` first, so the next call
-        /// retries rather than sampling a texture whose shape does not match
-        /// what `data_len` claims (the same discipline
-        /// `shader_surface::upload_data` follows for its own retry).
+        /// On a refusal `self.data_len` is reset to `0` first, so the next
+        /// call retries rather than sampling a texture whose shape does not
+        /// match what `data_len` claims (the same discipline
+        /// `shader_surface::upload_data` follows for its own retry), and the
+        /// frame is still drawn — with `u_data_len = 0`, which is the
+        /// documented meaning of "no data".
         fn upload_data(
             &mut self,
             gl: &hgl::Gl,
             data: Option<&Arc<[f32]>>,
-        ) -> Result<(), DataFailure> {
+            warned: &RefCell<WarnLatch>,
+        ) {
             let Some(data) = data else {
                 self.data_source = None;
                 self.data_len = 0;
-                return Ok(());
+                return;
             };
             if self
                 .data_source
                 .as_ref()
                 .is_some_and(|held| Arc::ptr_eq(held, data))
             {
-                return Ok(());
+                return;
             }
             let len = u32::try_from(data.len()).unwrap_or(u32::MAX).max(1);
             if len != self.data_len.max(1) || self.data_len == 0 {
@@ -948,7 +987,8 @@ mod imp {
                     Err(error) => {
                         self.data_source = None;
                         self.data_len = 0;
-                        return Err(DataFailure { error, len });
+                        warn_on_data_failure(warned, &DataFailure { error, len });
+                        return;
                     }
                 };
                 self.data = texture;
@@ -956,7 +996,6 @@ mod imp {
             self.data.upload_f32(gl, data);
             self.data_len = u32::try_from(data.len()).unwrap_or(u32::MAX);
             self.data_source = Some(Arc::clone(data));
-            Ok(())
         }
 
         /// Run one pass with the program compiled for it.
@@ -1122,8 +1161,8 @@ mod imp {
     #[cfg(all(test, feature = "system-tests"))]
     mod tests {
         use super::{
-            Arc, DataFailure, GlBlend, GlDraw, GlPass, GlPipeline, GlProgram, GlSurface, GlTarget,
-            GlUniforms, PROGRAMS, Resources, gdk, hgl,
+            Arc, GlBlend, GlDraw, GlPass, GlPipeline, GlProgram, GlSurface, GlTarget, GlUniforms,
+            PROGRAMS, RefCell, Resources, WarnLatch, gdk, hgl,
         };
         use gtk::prelude::*;
 
@@ -1232,16 +1271,19 @@ mod imp {
             );
         }
 
-        /// **#1023 item 3 / PR #1031 review M3.** `Resources::upload_data`
-        /// maps a driver-refused allocation to `Err(DataFailure)` carrying
-        /// the length that failed — the one half of the fix that genuinely
-        /// needs a live driver. The other half — that `draw()`'s caller
-        /// turns that `Err` into a latched journal line through the
-        /// widget's own `warned_data` — is covered hermetically, with no GL
-        /// context at all, by `warn_on_data_failure`'s own test in this
+        /// **#1023 item 3 / PR #1031 review M3+H1.** `Resources::upload_data`
+        /// routes a driver-refused allocation into the latch it was handed,
+        /// keyed by the length that failed — the one half of the fix that
+        /// genuinely needs a live driver. The other half — that a refusal
+        /// becomes a latched journal line — is covered hermetically, with no
+        /// GL context at all, by `warn_on_data_failure`'s own test in this
         /// file's outer `#[cfg(test)] mod tests`: this test's job is only to
-        /// prove the `Result` this function hands that one is the real
-        /// thing.
+        /// prove that a real driver refusal reaches it.
+        ///
+        /// Asserts on the **latch**, not on a returned `Result`: since PR
+        /// #1031's second fix round `upload_data` takes the latch and reports
+        /// for itself, precisely so `draw` cannot drop an error it is never
+        /// handed (review H1).
         ///
         /// A length far over any real `GL_MAX_TEXTURE_SIZE` (the GLES 3.x
         /// floor is 2048; even a high-end desktop part tops out at 16384 or
@@ -1251,8 +1293,10 @@ mod imp {
         /// separation `hytte_gl::checked_extent`'s own hermetic tests rely
         /// on.
         ///
-        /// **Falsified** by reverting `Resources::upload_data` to swallow the
-        /// error (no `Result`): both assertions below panic on `Ok`.
+        /// **Falsified** by deleting the `warn_on_data_failure` call from
+        /// `upload_data`'s refusal arm: the latch claims nothing and both
+        /// assertions below go red. (That is the one mutation left in this
+        /// path that the hermetic suite cannot see — it needs this driver.)
         #[gtk::test]
         fn a_refused_length_maps_to_its_own_data_failure() {
             // Comfortably over any real driver's GL_MAX_TEXTURE_SIZE.
@@ -1276,39 +1320,49 @@ mod imp {
             let mut resources = Resources::build(&gl, &pipeline, program, (4, 4))
                 .expect("a small grid always builds");
 
-            let a: Arc<[f32]> = Arc::from(vec![0.0_f32; OVER]);
-            match resources.upload_data(&gl, Some(&a)) {
-                Err(DataFailure { len, .. }) => {
-                    assert_eq!(len, u32::try_from(OVER).unwrap(), "the length that failed");
-                }
-                Ok(()) => panic!("a {OVER}-texel strip must be refused on any real driver"),
-            }
+            let warned = RefCell::new(WarnLatch::default());
 
-            // A second, DIFFERENT over-limit length maps to ITS OWN length —
-            // not a stale one left over from the first refusal.
+            let a: Arc<[f32]> = Arc::from(vec![0.0_f32; OVER]);
+            resources.upload_data(&gl, Some(&a), &warned);
+            assert_eq!(
+                warned.borrow().said.iter().copied().collect::<Vec<_>>(),
+                vec![u64::try_from(OVER).unwrap()],
+                "a {OVER}-texel strip must be refused on any real driver, and the refusal must \
+                 be latched under the length that failed",
+            );
+
+            // A second, DIFFERENT over-limit length is latched under ITS OWN
+            // length — not swallowed by the first refusal, and not a stale
+            // one left over from it.
             let b: Arc<[f32]> = Arc::from(vec![0.0_f32; OVER + 1]);
-            match resources.upload_data(&gl, Some(&b)) {
-                Err(DataFailure { len, .. }) => {
-                    assert_eq!(
-                        len,
-                        u32::try_from(OVER + 1).unwrap(),
-                        "the length that failed"
-                    );
-                }
-                Ok(()) => panic!("a {} -texel strip must be refused too", OVER + 1),
-            }
+            resources.upload_data(&gl, Some(&b), &warned);
+            assert_eq!(
+                warned.borrow().said.iter().copied().collect::<Vec<_>>(),
+                vec![
+                    u64::try_from(OVER).unwrap(),
+                    u64::try_from(OVER + 1).unwrap()
+                ],
+                "a second, differently sized refusal must earn its own latch slot",
+            );
         }
 
-        /// **PR #1031 review M3, closing the residual gap.** Neither
+        /// **PR #1031 review M3/H1.** Neither
         /// `a_refused_length_maps_to_its_own_data_failure` above (drives
-        /// `Resources::upload_data` directly) nor
+        /// `Resources::upload_data` directly, with a latch of its own) nor
         /// `warn_on_data_failure_reaches_the_latch_and_warns_once_per_length`
         /// (hermetic, drives `warn_on_data_failure` directly) observes
-        /// `draw`'s own call site — the exact gap the review's mutation 6
-        /// exploited (`let _ = resources.upload_data(…);`, deleting the
-        /// whole logging call). This one does: it drives `draw()` itself
-        /// through `set_state`, with a real driver-refused grid, and reads
-        /// the result back out of the widget's **own** `warned_data` field.
+        /// `draw`'s own call site — that it passes the widget's **own**
+        /// `warned_data` and not some other latch. This one does: it drives
+        /// `draw()` itself through `set_state`, with a real driver-refused
+        /// grid, and reads the result back out of that field.
+        ///
+        /// It is *not* what stops the shipped bug coming back: this test
+        /// needs a live driver and therefore runs in no environment this
+        /// repository has (review H1 measured that), so the call site was
+        /// restructured until the bug had no spelling left there — see
+        /// [`super::warn_on_data_failure`]. This test is the belt to that
+        /// structural brace, and earns its keep the day a mesa-bearing
+        /// `system-tests` closure lands.
         ///
         /// `draw()` is called directly on a bare `imp::GlSurface::default()`
         /// (never through `render`/a mapped `GtkGLArea`) — safe here because
@@ -1317,10 +1371,11 @@ mod imp {
         /// `Resources::run`, for each step/frame pass) is never reached; the
         /// data-upload block runs and returns well before that loop.
         ///
-        /// **Falsified** (PR #1031 review, mutation 6) by reverting `draw`'s
-        /// call site to `let _ = resources.upload_data(&gl,
-        /// state.data.as_ref());`: `warned_data` never claims anything and
-        /// the length assertion below goes red.
+        /// **Falsified** by handing `upload_data` a throwaway latch at
+        /// `draw`'s call site instead of `&self.warned_data`: the assertion
+        /// below goes red. (`dead_code` on the then-unread field catches that
+        /// same mutation without a driver, which is why the structural fix is
+        /// the load-bearing one.)
         #[gtk::test]
         fn draw_routes_a_refused_upload_into_its_own_warned_data_latch() {
             const OVER: usize = 100_000;
@@ -1433,8 +1488,8 @@ impl Default for GlSurface {
 mod tests {
     use super::{
         DATA_STRIP_REFUSED, DataFailure, GlProgram, GlUniforms, GlValue, MAX_STEPS_PER_RENDER,
-        WarnLatch, abandon_gl, fit_rect, fresh_last_drawn, gl_abandoned, hgl, resources_reusable,
-        steps_owed, warn_on_data_failure,
+        PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED, WarnLatch, abandon_gl, fit_rect,
+        fresh_last_drawn, gl_abandoned, hgl, resources_reusable, steps_owed, warn_on_data_failure,
     };
     use std::cell::RefCell;
     use std::sync::Arc;
@@ -1669,14 +1724,30 @@ mod tests {
     /// decided by whichever thread reaches it first — the same reason
     /// `shader_map::tests::counting_events` (`trollshell`) exists in the
     /// longer form; this crate cannot depend on that one, so it is
-    /// duplicated rather than shared. No warm-up phase here: nothing else in
-    /// this crate's test suite reaches `hytte_ui::gl_surface`'s
-    /// `tracing::warn!` callsites (the only other consumer,
-    /// `imp::tests::a_refused_length_maps_to_its_own_data_failure`, is a
-    /// separate, `system-tests`-gated binary target and asserts on
-    /// `Resources::upload_data`'s return value directly, never reaching
-    /// `warn_on_data_failure` at all) — so there is no sibling test that
-    /// could register this callsite's `Interest` first.
+    /// duplicated rather than shared.
+    ///
+    /// **The warm-up below is load-bearing, and the reason it is here is a
+    /// correction** (PR #1031 review M1). The first version of this helper
+    /// skipped it, arguing that `imp::tests` is "a separate,
+    /// `system-tests`-gated binary target" that "never reaches
+    /// `warn_on_data_failure`". Both halves were false: `mod imp { … #[cfg]
+    /// mod tests … }` compiles into this crate's *one* lib-test binary (182
+    /// tests under `--features system-tests`, 83 without — same target), and
+    /// `imp::tests::draw_routes_a_refused_upload_into_its_own_warned_data_latch`
+    /// drives `draw`, which on any machine with a GL driver reaches
+    /// [`warn_on_data_failure`]'s `warn!` **with no subscriber installed**,
+    /// on the GTK test thread. A subscriber-less first hit caches
+    /// `Interest::never()` for that callsite process-wide
+    /// (`tracing_core::callsite::register` → `Rebuilder::JustOne` →
+    /// `dispatcher::get_default` on the registering thread), which would
+    /// blank this helper's count with `left: 0, right: 2` — #991/#1014/#1022,
+    /// a flake this repository has already paid for four times, and one that
+    /// would fire on a developer's glass and never in CI.
+    ///
+    /// So: touch the callsites *before* `with_default` installs the
+    /// subscriber, so its `Dispatch::new` rebuilds their `Interest` against
+    /// it. Costs one silent `warn!` per call and needs no discipline from any
+    /// other test.
     fn counting_events(emit: impl FnOnce()) -> u32 {
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1701,30 +1772,45 @@ mod tests {
             fn exit(&self, _: &tracing::Id) {}
         }
 
+        // Warm-up: register this module's `warn!` callsites while no
+        // subscriber is installed, so the `Dispatch::new` below rebuilds
+        // their `Interest` against the counting one. See this function's doc.
+        warn_on_data_failure(
+            &RefCell::new(WarnLatch::default()),
+            &DataFailure {
+                error: hgl::Error::TextureSize {
+                    size: (0, 0),
+                    limit: 0,
+                },
+                len: u32::MAX,
+            },
+        );
+
         let count = StdArc::new(AtomicU32::new(0));
         tracing::subscriber::with_default(Counting(StdArc::clone(&count)), emit);
         count.load(Ordering::Relaxed)
     }
 
-    /// **PR #1031 review M3.** The refusal reaches `warned_data` and a real
-    /// journal line — through [`warn_on_data_failure`], the exact function
-    /// `imp::GlSurface::draw` calls, not a standalone `WarnLatch` built
-    /// alongside it for the test's own convenience.
+    /// **PR #1031 review M3/H1.** A refusal reaches the latch **and** a real
+    /// journal line — through [`warn_on_data_failure`], with exactly the
+    /// arguments `Resources::upload_data`'s refusal arm passes it
+    /// (`&self.warned_data`-shaped latch, `&DataFailure { error, len }`), not
+    /// a `WarnLatch` driven bare for the test's own convenience.
     ///
-    /// `DataFailure` is constructed by hand rather than through a real
-    /// `Texture::new` refusal: the driver-refusal case itself still needs
-    /// real GL (`imp::tests::a_refused_length_maps_to_its_own_data_failure`,
-    /// gated on `system-tests` + a live driver, which this sandbox does not
-    /// have) — but everything downstream of that `Result`, which is what
-    /// item 3 actually fixed, does not, and this test needs no feature gate
-    /// and no display to run.
+    /// Since the second fix round this *is* the whole reporting half:
+    /// `upload_data` takes the latch and calls this, `draw` is handed no
+    /// `Result`, and the one-line re-swallow the review found at that call
+    /// site no longer type-checks. `DataFailure` is constructed by hand
+    /// rather than through a real `Texture::new` refusal — producing a
+    /// genuine one still needs real GL
+    /// (`imp::tests::a_refused_length_maps_to_its_own_data_failure`, gated on
+    /// `system-tests` + a live driver, which this sandbox does not have) —
+    /// but everything downstream of it, which is what item 3 actually fixed,
+    /// does not.
     ///
-    /// **Falsified** (PR #1031 review, mutation 6) by re-swallowing the
-    /// error at `draw`'s call site instead of calling this function (`let _
-    /// = resources.upload_data(…);`, deleting the whole
-    /// `warn_on_data_failure` call): the review measured the prior version
-    /// of this test staying green under exactly that mutation, because it
-    /// drove a fresh local `WarnLatch` the mutated call site never touches.
+    /// **Falsified** by emptying this function's body (`let _ = (latch,
+    /// failure);`): `left: 0, right: 2`. Also red under a one-slot
+    /// `WarnLatch`, and under a latch keyed by anything but the length.
     #[test]
     fn warn_on_data_failure_reaches_the_latch_and_warns_once_per_length() {
         let latch = RefCell::new(WarnLatch::default());
@@ -1737,19 +1823,51 @@ mod tests {
         };
 
         let emitted = counting_events(|| {
-            warn_on_data_failure(&latch, Err(refusal(100_000)));
+            warn_on_data_failure(&latch, &refusal(100_000));
             // A repeat of the SAME length must not re-warn.
-            warn_on_data_failure(&latch, Err(refusal(100_000)));
+            warn_on_data_failure(&latch, &refusal(100_000));
             // A DIFFERENT length must still get its own line.
-            warn_on_data_failure(&latch, Err(refusal(100_001)));
-            // The happy path must never warn at all.
-            warn_on_data_failure(&latch, Ok(()));
+            warn_on_data_failure(&latch, &refusal(100_001));
         });
         assert_eq!(
             emitted, 2,
             "a repeated refusal of the same length must cost one journal line; a different \
-             refused length must cost its own; a success must cost none",
+             refused length must cost its own",
         );
+        assert_eq!(
+            latch.borrow().said.iter().copied().collect::<Vec<_>>(),
+            vec![100_000_u64, 100_001_u64],
+            "…and each is latched under the length that failed, so a later repeat stays quiet",
+        );
+    }
+
+    /// **PR #1031 review L1** (round 1's L2, the `gl_surface` half). Neither
+    /// of `draw`'s early-return arms may claim the surface "draws nothing":
+    /// the only clear in this module is `Resources::run`'s
+    /// `GlTarget::Screen` arm, and neither arm reaches it, so what is really
+    /// on screen is the last good frame.
+    ///
+    /// [`DATA_STRIP_REFUSED`] is deliberately **not** in this list: that path
+    /// does not return, the frame is drawn, and its own test asserts it says
+    /// so (`u_data_len = 0`). Between the two files this PR edits there are
+    /// five such messages; `shader_surface`'s
+    /// `none_of_draws_three_early_return_messages_claim_the_widget_draws_nothing`
+    /// pins the other three.
+    ///
+    /// **Falsified** by reverting either const to #1020's wording.
+    #[test]
+    fn neither_early_return_message_claims_the_surface_draws_nothing() {
+        for msg in [PROGRAM_UNREGISTERED_REFUSED, PIPELINE_BUILD_REFUSED] {
+            assert!(
+                !msg.contains("draws nothing"),
+                "an early return out of draw() leaves the last frame up, so no such message may \
+                 claim the surface draws nothing (PR #1031 review L1): {msg:?}",
+            );
+            assert!(
+                msg.contains("keeps whatever it last successfully drew"),
+                "…and each should say what actually happens instead: {msg:?}",
+            );
+        }
     }
 
     /// **PR #1031 review L3.** The data-strip refusal message says the

@@ -7,6 +7,7 @@
 mod assets;
 mod commands;
 mod components;
+mod config;
 mod control;
 mod fullscreen;
 mod modal;
@@ -123,6 +124,13 @@ fn main() -> hytte::ui::Result<()> {
     hytte::reactive::install_panic_hook();
 
     App::new("mov.vibec0re.trollshell")
+        // The config-file layering's first live subsystem (#869, phase 1 of
+        // #866): `core-leds.toml` dresses the Stats drawer's per-core LED
+        // panel, layered nix-base → overlay → documented default, with the
+        // four `TROLLSHELL_CORE_LEDS_*` variables still winning (and warning
+        // once each) for the deprecation window. Polls its layers' mtimes, so
+        // an edit re-skins the panel with the shell up.
+        .with(config::core_leds::service())
         .with(clock::service())
         .with(wifiscan::service())
         // wifiscan + geoclue feed `places` (the location resolver); `places`

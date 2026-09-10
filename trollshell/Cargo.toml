@@ -24,6 +24,15 @@ system-tests = []
 anyhow.workspace = true
 chrono.workspace = true
 hytte = { path = "../crates/hytte" }
+# The config-file layering (#866/#868), for `src/config/` — the XDG search
+# path, the four merge rules and the `Subsystem` reader/validator/writer.
+# `hytte-config` is the GTK-free leaf `hytte-services` and the control-center
+# already share (#640); linking it here adds no new resolved package, since
+# `hytte` pulls it in through `hytte-services` already. It is deliberately
+# *not* reached through a `hytte` re-export: the umbrella re-exports the four
+# runtime crates, and this is a leaf both the shell and a settings app link
+# directly.
+hytte-config = { path = "../crates/hytte-config" }
 # Plugin host transport (#35 PR 2): the GTK-free wire protocol + its tokio
 # framing helpers. GTK/adw/futures-signals still go through `hytte`'s
 # re-exports; tokio + the proto crate aren't re-exported, so they're direct.
@@ -61,6 +70,12 @@ tokio = { workspace = true, features = [
 # ownership goes through `hytte_bus::own_name`, never a raw zbus connection —
 # same version/features as hytte-services' dep.
 zbus.workspace = true
+# Every `core-leds.toml` schema field is a raw `toml::Value`, so serde can
+# never reject a known key's value — a wrong type is a per-key rejection that
+# quotes the value back, not a whole-file failure (#1040 V9/T1). No new
+# resolved package: `hytte-config` already links it, and every layer this crate
+# reads went through `toml` on the way in.
+toml.workspace = true
 tracing.workspace = true
 # Workspace `tracing-subscriber` sets `default-features = false` (what
 # hytte-services' dev-dependency needs); widen back to the full default set

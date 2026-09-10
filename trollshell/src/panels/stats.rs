@@ -33,6 +33,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use hytte::adw::{self, prelude::*};
+use hytte::futures_signals::map_ref;
 use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self, gio, glib};
 use hytte::prelude::*;
@@ -41,7 +42,7 @@ use hytte::services::app_usage::{self, ProcSample};
 use hytte::services::sensors::{self, CpuFreq, CpuLoad};
 use hytte::services::systemd;
 use hytte::ui::{MultiSparkline, PixelSurface};
-use hytte_preem::{ColorMap, DisplayStyle, Fill, LedMatrix};
+use hytte_preem::LedMatrix;
 
 use crate::components::cast;
 use crate::components::format::{fmt_bytes, fmt_hz, fmt_rate};
@@ -52,6 +53,7 @@ use crate::components::layout::{
 use crate::components::markup;
 use crate::components::monitor_key::monitor_key;
 use crate::components::reactive_list::reactive_list;
+use crate::config::core_leds::{self, CoreLeds};
 
 /// One card in the combined Stats page (#516). Named after the resource chip
 /// that scrolls to it, in the same top-to-bottom order [`panel_stats`] stacks
@@ -922,179 +924,6 @@ fn build_live_per_core_row() -> adw::ActionRow {
     row
 }
 
-// ── The per-core LED panel's look (#857) ─────────────────────────────────────
-
-/// How the per-core LED panel is dressed this session (#857).
-///
-/// Four session env vars rather than four hard-coded constants, for the same
-/// reason `TROLLSHELL_STATS_LAYOUT` is one (#508): this is a pure look-and-feel
-/// choice with no right answer, CI cannot judge it, and the shell has no config
-/// DSL to put it in. Annika's issue asked for a shape, a fill and a colour
-/// option; an env var each lets all of `vfd|lcd|oled|crt` × `style|heat|
-/// rainbow|transpride|#rrggbb` be tried on real glass by restarting the shell
-/// instead of rebuilding it.
-///
-/// The skin and the colour map are **independent axes** (see the `hytte-preem`
-/// `color_map` docs): `…_STYLE=crt` with `…_COLOR=heat` gives heat-mapped lamps
-/// *through* the tube's scanlines, not one instead of the other.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CoreLeds {
-    /// The kit skin — the panel's physical character.
-    style: DisplayStyle,
-    /// The colour axis — what colour each lamp lights in.
-    color: ColorMap,
-    /// A pinned row count, or `None` for the automatic `rect` shape.
-    rows: Option<usize>,
-    /// What a ragged last row's leftover slots look like.
-    fill: Fill,
-}
-
-impl Default for CoreLeds {
-    fn default() -> Self {
-        Self {
-            // VFD: near-black field with a phosphor halo off every lit lamp —
-            // the "blinken lichten" look, and the skin whose glow reads best
-            // against the drawer's dark card.
-            style: DisplayStyle::Vfd,
-            // Heat: the panel's whole job is "which core is busy", and a
-            // level-driven ramp answers that at a glance in a way a single ink
-            // cannot. `style` is one env var away for anyone who wants the
-            // accent-tinted single ink back.
-            color: ColorMap::Heat,
-            rows: None,
-            fill: Fill::Spare,
-        }
-    }
-}
-
-/// Parse `TROLLSHELL_CORE_LEDS_STYLE`. `None`/unset is the default skin;
-/// an unrecognized value returns `Err(other)` so the caller can warn once.
-fn parse_core_leds_style(raw: Option<&str>) -> Result<DisplayStyle, &str> {
-    match raw {
-        None => Ok(CoreLeds::default().style),
-        Some(v) => DisplayStyle::ALL
-            .into_iter()
-            .find(|s| s.name() == v)
-            .ok_or(v),
-    }
-}
-
-/// Parse `TROLLSHELL_CORE_LEDS_COLOR`: one of the kit's named maps, or an
-/// `#rrggbb` / `rrggbb` literal for Annika's `(r, g, b)` option.
-fn parse_core_leds_color(raw: Option<&str>) -> Result<ColorMap, &str> {
-    let Some(v) = raw else {
-        return Ok(CoreLeds::default().color);
-    };
-    if let Some(map) = ColorMap::ALL.into_iter().find(|m| m.name() == v) {
-        return Ok(map);
-    }
-    parse_hex_rgb(v).ok_or(v)
-}
-
-/// `#rrggbb` or bare `rrggbb` → an [`ColorMap::Rgb`]. Case-insensitive; any
-/// other length or a non-hex digit is `None`.
-fn parse_hex_rgb(raw: &str) -> Option<ColorMap> {
-    let hex = raw.strip_prefix('#').unwrap_or(raw);
-    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let byte = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
-    Some(ColorMap::Rgb(byte(0)?, byte(2)?, byte(4)?))
-}
-
-/// Parse `TROLLSHELL_CORE_LEDS_ROWS`: `rect` (or unset) for the automatic
-/// shape, or a positive row count. `0` is rejected rather than silently
-/// clamped — it is a typo, not an intent.
-///
-/// `rect` is Annika's word for it from #857, and since her second pass on the
-/// same issue ("rectangle for led view would be still more preem tho") it now
-/// keeps its promise: the automatic shape is [`LedMatrix::wide`]'s wide
-/// rectangle rather than the near-square panel #861 shipped. Still automatic
-/// rather than a pinned default row count, because a fixed `rows = 4` reads
-/// well at 64 cores and absurdly at 4 — see [`LedMatrix::wide`].
-fn parse_core_leds_rows(raw: Option<&str>) -> Result<Option<usize>, &str> {
-    match raw {
-        None | Some("rect") => Ok(None),
-        Some(v) => match v.parse::<usize>() {
-            Ok(n) if n > 0 => Ok(Some(n)),
-            _ => Err(v),
-        },
-    }
-}
-
-/// Parse `TROLLSHELL_CORE_LEDS_FILL`: `spare` (unset default) or `blank`.
-fn parse_core_leds_fill(raw: Option<&str>) -> Result<Fill, &str> {
-    match raw {
-        None | Some("spare") => Ok(Fill::Spare),
-        Some("blank") => Ok(Fill::Blank),
-        Some(other) => Err(other),
-    }
-}
-
-/// Resolve one env var through its parser, warning once on an unrecognized
-/// value and falling back to `fallback`.
-///
-/// Split out so all four knobs warn in the same shape, and so the parsers
-/// themselves stay pure (and testable) functions of a `&str`.
-fn core_leds_var<T>(
-    name: &str,
-    parse: impl FnOnce(Option<&str>) -> Result<T, &str>,
-    expected: &str,
-    fallback: T,
-) -> T {
-    let raw = std::env::var(name).ok();
-    match parse(raw.as_deref()) {
-        Ok(v) => v,
-        Err(other) => {
-            tracing::warn!(
-                var = %name,
-                value = %other,
-                expected = %expected,
-                "per-core LED panel option unrecognized; using the default",
-            );
-            fallback
-        }
-    }
-}
-
-/// The per-core LED panel's dressing for this process, read once from the
-/// environment and cached — the [`stats_layout`] pattern, for the same reason
-/// (a session env var is process-constant, so re-reading it per redraw would
-/// buy nothing and cost a `getenv` a second).
-fn core_leds() -> CoreLeds {
-    use std::sync::OnceLock;
-    static LEDS: OnceLock<CoreLeds> = OnceLock::new();
-    *LEDS.get_or_init(|| {
-        let default = CoreLeds::default();
-        CoreLeds {
-            style: core_leds_var(
-                "TROLLSHELL_CORE_LEDS_STYLE",
-                parse_core_leds_style,
-                "vfd/lcd/oled/crt",
-                default.style,
-            ),
-            color: core_leds_var(
-                "TROLLSHELL_CORE_LEDS_COLOR",
-                parse_core_leds_color,
-                "style/rainbow/transpride/heat/#rrggbb",
-                default.color,
-            ),
-            rows: core_leds_var(
-                "TROLLSHELL_CORE_LEDS_ROWS",
-                parse_core_leds_rows,
-                "rect or a positive row count",
-                default.rows,
-            ),
-            fill: core_leds_var(
-                "TROLLSHELL_CORE_LEDS_FILL",
-                parse_core_leds_fill,
-                "spare/blank",
-                default.fill,
-            ),
-        }
-    })
-}
-
 /// The largest on-screen box the per-core LED panel may occupy, in logical px
 /// (#857).
 ///
@@ -1138,24 +967,18 @@ fn core_panel_scale(buf_w: usize, buf_h: usize) -> u32 {
     u32::try_from(by_w.min(by_h).max(1)).unwrap_or(1)
 }
 
-/// Build the [`LedMatrix`] for `cores` lamps, in the session's configured skin,
-/// colour map and fill ([`core_leds`]).
+/// Build the [`LedMatrix`] for `cores` lamps in the configured skin, colour
+/// map and fill.
 ///
-/// The shape is the wide-rectangle [`LedMatrix::wide`] unless
-/// `TROLLSHELL_CORE_LEDS_ROWS` pinned a row count, in which case the columns
-/// fall out of it — which is where [`Fill`] starts to matter, since 64 lamps on
-/// 3 rows needs 22 columns and leaves the last row two slots short.
-fn core_led_matrix(cores: usize) -> LedMatrix {
-    core_led_matrix_for(core_leds(), cores)
-}
-
-/// [`core_led_matrix`] with the dressing passed in rather than read from the
-/// environment.
+/// The shape is the wide-rectangle [`LedMatrix::wide`] unless `rows` pinned a
+/// row count, in which case the columns fall out of it — which is where
+/// `Fill` starts to matter, since 64 lamps on 3 rows needs 22 columns and
+/// leaves the last row two slots short.
 ///
-/// Split out so the shape choice is testable at all: [`core_leds`] resolves
-/// four env vars into a process-wide `OnceLock`, so a test that drove it would
-/// depend on the ambient environment *and* on which test ran first. A `CoreLeds`
-/// value has neither problem.
+/// The dressing is a **parameter**, not something this reads: since #869 it is
+/// live config ([`crate::config::core_leds`]), which is also what makes the
+/// shape choice testable at all — a function that resolved it itself would
+/// depend on the ambient environment *and* on which test ran first.
 fn core_led_matrix_for(cfg: CoreLeds, cores: usize) -> LedMatrix {
     let base = match cfg.rows {
         Some(rows) => LedMatrix::new(cfg.style, cores.max(1).div_ceil(rows), rows),
@@ -1272,45 +1095,82 @@ fn core_panel_surface() -> PixelSurface {
 /// each tick rasterises one frame (~116 µs on VFD at 64 cores, measured
 /// `--release`) and swaps the texture. Same-size swaps take
 /// `PixelSurface`'s `queue_draw` path rather than `queue_resize`.
+///
+/// Since #869 the dressing is the **second** input: `core-leds.toml` is live
+/// config, so a saved edit re-fires this binding and re-skins the panel with
+/// the shell up. `map_ref!` folds the two sources into one signal rather than
+/// having the apply closure read a snapshot, so a config change repaints
+/// immediately instead of on the next CPU tick.
 fn build_per_core_leds_row() -> gtk::Box {
+    per_core_leds_row(sensors::cpu(), core_leds::signal())
+}
+
+/// [`build_per_core_leds_row`] with its two live inputs handed in.
+///
+/// The split is #831's shape applied one level out from
+/// [`bind_per_core_leds`], and #1040 V3 is why it goes this far: #869 moved
+/// the feature's central wiring — the `map_ref!` that folds the config signal
+/// in beside the CPU one — into the builder, where both accessors
+/// `.expect()` without a registered `Registry` and so nothing could drive it.
+/// Dropping `core_leds::signal()` from that fold kills #869's entire payoff
+/// (the panel stops re-skinning on a save) and left the suite green;
+/// `bind_per_core_leds`' own tests pin the apply closure, not what feeds it.
+///
+/// What stays unpinned is now the *one* line above: the two accessor calls.
+fn per_core_leds_row<C, L>(cpu: C, leds: L) -> gtk::Box
+where
+    C: Signal<Item = CpuLoad> + 'static,
+    L: Signal<Item = CoreLeds> + 'static,
+{
     let row = core_panel_row();
     let panel = core_panel_surface();
     row.append(&panel);
 
-    bind_per_core_leds(&panel, sensors::cpu());
+    let dressed = map_ref! {
+        let cpu = cpu,
+        let leds = leds =>
+        (cpu.clone(), *leds)
+    };
+    bind_per_core_leds(&panel, dressed);
 
     row
 }
 
-/// Rasterise one LED frame per `signal` emission into `panel`.
+/// Rasterise one LED frame per emission into `panel`, in the dressing the
+/// emission carries.
 ///
 /// Split out of [`build_per_core_leds_row`] so this `bind` call site's
 /// `WeakRef` contract (#224, `hytte-reactive/src/bind.rs:16-22`) can be driven
 /// with a synthetic signal in tests, the same extraction #772 made for its
-/// four sites. The builder reads `sensors::cpu()` inline, which `.expect()`s
-/// without a registered `Registry` (#831). This is the successor of #831's
-/// `cores_row` site in this file: #857 replaced the `gtk::FlowBox` of per-core
-/// `ProgressBar`s with the LED panel, carrying the same untestable inline
-/// accessor across.
+/// four sites. The builder reads `sensors::cpu()` and
+/// [`core_leds::signal`](crate::config::core_leds::signal) inline, both of
+/// which `.expect()` without a registered `Registry` (#831). This is the
+/// successor of #831's `cores_row` site in this file: #857 replaced the
+/// `gtk::FlowBox` of per-core `ProgressBar`s with the LED panel, carrying the
+/// same untestable inline accessor across.
 fn bind_per_core_leds<S>(panel: &PixelSurface, signal: S)
 where
-    S: Signal<Item = CpuLoad> + 'static,
+    S: Signal<Item = (CpuLoad, CoreLeds)> + 'static,
 {
-    bind(signal, panel, move |panel, c: CpuLoad| {
-        let levels: Vec<f32> = c
-            .per_core
-            .iter()
-            .map(|&load| cast::f64_to_f32(load))
-            .collect();
-        let frame = core_led_matrix(levels.len()).render(&levels);
-        panel.set_scale(core_panel_scale(frame.width(), frame.height()));
-        panel.set_pixels(
-            u32::try_from(frame.width()).unwrap_or(0),
-            u32::try_from(frame.height()).unwrap_or(0),
-            frame.data(),
-        );
-        panel.set_tooltip_text(Some(&core_panel_tooltip(&c.per_core)));
-    });
+    bind(
+        signal,
+        panel,
+        move |panel, (c, leds): (CpuLoad, CoreLeds)| {
+            let levels: Vec<f32> = c
+                .per_core
+                .iter()
+                .map(|&load| cast::f64_to_f32(load))
+                .collect();
+            let frame = core_led_matrix_for(leds, levels.len()).render(&levels);
+            panel.set_scale(core_panel_scale(frame.width(), frame.height()));
+            panel.set_pixels(
+                u32::try_from(frame.width()).unwrap_or(0),
+                u32::try_from(frame.height()).unwrap_or(0),
+                frame.data(),
+            );
+            panel.set_tooltip_text(Some(&core_panel_tooltip(&c.per_core)));
+        },
+    );
 }
 
 fn build_live_memory_row() -> adw::ActionRow {
@@ -2201,11 +2061,9 @@ fn flapping_subtitle(
 #[cfg(test)]
 mod tests {
     use super::{
-        CORE_PANEL_MAX_H, CORE_PANEL_MAX_W, ColorMap, CoreLeds, DisplayStyle, Duration, Fill,
-        StatsLayout, StatsSection, TaskState, core_led_matrix_for, core_panel_scale,
-        core_panel_tooltip, flapping_subtitle, is_flapping, parse_core_leds_color,
-        parse_core_leds_fill, parse_core_leds_rows, parse_core_leds_style, parse_hex_rgb,
-        parse_stats_layout,
+        CORE_PANEL_MAX_H, CORE_PANEL_MAX_W, CoreLeds, Duration, StatsLayout, StatsSection,
+        TaskState, core_led_matrix_for, core_panel_scale, core_panel_tooltip, flapping_subtitle,
+        is_flapping, parse_stats_layout,
     };
 
     /// The [`StatsSection`] declaration order is the panel's canonical
@@ -2334,9 +2192,12 @@ mod tests {
         }
     }
 
-    /// A pinned `TROLLSHELL_CORE_LEDS_ROWS` still overrides the automatic
-    /// shape — including into a shape that is *worse* than the default, which
-    /// is the user's call to make.
+    /// A pinned `rows` in `core-leds.toml` (or, for the deprecation window,
+    /// `TROLLSHELL_CORE_LEDS_ROWS`) still overrides the automatic shape —
+    /// including into a shape that is *worse* than the default, which is the
+    /// user's call to make. Bounded, though: `config::core_leds::MAX_ROWS` caps
+    /// what a pin may ask for, so "worse" cannot become "a frame too big to
+    /// allocate" (#1040 F2).
     ///
     /// Falsified by dropping [`core_led_matrix_for`]'s `Some(rows)` arm: the
     /// override silently becomes a no-op and 4 cores stay 4x1.
@@ -2442,75 +2303,6 @@ mod tests {
             core_panel_tooltip(&[-1.0]).contains("max 0%"),
             "a negative load reported below zero"
         );
-    }
-
-    /// The env knobs resolve to the documented defaults when unset, accept
-    /// every value the warning text advertises, and reject anything else so
-    /// `core_leds_var` can warn rather than silently pick something.
-    #[test]
-    fn the_led_panel_env_knobs_parse() {
-        let default = CoreLeds::default();
-        // Unset is the default, silently — the `TROLLSHELL_STATS_LAYOUT` rule.
-        assert_eq!(parse_core_leds_style(None), Ok(default.style));
-        assert_eq!(parse_core_leds_color(None), Ok(default.color));
-        assert_eq!(parse_core_leds_rows(None), Ok(default.rows));
-        assert_eq!(parse_core_leds_fill(None), Ok(default.fill));
-
-        // Every skin the warning names, by the kit's own `name()` vocabulary.
-        for style in DisplayStyle::ALL {
-            assert_eq!(parse_core_leds_style(Some(style.name())), Ok(style));
-        }
-        assert_eq!(parse_core_leds_style(Some("plasma")), Err("plasma"));
-
-        // Every named map, plus the `#rrggbb` literal.
-        for map in ColorMap::ALL {
-            assert_eq!(parse_core_leds_color(Some(map.name())), Ok(map));
-        }
-        assert_eq!(
-            parse_core_leds_color(Some("#9b59b6")),
-            Ok(ColorMap::Rgb(0x9b, 0x59, 0xb6))
-        );
-        assert_eq!(parse_core_leds_color(Some("puce")), Err("puce"));
-        // `rgb` is `ColorMap::name`'s output but not an input: it carries no
-        // components, so accepting it would mean inventing a colour.
-        assert_eq!(parse_core_leds_color(Some("rgb")), Err("rgb"));
-
-        assert_eq!(parse_core_leds_rows(Some("rect")), Ok(None));
-        assert_eq!(parse_core_leds_rows(Some("3")), Ok(Some(3)));
-        assert_eq!(
-            parse_core_leds_rows(Some("0")),
-            Err("0"),
-            "0 rows is a typo"
-        );
-        assert_eq!(parse_core_leds_rows(Some("-2")), Err("-2"));
-        assert_eq!(parse_core_leds_rows(Some("many")), Err("many"));
-
-        assert_eq!(parse_core_leds_fill(Some("spare")), Ok(Fill::Spare));
-        assert_eq!(parse_core_leds_fill(Some("blank")), Ok(Fill::Blank));
-        assert_eq!(parse_core_leds_fill(Some("none")), Err("none"));
-    }
-
-    /// The `#rrggbb` literal: with or without the hash, either case, and
-    /// nothing else — a short, long or non-hex string is rejected rather than
-    /// silently truncated.
-    #[test]
-    fn hex_colours_parse_both_ways() {
-        assert_eq!(
-            parse_hex_rgb("#ff8800"),
-            Some(ColorMap::Rgb(0xff, 0x88, 0x00))
-        );
-        assert_eq!(
-            parse_hex_rgb("ff8800"),
-            Some(ColorMap::Rgb(0xff, 0x88, 0x00))
-        );
-        assert_eq!(
-            parse_hex_rgb("FF8800"),
-            Some(ColorMap::Rgb(0xff, 0x88, 0x00))
-        );
-        assert_eq!(parse_hex_rgb("#f80"), None, "short hex is not accepted");
-        assert_eq!(parse_hex_rgb("#ff8800ff"), None, "alpha is not accepted");
-        assert_eq!(parse_hex_rgb("#gg8800"), None);
-        assert_eq!(parse_hex_rgb(""), None);
     }
 
     /// The flapping filter keys on the *streak*, and its boundary is 1, not
@@ -2941,7 +2733,7 @@ mod pin_tests {
     use hytte::services::sensors::CpuLoad;
     use hytte::ui::PixelSurface;
 
-    use super::{bind_per_core_leds, build_top_apps_expander};
+    use super::{CoreLeds, bind_per_core_leds, build_top_apps_expander, per_core_leds_row};
 
     /// Run the GTK main loop until it has nothing left to dispatch.
     fn pump() {
@@ -2959,6 +2751,12 @@ mod pin_tests {
         }
     }
 
+    /// The panel's binding takes load **and** dressing since #869 (`core-leds.toml`
+    /// is live config); these tests stand in for both sources with one `Mutable`.
+    fn dressed(cpu: CpuLoad) -> (CpuLoad, CoreLeds) {
+        (cpu, CoreLeds::default())
+    }
+
     /// Anti-vacuity guard for the per-core pin test below: the binding must
     /// actually apply, or "the widget died" would prove nothing about the
     /// closure. The tooltip is the apply body's last statement, so seeing it
@@ -2967,17 +2765,109 @@ mod pin_tests {
     fn per_core_leds_binding_applies_a_value() {
         adw::init().expect("libadwaita init");
         let panel = PixelSurface::new();
-        let cpu: Mutable<CpuLoad> = Mutable::new(CpuLoad::default());
+        let cpu: Mutable<(CpuLoad, CoreLeds)> = Mutable::new(dressed(CpuLoad::default()));
         bind_per_core_leds(&panel, cpu.signal_cloned());
         pump();
 
-        cpu.set(four_cores());
+        cpu.set(dressed(four_cores()));
         pump();
 
         let tooltip = panel.tooltip_text().map(|t| t.to_string());
         assert!(
             tooltip.as_deref().is_some_and(|t| t.starts_with("4 cores")),
             "the emitted CpuLoad's four cores must reach the panel's tooltip, got {tooltip:?}"
+        );
+    }
+
+    /// The dressing the emission carries is the dressing the panel draws in —
+    /// the wiring #869's live reload rests on, and the one thing the tooltip
+    /// assertion above cannot see.
+    ///
+    /// Measured rather than compared pixel-for-pixel because `PixelSurface`
+    /// exposes no buffer getter: its *natural* size is the buffer size times
+    /// `core_panel_scale`, so a dressing that changes the matrix shape changes
+    /// the measurement. Four cores as a 1x4 column is a different shape from
+    /// four cores as the automatic wide rectangle.
+    ///
+    /// Falsified by rasterising `CoreLeds::default()` instead of the emitted
+    /// dressing: both measurements then agree and this goes red.
+    #[gtk::test]
+    fn per_core_leds_binding_follows_the_emitted_dressing() {
+        adw::init().expect("libadwaita init");
+        let panel = PixelSurface::new();
+        let src: Mutable<(CpuLoad, CoreLeds)> = Mutable::new(dressed(four_cores()));
+        bind_per_core_leds(&panel, src.signal_cloned());
+        pump();
+        let (_, automatic, _, _) = panel.measure(gtk::Orientation::Horizontal, -1);
+
+        src.set((
+            four_cores(),
+            CoreLeds {
+                rows: Some(4),
+                ..CoreLeds::default()
+            },
+        ));
+        pump();
+        let (_, pinned, _, _) = panel.measure(gtk::Orientation::Horizontal, -1);
+
+        assert!(
+            automatic > 0 && pinned > 0,
+            "anti-vacuity: both frames must have reached the surface, got {automatic} and {pinned}"
+        );
+        assert_ne!(
+            automatic, pinned,
+            "a pinned row count must reshape the panel: the emitted CoreLeds is what the \
+             rasteriser dresses with, so ignoring it (and always using the default) leaves the \
+             two measurements identical"
+        );
+    }
+
+    /// **A config save alone re-skins the panel** — the row's own wiring, not
+    /// just the binding under it (#1040 V3, mutation Z5).
+    ///
+    /// #869's payoff is that `core-leds.toml` is live: save an edit, the panel
+    /// re-skins with no restart. The mechanism is the `map_ref!` inside
+    /// [`per_core_leds_row`] that folds the config signal in beside the CPU
+    /// one — and dropping it (passing `CoreLeds::default()` instead) left the
+    /// whole suite green, because `per_core_leds_binding_follows_the_emitted_dressing`
+    /// pins [`bind_per_core_leds`], which is downstream of the fold.
+    ///
+    /// Driven here with the CPU source held **still**: only the dressing
+    /// moves, so a panel that re-measures can only have heard the config
+    /// signal. Measured rather than compared pixel-for-pixel for the reason
+    /// its sibling gives — `PixelSurface` exposes no buffer getter, but its
+    /// natural size follows the matrix shape.
+    #[gtk::test]
+    fn a_config_change_alone_re_skins_the_row() {
+        adw::init().expect("libadwaita init");
+        let cpu: Mutable<CpuLoad> = Mutable::new(four_cores());
+        let leds: Mutable<CoreLeds> = Mutable::new(CoreLeds::default());
+        let row = per_core_leds_row(cpu.signal_cloned(), leds.signal());
+        pump();
+
+        let panel: PixelSurface = row
+            .first_child()
+            .expect("the row holds the surface")
+            .downcast()
+            .expect("…and it is a PixelSurface");
+        let (_, automatic, _, _) = panel.measure(gtk::Orientation::Horizontal, -1);
+
+        // Only the dressing moves. The CPU signal is untouched.
+        leds.set(CoreLeds {
+            rows: Some(4),
+            ..CoreLeds::default()
+        });
+        pump();
+        let (_, pinned, _, _) = panel.measure(gtk::Orientation::Horizontal, -1);
+
+        assert!(
+            automatic > 0 && pinned > 0,
+            "anti-vacuity: both frames must have reached the surface, got {automatic} and {pinned}"
+        );
+        assert_ne!(
+            automatic, pinned,
+            "a config save alone must reshape the panel: dropping core_leds::signal() from the \
+             row's map_ref! leaves the two measurements identical and #869's live re-skin dead"
         );
     }
 
@@ -2989,7 +2879,7 @@ mod pin_tests {
         adw::init().expect("libadwaita init");
         let panel = PixelSurface::new();
         let weak = panel.downgrade();
-        let cpu: Mutable<CpuLoad> = Mutable::new(four_cores());
+        let cpu: Mutable<(CpuLoad, CoreLeds)> = Mutable::new(dressed(four_cores()));
         bind_per_core_leds(&panel, cpu.signal_cloned());
         pump();
 
@@ -3004,7 +2894,7 @@ mod pin_tests {
 
         // The binding must release cleanly on the next emission, not panic on
         // a dead weak ref: `bind` upgrades, gets `None`, and breaks its loop.
-        cpu.set(CpuLoad::default());
+        cpu.set(dressed(CpuLoad::default()));
         pump();
     }
 

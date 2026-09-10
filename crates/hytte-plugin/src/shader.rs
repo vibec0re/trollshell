@@ -66,7 +66,7 @@
 //!   over [`MAX_SHADER_DATA_BYTES`], `data.len()` not equal to `data_width *
 //!   data_height * format.bytes_per_texel()`, a zero-sided drawn surface or
 //!   data grid, or a grid side over [`MAX_SHADER_DATA_EXTENT`] (#1021/#1030,
-//!   mirroring #1020's host-side extent cap and its `Refusal::EmptyGrid`).
+//!   mirroring #968's host-side `Refusal::EmptyGrid` and #1020's extent cap).
 //!   [`Shader::cap_refusal`] names which, and with what numbers, so
 //!   refusing here turns a silent blank chip into a value the plugin can log
 //!   or branch on, instead of shipping a node the host quietly replaces with
@@ -533,7 +533,7 @@ mod tests {
     }
 
     /// **The SDK refuses a zero-sided data grid or drawn surface** (#1030,
-    /// mirroring #1020's host-side `Refusal::EmptyGrid` in
+    /// mirroring #968's host-side `Refusal::EmptyGrid` in
     /// `trollshell/src/plugins/shader_map.rs`'s `refusal`): `0×N`, `N×0` and
     /// `0×0` are all refused on either the data grid or the drawn surface,
     /// independently of one another, and `1×1` on both builds.
@@ -596,6 +596,53 @@ mod tests {
             assert!(
                 Shader::new("s", BODY).size(1, 1).node().is_some(),
                 "1x1 surface over the default 1x1 grid",
+            );
+        });
+    }
+
+    /// **The shared check order is the host's, where two refusals fire at
+    /// once.** `shader_map.rs::refusal` (`trollshell/src/plugins/shader_map.rs:312-354`)
+    /// is a chain of early returns, so which variant a node gets is decided by
+    /// position, not just by predicate — and two of the five checks overlap
+    /// with `EmptyGrid` on real inputs. Both cases below trip `EmptyGrid`
+    /// *and* a neighbour; the host names the neighbour in the first and
+    /// `EmptyGrid` in the second (`shader_map.rs:337` — `data_len_ok` — before
+    /// `shader_map.rs:345` — the zero-side guard — before `shader_map.rs:348`
+    /// — the extent guard), and this pins the SDK to the same answers.
+    ///
+    /// **Falsified** by moving the `EmptyGrid` guard in
+    /// [`Shader::cap_refusal`]: before `MalformedData` reddens the first
+    /// assertion, after `GridTooLarge` reddens the second.
+    #[test]
+    fn empty_grid_sits_between_malformed_data_and_grid_too_large() {
+        with_shader_support(true, || {
+            // `MalformedData` before `EmptyGrid` (shader_map.rs: the
+            // `data_len_ok` guard precedes the zero-side guard). A 0×4 grid
+            // with three bytes is both zero-sided and inconsistent; the host
+            // reports the length, because that is the more basic mistake.
+            assert_eq!(
+                Shader::new("s", BODY)
+                    .data(ShaderData::R8, 0, 4, vec![1, 2, 3])
+                    .cap_refusal(),
+                Some(ShaderCapRefusal::MalformedData {
+                    len: 3,
+                    size: (0, 4),
+                    format: ShaderData::R8,
+                }),
+                "a zero-sided grid whose buffer also mismatches is MalformedData",
+            );
+
+            // `EmptyGrid` before `GridTooLarge` (shader_map.rs: the zero-side
+            // guard precedes the extent guard). A 0 × (EXTENT+1) grid with an
+            // empty buffer is a consistent shape, so `MalformedData` does not
+            // fire, and it is both zero-sided and over the extent cap; the
+            // host reports the empty grid.
+            assert_eq!(
+                Shader::new("s", BODY)
+                    .data(ShaderData::R8, 0, MAX_SHADER_DATA_EXTENT + 1, Vec::new())
+                    .cap_refusal(),
+                Some(ShaderCapRefusal::EmptyGrid),
+                "a zero-sided grid whose other axis is over the extent cap is EmptyGrid",
             );
         });
     }

@@ -674,7 +674,7 @@ self:
                   session-wide via `programs.trollshell.weather.fallbackCity`
                   instead of per-plugin here).
 
-                The full inventory — swept from source, all 12 bundled
+                The full inventory — swept from source, all 13 bundled
                 plugins including the ones with zero knobs — is published at
                 <https://vibec0re.github.io/trollshell/plugin-env.html>
                 (source: `docs/plugin-env.md`). An absolute URL rather than a
@@ -765,9 +765,9 @@ self:
             plugins.pet.package = trollshell.packages.''${system}.hytte-plugin-pet;
 
         The bundled ids are: audio-widget, bar-clock-demo, caw, clock-demo,
-        departures, infobroker, pet, preem-demo, terminal, timer, usage,
-        weather (each output named `hytte-plugin-<id>`). Their per-plugin
-        runtime knobs go through `env` / `secrets` above.
+        departures, infobroker, niri-layouts, pet, preem-demo, terminal,
+        timer, usage, weather (each output named `hytte-plugin-<id>`). Their
+        per-plugin runtime knobs go through `env` / `secrets` above.
       '';
     };
   };

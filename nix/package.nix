@@ -227,7 +227,7 @@ let
   # THE workspace compile — the single cargo invocation that produces every
   # binary this flake ships (#572, implementing kaesaecracker's plan).
   #
-  # Everything downstream (the shell, the control center, the 12 bundled widget
+  # Everything downstream (the shell, the control center, the 13 bundled widget
   # plugins, the hytte-infobroker CLI, and since #588 the two nixosTest probe
   # *examples*) is a *slice* of this one output: a `cp` of one binary out of
   # `$out/bin`, optionally wrapped. There is no second crane invocation anywhere

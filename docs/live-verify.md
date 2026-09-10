@@ -315,6 +315,26 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       didn't declare a capability for. The host should log
       "requires a capability it didn't declare; dropped" and no
       drawer/OSD/toast should fire.
+- [ ] **(#1019)** Niri layouts — nothing about this plugin can be verified
+      without a live niri session, so all three legs are live-only. **The
+      chip:** on a workspace with three tiled columns, click each of the three
+      glyph buttons on the bar (`equal` / `golden` / `split`, left to right) and
+      watch the columns resize — `equal` to a third each, `golden` to a wide
+      first column with two narrow ones after it, `split` to half the working
+      area each (so the third scrolls off). Hovering each glyph should show its
+      legend. **Stacked columns count once:** stack three windows into one
+      column beside a single other window and click `split` — you should get
+      **two** half-width columns, not four quarter-width ones. **The CLI:**
+      from a terminal in the session, `hytte-plugin-niri-layouts apply golden`
+      should do the same thing and exit `0`; on an empty workspace it should
+      print "no tiled columns" and still exit `0`; with `NIRI_SOCKET` unset
+      (`env -u NIRI_SOCKET hytte-plugin-niri-layouts apply equal`) it should
+      print niri's own error and exit non-zero. **The bind:** merge the three
+      `Mod+Shift+{E,G,S}` binds from `etc/niri/binds.kdl` and confirm they work
+      with the **shell stopped** (`systemctl --user stop trollshell`) — that is
+      the whole point of the standalone hat. Finally, make niri refuse a
+      request (an old niri without `--id` on `set-window-width`) and confirm the
+      chip raises a toast carrying niri's own error text.
 
 ## Infobroker
 

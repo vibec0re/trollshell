@@ -1,0 +1,33 @@
+[package]
+name = "hytte-plugin-niri-layouts"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Three one-click column layouts (equal / golden / split) for the focused niri workspace — a trollshell bar chip that is also a standalone CLI, so the same binary drives a niri spawn bind (issue #1019)"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "hytte-plugin-niri-layouts"
+path = "src/main.rs"
+
+[dependencies]
+# The plugin runtime SDK. It re-exports everything else this crate needs — the
+# proto vocabulary (Mount / Node / Effect::Notify / Capability::Notify),
+# `tokio` (the command-lane worker's `spawn` + `spawn_blocking`) and
+# `tokio_stream` (`wrappers::UnboundedReceiverStream`, behind the `sync` feature
+# the SDK already enables) — so there is deliberately no direct `tokio`
+# dependency here. No gtk / adw / hytte-ui: a plugin never links the shell.
+hytte-plugin = { path = "../hytte-plugin" }
+# niri's own IPC types plus its blocking `socket::Socket`. This plugin dials
+# `$NIRI_SOCKET` **itself** rather than routing widths through the shell:
+# `Effect::Niri` only knows FocusWorkspace / FocusWindow, so the shell route
+# would cost a proto bump, a capability and a host handler for something the
+# shell itself never needs — and talking to niri directly is what lets the same
+# binary work as a bare `spawn` bind with no shell running at all. Version-
+# shared with `hytte-services`' shell-side client, which is why #1019 promoted
+# it to `[workspace.dependencies]` (#453); it adds no resolved package.
+niri-ipc.workspace = true

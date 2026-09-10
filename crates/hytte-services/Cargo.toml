@@ -36,7 +36,7 @@ hytte-bus = { path = "../hytte-bus" }
 hytte-config = { path = "../hytte-config" }
 hytte-ecal = { path = "../hytte-ecal" }
 hytte-reactive = { path = "../hytte-reactive" }
-niri-ipc = "26.4.0"
+niri-ipc.workspace = true
 # Native PipeWire client. libpipewire-sys / libspa-sys discover the C
 # libs via pkg-config; flake.nix supplies `pipewire` in buildInputs so
 # the .pc files for libpipewire-0.3 and libspa-0.2 are on PKG_CONFIG_PATH.

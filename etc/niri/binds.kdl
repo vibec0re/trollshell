@@ -48,4 +48,13 @@ binds {
     // etc/cliphist/README.md for the full recipe and a manual busctl
     // one-liner to test the verb without this keybind.
     Mod+V hotkey-overlay-title="Open Clipboard History" { spawn "busctl" "--user" "call" "mov.vibec0re.trollshell" "/mov/vibec0re/trollshell" "org.gtk.Actions" "Activate" "sava{sv}" "open-page" "1" "s" "clipboard" "0"; }
+
+    // Column layouts (#1019) — the same binary that paints the bar chip also
+    // applies one layout and exits, so these are plain `spawn`s with no shell,
+    // no D-Bus and no running plugin involved: it reads $NIRI_SOCKET itself.
+    // Counts are COLUMNS, not windows (a stacked column has one width). The
+    // three chords are a suggestion — nothing in trollshell reserves them.
+    Mod+Shift+E hotkey-overlay-title="Layout: equal columns" { spawn "hytte-plugin-niri-layouts" "apply" "equal"; }
+    Mod+Shift+G hotkey-overlay-title="Layout: golden" { spawn "hytte-plugin-niri-layouts" "apply" "golden"; }
+    Mod+Shift+S hotkey-overlay-title="Layout: split" { spawn "hytte-plugin-niri-layouts" "apply" "split"; }
 }

@@ -21,6 +21,14 @@ mutations show up in the bar and OSD without further wiring.
   package is installed).
 - `playerctl` — MPRIS client for play/pause/next/prev across players
   (mpv, Firefox, Spotify, etc.).
+- `hytte-plugin-niri-layouts` — this repo's own column-layout binary (#1019),
+  used by the three `Mod+Shift+{E,G,S}` binds. It ships in this flake as
+  `packages.hytte-plugin-niri-layouts`; the same binary is also the bar chip,
+  so if you already run it as a plugin (`programs.trollshell.plugins`) the
+  bind path needs it on `PATH` as well — the plugin launcher runs it from the
+  nix store, which is not the same thing. `nix profile install` it, or add it
+  to `home.packages`. Passing it `apply <layout>` makes it a one-shot: it
+  talks to `$NIRI_SOCKET` directly, so the binds work with trollshell stopped.
 
 Install on Arch:
 

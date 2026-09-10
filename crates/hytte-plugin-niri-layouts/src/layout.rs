@@ -299,8 +299,14 @@ mod tests {
     #[test]
     fn floating_and_fullscreen_windows_are_skipped() {
         let ws = vec![workspace(1, OUTPUT, true)];
+        // The two skipped windows sit in columns of their *own* (3 and 4), not
+        // on top of a tiled one — otherwise dropping the skip would silently
+        // lose to the tiled window's lower tile index and this test would pass
+        // against a planner that no longer skips anything.
+        let mut floater = floating(90, 1);
+        floater.layout.pos_in_scrolling_layout = Some((3, 1));
         let windows = vec![
-            floating(90, 1),
+            floater,
             fullscreen(91, 1),
             tile(10, 1, 1, 1),
             tile(20, 1, 2, 1),
@@ -320,12 +326,17 @@ mod tests {
     fn windows_on_another_workspace_or_output_are_skipped() {
         // Workspace 1 is active on the focused output; 2 is the inactive one
         // beside it; 3 is active but on a different output.
+        //
+        // Each foreign window sits in a column index of its own, for the same
+        // reason as the test above: with all three in column 1 they would
+        // collapse onto one entry and a planner that had stopped filtering by
+        // workspace would produce an identical plan.
         let ws = vec![
             workspace(1, OUTPUT, true),
             workspace(2, OUTPUT, false),
             workspace(3, OTHER_OUTPUT, true),
         ];
-        let windows = vec![tile(10, 1, 1, 1), tile(20, 2, 1, 1), tile(30, 3, 1, 1)];
+        let windows = vec![tile(10, 1, 1, 1), tile(20, 2, 2, 1), tile(30, 3, 3, 1)];
 
         let got = plan(&windows, &ws, Some(OUTPUT), Layout::Equal);
 

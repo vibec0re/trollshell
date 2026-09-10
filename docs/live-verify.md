@@ -2111,10 +2111,10 @@ session.
       seconds, and the shell coming back must log exactly one
       `ListAiKeys recovered` line — transitions only, same as #989's banner.
       Grepping unqualified will also catch the Plugins tab's own
-      `ListPlugins failed`, which has **no** transitions guard and so logs
-      every ~2 s while the shell is down — a pre-existing gap, not this
-      entry's regression, but easy to misread as one if you don't filter for
-      `ListAiKeys`. Finally,
+      `ListPlugins failed`/`ListPlugins recovered` lines — since #1017 that
+      poller got the same transitions guard, so an unfiltered grep now shows
+      one line per outage from _each_ tab rather than a `ListPlugins` flood
+      to filter past. Finally,
       with the shell running, **set or clear a key from the tab** right as a
       shell restart could plausibly land a reachability-triggered read at the
       same instant (restart the shell, then immediately click Apply/Clear) —

@@ -3525,8 +3525,8 @@ mod gtk_tests {
     /// thread reaches it *first*; this file's own poll-ordering tests already
     /// drive `on_poll_result` with `poll_err()`/`poll_ok(…)` on other threads
     /// with **no** subscriber installed, and `cargo test` runs test functions
-    /// concurrently by default. If one of them reaches the "ListPlugins
-    /// failed" or "ListPlugins recovered" callsite first, `tracing-core`'s
+    /// concurrently by default. If one of them reaches the "`ListPlugins`
+    /// failed" or "`ListPlugins` recovered" callsite first, `tracing-core`'s
     /// fast path can cache `Interest::never()` for it — a cache that then
     /// sticks for the rest of the process, and every count below silently
     /// reads back `0`.

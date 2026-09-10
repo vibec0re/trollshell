@@ -452,20 +452,24 @@ fn host_msgs() -> Vec<HostMsg> {
         HostMsg::Event {
             node: "go".into(),
             kind: EventKind::Click,
+            output: None,
         },
         HostMsg::Event {
             node: "scroller".into(),
             kind: EventKind::Scroll { dx: 0.0, dy: -1.5 },
+            output: None,
         },
         HostMsg::Event {
             node: "brightness".into(),
             kind: EventKind::ValueChanged { value: 0.62 },
+            output: None,
         },
         HostMsg::Event {
             node: "term-input".into(),
             kind: EventKind::Submitted {
                 text: "caw --help".into(),
             },
+            output: None,
         },
         HostMsg::EffectResult {
             id: 7,
@@ -889,6 +893,33 @@ fn vocab_gaps_tree() -> Node {
     }
 }
 
+/// The chip tree of #1050's own motivating plugin shape: a two-icon row that a
+/// per-screen verdict either shows or hides. Deliberately small — this fixture
+/// exists to pin the **frame's** new field, not another tree vocabulary, and a
+/// short tree keeps the added `hidden_on` bytes legible in a hex diff.
+fn hidden_on_tree() -> Node {
+    Node::Row {
+        id: Some("layouts".into()),
+        classes: vec!["ts-layouts".into()],
+        spacing: 4,
+        children: vec![
+            Node::Icon {
+                id: Some("golden".into()),
+                name: "view-columns-symbolic".into(),
+                classes: vec![],
+                tooltip: None,
+            },
+            Node::Icon {
+                id: Some("even".into()),
+                name: "view-grid-symbolic".into(),
+                classes: vec![],
+                tooltip: None,
+            },
+        ],
+        tooltip: None,
+    }
+}
+
 fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
     vec![
         ("manifest_full_v1", Box::new(full_manifest())),
@@ -904,6 +935,7 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
                 tree: node_tree(),
                 panel: Some(panel_tree()),
                 effects: effect_table(),
+                hidden_on: Vec::new(),
             }),
         ),
         (
@@ -912,6 +944,7 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
                 tree: preem_tree(),
                 panel: None,
                 effects: vec![],
+                hidden_on: Vec::new(),
             }),
         ),
         (
@@ -920,6 +953,7 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
                 tree: shader_tree(),
                 panel: None,
                 effects: vec![],
+                hidden_on: Vec::new(),
             }),
         ),
         (
@@ -928,6 +962,7 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
                 tree: tooltip_tree(),
                 panel: None,
                 effects: vec![],
+                hidden_on: Vec::new(),
             }),
         ),
         (
@@ -936,6 +971,7 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
                 tree: tooltip_rows_tree(),
                 panel: None,
                 effects: vec![],
+                hidden_on: Vec::new(),
             }),
         ),
         (
@@ -944,10 +980,42 @@ fn golden_table() -> Vec<(&'static str, Box<dyn Golden>)> {
                 tree: vocab_gaps_tree(),
                 panel: None,
                 effects: vec![],
+                hidden_on: Vec::new(),
             }),
         ),
         ("plugin_control_msgs_v1", Box::new(plugin_control_msgs())),
         ("host_msgs_v1", Box::new(host_msgs())),
+        // #1050's two additive fields get a fixture each, and they are
+        // **new files** rather than new members of the tables above — that is
+        // the point. A defaulted, `skip_serializing_if`-elided field must leave
+        // every pre-existing fixture byte-identical (which is what makes it
+        // invisible to an older peer, and why it costs no `VOCAB` bump); had
+        // either been folded into `plugin_render_v1` or `host_msgs_v1`, those
+        // files would have moved and the compat claim would be untestable.
+        // `golden_bytes_are_pinned` covers both halves for the new files too:
+        // today's encoder must still produce these exact bytes, and these exact
+        // bytes must still decode to a value carrying the field.
+        (
+            "plugin_render_hidden_on_v1",
+            Box::new(PluginMsg::Render {
+                tree: hidden_on_tree(),
+                panel: None,
+                // Two names, so the fixture pins the *array* encoding rather
+                // than a single string that a one-element special case could
+                // fake, and a hyphenated connector, which is the shape every
+                // real Wayland/DRM output name has.
+                hidden_on: vec!["DP-2".into(), "HDMI-A-1".into()],
+                effects: vec![],
+            }),
+        ),
+        (
+            "host_event_output_v1",
+            Box::new(HostMsg::Event {
+                node: "golden".into(),
+                kind: EventKind::Click,
+                output: Some("DP-2".into()),
+            }),
+        ),
     ]
 }
 

@@ -7,10 +7,10 @@ use hytte_plugin_proto::{
     DEFAULT_SLIDER_STEP_FRACTION, DatasourceError, DatasourceOutcome, Dir, Effect, EffectOutcome,
     EventKind, HostMsg, LedStripConfig, LedStripState, LogLevel, MAX_FRAME_LEN,
     MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Manifest, MediaAction, Mount, NiriAction, Node,
-    OPEN_URI_VOCAB, PROTO_VERSION, Page, PluginMsg, PreemWidget, ProtoError, ProvidedDatasource,
-    SCROLLED_VOCAB, SHADER_VOCAB, ShaderData, SliderFloats, StateKey, StateSnapshot, VOCAB,
-    VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body, sane_fraction,
-    sane_slider_floats,
+    NodeId, OPEN_URI_VOCAB, PROTO_VERSION, Page, PluginMsg, PreemWidget, ProtoError,
+    ProvidedDatasource, SCROLLED_VOCAB, SHADER_VOCAB, ShaderData, SliderFloats, StateKey,
+    StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body,
+    sane_fraction, sane_slider_floats,
 };
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -199,12 +199,14 @@ fn plugin_msgs_round_trip() {
         tree: sample_tree(),
         panel: None,
         effects: sample_effects(),
+        hidden_on: Vec::new(),
     });
     // A panel-bearing render is in the standard round-trip set too (#349 PR2).
     round_trip_plugin(&PluginMsg::Render {
         tree: sample_tree(),
         panel: Some(sample_tree()),
         effects: sample_effects(),
+        hidden_on: Vec::new(),
     });
     round_trip_plugin(&PluginMsg::Log {
         level: LogLevel::Warn,
@@ -226,14 +228,17 @@ fn host_msgs_round_trip() {
     round_trip_host(&HostMsg::Event {
         node: "go".into(),
         kind: EventKind::Click,
+        output: None,
     });
     round_trip_host(&HostMsg::Event {
         node: "scroller".into(),
         kind: EventKind::Scroll { dx: 0.0, dy: -1.5 },
+        output: None,
     });
     round_trip_host(&HostMsg::Event {
         node: "brightness".into(),
         kind: EventKind::ValueChanged { value: 0.62 },
+        output: None,
     });
     round_trip_host(&HostMsg::EffectResult {
         id: 7,
@@ -1001,6 +1006,7 @@ fn submitted_event_round_trips() {
         kind: EventKind::Submitted {
             text: "caw --help".into(),
         },
+        output: None,
     };
     let back: HostMsg = decode(&encode(&msg)).expect("decode Submitted event");
     assert_eq!(msg, back);
@@ -1021,6 +1027,7 @@ fn value_changed_event_round_trips() {
     let msg = HostMsg::Event {
         node: "brightness".into(),
         kind: EventKind::ValueChanged { value: 0.375 },
+        output: None,
     };
     let back: HostMsg = decode(&encode(&msg)).expect("decode ValueChanged event");
     assert_eq!(msg, back);
@@ -1355,6 +1362,7 @@ fn render_with_panel_round_trips() {
             tooltip: None,
         }),
         effects: vec![Effect::OpenPage(Page::PluginSelf)],
+        hidden_on: Vec::new(),
     };
     let back: PluginMsg = decode(&encode(&msg)).expect("decode panel-bearing Render");
     assert_eq!(msg, back);
@@ -1369,6 +1377,7 @@ fn render_without_panel_stays_off_the_wire() {
         tree: sample_tree(),
         panel: None,
         effects: vec![],
+        hidden_on: Vec::new(),
     };
     let body = encode_body(&msg);
     assert!(
@@ -1407,8 +1416,261 @@ fn render_without_panel_decodes_old_frame_compat() {
             // Absent `panel` defaults to None (no plugin panel).
             panel: None,
             effects: vec![Effect::OpenPage(Page::Media)],
+            hidden_on: Vec::new(),
         },
         "absent panel defaults to None",
+    );
+}
+
+// ── Per-screen visibility: Render.hidden_on / Event.output (#1050) ───────────
+
+#[test]
+fn render_with_hidden_on_round_trips() {
+    // A `Render` naming the outputs its card is hidden on survives the
+    // round-trip with the list intact, order included — the host compares
+    // connector names exactly, so a re-ordering or de-duplicating encoder would
+    // be a wire change, not a cosmetic one.
+    let msg = PluginMsg::Render {
+        tree: sample_tree(),
+        panel: None,
+        effects: vec![],
+        hidden_on: vec!["DP-2".into(), "HDMI-A-1".into(), "eDP-1".into()],
+    };
+    let back: PluginMsg = decode(&encode(&msg)).expect("decode hidden_on-bearing Render");
+    assert_eq!(msg, back);
+
+    let body = encode_body(&msg);
+    assert!(
+        contains(&body, b"hidden_on") && contains(&body, b"HDMI-A-1"),
+        "the field name and every connector ride the wire",
+    );
+}
+
+#[test]
+fn render_without_hidden_on_stays_off_the_wire() {
+    // An empty `hidden_on` must NOT put a `hidden_on` key on the wire
+    // (`skip_serializing_if = "Vec::is_empty"`), which is the whole compat
+    // argument: a frame that does not use the field is byte-identical to a
+    // pre-#1050 one, so `PROTO_VERSION` stays 1 and `VOCAB` does not move.
+    // `golden_bytes_are_pinned` proves the same thing against ten committed
+    // fixtures; this proves the *mechanism*.
+    let msg = PluginMsg::Render {
+        tree: sample_tree(),
+        panel: None,
+        effects: vec![],
+        hidden_on: Vec::new(),
+    };
+    let body = encode_body(&msg);
+    assert!(
+        !contains(&body, b"hidden_on"),
+        "an empty hidden_on carries no hidden_on key",
+    );
+}
+
+#[test]
+fn render_without_hidden_on_decodes_old_frame_compat() {
+    // A `Render` frame built before #1050 has no `hidden_on` key. The current
+    // decoder must still accept it, defaulting to the empty list — i.e. "hidden
+    // nowhere", which is exactly the pre-#1050 mirror-onto-every-monitor
+    // behaviour. Modeled as an externally-tagged enum mirroring the pre-#1050
+    // field set, so it serializes as `{"Render": { tree, panel, effects }}`
+    // exactly like an already-deployed plugin.
+    #[derive(serde::Serialize)]
+    enum PluginMsgOld {
+        Render {
+            tree: Node,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            panel: Option<Node>,
+            effects: Vec<Effect>,
+        },
+    }
+
+    let old = PluginMsgOld::Render {
+        tree: sample_tree(),
+        panel: None,
+        effects: vec![Effect::OpenPage(Page::Media)],
+    };
+    let body = encode_body(&old);
+    assert!(
+        !contains(&body, b"hidden_on"),
+        "an old frame carries no hidden_on key",
+    );
+    let decoded: PluginMsg = decode_body(&body).expect("decode pre-#1050 Render frame");
+    assert_eq!(
+        decoded,
+        PluginMsg::Render {
+            tree: sample_tree(),
+            panel: None,
+            effects: vec![Effect::OpenPage(Page::Media)],
+            // Absent `hidden_on` defaults to "hidden on no output".
+            hidden_on: Vec::new(),
+        },
+        "absent hidden_on defaults to the empty list",
+    );
+}
+
+#[test]
+fn an_older_plugin_skips_hidden_on_rather_than_failing() {
+    // The mirror of the test above, and the half that actually justifies "no
+    // `VOCAB` bump": a plugin built *before* #1050 must survive receiving a
+    // frame that carries the new key. An unknown *field* in a named map is
+    // skipped by `rmp-serde`; an unknown *variant tag* would fail the whole
+    // body. That asymmetry is the rule cited in the crate root, so it is pinned
+    // here rather than asserted in prose.
+    //
+    // (`hidden_on` is plugin → host, so the peer that meets an unexpected key is
+    // an older *host*; the decoder is the same one either way. The mirror enum
+    // stands in for that host's `PluginMsg`.)
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    enum PluginMsgOld {
+        Render {
+            tree: Node,
+            #[serde(default)]
+            panel: Option<Node>,
+            effects: Vec<Effect>,
+        },
+    }
+
+    let new = PluginMsg::Render {
+        tree: sample_tree(),
+        panel: None,
+        effects: vec![],
+        hidden_on: vec!["DP-2".into()],
+    };
+    let body = encode_body(&new);
+    assert!(
+        contains(&body, b"hidden_on"),
+        "precondition: the frame really does carry the new key",
+    );
+    let old: PluginMsgOld =
+        decode_body(&body).expect("a pre-#1050 host skips the unknown hidden_on key");
+    let PluginMsgOld::Render { tree, .. } = old;
+    assert_eq!(
+        tree,
+        sample_tree(),
+        "and still decodes the rest of the frame it does understand",
+    );
+}
+
+#[test]
+fn event_with_output_round_trips() {
+    // The host→plugin half: the connector of the monitor whose copy of the card
+    // produced the interaction, across all four event kinds — `output` is
+    // orthogonal to `kind`, and nothing may special-case one of them.
+    for kind in [
+        EventKind::Click,
+        EventKind::Scroll { dx: 0.0, dy: -1.5 },
+        EventKind::ValueChanged { value: 0.62 },
+        EventKind::Submitted {
+            text: "caw --help".into(),
+        },
+    ] {
+        let msg = HostMsg::Event {
+            node: "chip".into(),
+            kind,
+            output: Some("DP-2".into()),
+        };
+        let back: HostMsg = decode(&encode(&msg)).expect("decode output-bearing Event");
+        assert_eq!(back, msg);
+    }
+}
+
+#[test]
+fn event_without_output_stays_off_the_wire() {
+    // `output: None` must NOT put an `output` key on the wire, so an
+    // unattributable event (the drawer panel, which has no monitor in scope) is
+    // byte-identical to a pre-#1050 `Event`.
+    let msg = HostMsg::Event {
+        node: "chip".into(),
+        kind: EventKind::Click,
+        output: None,
+    };
+    let body = encode_body(&msg);
+    assert!(
+        !contains(&body, b"output"),
+        "an absent output carries no output key",
+    );
+}
+
+#[test]
+fn event_without_output_decodes_old_frame_compat() {
+    // An `Event` frame built before #1050 has no `output` key; the current
+    // decoder defaults it to `None` ("the host could not attribute this to a
+    // screen"), which is what every pre-#1050 event effectively was.
+    #[derive(serde::Serialize)]
+    enum HostMsgOld {
+        Event { node: NodeId, kind: EventKind },
+    }
+
+    let body = encode_body(&HostMsgOld::Event {
+        node: "chip".into(),
+        kind: EventKind::Click,
+    });
+    assert!(
+        !contains(&body, b"output"),
+        "an old frame carries no output key",
+    );
+    let decoded: HostMsg = decode_body(&body).expect("decode pre-#1050 Event frame");
+    assert_eq!(
+        decoded,
+        HostMsg::Event {
+            node: "chip".into(),
+            kind: EventKind::Click,
+            output: None,
+        },
+        "absent output defaults to None",
+    );
+}
+
+#[test]
+fn an_older_plugin_skips_event_output_rather_than_failing() {
+    // The #305 question for a host→plugin addition: does an old plugin survive
+    // receiving it? For a *field* the answer is yes by construction — it is
+    // skipped, not decoded — which is why this needs no `StateKey`/`Capability`
+    // send-gate the way an appended `HostMsg` **variant** does. Pinned, because
+    // that argument is the entire reason this shipped as a field.
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    enum HostMsgOld {
+        Event { node: NodeId, kind: EventKind },
+    }
+
+    let body = encode_body(&HostMsg::Event {
+        node: "chip".into(),
+        kind: EventKind::Click,
+        output: Some("DP-2".into()),
+    });
+    assert!(
+        contains(&body, b"output"),
+        "precondition: the frame really does carry the new key",
+    );
+    let old: HostMsgOld =
+        decode_body(&body).expect("a pre-#1050 plugin skips the unknown output key");
+    assert_eq!(
+        old,
+        HostMsgOld::Event {
+            node: "chip".into(),
+            kind: EventKind::Click,
+        },
+        "and still decodes the rest of the frame it does understand",
+    );
+}
+
+#[test]
+fn the_per_screen_fields_bump_no_vocabulary_generation() {
+    // #1050 adds two defaulted **fields**, not variants. The crate root's rule
+    // ("appending a wire variant ⇒ bump `VOCAB`") therefore does not fire, and
+    // the counter must not have moved for them. Pinned as an equality against
+    // the newest *variant* generation (`OPEN_URI_VOCAB`, #1045) rather than a
+    // bare literal: a later PR that legitimately appends a variant bumps both
+    // together and this stays green, while a reflexive `VOCAB += 1` for a field
+    // addition — the mistake this test exists to catch — turns it red.
+    assert_eq!(
+        VOCAB, OPEN_URI_VOCAB,
+        "#1050's fields must not have advanced VOCAB past the newest appended variant",
+    );
+    assert_eq!(
+        PROTO_VERSION, 1,
+        "…nor PROTO_VERSION: a defaulted field is additive",
     );
 }
 
@@ -2566,6 +2828,7 @@ fn a_poisoned_node_round_trips_unsanitised_and_the_clamp_fixes_it_after_decode()
         tree,
         panel: None,
         effects: vec![],
+        hidden_on: Vec::new(),
     };
     let back: PluginMsg = decode(&encode(&frame)).expect("a poisoned frame still decodes");
     let PluginMsg::Render { tree: decoded, .. } = back else {

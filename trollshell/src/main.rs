@@ -417,11 +417,14 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
             widgets::sidebar_toggle::widget(monitor),
             widgets::workspaces::widget(monitor),
             widgets::window_list::widget(monitor),
-            plugins::bar_left_slot(),
+            plugins::bar_left_slot(monitor),
         ])
-        .center([widgets::mpris::widget(monitor), plugins::bar_center_slot()])
+        .center([
+            widgets::mpris::widget(monitor),
+            plugins::bar_center_slot(monitor),
+        ])
         .right([
-            plugins::bar_right_slot(),
+            plugins::bar_right_slot(monitor),
             group([widgets::tray::widget(monitor)]),
             group([
                 widgets::bluetooth::widget(monitor),

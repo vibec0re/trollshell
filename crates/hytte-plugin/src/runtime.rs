@@ -256,6 +256,10 @@ where
         &PluginMsg::Render {
             tree: last_view.tree.clone(),
             panel: last_view.panel.clone(),
+            // #1050: the seed frame carries the per-screen verdict too. A plugin
+            // whose first view is already "nothing to show on DP-2" must not
+            // flash a chip there for the interval until its next render.
+            hidden_on: last_view.hidden_on.clone(),
             effects: Vec::new(),
         },
     )
@@ -300,7 +304,11 @@ where
         let step = tokio::select! {
             frame = rx.recv() => match frame {
                 Some(Ok(HostMsg::StateSnapshot { snapshot })) => Step::Update(Input::Snapshot(snapshot)),
-                Some(Ok(HostMsg::Event { node, kind })) => Step::Update(Input::Event { node, kind }),
+                // `output` (#1050, the monitor whose card produced this) is
+                // decoded and deliberately dropped: `Input::Event` cannot grow a
+                // field without breaking every plugin's match arm, so surfacing
+                // it rides #1050's plugin arm. See the doc on `Input::Event`.
+                Some(Ok(HostMsg::Event { node, kind, output: _ })) => Step::Update(Input::Event { node, kind }),
                 Some(Ok(HostMsg::EffectResult { id, outcome })) => {
                     Step::Update(Input::EffectResult { id, outcome })
                 }
@@ -435,6 +443,12 @@ where
             let frame = PluginMsg::Render {
                 tree: view.tree.clone(),
                 panel: view.panel.clone(),
+                // #1050. `changed` above is a whole-`View` compare, so a frame
+                // whose *only* difference is the hidden-on set still sends —
+                // which is the entire point: a plugin that goes from "shown on
+                // both screens" to "hidden on DP-2" typically renders the very
+                // same tree, and dedup on `(tree, panel)` alone would swallow it.
+                hidden_on: view.hidden_on.clone(),
                 effects,
             };
             if let Err(e) = write_frame(&mut wr, &frame).await {
@@ -1351,6 +1365,7 @@ mod tests {
                 tree,
                 panel,
                 effects,
+                ..
             } = next_plugin_frame(&mut hrd).await
             else {
                 panic!("third frame must be the seed Render");
@@ -1373,6 +1388,7 @@ mod tests {
                 tree,
                 panel,
                 effects,
+                ..
             } = next_plugin_frame(&mut hrd).await
             else {
                 panic!("a panel change alone must re-render");
@@ -1420,6 +1436,7 @@ mod tests {
                 &HostMsg::Event {
                     node: "echo-btn".to_owned(),
                     kind: EventKind::Click,
+                    output: None,
                 },
             )
             .await;
@@ -1450,6 +1467,7 @@ mod tests {
                 &HostMsg::Event {
                     node: "not-ours".to_owned(),
                     kind: EventKind::Click,
+                    output: None,
                 },
             )
             .await;
@@ -1828,6 +1846,7 @@ mod tests {
                 &HostMsg::Event {
                     node: "cmd-btn".to_owned(),
                     kind: EventKind::Click,
+                    output: None,
                 },
             )
             .await;
@@ -1869,6 +1888,7 @@ mod tests {
                     &HostMsg::Event {
                         node: "cmd-btn".to_owned(),
                         kind: EventKind::Click,
+                        output: None,
                     },
                 )
                 .await;
@@ -1905,6 +1925,7 @@ mod tests {
                 &HostMsg::Event {
                     node: "echo-btn".to_owned(),
                     kind: EventKind::Click,
+                    output: None,
                 },
             )
             .await;

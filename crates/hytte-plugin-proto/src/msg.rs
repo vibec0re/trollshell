@@ -33,6 +33,62 @@ pub enum PluginMsg {
         /// unchanged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         panel: Option<Node>,
+        /// The **connector names** (`"DP-1"`, `"eDP-1"`, `"HDMI-A-2"` — niri's
+        /// and Wayland's own output names) of the monitors this frame's card
+        /// must **not** be shown on (#1050).
+        ///
+        /// # Why the wire needs this at all
+        ///
+        /// A plugin renders **one** `tree` and the host mirrors it onto *every*
+        /// monitor's bar/sidebar — one render mailbox, one reconciler per
+        /// monitor over the same list. That is deliberate (a plugin should not
+        /// have to know how many screens exist to draw a chip), but it means a
+        /// plugin whose *verdict* is per-screen has no way to express it: before
+        /// this field, a plugin could only fold its state off the **focused**
+        /// output and every screen's chip followed that one answer. #1019's
+        /// niri-layouts chip is the reported case — "hide unless the active
+        /// workspace has ≥ 2 windows" was computed once, so screen B's chip
+        /// showed screen A's count.
+        ///
+        /// `hidden_on` is the narrow fix: **same tree everywhere, visibility per
+        /// screen.** It carries visibility only — a plugin that wants genuinely
+        /// *different content* per monitor still cannot have it, and that is the
+        /// intended limit (see the crate root's multi-monitor note).
+        ///
+        /// # Host semantics
+        ///
+        /// The host's per-monitor reconciler hides a card whose `hidden_on`
+        /// contains **that monitor's** connector, and treats it as absent when
+        /// deciding whether the region collapses on that monitor — the same
+        /// treatment a tree that renders nothing already gets (#1042). The two
+        /// rules are a disjunction: a card is hidden here if its tree renders
+        /// nothing **or** this output is listed.
+        ///
+        /// A name matching no connected monitor is **ignored silently** — it
+        /// hides nothing anywhere, and is never an error. There is no host-side
+        /// validation of connector names (nor can there be a useful one: outputs
+        /// come and go with hot-plug, and a name for a monitor that is currently
+        /// off is a legitimate thing to carry). The host does log the ignored
+        /// names at `debug` when the set changes, so a typo (`"DP1"` for
+        /// `"DP-1"`) is diagnosable rather than merely silent.
+        ///
+        /// Names are compared **exactly** — no case folding, no normalisation.
+        ///
+        /// # Compat
+        ///
+        /// Additive, exactly like [`panel`](PluginMsg::Render::panel) and
+        /// [`RunCommand.detached`](crate::effect::Effect::RunCommand): a
+        /// defaulted field, not a new variant, so an empty list is
+        /// `skip_serializing_if`-elided and a frame that does not use it is
+        /// **byte-identical** to a pre-#1050 one. It therefore keeps
+        /// [`PROTO_VERSION`](crate::PROTO_VERSION) *and* leaves
+        /// [`VOCAB`](crate::VOCAB) alone — the vocabulary counter tracks
+        /// appended *variants* (which an older peer cannot decode at all), while
+        /// an unknown *field key* is skipped by `rmp-serde` on decode. An older
+        /// host therefore ignores this field and mirrors the card everywhere,
+        /// which is exactly the pre-#1050 behaviour.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hidden_on: Vec<String>,
         effects: Vec<Effect>,
     },
     /// A diagnostic line surfaced in the host log, tagged with the plugin id.
@@ -53,7 +109,43 @@ pub enum HostMsg {
     /// latest-wins — no per-key deltas).
     StateSnapshot { snapshot: StateSnapshot },
     /// A user interaction on a rendered node, addressed by its [`NodeId`].
-    Event { node: NodeId, kind: EventKind },
+    Event {
+        node: NodeId,
+        kind: EventKind,
+        /// The **connector name** of the monitor whose copy of the card produced
+        /// this event (#1050) — the other half of the multi-monitor story
+        /// [`Render.hidden_on`](PluginMsg::Render::hidden_on) opens.
+        ///
+        /// One tree is mirrored onto every monitor, so before this field a click
+        /// was un-attributable: a plugin acting on "the screen the user clicked
+        /// on" had to guess, and the only available proxy — whatever output has
+        /// keyboard focus — is not the same thing (#1019's layouts chip laid out
+        /// the focused workspace, not the workspace on the screen whose chip was
+        /// pressed). `output` makes it deterministic.
+        ///
+        /// `None` means **the host could not attribute the event to a screen**,
+        /// not "the primary monitor" — treat it as unknown and fall back to
+        /// whatever the plugin did before #1050. Today the host sends `None`
+        /// from exactly one place, the plugin **drawer panel**: the drawer's
+        /// page stack is built without a monitor in scope (`modal.rs`'s
+        /// `build_pages_stack`), and the active-panel selection is a single
+        /// process-wide value rather than a per-monitor one, so a panel event
+        /// genuinely has no screen to name. Bar chips and sidebar cards always
+        /// carry `Some`. A monitor with no connector name reported by GDK would
+        /// also produce `None`.
+        ///
+        /// # Compat
+        ///
+        /// Additive: a defaulted, `skip_serializing_if`-elided field, so an
+        /// `Event` without an output is **byte-identical** to a pre-#1050 one
+        /// and a plugin built against the older proto skips the unknown key.
+        /// Being a *field* and not a new [`HostMsg`] variant is also what keeps
+        /// it outside the #305 opt-in rule — there is no undecodable variant tag
+        /// for an old plugin to choke on — and outside the
+        /// [`VOCAB`](crate::VOCAB) census for the same reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+    },
     /// The result of a brokered [`Effect::RunCommand`](crate::effect::Effect::RunCommand),
     /// keyed by the command's `id`.
     EffectResult { id: u64, outcome: EffectOutcome },

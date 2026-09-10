@@ -214,6 +214,7 @@ fn render_frame_mixing_preem_and_legacy_nodes_round_trips() {
         },
         panel: None,
         effects: vec![],
+        hidden_on: Vec::new(),
     };
     let back = decode::<PluginMsg>(&encode(&msg)).expect("render frame decodes");
     assert_eq!(back, msg);

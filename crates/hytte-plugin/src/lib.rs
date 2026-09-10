@@ -547,6 +547,25 @@ pub enum Input<M> {
     /// (latest-wins, no deltas).
     Snapshot(StateSnapshot),
     /// A user interaction on one of the plugin's rendered nodes.
+    ///
+    /// # The wire carries an `output`; this variant does not yet surface it
+    ///
+    /// Since #1050 the host stamps every card event with the connector name of
+    /// the monitor whose copy produced it
+    /// ([`HostMsg::Event.output`](proto::HostMsg::Event::output)), so a plugin
+    /// can act on *the screen that was clicked* rather than whichever output
+    /// holds keyboard focus. The runtime decodes that frame and currently drops
+    /// the field on the floor here.
+    ///
+    /// That is a deliberate hold, not an oversight. Adding a third field to
+    /// this struct variant is a **source-breaking change for every plugin in
+    /// the tree**: `Input::Event { node, kind }` appears as an exhaustive match
+    /// arm in fourteen plugin crates, and each would need `, ..` (plus every
+    /// test that *constructs* the variant would need `output: None`). That is a
+    /// flag day, and it belongs in the round that has a consumer for the value
+    /// — #1050's plugin arm — not in the host arm that merely puts it on the
+    /// wire. A non-Rust plugin can read the field today; a Rust one gets it the
+    /// day this variant grows the field.
     Event {
         /// The interacted node, by the id the plugin assigned in its view.
         node: NodeId,
@@ -709,6 +728,8 @@ pub enum Input<M> {
 ///     chip_node().into()                    // no panel
 ///     // or:
 ///     View::new(chip_node()).panel(detail_node())
+///     // or, hidden on the screens where there is nothing to show (#1050):
+///     View::new(chip_node()).hidden_on(["DP-2"])
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq)]
@@ -720,19 +741,52 @@ pub struct View {
     /// [`Effect::OpenPage(Page::PluginSelf)`](proto::Page::PluginSelf).
     /// `None` = no panel; the chip/card is the whole surface.
     pub panel: Option<Node>,
+    /// The connector names of the monitors this view's card is **hidden** on
+    /// (#1050) — see [`Render.hidden_on`](proto::PluginMsg::Render::hidden_on)
+    /// for the full contract. Empty (the default) = shown everywhere, which is
+    /// what every plugin did before the field existed.
+    ///
+    /// One tree is mirrored onto every screen, so this is the *only* way a
+    /// plugin can differ per monitor, and it differs in visibility alone. The
+    /// shape a per-screen plugin wants is: fold your state into a
+    /// `output → verdict` map, then list the outputs whose verdict is "nothing
+    /// to show". Names that match no connected monitor are ignored.
+    pub hidden_on: Vec<String>,
 }
 
 impl View {
-    /// A panel-less view of `tree` (equivalent to `tree.into()`).
+    /// A panel-less view of `tree` (equivalent to `tree.into()`), shown on every
+    /// monitor.
     #[must_use]
     pub fn new(tree: Node) -> Self {
-        Self { tree, panel: None }
+        Self {
+            tree,
+            panel: None,
+            hidden_on: Vec::new(),
+        }
     }
 
     /// Attach the drawer-panel tree.
     #[must_use]
     pub fn panel(mut self, panel: Node) -> Self {
         self.panel = Some(panel);
+        self
+    }
+
+    /// Hide this view's card on the named outputs (#1050) — connector names as
+    /// niri/Wayland spell them (`"DP-1"`, `"eDP-1"`, `"HDMI-A-2"`), compared
+    /// exactly.
+    ///
+    /// **Replaces** the list rather than appending to it, so a `view()` that
+    /// recomputes its verdict every frame — the intended usage — cannot leak a
+    /// stale screen into it.
+    #[must_use]
+    pub fn hidden_on<I, S>(mut self, outputs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.hidden_on = outputs.into_iter().map(Into::into).collect();
         self
     }
 }

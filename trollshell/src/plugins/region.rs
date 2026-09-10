@@ -7,6 +7,27 @@
 //! [`super::PluginHandles`] `Mutable<Vec<SlotRender>>` fields; [`upsert_region`]
 //! and [`clear_region_if_owned`] mutate them (shared with the reader task in
 //! [`super::session`]).
+//!
+//! # One list, N monitors — and the two places that differ (#1050)
+//!
+//! A mount's render list is **shared**: every monitor builds its own region
+//! container and its own reconciler, and all of them read the same
+//! `Vec<SlotRender>`. That mirroring is what lets a plugin draw a chip without
+//! knowing how many screens exist, and nothing here can give one monitor a
+//! *different tree* from another.
+//!
+//! Since #1050 two things are per-monitor, and both hang off the `connector`
+//! this region was built with:
+//!
+//! - **Visibility.** A card is hidden on this monitor when its frame's
+//!   `hidden_on` names this connector — folded into the same decision as
+//!   #1042's "the tree renders nothing", and into the region-collapse rule
+//!   built on it, so a chip hidden on screen B leaves no pill *and* no gap
+//!   there while still painting on screen A.
+//! - **Event attribution.** A card's outgoing [`HostMsg::Event`] carries this
+//!   connector as its `output`, so a plugin can act on the screen that was
+//!   clicked. The drawer panel is the one mount with no monitor in scope and
+//!   sends `None` (see [`build_panel_child`]).
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -16,7 +37,9 @@ use hytte::futures_signals::map_ref;
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, glib, prelude::*};
 use hytte::reactive::registry;
-use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode, NodeId, Reconciler};
+use hytte::ui::{
+    Dir as UiDir, EventKind as UiEventKind, Monitor, Node as UiNode, NodeId, Reconciler,
+};
 use hytte_plugin_proto::{HostMsg, wire};
 use tokio::sync::mpsc;
 
@@ -86,11 +109,12 @@ fn bar_right_render_signal() -> impl Signal<Item = Vec<SlotRender>> {
 /// above the built-in weather/calendar/tasks cards, so a plugin here leads the
 /// sidebar (#301).
 #[must_use]
-pub fn sidebar_lead_slot() -> gtk::Widget {
+pub fn sidebar_lead_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         lead_render_signal(),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
+        monitor.connector(),
     )
 }
 
@@ -98,22 +122,24 @@ pub fn sidebar_lead_slot() -> gtk::Widget {
 /// vertical container of N plugin cards. Built per monitor from
 /// `overlays::sidebar::build_card` and appended above the built-in widgets.
 #[must_use]
-pub fn sidebar_top_slot() -> gtk::Widget {
+pub fn sidebar_top_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         top_render_signal(),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
+        monitor.connector(),
     )
 }
 
 /// The [`Mount::SidebarBottom`](hytte_plugin_proto::Mount::SidebarBottom)
 /// **region**, appended below the built-in sidebar widgets.
 #[must_use]
-pub fn sidebar_bottom_slot() -> gtk::Widget {
+pub fn sidebar_bottom_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         bottom_render_signal(),
         gtk::Orientation::Vertical,
         "ts-plugin-card",
+        monitor.connector(),
     )
 }
 
@@ -123,33 +149,36 @@ pub fn sidebar_bottom_slot() -> gtk::Widget {
 /// renders inside a `.ts-plugin-chip` pill, mirroring the sidebar card path but
 /// laid out horizontally so co-mounted chips sit side by side.
 #[must_use]
-pub fn bar_left_slot() -> gtk::Widget {
+pub fn bar_left_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         bar_left_render_signal(),
         gtk::Orientation::Horizontal,
         "ts-plugin-chip",
+        monitor.connector(),
     )
 }
 
 /// The [`Mount::BarCenter`](hytte_plugin_proto::Mount::BarCenter) **region** — a
 /// horizontal row of N plugin chips, appended into the bar's center group (#349).
 #[must_use]
-pub fn bar_center_slot() -> gtk::Widget {
+pub fn bar_center_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         bar_center_render_signal(),
         gtk::Orientation::Horizontal,
         "ts-plugin-chip",
+        monitor.connector(),
     )
 }
 
 /// The [`Mount::BarRight`](hytte_plugin_proto::Mount::BarRight) **region** — a
 /// horizontal row of N plugin chips, appended into the bar's right group (#349).
 #[must_use]
-pub fn bar_right_slot() -> gtk::Widget {
+pub fn bar_right_slot(monitor: &Monitor) -> gtk::Widget {
     build_region(
         bar_right_render_signal(),
         gtk::Orientation::Horizontal,
         "ts-plugin-chip",
+        monitor.connector(),
     )
 }
 
@@ -169,6 +198,12 @@ struct MountedCard {
     /// Outbound of the connection currently owning this plugin's card, swapped
     /// on each render so events always reach the live connection.
     outbound: Rc<RefCell<Option<mpsc::Sender<HostMsg>>>>,
+    /// The `hidden_on` set of the frame this card was last reconciled from
+    /// (#1050) — bookkeeping for [`log_hidden_on_change`] only, never a render
+    /// input (the visibility decision reads the *incoming* frame, not this).
+    /// Kept per card rather than per region because each plugin's set moves
+    /// independently.
+    hidden_on: Vec<String>,
 }
 
 /// Build the `gtk::Box` region driven by `signal` (a mount's sorted render
@@ -180,10 +215,19 @@ struct MountedCard {
 /// on each card root: `ts-plugin-card` for a sidebar card, `ts-plugin-chip` for
 /// a bar chip. The region hides itself while empty so an unused bar region never
 /// introduces a phantom inter-widget gap in the bar group it sits in.
+///
+/// `connector` is **this** region's monitor, by the name niri and Wayland use
+/// (#1050) — the only per-monitor input a reconciler has, since every monitor's
+/// region reads the same shared render list. It drives both halves of per-screen
+/// behaviour (see the module header): which cards `hidden_on` hides here, and
+/// what `output` this region's events carry. `None` (a monitor GDK reports no
+/// connector for) degrades to the pre-#1050 behaviour exactly: nothing is ever
+/// hidden by name, and events carry no output.
 fn build_region(
     signal: impl Signal<Item = Vec<SlotRender>> + 'static,
     orientation: gtk::Orientation,
     card_class: &'static str,
+    connector: Option<String>,
 ) -> gtk::Widget {
     // Chips in a horizontal bar row want a small gap between co-mounted plugins;
     // sidebar cards stack tight (each card owns its own bottom margin in CSS).
@@ -279,7 +323,13 @@ fn build_region(
     // here: mutation (b) of the #920 review showed a per-card `forget_scope` on
     // this teardown path breaks the cross-monitor invariant `gtk_tests` pins.
     hytte::reactive::bind(signal, &container, move |container, renders| {
-        reconcile_region(container, &cards_for_signal, &renders, card_class);
+        reconcile_region(
+            container,
+            &cards_for_signal,
+            &renders,
+            card_class,
+            connector.as_deref(),
+        );
         // **The re-arm point** (#897), and the reason it is here rather than
         // inside `reconcile_region`: a mapping pass is the only thing that can
         // give a settled widget somewhere to go, and `reconcile_region` holds
@@ -378,16 +428,92 @@ fn root_renders_nothing(node: &wire::Node) -> bool {
     }
 }
 
+/// Whether `render` asks to be hidden on the monitor this region belongs to
+/// (#1050) — the per-screen half of the visibility decision, alongside
+/// [`root_renders_nothing`]'s per-tree half.
+///
+/// Comparison is **exact**: no case folding, no normalisation, no prefix match.
+/// Connector names are opaque identifiers the compositor hands out (`"DP-2"`,
+/// `"eDP-1"`, `"HDMI-A-1"`), and a fuzzy match here would silently hide a chip
+/// on a screen the plugin never named.
+///
+/// A `None` connector — a monitor GDK reports no connector for — is never
+/// hidden by name. That is the safe direction: showing a chip the plugin wanted
+/// hidden is a cosmetic miss, while hiding one it wanted shown loses a control.
+///
+/// A name that matches no *connected* monitor simply hides nothing anywhere,
+/// which is the documented wire contract; [`unknown_connectors`] is what turns
+/// that from silent into diagnosable.
+fn hidden_on_this_output(render: &SlotRender, connector: Option<&str>) -> bool {
+    let Some(connector) = connector else {
+        return false;
+    };
+    render.hidden_on.iter().any(|name| name == connector)
+}
+
+/// Whether a card renders anything **on this monitor** — the #1042 predicate
+/// (does its tree bottom out in nothing?) disjoined with #1050's per-screen
+/// hide. Both the card's own `set_visible` and the region-collapse rule read
+/// this one function, which is what keeps them from disagreeing: before #1050
+/// the collapse rule was `any(!root_renders_nothing(…))` written out inline, and
+/// adding a second reason to be invisible in only one of the two places would
+/// have left a region visible-but-empty (a permanent `spacing` sliver in the bar
+/// group — exactly the #1042 HIGH-1 bug, re-introduced through the other door).
+fn card_shows_here(render: &SlotRender, connector: Option<&str>) -> bool {
+    !root_renders_nothing(&render.tree) && !hidden_on_this_output(render, connector)
+}
+
+/// The entries of `hidden_on` that name no monitor currently attached to
+/// `display` — a plugin author's typo (`"DP1"` for `"DP-1"`), or a screen that
+/// has since been unplugged.
+///
+/// Pure and display-agnostic (it takes the known set, not the display) so it is
+/// testable without a second monitor; the caller does the GDK lookup. Returning
+/// the offending names rather than a bool is what makes the log line worth
+/// reading.
+///
+/// Deliberately **not** an error path: an output that is currently off is a
+/// perfectly legitimate thing for a plugin to name (it will matter again the
+/// moment the screen comes back), so this can only ever be `debug`.
+fn unknown_connectors<'a>(hidden_on: &'a [String], known: &HashSet<String>) -> Vec<&'a str> {
+    hidden_on
+        .iter()
+        .filter(|name| !known.contains(*name))
+        .map(String::as_str)
+        .collect()
+}
+
+/// The connector names of every monitor GDK currently reports, or `None` when
+/// there is no display to ask (which is the answer, not an empty set — an empty
+/// set would make every name "unknown" and log a false alarm).
+fn attached_connectors() -> Option<HashSet<String>> {
+    let display = gtk::gdk::Display::default()?;
+    Some(
+        display
+            .monitors()
+            .into_iter()
+            .filter_map(|m| m.ok())
+            .filter_map(|obj| obj.downcast::<gtk::gdk::Monitor>().ok())
+            .filter_map(|m| m.connector().map(|s| s.to_string()))
+            .collect(),
+    )
+}
+
 /// Reconcile a mount region's child cards against the latest sorted plugin
 /// render list. Adds a card + reconciler for a newly-joined plugin, updates &
 /// reorders existing cards, and removes cards whose plugin left — each keyed by
 /// plugin id, so one plugin's join/leave never disturbs a sibling's widget
 /// (the per-plugin removal semantics of #274).
+///
+/// `connector` is this region's monitor (#1050): the same render list reconciles
+/// into every monitor's region, and this is the only argument that differs
+/// between them.
 fn reconcile_region(
     container: &gtk::Box,
     cards: &Rc<RefCell<Vec<MountedCard>>>,
     renders: &[SlotRender],
     card_class: &str,
+    connector: Option<&str>,
 ) {
     // Reveal the region when at least one plugin renders actual content, so an
     // empty region (no plugin mounted here yet) adds no spacing to its parent
@@ -408,9 +534,17 @@ fn reconcile_region(
     // the other way it is a `RefCell already mutably borrowed` panic on the
     // GTK main thread — the same class of re-entrancy #627/#630/#631/#632/#638/
     // #643 fixed across the shell, and one the tests caught here. `any(...)`
-    // over `renders` reads `r.tree` only — no borrow of `cards` — so this stays
-    // safely before the line below.
-    container.set_visible(renders.iter().any(|r| !root_renders_nothing(&r.tree)));
+    // over `renders` reads `r.tree`/`r.hidden_on` only — no borrow of `cards` —
+    // so this stays safely before the line below.
+    //
+    // Since #1050 the predicate is [`card_shows_here`], not `!root_renders_nothing`
+    // alone: a card hidden on *this* monitor counts as empty **for this
+    // monitor's region**, so a lone chip that goes hidden on screen B collapses
+    // B's region while A's — reading the identical render list — stays exactly
+    // as it was. That per-monitor asymmetry is the whole feature; a collapse
+    // rule that ignored `hidden_on` would keep the #1039 "no pill, no gap"
+    // promise on A and break it on B.
+    container.set_visible(renders.iter().any(|r| card_shows_here(r, connector)));
 
     let mut cards = cards.borrow_mut();
 
@@ -448,13 +582,20 @@ fn reconcile_region(
         // its width, hiding only the empty plugin's own card. Applies to both
         // card shapes (`ts-plugin-card` sidebar, `ts-plugin-chip` bar) since
         // both go through this one loop.
-        let has_content = !root_renders_nothing(&render.tree);
+        //
+        // #1050 adds the second reason to be invisible — this monitor being
+        // named in the frame's `hidden_on` — through the same
+        // [`card_shows_here`] the region-collapse rule above uses, so the card
+        // and its region can never disagree about whether it counts.
+        let has_content = card_shows_here(render, connector);
         if let Some(idx) = cards.iter().position(|c| c.plugin_id == render.plugin_id) {
             let card = &mut cards[idx];
             // Swap in the live connection's outbound, then re-render its tree.
             *card.outbound.borrow_mut() = Some(render.outbound.clone());
             card.reconciler.render(&ui_tree);
             card.root.set_visible(has_content);
+            log_hidden_on_change(card, render, connector);
+            card.hidden_on.clone_from(&render.hidden_on);
             container.reorder_child_after(&card.root, prev.as_ref());
             prev = Some(card.root.clone().upcast());
         } else {
@@ -465,6 +606,12 @@ fn reconcile_region(
             let outbound: Rc<RefCell<Option<mpsc::Sender<HostMsg>>>> =
                 Rc::new(RefCell::new(Some(render.outbound.clone())));
             let ev_outbound = outbound.clone();
+            // #1050: this region's monitor, captured once per card, stamped on
+            // every event it emits. Captured (rather than read at event time)
+            // because a region belongs to one monitor for its whole life — the
+            // hot-plug path destroys and rebuilds the surface rather than
+            // re-pointing it, so there is nothing to re-read.
+            let ev_output = connector.map(str::to_owned);
             let mut reconciler = Reconciler::new(&root, move |id: NodeId, kind: UiEventKind| {
                 if let Some(tx) = ev_outbound.borrow().as_ref() {
                     // Non-blocking: a stuck plugin's full outbound queue drops the
@@ -473,6 +620,10 @@ fn reconcile_region(
                     let _ = tx.try_send(HostMsg::Event {
                         node: id,
                         kind: to_wire_event(kind),
+                        // Which screen's copy of the mirrored card this was, so
+                        // a plugin can act on *that* output instead of guessing
+                        // from keyboard focus (#1050 / #1019).
+                        output: ev_output.clone(),
                     });
                 }
             });
@@ -480,13 +631,60 @@ fn reconcile_region(
             root.set_visible(has_content);
             container.insert_child_after(&root, prev.as_ref());
             prev = Some(root.clone().upcast());
-            cards.push(MountedCard {
+            let mut card = MountedCard {
                 plugin_id: render.plugin_id.clone(),
                 preem_scope,
                 root,
                 reconciler,
                 outbound,
-            });
+                // Seeded empty rather than from `render`, so the very first
+                // frame counts as a *change* and gets its names checked —
+                // otherwise a plugin whose first-ever frame carries a typo'd
+                // connector would never be reported.
+                hidden_on: Vec::new(),
+            };
+            log_hidden_on_change(&card, render, connector);
+            card.hidden_on.clone_from(&render.hidden_on);
+            cards.push(card);
+        }
+    }
+}
+
+/// Log this card's #1050 per-screen verdict, but only when the frame's
+/// `hidden_on` actually **changed** for it.
+///
+/// A plugin re-renders at up to ~30 Hz and the set is usually constant, so
+/// logging per frame would drown the debug stream; keying on the change gives
+/// one line per real transition. Two things are worth saying:
+///
+/// - this monitor is now (or is no longer) named — the positive signal that the
+///   feature is doing something;
+/// - names in the set that match **no attached monitor** — the wire contract
+///   says those are ignored silently, and this is what keeps "silently" from
+///   meaning "undiagnosably". A typo (`"DP1"`) otherwise presents only as "the
+///   chip never hides", with nothing anywhere to explain it.
+///
+/// The GDK monitor list is read only on that change edge, so the steady state
+/// costs one `Vec<String>` comparison per card per frame and nothing else.
+fn log_hidden_on_change(card: &MountedCard, render: &SlotRender, connector: Option<&str>) {
+    if card.hidden_on == render.hidden_on {
+        return;
+    }
+    if hidden_on_this_output(render, connector) {
+        tracing::debug!(
+            plugin = %card.plugin_id,
+            output = connector.unwrap_or("<unknown>"),
+            "plugin card hidden on this output (#1050)",
+        );
+    }
+    if let Some(known) = attached_connectors() {
+        let unknown = unknown_connectors(&render.hidden_on, &known);
+        if !unknown.is_empty() {
+            tracing::debug!(
+                plugin = %card.plugin_id,
+                unknown = ?unknown,
+                "plugin hidden_on names outputs that are not attached; ignored (#1050)",
+            );
         }
     }
 }
@@ -624,6 +822,15 @@ fn build_panel_child(
             let _ = tx.try_send(HostMsg::Event {
                 node: id,
                 kind: to_wire_event(kind),
+                // **The one `None` in the host** (#1050). Unlike a card, the
+                // drawer panel child is built with no monitor in scope —
+                // `modal.rs`'s `build_pages_stack()` takes no `Monitor`, and the
+                // active-panel selection (`active_panel_id`) is a single
+                // process-wide value rather than one per screen — so a panel
+                // event genuinely has no output to name. `None` says "not
+                // attributable", which is exactly true here; it must never be
+                // read as "the primary monitor".
+                output: None,
             });
         }
     });
@@ -1088,10 +1295,20 @@ mod gtk_tests {
     /// handle would keep the container alive and never see its `connect_destroy`
     /// run at all.
     fn mount_region(renders: &Mutable<Vec<SlotRender>>) -> gtk::Window {
+        mount_region_on(renders, None)
+    }
+
+    /// [`mount_region`], but on a **named** monitor (#1050) — the seam the
+    /// per-screen tests need. Two windows built from the same `renders` mutable
+    /// with different connectors is the host's real multi-monitor topology in
+    /// miniature: one shared render list, one reconciler per screen, each
+    /// deciding visibility for itself.
+    fn mount_region_on(renders: &Mutable<Vec<SlotRender>>, connector: Option<&str>) -> gtk::Window {
         let region = build_region(
             renders.signal_cloned(),
             gtk::Orientation::Horizontal,
             "ts-plugin-chip",
+            connector.map(str::to_owned),
         );
         let window = gtk::Window::new();
         window.set_child(Some(&region));
@@ -1121,6 +1338,7 @@ mod gtk_tests {
             panel: Some(preem_tree("panel")),
             grants: Grants::none(),
             outbound: tx.clone(),
+            hidden_on: Vec::new(),
         }
     }
 
@@ -1221,6 +1439,7 @@ mod gtk_tests {
                 row_with_label_tree("root", "label", "hi"),
             )],
             "ts-plugin-chip",
+            None,
         );
         let width_with_busy_only = container.measure(gtk::Orientation::Horizontal, -1).1;
 
@@ -1233,6 +1452,7 @@ mod gtk_tests {
                 render_with_tree("busy", &tx, row_with_label_tree("root", "label", "hi")),
             ],
             "ts-plugin-chip",
+            None,
         );
 
         let empty_card_root = cards
@@ -1290,6 +1510,7 @@ mod gtk_tests {
             &cards,
             &[render_with_tree("empty", &tx, empty_row_tree("root"))],
             "ts-plugin-chip",
+            None,
         );
 
         assert!(
@@ -1342,6 +1563,7 @@ mod gtk_tests {
             &cards,
             &[render_with_tree("toggle", &tx, empty_row_tree("root"))],
             "ts-plugin-chip",
+            None,
         );
         assert!(
             !cards.borrow()[0].root.is_visible(),
@@ -1371,6 +1593,7 @@ mod gtk_tests {
                 row_with_label_tree("root", "label", "hi"),
             )],
             "ts-plugin-chip",
+            None,
         );
 
         let card_root = cards.borrow()[0].root.clone();
@@ -1403,6 +1626,7 @@ mod gtk_tests {
             &cards,
             &[render_with_tree("leaf", &tx, leaf_label_tree("root", ""))],
             "ts-plugin-chip",
+            None,
         );
 
         assert!(
@@ -1434,6 +1658,7 @@ mod gtk_tests {
                 render_with_tree("busy", &tx, row_with_label_tree("root", "label", "hi")),
             ],
             "ts-plugin-chip",
+            None,
         );
 
         let cards = cards.borrow();
@@ -1484,6 +1709,7 @@ mod gtk_tests {
             &cards,
             &[render_with_tree("scrolled", &tx, tree)],
             "ts-plugin-chip",
+            None,
         );
 
         assert!(
@@ -1521,6 +1747,7 @@ mod gtk_tests {
             &cards,
             &[render_with_tree("nested-empty", &tx, tree)],
             "ts-plugin-chip",
+            None,
         );
 
         assert!(
@@ -1558,6 +1785,7 @@ mod gtk_tests {
             &cards,
             &[render_with_tree("nested-busy", &tx, tree)],
             "ts-plugin-chip",
+            None,
         );
 
         assert!(
@@ -1584,6 +1812,7 @@ mod gtk_tests {
             &cards,
             &[render_with_tree("spacer", &tx, wire::Node::Spacer)],
             "ts-plugin-chip",
+            None,
         );
 
         assert!(
@@ -1730,6 +1959,7 @@ mod gtk_tests {
             &cards,
             &[render_of("leaver", &tx)],
             "ts-plugin-chip",
+            None,
         );
         assert_eq!(
             preem_render::instance_count(&scope),
@@ -1738,7 +1968,7 @@ mod gtk_tests {
         );
 
         // The plugin disconnects: its render leaves the region's mailbox.
-        reconcile_region(&container, &cards, &[], "ts-plugin-chip");
+        reconcile_region(&container, &cards, &[], "ts-plugin-chip", None);
         assert!(cards.borrow().is_empty(), "the card itself must be gone");
         assert_eq!(
             preem_render::instance_count(&scope),
@@ -1778,7 +2008,7 @@ mod gtk_tests {
             grants: Grants::all(),
             ..render_of("shader-leaver", &tx)
         };
-        reconcile_region(&container, &cards, &[render], "ts-plugin-chip");
+        reconcile_region(&container, &cards, &[render], "ts-plugin-chip", None);
         assert_eq!(
             shader_map::cached_states(&scope),
             1,
@@ -1786,7 +2016,7 @@ mod gtk_tests {
         );
 
         // The plugin disconnects: its render leaves the region's mailbox.
-        reconcile_region(&container, &cards, &[], "ts-plugin-chip");
+        reconcile_region(&container, &cards, &[], "ts-plugin-chip", None);
         assert!(cards.borrow().is_empty(), "the card itself must be gone");
         assert_eq!(
             shader_map::cached_states(&scope),
@@ -2177,6 +2407,7 @@ mod gtk_tests {
             renders.signal_cloned(),
             gtk::Orientation::Horizontal,
             "ts-plugin-chip",
+            None,
         );
         // A revealer with no transition, so `set_reveal_child` unmaps the child
         // immediately rather than over an animation — the same `child_visible`
@@ -2270,6 +2501,7 @@ mod gtk_tests {
             renders.signal_cloned(),
             gtk::Orientation::Horizontal,
             "ts-plugin-chip",
+            None,
         );
         let region_weak = region.downgrade();
         let window = gtk::Window::new();
@@ -2348,6 +2580,7 @@ mod gtk_tests {
             renders.signal_cloned(),
             gtk::Orientation::Vertical,
             "ts-plugin-card",
+            None,
         );
         let region_weak = region.downgrade();
         let card = gtk::Box::new(gtk::Orientation::Vertical, 0);

@@ -581,6 +581,7 @@ fn render_of(
         panel: None,
         grants: Grants::none(),
         outbound: tx.clone(),
+        hidden_on: Vec::new(),
     }
 }
 
@@ -1163,6 +1164,7 @@ async fn bar_mount_render_reaches_bar_region() {
             // dedicated panels mailbox (#349 PR2) must stay empty.
             panel: None,
             effects: vec![],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -1243,6 +1245,7 @@ async fn panel_render_populates_panels_mailbox() {
                 tooltip: None,
             }),
             effects: vec![],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -1280,6 +1283,7 @@ async fn panel_render_populates_panels_mailbox() {
             },
             panel: None,
             effects: vec![],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -2241,6 +2245,7 @@ async fn duplicate_id_connection_is_rejected_end_to_end() {
             },
             panel: None,
             effects: vec![],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -2382,6 +2387,7 @@ async fn newer_vocab_register_is_rejected_and_equal_vocab_is_accepted() {
             },
             panel: None,
             effects: vec![],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -2433,6 +2439,7 @@ async fn ungranted_effect_never_reaches_the_broker() {
             },
             panel: None,
             effects: vec![Effect::OpenPage(Page::PowerMenu)],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -2474,6 +2481,7 @@ async fn granted_effect_reaches_the_broker() {
             },
             panel: None,
             effects: vec![Effect::OpenPage(Page::PowerMenu)],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -2836,6 +2844,7 @@ async fn provider_manifest_registers_a_routable_datasource() {
             },
             panel: None,
             effects: vec![],
+            hidden_on: Vec::new(),
         },
     )
     .await
@@ -2893,6 +2902,7 @@ async fn provides_without_capability_is_not_registered() {
             },
             panel: None,
             effects: vec![],
+            hidden_on: Vec::new(),
         },
     )
     .await

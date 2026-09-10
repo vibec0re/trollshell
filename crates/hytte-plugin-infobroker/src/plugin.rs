@@ -1081,7 +1081,7 @@ mod tests {
             ..BrokerSnapshot::default()
         };
         // The chip badges the pending count with the warning class.
-        let View { tree, panel } = m.view();
+        let View { tree, panel, .. } = m.view();
         let Node::Box { children, .. } = &tree else {
             panic!("chip root is a Box");
         };

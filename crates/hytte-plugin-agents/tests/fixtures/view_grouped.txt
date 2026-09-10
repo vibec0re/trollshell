@@ -290,7 +290,7 @@ View {
                                                         "heading",
                                                     ],
                                                     tooltip: Some(
-                                                        "choom",
+                                                        "choom (trollshell-choom)",
                                                     ),
                                                 },
                                             },
@@ -606,11 +606,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "choom",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "choom (trollshell-choom)",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -664,11 +670,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "nixos-choom",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "nixos-choom",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -722,11 +734,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "stray",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "stray",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {

@@ -123,14 +123,25 @@ pub const MAX_ROWS: usize = 20;
 /// The plugin drawer child has no scroller of its own, so this is the panel's
 /// only bound. A child shorter than the cap is not stretched, so the number
 /// only ever matters for a panel that would otherwise overflow — which, with
-/// the full roster on the overview, is any hive past a handful of agents. 560
-/// is the shell's own historic drawer-card baseline (`modal.rs`'s
-/// `MIN_CARD_HEIGHT` lineage); a plugin cannot see the monitor, so it cannot
-/// derive the number the way the Stats page now does.
+/// the full roster on the overview, is any hive past a handful of agents.
+///
+/// **560 is a constant, and #701 is why that is a known limitation rather than
+/// a good number.** It is the shell's own former Stats-page cap
+/// (`stats_scrolled(&grid, 560)`, now `OLD_STATS_CAP` in `modal.rs`'s tests),
+/// and #701 replaced it precisely because a constant is wrong on a real
+/// output: on a 1440-tall screen the page clamped itself to 560 and scrolled
+/// with the bottom half empty. The shell now derives that budget from the
+/// monitor (`modal::clamp_card_height`); a plugin cannot, because the
+/// vocabulary hands it no drawer height. So this errs toward the size of the
+/// drawer in @kaesaecracker's screenshots (~600 px of content) and the
+/// follow-up is a host-supplied height hint, not a better guess here.
 pub const PANEL_VIEWPORT_PX: u16 = 560;
 
 /// How many characters of the agent's display name line 1 shows.
 const NAME_CHARS: i32 = 20;
+
+/// The same, in the panel's roster — the drawer is wider than the sidebar.
+const PANEL_NAME_CHARS: i32 = 32;
 
 /// Past this many characters the status caption stops wrapping and ellipsizes.
 ///
@@ -189,6 +200,41 @@ fn clipped(body: impl Into<String>, chars: i32, classes: &[&str]) -> Node {
         ellipsize: true,
         tooltip: Some(body),
         classes: cls(classes),
+    }
+}
+
+/// [`clipped`] with an **explicit** hover instead of the node's own full text —
+/// for the cases where the hover says more than the label does.
+fn clipped_titled(
+    body: impl Into<String>,
+    chars: i32,
+    hover: impl Into<String>,
+    classes: &[&str],
+) -> Node {
+    Node::Text {
+        id: None,
+        text: body.into(),
+        max_width_chars: Some(chars),
+        ellipsize: true,
+        tooltip: Some(hover.into()),
+        classes: cls(classes),
+    }
+}
+
+/// What an agent name's hover says: the display label, **plus the hive's own
+/// name** whenever a `[display.<name>].label` renamed it.
+///
+/// The hive's name is what `hivectl` takes, what every request frame carries
+/// and what the logs print, so a renamed row that shows only the label leaves
+/// no way to find out what to type. This is the one thing the old row-level
+/// tooltip carried that the status caption does not — the status now shows in
+/// full on line 2, so this is all that is left of it.
+fn name_hover(name: &str, cfg: &AgentsConfig) -> String {
+    let label = cfg.label_for(name);
+    if label == name {
+        name.to_owned()
+    } else {
+        format!("{label} ({name})")
     }
 }
 
@@ -402,7 +448,12 @@ fn agent_row(agent: &Agent, cfg: &AgentsConfig, open: bool) -> Node {
             // Clipped, not a bare `Label`: a `Label`'s natural width forces its
             // container wider (the #281 sidebar blow-out), and an agent name may
             // be up to 63 bytes.
-            clipped(cfg.label_for(name), NAME_CHARS, &["heading"]),
+            clipped_titled(
+                cfg.label_for(name),
+                NAME_CHARS,
+                name_hover(name, cfg),
+                &["heading"],
+            ),
         ),
         icon_titled(
             status.icon(),
@@ -710,15 +761,14 @@ fn hive_section(hive: &Hive, ctx: PanelContext<'_>) -> Node {
         Some(_) => "just now".to_owned(),
         None => "never".to_owned(),
     };
-    let mut rows = vec![
+    // Reachability, not links: the dashboard root lives in the `links` group,
+    // once — an agent's page and the hive overview both used to emit it, which
+    // put two `dashboard` rows on the same panel.
+    let rows = vec![
         detail("state", &reachability),
         detail("socket", ctx.socket),
         detail("last poll", &last_poll),
     ];
-    // The dashboard root, when the hive says it is reachable from a browser.
-    if let Some(home) = hive_home(ctx) {
-        rows.push(detail("dashboard", home));
-    }
     section("hive", list(false, &["ts-agents-panel-list"], rows))
 }
 
@@ -742,7 +792,12 @@ fn panel_roster_row(agent: &Agent, cfg: &AgentsConfig) -> Node {
             button(
                 format!("{}{name}", ids::CHAT),
                 &["flat", "ts-agent-name"],
-                label(cfg.label_for(name), &[]),
+                clipped_titled(
+                    cfg.label_for(name),
+                    PANEL_NAME_CHARS,
+                    name_hover(name, cfg),
+                    &[],
+                ),
             ),
             icon_titled(
                 status.icon(),
@@ -866,6 +921,23 @@ pub fn panel(
     }
 
     children.push(hive_section(hive, ctx));
+
+    // The overview's own links group. The selected-agent page emits its own
+    // (agent page + dashboard), so this is the branch that keeps the dashboard
+    // reachable when nothing is selected — without either panel showing it
+    // twice.
+    if selected.is_none()
+        && let Some(home) = hive_home(ctx)
+    {
+        children.push(section(
+            "links",
+            list(
+                false,
+                &["ts-agents-panel-list"],
+                vec![detail("dashboard", home)],
+            ),
+        ));
+    }
 
     if selected.is_none() {
         let agents = hive.agents();
@@ -1165,6 +1237,95 @@ mod tests {
         for i in 0..MAX_ROWS + 7 {
             let want = format!("chat:agent-{i}");
             assert!(ids.contains(&want), "the panel roster must list {want}");
+        }
+    }
+
+    /// A `[display.<name>].label` renames the row, and the hive's own name is
+    /// what `hivectl`, every request frame and every log line use — so the
+    /// hover has to carry it, on the card **and** in the panel's roster.
+    ///
+    /// This is the one thing the retired row-level tooltip carried that the
+    /// status caption does not, so it is the one that had to move rather than
+    /// simply go.
+    ///
+    /// Falsification: hand `clipped_titled` the label instead of
+    /// `name_hover(name, cfg)` at either call site and this goes red.
+    #[test]
+    fn a_renamed_row_still_hovers_the_hives_own_name() {
+        let mut cfg = AgentsConfig::default();
+        cfg.display.insert(
+            "trollshell-choom".to_owned(),
+            crate::config::Display {
+                label: Some("choom".to_owned()),
+                icon: None,
+                project: None,
+            },
+        );
+        let hive = Hive::Up {
+            agents: vec![running("trollshell-choom", "idle")],
+        };
+
+        for tree in [
+            super::card(&hive, &cfg, &ExpandedGroups::new(), None),
+            super::panel(&hive, &cfg, None, ctx()),
+        ] {
+            let name = find_text(&tree, "choom").expect("the label renders");
+            assert_eq!(
+                name.tooltip.as_deref(),
+                Some("choom (trollshell-choom)"),
+                "a renamed row must still say what the hive calls it"
+            );
+        }
+
+        // An agent nobody renamed hovers its plain name, not `name (name)`.
+        let plain = super::card(
+            &Hive::Up {
+                agents: vec![running("argus", "idle")],
+            },
+            &AgentsConfig::default(),
+            &ExpandedGroups::new(),
+            None,
+        );
+        assert_eq!(
+            find_text(&plain, "argus")
+                .expect("renders")
+                .tooltip
+                .as_deref(),
+            Some("argus")
+        );
+    }
+
+    /// The hive's dashboard root appears **once** on a panel, not once per
+    /// section. Both the selected agent's `links` group and the hive overview
+    /// want it, and emitting it from both put two `dashboard` rows on the same
+    /// page.
+    ///
+    /// Falsification: put `detail("dashboard", home)` back into `hive_section`
+    /// and the selected case goes red; drop the `selected.is_none()` links
+    /// branch in `panel` and the overview case does.
+    #[test]
+    fn the_dashboard_link_is_emitted_exactly_once_either_way() {
+        let urls = crate::hive::wire::HiveUrls {
+            domain: Some("hive.local".to_owned()),
+            home: Some("https://hive.local/".to_owned()),
+        };
+        let hive = Hive::Up {
+            agents: vec![running("argus", "idle")],
+        };
+        let cfg = AgentsConfig::default();
+        let with_urls = super::PanelContext {
+            urls: Some(&urls),
+            ..ctx()
+        };
+        let name = AgentName::parse("argus").expect("legal");
+
+        for selected in [None, Some(&name)] {
+            let tree = super::panel(&hive, &cfg, selected, with_urls);
+            let seen = texts(&tree).iter().filter(|t| *t == "dashboard").count();
+            assert_eq!(
+                seen, 1,
+                "one dashboard row per panel; selected={selected:?}"
+            );
         }
     }
 

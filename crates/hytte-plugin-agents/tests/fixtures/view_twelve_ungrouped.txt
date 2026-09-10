@@ -1529,11 +1529,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "agent-0",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "agent-0",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -1587,11 +1593,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "agent-1",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "agent-1",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -1645,11 +1657,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "agent-2",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "agent-2",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -1703,11 +1721,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "agent-3",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "agent-3",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -1761,11 +1785,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "agent-4",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "agent-4",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -1819,11 +1849,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "agent-5",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "agent-5",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -1877,11 +1913,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "agent-6",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "agent-6",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -1935,11 +1977,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "agent-7",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "agent-7",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -1993,11 +2041,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "agent-8",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "agent-8",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -2051,11 +2105,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "agent-9",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "agent-9",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -2109,11 +2169,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "agent-10",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "agent-10",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -2167,11 +2233,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "agent-11",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "agent-11",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {

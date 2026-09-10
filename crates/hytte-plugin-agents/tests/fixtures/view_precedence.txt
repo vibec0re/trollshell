@@ -805,11 +805,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "wedged",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "wedged",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -863,11 +869,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "locked-out",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "locked-out",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -921,11 +933,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "parked",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "parked",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -979,11 +997,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "off",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "off",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {
@@ -1037,11 +1061,17 @@ View {
                                                         "flat",
                                                         "ts-agent-name",
                                                     ],
-                                                    child: Label {
+                                                    child: Text {
                                                         id: None,
                                                         text: "busy",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
                                                         classes: [],
-                                                        tooltip: None,
+                                                        tooltip: Some(
+                                                            "busy",
+                                                        ),
                                                     },
                                                 },
                                                 Icon {

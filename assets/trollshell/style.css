@@ -647,8 +647,11 @@
 }
 /* Row padding is the plugin's to spend, because `ListBox { dense: true }` hands
  * the height budget back by zeroing the auto-wrapper's floor (`.hytte-dense-row`
- * in the library sheet). */
-.ts-agents-card .ts-agent-row {
+ * in the library sheet) — which is also why the state notices ("no hive — …",
+ * "+N more") need the same rule: they are list children too, and dense means
+ * nothing pads them but this. */
+.ts-agents-card .ts-agent-row,
+.ts-agents-card .ts-agents-notice {
     padding: 0.308em 0.462em;
 }
 .ts-agents-card button.ts-agent-btn,

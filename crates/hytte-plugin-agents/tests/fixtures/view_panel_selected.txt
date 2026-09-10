@@ -917,41 +917,6 @@ View {
                                             ],
                                             tooltip: None,
                                         },
-                                        Row {
-                                            id: None,
-                                            classes: [
-                                                "ts-agent-detail",
-                                            ],
-                                            spacing: 6,
-                                            children: [
-                                                Label {
-                                                    id: None,
-                                                    text: "dashboard",
-                                                    classes: [
-                                                        "dim-label",
-                                                        "caption",
-                                                    ],
-                                                    tooltip: None,
-                                                },
-                                                Spacer,
-                                                Text {
-                                                    id: None,
-                                                    text: "https://hive.local/",
-                                                    max_width_chars: Some(
-                                                        28,
-                                                    ),
-                                                    ellipsize: true,
-                                                    classes: [
-                                                        "caption",
-                                                        "numeric",
-                                                    ],
-                                                    tooltip: Some(
-                                                        "https://hive.local/",
-                                                    ),
-                                                },
-                                            ],
-                                            tooltip: None,
-                                        },
                                     ],
                                 },
                             ],

@@ -29,6 +29,25 @@ keys must go through `programs.trollshell.plugins.<name>.secrets` instead
 keyring as `<SLOT>_API_KEY` at spawn time — never written to disk. See
 `nix/module-common.nix`'s `secrets` option description for the full mechanism.
 
+A secret also never rides the launch **argv** (#984): the launcher sets the
+value in the `systemd-run` process's own environment and passes the bare
+`--setenv=<SLOT>_API_KEY` form, which `systemd-run(1)` resolves from there.
+`/proc/<pid>/cmdline` is world-readable (`0444`) and `/proc/<pid>/environ` is
+not (`0400`), so the key stops being readable by other local users.
+
+"Never written to disk" above means never in `plugins.json`, never in a shipped
+unit file, and never in the plugin's own config. It does **not** mean the value
+exists only in memory: once the unit is running, the key is readable by the
+owning user through the transient unit fragment systemd writes at
+`/run/user/<uid>/systemd/transient/trollshell-plugin-<id>.service` (the file is
+`0644` and carries `Environment="<SLOT>_API_KEY=<value>"`; what contains it is
+`/run/user/<uid>` being `0700`), through
+`systemctl --user show -p Environment trollshell-plugin-<id>`, and through the
+plugin's own `/proc/<pid>/environ`. All three are same-user and in scope per
+#956 — that is the boundary this design defends, and the argv was the one
+channel that crossed it. The non-secret `env` above stays inline on the argv on
+purpose: it is already public in the state file.
+
 **Precedence**, for a plugin that also reads a config file (e.g. usage's
 `~/.config/trollshell/usage.toml`): environment wins over the file, which wins
 over the plugin's built-in default. Not every plugin has all three layers —

@@ -2172,9 +2172,12 @@ mod tests {
         }
     }
 
-    /// A pinned `TROLLSHELL_CORE_LEDS_ROWS` still overrides the automatic
-    /// shape — including into a shape that is *worse* than the default, which
-    /// is the user's call to make.
+    /// A pinned `rows` in `core-leds.toml` (or, for the deprecation window,
+    /// `TROLLSHELL_CORE_LEDS_ROWS`) still overrides the automatic shape —
+    /// including into a shape that is *worse* than the default, which is the
+    /// user's call to make. Bounded, though: `config::core_leds::MAX_ROWS` caps
+    /// what a pin may ask for, so "worse" cannot become "a frame too big to
+    /// allocate" (#1040 F2).
     ///
     /// Falsified by dropping [`core_led_matrix_for`]'s `Some(rows)` arm: the
     /// override silently becomes a no-op and 4 cores stay 4x1.

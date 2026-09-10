@@ -1651,17 +1651,22 @@ session.
     `~/.config/trollshell/core-leds.toml`** (`style` / `color` / `rows` /
     `fill`), where an edit takes effect **live** — see the #869 entry below.
     The four variables below still work and still win, but each now logs one
-    deprecation line at startup naming the file key it moves to; an
-    unrecognized value logs one `tracing::warn` and falls through to the file:
+    deprecation line at startup naming the file key it moves to **and the
+    vocabulary that key accepts**; an unrecognized value logs **one**
+    `tracing::warn` (not two — it replaces the deprecation line rather than
+    joining it) and falls through to the file:
     - `TROLLSHELL_CORE_LEDS_STYLE` = `vfd` (default) / `lcd` / `oled` / `crt`
     - `TROLLSHELL_CORE_LEDS_COLOR` = `heat` (default) / `style` / `rainbow` /
       `transpride` / `#rrggbb`. `style` should give the plain single-ink panel
       — the pre-#857 look, and the guarantee the byte-identity tests pin.
     - `TROLLSHELL_CORE_LEDS_ROWS` = `rect` (default — a **wide rectangle**
-      since the second #857 pass, near-square before it) or a row
-      count. `=3` on a many-core box makes a wide, short strip — check it does
-      not push the drawer wider (it is 247 px at 1× on a 64-core box, and the
-      scale deliberately refuses to blow it up past the budget).
+      since the second #857 pass, near-square before it) or a row count
+      **from 1 to 64**. `=3` on a many-core box makes a wide, short strip —
+      check it does not push the drawer wider (it is 247 px at 1× on a 64-core
+      box, and the scale deliberately refuses to blow it up past the budget).
+      `=65` (or `=0`, or `=-1`) is rejected with one warning and falls through
+      to the file: the budget box shows nine rows at 1×, so a bigger number is
+      a typo, and an unbounded one used to ask for a multi-gigabyte frame.
     - `TROLLSHELL_CORE_LEDS_FILL` = `spare` (default) / `blank` — only visible
       when the last row is ragged **and** the skin ghosts, so pair it with
       `…_ROWS=3` and `…_STYLE=lcd` (or `vfd`). `spare` shows unlit lamps
@@ -1732,10 +1737,12 @@ session.
     `TROLLSHELL_CORE_LEDS_STYLE=oled` while `core-leds.toml` says
     `style = "crt"`. Expect an OLED panel (the variable wins), and **exactly
     one** journal line of this shape — with the real resolved path in it, not
-    a literal `~`:
+    a literal `~`, and with the key's vocabulary spelt out, since until nix
+    renders a base file the only other place a key is explained is
+    `DEFAULT_TOML` in the source:
 
     ```text
-    TROLLSHELL_CORE_LEDS_STYLE is deprecated; set `style` in /home/annika/.config/trollshell/core-leds.toml
+    TROLLSHELL_CORE_LEDS_STYLE is deprecated; set `style` in /home/annika/.config/trollshell/core-leds.toml — it accepts one of vfd/lcd/oled/crt
     ```
 
     Then edit `color` in the file and save: the colour must change live
@@ -1743,16 +1750,38 @@ session.
     (the variable stays pinned across reloads) and the deprecation line must
     **not** repeat. A line every few seconds means the reload is announcing.
 
+  - **A bad variable costs one line, not two.** Start with
+    `TROLLSHELL_CORE_LEDS_STYLE=plasma`. Expect the file's (or default) skin
+    and **exactly one** warning, which carries the whole instruction on its
+    own — no separate deprecation line beside it:
+
+    ```text
+    TROLLSHELL_CORE_LEDS_STYLE is set to `plasma`, which is not valid; expected one of vfd/lcd/oled/crt — ignoring it and taking `style` from /home/annika/.config/trollshell/core-leds.toml
+    ```
+
   - **A malformed file keeps the last good skin.** With the shell running and
     a working `core-leds.toml`, save a deliberately broken one (`style = "crt`
     — unterminated string, or `style = "plasma"` — a value no parser accepts).
     The panel must keep rendering the **last good** skin, not snap back to the
     default, and the journal gets one warning per save (not one per poll).
     Repair the file and save: the panel picks it up again.
+  - **Deleting the file gives the defaults back.** With a working
+    `core-leds.toml` applied, `rm` it. Within ~3 s the panel must return to the
+    built-in look (VFD, heat, automatic rectangle, spare fill) — a delete is an
+    intent, not a mistake, and it is the only way to get the stock look back
+    without hand-restoring every key. Note the asymmetry with the line above:
+    an unparseable file keeps the last good skin, an absent one does not.
   - **An unknown key is loud and harmless.** Add `colour = "rainbow"` (British
-    spelling) alongside a valid `style`. Expect one `unknown key in config`
-    warning naming `colour`, the panel unchanged in colour, and the `style`
-    beside it still applied.
+    spelling) alongside a valid `style`. Expect **one** `unknown key in config`
+    warning naming `colour` (one, not two — the config is loaded exactly once
+    per startup), the panel unchanged in colour, and the `style` beside it
+    still applied.
+  - **`rows` takes both spellings, and is capped.** `rows = "rect"` — the word
+    the deprecated variable took — must work exactly as `rows = 0` does, and a
+    typo like `rows = "many"` must be a _per-key_ rejection that leaves the
+    rest of the file applied, not a whole-file failure that drops the panel to
+    defaults. `rows = 65` is rejected the same way; the budget box shows nine
+    rows at 1×, so anything past 64 is a typo rather than an intent.
   - **The base layer.** Nix does not render a base file yet (out of #869's
     lane). To exercise the layer by hand, put a `core-leds.toml` under a
     directory on `XDG_CONFIG_DIRS` (e.g.

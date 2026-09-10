@@ -89,11 +89,32 @@ impl ChannelStats {
 /// Why a case failed, or [`Verdict::Pass`].
 ///
 /// An enum rather than a `bool` because the transcript goes on #893 and "which
-/// of the four ways did it fail" is the whole value of pasting it.
+/// of the ways did it fail" is the whole value of pasting it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
     /// Inside the ceiling on every channel, with the beam where the kit put it.
     Pass,
+    /// **Every compared pixel is `0, 0, 0`** — the GL arm drew nothing at all.
+    ///
+    /// The failure shape #1070's review finding M2 named
+    /// (<https://github.com/vibec0re/trollshell/pull/1070#issuecomment-5621283282>):
+    /// a glvnd stub for an unimplemented entry point returns `0` without
+    /// trapping, so a wrong dispatch table degrades to an empty compile log or
+    /// a no-op texture allocation — a **silent black chip**, with no GL error,
+    /// no `GLArea::error()` and a live context.
+    ///
+    /// **This is a split of [`Self::UndrawnFramebuffer`], not new coverage, and
+    /// the distinction matters to anyone editing [`Stats::verdict`].** An
+    /// all-zero readback is a strict subset of "one flat colour", and `uniform`
+    /// was already checked ahead of the ceiling before #1072, so M2's "a case,
+    /// not a pass" was satisfied without this variant — measured: deleting the
+    /// `all_zero` branch reports `UndrawnFramebuffer`, not `PASS`. What this
+    /// adds is the *diagnosis*, which is worth having, because "the GL arm drew
+    /// nothing" and "the GL arm drew a flat colour" send a reader to different
+    /// bugs. What it does **not** do is make the `uniform` branch redundant:
+    /// remove that one believing this covers its ground and a flat *non-black*
+    /// framebuffer starts reporting `PASS`.
+    RendersNothing,
     /// The readback is a single flat colour, so nothing was drawn — see
     /// [`Stats::uniform`].
     UndrawnFramebuffer,
@@ -110,6 +131,7 @@ impl Verdict {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Pass => "PASS",
+            Self::RendersNothing => "FAIL(nothing)",
             Self::UndrawnFramebuffer => "FAIL(blank)",
             Self::OverCeiling => "FAIL(ceiling)",
             Self::BeamMoved => "FAIL(beam)",
@@ -145,6 +167,38 @@ pub(crate) struct Stats {
     /// `glGetError` is clean. A `Scope` always paints a graticule, so a real
     /// frame is never uniform.
     pub(crate) uniform: bool,
+    /// Every compared GL pixel is `0, 0, 0` — see [`Verdict::RendersNothing`].
+    ///
+    /// A strict subset of [`Self::uniform`], reported separately because it is
+    /// the one failure shape a reader has to be told by name: "the GL arm drew
+    /// nothing" is a different bug report from "the GL arm drew a flat
+    /// colour", and #1070's M2 is specifically the first.
+    pub(crate) all_zero: bool,
+    /// The single worst compared pixel, for the transcript: where it is, which
+    /// channel, and what each arm put there.
+    ///
+    /// `None` only for an empty comparison. Reported because a bare `max 141`
+    /// classifies nothing — the *coordinates* are what say whether a
+    /// disagreement sits on an edge (rasterisation), in the interior of a flat
+    /// fill (gamma, or shader math), or only where the trace is (blend).
+    pub(crate) worst: Option<WorstPixel>,
+}
+
+/// The worst compared pixel of one case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorstPixel {
+    /// Reference-frame column.
+    pub(crate) x: usize,
+    /// Reference-frame row, top-down (the kit's convention).
+    pub(crate) y: usize,
+    /// Index into [`CHANNELS`].
+    pub(crate) channel: usize,
+    /// `|Δ|` on that channel, in 255ths.
+    pub(crate) delta: u8,
+    /// What the GL arm put there, RGB.
+    pub(crate) gl: [u8; 3],
+    /// What the CPU kit put there, RGB.
+    pub(crate) cpu: [u8; 3],
 }
 
 impl Stats {
@@ -167,6 +221,12 @@ impl Stats {
     /// framebuffer first (because it makes every other number meaningless),
     /// then the ceiling, then the structural check.
     pub(crate) fn verdict(&self) -> Verdict {
+        // "Drew nothing at all" first, then "drew one flat colour": the second
+        // is the general case of the first, and the first is the one #1070's
+        // M2 says must never be reported as anything else.
+        if self.all_zero {
+            return Verdict::RendersNothing;
+        }
         if self.uniform {
             return Verdict::UndrawnFramebuffer;
         }
@@ -237,42 +297,55 @@ impl Layout {
 /// shows up as [`Stats::uniform`] — the guard, not a silent zero.
 pub(crate) fn compare(gl: &[u8], reference: &[u8], layout: Layout) -> Stats {
     let (ref_w, ref_h) = layout.reference;
-    let (alloc_w, alloc_h) = (layout.alloc.0 as usize, layout.alloc.1 as usize);
-    let scale = (layout.device_scale as usize).max(1);
 
     let mut deltas: [Vec<u8>; 3] = std::array::from_fn(|_| Vec::with_capacity(ref_w * ref_h));
     let mut peak_row_mismatches = 0_u32;
     let mut first_gl: Option<[u8; 3]> = None;
     let mut uniform = true;
+    let mut all_zero = true;
+    let mut worst: Option<WorstPixel> = None;
 
-    let gl_at = |x: usize, y: usize| -> [u8; 3] {
-        // Bottom-up, and point-sampled through the device scale.
-        let (sx, sy) = (x * scale, y * scale);
-        let flipped = alloc_h.saturating_sub(1).saturating_sub(sy);
-        let i = (flipped * alloc_w + sx) * 4;
-        gl.get(i..i + 3)
-            .map_or([0, 0, 0], |px| [px[0], px[1], px[2]])
-    };
-    let ref_at = |x: usize, y: usize| -> [u8; 3] {
-        let i = (y * ref_w + x) * 4;
-        reference
-            .get(i..i + 3)
-            .map_or([0, 0, 0], |px| [px[0], px[1], px[2]])
-    };
     let luma = |px: [u8; 3]| u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2]);
 
     for x in 0..ref_w {
         let (mut gl_peak, mut gl_peak_row) = (0, 0);
         let (mut cpu_peak, mut cpu_peak_row) = (0, 0);
         for y in 0..ref_h {
-            let (g, c) = (gl_at(x, y), ref_at(x, y));
+            let (g, c) = (
+                gl_pixel(gl, layout, x, y),
+                ref_pixel(reference, layout, x, y),
+            );
             match first_gl {
                 None => first_gl = Some(g),
                 Some(seen) if seen != g => uniform = false,
                 Some(_) => {}
             }
+            all_zero &= g == [0, 0, 0];
             for (channel, bucket) in deltas.iter_mut().enumerate() {
-                bucket.push(g[channel].abs_diff(c[channel]));
+                let delta = g[channel].abs_diff(c[channel]);
+                bucket.push(delta);
+                // `>` and not `>=`, so the worst pixel reported is the *first*
+                // one at that magnitude in this loop's own **column-major**
+                // order (x outer, then y, then R/G/B) — a stable coordinate to
+                // paste into a transcript rather than whichever tie the loop
+                // happened to end on.
+                //
+                // Column-major is structural, not a choice: the per-column peak
+                // rows above accumulate across the inner loop, so `x` has to be
+                // the outer one. The comment here said "row-major" until #1072's
+                // review measured otherwise; the test below now pins the order
+                // it actually walks, because that order *is* the coordinate a
+                // transcript gets triaged from.
+                if worst.is_none_or(|held| delta > held.delta) {
+                    worst = Some(WorstPixel {
+                        x,
+                        y,
+                        channel,
+                        delta,
+                        gl: g,
+                        cpu: c,
+                    });
+                }
             }
             if luma(g) > gl_peak {
                 gl_peak = luma(g);
@@ -288,14 +361,87 @@ pub(crate) fn compare(gl: &[u8], reference: &[u8], layout: Layout) -> Stats {
         }
     }
 
+    let empty = deltas[0].is_empty();
     Stats {
         channels: std::array::from_fn(|channel| distribution(&mut deltas[channel])),
         pixels: ref_w * ref_h,
         peak_row_mismatches,
         // An empty comparison is not "uniform", it is nothing at all — but it
         // is still not a frame, so it fails the same way.
-        uniform: uniform || deltas[0].is_empty(),
+        uniform: uniform || empty,
+        // A readback that never arrived reads as zeros through `gl_pixel`,
+        // which is the same report as one that arrived full of them: in both
+        // the GL arm put no pixels in front of the comparison.
+        all_zero,
+        worst,
     }
+}
+
+/// One pixel of the GL readback, in **reference-frame** coordinates.
+///
+/// Bottom-up (GL's window origin), point-sampled through the device scale, and
+/// out-of-range reads as black rather than panicking — which is what surfaces
+/// a short or absent readback as [`Stats::all_zero`] instead of a silent zero.
+fn gl_pixel(gl: &[u8], layout: Layout, x: usize, y: usize) -> [u8; 3] {
+    let (alloc_w, alloc_h) = (layout.alloc.0 as usize, layout.alloc.1 as usize);
+    let scale = (layout.device_scale as usize).max(1);
+    let (sx, sy) = (x * scale, y * scale);
+    let flipped = alloc_h.saturating_sub(1).saturating_sub(sy);
+    let i = (flipped * alloc_w + sx) * 4;
+    gl.get(i..i + 3)
+        .map_or([0, 0, 0], |px| [px[0], px[1], px[2]])
+}
+
+/// One pixel of the CPU reference frame, top-down RGBA8 at `layout.reference`.
+fn ref_pixel(reference: &[u8], layout: Layout, x: usize, y: usize) -> [u8; 3] {
+    let (ref_w, _) = layout.reference;
+    let i = (y * ref_w + x) * 4;
+    reference
+        .get(i..i + 3)
+        .map_or([0, 0, 0], |px| [px[0], px[1], px[2]])
+}
+
+/// The per-pixel **worst-channel** `|Δ|` over the compared region, row-major in
+/// reference-frame order (top-down), one byte per pixel.
+///
+/// The evidence half of the harness, and the reason #1072 could be classified
+/// at all: a mean and a max say *how big* the disagreement is, and a picture of
+/// where it sits says *what kind* it is. Concentrated on the trace → blend;
+/// flat across a solid fill → gamma or shader math; a one-pixel outline →
+/// rasterisation edge coverage. Written out as a PPM by the harness; kept here
+/// rather than in the example so it walks the buffers through the same
+/// [`gl_pixel`] / [`ref_pixel`] pair the verdict does, and so it has a test.
+pub(crate) fn delta_map(gl: &[u8], reference: &[u8], layout: Layout) -> Vec<u8> {
+    let (ref_w, ref_h) = layout.reference;
+    let mut out = Vec::with_capacity(ref_w * ref_h);
+    for y in 0..ref_h {
+        for x in 0..ref_w {
+            let (g, c) = (
+                gl_pixel(gl, layout, x, y),
+                ref_pixel(reference, layout, x, y),
+            );
+            out.push(
+                (0..3)
+                    .map(|channel| g[channel].abs_diff(c[channel]))
+                    .max()
+                    .unwrap_or(0),
+            );
+        }
+    }
+    out
+}
+
+/// The GL readback re-laid-out as a top-down RGB image at the reference size —
+/// the "what the GL arm actually drew" half of the evidence pair.
+pub(crate) fn gl_image(gl: &[u8], layout: Layout) -> Vec<u8> {
+    let (ref_w, ref_h) = layout.reference;
+    let mut out = Vec::with_capacity(ref_w * ref_h * 3);
+    for y in 0..ref_h {
+        for x in 0..ref_w {
+            out.extend_from_slice(&gl_pixel(gl, layout, x, y));
+        }
+    }
+    out
 }
 
 /// Mean / p99 / max over one channel's deltas. Sorts in place.
@@ -433,14 +579,171 @@ mod tests {
     fn an_undrawn_framebuffer_fails_rather_than_reporting_numbers() {
         let (w, h) = (16, 8);
         let cpu = frame(w, h, trace(4));
-        let blank = vec![0u8; w * h * 4];
-        let stats = compare(&blank, &cpu, layout(w, h));
+        // A *flat colour* that is not black: uniform, but something was drawn.
+        let flat = flipped(w, h, |_, _| [0x20, 0x00, 0x40]);
+        let stats = compare(&flat, &cpu, layout(w, h));
         assert!(stats.uniform, "every pixel the same colour");
+        assert!(!stats.all_zero, "…but not zero");
         assert_eq!(stats.verdict(), Verdict::UndrawnFramebuffer);
+    }
 
-        // …and so does a readback that never arrived at all.
-        let nothing = compare(&[], &cpu, layout(w, h));
-        assert_eq!(nothing.verdict(), Verdict::UndrawnFramebuffer);
+    /// **"Renders nothing" is a failure, and it is named** — #1070's review
+    /// finding M2, folded in here by #1072.
+    ///
+    /// A glvnd stub for an unimplemented entry point returns `0` without
+    /// trapping, so a wrong dispatch table degrades to an empty compile log or
+    /// a no-op texture allocation: a black chip with a live context, no
+    /// `GLArea::error()` and a clean `glGetError`.
+    ///
+    /// The dark half below is the load-bearing one: its reference differs from
+    /// black by 2/255, which sits inside every one of mean, p99 and max — so
+    /// **the deltas do not catch it**, and the test asserts that before
+    /// asserting the verdict. What does catch it is the flat-frame family of
+    /// guards, and this test pins *which member* answers: `RendersNothing`,
+    /// not `UndrawnFramebuffer`.
+    ///
+    /// **Falsified** by dropping the `all_zero` branch from `verdict()`: the
+    /// dark half then reports `UndrawnFramebuffer`. Measured, and worth being
+    /// precise about, because #1072's first draft of this doc claimed it would
+    /// report `PASS` and #1072's review showed otherwise — `all_zero` is a
+    /// strict subset of `uniform`, and `uniform` was already checked ahead of
+    /// the ceiling on `main`. The variant buys the diagnosis, not the catch.
+    /// The mutation that *does* produce `PASS` here is dropping the `uniform`
+    /// branch **and** the `all_zero` one; either alone still reds.
+    #[test]
+    fn an_all_black_gl_output_is_a_failure_even_against_a_dark_reference() {
+        let (w, h) = (16, 8);
+        let black = vec![0u8; w * h * 4];
+
+        let bright = compare(&black, &frame(w, h, trace(4)), layout(w, h));
+        assert!(bright.all_zero, "every compared pixel is 0,0,0");
+        assert_eq!(bright.verdict(), Verdict::RendersNothing);
+
+        // The dangerous half: a nearly-black reference, where the *deltas*
+        // cannot tell "drew the dark skin correctly" from "drew nothing" —
+        // only the flat-frame guards can, and `all_zero` is which of them
+        // answers.
+        let dark = compare(&black, &frame(w, h, |_, _| [2, 1, 2]), layout(w, h));
+        assert!(
+            dark.worst_mean() <= CEILING_MEAN
+                && dark.worst_p99() <= super::CEILING_P99
+                && dark.worst_max() <= CEILING_MAX,
+            "the premise: inside every ceiling — {:?}",
+            dark.channels
+        );
+        assert_eq!(dark.peak_row_mismatches, 0, "…and no beam moved");
+        assert_eq!(
+            dark.verdict(),
+            Verdict::RendersNothing,
+            "…yet it drew nothing, and that is a failure"
+        );
+
+        // A readback that never arrived at all reads the same way: the GL arm
+        // put no pixels in front of the comparison either way.
+        let nothing = compare(&[], &frame(w, h, trace(4)), layout(w, h));
+        assert_eq!(nothing.verdict(), Verdict::RendersNothing);
+    }
+
+    /// The worst pixel is reported with its coordinates, its channel and both
+    /// arms' colours — the readout that makes a classification possible.
+    ///
+    /// **Falsified** by dropping the worst-pixel branch from `compare`
+    /// (`worst` is `None`), or by reporting the wrong member of the pair — see
+    /// the tie test below, which is the half that pins *which* pixel.
+    #[test]
+    fn the_worst_pixel_is_located_with_its_channel_and_both_colours() {
+        let (w, h) = (16, 8);
+        let cpu = frame(w, h, |_, _| [10, 20, 30]);
+        let gl = flipped(w, h, |x, y| {
+            if (x, y) == (5, 3) {
+                [10, 20, 130]
+            } else {
+                [10, 20, 30]
+            }
+        });
+        let stats = compare(&gl, &cpu, layout(w, h));
+        let worst = stats.worst.expect("a non-empty comparison has one");
+        assert_eq!((worst.x, worst.y), (5, 3), "reference-frame, top-down");
+        assert_eq!(super::CHANNELS[worst.channel], "B");
+        assert_eq!(worst.delta, 100);
+        assert_eq!(worst.gl, [10, 20, 130]);
+        assert_eq!(worst.cpu, [10, 20, 30]);
+        assert!(
+            compare(&[], &cpu, layout(0, 0)).worst.is_none(),
+            "…and an empty comparison has none"
+        );
+    }
+
+    /// **A tie reports the first pixel in the scan's own order**, and that
+    /// order is column-major (x outer).
+    ///
+    /// #1072's review measured the previous version of this claim and it did
+    /// not hold: the doc said `>=` for `>` would move the coordinates "to the
+    /// last tie rather than the first", but the fixture planted a *unique*
+    /// maximum, so there was no tie for the mutation to move and all 22 tests
+    /// stayed green. A falsification note that survives its own mutation is
+    /// worse than none. This one plants a real tie.
+    ///
+    /// Two pixels, same `|Δ|`, chosen so the two candidate scan orders
+    /// disagree about which comes first: `(2, 5)` wins column-major (smaller
+    /// `x`), `(9, 1)` wins row-major (smaller `y`). So the assertion pins the
+    /// tie-break *and* the traversal at once — which matters because the
+    /// reported coordinate is what a transcript gets triaged from, and an
+    /// unstable one sends the reader to the wrong pixel.
+    ///
+    /// **Falsified**, measured, two ways: `delta > held.delta` → `>=` in
+    /// `compare` reports `(9, 1)`; swapping `compare`'s loop nesting to y-outer
+    /// reports `(9, 1)` as well.
+    #[test]
+    fn a_tie_reports_the_first_pixel_the_column_major_scan_reaches() {
+        let (w, h) = (16, 8);
+        let cpu = frame(w, h, |_, _| [10, 20, 30]);
+        // `(2, 5)` is first by column; `(9, 1)` is first by row. Same delta.
+        let gl = flipped(w, h, |x, y| {
+            if (x, y) == (2, 5) || (x, y) == (9, 1) {
+                [10, 20, 130]
+            } else {
+                [10, 20, 30]
+            }
+        });
+        let worst = compare(&gl, &cpu, layout(w, h))
+            .worst
+            .expect("two candidates, one report");
+        assert_eq!(worst.delta, 100, "the premise: the two are tied");
+        assert_eq!(
+            (worst.x, worst.y),
+            (2, 5),
+            "column-major reaches (2, 5) first; row-major would say (9, 1), \
+             and `>=` would say (9, 1) too",
+        );
+    }
+
+    /// The delta map is the per-pixel worst channel, in the reference frame's
+    /// own top-down order — so a diff image lines up with the reference image
+    /// pixel for pixel rather than being vertically mirrored.
+    ///
+    /// **Falsified** by dropping the flip out of `gl_pixel`: the lit pixel in
+    /// the map moves to row `h - 1 - y`.
+    #[test]
+    fn the_delta_map_is_top_down_and_per_pixel() {
+        let (w, h) = (8, 4);
+        let cpu = frame(w, h, |_, _| [0, 0, 0]);
+        let gl = flipped(w, h, |x, y| {
+            if (x, y) == (2, 1) {
+                [0, 77, 0]
+            } else {
+                [0, 0, 0]
+            }
+        });
+        let map = super::delta_map(&gl, &cpu, layout(w, h));
+        assert_eq!(map.len(), w * h, "one byte per pixel");
+        assert_eq!(map[w + 2], 77, "at the reference's own (2, 1)");
+        assert_eq!(map.iter().filter(|d| **d > 0).count(), 1);
+
+        // …and the same flip for the image the harness writes beside it.
+        let image = super::gl_image(&gl, layout(w, h));
+        assert_eq!(image.len(), w * h * 3, "RGB, no alpha");
+        assert_eq!(&image[(w + 2) * 3..(w + 2) * 3 + 3], &[0, 77, 0]);
     }
 
     /// **A beam in the wrong place fails**, even when every channel is inside
@@ -644,6 +947,7 @@ mod tests {
             pixels: 1,
             peak_row_mismatches: 0,
             uniform: false,
+            ..Stats::default()
         };
         assert_eq!(stats.verdict(), Verdict::Pass);
     }
@@ -654,6 +958,7 @@ mod tests {
     fn every_verdict_is_named_and_only_one_passes() {
         let all = [
             Verdict::Pass,
+            Verdict::RendersNothing,
             Verdict::UndrawnFramebuffer,
             Verdict::OverCeiling,
             Verdict::BeamMoved,

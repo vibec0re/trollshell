@@ -1377,42 +1377,45 @@ session.
       rasterisation per tick remains. Nothing should look different on
       screen — same picture, same pixels; this PR moves ownership only,
       never a byte of content.
-- [ ] **(#893 stage B / #886 / #863)** **`Scope` renders on a `GtkGLArea` —
-      opt-in via `TROLLSHELL_PREEM_RENDERER=gl` while #1072 is open.** #1067
-      got the GL loader actually resolving entry points for the first time,
-      and the day it did, `preem_gl_diff` reported 12/12 cases over the parity
-      ceiling with no classification yet of whether that is the shader math or
-      the harness's own assumptions — so #1072 flipped the shipped default to
-      **CPU** (`hytte_gl`'s loader route never runs unless something opts into
-      GL) rather than switch every preem chip's renderer on glass with no
-      parity evidence behind it. `TROLLSHELL_PREEM_RENDERER=gl` opts in; the
-      PR that closes #1072 makes GL the default again. Nothing in this entry
-      can be gated in CI: `nix flake check`'s system-tests bucket runs
-      `xvfb-run` in a sandbox with no `/dev/dri` and no mesa in the closure, so
-      the shell's GL path never executes there. What CI _does_ hold is the arm
+- [ ] **(#893 stage B / #886 / #863 / #1072)** **`Scope` renders on a
+      `GtkGLArea`, and that is the default again.** #1067 got the GL loader
+      actually resolving entry points for the first time, and the day it did,
+      `preem_gl_diff` reported 12/12 cases over the parity ceiling — so #1070
+      parked the shipped default on **CPU** rather than switch every preem
+      chip's renderer on glass with no parity evidence behind it. #1072
+      classified those twelve: every one of them was the **harness** reading
+      the wrong framebuffer (`gtk_gl_area_snapshot` hands its texture to GSK
+      and the next `attach_buffers` takes a different one out of the area's
+      pool, so each case was scored against its predecessor's picture). Read
+      after the pool settles, and required to be stable across two renders of
+      the same state, the two arms are **byte-identical — max |Δ| 0 of 255 on
+      every channel of all twelve cases, under llvmpipe + Xvfb** (Mesa 26.2.2).
+      So GL is the default and `TROLLSHELL_PREEM_RENDERER=cpu` is the kill
+      switch. Nothing in this entry can be gated in CI: `nix flake check`'s
+      system-tests bucket runs `xvfb-run` in a sandbox with no `/dev/dri` and
+      no mesa in the closure, so the shell's GL path never executes there
+      (#1036 is the issue for changing that). What CI _does_ hold is the arm
       selection, the uniform table, the animation state machine and the
       reconciler's node handling — everything up to the draw call. The draw is
       yours.
-  1. **The GL arm's picture is right.** Start the shell with
-     `TROLLSHELL_PREEM_RENDERER=gl` in the unit's environment and open
-     `hytte-plugin-preem-demo`'s card. The scope must look like the scope did:
-     same graticule, same beam, same phosphor trail length, same skin colours.
-     A gamma-shifted or washed-out trace means the `GtkGLArea` framebuffer is
-     being treated as linear where `PixelSurface`'s texture was sRGB — the one
-     colour-space question this design could not settle from the sources.
+  1. **The GL arm's picture is right.** Start the shell (no environment
+     variable needed now) and open `hytte-plugin-preem-demo`'s card. The scope
+     must look like the scope did: same graticule, same beam, same phosphor
+     trail length, same skin colours. A gamma-shifted or washed-out trace
+     means the `GtkGLArea` framebuffer is being treated as linear where
+     `PixelSurface`'s texture was sRGB — the one colour-space question this
+     design could not settle from the sources, and the one llvmpipe's
+     byte-identical result does not transfer to your driver for free.
      `RUST_LOG=hytte_gl=debug journalctl --user -u trollshell | grep 'resolved'`
      names which loader route won (glvnd or libepoxy, #1067);
      `journalctl --user -u trollshell | grep -i 'GlSurface\|GL context'` should
-     otherwise be silent — a line there names the fallback that fired. This is
-     also where #1072's actual parity question gets answered: does the picture
-     genuinely match, or is `preem_gl_diff`'s 12/12 finding visible here too?
-  2. **The default (unset) is what ships, and it is the CPU kit.** Restart
-     with no `TROLLSHELL_PREEM_RENDERER` set (or explicitly `=cpu`, kept as the
-     redundant spelling) and confirm the scope draws — and draws the CPU kit's
-     own picture. That identity is byte-checked in CI
-     (`the_cpu_arm_still_emits_the_kits_own_bytes_as_a_pixels_node`, plus every
-     existing `*_renders_at_parity_with_the_kit` test, which all run on the CPU
-     arm by default). What only glass can confirm is that opting in is
+     otherwise be silent — a line there names the fallback that fired.
+  2. **The kill switch still forces the kit.** Restart with
+     `TROLLSHELL_PREEM_RENDERER=cpu` in the unit's environment and confirm the
+     scope draws the CPU kit's own picture. That identity is byte-checked in
+     CI (`the_cpu_arm_still_emits_the_kits_own_bytes_as_a_pixels_node`, plus
+     every existing `*_renders_at_parity_with_the_kit` test, which all run on
+     the CPU arm by default). What only glass can confirm is that the switch is
      actually _read_: the variable is consumed once at the first `Scope`
      build, so it has to be in the unit's environment, not just your shell's.
   3. **A bar's worth of scopes.**
@@ -1421,13 +1424,40 @@ session.
      idle baseline. The number to beat is stage A's `gl-x3` layer result,
      16.77 ms. `--areas 3` was all stage A measured, so this is the
      extrapolation being checked rather than re-confirmed.
-  4. **The parity numbers.** `cargo run -p trollshell --example preem_gl_diff`
-     prints a per-channel mean / p99 / max against the CPU kit for each skin at
-     three points in the fade, plus a per-column peak-row structural check. The
-     proposed ceiling is **mean ≤ 2 / p99 ≤ 8 / max ≤ 32** of 255 (#893,
-     Annika's answer 4). Paste the transcript on #893; if the span-quad design
-     holds, the observed numbers should be far tighter and the ceiling tightens
-     to observed + margin.
+  4. **The parity numbers, on your driver.** `preem_gl_diff` prints a
+     per-channel mean / p99 / max against the CPU kit for each skin at three
+     points in the fade, plus a per-column peak-row structural check, the worst
+     pixel's coordinates and channel, an edge/field/lit region split, and three
+     netpbm images per case under `gates/` (`pnmtopng` them to look). The
+     ceiling is **mean ≤ 2 / p99 ≤ 8 / max ≤ 32** of 255 (#893, Annika's
+     answer 4). Under llvmpipe every case reads **0 / 0 / 0** — the span-quad
+     design does hold, exactly — so on real hardware anything above zero is
+     worth reading rather than shrugging at, and the region split says which of
+     #1072's four buckets it is: only on edges is rasterisation coverage, flat
+     across the field is gamma/sRGB, in the lit interior is shader math. It
+     runs headless too, which is how the #1072 numbers were taken:
+
+     ```sh
+     nix develop --command bash -c '
+       MESA=$(nix build nixpkgs#mesa --no-link --print-out-paths)
+       export LIBGL_ALWAYS_SOFTWARE=1 GDK_BACKEND=x11 \
+              LD_LIBRARY_PATH="$MESA/lib:$LD_LIBRARY_PATH" \
+              __EGL_VENDOR_LIBRARY_FILENAMES="$MESA/share/glvnd/egl_vendor.d/50_mesa.json"
+       xvfb-run -a cargo run -p trollshell --example preem_gl_diff'
+     ```
+
+     `__EGL_VENDOR_LIBRARY_FILENAMES` is the one that is definitely
+     load-bearing: glvnd's default vendor directories are
+     `/usr/share/glvnd/egl_vendor.d` and `/run/opengl-driver/share/…`, neither
+     of which exists in a nix sandbox, so without it `eglInitialize` finds no
+     vendor at all (the #1036 spike's finding). `LIBGL_DRIVERS_PATH` was in the
+     spike's recipe and is **not** kept here — #1072's review ran it as
+     `$MESA/lib`, as `$MESA/lib/dri` and omitted entirely, and all three pass;
+     it is the GLX-era knob and EGL resolves without it. The other three have
+     not been bisected individually. Exit status is the verdict — it is `1` on
+     any failure, including `FAIL(nothing)`: a GL arm that drew literally
+     nothing, which the deltas alone cannot catch against a dark skin.
+
   5. **CPU and GL side by side.** Two shells cannot share the session, so do it
      in sequence on the same preem-demo card and compare screenshots — or put a
      GL scope next to a CPU-only kit widget (the gauge, which has no GL arm in
@@ -1445,6 +1475,7 @@ session.
      confirm the scope falls back to the CPU kit with one journal line rather
      than showing a blank chip. The phosphor restarts from black, which is the
      honest outcome — the GL arm never drew a trail to inherit.
+
 - [ ] **(#893)** **The shader widget: a plugin's own GLSL on the GPU.** A
       plugin ships a fragment body plus a data buffer; the shell compiles the
       body once and per frame re-uploads only the buffer. Everything up to the

@@ -1620,6 +1620,18 @@ kept = true
             5,
             "and the save itself still takes"
         );
+
+        // The whole rendering, so what a save through an inline table actually
+        // produces is written down rather than inferred from four `contains`.
+        // The three appended keys are the documented "a whole-value save pins
+        // every key" behaviour, and the spacing around them is `set_value`'s
+        // append rule: red if it stops clearing `mystery`'s trailing space,
+        // which would render `42 , color`.
+        assert_eq!(
+            out,
+            "core = { brightness = 5, _unset = [\"label\"], mystery = 42, \
+             color = \"amber\", palette = [\"amber\", \"rust\"] }\nenabled = true\n"
+        );
     }
 
     /// The fidelity half of shape 1, asserted on **bytes** rather than on

@@ -8247,6 +8247,7 @@ fn audit_line_names_the_effect_id_and_the_launched_unit() {
             AuditDecision::Allowed,
             None,
             None,
+            None,
         ),
         "2026-07-24T00:00:00Z plugin=timer effect=Notify decision=allowed",
     );
@@ -8258,6 +8259,7 @@ fn audit_line_names_the_effect_id_and_the_launched_unit() {
             "RunCommand",
             AuditDecision::Allowed,
             Some(7),
+            None,
             None,
         ),
         "2026-07-24T00:00:00Z plugin=timer effect=RunCommand decision=allowed id=7",
@@ -8271,6 +8273,7 @@ fn audit_line_names_the_effect_id_and_the_launched_unit() {
             "RunCommand(detached)",
             AuditDecision::Allowed,
             Some(7),
+            None,
             Some("trollshell-launch-caw-7-4242-0.service"),
         ),
         "2026-07-24T00:00:00Z plugin=caw effect=RunCommand(detached) decision=allowed \
@@ -8284,6 +8287,7 @@ fn audit_line_names_the_effect_id_and_the_launched_unit() {
         "RunCommand(detached)",
         AuditDecision::Allowed,
         Some(1),
+        None,
         Some("trollshell-launch-bad id\n-1-2-3.service"),
     );
     assert!(!line.contains('\n'), "no newline may reach the log: {line}");

@@ -574,6 +574,14 @@ pub enum Input<M> {
     ///   answers when the desktop has resolved the handler, which may be after
     ///   an application-chooser dialog, so do not assume it lands in the same
     ///   frame as the click.
+    ///
+    /// `RunCommand` and `OpenUri` both reply on this same `id` field, and
+    /// [`RequestConsent`](proto::Effect::RequestConsent)'s
+    /// [`ConsentDecision`](Input::ConsentDecision) round-trip carries the same
+    /// allocation contract on its own `request_id` — so treat every
+    /// reply-bearing effect kind as one shared id space and allocate from a
+    /// single counter, not one per kind, or two effects in flight at once can
+    /// collide on the same value (#1060).
     EffectResult {
         /// The `id` the plugin chose on the originating effect.
         id: u64,

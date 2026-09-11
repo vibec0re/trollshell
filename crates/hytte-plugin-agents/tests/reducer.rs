@@ -354,9 +354,16 @@ fn the_edit_button_opens_this_agents_page() {
 /// `[startstop]`. `SetPaused` is unchanged and still reachable, from the drawer
 /// page's pause control.
 ///
-/// Falsification: make `lifecycle_affordance` ignore the status and always
-/// return `START` and the second frame reds; point either arm at `SetPaused`
-/// and both do.
+/// This pins the **frames**, not which button a row draws: it clicks the ids
+/// directly, so `lifecycle_affordance`'s state→verb choice is deliberately not
+/// falsified here — `view.rs`'s
+/// `a_card_row_is_two_lines_with_exactly_the_mocks_two_buttons` is where that
+/// lives, and it does red on it (verified). Splitting it that way is the point:
+/// the view decides which verb is offered, the reducer decides what the verb
+/// sends, and a mutation to either has exactly one home.
+///
+/// Falsification: point either arm at `SetPaused`, or widen the scope past one
+/// agent, and both frames red.
 #[test]
 fn the_lifecycle_button_starts_a_stopped_agent_and_stops_a_running_one() {
     let (mut m, mut rx) = model();

@@ -65,7 +65,11 @@
 //! [`crate::subsystem::assemble`] logs it **naming the layer file**. The
 //! detection lives here, next to the code that honours the marker; the
 //! reporting lives there, where the file name is — the same split, for the
-//! same reason, as rule 4's unknown keys.
+//! same reason, as rule 4's unknown keys. Since #1018 `assemble` also returns
+//! the finding as data, on [`crate::subsystem::Loaded::unset_findings`], the way
+//! rule 4 returns unknown keys on `unknown_keys` — this module still never
+//! sees a layer name, so the pairing happens where [`crate::subsystem`]
+//! already computes one for the `warn!`.
 //!
 //! # A marker that names nothing
 //!
@@ -869,8 +873,31 @@ mod tests {
         );
     }
 
+    /// The sentence a caller with no field-structured log can print — the
+    /// sibling [`InertUnset`]'s sentence is pinned the same way, immediately
+    /// below.
+    ///
+    /// Red if `MalformedUnset`'s `Display` is ever reworded: every other
+    /// assertion on this type compares two `MalformedUnset`s (or two
+    /// `Finding`s built from the same `to_string()` call) to each other, so
+    /// nothing else in the suite notices the *text* changing (#1018 review
+    /// M-2 — measured: rewording the format string left the whole suite
+    /// green, while the mirror mutation on `InertUnset` reddened the test
+    /// below).
+    #[test]
+    fn a_malformed_unset_says_what_is_wrong_in_one_line() {
+        assert_eq!(
+            MalformedUnset {
+                key: "core._unset".into(),
+                found: "string",
+            }
+            .to_string(),
+            "core._unset should be a key name, but is a string"
+        );
+    }
+
     /// The sentence a caller with no field-structured log can print, matching
-    /// [`MalformedUnset`]'s.
+    /// [`MalformedUnset`]'s, pinned immediately above.
     #[test]
     fn an_inert_unset_says_what_is_wrong_in_one_line() {
         assert_eq!(

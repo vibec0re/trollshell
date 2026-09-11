@@ -10,6 +10,7 @@
   gtk4,
   libadwaita,
   gtk4-layer-shell,
+  webkitgtk_6_0,
   gsettings-desktop-schemas,
   adwaita-icon-theme,
   hicolor-icon-theme,
@@ -131,6 +132,16 @@ let
     gtk4
     libadwaita
     gtk4-layer-shell
+    # WebKitGTK 6.0 — `webkit6-sys`'s pkg-config lookup (`webkitgtk-6.0.pc`),
+    # for the #950 companion window (crates/trollshell-agent-window) and
+    # nothing else. It is in the workspace's buildInputs because there is one
+    # `craneLib.buildPackage` for the whole workspace (#572/#587), so every
+    # native dependency any member needs lives here; it does **not** put a web
+    # engine into the shell's runtime closure, because the shell's binary does
+    # not link it. The devShell inherits this list through
+    # `passthru.devInputs`, so a `cargo build` in the shell finds the same .pc
+    # file the sandbox does.
+    webkitgtk_6_0
     gsettings-desktop-schemas
     adwaita-icon-theme
     hicolor-icon-theme

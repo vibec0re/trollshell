@@ -1,0 +1,93 @@
+[package]
+name = "trollshell-agent-window"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The per-agent companion window: hyperhive's agent page in a WebKitGTK view inside trollshell's own chrome (issue #950, phase P2 of #947)"
+
+[lints]
+workspace = true
+
+[features]
+# Opt-in test bucket: the tests that need a real display server (GTK), exactly
+# as `trollshell-control-center` / `hytte-ui` declare it. Off by default so
+# `cargo test` stays hermetic — the chrome's *models* are pure and tested
+# without one; what needs a display is the handful of tests that assert a
+# `gtk::Label` actually carries what a model said.
+#
+# `nix flake check`'s `system-tests` derivation runs
+# `xvfb-run -a cargo test --workspace --locked --features system-tests`, and its
+# `clippy` derivation passes `--features system-tests` too, so declaring the
+# feature here is all it takes for both to pick this crate's gated module up.
+system-tests = []
+
+# A library beside the binary, for the reason `hytte-plugin-agents` has one:
+# `tests/feed.rs` drives the poll loop against a scripted `host.sock`, and an
+# integration test cannot reach into a bin-only crate.
+[lib]
+name = "trollshell_agent_window"
+path = "src/lib.rs"
+
+# `main` is the command line, the application registration and the window's
+# wiring — everything it shows is in the library.
+[[bin]]
+name = "trollshell-agent-window"
+path = "src/main.rs"
+
+[dependencies]
+# GTK4 + libadwaita — a normal windowed app, never layer-shell and never linked
+# into the shell (the `trollshell-control-center` precedent, #399). Versions and
+# features mirror that crate's so the workspace lock unifies to one build of
+# each.
+adw.workspace = true
+gtk = { workspace = true, features = ["v4_14"] }
+# The whole point of the window: hyperhive's own agent page, rendered by
+# WebKitGTK inside our chrome, so parity with the hive's frontend is free and
+# permanent (spec #955 §7.1). WebKitGTK lands **only** here — the shell never
+# links a web engine.
+webkit = { workspace = true }
+# P1's hive client, reused rather than re-mirrored: `hive::{wire, client}`, the
+# `model::{Agent, AgentName, Status}` collapse and `agents.toml`
+# (`config::load`) all come from the plugin crate, which exposes them as a
+# library for exactly this. Two readers of one socket must agree byte for byte
+# on its verbs — the #640 argument for `hytte-config`, applied to a wire.
+#
+# It drags the plugin SDK (proto + hytte-preem + tokio) as an rlib and no GUI
+# closure; the alternative, a third crate holding the client, would move ~700
+# lines to buy nothing this window needs.
+hytte-plugin-agents = { path = "../hytte-plugin-agents" }
+# The poll loop's socket I/O and its `select!`. The window drives its own
+# multi-thread runtime (it links no `hytte-reactive`, so there is no shared
+# one), and hands results to the GTK thread over a `tokio::sync::mpsc` whose
+# `recv()` is executor-agnostic — which is what lets `glib::spawn_future_local`
+# await it on the main context with no bridging crate.
+tokio = { workspace = true, default-features = false, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+tracing.workspace = true
+# Workspace `tracing-subscriber` sets `default-features = false` (what
+# hytte-services' dev-dependency needs); widen back to the full default set
+# here, matching `trollshell-control-center`'s manifest.
+tracing-subscriber = { workspace = true, default-features = true, features = [
+  "fmt",
+  "env-filter",
+] }
+
+[dev-dependencies]
+# The scripted `host.sock` reads each request's `cmd` tag to decide what to
+# answer — the daemon's own dispatch, in ten lines.
+serde_json.workspace = true
+# The scripted `host.sock`: a real `UnixListener` in a `TempDir` answering from
+# a recorded queue, the shape `hytte-plugin-agents/tests/fake_socket.rs` uses.
+tempfile.workspace = true
+# `test-util` for `#[tokio::test(start_paused = true)]`, so a test that asserts
+# a poll cadence is instant instead of sleeping for it.
+tokio = { workspace = true, features = ["test-util"] }

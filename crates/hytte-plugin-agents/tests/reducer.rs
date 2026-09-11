@@ -41,11 +41,11 @@ fn status(rows: Vec<AgentStatusRow>) -> Input<Msg> {
     Input::App(Msg::Status(Ok(rows)))
 }
 
+/// A click the host could not attribute to a screen — `output: None`, which
+/// is what the drawer panel sends and what every event carried before #1050.
+/// The card reads no `output`, so this is the whole surface these tests need.
 fn click(id: &str) -> Input<Msg> {
-    Input::Event {
-        node: id.to_owned(),
-        kind: EventKind::Click,
-    }
+    Input::event(id, EventKind::Click)
 }
 
 /// Every frame queued on the command lane so far, as the JSON lines they will

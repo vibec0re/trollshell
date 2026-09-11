@@ -231,6 +231,36 @@ impl Subsystem for AgentsConfig {
     const DEFAULT_TOML: &'static str = DEFAULT_TOML;
     type Error = Invalid;
 
+    /// `agents.toml` has **no spellings**, so the resolved form is the file
+    /// itself (#1044).
+    ///
+    /// [`Subsystem::Resolved`] exists to separate "what the file says" from
+    /// "what that word means" — `core-leds.toml`'s `style = "crt"` becoming a
+    /// `DisplayStyle`, a number of seconds becoming a `Duration`. Every key
+    /// here is already its own value: `socket` is a path, `poll_seconds` is a
+    /// count, and `[display.<name>]` is three optional strings that are
+    /// rendered verbatim. There is no word to judge, so a distinct `Resolved`
+    /// type would be this struct with the fields copied across and nothing
+    /// done to them.
+    ///
+    /// The one derived value, [`AgentsConfig::poll_interval`], is a **clamp**
+    /// rather than a parse: it cannot reject anything, only pull an
+    /// out-of-range number back into the validated band, and it is already a
+    /// method so a caller holding a hand-built config gets the same bound.
+    ///
+    /// # The residual, stated rather than implied
+    ///
+    /// The trait's doc asks for every field to be a raw `toml::Value` so that
+    /// serde's **whole-file** verdict never decides a single key's fate
+    /// (#1040 T1). These fields are natively typed instead, so
+    /// `poll_seconds = "soon"` is a deserialisation failure for the whole
+    /// layer, not one warned key — the same behaviour this subsystem has had
+    /// since it was written, and the reason [`Invalid`] still carries
+    /// whole-file rules. Adopting the per-key shape means retyping the schema
+    /// and is a change of contract, not a rebase; it is #947 follow-up work,
+    /// not something this file should half-do.
+    type Resolved = Self;
+
     fn validate(&self) -> Result<(), Self::Error> {
         if self.socket.trim().is_empty() || !self.socket.starts_with('/') {
             return Err(Invalid::Socket(self.socket.clone()));
@@ -239,6 +269,18 @@ impl Subsystem for AgentsConfig {
             return Err(Invalid::PollSeconds(self.poll_seconds));
         }
         Ok(())
+    }
+
+    /// Every key is already its value — see [`Subsystem::Resolved`] above.
+    ///
+    /// The rejection list is **always** empty, and that is a statement about
+    /// this schema rather than a stub: nothing here turns a string into
+    /// anything, so there is no per-key verdict to report. The keys that can
+    /// still be wrong (`socket`, `poll_seconds`) constrain the file as a whole
+    /// and are judged in [`Self::validate`], which is where the trait puts a
+    /// whole-file rule.
+    fn parsed(&self) -> (Self, Vec<hytte_config::subsystem::InvalidValue>) {
+        (self.clone(), Vec::new())
     }
 }
 

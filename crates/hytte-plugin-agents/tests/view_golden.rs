@@ -156,10 +156,10 @@ fn scenarios() -> Vec<(&'static str, Agents)> {
                     home: Some("https://hive.local/".to_owned()),
                 },
             ))));
-            m.update(Input::Event {
-                node: "chat:trollshell-choom".to_owned(),
-                kind: hytte_plugin::proto::EventKind::Click,
-            });
+            m.update(Input::event(
+                "chat:trollshell-choom",
+                hytte_plugin::proto::EventKind::Click,
+            ));
             m
         }),
         // The same roster with one row's details unfolded **in the card** —
@@ -170,10 +170,10 @@ fn scenarios() -> Vec<(&'static str, Agents)> {
             m.update(Input::App(Msg::Status(Ok(roster(
                 "agent_status_grouped.json",
             )))));
-            m.update(Input::Event {
-                node: "details:trollshell-choom".to_owned(),
-                kind: hytte_plugin::proto::EventKind::Click,
-            });
+            m.update(Input::event(
+                "details:trollshell-choom",
+                hytte_plugin::proto::EventKind::Click,
+            ));
             m
         }),
     ]

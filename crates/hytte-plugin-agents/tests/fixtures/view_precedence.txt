@@ -1126,4 +1126,5 @@ View {
             tooltip: None,
         },
     ),
+    hidden_on: [],
 }

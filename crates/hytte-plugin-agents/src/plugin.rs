@@ -432,9 +432,15 @@ impl Plugin for Agents {
                 }]
             }
             Input::App(Msg::Status(result)) => self.fold_status(result),
+            // `..` is mandatory since #1083 made `Input::Event`
+            // `#[non_exhaustive]` and gave it an `output`. The card is
+            // per-monitor decoration with no output-dependent behaviour, so
+            // which output the click came from is deliberately ignored here
+            // rather than threaded into the model.
             Input::Event {
                 node,
                 kind: EventKind::Click,
+                ..
             } => self.click(&node),
             // Additive `Input` variants — this plugin issues no `RunCommand`,
             // no datasource query, and declares neither `Consent` nor the

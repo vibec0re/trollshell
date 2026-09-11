@@ -153,6 +153,15 @@ struct Editor {
     /// clobbered, and it is re-read from the file after each successful write
     /// so it always says exactly what is on disk.
     base: Rc<RefCell<Vec<Place>>>,
+    /// The entry row `[departures].endpoint` (#1124) is edited through — a
+    /// whole-shell setting, not per-place, so it lives beside `base` rather
+    /// than inside it. Kept so a successful save or an out-of-band
+    /// [`Self::reload`] can push the file's own word for it back into the
+    /// displayed text (the group it lives in isn't part of [`Self::rebuild`]'s
+    /// per-place teardown, unlike `station`'s row, which is simply rebuilt
+    /// fresh every time); the widget's own text is the state, so there's no
+    /// separate cell to keep in sync the way `base` needs one.
+    departures_endpoint_row: adw::EntryRow,
     /// The stack detail pages are pushed onto.
     nav: adw::NavigationView,
     /// The root page's list of places, rebuilt whenever the set changes.
@@ -222,6 +231,29 @@ impl Editor {
         self.save(next)
     }
 
+    /// Write the departures endpoint (#1124), then re-read what the file
+    /// actually says — the endpoint-only counterpart to [`Self::save`]. No
+    /// `check_base` here (as [`Self::save`] has via [`places::save`]): the key
+    /// is a single scalar with nothing to have drifted underneath an edit the
+    /// way the place set can.
+    ///
+    /// Returns whether the save landed; a failure toasts and leaves both the
+    /// file and the displayed text untouched.
+    fn save_departures_endpoint(&self, next: Option<String>) -> bool {
+        match places::save_departures_endpoint(next.as_deref()) {
+            Ok(()) => {
+                let reloaded = places::load_departures_endpoint();
+                self.departures_endpoint_row
+                    .set_text(reloaded.as_deref().unwrap_or_default());
+                true
+            }
+            Err(err) => {
+                self.report(&err);
+                false
+            }
+        }
+    }
+
     /// Surface a rejected save. `ChangedOnDisk` gets a Reload action instead of
     /// a bare complaint — it is the one failure the user can clear with one
     /// click, and the only one where *this* window is holding the stale copy.
@@ -247,6 +279,11 @@ impl Editor {
     /// and the reload may have removed or reordered it.
     fn reload(&self) {
         *self.base.borrow_mut() = places::load_places();
+        self.departures_endpoint_row.set_text(
+            places::load_departures_endpoint()
+                .as_deref()
+                .unwrap_or_default(),
+        );
         while self.nav.pop() {}
         self.rebuild();
     }
@@ -774,6 +811,28 @@ impl Editor {
 /// That session-only limitation is triage option (B) on #640 and is
 /// deliberately *not* fixed here — persisting it is a `geoclue.rs` change this
 /// tab doesn't touch. What this does is make it visible instead of silent.
+/// Build the departures backend group (#1124): a free-form entry for
+/// `[departures].endpoint` — a short name or a full URL — following the same
+/// plain-entry shape `station`'s own row uses. The row itself
+/// (`editor.departures_endpoint_row`) and its apply handler are built by the
+/// caller ([`build_page`]), alongside `Editor`'s own construction; this
+/// function only lays it out in its own titled group.
+fn build_departures_endpoint_group(editor: &Editor) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Departures backend")
+        .description(
+            "Which transport.rest deployment the departures widget fetches from. Leave blank \
+             for bvg (Berlin). Short names: bvg, vbb, db — or paste a full https://... base URL \
+             for another transport.rest deployment. Not per-place: the whole shell fetches from \
+             one backend. VBB and BVG share the VBB station id space; DB uses its own EVA ids, \
+             so switching usually means finding a new station id from the new backend's own \
+             /locations?query= route.",
+        )
+        .build();
+    group.add(&editor.departures_endpoint_row);
+    group
+}
+
 fn build_override_group(editor: &Editor) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
         .title("Weather location override")
@@ -835,8 +894,15 @@ pub(crate) fn build_page() -> (adw::ToastOverlay, glib::SourceId) {
         )
         .build();
 
+    let departures_endpoint_row = adw::EntryRow::builder()
+        .title("Endpoint")
+        .text(places::load_departures_endpoint().unwrap_or_default())
+        .show_apply_button(true)
+        .build();
+
     let editor = Editor {
         base: Rc::new(RefCell::new(places::load_places())),
+        departures_endpoint_row: departures_endpoint_row.clone(),
         nav: nav.clone(),
         list: list.clone(),
         rows: Rc::new(RefCell::new(Vec::new())),
@@ -853,6 +919,15 @@ pub(crate) fn build_page() -> (adw::ToastOverlay, glib::SourceId) {
         syncing: Rc::new(Cell::new(false)),
     };
     editor.rebuild();
+
+    // The departures backend entry → `save_departures_endpoint`; blank means
+    // "use the default" (#1124), the same convention `station`'s row uses.
+    {
+        let editor = editor.clone();
+        departures_endpoint_row.connect_apply(move |entry| {
+            editor.save_departures_endpoint(endpoint_from_entry(&entry.text()));
+        });
+    }
 
     // Auto/manual toggle → SetAutoLocation, then re-read the resolved place.
     {
@@ -874,6 +949,7 @@ pub(crate) fn build_page() -> (adw::ToastOverlay, glib::SourceId) {
     let page = adw::PreferencesPage::new();
     page.add(&status);
     page.add(&list);
+    page.add(&build_departures_endpoint_group(&editor));
     page.add(&build_override_group(&editor));
     nav.add(&adw::NavigationPage::new(&page, "Places"));
 
@@ -980,6 +1056,18 @@ fn as_u32(value: f64) -> u32 {
     }
 }
 
+/// What the departures-endpoint entry (#1124) hands back, normalized: blank
+/// means "use the default" (`None`) rather than an empty string, the same
+/// convention `station`'s row uses. `places::save_departures_endpoint`
+/// validates the non-blank case (an unknown short name or a non-URL string is
+/// rejected there, surfaced as a toast) — this is purely the text-box-to-value
+/// mapping, kept as its own function so it's unit-testable independently of a
+/// live `EntryRow`.
+fn endpoint_from_entry(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1060,6 +1148,21 @@ mod tests {
         assert_eq!(as_u32(f64::NEG_INFINITY), 0);
         assert_eq!(as_usize(f64::INFINITY), 4096);
     }
+
+    #[test]
+    fn endpoint_entry_blank_means_default() {
+        assert_eq!(endpoint_from_entry(""), None);
+        assert_eq!(endpoint_from_entry("   "), None);
+    }
+
+    #[test]
+    fn endpoint_entry_trims_a_configured_value() {
+        assert_eq!(endpoint_from_entry("  vbb  "), Some("vbb".to_owned()));
+        assert_eq!(
+            endpoint_from_entry("https://v6.hvv.transport.rest"),
+            Some("https://v6.hvv.transport.rest".to_owned())
+        );
+    }
 }
 
 /// The window-controls-duplication regression for the Places tab's pushed
@@ -1104,6 +1207,9 @@ mod gtk_tests {
         let list = adw::PreferencesGroup::new();
         let editor = Editor {
             base: Rc::new(RefCell::new(vec![Place::new("Home", 52.4556, 13.5085)])),
+            // No file I/O here either (see the doc comment above) — a detached
+            // row, never read back.
+            departures_endpoint_row: adw::EntryRow::builder().title("Endpoint").build(),
             nav: nav.clone(),
             list: list.clone(),
             rows: Rc::new(RefCell::new(Vec::new())),

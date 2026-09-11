@@ -73,15 +73,16 @@ anyone else's. Check these on a fresh install:
   `~/.config/trollshell/places.toml` on first run with one `[[place]]` for
   Berlin-Schöneweide (`station = "900192001"`, the BVG id for S Schöneweide
   Bhf) — see the `departures` section below, which reads this file's station
-  config directly. Past just being the wrong city for you, the departures
-  fetch itself talks straight to `v6.bvg.transport.rest`, Berlin's own
-  transit API, with no alternate backend configurable anywhere — so today
-  the whole `departures` plugin (and caw's departures ingredient, which
-  shares the same feed and file) only works for stations inside BVG's
-  transit network. Outside that network there's currently no station id
-  that will work; disable the plugin rather than hunting for one. That
-  backend coupling is a code constraint, not a config knob, so it's out of
-  this doc's scope to fix — flag it if you hit it.
+  config directly. Outside Berlin, also set the `[departures].endpoint` key
+  (#1124): a short name (`bvg`, `vbb`, `db`) or a full `https://…`
+  transport.rest base URL — absent means `bvg`, so an existing config with no
+  key behaves exactly as before. VBB and BVG share the VBB station id space;
+  DB uses its own EVA ids, so switching backend usually means finding a new
+  `station` id from that backend's own `/locations?query=<name>` route rather
+  than reusing the Berlin one. This is a `places.toml` key, not an env var —
+  see `crates/hytte-config/src/places.rs`'s `DEFAULT_CONFIG` for the
+  documented example — so it isn't one of the tables below either; it's noted
+  here because it's exactly the gap this checklist used to flag as unfixable.
 - **Weather's fallback city**, `TROLLSHELL_WEATHER_CITY` — genuinely global
   (open-meteo, not BVG-scoped), unset by default, and GeoClue2 is tried
   first regardless. Only needs setting if GeoClue2 isn't available on your
@@ -131,12 +132,14 @@ No runtime knobs — configuration is entirely via the shell/wire protocol.
 ### departures (`hytte-plugin-departures`)
 
 No environment-variable knobs. Station config (which stop, walk-time budget,
-line/direction filter) comes entirely from the first `[[place]]` block of
-`~/.config/trollshell/places.toml` — the same file + schema the native
-`hytte-services::places` service owns and documents a default for
-(`feed.rs::load_station_config`). The file is re-read on every poll, so an
-edit while the board is open is picked up on the next fetch. Only `$HOME` is
-read (to locate the file) — not a configurable knob.
+line/direction filter) comes from the first `[[place]]` block of
+`~/.config/trollshell/places.toml`, and which transport.rest backend to fetch
+from comes from that same file's whole-shell `[departures].endpoint` (#1124,
+absent → `bvg`) — the same file + schema the native `hytte-services::places`
+service owns and documents a default for (`feed.rs::load_station_config`,
+`feed.rs::resolve_endpoint`). The file is re-read on every poll, so an edit
+while the board is open is picked up on the next fetch. Only `$HOME` is read
+(to locate the file) — not a configurable knob.
 
 ### infobroker (`hytte-plugin-infobroker`)
 

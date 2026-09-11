@@ -128,10 +128,11 @@ fn main() -> hytte::ui::Result<()> {
     App::new("mov.vibec0re.trollshell")
         // The config-file layering's first live subsystem (#869, phase 1 of
         // #866): `core-leds.toml` dresses the Stats drawer's per-core LED
-        // panel, layered nix-base → overlay → documented default, with the
-        // four `TROLLSHELL_CORE_LEDS_*` variables still winning (and warning
-        // once each) for the deprecation window. Polls its layers' mtimes, so
-        // an edit re-skins the panel with the shell up.
+        // panel, layered nix-base → overlay → documented default. The four
+        // `TROLLSHELL_CORE_LEDS_*` variables that used to carry these knobs
+        // are gone (#1041 step 3) — a still-set one now warns once and does
+        // nothing. Polls its layers' mtimes, so an edit re-skins the panel
+        // with the shell up.
         .with(config::core_leds::service())
         // The workspace stacks (#1071 phase 2): `workspaces.toml` layered the
         // same way, polled the same way, and republished into the Workspaces

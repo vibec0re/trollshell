@@ -2473,16 +2473,134 @@ switch` repoints atomically to a new store path every rebuild; the running
     index, so `niri msg action move-workspace-down` on a named workspace should
     re-order the cards to match. App icons on a card follow niri's _column_
     order, so `move-column-left` should re-order the icons.
-  - **Nothing else appeared.** Phase 1 is read-only: there must be no `+`
-    button, no Start/Stop, no Edit, and no `workspaces.toml` written anywhere
-    under `~/.config/trollshell/`. Those are phases 2–4.
+  - **Nothing else appeared.** _Historical, for phase 1 only:_ it was read-only,
+    with no `+` button, no Start/Stop, no Edit and no `workspaces.toml`. Phase 2
+    adds Start/Stop, ephemeral cards and the file — but **still no `+` button**
+    (§3.7 settles that Edit → Save is what persists a workspace), which the
+    phase-2 block below re-checks.
   - **Regression check on the two pages this touched.** The Stats drawer's
     "Top apps" expanders resolve their icons through the same helper, which
     moved to `components/app_meta.rs` — confirm CPU/Memory top-apps rows still
     show real app icons and display names, not the generic fallback. And the
     Settings page's **More** group moved into its own function — confirm all
-    four rows (Workspaces, Wallpaper, Displays, Clipboard history) are there and
-    each still deep-links to its page.
+    four rows (Wallpaper, Displays, Clipboard history, Workspaces — in that
+    order since #1071 phase 2, which appended rather than inserting) are there
+    and each still deep-links to its page.
+
+- [ ] **(#1071 phase 2)** The file, the primitives, and Start/Stop. Everything
+      here needs a live niri session **and** a running `systemd --user`; the
+      hermetic suite drives both through scripted fakes, so none of the rows
+      below is reachable on CI.
+  - **The file is live.** With the shell up, hand-write
+    `~/.config/trollshell/workspaces.toml`:
+    `toml
+    [workspace.chat]
+    monitor = "DP-1"
+    apps = [{ id = "Alacritty" }]
+    `
+    Within ~3 s a greyed `chat` card appears in `DP-1`'s column saying **"Not on
+    a screen"**, with one dim Alacritty icon and a **▶** button. No shell
+    restart. Add a typo'd key (`layuot = "golden"`) → the journal gets exactly
+    one line, `workspace.* = chat.layuot is not valid; expected monitor,
+autostart, layout or apps`, and every other key still applies. Put a bad
+    value on a real key (`layout = "gilded"`) → one line naming _that_ key, the
+    stack still loads, and `monitor` still applies.
+  - **Names are slice names.** Try `[workspace."chat--dev"]` and
+    `[workspace.Chat]`. The first is dropped with one line (a doubled dash
+    cannot be a systemd unit — measured: `trollshell-ws--foo.slice` is
+    _"Invalid argument"_); the second is **folded** to `chat`, because niri
+    matches workspace names case-insensitively and the two would otherwise be
+    one workspace with two slices.
+  - **Start, on a busy current workspace.** Focus a workspace that has windows
+    on it, then hit **▶** on `chat`. A **new** workspace appears (Annika's
+    ruling: _"if you start an entire stopped stack a new workspace is in
+    order"_), is named `chat` — check `niri msg workspaces` — and Alacritty
+    opens on it. The button becomes ⏹ and the greying lifts.
+  - **Start, on an empty current workspace.** Switch to an empty workspace and
+    hit ▶ on a second stack. It **adopts** the current workspace rather than
+    creating another (_"if nothing is on the current workspace, adopt current
+    workspace"_). `niri msg workspaces` shows no extra workspace.
+  - **The slice, and what Stop takes down.**
+    ```sh
+    systemd-cgls --user-unit trollshell-ws-chat.slice
+    systemctl --user list-units 'trollshell-ws-*'
+    ```
+    One `trollshell-ws-chat-0.service` per app of the stack, inside
+    `trollshell-ws-chat.slice`. Now open something on that workspace **by hand**
+    (from a terminal already on it, so it gets no unit of its own, and also
+    something launched from a launcher, which niri puts in an `app-niri-*.scope`)
+    and hit **⏹**. Everything goes: the slice takes the stack's own units, the
+    `app-niri-*.scope` is stopped by unit, and the hand-started one is closed
+    through niri. Then `niri msg workspaces` shows the workspace **unnamed**
+    again.
+  - **Two stacks whose names share a dash prefix — the nesting hazard.** Save or
+    write both `chat` and `chat-dev`, start both, then stop `chat` only.
+    `chat-dev` must still be running. (`-` is systemd's slice-hierarchy
+    separator, so a naive `trollshell-ws-chat-dev.slice` would be a _child_ of
+    `chat`'s and go down with it — measured. The name's own dashes are written
+    `\x2d`, so check `systemctl --user list-units 'trollshell-ws-*'` really
+    shows `trollshell-ws-chat\x2ddev.slice` and that it renders as
+    `Slice /trollshell/ws/chat-dev`.)
+  - **The naming hazard the housekeeping closes.** Start `chat`, then close
+    every one of its windows **by hand** without pressing ⏹. The card goes
+    Inactive within a beat (the workspace still carries the name at this point —
+    `niri msg workspaces`). Wait a moment, then press **▶** again: it must
+    start normally. If it silently launched onto the focused workspace and left
+    the card grey, the housekeeping that releases the lingering name has
+    regressed — `SetWorkspaceName` returns success either way, so there is no
+    error to look for.
+  - **`Starting` is visible.** Put something slow in a stack — a browser — and
+    watch the button while it comes up: a spinner, not an icon, and **not
+    clickable**. Clicking it during that window must do nothing and must not
+    start a second copy.
+  - **The stray-window reconcile.** Add an app that opens its window on whatever
+    workspace was focused rather than the new one. Within the 10 s grace window
+    it should be **moved onto** the stack's workspace. An app that never opens a
+    window at all must not wedge the Start — it finishes at the end of the
+    grace window with the others in place.
+  - **A name that did not land never launches.** Name a workspace `chat` by hand
+    (`niri msg action set-workspace-name chat`) on a workspace with windows, so
+    the card reads Active and offers ⏹ rather than ▶. There is no way to press
+    Start into a taken name from the UI; if you can, the card-level refusal has
+    regressed. (The read-back after the batch is what makes this safe, since
+    niri reports success for a `SetWorkspaceName` it silently ignored.)
+  - **Ephemeral card → Edit → Save.** Open a couple of apps on an **unnamed**
+    workspace. A card titled **"Unsaved workspace"** appears in that screen's
+    column with the live app icons and a name field — and **no `+` button
+    anywhere on the page** (§3.7). Type `Chat Room` → the field goes red and
+    nothing is written. Type `chat2` → `~/.config/trollshell/workspaces.toml`
+    grows `[workspace.chat2]` with one `apps` entry per app, in niri's
+    left-to-right column order, and **no `order` key** (arrays replace whole, so
+    inventing one would discard a base-pinned order). The card becomes a saved
+    one, with a ⏹ button, without a shell restart.
+  - **A no-change save touches no bytes.** Hand-annotate the file with comments,
+    `md5sum` it, save an unrelated ephemeral workspace, and confirm the existing
+    stacks' lines and every comment are byte-identical.
+  - **The layered base.** Put a stack in `$XDG_CONFIG_DIRS`' copy (the
+    home-manager base) and a _different_ one in your overlay: both cards show.
+    Change one key of the base stack in the overlay: only that key changes.
+    Remove the base stack with `[workspace]` + `_unset = ["<name>"]` in the
+    overlay: its card goes and its siblings stay.
+  - **The trailing column.** Set `monitor = "DP-9"` (a connector you do not
+    have). The card moves to a greyed **"Not connected"** column at the right.
+    Its ▶ still works and starts the stack on the focused screen.
+  - **The card list scrolls.** Save enough stacks that a column overflows (a
+    dozen on a 1080p screen). The column must scroll rather than clip — before
+    #1071 phase 2 there was no scroller and the overflow was simply unreachable.
+  - **Nothing from phases 3–4 appeared.** No autostart (a stack with
+    `autostart = true` must **not** come up at login yet — the key is accepted
+    and recorded, not acted on), no column-order restore (the apps land in
+    whatever order they open, not the stack's), no drag between columns, and no
+    edit sub-page — the only Edit is the ephemeral card's name field.
+  - **The generalised launcher did not change what it launches.** Regression
+    check on the two call sites that moved: `systemctl --user status
+trollshell-plugin-<id>.service` still shows `Restart=on-failure`,
+    `PartOf=…target` and the plugin's declared env; a plugin with a keyring slot
+    still receives its key (`systemctl --user show -p Environment
+trollshell-plugin-<id>.service`) while `tr '\0' '\n' < /proc/<pid>/cmdline`
+    on the `systemd-run` process shows the **bare** `--setenv=<NAME>` with no
+    value. And a plugin's detached `RunCommand` still lands in
+    `trollshell-launch.slice`.
 
 ## Control-center
 

@@ -3,8 +3,9 @@
 //!
 //! # Two hats, one binary — and the HTTP hat is the one that matters
 //!
-//! This crate keeps its original job: serve `POST /v1/chat/completions` on
-//! loopback so pet and caw can ride a Claude subscription unchanged. #866 adds
+//! This crate keeps its original job: serve `POST /v1/chat/completions` on a
+//! same-uid socket (#993) so pet and caw can ride a Claude subscription
+//! unchanged. #866 adds
 //! a second hat — the daemon now *also* speaks the widget-plugin protocol, so it
 //! rides `programs.trollshell.plugins` (and therefore the launcher, the
 //! control-center's Plugins tab, and #392's keyring injection) instead of

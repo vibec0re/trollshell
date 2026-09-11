@@ -27,6 +27,32 @@ self:
   # the two real modules, which each import this exactly once.
   key = "trollshell-module-common";
 
+  # Options this module used to declare, so a config that still sets one fails
+  # with a sentence instead of "The option … does not exist". These ride the
+  # `key` above, so they are collapsed to a single declaration exactly like the
+  # rest of the module.
+  imports = [
+    (lib.mkRemovedOptionModule [ "programs" "trollshell" "claudeBridge" "port" ] ''
+      The claude bridge no longer listens on a TCP port (#993). It binds a
+      same-uid Unix socket at $XDG_RUNTIME_DIR/trollshell/claude-bridge.sock
+      (0600 inside a 0700 directory) instead, because a loopback port carries
+      no file mode: every other account on the machine, and anything sharing
+      the host network namespace, could reach a keyless endpoint that spends
+      your Claude subscription.
+
+      The path is deliberately not configurable, so there is nothing to set
+      here. Point a plugin at the bridge with the read-only
+      programs.trollshell.claudeBridge.baseUrl instead:
+
+        programs.trollshell.plugins.pet.env.PET_LLM_URL =
+          config.programs.trollshell.claudeBridge.baseUrl;
+
+      (and drop any hand-written PET_LLM_URL/CAW_LLM_URL naming 127.0.0.1:8787,
+      which now gets a connection refused and degrades the plugin to its canned
+      output.)
+    '')
+  ];
+
   options.programs.trollshell = {
     enable = lib.mkEnableOption "trollshell — hytte-based Wayland desktop shell";
 
@@ -282,11 +308,19 @@ self:
       };
     };
 
-    # The Claude bridge (#584/#694): a keyless, loopback-only OpenAI-compatible
-    # shim in front of headless Claude Code (`claude --print`), so the
-    # LLM-backed plugins can ride a Claude Code subscription instead of a
-    # metered provider — `hytte_ai_providers::Provider` is just a base URL, so
-    # pointing a plugin at http://127.0.0.1:<port> is the whole integration.
+    # The Claude bridge (#584/#694/#993): a keyless OpenAI-compatible shim in
+    # front of headless Claude Code (`claude --print`), so the LLM-backed
+    # plugins can ride a Claude Code subscription instead of a metered provider
+    # — `hytte_ai_providers::Provider` is just a base URL, so pointing a plugin
+    # at `claudeBridge.baseUrl` is the whole integration.
+    #
+    # Since #993 that base URL names a SAME-UID UNIX SOCKET
+    # (unix://$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock, 0600 in a 0700
+    # dir), not 127.0.0.1:8787. The route is keyless and spends somebody's
+    # Claude subscription, so reachability is the authorization boundary, and a
+    # loopback port carries no file mode — every local uid and every host-netns
+    # container was inside it. `port` is retired; see the mkRemovedOptionModule
+    # at the top of this file.
     #
     # HOME-MANAGER-ONLY, same reasoning nightlight documents above (#657): the
     # bridge is rendered by nix/hm-module.nix, and a NixOS-only deployment has no

@@ -6,7 +6,7 @@
 //! The bridge's two duties run on **two different tokio runtimes**, and neither
 //! can hand the other a handle at construction time:
 //!
-//! - `main` builds a multi-thread runtime, binds the loopback listener on it and
+//! - `main` builds a multi-thread runtime, binds the same-uid socket on it and
 //!   spawns the accept loop there. That is the primary duty and it starts first.
 //! - [`hytte_plugin::run`] builds a *current-thread* runtime of its own,
 //!   `block_on`s it and never returns, and it constructs the plugin model

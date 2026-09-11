@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "A loopback shim that puts an OpenAI-compatible face on either headless Claude Code (keyless, rides a subscription) or the Anthropic Messages API (keyed, metered), so the hytte LLM plugins can use either unchanged (issues #584, #730)"
+description = "A same-uid-socket shim that puts an OpenAI-compatible face on either headless Claude Code (keyless, rides a subscription) or the Anthropic Messages API (keyed, metered), so the hytte LLM plugins can use either unchanged (issues #584, #730)"
 
 [lints]
 workspace = true
@@ -44,7 +44,7 @@ hytte-ai-providers = { path = "../hytte-ai-providers" }
 httparse.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
-# `net` for the loopback listener, `io-util` for the request read/response
+# `net` for the same-uid socket listener, `io-util` for the request read/response
 # write, `sync` for the load-shed semaphore + single-flight watch channels,
 # `time` for the request budget, `rt-multi-thread`/`macros` for the runtime.
 # (`process` comes in through hive-claude.)

@@ -1,4 +1,4 @@
-//! Workspaces drawer page — phases 1 and 2 of the workspace-stacks epic
+//! Workspaces drawer page — phases 1 to 3 of the workspace-stacks epic
 //! (#1071 §6), designed on discussion #1063.
 //!
 //! One column per monitor, side by side; in each column, a card per saved stack
@@ -33,17 +33,27 @@
 //! `hytte::services::displays::outputs()` already sorts outputs into, so the
 //! Workspaces page and the Displays page list the same screens the same way.
 //! One trailing column may follow them: the stacks whose recorded monitor is not
-//! connected (§5). Phase 3 (§3.6) gives cards a saved order *inside* a column
-//! via `MoveWorkspaceToIndex`; the column order itself stays a property of the
-//! connector set.
+//! connected (§5). Cards *inside* a column follow the file's `order` (§3.6),
+//! which `workspace_stacks::order_index` also hands to niri as the started
+//! workspace's index; the column order itself stays a property of the connector
+//! set.
 //!
-//! ## What is still phases 3–4
+//! ## Dragging a card between columns (§5, phase 3)
 //!
-//! No autostart, no column-order restore, no card drag between columns, and no
-//! edit sub-page: phase 2's Edit is the ephemeral card's inline name field, and
-//! Save takes the **name only** (§3.7) — the apps come from the workspace as it
-//! is right now and everything else is defaulted. The full form, the
-//! desktop-entry picker and `Exec` field-code stripping are phase 4.
+//! A card's screen is set by **dragging it into another monitor's column** —
+//! there is no monitor field anywhere in the UI, by design (Annika, on the epic
+//! thread). A saved card carries a [`card_drag_source`]; every *connected*
+//! monitor's column carries a [`monitor_drop_target`]; the drop rewrites the
+//! stack's `monitor` in the overlay and, for an Active stack, moves its live
+//! workspace with it. Reordering *within* a column is not this — §5 puts the
+//! card order's drag handles in the phase-4 Edit sub-page.
+//!
+//! ## What is still phase 4
+//!
+//! No edit sub-page: the only Edit here is the ephemeral card's inline name
+//! field, and Save takes the **name only** (§3.7) — the apps come from the
+//! workspace as it is right now and everything else is defaulted. The full
+//! form, the desktop-entry picker and `Exec` field-code stripping are phase 4.
 //!
 //! ## Testability seam
 //!
@@ -59,7 +69,7 @@ use std::rc::Rc;
 
 use hytte::futures_signals::map_ref;
 use hytte::futures_signals::signal::Signal;
-use hytte::gtk::{self, pango, prelude::*};
+use hytte::gtk::{self, gdk, glib, pango, prelude::*};
 use hytte::prelude::*;
 use hytte::services::niri::{self, Window, Workspace};
 use hytte::services::systemd;
@@ -83,6 +93,16 @@ const APP_IDLE_CLASS: &str = "ts-ws-app-idle";
 
 /// CSS class on a card that is not on a screen (#1071 §5).
 const CARD_INACTIVE_CLASS: &str = "ts-ws-card-inactive";
+
+/// CSS class on a monitor column the pointer is dragging a card over (#1071 §5).
+const COLUMN_DROP_CLASS: &str = "ts-ws-column-drop";
+
+/// CSS class on a card while it is being dragged.
+const CARD_DRAGGING_CLASS: &str = "ts-ws-card-dragging";
+
+/// Tooltip on a saved card, since a drag is the only affordance for the screen
+/// a stack lives on (§5 has no monitor field, by design).
+const DRAG_HINT: &str = "Drag this card to another screen's column to move it there.";
 
 /// Design-baseline height cap for one monitor's card list, in CSS px, before
 /// [`crate::scale::scale`]. Sized like `panels::connections`' list scroller —
@@ -193,12 +213,33 @@ struct Card {
     /// lit or dim by whether a window of it is open. For an ephemeral card: the
     /// live windows, always lit.
     apps: Vec<StackApp>,
+    /// The niri workspace currently carrying this stack's name, if any.
+    ///
+    /// What tells a drag between monitor columns whether there is anything to
+    /// *move* as well as to record (#1071 §5): an Active stack's workspace goes
+    /// with it, an Inactive one's next Start just reads the file. `None` on an
+    /// ephemeral card, which has no stack to rewrite and is not draggable.
+    live: Option<u64>,
 }
 
 impl Card {
     /// Whether a Start/Stop button acts, and what it says.
     fn is_active(&self) -> bool {
         matches!(self.kind, Kind::Saved(StackState::Active))
+    }
+
+    /// The niri workspace a drag to another monitor should move as well as
+    /// record (#1071 §5) — `Some` **only while Active**.
+    ///
+    /// [`Card::live`] is set whenever a workspace carries the stack's name, and
+    /// that is deliberately weaker than Active: a stack whose windows the user
+    /// closed by hand still has its lingering empty workspace (niri does not
+    /// remove one immediately) right up until the next Start releases the name.
+    /// Moving *that* across screens would shuffle the user's workspace indices
+    /// on both monitors to relocate an empty placeholder — so the file is the
+    /// whole change for an Inactive stack, and its next Start reads it.
+    fn workspace_to_move(&self) -> Option<u64> {
+        self.is_active().then_some(self.live).flatten()
     }
 }
 
@@ -290,6 +331,7 @@ fn model(
                     running: open.contains(app.id.as_str()),
                 })
                 .collect(),
+            live: live.map(|w| w.id),
         };
 
         match stack.monitor.as_deref() {
@@ -327,7 +369,8 @@ fn model(
             // Save records, and #1071 §3.4 step 3 makes the stack's order be
             // niri's column order. Collecting through a `BTreeSet` here (as this
             // did) silently sorted it lexicographically, which is the input
-            // phase 3's `MoveColumnToIndex` would then have restored wrongly.
+            // `workspace_stacks::column_order_batch` would then have restored
+            // wrongly.
             apps: ordered_app_ids(workspace.id, windows)
                 .into_iter()
                 .map(|app_id| StackApp {
@@ -335,6 +378,10 @@ fn model(
                     running: true,
                 })
                 .collect(),
+            // Deliberately `None`: an ephemeral card has no entry in the file,
+            // so there is nothing for a drag to rewrite. Its workspace id lives
+            // on `Kind::Ephemeral`, where Save uses it.
+            live: None,
         });
     }
 
@@ -490,13 +537,29 @@ where
             columns_box.append(&hint(NO_OUTPUTS_HINT));
             return;
         }
+        // A card dropped on a column may have come from **any** column, so the
+        // "does this stack have a live workspace to move too" answer has to be
+        // page-wide rather than per column. Rebuilt with the model, so it is
+        // never more than one revision old — the same currency every other
+        // handler on this page has.
+        let live: Rc<BTreeMap<String, u64>> = Rc::new(
+            columns
+                .iter()
+                .flat_map(|c| &c.cards)
+                .filter_map(|card| Some((card.name.clone(), card.workspace_to_move()?)))
+                .collect(),
+        );
         for column in &columns {
-            columns_box.append(&build_column(column, &meta_cache));
+            columns_box.append(&build_column(column, &meta_cache, &live));
         }
     });
 }
 
-fn build_column(column: &Column, meta_cache: &MetaCache) -> gtk::Widget {
+fn build_column(
+    column: &Column,
+    meta_cache: &MetaCache,
+    live: &Rc<BTreeMap<String, u64>>,
+) -> gtk::Widget {
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 8);
     outer.add_css_class("ts-ws-column");
     outer.set_hexpand(true);
@@ -554,7 +617,108 @@ fn build_column(column: &Column, meta_cache: &MetaCache) -> gtk::Widget {
     scroller.add_css_class("ts-ws-scroller");
     outer.append(&scroller);
 
+    // A connected monitor's column takes cards dropped on it (#1071 §5). The
+    // trailing "Not connected" column deliberately does not: it is not a
+    // screen, so there is no connector to record and nowhere for niri to move a
+    // workspace to.
+    if !column.offline {
+        outer.add_controller(monitor_drop_target(&column.connector, live));
+    }
+
     outer.upcast()
+}
+
+/// The drop half of #1071 §5's drag between monitor columns.
+///
+/// Accepts a plain string — the stack's name, which is what
+/// [`card_drag_source`] puts on the drag — rather than a custom `GType`: the
+/// two ends are the same page in the same process, and a string keeps the drag
+/// inspectable with the ordinary GTK tooling.
+///
+/// `gdk::DragAction::MOVE` rather than `COPY`, which is what it is: a stack
+/// lives on one screen, and the drop moves it rather than duplicating it.
+fn monitor_drop_target(connector: &str, live: &Rc<BTreeMap<String, u64>>) -> gtk::DropTarget {
+    let target = gtk::DropTarget::new(glib::types::Type::STRING, gdk::DragAction::MOVE);
+    // The highlight is on the *column*, so the user can see which screen the
+    // card is about to land on while the pointer is still over the gap between
+    // two cards.
+    target.connect_enter(|target, _, _| {
+        if let Some(widget) = target.widget() {
+            widget.add_css_class(COLUMN_DROP_CLASS);
+        }
+        gdk::DragAction::MOVE
+    });
+    target.connect_leave(|target| {
+        if let Some(widget) = target.widget() {
+            widget.remove_css_class(COLUMN_DROP_CLASS);
+        }
+    });
+    let connector = connector.to_owned();
+    let live = live.clone();
+    target.connect_drop(move |target, value, _, _| {
+        if let Some(widget) = target.widget() {
+            widget.remove_css_class(COLUMN_DROP_CLASS);
+        }
+        let Ok(name) = value.get::<String>() else {
+            return false;
+        };
+        drop_on_monitor(&name, &connector, live.get(&name).copied())
+    });
+    target
+}
+
+/// A card dropped on the column of `connector`: record the screen, and move the
+/// live workspace with it when there is one (#1071 §5).
+///
+/// Returns whether the drop changed anything, which is what GTK reports back to
+/// the drag source as success or failure.
+///
+/// The file is re-read **here**, at drop time, for the same reason
+/// [`start_by_name`] re-reads it at click time: the drawer can sit open across
+/// an edit and the page's model is one revision behind at best. It is also what
+/// makes the no-op case cheap — a card dropped back on the screen it already
+/// records writes nothing, so a stray two-pixel drag does not rewrite the
+/// config file.
+fn drop_on_monitor(name: &str, connector: &str, live: Option<u64>) -> bool {
+    let Some(stack) = config_workspaces::current().stacks.get(name).cloned() else {
+        tracing::warn!(workspace = name, "no such stack in workspaces.toml");
+        return false;
+    };
+    if stack.monitor.as_deref() == Some(connector) {
+        return false;
+    }
+    workspace_stacks::spawn_move_to_monitor(name.to_owned(), connector.to_owned(), live);
+    true
+}
+
+/// The drag half: a saved card carries its stack's name (#1071 §5).
+///
+/// Only saved cards get one. An ephemeral card has no entry in the file, so
+/// there is no `monitor` for a drop to rewrite — it is the workspace niri has
+/// already put somewhere, and moving *it* between screens is niri's own
+/// business, not this page's.
+///
+/// In-column reordering is **not** this: #1071 §5 puts the card order's drag
+/// handles in the Edit sub-page (phase 4), and this controller only ever
+/// answers the question "which screen".
+fn card_drag_source(name: &str) -> gtk::DragSource {
+    let source = gtk::DragSource::new();
+    source.set_actions(gdk::DragAction::MOVE);
+    let name = name.to_owned();
+    source.connect_prepare(move |source, _, _| {
+        // Dim the card while it is in flight, so the column it came from does
+        // not look like it still holds it.
+        if let Some(widget) = source.widget() {
+            widget.add_css_class(CARD_DRAGGING_CLASS);
+        }
+        Some(gdk::ContentProvider::for_value(&name.to_value()))
+    });
+    source.connect_drag_end(|source, _, _| {
+        if let Some(widget) = source.widget() {
+            widget.remove_css_class(CARD_DRAGGING_CLASS);
+        }
+    });
+    source
 }
 
 fn build_card(card: &Card, meta_cache: &MetaCache) -> gtk::Widget {
@@ -600,6 +764,14 @@ fn build_card(card: &Card, meta_cache: &MetaCache) -> gtk::Widget {
 
     if let Kind::Ephemeral { workspace } = card.kind {
         outer.append(&save_row(card, workspace));
+    }
+
+    // A saved card can be dragged into another screen's column (#1071 §5).
+    // There is no monitor field anywhere in the UI; this *is* the monitor
+    // control, which is Annika's call on the epic thread.
+    if matches!(card.kind, Kind::Saved(_)) {
+        outer.set_tooltip_text(Some(DRAG_HINT));
+        outer.add_controller(card_drag_source(&card.name));
     }
 
     outer.upcast()
@@ -648,7 +820,7 @@ fn start_by_name(name: &str) {
         tracing::warn!(workspace = name, "no such stack in workspaces.toml");
         return;
     };
-    workspace_stacks::spawn_start(name.to_owned(), stack, saved.stacks);
+    workspace_stacks::spawn_start(name.to_owned(), stack, saved);
 }
 
 /// The ephemeral card's Edit → Save (#1071 §3.7).
@@ -657,8 +829,9 @@ fn start_by_name(name: &str) {
 /// sub-page either: §3.7 settles that an unnamed workspace is a card like any
 /// other and that Save is what creates its entry. Phase 2's Save takes the
 /// **name only** — the apps come from what is on the workspace right now, and
-/// everything else is defaulted, since the monitor is set by dragging (phase 3)
-/// and the layout/autostart fields live in the edit form (phase 4).
+/// everything else is defaulted, since the monitor is set by dragging the card
+/// between columns and the layout/autostart fields live in the phase-4 edit
+/// form.
 ///
 /// # Two checks here, one on the runtime
 ///
@@ -1158,7 +1331,7 @@ mod model_tests {
     /// not alphabetical.
     ///
     /// This list is what a Save records, and #1071 §3.4 step 3 makes the stack's
-    /// order *be* niri's column order — so phase 3's `MoveColumnToIndex` would
+    /// order *be* niri's column order — so `column_order_batch` would
     /// restore whatever this gets wrong. Routing it through a `BTreeSet` (as it
     /// did) sorted it lexicographically with nothing to notice.
     ///
@@ -1250,6 +1423,52 @@ mod model_tests {
         assert!(built(&[orphan], &[], &no_stacks()).is_empty());
         assert!(built(&[], &[], &saved(&[("chat", stack(None, &["x"]))])).is_empty());
     }
+
+    /// #1071 §5: a drag also moves the **live** workspace, but only while the
+    /// stack is Active.
+    ///
+    /// **The mutation**: returning `card.live` unconditionally. An Inactive
+    /// stack still has a niri workspace carrying its name — the lingering empty
+    /// one niri has not cleaned up yet — so the drag would relocate that
+    /// placeholder across screens, shuffling the workspace indices on both to
+    /// move nothing the user can see.
+    #[test]
+    fn only_an_active_card_carries_a_workspace_to_move() {
+        let workspaces = [ws_focused(1, 1, LEFT, Some("chat"))];
+        let file = saved(&[("chat", stack(Some(LEFT), &["firefox"]))]);
+
+        // Named, with a window: Active.
+        let active = built(&workspaces, &[win(9, 1, "firefox", 1)], &file);
+        let card = &find(&active, LEFT).cards[0];
+        assert_eq!(card.kind, Kind::Saved(StackState::Active));
+        assert_eq!(card.workspace_to_move(), Some(1));
+
+        // Named, no window, no slice: Inactive — the lingering workspace.
+        let inactive = built(&workspaces, &[], &file);
+        let card = &find(&inactive, LEFT).cards[0];
+        assert_eq!(card.kind, Kind::Saved(StackState::Inactive));
+        assert_eq!(
+            card.live,
+            Some(1),
+            "the lingering workspace is still there — so this is not vacuous"
+        );
+        assert_eq!(card.workspace_to_move(), None);
+    }
+
+    /// An ephemeral card has no entry in the file, so a drag has nothing to
+    /// rewrite and it carries no workspace to move either.
+    #[test]
+    fn an_ephemeral_card_is_not_draggable() {
+        let columns = built(
+            &[ws_focused(1, 1, LEFT, None)],
+            &[win(9, 1, "firefox", 1)],
+            &no_stacks(),
+        );
+        let card = &find(&columns, LEFT).cards[0];
+        assert!(matches!(card.kind, Kind::Ephemeral { workspace: 1 }));
+        assert_eq!(card.live, None);
+        assert_eq!(card.workspace_to_move(), None);
+    }
 }
 
 #[cfg(all(test, feature = "system-tests"))]
@@ -1312,6 +1531,28 @@ mod tests {
 
     fn columns(page: &gtk::Widget) -> Vec<gtk::Widget> {
         by_class(page, "ts-ws-column")
+    }
+
+    /// The event controllers attached to `widget` itself.
+    ///
+    /// GTK4 has no "is this widget a drop target" flag — a target *is* a
+    /// controller — so this is how #1071 §5's "which columns take a card" is
+    /// read back. `observe_controllers` is the widget's own list, not its
+    /// descendants', which is what makes the offline-column assertion mean
+    /// something.
+    fn controllers(widget: &gtk::Widget) -> Vec<gtk::EventController> {
+        let list = widget.observe_controllers();
+        (0..list.n_items())
+            .filter_map(|i| list.item(i)?.downcast::<gtk::EventController>().ok())
+            .collect()
+    }
+
+    fn has_drop_target(widget: &gtk::Widget) -> bool {
+        controllers(widget).iter().any(|c| c.is::<gtk::DropTarget>())
+    }
+
+    fn has_drag_source(widget: &gtk::Widget) -> bool {
+        controllers(widget).iter().any(|c| c.is::<gtk::DragSource>())
     }
 
     fn cards(scope: &gtk::Widget) -> Vec<gtk::Widget> {
@@ -1967,6 +2208,102 @@ mod tests {
              the apply closure (rather than taking the closure's own argument \
              from `bind`) would keep this alive for the life of the binding, \
              defeating #224's WeakRef contract"
+        );
+    }
+
+    /// Every connected monitor's column takes a drop; the "Not connected"
+    /// column does not (#1071 §5).
+    ///
+    /// A drop target on the offline column would look like an affordance and
+    /// then record a connector nobody has, so the very next model rebuild would
+    /// put the card straight back where it came from.
+    #[gtk::test]
+    fn every_monitor_column_takes_a_drop_and_the_offline_one_does_not() {
+        let f = fixture();
+        f.workspaces.set(vec![
+            ws(1, 1, LEFT, None),
+            ws(2, 1, RIGHT, None),
+        ]);
+        f.saved.set(saved(&[
+            ("chat", stack(Some(LEFT), &["firefox"])),
+            // Names a screen that is not here → the trailing offline column.
+            ("gone", stack(Some("dp-9"), &["Alacritty"])),
+        ]));
+        pump();
+
+        let all = columns(&f.page);
+        assert_eq!(all.len(), 3, "two screens plus the offline column");
+        for column in &all[..2] {
+            assert!(
+                has_drop_target(column),
+                "a connected monitor's column takes a drop"
+            );
+        }
+        assert_eq!(
+            label_text(&all[2], "ts-ws-column-title"),
+            OFFLINE_COLUMN,
+            "the third really is the offline one"
+        );
+        assert!(
+            !has_drop_target(&all[2]),
+            "the offline column is not a screen and takes no drop"
+        );
+    }
+
+    /// A saved card is draggable; an ephemeral one is not (#1071 §5 — there is
+    /// no file entry for a drop to rewrite).
+    #[gtk::test]
+    fn only_saved_cards_carry_a_drag_source() {
+        let f = fixture();
+        f.workspaces
+            .set(vec![ws(1, 1, LEFT, Some("chat")), ws(2, 2, LEFT, None)]);
+        // The unnamed workspace needs a window to be a card at all.
+        f.windows.set(vec![win(9, 2, "Alacritty", 1)]);
+        f.saved
+            .set(saved(&[("chat", stack(Some(LEFT), &["firefox"]))]));
+        pump();
+
+        let column = &columns(&f.page)[0];
+        let cards = cards(column);
+        assert_eq!(cards.len(), 2, "one saved, one ephemeral");
+        assert!(
+            has_drag_source(&cards[0]),
+            "the saved card can be dragged to another screen"
+        );
+        assert!(
+            !has_drag_source(&cards[1]),
+            "the ephemeral card cannot: it has nothing in the file to rewrite"
+        );
+    }
+
+    /// Cards inside a column follow the file's `order`, not the alphabet
+    /// (#1071 §3.6) — and an Inactive one keeps its place among the Active
+    /// ones.
+    #[gtk::test]
+    fn cards_in_a_column_follow_the_file_order() {
+        let f = fixture();
+        f.workspaces
+            .set(vec![ws(1, 1, LEFT, Some("music")), ws(2, 2, LEFT, None)]);
+        f.windows.set(vec![win(9, 1, "spotify", 1)]);
+        // `order` is zoo, music, apt — not alphabetical — and `music` is the
+        // only Active one, so an Inactive card has to hold its place on
+        // either side of it.
+        f.saved.set(saved(&[
+            ("zoo", stack(Some(LEFT), &["firefox"])),
+            ("music", stack(Some(LEFT), &["spotify"])),
+            ("apt", stack(Some(LEFT), &["Alacritty"])),
+        ]));
+        pump();
+
+        let column = &columns(&f.page)[0];
+        let names: Vec<String> = cards(column)
+            .iter()
+            .map(|card| label_text(card, "ts-ws-card-name"))
+            .collect();
+        assert_eq!(
+            names,
+            ["zoo", "music", "apt"],
+            "the file's order, with the Inactive cards keeping their places"
         );
     }
 }

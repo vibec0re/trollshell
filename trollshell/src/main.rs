@@ -344,6 +344,24 @@ fn main() -> hytte::ui::Result<()> {
             // is event-driven and covers everything but that.
             workspace_stacks::spawn_pollers();
 
+            // Autostart the stacks that ask for it (#1071 §3.5), once, as soon
+            // as niri has reported an output. Not here-and-now: the niri
+            // service's event stream publishes an empty workspace list before
+            // it has connected, and a stack's monitor cannot be checked against
+            // a screen list nobody has sent yet — so the driver waits for the
+            // first snapshot that names one and then latches.
+            //
+            // On the GTK main context rather than the runtime because both of
+            // the things it reaches for live on this thread: the config handle
+            // is in the thread-local registry, and the launch marks the
+            // `Starting` handle the page binds to. The transaction it starts
+            // runs on the runtime, sequentially, one stack after another.
+            glib::MainContext::default().spawn_local(workspace_stacks::autostart_driver(
+                niri::workspaces(),
+                config::workspaces::current,
+                workspace_stacks::spawn_autostart,
+            ));
+
             // Gate netconn's always-on `ss -tunpH` poller on drawer
             // visibility (#50): it only feeds the Connections/Network drawer
             // pages, so park it whenever none of those is on-screen. The modal

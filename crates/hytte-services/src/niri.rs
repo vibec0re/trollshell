@@ -583,6 +583,38 @@ pub enum WorkspaceAction {
     MoveWindow { window: u64, workspace: u64 },
     /// Close window `window`.
     CloseWindow { window: u64 },
+    /// Focus window `window` — and, with it, the column that window is in.
+    ///
+    /// niri-ipc 26.4 spells this one's target `id: u64` rather than
+    /// `Option<u64>` (`lib.rs:322`), so it is the only action here whose
+    /// mandatory target is niri's own.
+    FocusWindow { window: u64 },
+    /// Move the **focused** column to `index` (1-based) on its workspace.
+    ///
+    /// # The one action with no id form, and what stands in for one
+    ///
+    /// `Action::MoveColumnToIndex { index: usize }` (niri-ipc 26.4,
+    /// `lib.rs:402`) takes no target at all: niri offers no
+    /// "move *that* column" spelling, only "move the focused one". That is
+    /// exactly the "whatever is focused right now" shape the rest of this enum
+    /// exists to make unrepresentable — so the target is supplied by the action
+    /// **immediately before it in the same batch**, a [`Self::FocusWindow`],
+    /// and a batch is one socket in order ([`send_actions`]), which is what
+    /// makes "immediately before" mean anything.
+    ///
+    /// Never emit one on its own. The single producer in the tree is
+    /// `trollshell`'s `workspace_stacks::column_order_batch`, and
+    /// `every_move_column_is_addressed_by_the_focus_before_it` pins that every
+    /// one it emits is preceded by its own `FocusWindow`.
+    MoveColumnToIndex { index: usize },
+    /// Move workspace `workspace` to `index` (1-based) **on its own monitor**
+    /// (#1071 §3.6).
+    ///
+    /// niri's index is per output, not global: a workspace is placed among the
+    /// workspaces of the monitor it is on.
+    MoveWorkspaceToIndex { workspace: u64, index: usize },
+    /// Move workspace `workspace` to the output `output` (#1071 §5).
+    MoveWorkspaceToMonitor { workspace: u64, output: String },
 }
 
 /// [`WorkspaceAction`] as the `niri-ipc` action it sends.
@@ -608,6 +640,21 @@ fn lower(action: WorkspaceAction) -> Action {
             focus: true,
         },
         WorkspaceAction::CloseWindow { window } => Action::CloseWindow { id: Some(window) },
+        WorkspaceAction::FocusWindow { window } => Action::FocusWindow { id: window },
+        // No target to drop: niri has none to give. See the variant's doc.
+        WorkspaceAction::MoveColumnToIndex { index } => Action::MoveColumnToIndex { index },
+        WorkspaceAction::MoveWorkspaceToIndex { workspace, index } => {
+            Action::MoveWorkspaceToIndex {
+                index,
+                reference: Some(WorkspaceReferenceArg::Id(workspace)),
+            }
+        }
+        WorkspaceAction::MoveWorkspaceToMonitor { workspace, output } => {
+            Action::MoveWorkspaceToMonitor {
+                output,
+                reference: Some(WorkspaceReferenceArg::Id(workspace)),
+            }
+        }
     }
 }
 
@@ -1379,6 +1426,73 @@ mod tests {
         assert_eq!(
             wire(&lower(WorkspaceAction::CloseWindow { window: 9 })),
             r#"{"CloseWindow":{"id":9}}"#
+        );
+        // #1071 phase 3. `FocusWindow`'s target is mandatory in niri-ipc
+        // itself, and both workspace moves take the `Id` reference rather than
+        // `null` — a `null` reference would move whatever workspace happened
+        // to be focused, which during an autostart run is another stack's.
+        assert_eq!(
+            wire(&lower(WorkspaceAction::FocusWindow { window: 9 })),
+            r#"{"FocusWindow":{"id":9}}"#
+        );
+        assert_eq!(
+            wire(&lower(WorkspaceAction::MoveWorkspaceToIndex {
+                workspace: 3,
+                index: 2
+            })),
+            r#"{"MoveWorkspaceToIndex":{"index":2,"reference":{"Id":3}}}"#
+        );
+        assert_eq!(
+            wire(&lower(WorkspaceAction::MoveWorkspaceToMonitor {
+                workspace: 3,
+                output: "HDMI-A-1".to_owned()
+            })),
+            r#"{"MoveWorkspaceToMonitor":{"output":"HDMI-A-1","reference":{"Id":3}}}"#
+        );
+    }
+
+    /// The one action niri gives no target for, pinned as what it is.
+    ///
+    /// `MoveColumnToIndex` moves the **focused** column, so its correctness is
+    /// a property of the batch rather than of the message: the `FocusWindow`
+    /// before it is the target. This pins the message; the pairing is pinned
+    /// where the batch is built
+    /// (`trollshell`'s `every_move_column_is_addressed_by_the_focus_before_it`).
+    #[test]
+    fn move_column_to_index_carries_only_an_index() {
+        assert_eq!(
+            wire(&lower(WorkspaceAction::MoveColumnToIndex { index: 1 })),
+            r#"{"MoveColumnToIndex":{"index":1}}"#
+        );
+    }
+
+    /// A focus/move pair rides **one** socket in the order given — which is
+    /// the whole reason `MoveColumnToIndex`'s missing target is safe (#1071
+    /// §3.4 step 3). Two sockets, or a reordering, and the move would land on
+    /// whatever column the compositor had focused in between.
+    #[test]
+    fn a_focus_and_its_column_move_ride_one_socket_in_order() {
+        let mut fake = Fake::default();
+        send_actions_over(
+            &mut fake,
+            vec![
+                WorkspaceAction::FocusWindow { window: 9 },
+                WorkspaceAction::MoveColumnToIndex { index: 1 },
+                WorkspaceAction::FocusWindow { window: 10 },
+                WorkspaceAction::MoveColumnToIndex { index: 2 },
+            ],
+        )
+        .expect("the batch lands");
+
+        assert_eq!(fake.connects(), 1, "one socket for the whole batch");
+        assert_eq!(
+            fake.seen().into_iter().map(|(_, a)| a).collect::<Vec<_>>(),
+            vec![
+                r#"{"FocusWindow":{"id":9}}"#,
+                r#"{"MoveColumnToIndex":{"index":1}}"#,
+                r#"{"FocusWindow":{"id":10}}"#,
+                r#"{"MoveColumnToIndex":{"index":2}}"#,
+            ]
         );
     }
 

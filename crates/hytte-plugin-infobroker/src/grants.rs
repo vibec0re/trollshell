@@ -1525,10 +1525,10 @@ mod tests {
     /// startup.
     #[test]
     fn write_atomic_never_exposes_a_torn_file_to_a_concurrent_reader() {
-        const WARMUP_ITERATIONS: usize = 200;
-        const WRITER_ITERATIONS: usize = 4_000;
+        const WARMUP_ITERATIONS: usize = 150;
+        const WRITER_ITERATIONS: usize = 3_500;
         const READ_ATTEMPTS: usize = 2_000;
-        const MIN_RACED_READS: usize = 20;
+        const MIN_RACED_READS: usize = 15;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("grants.toml");

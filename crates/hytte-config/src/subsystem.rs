@@ -3235,9 +3235,10 @@ kept = true
     /// this pins).
     #[test]
     fn an_inert_marker_finding_survives_a_table_that_reads_as_absent() {
-        let loaded =
-            assemble::<OptTable>(&layers(&["enabled = true\n\n[core]\n_unset = [\"mystery2\"]\n"]))
-                .expect("assembles");
+        let loaded = assemble::<OptTable>(&layers(&[
+            "enabled = true\n\n[core]\n_unset = [\"mystery2\"]\n",
+        ]))
+        .expect("assembles");
 
         assert!(
             loaded.config.core.is_none(),

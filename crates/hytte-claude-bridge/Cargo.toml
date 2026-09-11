@@ -30,6 +30,14 @@ hive-claude.workspace = true
 # A `path` dep, matching every other consumer of this SDK in the workspace (it
 # is deliberately not a `[workspace.dependencies]` entry).
 hytte-plugin = { path = "../hytte-plugin" }
+# The client crate — for its socket-path constants ONLY (#993), not for its
+# HTTP client. `hytte_ai_providers::bridge_socket_path_in` is the one definition
+# of where this daemon listens and where pet/caw dial, and a path two ends must
+# agree on byte-for-byte is a wire contract, not a value to restate (the
+# `hytte_plugin_proto::topology` argument). GTK-free, and every package it
+# resolves (ureq, serde, serde_json) is already a direct dependency below, so
+# the edge adds no `Cargo.lock` entry.
+hytte-ai-providers = { path = "../hytte-ai-providers" }
 # The whole HTTP server. One route does not justify axum/hyper/tower (~20 new
 # lock entries, none of which are in `Cargo.lock` today); `httparse` already is
 # (via `ureq-proto`), so promoting it to a direct dependency costs nothing.

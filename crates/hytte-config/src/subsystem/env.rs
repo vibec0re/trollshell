@@ -333,7 +333,13 @@ pub fn warn_removed_env(subsystem: &str, var: &str, key: &str, accepts: &str) {
 /// a variable does nothing, there is nothing left to attempt parsing, and no
 /// "unusable value" case to distinguish from a usable one — every set value
 /// gets the same one line, from [`removed_message`].
-pub fn removed<T>(subsystem: &str, knob: &EnvKnob, raw: Option<&str>, fallback: T, announce: Deprecations) -> T {
+pub fn removed<T>(
+    subsystem: &str,
+    knob: &EnvKnob,
+    raw: Option<&str>,
+    fallback: T,
+    announce: Deprecations,
+) -> T {
     if raw.is_some() && announce == Deprecations::Announce {
         warn_removed_env(subsystem, knob.var, knob.key, knob.file_accepts);
     }
@@ -602,7 +608,13 @@ mod tests {
     fn an_unset_variable_is_silent_once_removed() {
         let (captured, _guard) = capture();
 
-        let resolved = removed("core-leds", &STYLE, None, "from-the-file", Deprecations::Announce);
+        let resolved = removed(
+            "core-leds",
+            &STYLE,
+            None,
+            "from-the-file",
+            Deprecations::Announce,
+        );
 
         assert_eq!(resolved, "from-the-file");
         assert_eq!(captured.warnings(), Vec::<String>::new());

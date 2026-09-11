@@ -579,8 +579,20 @@ fill = "spare"
             lookup(FILL.var),
         );
         CoreLeds {
-            style: env::removed(Self::NAME, &STYLE, style.as_deref(), layered.style, announce),
-            color: env::removed(Self::NAME, &COLOR, color.as_deref(), layered.color, announce),
+            style: env::removed(
+                Self::NAME,
+                &STYLE,
+                style.as_deref(),
+                layered.style,
+                announce,
+            ),
+            color: env::removed(
+                Self::NAME,
+                &COLOR,
+                color.as_deref(),
+                layered.color,
+                announce,
+            ),
             rows: env::removed(Self::NAME, &ROWS, rows.as_deref(), layered.rows, announce),
             fill: env::removed(Self::NAME, &FILL, fill.as_deref(), layered.fill, announce),
         }

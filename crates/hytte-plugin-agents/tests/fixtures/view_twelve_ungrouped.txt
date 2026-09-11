@@ -159,13 +159,15 @@ View {
                                         max_width_chars: Some(
                                             30,
                                         ),
-                                        ellipsize: false,
+                                        ellipsize: true,
                                         classes: [
                                             "dim-label",
                                             "caption",
                                             "ts-agent-status",
                                         ],
-                                        tooltip: None,
+                                        tooltip: Some(
+                                            "working on task 0 of a rather long description",
+                                        ),
                                     },
                                 ],
                                 tooltip: None,
@@ -270,13 +272,15 @@ View {
                                         max_width_chars: Some(
                                             30,
                                         ),
-                                        ellipsize: false,
+                                        ellipsize: true,
                                         classes: [
                                             "dim-label",
                                             "caption",
                                             "ts-agent-status",
                                         ],
-                                        tooltip: None,
+                                        tooltip: Some(
+                                            "working on task 1 of a rather long description",
+                                        ),
                                     },
                                 ],
                                 tooltip: None,
@@ -381,13 +385,15 @@ View {
                                         max_width_chars: Some(
                                             30,
                                         ),
-                                        ellipsize: false,
+                                        ellipsize: true,
                                         classes: [
                                             "dim-label",
                                             "caption",
                                             "ts-agent-status",
                                         ],
-                                        tooltip: None,
+                                        tooltip: Some(
+                                            "working on task 2 of a rather long description",
+                                        ),
                                     },
                                 ],
                                 tooltip: None,
@@ -492,13 +498,15 @@ View {
                                         max_width_chars: Some(
                                             30,
                                         ),
-                                        ellipsize: false,
+                                        ellipsize: true,
                                         classes: [
                                             "dim-label",
                                             "caption",
                                             "ts-agent-status",
                                         ],
-                                        tooltip: None,
+                                        tooltip: Some(
+                                            "working on task 3 of a rather long description",
+                                        ),
                                     },
                                 ],
                                 tooltip: None,
@@ -603,13 +611,15 @@ View {
                                         max_width_chars: Some(
                                             30,
                                         ),
-                                        ellipsize: false,
+                                        ellipsize: true,
                                         classes: [
                                             "dim-label",
                                             "caption",
                                             "ts-agent-status",
                                         ],
-                                        tooltip: None,
+                                        tooltip: Some(
+                                            "working on task 4 of a rather long description",
+                                        ),
                                     },
                                 ],
                                 tooltip: None,
@@ -714,13 +724,15 @@ View {
                                         max_width_chars: Some(
                                             30,
                                         ),
-                                        ellipsize: false,
+                                        ellipsize: true,
                                         classes: [
                                             "dim-label",
                                             "caption",
                                             "ts-agent-status",
                                         ],
-                                        tooltip: None,
+                                        tooltip: Some(
+                                            "working on task 5 of a rather long description",
+                                        ),
                                     },
                                 ],
                                 tooltip: None,
@@ -825,13 +837,15 @@ View {
                                         max_width_chars: Some(
                                             30,
                                         ),
-                                        ellipsize: false,
+                                        ellipsize: true,
                                         classes: [
                                             "dim-label",
                                             "caption",
                                             "ts-agent-status",
                                         ],
-                                        tooltip: None,
+                                        tooltip: Some(
+                                            "working on task 6 of a rather long description",
+                                        ),
                                     },
                                 ],
                                 tooltip: None,
@@ -936,13 +950,15 @@ View {
                                         max_width_chars: Some(
                                             30,
                                         ),
-                                        ellipsize: false,
+                                        ellipsize: true,
                                         classes: [
                                             "dim-label",
                                             "caption",
                                             "ts-agent-status",
                                         ],
-                                        tooltip: None,
+                                        tooltip: Some(
+                                            "working on task 7 of a rather long description",
+                                        ),
                                     },
                                 ],
                                 tooltip: None,
@@ -1047,13 +1063,15 @@ View {
                                         max_width_chars: Some(
                                             30,
                                         ),
-                                        ellipsize: false,
+                                        ellipsize: true,
                                         classes: [
                                             "dim-label",
                                             "caption",
                                             "ts-agent-status",
                                         ],
-                                        tooltip: None,
+                                        tooltip: Some(
+                                            "working on task 8 of a rather long description",
+                                        ),
                                     },
                                 ],
                                 tooltip: None,
@@ -1158,13 +1176,15 @@ View {
                                         max_width_chars: Some(
                                             30,
                                         ),
-                                        ellipsize: false,
+                                        ellipsize: true,
                                         classes: [
                                             "dim-label",
                                             "caption",
                                             "ts-agent-status",
                                         ],
-                                        tooltip: None,
+                                        tooltip: Some(
+                                            "working on task 9 of a rather long description",
+                                        ),
                                     },
                                 ],
                                 tooltip: None,
@@ -1269,13 +1289,15 @@ View {
                                         max_width_chars: Some(
                                             30,
                                         ),
-                                        ellipsize: false,
+                                        ellipsize: true,
                                         classes: [
                                             "dim-label",
                                             "caption",
                                             "ts-agent-status",
                                         ],
-                                        tooltip: None,
+                                        tooltip: Some(
+                                            "working on task 10 of a rather long description",
+                                        ),
                                     },
                                 ],
                                 tooltip: None,
@@ -1380,13 +1402,15 @@ View {
                                         max_width_chars: Some(
                                             30,
                                         ),
-                                        ellipsize: false,
+                                        ellipsize: true,
                                         classes: [
                                             "dim-label",
                                             "caption",
                                             "ts-agent-status",
                                         ],
-                                        tooltip: None,
+                                        tooltip: Some(
+                                            "working on task 11 of a rather long description",
+                                        ),
                                     },
                                 ],
                                 tooltip: None,

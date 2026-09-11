@@ -29,6 +29,7 @@
 //! | `deployed` / `parent` / `status set` | dropped outright — the three rows she listed by name |
 //! | the `agent page` link | the drawer page keeps it, as the "open it in the browser instead" fallback to #950's `WebView` |
 //! | the pause/resume button | the drawer page; the mock has two buttons and `[startstop]` is the one she drew |
+//! | the status line's **wrapping** | its own hover — @kaesaecracker's second retest (2026-09-11) caught it making rows different heights; see [`status_caption`] |
 //!
 //! **The row itself is deliberately not clickable.** Her spec is "click on
 //! agent opens agent page in trollshell-webview", which is
@@ -54,10 +55,10 @@
 //! 2. **[`Node::Text`] carries a `tooltip`** (#961/#971). That is what retired
 //!    the row-level tooltip: the untruncated status used to have nowhere to
 //!    live except the enclosing row's `Box`, which put one legend over every
-//!    glyph in the row. Now the string that got cut carries its own hover, and
-//!    the second line shows the harness's status **in full** anyway — the
-//!    ellipsis is the last resort for a status past [`STATUS_WRAP_MAX`], not
-//!    the normal case.
+//!    glyph in the row. Now the string that got cut carries its own hover —
+//!    which is what lets line 2 be a single ellipsized line without losing the
+//!    tail (see [`status_caption`]), and why the hover stays on that `Text`
+//!    rather than moving back up to the row.
 //! 3. **[`Node::ListBox`] can be `dense`** (#966/#969). The host materializes a
 //!    `ListBox` as a real `GtkListBox`, which auto-wraps every child in a
 //!    `GtkListBoxRow` carrying libadwaita's row min-height — most of why twelve
@@ -204,15 +205,8 @@ const NAME_CHARS: i32 = 20;
 /// The same, in the panel's roster — the drawer is wider than the sidebar.
 const PANEL_NAME_CHARS: i32 = 32;
 
-/// Past this many characters the status caption stops wrapping and ellipsizes.
-///
-/// The caption's job is to show the harness's line **in full** — that is the
-/// whole point of giving the row its second line back. Wrapping does that for
-/// anything a status realistically says; past this it would turn one row into
-/// five, so the tail moves to the hover instead.
-const STATUS_WRAP_MAX: usize = 88;
-
-/// The ellipsized width of a status past [`STATUS_WRAP_MAX`].
+/// The ellipsized width of a status in the **panel's** roster row, which is
+/// one line there and always has been.
 const STATUS_CHARS: i32 = 34;
 
 /// The ellipsized width of a key/value line's value.
@@ -248,11 +242,14 @@ const PANEL_TEXT_CHARS: i32 = 56;
 /// chose and is not bounded by anything this crate controls.
 const MODEL_CHARS: i32 = 10;
 
-/// The wrap width of the status text on line 2 of a card row.
+/// The **ellipsized** width of the status on line 2 of a card row.
 ///
 /// Narrower than [`CARD_TEXT_CHARS`] because line 2 is a `Row`: the state glyph
 /// and, when set, the update badge sit to the left of the text, so the text's
 /// share of the 320 px clamp is smaller than a full-width line's.
+///
+/// It was a *wrap* width until @kaesaecracker's 2026-09-11 retest — see
+/// [`status_caption`] for why line 2 stopped wrapping.
 const CARD_STATUS_CHARS: i32 = 30;
 
 /// The ellipsized width of a project group's header.
@@ -551,25 +548,39 @@ fn pause_affordance(agent: &Agent) -> (&'static str, &'static str) {
     }
 }
 
-/// The harness's status line, as line 2 of the row: **in full**, dim, wrapping.
+/// The harness's status line, as line 2 of the row: **one** dim line,
+/// end-ellipsized, with the whole string on its own hover.
 ///
-/// Ellipsizing is the last resort ([`STATUS_WRAP_MAX`]), and when it happens the
-/// `Text` carries the whole string as its own hover.
+/// # Every row is the same height, and that is the whole point
+///
+/// This used to wrap (and ellipsize only past a `STATUS_WRAP_MAX` budget), on
+/// the argument that the status should be readable in full without a hover.
+/// @kaesaecracker's 2026-09-11 retest of `c55d0a4f` is what retired that: a
+/// status of ordinary length — `argus` and `triage` in her screenshot — wraps
+/// to two or three lines at this width, so the pills in one card came out
+/// visibly different heights and the roster stopped reading as a list. Annika's
+/// v1 mock says **two lines**, not "two lines plus however many the status
+/// needs", and a row whose height depends on its content cannot honour that.
+///
+/// So the wrap is gone and the hover is no longer the last resort: it is where
+/// a long status is read, every time. That is the trade — one hover for a
+/// uniform roster — and it is the same one [`clipped`] makes everywhere else in
+/// this file. `ellipsize: true` is `set_wrap(false)` plus
+/// `EllipsizeMode::End` in the host (`hytte-ui`'s `apply_text_flow`), so the
+/// cut is at the end and the beginning of the status — the part that says what
+/// the agent is doing — is always the part that survives.
+///
+/// The hover lives on this `Text`, **not** on the enclosing row: #961/#971
+/// added `Node::Text.tooltip` precisely to retire a row-level tooltip, which
+/// put one legend over every glyph in the row (see the module doc). A row-level
+/// hover would show the status over the buttons and the model pill too, which
+/// is the regression that change undid.
 fn status_caption(agent: &Agent) -> Node {
-    let line = agent.status_line();
-    if line.chars().count() > STATUS_WRAP_MAX {
-        clipped(
-            line,
-            STATUS_CHARS,
-            &["dim-label", "caption", "ts-agent-status"],
-        )
-    } else {
-        wrapped(
-            line,
-            CARD_STATUS_CHARS,
-            &["dim-label", "caption", "ts-agent-status"],
-        )
-    }
+    clipped(
+        agent.status_line(),
+        CARD_STATUS_CHARS,
+        &["dim-label", "caption", "ts-agent-status"],
+    )
 }
 
 /// Only the flags that are **on**, as chips.
@@ -1275,10 +1286,7 @@ pub fn panel(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MAX_ROWS, PANEL_MAX_ROWS, PANEL_VIEWPORT_PX, STATUS_CHARS, STATUS_WRAP_MAX, age, ids,
-        parse_set_at,
-    };
+    use super::{MAX_ROWS, PANEL_MAX_ROWS, PANEL_VIEWPORT_PX, age, ids, parse_set_at};
     use crate::config::AgentsConfig;
     use crate::hive::wire::AgentStatusRow;
     use crate::model::{Agent, AgentName, ExpandedGroups, Hive};
@@ -1341,76 +1349,109 @@ mod tests {
         assert_eq!(parse_set_at("1757239200"), None);
     }
 
-    /// @kaesaecracker's "crammed": the row is **two lines**, and line 2 is the
-    /// harness's status **in full** — wrapping, not cut.
+    /// **Line 2 is exactly one line, at every status length** — the property
+    /// that makes every pill in a card the same height.
     ///
-    /// Falsification: swap `status_caption`'s wrapping arm for the ellipsizing
-    /// one (i.e. clip every status the way the one-line row did) and the
-    /// `ellipsize` assertion goes red.
+    /// @kaesaecracker's 2026-09-11 retest of `c55d0a4f` is why this is asserted
+    /// over a *range* rather than at one length: the old rule wrapped up to
+    /// `STATUS_WRAP_MAX` (88 chars) and ellipsized past it, so the rows that
+    /// came out wrong were the **ordinary** ones — long enough to wrap at 30
+    /// chars, short enough never to reach the ellipsize arm. A single-length
+    /// fixture is exactly what let that ship: the short case passed, the
+    /// absurd case passed, and the middle of the range was untested.
+    ///
+    /// So: short, middling (her `argus`/`triage` shape) and absurd, all three
+    /// `ellipsize: true` with the same cap and the whole string on hover.
+    ///
+    /// Falsification: put `status_caption`'s wrapping arm back for any subrange
+    /// and the middling case reds; drop `clipped`'s `tooltip: Some(body)` and
+    /// every hover assertion reds.
     #[test]
-    fn line_two_carries_the_whole_status_and_does_not_clip_it() {
-        // 63 chars — a realistic harness line, and the length that was being
-        // cut at 22 characters on the one-line row.
-        const LINE: &str = "idle — #4077 approved, watching for review assignments";
-        assert!(LINE.chars().count() <= STATUS_WRAP_MAX);
-
-        let tree = card_of(vec![running("argus", LINE)]);
-        let status = find_text(&tree, LINE).expect("the status renders somewhere");
-        assert!(
-            !status.ellipsize,
-            "the status line must be shown in full, not ellipsized"
-        );
-        // A **wrap** width, not a truncation: with `ellipsize: false` the host
-        // sets `set_wrap(true)`, so `max_width_chars` caps the label's natural
-        // width and the text flows onto more lines rather than being cut. It
-        // was `None` until #963's review, which is the same absent bound MED-2
-        // found widening the drawer one surface over — the string is shown in
-        // full either way, but only this way without pushing its container.
-        assert_eq!(
-            status.max_width_chars,
-            Some(super::CARD_STATUS_CHARS),
-            "line 2 must cap its natural width while still showing everything"
+    fn line_two_is_one_ellipsized_line_at_every_status_length() {
+        // No trailing whitespace anywhere: `Agent::status_line` trims, so a
+        // padded fixture would not be the string the tree carries.
+        let middling = "idle — #4077 approved, watching for review assignments".to_owned();
+        let absurd = format!(
+            "idle — {}",
+            ["watching for review assignments"; 6].join(", ")
         );
         assert!(
-            status.classes.iter().any(|c| c == "ts-agent-status"),
-            "line 2 is the status caption: {:?}",
-            status.classes
+            (31..=88).contains(&middling.chars().count()),
+            "the middling case must sit in the old wrap band: {}",
+            middling.chars().count()
         );
+        assert!(absurd.chars().count() > 88, "and the absurd one past it");
 
-        // …and it really is a second line: the row is a vertical stack whose
-        // first child is the head row and whose second is that caption.
-        let row = find_class(&tree, "ts-agent-row").expect("the row renders");
-        let Node::Box { dir, children, .. } = &row else {
-            panic!("an agent row is a vertical stack, got {row:?}");
-        };
-        assert_eq!(*dir, hytte_plugin::proto::Dir::Vertical);
-        assert_eq!(children.len(), 2, "two lines, no unfold: {children:?}");
+        for line in [&"idle".to_owned(), &middling, &absurd] {
+            let tree = card_of(vec![running("argus", line)]);
+            let status = find_text(&tree, line).expect("the status renders");
+            assert!(
+                status.ellipsize,
+                "line 2 must be one line at every length, or rows get uneven \
+                 heights ({} chars)",
+                line.chars().count()
+            );
+            assert_eq!(
+                status.max_width_chars,
+                Some(super::CARD_STATUS_CHARS),
+                "…and bound, so a long status cannot widen the card"
+            );
+            assert_eq!(
+                status.tooltip.as_deref(),
+                Some(line.as_str()),
+                "the cut string carries its own untruncated hover (#971)"
+            );
+            assert!(
+                status.classes.iter().any(|c| c == "ts-agent-status"),
+                "line 2 is the status caption: {:?}",
+                status.classes
+            );
+
+            // …and it really is a second line: the row is a vertical stack of
+            // exactly the head row and that caption.
+            let row = find_class(&tree, "ts-agent-row").expect("the row renders");
+            let Node::Box { dir, children, .. } = &row else {
+                panic!("an agent row is a vertical stack, got {row:?}");
+            };
+            assert_eq!(*dir, hytte_plugin::proto::Dir::Vertical);
+            assert_eq!(children.len(), 2, "two lines, no unfold: {children:?}");
+        }
     }
 
-    /// Past [`STATUS_WRAP_MAX`] the caption ellipsizes — and then the **`Text`
-    /// itself** carries the whole string as hover (#971), not the row.
+    /// The hover stays on the status **`Text`**, never on the enclosing row.
     ///
-    /// Falsification: drop the `tooltip: Some(body)` from `clipped` and the
-    /// hover assertion goes red; raise `STATUS_WRAP_MAX` past the fixture and
-    /// the `ellipsize` one does.
+    /// #961/#971 added `Node::Text.tooltip` to retire a row-level tooltip,
+    /// which put one legend over every glyph in the row. Now that line 2 is
+    /// always ellipsized, the hover is load-bearing rather than a last resort —
+    /// which makes it exactly the moment somebody would be tempted to move it
+    /// up to the row "so the whole pill shows it". This says no.
+    ///
+    /// Falsification: set the tooltip on `agent_row`'s `vstack` (or on line
+    /// 2's `hrow`) and the row/line assertions red.
     #[test]
-    fn an_absurdly_long_status_clips_and_hovers_itself_in_full() {
-        // No trailing whitespace: `Agent::status_line` trims, so a padded
-        // fixture would not be the string the tree actually carries.
+    fn the_status_hover_is_on_the_text_not_on_the_row() {
         let long = format!(
             "idle — {}",
             ["watching for review assignments"; 6].join(", ")
         );
-        assert!(long.chars().count() > STATUS_WRAP_MAX);
-
         let tree = card_of(vec![running("argus", &long)]);
-        let status = find_text(&tree, &long).expect("the status renders");
-        assert!(status.ellipsize, "past the wrap budget it must ellipsize");
-        assert_eq!(status.max_width_chars, Some(STATUS_CHARS));
+
+        let row = find_class(&tree, "ts-agent-row").expect("the row renders");
+        let Node::Box { tooltip, .. } = &row else {
+            panic!("an agent row is a vertical stack, got {row:?}")
+        };
+        assert_eq!(*tooltip, None, "the row must not carry the status legend");
+
+        let line2 = find_class(&tree, "ts-agent-statusline").expect("line 2 renders");
+        let Node::Row { tooltip, .. } = &line2 else {
+            panic!("line 2 is a Row, got {line2:?}")
+        };
+        assert_eq!(*tooltip, None, "…nor line 2's own container");
+
         assert_eq!(
-            status.tooltip.as_deref(),
-            Some(long.as_str()),
-            "the cut string carries its own untruncated hover"
+            find_text(&tree, &long).expect("the status renders").tooltip,
+            Some(long.clone()),
+            "the Text that got cut is what hovers"
         );
     }
 
@@ -1862,6 +1903,19 @@ mod tests {
                 );
             }
         }
+
+        // **On the card, the long status is one ellipsized line** — bounded is
+        // not enough there. A wrapping `Text` is bounded and still makes that
+        // row taller than its neighbours, which is what @kaesaecracker's
+        // 2026-09-11 screenshot showed; `line_two_is_one_ellipsized_line_at_every_status_length`
+        // owns the rule, and this asserts it survives at the pathological
+        // length this test already builds.
+        let card = &surfaces[0].1;
+        let status = find_text(card, &long_status).expect("the status renders on the card");
+        assert!(
+            status.ellipsize,
+            "the card's line 2 must never wrap, at any length"
+        );
     }
 
     /// The panel's roster is capped too, and states its overflow — the card's

@@ -185,13 +185,15 @@ Box {
                                     max_width_chars: Some(
                                         30,
                                     ),
-                                    ellipsize: false,
+                                    ellipsize: true,
                                     classes: [
                                         "dim-label",
                                         "caption",
                                         "ts-agent-status",
                                     ],
-                                    tooltip: None,
+                                    tooltip: Some(
+                                        "stopped",
+                                    ),
                                 },
                             ],
                             tooltip: None,

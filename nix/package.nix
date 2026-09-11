@@ -27,8 +27,11 @@
 let
   # crane's default cleanCargoSource keeps only .rs/.toml/.lock; on top of that
   # we keep ONLY the assets the *compile* genuinely reads:
-  #   - tests/fixtures — include_str!'d by the internals suite (doCheck runs
-  #     `cargo test` in the sandbox).
+  #   - tests/fixtures — include_str!'d by the internals suite (the hermetic
+  #     `cargo test --workspace` run). Since #1115 that run no longer happens
+  #     on this derivation's own `doCheck` — it's `checks.workspace-tests`
+  #     (flake.nix) now — but that check reuses this exact `src` via
+  #     `commonArgs`, so the fixtures still have to ship here.
   #   - assets/hytte-ui/style.css — hytte-ui's DEFAULT_STYLESHEET fallback
   #     (crates/hytte-ui/src/app.rs) include_str!'s this one file at compile
   #     time, so it must be present even though the rest of `assets/` isn't.
@@ -165,14 +168,19 @@ let
     # the workspace stage was `--workspace`, so the deps cache was largely dead
     # weight; stating the scope once here keeps every stage feature-identical.
     cargoExtraArgs = "--workspace --locked";
-    # Run the hermetic internals suite as part of the build. The real-system
-    # tests (dbus-daemon + display server) sit behind the `system-tests` cargo
-    # feature, which we deliberately don't enable here, so the default workspace
-    # `cargo test` needs no live daemons and runs cleanly in the sandbox.
-    # `cargoExtraArgs` already scopes the test run to `--workspace`, so no
-    # separate `cargoTestExtraArgs` is needed.
-    doCheck = true;
-    cargoTestExtraArgs = "";
+    # #1115: `doCheck` is deliberately NOT set here any more. It used to be
+    # `true` on this shared bundle, so both the deps stage below and the
+    # workspace compile ran the whole hermetic internals suite — meaning a
+    # consumer's `nix build .#trollshell` (or any other slice of `workspace`)
+    # paid for it too, and the deps stage compiled the dev-dependency graph
+    # just to feed that. Neither belongs to a package build: `nix flake
+    # check` already builds the package (#449), and now runs the hermetic
+    # suite as its own check instead — `checks.workspace-tests` in flake.nix.
+    # Same shape hyperhive settled on for the same problem
+    # (`hyperhive/nix/rust.nix:43-94`): two named `buildDepsOnly` caches, one
+    # per audience, rather than one cache and a shared `doCheck`. See
+    # `cargoArtifacts` and `cargoArtifactsBinOnly` below for the two, and
+    # `workspace`'s own `doCheck = false` for the compile stage.
 
     # No compile-time TROLLSHELL_DATA_DIR / HYTTE_UI_DATA_DIR here: both are
     # injected at *runtime* by the wrapper below, pointing at the standalone
@@ -216,13 +224,41 @@ let
     '';
   };
 
-  # The external dependency closure, cached on Cargo.lock changes only. Same
-  # `--workspace --locked` scope as the workspace build above it, so the feature
-  # union matches and the compile stage actually inherits these artifacts. The
-  # deps stage compiles dummy workspace crates, so running their (nonexistent)
-  # tests would be pure overhead — `--no-run` still compiles + caches the
-  # dev-dependency graph, which is the point.
-  cargoArtifacts = craneLib.buildDepsOnly (commonArgs // { cargoTestExtraArgs = "--no-run"; });
+  # The external dependency closure for the CHECKS (clippy, `system-tests`,
+  # and — since #1115 — `workspace-tests` in flake.nix), cached on Cargo.lock
+  # changes only. Same `--workspace --locked` scope as `commonArgs`, so the
+  # feature union matches whatever each check compiles against it.
+  #
+  # `craneLib.buildDepsOnly`'s own default `doCheck = true` is deliberately
+  # left alone here (no override): it adds `--all-targets` to the check
+  # command and a `cargo test --no-run`, so this cache compiles and caches
+  # the dev-dependency graph and every test harness in the workspace — dead
+  # weight for a plain compile, but exactly what a check that runs or lints
+  # tests needs. `cargoArtifactsBinOnly` below is the OTHER audience: no
+  # `doCheck`, no dev-deps, feeding `workspace`'s own compile instead.
+  #
+  # Same split hyperhive made for the same reason
+  # (`hyperhive/nix/rust.nix:43-75`, `cargoArtifacts`): one cache per
+  # audience, because a deploy never runs or links a test binary and
+  # shouldn't pay to compile one.
+  cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+  # The external dependency closure for the PACKAGE build — the audience
+  # `cargoArtifacts` above deliberately doesn't serve. `doCheck = false` here
+  # drops `buildDepsOnly`'s default `--all-targets` + `cargo test --no-run`,
+  # so dev-dependencies and test harnesses are never compiled for a consumer
+  # build at all. Distinct `pname` (rather than sharing `commonArgs`'
+  # `"trollshell"`) so the two caches are told apart in build logs and store
+  # paths, not just in this file — same reasoning and the same distinct-name
+  # convention as hyperhive's `cargoArtifactsBinOnly`
+  # (`hyperhive/nix/rust.nix:77-94`).
+  cargoArtifactsBinOnly = craneLib.buildDepsOnly (
+    commonArgs
+    // {
+      pname = "trollshell-workspace-bin";
+      doCheck = false;
+    }
+  );
 
   # THE workspace compile — the single cargo invocation that produces every
   # binary this flake ships (#572, implementing kaesaecracker's plan).
@@ -233,9 +269,12 @@ let
   # `$out/bin`, optionally wrapped. There is no second crane invocation anywhere
   # in the tree that compiles the default feature set, so there is no second
   # cargo fingerprint universe that can drift out of sync with this one. The
-  # only crane calls left are `checks.{clippy,system-tests}`, which compile
+  # only other crane calls are `checks.{clippy,system-tests}`, which compile
   # `--features system-tests` — a genuinely different feature union that by
-  # construction cannot be a slice of this build.
+  # construction cannot be a slice of this build — and, since #1115,
+  # `checks.workspace-tests`, which reuses this derivation's own `commonArgs`
+  # (same feature union as this build) and the `cargoArtifacts` cache above
+  # (NOT the `cargoArtifactsBinOnly` this compile uses — see both for why).
   #
   # History: #530 introduced an intermediate `cargoBuild` whose packed `target`
   # dir was inherited as `cargoArtifacts` by a `buildPackage` per binary, on the
@@ -248,9 +287,10 @@ let
   #
   # `buildPackage` captures the binaries from cargo's JSON build log in a
   # `postBuild` hook (crane's installFromCargoBuildLogHook), i.e. BEFORE the
-  # check phase — so hosting `doCheck` here cannot clobber what gets installed,
-  # and the dev-dependency feature unification `cargo test` triggers is
-  # harmless because nothing downstream compiles anything.
+  # check phase — the capture never depended on whether a check phase ran at
+  # all. That's why #1115 could turn `doCheck` off below without touching
+  # this hook: it already fires at the end of the build phase, `runHook
+  # postBuild`, regardless of `doCheck`.
   #
   # `dontWrapGApps` keeps `$out/bin` raw, unwrapped ELFs. The GTK apps
   # (trollshell, trollshell-control-center) get wrapped in their own slice
@@ -261,7 +301,16 @@ let
   workspace = craneLib.buildPackage (
     commonArgs
     // {
-      inherit cargoArtifacts;
+      # `cargoArtifactsBinOnly`, NOT `cargoArtifacts` — this is the compile
+      # stage the bin-only cache exists for (see both bindings above). Same
+      # pairing as hyperhive's `workspaceBuild`
+      # (`hyperhive/nix/packages/default.nix:61-68`): the deploy path takes
+      # the no-test-graph cache and sets its own `doCheck = false`
+      # (`buildPackage`'s own default is `args.doCheck or true`, so this has
+      # to be explicit here even though `commonArgs` carries no `doCheck` of
+      # its own any more).
+      cargoArtifacts = cargoArtifactsBinOnly;
+      doCheck = false;
       pname = "trollshell-workspace";
       dontWrapGApps = true;
 
@@ -269,73 +318,58 @@ let
       # `wifi_probe` (nix/probe.nix, nix/wifi-probe.nix) — are `--example`
       # targets, and cargo's default `build` target selection is lib + bins, so
       # crane's installFromCargoBuildLog never sees them: they aren't in the
-      # build phase's JSON log. They are nonetheless already compiled in this
-      # very derivation. `cargo test`'s documented default target selection
-      # builds every example "to ensure they compile", and `doCheck = true`
-      # above runs `cargo test --workspace --locked` in this same target dir
-      # under the same release profile. The check phase runs before
-      # installPhase (stdenv's phase order), so by the time this hook fires both
-      # binaries are sitting in `target/release/examples/`. Copy them into
-      # `$out/bin` alongside the declared bins so nix/{probe,wifi-probe}.nix can
-      # slice them out like every other package output (#588).
+      # build phase's JSON log.
       #
-      # Deliberately NOT `cargoBuildExtraArgs = "--bins --examples"`, which
-      # would be the obvious explicit spelling: selecting an example target
-      # makes cargo unify that package's *dev*-dependencies into the build graph
-      # (resolver v3), producing a THIRD feature configuration that neither the
-      # deps stage's `cargo build --workspace` (no dev-deps) nor its `cargo test
-      # --no-run` (dev-deps of *every* member) cached. hytte-reactive's dev
-      # `tokio = { features = ["test-util"] }` alone is enough to make the two
-      # unions differ, so tokio — and the whole graph beneath it — would
-      # recompile a third time. Riding the check phase costs zero extra
-      # compilation, which is the entire point of #572/#588.
+      # Before #1115 this rode `doCheck = true` for free: `cargo test`'s
+      # documented default target selection builds every example "to ensure
+      # they compile", so the check phase's `cargo test --workspace --locked`
+      # produced both binaries as a side effect of a dev-dependency compile
+      # that was already happening for the hermetic suite. `doCheck` is now
+      # `false` on this derivation (#1115) — there is no check phase here any
+      # more for that side effect to ride — so build the two examples
+      # explicitly instead.
+      #
+      # Scoped one crate at a time (`-p hytte-ecal --example probe`, then
+      # `-p hytte-services --example wifi_probe`) rather than `--workspace
+      # --examples`: selecting an example target unifies that *package's own*
+      # dev-dependencies into the build graph (resolver v3), and scoping
+      # avoids pulling every OTHER workspace member's dev-deps in too —
+      # cheaper than the `cargo test --workspace` compile this replaces, and
+      # this derivation sits on `cargoArtifactsBinOnly` (above), which has no
+      # cached "dev-deps of every member" artifact for a wider `--workspace
+      # --examples` build to matter less by matching anyway.
+      # `cargoWithProfile` (crane's helper, sourced by `cargoHelperFunctionsHook`
+      # into every phase of this derivation, not just build/check) keeps the
+      # profile the same `--release` the rest of this derivation uses.
+      #
       # `-print -quit` rather than the usual `… | head -1`: stdenv's setup.sh
       # runs the build script under `set -eu -o pipefail`, so a `find | head`
       # pipeline can abort the whole build on SIGPIPE once `head` closes the
       # pipe. `-quit` stops the traversal at the first hit instead, with no pipe
       # and no race — and it doesn't walk the rest of a multi-GiB target dir.
       postInstall = ''
+        cargoWithProfile build --locked -p hytte-ecal --example probe
+        cargoWithProfile build --locked -p hytte-services --example wifi_probe
         for example in probe wifi_probe; do
           exampleBin="$(find "''${CARGO_TARGET_DIR:-target}" -type f -name "$example" -path '*/examples/*' -print -quit)"
           if [ -z "$exampleBin" ]; then
             echo "ERROR: example binary '$example' was not built." >&2
-            echo "The workspace build installs the nixosTest probe examples out of" >&2
-            echo "the check phase's target dir; that requires doCheck = true." >&2
             exit 1
           fi
           install -Dm755 "$exampleBin" "$out/bin/$example"
         done
       '';
 
-      # The check phase's icon-theme environment (#1038 review, MED-4).
-      #
-      # `hytte-plugin-niri-layouts` resolves its three Adwaita symbolic names
-      # against the theme on `$XDG_DATA_DIRS` — the only gate between a typo and
-      # an `image-missing` box on the bar, since a themed icon name is just a
-      # string on the plugin wire and nothing else in the tree ever looks at it.
-      # nixpkgs puts **no** icon theme on a build's `XDG_DATA_DIRS` of its own
-      # accord (measured: it holds one unrelated `patchelf` share and nothing
-      # else), so that test was silently *skipping* here while its doc comment
-      # claimed it gated CI. `adwaita-icon-theme` is already in `buildInputs`
-      # above, so exporting its share costs nothing.
-      #
-      # `TROLLSHELL_REQUIRE_ICON_THEME=1` closes the other half: with it set, a
-      # theme that is still not visible **fails** the test instead of skipping
-      # it, so this env can never rot back into a silent no-op — a skip in
-      # captured `cargo test` output is indistinguishable from a pass.
-      #
-      # Deliberately on this derivation rather than in `commonArgs`: the deps
-      # stage (`buildDepsOnly`) hashes `commonArgs`, and adding an env var there
-      # would invalidate the external-dependency cache for a variable no
-      # dependency reads. `checks.system-tests` (flake.nix) sets its own
-      # `preCheck` and so does not inherit this either way.
-      preCheck = ''
-        export XDG_DATA_DIRS="${adwaita-icon-theme}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
-        export TROLLSHELL_REQUIRE_ICON_THEME=1
-      '';
+      # The icon-theme test env (`every_icon_name_exists_in_the_adwaita_theme_on_the_search_path`,
+      # crates/hytte-plugin-niri-layouts/src/plugin.rs) used to live here as a
+      # `preCheck` (#1038 review MED-4) because `doCheck = true` ran the
+      # hermetic suite on this very derivation. #1115 turned that off — there
+      # is no check phase left here for a `preCheck` to gate — so the
+      # equivalent env moved to `checks.workspace-tests` (flake.nix), which
+      # runs that suite now.
 
       passthru = {
-        inherit cargoArtifacts commonArgs;
+        inherit cargoArtifacts cargoArtifactsBinOnly commonArgs;
         devInputs = { inherit nativeBuildInputs buildInputs; };
       };
 
@@ -391,9 +425,12 @@ stdenv.mkDerivation {
 
   # `workspace` is what nix/plugin.nix, nix/control-center.nix and (since #588)
   # nix/{probe,wifi-probe}.nix slice their own binaries out of; `commonArgs` +
-  # `cargoArtifacts` are what the leaf flake checks (clippy / system-tests)
-  # reuse, since they compile a different feature set (`--features
-  # system-tests`) and so cannot be a slice of `workspace`.
+  # `cargoArtifacts` are what the leaf flake checks (clippy / system-tests /
+  # since #1115 workspace-tests) reuse instead of `workspace` itself — clippy
+  # and system-tests because they compile a different feature set (`--features
+  # system-tests`) and so cannot be a slice of `workspace`, workspace-tests
+  # because `workspace` sits on `cargoArtifactsBinOnly` (no dev-dependency
+  # graph) rather than `cargoArtifacts` (which has one).
   passthru = workspace.passthru // {
     inherit workspace assets;
   };

@@ -88,7 +88,7 @@
 //! [`assemble`] warns, same split, same reason (#1008).
 //!
 //! Since #1018, the third and fourth shapes are also returned as data, on
-//! [`Loaded::findings`], the way the first two are on [`Loaded::unknown_keys`]
+//! [`Loaded::unset_findings`], the way the first two are on [`Loaded::unknown_keys`]
 //! — so a settings UI can show a typo'd `_unset` without scraping the journal.
 //! The `warn!` calls are unchanged; the `Vec` is filled from the same two
 //! loops, not a second pass.
@@ -411,18 +411,25 @@ pub enum FindingKind {
 ///
 /// [`crate::merge`] never sees a file name (its module docs lean on that), so
 /// this type — not [`crate::merge::MalformedUnset`]/[`crate::merge::InertUnset`]
-/// themselves — is where the layer is attached: `assemble` already renders a
-/// layer name once per finding for the `warn!` field, and this pairs the same
-/// string with the same finding rather than teaching `merge` a new concept.
+/// themselves — is where the layer is attached: `assemble` already has the
+/// `Option<&Path>` in hand at both push sites (it only needs [`layer_name`]'s
+/// rendering for the `warn!` field), and hands the same value to `Finding`.
 ///
-/// `#[non_exhaustive]`: every construction site is inside this crate.
+/// `#[non_exhaustive]`: every construction site is inside this crate; use
+/// [`Finding::new`] to build one elsewhere (a downstream test fixture, say).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Finding {
-    /// Which layer the marker was found in: a path, or "the built-in
-    /// default" — rendered exactly like the `warn!`'s `layer` field beside
-    /// it.
-    pub layer: String,
+    /// Which layer the marker was found in: `Some` a layer file, `None` for
+    /// [`Subsystem::DEFAULT_TOML`] — there is no file to open, and the bug is
+    /// ours rather than the user's (#1018 review M-1: `String` here used to
+    /// be a lossy [`Path::display`] projection — U+FFFD on non-UTF-8, and
+    /// `"the built-in default"` was type-identical to a real path, so a
+    /// caller had no way back to a `PathBuf` and no way to tell "our bug"
+    /// from "your file" without matching on English). `Option<PathBuf>`
+    /// mirrors [`layer_name`]'s own parameter type and lets a settings UI
+    /// compare this against [`Loaded::sources`] or open the file directly.
+    pub layer: Option<PathBuf>,
     /// Dotted path: the marker's own path for [`FindingKind::MalformedUnset`]
     /// ([`crate::merge::MalformedUnset::key`]), the *named* key's path for
     /// [`FindingKind::InertUnset`] ([`crate::merge::InertUnset::key`]).
@@ -433,12 +440,40 @@ pub struct Finding {
     /// [`crate::merge::InertUnset`]'s own `Display` renders — not the `warn!`
     /// message text, which is a fixed constant naming neither the key nor the
     /// layer; this is the sentence a UI with no structured-log fields to read
-    /// would want to show instead.
+    /// would want to show instead. Both sentences are pinned as literals in
+    /// `crate::merge`'s own tests (#1018 review M-2), so rewording either one
+    /// is not silent here either.
     pub message: String,
 }
 
+impl Finding {
+    /// Build a [`Finding`] directly. `#[non_exhaustive]` keeps a struct
+    /// literal out of reach outside this crate — every real one is built in
+    /// [`assemble`] — but a downstream test still needs a way to construct a
+    /// fixture (#1018 review L-4).
+    #[must_use]
+    pub fn new(
+        layer: Option<PathBuf>,
+        key: impl Into<String>,
+        kind: FindingKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            layer,
+            key: key.into(),
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
 /// A loaded subsystem config, plus what the load learned on the way.
+///
+/// `#[non_exhaustive]`: this is the type that grows a field — `unset_findings`
+/// is the second one added since #866 (#1018 review L-1) — so a struct
+/// literal outside this crate would already have broken once.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Loaded<S> {
     /// The merged, validated config.
     pub config: S,
@@ -452,7 +487,14 @@ pub struct Loaded<S> {
     /// layers — see [`Finding`]. Warned exactly as before (#988/#1008); this
     /// is the same information returned as data, the way rule 4's typos are
     /// on `unknown_keys` (#1018).
-    pub findings: Vec<Finding>,
+    ///
+    /// Named for what it actually holds, not for "everything `assemble`
+    /// diagnoses" (#1018 review L-2): [`REQUIRED_TABLE_MESSAGE`] (#1088, a
+    /// table the schema refuses to drop) and [`warn_rejected_value`] (#1040,
+    /// a per-key value rejection, raised one level up in the load path) are
+    /// warned exactly the same way and are **not** in this `Vec`. Add a field
+    /// for either the day something needs to read it back as data.
+    pub unset_findings: Vec<Finding>,
 }
 
 /// Why a layered load or save failed.
@@ -649,12 +691,12 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
         tables.push(parse_layer(body, Some(path))?);
     }
 
-    // #1018: the findings returned in `Loaded::findings` below are built from
-    // these same two loops, not a second pass over the layers — one `push`
-    // beside each `warn!`, so the two can never drift apart on *which*
-    // markers were found, only (if a mutation drops one) on whether this
-    // `Vec` or the journal hears about it.
-    let mut findings: Vec<Finding> = Vec::new();
+    // #1018: `unset_findings` below is built from these same two loops, not a
+    // second pass over the layers — one `push` beside each `warn!`, so the
+    // two can never drift apart on *which* markers were found, only (if a
+    // mutation drops one) on whether this `Vec` or the journal hears about
+    // it.
+    let mut unset_findings: Vec<Finding> = Vec::new();
 
     // #988: a `_unset` the merge cannot honour is dropped either way, so it
     // has to be *said* — otherwise the user gets the inherited value back with
@@ -664,16 +706,15 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
     // attribute to a file.
     for (path, table) in paths.iter().zip(&tables) {
         for bad in merge::malformed_unset(table) {
-            let layer = layer_name(*path);
             tracing::warn!(
                 subsystem = S::NAME,
-                layer = %layer,
+                layer = %layer_name(*path),
                 key = %bad.key,
                 found = bad.found,
                 "{MALFORMED_UNSET_MESSAGE}"
             );
-            findings.push(Finding {
-                layer,
+            unset_findings.push(Finding {
+                layer: (*path).map(Path::to_path_buf),
                 key: bad.key.clone(),
                 kind: FindingKind::MalformedUnset,
                 message: bad.to_string(),
@@ -687,15 +728,14 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
     // marker is stripped before the schema is shown the table, so the name
     // inside it never reaches `serde_ignored`.
     for inert in merge::inert_unset(&tables) {
-        let layer = layer_name(paths[inert.layer]);
         tracing::warn!(
             subsystem = S::NAME,
-            layer = %layer,
+            layer = %layer_name(paths[inert.layer]),
             key = %inert.key,
             "{INERT_UNSET_MESSAGE}"
         );
-        findings.push(Finding {
-            layer,
+        unset_findings.push(Finding {
+            layer: paths[inert.layer].map(Path::to_path_buf),
             key: inert.key.clone(),
             kind: FindingKind::InertUnset,
             message: inert.to_string(),
@@ -724,7 +764,7 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
         config,
         sources: layers.iter().map(|(path, _)| path.clone()).collect(),
         unknown_keys,
-        findings,
+        unset_findings,
     })
 }
 
@@ -1735,9 +1775,9 @@ palette = ["amber", "rust"]
         assert!(loaded.config.enabled);
         assert!(loaded.sources.is_empty());
         assert!(
-            loaded.findings.is_empty(),
+            loaded.unset_findings.is_empty(),
             "a clean file has no `_unset` marker to find: {:?}",
-            loaded.findings
+            loaded.unset_findings
         );
     }
 
@@ -2349,15 +2389,15 @@ kept = true
         );
     }
 
-    // ── #1018: the same findings, returned as data ───────────────────────────
+    // ── #1018: the same unset_findings, returned as data ───────────────────────────
 
-    /// [`Loaded::findings`] carries the same detection the warning above pins,
+    /// [`Loaded::unset_findings`] carries the same detection the warning above pins,
     /// as data — a control-center or `validate` command's only way to see it
     /// without scraping the journal (#1018).
     ///
     /// A separate test from
     /// [`a_malformed_unset_marker_warns_naming_the_layer`] on purpose: the
-    /// mutation that drops the `findings.push` in [`assemble`] must leave the
+    /// mutation that drops the `unset_findings.push` in [`assemble`] must leave the
     /// `warn!` call untouched, so this test going red while that one stays
     /// green is what proves the two paths are separate.
     #[test]
@@ -2367,9 +2407,9 @@ kept = true
         let loaded = assembled(&["[core]\n_unset = \"color\"\n"]);
 
         assert_eq!(
-            loaded.findings,
+            loaded.unset_findings,
             [Finding {
-                layer: "/layer/0.toml".into(),
+                layer: Some(PathBuf::from("/layer/0.toml")),
                 key: "core._unset".into(),
                 kind: FindingKind::MalformedUnset,
                 message: merge::MalformedUnset {
@@ -2379,7 +2419,7 @@ kept = true
                 .to_string(),
             }],
             "the finding, not just the warning: {:?}",
-            loaded.findings
+            loaded.unset_findings
         );
         assert_eq!(
             unset_warnings(&captured).len(),
@@ -2398,10 +2438,10 @@ kept = true
         let loaded = assembled(&["[core]\n_unset = [\"color\", 3, true]\n"]);
 
         assert_eq!(
-            loaded.findings,
+            loaded.unset_findings,
             [
                 Finding {
-                    layer: "/layer/0.toml".into(),
+                    layer: Some(PathBuf::from("/layer/0.toml")),
                     key: "core._unset[1]".into(),
                     kind: FindingKind::MalformedUnset,
                     message: merge::MalformedUnset {
@@ -2411,7 +2451,7 @@ kept = true
                     .to_string(),
                 },
                 Finding {
-                    layer: "/layer/0.toml".into(),
+                    layer: Some(PathBuf::from("/layer/0.toml")),
                     key: "core._unset[2]".into(),
                     kind: FindingKind::MalformedUnset,
                     message: merge::MalformedUnset {
@@ -2422,7 +2462,7 @@ kept = true
                 },
             ],
             "one finding per offending element: {:?}",
-            loaded.findings
+            loaded.unset_findings
         );
         assert_eq!(
             unset_warnings(&captured).len(),
@@ -2463,9 +2503,9 @@ kept = true
             "the control is the ordinary rule-4 path, unchanged"
         );
         assert!(
-            loaded.findings.is_empty(),
+            loaded.unset_findings.is_empty(),
             "no complaint means no finding either: {:?}",
-            loaded.findings
+            loaded.unset_findings
         );
     }
 
@@ -2512,9 +2552,9 @@ kept = true
         assert_eq!(fields.get("found").map(String::as_str), Some("string"));
         assert_eq!(loaded.config.color, "amber", "and it removed nothing");
         assert_eq!(
-            loaded.findings,
+            loaded.unset_findings,
             [Finding {
-                layer: "the built-in default".into(),
+                layer: None,
                 key: "_unset".into(),
                 kind: FindingKind::MalformedUnset,
                 message: merge::MalformedUnset {
@@ -2524,7 +2564,7 @@ kept = true
                 .to_string(),
             }],
             "the finding names our own bug the same way the warning does: {:?}",
-            loaded.findings
+            loaded.unset_findings
         );
     }
 
@@ -3233,6 +3273,18 @@ kept = true
     /// red if it is somehow reported twice (`inert_unset` running once over
     /// the whole layer stack, not once per accepted #1088 candidate, is what
     /// this pins).
+    ///
+    /// The finding assertion runs **first**, deliberately (#1018 review L-3):
+    /// with the `core.is_none()` check first instead, any mutation to
+    /// #1088's own rule — unrelated to this finding — reddens this test
+    /// before the finding is even checked, so its failure carries no
+    /// information about the composition this test exists to pin. Measured:
+    /// forcing #1088's per-table prune to never accept a drop reddens this
+    /// test alongside 8 genuine #1088 tests either way, but with the finding
+    /// assertion first, the failure is unambiguously "the table did not go
+    /// absent" rather than "the finding was lost" — and the finding assertion
+    /// itself stays green under that mutation, which is the actual proof that
+    /// the finding count does not depend on whether #1088 drops the table.
     #[test]
     fn an_inert_marker_finding_survives_a_table_that_reads_as_absent() {
         let loaded = assemble::<OptTable>(&layers(&[
@@ -3240,16 +3292,10 @@ kept = true
         ]))
         .expect("assembles");
 
-        assert!(
-            loaded.config.core.is_none(),
-            "the block holds nothing of the schema's once the marker is \
-             stripped, so #1088's rule reads it as absent: {:?}",
-            loaded.config.core
-        );
         assert_eq!(
-            loaded.findings,
+            loaded.unset_findings,
             [Finding {
-                layer: "/layer/0.toml".into(),
+                layer: Some(PathBuf::from("/layer/0.toml")),
                 key: "core.mystery2".into(),
                 kind: FindingKind::InertUnset,
                 message: merge::InertUnset {
@@ -3260,7 +3306,13 @@ kept = true
             }],
             "the finding from before the merge must survive the table's own \
              absence, exactly once: {:?}",
-            loaded.findings
+            loaded.unset_findings
+        );
+        assert!(
+            loaded.config.core.is_none(),
+            "the block holds nothing of the schema's once the marker is \
+             stripped, so #1088's rule reads it as absent: {:?}",
+            loaded.config.core
         );
     }
 
@@ -3689,12 +3741,12 @@ kept = true
 
     // ── #1018: the same finding, returned as data ────────────────────────────
 
-    /// [`Loaded::findings`] carries the inert-marker detection too, as data —
+    /// [`Loaded::unset_findings`] carries the inert-marker detection too, as data —
     /// the same split as the malformed shape above (#1018).
     ///
     /// A separate test from
     /// [`an_unset_marker_naming_a_key_no_layer_sets_is_warned_about`] on
-    /// purpose, for the same reason: dropping the `findings.push` in
+    /// purpose, for the same reason: dropping the `unset_findings.push` in
     /// [`assemble`] must not touch the `warn!` call, so this one going red
     /// while that one stays green is what proves the two paths are separate.
     #[test]
@@ -3704,9 +3756,9 @@ kept = true
         let loaded = assembled(&["[core]\n_unset = [\"colr\", \"color\"]\n"]);
 
         assert_eq!(
-            loaded.findings,
+            loaded.unset_findings,
             [Finding {
-                layer: "/layer/0.toml".into(),
+                layer: Some(PathBuf::from("/layer/0.toml")),
                 key: "core.colr".into(),
                 kind: FindingKind::InertUnset,
                 message: merge::InertUnset {
@@ -3716,7 +3768,7 @@ kept = true
                 .to_string(),
             }],
             "the finding, not just the warning: {:?}",
-            loaded.findings
+            loaded.unset_findings
         );
         assert_eq!(
             inert_warnings(&captured).len(),
@@ -3758,9 +3810,9 @@ kept = true
             "…and it did erase it, which is what makes the silence correct"
         );
         assert!(
-            loaded.findings.is_empty(),
+            loaded.unset_findings.is_empty(),
             "no complaint means no finding either: {:?}",
-            loaded.findings
+            loaded.unset_findings
         );
     }
 
@@ -3803,9 +3855,9 @@ kept = true
         assert_eq!(fields.get("key").map(String::as_str), Some("colr"));
         assert_eq!(loaded.config.color, "amber", "and it removed nothing");
         assert_eq!(
-            loaded.findings,
+            loaded.unset_findings,
             [Finding {
-                layer: "the built-in default".into(),
+                layer: None,
                 key: "colr".into(),
                 kind: FindingKind::InertUnset,
                 message: merge::InertUnset {
@@ -3815,7 +3867,7 @@ kept = true
                 .to_string(),
             }],
             "the finding names our own bug the same way the warning does: {:?}",
-            loaded.findings
+            loaded.unset_findings
         );
     }
 

@@ -61,3 +61,7 @@ pub mod plugins;
 #[allow(dead_code)]
 pub mod scale;
 pub mod widgets;
+// In the closure since #1071 phase 2: `panels::workspaces` puts Start/Stop on
+// its cards, and both transactions live here rather than in the panel because
+// none of either is GTK (see that module's own doc).
+pub mod workspace_stacks;

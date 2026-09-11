@@ -20,6 +20,7 @@ mod revision;
 mod scale;
 mod secrets;
 mod widgets;
+mod workspace_stacks;
 
 use std::cell::RefCell;
 

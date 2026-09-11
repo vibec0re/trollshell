@@ -103,3 +103,4 @@
 //! through, live in [`hytte_config::subsystem::env`].
 
 pub mod core_leds;
+pub mod workspaces;

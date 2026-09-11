@@ -115,17 +115,24 @@ pub mod ids {
     /// The row's **edit** button — Annika's `[optionsedit]`, 2026-09-11 on
     /// [#963](https://github.com/vibec0re/trollshell/pull/963).
     ///
-    /// Today it opens this plugin's drawer page on that agent. Its real
-    /// destination is a **modal dialog**, which is
-    /// [#1010](https://github.com/vibec0re/trollshell/issues/1010)'s decision
-    /// and is still waiting on one answer (modal to the shell, or to the
-    /// session), so the effect it emits — `OpenPage(PluginSelf)` — does not
-    /// change when the dialog lands; only where the host puts the page does.
+    /// Today it opens this plugin's drawer page on that agent, which is a
+    /// **placeholder**. Its real destination is the agent's own companion
+    /// window on its **settings tab** —
+    /// [#950](https://github.com/vibec0re/trollshell/issues/950), settled by
+    /// Annika on #947 (2026-09-11 07:43Z): one surface per agent, so the same
+    /// window serves the row click (the agent page) and this button (its
+    /// settings). **Not**
+    /// [#1010](https://github.com/vibec0re/trollshell/issues/1010)'s modal —
+    /// that stays the answer for every *other* plugin's page and is not this
+    /// crate's concern at all.
+    ///
+    /// So this arm **will** change when #950 lands: opening a separate GTK
+    /// window is not `OpenPage(PluginSelf)`, which names a page inside the
+    /// shell. The id is stable, the effect behind it is not.
     ///
     /// It replaces `chat:`, the old name button. That id's documented future
-    /// was a chat companion window, which is now
-    /// [#950](https://github.com/vibec0re/trollshell/issues/950)'s `WebView` and
-    /// belongs to the **row click**, not to a button — see the module doc.
+    /// was a chat companion window, which is the same #950 window reached from
+    /// the **row click** rather than from a button — see the module doc.
     pub const EDIT: &str = "edit:";
     /// The pause/resume toggle. **Panel only** since the card went to two
     /// lines: Annika's mock has exactly two buttons per row and start/stop is
@@ -1001,10 +1008,13 @@ fn panel_roster_row(agent: &Agent, cfg: &AgentsConfig) -> Node {
 /// The selected agent's page — **the edit page, for now** (Annika,
 /// 2026-09-11: "then opensedit can open edit dialog").
 ///
-/// The card's `edit` button opens it, and #1010's modal dialog is where it is
-/// going to live; that is a decision about the *surface* the host mounts a
-/// plugin page on, not about this tree, so nothing here changes when the
-/// dialog lands.
+/// The card's `edit` button opens it, as a **placeholder** for the agent's own
+/// companion window on its settings tab —
+/// [#950](https://github.com/vibec0re/trollshell/issues/950), Annika's call on
+/// #947 (2026-09-11 07:43Z). When that window exists this tree is what its
+/// settings tab is built from, or is replaced by it; either way the button
+/// stops pointing here. It is **not** #1010's modal, which stays the answer
+/// for every other plugin's page.
 ///
 /// Trimmed to the card's own two lines plus what the card gave up:
 ///

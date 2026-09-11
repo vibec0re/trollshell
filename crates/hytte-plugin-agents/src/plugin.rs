@@ -352,10 +352,12 @@ impl Agents {
         }
         if let Some(rest) = node.strip_prefix(ids::EDIT) {
             // Annika's `[optionsedit]` (2026-09-11). It opens this plugin's own
-            // page on that agent — and keeps doing exactly that when #1010's
-            // modal lands, because `OpenPage(PluginSelf)` names the page, not
-            // the surface the host mounts it on. Still read-only until #952;
-            // the button is named for where it is going.
+            // page on that agent, which is a placeholder: its real destination
+            // is the agent's companion window on its settings tab (#950, her
+            // call on #947 at 07:43Z), and opening a separate GTK window is not
+            // `OpenPage(PluginSelf)` — so this arm changes when #950 lands.
+            // Still read-only until #952; the button is named for where it is
+            // going.
             if let Some(name) = AgentName::parse(rest) {
                 return self.open_detail(name);
             }

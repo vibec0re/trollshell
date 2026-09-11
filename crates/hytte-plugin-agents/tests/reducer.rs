@@ -322,9 +322,12 @@ fn the_row_itself_is_not_a_click_target_until_the_webview_exists() {
 /// The **edit** button — Annika's `[optionsedit]` — opens this plugin's page on
 /// that agent, and asks the hive nothing.
 ///
-/// `OpenPage(PluginSelf)` names the *page*; #1010's modal dialog changes the
-/// surface the host mounts it on, not this effect, which is why the button can
-/// be wired now and the dialog can land later without touching this arm.
+/// This pins a **placeholder**, deliberately. Its real destination is the
+/// agent's companion window on its settings tab (#950, her call on #947 at
+/// 2026-09-11 07:43Z), and opening a separate GTK window is not
+/// `OpenPage(PluginSelf)` — so this test is expected to change with that
+/// window, and the arm it covers with it. What must survive the swap is the
+/// other half: the button asks the hive nothing.
 ///
 /// Falsification: point the `ids::EDIT` arm at anything else and the `Effect`
 /// or the `selected` assertion reds.

@@ -440,9 +440,12 @@ the reducer but cannot prove the hive agrees.
       button**. The list button beside `up · N` opens the plugin's page at the
       hive overview — state, socket, last-poll age, a clickable `dashboard`
       link, and the **full, uncapped** roster. A row's `edit` button opens that
-      agent's page instead. **Expect it top right:** that is the drawer, and
-      #1010's decision is that plugin pages become modal dialogs — the surface
-      changes there, not here. Nothing else on a row leaves the sidebar.
+      agent's page instead. **Expect it top right:** that is the drawer, and it
+      is a **placeholder** — Annika settled on #947 (2026-09-11) that the edit
+      button's real destination is the agent's own #950 companion window on its
+      **settings tab**, the same window the row click opens on the agent page.
+      (#1010's modal is for every _other_ plugin page and does not govern this
+      one.) Nothing else on a row leaves the sidebar.
 - [ ] **(#947 P1)** The agent page is the same pill, plus what the card gave
       up. With an agent selected, confirm: a header with the runtime icon, the
       name at title size, the **model chip**, and `[start|stop]` + `[pause]` as

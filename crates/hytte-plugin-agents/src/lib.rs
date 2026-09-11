@@ -28,13 +28,19 @@
 //! | §6.1's row click opens something | the row is **not** a click target at all | her click target is #950's `WebView`, which does not exist yet; opening the drawer instead would train the wrong surface |
 //! | §6.4's page is "the selected agent's **full** detail" | the same pill, the flags, the agent's link — no `deployed` / `parent` / `status set` | the three rows she named; `model` survives as line 1's chip with the full id on its hover |
 //!
-//! Two things the v1 spec asks for are **not** in this crate and cannot be:
-//! the row click's destination is #950, and the edit button's destination is
-//! [#1010](https://github.com/vibec0re/trollshell/issues/1010)'s modal dialog —
-//! a decision about which host surface a plugin page mounts on, still waiting
-//! on one answer from Annika (modal to the shell, or to the session). The edit
-//! button emits `OpenPage(PluginSelf)` either way, so it needs no change when
-//! that lands.
+//! **Both of the v1 destinations are [#950](https://github.com/vibec0re/trollshell/issues/950),
+//! and neither is in this crate.** Annika settled it on #947 (2026-09-11
+//! 07:43Z): the agent's companion window — a `WebKitGTK` view in a window the
+//! shell owns, one per agent, with chrome that reads `host.sock` directly — is
+//! the single surface for an agent. The **row click** opens it on the agent
+//! page; the **edit button** opens it on its settings tab. This crate's drawer
+//! page is the placeholder for the second until that window exists.
+//!
+//! So the edit arm **will** change when #950 lands — opening a separate GTK
+//! window is not `OpenPage(PluginSelf)`, which names a page inside the shell.
+//! [#1010](https://github.com/vibec0re/trollshell/issues/1010)'s modal (shell
+//! vs session, still waiting on one word from her) stays the answer for every
+//! *other* plugin's page and governs nothing here.
 //!
 //! # What it links, and what it does not
 //!

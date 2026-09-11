@@ -371,9 +371,9 @@ mod tests {
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use super::{Header, Press, Settings};
-    use gtk::prelude::ToggleButtonExt as _;
     use crate::chrome::{Controls, Facts, HeaderModel};
     use crate::feed::AgentState;
+    use gtk::prelude::ToggleButtonExt as _;
     use hytte_plugin_agents::config::AgentsConfig;
     use hytte_plugin_agents::hive::wire::AgentStatusRow;
     use hytte_plugin_agents::model::{Agent, AgentName};
@@ -484,12 +484,8 @@ mod gtk_tests {
     fn the_settings_page_rebuilds_without_stale_rows() {
         let settings = Settings::new();
         let cfg = AgentsConfig::default();
-        let facts = |state: &AgentState| {
-            (
-                Facts::agent(&name("stray"), state),
-                Facts::hive(&cfg, None),
-            )
-        };
+        let facts =
+            |state: &AgentState| (Facts::agent(&name("stray"), state), Facts::hive(&cfg, None));
 
         let (a, h) = facts(&AgentState::Connecting);
         let expected = a.len() + h.len();

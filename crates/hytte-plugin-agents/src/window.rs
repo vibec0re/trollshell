@@ -73,11 +73,7 @@ impl Tab {
 /// defaults to), so nothing depends on which spelling arrives.
 #[must_use]
 pub fn argv(name: &str, tab: Tab) -> Vec<String> {
-    let mut out = vec![
-        BINARY.to_owned(),
-        ARG_AGENT.to_owned(),
-        name.to_owned(),
-    ];
+    let mut out = vec![BINARY.to_owned(), ARG_AGENT.to_owned(), name.to_owned()];
     if tab != Tab::Agent {
         out.push(ARG_TAB.to_owned());
         out.push(tab.as_str().to_owned());
@@ -106,8 +102,7 @@ pub fn on_path() -> bool {
 /// mode bits are what `PATH` resolution itself looks at.
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(path)
-        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// Whether the companion window can be launched — resolved **once** per
@@ -303,7 +298,10 @@ mod tests {
     #[test]
     fn the_path_probe_caches_its_answer() {
         let mut p = Probe::path();
-        assert!(p.cached.is_none(), "nothing is resolved before it is needed");
+        assert!(
+            p.cached.is_none(),
+            "nothing is resolved before it is needed"
+        );
         let first = p.available();
         assert_eq!(p.cached, Some(first), "the answer is remembered");
         // Pin the cache rather than PATH: flip it and the second call must

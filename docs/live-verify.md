@@ -549,7 +549,7 @@ whole point of the window.
       page, and that the drawer does **not** also open a plugin page behind it.
 - [ ] **(#950)** **A second launch focuses the first.** With the window open on
       the agent page, click the pen: no second window appears, the existing one
-      is presented *and* switches to Settings (that is the
+      is presented _and_ switches to Settings (that is the
       `HANDLES_COMMAND_LINE` forward — if it merely raises without switching,
       the remote command line is being dropped). Then open a **different**
       agent's window and confirm the two coexist.
@@ -581,7 +581,7 @@ whole point of the window.
       window picks it up like any other client. Failing that, launch it with
       `TROLLSHELL_AGENT_WINDOW_CA=/var/lib/hive-tls/trust-bundle.pem`, which
       trusts that certificate **for the agent's host only**. Confirm in both
-      cases that the page loads *and* that an unrelated https host in the same
+      cases that the page loads _and_ that an unrelated https host in the same
       window still fails on a bad certificate — this window never turns TLS
       checking off.
 - [ ] **(#950)** **Without the window, nothing regresses.** Set

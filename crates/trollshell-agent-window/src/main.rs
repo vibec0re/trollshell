@@ -5,7 +5,6 @@
 //! its module docs for the design, and `cli::app_id` for why the application
 //! id carries the agent.
 
-
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -32,8 +31,7 @@ const DEFAULT_LOG_LEVEL: tracing_subscriber::filter::LevelFilter =
 const EXIT_USAGE: u8 = 2;
 
 /// What the window shows before the hive has a page URL for this agent.
-const NO_PAGE: &str =
-    "This hive publishes no page for this agent yet — its domain is unconfigured, or the agent is \
+const NO_PAGE: &str = "This hive publishes no page for this agent yet — its domain is unconfigured, or the agent is \
      not on its roster. The header above still follows the agent's live status.";
 
 fn main() -> glib::ExitCode {

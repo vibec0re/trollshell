@@ -192,9 +192,10 @@ async fn each_button_sends_its_verb_once_and_repolls() {
     ] {
         cmd_tx.send(req).expect("the loop is listening");
     }
-    until("the loop drained the command lane and re-polled after each", || {
-        hive.writes().len() >= 4 && polls(&hive) >= after_seed + 4
-    })
+    until(
+        "the loop drained the command lane and re-polled after each",
+        || hive.writes().len() >= 4 && polls(&hive) >= after_seed + 4,
+    )
     .await;
 
     assert_eq!(
@@ -269,7 +270,10 @@ async fn the_hives_urls_are_fetched_once() {
     }
     assert!(polls(&hive) >= 5, "{:?}", hive.seen());
     assert_eq!(
-        hive.seen().iter().filter(|l| l.contains("\"urls\"")).count(),
+        hive.seen()
+            .iter()
+            .filter(|l| l.contains("\"urls\""))
+            .count(),
         1,
         "{:?}",
         hive.seen()

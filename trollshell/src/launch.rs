@@ -53,15 +53,50 @@
 //!     [--property=P]… [--setenv=K=V]… [--setenv=K]… -- argv…
 //! ```
 //!
-//! The plugin launcher passes no slice and three properties; the detached
-//! launcher passes a slice and no properties; neither carries both, so the two
-//! old orders are the same order with one of the optional groups empty.
+//! The plugin launcher passes no slice and, since #1098, four properties
+//! (three at the #1071 phase 2 move, plus `TimeoutStopSec` — see
+//! [`PLUGIN_TIMEOUT_STOP`]); the detached launcher passes a slice and no
+//! properties; neither carries both, so the two old orders are the same order
+//! with one of the optional groups empty.
 
 /// The program every launch runs. Injectable at the [`command`] call so a
 /// hermetic test can point a launch at a recording stub (`effects`' #964
 /// `the_dispatched_unit_reaches_the_systemd_run_argv` does exactly that)
 /// without a user manager.
 pub(crate) const SYSTEMD_RUN: &str = "systemd-run";
+
+/// `TimeoutStopSec=` for a **plugin** unit only (#1098, #1092 review M4).
+///
+/// `hytte-plugin`'s `run` gives an awaiting `Plugin::shutdown` hook a 2 s
+/// inner grace (`crates/hytte-plugin/src/lib.rs`'s "Process shutdown"
+/// section, `SHUTDOWN_GRACE` in `runtime.rs`) — but `tokio::time::timeout`
+/// can only reclaim control at an `.await` point, so that grace does nothing
+/// for a hook that blocks the thread instead (measured: 8059 ms held against
+/// a 2000 ms grace). Without an explicit `TimeoutStopSec`, the outer bound a
+/// stuck hook actually sits under is the user manager's own
+/// `DefaultTimeoutStopSec` (90 s on a stock systemd), so `systemctl --user
+/// stop` — and the whole session's shutdown, since `plugin_launcher`'s units
+/// are `PartOf=` the session target — can wait most of a minute and a half on
+/// one wedged plugin. 10 s is comfortably above the 2 s inner grace (and the
+/// infobroker's `drain()`, which is milliseconds) while staying well under
+/// the manager default, so the two numbers are paired rather than one being
+/// an accident of the other.
+///
+/// Plugin units **only**: a workspace-stack app launch
+/// (`workspace_stacks::app_launch`) starts an arbitrary desktop app — a
+/// browser closing slowly is not a stuck shutdown hook, and forcing a 10 s
+/// `SIGKILL` on it would be a regression, not a fix — so it keeps systemd's
+/// default and this constant is never added to its `properties`.
+///
+/// The only production reference is `plugin_launcher::plugin_launch`, which
+/// `lib.rs`'s shadow `[lib]` target (`trollshell/src/lib.rs`'s module doc)
+/// deliberately excludes from its narrower closure — so the plain (non-test)
+/// build of *that* target sees no reference at all and `dead_code` cannot
+/// tell that apart from a genuine orphan (same shape as `lib.rs`'s `scale`
+/// module carve-out). Live in the real binary; `#[cfg(test)]` also uses it
+/// directly, just below.
+#[allow(dead_code)]
+pub(crate) const PLUGIN_TIMEOUT_STOP: &str = "10s";
 
 /// One transient-unit launch, as a request rather than an argv.
 ///
@@ -84,8 +119,9 @@ pub(crate) struct Launch {
     pub slice: Option<String>,
     /// `--property=` values, verbatim and in order (e.g.
     /// `"Restart=on-failure"`). A `Vec<String>` rather than a typed set: the
-    /// vocabulary is systemd's, it is large, and the two callers that use it
-    /// want three fixed entries between them.
+    /// vocabulary is systemd's, it is large, and the callers that use it want
+    /// a handful of fixed entries each (the plugin launcher's four, since
+    /// #1098's [`PLUGIN_TIMEOUT_STOP`]).
     pub properties: Vec<String>,
     /// `--setenv=K=V` — values that may ride the world-readable argv because
     /// they are already world-readable (nix renders `plugins.json` `0444`) or
@@ -204,7 +240,7 @@ pub(crate) fn envs_of(cmd: &tokio::process::Command) -> Vec<(String, Option<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{Launch, SYSTEMD_RUN, argv_of, command, envs_of};
+    use super::{Launch, PLUGIN_TIMEOUT_STOP, SYSTEMD_RUN, argv_of, command, envs_of};
 
     fn argv(launch: &Launch) -> Vec<String> {
         argv_of(&command(SYSTEMD_RUN, launch))
@@ -283,6 +319,56 @@ mod tests {
                 "--property=RestartSec=2",
                 "--property=PartOf=niri-session.target",
             ]
+        );
+    }
+
+    /// #1098 (#1092 review M4): a plugin-kind launch — shaped like
+    /// `plugin_launcher::plugin_launch`'s properties, `PLUGIN_TIMEOUT_STOP`
+    /// included alongside the pre-existing supervision properties — renders
+    /// the `TimeoutStopSec` property.
+    ///
+    /// Mutation: drop `PLUGIN_TIMEOUT_STOP` from the literal below → red
+    /// (`--property=TimeoutStopSec=10s` no longer in `args`).
+    #[test]
+    fn a_plugin_launch_carries_the_timeout_stop_property() {
+        let args = argv(&Launch {
+            unit: "trollshell-plugin-demo.service".to_owned(),
+            properties: vec![
+                "Restart=on-failure".to_owned(),
+                "RestartSec=2".to_owned(),
+                "PartOf=niri-session.target".to_owned(),
+                format!("TimeoutStopSec={PLUGIN_TIMEOUT_STOP}"),
+            ],
+            ..Launch::default()
+        });
+        assert!(
+            args.contains(&"--property=TimeoutStopSec=10s".to_owned()),
+            "a plugin launch must bound its stop below the 90s manager default: {args:?}"
+        );
+    }
+
+    /// #1098 (#1092 review M4): a workspace-stack app launch — shaped like
+    /// `workspace_stacks::app_launch`, which passes no properties at all —
+    /// carries no `TimeoutStopSec`. Phase 2 launches arbitrary desktop apps
+    /// (a browser, say) into a per-workspace slice; a 10 s `SIGKILL` on one
+    /// closing slowly would be a regression, not a fix, so it keeps systemd's
+    /// default.
+    ///
+    /// Mutation: add `PLUGIN_TIMEOUT_STOP` to this launch's properties too →
+    /// red (`--property=TimeoutStopSec=…` now present).
+    #[test]
+    fn a_workspace_app_launch_carries_no_timeout_stop_property() {
+        let args = argv(&Launch {
+            unit: "trollshell-ws-chat-0.service".to_owned(),
+            slice: Some("trollshell-ws-chat.slice".to_owned()),
+            properties: Vec::new(),
+            ..Launch::default()
+        });
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("--property=TimeoutStopSec")),
+            "a workspace-stack app launch must keep systemd's default stop timeout: {args:?}"
         );
     }
 

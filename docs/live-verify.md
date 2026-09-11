@@ -1869,37 +1869,38 @@ session.
     reported minimum width is 0 px at any core count (one `PixelSurface`, whose
     `measure` hard-codes a 0 minimum, replaces 64 bars each with an 8 px CSS
     floor). If the drawer's minimum width grew, this regressed.
-  - **The colour axis is orthogonal to the skin.** Set
-    `TROLLSHELL_CORE_LEDS_STYLE=crt` **and** `TROLLSHELL_CORE_LEDS_COLOR=heat`
-    and restart the shell: expect heat-coloured lamps _through_ the CRT's
-    scanline comb and curved-glass vignette — both at once, not one instead of
-    the other. That composition is the whole design claim of #857 and the
-    single most valuable thing to eyeball.
+  - **The colour axis is orthogonal to the skin.** In
+    `~/.config/trollshell/core-leds.toml` set `style = "crt"` **and**
+    `color = "heat"` and save (or restart): expect heat-coloured lamps
+    _through_ the CRT's scanline comb and curved-glass vignette — both at
+    once, not one instead of the other. That composition is the whole design
+    claim of #857 and the single most valuable thing to eyeball.
   - Sweep the four knobs. **Since #869 these live in
     `~/.config/trollshell/core-leds.toml`** (`style` / `color` / `rows` /
     `fill`), where an edit takes effect **live** — see the #869 entry below.
-    The four variables below still work and still win, but each now logs one
-    deprecation line at startup naming the file key it moves to **and the
-    vocabulary that key accepts**; an unrecognized value logs **one**
-    `tracing::warn` (not two — it replaces the deprecation line rather than
-    joining it) and falls through to the file:
-    - `TROLLSHELL_CORE_LEDS_STYLE` = `vfd` (default) / `lcd` / `oled` / `crt`
-    - `TROLLSHELL_CORE_LEDS_COLOR` = `heat` (default) / `style` / `rainbow` /
-      `transpride` / `#rrggbb`. `style` should give the plain single-ink panel
-      — the pre-#857 look, and the guarantee the byte-identity tests pin.
-    - `TROLLSHELL_CORE_LEDS_ROWS` = `rect` (default — a **wide rectangle**
-      since the second #857 pass, near-square before it) or a row count
-      **from 1 to 64**. `=3` on a many-core box makes a wide, short strip —
-      check it does not push the drawer wider (it is 247 px at 1× on a 64-core
-      box, and the scale deliberately refuses to blow it up past the budget).
-      `=65` (or `=0`, or `=-1`) is rejected with one warning and falls through
-      to the file: the budget box shows nine rows at 1×, so a bigger number is
-      a typo, and an unbounded one used to ask for a multi-gigabyte frame.
-    - `TROLLSHELL_CORE_LEDS_FILL` = `spare` (default) / `blank` — only visible
-      when the last row is ragged **and** the skin ghosts, so pair it with
-      `…_ROWS=3` and `…_STYLE=lcd` (or `vfd`). `spare` shows unlit lamps
-      filling the tail, `blank` leaves the gap bare. On `oled`/`crt` the two
-      are identical by construction (no ghost to differ on).
+    The four `TROLLSHELL_CORE_LEDS_*` variables that used to carry them are
+    **gone** (#1041 step 3): setting one now does **nothing** to the resolved
+    value and logs exactly **one** `tracing::warn` at startup naming the file
+    key to use instead — see the #1041 entry below for that line's exact
+    shape.
+    - `style` = `vfd` (default) / `lcd` / `oled` / `crt`
+    - `color` = `heat` (default) / `style` / `rainbow` / `transpride` /
+      `#rrggbb`. `style` should give the plain single-ink panel — the
+      pre-#857 look, and the guarantee the byte-identity tests pin.
+    - `rows` = `0` or `"rect"` (default — a **wide rectangle** since the
+      second #857 pass, near-square before it) or a row count **from 1 to
+      64**. `3` on a many-core box makes a wide, short strip — check it does
+      not push the drawer wider (it is 247 px at 1× on a 64-core box, and the
+      scale deliberately refuses to blow it up past the budget). `65` (or a
+      negative value) is rejected with one warning and falls back to the
+      built-in default: the budget box shows nine rows at 1×, so a bigger
+      number is a typo, and an unbounded one used to ask for a
+      multi-gigabyte frame.
+    - `fill` = `spare` (default) / `blank` — only visible when the last row
+      is ragged **and** the skin ghosts, so pair it with `rows = 3` and
+      `style = "lcd"` (or `"vfd"`). `spare` shows unlit lamps filling the
+      tail, `blank` leaves the gap bare. On `oled`/`crt` the two are
+      identical by construction (no ghost to differ on).
   - Hover the panel: the tooltip should read
     `N cores · avg X% · max Y% (core K)`. This **replaces** the old per-bar
     `"42%"` tooltip — the per-lamp readout is gone (a pointer-precise version
@@ -1937,9 +1938,9 @@ session.
     viewport. The scroll is coordinate-based (`compute_bounds`), so it should
     be indifferent to the rearrangement — this check exists to prove that,
     not because a break is expected.
-  - `TROLLSHELL_CORE_LEDS_ROWS=8` still overrides the automatic shape (and on
-    a 64-core box gives back roughly #861's square). `=rect` or unset is the
-    new rectangle.
+  - A pinned `rows = 8` in `core-leds.toml` still overrides the automatic
+    shape (and on a 64-core box gives back roughly #861's square). `"rect"`,
+    `0`, or an absent key is the new rectangle.
 - [ ] **(#869)** **`core-leds.toml` — the config-file pilot.** Phase 1 of
       #866: the LED panel's four knobs are the first subsystem read through
       the #868 layering — `places.toml` has reloaded live since long before
@@ -1965,42 +1966,26 @@ session.
     `trollshell/src/config/core_leds.rs` — copy it into your overlay as a
     starting point and check that the comments actually tell you what to type,
     since that block is the only place a key is explained.
-  - **The environment still wins, once, loudly.** Start the shell with
-    `TROLLSHELL_CORE_LEDS_STYLE=oled` while `core-leds.toml` says
-    `style = "crt"`. Expect an OLED panel (the variable wins), and **exactly
-    one** journal line of this shape — with the real resolved path in it, not
-    a literal `~`, and with the key's vocabulary spelt out, since until nix
-    renders a base file the only other place a key is explained is
-    `DEFAULT_TOML` in the source:
+  - **(#1041) The environment used to win — now it does nothing, once,
+    loudly.** Start the shell with `TROLLSHELL_CORE_LEDS_STYLE=oled` while
+    `core-leds.toml` says `style = "crt"`. Expect the **CRT** panel — the
+    file's own value, never the variable's, regardless of whether the
+    variable's value would ever have parsed under the old scheme — and
+    **exactly one** journal line of this shape, with the real resolved path in
+    it, not a literal `~`:
 
     ```text
-    TROLLSHELL_CORE_LEDS_STYLE is deprecated; set `style` in /home/annika/.config/trollshell/core-leds.toml — it accepts one of vfd/lcd/oled/crt
-    ```
-
-    The vocabulary in that line is the **file**'s, which matters for exactly
-    one knob: start with `TROLLSHELL_CORE_LEDS_ROWS=rect` instead and the line
-    must offer `0 or "rect" for the automatic rectangle, or a row count from 1 to 64` — the `0` included, because the file takes it and this line is the
-    only place on disk that says so until nix renders a base file. (The
-    _unusable_-variable line below is the other way round: it must **not**
-    offer a `0`, since the variable never took one.)
-
-    Then edit `color` in the file and save: the colour must change live
-    **while `style` stays OLED**
-    (the variable stays pinned across reloads) and the deprecation line must
-    **not** repeat. A line every few seconds means the reload is announcing.
-
-  - **A bad variable costs one line, not two.** Start with
-    `TROLLSHELL_CORE_LEDS_STYLE=plasma`. Expect the file's (or default) skin
-    and **exactly one** warning, which carries the whole instruction on its
-    own — no separate deprecation line beside it:
-
-    ```text
-    TROLLSHELL_CORE_LEDS_STYLE is set to `plasma`, which is not valid; expected one of vfd/lcd/oled/crt — ignoring it and taking `style` from /home/annika/.config/trollshell/core-leds.toml
+    TROLLSHELL_CORE_LEDS_STYLE does nothing any more; set `style` in /home/annika/.config/trollshell/core-leds.toml instead — it accepts one of vfd/lcd/oled/crt
     ```
 
     One for the life of the shell, not one per reload: edit and save the file
-    a few times and confirm the line does **not** come back. A process's
-    environment cannot change under it, so a repeat would be pure noise.
+    a few times with the variable still set, confirm the panel keeps tracking
+    the file (never OLED) and the line does **not** repeat. Then try
+    `TROLLSHELL_CORE_LEDS_STYLE=plasma` (a value nothing ever accepted) and
+    confirm the line and the behaviour are identical — there is no separate
+    "unusable value" case any more, since the value is never read. Finally
+    unset the variable and restart: the journal must carry **no** line for it
+    at all.
 
   - **A file caught mid-edit keeps the last good skin.** With the shell
     running and a working `core-leds.toml`, save a deliberately broken one —
@@ -2440,11 +2425,12 @@ switch` repoints atomically to a new store path every rebuild; the running
       needs a live niri session — the page is built entirely out of
       `niri::workspaces()` + `niri::windows()`, both of which are empty in a
       sandbox.
-  - **Open it.** Settings drawer → **More** → **Workspaces**, or (since #1108,
-    below) the dedicated grid-icon chip right of the mpris chip in the bar —
-    the numbered `[1 2 3 …]` switcher itself is untouched (epic revision 5:
-    no name ever shows there). It also opens from a niri keybind, via the
-    command surface:
+  - **Open it.** Settings drawer → **More** → **Workspaces** (there is no bar
+    chip — #1108 shipped one and then dropped it per Annika's call on the
+    issue; the numbered `[1 2 3 …]` switcher itself is untouched, epic
+    revision 5: no name ever shows there). It also opens from a niri keybind,
+    via the command surface (see `etc/niri/binds.kdl`'s commented sample
+    line):
     ```sh
     busctl --user call mov.vibec0re.trollshell /mov/vibec0re/trollshell \
         org.gtk.Actions Activate 'sava{sv}' open-page 1 s workspaces 0
@@ -2748,25 +2734,23 @@ trollshell`. Expect the cards to come back Active and **no notification at
     (`niri msg action toggle-window-floating`) and confirm the rest still land
     at 1, 2, 3.
 
-- [ ] **(#1108)** The workspace-manager bar chip, and the Workspaces page
-      filling the drawer's existing wide width cap instead of shrinking to
-      its content. No niri/systemd session required — this is pure bar-chip
-      and drawer-sizing behavior on top of whatever phase 1-3 state already
-      exists.
-  - **The chip.** A grid-icon-only chip sits in the bar right of the mpris
-    chip (still left of the plugin center slot), tooltip "Workspaces". Click
-    it → the Workspaces page opens, same as the Settings → More route above.
-    Click it again while the page is already open → the drawer retracts, same
-    as every other chip-opened page.
+- [ ] **(#1108)** The Workspaces page filling the drawer's existing wide width
+      cap instead of shrinking to its content. No niri/systemd session
+      required — this is pure drawer-sizing behavior on top of whatever
+      phase 1-3 state already exists. **There is no bar chip**: #1108 shipped
+      one, then Annika called for it to be dropped on the same issue ("the
+      chip can be dropped") — the width fill stayed, the chip didn't. Reach
+      the page via Settings → More → Workspaces, or the `open-page` command
+      surface (`etc/niri/binds.kdl`'s commented sample line).
   - **Only that page fills the cap.** With one or two monitors, the
     Workspaces page used to shrink to its content's natural width (visibly
     narrower than the Stats multicolumn page even though both share the same
-    wide clamp). Open the Workspaces page and compare its card width against
-    the Stats page (any layout with two side-by-side history graphs) — the
-    two should now measure the same width, the shared cap, regardless of how
-    many monitor columns Workspaces actually has. Open Settings (any chip),
-    then reopen Workspaces (the new chip, or Settings → More → Workspaces) —
-    the filled width must still hold on the second show, not just the first
+    wide clamp). Open the Workspaces page (Settings → More → Workspaces, or
+    the keybind) and compare its card width against the Stats page (any
+    layout with two side-by-side history graphs) — the two should now measure
+    the same width, the shared cap, regardless of how many monitor columns
+    Workspaces actually has. Open Settings, then reopen Workspaces — the
+    filled width must still hold on the second show, not just the first
     build. Every other page's width must be visually unchanged from before
     #1108 (still shrinking to its own content, not filling any cap).
 - [ ] **(#1071 phase 4, #1109)** The Edit sub-page, the desktop-entry picker,
@@ -2932,6 +2916,20 @@ trollshell`. Expect the cards to come back Active and **no notification at
     **✎** before the poll rebuilds the card. Expect a notification saying it is
     no longer in the file — not a button that does nothing (#1113's review
     LOW 15).
+
+- [ ] **(#1110)** Monitor columns order by the outputs' physical layout, not by
+      connector name — corrects the phase-1 "**Two screens, one column each**"
+      row above, which predates this fix and still says "ordered lexically
+      (`DP-1` left of `HDMI-A-1`)". With **three** monitors arranged so their
+      connector names sort in a different order than their physical layout
+      (e.g. a `kanshi` profile placing `HDMI-A-1` on the left, `DP-1` in the
+      middle, `DP-2` on the right), open the Workspaces page and confirm the
+      columns read left to right in **physical** order, matching the Displays
+      page's arrangement diagram — not connector-alphabetical. Reshuffle the
+      layout (swap two outputs' `position` in the kanshi profile, or
+      `niri msg output <name> position` if applied live) and confirm the
+      columns re-order to follow. Two monitors at the same x (stacked
+      vertically) should order top to bottom.
 
 ## Control-center
 

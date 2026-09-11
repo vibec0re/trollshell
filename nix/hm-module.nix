@@ -260,6 +260,30 @@ let
   configDirsUnitEnvironment = lib.optional (
     configFiles != { }
   ) "\"XDG_CONFIG_DIRS=${configBase}:/etc/xdg\"";
+
+  # #1041 step 3: `trollshell/src/config/core_leds.rs`'s `resolve` no longer
+  # reads any of these four variables' VALUE — it only checks whether one is
+  # *set*, to log one startup warning naming the `core-leds.toml` key that
+  # replaces it. Before #866 the documented way to reach a shell knob that had
+  # no first-class option was a `systemd.user.services.trollshell.Service
+  # .Environment` override (the same escape hatch `nix/hm-module.nix`'s
+  # `claudeBridge` assertions block, further down, retires for that unit); if
+  # anyone is still using it for one of these four, that override now
+  # evaluates cleanly and does exactly nothing at runtime. Scanned against the
+  # FINAL merged `Environment` list — every module's contribution, this file's
+  # own render (`configDirsUnitEnvironment` above) included — via `hasInfix`
+  # rather than `hasPrefix`, since a hand-written override may or may not wrap
+  # its entry in the embedded quotes this file's own `Environment=` lines use.
+  retiredCoreLedsEnvVars = [
+    "TROLLSHELL_CORE_LEDS_STYLE"
+    "TROLLSHELL_CORE_LEDS_COLOR"
+    "TROLLSHELL_CORE_LEDS_ROWS"
+    "TROLLSHELL_CORE_LEDS_FILL"
+  ];
+  trollshellUnitEnvironment = config.systemd.user.services.trollshell.Service.Environment or [ ];
+  retiredCoreLedsEnvVarsStillSet = lib.filter (
+    var: lib.any (line: lib.hasInfix "${var}=" line) trollshellUnitEnvironment
+  ) retiredCoreLedsEnvVars;
 in
 {
   _file = "nix/hm-module.nix";
@@ -408,6 +432,38 @@ in
           };
           Install.WantedBy = [ cfg.systemd.target ];
         };
+      }
+
+      # #1041 step 3: catch a retired TROLLSHELL_CORE_LEDS_* variable reaching
+      # the unit through the pre-#866 Environment= escape hatch — see
+      # `retiredCoreLedsEnvVarsStillSet` in the `let` above for the full
+      # story. Unconditional, not behind an `lib.mkIf`, so the flake's
+      # `nixos-module`-shaped checks force the predicate on every run — see
+      # the note on the night-light assertion in `nix/nixos-module.nix` about
+      # an `mkIf`-guarded assertion being invisible to that kind of check
+      # (#681).
+      {
+        assertions = [
+          {
+            assertion = retiredCoreLedsEnvVarsStillSet == [ ];
+            message = ''
+              systemd.user.services.trollshell.Service.Environment still sets
+              ${toString retiredCoreLedsEnvVarsStillSet}. The four
+              TROLLSHELL_CORE_LEDS_{STYLE,COLOR,ROWS,FILL} variables are
+              retired (#1041 step 3): trollshell no longer reads any of their
+              values, only checking whether one is set to log a single
+              startup warning. Setting one through the unit's own
+              Environment= is the pre-#866 escape hatch, and it now does
+              nothing — the per-core LED panel keeps whatever
+              core-leds.toml (or its built-in default) says.
+
+              Move it: set the matching key(s) under
+              programs.trollshell.config.core-leds (style / color / rows /
+              fill — #1081), or edit
+              ~/.config/trollshell/core-leds.toml by hand.
+            '';
+          }
+        ];
       }
 
       # Declarative plugins (#350, launch model #419): write the launch-state

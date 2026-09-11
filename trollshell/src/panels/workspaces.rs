@@ -22,21 +22,29 @@
 //!
 //! ## Where the columns come from
 //!
-//! From niri, not from GDK. Every `Workspace` carries the `output` it lives on,
-//! and niri keeps at least one workspace per connected output, so the connected
-//! set comes out of the *same* snapshot the cards are built from. Joining a
-//! second monitor source would only introduce a window where the two disagree;
-//! `App::monitors()` is not reachable from a panel anyway, since
-//! `modal::build_page` hands a page no `&Monitor`.
+//! The *set* of columns comes from niri, not from GDK. Every `Workspace`
+//! carries the `output` it lives on, and niri keeps at least one workspace per
+//! connected output, so the connected set comes out of the *same* snapshot the
+//! cards are built from. Joining a second monitor source would only introduce
+//! a window where the two disagree; `App::monitors()` is not reachable from a
+//! panel anyway, since `modal::build_page` hands a page no `&Monitor`.
 //!
-//! Column order is lexical by connector, which is the order
-//! `hytte::services::displays::outputs()` already sorts outputs into, so the
-//! Workspaces page and the Displays page list the same screens the same way.
+//! Column **order**, since #1110, is the outputs' logical position — `(x, y)`
+//! as niri reports it, left-to-right then top-to-bottom, connector only the
+//! tie-break for two outputs at the same point. That position is not on
+//! `Workspace`, so [`model`] takes a second snapshot,
+//! `hytte::services::displays::outputs()`, purely for `Output::x`/`::y`; a
+//! connector the position snapshot hasn't (yet) caught up with falls back to
+//! `(0, 0)`, which degrades to the old connector-lexical order rather than
+//! scrambling the columns. Before #1110 the order was lexical by connector,
+//! which is what `by_output`'s `BTreeMap` gave for free and happened to also
+//! be `displays::outputs()`'s own sort — coincidence, not a rule, and wrong on
+//! any layout whose connector names don't read left to right (#1110).
 //! One trailing column may follow them: the stacks whose recorded monitor is not
 //! connected (§5). Cards *inside* a column follow the file's `order` (§3.6),
 //! which `workspace_stacks::order_index` also hands to niri as the started
-//! workspace's index; the column order itself stays a property of the connector
-//! set.
+//! workspace's index; the column order itself stays a property of the
+//! connected outputs, not of the cards in it.
 //!
 //! ## Dragging a card (§5/§3.6)
 //!
@@ -73,6 +81,7 @@ use hytte::futures_signals::map_ref;
 use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self, gdk, glib, pango, prelude::*};
 use hytte::prelude::*;
+use hytte::services::displays::{self, Output as DisplayOutput};
 use hytte::services::niri::{self, Window, Workspace};
 
 use crate::components::app_meta::{MetaCache, fallback_icon, resolve_app_meta};
@@ -289,12 +298,18 @@ struct PageModel {
 /// the focused output, because that is where a Start would put it. A stack
 /// whose recorded monitor is *absent* goes to the trailing offline column
 /// rather than somewhere misleading.
+///
+/// Column **order** (#1110): by the outputs' logical position (`outputs`,
+/// `(x, y)`), connector only the tie-break; a connector `outputs` has no entry
+/// for falls back to `(0, 0)`. The offline column always trails, regardless of
+/// position.
 fn model(
     workspaces: &[Workspace],
     windows: &[Window],
     saved: &Workspaces,
     slices_up: &BTreeSet<String>,
     starting: &BTreeSet<String>,
+    outputs: &[DisplayOutput],
 ) -> PageModel {
     let connected: BTreeSet<&str> = workspaces
         .iter()
@@ -308,9 +323,19 @@ fn model(
         .find(|w| w.is_focused)
         .and_then(|w| w.output.as_deref());
 
-    // `BTreeMap` rather than a sort afterwards: the connector ordering *is* the
-    // column ordering, so putting it in the collection type means no later edit
-    // can drop the sort without also losing the grouping.
+    // Connector -> logical position, for the final column sort below. A
+    // connector `connected` names but this snapshot hasn't (yet) reported
+    // falls back to `(0, 0)` at the sort site rather than here, so a missing
+    // entry reads the same as an explicit `(0, 0)` output — both degrade to
+    // the connector tie-break.
+    let positions: BTreeMap<&str, (i32, i32)> = outputs
+        .iter()
+        .map(|o| (o.name.as_str(), (o.x, o.y)))
+        .collect();
+
+    // `BTreeMap` for cheap dedup while grouping cards by output as they're
+    // built — **not** for its order, which used to be the column order but
+    // isn't any more (#1110): that's decided afterwards, by `positions`.
     let mut by_output: BTreeMap<&str, Vec<Card>> = connected
         .iter()
         .map(|connector| ((*connector), Vec::new()))
@@ -367,6 +392,23 @@ fn model(
         by_output.entry(output).or_default().push(card);
     }
 
+    let columns = order_columns(by_output, offline, &positions);
+    PageModel { columns, order }
+}
+
+/// Turn the per-connector groupings into the final, ordered column list
+/// (#1110). Split out of [`model`] purely to keep that function under
+/// clippy's line count — the sort itself needs nothing `model` doesn't
+/// already have in hand.
+///
+/// Position order, connector the tie-break; a connector `positions` has no
+/// entry for falls back to `(0, 0)`. The offline column, if any, always
+/// trails, regardless of position.
+fn order_columns(
+    by_output: BTreeMap<&str, Vec<Card>>,
+    offline: Vec<Card>,
+    positions: &BTreeMap<&str, (i32, i32)>,
+) -> Vec<Column> {
     let mut columns: Vec<Column> = by_output
         .into_iter()
         .map(|(connector, cards)| Column {
@@ -375,6 +417,17 @@ fn model(
             cards,
         })
         .collect();
+    columns.sort_by(|a, b| {
+        let pos_a = positions
+            .get(a.connector.as_str())
+            .copied()
+            .unwrap_or((0, 0));
+        let pos_b = positions
+            .get(b.connector.as_str())
+            .copied()
+            .unwrap_or((0, 0));
+        (pos_a, &a.connector).cmp(&(pos_b, &b.connector))
+    });
     if !offline.is_empty() {
         columns.push(Column {
             connector: OFFLINE_COLUMN.to_owned(),
@@ -382,7 +435,7 @@ fn model(
             cards: offline,
         });
     }
-    PageModel { columns, order }
+    columns
 }
 
 /// The ephemeral cards — an unnamed workspace with windows on it — paired with
@@ -515,17 +568,19 @@ pub fn panel_workspaces() -> gtk::Widget {
         config_workspaces::signal(),
         workspace_stacks::slices_up(),
         workspace_stacks::starting(),
+        displays::outputs(),
     )
 }
 
 /// [`panel_workspaces`] with every source injected, so a test can drive the page
 /// without a registered `Registry`.
-fn build_panel<W, N, S, U, T>(
+fn build_panel<W, N, S, U, T, O>(
     workspaces: W,
     windows: N,
     saved: S,
     slices_up: U,
     starting: T,
+    outputs: O,
 ) -> gtk::Widget
 where
     W: Signal<Item = Vec<Workspace>> + 'static,
@@ -533,6 +588,7 @@ where
     S: Signal<Item = Workspaces> + 'static,
     U: Signal<Item = BTreeSet<String>> + 'static,
     T: Signal<Item = BTreeSet<String>> + 'static,
+    O: Signal<Item = Vec<DisplayOutput>> + 'static,
 {
     let columns_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     columns_box.add_css_class("ts-ws-columns");
@@ -545,8 +601,9 @@ where
         let windows = windows,
         let saved = saved,
         let slices_up = slices_up,
-        let starting = starting =>
-            model(workspaces, windows, saved, slices_up, starting)
+        let starting = starting,
+        let outputs = outputs =>
+            model(workspaces, windows, saved, slices_up, starting, outputs)
     }
     // `Window` does not derive `PartialEq` (only `Workspace` does), so the
     // *inputs* cannot be deduped — but the model can, and it is what the
@@ -1284,11 +1341,30 @@ fn hint(text: &str) -> gtk::Label {
 #[cfg(test)]
 mod fixtures {
     use crate::config::workspaces::{Stack, StackApp, Workspaces};
+    use hytte::reactive::Pending;
+    use hytte::services::displays::Output as DisplayOutput;
     use hytte::services::niri::{Window, WindowLayout, Workspace};
     use std::collections::BTreeMap;
 
     pub(super) const LEFT: &str = "DP-1";
     pub(super) const RIGHT: &str = "HDMI-A-1";
+
+    /// A [`DisplayOutput`] at logical position `(x, y)` — #1110's column
+    /// order. Only `name`/`x`/`y` matter to the model; the rest are neutral
+    /// filler.
+    pub(super) fn output_at(name: &str, x: i32, y: i32) -> DisplayOutput {
+        DisplayOutput {
+            name: name.to_owned(),
+            make: String::new(),
+            model: String::new(),
+            mode: None,
+            enabled: Pending::settled(true),
+            scale: 1.0,
+            transform: "normal".to_owned(),
+            x,
+            y,
+        }
+    }
 
     /// A workspace on `output`, named iff `name` is `Some`. Not focused.
     pub(super) fn ws(id: u64, idx: u8, output: &str, name: Option<&str>) -> Workspace {
@@ -1374,19 +1450,23 @@ mod fixtures {
 
 #[cfg(test)]
 mod model_tests {
-    use super::fixtures::{LEFT, RIGHT, no_stacks, saved, stack, win, ws, ws_focused};
+    use super::fixtures::{LEFT, RIGHT, no_stacks, output_at, saved, stack, win, ws, ws_focused};
     use super::{
-        Card, Column, DropAction, DropContext, Droppable, Kind, OFFLINE_COLUMN, PageModel,
-        StackState, drop_context, drop_plan, model, reorder_onto,
+        Card, Column, DisplayOutput, DropAction, DropContext, Droppable, Kind, OFFLINE_COLUMN,
+        PageModel, StackState, drop_context, drop_plan, model, reorder_onto,
     };
     use crate::config::workspaces::Workspaces;
     use std::collections::BTreeSet;
 
-    /// The whole page model with nothing in flight and no slice up.
+    /// The whole page model with nothing in flight and no slice up, and no
+    /// output positions known unless given — a missing position falls back to
+    /// `(0, 0)` for every connector, which degrades to the connector
+    /// tie-break (#1110).
     fn page(
         workspaces: &[hytte::services::niri::Workspace],
         windows: &[hytte::services::niri::Window],
         file: &Workspaces,
+        outputs: &[DisplayOutput],
     ) -> PageModel {
         model(
             workspaces,
@@ -1394,17 +1474,28 @@ mod model_tests {
             file,
             &BTreeSet::new(),
             &BTreeSet::new(),
+            outputs,
         )
     }
 
-    /// [`page`]'s columns — the common case, since most rows are about what is
-    /// drawn rather than about the order a drag rewrites.
+    /// [`page`]'s columns, with no output positions known — the common case
+    /// for tests that don't care about column *order*.
     fn built(
         workspaces: &[hytte::services::niri::Workspace],
         windows: &[hytte::services::niri::Window],
         file: &Workspaces,
     ) -> Vec<Column> {
-        page(workspaces, windows, file).columns
+        built_with_outputs(workspaces, windows, file, &[])
+    }
+
+    /// [`built`], with output positions supplied — #1110's column order.
+    fn built_with_outputs(
+        workspaces: &[hytte::services::niri::Workspace],
+        windows: &[hytte::services::niri::Window],
+        file: &Workspaces,
+        outputs: &[DisplayOutput],
+    ) -> Vec<Column> {
+        page(workspaces, windows, file, outputs).columns
     }
 
     /// A [`DropContext`] over these cards, in this page-wide order.
@@ -1441,10 +1532,14 @@ mod model_tests {
             .unwrap_or_else(|| panic!("no column for {connector}"))
     }
 
-    /// One column per connected output, ordered by connector — unchanged from
-    /// phase 1, but now driven by the *connected set* rather than by which
-    /// outputs happen to carry a named workspace, since a saved stack must have
-    /// a column to sit in even when nothing of it is running.
+    /// One column per connected output — unchanged from phase 1, but now
+    /// driven by the *connected set* rather than by which outputs happen to
+    /// carry a named workspace, since a saved stack must have a column to sit
+    /// in even when nothing of it is running. No output positions are known
+    /// here, so every connector ties at the `(0, 0)` fallback and the order
+    /// degrades to the connector tie-break (`LEFT` = `"DP-1"` < `RIGHT` =
+    /// `"HDMI-A-1"`) — see [`columns_order_by_output_position_not_connector`]
+    /// for the case that actually exercises position (#1110).
     ///
     /// Falsified by collapsing the fold to a single column.
     #[test]
@@ -1455,6 +1550,63 @@ mod model_tests {
             &no_stacks(),
         );
         assert_eq!(connectors(&columns), [LEFT, RIGHT]);
+    }
+
+    /// #1110: columns order by the outputs' logical position, not by
+    /// connector name. `DP-3` sits leftmost (`x = 0`), then `DP-1`
+    /// (`x = 1920`), then `DP-2` (`x = 3840`) — the reverse of connector
+    /// order, which is exactly what makes this falsify a regression to
+    /// lexical sorting.
+    ///
+    /// Falsified by sorting columns by connector instead of position.
+    #[test]
+    fn columns_order_by_output_position_not_connector() {
+        let columns = built_with_outputs(
+            &[
+                ws(1, 1, "DP-1", None),
+                ws(2, 1, "DP-2", None),
+                ws(3, 1, "DP-3", None),
+            ],
+            &[],
+            &no_stacks(),
+            &[
+                output_at("DP-1", 1920, 0),
+                output_at("DP-2", 3840, 0),
+                output_at("DP-3", 0, 0),
+            ],
+        );
+        assert_eq!(connectors(&columns), ["DP-3", "DP-1", "DP-2"]);
+    }
+
+    /// #1110: two outputs at the same `x` order by `y`, connector only the
+    /// second tie-break. `DP-9` (alphabetically last) sits above `DP-1`
+    /// because its `y` is smaller — sorting by connector alone (ignoring `y`)
+    /// would put `DP-1` first instead.
+    ///
+    /// Falsified by dropping `y` from the sort key.
+    #[test]
+    fn equal_x_orders_by_y_then_connector() {
+        let columns = built_with_outputs(
+            &[ws(1, 1, "DP-1", None), ws(2, 1, "DP-9", None)],
+            &[],
+            &no_stacks(),
+            &[output_at("DP-1", 0, 1080), output_at("DP-9", 0, 0)],
+        );
+        assert_eq!(connectors(&columns), ["DP-9", "DP-1"]);
+    }
+
+    /// #1110: the offline column still trails every positioned column, even
+    /// when a positioned connector would otherwise sort after it.
+    #[test]
+    fn offline_column_trails_a_positioned_set() {
+        let file = saved(&[("chat", stack(Some("DP-9"), &["x"]))]);
+        let columns = built_with_outputs(
+            &[ws(1, 1, "DP-1", None)],
+            &[],
+            &file,
+            &[output_at("DP-1", 3840, 0)],
+        );
+        assert_eq!(connectors(&columns), ["DP-1", super::OFFLINE_COLUMN]);
     }
 
     /// A saved stack is a card whether or not it is running — that is what
@@ -1504,6 +1656,7 @@ mod model_tests {
             // `dev`'s units are up although its windows are gone.
             &BTreeSet::from(["dev".to_owned()]),
             &BTreeSet::from(["music".to_owned()]),
+            &[],
         )
         .columns;
         let kinds: Vec<&Kind> = find(&columns, LEFT).cards.iter().map(|c| &c.kind).collect();
@@ -2150,6 +2303,7 @@ mod model_tests {
             &[ws_focused(1, 1, LEFT, None), ws(2, 1, RIGHT, None)],
             &[],
             &file,
+            &[],
         ));
         assert_eq!(
             names(&ctx.order),
@@ -2181,6 +2335,7 @@ mod model_tests {
             ],
             &[win(9, 1, "firefox", 1), win(10, 3, "thunderbird", 1)],
             &file,
+            &[],
         ))
         .cards;
 
@@ -2209,10 +2364,10 @@ mod model_tests {
 
 #[cfg(all(test, feature = "system-tests"))]
 pub(in crate::panels) mod tests {
-    use super::fixtures::{LEFT, RIGHT, no_stacks, saved, stack, win, ws};
+    use super::fixtures::{LEFT, RIGHT, no_stacks, output_at, saved, stack, win, ws};
     use super::{
-        APP_IDLE_CLASS, APP_RUNNING_CLASS, CARD_INACTIVE_CLASS, EMPTY_COLUMN_HINT, EPHEMERAL_NAME,
-        NO_OUTPUTS_HINT, OFFLINE_COLUMN, PageModel, bind_columns, build_panel,
+        APP_IDLE_CLASS, APP_RUNNING_CLASS, CARD_INACTIVE_CLASS, DisplayOutput, EMPTY_COLUMN_HINT,
+        EPHEMERAL_NAME, NO_OUTPUTS_HINT, OFFLINE_COLUMN, PageModel, bind_columns, build_panel,
     };
     use crate::config::workspaces::Workspaces;
     use hytte::adw;
@@ -2320,6 +2475,7 @@ pub(in crate::panels) mod tests {
         saved: Mutable<Workspaces>,
         slices_up: Mutable<BTreeSet<String>>,
         starting: Mutable<BTreeSet<String>>,
+        outputs: Mutable<Vec<DisplayOutput>>,
     }
 
     fn fixture() -> Fixture {
@@ -2329,12 +2485,14 @@ pub(in crate::panels) mod tests {
         let saved: Mutable<Workspaces> = Mutable::new(no_stacks());
         let slices_up: Mutable<BTreeSet<String>> = Mutable::new(BTreeSet::new());
         let starting: Mutable<BTreeSet<String>> = Mutable::new(BTreeSet::new());
+        let outputs: Mutable<Vec<DisplayOutput>> = Mutable::new(Vec::new());
         let page = build_panel(
             workspaces.signal_cloned(),
             windows.signal_cloned(),
             saved.signal_cloned(),
             slices_up.signal_cloned(),
             starting.signal_cloned(),
+            outputs.signal_cloned(),
         );
         pump();
         Fixture {
@@ -2344,6 +2502,7 @@ pub(in crate::panels) mod tests {
             saved,
             slices_up,
             starting,
+            outputs,
         }
     }
 
@@ -2414,8 +2573,12 @@ pub(in crate::panels) mod tests {
         );
     }
 
-    /// §7: **one column per monitor**, side by side, in connector order — and
-    /// each column is actually on screen inside the page, not merely `visible`.
+    /// §7: **one column per monitor**, side by side — and each column is
+    /// actually on screen inside the page, not merely `visible`. No output
+    /// positions are set here, so the columns fall back to the connector
+    /// tie-break (`LEFT` = `"DP-1"` < `RIGHT` = `"HDMI-A-1"`); see
+    /// [`columns_order_by_output_position`] for the case actually driven by
+    /// position (#1110).
     ///
     /// Falsified by collapsing `model`'s per-output fold to one column.
     #[gtk::test]
@@ -2448,6 +2611,35 @@ pub(in crate::panels) mod tests {
             "the monitors' columns overlap instead of sitting side by side: \
              {first:?} then {second:?}"
         );
+
+        window.destroy();
+    }
+
+    /// #1110: rendered column order follows the outputs' logical position,
+    /// not connector name. `RIGHT` (`"HDMI-A-1"`) is positioned at `x = 0`
+    /// and `LEFT` (`"DP-1"`) at `x = 1920` — the reverse of connector order —
+    /// so a regression to lexical sorting renders `LEFT` first instead.
+    #[gtk::test]
+    fn columns_order_by_output_position() {
+        let f = fixture();
+        f.workspaces.set(vec![
+            ws(1, 1, RIGHT, Some("right-one")),
+            ws(2, 1, LEFT, Some("left-one")),
+        ]);
+        f.outputs
+            .set(vec![output_at(RIGHT, 0, 0), output_at(LEFT, 1920, 0)]);
+        pump();
+        let window = present(&f.page);
+
+        let cols = columns(&f.page);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(
+            label_text(&cols[0], "ts-ws-column-title"),
+            RIGHT,
+            "RIGHT sits at x=0, so it renders first despite sorting after LEFT \
+             by connector name"
+        );
+        assert_eq!(label_text(&cols[1], "ts-ws-column-title"), LEFT);
 
         window.destroy();
     }

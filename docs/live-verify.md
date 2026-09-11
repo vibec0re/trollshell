@@ -1427,13 +1427,16 @@ session.
       the same state, the two arms are **byte-identical — max |Δ| 0 of 255 on
       every channel of all twelve cases, under llvmpipe + Xvfb** (Mesa 26.2.2).
       So GL is the default and `TROLLSHELL_PREEM_RENDERER=cpu` is the kill
-      switch. Nothing in this entry can be gated in CI: `nix flake check`'s
-      system-tests bucket runs `xvfb-run` in a sandbox with no `/dev/dri` and
-      no mesa in the closure, so the shell's GL path never executes there
-      (#1036 is the issue for changing that). What CI _does_ hold is the arm
-      selection, the uniform table, the animation state machine and the
-      reconciler's node handling — everything up to the draw call. The draw is
-      yours.
+      switch. This entry used to say nothing here could be gated in CI —
+      stale since #1077 put Mesa llvmpipe into `nix flake check`'s
+      system-tests bucket, and wrong outright after #1080: that check now
+      builds and runs `preem_gl_diff` itself under that same llvmpipe
+      context, with `TROLLSHELL_PARITY_EXACT=1` pinning it to the bit-exact
+      result measured above — any non-zero delta on any channel fails the
+      check, not just a ceiling breach. What still can't be gated is the one
+      question llvmpipe's bit-exactness can't answer: colour space on a real
+      driver (item 1 below) — everything up to and including the draw call
+      under software rendering is now CI's; the draw on _your_ GPU is yours.
   1. **The GL arm's picture is right.** Start the shell (no environment
      variable needed now) and open `hytte-plugin-preem-demo`'s card. The scope
      must look like the scope did: same graticule, same beam, same phosphor

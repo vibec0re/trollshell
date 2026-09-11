@@ -577,7 +577,23 @@
                 # but is not bit-exact still fails, named `FAIL(exact)`
                 # (`trollshell/examples/preem_gl_diff.rs`). The ceiling itself
                 # is untouched — a real driver still only has to clear it, not
-                # match llvmpipe byte for byte.
+                # match llvmpipe byte for byte. A case that only fails the
+                # exact check still prints its own `PASS <case>` line before
+                # the `FAIL(exact) <case>` one right after it (#1089 review,
+                # INFO-2) — the exit code and the `-- summary --` block's
+                # `PASS all N case(s)`/`FAIL M of N` line are the verdict; a
+                # `grep '^PASS'` count over the transcript is not.
+                #
+                # This pin rides whatever Mesa `nixpkgs` resolves to today
+                # (26.2.1 as of #1080) — it is not a hash-pinned llvmpipe
+                # build. A `nix flake update` that moves Mesa can therefore red
+                # this exact-mode check on a PR that never touched a shader,
+                # and it will look exactly like a renderer regression (#1089
+                # review, INFO-5). If that happens: re-measure on the new Mesa
+                # first (the `docs/live-verify.md` headless recipe, or just
+                # read this check's own `FAIL(exact)` numbers) before
+                # suspecting the diff — and the fix is to re-measure, never to
+                # raise the ceiling `#893`/`#1078` settled for real hardware.
                 export TROLLSHELL_PARITY_EXACT=1
               '';
               checkPhaseCargoCommand = ''
@@ -587,11 +603,19 @@
                 # in the same phase and the same llvmpipe env as the GL-context
                 # tests above, so a shader or kit change that breaks parity
                 # ships red here instead of shipping silently until someone
-                # runs the `docs/live-verify.md` recipe by hand. Built as its
-                # own step (rather than relying on the preceding `cargo test`
-                # to have compiled it as a side effect) so a harness compile
-                # failure is attributed to this line, not buried in the test
-                # run's own output.
+                # runs the `docs/live-verify.md` recipe by hand. The dedicated
+                # `cargo build` below is a deliberate no-op, not a hedge
+                # against an uncompiled example: `cargo test` already builds
+                # every example (measured — deleting the binary and re-running
+                # `cargo test -p trollshell --features system-tests --no-run`
+                # alone puts it straight back), so a broken example fails on
+                # the `cargo test` line above, not here (#1089 review, LOW-2).
+                # What this line actually buys is independence from `cargo
+                # test`'s own target selection: it guarantees the binary
+                # exists at the exact path the `find` below expects, on this
+                # line's own terms, rather than as a side effect this check
+                # would silently lose the day `cargo test`'s target set ever
+                # changes.
                 #
                 # `--workspace --features system-tests`, matching the `cargo
                 # test` invocation above byte for byte, and deliberately not
@@ -621,9 +645,15 @@
                 # `PREEM_GL_DIFF_OUT` is the harness's own override point
                 # (default `gates/`, the repo's scratch directory) — pointed at
                 # `$out/parity` so the per-case `.gl.ppm`/`.cpu.ppm`/
-                # `.delta.pgm` evidence lands in the check's own output and
-                # survives a green build (`result/parity`) and, via
-                # `nix build --keep-failed`, a red one too.
+                # `.delta.pgm` evidence lands in the check's own output and is
+                # there on a green build (`result/parity`). On a *red* build
+                # `$out` is never registered as a valid store path — measured
+                # on nix 2.34.8, `--keep-failed` preserves the build's scratch
+                # directory, not `$out`, and the partial `$out` written before
+                # the failure is not reachable through it either (#1089
+                # review, LOW-1) — so the durable record of a red run is the
+                # `-L` transcript's `FAIL(exact) <case>`/`FAIL(ceiling) <case>`
+                # lines (kept in CI's own log), not a store path.
                 cargo build --workspace --locked --features system-tests --example preem_gl_diff
                 exampleBin="$(find "''${CARGO_TARGET_DIR:-target}" -type f -name preem_gl_diff -path '*/examples/*' -print -quit)"
                 if [ -z "$exampleBin" ]; then
@@ -632,6 +662,22 @@
                 fi
                 mkdir -p "$out/parity"
                 PREEM_GL_DIFF_OUT="$out/parity" xvfb-run -a "$exampleBin"
+                # #1078 item 5 left this open for #1080 to decide ("Noted for
+                # #1080 to decide what the CI wiring asserts"), and up to here
+                # this line only asserted the harness's own exit status. That
+                # misses one shape: a run that exercised **zero** cases still
+                # prints `PASS all 0 case(s)` and exits 0 (#1089 review,
+                # LOW-3) — no live path reaches that today (the case list is
+                # the fixed 4 skins × 3 idle points and this line passes no
+                # argv), but a future `--skins` regression that silently
+                # empties the list would ship green through the exit code
+                # alone. Assert the evidence instead of trusting the exit
+                # code: exactly 12 cases means exactly 12 `.gl.ppm` files.
+                gl_ppm_count="$(find "$out/parity" -maxdepth 1 -name '*.gl.ppm' -type f | wc -l)"
+                if [ "$gl_ppm_count" -ne 12 ]; then
+                  echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected 12 — a case-count regression, not a parity failure." >&2
+                  exit 1
+                fi
               '';
             }
           );

@@ -2347,6 +2347,56 @@ switch` repoints atomically to a new store path every rebuild; the running
       should be an honest no-op (a single debug line, not a crash or a fake
       success).
 
+## Workspaces page (#1071)
+
+- [ ] **(#1071 phase 1)** The read-only Workspaces drawer page. Everything here
+      needs a live niri session — the page is built entirely out of
+      `niri::workspaces()` + `niri::windows()`, both of which are empty in a
+      sandbox.
+  - **Open it.** Settings drawer → **More** → **Workspaces** (the bar keeps its
+    numbered `[1 2 3 …]` switcher, epic revision 5, so there is no chip). It
+    also opens from a niri keybind, via the command surface:
+    ```sh
+    busctl --user call mov.vibec0re.trollshell /mov/vibec0re/trollshell \
+        org.gtk.Actions Activate 'sava{sv}' open-page 1 s workspaces 0
+    ```
+  - **A named workspace becomes a card.** With the page open, name the focused
+    workspace and watch the card appear without reopening the drawer:
+    ```sh
+    niri msg action set-workspace-name chat
+    ```
+    Expect a card titled `chat` in the column headed by that screen's connector,
+    carrying one icon per app with a window open there — the real desktop-entry
+    icons (Firefox's, the terminal's), not `application-x-executable`. Hovering
+    an icon should tooltip the app's display name. Then
+    `niri msg action unset-workspace-name` → the card goes away and the column
+    stays, showing "No named workspaces on this screen".
+  - **The icons follow the windows.** With the card on screen, open a new app on
+    that workspace → its icon joins the strip within a beat; close it → the icon
+    goes. Two windows of the _same_ app must stay **one** icon. Moving a window
+    to another workspace (`niri msg action move-window-to-workspace 3`) should
+    move its icon to that workspace's card, if that one is named.
+  - **Two screens, one column each.** On a multi-monitor setup, confirm one
+    column per connected output, side by side, headed by the connector name and
+    ordered lexically (`DP-1` left of `HDMI-A-1`) — the same order the Displays
+    page lists them in. Name a workspace on each screen and confirm each card
+    lands in its own screen's column. Hot-unplug one output → its column goes;
+    plug it back → it returns.
+  - **Column order under niri.** Cards inside a column follow niri's workspace
+    index, so `niri msg action move-workspace-down` on a named workspace should
+    re-order the cards to match. App icons on a card follow niri's _column_
+    order, so `move-column-left` should re-order the icons.
+  - **Nothing else appeared.** Phase 1 is read-only: there must be no `+`
+    button, no Start/Stop, no Edit, and no `workspaces.toml` written anywhere
+    under `~/.config/trollshell/`. Those are phases 2–4.
+  - **Regression check on the two pages this touched.** The Stats drawer's
+    "Top apps" expanders resolve their icons through the same helper, which
+    moved to `components/app_meta.rs` — confirm CPU/Memory top-apps rows still
+    show real app icons and display names, not the generic fallback. And the
+    Settings page's **More** group moved into its own function — confirm all
+    four rows (Workspaces, Wallpaper, Displays, Clipboard history) are there and
+    each still deep-links to its page.
+
 ## Control-center
 
 - [ ] **(#515)** AI Keys tab: set an OpenRouter key → the row flips to "Key

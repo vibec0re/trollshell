@@ -238,6 +238,20 @@ struct Column {
     cards: Vec<Card>,
 }
 
+impl Column {
+    /// The connector a drop landing in this column may record — `None` for the
+    /// trailing "not connected" one (review HIGH 1).
+    ///
+    /// A method rather than an inline `(!offline).then_some(…)` at the one call
+    /// site so the choice is falsifiable: `drop_plan` being right about `None`
+    /// is no help if the thing that decides `None` is untested, and the first
+    /// cut of this fix passed its own `drop_plan` test with the wiring still
+    /// handing `OFFLINE_COLUMN` through.
+    fn drop_connector(&self) -> Option<&str> {
+        (!self.offline).then_some(self.connector.as_str())
+    }
+}
+
 /// Heading of the trailing column for stacks whose monitor is absent.
 const OFFLINE_COLUMN: &str = "Not connected";
 
@@ -619,7 +633,7 @@ fn build_column(column: &Column, meta_cache: &MetaCache, context: &Rc<DropContex
         // `None` for the offline column: its heading is not a connector (review
         // HIGH 1). `drop_plan` then declines the monitor half and keeps the
         // reorder one.
-        let connector = (!column.offline).then_some(column.connector.as_str());
+        let connector = column.drop_connector();
         for card in &column.cards {
             cards.append(&build_card(card, meta_cache, connector, context));
         }
@@ -1362,8 +1376,8 @@ mod fixtures {
 mod model_tests {
     use super::fixtures::{LEFT, RIGHT, no_stacks, saved, stack, win, ws, ws_focused};
     use super::{
-        Card, Column, DropAction, DropContext, Droppable, Kind, PageModel, StackState,
-        drop_context, drop_plan, model, reorder_onto,
+        Card, Column, DropAction, DropContext, Droppable, Kind, OFFLINE_COLUMN, PageModel,
+        StackState, drop_context, drop_plan, model, reorder_onto,
     };
     use crate::config::workspaces::Workspaces;
     use std::collections::BTreeSet;
@@ -2056,6 +2070,37 @@ mod model_tests {
         // rather than falling through to a monitor rewrite.
         assert_eq!(drop_plan("chat", None, None, &ctx), None);
         assert_eq!(drop_plan("chat", None, Some("chat"), &ctx), None);
+    }
+
+    /// …and the column is what *decides* that `None` — the half `drop_plan`
+    /// cannot see.
+    ///
+    /// The first cut of the HIGH 1 fix passed the `drop_plan` test above with
+    /// the wiring still handing `OFFLINE_COLUMN` through, because that test
+    /// supplies the `None` itself. This is the mutation-sensitive half.
+    ///
+    /// **The mutation**: `build_column` passing `Some(column.connector)`
+    /// unconditionally reds this.
+    #[test]
+    fn only_a_connected_column_offers_a_connector_to_a_drop() {
+        let columns = built(
+            &[ws_focused(1, 1, LEFT, None)],
+            &[],
+            &saved(&[("gone", stack(Some("dp-9"), &["firefox"]))]),
+        );
+        let live = find(&columns, LEFT);
+        let offline = find(&columns, OFFLINE_COLUMN);
+        assert!(
+            offline.offline,
+            "the fixture must produce the trailing column"
+        );
+
+        assert_eq!(live.drop_connector(), Some(LEFT));
+        assert_eq!(
+            offline.drop_connector(),
+            None,
+            "the \"not connected\" heading was offered to a drop as a connector"
+        );
     }
 
     /// §3.7: an ephemeral card's Edit opens on a draft that **records the

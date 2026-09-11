@@ -386,7 +386,11 @@ fn departures_url(base_url: &str, station: &str) -> String {
 
 /// One blocking HTTP fetch + parse of the suburban departures at `station`,
 /// against `base_url`.
-fn fetch_departures(agent: &ureq::Agent, base_url: &str, station: &str) -> Result<Vec<Row>, String> {
+fn fetch_departures(
+    agent: &ureq::Agent,
+    base_url: &str,
+    station: &str,
+) -> Result<Vec<Row>, String> {
     let url = departures_url(base_url, station);
     let mut resp = agent.get(&url).call().map_err(|e| format!("http: {e}"))?;
     let body = resp

@@ -1270,7 +1270,10 @@ pub fn render_departures_endpoint(
         Some(value) => {
             match root.get("departures") {
                 None => {
-                    root.insert("departures", toml_edit::Item::Table(toml_edit::Table::new()));
+                    root.insert(
+                        "departures",
+                        toml_edit::Item::Table(toml_edit::Table::new()),
+                    );
                 }
                 Some(item) if item.is_table() => {}
                 Some(_) => {

@@ -2649,9 +2649,8 @@ trollshell-plugin-<id>.service`) while `tr '\0' '\n' < /proc/<pid>/cmdline`
       drag between screens. Everything here needs a real niri session and a
       hand-written `~/.config/trollshell/workspaces.toml`; none of it can be
       checked from a test.
-
   - **Column order is the stack order.** Write a stack whose apps are listed in
-    an order the apps will *not* open in — a slow one first:
+    an order the apps will _not_ open in — a slow one first:
 
     ```toml
     [workspace.dev]
@@ -2666,6 +2665,7 @@ trollshell-plugin-<id>.service`) while `tr '\0' '\n' < /proc/<pid>/cmdline`
     reports each window's `pos_in_scrolling_layout` if the eye is not enough.
     If the order is whatever they opened in, the one batch after the grace
     window has regressed.
+
   - **…and a gap closes up.** Put an app in the middle of the list that will
     never open a window (`{ id = "definitely-not-a-command" }`). The other two
     must still end up adjacent, in order, with nothing between them — and the
@@ -2713,7 +2713,7 @@ trollshell-plugin-<id>.service`) while `tr '\0' '\n' < /proc/<pid>/cmdline`
     pick up a card and drop it where it already is: the file must be
     byte-identical. A two-pixel accidental drag must not rewrite config.
   - **In-column reordering is still phase 4.** Dragging a card up or down
-    *within* one column does nothing — §5 puts the order's drag handles in the
+    _within_ one column does nothing — §5 puts the order's drag handles in the
     Edit sub-page, which does not exist yet. Only the screen changes.
 
 ## Control-center

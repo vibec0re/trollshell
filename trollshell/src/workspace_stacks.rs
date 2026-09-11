@@ -747,8 +747,7 @@ pub(crate) trait Ops {
     /// On the seam for the same reason [`Ops::save_stack`] is: the real one
     /// resolves its own path through `xdg::overlay_path`, so a transaction test
     /// that reached it would write the **developer's real** `~/.config`.
-    fn set_monitor(&self, name: &str, monitor: &str)
-    -> impl Future<Output = Result<(), String>>;
+    fn set_monitor(&self, name: &str, monitor: &str) -> impl Future<Output = Result<(), String>>;
     fn unit_for_pid(&self, pid: u32) -> impl Future<Output = Option<String>>;
     fn stop_unit(&self, unit: &str) -> impl Future<Output = Result<(), String>>;
     fn stop_slice(&self, name: &str) -> impl Future<Output = Result<(), String>>;
@@ -901,14 +900,8 @@ pub(crate) async fn start(
 
     let workspaces = ops.workspaces().await?;
     let windows = ops.windows().await?;
-    let plan = plan_start(
-        name,
-        stack,
-        &workspaces,
-        &windows,
-        &saved.names_in_order(),
-    )
-    .map_err(|e| e.to_string())?;
+    let plan = plan_start(name, stack, &workspaces, &windows, &saved.names_in_order())
+        .map_err(|e| e.to_string())?;
 
     ops.send_actions(plan.batch.clone()).await?;
 

@@ -18,9 +18,8 @@ use hytte::services::niri::{Window, WindowLayout, Workspace, WorkspaceAction};
 use super::{
     AutostartPlan, Launched, Layout, Ops, Stack, StackApp, StackState, StartError, StopStep,
     Workspaces, app_launch, autostart_all, autostart_driver, autostart_plan, autostart_tick,
-    column_order_batch,
-    may_stop, missing_apps, move_to_monitor, names_to_release, order_index, plan_start, save,
-    start, state_of, stop, stop_plan, stray_moves,
+    column_order_batch, may_stop, missing_apps, move_to_monitor, names_to_release, order_index,
+    plan_start, save, start, state_of, stop, stop_plan, stray_moves,
 };
 use crate::launch::Launch;
 
@@ -324,6 +323,18 @@ impl Ops for Script {
 /// wait a transaction does goes through `Ops::sleep`, which `Script` answers
 /// instantly, so no test ever spends wall-clock time here. Without a time
 /// driver `tokio::time::timeout` panics rather than returning.
+/// Let the executor run whatever a `Mutable::set` just woke.
+///
+/// A handful of yields rather than a sleep: setting a `Mutable` calls the
+/// subscribed task's waker, and the next turn of the current-thread executor
+/// polls it. No timer is involved, so this is deterministic — and eight turns
+/// is far more than the one or two a `for_each` over one signal needs.
+async fn settle() {
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+}
+
 fn run<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -1391,7 +1402,11 @@ fn the_column_batch_is_a_focus_and_a_move_per_app_in_stack_order() {
         win_at(13, 1, "thunderbird", 3),
     ];
     assert_eq!(
-        column_order_batch(&stack(&["firefox", "thunderbird", "Alacritty"]), 1, &windows),
+        column_order_batch(
+            &stack(&["firefox", "thunderbird", "Alacritty"]),
+            1,
+            &windows
+        ),
         [
             WorkspaceAction::FocusWindow { window: 12 },
             WorkspaceAction::MoveColumnToIndex { index: 1 },
@@ -1418,7 +1433,11 @@ fn every_move_column_is_addressed_by_the_focus_before_it() {
         // Not on this workspace: never touched.
         win_at(13, 2, "thunderbird", 1),
     ];
-    let batch = column_order_batch(&stack(&["firefox", "Alacritty", "thunderbird"]), 1, &windows);
+    let batch = column_order_batch(
+        &stack(&["firefox", "Alacritty", "thunderbird"]),
+        1,
+        &windows,
+    );
     assert!(
         !batch.is_empty(),
         "the assertion below is vacuous on an empty batch"
@@ -1449,7 +1468,11 @@ fn every_move_column_is_addressed_by_the_focus_before_it() {
 fn a_missing_app_leaves_a_gap_the_next_ones_close_up() {
     let windows = [win_at(11, 1, "firefox", 2), win_at(12, 1, "thunderbird", 1)];
     assert_eq!(
-        column_order_batch(&stack(&["firefox", "Alacritty", "thunderbird"]), 1, &windows),
+        column_order_batch(
+            &stack(&["firefox", "Alacritty", "thunderbird"]),
+            1,
+            &windows
+        ),
         [
             WorkspaceAction::FocusWindow { window: 11 },
             WorkspaceAction::MoveColumnToIndex { index: 1 },
@@ -1555,7 +1578,11 @@ fn a_stack_with_no_layout_spawns_nothing() {
 fn missing_apps_names_what_never_arrived() {
     let windows = [win(9, 1, "firefox"), win(10, 2, "thunderbird")];
     assert_eq!(
-        missing_apps(&stack(&["firefox", "Alacritty", "thunderbird"]), 1, &windows),
+        missing_apps(
+            &stack(&["firefox", "Alacritty", "thunderbird"]),
+            1,
+            &windows
+        ),
         ["Alacritty", "thunderbird"],
         "a window on another workspace is not this stack's"
     );
@@ -1810,14 +1837,6 @@ fn the_driver_latches_across_snapshots() {
         });
         let task = tokio::task::spawn_local(driver);
 
-        // A handful of yields per step: the signal wakes the driver task and
-        // the executor polls it on the next turn. No timer, so this is
-        // deterministic rather than a sleep.
-        async fn settle() {
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-        }
         settle().await;
         assert!(launches.borrow().is_empty(), "no outputs yet");
 

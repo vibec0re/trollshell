@@ -1548,11 +1548,15 @@ mod tests {
     }
 
     fn has_drop_target(widget: &gtk::Widget) -> bool {
-        controllers(widget).iter().any(|c| c.is::<gtk::DropTarget>())
+        controllers(widget)
+            .iter()
+            .any(ObjectExt::is::<gtk::DropTarget>)
     }
 
     fn has_drag_source(widget: &gtk::Widget) -> bool {
-        controllers(widget).iter().any(|c| c.is::<gtk::DragSource>())
+        controllers(widget)
+            .iter()
+            .any(ObjectExt::is::<gtk::DragSource>)
     }
 
     fn cards(scope: &gtk::Widget) -> Vec<gtk::Widget> {
@@ -2220,10 +2224,8 @@ mod tests {
     #[gtk::test]
     fn every_monitor_column_takes_a_drop_and_the_offline_one_does_not() {
         let f = fixture();
-        f.workspaces.set(vec![
-            ws(1, 1, LEFT, None),
-            ws(2, 1, RIGHT, None),
-        ]);
+        f.workspaces
+            .set(vec![ws(1, 1, LEFT, None), ws(2, 1, RIGHT, None)]);
         f.saved.set(saved(&[
             ("chat", stack(Some(LEFT), &["firefox"])),
             // Names a screen that is not here → the trailing offline column.

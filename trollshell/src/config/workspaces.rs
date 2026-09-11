@@ -737,8 +737,8 @@ pub fn current() -> Workspaces {
 #[cfg(test)]
 mod tests {
     use super::{
-        Layout, Stack, StackApp, Workspaces, WorkspacesConfig, save_stack_to,
-        set_stack_monitor_to, stack_value,
+        Layout, Stack, StackApp, Workspaces, WorkspacesConfig, save_stack_to, set_stack_monitor_to,
+        stack_value,
     };
     use hytte_config::subsystem::{self, Subsystem};
     use hytte_config::test_support::capture;

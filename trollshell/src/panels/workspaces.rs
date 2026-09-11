@@ -578,6 +578,24 @@ mod tests {
         while gtk::glib::MainContext::default().iteration(false) {}
     }
 
+    /// Drive the GTK main loop until `done()` holds, or `ms` of wall clock has
+    /// passed.
+    ///
+    /// Needed on top of [`pump`] for anything that only settles on a **frame**:
+    /// appending a child queues an allocation on its parent, and the queue is
+    /// drained by the frame clock rather than by an idle. Same helper, same
+    /// reason, as `overlays::sidebar`'s scroll tests.
+    fn pump_until(ms: u64, done: impl Fn() -> bool) {
+        let expired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = expired.clone();
+        gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(ms), move || {
+            flag.set(true);
+        });
+        while !expired.get() && !done() {
+            gtk::glib::MainContext::default().iteration(true);
+        }
+    }
+
     /// Every descendant of `root` carrying `class`, depth-first in tree order.
     ///
     /// The page is `gtk::Box`es all the way down and GTK exposes no "find by
@@ -613,11 +631,11 @@ mod tests {
 
     /// The text of the first `gtk::Label` under `scope` carrying `class`.
     fn label_text(scope: &gtk::Widget, class: &str) -> String {
-        by_class(scope, class)
+        let label = by_class(scope, class)
             .into_iter()
             .find_map(|w| w.downcast::<gtk::Label>().ok())
-            .map(|l| l.text().to_string())
-            .unwrap_or_else(|| panic!("no .{class} label under the scope"))
+            .unwrap_or_else(|| panic!("no .{class} label under the scope"));
+        label.text().to_string()
     }
 
     /// The page, plus the two handles that drive it.
@@ -663,6 +681,15 @@ mod tests {
     /// exactly how a chip once shipped drawn 250px outside its clipping bin
     /// with both geometry tests green. Nothing here reads that flag.
     fn assert_inside_and_hittable(outer: &gtk::Widget, inner: &gtk::Widget, what: &str) {
+        // A child appended after the window was presented has no allocation
+        // until the next frame, so wait for one rather than reading a
+        // guaranteed-empty rectangle. A genuinely zero-area widget still fails
+        // the assertion below once the timeout expires.
+        pump_until(2000, || {
+            inner
+                .compute_bounds(outer)
+                .is_some_and(|b| b.width() > 0.0 && b.height() > 0.0)
+        });
         let rect = bounds_in(outer, inner, what);
         assert!(
             rect.width() > 0.0 && rect.height() > 0.0,
@@ -919,7 +946,7 @@ mod tests {
         pump();
         assert_eq!(stack.visible_child_name().as_deref(), Some("media"));
         assert!(
-            f.page.parent().is_some_and(|p| p == stack.clone().upcast()),
+            f.page.parent().as_ref() == Some(stack.upcast_ref::<gtk::Widget>()),
             "a page that is not the visible child is still a child of the stack"
         );
 
@@ -927,9 +954,7 @@ mod tests {
         pump();
         assert_eq!(stack.visible_child_name().as_deref(), Some("workspaces"));
         assert!(
-            stack
-                .child_by_name("media")
-                .is_some_and(|w| w == media.clone().upcast()),
+            stack.child_by_name("media").as_ref() == Some(media.upcast_ref::<gtk::Widget>()),
             "showing the Workspaces page replaced the `media` child instead of \
              covering it"
         );

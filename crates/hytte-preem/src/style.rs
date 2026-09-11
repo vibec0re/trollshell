@@ -17,7 +17,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::contrast;
-use super::dot_matrix::{DOT, PAD};
+use super::dot_matrix::DEFAULT_DOT_PX;
 use super::frame::{Frame, Rgba};
 
 /// The host-resolved desktop accent (#376), packed `[r, g, b, 0xff]`
@@ -919,18 +919,26 @@ const COORD_ONE: i64 = 1024;
 const CORNER_DIV: usize = 6;
 
 /// Width of the vignette's edge ramp, as a divisor of the buffer's short side.
-/// 9 puts the ramp at exactly [`PAD`] px on the kit's 36 px dot strips, so
+/// 9 puts the ramp at exactly one dot cell on the kit's 36 px dot strips, so
 /// there it spends itself inside the bezel and never touches a dot; on the
 /// taller surfaces (scope, gauge, boards) it reaches a few rows into the
 /// picture, which is where a real tube's edge falloff is actually visible.
 const BAND_DIV: usize = 9;
 
 /// The comb's phase is stated relative to buffer row 0, and it only lands in
-/// the dot grid's seams because every dot surface puts its grid origin at
-/// [`PAD`] and `PAD` is a whole number of [`DOT`]s. If that ever stops holding
-/// the comb silently walks onto the dot cores, so pin it here rather than in a
-/// test that could be deleted.
-const _: () = assert!(PAD.is_multiple_of(DOT));
+/// the dot grid's seams because a dot surface puts its grid origin at its
+/// bezel and the bezel **is** one dot cell (`Dots::pad`) — so the origin is a
+/// whole number of comb pitches iff the comb's pitch is the surface's own dot
+/// pitch. Pin that here rather than in a test that could be deleted.
+///
+/// Since #1091 a dot surface can be built at a *different* pitch, and the comb
+/// does not follow it: see [`Mask::CRT`] for why the tube is resolved from the
+/// skin rather than from the widget, and what that costs.
+const _: () = assert!(MASK_COMB_PITCH == DEFAULT_DOT_PX);
+
+/// The CRT comb's pitch in emission rows — the kit's *default* dot pitch, which
+/// is the grid every surface that does not state one renders on.
+const MASK_COMB_PITCH: usize = 4;
 
 /// The CRT pass's two screen-space masks, multiplied into the lit layer by
 /// [`Emission::composite`].
@@ -968,17 +976,31 @@ pub(crate) struct Mask {
 impl Mask {
     /// The CRT tube.
     ///
-    /// **Pitch** is [`DOT`], the kit's virtual pixel: one dark line per dot
-    /// row is the coarsest comb that still reads as a raster rather than as a
-    /// stripe pattern.
+    /// **Pitch** is [`MASK_COMB_PITCH`], the kit's default virtual pixel: one
+    /// dark line per dot row is the coarsest comb that still reads as a raster
+    /// rather than as a stripe pattern.
     ///
-    /// **Phase** is `DOT - 1`, the last row of each dot cell. The dot falloff
+    /// **Phase** is `pitch - 1`, the last row of each dot cell. The dot falloff
     /// is `[25, 120, 120, 25]` down a cell, so rows `1` and `2` are the bright
-    /// core and rows `0` and `DOT - 1` are the dim rim either side of the seam
-    /// between two dot rows: the comb has to sit on one of those two, and the
-    /// falloff is vertically symmetric, so they are equivalent optically.
-    /// `DOT - 1` is taken because it reads as the dark gap *below* each
+    /// core and rows `0` and `pitch - 1` are the dim rim either side of the
+    /// seam between two dot rows: the comb has to sit on one of those two, and
+    /// the falloff is vertically symmetric, so they are equivalent optically.
+    /// `pitch - 1` is taken because it reads as the dark gap *below* each
     /// illuminated line, which is where a raster's retrace sits.
+    ///
+    /// # It does not follow a widget's own dot pitch (#1091)
+    ///
+    /// The tube is resolved from the [`DisplayStyle`] — it is a property of the
+    /// *glass*, and it is multiplied into the lit layer of the
+    /// [`Scope`](super::Scope), the [`Gauge`](super::Gauge) and the
+    /// [`FlipBoard`](super::FlipBoard) too, none of which has a dot pitch at
+    /// all. So a `dot_px(2)` ticker on the CRT skin gets the same 4-row comb
+    /// every other surface gets, and its seams no longer line up with the dot
+    /// rows. What it costs is that specific alignment on that specific skin;
+    /// what threading a per-widget pitch into a screen-space pass would cost is
+    /// a pitch argument on every `composite` in the kit. The mask stays
+    /// screen-space, which is the same call `a_lit_dot_matches_the_static_display`
+    /// already documents for masked skins.
     ///
     /// **`scanline_keep` = 150/256 ≈ 0.59**: a 41 % dip, one row in four, so
     /// the comb is unmistakable while the surface loses only
@@ -990,8 +1012,8 @@ impl Mask {
     /// ticker at ~0.73 — a clear falloff you read as curvature, without the
     /// last characters becoming unreadable.
     const CRT: Self = Self {
-        pitch: DOT,
-        phase: DOT - 1,
+        pitch: MASK_COMB_PITCH,
+        phase: MASK_COMB_PITCH - 1,
         scanline_keep: 150,
         corner_keep: 115,
     };
@@ -2876,7 +2898,7 @@ mod tests {
     // A third, `COMB_FREE`, is not a strawman but the reference the phase
     // tests difference against: the pass with its comb switched off.
 
-    use super::super::dot_matrix::{dot_matrix, lit_dot};
+    use super::super::dot_matrix::{Dots, dot_matrix};
     use super::super::font;
     use super::super::gauge::Gauge;
     use super::super::led_strip::LedStrip;
@@ -2884,7 +2906,12 @@ mod tests {
     use super::super::scope::Scope;
     use super::super::seven_seg::seven_seg;
     use super::super::split_flap::{FlipBoard, Mechanism};
-    use super::{DOT, MASK_ONE, Mask, PAD, Rgba};
+    use super::{MASK_COMB_PITCH, MASK_ONE, Mask, Rgba};
+
+    /// The dot geometry the comb is phased against — the kit's default pitch,
+    /// which is also its bezel (`Dots::pad`).
+    const DOT: usize = MASK_COMB_PITCH;
+    const PAD: usize = MASK_COMB_PITCH;
 
     /// The pass with its comb switched off — the reference the phase tests
     /// difference the real pass against.
@@ -2923,16 +2950,18 @@ mod tests {
     }
 
     /// A frame of `n` dot-matrix cells' worth of grid, every dot lit with the
-    /// kit's own [`lit_dot`] painter — the real dot hardware, so the comb's
-    /// phase is checked against the geometry it actually has to miss.
+    /// kit's own [`Dots::lit_dot`] painter — the real dot hardware at the
+    /// default pitch, so the comb's phase is checked against the geometry it
+    /// actually has to miss.
     fn lit_dot_grid(cells: usize) -> (Emission, usize, usize) {
+        let dots = Dots::default();
         let w = 2 * PAD + cells * font::GLYPH_W * DOT;
         let h = 2 * PAD + font::GLYPH_H * DOT;
         let mut e = Emission::new(w, h);
         for cell in 0..cells {
             for row in 0..font::GLYPH_H {
                 for col in 0..font::GLYPH_W {
-                    lit_dot(
+                    dots.lit_dot(
                         &mut e,
                         PAD + (cell * font::GLYPH_W + col) * DOT,
                         PAD + row * DOT,

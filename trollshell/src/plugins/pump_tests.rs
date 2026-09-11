@@ -70,6 +70,7 @@ fn marquee_node(id: &str) -> wire::Node {
                 window_px: 192,
                 gap_dots: 6,
                 speed_dots_per_sec: 20.0,
+                ..vocab::MarqueeConfig::default()
             },
             state: vocab::MarqueeState {
                 text: "AN ANIMATING SCROLLING MARQUEE TICKER".into(),

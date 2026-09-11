@@ -8,10 +8,13 @@
 //! [`window`](MarqueeStrip::window) paints that grid's unlit (ghost) dots at
 //! their fixed positions and then lights the dots the bitmap says are on at
 //! this offset. The dot *hardware* is
-//! [`dot_matrix`](super::dot_matrix)'s — same [`DOT`] pitch, same [`PAD`]
-//! bezel, same falloff painters — so a scrolled dot is pixel-for-pixel a
-//! static one, and the [`DisplayStyle`] skin, the accent tint and the
-//! ghost/bloom passes are all inherited rather than re-implemented.
+//! [`dot_matrix`](super::dot_matrix)'s — same pitch, same bezel, same falloff
+//! painters, all carried in one shared [`Dots`] value — so a scrolled dot is
+//! pixel-for-pixel a static one, and the [`DisplayStyle`] skin, the accent tint
+//! and the ghost/bloom passes are all inherited rather than re-implemented.
+//! That includes the pitch knob: [`Marquee::dot_px`] is
+//! [`DotMatrix::dot_px`](super::DotMatrix::dot_px), so a `dot_px(2)` ticker is
+//! `9 * 2` = 18 px tall and fits a 32 px bar (#1091).
 //!
 //! # The unit is a virtual pixel (#839)
 //!
@@ -70,7 +73,7 @@
 //! `false` and [`period`](MarqueeStrip::period) is `0`. Only text wider than
 //! the grid actually scrolls.
 
-use super::dot_matrix::{DOT, PAD, ghost_dot, lit_dot};
+use super::dot_matrix::Dots;
 use super::font;
 use super::frame::Frame;
 use super::style::{DisplayStyle, Emission};
@@ -133,17 +136,49 @@ pub struct Marquee {
     style: DisplayStyle,
     window_px: usize,
     gap_dots: usize,
+    dots: Dots,
 }
 
 impl Marquee {
-    /// A marquee in `style` with the default window and gap.
+    /// A marquee in `style` with the default window, gap and dot pitch.
     #[must_use]
     pub fn new(style: DisplayStyle) -> Self {
         Self {
             style,
             window_px: DEFAULT_WINDOW_PX,
             gap_dots: DEFAULT_GAP_DOTS,
+            dots: Dots::default(),
         }
+    }
+
+    /// Set the dot pitch in buffer pixels, clamped to
+    /// [`MIN_DOT_PX`](super::MIN_DOT_PX)`..=`[`MAX_DOT_PX`](super::MAX_DOT_PX).
+    ///
+    /// The same hardware knob [`DotMatrix::dot_px`](super::DotMatrix::dot_px)
+    /// turns, and it moves the *height* — `9 * px`, so 18 px at 2 and 36 at the
+    /// default — while [`window_px`](Self::window_px) stays the width (#1091).
+    ///
+    /// # Two things it changes that are not the height
+    ///
+    /// A finer pitch fits **more dot columns** inside the same window — 94 at
+    /// pitch 2 where 4 fits 46, in a 192 px window. That does *not* change the
+    /// loop [`period`](MarqueeStrip::period), which is `bitmap.len() +
+    /// gap_dots` and so is in dots and pitch-independent. What it changes is
+    /// the two things a bar ticker meets first:
+    ///
+    /// - **A message that scrolls at one pitch can hold static at a finer
+    ///   one.** The [hold rule](self#short-text-holds) compares the message
+    ///   against the *grid*, so a 10-char title that scrolls in a 192 px window
+    ///   at pitch 4 fits the grid at 3 and at 2, and stops moving. That is the
+    ///   rule working, not a dropped pitch.
+    /// - **A fixed dots-per-second is a slower ticker.**
+    ///   [`window`](MarqueeStrip::window) steps whole *dots*, so a shell
+    ///   integrating 12 dots/s moves 48 px/s at pitch 4 and 24 px/s at pitch 2.
+    ///   Scale the speed with the pitch if you want the on-screen rate held.
+    #[must_use]
+    pub fn dot_px(mut self, px: usize) -> Self {
+        self.dots = Dots::new(px);
+        self
     }
 
     /// The visible window width in **final** buffer pixels — the width of the
@@ -152,7 +187,7 @@ impl Marquee {
     /// the kit's sizing docs).
     ///
     /// The dot grid inside is as many whole dot cells as fit between the
-    /// [`PAD`] bezels, centered in the window; a width that isn't a whole
+    /// one-cell bezels, centered in the window; a width that isn't a whole
     /// number of dots widens the bezel rather than clipping a dot. This is the
     /// only knob in buffer pixels — everything that *moves* is in dots.
     #[must_use]
@@ -179,10 +214,11 @@ impl Marquee {
         let palette = self.style.palette();
         // As many whole dot cells as fit between the bezels; the leftover
         // splits evenly, so the grid is centered and the margin is never
-        // narrower than `PAD`.
-        let cols = self.window_px.saturating_sub(2 * PAD) / DOT;
-        let origin_x = (self.window_px - cols * DOT) / 2;
-        let height = 2 * PAD + font::GLYPH_H * DOT;
+        // narrower than one dot cell.
+        let (dot, pad) = (self.dots.dot(), self.dots.pad());
+        let cols = self.window_px.saturating_sub(2 * pad) / dot;
+        let origin_x = (self.window_px - cols * dot) / 2;
+        let height = self.dots.height();
 
         // The backdrop: the field plus the *fixed* ghost matrix, painted once.
         // Nothing the offset does can move it — every frame starts from this
@@ -191,7 +227,8 @@ impl Marquee {
         if let Some(ghost) = palette.ghost {
             for col in 0..cols {
                 for row in 0..font::GLYPH_H {
-                    ghost_dot(&mut base, origin_x + col * DOT, PAD + row * DOT, ghost);
+                    self.dots
+                        .ghost_dot(&mut base, origin_x + col * dot, pad + row * dot, ghost);
                 }
             }
         }
@@ -211,6 +248,7 @@ impl Marquee {
             origin_x,
             period,
             style: self.style,
+            dots: self.dots,
         }
     }
 }
@@ -228,8 +266,8 @@ pub struct MarqueeStrip {
     base: Frame,
     /// Dot cells across the window's fixed grid.
     cols: usize,
-    /// Buffer-pixel x of the grid's first dot cell (the bezel is `PAD` or
-    /// wider). The grid's y origin is always `PAD`.
+    /// Buffer-pixel x of the grid's first dot cell (the bezel is one dot cell
+    /// or wider). The grid's y origin is always the bezel, i.e. `dots.pad()`.
     origin_x: usize,
     /// The scroll period **in dots**: the bitmap+gap length the offset wraps
     /// around, or `0` when the message holds static (fits the grid).
@@ -238,6 +276,10 @@ pub struct MarqueeStrip {
     /// live accent change (#376); `bg`/`ghost` are accent-independent, so the
     /// baked backdrop can't go stale.
     style: DisplayStyle,
+    /// The dot hardware this strip was rasterised on — pitch, bezel and
+    /// falloff. Kept rather than re-derived so the lit pass lands on exactly
+    /// the grid the baked backdrop was painted for, at any pitch (#1091).
+    dots: Dots,
 }
 
 impl MarqueeStrip {
@@ -296,14 +338,23 @@ impl MarqueeStrip {
             };
             for row in 0..font::GLYPH_H {
                 if (column >> row) & 1 == 1 {
-                    lit_dot(&mut lit, self.origin_x + col * DOT, PAD + row * DOT);
+                    let (dot, pad) = (self.dots.dot(), self.dots.pad());
+                    self.dots
+                        .lit_dot(&mut lit, self.origin_x + col * dot, pad + row * dot);
                 }
             }
         }
         if let Some(bloom) = palette.bloom {
             lit.bloom(bloom);
         }
-        lit.composite(&mut out, palette.ink, palette.mask);
+        // Re-phased onto this strip's dot grid, exactly as the static display
+        // does it — the two surfaces share the hardware, so they share the
+        // tube's alignment to it (`Mask::with_pitch`). A no-op at the default.
+        lit.composite(
+            &mut out,
+            palette.ink,
+            palette.mask.map(|mask| mask.with_pitch(self.dots.dot())),
+        );
         out
     }
 }
@@ -311,8 +362,14 @@ impl MarqueeStrip {
 #[cfg(test)]
 mod tests {
     use super::super::DisplayStyle;
-    use super::super::dot_matrix::dot_matrix;
-    use super::{DOT, Frame, Marquee, MarqueeStrip, PAD, font, rasterize};
+    use super::super::dot_matrix::{DEFAULT_DOT_PX, DotMatrix, MAX_DOT_PX, MIN_DOT_PX, dot_matrix};
+    use super::{Frame, Marquee, MarqueeStrip, font, rasterize};
+
+    /// The pitch and bezel the marquee shipped with before #1091 made them a
+    /// knob. Every test below that does not *name* a pitch is asserting the
+    /// unchanged default geometry.
+    const DOT: usize = DEFAULT_DOT_PX;
+    const PAD: usize = DEFAULT_DOT_PX;
 
     /// A long message that overflows any reasonable window (so it scrolls).
     const LONG: &str = "PREEM RASTER KIT ~ SCROLLING TICKER ~ ";
@@ -640,5 +697,208 @@ mod tests {
         let a = rasterize("A");
         assert_eq!(a.len(), font::GLYPH_W);
         assert_eq!(a[0] & 1, 0, "'A' is not lit at its top-left corner");
+    }
+
+    /// FNV-1a 64 over a window's bytes — see `dot_matrix.rs`'s copy.
+    fn digest(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// The marquee shares the dot hardware, so it inherits the byte-identity
+    /// obligation: at the default pitch every window is the buffer
+    /// `origin/main` produced before the pitch was a parameter.
+    ///
+    /// **Falsified** by any drift in the falloff at pitch 4, the bezel, or the
+    /// grid origin — all three of which the refactor moved from consts into
+    /// [`Dots`](super::Dots).
+    #[test]
+    fn the_default_pitch_windows_the_pre_1091_bytes() {
+        // (style, offset, digest) recorded on origin/main @ bdb3a06 for a
+        // 96 px window over `MESSAGE`.
+        const MESSAGE: &str = "PREEM RASTER KIT ~ ";
+        let cases: [(DisplayStyle, usize, u64); 16] = [
+            (DisplayStyle::Vfd, 0, 0xdade_0f6c_9e00_fd8d),
+            (DisplayStyle::Vfd, 1, 0x7411_0062_b149_f887),
+            (DisplayStyle::Vfd, 7, 0xd870_584f_77bf_1fc5),
+            (DisplayStyle::Vfd, 33, 0x8699_137d_92bb_ca6b),
+            (DisplayStyle::Lcd, 0, 0xbeef_3d8b_8300_4a5d),
+            (DisplayStyle::Lcd, 1, 0xbe39_5991_c5c0_8245),
+            (DisplayStyle::Lcd, 7, 0x49ac_3d39_016f_7acd),
+            (DisplayStyle::Lcd, 33, 0x82fa_ba01_eff0_f375),
+            (DisplayStyle::Oled, 0, 0x7725_09e9_61a1_7b7d),
+            (DisplayStyle::Oled, 1, 0x7752_1440_617b_5751),
+            (DisplayStyle::Oled, 7, 0x9d2c_a06a_e543_d7cd),
+            (DisplayStyle::Oled, 33, 0x9230_e84b_fda6_21a5),
+            (DisplayStyle::Crt, 0, 0x4a2f_cf8d_8700_e3b6),
+            (DisplayStyle::Crt, 1, 0x19a0_ef2f_648c_5f18),
+            (DisplayStyle::Crt, 7, 0x3596_ff2d_e279_3b51),
+            (DisplayStyle::Crt, 33, 0xfc82_5f18_b79f_07d7),
+        ];
+        for (style, offset, want) in cases {
+            let strip = Marquee::new(style).window_px(96).render(MESSAGE);
+            assert_eq!(strip.period(), 119, "{style:?} period");
+            let f = strip.window(offset);
+            assert_eq!((f.width(), f.height()), (96, 36), "{style:?} @ {offset}");
+            assert_eq!(
+                digest(f.data()),
+                want,
+                "{style:?} @ {offset} drifted from the pre-#1091 bytes"
+            );
+        }
+    }
+
+    /// #1091's headline: a `dot_px(2)` ticker is 18 px tall and fits the 32 px
+    /// bar, with 27 px at 3 and the unchanged 36 px at the default.
+    ///
+    /// **Falsified** by pinning the bezel at 4 while the pitch moves — the
+    /// window would still be the width asked for, and the height would be
+    /// `8 + 7*px` instead of `9*px`.
+    #[test]
+    fn the_pitch_sets_the_window_height() {
+        for (px, height) in [(2, 18), (3, 27), (4, 36), (8, 72)] {
+            let strip = Marquee::new(DisplayStyle::Vfd)
+                .dot_px(px)
+                .window_px(96)
+                .render(LONG);
+            assert_eq!(strip.height(), height, "dot_px {px}");
+            let f = strip.window(5);
+            assert_eq!(f.height(), height, "dot_px {px} window");
+            assert_eq!(f.width(), 96, "dot_px {px} keeps the stated width");
+            assert_eq!(f.data().len(), f.width() * f.height() * 4);
+        }
+    }
+
+    /// The pitch clamps like the static display's, and out-of-range values
+    /// render the nearest legal pitch rather than panicking.
+    #[test]
+    fn the_pitch_clamps_into_range() {
+        let at = |px| {
+            Marquee::new(DisplayStyle::Lcd)
+                .dot_px(px)
+                .window_px(64)
+                .render(LONG)
+                .window(3)
+        };
+        assert_eq!(at(0), at(MIN_DOT_PX));
+        assert_eq!(at(1), at(MIN_DOT_PX));
+        assert_eq!(at(9), at(MAX_DOT_PX));
+        assert_eq!(at(usize::MAX), at(MAX_DOT_PX));
+    }
+
+    /// The **lit** pass stamps on the strip's own pitch, not on the default —
+    /// measured through where the light lands vertically, which is a different
+    /// mechanism from [`a_lit_dot_matches_the_static_display_at_every_pitch`]'s
+    /// per-pixel comparison and the reason this exists as a second test.
+    ///
+    /// `MarqueeStrip::window` re-deriving `Dots::default()` instead of reading
+    /// `self.dots` was the one mutation #1094's review found with a **single**
+    /// covering test, and the shell-side parity test cannot close it: its
+    /// oracle comes from the same kit, and the height it asserts comes from the
+    /// baked backdrop, which `render` builds from the right pitch either way.
+    /// Here the backdrop is the *reference* being subtracted, so only the lit
+    /// pass can move the answer: at pitch 3 a default-pitch stamp puts the top
+    /// dot row at y 4 instead of 3 and runs the bottom one off the 27 px
+    /// buffer.
+    ///
+    /// LCD, so no bloom can spread light off the grid, and the NOTDEF box
+    /// (whose leftmost column is lit on every glyph row) so the top and bottom
+    /// rows are both guaranteed to carry light.
+    #[test]
+    fn the_lit_pass_stamps_on_the_strips_own_pitch() {
+        for px in MIN_DOT_PX..=MAX_DOT_PX {
+            let strip = Marquee::new(DisplayStyle::Lcd)
+                .dot_px(px)
+                .window_px(96)
+                .render("💕");
+            assert!(
+                !strip.scrolls(),
+                "one glyph holds in a 96 px window at {px}"
+            );
+            let want = Marquee::new(DisplayStyle::Lcd)
+                .dot_px(px)
+                .window_px(96)
+                .render("")
+                .window(0);
+            let f = strip.window(0);
+            let lit_rows: Vec<usize> = (0..f.height())
+                .filter(|&y| (0..f.width()).any(|x| f.at(x, y) != want.at(x, y)))
+                .collect();
+            assert_eq!(
+                lit_rows.first().copied(),
+                Some(px),
+                "dot_px {px}: light starts at the bezel, i.e. one dot cell down"
+            );
+            assert_eq!(
+                lit_rows.last().copied(),
+                Some(8 * px - 1),
+                "dot_px {px}: …and ends on the last row of the seventh dot row"
+            );
+        }
+    }
+
+    /// The grid geometry follows the pitch at every pitch: whole dot cells
+    /// between bezels at least one cell wide, centered, and the same rows the
+    /// static display of that pitch uses — so the two still stack flush.
+    #[test]
+    fn the_grid_follows_the_pitch() {
+        for px in MIN_DOT_PX..=MAX_DOT_PX {
+            for window_px in [64, 96, 200, 268] {
+                let strip = Marquee::new(DisplayStyle::Vfd)
+                    .dot_px(px)
+                    .window_px(window_px)
+                    .render(LONG);
+                let margin = window_px - strip.cols * px;
+                assert!(
+                    margin >= 2 * px,
+                    "{px}/{window_px}: bezel keeps {margin} px"
+                );
+                assert!(margin < 2 * px + px, "{px}/{window_px}: no room left over");
+                assert_eq!(strip.origin_x, margin / 2, "{px}/{window_px}: centered");
+                assert_eq!(
+                    strip.height(),
+                    DotMatrix::new(DisplayStyle::Vfd).dot_px(px).height(),
+                    "{px}/{window_px}: stacks flush with the static display"
+                );
+            }
+        }
+    }
+
+    /// A lit dot is the static display's dot **at the same pitch** — the whole
+    /// point of sharing one [`Dots`](super::Dots) value rather than two consts.
+    /// Mask-free skins only, for `a_lit_dot_matches_the_static_display`'s
+    /// screen-space reason.
+    #[test]
+    fn a_lit_dot_matches_the_static_display_at_every_pitch() {
+        for px in MIN_DOT_PX..=MAX_DOT_PX {
+            for style in DisplayStyle::ALL
+                .into_iter()
+                .filter(|s| s.palette().mask.is_none())
+            {
+                let statik = DotMatrix::new(style).dot_px(px).render("A");
+                let strip = Marquee::new(style).dot_px(px).window_px(96).render("A");
+                assert!(!strip.scrolls(), "one glyph fits a 96 px window at {px}");
+                let f = strip.window(0);
+                assert_eq!(f.height(), statik.height(), "{style:?} @ {px} dot rows");
+                for row in 0..font::GLYPH_H {
+                    for col in 0..font::GLYPH_W {
+                        for dy in 0..px {
+                            for dx in 0..px {
+                                let (x, y) = (col * px + dx, px + row * px + dy);
+                                assert_eq!(
+                                    f.at(strip.origin_x + x, y),
+                                    statik.at(px + x, y),
+                                    "{style:?} @ {px} dot ({col},{row}) px ({dx},{dy})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

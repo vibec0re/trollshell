@@ -28,6 +28,22 @@
 //!   font-space bitmap sampled onto a **fixed** physical dot grid, stepped one
 //!   whole virtual pixel (one dot) at a time, so the grid never moves with the
 //!   text (#839).
+//!
+//! ## The dot pitch is the height knob (#1091)
+//!
+//! Both dot surfaces are `9 * dot_px` buffer pixels tall — a one-cell bezel on
+//! each side plus the font's seven rows — and nothing else moves that number,
+//! because `scale` (where a widget has one) only multiplies what is already
+//! there. So a dot-matrix readout or a marquee sized for a 32 px bar is a
+//! *pitch* question, not a scale question: [`DotMatrix::dot_px`] and
+//! [`Marquee::dot_px`] take it, clamped to
+//! [`MIN_DOT_PX`]`..=`[`MAX_DOT_PX`] and defaulting to [`DEFAULT_DOT_PX`].
+//! That gives **18 px at 2**, 27 at 3 and the kit's long-standing 36 at 4;
+//! each character advances `6 * dot_px`. The falloff that makes a dot read as
+//! round is computed for whatever pitch is asked for, and reproduces the
+//! hand-tuned 4×4 table exactly at the default — so the free functions
+//! [`dot_matrix`] / [`Marquee::new`], and every caller written before the knob
+//! existed, render the same bytes they always did.
 //! - [`seven_seg`] — a classic seven-segment readout (digits, `:`, `-`,
 //!   space) with the authentic dim ghost segments behind the lit ones.
 //! - [`TextBox`] — the "8bit textbox": wrapped 5×7 pixel-font text on a
@@ -135,7 +151,7 @@ mod style;
 mod textbox;
 
 pub use color_map::ColorMap;
-pub use dot_matrix::dot_matrix;
+pub use dot_matrix::{DEFAULT_DOT_PX, DotMatrix, MAX_DOT_PX, MIN_DOT_PX, dot_matrix};
 pub use frame::{Frame, Rgba};
 pub use gauge::{DEFAULT_DAMPING, DEFAULT_FREQ_HZ, Gauge, Needle, OVERTRAVEL, TRAIL_SPAN_SECS};
 pub use led_matrix::{Fill, LedMatrix};

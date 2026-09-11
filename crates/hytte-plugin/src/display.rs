@@ -577,14 +577,31 @@ pub struct DotMatrix {
 }
 
 impl DotMatrix {
-    /// A dot-matrix strip in `style`.
+    /// A dot-matrix strip in `style`, at the kit's default dot pitch.
     #[must_use]
     pub fn new(style: StyleName) -> Self {
         Self {
             config: DotMatrixConfig {
                 style: style_ref(style),
+                ..DotMatrixConfig::default()
             },
         }
+    }
+
+    /// The dot pitch in buffer pixels — the edge of the square cell each font
+    /// pixel becomes, and **the strip's height**: `9 * px`, so 18 at `2`
+    /// against the default's 36 (#1091).
+    ///
+    /// A **config** change, so in state mode moving it rebuilds the shell's
+    /// renderer. Stated rather than clamped here, like
+    /// [`FlipBoard::glyph_px`]: the kit's `DotMatrix::dot_px` clamps the raster
+    /// arm and `PreemWidget::clamped` clamps the wire, so one number out of
+    /// range renders the nearest legal pitch on both arms instead of two
+    /// clamps that can drift apart.
+    #[must_use]
+    pub fn dot_px(mut self, px: u32) -> Self {
+        self.config.dot_px = px;
+        self
     }
 
     /// Switch the skin (a **config** change: in state mode the shell rebuilds
@@ -661,7 +678,11 @@ impl DotMatrix {
                     text: text.to_owned(),
                 },
             },
-            || kit::dot_matrix(text, display_style(self.config.style.style)),
+            || {
+                kit::DotMatrix::new(display_style(self.config.style.style))
+                    .dot_px(dim(self.config.dot_px))
+                    .render(text)
+            },
         )
     }
 }
@@ -998,6 +1019,16 @@ impl Marquee {
         self
     }
 
+    /// The dot pitch in buffer pixels — the **height** knob, `9 * px`, so 18 at
+    /// `2` where [`window_px`](Self::window_px) stays the width (#1091). The
+    /// same knob [`DotMatrix::dot_px`] turns, and stated rather than clamped for
+    /// that method's reason.
+    #[must_use]
+    pub fn dot_px(mut self, px: u32) -> Self {
+        self.config.dot_px = px;
+        self
+    }
+
     /// Scroll speed in dots per second. `0.0` parks the message.
     #[must_use]
     pub fn speed_dots_per_sec(mut self, speed: f32) -> Self {
@@ -1129,6 +1160,7 @@ impl Marquee {
                 kit::Marquee::new(display_style(self.config.style.style))
                     .window_px(dim(self.config.window_px))
                     .gap_dots(dim(self.config.gap_dots))
+                    .dot_px(dim(self.config.dot_px))
                     .render(text)
                     .window(self.scroll_dots())
             },
@@ -2284,6 +2316,19 @@ mod tests {
                 == kit::dot_matrix("HELLO", DisplayStyle::Vfd).into_node(Some("dm"), no_cls()),
             "dot matrix",
         );
+        // …and with the pitch moved (#1091), which the default-pitch case above
+        // cannot see: the builder has to reach the kit's own `dot_px`, not just
+        // ride `kit::dot_matrix`'s default.
+        assert!(
+            DotMatrix::new(StyleName::Vfd)
+                .dot_px(2)
+                .node_in(raster, "dm", no_cls(), "HELLO")
+                == kit::DotMatrix::new(DisplayStyle::Vfd)
+                    .dot_px(2)
+                    .render("HELLO")
+                    .into_node(Some("dm"), no_cls()),
+            "dot matrix at a moved pitch",
+        );
         assert!(
             SevenSeg::new(StyleName::Crt).node_in(raster, "ss", no_cls(), "12:34")
                 == kit::seven_seg("12:34", DisplayStyle::Crt).into_node(Some("ss"), no_cls()),
@@ -2355,6 +2400,28 @@ mod tests {
                     .window(20)
                     .into_node(Some("mq"), no_cls()),
             "marquee",
+        );
+
+        // …and the same sequence with the pitch moved (#1091). A finer pitch
+        // fits more dot columns in the same window, so the *offset* the
+        // accumulator reaches is unchanged while the whole grid differs — which
+        // is exactly the case a default-pitch comparison cannot see.
+        let mut small = Marquee::new(StyleName::Vfd)
+            .window_px(268)
+            .gap_dots(4)
+            .dot_px(2)
+            .speed_dots_per_sec(20.0);
+        small.advance_in(raster, 1.0);
+        assert!(
+            small.node_in(raster, "mq", no_cls(), MSG)
+                == kit::Marquee::new(DisplayStyle::Vfd)
+                    .window_px(268)
+                    .gap_dots(4)
+                    .dot_px(2)
+                    .render(MSG)
+                    .window(20)
+                    .into_node(Some("mq"), no_cls()),
+            "marquee at a moved pitch",
         );
 
         // — the led strip: the same push/decay sequence through the same

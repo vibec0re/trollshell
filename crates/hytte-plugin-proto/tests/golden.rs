@@ -52,10 +52,10 @@
 
 use hytte_plugin_proto::{
     AccentRole, AudioAction, AudioSpectrum, Capability, ClockState, ConsentDecision,
-    DatasourceError, DatasourceOutcome, Dir, DotMatrixConfig, DotMatrixState, Effect,
-    EffectOutcome, EventKind, FlipBoardConfig, FlipBoardState, GaugeConfig, GaugeRange, GaugeState,
-    HostMsg, LedStripConfig, LedStripState, LogLevel, Manifest, MarqueeConfig, MarqueeState,
-    Mechanism, MediaAction, Mount, NiriAction, Node, NowPlaying, PROTO_VERSION, Page,
+    DEFAULT_DOT_PX, DatasourceError, DatasourceOutcome, Dir, DotMatrixConfig, DotMatrixState,
+    Effect, EffectOutcome, EventKind, FlipBoardConfig, FlipBoardState, GaugeConfig, GaugeRange,
+    GaugeState, HostMsg, LedStripConfig, LedStripState, LogLevel, Manifest, MarqueeConfig,
+    MarqueeState, Mechanism, MediaAction, Mount, NiriAction, Node, NowPlaying, PROTO_VERSION, Page,
     PeakHoldConfig, PluginMsg, PreemWidget, ProvidedDatasource, SPECTRUM_BINS, ScopeConfig,
     ScopeState, SevenSegConfig, SevenSegState, ShaderData, StateKey, StateSnapshot, StyleName,
     StyleRef, TextBoxConfig, TextBoxState, TextBoxWidth, UpcomingEvent, VOCAB, VOCAB_UNCONDITIONAL,
@@ -579,6 +579,11 @@ fn preem_tree() -> Node {
                 PreemWidget::DotMatrix {
                     config: DotMatrixConfig {
                         style: StyleRef::new(StyleName::Vfd),
+                        // Deliberately the default: `dot_px` carries
+                        // `skip_serializing_if`, so this fixture must keep
+                        // costing zero bytes across #1091 (see
+                        // `a_default_dot_px_never_reaches_the_wire`).
+                        dot_px: DEFAULT_DOT_PX,
                     },
                     state: DotMatrixState {
                         text: "12:34".into(),
@@ -636,6 +641,8 @@ fn preem_tree() -> Node {
                         style: StyleRef::new(StyleName::Vfd).with_accent(AccentRole::Neutral),
                         window_px: 268,
                         gap_dots: 8,
+                        // Default on purpose — see the `dm` node above.
+                        dot_px: DEFAULT_DOT_PX,
                         speed_dots_per_sec: 24.5,
                     },
                     state: MarqueeState {

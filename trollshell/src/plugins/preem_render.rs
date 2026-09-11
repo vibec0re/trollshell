@@ -564,8 +564,14 @@ impl Steps {
 #[derive(Debug)]
 enum Renderer {
     /// Pure — no instance state; re-rendered from the text on change.
+    ///
+    /// The pitch is kept because the kit resolves it at *construction*
+    /// (`kit::DotMatrix::dot_px`) while this arm re-renders from the text, so
+    /// there is no builder here to hold it — and the wire's `dot_px` is config,
+    /// so it can only change through a rebuild (#1091).
     DotMatrix {
         text: String,
+        dot_px: usize,
     },
     /// Pure.
     SevenSeg {
@@ -2136,8 +2142,9 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
     // costs nothing and cannot miss a future widget that bakes.
     let pins = pins_for(widget.style());
     Some(kit::with_pins(pins, || match widget {
-        W::DotMatrix { state, .. } => Renderer::DotMatrix {
+        W::DotMatrix { config, state } => Renderer::DotMatrix {
             text: state.text.clone(),
+            dot_px: dim(config.dot_px),
         },
         W::SevenSeg { state, .. } => Renderer::SevenSeg {
             text: state.text.clone(),
@@ -2270,6 +2277,7 @@ fn marquee_strip(
     kit::Marquee::new(style)
         .window_px(dim(config.window_px))
         .gap_dots(dim(config.gap_dots))
+        .dot_px(dim(config.dot_px))
         .render(text)
 }
 
@@ -2324,7 +2332,9 @@ impl Renderer {
     fn update(&mut self, widget: &vocab::PreemWidget) {
         use vocab::PreemWidget as W;
         match (self, widget) {
-            (Self::DotMatrix { text }, W::DotMatrix { state, .. }) => {
+            (Self::DotMatrix { text, .. }, W::DotMatrix { state, .. }) => {
+                // The pitch is config, so `same_config` already agreed it is
+                // unchanged — only the text can move here.
                 text.clone_from(&state.text);
             }
             (Self::SevenSeg { text }, W::SevenSeg { state, .. }) => text.clone_from(&state.text),
@@ -2624,7 +2634,9 @@ impl Renderer {
     /// [`gl_surface`](Self::gl_surface) first and only falls through to here.
     fn render(&self, style: kit::DisplayStyle) -> Option<kit::Frame> {
         Some(match self {
-            Self::DotMatrix { text } => kit::dot_matrix(text, style),
+            Self::DotMatrix { text, dot_px } => {
+                kit::DotMatrix::new(style).dot_px(*dot_px).render(text)
+            }
             Self::SevenSeg { text } => kit::seven_seg(text, style),
             // The box baked its palette at construction, so it takes no style
             // here — see `invalidate_cached_frames`.

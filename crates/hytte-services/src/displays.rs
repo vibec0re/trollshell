@@ -85,6 +85,12 @@ pub struct Output {
     pub scale: f64,
     /// Output transform as a stable string (`"normal"`, `"90"`, `"flipped"`).
     pub transform: String,
+    /// The output's logical x position, in niri's compositor-space
+    /// coordinates (`LogicalOutput::x`). `0` when disabled.
+    pub x: i32,
+    /// The output's logical y position (`LogicalOutput::y`). `0` when
+    /// disabled.
+    pub y: i32,
 }
 
 /// Active mode of an output.
@@ -514,6 +520,7 @@ fn convert(o: &niri_ipc::Output) -> Output {
     let transform = o
         .logical
         .map_or_else(|| "normal".to_string(), |l| transform_str(l.transform));
+    let (x, y) = o.logical.map_or((0, 0), |l| (l.x, l.y));
 
     Output {
         name: o.name.clone(),
@@ -525,6 +532,8 @@ fn convert(o: &niri_ipc::Output) -> Output {
         enabled: Pending::settled(enabled),
         scale,
         transform,
+        x,
+        y,
     }
 }
 
@@ -598,6 +607,21 @@ mod tests {
         Arc::new(list.into_iter().map(|o| (o.name.clone(), o)).collect())
     }
 
+    /// [`mk_output`], but with a logical position — for the `x`/`y` mapping
+    /// tests (#1110), which don't care about scale/transform.
+    fn mk_output_at(name: &str, x: i32, y: i32) -> NiriOutput {
+        NiriOutput {
+            logical: Some(LogicalOutput {
+                x,
+                y,
+                ..mk_output(name, true, 1.0)
+                    .logical
+                    .expect("mk_output(.., true, ..) always sets logical")
+            }),
+            ..mk_output(name, true, 1.0)
+        }
+    }
+
     // ── Projection ────────────────────────────────────────────────────────────
 
     #[test]
@@ -646,6 +670,30 @@ mod tests {
         assert_eq!(o.mode, None);
         assert!((o.scale - 1.0).abs() < f64::EPSILON);
         assert_eq!(o.transform, "normal");
+    }
+
+    /// `Output::x`/`::y` come straight out of niri's `LogicalOutput` (#1110) —
+    /// the same field the Workspaces drawer page orders its monitor columns
+    /// by, rather than by connector name.
+    ///
+    /// Falsified by dropping the `o.logical.map_or((0, 0), …)` mapping and
+    /// leaving `x`/`y` at their `Default` (both tests would then read `(0, 0)`
+    /// regardless of the fixture).
+    #[test]
+    fn convert_reads_logical_position_from_niri() {
+        let raw = snapshot(vec![mk_output_at("DP-1", 1920, 200)]);
+        let list = convert_snapshot(&raw);
+        assert_eq!(list.len(), 1);
+        assert_eq!((list[0].x, list[0].y), (1920, 200));
+    }
+
+    #[test]
+    fn disabled_output_reports_origin_position() {
+        // `logical: None` is the canonical disabled tell for position too —
+        // there is no "last known" position to fall back on.
+        let raw = snapshot(vec![mk_output("DP-2", false, 1.0)]);
+        let list = convert_snapshot(&raw);
+        assert_eq!((list[0].x, list[0].y), (0, 0));
     }
 
     #[test]

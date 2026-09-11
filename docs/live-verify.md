@@ -2933,6 +2933,20 @@ trollshell`. Expect the cards to come back Active and **no notification at
     no longer in the file — not a button that does nothing (#1113's review
     LOW 15).
 
+- [ ] **(#1110)** Monitor columns order by the outputs' physical layout, not by
+      connector name — corrects the phase-1 "**Two screens, one column each**"
+      row above, which predates this fix and still says "ordered lexically
+      (`DP-1` left of `HDMI-A-1`)". With **three** monitors arranged so their
+      connector names sort in a different order than their physical layout
+      (e.g. a `kanshi` profile placing `HDMI-A-1` on the left, `DP-1` in the
+      middle, `DP-2` on the right), open the Workspaces page and confirm the
+      columns read left to right in **physical** order, matching the Displays
+      page's arrangement diagram — not connector-alphabetical. Reshuffle the
+      layout (swap two outputs' `position` in the kanshi profile, or
+      `niri msg output <name> position` if applied live) and confirm the
+      columns re-order to follow. Two monitors at the same x (stacked
+      vertically) should order top to bottom.
+
 ## Control-center
 
 - [ ] **(#515)** AI Keys tab: set an OpenRouter key → the row flips to "Key

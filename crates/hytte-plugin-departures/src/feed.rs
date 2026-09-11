@@ -1,5 +1,6 @@
 //! The departures feed: the visibility-gated poll task, the HAFAS
-//! (`v6.bvg.transport.rest`) client, and the `places.toml` station config.
+//! (`v6.<backend>.transport.rest`, BVG by default — #1124 made the backend a
+//! `places.toml` setting) client, and the `places.toml` station config.
 //!
 //! Ported from `hytte-services::departures` (the HTTP client + wire format +
 //! filter) and `hytte-services::places` (the config file). HAFAS is plain
@@ -206,20 +207,79 @@ fn parse_response(body: &str, now_unix: i64) -> Result<Vec<Row>, String> {
         .collect())
 }
 
+// ── Departures endpoint (#1124) ──────────────────────────────────────────────
+//
+// A single, whole-shell `[departures].endpoint` key — not per-place, since
+// which transport.rest backend answers is a property of which transit network
+// you live in. Mirrors `hytte_config::places::DEPARTURES_ENDPOINT_NAMES` /
+// `resolve_departures_endpoint`, duplicated rather than linked: this plugin
+// can't pull in the shell's config crate without weighing whether that
+// belongs in a plugin binary at all (see the module doc's "three independent
+// implementations" note), and the mapping is one string literal per name —
+// easy to keep the two copies in sync by eye.
+
+/// Short names transport.rest answers for out of the box.
+const ENDPOINT_NAMES: [&str; 3] = ["bvg", "vbb", "db"];
+
+/// Resolve a configured `[departures].endpoint` into `(base_url,
+/// display_label)`. The label feeds the "can't reach <label>" reachability
+/// text a fetch failure renders.
+///
+/// * `None`, or blank — the key absent, or present but empty — → BVG's URL.
+/// * A name in [`ENDPOINT_NAMES`] → that name's `v6.<name>.transport.rest`
+///   base, upper-cased as the label.
+/// * Anything starting `http://`/`https://` → used verbatim (trailing slash
+///   trimmed), the URL itself as the label.
+/// * Anything else → an error naming the three short names.
+fn resolve_endpoint(raw: Option<&str>) -> Result<(String, String), String> {
+    let Some(value) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(("https://v6.bvg.transport.rest".to_owned(), "BVG".to_owned()));
+    };
+    if value.starts_with("http://") || value.starts_with("https://") {
+        let base = value.trim_end_matches('/').to_owned();
+        return Ok((base.clone(), base));
+    }
+    if ENDPOINT_NAMES.contains(&value) {
+        return Ok((
+            format!("https://v6.{value}.transport.rest"),
+            value.to_uppercase(),
+        ));
+    }
+    Err(format!(
+        "unknown departures endpoint {value:?} — use {} or a full http(s):// base URL",
+        ENDPOINT_NAMES.join(", ")
+    ))
+}
+
 // ── Station config (ported subset of places.toml) ────────────────────────────
 
-/// The station the board fetches for, plus its filter + walk budget.
+/// The station the board fetches for, plus its filter, walk budget and
+/// resolved departures backend.
 #[derive(Debug)]
 struct StationConfig {
     station: String,
     walk_minutes: u32,
     filter: Filter,
+    /// The transport.rest base URL to fetch from, resolved from
+    /// `[departures].endpoint` (#1124).
+    base_url: String,
+    /// Human-readable name of [`Self::base_url`]'s backend, for the "can't
+    /// reach <label>" reachability text.
+    backend_label: String,
+}
+
+#[derive(Deserialize, Default)]
+struct DeparturesCfg {
+    #[serde(default)]
+    endpoint: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ConfigFile {
     #[serde(default)]
     place: Vec<PlaceCfg>,
+    #[serde(default)]
+    departures: DeparturesCfg,
 }
 
 /// A forward-compatible subset of the native `places.toml` `[[place]]` — only
@@ -248,11 +308,14 @@ fn config_path() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("HOME")?).join(CONFIG_REL_PATH))
 }
 
-/// Parse the first place's station config out of a `places.toml` body. Pure, so
-/// the schema port is unit-testable. `Ok(None)` = no place, or the first place
-/// has no (non-blank) `station`.
+/// Parse the first place's station config (plus the whole-shell departures
+/// endpoint) out of a `places.toml` body. Pure, so the schema port is
+/// unit-testable. `Ok(None)` = no place, or the first place has no (non-blank)
+/// `station` — checked *after* the endpoint resolves, so a bad
+/// `[departures].endpoint` is reported even before a station exists to fetch.
 fn parse_station_config(toml_text: &str) -> Result<Option<StationConfig>, String> {
     let cfg: ConfigFile = toml::from_str(toml_text).map_err(|e| format!("config: {e}"))?;
+    let (base_url, backend_label) = resolve_endpoint(cfg.departures.endpoint.as_deref())?;
     let Some(first) = cfg.place.into_iter().next() else {
         return Ok(None);
     };
@@ -266,12 +329,15 @@ fn parse_station_config(toml_text: &str) -> Result<Option<StationConfig>, String
             lines: nonblank(first.lines),
             directions: nonblank(first.directions),
         },
+        base_url,
+        backend_label,
     }))
 }
 
 /// Load the station config from disk. `Err` carries an actionable, prefix-free
-/// message (rendered plainly, not under "can't reach BVG") when there's no
-/// file/place/station; a real read error is surfaced as-is.
+/// message (rendered plainly, not under "can't reach <backend>") when there's
+/// no file/place/station, or the configured endpoint is invalid; a real read
+/// error is surfaced as-is.
 fn load_station_config() -> Result<StationConfig, String> {
     let Some(path) = config_path() else {
         return Err("no departures station configured (HOME unset)".to_owned());
@@ -289,7 +355,8 @@ fn load_station_config() -> Result<StationConfig, String> {
     match parse_station_config(&text)? {
         Some(cfg) => Ok(cfg),
         None => Err(format!(
-            "no departures station configured — set `station` on the first [[place]] in {}",
+            "no departures station configured — set `station` on the first [[place]] in {} \
+             (outside Berlin, also set [departures].endpoint)",
             path.display()
         )),
     }
@@ -305,13 +372,26 @@ fn http_agent() -> ureq::Agent {
     config.into()
 }
 
-/// One blocking HTTP fetch + parse of the suburban departures at `station`.
-fn fetch_departures(agent: &ureq::Agent, station: &str) -> Result<Vec<Row>, String> {
-    let url = format!(
-        "https://v6.bvg.transport.rest/stops/{station}/departures\
+/// Build the departures request URL from the configured `base_url` (#1124;
+/// `https://v6.bvg.transport.rest` by default) and `station`. Pure, so the
+/// one string this whole issue is about is unit-testable without a live
+/// fetch.
+fn departures_url(base_url: &str, station: &str) -> String {
+    format!(
+        "{base_url}/stops/{station}/departures\
          ?results={FETCH_COUNT}&suburban=true&subway=false&bus=false&tram=false\
          &regional=false&express=false&ferry=false&tariff=false&language=de"
-    );
+    )
+}
+
+/// One blocking HTTP fetch + parse of the suburban departures at `station`,
+/// against `base_url`.
+fn fetch_departures(
+    agent: &ureq::Agent,
+    base_url: &str,
+    station: &str,
+) -> Result<Vec<Row>, String> {
+    let url = departures_url(base_url, station);
     let mut resp = agent.get(&url).call().map_err(|e| format!("http: {e}"))?;
     let body = resp
         .body_mut()
@@ -325,10 +405,16 @@ fn fetch_departures(agent: &ureq::Agent, station: &str) -> Result<Vec<Row>, Stri
 /// One full refresh: (re)load config, fetch, filter, stamp the walk budget, and
 /// cap to the display count. Blocking — runs on a `spawn_blocking` thread.
 /// Re-reading config here is the live-reload seam.
+///
+/// A fetch failure is wrapped with the configured backend's display label
+/// here (`"can't reach <label>: …"`, #1124) rather than left for the view
+/// layer to guess at — this is the one place that knows which backend was
+/// actually dialled.
 fn fetch_once() -> Result<Vec<Row>, String> {
     let cfg = load_station_config()?;
     let agent = http_agent();
-    let all = fetch_departures(&agent, &cfg.station)?;
+    let all = fetch_departures(&agent, &cfg.base_url, &cfg.station)
+        .map_err(|e| format!("can't reach {}: {e}", cfg.backend_label))?;
     let walk = cfg.walk_minutes;
     Ok(all
         .into_iter()
@@ -544,6 +630,68 @@ mod tests {
         assert!(!f.matches(&row("S9", "Wildau")));
     }
 
+    // ── Departures endpoint (#1124) ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_endpoint_defaults_to_bvg_when_absent_or_blank() {
+        assert_eq!(
+            resolve_endpoint(None).unwrap(),
+            ("https://v6.bvg.transport.rest".to_owned(), "BVG".to_owned())
+        );
+        assert_eq!(
+            resolve_endpoint(Some("   ")).unwrap(),
+            ("https://v6.bvg.transport.rest".to_owned(), "BVG".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_maps_known_short_names() {
+        assert_eq!(
+            resolve_endpoint(Some("bvg")).unwrap(),
+            ("https://v6.bvg.transport.rest".to_owned(), "BVG".to_owned())
+        );
+        assert_eq!(
+            resolve_endpoint(Some("vbb")).unwrap(),
+            ("https://v6.vbb.transport.rest".to_owned(), "VBB".to_owned())
+        );
+        assert_eq!(
+            resolve_endpoint(Some("db")).unwrap(),
+            ("https://v6.db.transport.rest".to_owned(), "DB".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_accepts_a_full_url_verbatim() {
+        let (url, label) = resolve_endpoint(Some("https://v6.hvv.transport.rest/")).unwrap();
+        assert_eq!(
+            url, "https://v6.hvv.transport.rest",
+            "trailing slash trimmed"
+        );
+        assert_eq!(label, url, "a custom URL labels itself");
+    }
+
+    #[test]
+    fn resolve_endpoint_rejects_an_unknown_name() {
+        let err = resolve_endpoint(Some("hamburg")).unwrap_err();
+        assert!(
+            err.contains("bvg") && err.contains("vbb") && err.contains("db"),
+            "hint should list the three names, got: {err}"
+        );
+    }
+
+    #[test]
+    fn departures_url_uses_the_configured_base_not_a_bvg_literal() {
+        let url = departures_url("https://v6.vbb.transport.rest", "900180001");
+        assert!(
+            url.starts_with("https://v6.vbb.transport.rest/stops/900180001/departures?"),
+            "got: {url}"
+        );
+        assert!(
+            !url.contains("bvg"),
+            "must not fall back to the bvg host: {url}"
+        );
+    }
+
     // ── Station config (ported subset of the native places schema) ────────────
 
     /// A realistic `places.toml` fragment in the native schema, including the
@@ -570,6 +718,25 @@ mod tests {
         assert_eq!(cfg.walk_minutes, 10);
         assert_eq!(cfg.filter.lines, ["S8", "S85", "S9"]);
         assert_eq!(cfg.filter.directions, ["Spandau", "Birkenwerder"]);
+        // No `[departures]` table → defaults to bvg (#1124).
+        assert_eq!(cfg.base_url, "https://v6.bvg.transport.rest");
+        assert_eq!(cfg.backend_label, "BVG");
+    }
+
+    #[test]
+    fn config_reads_the_configured_departures_endpoint() {
+        let toml = format!("{PLACES_TOML}\n[departures]\nendpoint = \"vbb\"\n");
+        let cfg = parse_station_config(&toml).unwrap().unwrap();
+        assert_eq!(cfg.base_url, "https://v6.vbb.transport.rest");
+        assert_eq!(cfg.backend_label, "VBB");
+    }
+
+    #[test]
+    fn config_rejects_an_unknown_departures_endpoint_even_with_no_station() {
+        // Validated before a station is even looked at (#1124).
+        let toml = "[departures]\nendpoint = \"hamburg\"\n";
+        let err = parse_station_config(toml).unwrap_err();
+        assert!(err.contains("hamburg"), "got: {err}");
     }
 
     #[test]

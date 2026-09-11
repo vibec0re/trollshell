@@ -88,10 +88,9 @@ radius_km = 12.0
 # populated filter then matches nothing, forever, and the widget just looks
 # like a quiet evening instead of telling you it's misconfigured.
 #
-# That URL is not just where ids come from — it is the ONLY network the fetch
-# will ever read: endpoint, product filter and id space are BVG (Berlin) by
-# construction (#789), so no station id outside that network resolves.
-# Outside Berlin, disable the departures plugin rather than hunting for one.
+# That URL is also where the fetch reads by default: BVG (Berlin) is the
+# transport.rest backend a station id resolves against unless `[departures]`
+# below names a different one (#1124) — outside Berlin, set that first.
 station = "900192001" # S Schöneweide Bhf (Berlin)
 
 # Walk time from here to the platform, in minutes. With this set, the list
@@ -109,6 +108,18 @@ walk_minutes = 10
 # once you've confirmed the unfiltered board works:
 # lines = ["S8", "S85", "S9"]
 # directions = ["Spandau", "Birkenwerder", "Hohen Neuendorf", "Waidmannslust"]
+
+# Departures backend (optional, #1124): which transport.rest deployment the
+# fetch talks to. Absent means bvg — Berlin only. Short names: bvg, vbb, db;
+# or paste a full https://... base URL for another transport.rest deployment
+# (e.g. hvv, oebb). Not per-place — the whole shell fetches from one backend.
+#
+# VBB and BVG share the VBB station id space, but DB uses its own EVA ids, so
+# switching backend usually means finding a new `station` id from that
+# backend's own https://v6.<name>.transport.rest/locations?query=<name> route
+# rather than reusing the one above.
+# [departures]
+# endpoint = "vbb"
 "#;
 
 /// A configured place: location identity, Wi-Fi fingerprint, and optional
@@ -477,6 +488,12 @@ pub enum PlacesError {
     Encode(String),
     /// The atomic write failed; the previous config is untouched.
     Write(String),
+    /// `[departures].endpoint` (#1124) is neither one of
+    /// [`DEPARTURES_ENDPOINT_NAMES`] nor a `http(s)://` base URL.
+    Endpoint {
+        /// The rejected raw value.
+        value: String,
+    },
 }
 
 impl std::fmt::Display for PlacesError {
@@ -513,6 +530,11 @@ impl std::fmt::Display for PlacesError {
                     "could not write places.toml ({e}); the previous config is unchanged"
                 )
             }
+            Self::Endpoint { value } => write!(
+                f,
+                "\"{value}\" is not a departures endpoint — use {} or a full http(s):// base URL",
+                DEPARTURES_ENDPOINT_NAMES.join(", ")
+            ),
         }
     }
 }
@@ -1109,6 +1131,206 @@ pub fn save_to(path: &Path, base: &[Place], next: Vec<Place>) -> Result<(), Plac
 pub fn save(base: &[Place], next: Vec<Place>) -> Result<(), PlacesError> {
     let path = config_path().ok_or(PlacesError::NoConfigPath)?;
     save_to(&path, base, next)
+}
+
+// ── Departures endpoint (#1124) ──────────────────────────────────────────────
+//
+// A single `endpoint` key in a top-level `[departures]` table — deliberately
+// *not* a `Place` field. `places_byte_identical.rs` pins `Place`'s derived
+// `Debug` output verbatim (#640/#703); any field added there shows up in that
+// output too, and the only way to keep the golden text green would be a
+// hand-written `Debug` impl that omits it. A table this reader/writer pair has
+// never heard of already round-trips untouched (the fixture's `[unrelated]`
+// table proves it), so a brand-new one costs nothing to add this way, and BVG,
+// VBB and DB are properties of *which network you live in*, not of any one
+// place: unlike `station`, a value here is not tied to a `[[place]]` block.
+
+/// Short names transport.rest answers for out of the box (#1124). Order here
+/// is the order [`PlacesError::Endpoint`]'s hint lists them in.
+pub const DEPARTURES_ENDPOINT_NAMES: [&str; 3] = ["bvg", "vbb", "db"];
+
+/// `https://v6.<name>.transport.rest` — the HAFAS v6 REST base a short name
+/// maps to. Meaningful only for a `name` in [`DEPARTURES_ENDPOINT_NAMES`];
+/// [`resolve_departures_endpoint`] is the one caller and already checked
+/// membership first.
+#[must_use]
+pub fn departures_base_url(name: &str) -> String {
+    format!("https://v6.{name}.transport.rest")
+}
+
+/// Resolve a configured `[departures].endpoint` value into the base URL the
+/// departures fetch should hit:
+/// * `None`, or blank — the key absent, or present but empty — → `bvg`'s URL,
+///   so an existing config with no key behaves exactly as before.
+/// * A name in [`DEPARTURES_ENDPOINT_NAMES`] → that name's URL.
+/// * Anything starting `http://` or `https://` → used verbatim, minus a
+///   trailing slash.
+/// * Anything else → [`PlacesError::Endpoint`].
+///
+/// # Errors
+/// [`PlacesError::Endpoint`] for a value that is neither a recognised name nor
+/// a URL.
+pub fn resolve_departures_endpoint(endpoint: Option<&str>) -> Result<String, PlacesError> {
+    let Some(value) = endpoint.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(departures_base_url("bvg"));
+    };
+    if value.starts_with("http://") || value.starts_with("https://") {
+        return Ok(value.trim_end_matches('/').to_owned());
+    }
+    if DEPARTURES_ENDPOINT_NAMES.contains(&value) {
+        return Ok(departures_base_url(value));
+    }
+    Err(PlacesError::Endpoint {
+        value: value.to_owned(),
+    })
+}
+
+/// Validate a configured endpoint without needing its resolved URL — what an
+/// editor calls before a save. Same rules as [`resolve_departures_endpoint`].
+///
+/// # Errors
+/// [`PlacesError::Endpoint`], as [`resolve_departures_endpoint`].
+pub fn validate_departures_endpoint(endpoint: Option<&str>) -> Result<(), PlacesError> {
+    resolve_departures_endpoint(endpoint).map(|_| ())
+}
+
+/// The `[departures]` table, as read. Only `endpoint` exists today; unknown
+/// keys are ignored rather than rejected, matching [`PlaceCfg`]'s own
+/// tolerance.
+#[derive(serde::Deserialize, Default)]
+struct DeparturesCfg {
+    #[serde(default)]
+    endpoint: Option<String>,
+}
+
+/// A config file, from the departures table's point of view — `place` isn't
+/// modelled here, so it's ignored rather than rejected the same way an
+/// unrelated top-level table is.
+#[derive(serde::Deserialize, Default)]
+struct DeparturesConfigFile {
+    #[serde(default)]
+    departures: DeparturesCfg,
+}
+
+/// Parse the `[departures].endpoint` key out of a `places.toml` body, if any.
+/// Pure, so the schema is unit-testable independently of `[[place]]` parsing.
+/// An absent table, an absent key, or a blank value all read as `None` — "use
+/// the default", not an error.
+///
+/// # Errors
+/// A `String` if `toml_text` isn't valid TOML.
+pub fn parse_departures_endpoint(toml_text: &str) -> Result<Option<String>, String> {
+    let cfg: DeparturesConfigFile =
+        toml::from_str(toml_text).map_err(|e| format!("config: {e}"))?;
+    Ok(cfg
+        .departures
+        .endpoint
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty()))
+}
+
+/// Load the configured endpoint from `~/.config/trollshell/places.toml`.
+/// `None` for a missing file, an unreadable/unparseable one, or an absent/
+/// blank key — every "can't tell" case reads the same as "use the default",
+/// mirroring [`load_places`] falling back to [`builtin_default`].
+#[must_use]
+pub fn load_departures_endpoint() -> Option<String> {
+    let path = config_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_departures_endpoint(&text).ok().flatten()
+}
+
+/// Render `endpoint` into `[departures].endpoint` of whatever document
+/// `existing` holds, patching it rather than rebuilding — the endpoint-only
+/// counterpart to [`render_places`], for the same format-preserving reasons,
+/// and touching nothing [`render_places`] itself would touch.
+///
+/// `endpoint: None` (or blank) removes the key — and the whole `departures`
+/// table, if this was its only key — rather than writing it blank: the schema
+/// spells "use the default" as an absent key, the same convention `station`
+/// uses. Validated *before* the document is touched, so a rejected save never
+/// partially writes.
+///
+/// # Errors
+/// [`PlacesError::Endpoint`] when `endpoint` is `Some` and neither a
+/// recognised name nor a URL. [`PlacesError::Encode`] when `existing` isn't
+/// valid TOML, or when a `departures` key exists but isn't a table.
+pub fn render_departures_endpoint(
+    existing: &str,
+    endpoint: Option<&str>,
+) -> Result<String, PlacesError> {
+    let normalized = endpoint.map(str::trim).filter(|s| !s.is_empty());
+    validate_departures_endpoint(normalized)?;
+
+    let mut doc: toml_edit::DocumentMut = existing.parse().map_err(|e: toml_edit::TomlError| {
+        PlacesError::Encode(format!("the file being replaced is not valid TOML: {e}"))
+    })?;
+    let root = doc.as_table_mut();
+    match normalized {
+        Some(value) => {
+            match root.get("departures") {
+                None => {
+                    root.insert(
+                        "departures",
+                        toml_edit::Item::Table(toml_edit::Table::new()),
+                    );
+                }
+                Some(item) if item.is_table() => {}
+                Some(_) => {
+                    return Err(PlacesError::Encode(
+                        "`departures` exists but isn't a table".to_owned(),
+                    ));
+                }
+            }
+            let table = root
+                .get_mut("departures")
+                .and_then(toml_edit::Item::as_table_mut)
+                .expect("just ensured `departures` is a table");
+            set_value(table, "endpoint", toml_edit::Value::from(value));
+        }
+        None => {
+            if let Some(table) = root
+                .get_mut("departures")
+                .and_then(toml_edit::Item::as_table_mut)
+            {
+                table.remove("endpoint");
+                if table.is_empty() {
+                    root.remove("departures");
+                }
+            }
+        }
+    }
+    Ok(doc.to_string())
+}
+
+/// Patch + atomically write the departures endpoint to `path`. The
+/// endpoint-only counterpart to [`persist_to`].
+///
+/// # Errors
+/// As [`render_departures_endpoint`], plus [`PlacesError::Write`] if the
+/// atomic write fails; the previous config is then untouched.
+pub fn persist_departures_endpoint_to(
+    path: &Path,
+    endpoint: Option<&str>,
+) -> Result<(), PlacesError> {
+    let existing = std::fs::read_to_string(path).unwrap_or_else(|_| DEFAULT_CONFIG.to_owned());
+    let body = render_departures_endpoint(&existing, endpoint)?;
+    config_file::write_atomic(path, &body, config_file::Durability::FsyncParent)
+        .map_err(|e| PlacesError::Write(e.to_string()))
+}
+
+/// [`persist_departures_endpoint_to`] against the user's real
+/// `~/.config/trollshell/places.toml`. No `check_base` counterpart here (as
+/// [`save_to`] has for places): the key is a single scalar with no set of
+/// things that could have drifted from underneath an edit the way
+/// `[[place]]` can.
+///
+/// # Errors
+/// [`PlacesError::NoConfigPath`] when `$HOME` is unset, else as
+/// [`persist_departures_endpoint_to`].
+pub fn save_departures_endpoint(endpoint: Option<&str>) -> Result<(), PlacesError> {
+    let path = config_path().ok_or(PlacesError::NoConfigPath)?;
+    persist_departures_endpoint_to(&path, endpoint)
 }
 
 #[cfg(test)]
@@ -2174,5 +2396,214 @@ mine = true
     /// a tempdir without mutating `$HOME`.
     fn load_from(path: &Path) -> Vec<Place> {
         parse_places(&std::fs::read_to_string(path).expect("readable")).expect("parses")
+    }
+
+    // ── Departures endpoint (#1124) ───────────────────────────────────────────
+
+    #[test]
+    fn resolve_departures_endpoint_defaults_to_bvg_when_absent_or_blank() {
+        assert_eq!(
+            resolve_departures_endpoint(None).unwrap(),
+            "https://v6.bvg.transport.rest"
+        );
+        assert_eq!(
+            resolve_departures_endpoint(Some("   ")).unwrap(),
+            "https://v6.bvg.transport.rest"
+        );
+    }
+
+    #[test]
+    fn resolve_departures_endpoint_maps_the_three_short_names() {
+        assert_eq!(
+            resolve_departures_endpoint(Some("bvg")).unwrap(),
+            "https://v6.bvg.transport.rest"
+        );
+        assert_eq!(
+            resolve_departures_endpoint(Some("vbb")).unwrap(),
+            "https://v6.vbb.transport.rest"
+        );
+        assert_eq!(
+            resolve_departures_endpoint(Some("db")).unwrap(),
+            "https://v6.db.transport.rest"
+        );
+    }
+
+    #[test]
+    fn resolve_departures_endpoint_accepts_a_full_url_verbatim() {
+        assert_eq!(
+            resolve_departures_endpoint(Some("https://v6.hvv.transport.rest/")).unwrap(),
+            "https://v6.hvv.transport.rest",
+            "trailing slash trimmed"
+        );
+    }
+
+    #[test]
+    fn resolve_departures_endpoint_rejects_an_unknown_name_with_a_hint() {
+        let err = resolve_departures_endpoint(Some("hamburg")).unwrap_err();
+        assert_eq!(
+            err,
+            PlacesError::Endpoint {
+                value: "hamburg".to_owned()
+            }
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("bvg") && text.contains("vbb") && text.contains("db"),
+            "hint should list the three names, got: {text}"
+        );
+    }
+
+    #[test]
+    fn validate_departures_endpoint_agrees_with_resolve() {
+        assert!(validate_departures_endpoint(None).is_ok());
+        assert!(validate_departures_endpoint(Some("db")).is_ok());
+        assert!(validate_departures_endpoint(Some("hamburg")).is_err());
+    }
+
+    #[test]
+    fn parse_departures_endpoint_reads_absent_present_and_blank() {
+        assert_eq!(parse_departures_endpoint("").unwrap(), None);
+        assert_eq!(
+            parse_departures_endpoint("[[place]]\nname = \"Home\"\n").unwrap(),
+            None,
+            "no [departures] table at all"
+        );
+        assert_eq!(
+            parse_departures_endpoint("[departures]\nendpoint = \"vbb\"\n").unwrap(),
+            Some("vbb".to_owned())
+        );
+        assert_eq!(
+            parse_departures_endpoint("[departures]\nendpoint = \"  \"\n").unwrap(),
+            None,
+            "a blank value reads the same as absent"
+        );
+    }
+
+    #[test]
+    fn parse_departures_endpoint_malformed_is_err() {
+        assert!(parse_departures_endpoint("[departures]\nendpoint = ").is_err());
+    }
+
+    /// A file with no `[departures]` table, an unrelated top-level table and a
+    /// `[[place]]` array — the same shape [`FIXTURE`] in
+    /// `places_byte_identical.rs` pins, kept local here so this file's own
+    /// tests don't depend on an integration test's fixture.
+    const NO_DEPARTURES_TABLE: &str = "# A comment.\n\n[[place]]\nname = \"Home\"\nlat = 1.0\nlon = 2.0\n\n[unrelated]\nkept = true\n";
+
+    #[test]
+    fn render_departures_endpoint_absent_key_leaves_a_table_less_file_untouched() {
+        // The writer's half of the byte-identical promise: nothing to do when
+        // there is no key and nothing was asked for.
+        let rendered = render_departures_endpoint(NO_DEPARTURES_TABLE, None).unwrap();
+        assert_eq!(rendered, NO_DEPARTURES_TABLE);
+    }
+
+    #[test]
+    fn render_departures_endpoint_writes_a_fresh_table_and_preserves_the_rest() {
+        let rendered = render_departures_endpoint(NO_DEPARTURES_TABLE, Some("vbb")).unwrap();
+        assert!(rendered.contains("[departures]"));
+        assert!(rendered.contains("endpoint = \"vbb\""));
+        // Everything else — the comment, the place, the unrelated table —
+        // survives untouched.
+        assert!(rendered.contains("# A comment."));
+        assert!(rendered.contains("name = \"Home\""));
+        assert!(rendered.contains("[unrelated]\nkept = true"));
+        // A reparse gets the same value back.
+        assert_eq!(
+            parse_departures_endpoint(&rendered).unwrap(),
+            Some("vbb".to_owned())
+        );
+    }
+
+    #[test]
+    fn render_departures_endpoint_updates_an_existing_key_and_keeps_its_comment() {
+        let existing = "# a hand comment on the key\n[departures]\nendpoint = \"vbb\" # was vbb\n";
+        let rendered = render_departures_endpoint(existing, Some("db")).unwrap();
+        assert!(rendered.contains("# a hand comment on the key"));
+        assert!(rendered.contains("endpoint = \"db\""));
+        assert!(
+            !rendered.contains("was vbb"),
+            "the trailing value comment does not survive a changed value, matching `station`"
+        );
+    }
+
+    #[test]
+    fn render_departures_endpoint_none_removes_the_key_and_the_table() {
+        let existing = "[departures]\nendpoint = \"vbb\"\n";
+        let rendered = render_departures_endpoint(existing, None).unwrap();
+        assert_eq!(parse_departures_endpoint(&rendered).unwrap(), None);
+        assert!(
+            !rendered.contains("[departures]"),
+            "an emptied table is dropped entirely, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_departures_endpoint_none_keeps_a_departures_table_with_other_keys() {
+        let existing = "[departures]\nendpoint = \"vbb\"\nunrelated_future_key = true\n";
+        let rendered = render_departures_endpoint(existing, None).unwrap();
+        assert_eq!(parse_departures_endpoint(&rendered).unwrap(), None);
+        assert!(
+            rendered.contains("[departures]") && rendered.contains("unrelated_future_key"),
+            "a table with a key this model doesn't own survives, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_departures_endpoint_rejects_an_invalid_value_and_touches_nothing() {
+        let err = render_departures_endpoint(NO_DEPARTURES_TABLE, Some("hamburg")).unwrap_err();
+        assert_eq!(
+            err,
+            PlacesError::Endpoint {
+                value: "hamburg".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn render_departures_endpoint_refuses_a_non_table_departures_key() {
+        let existing = "departures = \"not a table\"\n";
+        assert!(matches!(
+            render_departures_endpoint(existing, Some("vbb")),
+            Err(PlacesError::Encode(_))
+        ));
+    }
+
+    #[test]
+    fn persist_departures_endpoint_to_writes_and_reads_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("places.toml");
+        std::fs::write(&path, NO_DEPARTURES_TABLE).expect("seed");
+
+        persist_departures_endpoint_to(&path, Some("db")).expect("persist");
+        let saved = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            parse_departures_endpoint(&saved).unwrap(),
+            Some("db".to_owned())
+        );
+        // The rest of the file is untouched.
+        assert!(saved.contains("name = \"Home\""));
+        assert!(saved.contains("[unrelated]\nkept = true"));
+
+        // An invalid value is refused and the file is left exactly as it was.
+        let before = std::fs::read_to_string(&path).expect("readable");
+        assert!(persist_departures_endpoint_to(&path, Some("hamburg")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).expect("readable"), before);
+
+        // Unsetting it again round-trips to the table-less shape.
+        persist_departures_endpoint_to(&path, None).expect("unset");
+        let cleared = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(parse_departures_endpoint(&cleared).unwrap(), None);
+        assert!(!cleared.contains("[departures]"));
+    }
+
+    #[test]
+    fn save_departures_endpoint_no_config_path_without_home() {
+        temp_env::with_var_unset("HOME", || {
+            assert_eq!(
+                save_departures_endpoint(Some("vbb")),
+                Err(PlacesError::NoConfigPath)
+            );
+        });
     }
 }

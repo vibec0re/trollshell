@@ -318,14 +318,18 @@ fn safe_line(line: &str) -> String {
         .collect()
 }
 
-/// The error-row text. Fetch failures carry a lowercase `kind:` prefix from the
-/// [`feed`] helpers (`http:` / `body:` / `decode:` / `join:`); those get the
-/// native widget's "can't reach BVG" reachability context. A configuration
-/// message (no such prefix) is shown as-is, so its actionable hint isn't buried.
+/// The error-row text. `feed`'s own [`feed::fetch_once`]-level errors already
+/// carry their actionable framing by the time they land here: a
+/// `"can't reach <backend>: …"` prefix for a network fault (#1124 moved that
+/// wrapping into `feed`, which is the one place that knows which backend was
+/// actually dialled — it used to be hardcoded "BVG" here, unconditionally
+/// wrong for a `vbb`/`db`/custom endpoint), or a plain config hint otherwise.
+/// The one kind `feed` can't label this way is a `spawn_blocking` join
+/// failure (`"join: …"`, the fetch task itself panicked before any backend was
+/// resolved) — given a generic reachability wrap here rather than left bare.
 fn error_text(err: &str) -> String {
-    const NET_PREFIXES: [&str; 4] = ["http:", "body:", "decode:", "join:"];
-    if NET_PREFIXES.iter().any(|p| err.starts_with(p)) {
-        format!("can't reach BVG: {err}")
+    if let Some(detail) = err.strip_prefix("join:") {
+        format!("can't reach the departures backend:{detail}")
     } else {
         err.to_owned()
     }
@@ -896,18 +900,34 @@ mod tests {
     }
 
     #[test]
-    fn error_text_wraps_fetch_errors_but_shows_config_hints_plainly() {
+    fn error_text_shows_feeds_own_reachability_wrap_unchanged() {
+        // `feed::fetch_once` already names the configured backend (#1124) — no
+        // double-wrap here, and critically no hardcoded "BVG" for a `vbb`/`db`
+        // config.
         assert_eq!(
-            error_text("http: connection refused"),
-            "can't reach BVG: http: connection refused"
+            error_text("can't reach VBB: http: connection refused"),
+            "can't reach VBB: http: connection refused"
         );
         assert_eq!(
-            error_text("decode: bad json"),
-            "can't reach BVG: decode: bad json"
+            error_text("can't reach DB: decode: bad json"),
+            "can't reach DB: decode: bad json"
         );
-        // A no-station hint isn't a reachability problem — no prefix.
+    }
+
+    #[test]
+    fn error_text_shows_config_hints_plainly() {
         let hint = "no departures station configured — set `station` in places.toml";
         assert_eq!(error_text(hint), hint);
+    }
+
+    #[test]
+    fn error_text_wraps_a_bare_join_failure() {
+        // The one kind that never passes through `feed`'s own backend-aware
+        // wrap: the fetch task panicked before any backend was resolved.
+        assert_eq!(
+            error_text("join: task panicked"),
+            "can't reach the departures backend: task panicked"
+        );
     }
 
     // ── next_state — ported transition table ─────────────────────────────────
@@ -1124,6 +1144,23 @@ mod tests {
             &kids[0],
             Node::Text { text, classes, .. }
                 if text.starts_with("no departures station configured")
+                    && classes == &["ts-departures-error"]
+        ));
+    }
+
+    #[test]
+    fn view_network_error_names_the_configured_backend_not_bvg() {
+        // #1124: a vbb/db config's fetch failure must not read "can't reach
+        // BVG" — `feed` already stamped the real backend in.
+        let (mut board, _rx) = fresh();
+        board.update(Input::App(BoardMsg::Fetched(Err(
+            "can't reach VBB: http: connection refused".to_owned(),
+        ))));
+        let kids = root_children(&board);
+        assert!(matches!(
+            &kids[0],
+            Node::Text { text, classes, .. }
+                if text == "can't reach VBB: http: connection refused"
                     && classes == &["ts-departures-error"]
         ));
     }

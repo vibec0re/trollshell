@@ -406,6 +406,30 @@
                 touch $out
               '';
 
+          # `programs.trollshell.claudeBridge.baseUrl` (`nix/module-common.nix`)
+          # is a plain nix string literal naming the same socket
+          # `crates/hytte-ai-providers/src/unix.rs`'s `BRIDGE_SOCKET_DIR`/
+          # `BRIDGE_SOCKET_FILE`/`BRIDGE_BASE_URL` constants define and
+          # `crates/hytte-claude-bridge/src/main.rs`'s module doc restates in
+          # prose (#1099 review M1, #1100). Nothing compiles the nix literal
+          # against the Rust constants, or the Rust doc sentence against the
+          # constants it describes — #1099's review measured that a rename of
+          # the Rust file name left `cargo test`, `cargo clippy` and every
+          # module-eval check green, because the daemon binds a path only a
+          # live session would notice went stale. Same posture as `bind-pins`
+          # above: a source-level defect no compile in this flake can see, so
+          # a script rather than a test, with no cargoArtifacts so it goes red
+          # in seconds. `nix/lint-bridge-socket.py`'s own header has the full
+          # story, including why this is not a `cargo test` (the
+          # `core-leds-vocab` crane-filter reasoning applies unchanged).
+          bridge-socket =
+            pkgs.runCommand "trollshell-bridge-socket-check" { nativeBuildInputs = [ pkgs.python3 ]; }
+              ''
+                cd ${self}
+                python3 nix/lint-bridge-socket.py
+                touch $out
+              '';
+
           # The preem GL renderer's shaders, compiled in the dialect the shell
           # compiles them in (#893 stage B). Same posture and same reasons as
           # `bind-pins` above: a source-level defect no compile in this flake

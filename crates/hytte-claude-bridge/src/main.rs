@@ -111,10 +111,11 @@
 //!
 //! # Where `ANTHROPIC_API_KEY` comes from, after #866
 //!
-//! Under the **static unit** (`etc/systemd/user/trollshell-claude-bridge.service`,
-//! still the reference for hand-installed deployments) the variable is scrubbed
-//! by `UnsetEnvironment=`, so `~/.config/trollshell/anthropic.key` is the only
-//! source that works there (#752).
+//! Under the **retired static unit** (`etc/systemd/user/trollshell-claude-bridge.service`,
+//! removed in #890 — there is no shipped unit to point an operator at any
+//! more) the variable used to be scrubbed by `UnsetEnvironment=`, so
+//! `~/.config/trollshell/anthropic.key` was the only source that worked there
+//! (#752).
 //!
 //! Under the **launcher** the shape is different by design. A transient unit
 //! spawned by `systemd-run` carries no `UnsetEnvironment=`, so that scrub does

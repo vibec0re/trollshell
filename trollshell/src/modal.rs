@@ -1066,10 +1066,12 @@ fn on_active_show(panel: &ModalPanel, active: &Active) {
     match active {
         Active::Builtin(page) => on_page_show(panel, *page),
         Active::Plugin(id) => crate::plugins::set_active_panel(Some(id)),
-        // Nothing: the form is already seeded — `panels::workspace_edit::open`
-        // publishes the whole `Draft` before the switch, because a name alone
-        // would not be enough to rebuild the form (that module's doc says why).
-        Active::WorkspaceEdit(_) => {}
+        // The form is already seeded — `panels::workspace_edit::open` publishes
+        // the whole `Draft` before the switch, because a name alone would not be
+        // enough to rebuild the form (that module's doc says why). The one thing
+        // left is #1108's width cap, so the drawer does not jump narrower the
+        // moment ✎ is pressed.
+        Active::WorkspaceEdit(_) => apply_workspace_edit_width_cap(panel),
     }
 }
 
@@ -2116,6 +2118,25 @@ fn apply_workspaces_width_cap(panel: &ModalPanel) {
         return;
     };
     clamp.set_size_request(scale(DRAWER_MAX_WIDTH_WIDE), -1);
+}
+
+/// The same cap for the Workspaces **Edit** sub-page (#1108 × #1071 phase 4).
+///
+/// Without it the drawer visibly jumps narrower the moment ✎ is pressed and back
+/// when Save or Cancel returns: the sub-page *is* the Workspaces page with its
+/// content replaced, so it has to measure the same.
+///
+/// A separate function rather than a parameter on
+/// [`apply_workspaces_width_cap`] because the two children are different shapes.
+/// That one's child is `finish_page_clamped`'s `adw::Clamp` directly; this one's
+/// is `panels::workspace_edit::edit_slot`'s bind container — a `gtk::Box` whose
+/// child is rebuilt per selection — so there is no clamp to downcast to at this
+/// level, and the request goes on the box that holds it.
+fn apply_workspace_edit_width_cap(panel: &ModalPanel) {
+    let Some(widget) = panel.stack.child_by_name(WORKSPACE_EDIT_STACK_CHILD) else {
+        return;
+    };
+    widget.set_size_request(scale(DRAWER_MAX_WIDTH_WIDE), -1);
 }
 
 #[cfg(test)]

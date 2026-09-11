@@ -15,6 +15,17 @@
 //! *deserialising* the merged table, so it lives in [`crate::subsystem`] where
 //! the schema type is known.
 //!
+//! Rule 2 has one **reader-side corollary**, and it lives over there for the
+//! same reason rule 4 does — answering it needs the schema. A table left
+//! carrying no key the schema owns reads as **absent**, so an `Option<Table>`
+//! over it is `None` rather than a struct full of defaults (#1025): since
+//! #1008 the writer deliberately keeps a table the user has lines in — a
+//! marker, a key the schema does not know — even when the schema's own value
+//! went away, and a reader that turned those lines into defaults would write
+//! the defaults back on the next save. Nothing here is involved in it: the
+//! merged table is all it reads, and [`crate::subsystem::assemble`]'s own
+//! `read_merged` argues it in full.
+//!
 //! # "Absent is not null", in a format with no null
 //!
 //! TOML has no null literal, so the difference between "I did not mention this
@@ -117,6 +128,15 @@ pub fn merge_into(base: &mut toml::Table, overlay: &toml::Table) {
             // Tables: deep merge, key by key. Without this arm the whole
             // sub-table would be replaced and every key the overlay did not
             // restate would vanish.
+            //
+            // A union of keys, so the result carries a key the schema owns iff
+            // some layer did — which is what lets rule 2's reader-side
+            // corollary (#1025, module docs) be asked once of the merged table
+            // rather than layer by layer, and lets a marker's erasure be
+            // honoured *before* it is asked. The corollary reads nothing but
+            // the merged table: whether a block ended up empty because a marker
+            // emptied it or because the user typed it that way is a difference
+            // it deliberately does not consult (#1088 review, M2).
             (Some(toml::Value::Table(into)), toml::Value::Table(from)) => merge_into(into, from),
             // Everything else — scalars, arrays, and a table with nothing (or
             // a scalar) under it — replaces whole. An array is deliberately

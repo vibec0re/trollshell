@@ -553,6 +553,10 @@ fn parse_layer(body: &str, path: Option<&Path>) -> Result<toml::Table, ConfigErr
 /// body (**lowest precedence first**), merged, checked against the schema and
 /// validated. No I/O, so every rule above is unit-testable.
 ///
+/// Rule 2's reader-side corollary — a table carrying no key the schema owns
+/// reads as absent, so an `Option<Table>` over it is `None` (#1025) — is
+/// applied here, by [`read_merged`], which carries the argument.
+///
 /// # Errors
 /// [`ConfigError::Parse`] for a layer that is not TOML, [`ConfigError::Schema`]
 /// for a known key of the wrong type, [`ConfigError::Invalid`] when
@@ -618,11 +622,7 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
 
     let merged = merge::merge_all(tables);
 
-    let mut unknown_keys = Vec::new();
-    let config: S = serde_ignored::deserialize(merged.into_deserializer(), |path| {
-        unknown_keys.push(dotted_key(&path));
-    })
-    .map_err(|e| ConfigError::Schema(e.to_string()))?;
+    let (config, unknown_keys) = read_merged::<S>(merged)?;
 
     // Rule 4: loud, but never fatal. A typo must be visible and must not take
     // the shell down.
@@ -643,6 +643,303 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
         sources: layers.iter().map(|(path, _)| path.clone()).collect(),
         unknown_keys,
     })
+}
+
+/// The key [`schema_descends`] plants. Long and namespaced because a schema
+/// that happens to own a key by this name would answer the probe's question
+/// with its own — and the only consequence of a collision is a table not read
+/// as absent, never one wrongly dropped.
+const DESCEND_PROBE_KEY: &str = "_hytte_probe_is_this_table_walked";
+
+/// The one message a table the schema will not let go of produces.
+///
+/// A `const` for the same anti-drift reason as [`MALFORMED_UNSET_MESSAGE`]: the
+/// test selects on it exactly.
+const REQUIRED_TABLE_MESSAGE: &str = "table has no key this schema owns, but the schema will not load without it; \
+     keeping it, so its keys read as their defaults";
+
+/// The merged table read as `S`, beside the dotted paths of the keys `S`'s
+/// schema does not know.
+///
+/// # Rule 2's reader-side corollary: a table with nothing of the schema's in it reads as absent (#1025)
+///
+/// Since #1008 a save keeps a table the user has lines in — a
+/// [`merge::UNSET_KEY`] marker, a key the schema does not know — even when the
+/// schema's `Option<Table>` for it went to `None`; [`render_overlay`] carries
+/// the argument for why the bytes are theirs. The consequence on the way back
+/// in is this function's business: plain `serde` reads `Option<T>` as `None`
+/// only when the key is entirely **absent**, so the table those lines keep
+/// alive used to come back as `Some(<per-field defaults>)` — `brightness = 0`,
+/// `color = ""` — and the next save wrote the degenerate values into the file.
+/// A field's `None` has to round-trip, or an `Option<Table>` is a shape no
+/// subsystem can safely use.
+///
+/// So a table carrying **no key the schema owns** reads as absent, on two
+/// conditions, each decided per table by asking the schema rather than by
+/// guessing at it:
+///
+/// 1. **The schema descends into it** — it is a struct whose keys the schema
+///    knows, not a value it swallows whole. [`schema_descends`] is the
+///    question; the paragraph below is why it has to be asked.
+/// 2. **The schema loads without it.** Removing it and re-reading is the whole
+///    test, and the only thing here that can tell an `Option<Table>` from a
+///    required one.
+///
+/// **Per table, never per document** (#1088 review, H1). The re-read decides
+/// one candidate at a time, against the document with every drop accepted so
+/// far already applied, and a candidate the schema refuses is put back and
+/// recorded — so a required sibling costs only itself. Deciding once for the
+/// whole document meant a required `needs` dragged an unrelated, legitimately
+/// absent `core` back to `Some(0, "", [])`, which is #1025's own hole
+/// reappearing one schema field away. Putting a table back is also the one
+/// place a schema fact here is worth saying out loud, so it warns
+/// ([`REQUIRED_TABLE_MESSAGE`]).
+///
+/// **Why "does the schema descend" is a separate question** (#1088 review, M2
+/// and M3). `core = {}` and `style = {}` are the same bytes and want opposite
+/// answers: an `Option<Table>` the user typed empty holds nothing of the
+/// schema's and should read as absent, while a field of type [`toml::Value`] —
+/// #1040's shape, so one bad key never takes its siblings down — is *holding*
+/// that empty table as its value, and taking it away would take the key from
+/// [`Subsystem::parsed`], whose whole job is to say out loud that it is not a
+/// valid one. "Does the schema load without it" cannot separate them: a
+/// `#[serde(default)]` [`toml::Value`] field loads perfectly well without its
+/// key. Only the shape of the field separates them, so that is what is asked.
+///
+/// **A map is outside the rule; its entries are not** (#1088 review, LOW-1).
+/// `core = {}` on a `BTreeMap<String, Core>` field stays an empty map, because
+/// the map itself swallows the table — but each *entry* of it is a struct the
+/// schema walks, so `[core.a]` with nothing of `Core`'s in it reads as absent
+/// and the entry goes. For a struct field, "absent" is a shape the schema
+/// declared; a map key is the user's own content and has no `None` to
+/// round-trip into, so the two are not the same question. No `Subsystem` in
+/// this workspace has a map-typed field, which is the only reason this is
+/// written down rather than fixed: the first author to type one should decide
+/// it deliberately.
+///
+/// # Passes
+///
+/// The document is read once as it stands, and once more per candidate:
+///
+/// * [`Loaded::unknown_keys`] comes from the **first** pass, always. Pruning
+///   only removes keys, so a later pass cannot see one the first did not, and
+///   rule 4 must still name the key that made the table absent — it is the
+///   likeliest thing the user got wrong in that block.
+/// * A **first** pass that fails is reported as it always was. Without the
+///   ignored set there is no answer to "schema-owned", and inventing one would
+///   drop a table on uncertain information — the mirror of the rule
+///   [`schema_paths`] applies to removal on the writing side.
+/// * The config handed back is the one that came out of the last accepted
+///   candidate, so it always matches the document as it finally stands.
+///
+/// The walk is **greedy, not a search**: a candidate the schema refuses is
+/// recorded, which makes the table above it owned, so an outer table that could
+/// have been dropped whole is never tried. That is `main`'s answer for the
+/// shape anyway (`[a.b]` where `b` is required inside an optional `a` reads as
+/// `Some`), and the refusal is warned about, so it is visible rather than
+/// merely conservative.
+///
+/// [`schema_paths`] deliberately keeps its own raw `serde_ignored` pass rather
+/// than coming through here: it wants the ignored set of the document *as
+/// written*, and a pruned pass would stop reporting the user's key inside a
+/// dropped table, which is precisely how [`patch`] would come to count it as
+/// schema-owned and delete it.
+fn read_merged<S: Subsystem>(merged: toml::Table) -> Result<(S, Vec<String>), ConfigError> {
+    // Only a table-valued key can ever read as absent, and every nested table
+    // lives inside a top-level one — so this is the whole test, and a flat
+    // schema (`CoreLedsConfig`, the only live one, and the one on the watch
+    // path) never pays for the clone on a reload (#1088 review, L3).
+    let candidates_possible = merged.values().any(toml::Value::is_table);
+    let pruned = candidates_possible.then(|| merged.clone());
+
+    let mut unknown_keys = Vec::new();
+    let mut config: S = serde_ignored::deserialize(merged.into_deserializer(), |path| {
+        unknown_keys.push(dotted_key(&path));
+    })
+    .map_err(|e| ConfigError::Schema(e.to_string()))?;
+
+    let Some(mut doc) = pruned else {
+        return Ok((config, unknown_keys));
+    };
+
+    let unknown: BTreeSet<&str> = unknown_keys.iter().map(String::as_str).collect();
+    // Tables the schema turned out to insist on. Recomputing the candidate list
+    // each round is what makes the cascade work — a table whose last live
+    // sub-table was just dropped becomes a candidate itself — and this is what
+    // stops it being recomputed forever.
+    let mut required: BTreeSet<String> = BTreeSet::new();
+
+    loop {
+        let mut candidates = Vec::new();
+        absent_tables::<S>(&doc, &doc, "", &unknown, &required, &mut candidates);
+        // Deepest first, so an inner table is decided before the outer one that
+        // may only be absent because the inner one went.
+        let Some(path) = candidates.into_iter().next() else {
+            break;
+        };
+        let Some(table) = take_at(&mut doc, &path) else {
+            // The one way this happens is a schema key with a literal `.` in
+            // its name, which [`split_path`] reads as a nesting hop and cannot
+            // resolve. Recorded as required and skipped, **not** broken out of:
+            // a `break` here abandoned the rule for the whole document, so an
+            // unrelated sibling flipped a legitimately absent `Option<Table>`
+            // back to `Some(<field defaults>)` — H1's shape, in the one path
+            // "a table not dropped" was supposed to describe (#1088 review,
+            // LOW-2). Recording it is what makes the skip terminate.
+            required.insert(path);
+            continue;
+        };
+        match reads_as::<S>(&doc) {
+            Ok(next) => config = next,
+            Err(message) => {
+                // Order inside the document does not survive the round trip
+                // through `remove`/`insert`, and does not need to: this table
+                // is only ever deserialised, never rendered back to bytes.
+                put_at(&mut doc, &path, table);
+                tracing::warn!(
+                    subsystem = S::NAME,
+                    key = %path,
+                    error = %message,
+                    "{REQUIRED_TABLE_MESSAGE}"
+                );
+                required.insert(path);
+            }
+        }
+    }
+
+    Ok((config, unknown_keys))
+}
+
+/// Every table in `table` that carries no key the schema owns, **deepest
+/// first**, with `doc` the whole document the paths are rooted in.
+///
+/// `unknown` is [`serde_ignored`]'s report over `doc`, as [`dotted_key`] paths,
+/// so a key in it was one the schema never descended into — the whole key is
+/// the user's, table or not, and it is neither counted nor walked. Every other
+/// key **is** the schema's, and only a table can then still turn out to be
+/// absent. A table already in `required` counts as owned: the schema said it
+/// needs that one, which makes it as much the schema's as any key.
+///
+/// [`schema_descends`] is only asked about an **empty** table. A non-empty
+/// candidate is one whose every key is either a key `serde_ignored` reported —
+/// which is itself proof the schema walked this table to reach it — or a
+/// sub-table that answered the same question one level down.
+///
+/// The dotted paths carry [`schema_paths`]' quoted-key ambiguity: a key with a
+/// literal `.` in it reads like a nesting hop. The consequence here is a table
+/// not dropped rather than one wrongly dropped, and no schema in the workspace
+/// has such a key.
+fn absent_tables<S: Subsystem>(
+    doc: &toml::Table,
+    table: &toml::Table,
+    prefix: &str,
+    unknown: &BTreeSet<&str>,
+    required: &BTreeSet<String>,
+    out: &mut Vec<String>,
+) -> bool {
+    let mut owned = false;
+
+    for (key, value) in table {
+        let path = format!("{prefix}{key}");
+        if unknown.contains(path.as_str()) {
+            continue;
+        }
+        let Some(nested) = value.as_table() else {
+            owned = true;
+            continue;
+        };
+        let nested_owned =
+            absent_tables::<S>(doc, nested, &format!("{path}."), unknown, required, out);
+        let absent = !nested_owned
+            && !required.contains(path.as_str())
+            && (!nested.is_empty() || schema_descends::<S>(doc, &path));
+        if absent {
+            out.push(path);
+        } else {
+            owned = true;
+        }
+    }
+
+    owned
+}
+
+/// Does `S`'s schema **walk the keys** of the table at `path`, or does it take
+/// the table whole as one value?
+///
+/// Asked by planting one key no schema is expected to own and seeing whether
+/// [`serde_ignored`] reports it: a field that walks its keys reports the plant
+/// as ignored, while a [`toml::Value`], a map, or anything else that swallows a
+/// table reports nothing. There is no other way to ask — for an *empty* table
+/// `serde_ignored` has nothing to report either way, which is exactly the case
+/// this exists for.
+///
+/// **Every uncertain answer is `false`**, and false is the conservative one: it
+/// keeps the table, which is what the reader did before #1025. A schema that
+/// refuses the plant outright (`deny_unknown_fields`) is one such answer, as is
+/// a map that accepts the plant without reporting it.
+///
+/// **Cost, so nobody puts this on a hot path** (#1088 review, NIT-1). One
+/// document clone plus one full `serde_ignored` pass, and [`read_merged`]
+/// recomputes its candidate list every round — so `n` still-empty tables cost
+/// about `n²/2` of these, not `n` (measured end to end: 40 empty tables,
+/// 26.7 ms). It is not a live cost: `assemble` runs per *save*, not per poll
+/// (`watch::Watcher::poll` returns before loading when no stamp moved), and a
+/// flat schema never reaches the loop at all. Memoising per path would make it
+/// linear the day a document with dozens of empty tables exists.
+fn schema_descends<S: Subsystem>(doc: &toml::Table, path: &str) -> bool {
+    let mut probe = doc.clone();
+    let Some((parent, leaf)) = split_path(&mut probe, path) else {
+        return false;
+    };
+    let Some(toml::Value::Table(planted)) = parent.get_mut(leaf) else {
+        return false;
+    };
+    planted.insert(DESCEND_PROBE_KEY.to_string(), toml::Value::Integer(0));
+
+    let expected = format!("{path}.{DESCEND_PROBE_KEY}");
+    let mut reported = false;
+    let parsed: Result<S, _> = serde_ignored::deserialize(probe.into_deserializer(), |p| {
+        reported |= dotted_key(&p) == expected;
+    });
+    parsed.is_ok() && reported
+}
+
+/// Does `S` read `doc` at all — the question "may this table be absent" is
+/// asked by removing it and asking this.
+///
+/// The clone is what [`serde::de::IntoDeserializer`] costs; it is paid once per
+/// candidate table, and candidates only exist in a document that has one.
+fn reads_as<S: Subsystem>(doc: &toml::Table) -> Result<S, String> {
+    let parsed: Result<S, _> = serde_ignored::deserialize(doc.clone().into_deserializer(), |_| {});
+    parsed.map_err(|e| e.to_string())
+}
+
+/// The value at dotted `path`, taken out of `doc`.
+fn take_at(doc: &mut toml::Table, path: &str) -> Option<toml::Value> {
+    let (parent, leaf) = split_path(doc, path)?;
+    parent.remove(leaf)
+}
+
+/// [`take_at`]'s inverse, for a path that was just taken from `doc`.
+fn put_at(doc: &mut toml::Table, path: &str, value: toml::Value) {
+    if let Some((parent, leaf)) = split_path(doc, path) {
+        parent.insert(leaf.to_string(), value);
+    }
+}
+
+/// The table holding dotted `path`'s last segment, and that segment.
+fn split_path<'d, 'p>(
+    doc: &'d mut toml::Table,
+    path: &'p str,
+) -> Option<(&'d mut toml::Table, &'p str)> {
+    let Some((parents, leaf)) = path.rsplit_once('.') else {
+        return Some((doc, path));
+    };
+    let mut at = doc;
+    for segment in parents.split('.') {
+        at = at.get_mut(segment)?.as_table_mut()?;
+    }
+    Some((at, leaf))
 }
 
 /// Read the layer files that exist, lowest precedence first.
@@ -1159,24 +1456,23 @@ fn patch(
 /// user's only remaining line is a marker; the cost of the other choice is
 /// silent data loss, so it is not close.
 ///
-/// **What (2) preserves, precisely: the bytes, not the field's `None`.** The
-/// marker, its comment and the keys the schema does not know survive the save,
-/// and the keys the schema *does* own are gone and stay gone — that much is
-/// pinned. The `Option` field's own `None`-ness does **not** survive a reload:
-/// plain `serde` reads `Option<T>` as `None` only when the key is entirely
-/// absent, and keeping the table for the user's lines is exactly what stops it
-/// being absent. So `assemble` hands back `Some(<per-field defaults>)` — and
-/// per-*field* `#[serde(default)]` means the field type's default, not the
-/// struct's `Default` impl, so a save after that reload writes
-/// `brightness = 0, color = ""` into the file rather than the documented
-/// defaults. `an_erased_optional_table_kept_for_the_users_keys_reloads_as_some_defaults_today`
-/// pins that as it behaves now, honestly and without `#[ignore]`.
+/// **What (2) preserves is the bytes; the field's `None` is the reader's half
+/// of the same guarantee.** The marker, its comment and the keys the schema
+/// does not know survive the save, and the keys the schema *does* own are gone
+/// and stay gone — that is this function's whole contribution. It is not
+/// enough on its own: plain `serde` reads `Option<T>` as `None` only when the
+/// key is entirely absent, so a table kept for the user's lines used to come
+/// back as `Some(<per-field defaults>)` — per-*field* `#[serde(default)]`, so
+/// the field types' defaults rather than the struct's `Default` impl — and the
+/// save after that reload wrote `brightness = 0, color = ""` into the file.
 ///
-/// Fixing it is a **reader** question, not a writer one — "a table with no
-/// schema-owned key in it reads as absent for that layer" — which is why it is
-/// **#1025** and not a patch to this function. Until that lands, an
-/// `Option<Table>` field is a shape a subsystem author should reach for knowing
-/// this.
+/// That was a **reader** hole, not a writer one, which is why the fix is
+/// [`read_merged`]'s rule (#1025) and not a patch here: a table carrying no
+/// key the schema owns reads as absent. With both halves in place a `None`
+/// round-trips — the second save of an erased table is byte-identical to the
+/// first, which
+/// `an_erased_optional_table_kept_for_the_users_keys_reloads_as_none` pins end
+/// to end.
 ///
 /// # Errors
 /// [`ConfigError::Encode`] when `existing` is not valid TOML — refusing rather
@@ -2073,6 +2369,171 @@ kept = true
         }
     }
 
+    /// A subsystem in the shape #1040 settled on: the field is a raw
+    /// [`toml::Value`], so **every** spelling deserialises and
+    /// [`Subsystem::parsed`] is the only judge of it. A table is one of those
+    /// spellings, which is what #1025's rule has to stay clear of.
+    ///
+    /// The default is a `#[serde(default)]` rather than a required key
+    /// deliberately: with the key required, dropping it would simply fail the
+    /// re-read and fall back, and a test over that could not tell a rule that
+    /// respects the field from one that does not.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct RawValue {
+        #[serde(default = "rect")]
+        style: toml::Value,
+    }
+
+    fn rect() -> toml::Value {
+        toml::Value::String("rect".into())
+    }
+
+    impl Subsystem for RawValue {
+        const NAME: &'static str = "raw-value";
+        const DEFAULT_TOML: &'static str = "style = \"rect\"\n";
+        type Error = std::convert::Infallible;
+        type Resolved = ();
+        fn parsed(&self) -> ((), Vec<InvalidValue>) {
+            ((), Vec::new())
+        }
+        fn validate(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// A subsystem whose table is **required**: no `Option`, no
+    /// `#[serde(default)]` on the field, so "absent" is not something this
+    /// schema can be told. The one shape that makes the re-read in
+    /// [`read_merged`] fail, which is how a field's optionality gets observed
+    /// at all from there.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct NeedsTable {
+        core: Core,
+    }
+
+    impl Subsystem for NeedsTable {
+        const NAME: &'static str = "needs-table";
+        const DEFAULT_TOML: &'static str = "[core]\n";
+        type Error = std::convert::Infallible;
+        type Resolved = ();
+        fn parsed(&self) -> ((), Vec<InvalidValue>) {
+            ((), Vec::new())
+        }
+        fn validate(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// Two tables in one document — one optional, one required — which is the
+    /// shape that tells a per-table decision from a per-document one, and the
+    /// shape every schema with more than one block has (#1088 review, H1).
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct MixedTables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        core: Option<Core>,
+        needs: Core,
+    }
+
+    impl Subsystem for MixedTables {
+        const NAME: &'static str = "mixed-tables";
+        const DEFAULT_TOML: &'static str = "[needs]\n";
+        type Error = std::convert::Infallible;
+        type Resolved = ();
+        fn parsed(&self) -> ((), Vec<InvalidValue>) {
+            ((), Vec::new())
+        }
+        fn validate(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// `Leds`' table, with the block left **out** of `DEFAULT_TOML` — so a
+    /// typed-empty `[core]` reaches the schema as an empty table instead of
+    /// merging with the default's keys. The only fixture here that can show
+    /// what a typed-empty block does to a non-`Option` table field.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Defaulted {
+        #[serde(default)]
+        core: Core,
+    }
+
+    impl Subsystem for Defaulted {
+        const NAME: &'static str = "defaulted";
+        const DEFAULT_TOML: &'static str = "";
+        type Error = std::convert::Infallible;
+        type Resolved = ();
+        fn parsed(&self) -> ((), Vec<InvalidValue>) {
+            ((), Vec::new())
+        }
+        fn validate(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// A schema key with a literal `.` in its name, beside an ordinary
+    /// `Option<Table>`. The dotted name is indistinguishable from a nesting hop
+    /// in the paths this module speaks in, so the table behind it can never be
+    /// resolved — and the sibling must not pay for that (#1088 review, LOW-2).
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct DottedName {
+        #[serde(default, rename = "a.b", skip_serializing_if = "Option::is_none")]
+        dotted: Option<Core>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        core: Option<Core>,
+    }
+
+    impl Subsystem for DottedName {
+        const NAME: &'static str = "dotted-name";
+        const DEFAULT_TOML: &'static str = "";
+        type Error = std::convert::Infallible;
+        type Resolved = ();
+        fn parsed(&self) -> ((), Vec<InvalidValue>) {
+            ((), Vec::new())
+        }
+        fn validate(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// The shape the **house recipe** mandates (`trollshell/src/config/mod.rs`):
+    /// `#[serde(default)]` on the *container*, one hand-written `Default`, so
+    /// the table's own default and the sum of its field defaults are the same
+    /// thing.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Recipe {
+        #[serde(default)]
+        core: RecipeCore,
+    }
+
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(default)]
+    struct RecipeCore {
+        color: String,
+        brightness: u8,
+    }
+
+    impl Default for RecipeCore {
+        fn default() -> Self {
+            Self {
+                color: "amber".into(),
+                brightness: 3,
+            }
+        }
+    }
+
+    impl Subsystem for Recipe {
+        const NAME: &'static str = "recipe";
+        const DEFAULT_TOML: &'static str = "[core]\ncolor = \"amber\"\nbrightness = 3\n";
+        type Error = std::convert::Infallible;
+        type Resolved = ();
+        fn parsed(&self) -> ((), Vec<InvalidValue>) {
+            ((), Vec::new())
+        }
+        fn validate(&self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
     /// **#1008 shape 1.** A table the user spelled inline is patched *in
     /// place*: [`patch`] recurses through
     /// [`toml_edit::Item::as_table_like_mut`], so the marker and every key the
@@ -2394,57 +2855,541 @@ kept = true
         }
     }
 
-    /// **#1025, current behaviour.** What shape 2 preserves is the *bytes*, not
-    /// the field's `None`. Keeping the table for the user's marker is exactly
-    /// what stops the key being absent, and plain `serde` reads `Option<T>` as
-    /// `None` only when it is — so the reload after the save hands back
-    /// `Some(…)`, and because per-*field* `#[serde(default)]` uses the field
-    /// type's default rather than `Core`'s own `Default` impl, the values are
-    /// `0`/`""`/`[]` rather than the documented `3`/`"amber"`. The save after
-    /// *that* writes them into the file.
-    ///
-    /// Closing the loop is what makes this visible: every other round-trip test
-    /// here hand-builds the "after" value, so none of them ever asks what a
-    /// reload of what was just written actually says.
-    ///
-    /// #1025 flips this — a table with no schema-owned key in it reads as
-    /// absent for that layer — and the assertions below become `None` and a
-    /// fixed point. It is a reader rule, not a writer one, which is why it is
-    /// not fixed here. Red under exactly that mutation to `assemble`.
-    #[test]
-    fn an_erased_optional_table_kept_for_the_users_keys_reloads_as_some_defaults_today() {
-        let existing = "enabled = true\ncore = { _unset = [\"label\"], brightness = 7 }\n";
+    // ── #1025: rule 2's reader-side corollary ───────────────────────────────
+    //
+    // The writer keeps a table the user has lines in (shape 2 above); the
+    // reader must not turn those lines into a struct full of defaults. The
+    // rule and every boundary it has are argued on `read_merged`.
 
+    /// **The load-bearing one (#1025).** Closes the loop `render_overlay`'s
+    /// two halves make between them: save → load → save → load, with the
+    /// schema's `Option<Table>` at `None` and the user's own two kinds of line
+    /// — a marker and a key the schema does not know — keeping the block alive
+    /// the whole way.
+    ///
+    /// Both halves are asserted at once because either alone is satisfiable by
+    /// something broken: a reader that dropped the user's lines would round-trip
+    /// a `None` fine (and lose their bytes), and #1016's writer round-trips the
+    /// bytes fine while handing back `Some(<per-field defaults>)`, which is the
+    /// hole this closes. The second save being *byte-identical* to the first is
+    /// what makes it a fixed point rather than a slow drift into
+    /// `brightness = 0, color = ""`.
+    ///
+    /// Every other round-trip test here hand-builds the "after" value, so none
+    /// of them ever asks what a reload of what was just written says. This one
+    /// only reloads.
+    ///
+    /// Red if the rule stops firing — [`absent_tables`] finding nothing, or
+    /// either of the two questions [`read_merged`] asks about a candidate
+    /// answering the wrong way: the reload is `Some(0/""/[])` and the second
+    /// save writes those three keys into the file.
+    #[test]
+    fn an_erased_optional_table_kept_for_the_users_keys_reloads_as_none() {
+        let existing =
+            "enabled = true\ncore = { _unset = [\"label\"], brightness = 7, mystery = 1 }\n";
+
+        // The user turns the optional block off. #1008's half: the schema's own
+        // key goes, their marker and their key stay.
         let erased = OptTable {
             enabled: true,
             core: None,
         };
         let saved = render_overlay(existing, &erased).expect("renders");
         assert_eq!(
-            saved, "enabled = true\ncore = { _unset = [\"label\"] }\n",
-            "the bytes half holds: the marker stays, the schema's key goes"
+            saved, "enabled = true\ncore = { _unset = [\"label\"], mystery = 1 }\n",
+            "the bytes half: the marker and the unknown key stay, `brightness` goes"
         );
 
-        let reloaded = assemble::<OptTable>(&layers(&[&saved]))
+        // #1025's half, and the point of the whole issue.
+        let first = assemble::<OptTable>(&layers(&[&saved]))
             .expect("reloads")
             .config;
-        let core = reloaded
-            .core
-            .as_ref()
-            .expect("#1025 will flip this to `None`: the table is still there");
-        assert_eq!(
-            (core.brightness, core.color.as_str(), core.palette.len()),
-            (0, "", 0),
-            "#1025 will flip this too — and note these are the *field* types' \
-             defaults, not Core::default()'s 3/\"amber\""
+        assert!(
+            first.core.is_none(),
+            "the block holds nothing of the schema's, so the field it stands \
+             for is absent — not `Some` of the field types' defaults"
         );
 
-        let again = render_overlay(&saved, &reloaded).expect("renders again");
+        // A fixed point: saving what was just read changes no byte.
+        let again = render_overlay(&saved, &first).expect("renders again");
         assert_eq!(
-            again,
-            "enabled = true\ncore = { _unset = [\"label\"], brightness = 0, color = \"\", palette = [] }\n",
-            "#1025 will flip this to a fixed point; today the second save writes \
-             the degenerate values back"
+            again, saved,
+            "the second save must write nothing back into the block it left \
+             the user"
+        );
+
+        let second = assemble::<OptTable>(&layers(&[&again]))
+            .expect("reloads twice")
+            .config;
+        assert!(
+            second.core.is_none(),
+            "and it is still absent on the load after that"
+        );
+    }
+
+    /// The other side of the rule, and the reason it is stated over the keys
+    /// rather than over the *header*: one key of the schema's is enough to make
+    /// the table present, and the keys it does not carry come from where they
+    /// always did.
+    ///
+    /// Red if the rule fires on a table that has a schema-owned key in it.
+    #[test]
+    fn a_table_carrying_one_key_of_the_schemas_still_reads_as_some() {
+        let loaded = assemble::<OptTable>(&layers(&[
+            "enabled = true\n\n[core]\n_unset = [\"label\"]\nmystery = 1\nbrightness = 7\n",
+        ]))
+        .expect("assembles");
+
+        let core = loaded
+            .config
+            .core
+            .as_ref()
+            .expect("the schema owns `brightness`, and it is set in there");
+        assert_eq!(
+            (core.brightness, core.color.as_str(), core.palette.len()),
+            (7, "", 0),
+            "the one key the user set, and the field types' defaults for the \
+             rest — `OptTable`'s `DEFAULT_TOML` states none of them"
+        );
+        assert_eq!(
+            loaded.unknown_keys,
+            ["core.mystery"],
+            "and their own key is still named, in a table that stayed"
+        );
+    }
+
+    /// A marker that erases the last of the schema's keys out of a block leaves
+    /// nothing of the schema's in it, so the field it stands for is absent —
+    /// the same answer the round-trip above gets, reached by rule 1 instead of
+    /// by the writer.
+    ///
+    /// What reaches the schema is a bare empty table — `merge_into` strips the
+    /// marker, so by then the erasure is invisible and nothing here can tell
+    /// this block from one the user typed empty. It does not have to:
+    /// [`schema_descends`] answers the question that actually decides it, which
+    /// is what the field is, not how the block came to be empty (#1088 review,
+    /// M2).
+    ///
+    /// Red if [`schema_descends`] stops being consulted — the emptied block
+    /// reads as `Some(0/""/[])`, which is the base layer's `brightness = 3`
+    /// erased into a degenerate value rather than into absence.
+    #[test]
+    fn a_marker_that_empties_a_block_of_the_schemas_keys_makes_the_field_absent() {
+        let loaded = assemble::<OptTable>(&layers(&[
+            "enabled = true\n\n[core]\nbrightness = 3\n",
+            "[core]\n_unset = [\"brightness\"]\n",
+        ]))
+        .expect("assembles");
+
+        assert!(
+            loaded.config.core.is_none(),
+            "the overlay erased the only key the schema had in there: {:?}",
+            loaded.config.core
+        );
+    }
+
+    /// Rule 4 does not move: the key that made the table absent is exactly the
+    /// key the user most likely got wrong in that block, so it is still named,
+    /// still once, and still returned.
+    ///
+    /// The `enabled = false` beside it is the live control — a capture that
+    /// observed nothing would satisfy a `is_empty()` assertion just as well —
+    /// and it also pins that the rule takes the table without taking its
+    /// siblings.
+    ///
+    /// Red if `unknown_keys` is taken from the *pruned* pass: the key is gone
+    /// from the document by then, nothing is warned, and a settings UI has
+    /// nothing to show.
+    #[test]
+    fn a_table_holding_only_a_key_the_schema_does_not_know_is_absent_and_still_warned_about() {
+        let (captured, _guard) = capture();
+
+        let loaded = assemble::<OptTable>(&layers(&["enabled = false\n\n[core]\nmystery = 1\n"]))
+            .expect("assembles");
+
+        assert!(
+            loaded.config.core.is_none(),
+            "nothing of the schema's in it"
+        );
+        assert!(!loaded.config.enabled, "and the sibling key is untouched");
+        assert_eq!(
+            loaded.unknown_keys,
+            ["core.mystery"],
+            "still returned for a settings UI"
+        );
+
+        let named: Vec<_> = captured
+            .events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::WARN)
+            .filter(|e| e.fields.get("key").map(String::as_str) == Some("core.mystery"))
+            .collect();
+        assert_eq!(named.len(), 1, "warned exactly once: {named:#?}");
+    }
+
+    /// The boundary, and the reason the rule is not simply "an empty table is
+    /// absent": a schema field of type [`toml::Value`] — #1040's shape, so one
+    /// bad key never takes its siblings down — *holds* that empty table as its
+    /// value. Taking it away would take it away from [`Subsystem::parsed`],
+    /// whose whole job is to say out loud that it is not a valid one.
+    ///
+    /// The question that separates it from `core = {}` on an `Option<Table>`
+    /// (which does read as absent, two tests down) is the **shape of the
+    /// field**, not the shape of the bytes — they are the same bytes. "Does the
+    /// schema load without it" cannot separate them either: this field has a
+    /// `serde` default, so it loads fine without its key. Only
+    /// [`schema_descends`] can.
+    ///
+    /// Red if [`schema_descends`] stops gating the drop, or answers `true` for
+    /// a field that swallows the table whole: `style` is dropped, the field
+    /// falls back to `"rect"`, and the user's `{}` is judged by nobody.
+    #[test]
+    fn a_table_the_user_typed_empty_is_still_the_schemas_to_judge() {
+        let loaded = assemble::<RawValue>(&layers(&["style = {}\n"])).expect("assembles");
+
+        assert_eq!(
+            loaded.config.style,
+            toml::Value::Table(toml::Table::new()),
+            "the spelling reaches the schema — `parsed` is the only judge of it"
+        );
+        assert!(
+            loaded.unknown_keys.is_empty(),
+            "and a `toml::Value` field knows no unknown keys: {:?}",
+            loaded.unknown_keys
+        );
+    }
+
+    /// A marker that **erased nothing** must not cost the user their value
+    /// either (#1088 review, M2). An inert name (no layer sets it) and a
+    /// malformed marker (not an array, refused outright) both leave a block
+    /// that is empty because the user typed one bad line in it, not because
+    /// anything was taken out of it — and either way the field's *shape* is
+    /// what decides, so neither is consulted at all.
+    ///
+    /// Both rows are `main`'s answers, so this is a regression pin as much as a
+    /// new one: an earlier draft of #1025 keyed the carve-out on a marker being
+    /// *present* in the block, and turned both of these into `String("rect")`.
+    #[test]
+    fn a_marker_that_erased_nothing_does_not_cost_a_value_field_its_table() {
+        for body in [
+            "[style]\n_unset = [\"nothing\"]\n",
+            "[style]\n_unset = \"color\"\n",
+        ] {
+            let loaded = assemble::<RawValue>(&layers(&[body])).expect("assembles");
+            assert_eq!(
+                loaded.config.style,
+                toml::Value::Table(toml::Table::new()),
+                "the block is the user's, one bad line and all: {body:?}"
+            );
+        }
+    }
+
+    /// The cross-layer half of the same (#1088 review, M2): a marker in the
+    /// **base** layer must not reach across and decide how the *overlay*'s
+    /// `style = {}` reads. Two files that never mention each other.
+    #[test]
+    fn a_marker_in_another_layer_does_not_decide_this_ones_typed_empty_table() {
+        let loaded = assemble::<RawValue>(&layers(&[
+            "[style]\n_unset = [\"nothing\"]\n",
+            "style = {}\n",
+        ]))
+        .expect("assembles");
+
+        assert_eq!(
+            loaded.config.style,
+            toml::Value::Table(toml::Table::new()),
+            "the overlay wrote a value; the base's marker is not about it"
+        );
+    }
+
+    /// **#1025's closing sentence, on the shape that is not an erasure at all**
+    /// (#1088 review, M3). `core = {}` typed on an `Option<Table>` holds nothing
+    /// of the schema's, so it reads as `None` — and the save that follows can no
+    /// longer write `brightness = 0, color = "", palette = []` into the file,
+    /// which is what it did before.
+    ///
+    /// The first save removes the empty block: it holds nothing of the user's
+    /// either, and "a table left holding nothing is removed whole" is
+    /// [`render_overlay`]'s existing, separately pinned rule
+    /// (`a_save_that_drops_an_optional_table_with_nothing_of_the_users_in_it_removes_the_block`).
+    /// From there it is a fixed point.
+    ///
+    /// Red if [`schema_descends`] is not consulted for an empty table, or if
+    /// the drop is refused for one: the load is `Some(0/""/[])` and the save
+    /// writes the degenerate values back.
+    #[test]
+    fn an_optional_table_the_user_typed_empty_reads_as_none_and_writes_nothing_back() {
+        for existing in ["enabled = true\ncore = {}\n", "enabled = true\n\n[core]\n"] {
+            let first = assemble::<OptTable>(&layers(&[existing]))
+                .expect("assembles")
+                .config;
+            assert!(
+                first.core.is_none(),
+                "an empty block on an `Option<Table>` is the absent one: {existing:?}"
+            );
+
+            let saved = render_overlay(existing, &first).expect("renders");
+            assert_eq!(
+                saved, "enabled = true\n",
+                "not one degenerate value written back; the empty block goes \
+                 whole, as every save of an empty block already did: {existing:?}"
+            );
+
+            let second = assemble::<OptTable>(&layers(&[&saved]))
+                .expect("reloads")
+                .config;
+            assert!(second.core.is_none(), "still absent: {existing:?}");
+            assert_eq!(
+                render_overlay(&saved, &second).expect("renders again"),
+                saved,
+                "and a fixed point from there: {existing:?}"
+            );
+        }
+    }
+
+    /// **The sibling case (#1088 review, H1).** One document, two tables: an
+    /// `Option<Table>` that legitimately reads as absent, and a **required**
+    /// one that cannot. The decision has to be per table — the required one
+    /// must cost only itself.
+    ///
+    /// The two rows differ only in whether `needs` also looks absent. `core`'s
+    /// answer must not move between them, and that is the whole test: a
+    /// document-wide fallback answers `None` in the first row and
+    /// `Some(0, "", [])` in the second, which is #1025's own hole reappearing
+    /// one schema field away.
+    ///
+    /// Red under a document-wide fallback (`reread.unwrap_or(config)` over the
+    /// whole prune) — the second row alone.
+    #[test]
+    fn a_required_table_that_cannot_be_absent_costs_only_itself() {
+        let rows = [
+            ("a sibling that is present", "[needs]\nbrightness = 4\n"),
+            ("a sibling that also looks absent", "[needs]\nalso = 2\n"),
+        ];
+
+        for (what, needs) in rows {
+            let loaded =
+                assemble::<MixedTables>(&layers(&[&format!("[core]\nmystery = 1\n\n{needs}")]))
+                    .expect("assembles");
+
+            assert!(
+                loaded.config.core.is_none(),
+                "`core` holds nothing of the schema's either way — {what}: {:?}",
+                loaded.config.core
+            );
+        }
+    }
+
+    /// The same rule for the *other* way a candidate can fail to be decided
+    /// (#1088 review, LOW-2): a schema key with a literal `.` in its name makes
+    /// a path this module cannot resolve, so that table is simply never
+    /// dropped. That is the documented fail-safe direction — but it has to cost
+    /// only itself, exactly like a required sibling does.
+    ///
+    /// The two rows differ only in whether the unresolvable table is there at
+    /// all, and `core`'s answer must not move between them.
+    ///
+    /// Red if the unresolvable path goes back to breaking out of the loop: the
+    /// second row reads `Some(0/""/[])` — H1's shape again, in the one path the
+    /// paths' own doc calls harmless.
+    #[test]
+    fn a_key_this_module_cannot_address_costs_only_itself() {
+        for (what, dotted) in [
+            ("no dotted name in the document", ""),
+            (
+                "one that cannot be addressed",
+                "\"a.b\" = { mystery = 1 }\n",
+            ),
+        ] {
+            let loaded =
+                assemble::<DottedName>(&layers(&[&format!("{dotted}[core]\nmystery = 1\n")]))
+                    .expect("assembles");
+
+            assert!(
+                loaded.config.core.is_none(),
+                "`core` is absent either way — {what}: {:?}",
+                loaded.config.core
+            );
+        }
+    }
+
+    /// A table the schema **requires** cannot read as absent, and the way that
+    /// is settled is by asking rather than by guessing: nothing visible from
+    /// [`read_merged`] says whether a field is an `Option`, so the rule is
+    /// applied and the re-read is what refuses it. The load then stands on the
+    /// unpruned pass, exactly as it did before #1025.
+    ///
+    /// It also **says so** (#1088 review, M1). Withdrawing the rule for one
+    /// table is a schema fact the user cannot see any other way — the block
+    /// looks empty of everything the schema knows and comes back full of
+    /// defaults — and a silent fallback is the failure mode this crate exists
+    /// to argue against.
+    ///
+    /// Red if the re-read's failure stops being a fallback — the load fails
+    /// with serde's `missing field core`, and a schema with a required table
+    /// and one stray key in it becomes unloadable — and red if the `warn!` goes.
+    #[test]
+    fn a_table_the_schema_requires_is_not_dropped_out_from_under_it() {
+        let (captured, _guard) = capture();
+
+        let loaded =
+            assemble::<NeedsTable>(&layers(&["[core]\nmystery = 1\n"])).expect("still assembles");
+
+        assert_eq!(
+            (
+                loaded.config.core.brightness,
+                loaded.config.core.color.as_str()
+            ),
+            (0, ""),
+            "the unpruned read, field defaults and all"
+        );
+        assert_eq!(
+            loaded.unknown_keys,
+            ["core.mystery"],
+            "and their key is still named"
+        );
+
+        let kept: Vec<_> = captured
+            .events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::WARN && e.message == REQUIRED_TABLE_MESSAGE)
+            .collect();
+        assert_eq!(kept.len(), 1, "said once, for the one table: {kept:#?}");
+        assert_eq!(
+            kept[0].fields.get("key").map(String::as_str),
+            Some("core"),
+            "naming the block: {:#?}",
+            kept[0].fields
+        );
+        assert_eq!(
+            kept[0].fields.get("subsystem").map(String::as_str),
+            Some("needs-table")
+        );
+        assert!(
+            kept[0]
+                .fields
+                .get("error")
+                .is_some_and(|e| e.contains("core")),
+            "and carrying the schema's own reason: {:#?}",
+            kept[0].fields
+        );
+    }
+
+    /// The other side of M1: a table the schema **lets go of** says nothing.
+    /// The warning is about the rule being withdrawn, not about it being
+    /// applied — the applied case is the ordinary one and would be noise on
+    /// every load of every file with an erased block in it.
+    #[test]
+    fn a_table_the_schema_accepts_as_absent_is_not_warned_about() {
+        let (captured, _guard) = capture();
+
+        let loaded = assemble::<OptTable>(&layers(&["enabled = true\n\n[core]\nmystery = 1\n"]))
+            .expect("assembles");
+        assert!(loaded.config.core.is_none(), "the control: the rule fired");
+
+        let kept: Vec<_> = captured
+            .events()
+            .into_iter()
+            .filter(|e| e.message == REQUIRED_TABLE_MESSAGE)
+            .collect();
+        assert!(
+            kept.is_empty(),
+            "nothing was kept, so nothing is said: {kept:#?}"
+        );
+        assert_eq!(
+            captured.warnings().len(),
+            1,
+            "and the one warning is rule 4's, about their key: {:#?}",
+            captured.warnings()
+        );
+    }
+
+    /// **What "absent" means for a table field that is not an `Option`, and
+    /// where it is observable at all** (#1088 review, L1). #866's rule 1, one
+    /// level up: an erased key falls back to the code default, and a block left
+    /// with none of the schema's keys in it falls back to the code default for
+    /// the *table*.
+    ///
+    /// "Left with none" covers both ways of getting there — every key erased
+    /// out of it, and a block the user simply **typed empty** (#1088 review,
+    /// NIT-2). The second row below is the erasure; a bare `[core]` lands in
+    /// exactly the same place, which is why the sentence is about the block's
+    /// contents rather than about the marker.
+    ///
+    /// For a schema written to the **house recipe** — `#[serde(default)]` on
+    /// the container, one hand-written `Default`
+    /// (`trollshell/src/config/mod.rs`) — that is the same answer either way,
+    /// which the test below pins. The rule is *invisible* to such a schema, and
+    /// `CoreLedsConfig`, the only live `Subsystem`, is one.
+    ///
+    /// It takes a type whose **per-field** defaults disagree with its **own**
+    /// `Default` for the two answers to differ — a type already inconsistent
+    /// with itself before any layering touches it, and the shape the recipe
+    /// rules out. `Core` is exactly that type, which is why it is the
+    /// illustration here and why it is the *only* one: erasing two of its three
+    /// keys leaves the field defaults, erasing the third brings the table's own
+    /// `Default` back. The unambiguous shape for "this block may be absent" is
+    /// an `Option<Table>`, which is what #1025 exists to make usable.
+    #[test]
+    fn the_discontinuity_needs_a_type_whose_field_defaults_disagree_with_its_own() {
+        let two_of_three = assembled(&["[core]\n_unset = [\"color\", \"brightness\"]\n"]);
+        assert_eq!(
+            (
+                two_of_three.config.core.color.as_str(),
+                two_of_three.config.core.brightness
+            ),
+            ("", 0),
+            "one key of the schema's is left, so this is an ordinary read"
+        );
+
+        let all_three = assembled(&["[core]\n_unset = [\"color\", \"brightness\", \"palette\"]\n"]);
+        assert_eq!(
+            all_three.config.core,
+            Core::default(),
+            "the code default for the table, reached honestly — not the base \
+             layer's values, which the marker really did erase"
+        );
+        assert_ne!(
+            all_three.config.core.color, two_of_three.config.core.color,
+            "and this is the whole discontinuity, in the one schema shape that \
+             can show it"
+        );
+
+        // The other way into the same place (#1088 review, NIT-2). `Leds`
+        // cannot show it — its `DEFAULT_TOML` writes `[core]`, so a typed-empty
+        // overlay block merges with the default's keys and is never empty —
+        // which is what `Defaulted` is for.
+        let typed_empty = assemble::<Defaulted>(&layers(&["[core]\n"]))
+            .expect("assembles")
+            .config;
+        assert_eq!(
+            typed_empty.core,
+            Core::default(),
+            "typing the block empty lands where erasing every key out of it \
+             does; the rule is about what is left in the block, not about how \
+             it got that way"
+        );
+    }
+
+    /// The same two rows against a schema written to the house recipe: one
+    /// answer, no edge (#1088 review, L1). This is what makes "the rule is
+    /// invisible to the shape the repo mandates" a measured claim rather than
+    /// an assurance.
+    #[test]
+    fn the_rule_is_invisible_to_a_schema_written_to_the_house_recipe() {
+        let one_of_two = assemble::<Recipe>(&layers(&["[core]\n_unset = [\"color\"]\n"]))
+            .expect("assembles")
+            .config;
+        let both = assemble::<Recipe>(&layers(&["[core]\n_unset = [\"color\", \"brightness\"]\n"]))
+            .expect("assembles")
+            .config;
+
+        assert_eq!(one_of_two.core, RecipeCore::default());
+        assert_eq!(
+            both.core,
+            RecipeCore::default(),
+            "container-level `#[serde(default)]` makes both answers the code \
+             default, so removing the last line changes nothing"
         );
     }
 

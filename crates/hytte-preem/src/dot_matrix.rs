@@ -166,12 +166,7 @@ impl Dots {
 /// distance is not an integer and a float would put the pitch-4 reproduction of
 /// the shipped table at the mercy of rounding.
 const fn radius_sq(k: usize, dot: usize) -> usize {
-    let doubled = 2 * k + 1;
-    let delta = if doubled >= dot {
-        doubled - dot
-    } else {
-        dot - doubled
-    };
+    let delta = (2 * k + 1).abs_diff(dot);
     delta * delta
 }
 
@@ -411,25 +406,45 @@ mod tests {
             (DisplayStyle::Vfd, "PREEM", 124, 0x8241_b872_24c7_5189),
             (DisplayStyle::Vfd, "88:88", 124, 0xcaef_9bd7_997d_5b25),
             (DisplayStyle::Vfd, "åäö 💕", 124, 0x7473_0cf4_0fff_0fe9),
-            (DisplayStyle::Vfd, "0123456789~/", 292, 0x914f_633e_fec0_afdd),
+            (
+                DisplayStyle::Vfd,
+                "0123456789~/",
+                292,
+                0x914f_633e_fec0_afdd,
+            ),
             (DisplayStyle::Lcd, "", 8, 0xac22_ef75_3302_65e5),
             (DisplayStyle::Lcd, " ", 28, 0xa24c_7b3c_189b_30bd),
             (DisplayStyle::Lcd, "PREEM", 124, 0x6873_a9e3_6e89_15c5),
             (DisplayStyle::Lcd, "88:88", 124, 0x6631_e93c_35b2_fc3d),
             (DisplayStyle::Lcd, "åäö 💕", 124, 0x351a_e3d6_d0eb_4195),
-            (DisplayStyle::Lcd, "0123456789~/", 292, 0xe9d5_d549_d396_92ad),
+            (
+                DisplayStyle::Lcd,
+                "0123456789~/",
+                292,
+                0xe9d5_d549_d396_92ad,
+            ),
             (DisplayStyle::Oled, "", 8, 0xfbf2_17cf_4070_f025),
             (DisplayStyle::Oled, " ", 28, 0x9668_ffbf_cdd5_b0a5),
             (DisplayStyle::Oled, "PREEM", 124, 0x49e2_7059_5ce5_f975),
             (DisplayStyle::Oled, "88:88", 124, 0xc7b2_b497_a032_f6f5),
             (DisplayStyle::Oled, "åäö 💕", 124, 0x7b15_b48a_8807_5865),
-            (DisplayStyle::Oled, "0123456789~/", 292, 0x4c57_6dc0_a3f5_14fd),
+            (
+                DisplayStyle::Oled,
+                "0123456789~/",
+                292,
+                0x4c57_6dc0_a3f5_14fd,
+            ),
             (DisplayStyle::Crt, "", 8, 0x6408_f107_ecf4_3ca5),
             (DisplayStyle::Crt, " ", 28, 0xc452_bcb6_60d2_1965),
             (DisplayStyle::Crt, "PREEM", 124, 0x73a6_646d_5a4c_d717),
             (DisplayStyle::Crt, "88:88", 124, 0x3950_58fb_a645_3488),
             (DisplayStyle::Crt, "åäö 💕", 124, 0x0bda_72c5_de73_9f61),
-            (DisplayStyle::Crt, "0123456789~/", 292, 0xfa36_5f24_26b0_11fa),
+            (
+                DisplayStyle::Crt,
+                "0123456789~/",
+                292,
+                0xfa36_5f24_26b0_11fa,
+            ),
         ];
         for (style, text, width, want) in cases {
             let frame = dot_matrix(text, style);

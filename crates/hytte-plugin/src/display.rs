@@ -2316,6 +2316,19 @@ mod tests {
                 == kit::dot_matrix("HELLO", DisplayStyle::Vfd).into_node(Some("dm"), no_cls()),
             "dot matrix",
         );
+        // …and with the pitch moved (#1091), which the default-pitch case above
+        // cannot see: the builder has to reach the kit's own `dot_px`, not just
+        // ride `kit::dot_matrix`'s default.
+        assert!(
+            DotMatrix::new(StyleName::Vfd)
+                .dot_px(2)
+                .node_in(raster, "dm", no_cls(), "HELLO")
+                == kit::DotMatrix::new(DisplayStyle::Vfd)
+                    .dot_px(2)
+                    .render("HELLO")
+                    .into_node(Some("dm"), no_cls()),
+            "dot matrix at a moved pitch",
+        );
         assert!(
             SevenSeg::new(StyleName::Crt).node_in(raster, "ss", no_cls(), "12:34")
                 == kit::seven_seg("12:34", DisplayStyle::Crt).into_node(Some("ss"), no_cls()),
@@ -2387,6 +2400,28 @@ mod tests {
                     .window(20)
                     .into_node(Some("mq"), no_cls()),
             "marquee",
+        );
+
+        // …and the same sequence with the pitch moved (#1091). A finer pitch
+        // fits more dot columns in the same window, so the *offset* the
+        // accumulator reaches is unchanged while the whole grid differs — which
+        // is exactly the case a default-pitch comparison cannot see.
+        let mut small = Marquee::new(StyleName::Vfd)
+            .window_px(268)
+            .gap_dots(4)
+            .dot_px(2)
+            .speed_dots_per_sec(20.0);
+        small.advance_in(raster, 1.0);
+        assert!(
+            small.node_in(raster, "mq", no_cls(), MSG)
+                == kit::Marquee::new(DisplayStyle::Vfd)
+                    .window_px(268)
+                    .gap_dots(4)
+                    .dot_px(2)
+                    .render(MSG)
+                    .window(20)
+                    .into_node(Some("mq"), no_cls()),
+            "marquee at a moved pitch",
         );
 
         // — the led strip: the same push/decay sequence through the same

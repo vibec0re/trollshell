@@ -278,14 +278,14 @@ pub use msg::{HostMsg, LogLevel, PluginMsg};
 pub use preem::{
     AccentRole, DEFAULT_DOT_PX, DotMatrixConfig, DotMatrixState, FlipBoardConfig, FlipBoardState,
     GaugeConfig, GaugeRange, GaugeState, LedStripConfig, LedStripState, MAX_BUFFER_DIM, MAX_CELLS,
-    MAX_CORNER,
-    MAX_DAMPING, MAX_DIVISIONS, MAX_FLIP_DURATION_SECS, MAX_FLIP_STAGGER_SECS, MAX_FREQUENCY_HZ,
-    MAX_DOT_PX, MAX_GAP_DOTS, MAX_LEDS, MAX_MARQUEE_SPEED_DPS, MAX_PAD, MAX_PEAK_HOLD_RATE, MAX_RASTER_PIXELS,
-    MAX_SCALE, MAX_SCOPE_SAMPLES, MAX_STRIP_DIM, MAX_SUBDIVISIONS, MAX_SWEEP_DEG, MAX_TEXT_COLS,
-    MAX_TEXT_LEN, MAX_TEXT_LINES, MIN_DAMPING, MIN_DOT_PX, MIN_FLIP_DURATION_SECS,
-    MIN_FREQUENCY_HZ, MIN_SWEEP_DEG, MarqueeConfig, MarqueeState, Mechanism, PREEM_VOCAB, PeakHoldConfig,
-    PreemWidget, Rgba, ScopeConfig, ScopeState, SevenSegConfig, SevenSegState, StyleName, StyleRef,
-    TextBoxConfig, TextBoxState, TextBoxWidth, preem, preem_id, preem_styled,
+    MAX_CORNER, MAX_DAMPING, MAX_DIVISIONS, MAX_DOT_PX, MAX_FLIP_DURATION_SECS,
+    MAX_FLIP_STAGGER_SECS, MAX_FREQUENCY_HZ, MAX_GAP_DOTS, MAX_LEDS, MAX_MARQUEE_SPEED_DPS,
+    MAX_PAD, MAX_PEAK_HOLD_RATE, MAX_RASTER_PIXELS, MAX_SCALE, MAX_SCOPE_SAMPLES, MAX_STRIP_DIM,
+    MAX_SUBDIVISIONS, MAX_SWEEP_DEG, MAX_TEXT_COLS, MAX_TEXT_LEN, MAX_TEXT_LINES, MIN_DAMPING,
+    MIN_DOT_PX, MIN_FLIP_DURATION_SECS, MIN_FREQUENCY_HZ, MIN_SWEEP_DEG, MarqueeConfig,
+    MarqueeState, Mechanism, PREEM_VOCAB, PeakHoldConfig, PreemWidget, Rgba, ScopeConfig,
+    ScopeState, SevenSegConfig, SevenSegState, StyleName, StyleRef, TextBoxConfig, TextBoxState,
+    TextBoxWidth, preem, preem_id, preem_styled,
 };
 pub use state::{
     AudioSpectrum, ClockState, MAX_UPCOMING_EVENTS, NowPlaying, SPECTRUM_BINS, StateSnapshot,

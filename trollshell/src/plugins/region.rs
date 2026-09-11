@@ -2863,6 +2863,7 @@ mod gtk_tests {
                     window_px: 192,
                     gap_dots: 6,
                     speed_dots_per_sec: speed,
+                    ..vocab::MarqueeConfig::default()
                 },
                 state: vocab::MarqueeState {
                     text: "A LONG SCROLLING MESSAGE".into(),

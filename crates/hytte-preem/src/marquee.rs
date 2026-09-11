@@ -779,7 +779,10 @@ mod tests {
                     .window_px(window_px)
                     .render(LONG);
                 let margin = window_px - strip.cols * px;
-                assert!(margin >= 2 * px, "{px}/{window_px}: bezel keeps {margin} px");
+                assert!(
+                    margin >= 2 * px,
+                    "{px}/{window_px}: bezel keeps {margin} px"
+                );
                 assert!(margin < 2 * px + px, "{px}/{window_px}: no room left over");
                 assert_eq!(strip.origin_x, margin / 2, "{px}/{window_px}: centered");
                 assert_eq!(

@@ -20,18 +20,15 @@
 
 use hytte_plugin_proto::{
     AccentRole, Cls, DEFAULT_DOT_PX, DotMatrixConfig, DotMatrixState, FlipBoardConfig,
-    FlipBoardState, GaugeConfig,
-    GaugeRange, GaugeState, HostMsg, LedStripConfig, LedStripState, MAX_BUFFER_DIM, MAX_CELLS,
-    MAX_DAMPING, MAX_DOT_PX, MAX_FLIP_DURATION_SECS, MAX_FLIP_STAGGER_SECS, MAX_FREQUENCY_HZ,
-    MAX_GAP_DOTS,
-    MAX_LEDS, MAX_MARQUEE_SPEED_DPS, MAX_PEAK_HOLD_RATE, MAX_RASTER_PIXELS, MAX_SCALE,
-    MAX_SCOPE_SAMPLES, MAX_STRIP_DIM, MAX_SWEEP_DEG, MAX_TEXT_LEN, MIN_DAMPING,
-    MIN_DOT_PX, MIN_FLIP_DURATION_SECS, MIN_FREQUENCY_HZ, MIN_SWEEP_DEG, Manifest, MarqueeConfig,
-    MarqueeState,
-    Mechanism, Mount, Node, PREEM_VOCAB, PeakHoldConfig, PluginMsg, PreemWidget, ScopeConfig,
-    ScopeState, SevenSegConfig, SevenSegState, StyleName, StyleRef, TextBoxConfig, TextBoxState,
-    TextBoxWidth, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body, preem,
-    preem_id, preem_styled,
+    FlipBoardState, GaugeConfig, GaugeRange, GaugeState, HostMsg, LedStripConfig, LedStripState,
+    MAX_BUFFER_DIM, MAX_CELLS, MAX_DAMPING, MAX_DOT_PX, MAX_FLIP_DURATION_SECS,
+    MAX_FLIP_STAGGER_SECS, MAX_FREQUENCY_HZ, MAX_GAP_DOTS, MAX_LEDS, MAX_MARQUEE_SPEED_DPS,
+    MAX_PEAK_HOLD_RATE, MAX_RASTER_PIXELS, MAX_SCALE, MAX_SCOPE_SAMPLES, MAX_STRIP_DIM,
+    MAX_SWEEP_DEG, MAX_TEXT_LEN, MIN_DAMPING, MIN_DOT_PX, MIN_FLIP_DURATION_SECS, MIN_FREQUENCY_HZ,
+    MIN_SWEEP_DEG, Manifest, MarqueeConfig, MarqueeState, Mechanism, Mount, Node, PREEM_VOCAB,
+    PeakHoldConfig, PluginMsg, PreemWidget, ScopeConfig, ScopeState, SevenSegConfig, SevenSegState,
+    StyleName, StyleRef, TextBoxConfig, TextBoxState, TextBoxWidth, VOCAB, VOCAB_UNCONDITIONAL,
+    decode, decode_body, encode, encode_body, preem, preem_id, preem_styled,
 };
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -58,6 +55,11 @@ fn from_hex(s: &str) -> Vec<u8> {
 /// One populated instance of **every** [`PreemWidget`] variant, each with
 /// deliberately non-default config and state so a dropped or defaulted field
 /// shows up as an inequality rather than passing by coincidence.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one populated literal per widget variant; splitting it would hide \
+              the roster this fixture exists to be"
+)]
 fn all_widgets() -> Vec<PreemWidget> {
     vec![
         PreemWidget::DotMatrix {
@@ -1652,9 +1654,10 @@ fn preem_worst_case_footprint_is_bounded() {
             // the config for #1091's reason above; the old `2 * 2 + GLYPH_H * 2`
             // was an 18 px understatement of the 36 px the kit actually draws,
             // which weakened this bound by half on the one axis it could see.
-            PreemWidget::Marquee { config, .. } => {
-                (config.window_px, 2 * config.dot_px + GLYPH_H * config.dot_px)
-            }
+            PreemWidget::Marquee { config, .. } => (
+                config.window_px,
+                2 * config.dot_px + GLYPH_H * config.dot_px,
+            ),
             PreemWidget::Scope { config, .. } => {
                 (config.cols * config.scale, config.rows * config.scale)
             }

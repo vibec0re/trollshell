@@ -3619,6 +3619,106 @@ fn dot_matrix_renders_at_parity_with_the_kit() {
     }
 }
 
+/// #1091: the wire's `dot_px` reaches the kit on **both** dot surfaces, and
+/// the resulting chip is the height the issue asked for — 18 px at pitch 2,
+/// which is what fits the 32 px bar.
+///
+/// Parity against a kit oracle built at the same pitch, not just a height
+/// assertion: a host that ignored `dot_px` and rendered at the default would
+/// still produce *a* frame, so the height is the tell and the bytes are the
+/// proof.
+///
+/// **Falsified** by dropping either pass-through — `Renderer::DotMatrix`'s
+/// `dot_px` field or `marquee_strip`'s `.dot_px(…)` — in which case the shell
+/// renders 36 px where the plugin asked for 18.
+#[test]
+fn a_moved_dot_pitch_reaches_the_kit_on_both_dot_surfaces() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("parity-dot-pitch");
+    for (px, height) in [(2_u32, 18_u32), (3, 27), (4, 36), (8, 72)] {
+        let dm = preem_node(
+            Some("dm"),
+            vocab::PreemWidget::DotMatrix {
+                config: vocab::DotMatrixConfig {
+                    style: vocab::StyleRef::new(vocab::StyleName::Vfd),
+                    dot_px: px,
+                },
+                state: vocab::DotMatrixState {
+                    text: "12:34".into(),
+                },
+            },
+        );
+        let oracle = kit::DotMatrix::new(kit::DisplayStyle::Vfd)
+            .dot_px(usize::try_from(px).expect("pitch fits usize"))
+            .render("12:34");
+        let mapped = mapped_pixels(&scope, &dm);
+        assert_eq!(mapped.1, height, "dot matrix at dot_px {px} is {height} px");
+        assert_eq!(mapped, kit_pixels(&oracle), "dot-matrix parity at {px}");
+
+        let text = "SCROLLING MARQUEE TEST";
+        let mq = preem_node(
+            Some("mq"),
+            vocab::PreemWidget::Marquee {
+                config: vocab::MarqueeConfig {
+                    style: vocab::StyleRef::new(vocab::StyleName::Vfd),
+                    window_px: 192,
+                    gap_dots: 6,
+                    dot_px: px,
+                    speed_dots_per_sec: 0.0,
+                },
+                state: vocab::MarqueeState { text: text.into() },
+            },
+        );
+        let oracle = kit::Marquee::new(kit::DisplayStyle::Vfd)
+            .window_px(192)
+            .gap_dots(6)
+            .dot_px(usize::try_from(px).expect("pitch fits usize"))
+            .render(text);
+        let mapped = mapped_pixels(&scope, &mq);
+        assert_eq!(mapped.1, height, "marquee at dot_px {px} is {height} px");
+        assert_eq!(mapped.0, 192, "…and still the window width it asked for");
+        assert_eq!(
+            mapped,
+            kit_pixels(&oracle.window(0)),
+            "marquee parity at {px}"
+        );
+    }
+}
+
+/// A pitch change is a **config** change, so it rebuilds the renderer rather
+/// than being folded in as new state — which is what the vocabulary's per-config
+/// doc promises and what keeps a 36 px instance from drawing an 18 px frame.
+///
+/// **Falsified** by hand-writing `config_eq`'s dot arms field by field and
+/// forgetting `dot_px`: the shell would keep the old renderer and the chip would
+/// never change size. (It compares whole structs precisely so it cannot.)
+#[test]
+fn a_pitch_change_rebuilds_the_instance() {
+    let _ink = preem_ink_lock();
+    let scope = Scope::detached("rebuild-dot-pitch");
+    let at = |px: u32| {
+        preem_node(
+            Some("dm"),
+            vocab::PreemWidget::DotMatrix {
+                config: vocab::DotMatrixConfig {
+                    style: vocab::StyleRef::new(vocab::StyleName::Lcd),
+                    dot_px: px,
+                },
+                state: vocab::DotMatrixState { text: "88".into() },
+            },
+        )
+    };
+    let wide = mapped_pixels(&scope, &at(4));
+    let narrow = mapped_pixels(&scope, &at(2));
+    assert_eq!(wide.1, 36);
+    assert_eq!(
+        narrow.1, 18,
+        "the same node id at a new pitch must re-render, not reuse the 36 px instance",
+    );
+    // …and back up again, so the rebuild is not one-way.
+    assert_eq!(mapped_pixels(&scope, &at(4)), wide);
+}
+
 /// Visual parity, `SevenSeg`, in every skin.
 #[test]
 fn seven_seg_renders_at_parity_with_the_kit() {

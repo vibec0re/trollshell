@@ -1047,6 +1047,30 @@ audio feed, not the raster.
   4. Worth a look on all three skins: on LCD the ghost grid is at its most
      visible (so 1 is easiest to judge there), and on VFD/OLED the bloom should
      glow off the lit dots without dragging the grid with it.
+- [ ] **(#1091)** A marquee with `dot_px = 2` fits the bar without growing it.
+      The pitch is a runtime knob now, and `9 * dot_px` is the whole height, so
+      a bar-mounted ticker asks for `2` and gets 18 px against the bar's 32 —
+      which CI can check as arithmetic but not as glass. Point a bar-mounted
+      plugin at `Marquee::new(…).dot_px(2)` (the `hytte-plugin-bar-clock-demo`
+      shape, or `preem-demo` with `Mount::Bar`), then:
+  1. **The bar does not grow.** Its height stays wherever `assets/trollshell/style.css`
+     puts it — if the bar gets taller, the chip is asking for more than 32 px
+     and the pitch did not reach the kit.
+  2. **The text is still legible at 2 px per dot.** Each font pixel is a solid
+     2×2 block at that pitch (there is no room for a rim, so the falloff
+     plateau covers the whole cell by design) — it should read as a chunky
+     small ticker, not as a grey smear. Compare against `dot_px = 3` (27 px,
+     which does _not_ fit a 32 px bar once the chip has any padding) to judge
+     whether 2 is the one to ship in the bar.
+  3. **Nothing that did not ask for a pitch moved.** The sidebar preem-demo card
+     still renders its 36 px dot-matrix and marquee rows exactly as before —
+     the byte-identity tests cover this, but it is the cheapest possible
+     eyeball check that the defaults really are untouched.
+  4. **On the CRT skin the scanline comb is deliberately still 4 rows**, not the
+     widget's own pitch (`Mask::CRT` documents why: the tube is the skin's, and
+     it masks the scope and gauge too). At `dot_px = 2` the comb therefore no
+     longer lands in the dot seams. Judge whether that reads acceptably or
+     wants a follow-up — it is a known, documented cost, not a regression.
 - [ ] **(#397)** Split-flap and nixie boards (the two bottom rows of the
       preem-demo card, `HH:MM:SS` on both, deliberately running in slow motion
       so the mechanisms are legible at the shell's ~1 Hz heartbeat):

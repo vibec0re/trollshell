@@ -53,10 +53,9 @@
 use hytte_plugin_proto::{
     AccentRole, AudioAction, AudioSpectrum, Capability, ClockState, ConsentDecision,
     DEFAULT_DOT_PX, DatasourceError, DatasourceOutcome, Dir, DotMatrixConfig, DotMatrixState,
-    Effect,
-    EffectOutcome, EventKind, FlipBoardConfig, FlipBoardState, GaugeConfig, GaugeRange, GaugeState,
-    HostMsg, LedStripConfig, LedStripState, LogLevel, Manifest, MarqueeConfig, MarqueeState,
-    Mechanism, MediaAction, Mount, NiriAction, Node, NowPlaying, PROTO_VERSION, Page,
+    Effect, EffectOutcome, EventKind, FlipBoardConfig, FlipBoardState, GaugeConfig, GaugeRange,
+    GaugeState, HostMsg, LedStripConfig, LedStripState, LogLevel, Manifest, MarqueeConfig,
+    MarqueeState, Mechanism, MediaAction, Mount, NiriAction, Node, NowPlaying, PROTO_VERSION, Page,
     PeakHoldConfig, PluginMsg, PreemWidget, ProvidedDatasource, SPECTRUM_BINS, ScopeConfig,
     ScopeState, SevenSegConfig, SevenSegState, ShaderData, StateKey, StateSnapshot, StyleName,
     StyleRef, TextBoxConfig, TextBoxState, TextBoxWidth, UpcomingEvent, VOCAB, VOCAB_UNCONDITIONAL,

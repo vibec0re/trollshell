@@ -149,7 +149,10 @@ pub(crate) enum SaveError {
     /// The typed name is not a usable workspace name. Carries the sanitised form
     /// to offer, when there is one — §3.1's *"refuses anything else and offers
     /// the sanitised form"*.
-    InvalidName { typed: String, suggestion: Option<String> },
+    InvalidName {
+        typed: String,
+        suggestion: Option<String>,
+    },
     /// The stack is Active and the name changed. Its apps are running in
     /// `trollshell-ws-<old>.slice` and its units are named after it, so a rename
     /// would leave Stop looking for a slice that no longer matches anything —
@@ -222,7 +225,11 @@ pub(crate) fn plan_save(draft: &Draft) -> Result<SavePlan, SaveError> {
         // An ephemeral card's Save is a creation, and §3.7 routes it through
         // `workspace_stacks::save` so the file write and the `SetWorkspaceName`
         // are one transaction. A saved card's is a replacement.
-        name_workspace: draft.previous.is_none().then_some(draft.workspace).flatten(),
+        name_workspace: draft
+            .previous
+            .is_none()
+            .then_some(draft.workspace)
+            .flatten(),
         previous: draft.previous.clone(),
         name,
         stack,
@@ -786,16 +793,13 @@ fn row_drag_source(index: usize) -> gtk::DragSource {
     let source = gtk::DragSource::new();
     source.set_actions(gdk::DragAction::MOVE);
     let payload = i64::try_from(index).unwrap_or(-1);
-    source.connect_prepare(move |_, _, _| Some(gdk::ContentProvider::for_value(&payload.to_value())));
+    source
+        .connect_prepare(move |_, _, _| Some(gdk::ContentProvider::for_value(&payload.to_value())));
     source
 }
 
 /// A row's drop target: dropping row `from` on row `index` moves it there.
-fn row_drop_target(
-    index: usize,
-    draft: &Rc<RefCell<Draft>>,
-    redraw: &Redraw,
-) -> gtk::DropTarget {
+fn row_drop_target(index: usize, draft: &Rc<RefCell<Draft>>, redraw: &Redraw) -> gtk::DropTarget {
     let target = gtk::DropTarget::new(glib::types::Type::I64, gdk::DragAction::MOVE);
     let draft = Rc::clone(draft);
     let redraw = Rc::clone(redraw);
@@ -995,7 +999,10 @@ mod tests {
             .into_iter()
             .find_map(|w| w.downcast::<gtk::Switch>().ok())
             .expect("the autostart switch");
-        assert!(autostart.is_active(), "the switch opens on the stack's value");
+        assert!(
+            autostart.is_active(),
+            "the switch opens on the stack's value"
+        );
 
         // An Active stack says why its name cannot change (§5's rename refusal).
         assert!(
@@ -1156,7 +1163,9 @@ mod tests {
 
         for row in app_rows(&page) {
             assert!(
-                controllers(&row).iter().any(ObjectExt::is::<gtk::DropTarget>),
+                controllers(&row)
+                    .iter()
+                    .any(ObjectExt::is::<gtk::DropTarget>),
                 "an app row must take a drop, or the order cannot be changed"
             );
         }
@@ -1275,7 +1284,10 @@ mod model_tests {
             workspace: Some(7),
             ..draft("chat", None)
         };
-        assert_eq!(plan_save(&ephemeral).expect("accepted").name_workspace, Some(7));
+        assert_eq!(
+            plan_save(&ephemeral).expect("accepted").name_workspace,
+            Some(7)
+        );
 
         // A saved, Active stack has a live workspace too — and it already
         // carries the name, so a Save must not re-name it.

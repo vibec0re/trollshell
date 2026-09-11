@@ -1742,8 +1742,8 @@ apps = [
         let path = dir.path().join("workspaces.toml");
         let body = two_stacks(&path);
 
-        let err = save_edit_to(&path, Some("chat"), "chat--dev", &Stack::default())
-            .expect_err("refused");
+        let err =
+            save_edit_to(&path, Some("chat"), "chat--dev", &Stack::default()).expect_err("refused");
         assert!(matches!(err, ConfigError::Invalid(_)), "{err}");
         assert_eq!(
             std::fs::read_to_string(&path).expect("reads back"),
@@ -1767,7 +1767,10 @@ apps = [
 
         let after = std::fs::read_to_string(&path).expect("reads back");
         assert_ne!(after, body, "nothing was written at all");
-        assert!(after.contains("# my stacks"), "the comment survives: {after}");
+        assert!(
+            after.contains("# my stacks"),
+            "the comment survives: {after}"
+        );
         assert!(
             after.contains("monitor = \"DP-1\"") && after.contains("layout = \"golden\""),
             "a stack table was rewritten: {after}"

@@ -2785,6 +2785,7 @@ trollshell`. Expect the cards to come back Active and **no notification at
     the id as a command). It must now start the app, and
     `journalctl --user -u trollshell -f` must show no "nothing to start for
     this app" line.
+
   - **…and an id that names nothing says so, once.** Add
     `{ id = "definitely.not.installed" }` to the same stack. The journal must
     carry **one** warning naming that id and telling you to set a launch command
@@ -2813,7 +2814,7 @@ trollshell`. Expect the cards to come back Active and **no notification at
     with an icon, a name and an editable launch command per row, **Add app**,
     the layout dropdown, the autostart switch — and **no monitor field**. Change
     every field, then press **Cancel**: `md5sum
-    ~/.config/trollshell/workspaces.toml` before and after must match byte for
+~/.config/trollshell/workspaces.toml` before and after must match byte for
     byte.
   - **…and Save with nothing changed is also byte-identical.** Open Edit, change
     nothing, press **Save**. Same `md5sum`. If the file churns, the writer is
@@ -2836,7 +2837,7 @@ trollshell`. Expect the cards to come back Active and **no notification at
     — not the focused one, if they differ.
   - **The picker lists applications and searches them.** In Edit press
     **Add app…**. A searchable list of installed applications, each with its
-    icon, display name and desktop id. Type to narrow — by name *and* by id
+    icon, display name and desktop id. Type to narrow — by name _and_ by id
     (`nautilus` must find "Files"). Pick one: a row appears at the bottom of the
     app list. Save, and `workspaces.toml` carries `{ id = "<that id>" }`.
   - **…and it hides what a menu hides.** An entry with `NoDisplay=true` must
@@ -2854,7 +2855,7 @@ trollshell`. Expect the cards to come back Active and **no notification at
     card **onto another card in the same column**. The card under the pointer
     outlines; on drop only `order` changes. Two things to check by eye: every
     comment and every `[workspace.*]` table is untouched, and — with stacks on
-    **two** screens interleaved in `order` — the *other* screen's names keep
+    **two** screens interleaved in `order` — the _other_ screen's names keep
     their relative order. Dragging a card down onto its neighbour must land it
     **below** that neighbour, and up onto its neighbour **above** it.
   - **…and a drop on a card in another column does both.** The stack's `monitor`

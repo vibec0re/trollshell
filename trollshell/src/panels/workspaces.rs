@@ -376,10 +376,7 @@ fn model(
 ///
 /// An unnamed *empty* workspace is niri's trailing spare, not a card; a named
 /// workspace that no stack knows about is the user's own and is left alone.
-fn ephemeral_cards<'w>(
-    workspaces: &'w [Workspace],
-    windows: &[Window],
-) -> Vec<(&'w str, Card)> {
+fn ephemeral_cards<'w>(workspaces: &'w [Workspace], windows: &[Window]) -> Vec<(&'w str, Card)> {
     let mut unnamed: Vec<&Workspace> = workspaces
         .iter()
         .filter(|w| w.name.is_none())
@@ -594,11 +591,7 @@ where
     });
 }
 
-fn build_column(
-    column: &Column,
-    meta_cache: &MetaCache,
-    context: &Rc<DropContext>,
-) -> gtk::Widget {
+fn build_column(column: &Column, meta_cache: &MetaCache, context: &Rc<DropContext>) -> gtk::Widget {
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 8);
     outer.add_css_class("ts-ws-column");
     outer.set_hexpand(true);
@@ -1066,7 +1059,10 @@ fn draft_for(card: &Card) -> Option<workspace_edit::Draft> {
             // Read back rather than captured, the same call `start_by_name`
             // makes and for the same reason: a captured `Stack` could be a
             // revision behind the file the Save is about to rewrite.
-            let stack = config_workspaces::current().stacks.get(&card.name).cloned()?;
+            let stack = config_workspaces::current()
+                .stacks
+                .get(&card.name)
+                .cloned()?;
             Some(workspace_edit::Draft {
                 previous: Some(card.name.clone()),
                 name: card.name.clone(),
@@ -1288,8 +1284,8 @@ mod fixtures {
 mod model_tests {
     use super::fixtures::{LEFT, RIGHT, no_stacks, saved, stack, win, ws, ws_focused};
     use super::{
-        Card, Column, DropAction, DropContext, Droppable, Kind, PageModel, StackState, drop_context,
-        drop_plan, model, reorder_onto,
+        Card, Column, DropAction, DropContext, Droppable, Kind, PageModel, StackState,
+        drop_context, drop_plan, model, reorder_onto,
     };
     use crate::config::workspaces::Workspaces;
     use std::collections::BTreeSet;
@@ -1467,7 +1463,10 @@ mod model_tests {
         );
         let cards = &find(&columns, LEFT).cards;
         assert_eq!(cards.len(), 1);
-        assert!(matches!(cards[0].kind, Kind::Ephemeral { workspace: 1, .. }));
+        assert!(matches!(
+            cards[0].kind,
+            Kind::Ephemeral { workspace: 1, .. }
+        ));
         assert_eq!(cards[0].name, "", "it has no name until it is saved");
         assert_eq!(
             app_ids(&cards[0]),
@@ -1581,7 +1580,10 @@ mod model_tests {
         let cards = &find(&columns, LEFT).cards;
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0].name, "chat");
-        assert!(matches!(cards[1].kind, Kind::Ephemeral { workspace: 2, .. }));
+        assert!(matches!(
+            cards[1].kind,
+            Kind::Ephemeral { workspace: 2, .. }
+        ));
     }
 
     /// **MEDIUM-7.** An ephemeral card's apps are in **niri's column order**,
@@ -1670,10 +1672,7 @@ mod model_tests {
         );
         assert_eq!(
             windows,
-            &[
-                ("firefox".to_owned(), Some(4242)),
-                ("mpv".to_owned(), None),
-            ],
+            &[("firefox".to_owned(), Some(4242)), ("mpv".to_owned(), None),],
             "the windows must arrive in column order, each with its own pid"
         );
     }
@@ -1813,10 +1812,7 @@ mod model_tests {
     /// guessed at.
     #[test]
     fn a_drop_of_something_that_is_not_a_card_is_refused() {
-        assert_eq!(
-            drop_plan("chat", LEFT, None, &context(&[], &[])),
-            None
-        );
+        assert_eq!(drop_plan("chat", LEFT, None, &context(&[], &[])), None);
     }
 
     // ── #1071 §3.6, the in-column reorder (phase 4) ──────────────────────────
@@ -1920,7 +1916,10 @@ mod model_tests {
             &["chat", "dev"],
         );
         let action = drop_plan("dev", LEFT, Some("chat"), &ctx).expect("reordered");
-        assert_eq!(action.monitor, None, "an in-column drop is not a screen change");
+        assert_eq!(
+            action.monitor, None,
+            "an in-column drop is not a screen change"
+        );
         assert_eq!(
             action.workspace, None,
             "there is nothing for niri to do about a position in a list"

@@ -365,7 +365,10 @@ mod tests {
 
     #[test]
     fn a_plain_exec_line_splits_on_whitespace() {
-        assert_eq!(words("alacritty -e weechat"), ["alacritty", "-e", "weechat"]);
+        assert_eq!(
+            words("alacritty -e weechat"),
+            ["alacritty", "-e", "weechat"]
+        );
         assert_eq!(words("   firefox   "), ["firefox"]);
         assert_eq!(words(""), Vec::<String>::new());
     }
@@ -387,7 +390,10 @@ mod tests {
         assert_eq!(words(r#""a\"b" c\ d"#), [r#"a"b"#, "c d"]);
         // Single quotes are literal: a `$` inside them is not special here
         // because nothing in this path ever reaches a shell.
-        assert_eq!(words(r#"sh -c 'echo "$@"' x"#), ["sh", "-c", r#"echo "$@""#, "x"]);
+        assert_eq!(
+            words(r#"sh -c 'echo "$@"' x"#),
+            ["sh", "-c", r#"echo "$@""#, "x"]
+        );
     }
 
     /// Documented: an unterminated quote closes at the end rather than erroring,

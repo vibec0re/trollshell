@@ -343,10 +343,7 @@ mod tests {
         );
 
         // By id, for an application whose display name shares nothing with it.
-        assert_eq!(
-            typed(&popover, &search, "nautilus"),
-            ["org.gnome.Nautilus"]
-        );
+        assert_eq!(typed(&popover, &search, "nautilus"), ["org.gnome.Nautilus"]);
 
         // Clearing it brings the whole (still-filtered) list back — and the
         // hidden entry is still not among them.

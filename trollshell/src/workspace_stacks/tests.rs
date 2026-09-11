@@ -1114,7 +1114,12 @@ fn owned(words: &[&str]) -> Vec<String> {
 /// One app's unit name, slice and argv.
 #[test]
 fn an_app_launches_into_the_stacks_own_slice() {
-    let start = app_start("chat", 1, &overridden("Alacritty", "alacritty -e weechat"), None);
+    let start = app_start(
+        "chat",
+        1,
+        &overridden("Alacritty", "alacritty -e weechat"),
+        None,
+    );
     let AppStart::Unit(launch) = start else {
         panic!("an override is a unit launch, got {start:?}");
     };
@@ -1139,7 +1144,10 @@ fn a_resolved_entry_launches_its_exec_with_the_field_codes_stripped() {
     let cases: [(&str, &[&str]); 5] = [
         ("firefox %u", &["firefox"]),
         ("firefox %U", &["firefox"]),
-        ("/usr/bin/nautilus --new-window %F", &["/usr/bin/nautilus", "--new-window"]),
+        (
+            "/usr/bin/nautilus --new-window %F",
+            &["/usr/bin/nautilus", "--new-window"],
+        ),
         ("prog %i %c %k --flag", &["prog", "--flag"]),
         // `%%` is the spec's escape for a literal percent and survives as one.
         ("prog 100%% %f", &["prog", "100%"]),
@@ -1162,7 +1170,12 @@ fn a_resolved_entry_launches_its_exec_with_the_field_codes_stripped() {
 /// `DBusActivatable=true` one, which is the whole reason the field exists.
 #[test]
 fn an_override_is_taken_verbatim_and_beats_the_entry() {
-    let start = app_start("chat", 0, &overridden("app", "prog --pct 50%u"), Some(&entry("other")));
+    let start = app_start(
+        "chat",
+        0,
+        &overridden("app", "prog --pct 50%u"),
+        Some(&entry("other")),
+    );
     assert_eq!(
         argv_of(&start),
         Some(owned(&["prog", "--pct", "50%u"])),
@@ -1226,10 +1239,20 @@ fn an_id_that_names_no_entry_resolves_to_nothing_rather_than_to_itself() {
     // An entry whose `Exec` is nothing but field codes has no command left
     // either, and an empty argv is not a launch.
     let start = app_start("chat", 0, &by_id("app"), Some(&entry("%U")));
-    assert_eq!(start, AppStart::Unresolved { id: "app".to_owned() });
+    assert_eq!(
+        start,
+        AppStart::Unresolved {
+            id: "app".to_owned()
+        }
+    );
     // …and neither is an override that is only whitespace.
     let start = app_start("chat", 0, &overridden("app", "   "), None);
-    assert_eq!(start, AppStart::Unresolved { id: "app".to_owned() });
+    assert_eq!(
+        start,
+        AppStart::Unresolved {
+            id: "app".to_owned()
+        }
+    );
 }
 
 /// End to end through a real Start: the three kinds side by side, so the
@@ -1258,8 +1281,16 @@ fn a_start_resolves_each_apps_entry_and_launches_activates_or_warns() {
     assert_eq!(
         script.launch_argvs(),
         vec![
-            vec!["firefox".to_owned(), "--name".to_owned(), "firefox".to_owned()],
-            vec!["alacritty".to_owned(), "-e".to_owned(), "weechat".to_owned()],
+            vec![
+                "firefox".to_owned(),
+                "--name".to_owned(),
+                "firefox".to_owned()
+            ],
+            vec![
+                "alacritty".to_owned(),
+                "-e".to_owned(),
+                "weechat".to_owned()
+            ],
         ],
         "only the Exec-resolved app and the override forked: {:?}",
         script.calls()

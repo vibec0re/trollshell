@@ -155,6 +155,15 @@ Beyond the package build's `doCheck`, the flake's `checks` output
   a failure the same way, gating the one test that has a skip branch
   (`detached_launch_falls_back_without_a_user_manager`) — its siblings accept
   either `LaunchReport` fallback and need no gate.
+  Since #1080, the same `checkPhaseCargoCommand` also builds and runs
+  `trollshell/examples/preem_gl_diff` — the #893 stage B CPU/GL parity
+  harness — through that same llvmpipe context, with `TROLLSHELL_PARITY_EXACT=1`
+  pinning it to the bit-exact result (`max |Δ| 0` on every channel, all
+  twelve cases) llvmpipe has measured since #1078, tighter than the on-glass
+  ceiling (mean 2 / p99 8 / max 32, #893). Its per-case evidence images go to
+  `$out/parity` (`PREEM_GL_DIFF_OUT`) instead of the default `gates/`, so a
+  build's own output carries them. No new closure inputs — it runs through
+  the same `mesa`/`xvfb-run` the GL tests already pulled in.
 
 ### Lint — strict, treat as the gate
 

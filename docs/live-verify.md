@@ -2440,9 +2440,11 @@ switch` repoints atomically to a new store path every rebuild; the running
       needs a live niri session — the page is built entirely out of
       `niri::workspaces()` + `niri::windows()`, both of which are empty in a
       sandbox.
-  - **Open it.** Settings drawer → **More** → **Workspaces** (the bar keeps its
-    numbered `[1 2 3 …]` switcher, epic revision 5, so there is no chip). It
-    also opens from a niri keybind, via the command surface:
+  - **Open it.** Settings drawer → **More** → **Workspaces**, or (since #1108,
+    below) the dedicated grid-icon chip right of the mpris chip in the bar —
+    the numbered `[1 2 3 …]` switcher itself is untouched (epic revision 5:
+    no name ever shows there). It also opens from a niri keybind, via the
+    command surface:
     ```sh
     busctl --user call mov.vibec0re.trollshell /mov/vibec0re/trollshell \
         org.gtk.Actions Activate 'sava{sv}' open-page 1 s workspaces 0
@@ -2745,6 +2747,28 @@ trollshell`. Expect the cards to come back Active and **no notification at
     all, so the tiled apps around it are not shifted — open a stack app floating
     (`niri msg action toggle-window-floating`) and confirm the rest still land
     at 1, 2, 3.
+
+- [ ] **(#1108)** The workspace-manager bar chip, and the Workspaces page
+      filling the drawer's existing wide width cap instead of shrinking to
+      its content. No niri/systemd session required — this is pure bar-chip
+      and drawer-sizing behavior on top of whatever phase 1-3 state already
+      exists.
+  - **The chip.** A grid-icon-only chip sits in the bar right of the mpris
+    chip (still left of the plugin center slot), tooltip "Workspaces". Click
+    it → the Workspaces page opens, same as the Settings → More route above.
+    Click it again while the page is already open → the drawer retracts, same
+    as every other chip-opened page.
+  - **Only that page fills the cap.** With one or two monitors, the
+    Workspaces page used to shrink to its content's natural width (visibly
+    narrower than the Stats multicolumn page even though both share the same
+    wide clamp). Open the Workspaces page and compare its card width against
+    the Stats page (any layout with two side-by-side history graphs) — the
+    two should now measure the same width, the shared cap, regardless of how
+    many monitor columns Workspaces actually has. Open Settings (any chip),
+    then reopen Workspaces (the new chip, or Settings → More → Workspaces) —
+    the filled width must still hold on the second show, not just the first
+    build. Every other page's width must be visually unchanged from before
+    #1108 (still shrinking to its own content, not filling any cap).
 
 ## Control-center
 

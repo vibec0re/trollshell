@@ -19,19 +19,22 @@
 //!
 //! # Resolution order, per key
 //!
-//! 1. the **environment variable**, when it is set *and* parses — with one
-//!    deprecation warning at startup ([`Deprecations`]);
-//! 2. the **config layers**: `$XDG_CONFIG_DIRS/trollshell/core-leds.toml`
+//! 1. the **config layers**: `$XDG_CONFIG_DIRS/trollshell/core-leds.toml`
 //!    (nix's base) then `$XDG_CONFIG_HOME/trollshell/core-leds.toml` (yours),
 //!    merged by [`hytte_config::merge`]'s four rules;
-//! 3. [`CoreLedsConfig::DEFAULT_TOML`] — the documented built-in default,
-//!    which is the bottom merge layer, so a missing file behaves exactly like
-//!    an unset variable did and says nothing about it.
+//! 2. [`CoreLedsConfig::DEFAULT_TOML`] — the documented built-in default,
+//!    which is the bottom merge layer, so a missing file says nothing about
+//!    it.
 //!
-//! A **set but unparseable** variable keeps the pre-#869 behaviour: one `warn!`
-//! naming the accepted values, then fall through to the layer below. Exactly
-//! one line, not two, and both lines are startup-only — see
-//! [`hytte_config::subsystem::env`] for why.
+//! # The four environment variables are gone (#1041 step 3)
+//!
+//! `TROLLSHELL_CORE_LEDS_{STYLE,COLOR,ROWS,FILL}` used to win over the file
+//! (#869's step 2, the pilot's original deprecation window). They no longer
+//! do anything: [`CoreLedsConfig::resolve`] checks each one only for
+//! **presence**, never reads its value, and a set one still costs exactly one
+//! `warn!` at startup — [`hytte_config::subsystem::env::removed`] — naming the
+//! file key that replaces it. An unset one says nothing, and a reload never
+//! repeats the line. Annika's word on #1041, 2026-09-11.
 //!
 //! # A bad *value* costs its own key, and only its own key
 //!
@@ -69,7 +72,8 @@
 //! moves. A reload of a layer that is not TOML keeps the last good file layer
 //! and warns; a deleted layer falls back to the layer below it (and, with
 //! nothing left, to the built-in defaults); a reload never re-announces a
-//! deprecated variable, and the variable keeps winning across reloads. See
+//! removed variable, which — since #1041 step 3 — never wins to begin with.
+//! See
 //! [`hytte_config::subsystem::watch`] for the three orderings that make that
 //! true, and for the generic `CadenceSource`/`wait_cadence` mechanism this
 //! subsystem's battery split rides — everything below is this subsystem's own
@@ -551,13 +555,18 @@ fill = "spare"
         (leds, rejected)
     }
 
-    /// The environment layered over `layered`, key by key — the merged file
-    /// value is the fallback for every knob the environment does not carry.
+    /// The four `TROLLSHELL_CORE_LEDS_*` variables, checked for **presence**
+    /// only (#1041 step 3) — `layered`, the merged file value, is returned
+    /// unchanged either way.
     ///
-    /// Four [`env::key`] calls, one per knob, which is the whole fan-out a
-    /// family #2 writes: the four parsers return four different types, so a
-    /// homogeneous table of `(var, key, parser)` triples cannot express them
-    /// (see [`env`]'s module doc for the decision).
+    /// Four [`env::removed`] calls, one per knob, mirroring the four
+    /// [`env::key`] calls this replaced: a family #2 still mid-deprecation
+    /// keeps calling `key`, one call per knob for the same reason (see
+    /// [`env`]'s module doc) — this is the shape its own step 3 will take.
+    /// There is no `parse` argument any more: a variable that does nothing is
+    /// never read for its value, only checked for whether it is set at all,
+    /// so each call's only effect is the one warning [`env::removed`] emits
+    /// for a set variable.
     fn resolve(
         layered: CoreLeds,
         lookup: &dyn Fn(&str) -> Option<String>,
@@ -570,38 +579,10 @@ fill = "spare"
             lookup(FILL.var),
         );
         CoreLeds {
-            style: env::key(
-                Self::NAME,
-                &STYLE,
-                style.as_deref(),
-                parse_core_leds_style,
-                layered.style,
-                announce,
-            ),
-            color: env::key(
-                Self::NAME,
-                &COLOR,
-                color.as_deref(),
-                parse_core_leds_color,
-                layered.color,
-                announce,
-            ),
-            rows: env::key(
-                Self::NAME,
-                &ROWS,
-                rows.as_deref(),
-                parse_core_leds_rows,
-                layered.rows,
-                announce,
-            ),
-            fill: env::key(
-                Self::NAME,
-                &FILL,
-                fill.as_deref(),
-                parse_core_leds_fill,
-                layered.fill,
-                announce,
-            ),
+            style: env::removed(Self::NAME, &STYLE, style.as_deref(), layered.style, announce),
+            color: env::removed(Self::NAME, &COLOR, color.as_deref(), layered.color, announce),
+            rows: env::removed(Self::NAME, &ROWS, rows.as_deref(), layered.rows, announce),
+            fill: env::removed(Self::NAME, &FILL, fill.as_deref(), layered.fill, announce),
         }
     }
 }
@@ -633,7 +614,8 @@ pub struct CoreLedsHandles {
 pub struct CoreLedsService {
     /// Layer paths, lowest precedence first.
     paths: Vec<PathBuf>,
-    /// How a deprecated variable is read.
+    /// How a retired variable is checked for presence (#1041 step 3 — its
+    /// value, if any, is never read).
     lookup: EnvLookup,
     /// How the poller reads the current battery state (#1041) — turned into a
     /// `CadenceSource` by [`battery_cadence_source`] in [`Self::start`], not
@@ -986,7 +968,7 @@ mod tests {
     /// literal but reads the vocabulary out of the [`Knob`]; only this one
     /// spells the whole sentence out. Without it the wording would be asserted
     /// against itself — the green-and-blind shape #1040 F4 caught in
-    /// `deprecations()` — and nothing would see the vocabulary reworded out
+    /// `removed_lines()` — and nothing would see the vocabulary reworded out
     /// from under the sentence it has to read inside.
     ///
     /// **Red if the value stops being quoted as the TOML it was written as**,
@@ -1028,25 +1010,27 @@ mod tests {
         }
     }
 
-    /// **The two vocabularies differ in exactly one spelling, and each line
-    /// states its own** (#1040 V4).
+    /// **The removed-variable line still teaches the file vocabulary for
+    /// `rows`, and the variable never wins** — integration-tested at this
+    /// subsystem's own `resolve` rather than only generically in
+    /// `hytte_config::subsystem::env::tests` (#1041 step 3).
     ///
-    /// `rows` is the pilot's single translation point: TOML's `0` is the
-    /// file's spelling of the word `rect`, and `TROLLSHELL_CORE_LEDS_ROWS=0`
-    /// is rejected. One shared `expected` string therefore made the
-    /// *variable*'s own rejection line contradict itself, verbatim:
+    /// `rows` is the pilot's one knob whose two vocabularies genuinely differ
+    /// (#1040 V4): the variable never took the TOML integer `0`, so its own
+    /// line must not offer it. Before this round the two calls this replaces
+    /// (`the_variable_line_does_not_offer_a_spelling_the_variable_rejects`,
+    /// `the_deprecation_line_teaches_the_file_spelling`) pinned that split on
+    /// the two `env::key` messages; #1041 retired that call for `core-leds`
+    /// in favour of `env::removed`, which has no "unusable value" line left
+    /// to distinguish — every set value, `0`-shaped or not, produces the same
+    /// one line, from the file's own vocabulary.
     ///
-    /// ```text
-    /// TROLLSHELL_CORE_LEDS_ROWS is set to `0`, which is not valid;
-    ///   expected "rect" (or 0) …
-    /// ```
-    ///
-    /// **Red if the two are collapsed back into one string** — in either
-    /// direction: sharing the file's wording puts `0` back in the variable's
-    /// line, sharing the variable's takes the file's own spelling out of the
-    /// deprecation line that is supposed to teach it.
+    /// **Red if `resolve` reads `rows`'s value at all** (the file's default
+    /// would not survive an env `"0"` unless the variable is now ignored), or
+    /// if the removed-line call site is ever swapped back to
+    /// `knob.env_accepts`.
     #[test]
-    fn the_variable_line_does_not_offer_a_spelling_the_variable_rejects() {
+    fn the_removed_rows_line_teaches_the_file_spelling_and_never_wins() {
         let (captured, _guard) = capture();
         let resolved = resolve(
             CoreLeds::default(),
@@ -1054,89 +1038,28 @@ mod tests {
             Deprecations::Announce,
         );
 
-        assert_eq!(resolved.rows, None, "live control: `0` fell through");
-        let line = warnings(&captured)
-            .into_iter()
-            .find(|w| w.starts_with("TROLLSHELL_CORE_LEDS_ROWS is set to `0`"))
-            .expect("the unusable-variable line");
-
-        // The line the variable path produces is built from `env_accepts` …
-        assert!(
-            line.contains(ROWS.env_accepts),
-            "the variable's line must be built from its own vocabulary: {line}"
+        assert_eq!(
+            resolved.rows,
+            CoreLeds::default().rows,
+            "the variable does nothing — the default wins even for the one \
+             spelling it never accepted"
         );
-        // … and that vocabulary must not contain the `0` spelling anywhere.
-        // A digit search rather than a substring one on purpose: `!contains(
-        // "or 0")` passed the whole file vocabulary through unnoticed
-        // (mutation V4a, green — it renders as "expected 0 or \"rect\" …",
-        // which reads exactly as self-contradictory and contains no "or 0").
-        // The variable's vocabulary is the one sentence here with no digit `0`
-        // in it at all: "1 to 64" has none.
-        assert!(
-            !ROWS.env_accepts.contains('0'),
-            "the vocabulary offered for a rejected `0` must not contain a `0`: {:?}",
-            ROWS.env_accepts
-        );
-        // …while the file, which really does take it, says so — and the two
-        // are genuinely different strings, not one shared by both paths.
-        assert!(
-            ROWS.file_accepts.contains("0 or \"rect\""),
-            "the file vocabulary must teach the spelling the file accepts: {:?}",
-            ROWS.file_accepts
-        );
-        assert_ne!(
-            ROWS.env_accepts, ROWS.file_accepts,
-            "this is the one knob whose two spellings differ; collapsing them is the bug"
-        );
-    }
-
-    /// …and the **deprecation** line carries the *file* vocabulary, which is
-    /// the other half of that split (#1040 T3).
-    ///
-    /// The test above covers the line an *unusable* variable produces. Nothing
-    /// covered the line a **usable** one produces: swapping
-    /// `knob.file_accepts` for `knob.env_accepts` at `env_key`'s announcing
-    /// call site left the suite green at 585 (mutation R12), because no capture
-    /// test set `TROLLSHELL_CORE_LEDS_ROWS` to a valid value — the other three
-    /// knobs are [`Knob::same`], so for them the swap is a no-op.
-    ///
-    /// What it silently drops is the `0` spelling, from the one line on disk
-    /// that teaches it: `DEFAULT_TOML` exists nowhere until nix renders a base
-    /// file, so the deprecation line — which is *about* the file — is where a
-    /// migrating user learns what the file takes. Measured, with
-    /// `TROLLSHELL_CORE_LEDS_ROWS=rect`:
-    ///
-    /// ```text
-    /// now:  … it accepts 0 or "rect" for the automatic rectangle, or a row count from 1 to 64
-    /// R12:  … it accepts rect for the automatic rectangle, or a row count from 1 to 64
-    /// ```
-    ///
-    /// **Red if the announcing call site takes the variable's vocabulary.**
-    #[test]
-    fn the_deprecation_line_teaches_the_file_spelling() {
-        let (captured, _guard) = capture();
-        let resolved = resolve(
-            CoreLeds::default(),
-            &env(&[("TROLLSHELL_CORE_LEDS_ROWS", "rect")]),
-            Deprecations::Announce,
-        );
-        assert_eq!(resolved.rows, None, "live control: the variable was read");
 
         let line = warnings(&captured)
             .into_iter()
-            .find(|w| w.starts_with("TROLLSHELL_CORE_LEDS_ROWS is deprecated"))
-            .expect("the deprecation line for rows");
+            .find(|w| w.starts_with("TROLLSHELL_CORE_LEDS_ROWS does nothing any more"))
+            .expect("the removed-variable line for rows");
 
-        // The `0` spelling, stated as the literal the file accepts — not
-        // `ROWS.file_accepts`, which would assert the constant against itself
-        // through the code path (the shape that made R12 green).
-        assert!(line.contains("0 or \"rect\""), "{line}");
         assert!(
             line.ends_with(
                 "— it accepts 0 or \"rect\" for the automatic rectangle, \
                  or a row count from 1 to 64"
             ),
-            "the whole vocabulary, verbatim: {line}"
+            "the file's own vocabulary, verbatim: {line}"
+        );
+        assert!(
+            !line.contains(ROWS.env_accepts) || ROWS.env_accepts == ROWS.file_accepts,
+            "must not be built from the variable's own (different) vocabulary: {line}"
         );
     }
 
@@ -1164,9 +1087,9 @@ mod tests {
         );
     }
 
-    /// **`rows = "rect"` works in the file** — the word the deprecated variable
-    /// took, and the word the deprecation line walks a migrating user toward
-    /// (#1040 F5).
+    /// **`rows = "rect"` works in the file** — the word the retired
+    /// `TROLLSHELL_CORE_LEDS_ROWS` variable took, and the word the
+    /// removed-variable line walks a migrating user toward (#1040 F5).
     ///
     /// While `rows` was typed `i64`, it was a `ConfigError::Schema`: a
     /// **whole-file** failure that discarded every other key in the file and
@@ -1587,14 +1510,16 @@ mod tests {
         assert_eq!(parse_hex_rgb(""), None);
     }
 
-    // ── Resolution: the environment wins, per key ───────────────────────────
+    // ── Resolution: the environment no longer wins (#1041 step 3) ───────────
 
-    /// A set variable beats the file, and only for its own key.
+    /// **A set variable does nothing**, for every one of its own keys — the
+    /// file wins throughout.
     ///
-    /// **Red if the env-wins branch is deleted** from `env_key` (the file's
-    /// `lcd` would come back instead of the variable's `crt`).
+    /// **Red if `resolve` reads the variable's value again**: reverting any of
+    /// the four `env::removed` call sites back to `env::key` would let `crt`
+    /// win `style` here while the other three still tracked the file.
     #[test]
-    fn a_set_variable_beats_the_file() {
+    fn a_set_variable_never_wins() {
         let file = CoreLeds {
             style: DisplayStyle::Lcd,
             color: ColorMap::Rainbow,
@@ -1608,16 +1533,16 @@ mod tests {
             Deprecations::Silent,
         );
 
-        assert_eq!(resolved.style, DisplayStyle::Crt, "the variable wins");
         assert_eq!(
-            (resolved.color, resolved.rows, resolved.fill),
-            (file.color, file.rows, file.fill),
-            "…and only for its own key: the other three stay the file's"
+            resolved, file,
+            "the variable does nothing at all — every key stays the file's"
         );
     }
 
     /// An unset variable resolves to the file's value, not to the built-in
-    /// default — the regression that would make the whole file inert.
+    /// default — the regression that would make the whole file inert. True
+    /// before #1041 step 3 and after it alike: an absent variable was always
+    /// silent and inert, only a *set* one's behaviour changed.
     #[test]
     fn an_unset_variable_leaves_the_file_alone() {
         let file = CoreLeds {
@@ -1630,11 +1555,11 @@ mod tests {
         assert_eq!(resolve(file, &no_env(), Deprecations::Silent), file);
     }
 
-    /// A set-but-unparseable variable does **not** win: it warns and falls
-    /// through to the file, which is the pre-#869 behaviour with the config
-    /// file in the place the hard-coded default used to occupy.
+    /// A value the old parser would have **rejected** does nothing either —
+    /// there is no "unusable value" case left to distinguish from a usable
+    /// one, because [`env::removed`] never parses the value at all.
     #[test]
-    fn an_unparseable_variable_falls_through_to_the_file() {
+    fn a_variable_set_to_a_once_unparseable_value_never_wins_either() {
         let file = CoreLeds {
             style: DisplayStyle::Oled,
             ..CoreLeds::default()
@@ -1649,7 +1574,7 @@ mod tests {
         assert_eq!(resolved.style, DisplayStyle::Oled);
     }
 
-    // ── The deprecation warning ─────────────────────────────────────────────
+    // ── The removed-variable warning (#1041 step 3) ─────────────────────────
     // The capture harness is `hytte_config::test_support` since #1044. It was a
     // third verbatim copy of the same 100 lines — and had already drifted from
     // `hytte-config`'s, which kept the structured fields this one threw away
@@ -1659,11 +1584,11 @@ mod tests {
     // what it replaces — see that module's doc for the measurement.
     use hytte_config::test_support::{Captured, capture};
 
-    /// The deprecation lines, selected on the **exact** rendered message. A
-    /// `contains("deprecated")` filter would turn green-and-blind the day the
-    /// wording changes — including the negative test below, whose whole job is
-    /// to observe an absence.
-    fn deprecations(captured: &Captured) -> Vec<String> {
+    /// The removed-variable lines, selected on the **exact** rendered message.
+    /// A `contains("does nothing")` filter would turn green-and-blind the day
+    /// the wording changes — including the negative test below, whose whole
+    /// job is to observe an absence.
+    fn removed_lines(captured: &Captured) -> Vec<String> {
         let expected: Vec<String> = [&STYLE, &COLOR, &ROWS, &FILL]
             .into_iter()
             .map(announced)
@@ -1676,14 +1601,15 @@ mod tests {
             .collect()
     }
 
-    /// The exact deprecation line one knob produces, against the process's own
-    /// resolved overlay path.
+    /// The exact removed-variable line one knob produces, against the
+    /// process's own resolved overlay path.
     ///
-    /// The *sentence* is pinned against a literal in `config::tests`; here the
-    /// job is only to select the line out of a capture, which needs whatever
-    /// path this machine resolves.
+    /// The *sentence* is pinned against a literal in
+    /// `hytte_config::subsystem::env::tests`; here the job is only to select
+    /// the line out of a capture, which needs whatever path this machine
+    /// resolves.
     fn announced(knob: &EnvKnob) -> String {
-        env::deprecation_message(
+        env::removed_message(
             knob.var,
             knob.key,
             &env::overlay_display(CoreLedsConfig::NAME),
@@ -1712,13 +1638,17 @@ mod tests {
             .collect()
     }
 
-    /// A set variable still wins, and says so **once**, naming the real
-    /// overlay path and the key it moves to.
+    /// **The flagship #1041 test: a set variable changes nothing, and costs
+    /// exactly one line naming the file key, per knob that was actually
+    /// set.**
     ///
-    /// Red if `warn_deprecated_env` stops being called, if the message is
-    /// reworded in one place and not the other, or if the wrong key is named.
+    /// Red if `warn_removed_env` stops being called, if the message is
+    /// reworded in one place and not the other, if the wrong key is named, or
+    /// — the mutation this exists to catch — if `resolve` reads the value
+    /// back and lets it win: `resolved` would then disagree with
+    /// `CoreLeds::default()`.
     #[test]
-    fn a_set_variable_announces_its_deprecation_once() {
+    fn a_set_variable_changes_nothing_and_warns_exactly_once_per_knob() {
         let (captured, _guard) = capture();
 
         let resolved = resolve(
@@ -1730,9 +1660,13 @@ mod tests {
             Deprecations::Announce,
         );
 
-        assert_eq!(resolved.style, DisplayStyle::Crt, "the variable still wins");
         assert_eq!(
-            deprecations(&captured),
+            resolved,
+            CoreLeds::default(),
+            "both set variables did nothing — the built-in default won throughout"
+        );
+        assert_eq!(
+            removed_lines(&captured),
             vec![announced(&STYLE), announced(&FILL)],
             "one line per *set* variable, in knob order, and no line for the two unset ones"
         );
@@ -1740,54 +1674,38 @@ mod tests {
 
     /// The other half, and the one that needs a **live control**: asserting an
     /// absence against a capture that observed nothing at all is not an
-    /// assertion. The unusable-value warning proves the capture was wired at
-    /// the moment the absence was observed.
-    ///
-    /// It also pins **F9**: a set-but-unusable variable costs *one* line, not a
-    /// deprecation line plus an unusable-value line. Red if `env_key` goes back
-    /// to announcing before it parses.
+    /// assertion. The one set variable's line proves the capture was wired at
+    /// the moment the absence — for the other three — was observed.
     #[test]
-    fn an_unset_variable_announces_nothing() {
+    fn unset_variables_announce_nothing() {
         let (captured, _guard) = capture();
 
-        resolve(
+        let resolved = resolve(
             CoreLeds::default(),
             &env(&[("TROLLSHELL_CORE_LEDS_COLOR", "puce")]),
             Deprecations::Announce,
         );
 
-        let warned = warnings(&captured);
         assert_eq!(
-            warned.len(),
-            1,
-            "one set-but-unusable variable is exactly one line: {warned:?}"
+            resolved,
+            CoreLeds::default(),
+            "the one set variable did nothing either, live control for the assertion below"
         );
-        assert!(
-            warned[0].starts_with("TROLLSHELL_CORE_LEDS_COLOR is set to `puce`"),
-            "live control: the capture must be observing this thread, got {warned:?}"
-        );
-        assert!(
-            warned[0].contains("`color`") && warned[0].contains("core-leds.toml"),
-            "…and the one line has to carry the instruction the deprecation line would have: \
-             {warned:?}"
-        );
-        assert!(
-            deprecations(&captured).is_empty(),
-            "a value nothing accepts is not also announced as a migration: {warned:?}"
+        assert_eq!(
+            removed_lines(&captured),
+            vec![announced(&COLOR)],
+            "exactly the one set variable announces, none of the other three"
         );
     }
 
     /// `Deprecations::Silent` — what every reload passes — says nothing at
-    /// all, for **either** line, so a live shell does not repeat itself every
-    /// few seconds. Both a variable that parsed and one that did not are set
-    /// here, since since #1040 V7 the two are gated together.
+    /// all, so a live shell does not repeat itself every few seconds.
     ///
-    /// The live control is the resolution itself rather than a line that was
-    /// observed: an absence-of-output test cannot use its own subject as
-    /// evidence that the subject ran. `crt` reaching the result proves both
-    /// variables were read on this thread.
+    /// The live control here is that both variables did nothing, whatever
+    /// their content: since #1041 step 3 a variable reaching the resolver is
+    /// no longer observable any other way than by its absence of effect.
     ///
-    /// **Red if either warning stops being gated on `Deprecations`.**
+    /// **Red if the warning stops being gated on `Deprecations`.**
     #[test]
     fn a_silent_resolution_announces_nothing() {
         let (captured, _guard) = capture();
@@ -1802,14 +1720,9 @@ mod tests {
         );
 
         assert_eq!(
-            resolved.style,
-            DisplayStyle::Crt,
-            "live control: the resolution under observation actually ran"
-        );
-        assert_eq!(
-            resolved.color,
-            CoreLeds::default().color,
-            "…including the unusable half, which fell through"
+            resolved,
+            CoreLeds::default(),
+            "both variables did nothing, whether or not either would once have parsed"
         );
         assert_eq!(
             warnings(&captured),
@@ -1827,7 +1740,7 @@ mod tests {
     /// green (mutation X1): the `resolve`-level tests pass their own
     /// `Deprecations`, so none of them could see which one production chose.
     /// The reload side already had this cover
-    /// (`a_reload_does_not_re_announce_a_pinned_variable`); this is the
+    /// (`a_reload_does_not_re_announce_a_removed_variable`); this is the
     /// symmetric half, and "the once-ness is a property of the two call sites"
     /// only closes with both.
     ///
@@ -1843,9 +1756,13 @@ mod tests {
             CoreLeds::default(),
             "live control: with no layers the file half is the documented default"
         );
-        assert_eq!(resolved.style, DisplayStyle::Crt, "…and the variable wins");
         assert_eq!(
-            deprecations(&captured),
+            resolved.style,
+            DisplayStyle::Vfd,
+            "…and the variable did nothing — the built-in default's own style, not `crt`"
+        );
+        assert_eq!(
+            removed_lines(&captured),
             vec![announced(&STYLE)],
             "the startup resolution announces exactly the set variable"
         );
@@ -2071,55 +1988,64 @@ mod tests {
         );
     }
 
-    /// An environment-pinned key stays pinned across a reload: the file moves,
-    /// the variable still wins for its own key, and the *other* keys still
-    /// track the file.
+    /// **A set variable does nothing across a reload either** — the file
+    /// moves, the variable stays set throughout, and every key tracks the
+    /// file on both loads.
     ///
-    /// **Red if the reload stops layering the environment** (it would publish
-    /// the file's `lcd`).
+    /// **Red if a reload starts layering the environment again** (it would
+    /// publish `crt` on the second load instead of the file's own `lcd`).
     #[test]
-    fn an_env_pinned_key_survives_a_reload() {
-        let pinned = env(&[("TROLLSHELL_CORE_LEDS_STYLE", "crt")]);
+    fn a_set_variable_still_does_nothing_across_a_reload() {
+        let ignored = env(&[("TROLLSHELL_CORE_LEDS_STYLE", "crt")]);
         let mut overlay = overlay();
         overlay.write("style = \"vfd\"\ncolor = \"heat\"\n");
         let mut watcher = watching(&overlay.layers());
-        let current = watcher.resolved(&pinned, Deprecations::Silent);
-        assert_eq!(current.style, DisplayStyle::Crt);
+        let current = watcher.resolved(&ignored, Deprecations::Silent);
+        assert_eq!(
+            current.style,
+            DisplayStyle::Vfd,
+            "the variable did nothing on the first load"
+        );
 
         overlay.write("style = \"lcd\"\ncolor = \"rainbow\"\n");
-        let next = watcher.poll(&current, &pinned).expect("changed → reload");
+        let next = watcher.poll(&current, &ignored).expect("changed → reload");
 
         assert_eq!(
             next.style,
-            DisplayStyle::Crt,
-            "the environment still wins after a reload"
+            DisplayStyle::Lcd,
+            "…nor on the reload: the file's new style, not the variable's"
         );
         assert_eq!(
             next.color,
             ColorMap::Rainbow,
-            "…while the keys it does not pin follow the file"
+            "…and the other key follows the file too"
         );
     }
 
-    /// A **reload** must not re-announce. The deprecation line is a startup
-    /// event; the poll runs every few seconds for the life of the shell, so an
-    /// announcing reload would fill the journal with the same line forever.
+    /// A **reload** must not re-announce, whatever the variable is set to.
+    /// The removed-variable line is a startup event; the poll runs every few
+    /// seconds for the life of the shell, so an announcing reload would fill
+    /// the journal with the same line forever — and, since #1041 step 3,
+    /// there is no "unusable value" case left that needs its own coverage
+    /// here: #1040 V7's two reload tests (a pinned-but-parseable value, a
+    /// pinned-but-unparseable one) collapse into this one, because both now
+    /// take the identical code path.
     ///
     /// The capture is installed *after* the startup resolution, so it observes
     /// the poll and nothing else. **Red if `Watcher::poll` passes
     /// `Deprecations::Announce`** — the call-site half of the latch, which the
-    /// `resolve`-level test above cannot see.
+    /// `resolve`-level tests above cannot see.
     #[test]
-    fn a_reload_does_not_re_announce_a_pinned_variable() {
-        let pinned = env(&[("TROLLSHELL_CORE_LEDS_STYLE", "crt")]);
+    fn a_reload_does_not_re_announce_a_removed_variable() {
+        let set = env(&[("TROLLSHELL_CORE_LEDS_STYLE", "crt")]);
         let mut overlay = overlay();
         overlay.write("color = \"heat\"\n");
         let mut watcher = watching(&overlay.layers());
-        let current = watcher.resolved(&pinned, Deprecations::Announce);
+        let current = watcher.resolved(&set, Deprecations::Announce);
 
         let (captured, _guard) = capture();
         overlay.write("color = \"rainbow\"\n");
-        let next = watcher.poll(&current, &pinned).expect("changed → reload");
+        let next = watcher.poll(&current, &set).expect("changed → reload");
 
         assert_eq!(
             next.color,
@@ -2128,50 +2054,13 @@ mod tests {
         );
         assert_eq!(
             next.style,
-            DisplayStyle::Crt,
-            "…with the variable still won"
+            CoreLeds::default().style,
+            "…with the variable still doing nothing"
         );
         assert!(
-            deprecations(&captured).is_empty(),
+            removed_lines(&captured).is_empty(),
             "a reload must not repeat the startup line: {:?}",
             captured.events()
-        );
-    }
-
-    /// **A bad variable costs one line for the life of the shell**, not one
-    /// per reload (#1040 V7).
-    ///
-    /// The unusable-value line used to be ungated, on the argument that "an
-    /// unusable variable is still unusable after an edit". True, and still one
-    /// extra journal line every three seconds forever — against a
-    /// `live-verify.md` bullet that promises **exactly one** two lines after
-    /// telling the reader that a repeating line means a bug. A process's
-    /// environment cannot change under it, so the repeat could never carry
-    /// news.
-    ///
-    /// **Red if the unusable-value warning stops being gated on
-    /// `Deprecations`.**
-    #[test]
-    fn a_reload_does_not_repeat_the_unusable_variable_line() {
-        let broken = env(&[("TROLLSHELL_CORE_LEDS_STYLE", "plasma")]);
-        let mut overlay = overlay();
-        overlay.write("color = \"heat\"\n");
-        let mut watcher = watching(&overlay.layers());
-        let current = watcher.resolved(&broken, Deprecations::Announce);
-
-        let (captured, _guard) = capture();
-        overlay.write("color = \"rainbow\"\n");
-        let next = watcher.poll(&current, &broken).expect("changed → reload");
-
-        assert_eq!(
-            next.color,
-            ColorMap::Rainbow,
-            "live control: the reload under observation must actually have happened"
-        );
-        assert_eq!(
-            warnings(&captured),
-            Vec::<String>::new(),
-            "a reload says nothing about a variable that was already reported"
         );
     }
 
@@ -2254,9 +2143,14 @@ mod tests {
     /// coverage: making it call the startup sequence twice (mutation Z2), or
     /// skip it entirely and resolve `Silent` inline (Z3, F3's original defect
     /// one level up), left the suite at 562 passed. Nobody would ever have
-    /// heard a deprecation line again and CI would not have noticed.
+    /// heard a removed-variable line again and CI would not have noticed.
     ///
-    /// **Red if `start` loads twice, announces twice, or stops announcing.**
+    /// Since #1041 step 3 the set variable (`FILL`) does nothing, which is the
+    /// other thing this test now pins: the handle's `fill` is the built-in
+    /// default (`spare`, the file sets none), never the variable's `blank`.
+    ///
+    /// **Red if `start` loads twice, announces twice, stops announcing, or
+    /// lets the variable's value reach the handle.**
     #[test]
     fn the_service_start_loads_once_and_announces_once() {
         let mut overlay = overlay();
@@ -2286,10 +2180,10 @@ mod tests {
             handles.leds.get(),
             CoreLeds {
                 style: DisplayStyle::Crt,
-                fill: Fill::Blank,
                 ..CoreLeds::default()
             },
-            "live control: the file's key and the variable's key both reached the handle"
+            "live control: the file's key reached the handle, and the variable's did nothing \
+             — `fill` stayed the built-in default rather than becoming `blank`"
         );
     }
 
@@ -2476,7 +2370,7 @@ mod tests {
     /// them on the floor, so the claim could not have been false in a way any
     /// test could see.
     #[test]
-    fn the_deprecation_line_carries_its_fields() {
+    fn the_removed_variable_line_carries_its_fields() {
         let (captured, _guard) = capture();
         resolve(
             CoreLeds::default(),
@@ -2488,7 +2382,7 @@ mod tests {
             .events()
             .into_iter()
             .find(|e| e.message == announced(&STYLE))
-            .expect("the deprecation line");
+            .expect("the removed-variable line");
         assert_eq!(
             event.fields.get("subsystem").map(String::as_str),
             Some("core-leds")

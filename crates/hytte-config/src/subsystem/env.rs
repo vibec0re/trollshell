@@ -1,12 +1,17 @@
-//! The environment layered **over** a subsystem's config file, and the one
-//! deprecation line a migrated variable produces (#866 step 2, hoisted out of
-//! the `core-leds.toml` pilot by #1044).
+//! The environment layered **over** a subsystem's config file, the one
+//! deprecation line a migrated variable produces while it is still read
+//! (#866 step 2, hoisted out of the `core-leds.toml` pilot by #1044), and the
+//! one line a variable produces once it no longer is (step 3, #1041).
 //!
 //! #866 settled three steps for each of the 43 environment variables
-//! trollshell's configuration used to live in. Step 2 is the one this module
-//! implements: the variable is still read and still **wins**, but a set one
-//! warns **once at startup** naming the file and the key it moves to. Step 3 —
-//! removing the variable — is a later decision, per subsystem.
+//! trollshell's configuration used to live in. Step 2 is [`key`]: the
+//! variable is still read and still **wins**, but a set one warns **once at
+//! startup** naming the file and the key it moves to. Step 3 is [`removed`]:
+//! a subsystem's own decision, made once its deprecation window has closed —
+//! the variable is no longer read for its *value* at all, only checked for
+//! *presence*, so a set one still warns once but the file (or the built-in
+//! default) always wins. `core-leds` was the first to reach it (#1041 item
+//! 3); every other subsystem still calls [`key`] until its own window closes.
 //!
 //! # Resolution order, per key
 //!
@@ -281,6 +286,60 @@ pub fn key<'a, T>(
     }
 }
 
+/// The **one** line a variable produces once its subsystem's deprecation
+/// window has closed (#1041 step 3): it is no longer read for its value at
+/// all, so there is nothing left to say about what it was set *to* — only
+/// that it does nothing now, and where the value belongs instead.
+///
+/// Deliberately not [`deprecation_message`] reworded in place: a subsystem
+/// that has reached step 3 and one still mid-window (calling [`key`]) can
+/// coexist in the same journal — `core-leds` reached it in #1041 while every
+/// other subsystem was still on step 2 — and a reader filtering on "is
+/// deprecated" vs. "does nothing any more" needs the two to read as genuinely
+/// different instructions, not one message two subsystems happen to share.
+///
+/// `accepts` is the knob's **file** vocabulary, for the same reason
+/// [`deprecation_message`]'s is: this line's job is to tell the reader what
+/// to type in the file it names.
+#[must_use]
+pub fn removed_message(var: &str, key: &str, file: &str, accepts: &str) -> String {
+    format!("{var} does nothing any more; set `{key}` in {file} instead — it accepts {accepts}")
+}
+
+/// Warn that `var` does nothing any more, and name the config key that
+/// replaces it.
+///
+/// Call this **once per set variable at startup**, exactly like
+/// [`warn_deprecated_env`] — see that function's doc for why a reload must
+/// never call it.
+pub fn warn_removed_env(subsystem: &str, var: &str, key: &str, accepts: &str) {
+    let file = overlay_display(subsystem);
+    tracing::warn!(
+        subsystem,
+        var,
+        key,
+        accepts,
+        file = %file,
+        "{}",
+        removed_message(var, key, &file, accepts)
+    );
+}
+
+/// Resolve one knob once its subsystem's deprecation window has closed
+/// (#1041 step 3): `raw` is checked only for **presence**, never parsed, and
+/// `fallback` (the merged file value) always wins.
+///
+/// The counterpart to [`key`] with no `parse` argument and no `Result`: once
+/// a variable does nothing, there is nothing left to attempt parsing, and no
+/// "unusable value" case to distinguish from a usable one — every set value
+/// gets the same one line, from [`removed_message`].
+pub fn removed<T>(subsystem: &str, knob: &EnvKnob, raw: Option<&str>, fallback: T, announce: Deprecations) -> T {
+    if raw.is_some() && announce == Deprecations::Announce {
+        warn_removed_env(subsystem, knob.var, knob.key, knob.file_accepts);
+    }
+    fallback
+}
+
 /// The process environment, for a subsystem's production call site.
 ///
 /// Every resolver takes its lookup as a parameter rather than reaching for the
@@ -296,7 +355,8 @@ pub fn process_env(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Deprecations, EnvKnob, deprecation_message, key, overlay_display_in, unusable_env_message,
+        Deprecations, EnvKnob, deprecation_message, key, overlay_display_in, removed,
+        removed_message, unusable_env_message,
     };
     use crate::test_support::capture;
     use crate::xdg;
@@ -306,6 +366,16 @@ mod tests {
         "style",
         "one of vfd/lcd/oled/crt",
     );
+
+    /// A knob whose two vocabularies genuinely differ — [`EnvKnob::same`]'s
+    /// three STYLE-shaped tests above cannot tell "picked `file_accepts`" from
+    /// "picked the only string it has".
+    const ROWS: EnvKnob = EnvKnob {
+        var: "TROLLSHELL_CORE_LEDS_ROWS",
+        key: "rows",
+        env_accepts: "rect, or a row count",
+        file_accepts: "0 or \"rect\", or a row count",
+    };
 
     /// A controlled environment: one absolute `$XDG_CONFIG_HOME`, nothing else
     /// set, so every path below is a literal this test states in full.
@@ -503,6 +573,109 @@ mod tests {
 
         assert_eq!(good, "crt", "the variable still wins");
         assert_eq!(bad, "from-the-file", "…and an unusable one still does not");
+        assert_eq!(captured.warnings(), Vec::<String>::new());
+    }
+
+    // ── `removed`: step 3, the deprecation window closed (#1041) ────────────
+
+    /// The removed-variable sentence, as a literal, for the same reason the
+    /// deprecation and unusable-value sentences above are: `docs/live-verify.md`
+    /// quotes it and a subsystem's own reword must travel there in the same
+    /// commit.
+    #[test]
+    fn the_removed_sentence_is_this_exact_sentence() {
+        assert_eq!(
+            removed_message(
+                "TROLLSHELL_CORE_LEDS_STYLE",
+                "style",
+                "/x/core-leds.toml",
+                "one of vfd/lcd/oled/crt"
+            ),
+            "TROLLSHELL_CORE_LEDS_STYLE does nothing any more; set `style` in \
+             /x/core-leds.toml instead — it accepts one of vfd/lcd/oled/crt"
+        );
+    }
+
+    /// An unset variable is silent — the negative that makes "one line per set
+    /// variable" meaningful, exactly as it is for [`key`].
+    #[test]
+    fn an_unset_variable_is_silent_once_removed() {
+        let (captured, _guard) = capture();
+
+        let resolved = removed("core-leds", &STYLE, None, "from-the-file", Deprecations::Announce);
+
+        assert_eq!(resolved, "from-the-file");
+        assert_eq!(captured.warnings(), Vec::<String>::new());
+    }
+
+    /// **A set variable never wins, whatever it says** — the whole point of
+    /// step 3. `removed` takes no `parse` argument at all: there is no code
+    /// path left that could read `raw`'s content, so this is really pinning
+    /// the signature as much as the behaviour. A `key`-shaped regression that
+    /// smuggled the value back in through `raw` would fail this the moment the
+    /// variable and the fallback disagree.
+    #[test]
+    fn a_set_variable_never_wins_once_removed() {
+        let (captured, _guard) = capture();
+
+        let resolved = removed(
+            "core-leds",
+            &STYLE,
+            Some("crt"),
+            "from-the-file",
+            Deprecations::Announce,
+        );
+
+        assert_eq!(resolved, "from-the-file", "the file always wins now");
+        assert_eq!(captured.warnings().len(), 1, "…but it still costs one line");
+    }
+
+    /// The one line names the **file** vocabulary, not the variable's — the
+    /// same split [`key`]'s deprecation line makes, and for the same reason:
+    /// this line's job is to tell the reader what to type in the file it
+    /// names. `ROWS` is the knob whose two vocabularies actually differ, so a
+    /// swap to `env_accepts` is observable here where it would not be on
+    /// [`EnvKnob::same`]'s `STYLE`.
+    #[test]
+    fn the_removed_line_teaches_the_file_vocabulary() {
+        let (captured, _guard) = capture();
+
+        removed(
+            "core-leds",
+            &ROWS,
+            Some("rect"),
+            Some(4_usize),
+            Deprecations::Announce,
+        );
+
+        let warned = captured.warnings();
+        assert_eq!(warned.len(), 1, "{warned:#?}");
+        assert!(
+            warned[0].contains(ROWS.file_accepts),
+            "the removed line teaches the *file* spelling: {warned:#?}"
+        );
+        assert!(
+            !warned[0].contains(ROWS.env_accepts) || ROWS.env_accepts == ROWS.file_accepts,
+            "…and not the variable's, which differs here: {warned:#?}"
+        );
+    }
+
+    /// `Silent` — what a reload passes — says nothing at all, exactly as it
+    /// does for [`key`]: the variable is fixed for the life of the process, so
+    /// a repeat could never carry news.
+    #[test]
+    fn a_silent_resolution_announces_nothing_once_removed() {
+        let (captured, _guard) = capture();
+
+        let resolved = removed(
+            "core-leds",
+            &STYLE,
+            Some("crt"),
+            "from-the-file",
+            Deprecations::Silent,
+        );
+
+        assert_eq!(resolved, "from-the-file");
         assert_eq!(captured.warnings(), Vec::<String>::new());
     }
 }

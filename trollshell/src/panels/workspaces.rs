@@ -349,48 +349,8 @@ fn model(
         }
     }
 
-    // Then the ephemeral ones — an unnamed workspace with windows on it. An
-    // unnamed *empty* workspace is niri's trailing spare, not a card; a named
-    // workspace that no stack knows about is the user's own and is left alone.
-    let mut ephemeral: Vec<&Workspace> = workspaces
-        .iter()
-        .filter(|w| w.name.is_none())
-        .filter(|w| windows.iter().any(|win| win.workspace_id == Some(w.id)))
-        .collect();
-    ephemeral.sort_by_key(|w| w.idx);
-    for workspace in ephemeral {
-        let Some(output) = workspace.output.as_deref() else {
-            continue;
-        };
-        by_output.entry(output).or_default().push(Card {
-            name: String::new(),
-            kind: Kind::Ephemeral {
-                workspace: workspace.id,
-                output: output.to_owned(),
-                windows: ordered_windows(workspace.id, windows)
-                    .into_iter()
-                    .map(|w| (w.0.to_owned(), w.1))
-                    .collect(),
-            },
-            // `ordered_app_ids`, **not** `open_app_ids`: this list is what a
-            // Save records, and #1071 §3.4 step 3 makes the stack's order be
-            // niri's column order. Collecting through a `BTreeSet` here (as this
-            // did) silently sorted it lexicographically, which is the input
-            // `workspace_stacks::column_order_batch` would then have restored
-            // wrongly.
-            apps: ordered_app_ids(workspace.id, windows)
-                .into_iter()
-                .map(|app_id| StackApp {
-                    app_id: app_id.to_owned(),
-                    running: true,
-                })
-                .collect(),
-            // Deliberately `None`: an ephemeral card has no entry in the file,
-            // so there is nothing for a drag to rewrite. Its workspace id lives
-            // on `Kind::Ephemeral`, where Save uses it.
-            live: None,
-            monitor: None,
-        });
+    for (output, card) in ephemeral_cards(workspaces, windows) {
+        by_output.entry(output).or_default().push(card);
     }
 
     let mut columns: Vec<Column> = by_output
@@ -409,6 +369,64 @@ fn model(
         });
     }
     PageModel { columns, order }
+}
+
+/// The ephemeral cards — an unnamed workspace with windows on it — paired with
+/// the connector each belongs in (#1071 §3.7).
+///
+/// An unnamed *empty* workspace is niri's trailing spare, not a card; a named
+/// workspace that no stack knows about is the user's own and is left alone.
+fn ephemeral_cards<'w>(
+    workspaces: &'w [Workspace],
+    windows: &[Window],
+) -> Vec<(&'w str, Card)> {
+    let mut unnamed: Vec<&Workspace> = workspaces
+        .iter()
+        .filter(|w| w.name.is_none())
+        .filter(|w| windows.iter().any(|win| win.workspace_id == Some(w.id)))
+        .collect();
+    unnamed.sort_by_key(|w| w.idx);
+    unnamed
+        .into_iter()
+        .filter_map(|workspace| {
+            let output = workspace.output.as_deref()?;
+            let on_workspace = ordered_windows(workspace.id, windows);
+            Some((
+                output,
+                Card {
+                    name: String::new(),
+                    kind: Kind::Ephemeral {
+                        workspace: workspace.id,
+                        output: output.to_owned(),
+                        windows: on_workspace
+                            .iter()
+                            .map(|(app_id, pid)| ((*app_id).to_owned(), *pid))
+                            .collect(),
+                    },
+                    // In **niri's column order**, not a set: this list is what a
+                    // Save records, and #1071 §3.4 step 3 makes the stack's
+                    // order be the column order. Collecting through a
+                    // `BTreeSet` here (as this once did) silently sorted it
+                    // lexicographically, which is the input
+                    // `workspace_stacks::column_order_batch` would then have
+                    // restored wrongly.
+                    apps: on_workspace
+                        .iter()
+                        .map(|(app_id, _)| StackApp {
+                            app_id: (*app_id).to_owned(),
+                            running: true,
+                        })
+                        .collect(),
+                    // Deliberately `None`: an ephemeral card has no entry in the
+                    // file, so there is nothing for a drag to rewrite. Its
+                    // workspace id lives on `Kind::Ephemeral`, where Save uses
+                    // it.
+                    live: None,
+                    monitor: None,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// The workspace carrying `name`, matched the way niri matches it — case

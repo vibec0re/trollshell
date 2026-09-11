@@ -35,7 +35,7 @@
 //! the same file — and hands back every key, so one read answers both `Exec=`
 //! and `DBusActivatable=`.
 //!
-//! It is also **plain file IO**: no GObject, no main-loop affinity. That is what
+//! It is also **plain file IO**: no `GObject`, no main-loop affinity. That is what
 //! lets `workspace_stacks`' Start transaction resolve an entry from the tokio
 //! runtime without hopping to the GTK thread. Only the *activation* of a
 //! `DBusActivatable` entry needs the main thread, because that one really does
@@ -48,7 +48,7 @@ const GROUP: &str = "Desktop Entry";
 
 /// What a Start needs to know about a desktop entry (#1071 §3.2).
 ///
-/// Plain data on purpose — no `gio::Icon`, no GObject of any kind — so it
+/// Plain data on purpose — no `gio::Icon`, no `GObject` of any kind — so it
 /// crosses from the GTK thread to the tokio runtime and back through the
 /// `workspace_stacks::Ops` seam like every other value there.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -114,7 +114,7 @@ pub(crate) fn launchable(id: &str) -> Option<Launchable> {
 
 /// Split an `Exec=` line — or a user's own launch-command override — into argv.
 ///
-/// Shell-style quoting, because that is what GLib itself applies to an `Exec`
+/// Shell-style quoting, because that is what `GLib` itself applies to an `Exec`
 /// line (`g_shell_parse_argv`, reached through `g_desktop_app_info`'s parameter
 /// expansion): single quotes are literal, double quotes allow `\` escapes, and a
 /// backslash outside quotes escapes the next character. A plain
@@ -123,7 +123,7 @@ pub(crate) fn launchable(id: &str) -> Option<Launchable> {
 /// that shape are the norm on this distribution.
 ///
 /// **An unterminated quote closes at the end of the string** rather than
-/// producing an error. GLib's parser refuses such a line outright; refusing here
+/// producing an error. `GLib`'s parser refuses such a line outright; refusing here
 /// would mean a stack app silently not launching because the user typed one
 /// stray `"` in the Edit form, and launching the obvious reading of what they
 /// typed is the better failure. There is no error path out of this function by
@@ -254,7 +254,7 @@ pub(crate) fn strip_field_codes(words: &[String]) -> Vec<String> {
 
 /// Start a `DBusActivatable=true` entry through GIO (#1071 §3.2).
 ///
-/// **GTK main thread only.** `gio::AppInfo` is a GObject interface, not `Send`,
+/// **GTK main thread only.** `gio::AppInfo` is a `GObject` interface, not `Send`,
 /// and this is the one call in the epic that genuinely needs the main loop —
 /// `workspace_stacks::Live::activate` hops here from the runtime and says why.
 ///
@@ -284,7 +284,7 @@ pub(crate) fn activate(id: &str) -> Result<(), String> {
 /// One row the **Add app** picker can offer (#1071 §5).
 ///
 /// Split from `gio::AppInfo` so the picker's filtering is a pure function of
-/// plain data: `AppInfo` is a GObject interface with no constructor a test can
+/// plain data: `AppInfo` is a `GObject` interface with no constructor a test can
 /// reach, so a picker that filtered `AppInfo`s directly could only be falsified
 /// against whatever happens to be installed on the machine running the suite.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(words(""), Vec::<String>::new());
     }
 
-    /// GLib parses an `Exec` line with `g_shell_parse_argv`, so a quoted
+    /// `GLib` parses an `Exec` line with `g_shell_parse_argv`, so a quoted
     /// argument is **one** argument. `sh -c '…'` wrapper entries are the norm
     /// here, and `split_whitespace` (what phase 2 used) breaks every one.
     #[test]

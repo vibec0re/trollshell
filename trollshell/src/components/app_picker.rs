@@ -11,7 +11,7 @@
 //! [`picker_popover`] takes its rows as a plain `Vec<PickerEntry>` rather than
 //! reading `gio::AppInfo::all()` itself, and [`add_app_button`] is the one-line
 //! wrapper that supplies the real ones. That is what makes §5's *"filtered to
-//! `NoDisplay=false`"* falsifiable: `gio::AppInfo` is a GObject interface with
+//! `NoDisplay=false`"* falsifiable: `gio::AppInfo` is a `GObject` interface with
 //! no constructor a test can reach, so a picker that filtered `AppInfo`s
 //! directly could only ever be checked against whatever happens to be installed
 //! on the machine running the suite — which is to say, not checked. With the
@@ -223,6 +223,26 @@ mod tests {
         while gtk::glib::MainContext::default().iteration(false) {}
     }
 
+    /// Drive the GTK main loop until `done()` holds, or `ms` of wall clock has
+    /// passed.
+    ///
+    /// Needed here because `GtkSearchEntry`'s `search-changed` is **delayed** —
+    /// that is the difference between it and a plain `changed`, and it is why
+    /// the picker uses it: the list is every installed application, and
+    /// rebuilding it on each of five keystrokes of "fire" would rescan and
+    /// re-resolve icons five times. So a `pump()` after `set_text` sees nothing;
+    /// the timer has to actually fire.
+    fn pump_until(ms: u64, done: impl Fn() -> bool) {
+        let expired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = expired.clone();
+        gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(ms), move || {
+            flag.set(true);
+        });
+        while !expired.get() && !done() {
+            gtk::glib::MainContext::default().iteration(true);
+        }
+    }
+
     fn entry(id: &str, name: &str, show: bool) -> PickerEntry {
         PickerEntry {
             id: id.to_owned(),
@@ -308,25 +328,36 @@ mod tests {
         assert_eq!(offered(&popover).len(), 3);
 
         let search = search(&popover);
-        search.set_text("fire");
-        pump();
-        assert_eq!(offered(&popover), ["org.mozilla.firefox"]);
+        /// Type `query` and wait for the debounced `search-changed` to land.
+        fn typed(popover: &gtk::Popover, search: &gtk::SearchEntry, query: &str) -> Vec<String> {
+            search.set_text(query);
+            let before = offered(popover);
+            pump_until(2000, || offered(popover) != before);
+            offered(popover)
+        }
+
+        assert_eq!(
+            typed(&popover, &search, "fire"),
+            ["org.mozilla.firefox"],
+            "typing did not narrow the rendered rows"
+        );
 
         // By id, for an application whose display name shares nothing with it.
-        search.set_text("nautilus");
-        pump();
-        assert_eq!(offered(&popover), ["org.gnome.Nautilus"]);
+        assert_eq!(
+            typed(&popover, &search, "nautilus"),
+            ["org.gnome.Nautilus"]
+        );
 
-        // Clearing it brings the whole (still-filtered) list back.
-        search.set_text("");
-        pump();
-        assert_eq!(offered(&popover).len(), 3);
+        // Clearing it brings the whole (still-filtered) list back — and the
+        // hidden entry is still not among them.
+        assert_eq!(
+            typed(&popover, &search, ""),
+            ["org.mozilla.firefox", "org.gnome.Nautilus", "Alacritty"]
+        );
 
         // A query nothing matches renders no rows at all rather than a stale
         // list.
-        search.set_text("no-such-application");
-        pump();
-        assert!(offered(&popover).is_empty());
+        assert!(typed(&popover, &search, "no-such-application").is_empty());
     }
 
     /// §5: *"selecting appends an app to the stack"* — the row hands its **id**

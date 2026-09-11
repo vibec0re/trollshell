@@ -961,7 +961,7 @@ impl Ops for Live {
         crate::config::workspaces::set_stack_monitor(name, monitor).map_err(|e| e.to_string())
     }
 
-    /// Plain file IO — `glib::KeyFile` over `$XDG_DATA_DIRS`, no GObject and no
+    /// Plain file IO — `glib::KeyFile` over `$XDG_DATA_DIRS`, no `GObject` and no
     /// main-loop affinity — so it runs on the runtime thread the transaction is
     /// already on. See `components::desktop_entry`'s module doc.
     async fn desktop_entry(&self, id: &str) -> Option<Launchable> {
@@ -970,7 +970,7 @@ impl Ops for Live {
 
     /// The one call in this file that has to run on the **GTK main thread**.
     ///
-    /// `gio::AppInfo` is a GObject interface, not `Send`, and its `launch` is
+    /// `gio::AppInfo` is a `GObject` interface, not `Send`, and its `launch` is
     /// what carries GIO's own D-Bus-activation logic — the desktop id → bus
     /// name → `org.freedesktop.Application.Activate` walk, plus its fallback to
     /// the entry's `Exec` when activation fails. Hand-rolling that over

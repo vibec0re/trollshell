@@ -58,6 +58,19 @@ use crate::components::layout::{DRAWER_MAX_WIDTH_WIDE, finish_page_clamped, page
 use crate::config::workspaces::{Layout, Stack, StackApp};
 use crate::workspace_stacks;
 
+/// A handle to "rebuild the app list", shared with the rows it builds.
+///
+/// The indirection is what lets a row's own **remove** button ask for the list
+/// it is a child of to be rebuilt: a row cannot reach its parent's builder from
+/// inside its own callback, and the builder cannot capture rows that do not
+/// exist yet. The `Option` is filled in once, immediately after the closure is
+/// made — it is only ever `None` for the length of that one statement.
+///
+/// Rebuilding rather than patching, because every row carries its **index** and
+/// a removal renumbers everything after it. A patch would leave stale indices,
+/// and a stale index removes the wrong app on the next press.
+type Redraw = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+
 /// CSS class on one app row, and the hook a test counts rows by.
 const APP_ROW_CLASS: &str = "ts-ws-edit-app";
 
@@ -386,14 +399,13 @@ where
         while let Some(child) = root.first_child() {
             root.remove(&child);
         }
-        match draft {
-            Some(draft) => root.append(&build_form(&draft)),
-            None => {
-                let hint = gtk::Label::new(Some(NOTHING_HINT));
-                hint.add_css_class("ts-ws-empty");
-                hint.set_xalign(0.0);
-                root.append(&hint);
-            }
+        if let Some(draft) = draft {
+            root.append(&build_form(&draft));
+        } else {
+            let hint = gtk::Label::new(Some(NOTHING_HINT));
+            hint.add_css_class("ts-ws-empty");
+            hint.set_xalign(0.0);
+            root.append(&hint);
         }
     });
     root.upcast()
@@ -410,40 +422,10 @@ fn build_form(seed: &Draft) -> gtk::Widget {
     let column = page_box();
     column.add_css_class("ts-popup-column");
 
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let back = gtk::Button::from_icon_name("go-previous-symbolic");
-    back.add_css_class("flat");
-    back.set_tooltip_text(Some("Back to the workspaces"));
-    back.connect_clicked(|_| cancel());
-    header.append(&back);
-
-    let title = gtk::Label::new(Some(if seed.previous.is_some() {
-        "Edit workspace"
-    } else {
-        "Save this workspace"
-    }));
-    title.add_css_class("title-4");
-    title.set_xalign(0.0);
-    title.set_hexpand(true);
-    header.append(&title);
-    column.append(&header);
+    column.append(&build_header(seed));
 
     // ── Name ────────────────────────────────────────────────────────────────
-    let name = gtk::Entry::builder()
-        .text(&seed.name)
-        .placeholder_text("Workspace name\u{2026}")
-        .max_length(32)
-        .hexpand(true)
-        .build();
-    name.add_css_class(NAME_ENTRY_CLASS);
-    {
-        let draft = Rc::clone(&draft);
-        name.connect_changed(move |entry| {
-            entry.remove_css_class("error");
-            entry.set_tooltip_text(None);
-            draft.borrow_mut().name = entry.text().to_string();
-        });
-    }
+    let name = build_name_field(seed, &draft);
     column.append(&labelled("Name", &name));
     if seed.active && seed.previous.is_some() {
         let note = gtk::Label::new(Some(RENAME_BLOCKED_HINT));
@@ -454,49 +436,7 @@ fn build_form(seed: &Draft) -> gtk::Widget {
     }
 
     // ── Apps ────────────────────────────────────────────────────────────────
-    let apps = gtk::ListBox::new();
-    apps.add_css_class("boxed-list");
-    apps.add_css_class("ts-ws-edit-apps");
-    apps.set_selection_mode(gtk::SelectionMode::None);
-
-    let meta_cache: MetaCache = Rc::new(RefCell::new(HashMap::new()));
-    // `Rc<dyn Fn()>` so a row's own buttons can ask for the list to be rebuilt
-    // after they have changed the draft under it — a row cannot rebuild the list
-    // it is a child of from inside its own callback without this indirection.
-    let redraw: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
-    {
-        let draft = Rc::clone(&draft);
-        let meta_cache = Rc::clone(&meta_cache);
-        let apps_weak = apps.downgrade();
-        let redraw_slot = Rc::clone(&redraw);
-        let rebuild: Rc<dyn Fn()> = Rc::new(move || {
-            let Some(apps) = apps_weak.upgrade() else {
-                return;
-            };
-            while let Some(child) = apps.first_child() {
-                apps.remove(&child);
-            }
-            let rows = draft.borrow().apps.clone();
-            if rows.is_empty() {
-                let empty = gtk::Label::new(Some("No apps yet — add one below."));
-                empty.add_css_class("ts-ws-empty");
-                empty.set_xalign(0.0);
-                apps.append(&empty);
-                return;
-            }
-            for (index, app) in rows.iter().enumerate() {
-                apps.append(&app_row(
-                    index,
-                    app,
-                    &meta_cache,
-                    &draft,
-                    &redraw_slot,
-                ));
-            }
-        });
-        *redraw.borrow_mut() = Some(Rc::clone(&rebuild));
-        rebuild();
-    }
+    let (apps, redraw) = build_app_list(&draft);
     column.append(&section_label("Apps"));
     column.append(&apps);
 
@@ -595,8 +535,96 @@ fn build_form(seed: &Draft) -> gtk::Widget {
     finish_page_clamped(&column, DRAWER_MAX_WIDTH_WIDE)
 }
 
+/// The form's title row: back to the cards, and what this form is for.
+fn build_header(seed: &Draft) -> gtk::Widget {
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let back = gtk::Button::from_icon_name("go-previous-symbolic");
+    back.add_css_class("flat");
+    back.set_tooltip_text(Some("Back to the workspaces"));
+    // The back arrow is Cancel: leaving the form is leaving it, and a page with
+    // two ways out that do different things is a page that loses edits.
+    back.connect_clicked(|_| cancel());
+    header.append(&back);
+
+    let title = gtk::Label::new(Some(if seed.previous.is_some() {
+        "Edit workspace"
+    } else {
+        "Save this workspace"
+    }));
+    title.add_css_class("title-4");
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    header.append(&title);
+    header.upcast()
+}
+
+/// The name field, writing into the draft as it is typed.
+fn build_name_field(seed: &Draft, draft: &Rc<RefCell<Draft>>) -> gtk::Entry {
+    let name = gtk::Entry::builder()
+        .text(&seed.name)
+        .placeholder_text("Workspace name\u{2026}")
+        .max_length(32)
+        .hexpand(true)
+        .build();
+    name.add_css_class(NAME_ENTRY_CLASS);
+    let draft = Rc::clone(draft);
+    name.connect_changed(move |entry| {
+        // Clear the red as soon as the correction starts, rather than leaving it
+        // through every keystroke of the fix (phase 2's LOW, kept).
+        entry.remove_css_class("error");
+        entry.set_tooltip_text(None);
+        draft.borrow_mut().name = entry.text().to_string();
+    });
+    name
+}
+
+/// The app list, and the handle that rebuilds it.
+///
+/// Returns both because the rows' own buttons need the handle and the caller
+/// needs the widget; see [`Redraw`] for why a rebuild rather than a patch.
+fn build_app_list(draft: &Rc<RefCell<Draft>>) -> (gtk::ListBox, Redraw) {
+    let apps = gtk::ListBox::new();
+    apps.add_css_class("boxed-list");
+    apps.add_css_class("ts-ws-edit-apps");
+    apps.set_selection_mode(gtk::SelectionMode::None);
+
+    let meta_cache: MetaCache = Rc::new(RefCell::new(HashMap::new()));
+    let redraw: Redraw = Rc::new(RefCell::new(None));
+
+    let rebuild: Rc<dyn Fn()> = {
+        let draft = Rc::clone(draft);
+        let redraw = Rc::clone(&redraw);
+        // Weak, so the closure the list itself transitively holds does not pin
+        // the list (#224's contract, stated by hand because this is not a
+        // `bind`).
+        let apps = apps.downgrade();
+        Rc::new(move || {
+            let Some(apps) = apps.upgrade() else {
+                return;
+            };
+            while let Some(child) = apps.first_child() {
+                apps.remove(&child);
+            }
+            let rows = draft.borrow().apps.clone();
+            if rows.is_empty() {
+                let empty = gtk::Label::new(Some("No apps yet — add one below."));
+                empty.add_css_class("ts-ws-empty");
+                empty.set_xalign(0.0);
+                apps.append(&empty);
+                return;
+            }
+            for (index, app) in rows.iter().enumerate() {
+                apps.append(&app_row(index, app, &meta_cache, &draft, &redraw));
+            }
+        })
+    };
+    *redraw.borrow_mut() = Some(Rc::clone(&rebuild));
+    rebuild();
+    (apps, redraw)
+}
+
 /// Run the stored rebuild closure, if the form is still alive.
-fn fire(redraw: &Rc<RefCell<Option<Rc<dyn Fn()>>>>) {
+fn fire(redraw: &Redraw) {
     // Cloned out of the `RefCell` before it is called: a rebuild appends rows
     // whose own callbacks hold this same `Rc`, and a `Ref` held across that is
     // the re-entrant borrow that aborts the process (#643/#663/#832).
@@ -647,7 +675,7 @@ fn refusal(why: &SaveError) -> String {
 fn commit(plan: &SavePlan) {
     match plan.name_workspace {
         Some(workspace) => {
-            workspace_stacks::spawn_save(workspace, plan.name.clone(), plan.stack.clone())
+            workspace_stacks::spawn_save(workspace, plan.name.clone(), plan.stack.clone());
         }
         None => workspace_stacks::spawn_save_edit(
             plan.previous.clone(),
@@ -663,7 +691,7 @@ fn app_row(
     app: &StackApp,
     meta_cache: &MetaCache,
     draft: &Rc<RefCell<Draft>>,
-    redraw: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    redraw: &Redraw,
 ) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     row.add_css_class(APP_ROW_CLASS);
@@ -766,7 +794,7 @@ fn row_drag_source(index: usize) -> gtk::DragSource {
 fn row_drop_target(
     index: usize,
     draft: &Rc<RefCell<Draft>>,
-    redraw: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    redraw: &Redraw,
 ) -> gtk::DropTarget {
     let target = gtk::DropTarget::new(glib::types::Type::I64, gdk::DragAction::MOVE);
     let draft = Rc::clone(draft);
@@ -858,6 +886,15 @@ mod tests {
 
     fn app_rows(root: &gtk::Widget) -> Vec<gtk::Widget> {
         by_class(root, APP_ROW_CLASS)
+    }
+
+    /// The event controllers attached to `widget` itself — how GTK4 answers
+    /// "is this a drag source / a drop target", since both *are* controllers.
+    fn controllers(widget: &gtk::Widget) -> Vec<gtk::EventController> {
+        let list = widget.observe_controllers();
+        (0..list.n_items())
+            .filter_map(|i| list.item(i)?.downcast::<gtk::EventController>().ok())
+            .collect()
     }
 
     /// The launch command shown on each app row, in row order.
@@ -1116,13 +1153,6 @@ mod tests {
         let page = slot(&target);
         target.set(Some(saved_draft()));
         pump();
-
-        fn controllers(widget: &gtk::Widget) -> Vec<gtk::EventController> {
-            let list = widget.observe_controllers();
-            (0..list.n_items())
-                .filter_map(|i| list.item(i)?.downcast::<gtk::EventController>().ok())
-                .collect()
-        }
 
         for row in app_rows(&page) {
             assert!(

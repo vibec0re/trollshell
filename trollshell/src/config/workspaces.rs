@@ -620,12 +620,12 @@ pub fn save_edit_to(
             )));
         }
         table.remove(previous);
-        order = rename_within(&order, previous, &name);
+        order = rename_within(order.as_ref(), previous, &name);
     }
 
     table.insert(name, stack_value(stack));
     let next = WorkspacesConfig {
-        order: order_value(&order, &existing),
+        order,
         workspace: Some(toml::Value::Table(table)),
     };
     hytte_config::subsystem::save_overlay_to(path, &next)
@@ -684,24 +684,6 @@ fn workspace_table(
     }
 }
 
-/// `order` as it should be written back after a possible rename.
-///
-/// `None` when the overlay had no `order` and the rename changed nothing — which
-/// is the case that keeps a Save from *inventing* an `order` key. Arrays replace
-/// whole (`merge.rs`), so an overlay that carries `order` at all overrides the
-/// base's entirely; writing one the user never asked for would silently discard
-/// a home-manager-pinned card order (#1101's own "design calls worth checking").
-fn order_value(
-    order: &Option<toml::Value>,
-    existing: &hytte_config::subsystem::Loaded<WorkspacesConfig>,
-) -> Option<toml::Value> {
-    if order == &existing.config.order {
-        existing.config.order.clone()
-    } else {
-        order.clone()
-    }
-}
-
 /// `order` with `from` replaced by `to`, **in place**.
 ///
 /// In place rather than removed-and-appended: a rename is not a reordering, and
@@ -709,11 +691,14 @@ fn order_value(
 /// invisible edit the user did not make.
 ///
 /// Pure, and stated over the raw `toml::Value` because that is what the overlay
-/// holds — a non-array `order` (another hand-edit slip) is returned untouched
-/// rather than replaced, so this writer never destroys a value it cannot read.
-fn rename_within(order: &Option<toml::Value>, from: &str, to: &str) -> Option<toml::Value> {
+/// holds. Two shapes pass through untouched, and both matter: an **absent**
+/// `order` stays absent — writing one would replace a base-pinned card order
+/// wholesale, since arrays replace (`merge.rs`) — and a **non-array** `order` (a
+/// hand-edit slip) is returned as it was, so this writer never destroys a value
+/// it cannot read.
+fn rename_within(order: Option<&toml::Value>, from: &str, to: &str) -> Option<toml::Value> {
     let Some(toml::Value::Array(items)) = order else {
-        return order.clone();
+        return order.cloned();
     };
     Some(toml::Value::Array(
         items

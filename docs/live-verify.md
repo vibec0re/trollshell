@@ -528,6 +528,73 @@ the reducer but cannot prove the hive agrees.
       them against the committed files. **A difference is a finding, not a
       formatting nit** — see that directory's `README.md`.
 
+### The companion window (#947 P2, #950)
+
+Needs the same hive, plus `programs.trollshell.agentWindow.enable` (on by
+default once a `plugins.agents` entry exists) so `trollshell-agent-window` is
+on the session's `PATH`. CI proves the argv both ends speak, the `?hide=`
+assembly, the verbs' bytes against a scripted socket and the TLS policy's
+scope; it cannot prove that hyperhive's page renders in WebKitGTK, which is the
+whole point of the window.
+
+- [ ] **(#950)** **The card's link opens the window, not the browser.** With
+      the window installed, click an agent's `agent page` link on the drawer
+      page and confirm a **new window** appears (title `<label> — agent`,
+      app-id `mov.vibec0re.trollshell.AgentWindow.<agent>`) rather than a
+      browser tab. Then `systemctl --user list-units 'trollshell-launch-*'` and
+      confirm it was started as a transient unit — it must be **outside** the
+      shell's cgroup, so `systemctl --user restart trollshell` leaves it alive.
+- [ ] **(#950)** **The pen opens the settings tab.** Click `[edit]` on a card
+      pill and confirm the same window opens **on Settings**, not on the agent
+      page, and that the drawer does **not** also open a plugin page behind it.
+- [ ] **(#950)** **A second launch focuses the first.** With the window open on
+      the agent page, click the pen: no second window appears, the existing one
+      is presented *and* switches to Settings (that is the
+      `HANDLES_COMMAND_LINE` forward — if it merely raises without switching,
+      the remote command line is being dropped). Then open a **different**
+      agent's window and confirm the two coexist.
+- [ ] **(#950)** **The embedded page is the feed alone.** Confirm hyperhive's
+      own header and composer are **gone** inside the view — the URL carries
+      `?hide=header,input` — and that our header (icon, name, model word, live
+      status) and the start/stop/pause buttons are the only chrome. If the
+      hive's own header is still there, the parameter regressed on the hive's
+      side (it was shipped by @the-sword-above on #950) and the fix is one
+      constant in `crates/trollshell-agent-window/src/page.rs`.
+- [ ] **(#950)** **The header follows the hive, not the page.** Drive a status
+      change from outside (`hivectl`, or the agent's own `set_status`) and
+      confirm our header line changes within one `poll_seconds` **without**
+      reloading the embedded page — the page keeps its scroll position and any
+      half-typed message. Pause the agent from the hive side and confirm the
+      pause toggle moves on its own and does **not** bounce back (a bounce
+      means the echo guard in `ui::Header::apply` is gone and the window is
+      fighting the daemon).
+- [ ] **(#950)** **Start / stop / pause hit only this agent.** Use each button
+      and check `hivectl list-agents` before and after that nothing else moved
+      — the §11 rule-one footgun again, and this is a second writer on the same
+      socket.
+- [ ] **(#950)** **TLS.** A default hyperhive gateway serves a self-signed leaf
+      under a host-held CA, and the machine's trust store does not carry it, so
+      expect a TLS failure page on first run. The fix in order of preference:
+      add the hive's anchor to the **system** store —
+      `security.pki.certificateFiles = [ "/var/lib/hive-tls/trust-bundle.pem" ];`
+      (the bundle, **not** `ca.pem`: the hive CA is an intermediate) — and the
+      window picks it up like any other client. Failing that, launch it with
+      `TROLLSHELL_AGENT_WINDOW_CA=/var/lib/hive-tls/trust-bundle.pem`, which
+      trusts that certificate **for the agent's host only**. Confirm in both
+      cases that the page loads *and* that an unrelated https host in the same
+      window still fails on a bad certificate — this window never turns TLS
+      checking off.
+- [ ] **(#950)** **Without the window, nothing regresses.** Set
+      `programs.trollshell.agentWindow.enable = false;`, rebuild, restart the
+      plugin, and confirm the card's link opens the **browser** again and the
+      pen opens the plugin's own drawer page, with exactly one journal line
+      about the window not being on `PATH` (not one per click).
+- [ ] **(#950)** **niri rules.** The app-id carries the agent, so a rule for
+      all of these windows matches the prefix — e.g.
+      `match app-id="^mov\.vibec0re\.trollshell\.AgentWindow"`. Confirm a
+      size/placement rule written that way applies to two different agents'
+      windows.
+
 ## Plugins & launcher
 
 - [ ] **(#489)** Plugins now launch via `systemd-run --user` transient units

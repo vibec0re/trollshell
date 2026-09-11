@@ -508,6 +508,14 @@ in
         home.packages = [ cfg.controlCenter.package ];
       })
 
+      # The per-agent companion window (#950): the hyperhive agents card's two
+      # destinations. On by default exactly when `plugins.agents` is declared —
+      # the plugin resolves this binary on the *user manager's* PATH, which is
+      # what the user profile feeds, and degrades to the browser without it.
+      (lib.mkIf cfg.agentWindow.enable {
+        home.packages = [ cfg.agentWindow.package ];
+      })
+
       # Group switch: turn the whole extras bundle on, each via mkDefault so an
       # explicit per-feature `enable = false` still wins. The wallpaper daemon
       # is whichever wallpaper.backend selects (default swaybg) — backend picks

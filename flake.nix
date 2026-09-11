@@ -105,6 +105,17 @@
             inherit workspace revision;
           };
 
+          # The per-agent companion window (#950, P2 of the agentic desktop):
+          # hyperhive's own agent page in a WebKitGTK view inside our chrome.
+          # Same slice-and-wrap shape as the control center — it is a windowed
+          # GTK app, and WebKit needs the GApplication env — but with no
+          # .desktop item, since it is meaningless without `--agent <name>`
+          # (nix/agent-window.nix says why). `programs.trollshell.agentWindow`
+          # installs it; the agents plugin launches it off `PATH`.
+          trollshell-agent-window = pkgs.callPackage ./nix/agent-window.nix {
+            inherit workspace revision;
+          };
+
           # Per-plugin flake packages (#558): `packages.hytte-plugin-<id>` for
           # each of the 14 bundled plugins. Generated from `bundledPluginNames`
           # (one attr each) rather than hand-written. Since #572 each is a `cp`
@@ -157,6 +168,7 @@
           inherit
             trollshell
             trollshell-control-center
+            trollshell-agent-window
             options-doc
             hytte-infobroker
             hytte-claude-bridge

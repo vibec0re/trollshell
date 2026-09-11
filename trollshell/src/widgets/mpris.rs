@@ -26,7 +26,7 @@
 //! or re-measures anything at runtime: the threshold is measured **once** from
 //! the built row (see [`build_bin`]) and then frozen into the breakpoint.
 //!
-//! ### The one non-obvious part: pinning the child's size request
+//! ### The one non-obvious part: freezing the child's size request
 //!
 //! A breakpoint that hides the full row would otherwise be a one-way door. With
 //! a plain `GtkBox` holding both renditions, hiding the full row drops the box's
@@ -35,56 +35,79 @@
 //! no matter how much space appears. Measured, that is a fall from `(34, 294)`
 //! to `(34, 34)`: permanently stuck, the iteration-1 failure wearing a new hat.
 //!
-//! [`build_bin`] pins the renditions box with `set_size_request(full_row_width)`,
-//! which raises **both** its minimum and its natural, so the box requests the
-//! same width whichever rendition is visible. The bin's own (smaller) size
-//! request is what lets the bar squeeze the slot below that. Request stability
-//! is exactly what makes the feedback loop impossible, and it is asserted by
+//! So the request the bar sees has to be the same whichever rendition shows:
+//! **minimum** the mini chip's width, so the bar may squeeze the slot;
+//! **natural** the full row's, so the bar keeps offering enough room to expand
+//! back into. That is all [`FrozenSize`] is — a `GtkLayoutManager` holding
+//! those two constants, installed by [`build_bin`] on an `AdwBin` between the
+//! breakpoint bin and the renditions box. It measures nothing at runtime and
+//! reacts to nothing; it is a declaration, not a computation, which is what
+//! separates it from the four iterations that tried to reconstruct the fit from
+//! outside the layout pass. Request stability is exactly what makes the
+//! feedback loop impossible, and it is asserted by
 //! `the_request_is_the_same_whichever_rendition_shows`.
 //!
-//! ### Its consequence: why the two renditions align differently
+//! ### Why a layout manager and not `set_size_request` (#838, #851, #854)
 //!
-//! Pinning the child uses `AdwBreakpointBin` against its own contract, and the
-//! bin does not bend. In libadwaita 1.9.3 (`src/adw-breakpoint-bin.c`):
+//! Because `set_size_request` raises a widget's **minimum** — the natural only
+//! follows because GTK clamps it up to the minimum (`gtk_widget_real_adjust_size_request`)
+//! — and the minimum is the one number that must stay small here. In
+//! libadwaita 1.9.3 (`src/adw-breakpoint-bin.c`):
 //!
 //! - `adw_breakpoint_bin_measure()` zeroes the **bin's** minimum once it has a
 //!   breakpoint — `if (priv->breakpoints->len > 0) min = 0;` (lines 375–376).
 //!   The child's own minimum is not touched.
 //! - `allocate_child()` measures the child fresh (line 223), and when the bin's
 //!   slot is narrower does `width = MAX (width, min_width)` before
-//!   `gtk_widget_allocate` (lines 256–259): the child gets the pinned `full_px`
-//!   however narrow the bin's own slot happens to be.
+//!   `gtk_widget_allocate` (lines 256–259): the child is laid out at its own
+//!   minimum however narrow the bin's slot happens to be.
 //! - `adw_breakpoint_bin_init()` calls
 //!   `gtk_widget_set_overflow (GTK_WIDGET (self), GTK_OVERFLOW_HIDDEN)`
 //!   (line 657), so the bin clips to its own allocation.
 //!
 //! "Collapsed" means, by the breakpoint's own condition, a bin width
-//! `A <= full_px - 1` — i.e. **always** strictly below the pinned child
-//! minimum. So in the one state this widget exists to produce, the renditions
-//! box is laid out `full_px` wide from the bin's left edge and then clipped at
-//! `A`. An `End`-aligned mini chip lands at `x = full_px - mini_px`, past the
-//! clip, and is neither drawn nor hit-testable. That is what #851 shipped;
-//! measured, a 34 px chip at `x = 260..294` inside a 147 px bin.
+//! `A <= full_px - 1`. A `set_size_request(full_px, -1)` pin on the renditions
+//! box therefore put the child's minimum **strictly above the bin's width in
+//! every collapsed allocation** — the one state this widget exists to produce.
+//! The box was laid out `full_px` wide from the bin's left edge and clipped at
+//! `A`, so everything inside it was positioned against a right edge that is not
+//! on screen. #851 shipped that with `halign: End` on both renditions and the
+//! chip simply vanished: measured, a 34 px chip at `x = 260..294` inside a
+//! 147 px bin. #854 bought it back into the clip rectangle with
+//! `halign: Start`, and that is where Annika found it on the seventh round —
+//! *"expanded is right aligned in bar; icon left aligned — attached to variable
+//! width window list. keep right plz"* — because `Start` pins the chip to the
+//! left edge of a slot whose left edge is wherever the variable-width window
+//! list happens to stop.
 //!
-//! Hence the asymmetry: the **full row keeps `halign: End`**, so it still sits
-//! against the right-hand status cluster when there is room, while the **mini
-//! chip takes `halign: Start`**, putting it at `x = 0` — which the bin's own
-//! `set_size_request(mini_px, …)` floor guarantees is inside the clipped area
-//! at every allocation. The cost is that the collapsed chip hugs the left of
-//! its slot instead of the right; a chip in a slightly wrong place beats one
-//! that is not there at all. The clean fix would be libadwaita's own
-//! `adw_breakpoint_bin_set_natural_size()`, but it is private
-//! (`adw-breakpoint-bin-private.h`) and absent from the Rust bindings.
+//! What the widget wants from the bin is `adw_breakpoint_bin_set_natural_size()`,
+//! which raises the natural and leaves the minimum alone. It exists, it does
+//! exactly this, and it is **private** (`adw-breakpoint-bin-private.h`, absent
+//! from the Rust bindings). [`FrozenSize`] is the public-API stand-in.
 //!
-//! libadwaita still warns on steady-state collapsed allocations (`… exceeds
-//! AdwBreakpointBin width: requested N px, A px available`, line 247). Its
-//! condition is `min_width > width` — the child's measured minimum against the
-//! bin's allocated width — and `adw-breakpoint-bin.c` reads neither `halign`
-//! nor `valign` anywhere, so the alignment cannot trigger or suppress it. It is
-//! the **pin** libadwaita is objecting to, and the pin cannot go. (The bin sets
-//! `block_warnings` around the first allocation and the breakpoint-transition
-//! pass, which is why a test that presents one window and allocates once sees
-//! no warning while a long-lived bar sees one per allocation.)
+//! With it, the bin's child reports a `mini_px` minimum, which is never above
+//! the bin's own allocation, so `allocate_child()`'s `MAX` is a no-op and the
+//! renditions box is laid out at **exactly the bin's width**. `halign: End`
+//! then means the bin's own right edge — for both renditions, at every
+//! allocation. There is no asymmetry left to document or to "tidy up": the two
+//! renditions are aligned the same way, and the chip stays inside the clip
+//! whatever the window list does. Asserted by
+//! `both_renditions_hug_the_bins_right_edge` (two squeezed widths and one roomy
+//! one, because a chip at a fixed offset inside a wider row coincides with the
+//! bin's right edge at exactly one allocation) and by
+//! `the_collapsed_chip_is_drawn_inside_the_bin`.
+//!
+//! It also retires the journal spam #856 recorded. `adw-breakpoint-bin.c:247`
+//! warns `… exceeds AdwBreakpointBin width: requested N px, A px available`
+//! whenever `min_width > width` — the child's measured minimum against the
+//! bin's allocated width — which the pin made true at every collapsed
+//! allocation and the shim makes false at all of them. Note that no test can
+//! see this either way: the bin sets `block_warnings` around the first
+//! allocation and the breakpoint-transition pass, so a test that presents one
+//! window and allocates once never reaches the warning at all. The measurement
+//! behind the claim is a deliberate *second* collapsed allocation under
+//! `xvfb-run` with stderr grepped for the line — one line per re-allocation
+//! with the pin, zero with the shim.
 //!
 //! Playback status is not an input to any of this: expand and collapse are
 //! purely about whether there is room on the bar (Annika's standing correction
@@ -99,6 +122,7 @@ use hytte::gtk::{self, gdk};
 use hytte::prelude::*;
 use hytte::services::mpris::{self, Player};
 
+use self::frozen_size::FrozenSize;
 use crate::components::mpris_controls::{bind_transport_button, play_pause_icon};
 
 /// Width of the "artist – title" label, in characters.
@@ -166,18 +190,21 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
 ///   what `AdwBreakpoint` is for, and they are declarative: the breakpoint
 ///   restores the previous values itself when it stops applying, so there is no
 ///   apply/unapply handler to keep in sync.
-/// - **`hexpand` on both renditions, but `halign(End)` on the full row and
-///   `halign(Start)` on the mini chip.** The full row is end-aligned so it is
-///   drawn against the right-hand status cluster, with the space it gives up
-///   falling into the bar's existing mid-gap. The mini chip is *deliberately*
-///   start-aligned instead: collapsed, the pinned box is laid out wider than
-///   the bin and clipped to it, so an end-aligned chip is clipped away
-///   entirely (#838). This asymmetry is load-bearing — see the module doc's
-///   "why the two renditions align differently" — and is asserted by
-///   `the_collapsed_chip_is_drawn_inside_the_bin`.
-/// - **`set_size_request` on the renditions box** — the load-bearing line. See
-///   the module doc: without it, collapsing drops the natural width and the chip
-///   can never expand again.
+/// - **`hexpand` and `halign(End)` on both renditions.** They are aligned the
+///   same way on purpose — Annika's *"keep right plz"* (#838): the slot's right
+///   edge is where the bar's right-hand status cluster begins, and that is
+///   where the media control belongs in either rendition, with the space it
+///   gives up falling into the bar's existing mid-gap rather than moving with
+///   the window list. This only works because [`FrozenSize`] keeps the box's
+///   *minimum* down, so the bin lays the box out at its own allocation instead
+///   of at the full row's width — see the module doc's "why a layout manager
+///   and not `set_size_request`". Asserted by
+///   `both_renditions_hug_the_bins_right_edge`.
+/// - **[`FrozenSize`] on an `AdwBin` between the bin and the box** — the
+///   load-bearing part. See the module doc: without a rendition-independent
+///   natural width, collapsing is a one-way door and the chip can never expand
+///   again; without a small minimum, the collapsed box is laid out wider than
+///   the bin and clipped.
 /// - **`set_size_request` on the bin** — required, not optional: libadwaita
 ///   documents that *"adding a breakpoint to `AdwBreakpointBin` will result in it
 ///   having no minimum size"*, and that `width-request` and `height-request`
@@ -196,23 +223,22 @@ pub fn widget(monitor: &Monitor) -> gtk::Widget {
 fn build_bin(full: &gtk::Widget, mini: &gtk::Widget) -> adw::BreakpointBin {
     for w in [full, mini] {
         w.set_hexpand(true);
+        w.set_halign(gtk::Align::End);
     }
-    // The alignments differ on purpose; this is not a typo, and "tidying" the
-    // two back into one loop reintroduces #838. `End` keeps the full row against
-    // the right-hand status cluster. `Start` is the only thing that keeps the
-    // mini chip inside the bin's clip rectangle, because collapsed the pinned
-    // box is allocated `full_px` from the bin's left edge and clipped to the
-    // bin's narrower slot. See the module doc.
-    full.set_halign(gtk::Align::End);
-    mini.set_halign(gtk::Align::Start);
 
     let renditions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     renditions.append(full);
     renditions.append(mini);
 
+    // The shim that freezes the request. It has no other job: `AdwBin` is the
+    // smallest thing in the bindings that parents one child and carries a
+    // layout manager.
+    let shim = adw::Bin::new();
+    shim.set_child(Some(&renditions));
+
     let bin = adw::BreakpointBin::new();
     bin.add_css_class("ts-mpris");
-    bin.set_child(Some(&renditions));
+    bin.set_child(Some(&shim));
 
     // Measure before hiding anything, with the tree and the CSS class already
     // in place. Frozen from here on.
@@ -221,7 +247,7 @@ fn build_bin(full: &gtk::Widget, mini: &gtk::Widget) -> adw::BreakpointBin {
     let height_px = natural_height(full).max(natural_height(mini));
 
     mini.set_visible(false);
-    renditions.set_size_request(full_px, -1);
+    shim.set_layout_manager(Some(FrozenSize::new(mini_px, full_px, height_px)));
     // Both axes: libadwaita warns at runtime ("does not have a minimum height,
     // set the 'height-request' property") if only one is given, because the
     // breakpoint strips the bin's minimum in *both* directions. The bar never
@@ -240,6 +266,98 @@ fn build_bin(full: &gtk::Widget, mini: &gtk::Widget) -> adw::BreakpointBin {
     bin.add_breakpoint(breakpoint);
 
     bin
+}
+
+/// A `GtkLayoutManager` that reports one frozen size request and hands its
+/// widget's whole allocation straight to its child.
+///
+/// The public-API stand-in for libadwaita's private
+/// `adw_breakpoint_bin_set_natural_size()`: it raises a natural width without
+/// raising the minimum, which `gtk_widget_set_size_request` cannot do and which
+/// is the entire difference between a mini chip that hugs the bar's right
+/// cluster and one that is clipped away or stranded on the left (#838). See the
+/// module doc's "why a layout manager and not `set_size_request`".
+///
+/// It has no inputs. The three numbers are measured once from the built
+/// renditions in [`build_bin`] and never read anything again, so this cannot
+/// become a fifth attempt at computing the fit from outside the layout pass:
+/// there is nothing here to recompute.
+mod frozen_size {
+    use hytte::gtk::glib;
+    use hytte::gtk::subclass::prelude::ObjectSubclassIsExt;
+
+    mod imp {
+        use std::cell::Cell;
+
+        use hytte::gtk::prelude::WidgetExt;
+        use hytte::gtk::subclass::prelude::*;
+        use hytte::gtk::{self, glib};
+
+        /// `width` is `(minimum, natural)`; `height` is both bounds at once —
+        /// the bar never squeezes this slot vertically.
+        #[derive(Default)]
+        pub struct FrozenSize {
+            pub width: Cell<(i32, i32)>,
+            pub height: Cell<i32>,
+        }
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for FrozenSize {
+            const NAME: &'static str = "TsMprisFrozenSize";
+            type Type = super::FrozenSize;
+            type ParentType = gtk::LayoutManager;
+        }
+
+        impl ObjectImpl for FrozenSize {}
+
+        impl LayoutManagerImpl for FrozenSize {
+            /// The frozen request. `for_size` is deliberately ignored: neither
+            /// axis of this widget depends on the other.
+            fn measure(
+                &self,
+                _widget: &gtk::Widget,
+                orientation: gtk::Orientation,
+                _for_size: i32,
+            ) -> (i32, i32, i32, i32) {
+                if orientation == gtk::Orientation::Horizontal {
+                    let (min, nat) = self.width.get();
+                    (min, nat, -1, -1)
+                } else {
+                    let height = self.height.get();
+                    (height, height, -1, -1)
+                }
+            }
+
+            /// Pass the allocation through untouched. `gtk_widget_allocate`
+            /// applies the child's own margins and alignment, so a child that
+            /// wants to sit against the right edge of what it is given still
+            /// does — the point of the exercise being that what it is given is
+            /// now the bin's own width.
+            fn allocate(&self, widget: &gtk::Widget, width: i32, height: i32, baseline: i32) {
+                if let Some(child) = widget.first_child() {
+                    child.allocate(width, height, baseline, None);
+                }
+            }
+        }
+    }
+
+    glib::wrapper! {
+        /// See the module doc.
+        pub struct FrozenSize(ObjectSubclass<imp::FrozenSize>)
+            @extends hytte::gtk::LayoutManager;
+    }
+
+    impl FrozenSize {
+        /// Freeze a request: `min_width` is the narrowest the bar may squeeze
+        /// the widget to, `natural_width` the width it keeps asking for, and
+        /// `height` both vertical bounds.
+        pub fn new(min_width: i32, natural_width: i32, height: i32) -> Self {
+            let this: Self = glib::Object::new();
+            this.imp().width.set((min_width, natural_width));
+            this.imp().height.set(height);
+            this
+        }
+    }
 }
 
 /// A widget's natural width.
@@ -400,10 +518,14 @@ mod gtk_tests {
     /// Which rendition the bin is currently showing: the `GtkBox` full row or
     /// the `GtkButton` mini chip.
     fn shown(bin: &adw::BreakpointBin) -> gtk::Widget {
-        let renditions = bin
+        let shim = bin
+            .child()
+            .and_downcast::<adw::Bin>()
+            .expect("bin child is the frozen-size shim");
+        let renditions = shim
             .child()
             .and_downcast::<gtk::Box>()
-            .expect("bin child is the renditions box");
+            .expect("the shim's child is the renditions box");
         let mut child = renditions.first_child();
         while let Some(w) = child {
             if w.is_visible() {

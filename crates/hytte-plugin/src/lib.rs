@@ -84,12 +84,11 @@
 //! Systemd's own `TimeoutStopSec` on the transient unit is the outer bound on
 //! all of this — if a stuck hook (or a stuck in-flight frame) still hasn't
 //! let the process exit by then, systemd escalates to `SIGKILL`, past
-//! anything this runtime can do about it. As of #1079,
-//! `trollshell/src/plugin_launcher.rs` does not set `TimeoutStopSec` on the
-//! units it starts, so that bound is in practice the service manager's own
-//! `DefaultTimeoutStopSec` (90 s on a stock systemd) rather than anything
-//! tuned to this 2 s inner grace — tracked separately on #419's lane, not a
-//! change this crate makes.
+//! anything this runtime can do about it. As of #1098, the launcher sets
+//! `TimeoutStopSec=10s` on every plugin unit it starts
+//! (`trollshell/src/launch.rs`'s `PLUGIN_TIMEOUT_STOP`), so that outer bound
+//! is now paired with this 2 s inner grace rather than left at the service
+//! manager's `DefaultTimeoutStopSec` (90 s on a stock systemd).
 //!
 //! # Self-driven re-renders
 //!

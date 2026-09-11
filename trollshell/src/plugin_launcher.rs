@@ -544,6 +544,10 @@ fn parse_fingerprint(description: &str) -> Option<&str> {
 ///   with the session but survive a shell restart. `target` is the state file's
 ///   (defaulting to [`DEFAULT_TARGET`]), so it is the *same* target the shell's
 ///   own unit binds to rather than a hardcoded guess at it (#707).
+/// - `TimeoutStopSec=`[`crate::launch::PLUGIN_TIMEOUT_STOP`] (#1098, #1092
+///   review M4): bounds a stuck `Plugin::shutdown` hook well below the user
+///   manager's 90 s default — see that constant's doc for why 10 s and why
+///   this launch only.
 /// - the spec's declared `env` is passed value-inline as `--setenv=K=V`: it is
 ///   nix-rendered into the world-readable state file, so the argv discloses
 ///   nothing new, and an explicit value can't be shadowed by whatever the shell
@@ -572,6 +576,7 @@ fn plugin_launch(
             "Restart=on-failure".to_owned(),
             "RestartSec=2".to_owned(),
             format!("PartOf={target}"),
+            format!("TimeoutStopSec={}", launch::PLUGIN_TIMEOUT_STOP),
         ],
         env: spec
             .env
@@ -1704,6 +1709,7 @@ mod tests {
                 "--property=Restart=on-failure",
                 "--property=RestartSec=2",
                 "--property=PartOf=graphical-session.target",
+                "--property=TimeoutStopSec=10s",
                 "--setenv=A=1",
                 // '=' in a *value* is fine (systemd splits on the first '=').
                 "--setenv=B=x=y",

@@ -134,6 +134,34 @@ pub struct AgentsConfig {
     #[serde(default = "default_poll_seconds")]
     pub poll_seconds: u64,
     /// Per-agent display overrides, keyed by the hive's own agent name.
+    ///
+    /// # The workspace's first map-typed `Subsystem` field, decided on purpose
+    ///
+    /// `hytte_config::subsystem`'s #1088 rules (see its
+    /// "A map is outside the rule; its entries are not" paragraph) asked the
+    /// first author to type a map to decide what an *empty entry* means, rather
+    /// than inherit it by accident. This is that decision, and it is **drop the
+    /// entry**:
+    ///
+    /// ```toml
+    /// [display.argus]     # nothing of `Display`'s in it
+    /// ```
+    ///
+    /// loads as `display = {}` with **no** unknown-key warning. The map itself
+    /// swallows the table (a map has no schema to descend into), and the entry
+    /// is a `Display` the schema *does* walk, so an entry holding none of its
+    /// three optional keys reads as absent and goes.
+    ///
+    /// That is right for this file rather than merely acceptable, because an
+    /// all-`None` `Display` is a **no-op by construction**: `label_for`,
+    /// `icon_for` and `project_for` each fall back to the same value whether
+    /// the entry is absent or present-and-empty. Keeping it would put a row in
+    /// the merged config that changes nothing and that the format-preserving
+    /// writer would then have to round-trip. The observable consequence is
+    /// confined to that: writing an empty `[display.x]` to reserve a slot does
+    /// not reserve one, and re-saving the file drops the heading.
+    ///
+    /// Pinned by `an_empty_display_entry_is_dropped_and_a_populated_one_is_not`.
     #[serde(default)]
     pub display: BTreeMap<String, Display>,
 }
@@ -256,9 +284,30 @@ impl Subsystem for AgentsConfig {
     /// `poll_seconds = "soon"` is a deserialisation failure for the whole
     /// layer, not one warned key — the same behaviour this subsystem has had
     /// since it was written, and the reason [`Invalid`] still carries
-    /// whole-file rules. Adopting the per-key shape means retyping the schema
-    /// and is a change of contract, not a rebase; it is #947 follow-up work,
-    /// not something this file should half-do.
+    /// whole-file rules.
+    ///
+    /// **And it is not only the structural keys** (#963 review, LOW-1). A
+    /// **cosmetic per-agent** value reaches the same whole-file verdict, which
+    /// is the case worth naming because it is the one nobody expects.
+    /// Measured:
+    ///
+    /// ```toml
+    /// socket = "/run/hyperhive/host.sock"
+    /// poll_seconds = 9
+    /// [display.argus]
+    /// label = 5            # invalid type: integer `5`, expected a string
+    /// ```
+    ///
+    /// …fails the layer, so `socket` **and** `poll_seconds` silently revert to
+    /// their built-ins — a look-and-feel typo reverting the socket path is
+    /// exactly #1040 V1's named anti-pattern ("one typo would revert every
+    /// other key"), reached through the softest key in the file. Pinned by
+    /// `a_bad_display_value_takes_the_whole_file_down`.
+    ///
+    /// Adopting the per-key shape means retyping the schema and is a change of
+    /// contract, not a rebase; it is #947 follow-up work, and the LOW-1 case
+    /// above is what scopes it — **retype `display` first**, since that is
+    /// where a typo costs the most relative to what it buys.
     type Resolved = Self;
 
     fn validate(&self) -> Result<(), Self::Error> {
@@ -447,6 +496,92 @@ mod tests {
         assert!(
             matches!(err, hytte_config::subsystem::ConfigError::Schema(_)),
             "{err:?}"
+        );
+    }
+
+    /// **An empty `[display.x]` entry is dropped, on purpose** — the decision
+    /// `hytte_config::subsystem`'s #1088 rules asked the workspace's first
+    /// map-typed field to make. See [`AgentsConfig::display`] for the argument.
+    ///
+    /// Three cases in one, because the interesting part is that they differ:
+    /// the map swallows its own empty table, an empty *entry* reads as absent
+    /// and goes, and a populated entry survives untouched. None of the three
+    /// warns — an empty entry is not an unknown key, it is a known one holding
+    /// nothing.
+    ///
+    /// Falsification: make `Display` materialise an all-`None` entry (give it
+    /// a `#[serde(default)]` non-`Option` field, say) and the second assertion
+    /// reds; drop the `#[serde(default)]` from `display` and the first does.
+    #[test]
+    fn an_empty_display_entry_is_dropped_and_a_populated_one_is_not() {
+        let empty_map = assemble::<AgentsConfig>(&[(
+            PathBuf::from("overlay.toml"),
+            "display = {}\n".to_owned(),
+        )])
+        .expect("an empty map assembles");
+        assert!(empty_map.config.display.is_empty());
+        assert!(
+            empty_map.unknown_keys.is_empty(),
+            "{:?}",
+            empty_map.unknown_keys
+        );
+
+        let empty_entry = assemble::<AgentsConfig>(&[(
+            PathBuf::from("overlay.toml"),
+            "[display.argus]\n".to_owned(),
+        )])
+        .expect("an empty entry assembles");
+        assert!(
+            empty_entry.config.display.is_empty(),
+            "an entry holding none of `Display`'s keys reads as absent: {:?}",
+            empty_entry.config.display
+        );
+        assert!(
+            empty_entry.unknown_keys.is_empty(),
+            "…and it is not an unknown key: {:?}",
+            empty_entry.unknown_keys
+        );
+
+        let populated = from_toml("[display.argus]\nlabel = \"a\"\n");
+        assert_eq!(populated.label_for("argus"), "a");
+    }
+
+    /// **A bad value in a cosmetic per-agent key takes the whole file down**
+    /// (#963 review, LOW-1) — the residual [`AgentsConfig::Resolved`] names.
+    ///
+    /// This is the case worth pinning rather than `poll_seconds`: nobody is
+    /// surprised that a broken *structural* key fails the layer, but a typo in
+    /// a display label silently reverting the socket path is #1040 V1's named
+    /// anti-pattern reached through the softest key in the file. Pinning it
+    /// makes the follow-up's scope ("retype `display` first") a fact rather
+    /// than an opinion.
+    ///
+    /// Falsification: retype `display`'s values as `toml::Value` and give
+    /// `parsed` a per-key verdict, and this reds — which is exactly the
+    /// follow-up landing.
+    #[test]
+    fn a_bad_display_value_takes_the_whole_file_down() {
+        let body = concat!(
+            "socket = \"/run/hyperhive/host.sock\"\n",
+            "poll_seconds = 9\n",
+            "[display.argus]\n",
+            "label = 5\n",
+        );
+        let err = assemble::<AgentsConfig>(&[(PathBuf::from("overlay.toml"), body.to_owned())])
+            .expect_err("a wrong-typed display value must fail the layer");
+        assert!(
+            matches!(err, hytte_config::subsystem::ConfigError::Schema(_)),
+            "{err:?}"
+        );
+
+        // …and the blast radius is the point: the two good keys are gone with
+        // it, because `load_or_default` degrades the whole file.
+        let good = from_toml("socket = \"/run/hyperhive/host.sock\"\npoll_seconds = 9\n");
+        assert_eq!(good.poll_seconds, 9, "they load fine on their own");
+        assert_ne!(
+            good.poll_seconds,
+            AgentsConfig::default().poll_seconds,
+            "…and differ from the built-in, so reverting to it is observable"
         );
     }
 }

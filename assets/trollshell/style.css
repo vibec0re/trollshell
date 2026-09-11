@@ -670,9 +670,11 @@
     min-width: 0;
     padding: 0.077em 0.231em;
 }
-/* The name is a flat button so it can be clicked; it should read as the row's
- * label, not as a control sitting in a box. */
-.ts-agents-card button.ts-agent-name,
+/* The **panel roster's** name is a flat button — it is how the drawer picks an
+ * agent — and it should read as the row's label rather than as a control in a
+ * box. The card has no such selector any more: since the pill round its
+ * `ts-agent-name` is a plain `Node::Text` (`view.rs`'s `agent_row`), because
+ * the row's own click belongs to #950's window and is deliberately unwired. */
 .ts-agents-panel button.ts-agent-name {
     min-height: 0;
     padding: 0 0.154em;

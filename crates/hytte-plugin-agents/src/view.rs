@@ -598,6 +598,34 @@ fn flag_chips(agent: &Agent) -> Vec<Node> {
 /// Which verb depends on the state the row is already showing: a stopped agent
 /// can only be started, anything else can be stopped. Both are `Scope`d to this
 /// one agent (spec §11 rule one).
+///
+/// # Why this has no optimistic flip, where pause does (#963 review, LOW-4)
+///
+/// [`Agent::paused`](crate::model::Agent::paused) carries a `pending_paused`
+/// that flips the row the instant the button is clicked; these two verbs just
+/// send and return, so the button keeps offering the stale verb until the next
+/// poll — ≤ [`DEFAULT_POLL_SECONDS`](crate::config::DEFAULT_POLL_SECONDS), 2 s
+/// by default. The round moved the control **with** the affordance off the card
+/// and the one **without** it on, so the asymmetry is stated rather than left
+/// to be rediscovered.
+///
+/// It is deliberate, and the reason is that the two verbs are not the same kind
+/// of operation. `SetPaused` writes a **marker**, which `hive/wire.rs` records
+/// as "applies immediately and works on a stopped container too … idempotent
+/// both ways" — the hive's answer is knowable at click time, so predicting it
+/// is not a guess. `Start`/`Stop` are **container lifecycle**: a start pulls,
+/// boots a unit and waits for the harness, which can take far longer than one
+/// poll and can end in [`Status::Failed`]. An optimistic `running` would be a
+/// claim this plugin cannot back — visibly wrong for seconds, and wrong in the
+/// worst direction on the one path that matters (a start that fails would read
+/// as running until the poll corrected it).
+///
+/// The correct fix is not a flip but a **transient state** — `starting…` /
+/// `stopping…` as its own [`Status`], which is neither a lie nor stale. That is
+/// a model field, a precedence row, a glyph and a golden per state; a feature,
+/// not a fix-round line. Until then the stale window is bounded by the poll and
+/// harmless in both directions: `Stop` is `graceful: true` (hyperhive's
+/// per-agent quiesce) and a second click on either verb is idempotent.
 fn lifecycle_affordance(agent: &Agent) -> (&'static str, &'static str, &'static str) {
     if agent.status() == Status::Stopped {
         (
@@ -1743,9 +1771,20 @@ mod tests {
     /// `max_width_chars`, or any `Label` at all, therefore widens the whole
     /// drawer: the #281 blow-out one surface over (#963 review, MED-2/LOW-5).
     ///
-    /// Falsification: drop the cap from either `wrapped` call in `agent_page`,
-    /// swap the panel header back to `label(…, &["title-4"])`, or make the
-    /// group header a plain `label` again, and this goes red.
+    /// **`ellipsize` is not a bound.** [`unbounded_texts`] used to exclude
+    /// ellipsizing nodes, which made this rule blind to every identity node the
+    /// pill round added — see that fn's own doc for the measurement. The
+    /// fixture below therefore carries an `active_model`, so the **model chip**
+    /// is in the tree this walks; without it the chip is absent and the
+    /// predicate has nothing to judge. (The reviewer verified the converse too:
+    /// adding the model to the fixture without fixing the predicate does *not*
+    /// catch an unbounded chip — the clause was the hole, not the data.)
+    ///
+    /// Falsification, all reproduced red: drop the cap from either `wrapped`
+    /// call in `agent_page`; swap the panel header back to
+    /// `label(…, &["title-4"])`; make the group header a plain `label`; or drop
+    /// `max_width_chars` from `clipped` / `clipped_titled` / `model_chip`,
+    /// which is the class that used to ship green.
     #[test]
     fn no_free_text_reports_an_unbounded_width_on_either_surface() {
         // 63 bytes — `AgentName::MAX_LEN`, and legal on the wire.
@@ -1753,6 +1792,10 @@ mod tests {
         let long_status = ["watching for review assignments"; 7].join(", ");
         let long_url = format!("https://hive.local/agent/{long_name}/");
         let long_project = "p".repeat(80);
+        // A model id whose *family* is unknown, so `model_family` falls through
+        // to the first-token branch and the chip's text is bounded by nothing
+        // but `MODEL_CHARS` — the case that cap actually exists for.
+        let long_model = "q".repeat(90);
 
         let mut cfg = AgentsConfig::default();
         cfg.display.insert(
@@ -1783,6 +1826,9 @@ mod tests {
                         status_text: Some(long_status.clone()),
                         url: Some(long_url.clone()),
                         deployed_sha: Some("0123456789abcdef0123".to_owned()),
+                        // Without this the model chip is not in the tree at
+                        // all, so the rule has nothing to judge about it.
+                        active_model: Some(long_model.clone()),
                         ..AgentStatusRow::default()
                     },
                 ),
@@ -2088,19 +2134,36 @@ mod tests {
         found
     }
 
-    /// Every `Text` in the tree that caps neither its width nor its flow — i.e.
-    /// every one whose natural width is its whole string.
+    /// Every `Text` in the tree with **no `max_width_chars`** — i.e. every one
+    /// whose natural width is its whole string.
+    ///
+    /// # `ellipsize` is not a bound, and excluding it blinded this rule (#963 review, MED-1)
+    ///
+    /// This used to require `&& !*ellipsize`, on the reading that an ellipsizing
+    /// label cuts itself. It does not: `ellipsize` decides what the widget draws
+    /// once it has been given a width, and `max_width_chars` is what *asks* for
+    /// one. [`clipped`]'s own doc says so — "without a natural-width bound the
+    /// label asks for its full text and the spacer has nothing left to give, so
+    /// the row grows instead of the text shrinking" — so an ellipsizing `Text`
+    /// with no cap is **precisely** the failure this rule exists for, and the
+    /// clause excluded it by construction.
+    ///
+    /// That mattered the moment the pill round landed, because everything it
+    /// added or moved goes through [`clipped`] / [`clipped_titled`], which are
+    /// `ellipsize: true`: the agent **name**, the **model chip** and the
+    /// `agent page` **URL**. The reviewer got all 52 lib tests green with all
+    /// three rendering `max_width_chars: None` — the #281 blow-out shape on a
+    /// 63-byte name, detected only by a **regenerable snapshot**, in a crate
+    /// that ships an `#[ignore] regenerate` test whose job is to rewrite exactly
+    /// those files. A golden regen would have blessed it.
     fn unbounded_texts(node: &Node) -> Vec<String> {
         let mut out = Vec::new();
         walk(node, &mut |n| {
             if let Node::Text {
                 text,
-                max_width_chars,
-                ellipsize,
+                max_width_chars: None,
                 ..
             } = n
-                && max_width_chars.is_none()
-                && !*ellipsize
             {
                 out.push(text.clone());
             }

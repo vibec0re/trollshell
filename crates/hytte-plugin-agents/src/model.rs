@@ -412,12 +412,30 @@ const MODEL_FAMILIES: [(&str, &str); 3] =
 /// `None` for an absent, empty or punctuation-only value — the caller then
 /// draws no chip at all rather than an empty one.
 ///
+/// # The word boundary is Unicode, not ASCII (#963 review, LOW-3)
+///
+/// The split is `!char::is_alphanumeric`, so a model id written in any script
+/// still yields a first token and therefore a chip. It was
+/// `!char::is_ascii_alphanumeric` until the review pointed out the failure mode
+/// that hides behind: an id with no ASCII alphanumerics at all tokenises to
+/// nothing, returns `None`, and the row renders **no chip** — not a fallback
+/// word, not a placeholder, nothing — which reads as "this agent has no model"
+/// rather than as "this build could not shorten the name". Today's roster is
+/// all ASCII (`claude-*`, `gpt-*`, `GLM-*`) so nobody would have hit it, and
+/// that is exactly why it was worth closing before somebody did.
+///
+/// The **family table** stays ASCII-cased (`eq_ignore_ascii_case`): its three
+/// entries are ASCII product names, and Unicode case folding on a lookup that
+/// can only ever match ASCII would be ceremony. A non-ASCII token simply does
+/// not match a family and falls through to the first-token branch, where
+/// `char::to_uppercase` *is* Unicode-correct.
+///
 /// Nothing is lost by shortening: the caller puts the **full** id on the
 /// chip's hover, which is this file's standing idiom for a clipped string.
 #[must_use]
 pub fn model_family(raw: &str) -> Option<String> {
     let tokens: Vec<&str> = raw
-        .split(|c: char| !c.is_ascii_alphanumeric())
+        .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
         .collect();
     let first = *tokens.first()?;
@@ -772,6 +790,24 @@ mod tests {
         assert_eq!(model_family(""), None);
         assert_eq!(model_family("   "), None);
         assert_eq!(model_family("---"), None);
+    }
+
+    /// A model id in any script still gets a chip — the word boundary is
+    /// Unicode, not ASCII (#963 review, LOW-3).
+    ///
+    /// The first two would have returned `None` under the old
+    /// `is_ascii_alphanumeric` split, rendering **no chip at all** and reading
+    /// as "no model". The third is the mixed case: an ASCII family word inside
+    /// a non-ASCII id still wins, because the family scan looks at every token.
+    ///
+    /// Falsification: put `is_ascii_alphanumeric` back and the first two go
+    /// `None`; make the family scan look only at the first token and the third
+    /// renders `Модель` instead of `Opus`.
+    #[test]
+    fn a_non_ascii_model_id_still_gets_a_chip() {
+        assert_eq!(model_family("модель-4").as_deref(), Some("Модель"));
+        assert_eq!(model_family("モデル").as_deref(), Some("モデル"));
+        assert_eq!(model_family("модель-opus-4").as_deref(), Some("Opus"));
     }
 
     #[test]

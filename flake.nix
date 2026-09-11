@@ -198,7 +198,7 @@
             inherit workspace revision;
           };
 
-          # The 13 per-plugin packages (#558), mirroring the `packages` output.
+          # The 14 per-plugin packages (#558), mirroring the `packages` output.
           # Merged into `checks` below so `nix flake check` actually *builds*
           # each one — the same reason #449 wired the two existing packages into
           # checks: flake check only builds what's listed here, so without this a

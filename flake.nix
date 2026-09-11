@@ -409,19 +409,24 @@
           # `programs.trollshell.claudeBridge.baseUrl` (`nix/module-common.nix`)
           # is a plain nix string literal naming the same socket
           # `crates/hytte-ai-providers/src/unix.rs`'s `BRIDGE_SOCKET_DIR`/
-          # `BRIDGE_SOCKET_FILE`/`BRIDGE_BASE_URL` constants define and
-          # `crates/hytte-claude-bridge/src/main.rs`'s module doc restates in
-          # prose (#1099 review M1, #1100). Nothing compiles the nix literal
-          # against the Rust constants, or the Rust doc sentence against the
-          # constants it describes — #1099's review measured that a rename of
-          # the Rust file name left `cargo test`, `cargo clippy` and every
-          # module-eval check green, because the daemon binds a path only a
-          # live session would notice went stale. Same posture as `bind-pins`
-          # above: a source-level defect no compile in this flake can see, so
-          # a script rather than a test, with no cargoArtifacts so it goes red
-          # in seconds. `nix/lint-bridge-socket.py`'s own header has the full
-          # story, including why this is not a `cargo test` (the
-          # `core-leds-vocab` crane-filter reasoning applies unchanged).
+          # `BRIDGE_SOCKET_FILE`/`BRIDGE_BASE_URL` constants define, and both
+          # that crate's and `crates/hytte-claude-bridge/src/main.rs`'s module
+          # docs restate in prose (#1099 review M1, #1100; hardened against a
+          # #1103 adversarial review's M1/M2/L1/L2 on the nix-to-Rust seam and
+          # the doc-prose scan). The Rust constants are already pinned against
+          # raw literals by plain `cargo test`
+          # (`bridge_url_resolves_to_the_bridge_socket_path`,
+          # `the_socket_path_is_the_one_the_client_dials`); nothing compiles
+          # the nix literal or either crate's doc prose against them — #1099's
+          # review measured that a rename of the Rust file name left
+          # `cargo test`, `cargo clippy` and every module-eval check green,
+          # because the daemon binds a path only a live session would notice
+          # went stale. Same posture as `bind-pins` above: a source-level
+          # defect no compile in this flake can see, so a script rather than a
+          # test, with no cargoArtifacts so it goes red in seconds.
+          # `nix/lint-bridge-socket.py`'s own header has the full story,
+          # including why this is not a `cargo test` (the `core-leds-vocab`
+          # crane-filter reasoning applies unchanged).
           bridge-socket =
             pkgs.runCommand "trollshell-bridge-socket-check" { nativeBuildInputs = [ pkgs.python3 ]; }
               ''

@@ -1950,6 +1950,10 @@ fn on_page_show(panel: &ModalPanel, page: Page) {
             apply_stats_max_height(panel);
             apply_stats_scroll(panel);
         }
+        // #1108: fill the shared wide clamp rather than shrink to content —
+        // re-applied on every show, not only the first build, the same way
+        // the Stats arm above re-pushes its own cap.
+        Page::Workspaces => apply_workspaces_width_cap(panel),
         _ => {}
     }
 }
@@ -2022,6 +2026,38 @@ fn apply_stats_max_height(panel: &ModalPanel) {
     if let Err(e) = widget.activate_action("stats.max-height", Some(&height.to_variant())) {
         tracing::debug!(error = %e, "modal: stats max-height action activation failed");
     }
+}
+
+/// Make the Workspaces page's own `AdwClamp` *fill* the shared wide cap
+/// (#1108, Annika on the issue 15:01Z: "680 cap sounds fine if used" — the
+/// page was shrinking to its content's natural width instead of reaching the
+/// existing `DRAWER_MAX_WIDTH_WIDE` ceiling it's already clamped to, so with
+/// one or two monitors the drawer read noticeably narrower than the Stats
+/// multicolumn page even though both share the same `finish_page_clamped`
+/// call). `maximum_size`/`tightening_threshold` already sit at
+/// `DRAWER_MAX_WIDTH_WIDE` from construction — a ceiling, not a floor — so
+/// this pushes a matching **minimum** width request onto the same clamp,
+/// the same seam [`build_positioner`] already uses to floor the drawer at
+/// its narrow-page minimum. Re-applied on every show (not only first build)
+/// — a no-op if the page was never opened on this monitor yet, exactly like
+/// [`apply_stats_max_height`].
+///
+/// Needs no action-group cooperation from `panels::workspaces` (that file is
+/// phase 4's lane while this ships, so it can't gain one):
+/// `panels::panel_workspaces` returns the `AdwClamp` itself —
+/// `finish_page_clamped`'s `clamp.upcast()`, with nothing wrapped around it —
+/// so the widget `ensure_page` stashed in `panel.stack` under
+/// `Page::Workspaces.stack_name()` *is* the clamp, and can be resized
+/// directly by downcasting it back.
+fn apply_workspaces_width_cap(panel: &ModalPanel) {
+    let Some(widget) = panel.stack.child_by_name(Page::Workspaces.stack_name()) else {
+        return;
+    };
+    let Ok(clamp) = widget.downcast::<adw::Clamp>() else {
+        tracing::debug!("modal: workspaces page child is not an AdwClamp");
+        return;
+    };
+    clamp.set_size_request(scale(DRAWER_MAX_WIDTH_WIDE), -1);
 }
 
 #[cfg(test)]
@@ -2686,5 +2722,178 @@ mod tests {
              re-borrowed DRAWER_OPEN while reset_drawer_open_states was still \
              holding it"
         );
+    }
+}
+
+/// GTK-level tests for #1108's width-cap mechanism. Split from `mod tests`
+/// above (which is plain `#[test]`, no display needed) because these build
+/// real `gtk::Widget`s and need `xvfb-run` + `--features system-tests`.
+///
+/// None of these tests drive a real `Bar`/`BarHandle` through `install` — nothing
+/// in this crate's test suite does (see `crates/hytte-ui/src/bar.rs`'s own
+/// `BarHandle` test for why: the field is private outside that crate, so
+/// only `Bar::new(...).show()` could mint one here, and that needs a whole
+/// bar built). A hand-built `ModalPanel` stands in instead: every field
+/// these tests' code paths touch (`stack`, `current`, `open_state`) is real;
+/// `geometry`/`window`/`positioner`/`card`/`revealer` are wired to plain,
+/// un-parented placeholders that the `Page::Workspaces` arms under test
+/// never dereference past what they already tolerate pre-first-map
+/// (`reposition_card`'s doc comment covers the same degrade-to-zero case).
+///
+/// Nor do they build the real Workspaces page: `panels::panel_workspaces`
+/// pulls `niri`/`config_workspaces`/`workspace_stacks` state out of a
+/// registered `Registry`, which `.expect()`s and panics outside a booted
+/// `App` — exactly why `panels::workspaces`'s own tests inject signals
+/// instead of calling `panel_workspaces` directly. A bare `adw::Clamp`
+/// stood in under `Page::Workspaces.stack_name()` is a faithful double: the
+/// code under test only ever asks the stack for that name and resizes
+/// whatever `AdwClamp` it finds — it doesn't care what's inside.
+#[cfg(all(test, feature = "system-tests"))]
+mod gtk_tests {
+    use super::{
+        Active, BarGeometry, DRAWER_MAX_WIDTH_WIDE, ModalPanel, PANELS, Page, drawer_open_state,
+        monitor_key, on_page_show, recompute_gates,
+    };
+    use crate::scale::scale;
+    use hytte::adw;
+    use hytte::gtk::{self, prelude::*};
+    use hytte::prelude::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    thread_local! {
+        static TEST_MONITOR: RefCell<Option<Monitor>> = const { RefCell::new(None) };
+    }
+
+    /// A real `Monitor`, captured from a one-shot `App::run` — same pattern
+    /// as `widgets::tasks`'s `test_monitor` (see that module's doc comment
+    /// for why it's cached rather than re-run per test).
+    fn test_monitor() -> Monitor {
+        if let Some(monitor) = TEST_MONITOR.with(|cell| cell.borrow().clone()) {
+            return monitor;
+        }
+        App::new("mov.vibec0re.trollshell.test.modal-workspaces-width")
+            .run(|app| {
+                let first = app.monitors().first().cloned();
+                TEST_MONITOR.with(|cell| *cell.borrow_mut() = first);
+                app.quit();
+            })
+            .expect("App::run");
+        TEST_MONITOR
+            .with(|cell| cell.borrow().clone())
+            .expect("the display server must report at least one output; `xvfb-run` provides one")
+    }
+
+    /// A minimal `ModalPanel` — see the module doc comment for why this
+    /// stands in for a real `install`-built one.
+    fn harness_panel(monitor: &Monitor) -> Rc<ModalPanel> {
+        let key = monitor_key(monitor);
+        Rc::new(ModalPanel {
+            window: gtk::Window::new(),
+            revealer: gtk::Revealer::new(),
+            stack: gtk::Stack::new(),
+            card: gtk::Overlay::new(),
+            current: RefCell::new(None),
+            positioner: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            geometry: BarGeometry {
+                edge: Edge::Top,
+                offset: 0,
+                monitor: monitor.clone(),
+                bar_window: gtk::Window::new(),
+            },
+            anchor: RefCell::new(None),
+            open_state: drawer_open_state(&key),
+        })
+    }
+
+    /// #1108's core mutation target: `on_page_show`'s `Page::Workspaces` arm
+    /// must push a **minimum** width request matching `DRAWER_MAX_WIDTH_WIDE`
+    /// onto the page's own `AdwClamp` on *every* show, not only at first
+    /// build — filling the existing cap instead of shrinking to content.
+    /// Deleting `apply_workspaces_width_cap(panel)` from that arm leaves the
+    /// clamp's width request at its `adw::Clamp::new()` default (`-1`,
+    /// meaning "no minimum, size to content") — red.
+    #[gtk::test]
+    fn on_page_show_fills_the_workspaces_clamp_to_the_cap() {
+        let monitor = test_monitor();
+        let panel = harness_panel(&monitor);
+        let clamp = adw::Clamp::new();
+        panel
+            .stack
+            .add_named(&clamp, Some(Page::Workspaces.stack_name()));
+
+        on_page_show(&panel, Page::Workspaces);
+
+        assert_eq!(clamp.width_request(), scale(DRAWER_MAX_WIDTH_WIDE));
+    }
+
+    /// The companion guarantee: every *other* page must keep its natural-width
+    /// (shrink-to-content) behaviour untouched — no width-request override at
+    /// all. Catches a mutant that force-fills every page rather than gating
+    /// on `Page::Workspaces`.
+    #[gtk::test]
+    fn on_page_show_leaves_other_pages_at_their_natural_width() {
+        let monitor = test_monitor();
+        let panel = harness_panel(&monitor);
+        let clamp = adw::Clamp::new();
+        panel
+            .stack
+            .add_named(&clamp, Some(Page::Settings.stack_name()));
+
+        on_page_show(&panel, Page::Settings);
+
+        assert_eq!(
+            clamp.width_request(),
+            -1,
+            "a page other than Workspaces must not get a width-request override"
+        );
+    }
+
+    /// The chip → drawer path end to end: clicking the chip built by
+    /// `widgets::workspace_manager::widget` must land on `Page::Workspaces`
+    /// (not just call *some* toggle) and the page it lands on must carry the
+    /// filled-to-cap width request — the same guarantee as the test above,
+    /// but proven through the real click handler + `modal::toggle` rather
+    /// than by calling `on_page_show` directly, so a regression in the
+    /// chip's own wiring (wrong `Page`, wrong click hookup) fails here even
+    /// if the on-show mechanism above stays correct in isolation.
+    #[gtk::test]
+    fn workspace_manager_chip_click_fills_the_drawer_to_the_cap() {
+        let monitor = test_monitor();
+        let key = monitor_key(&monitor);
+        let panel = harness_panel(&monitor);
+        panel
+            .stack
+            .add_named(&adw::Clamp::new(), Some(Page::Workspaces.stack_name()));
+        PANELS.with(|panels| {
+            panels.borrow_mut().insert(key.clone(), panel.clone());
+        });
+
+        let btn = crate::widgets::workspace_manager::widget(&monitor);
+        let btn = btn
+            .downcast::<gtk::Button>()
+            .expect("workspace_manager::widget returns a Button");
+        btn.emit_clicked();
+
+        assert_eq!(
+            *panel.current.borrow(),
+            Some(Active::Builtin(Page::Workspaces)),
+            "clicking the chip must open Page::Workspaces"
+        );
+        let clamp = panel
+            .stack
+            .child_by_name(Page::Workspaces.stack_name())
+            .and_then(|w| w.downcast::<adw::Clamp>().ok())
+            .expect("the stand-in clamp is still the visible child");
+        assert_eq!(clamp.width_request(), scale(DRAWER_MAX_WIDTH_WIDE));
+
+        // `PANELS`/`GATES`/`DRAWER_OPEN` are process-wide thread-locals
+        // shared by every `#[gtk::test]` in this binary (they all run on one
+        // thread) — leaving this key behind would leak into whichever test
+        // runs next.
+        PANELS.with(|panels| {
+            panels.borrow_mut().remove(&key);
+        });
+        recompute_gates();
     }
 }

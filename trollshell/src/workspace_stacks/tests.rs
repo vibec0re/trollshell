@@ -166,6 +166,10 @@ struct State {
     /// The argv of every launch, in order — `Call::Launch` carries only the unit
     /// name, and #1071 §3.2 is entirely about what ends up after the `--`.
     argvs: Vec<Vec<String>>,
+    /// The `(name, stack)` of every `save_stack`, in order. `Call::SaveStack`
+    /// carries only the name, and #1071 §3.7 is about what is *in* the entry the
+    /// Save creates.
+    saved_stacks: Vec<(String, Stack)>,
 }
 
 #[derive(Clone, Default)]
@@ -239,6 +243,25 @@ impl Script {
     /// The argv of every `systemd-run` launch, in order.
     fn launch_argvs(&self) -> Vec<Vec<String>> {
         self.0.borrow().argvs.clone()
+    }
+
+    /// The `(name, stack)` of every `workspaces.toml` write, in order.
+    fn saved_stacks(&self) -> Vec<(String, Stack)> {
+        self.0.borrow().saved_stacks.clone()
+    }
+
+    /// How many separate `send_actions` batches were sent.
+    ///
+    /// "One batch" is a property of the *count*, not of the contents — which is
+    /// why it needs its own accessor rather than being read off `actions()`,
+    /// which flattens them.
+    fn batches(&self) -> usize {
+        self.0
+            .borrow()
+            .calls
+            .iter()
+            .filter(|c| matches!(c, Call::Actions(_)))
+            .count()
     }
 
     /// The ids activated through their desktop entry, in order.
@@ -399,13 +422,14 @@ impl Ops for Script {
         state.activate_error.clone().map_or(Ok(()), Err)
     }
 
-    async fn save_stack(&self, name: &str, _stack: &Stack) -> Result<(), String> {
+    async fn save_stack(&self, name: &str, stack: &Stack) -> Result<(), String> {
         // Records; never writes. This is the whole point of the seam — see
         // `Ops::save_stack` — so do not "improve" this into a real write behind
         // a tempdir either: the transaction has no business knowing where the
         // file is, and a test that owns a path is a test that can leak one.
         let mut state = self.0.borrow_mut();
         state.calls.push(Call::SaveStack(name.to_owned()));
+        state.saved_stacks.push((name.to_owned(), stack.clone()));
         state.save_error.clone().map_or(Ok(()), Err)
     }
 
@@ -1707,6 +1731,58 @@ fn a_save_writes_then_names_this_workspace_and_verifies_it_landed() {
     assert!(
         reads[1] > named,
         "the read-back follows the naming: {calls:?}"
+    );
+}
+
+/// #1071 §3.7, end to end: the entry a Save creates carries the workspace's app
+/// ids, the command line of the one with no desktop entry, and the monitor — and
+/// the naming rides **one** batch, so the saved workspace *is* the Active card.
+///
+/// The payload is built by `panels::workspace_edit` (`ephemeral_apps` +
+/// `plan_save`, both pure and tested there); what this pins is that the
+/// transaction carries it through unaltered and in the right order.
+///
+/// **The mutation the brief names**: naming the workspace in a *second* batch.
+/// `batches()` counts `send_actions` calls rather than actions, so splitting the
+/// `SetName` off into its own later send reds here — `actions()` alone could not
+/// tell the difference, because it flattens.
+#[test]
+fn an_ephemeral_save_carries_the_whole_entry_and_names_the_workspace_in_one_batch() {
+    let before = vec![ws(7, 2, LEFT, None, true)];
+    let after = vec![ws(7, 2, LEFT, Some("chat"), true)];
+    let script = Script::default().with_workspaces(&[before, after]);
+
+    // What the Edit form hands over for an ephemeral card: the windows' app ids
+    // in column order, the unknown one carrying its running command line, and
+    // the screen niri reported.
+    let stack = Stack {
+        monitor: Some(LEFT.to_owned()),
+        apps: vec![
+            by_id("org.mozilla.firefox"),
+            overridden("weird-app", "/home/me/bin/weird --flag"),
+        ],
+        ..Stack::default()
+    };
+    run(save(&script, 7, "chat", &stack)).expect("saves");
+
+    assert_eq!(
+        script.saved_stacks(),
+        vec![("chat".to_owned(), stack)],
+        "the entry written is not the one the form described"
+    );
+    assert_eq!(
+        script.batches(),
+        1,
+        "§3.7's naming must ride ONE batch: {:?}",
+        script.calls()
+    );
+    assert_eq!(
+        script.actions(),
+        vec![WorkspaceAction::SetName {
+            workspace: 7,
+            name: "chat".to_owned()
+        }],
+        "named by id — so the card the user was looking at becomes the saved one"
     );
 }
 

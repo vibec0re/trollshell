@@ -695,10 +695,10 @@
     margin-bottom: 0.462em;
 }
 
-/* Workspaces drawer page (#1071 phases 1–2). One column per monitor, side by
+/* Workspaces drawer page (#1071 phases 1–4). One column per monitor, side by
    side; a `.ts-panel` card per saved stack and per unnamed-but-populated niri
-   workspace; a strip of app icons on each card, plus one Start/Stop button on a
-   saved one and a name field on an ephemeral one. Note these are `ts-ws-*`, NOT
+   workspace; a strip of app icons on each card, a Start/Stop button on a saved
+   one and an Edit button on every one (#1109). Note these are `ts-ws-*`, NOT
    `ts-workspaces-*`: `.ts-workspaces` is the BAR's numbered pill strip (see the
    rules near the top of this file), which the epic's revision 5 leaves
    untouched. */
@@ -762,13 +762,15 @@
 .ts-ws-apps {
     min-height: 1.4em;
 }
-/* The ephemeral card's Edit → Save row (#1071 §3.7): a name field and the
-   button that creates the entry. */
-.ts-ws-save {
-    margin-top: 0.231em;
-}
-.ts-ws-save-entry {
-    font-size: 0.9em;
+/* The Edit button every card carries (#1071 §5, #1109). Sized like
+   `.ts-ws-action` beside it so `[start/stop] [edit]` reads as one pair rather
+   than as a button and an afterthought. #1109 retired the inline name field
+   that used to sit on an ephemeral card, so `.ts-ws-save`/`.ts-ws-save-entry`
+   are gone with it — nothing is inline on a card any more. */
+.ts-ws-edit-open {
+    min-width: 1.6em;
+    min-height: 1.6em;
+    padding: 0;
 }
 /* An app with a window open on the card's workspace. A saved stack's app with
    no window flips to `.ts-ws-app-idle` below, which is what a stopped stack
@@ -801,6 +803,59 @@
 }
 .ts-ws-card-dragging {
     opacity: 0.45;
+}
+/* …and the card the pointer is over while reordering within a column (#1071
+   §3.6, phase 4). A line on the card being landed on rather than a box around
+   it, so it reads as "you will take this slot" and cannot be mistaken for the
+   column highlight above. Same `outline` reasoning: no reflow mid-drag. */
+.ts-ws-card-drop {
+    outline: 2px solid @accent_color;
+    outline-offset: -2px;
+    border-radius: 0.462em;
+}
+
+/* The Edit sub-page (#1071 §5, phase 4) — same drawer, content replaced. The
+   form is a column of labelled controls; only the app list needs rules of its
+   own, because its rows carry a drag handle and an inline launch-command
+   field. */
+.ts-ws-edit-apps {
+    margin-top: 0.231em;
+}
+/* The launch-command override. Smaller than the app's own name above it: it is
+   the detail line of the row, not its title. */
+.ts-ws-edit-exec {
+    font-size: 0.85em;
+}
+/* The drag handle is the only thing that starts an app-row drag — the row
+   itself must not, or selecting text in the field above would pick the row up.
+   Dimmed until the pointer is on the row, the way a list handle usually is. */
+.ts-ws-edit-handle {
+    opacity: 0.4;
+    min-width: 1.2em;
+}
+.ts-ws-edit-app:hover .ts-ws-edit-handle {
+    opacity: 0.8;
+}
+.ts-ws-edit-remove {
+    min-width: 1.6em;
+    min-height: 1.6em;
+    padding: 0;
+}
+/* The Add-app picker's popover (#1071 §5). Width is set here rather than in
+   Rust so it scales with the font like the rest of the drawer. */
+.ts-ws-picker {
+    min-width: 20em;
+}
+.ts-ws-picker-search {
+    margin: 0.231em;
+}
+.ts-ws-picker-name {
+    font-weight: 500;
+}
+/* The desktop id under each offered name — what actually goes in the file, so
+   it is shown, but quietly. */
+.ts-ws-picker-id {
+    font-size: 0.8em;
 }
 /* Network panel: make each PreferencesGroup a single card with its header
    INSIDE the card surface (not libadwaita's floating title above the list).

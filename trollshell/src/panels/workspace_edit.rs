@@ -811,6 +811,339 @@ fn section_label(text: &str) -> gtk::Label {
     label
 }
 
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use super::{
+        APP_ROW_CLASS, Draft, EXEC_ENTRY_CLASS, NAME_ENTRY_CLASS, NOTHING_HINT,
+        RENAME_BLOCKED_HINT, build_slot,
+    };
+    use crate::config::workspaces::{Layout, StackApp};
+    use hytte::adw;
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk::{self, prelude::*};
+
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    fn by_class(root: &impl IsA<gtk::Widget>, class: &str) -> Vec<gtk::Widget> {
+        fn walk(widget: &gtk::Widget, class: &str, out: &mut Vec<gtk::Widget>) {
+            if widget.has_css_class(class) {
+                out.push(widget.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(c) = child {
+                walk(&c, class, out);
+                child = c.next_sibling();
+            }
+        }
+        let mut out = Vec::new();
+        walk(root.upcast_ref(), class, &mut out);
+        out
+    }
+
+    fn entries(root: &gtk::Widget, class: &str) -> Vec<gtk::Entry> {
+        by_class(root, class)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Entry>().ok())
+            .collect()
+    }
+
+    fn name_field(root: &gtk::Widget) -> gtk::Entry {
+        entries(root, NAME_ENTRY_CLASS)
+            .into_iter()
+            .next()
+            .expect("the form has a name field")
+    }
+
+    fn app_rows(root: &gtk::Widget) -> Vec<gtk::Widget> {
+        by_class(root, APP_ROW_CLASS)
+    }
+
+    /// The launch command shown on each app row, in row order.
+    fn exec_texts(root: &gtk::Widget) -> Vec<String> {
+        entries(root, EXEC_ENTRY_CLASS)
+            .into_iter()
+            .map(|e| e.text().to_string())
+            .collect()
+    }
+
+    fn label_texts(root: &gtk::Widget, class: &str) -> Vec<String> {
+        by_class(root, class)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .map(|l| l.text().to_string())
+            .collect()
+    }
+
+    fn app(id: &str, exec: Option<&str>) -> StackApp {
+        StackApp {
+            id: id.to_owned(),
+            exec: exec.map(str::to_owned),
+        }
+    }
+
+    fn saved_draft() -> Draft {
+        Draft {
+            previous: Some("chat".to_owned()),
+            name: "chat".to_owned(),
+            apps: vec![
+                app("org.mozilla.firefox", None),
+                app("Alacritty", Some("alacritty -e weechat")),
+            ],
+            layout: Layout::Golden,
+            autostart: true,
+            monitor: Some("DP-1".to_owned()),
+            workspace: Some(3),
+            active: true,
+        }
+    }
+
+    fn ephemeral_draft() -> Draft {
+        Draft {
+            previous: None,
+            name: String::new(),
+            apps: vec![app("weird-app", Some("/home/me/bin/weird --flag"))],
+            monitor: Some("HDMI-A-1".to_owned()),
+            workspace: Some(7),
+            ..Draft::default()
+        }
+    }
+
+    /// The slot with a selection it can be driven from — the seam `edit_slot`
+    /// wraps around the thread-local.
+    fn slot(target: &Mutable<Option<Draft>>) -> gtk::Widget {
+        adw::init().expect("libadwaita init");
+        let page = build_slot(target.signal_cloned());
+        pump();
+        page
+    }
+
+    /// §5: the sub-page opens **from a saved card**, showing every field of the
+    /// stack — name, the apps with their launch commands, layout, autostart.
+    #[gtk::test]
+    fn the_edit_page_opens_from_a_saved_card() {
+        let target: Mutable<Option<Draft>> = Mutable::new(None);
+        let page = slot(&target);
+        assert!(
+            label_texts(&page, "ts-ws-empty").contains(&NOTHING_HINT.to_owned()),
+            "with nothing selected the page says so"
+        );
+
+        target.set(Some(saved_draft()));
+        pump();
+
+        assert_eq!(name_field(&page).text(), "chat");
+        assert_eq!(app_rows(&page).len(), 2, "one row per app of the stack");
+        assert_eq!(
+            exec_texts(&page),
+            ["", "alacritty -e weechat"],
+            "each row shows its own launch command, and an app with none shows none"
+        );
+
+        let layout = by_class(&page, "ts-ws-edit-layout")
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::DropDown>().ok())
+            .expect("the layout dropdown");
+        assert_eq!(
+            usize::try_from(layout.selected()).expect("a selection"),
+            super::LAYOUTS
+                .iter()
+                .position(|l| *l == Layout::Golden)
+                .expect("golden is offered"),
+            "the dropdown opens on the stack's own layout"
+        );
+
+        let autostart = by_class(&page, "ts-ws-edit-autostart")
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::Switch>().ok())
+            .expect("the autostart switch");
+        assert!(autostart.is_active(), "the switch opens on the stack's value");
+
+        // An Active stack says why its name cannot change (§5's rename refusal).
+        assert!(
+            label_texts(&page, "ts-ws-empty").contains(&RENAME_BLOCKED_HINT.to_owned()),
+            "an Active stack must say why a rename is refused before it is tried"
+        );
+    }
+
+    /// §3.7: the same page opens **from an ephemeral card**, with an empty name
+    /// and the running command line of the app that has no desktop entry —
+    /// *"shown for correction in Edit"*.
+    #[gtk::test]
+    fn the_edit_page_opens_from_an_ephemeral_card() {
+        let target: Mutable<Option<Draft>> = Mutable::new(None);
+        let page = slot(&target);
+        target.set(Some(ephemeral_draft()));
+        pump();
+
+        assert_eq!(
+            name_field(&page).text(),
+            "",
+            "an ephemeral card has no name until Save gives it one"
+        );
+        assert_eq!(app_rows(&page).len(), 1);
+        assert_eq!(
+            exec_texts(&page),
+            ["/home/me/bin/weird --flag"],
+            "§3.7's command line must be in the field, editable"
+        );
+        // No rename refusal: there is no name to rename *from*.
+        assert!(
+            !label_texts(&page, "ts-ws-empty").contains(&RENAME_BLOCKED_HINT.to_owned()),
+            "an ephemeral card was told it cannot be renamed"
+        );
+    }
+
+    /// The page **survives the refresh poll** (the brief).
+    ///
+    /// `workspaces.toml` is live-reloaded and niri's event stream re-fires for
+    /// the life of the session. The form must not be torn down under the user's
+    /// cursor when an equal selection is republished — a half-typed name and a
+    /// half-edited launch command have to still be there.
+    ///
+    /// **The mutation**: dropping `dedupe_cloned` from `build_slot` reds this —
+    /// the re-set rebuilds the form and both edits are gone.
+    #[gtk::test]
+    fn the_edit_page_survives_a_refresh_that_changes_nothing() {
+        let target: Mutable<Option<Draft>> = Mutable::new(None);
+        let page = slot(&target);
+        target.set(Some(saved_draft()));
+        pump();
+
+        // The user starts typing.
+        name_field(&page).set_text("chat-2");
+        let exec = entries(&page, EXEC_ENTRY_CLASS)
+            .into_iter()
+            .next()
+            .expect("a launch-command field");
+        exec.set_text("firefox --private-window");
+        pump();
+
+        // …and the poll republishes the very same selection, twice.
+        target.set(Some(saved_draft()));
+        pump();
+        target.set(Some(saved_draft()));
+        pump();
+
+        assert_eq!(
+            name_field(&page).text(),
+            "chat-2",
+            "the refresh poll threw away a half-typed name"
+        );
+        assert_eq!(
+            entries(&page, EXEC_ENTRY_CLASS)
+                .into_iter()
+                .next()
+                .expect("a launch-command field")
+                .text(),
+            "firefox --private-window",
+            "the refresh poll threw away a half-edited launch command"
+        );
+    }
+
+    /// Selecting a **different** card does rebuild the form — the dedupe is
+    /// about equal values, not about never rebuilding.
+    ///
+    /// Without this the test above would pass on a binding that ignored its
+    /// signal entirely.
+    #[gtk::test]
+    fn selecting_another_card_rebuilds_the_form() {
+        let target: Mutable<Option<Draft>> = Mutable::new(None);
+        let page = slot(&target);
+        target.set(Some(saved_draft()));
+        pump();
+        assert_eq!(app_rows(&page).len(), 2);
+
+        target.set(Some(ephemeral_draft()));
+        pump();
+        assert_eq!(name_field(&page).text(), "");
+        assert_eq!(app_rows(&page).len(), 1);
+
+        // …and clearing it returns to the empty state.
+        target.set(None);
+        pump();
+        assert!(
+            label_texts(&page, "ts-ws-empty").contains(&NOTHING_HINT.to_owned()),
+            "clearing the selection left the form up"
+        );
+    }
+
+    /// A row's **remove** button drops that app and only that app, and the list
+    /// redraws — the indices the remaining rows carry have to be re-issued or
+    /// the next remove takes the wrong one.
+    #[gtk::test]
+    fn removing_an_app_drops_that_row_and_renumbers_the_rest() {
+        let target: Mutable<Option<Draft>> = Mutable::new(None);
+        let page = slot(&target);
+        target.set(Some(Draft {
+            apps: vec![
+                app("a", Some("cmd-a")),
+                app("b", Some("cmd-b")),
+                app("c", Some("cmd-c")),
+            ],
+            ..saved_draft()
+        }));
+        pump();
+        assert_eq!(exec_texts(&page), ["cmd-a", "cmd-b", "cmd-c"]);
+
+        let remove = by_class(&page, "ts-ws-edit-remove")
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .nth(1)
+            .expect("the second row's remove button");
+        remove.emit_clicked();
+        pump();
+        assert_eq!(exec_texts(&page), ["cmd-a", "cmd-c"], "the wrong row went");
+
+        // Remove the (now) second row: if the indices had not been re-issued
+        // this would take `cmd-a`, or nothing at all.
+        let remove = by_class(&page, "ts-ws-edit-remove")
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Button>().ok())
+            .nth(1)
+            .expect("the second row's remove button");
+        remove.emit_clicked();
+        pump();
+        assert_eq!(exec_texts(&page), ["cmd-a"]);
+    }
+
+    /// Every app row carries both halves of §5's drag: a source on the handle
+    /// and a target on the row.
+    #[gtk::test]
+    fn every_app_row_can_be_dragged_and_dropped_on() {
+        let target: Mutable<Option<Draft>> = Mutable::new(None);
+        let page = slot(&target);
+        target.set(Some(saved_draft()));
+        pump();
+
+        fn controllers(widget: &gtk::Widget) -> Vec<gtk::EventController> {
+            let list = widget.observe_controllers();
+            (0..list.n_items())
+                .filter_map(|i| list.item(i)?.downcast::<gtk::EventController>().ok())
+                .collect()
+        }
+
+        for row in app_rows(&page) {
+            assert!(
+                controllers(&row).iter().any(ObjectExt::is::<gtk::DropTarget>),
+                "an app row must take a drop, or the order cannot be changed"
+            );
+        }
+        let handles = by_class(&page, "ts-ws-edit-handle");
+        assert_eq!(handles.len(), 2, "one drag handle per app row");
+        for handle in handles {
+            assert!(
+                controllers(&handle)
+                    .iter()
+                    .any(ObjectExt::is::<gtk::DragSource>),
+                "the handle is what starts the drag — the row is not, or \
+                 selecting text in the launch-command field would pick it up"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod model_tests {
     use super::{Draft, SaveError, SavePlan, ephemeral_apps, move_app, plan_save};

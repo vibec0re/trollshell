@@ -2333,10 +2333,17 @@ mod tests {
         window.destroy();
     }
 
-    /// An ephemeral card shows the live windows, deduped, and carries no
-    /// Start/Stop — its only action is the Save field (#1071 §3.7).
+    /// An ephemeral card shows the live windows, deduped, carries no Start/Stop
+    /// — it is already running — and offers **Edit** and nothing else
+    /// (#1071 §3.7 / #1109).
+    ///
+    /// **#1109's own assertion**: nothing inline. Phase 2 put a `gtk::Entry` and
+    /// a Save button on this card; Annika's ruling is that they go entirely, so
+    /// this asserts there is **no entry anywhere on any card** rather than
+    /// merely that the Edit button exists — a fallback left beside the button
+    /// would satisfy the weaker claim.
     #[gtk::test]
-    fn an_ephemeral_card_shows_its_windows_and_offers_a_name_field() {
+    fn an_ephemeral_card_shows_its_windows_and_offers_only_edit() {
         let f = fixture();
         f.workspaces.set(vec![ws(7, 1, LEFT, None)]);
         f.windows.set(vec![
@@ -2363,57 +2370,110 @@ mod tests {
             "there is nothing to Start: it is already running"
         );
 
-        let entry = by_class(&card, "ts-ws-save-entry")
-            .into_iter()
-            .find_map(|w| w.downcast::<gtk::Entry>().ok())
-            .expect("the Save field");
-        assert_inside_and_hittable(&card, entry.upcast_ref(), "the Save field");
-        let save = by_class(&card, "ts-ws-save-button")
+        let edit = by_class(&card, "ts-ws-edit-open")
             .into_iter()
             .find_map(|w| w.downcast::<gtk::Button>().ok())
-            .expect("the Save button");
-        assert!(save.is_sensitive());
+            .expect("every card carries an Edit button (#1109)");
+        assert!(edit.is_sensitive());
+        assert_inside_and_hittable(&card, edit.upcast_ref(), "the Edit button");
 
-        // A name that cannot be a slice is refused **in place** — no rewrite, no
-        // silent accept — and the tooltip offers the sanitised form §3.1 asks
-        // for.
-        //
-        // This stops at the validation boundary deliberately, and not only
-        // because the write needs a registry: past it, a *valid* name would
-        // reach `save_stack` and write the developer's own
-        // `~/.config/trollshell/workspaces.toml`. Keep every name this test
-        // types unusable. The write's round trip is `config::workspaces`' own
-        // `a_save_adds_its_stack_and_invents_no_order`, against a tempdir.
-        entry.set_text("Chat Room");
-        save.emit_clicked();
-        pump();
+        // #1109: "nightmare to render" — nothing inline on any card, and no
+        // fallback beside the button either.
+        let inline: Vec<gtk::Widget> = by_class(&f.page, "ts-ws-card")
+            .into_iter()
+            .flat_map(|card| {
+                fn walk(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+                    if widget.is::<gtk::Entry>() || widget.is::<gtk::Text>() {
+                        out.push(widget.clone());
+                    }
+                    let mut child = widget.first_child();
+                    while let Some(c) = child {
+                        walk(&c, out);
+                        child = c.next_sibling();
+                    }
+                }
+                let mut out = Vec::new();
+                walk(&card, &mut out);
+                out
+            })
+            .collect();
         assert!(
-            entry.has_css_class("error"),
-            "an unusable name marks the field rather than writing the file"
-        );
-        assert_eq!(
-            entry.text(),
-            "Chat Room",
-            "what was typed is kept — the suggestion is offered, not applied"
-        );
-        assert!(
-            entry
-                .tooltip_text()
-                .is_some_and(|t| t.contains("chat-room")),
-            "…and the sanitised form is what is offered: {:?}",
-            entry.tooltip_text()
-        );
-
-        // The red clears as soon as the correction starts, rather than staying
-        // through every keystroke of the fix.
-        entry.set_text("Chat Roo");
-        pump();
-        assert!(
-            !entry.has_css_class("error"),
-            "the error class is not sticky"
+            inline.is_empty(),
+            "#1109: no card may carry an inline text field — found {}",
+            inline.len()
         );
 
         window.destroy();
+    }
+
+    /// Every **saved** card carries an Edit button too, beside its Start/Stop —
+    /// Annika's `[start/stop] [edit]` (#1109).
+    #[gtk::test]
+    fn every_saved_card_carries_an_edit_button_beside_its_action() {
+        let f = fixture();
+        f.workspaces.set(vec![ws(1, 1, LEFT, None)]);
+        f.saved.set(saved(&[
+            ("chat", stack(Some(LEFT), &["firefox"])),
+            ("dev", stack(Some(LEFT), &["Alacritty"])),
+        ]));
+        pump();
+        let window = present(&f.page);
+
+        let all = cards(&f.page);
+        assert_eq!(all.len(), 2);
+        for card in &all {
+            let edit = by_class(card, "ts-ws-edit-open")
+                .into_iter()
+                .find_map(|w| w.downcast::<gtk::Button>().ok())
+                .expect("a saved card carries an Edit button");
+            assert_inside_and_hittable(card, edit.upcast_ref(), "the Edit button");
+            assert!(
+                !by_class(card, "ts-ws-action").is_empty(),
+                "…and still its Start/Stop"
+            );
+        }
+
+        window.destroy();
+    }
+
+    /// §3.6, phase 4: a saved card takes a drop as well as starting a drag, so a
+    /// card can be dropped **onto** another card to reorder it.
+    ///
+    /// Phase 3 shipped the drag source and the column target; the card target is
+    /// what this phase adds, and without it an in-column drag has nowhere to
+    /// land. Falsified by not attaching `card_drop_target`.
+    #[gtk::test]
+    fn a_saved_card_takes_a_drop_so_it_can_be_reordered_onto() {
+        let f = fixture();
+        f.workspaces.set(vec![ws(1, 1, LEFT, None)]);
+        f.saved.set(saved(&[
+            ("chat", stack(Some(LEFT), &["firefox"])),
+            ("dev", stack(Some(LEFT), &["Alacritty"])),
+        ]));
+        f.windows.set(vec![win(9, 1, "mpv", 1)]);
+        pump();
+
+        let saved_cards: Vec<gtk::Widget> = cards(&f.page)
+            .into_iter()
+            .filter(|c| !by_class(c, "ts-ws-action").is_empty())
+            .collect();
+        assert_eq!(saved_cards.len(), 2, "two saved cards");
+        for card in &saved_cards {
+            assert!(
+                has_drop_target(card),
+                "a saved card must take a drop, or it cannot be reordered onto"
+            );
+            assert!(has_drag_source(card), "…and still start one");
+        }
+
+        // The ephemeral card takes neither: it has no entry in the file, so
+        // there is nothing to reorder and nothing to rewrite.
+        let ephemeral = cards(&f.page)
+            .into_iter()
+            .find(|c| by_class(c, "ts-ws-action").is_empty())
+            .expect("the unnamed workspace is a card too");
+        assert!(!has_drop_target(&ephemeral));
+        assert!(!has_drag_source(&ephemeral));
     }
 
     /// §7: **Inactive is greyed, and `Starting` disables the button.**

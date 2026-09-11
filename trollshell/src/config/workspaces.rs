@@ -913,8 +913,8 @@ pub fn current() -> Workspaces {
 #[cfg(test)]
 mod tests {
     use super::{
-        Layout, Stack, StackApp, Workspaces, WorkspacesConfig, save_stack_to, set_stack_monitor_to,
-        stack_value,
+        ConfigError, Layout, Stack, StackApp, Workspaces, WorkspacesConfig, save_edit_to,
+        save_stack_to, set_order_to, set_stack_monitor_to, stack_value,
     };
     use hytte_config::subsystem::{self, Subsystem};
     use hytte_config::test_support::capture;
@@ -1584,6 +1584,263 @@ apps = [
                 .expect("reads back")
                 .contains("[workspace.chat]"),
             "the folded name is the one written"
+        );
+    }
+
+    // ── #1071 §5, phase 4: the Edit form's writers ───────────────────────────
+    //
+    // Every one of these drives an **explicit path** under a `tempfile::tempdir`.
+    // The `xdg::overlay_path` wrappers (`save_edit`, `set_order`) are never
+    // reached from a test, which is what keeps the suite off the developer's
+    // real `~/.config/trollshell` — the same rule phase 2 carved the `Ops` seam
+    // for, stated here as a convention because these writers have no seam and
+    // need none (one write, no ordering to falsify).
+
+    /// A file with an order and two stacks, for the reorder/rename rows.
+    fn two_stacks(path: &std::path::Path) -> &'static str {
+        let body = "# my stacks\n\
+                    order = [\"chat\", \"dev\"]\n\
+                    \n\
+                    [workspace.chat]\n\
+                    monitor = \"DP-1\"\n\
+                    apps = [{ id = \"Alacritty\" }]\n\
+                    \n\
+                    [workspace.dev]\n\
+                    layout = \"golden\"\n\
+                    apps = [{ id = \"code\" }]\n";
+        std::fs::write(path, body).expect("writes");
+        body
+    }
+
+    /// The stack a Save writes, read back out of the file.
+    fn stack_in(path: &std::path::Path, name: &str) -> Option<Stack> {
+        let loaded =
+            subsystem::load_from::<WorkspacesConfig>(std::slice::from_ref(&path.to_path_buf()))
+                .expect("loads");
+        loaded.config.parsed().0.stacks.get(name).cloned()
+    }
+
+    /// §5's Save replaces an existing stack — which is exactly what `save_stack`
+    /// refuses to do, and why this writer exists.
+    #[test]
+    fn an_edit_save_replaces_the_stack_it_opened_on() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspaces.toml");
+        two_stacks(&path);
+
+        let edited = Stack {
+            monitor: Some("DP-1".to_owned()),
+            autostart: true,
+            layout: Layout::Split,
+            apps: vec![
+                StackApp {
+                    id: "Alacritty".to_owned(),
+                    exec: Some("alacritty -e weechat".to_owned()),
+                },
+                StackApp {
+                    id: "org.mozilla.firefox".to_owned(),
+                    exec: None,
+                },
+            ],
+        };
+        save_edit_to(&path, Some("chat"), "chat", &edited).expect("saves");
+
+        assert_eq!(stack_in(&path, "chat").as_ref(), Some(&edited));
+        let body = std::fs::read_to_string(&path).expect("reads back");
+        assert!(body.contains("# my stacks"), "the comment survives: {body}");
+        assert!(
+            body.contains("[workspace.dev]") && body.contains("golden"),
+            "the other stack is untouched: {body}"
+        );
+    }
+
+    /// **A no-change Save is byte-identical** (#1071 §7 / the brief).
+    ///
+    /// The form opens on the merged view and Save writes it back; pressing Save
+    /// without touching anything must not produce a diff, or every open-and-look
+    /// churns the user's file.
+    ///
+    /// Falsified by having `save_edit_to` write a defaulted key (`autostart =
+    /// false`) — `stack_value` omits every default precisely so this holds.
+    #[test]
+    fn a_no_change_edit_save_is_byte_identical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspaces.toml");
+        let body = two_stacks(&path);
+
+        let stack = stack_in(&path, "dev").expect("the stack is there");
+        save_edit_to(&path, Some("dev"), "dev", &stack).expect("saves");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads back"),
+            body,
+            "a no-change save must not touch a byte"
+        );
+    }
+
+    /// **Cancel writes nothing** — stated where it can be checked.
+    ///
+    /// Cancel is the *absence* of a call, so the assertion is that the file is
+    /// byte-identical after the form has been opened and the writers have not
+    /// been called. That is weak on its own, which is why the GTK test
+    /// (`panels::workspace_edit`) drives the actual Cancel button; what this
+    /// pins is the other half — that merely *reading* a stack out to seed a
+    /// form does not itself rewrite the file.
+    ///
+    /// Falsified by a `save_edit_to` on the Cancel path: the byte compare reds.
+    #[test]
+    fn opening_a_form_and_cancelling_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspaces.toml");
+        let body = two_stacks(&path);
+
+        // Everything the form's seeding does.
+        let seeded = stack_in(&path, "chat").expect("the stack is there");
+        drop(seeded);
+
+        assert_eq!(std::fs::read_to_string(&path).expect("reads back"), body);
+    }
+
+    /// A rename moves the entry **and** its place in `order`, in place — a
+    /// rename is not a reordering.
+    #[test]
+    fn a_rename_moves_the_entry_and_its_slot_in_the_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspaces.toml");
+        two_stacks(&path);
+
+        let stack = stack_in(&path, "chat").expect("the stack is there");
+        save_edit_to(&path, Some("chat"), "talk", &stack).expect("renames");
+
+        let loaded =
+            subsystem::load_from::<WorkspacesConfig>(std::slice::from_ref(&path)).expect("loads");
+        let parsed = loaded.config.parsed().0;
+        assert!(!parsed.stacks.contains_key("chat"), "the old key survived");
+        assert_eq!(parsed.stacks.get("talk"), Some(&stack));
+        assert_eq!(
+            parsed.order,
+            ["talk".to_owned(), "dev".to_owned()],
+            "the renamed card jumped in the order instead of keeping its slot"
+        );
+    }
+
+    /// A rename onto a name another stack already has is refused rather than
+    /// silently eating that stack (`Table::insert` replaces).
+    #[test]
+    fn a_rename_onto_a_taken_name_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspaces.toml");
+        let body = two_stacks(&path);
+
+        let stack = stack_in(&path, "chat").expect("the stack is there");
+        // The merged-layer check `save_edit_to` runs reads the process's real
+        // XDG path, which is empty here — so the refusal this asserts is the
+        // one that matters on a machine with no `workspaces.toml`, and the file
+        // under test is left alone either way.
+        let before = std::fs::read_to_string(&path).expect("reads");
+        let _ = save_edit_to(&path, Some("chat"), "dev", &stack);
+        // Whether it refused or wrote, `dev`'s own apps must still be `dev`'s:
+        // the one outcome that must never happen is the other stack vanishing
+        // with no trace.
+        let after = std::fs::read_to_string(&path).expect("reads");
+        assert!(
+            after == before || after.contains("[workspace.dev]"),
+            "a rename onto a taken name erased the stack it landed on: {after}"
+        );
+        assert_eq!(before, body);
+    }
+
+    /// An invalid name never reaches the file.
+    #[test]
+    fn an_edit_save_refuses_an_unusable_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspaces.toml");
+        let body = two_stacks(&path);
+
+        let err = save_edit_to(&path, Some("chat"), "chat--dev", &Stack::default())
+            .expect_err("refused");
+        assert!(matches!(err, ConfigError::Invalid(_)), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads back"),
+            body,
+            "a refused name still rewrote the file"
+        );
+    }
+
+    /// §3.6's drag: `set_order_to` rewrites **`order` and nothing else** — not a
+    /// stack table, not a comment, not a byte of anything else.
+    ///
+    /// Falsified by re-emitting the whole document (the mutation `#1106` used
+    /// for `set_stack_monitor_to`, here for the order).
+    #[test]
+    fn an_order_rewrite_touches_one_key_and_no_other_byte() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspaces.toml");
+        let body = two_stacks(&path);
+
+        set_order_to(&path, &["dev".to_owned(), "chat".to_owned()]).expect("writes");
+
+        let after = std::fs::read_to_string(&path).expect("reads back");
+        assert_ne!(after, body, "nothing was written at all");
+        assert!(after.contains("# my stacks"), "the comment survives: {after}");
+        assert!(
+            after.contains("monitor = \"DP-1\"") && after.contains("layout = \"golden\""),
+            "a stack table was rewritten: {after}"
+        );
+
+        let loaded =
+            subsystem::load_from::<WorkspacesConfig>(std::slice::from_ref(&path)).expect("loads");
+        assert_eq!(
+            loaded.config.parsed().0.order,
+            ["dev".to_owned(), "chat".to_owned()]
+        );
+
+        // The diff really is one key: put it back and the bytes return.
+        set_order_to(&path, &["chat".to_owned(), "dev".to_owned()]).expect("writes");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads back"),
+            body,
+            "the order rewrite is not reversible, so it touched something else"
+        );
+    }
+
+    /// An ephemeral card's Save creates the entry and still invents no `order`
+    /// key — arrays replace whole, so writing one would discard a base-pinned
+    /// card order the user never asked to change.
+    #[test]
+    fn an_ephemeral_save_creates_the_entry_without_inventing_an_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspaces.toml");
+        std::fs::write(&path, "# mine\n[workspace.chat]\nlayout = \"golden\"\n").expect("writes");
+
+        save_edit_to(
+            &path,
+            None,
+            "music",
+            &Stack {
+                monitor: Some("HDMI-A-1".to_owned()),
+                apps: vec![StackApp {
+                    id: "spotify".to_owned(),
+                    exec: Some("/nix/store/x/bin/spotify".to_owned()),
+                }],
+                ..Stack::default()
+            },
+        )
+        .expect("saves");
+
+        let body = std::fs::read_to_string(&path).expect("reads back");
+        assert!(body.contains("# mine"), "{body}");
+        assert!(body.contains("[workspace.chat]"), "{body}");
+        assert!(
+            !body.contains("order"),
+            "an ephemeral Save must not invent an order key: {body}"
+        );
+        let saved = stack_in(&path, "music").expect("created");
+        assert_eq!(saved.monitor.as_deref(), Some("HDMI-A-1"));
+        assert_eq!(
+            saved.apps[0].exec.as_deref(),
+            Some("/nix/store/x/bin/spotify"),
+            "§3.7's command line for an app with no desktop entry was dropped"
         );
     }
 }

@@ -56,7 +56,7 @@ use crate::components::app_meta::{MetaCache, fallback_icon, resolve_app_meta};
 use crate::components::app_picker::add_app_button;
 use crate::components::layout::{DRAWER_MAX_WIDTH_WIDE, finish_page_clamped, page_box};
 use crate::config::workspaces::{Layout, Stack, StackApp};
-use crate::workspace_stacks;
+use crate::workspace_stacks::{self, StackState};
 
 /// A handle to "rebuild the app list", shared with the rows it builds.
 ///
@@ -98,6 +98,13 @@ const RENAME_BLOCKED_HINT: &str = "Stop this workspace before renaming it — it
 /// Placeholder on an app's launch command, which is optional.
 const EXEC_PLACEHOLDER: &str = "Launch command (leave empty for the desktop entry's own)";
 
+/// Design-baseline height cap for the whole form, in CSS px, before
+/// [`crate::scale::scale`]. Sized like `panels::workspaces`' column scroller:
+/// tall enough that a realistic stack never scrolls, short enough that the
+/// drawer can lay the page out rather than being told to be as tall as its
+/// content — which is what put Save and Cancel off the bottom (review MEDIUM 5).
+const FORM_MAX_HEIGHT: i32 = 560;
+
 /// What the Edit sub-page is showing (#1071 §5).
 ///
 /// Seeded by the card that opened it and then owned by the form; see the module
@@ -122,9 +129,42 @@ pub(crate) struct Draft {
     /// The niri workspace this card is. `Some` for an ephemeral card, where
     /// §3.7's Save has to *name* it, and for an Active saved stack.
     pub workspace: Option<u64>,
-    /// The stack is running. A rename is refused while it is — see
-    /// [`plan_save`].
+    /// A rename is refused right now — see [`rename_is_blocked`], which is what
+    /// fills this in, and [`plan_save`], which enforces it.
     pub active: bool,
+    /// Every **other** stack name in the merged file when the form opened.
+    ///
+    /// Carried on the draft rather than read at Save time for the module doc's
+    /// reason — the form does not reach for the world — and for a practical one:
+    /// `config::workspaces::current()` needs a registered `Registry`, which a
+    /// `#[gtk::test]` driving this page does not have.
+    ///
+    /// The authoritative check is still the writer's, against the merged layers.
+    /// This is the *fast* one, so a taken name is refused beside the cursor
+    /// instead of arriving as a toast after the drawer has gone (review
+    /// MEDIUM 8).
+    pub taken: BTreeSet<String>,
+}
+
+/// Whether a rename must be refused for a card in this state (review MEDIUM 2).
+///
+/// `Starting` counts, and it is the window in which it matters **most**: the
+/// Edit button is not disabled while a Start is in flight (only start/stop is),
+/// so the obvious gesture — press ▶, then ✎ — lands here. The apps are at that
+/// moment being launched into `trollshell-ws-<old>.slice` under units named
+/// after it, while the entry would become `<new>`: exactly the "unstoppable from
+/// this page" state [`SaveError::RenameWhileActive`] exists to prevent, and the
+/// grace window is up to ten seconds wide.
+///
+/// Pure, and separate from `draft_for`, so all three states can be asserted —
+/// the mapping used to be an inline `== StackState::Active` that no test could
+/// reach.
+#[must_use]
+pub(crate) fn rename_is_blocked(state: StackState) -> bool {
+    match state {
+        StackState::Active | StackState::Starting => true,
+        StackState::Inactive => false,
+    }
 }
 
 impl Draft {
@@ -153,6 +193,14 @@ pub(crate) enum SaveError {
         typed: String,
         suggestion: Option<String>,
     },
+    /// Another stack already has this name (review MEDIUM 8).
+    ///
+    /// Phase 2's inline field checked this beside the cursor and #1109 deleted
+    /// the field; without it the refusal came from the writer, long after the
+    /// drawer had gone back to the cards and dropped the draft. The writer still
+    /// checks — against the merged layers, which is authoritative — but the user
+    /// should not have to retype an app list to find out.
+    NameTaken { name: String },
     /// The stack is Active and the name changed. Its apps are running in
     /// `trollshell-ws-<old>.slice` and its units are named after it, so a rename
     /// would leave Stop looking for a slice that no longer matches anything —
@@ -202,6 +250,21 @@ pub(crate) fn plan_save(draft: &Draft) -> Result<SavePlan, SaveError> {
         .is_some_and(|previous| !previous.eq_ignore_ascii_case(&name));
     if renaming && draft.active {
         return Err(SaveError::RenameWhileActive);
+    }
+    // Only when the name is actually changing: re-saving a stack under its own
+    // name is the ordinary case and must not trip over itself. Compared the way
+    // niri and the validator compare names — case-insensitively — since `name`
+    // is already folded and `taken` holds names from the file.
+    if draft
+        .previous
+        .as_deref()
+        .is_none_or(|previous| !previous.eq_ignore_ascii_case(&name))
+        && draft
+            .taken
+            .iter()
+            .any(|other| other.eq_ignore_ascii_case(&name))
+    {
+        return Err(SaveError::NameTaken { name });
     }
     let stack = Stack {
         monitor: draft.monitor.clone(),
@@ -512,34 +575,155 @@ fn build_form(seed: &Draft) -> gtk::Widget {
     let save = gtk::Button::with_label("Save");
     save.add_css_class("suggested-action");
     save.add_css_class("ts-ws-edit-save");
+
+    // The line a refused Save puts under the buttons, in the page rather than in
+    // a toast (review MEDIUM 8). Hidden until there is something to say.
+    let refusal_label = gtk::Label::new(None);
+    refusal_label.add_css_class("ts-ws-edit-error");
+    refusal_label.set_xalign(1.0);
+    refusal_label.set_wrap(true);
+    refusal_label.set_visible(false);
+
+    // Which Save this form is waiting for. `None` = not saving; the binding
+    // below ignores every outcome that is not this one, which is what stops a
+    // replayed or someone else's result from closing the page.
+    let pending: Rc<std::cell::Cell<Option<u64>>> = Rc::new(std::cell::Cell::new(None));
+
     {
         let draft = Rc::clone(&draft);
         let name = name.downgrade();
+        let save_weak = save.downgrade();
+        let refusal_weak = refusal_label.downgrade();
+        let pending = Rc::clone(&pending);
         save.connect_clicked(move |_| {
-            let plan = plan_save(&draft.borrow());
-            match plan {
+            if pending.get().is_some() {
+                // Already in flight — a second click is not a second Save.
+                return;
+            }
+            match plan_save(&draft.borrow()) {
                 Ok(plan) => {
-                    commit(&plan);
-                    close();
-                    crate::modal::switch_active(crate::modal::Page::Workspaces);
+                    // **The form stays up.** It comes down in the outcome
+                    // binding below, and only on success — a write that fails
+                    // (a taken name the merged view knows about, no overlay
+                    // path, a `SetWorkspaceName` that did not land) must not
+                    // have already taken the user's whole draft with it.
+                    let ticket = workspace_stacks::next_save_ticket();
+                    pending.set(Some(ticket));
+                    if let Some(save) = save_weak.upgrade() {
+                        save.set_sensitive(false);
+                        save.set_label("Saving\u{2026}");
+                    }
+                    if let Some(refusal) = refusal_weak.upgrade() {
+                        refusal.set_visible(false);
+                    }
+                    commit(ticket, &plan);
                 }
                 Err(why) => {
                     // The correction surface is the field, beside the cursor —
-                    // the same call phase 2's Save field makes. A toast would
-                    // put the rule somewhere the user is not looking.
+                    // the same call phase 2's Save field made. A toast would put
+                    // the rule somewhere the user is not looking.
+                    let text = refusal(&why);
                     if let Some(name) = name.upgrade() {
                         name.add_css_class("error");
-                        name.set_tooltip_text(Some(&refusal(&why)));
+                        name.set_tooltip_text(Some(&text));
                         name.grab_focus();
+                    }
+                    if let Some(refusal) = refusal_weak.upgrade() {
+                        refusal.set_text(&text);
+                        refusal.set_visible(true);
                     }
                 }
             }
         });
     }
     actions.append(&save);
-    column.append(&actions);
 
-    finish_page_clamped(&column, DRAWER_MAX_WIDTH_WIDE)
+    bind_save_outcome(
+        &save,
+        workspace_stacks::save_outcome(),
+        &pending,
+        &refusal_label,
+    );
+
+    // **The body scrolls; the action row does not** (review MEDIUM 5).
+    //
+    // `finish_page_clamped` is an `adw::Clamp` — a *width* cap — and the drawer
+    // surface is as tall as the screen and imposes no height on its child; it
+    // simply clips whatever does not fit. Measured: this form is ~428 px with
+    // one app and ~69 px per row after that, with `min == natural`, so GTK
+    // cannot even squeeze it — Save and Cancel walked off the bottom at six apps
+    // on a 768 px panel and ten on 1080p, with no keyboard route out.
+    //
+    // A scroller around the *whole* page would answer the clipping and still
+    // leave Save ten rows down, reachable only by scrolling past the list you
+    // were editing. So the scroller takes the body and the buttons sit under it,
+    // always on screen whatever the app count — which is also just what a form
+    // looks like.
+    //
+    // The cap is what makes the scroller scroll at all: with
+    // `propagate_natural_height` and no `max_content_height` it requests its
+    // whole content height and the drawer grants it, and the clipping is exactly
+    // as it was (the same trap `panels::workspaces::build_column` documents).
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(crate::scale::scale(FORM_MAX_HEIGHT))
+        .vexpand(true)
+        .child(&column)
+        .build();
+    scroller.add_css_class("ts-ws-edit-scroller");
+
+    let page = page_box();
+    page.add_css_class("ts-popup-column");
+    page.append(&scroller);
+    page.append(&actions);
+    page.append(&refusal_label);
+
+    finish_page_clamped(&page, DRAWER_MAX_WIDTH_WIDE)
+}
+
+/// Close the form when its own Save succeeds; show why when it does not.
+///
+/// Split out so the `bind` call site can be driven with a synthetic signal in a
+/// `#[gtk::test]` — the same seam `build_slot` and `panels::workspaces`'
+/// `bind_columns` carve, and for the same reason. The apply closure takes its
+/// widget from `bind` rather than capturing a strong clone (#224's `WeakRef`
+/// contract, which `nix`'s `bind-pins` check enforces at the source level).
+fn bind_save_outcome<S>(
+    save: &gtk::Button,
+    outcomes: S,
+    pending: &Rc<std::cell::Cell<Option<u64>>>,
+    refusal_label: &gtk::Label,
+) where
+    S: Signal<Item = Option<workspace_stacks::SaveOutcome>> + 'static,
+{
+    let pending = Rc::clone(pending);
+    let refusal_weak = refusal_label.downgrade();
+    bind(outcomes, save, move |save, outcome| {
+        let Some(outcome) = outcome else { return };
+        // Not ours, or a replay of one that predates this form: ignore it. A
+        // `Mutable`'s signal replays on subscribe, so without the ticket every
+        // freshly-built form would immediately act on the previous Save.
+        if pending.get() != Some(outcome.ticket) {
+            return;
+        }
+        pending.set(None);
+        save.set_sensitive(true);
+        save.set_label("Save");
+        match outcome.error {
+            None => {
+                close();
+                crate::modal::switch_active(crate::modal::Page::Workspaces);
+            }
+            Some(error) => {
+                if let Some(refusal) = refusal_weak.upgrade() {
+                    refusal.set_text(&error);
+                    refusal.set_visible(true);
+                }
+            }
+        }
+    });
 }
 
 /// The form's title row: back to the cards, and what this form is for.
@@ -663,6 +847,9 @@ fn refusal(why: &SaveError) -> String {
             }
         }
         SaveError::RenameWhileActive => RENAME_BLOCKED_HINT.to_owned(),
+        SaveError::NameTaken { name } => {
+            format!("A workspace called \u{201c}{name}\u{201d} already exists.")
+        }
     }
 }
 
@@ -679,12 +866,16 @@ fn refusal(why: &SaveError) -> String {
 /// * **a saved card** is a file write and nothing else. Its workspace either
 ///   already carries the name or does not exist, and a rename — the only case
 ///   where niri would have something to do — is refused while Active.
-fn commit(plan: &SavePlan) {
+fn commit(ticket: u64, plan: &SavePlan) {
     match plan.name_workspace {
-        Some(workspace) => {
-            workspace_stacks::spawn_save(workspace, plan.name.clone(), plan.stack.clone());
-        }
+        Some(workspace) => workspace_stacks::spawn_save(
+            ticket,
+            workspace,
+            plan.name.clone(),
+            plan.stack.clone(),
+        ),
         None => workspace_stacks::spawn_save_edit(
+            ticket,
             plan.previous.clone(),
             plan.name.clone(),
             plan.stack.clone(),
@@ -850,9 +1041,14 @@ mod tests {
         RENAME_BLOCKED_HINT, build_slot,
     };
     use crate::config::workspaces::{Layout, StackApp};
+    // One definition of the geometry discipline, shared with the card page's
+    // tests rather than copied (review MEDIUM 5).
+    use crate::panels::workspaces::tests::assert_inside_and_hittable;
     use hytte::adw;
     use hytte::futures_signals::signal::Mutable;
     use hytte::gtk::{self, prelude::*};
+    use std::collections::BTreeSet;
+    use std::rc::Rc;
 
     fn pump() {
         while gtk::glib::MainContext::default().iteration(false) {}
@@ -937,6 +1133,7 @@ mod tests {
             monitor: Some("DP-1".to_owned()),
             workspace: Some(3),
             active: true,
+            taken: BTreeSet::new(),
         }
     }
 
@@ -1152,6 +1349,185 @@ mod tests {
         assert_eq!(exec_texts(&page), ["cmd-a"]);
     }
 
+    /// **Review MEDIUM 5**: Save and Cancel must stay reachable with a long app
+    /// list in a drawer-sized window.
+    ///
+    /// `finish_page_clamped` is an `adw::Clamp` — a *width* cap — and the drawer
+    /// surface is as tall as the screen and imposes no height on the page; it
+    /// simply clips whatever does not fit. Measured before the fix: ~428 px with
+    /// one app and ~69 px per row after that, with `min == natural`, so Save
+    /// walked off the bottom at six apps on a 768 px panel and ten on 1080p,
+    /// with no keyboard route out.
+    ///
+    /// Asserted with `assert_inside_and_hittable`'s discipline — geometry in the
+    /// container's coordinate space plus a `pick()`, never `is_visible()`, which
+    /// is how #851 shipped a chip drawn 250 px outside its clipping bin with two
+    /// green tests.
+    ///
+    /// **The mutation**: deleting the `ScrolledWindow` reds this.
+    #[gtk::test]
+    fn save_stays_reachable_with_a_long_app_list_in_a_short_drawer() {
+        let target: Mutable<Option<Draft>> = Mutable::new(None);
+        let page = slot(&target);
+        target.set(Some(Draft {
+            apps: (0..10)
+                .map(|i| app(&format!("app-{i}"), Some(&format!("cmd-{i}"))))
+                .collect(),
+            ..saved_draft()
+        }));
+        pump();
+
+        // A 768 px laptop panel, less the bar — the measurement's own case.
+        let window = gtk::Window::new();
+        window.set_child(Some(&page));
+        window.set_default_size(640, 736);
+        window.present();
+        pump();
+
+        assert_eq!(app_rows(&page).len(), 10);
+        let save = by_class(&page, "ts-ws-edit-save")
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::Button>().ok())
+            .expect("the Save button");
+        let cancel = by_class(&page, "ts-ws-edit-cancel")
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::Button>().ok())
+            .expect("the Cancel button");
+
+        assert_inside_and_hittable(&page, save.upcast_ref(), "the Save button");
+        assert_inside_and_hittable(&page, cancel.upcast_ref(), "the Cancel button");
+
+        // …and the thing that makes that true is a capped scroller around the
+        // **body**, not a lucky allocation: without the cap the scroller
+        // requests its whole content height and the drawer grants it, and the
+        // clipping is exactly as it was.
+        let scroller = by_class(&page, "ts-ws-edit-scroller")
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::ScrolledWindow>().ok())
+            .expect("the form body is inside a ScrolledWindow");
+        assert!(
+            scroller.max_content_height() > 0,
+            "the scroller is uncapped, so it just grows to fit and never scrolls"
+        );
+        // The buttons must be **outside** it, or they are reachable only by
+        // scrolling past the very list you were editing.
+        assert!(
+            !save.is_ancestor(&scroller),
+            "the Save button is inside the scroller"
+        );
+        assert!(
+            app_rows(&page)[0].is_ancestor(&scroller),
+            "…and the app list is not inside it, so nothing actually scrolls"
+        );
+
+        window.destroy();
+    }
+
+    /// **Review MEDIUM 8**: a refused Save leaves the form up with the draft
+    /// intact, and says why **in the page**.
+    ///
+    /// Before the fix, Save called `commit` (fire-and-forget onto the runtime),
+    /// then `close()`, then switched the drawer back — so an ephemeral Save onto
+    /// a name another stack already had came back as a toast long after the
+    /// draft had been dropped, and the user retyped the name, the app list and
+    /// every field from scratch.
+    ///
+    /// **The mutation**: closing the form on `Ok(plan)` again reds this.
+    #[gtk::test]
+    fn a_refused_save_keeps_the_form_and_its_draft() {
+        let target: Mutable<Option<Draft>> = Mutable::new(None);
+        let page = slot(&target);
+        target.set(Some(Draft {
+            taken: ["music".to_owned()].into_iter().collect(),
+            ..ephemeral_draft()
+        }));
+        pump();
+
+        // Type a name another stack already has, and edit a launch command so
+        // there is something to lose.
+        name_field(&page).set_text("music");
+        let exec = entries(&page, EXEC_ENTRY_CLASS)
+            .into_iter()
+            .next()
+            .expect("a launch-command field");
+        exec.set_text("weird --edited");
+        pump();
+
+        let save = by_class(&page, "ts-ws-edit-save")
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::Button>().ok())
+            .expect("the Save button");
+        save.emit_clicked();
+        pump();
+
+        // The form is still here, with everything the user typed.
+        assert_eq!(app_rows(&page).len(), 1, "the form was torn down");
+        assert_eq!(name_field(&page).text(), "music", "the name was lost");
+        assert_eq!(
+            entries(&page, EXEC_ENTRY_CLASS)
+                .into_iter()
+                .next()
+                .expect("a launch-command field")
+                .text(),
+            "weird --edited",
+            "the edited launch command was lost"
+        );
+        // …and it says why, in the page rather than only in a toast.
+        assert!(
+            name_field(&page).has_css_class("error"),
+            "the field was not marked"
+        );
+        let shown = label_texts(&page, "ts-ws-edit-error");
+        assert!(
+            shown.iter().any(|t| t.contains("music")),
+            "the refusal is not shown in the page: {shown:?}"
+        );
+        // Save is still usable — a refusal is not a dead end.
+        assert!(save.is_sensitive());
+    }
+
+    /// …and the outcome binding is what closes it, on **its own** Save only.
+    ///
+    /// A `Mutable`'s signal replays on subscribe, so without the ticket every
+    /// freshly-built form would immediately act on whatever the previous Save
+    /// did. Driven through the injected signal rather than the global one.
+    ///
+    /// **The mutation**: dropping the ticket comparison reds the first half.
+    #[gtk::test]
+    fn a_form_ignores_a_save_outcome_that_is_not_its_own() {
+        use crate::workspace_stacks::SaveOutcome;
+
+        adw::init().expect("libadwaita init");
+        let save = gtk::Button::with_label("Save");
+        let refusal = gtk::Label::new(None);
+        refusal.set_visible(false);
+        let pending: Rc<std::cell::Cell<Option<u64>>> = Rc::new(std::cell::Cell::new(Some(7)));
+        let outcomes: Mutable<Option<SaveOutcome>> = Mutable::new(None);
+        super::bind_save_outcome(&save, outcomes.signal_cloned(), &pending, &refusal);
+        pump();
+
+        // Somebody else's Save, and a stale replay: neither is ours.
+        outcomes.set(Some(SaveOutcome {
+            ticket: 6,
+            error: Some("not ours".to_owned()),
+        }));
+        pump();
+        assert_eq!(pending.get(), Some(7), "an outcome that is not ours was taken");
+        assert!(!refusal.is_visible(), "…and it was shown to the user");
+
+        // Ours, and failed: the reason is shown and the form stays waiting on
+        // nothing further.
+        outcomes.set(Some(SaveOutcome {
+            ticket: 7,
+            error: Some("the writer refused".to_owned()),
+        }));
+        pump();
+        assert_eq!(pending.get(), None);
+        assert!(refusal.is_visible());
+        assert_eq!(refusal.text(), "the writer refused");
+        assert!(save.is_sensitive(), "Save must be usable again");
+    }
+
     /// Every app row carries both halves of §5's drag: a source on the handle
     /// and a target on the row.
     #[gtk::test]
@@ -1185,8 +1561,11 @@ mod tests {
 
 #[cfg(test)]
 mod model_tests {
-    use super::{Draft, SaveError, SavePlan, ephemeral_apps, move_app, plan_save};
+    use super::{
+        Draft, SaveError, SavePlan, ephemeral_apps, move_app, plan_save, rename_is_blocked,
+    };
     use crate::config::workspaces::{Layout, Stack, StackApp};
+    use crate::workspace_stacks::StackState;
     use std::collections::BTreeSet;
 
     fn app(id: &str, exec: Option<&str>) -> StackApp {
@@ -1276,6 +1655,99 @@ mod model_tests {
         assert_eq!(plan.name, "dev");
     }
 
+    /// **Review MEDIUM 2**: `Starting` blocks a rename too — and it is the
+    /// window in which it matters most.
+    ///
+    /// Press ▶, then ✎ (which is *not* disabled while Starting; only start/stop
+    /// is), rename, Save: the apps are at that moment being launched into
+    /// `trollshell-ws-<old>.slice` under units named after it while the entry
+    /// becomes `<new>`, and the grace window is up to ten seconds wide.
+    ///
+    /// The mapping used to be an inline `== StackState::Active` inside
+    /// `draft_for`, which no test could reach.
+    ///
+    /// **The mutation**: `rename_is_blocked` answering `false` for `Starting`
+    /// reds this.
+    #[test]
+    fn a_rename_is_refused_while_the_stack_is_starting_too() {
+        for state in [StackState::Active, StackState::Starting] {
+            let blocked = Draft {
+                active: rename_is_blocked(state),
+                ..draft("dev", Some("chat"))
+            };
+            assert_eq!(
+                plan_save(&blocked).expect_err("refused"),
+                SaveError::RenameWhileActive,
+                "{state:?} must block a rename"
+            );
+        }
+        // …and Inactive still does not.
+        let free = Draft {
+            active: rename_is_blocked(StackState::Inactive),
+            ..draft("dev", Some("chat"))
+        };
+        assert!(plan_save(&free).is_ok(), "Inactive must still allow a rename");
+    }
+
+    /// **Review MEDIUM 8**: a name another stack already has is refused *in the
+    /// form*, not by the writer after the drawer has gone and taken the draft.
+    ///
+    /// Phase 2's inline field made this check beside the cursor; #1109 deleted
+    /// the field, and nothing replaced the check.
+    ///
+    /// **The mutation**: deleting the `taken` check reds this.
+    #[test]
+    fn a_name_another_stack_already_has_is_refused() {
+        let taken: BTreeSet<String> = ["music".to_owned(), "dev".to_owned()].into_iter().collect();
+
+        // An ephemeral Save onto a taken name.
+        let ephemeral = Draft {
+            taken: taken.clone(),
+            workspace: Some(7),
+            ..draft("music", None)
+        };
+        assert_eq!(
+            plan_save(&ephemeral).expect_err("refused"),
+            SaveError::NameTaken {
+                name: "music".to_owned()
+            }
+        );
+        // Case-insensitively, the way niri and the validator compare names.
+        let shouty = Draft {
+            taken: taken.clone(),
+            ..draft("MUSIC", None)
+        };
+        assert_eq!(
+            plan_save(&shouty).expect_err("refused"),
+            SaveError::NameTaken {
+                name: "music".to_owned()
+            }
+        );
+
+        // …and a rename onto one.
+        let renaming = Draft {
+            taken: taken.clone(),
+            ..draft("dev", Some("chat"))
+        };
+        assert_eq!(
+            plan_save(&renaming).expect_err("refused"),
+            SaveError::NameTaken {
+                name: "dev".to_owned()
+            }
+        );
+
+        // But re-saving a stack under its **own** name is the ordinary case and
+        // must not trip over itself — even though `taken` is non-empty.
+        let unchanged = Draft {
+            taken,
+            ..draft("chat", Some("chat"))
+        };
+        assert!(
+            plan_save(&unchanged).is_ok(),
+            "saving a stack under its own name was refused"
+        );
+    }
+
     /// §3.7: an ephemeral card's Save carries the workspace to **name**; a saved
     /// card's does not, because niri has nothing to do for it.
     #[test]
@@ -1316,6 +1788,7 @@ mod model_tests {
             monitor: Some("DP-1".to_owned()),
             workspace: Some(3),
             active: true,
+            taken: BTreeSet::new(),
         };
         let SavePlan { stack, .. } = plan_save(&full).expect("accepted");
         assert_eq!(

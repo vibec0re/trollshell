@@ -616,8 +616,12 @@ fn build_column(column: &Column, meta_cache: &MetaCache, context: &Rc<DropContex
     if column.cards.is_empty() {
         cards.append(&hint(EMPTY_COLUMN_HINT));
     } else {
+        // `None` for the offline column: its heading is not a connector (review
+        // HIGH 1). `drop_plan` then declines the monitor half and keeps the
+        // reorder one.
+        let connector = (!column.offline).then_some(column.connector.as_str());
         for card in &column.cards {
-            cards.append(&build_card(card, meta_cache, &column.connector, context));
+            cards.append(&build_card(card, meta_cache, connector, context));
         }
     }
 
@@ -703,7 +707,9 @@ fn monitor_drop_target(connector: &str, context: &Rc<DropContext>) -> gtk::DropT
         //
         // `before: None` — a drop on the column's own background is about the
         // screen and says nothing about where among the cards it should sit.
-        let Some(action) = drop_plan(&name, &connector, None, &context) else {
+        // This target is only ever attached to a *connected* column, so the
+        // connector is always `Some` here.
+        let Some(action) = drop_plan(&name, Some(&connector), None, &context) else {
             return false;
         };
         perform_drop(action);
@@ -724,7 +730,11 @@ fn monitor_drop_target(connector: &str, context: &Rc<DropContext>) -> gtk::DropT
 /// because the cards are the only things the user can aim at, and "drop it on
 /// the card you want to be above" is the rule both halves of a list-reorder drag
 /// can agree on.
-fn card_drop_target(name: &str, connector: &str, context: &Rc<DropContext>) -> gtk::DropTarget {
+fn card_drop_target(
+    name: &str,
+    connector: Option<&str>,
+    context: &Rc<DropContext>,
+) -> gtk::DropTarget {
     let target = gtk::DropTarget::new(glib::types::Type::STRING, gdk::DragAction::MOVE);
     target.connect_enter(|target, _, _| {
         if let Some(widget) = target.widget() {
@@ -738,7 +748,7 @@ fn card_drop_target(name: &str, connector: &str, context: &Rc<DropContext>) -> g
         }
     });
     let before = name.to_owned();
-    let connector = connector.to_owned();
+    let connector = connector.map(str::to_owned);
     let context = Rc::clone(context);
     target.connect_drop(move |target, value, _, _| {
         if let Some(widget) = target.widget() {
@@ -747,7 +757,8 @@ fn card_drop_target(name: &str, connector: &str, context: &Rc<DropContext>) -> g
         let Ok(dragged) = value.get::<String>() else {
             return false;
         };
-        let Some(action) = drop_plan(&dragged, &connector, Some(&before), &context) else {
+        let Some(action) = drop_plan(&dragged, connector.as_deref(), Some(&before), &context)
+        else {
             return false;
         };
         perform_drop(action);
@@ -872,12 +883,28 @@ fn reorder_onto(order: &[String], name: &str, target: &str) -> Option<Vec<String
 /// the drop is the user saying "here, always" and it writes.
 fn drop_plan(
     name: &str,
-    connector: &str,
+    connector: Option<&str>,
     before: Option<&str>,
     context: &DropContext,
 ) -> Option<DropAction> {
     let card = context.cards.get(name)?;
-    let monitor = (card.monitor.as_deref() != Some(connector)).then(|| connector.to_owned());
+    // `connector` is `None` for the trailing "Not connected" column, and that is
+    // the whole of review HIGH 1. That column's heading is the literal string
+    // `OFFLINE_COLUMN`; passing it through as a connector wrote
+    // `monitor = "Not connected"` into `workspaces.toml` — a value no output
+    // will ever match, stranding the card in the greyed column until the file is
+    // hand-edited — and, for an Active stack, sent niri a
+    // `MoveWorkspaceToMonitor { output: "Not connected" }`.
+    //
+    // Phase 3 stated this invariant for the *column* target ("it is not a
+    // screen, so there is no connector to record and nowhere for niri to move a
+    // workspace to"); phase 4's card target routed around it. An `Option` is the
+    // fix rather than a guard because it makes the offline case unrepresentable
+    // at the type level — and it keeps the **reorder** half working there, which
+    // is real: those cards are still ordered.
+    let monitor = connector
+        .filter(|connector| card.monitor.as_deref() != Some(*connector))
+        .map(str::to_owned);
     // A card dropped on **itself** is not a reorder, and `reorder_onto` would
     // answer `None` for it anyway — but saying so here keeps the self-drop from
     // reading as an accident of the pure function.
@@ -951,7 +978,7 @@ fn card_drag_source(name: &str) -> gtk::DragSource {
 fn build_card(
     card: &Card,
     meta_cache: &MetaCache,
-    connector: &str,
+    connector: Option<&str>,
     context: &Rc<DropContext>,
 ) -> gtk::Widget {
     // `.ts-panel` is the shell's card surface (`components::layout::section`
@@ -1036,6 +1063,17 @@ fn edit_button(card: &Card) -> gtk::Button {
     let card = card.clone();
     button.connect_clicked(move |_| {
         let Some(draft) = draft_for(&card) else {
+            // The stack went out of the file between the model being built and
+            // this click — the file is live-reloaded and the drawer can sit open
+            // across a hand edit. Say so (review LOW 15): returning in silence
+            // leaves the user pressing a dead button.
+            workspace_stacks::report(
+                &card.name,
+                &format!(
+                    "{} is no longer in workspaces.toml, so there is nothing to edit",
+                    card.name
+                ),
+            );
             return;
         };
         // Publish first, switch second: the drawer child is already built and
@@ -1059,10 +1097,8 @@ fn draft_for(card: &Card) -> Option<workspace_edit::Draft> {
             // Read back rather than captured, the same call `start_by_name`
             // makes and for the same reason: a captured `Stack` could be a
             // revision behind the file the Save is about to rewrite.
-            let stack = config_workspaces::current()
-                .stacks
-                .get(&card.name)
-                .cloned()?;
+            let saved = config_workspaces::current();
+            let stack = saved.stacks.get(&card.name).cloned()?;
             Some(workspace_edit::Draft {
                 previous: Some(card.name.clone()),
                 name: card.name.clone(),
@@ -1071,7 +1107,10 @@ fn draft_for(card: &Card) -> Option<workspace_edit::Draft> {
                 autostart: stack.autostart,
                 monitor: stack.monitor,
                 workspace: card.live,
-                active: *state == StackState::Active,
+                // `Starting` blocks a rename too — see `rename_is_blocked`, and
+                // review MEDIUM 2 for why that window is the one it matters in.
+                active: workspace_edit::rename_is_blocked(*state),
+                taken: other_names(&saved, Some(&card.name)),
             })
         }
         Kind::Ephemeral {
@@ -1081,6 +1120,7 @@ fn draft_for(card: &Card) -> Option<workspace_edit::Draft> {
         } => Some(ephemeral_draft(
             *workspace,
             output,
+            other_names(&config_workspaces::current(), None),
             // §3.7's mapping: the workspace's windows in column order, each
             // resolved through its desktop entry, with the ones that have none
             // carrying the running command line for correction. The only impure
@@ -1097,6 +1137,21 @@ fn draft_for(card: &Card) -> Option<workspace_edit::Draft> {
     }
 }
 
+/// Every saved stack name **except** `mine`, for the form's fast taken-name
+/// check (review MEDIUM 8).
+///
+/// `mine` is excluded because re-saving a stack under its own name is the
+/// ordinary case; `plan_save` also guards that, so this is belt and braces at
+/// the seam where the set is built rather than where it is read.
+fn other_names(saved: &Workspaces, mine: Option<&str>) -> BTreeSet<String> {
+    saved
+        .stacks
+        .keys()
+        .filter(|name| mine.is_none_or(|mine| !name.eq_ignore_ascii_case(mine)))
+        .cloned()
+        .collect()
+}
+
 /// The draft an **ephemeral** card's Edit opens with, given its apps (#1071
 /// §3.7). Pure.
 ///
@@ -1105,12 +1160,14 @@ fn draft_for(card: &Card) -> Option<workspace_edit::Draft> {
 fn ephemeral_draft(
     workspace: u64,
     output: &str,
+    taken: BTreeSet<String>,
     apps: Vec<crate::config::workspaces::StackApp>,
 ) -> workspace_edit::Draft {
     workspace_edit::Draft {
         previous: None,
         name: String::new(),
         apps,
+        taken,
         layout: Layout::None,
         autostart: false,
         // §3.7's *"record the monitor"* — the screen **niri** says the workspace
@@ -1784,7 +1841,7 @@ mod model_tests {
         );
 
         assert_eq!(
-            drop_plan("chat", RIGHT, None, &ctx),
+            drop_plan("chat", Some(RIGHT), None, &ctx),
             Some(DropAction {
                 name: "chat".to_owned(),
                 monitor: Some(RIGHT.to_owned()),
@@ -1794,7 +1851,7 @@ mod model_tests {
             "an Active stack's workspace follows it across screens"
         );
         assert_eq!(
-            drop_plan("dev", RIGHT, None, &ctx),
+            drop_plan("dev", Some(RIGHT), None, &ctx),
             Some(DropAction {
                 name: "dev".to_owned(),
                 monitor: Some(RIGHT.to_owned()),
@@ -1810,10 +1867,10 @@ mod model_tests {
     #[test]
     fn a_drop_on_the_screen_it_already_records_does_nothing() {
         let ctx = context(&[("chat", droppable(Some(LEFT), Some(7)))], &["chat"]);
-        assert_eq!(drop_plan("chat", LEFT, None, &ctx), None);
+        assert_eq!(drop_plan("chat", Some(LEFT), None, &ctx), None);
         // …and neither does dropping it on **itself**, which is what a drag
         // that travelled two pixels lands on.
-        assert_eq!(drop_plan("chat", LEFT, Some("chat"), &ctx), None);
+        assert_eq!(drop_plan("chat", Some(LEFT), Some("chat"), &ctx), None);
     }
 
     /// …but a stack that records **no** screen, dropped on the column it is
@@ -1824,7 +1881,7 @@ mod model_tests {
     fn a_drop_pins_a_stack_that_recorded_no_screen() {
         let ctx = context(&[("chat", droppable(None, None))], &["chat"]);
         assert_eq!(
-            drop_plan("chat", LEFT, None, &ctx).and_then(|a| a.monitor),
+            drop_plan("chat", Some(LEFT), None, &ctx).and_then(|a| a.monitor),
             Some(LEFT.to_owned())
         );
     }
@@ -1833,7 +1890,7 @@ mod model_tests {
     /// guessed at.
     #[test]
     fn a_drop_of_something_that_is_not_a_card_is_refused() {
-        assert_eq!(drop_plan("chat", LEFT, None, &context(&[], &[])), None);
+        assert_eq!(drop_plan("chat", Some(LEFT), None, &context(&[], &[])), None);
     }
 
     // ── #1071 §3.6, the in-column reorder (phase 4) ──────────────────────────
@@ -1919,7 +1976,7 @@ mod model_tests {
             ],
             &["chat", "dev"],
         );
-        let action = drop_plan("chat", RIGHT, Some("dev"), &ctx).expect("both halves");
+        let action = drop_plan("chat", Some(RIGHT), Some("dev"), &ctx).expect("both halves");
         assert_eq!(action.monitor.as_deref(), Some(RIGHT));
         assert_eq!(action.workspace, Some(7));
         assert_eq!(names(&action.order.expect("reordered")), ["dev", "chat"]);
@@ -1927,25 +1984,75 @@ mod model_tests {
 
     /// A drop **within** one column is the order alone: no `monitor`, and
     /// therefore no workspace for niri to move either.
+    ///
+    /// The dragged card is deliberately an **Active** one (review LOW 10 / the
+    /// reviewer's surviving **M11**): with `droppable(Some(LEFT), None)` the
+    /// card had no live workspace, so `workspace == None` held whether or not
+    /// `drop_plan` gated the workspace on the monitor half — the assertion was
+    /// vacuous and dropping the gate survived green.
     #[test]
     fn a_drop_within_one_column_rewrites_only_the_order() {
         let ctx = context(
             &[
                 ("chat", droppable(Some(LEFT), Some(7))),
-                ("dev", droppable(Some(LEFT), None)),
+                ("dev", droppable(Some(LEFT), Some(9))),
             ],
             &["chat", "dev"],
         );
-        let action = drop_plan("dev", LEFT, Some("chat"), &ctx).expect("reordered");
+        let action = drop_plan("dev", Some(LEFT), Some("chat"), &ctx).expect("reordered");
         assert_eq!(
             action.monitor, None,
             "an in-column drop is not a screen change"
         );
         assert_eq!(
             action.workspace, None,
-            "there is nothing for niri to do about a position in a list"
+            "there is nothing for niri to do about a position in a list — and \
+             this card really does have a live workspace (9) to have carried"
         );
         assert_eq!(names(&action.order.expect("reordered")), ["dev", "chat"]);
+    }
+
+    /// **Review HIGH 1**: the trailing "Not connected" column's heading is not a
+    /// connector, so a drop onto a card there must record **no screen** — and
+    /// must not ask niri to move a workspace to an output that does not exist.
+    ///
+    /// Before the fix `drop_plan` was handed the literal `OFFLINE_COLUMN`, and
+    /// `card.monitor != Some("Not connected")` is true for every real stack, so
+    /// the monitor half fired: `workspaces.toml` got `monitor = "Not connected"`
+    /// (stranding the card in the greyed column until the file was hand-edited)
+    /// and an Active stack got a bogus `MoveWorkspaceToMonitor`. Phase 3 stated
+    /// the invariant for the *column* target; phase 4's card target routed
+    /// around it.
+    ///
+    /// The reorder half still applies — those cards are still ordered.
+    ///
+    /// **The mutation**: taking `connector: &str` again, so the offline column
+    /// passes its heading through, reds this on the first assertion.
+    #[test]
+    fn a_drop_onto_a_card_in_the_offline_column_records_no_screen() {
+        let ctx = context(
+            &[
+                ("chat", droppable(Some("DP-9"), None)),
+                ("dev", droppable(Some("DP-9"), Some(7))),
+            ],
+            &["chat", "dev"],
+        );
+        let action =
+            drop_plan("chat", None, Some("dev"), &ctx).expect("the reorder half still applies");
+        assert_eq!(
+            action.monitor, None,
+            "\"Not connected\" was written to the file as a connector"
+        );
+        assert_eq!(
+            action.workspace, None,
+            "niri was asked to move a workspace to an output that does not exist"
+        );
+        assert_eq!(names(&action.order.expect("reordered")), ["dev", "chat"]);
+
+        // …and a drop there that would reorder nothing does nothing at all,
+        // rather than falling through to a monitor rewrite.
+        assert_eq!(drop_plan("chat", None, None, &ctx), None);
+        assert_eq!(drop_plan("chat", None, Some("chat"), &ctx), None);
     }
 
     /// §3.7: an ephemeral card's Edit opens on a draft that **records the
@@ -1962,7 +2069,7 @@ mod model_tests {
             id: "weird-app".to_owned(),
             exec: Some("/home/me/bin/weird".to_owned()),
         }];
-        let draft = super::ephemeral_draft(7, RIGHT, apps.clone());
+        let draft = super::ephemeral_draft(7, RIGHT, BTreeSet::new(), apps.clone());
         assert_eq!(
             draft.monitor.as_deref(),
             Some(RIGHT),
@@ -2053,7 +2160,7 @@ mod model_tests {
 }
 
 #[cfg(all(test, feature = "system-tests"))]
-mod tests {
+pub(in crate::panels) mod tests {
     use super::fixtures::{LEFT, RIGHT, no_stacks, saved, stack, win, ws};
     use super::{
         APP_IDLE_CLASS, APP_RUNNING_CLASS, CARD_INACTIVE_CLASS, EMPTY_COLUMN_HINT, EPHEMERAL_NAME,
@@ -2214,7 +2321,15 @@ mod tests {
     /// `is_visible()` is orthogonal to being on screen (#851/#838), which is
     /// exactly how a chip once shipped drawn 250px outside its clipping bin
     /// with both geometry tests green. Nothing here reads that flag.
-    fn assert_inside_and_hittable(outer: &gtk::Widget, inner: &gtk::Widget, what: &str) {
+    ///
+    /// Shared with `panels::workspace_edit`'s tests rather than copied there
+    /// (review MEDIUM 5): one definition of the discipline, so the Edit page's
+    /// geometry assertions cannot drift away from the card page's.
+    pub(in crate::panels) fn assert_inside_and_hittable(
+        outer: &gtk::Widget,
+        inner: &gtk::Widget,
+        what: &str,
+    ) {
         // A child appended after the window was presented has no allocation
         // until the next frame, so wait for one rather than reading a
         // guaranteed-empty rectangle. A genuinely zero-area widget still fails
@@ -2499,9 +2614,26 @@ mod tests {
                 .find_map(|w| w.downcast::<gtk::Button>().ok())
                 .expect("a saved card carries an Edit button");
             assert_inside_and_hittable(card, edit.upcast_ref(), "the Edit button");
+            let action = by_class(card, "ts-ws-action")
+                .into_iter()
+                .next()
+                .expect("…and still its Start/Stop");
+
+            // Annika's own spelling is `[start/stop] [edit]` (#1109), and the
+            // **order** is the part review LOW 14 found unasserted — both
+            // existing is what the weaker version checked, which a swap would
+            // have passed.
             assert!(
-                !by_class(card, "ts-ws-action").is_empty(),
-                "…and still its Start/Stop"
+                edit.prev_sibling().as_ref() == Some(&action),
+                "the Edit button must follow the Start/Stop one, not precede it"
+            );
+            let (left, right) = (
+                bounds_in(card, &action, "the Start/Stop button"),
+                bounds_in(card, edit.upcast_ref(), "the Edit button"),
+            );
+            assert!(
+                left.x() < right.x(),
+                "…and be drawn to its right: action at {left:?}, edit at {right:?}"
             );
         }
 

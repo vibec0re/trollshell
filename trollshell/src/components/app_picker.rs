@@ -20,9 +20,15 @@
 //!
 //! The filtering itself is [`crate::components::desktop_entry::filtered`], pure
 //! and separately tested; this module is the widget around it.
+//!
+//! ## Built on first open, not on construction
+//!
+//! [`add_app_button`] hands GTK a `create-popup-func` rather than a popover, so
+//! the `AppInfo::all()` scan and the rows happen the first time someone clicks.
+//! The button is built inside `build_form`, which runs inside a `bind`
+//! apply-loop, so an eager build put that cost in the path of *opening the Edit
+//! page* — see the comment there for the measurement.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use hytte::gtk::{self, glib, pango, prelude::*};
@@ -56,22 +62,43 @@ pub(crate) fn add_app_button(on_pick: impl Fn(&str) + 'static) -> gtk::Widget {
         .build();
     button.add_css_class("flat");
     button.add_css_class("ts-ws-add-app");
-    // Built once, when the button is built: `AppInfo::all()` is a directory
-    // scan of every `applications/` dir on the system, and doing it per popover
-    // open would cost that scan on every click. An application installed while
-    // the drawer is open is not offered until the page is rebuilt, which the
-    // config poll and the niri event stream both do often.
-    button.set_popover(Some(&picker_popover(
-        crate::components::desktop_entry::installed(),
-        on_pick,
-    )));
+
+    // **Lazily**, on first open — not at construction (review MEDIUM 6).
+    //
+    // This button is built inside `build_form`, which runs inside a `bind`
+    // apply-loop on the GTK main thread, and `desktop_entry::installed()` is a
+    // directory scan of every `applications/` dir on the system. Building the
+    // popover eagerly put that scan (and one rendered row per installed
+    // application) in the path of *opening the Edit page*, on every drawer,
+    // every time — measured at 25 ms for six applications in this container,
+    // and a desktop carries hundreds.
+    //
+    // `set_create_popup_func` is GTK's own answer: the closure runs the first
+    // time the button is clicked. The consequence to know is the one the
+    // eager build bought — the list is a snapshot from first open, so an
+    // application installed after that is not offered until the page is rebuilt
+    // (which the config poll and the niri event stream both do often).
+    let on_pick = Rc::new(on_pick);
+    button.set_create_popup_func(move |button| {
+        if button.popover().is_some() {
+            return;
+        }
+        let (entries, meta) = crate::components::desktop_entry::installed();
+        let on_pick = Rc::clone(&on_pick);
+        button.set_popover(Some(&picker_popover(entries, meta, move |id| on_pick(id))));
+    });
     button.upcast()
 }
 
-/// [`add_app_button`]'s popover with its rows injected, so a test can drive the
-/// picker without depending on what is installed.
+/// [`add_app_button`]'s popover with its rows and their icon cache injected, so
+/// a test can drive the picker without depending on what is installed.
+///
+/// `meta` arrives **pre-filled** from the same single `AppInfo::all()` scan that
+/// produced `entries` (see `desktop_entry::installed`), so rendering a row is a
+/// cache hit rather than another scan.
 pub(crate) fn picker_popover(
     entries: Vec<PickerEntry>,
+    meta: MetaCache,
     on_pick: impl Fn(&str) + 'static,
 ) -> gtk::Popover {
     let popover = gtk::Popover::new();
@@ -100,10 +127,12 @@ pub(crate) fn picker_popover(
     column.append(&scroller);
     popover.set_child(Some(&column));
 
-    // One cache for the popover's whole life: the same application can be
-    // re-rendered on every keystroke as the search narrows and widens, and each
-    // render resolves an icon.
-    let meta_cache: MetaCache = Rc::new(RefCell::new(HashMap::new()));
+    // One cache for the popover's whole life, arriving already full: the same
+    // application is re-rendered on every keystroke as the search narrows and
+    // widens, and each render resolves an icon. `installed()` filled this from
+    // the one scan it had to do anyway, so no row ever reaches
+    // `resolve_app_meta`'s own `AppInfo::all()` walk.
+    let meta_cache = meta;
     let entries = Rc::new(entries);
     let on_pick = Rc::new(on_pick);
 
@@ -212,11 +241,13 @@ fn picker_row(
 
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
-    use super::{PICKER_ROW_CLASS, picker_popover};
+    use super::{PICKER_ROW_CLASS, add_app_button, picker_popover};
+    use crate::components::app_meta::MetaCache;
     use crate::components::desktop_entry::PickerEntry;
     use hytte::adw;
     use hytte::gtk::{self, prelude::*};
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::rc::Rc;
 
     fn pump() {
@@ -324,6 +355,32 @@ mod tests {
         ]
     }
 
+    /// A cache already answering for every sampled id, the way `installed()`
+    /// hands one over.
+    ///
+    /// Filled with `None` ("scanned, no desktop entry") rather than left empty
+    /// on purpose: an empty cache is a **miss**, and a miss is what sends
+    /// `resolve_app_meta` off to scan the real `AppInfo::all()` of whatever
+    /// machine is running the suite. That is exactly the cost review MEDIUM 6 is
+    /// about, and a test that paid it would be measuring the host.
+    fn seeded(entries: &[PickerEntry]) -> MetaCache {
+        let cache: MetaCache = Rc::new(RefCell::new(HashMap::new()));
+        {
+            let mut cache = cache.borrow_mut();
+            for entry in entries {
+                cache.insert(entry.id.clone(), None);
+            }
+        }
+        cache
+    }
+
+    /// [`picker_popover`] over [`sample`], with its cache pre-filled.
+    fn popover_over(on_pick: impl Fn(&str) + 'static) -> gtk::Popover {
+        let entries = sample();
+        let meta = seeded(&entries);
+        picker_popover(entries, meta, on_pick)
+    }
+
     /// §5: the list is *"filtered to `NoDisplay=false`"* — and it is the widget
     /// that must honour it, not merely the pure predicate beside it.
     ///
@@ -331,7 +388,7 @@ mod tests {
     #[gtk::test]
     fn the_picker_never_offers_a_hidden_entry() {
         adw::init().expect("libadwaita init");
-        let popover = picker_popover(sample(), |_| {});
+        let popover = popover_over(|_| {});
         pump();
         let ids = offered(&popover);
         assert_eq!(
@@ -346,7 +403,7 @@ mod tests {
     #[gtk::test]
     fn typing_narrows_the_offered_rows() {
         adw::init().expect("libadwaita init");
-        let popover = picker_popover(sample(), |_| {});
+        let popover = popover_over(|_| {});
         pump();
         assert_eq!(offered(&popover).len(), 3);
 
@@ -382,6 +439,49 @@ mod tests {
         );
     }
 
+    /// Review MEDIUM 6: **constructing the button must touch no `AppInfo`.**
+    ///
+    /// The structural form of "the picker is built lazily", which is what makes
+    /// it checkable at all — a timing assertion would measure the host. The
+    /// popover is the whole cost (the scan plus one rendered row per installed
+    /// application), so "no popover yet" *is* "no scan yet".
+    ///
+    /// **The mutation**: going back to `set_popover(Some(&picker_popover(
+    /// installed(), …)))` at construction reds this.
+    #[gtk::test]
+    fn building_the_add_app_button_does_not_build_the_picker() {
+        adw::init().expect("libadwaita init");
+        let button = add_app_button(|_| {})
+            .downcast::<gtk::MenuButton>()
+            .expect("the Add app button is a MenuButton");
+        pump();
+        assert!(
+            button.popover().is_none(),
+            "the picker was built (and `AppInfo::all()` scanned) before anyone \
+             opened it — this is inside `build_form`, so it is in the path of \
+             opening the Edit page"
+        );
+
+        // …and it is the *create-popup* hook that will build it, not nothing at
+        // all: GTK calls that before showing the menu. The button has to be in a
+        // real toplevel first — popping one up outside a window realizes a
+        // popover with no surface, which segfaults rather than failing.
+        let window = gtk::Window::new();
+        window.set_child(Some(&button));
+        window.present();
+        pump();
+        button.popup();
+        pump();
+        assert!(
+            button.popover().is_some(),
+            "opening the button built no picker either"
+        );
+
+        button.popdown();
+        pump();
+        window.destroy();
+    }
+
     /// §5: *"selecting appends an app to the stack"* — the row hands its **id**
     /// back, which is the spelling `workspaces.toml` stores.
     #[gtk::test]
@@ -389,7 +489,7 @@ mod tests {
         adw::init().expect("libadwaita init");
         let picked: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let sink = Rc::clone(&picked);
-        let popover = picker_popover(sample(), move |id| sink.borrow_mut().push(id.to_owned()));
+        let popover = popover_over(move |id| sink.borrow_mut().push(id.to_owned()));
         pump();
 
         let child = popover.child().expect("the popover has a child");

@@ -20,7 +20,7 @@ use super::{
     StartError, StopStep, Workspaces, app_start, autostart_all, autostart_driver, autostart_plan,
     autostart_tick, column_order_batch, may_stop, missing_apps, move_to_monitor, names_to_release,
     order_index, plan_start, release_lingering_names, save, start, state_of, stop, stop_plan,
-    stray_moves,
+    stray_moves, Unresolvable,
 };
 use crate::launch::Launch;
 
@@ -207,6 +207,8 @@ impl Script {
                     Launchable {
                         exec: (*id).to_owned(),
                         dbus_activatable: false,
+
+                        try_exec_missing: false,
                     },
                 );
             }
@@ -221,6 +223,8 @@ impl Script {
             Launchable {
                 exec: exec.to_owned(),
                 dbus_activatable: false,
+
+                try_exec_missing: false,
             },
         );
         self
@@ -235,6 +239,8 @@ impl Script {
             Launchable {
                 exec: exec.to_owned(),
                 dbus_activatable: true,
+
+                try_exec_missing: false,
             },
         );
         self
@@ -1095,6 +1101,8 @@ fn entry(exec: &str) -> Launchable {
     Launchable {
         exec: exec.to_owned(),
         dbus_activatable: false,
+
+        try_exec_missing: false,
     }
 }
 
@@ -1185,6 +1193,8 @@ fn an_override_is_taken_verbatim_and_beats_the_entry() {
     let dbus = Launchable {
         exec: "never-run".to_owned(),
         dbus_activatable: true,
+
+        try_exec_missing: false,
     };
     let start = app_start("chat", 0, &overridden("app", "prog"), Some(&dbus));
     assert_eq!(
@@ -1205,6 +1215,8 @@ fn a_dbus_activatable_entry_is_activated_rather_than_executed() {
     let dbus = Launchable {
         exec: "never-run %U".to_owned(),
         dbus_activatable: true,
+
+        try_exec_missing: false,
     };
     let start = app_start("chat", 0, &by_id("org.gnome.Nautilus"), Some(&dbus));
     assert_eq!(
@@ -1231,7 +1243,8 @@ fn an_id_that_names_no_entry_resolves_to_nothing_rather_than_to_itself() {
     assert_eq!(
         start,
         AppStart::Unresolved {
-            id: "org.mozilla.firefox".to_owned()
+            id: "org.mozilla.firefox".to_owned(),
+            why: Unresolvable::NoEntry,
         },
         "the bare id was run as a command again"
     );
@@ -1242,7 +1255,8 @@ fn an_id_that_names_no_entry_resolves_to_nothing_rather_than_to_itself() {
     assert_eq!(
         start,
         AppStart::Unresolved {
-            id: "app".to_owned()
+            id: "app".to_owned(),
+            why: Unresolvable::NoCommand,
         }
     );
     // …and neither is an override that is only whitespace.
@@ -1250,7 +1264,94 @@ fn an_id_that_names_no_entry_resolves_to_nothing_rather_than_to_itself() {
     assert_eq!(
         start,
         AppStart::Unresolved {
-            id: "app".to_owned()
+            id: "app".to_owned(),
+            why: Unresolvable::NoCommand,
+        }
+    );
+}
+
+/// Review LOW 12: an entry whose `TryExec` names a missing program is not
+/// launched — GIO would not have built a `GDesktopAppInfo` for it either.
+///
+/// Without this the stack launches a command that is not there, which surfaces
+/// as a unit *start failure* rather than as §3.2's "nothing to start" warning
+/// naming the app — and the three reasons send the user to different fixes, so
+/// the warning says which one it was.
+///
+/// **The mutation**: dropping the `try_exec_missing` branch reds this.
+#[test]
+fn an_entry_whose_try_exec_is_missing_is_not_launched() {
+    let absent = Launchable {
+        exec: "ghost --window".to_owned(),
+        dbus_activatable: false,
+        try_exec_missing: true,
+    };
+    assert_eq!(
+        app_start("chat", 0, &by_id("ghost"), Some(&absent)),
+        AppStart::Unresolved {
+            id: "ghost".to_owned(),
+            why: Unresolvable::NotInstalled,
+        }
+    );
+
+    // …even when it also asks for D-Bus activation: not installed is not
+    // installed.
+    let absent_dbus = Launchable {
+        dbus_activatable: true,
+        ..absent.clone()
+    };
+    assert!(matches!(
+        app_start("chat", 0, &by_id("org.gnome.Ghost"), Some(&absent_dbus)),
+        AppStart::Unresolved {
+            why: Unresolvable::NotInstalled,
+            ..
+        }
+    ));
+
+    // But an **override** is the user's own statement about how to start it and
+    // still wins — they may know something the packaged entry does not.
+    assert_eq!(
+        argv_of(&app_start(
+            "chat",
+            0,
+            &overridden("ghost", "my-ghost"),
+            Some(&absent)
+        )),
+        Some(owned(&["my-ghost"]))
+    );
+}
+
+/// **Review MEDIUM 7**: `DBusActivatable=true` is honoured only for an id that
+/// is a usable D-Bus name; everything else takes the ordinary launcher into the
+/// stack's own slice.
+///
+/// GIO takes its D-Bus path only for a valid derived bus name and otherwise
+/// forks the child into **this shell's own cgroup** (measured, and recorded on
+/// `may_stop`) — so an entry declaring activation under a one-element id like
+/// `Alacritty` was not being activated at all: it was forked under
+/// `trollshell.service`, in no slice, dying with the next shell restart.
+///
+/// **The mutation**: dropping the `is_valid_bus_name` conjunct reds this.
+#[test]
+fn a_dbus_activatable_entry_with_an_unusable_id_is_launched_not_activated() {
+    let dbus = Launchable {
+        exec: "alacritty %U".to_owned(),
+        dbus_activatable: true,
+        try_exec_missing: false,
+    };
+
+    // One element: not a bus name, so GIO would have forked it under the shell.
+    assert_eq!(
+        argv_of(&app_start("chat", 0, &by_id("Alacritty"), Some(&dbus))),
+        Some(owned(&["alacritty"])),
+        "an unusable bus name must take the launcher, into the stack's slice"
+    );
+
+    // Two elements: a real bus name, so activation is the right path.
+    assert_eq!(
+        app_start("chat", 0, &by_id("org.gnome.Nautilus"), Some(&dbus)),
+        AppStart::Activate {
+            id: "org.gnome.Nautilus".to_owned()
         }
     );
 }

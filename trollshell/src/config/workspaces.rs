@@ -578,7 +578,58 @@ pub fn save_stack_to(path: &std::path::Path, name: &str, stack: &Stack) -> Resul
 /// [`ConfigError::NoOverlayPath`] when there is nowhere to write.
 pub fn save_edit(previous: Option<&str>, name: &str, stack: &Stack) -> Result<(), ConfigError> {
     let path = xdg::overlay_path(WorkspacesConfig::NAME).ok_or(ConfigError::NoOverlayPath)?;
-    save_edit_to(&path, previous, name, stack)
+    // Everything that needs the **layers** is read here, not in the writer — the
+    // same split `save_stack`/`save_stack_to` already established, and for a
+    // reason that bit: `save_edit_to` used to run the taken-name guard itself
+    // through `load_or_default`, which resolves the *process's* XDG search path
+    // rather than the `path` argument. So the guard was unfalsifiable from the
+    // tempdir tests (the one named for it asserted a tautology), and two of
+    // those tests' behaviour depended on what happened to be in the developer's
+    // real `~/.config/trollshell` — a test that can only fail on Annika's box.
+    save_edit_to(&path, previous, name, stack, &edit_context(previous))
+}
+
+/// What only the layer stack can answer, gathered where reading it is allowed.
+#[derive(Clone, Debug, Default)]
+pub struct EditContext {
+    /// Every stack name the **merged** layers currently hold. A base-pinned name
+    /// is taken too, and only the merged view can see that.
+    pub taken: BTreeSet<String>,
+    /// A layer **below** the overlay defines the name being renamed away from.
+    ///
+    /// What decides whether the rename writes an `_unset` marker. It has to be
+    /// answered here because the writer sees one file: `merge_into` honours the
+    /// marker against the layer below, and the overlay cannot tell whether there
+    /// *is* one.
+    ///
+    /// Writing the marker unconditionally would be sound but noisy — with no
+    /// base layer at all (the ordinary single-file case) it names a key no layer
+    /// has, which is exactly the **inert** marker #1008 added a warning for. So
+    /// a rename in a plain setup writes no marker, and a rename over a base
+    /// writes one.
+    pub previous_is_inherited: bool,
+}
+
+/// [`EditContext`] from the process's XDG layers.
+fn edit_context(previous: Option<&str>) -> EditContext {
+    let taken: BTreeSet<String> = hytte_config::subsystem::load_or_default::<WorkspacesConfig>()
+        .map(|config| config.parsed().0.stacks.into_keys().collect())
+        .unwrap_or_default();
+
+    // The layers below the writable one: `config_layers` puts the overlay last.
+    let layers = xdg::config_layers(WorkspacesConfig::NAME);
+    let base = layers.split_last().map(|(_, base)| base).unwrap_or(&[]);
+    let previous_is_inherited = previous.is_some_and(|previous| {
+        normalize_workspace_name(previous).is_some_and(|previous| {
+            hytte_config::subsystem::load_from::<WorkspacesConfig>(base)
+                .is_ok_and(|loaded| loaded.config.parsed().0.stacks.contains_key(&previous))
+        })
+    });
+
+    EditContext {
+        taken,
+        previous_is_inherited,
+    }
 }
 
 /// [`save_edit`] against an explicit overlay path, so the round trip is testable
@@ -591,6 +642,7 @@ pub fn save_edit_to(
     previous: Option<&str>,
     name: &str,
     stack: &Stack,
+    context: &EditContext,
 ) -> Result<(), ConfigError> {
     let name = normalize_workspace_name(name)
         .ok_or_else(|| ConfigError::Invalid(format!("invalid workspace name: {name:?}")))?;
@@ -604,24 +656,43 @@ pub fn save_edit_to(
     let existing = hytte_config::subsystem::load_from::<WorkspacesConfig>(&[path.to_path_buf()])?;
     let mut table = workspace_table(&existing)?;
     let mut order = existing.config.order.clone();
+    let renaming = previous.as_deref().is_some_and(|p| p != name);
 
-    if let Some(previous) = previous.as_deref()
-        && previous != name
-    {
+    if renaming {
         // A rename onto a name that is already somebody else's would silently
-        // eat that stack — `Table::insert` replaces. The check is against the
-        // overlay's own table *and* the merged view, for the reason
-        // `save_stack` states: a base-pinned name is taken too.
-        if hytte_config::subsystem::load_or_default::<WorkspacesConfig>()
-            .is_some_and(|config| config.parsed().0.stacks.contains_key(&name))
-        {
+        // eat that stack — `Table::insert` replaces. `taken` is the **merged**
+        // view, handed in by the caller (see `save_edit`), because a base-pinned
+        // name is taken too and this function must not go looking for one.
+        if context.taken.contains(&name) {
             return Err(ConfigError::Invalid(format!(
                 "a workspace called {name:?} already exists"
             )));
         }
+    }
+
+    if let Some(previous) = previous.as_deref().filter(|_| renaming) {
         table.remove(previous);
         order = rename_within(order.as_ref(), previous, &name);
+        // …and, when a layer **below** this one defines it, *say* the old name
+        // is gone — which removing it from the overlay does not (review
+        // MEDIUM 4). §4 designs for a home-manager base pinning a stack, and
+        // merge rule 1 is that absence is inheritance, never erasure: an overlay
+        // that merely stops mentioning `chat` inherits the base's `chat` right
+        // back, so one rename yields **two** cards. `_unset` is the spelling
+        // TOML lacks a null for.
+        //
+        // Whether there *is* such a layer is the caller's to answer — see
+        // `EditContext::previous_is_inherited`, and MEDIUM 3 for why this
+        // function does not go looking.
+        if context.previous_is_inherited {
+            unset_in(&mut table, previous);
+        }
     }
+
+    // Whatever else is true, the name being written is **not** unset. Without
+    // this, renaming away and back leaves an inert `_unset` marker naming a key
+    // the same layer also sets — which #1008 warns about, correctly.
+    clear_unset(&mut table, &name);
 
     table.insert(name, stack_value(stack));
     let next = WorkspacesConfig {
@@ -629,6 +700,53 @@ pub fn save_edit_to(
         workspace: Some(toml::Value::Table(table)),
     };
     hytte_config::subsystem::save_overlay_to(path, &next)
+}
+
+/// Add `name` to the `[workspace]` table's `_unset` array, creating it if need
+/// be, without disturbing any name already there.
+fn unset_in(table: &mut toml::Table, name: &str) {
+    let mut names: Vec<toml::Value> = table
+        .get(hytte_config::merge::UNSET_KEY)
+        .and_then(toml::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !names
+        .iter()
+        .any(|v| v.as_str().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+    {
+        names.push(name.into());
+    }
+    table.insert(
+        hytte_config::merge::UNSET_KEY.to_owned(),
+        toml::Value::Array(names),
+    );
+}
+
+/// Drop `name` from the `[workspace]` table's `_unset` array, removing the array
+/// entirely once it is empty rather than leaving `_unset = []` behind.
+fn clear_unset(table: &mut toml::Table, name: &str) {
+    let Some(names) = table
+        .get(hytte_config::merge::UNSET_KEY)
+        .and_then(toml::Value::as_array)
+    else {
+        return;
+    };
+    let kept: Vec<toml::Value> = names
+        .iter()
+        .filter(|v| !v.as_str().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+        .cloned()
+        .collect();
+    if kept.len() == names.len() {
+        return;
+    }
+    if kept.is_empty() {
+        table.remove(hytte_config::merge::UNSET_KEY);
+    } else {
+        table.insert(
+            hytte_config::merge::UNSET_KEY.to_owned(),
+            toml::Value::Array(kept),
+        );
+    }
 }
 
 /// Rewrite the card order (#1071 §3.6/§5, phase 4) — the file half of dragging a
@@ -898,11 +1016,12 @@ pub fn current() -> Workspaces {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigError, Layout, Stack, StackApp, Workspaces, WorkspacesConfig, save_edit_to,
-        save_stack_to, set_order_to, set_stack_monitor_to, stack_value,
+        ConfigError, EditContext, Layout, Stack, StackApp, Workspaces, WorkspacesConfig,
+        save_edit_to, save_stack_to, set_order_to, set_stack_monitor_to, stack_value,
     };
     use hytte_config::subsystem::{self, Subsystem};
     use hytte_config::test_support::capture;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     fn layers(bodies: &[(&str, &str)]) -> Vec<(PathBuf, String)> {
@@ -1628,7 +1747,7 @@ apps = [
                 },
             ],
         };
-        save_edit_to(&path, Some("chat"), "chat", &edited).expect("saves");
+        save_edit_to(&path, Some("chat"), "chat", &edited, &EditContext::default()).expect("saves");
 
         assert_eq!(stack_in(&path, "chat").as_ref(), Some(&edited));
         let body = std::fs::read_to_string(&path).expect("reads back");
@@ -1654,7 +1773,7 @@ apps = [
         let body = two_stacks(&path);
 
         let stack = stack_in(&path, "dev").expect("the stack is there");
-        save_edit_to(&path, Some("dev"), "dev", &stack).expect("saves");
+        save_edit_to(&path, Some("dev"), "dev", &stack, &EditContext::default()).expect("saves");
 
         assert_eq!(
             std::fs::read_to_string(&path).expect("reads back"),
@@ -1695,7 +1814,7 @@ apps = [
         two_stacks(&path);
 
         let stack = stack_in(&path, "chat").expect("the stack is there");
-        save_edit_to(&path, Some("chat"), "talk", &stack).expect("renames");
+        save_edit_to(&path, Some("chat"), "talk", &stack, &EditContext::default()).expect("renames");
 
         let loaded =
             subsystem::load_from::<WorkspacesConfig>(std::slice::from_ref(&path)).expect("loads");
@@ -1711,6 +1830,24 @@ apps = [
 
     /// A rename onto a name another stack already has is refused rather than
     /// silently eating that stack (`Table::insert` replaces).
+    ///
+    /// **Review MEDIUM 3**: this used to assert
+    /// `after == before || after.contains("[workspace.dev]")`, which is true on
+    /// either branch — so the one thing the test is named for was not pinned at
+    /// all. It could not be: `save_edit_to` ran the guard itself through
+    /// `load_or_default`, which resolves the **process's** XDG path rather than
+    /// the `path` argument, so a tempdir test could neither set the taken set
+    /// nor predict it. (It also made two tests here depend on what is in the
+    /// developer's real `~/.config/trollshell` — `a_rename_moves_the_entry_…`
+    /// renames to `talk`, and would have failed on a machine with a stack of
+    /// that name. CI has no such file, so it would only ever break on Annika's
+    /// box.)
+    ///
+    /// The guard is the caller's now — `save_edit` computes the merged set and
+    /// hands it in — so this asserts unconditionally.
+    ///
+    /// **The mutation**: deleting the `taken.contains` check reds it, which it
+    /// could not before.
     #[test]
     fn a_rename_onto_a_taken_name_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1718,21 +1855,171 @@ apps = [
         let body = two_stacks(&path);
 
         let stack = stack_in(&path, "chat").expect("the stack is there");
-        // The merged-layer check `save_edit_to` runs reads the process's real
-        // XDG path, which is empty here — so the refusal this asserts is the
-        // one that matters on a machine with no `workspaces.toml`, and the file
-        // under test is left alone either way.
-        let before = std::fs::read_to_string(&path).expect("reads");
-        let _ = save_edit_to(&path, Some("chat"), "dev", &stack);
-        // Whether it refused or wrote, `dev`'s own apps must still be `dev`'s:
-        // the one outcome that must never happen is the other stack vanishing
-        // with no trace.
-        let after = std::fs::read_to_string(&path).expect("reads");
-        assert!(
-            after == before || after.contains("[workspace.dev]"),
-            "a rename onto a taken name erased the stack it landed on: {after}"
+        let taken = EditContext {
+            taken: ["dev".to_owned()].into_iter().collect(),
+            previous_is_inherited: false,
+        };
+        let err = save_edit_to(&path, Some("chat"), "dev", &stack, &taken).expect_err("refused");
+        assert!(matches!(err, ConfigError::Invalid(_)), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads back"),
+            body,
+            "a refused rename still rewrote the file"
         );
-        assert_eq!(before, body);
+
+        // …and with the name genuinely free it goes through, so the refusal is
+        // the guard rather than the writer simply not working.
+        save_edit_to(&path, Some("chat"), "talk", &stack, &EditContext::default()).expect("renames");
+        assert!(stack_in(&path, "talk").is_some());
+    }
+
+    /// **Review MEDIUM 4**: renaming a stack a **base layer** pins must say the
+    /// old name is gone, or one rename yields two cards.
+    ///
+    /// `save_edit_to` removes the old key from the *overlay*, and merge rule 1
+    /// is that absence is inheritance, never erasure (§4 is explicit: removing a
+    /// base-pinned stack takes `_unset`). So without the marker the merged view
+    /// holds both — `talk` from the overlay and `chat` straight back from the
+    /// base, now also dropped out of `order` by `rename_within` and so landing
+    /// in `names_in_order`'s unordered tail.
+    ///
+    /// **The mutation**: deleting the `unset_in` call reds this — the merged
+    /// view comes back with two stacks.
+    #[test]
+    fn renaming_a_base_pinned_stack_unsets_the_old_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("base.toml");
+        let overlay = dir.path().join("workspaces.toml");
+        // A base a home-manager module might render, and an overlay that so far
+        // only carries a `monitor` a drag wrote — the partial-overlay case the
+        // review calls out alongside the fully-pinned one.
+        std::fs::write(
+            &base,
+            "order = [\"chat\"]\n\
+             [workspace.chat]\n\
+             layout = \"golden\"\n\
+             apps = [{ id = \"Alacritty\" }]\n",
+        )
+        .expect("writes");
+        std::fs::write(&overlay, "[workspace.chat]\nmonitor = \"DP-1\"\n").expect("writes");
+
+        let merged = |()| {
+            hytte_config::subsystem::load_from::<WorkspacesConfig>(&[
+                base.clone(),
+                overlay.clone(),
+            ])
+            .expect("loads")
+            .config
+            .parsed()
+            .0
+        };
+        assert!(merged(()).stacks.contains_key("chat"), "the base pins it");
+
+        let renamed = merged(()).stacks["chat"].clone();
+        save_edit_to(
+            &overlay,
+            Some("chat"),
+            "talk",
+            &renamed,
+            // What `edit_context` answers for this file pair: the base defines
+            // `chat`, so the overlay has to say it is gone.
+            &EditContext {
+                taken: BTreeSet::new(),
+                previous_is_inherited: true,
+            },
+        )
+        .expect("renames");
+
+        let after = merged(());
+        assert_eq!(
+            after.stacks.keys().collect::<Vec<_>>(),
+            ["talk"],
+            "the base-pinned stack came back, so one rename made two cards"
+        );
+        assert_eq!(after.stacks["talk"], renamed, "and it kept its contents");
+        assert!(
+            std::fs::read_to_string(&overlay)
+                .expect("reads")
+                .contains("_unset"),
+            "the overlay must spell the removal; TOML has no null"
+        );
+    }
+
+    /// The marker names in the overlay's `[workspace]` table, or `None`.
+    fn unset_names(path: &std::path::Path) -> Option<Vec<String>> {
+        let body = std::fs::read_to_string(path).expect("reads");
+        let doc: toml::Table = body.parse().expect("parses");
+        Some(
+            doc.get("workspace")?
+                .as_table()?
+                .get(hytte_config::merge::UNSET_KEY)?
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect(),
+        )
+    }
+
+    /// A rename with **no base layer** writes no marker at all.
+    ///
+    /// `_unset` naming a key no layer has is precisely the *inert* marker #1008
+    /// added a warning for, and the ordinary single-file setup would produce one
+    /// on every rename. That is why the decision is the caller's rather than an
+    /// unconditional write — see `EditContext::previous_is_inherited`.
+    #[test]
+    fn a_rename_with_nothing_below_it_writes_no_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspaces.toml");
+        two_stacks(&path);
+
+        let stack = stack_in(&path, "chat").expect("the stack is there");
+        save_edit_to(&path, Some("chat"), "talk", &stack, &EditContext::default())
+            .expect("renames");
+
+        assert_eq!(
+            unset_names(&path),
+            None,
+            "an inert marker was written: {}",
+            std::fs::read_to_string(&path).expect("reads")
+        );
+        assert!(stack_in(&path, "talk").is_some());
+        assert!(stack_in(&path, "chat").is_none());
+    }
+
+    /// …and renaming back clears the marker rather than leaving an **inert** one
+    /// naming a key this same layer sets (#1008 warns about exactly that).
+    #[test]
+    fn renaming_back_clears_the_marker_it_wrote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspaces.toml");
+        two_stacks(&path);
+        let inherited = EditContext {
+            taken: BTreeSet::new(),
+            previous_is_inherited: true,
+        };
+
+        let stack = stack_in(&path, "chat").expect("the stack is there");
+        save_edit_to(&path, Some("chat"), "talk", &stack, &inherited).expect("renames");
+        assert_eq!(
+            unset_names(&path).as_deref(),
+            Some(["chat".to_owned()].as_slice()),
+            "the first rename records the removal"
+        );
+
+        save_edit_to(&path, Some("talk"), "chat", &stack, &inherited).expect("renames back");
+        let body = std::fs::read_to_string(&path).expect("reads");
+        let marked = unset_names(&path).unwrap_or_default();
+        assert!(
+            !marked.iter().any(|n| n == "chat"),
+            "the marker still names `chat`, which this same layer now sets — \
+             that is the inert case: {body}"
+        );
+        assert!(
+            marked.iter().any(|n| n == "talk"),
+            "…and it must now name `talk` instead: {body}"
+        );
+        assert!(stack_in(&path, "chat").is_some(), "{body}");
+        assert!(stack_in(&path, "talk").is_none(), "{body}");
     }
 
     /// An invalid name never reaches the file.
@@ -1743,7 +2030,8 @@ apps = [
         let body = two_stacks(&path);
 
         let err =
-            save_edit_to(&path, Some("chat"), "chat--dev", &Stack::default()).expect_err("refused");
+            save_edit_to(&path, Some("chat"), "chat--dev", &Stack::default(), &EditContext::default())
+                .expect_err("refused");
         assert!(matches!(err, ConfigError::Invalid(_)), "{err}");
         assert_eq!(
             std::fs::read_to_string(&path).expect("reads back"),
@@ -1813,6 +2101,7 @@ apps = [
                 }],
                 ..Stack::default()
             },
+            &EditContext::default(),
         )
         .expect("saves");
 

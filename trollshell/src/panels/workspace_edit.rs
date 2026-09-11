@@ -302,11 +302,10 @@ pub(crate) fn plan_save(draft: &Draft) -> Result<SavePlan, SaveError> {
 /// The typed text as the nearest usable workspace name, or `None` when there is
 /// nothing left to suggest.
 ///
-/// Duplicated from `panels::workspaces`' own `sanitise` on purpose: the two
-/// fields it serves are the *same* rule stated at the *same* moment in two
-/// different forms, and folding them together would put a helper in
-/// `components/` whose only job is to be shared. If a third field ever needs it,
-/// that is the moment.
+/// Not shared with anything else: #1109 retired the inline name field on an
+/// ephemeral card that used to carry its own copy of this rule, so this is now
+/// the only field it serves. If a second field ever needs it, that is the
+/// moment to lift it into `components/`.
 fn sanitise(typed: &str) -> Option<String> {
     let mut out = String::new();
     for ch in typed.trim().chars() {
@@ -1427,6 +1426,26 @@ mod tests {
             "…and the app list is not inside it, so nothing actually scrolls"
         );
 
+        // #1121 gap B: a plain `gtk::Window` sizes itself to its child's
+        // *minimum*, not its natural size, so the `assert_inside_and_hittable`
+        // pair above never actually exercises the cap — this form's ten-app
+        // minimum is small (every entry can shrink), so the 640×736 default
+        // above is advisory and the window never clips the way the drawer (a
+        // layer surface with no imposed height) does. The real guarantee the
+        // cap gives is on the *request*: with it, the page must not ask for
+        // more height than a 768 px panel, less the bar, can give it.
+        //
+        // **The mutation**: the scroller's cap raised to `100_000` (uncapped
+        // in every way that matters here) reds this — the page's natural
+        // height for ten apps measures ~1049 px uncapped, which is what put
+        // Save and Cancel off the bottom in the first place.
+        let (_, natural, _, _) = page.measure(gtk::Orientation::Vertical, 640);
+        assert!(
+            natural <= 736,
+            "the page's natural height ({natural}) exceeds the drawer's real \
+             736 px budget — the scroller cap is not doing its job"
+        );
+
         window.destroy();
     }
 
@@ -1537,6 +1556,92 @@ mod tests {
         assert!(refusal.is_visible());
         assert_eq!(refusal.text(), "the writer refused");
         assert!(save.is_sensitive(), "Save must be usable again");
+    }
+
+    /// #1121 gap C: the *other* half of review MEDIUM 8. The fast half —
+    /// `plan_save`'s own refusal — is pinned by
+    /// `a_refused_save_keeps_the_form_and_its_draft`; this is the async half, a
+    /// failed [`workspace_stacks::SaveOutcome`] arriving through
+    /// `bind_save_outcome` (a `NoOverlayPath`, or a `SetWorkspaceName` that did
+    /// not land), which had no test of its own — closing the form there would
+    /// throw the user's draft away over a write it never actually made.
+    ///
+    /// `close()` — what a regression on this path would also call — writes to
+    /// the real thread-local `TARGET`, so a draft has to actually be in it for
+    /// "still open" to mean anything.
+    ///
+    /// **The mutation**: `bind_save_outcome` calling `close()` on `Some(error)`
+    /// too, instead of only on `None`, reds this.
+    #[gtk::test]
+    fn a_failed_save_outcome_leaves_the_form_open() {
+        use crate::workspace_stacks::SaveOutcome;
+
+        adw::init().expect("libadwaita init");
+        super::open(ephemeral_draft());
+
+        let save = gtk::Button::with_label("Save");
+        let refusal = gtk::Label::new(None);
+        refusal.set_visible(false);
+        let pending: Rc<std::cell::Cell<Option<u64>>> = Rc::new(std::cell::Cell::new(Some(11)));
+        let outcomes: Mutable<Option<SaveOutcome>> = Mutable::new(None);
+        super::bind_save_outcome(&save, outcomes.signal_cloned(), &pending, &refusal);
+        pump();
+
+        outcomes.set(Some(SaveOutcome {
+            ticket: 11,
+            error: Some("no overlay path".to_owned()),
+        }));
+        pump();
+
+        assert!(
+            super::TARGET.with(|target| target.get_cloned()).is_some(),
+            "a refused Save closed the form"
+        );
+
+        // `TARGET` is a thread-local shared by every `#[gtk::test]` in this
+        // binary — they all run on the one GTK thread gtk4-macros creates —
+        // so leave it as `close()` would, or the next test that opens the
+        // form finds a stale draft still sitting in it.
+        super::close();
+    }
+
+    /// **Cancel writes nothing** (#1071 §5) — observable after all.
+    ///
+    /// `EditContext` does not make this testable in a tempdir: the write
+    /// destination is `xdg::overlay_path` inside `save_edit`, which takes no
+    /// path parameter, and redirecting `$XDG_CONFIG_HOME` from a test needs
+    /// `std::env::set_var`, `unsafe` in edition 2024 and this crate forbids
+    /// it. It is testable anyway, because every write the form can start
+    /// claims a ticket from `workspace_stacks::next_save_ticket` — a
+    /// process-wide `AtomicU64` — before it spawns, so a Cancel that starts no
+    /// write claims none (#1121, adopted from the #1113 re-verification).
+    ///
+    /// **The mutation**: giving the Cancel handler Save's `Ok(plan)` arm
+    /// (i.e. having Cancel commit) reds this — on the assertion, not on an
+    /// abort.
+    #[gtk::test]
+    fn cancel_starts_no_write() {
+        let target: Mutable<Option<Draft>> = Mutable::new(None);
+        let page = slot(&target);
+        target.set(Some(ephemeral_draft()));
+        pump();
+        name_field(&page).set_text("chat");
+        pump();
+
+        let before = crate::workspace_stacks::next_save_ticket();
+        let cancel = by_class(&page, "ts-ws-edit-cancel")
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::Button>().ok())
+            .expect("the Cancel button");
+        cancel.emit_clicked();
+        pump();
+        let after = crate::workspace_stacks::next_save_ticket();
+
+        assert_eq!(
+            after - before,
+            1,
+            "Cancel claimed a save ticket, so it started a write"
+        );
     }
 
     /// Every app row carries both halves of §5's drag: a source on the handle

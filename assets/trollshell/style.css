@@ -895,8 +895,16 @@
     min-height: 1.6em;
     padding: 0;
 }
+/* #1119: double-size icons in a `gtk::FlowBox` now, wrapping instead of
+   clipping when a stack has more apps than the column is wide for.
+   `min-height` doubles with the icon size; the `flowboxchild` padding reset
+   keeps row/column spacing under this rule's own control rather than
+   doubled up with the theme's default. */
 .ts-ws-apps {
-    min-height: 1.4em;
+    min-height: 2.8em;
+}
+.ts-ws-apps flowboxchild {
+    padding: 0;
 }
 /* The Edit button every card carries (#1071 §5, #1109). Sized like
    `.ts-ws-action` beside it so `[start/stop] [edit]` reads as one pair rather

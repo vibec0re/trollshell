@@ -2139,7 +2139,10 @@ mod tests {
             "/bin/pet",
             &[
                 ("PET_NAME", "nisse"),
-                ("PET_LLM_URL", "http://127.0.0.1:8787"),
+                (
+                    "PET_LLM_URL",
+                    "unix://$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock",
+                ),
             ],
         );
         let units = vec![unit_for("pet", "active", &running)];

@@ -20,7 +20,11 @@
 //! - **Composition**: [`compose_plain`] is the deterministic, canned template —
 //!   the keyless path *and* the fallback. With a provider configured
 //!   ([`Cfg::from_env`], the pet-brain pattern: `$CAW_LLM_URL` for a local
-//!   `llama-server`, else the shared `openrouter.key` + `$CAW_LLM_MODEL`),
+//!   `llama-server` — or for `hytte-claude-bridge`, which since #993 is a
+//!   same-uid socket rather than a loopback port and so is named
+//!   `unix://$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock`; a `Provider` is
+//!   still just a base URL, so nothing here changed — else the shared
+//!   `openrouter.key` + `$CAW_LLM_MODEL`),
 //!   [`compose_llm`] asks for the same facts in caw's own voice — one
 //!   `chat()` call through [`hytte_ai_providers`]. Keyless and URL-less
 //!   resolves to the plain path up front: no doomed network round-trips

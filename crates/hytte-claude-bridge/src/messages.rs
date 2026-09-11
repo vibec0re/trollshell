@@ -548,8 +548,8 @@ fn load_key_from(env_override: Option<String>, config_dir: Option<PathBuf>) -> O
 /// The message printed before exiting when this mode has no key.
 ///
 /// Fail closed, matching [`crate::envguard`]: a bridge that will not start is
-/// loud, whereas one that binds 8787 and 502s every request looks like the
-/// plugin is broken.
+/// loud, whereas one that binds the socket and 502s every request looks like
+/// the plugin is broken.
 ///
 /// Loud is only worth anything if the remedy works. This is the string an
 /// operator reads in `systemctl status`, i.e. read *under the shipped unit*,

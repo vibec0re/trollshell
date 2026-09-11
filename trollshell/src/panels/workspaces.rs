@@ -1078,29 +1078,50 @@ fn draft_for(card: &Card) -> Option<workspace_edit::Draft> {
             workspace,
             output,
             windows,
-        } => Some(workspace_edit::Draft {
-            previous: None,
-            name: String::new(),
+        } => Some(ephemeral_draft(
+            *workspace,
+            output,
             // §3.7's mapping: the workspace's windows in column order, each
             // resolved through its desktop entry, with the ones that have none
-            // carrying the running command line for correction.
-            apps: workspace_edit::ephemeral_apps_for(
+            // carrying the running command line for correction. The only impure
+            // step — it reads `$XDG_DATA_DIRS` and `/proc` — which is why it is
+            // taken here and the rest of the draft is built by the pure function
+            // below.
+            workspace_edit::ephemeral_apps_for(
                 &windows
                     .iter()
                     .map(|(app_id, pid)| (app_id.clone(), pid.and_then(|p| u32::try_from(p).ok())))
                     .collect::<Vec<_>>(),
             ),
-            layout: Layout::None,
-            autostart: false,
-            // §3.7's *"record the monitor"* — the screen niri says the workspace
-            // is on.
-            monitor: Some(output.clone()),
-            workspace: Some(*workspace),
-            // An ephemeral card is by definition on screen, but `active` only
-            // gates the rename refusal and an ephemeral card has no name to
-            // rename *from*.
-            active: false,
-        }),
+        )),
+    }
+}
+
+/// The draft an **ephemeral** card's Edit opens with, given its apps (#1071
+/// §3.7). Pure.
+///
+/// Split from [`draft_for`] so §3.7's *"record the monitor"* is falsifiable: the
+/// rest of that arm reads `$XDG_DATA_DIRS` and `/proc`, which no test may do.
+fn ephemeral_draft(
+    workspace: u64,
+    output: &str,
+    apps: Vec<crate::config::workspaces::StackApp>,
+) -> workspace_edit::Draft {
+    workspace_edit::Draft {
+        previous: None,
+        name: String::new(),
+        apps,
+        layout: Layout::None,
+        autostart: false,
+        // §3.7's *"record the monitor"* — the screen **niri** says the workspace
+        // is on, not the column the card happened to be drawn in. For a stack
+        // with no recorded monitor those two differ whenever the focus is
+        // elsewhere, and the file must record where the windows actually are.
+        monitor: Some(output.to_owned()),
+        workspace: Some(workspace),
+        // An ephemeral card is by definition on screen, but `active` only gates
+        // the rename refusal and an ephemeral card has no name to rename *from*.
+        active: false,
     }
 }
 
@@ -1925,6 +1946,40 @@ mod model_tests {
             "there is nothing for niri to do about a position in a list"
         );
         assert_eq!(names(&action.order.expect("reordered")), ["dev", "chat"]);
+    }
+
+    /// §3.7: an ephemeral card's Edit opens on a draft that **records the
+    /// screen** and carries the workspace Save has to name — and says nothing
+    /// about a layout, an autostart or a previous name, because it has none.
+    ///
+    /// **The mutation**: dropping the `monitor` (or taking it from the focused
+    /// output rather than the card's own) reds this — and on a machine whose
+    /// focus is elsewhere, that is a Save that files the stack under the wrong
+    /// screen.
+    #[test]
+    fn an_ephemeral_drafts_monitor_is_the_screen_its_workspace_is_on() {
+        let apps = vec![crate::config::workspaces::StackApp {
+            id: "weird-app".to_owned(),
+            exec: Some("/home/me/bin/weird".to_owned()),
+        }];
+        let draft = super::ephemeral_draft(7, RIGHT, apps.clone());
+        assert_eq!(
+            draft.monitor.as_deref(),
+            Some(RIGHT),
+            "§3.7's 'record the monitor' was dropped"
+        );
+        assert_eq!(draft.workspace, Some(7), "Save has to name this workspace");
+        assert_eq!(draft.apps, apps);
+        assert_eq!(draft.previous, None, "an ephemeral Save is a creation");
+        assert_eq!(draft.name, "", "it has no name until one is typed");
+        assert_eq!(
+            draft.layout,
+            crate::config::workspaces::Layout::None,
+            "§3.7: layout `none` unless known"
+        );
+        assert!(!draft.autostart);
+        // Keyed by workspace id, which cannot collide with a stack name.
+        assert_eq!(draft.key(), "#7");
     }
 
     /// The page-wide order a drop rewrites is the one the cards are drawn in —

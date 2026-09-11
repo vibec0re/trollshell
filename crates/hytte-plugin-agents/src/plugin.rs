@@ -17,6 +17,7 @@ use crate::hive::{AgentStatusRow, HiveError};
 use crate::model::{Agent, AgentName, ExpandedGroups, Hive, Status, agent_url};
 use crate::poll::{Cmd, Msg, poll_task};
 use crate::view::{self, PanelContext, ids};
+use crate::window;
 
 /// Stable plugin id — the host's mount-slot ownership key, the audit-log
 /// subject, and the `programs.trollshell.plugins.<id>` config key.
@@ -70,12 +71,15 @@ pub struct Agents {
     /// contract `Input::EffectResult`'s own docs state: `RunCommand`,
     /// `OpenUri` and `RequestConsent`'s `request_id` share a single id space,
     /// so per-kind counters would collide the moment two effects were in
-    /// flight at once. P1 emits only `OpenUri`, and this is still the shared
-    /// counter so P2's `choom` launch and P3's approvals inherit it rather
-    /// than opening a second one.
+    /// flight at once. P1 emitted only `OpenUri`; since #950 the companion
+    /// window's detached `RunCommand` allocates from this same counter, and
+    /// P3's approvals will inherit it rather than opening a second one.
     next_effect_id: u64,
     /// The command lane to [`poll_task`].
     cmd_tx: CmdSender<Cmd>,
+    /// Whether the companion window (#950) can be launched — resolved once,
+    /// see [`window::Probe`].
+    window: window::Probe,
 }
 
 impl Agents {
@@ -94,7 +98,20 @@ impl Agents {
             prev_alarms: BTreeMap::new(),
             next_effect_id: 0,
             cmd_tx,
+            window: window::Probe::path(),
         }
+    }
+
+    /// Pin whether the companion window is installed, instead of resolving it
+    /// against this process's `PATH` (#950).
+    ///
+    /// The **test seam**, and the reason it exists rather than each test
+    /// inheriting the machine: which of the two routes a click takes is now a
+    /// property of the desktop, so a test that does not say which desktop it
+    /// describes would pass or fail depending on whether the reviewer happens
+    /// to have the window installed.
+    pub fn set_window_probe(&mut self, probe: window::Probe) {
+        self.window = probe;
     }
 
     /// Take the next correlation token. See [`Agents::next_effect_id`].
@@ -315,6 +332,29 @@ impl Agents {
     /// click, or a hive whose domain is unconfigured, opens nothing — the same
     /// silence the row's own `if let Some(url)` already guarantees, since
     /// neither renders the link in the first place.
+    /// Open the agent's **companion window** (#950), if this desktop has one.
+    ///
+    /// `None` means "not this route" — either the window is not installed
+    /// ([`window::Probe`], which also warns once) or the model no longer holds
+    /// the agent whose row was clicked. Both callers then take their P1 route,
+    /// so a desktop without the window keeps working exactly as it did.
+    ///
+    /// The launch carries **only the agent's name**: the window reads
+    /// `host.sock` itself, so nothing the model holds — not the URL, not the
+    /// status — has to survive the trip, and the window is correct even if the
+    /// roster moved between the render and the click. That is why this needs
+    /// no correlation table beyond the shared [`Agents::take_effect_id`]
+    /// counter.
+    fn open_window(&mut self, name: &AgentName, tab: window::Tab) -> Option<Vec<Effect>> {
+        if !self.window.available() || self.hive.agent(name).is_none() {
+            return None;
+        }
+        Some(vec![Effect::launch(
+            self.take_effect_id(),
+            window::argv(name.as_str(), tab),
+        )])
+    }
+
     fn open_agent_page(&mut self, name: &AgentName) -> Vec<Effect> {
         let Some(url) = self.hive.agent(name).and_then(agent_url).map(str::to_owned) else {
             return Vec::new();
@@ -351,22 +391,32 @@ impl Agents {
             return Vec::new();
         }
         if let Some(rest) = node.strip_prefix(ids::EDIT) {
-            // Annika's `[optionsedit]` (2026-09-11). It opens this plugin's own
-            // page on that agent, which is a placeholder: its real destination
-            // is the agent's companion window on its settings tab (#950, her
-            // call on #947 at 07:43Z), and opening a separate GTK window is not
-            // `OpenPage(PluginSelf)` — so this arm changes when #950 lands.
-            // Still read-only until #952; the button is named for where it is
-            // going.
+            // Annika's `[optionsedit]` (2026-09-11). Its destination is the
+            // agent's companion window **on its settings tab** — her call on
+            // #947 at 07:43Z, so an agent has one surface. This plugin's own
+            // drawer page was the placeholder for that window and is now its
+            // fallback: a desktop without `trollshell-agent-window` still gets
+            // the P1 behaviour rather than a dead button. Still read-only
+            // either way until #952.
             if let Some(name) = AgentName::parse(rest) {
+                if let Some(fx) = self.open_window(&name, window::Tab::Settings) {
+                    return fx;
+                }
                 return self.open_detail(name);
             }
             return Vec::new();
         }
         if let Some(rest) = node.strip_prefix(ids::OPEN) {
             // The row Mara's 2026-09-10 retest could read but not follow
-            // (#1045). One `OpenUri`, the URL taken from the model.
+            // (#1045). Since #950 it opens the agent's companion window — our
+            // chrome around hyperhive's own page — and falls back to the P1
+            // route, one `OpenUri` with the URL taken from the model, when the
+            // window is not installed. Annika on #947: a dedicated webview we
+            // control, "not the browser"; the browser stays the fallback.
             if let Some(name) = AgentName::parse(rest) {
+                if let Some(fx) = self.open_window(&name, window::Tab::Agent) {
+                    return fx;
+                }
                 return self.open_agent_page(&name);
             }
             return Vec::new();
@@ -422,14 +472,29 @@ impl Plugin for Agents {
     /// edges that park the poll (#305: the push is opt-in via the manifest,
     /// so a poller MUST subscribe to keep being gated).
     ///
-    /// Three capabilities, and only three: `OpenPage` (open its own panel),
-    /// `Notify` (§8's edge toast) and `OpenUri` (#1045 — follow an agent's own
-    /// page link). **Not** `RunCommand` — the `choom` argv is phase P2 — and
-    /// **not** `Consent`: approvals are phase P3 precisely because the row must
-    /// be trustworthy before it is allowed to raise a modal that approves a
-    /// config change (spec §13). The plugin declares no secret slot; its entire
-    /// authority is the desktop user's `hive-admin` group membership (spec §11
-    /// rule four).
+    /// Four capabilities: `OpenPage` (open its own panel), `Notify` (§8's edge
+    /// toast), `OpenUri` (#1045 — follow an agent's own page link) and, since
+    /// #950, `RunCommand` — the detached launch of the agent's **companion
+    /// window** ([`window`]). **Not** `Consent`: approvals are phase P3
+    /// precisely because the row must be trustworthy before it is allowed to
+    /// raise a modal that approves a config change (spec §13). The plugin
+    /// declares no secret slot; its entire authority is the desktop user's
+    /// `hive-admin` group membership (spec §11 rule four).
+    ///
+    /// # `RunCommand` is the highest-trust capability in the vocabulary, and
+    /// that is the price of the window
+    ///
+    /// It is arbitrary argv as the user, and one capability covers **both**
+    /// spawn modes by the proto's own decision ("a plugin that may run an
+    /// arbitrary `argv` at all can already launch a detacher of its own").
+    /// #1045 chose `OpenUri` over it for the *link* precisely because a link
+    /// needs only a destination. A window is not a destination: it is our own
+    /// binary, with our chrome around hyperhive's page, which is the whole
+    /// point Annika made on #947 ("we control it … additional buttons, status,
+    /// agent settings"). So the capability is narrowed by **what this plugin
+    /// spells** instead — [`window::argv`] is the only place an argv is built,
+    /// it names one constant binary, and the only variable in it is an
+    /// [`AgentName`] that was re-parsed after its trip through the host.
     ///
     /// # `OpenUri` is declared because the effect is emitted, not for symmetry
     ///
@@ -454,6 +519,7 @@ impl Plugin for Agents {
             Capability::OpenPage,
             Capability::Notify,
             Capability::OpenUri,
+            Capability::RunCommand,
         ];
         m
     }
@@ -503,16 +569,24 @@ impl Plugin for Agents {
                 }]
             }
             Input::App(Msg::Status(result)) => self.fold_status(result),
-            // A link the desktop would not open (#1045). The only reply-bearing
-            // effect P1 emits is `OpenUri`, so no correlation table is needed —
-            // and the host's own reason is already the sentence worth showing,
-            // which is why `EffectOutcome::output` exists ("so a plugin can
-            // toast it instead of leaving a click that silently does nothing",
-            // `hytte-plugin/src/lib.rs`). A success says nothing: the browser
-            // appearing IS the feedback.
+            // A link the desktop would not open (#1045), or a companion window
+            // the host could not launch (#950). Two reply-bearing effects now,
+            // and still **no correlation table**: both mean the same thing to
+            // the operator ("the thing you clicked did not appear"), and the
+            // host's own reason is already the sentence worth showing, which is
+            // why `EffectOutcome::output` exists ("so a plugin can toast it
+            // instead of leaving a click that silently does nothing",
+            // `hytte-plugin/src/lib.rs`). A table would buy a better noun and
+            // cost a map keyed on a counter that already has to be shared.
+            //
+            // A success says nothing: the window (or the browser) appearing IS
+            // the feedback. Note the asymmetry the host documents — a detached
+            // launch's `ok` reports only that the *launch* succeeded, never
+            // that the program ran, which is exactly why the window is resolved
+            // on `PATH` before it is launched (see [`window::Probe`]).
             Input::EffectResult { outcome, .. } if !outcome.ok => {
                 vec![Effect::Notify {
-                    summary: "couldn't open the link".to_owned(),
+                    summary: "couldn't open that".to_owned(),
                     body: outcome
                         .output
                         .unwrap_or_else(|| "the desktop refused it".to_owned()),

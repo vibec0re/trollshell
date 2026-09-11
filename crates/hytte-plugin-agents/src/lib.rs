@@ -96,5 +96,6 @@ pub mod model;
 pub mod plugin;
 pub mod poll;
 pub mod view;
+pub mod window;
 
 pub use plugin::{Agents, PLUGIN_ID};

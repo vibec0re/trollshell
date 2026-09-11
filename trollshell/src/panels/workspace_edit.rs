@@ -563,87 +563,7 @@ fn build_form(seed: &Draft) -> gtk::Widget {
     column.append(&labelled("Start at login", &autostart));
 
     // ── Save / Cancel ───────────────────────────────────────────────────────
-    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    actions.set_halign(gtk::Align::End);
-    actions.set_margin_top(6);
-
-    let cancel_button = gtk::Button::with_label("Cancel");
-    cancel_button.add_css_class("ts-ws-edit-cancel");
-    cancel_button.connect_clicked(|_| cancel());
-    actions.append(&cancel_button);
-
-    let save = gtk::Button::with_label("Save");
-    save.add_css_class("suggested-action");
-    save.add_css_class("ts-ws-edit-save");
-
-    // The line a refused Save puts under the buttons, in the page rather than in
-    // a toast (review MEDIUM 8). Hidden until there is something to say.
-    let refusal_label = gtk::Label::new(None);
-    refusal_label.add_css_class("ts-ws-edit-error");
-    refusal_label.set_xalign(1.0);
-    refusal_label.set_wrap(true);
-    refusal_label.set_visible(false);
-
-    // Which Save this form is waiting for. `None` = not saving; the binding
-    // below ignores every outcome that is not this one, which is what stops a
-    // replayed or someone else's result from closing the page.
-    let pending: Rc<std::cell::Cell<Option<u64>>> = Rc::new(std::cell::Cell::new(None));
-
-    {
-        let draft = Rc::clone(&draft);
-        let name = name.downgrade();
-        let save_weak = save.downgrade();
-        let refusal_weak = refusal_label.downgrade();
-        let pending = Rc::clone(&pending);
-        save.connect_clicked(move |_| {
-            if pending.get().is_some() {
-                // Already in flight — a second click is not a second Save.
-                return;
-            }
-            match plan_save(&draft.borrow()) {
-                Ok(plan) => {
-                    // **The form stays up.** It comes down in the outcome
-                    // binding below, and only on success — a write that fails
-                    // (a taken name the merged view knows about, no overlay
-                    // path, a `SetWorkspaceName` that did not land) must not
-                    // have already taken the user's whole draft with it.
-                    let ticket = workspace_stacks::next_save_ticket();
-                    pending.set(Some(ticket));
-                    if let Some(save) = save_weak.upgrade() {
-                        save.set_sensitive(false);
-                        save.set_label("Saving\u{2026}");
-                    }
-                    if let Some(refusal) = refusal_weak.upgrade() {
-                        refusal.set_visible(false);
-                    }
-                    commit(ticket, &plan);
-                }
-                Err(why) => {
-                    // The correction surface is the field, beside the cursor —
-                    // the same call phase 2's Save field made. A toast would put
-                    // the rule somewhere the user is not looking.
-                    let text = refusal(&why);
-                    if let Some(name) = name.upgrade() {
-                        name.add_css_class("error");
-                        name.set_tooltip_text(Some(&text));
-                        name.grab_focus();
-                    }
-                    if let Some(refusal) = refusal_weak.upgrade() {
-                        refusal.set_text(&text);
-                        refusal.set_visible(true);
-                    }
-                }
-            }
-        });
-    }
-    actions.append(&save);
-
-    bind_save_outcome(
-        &save,
-        workspace_stacks::save_outcome(),
-        &pending,
-        &refusal_label,
-    );
+    let (actions, refusal_label) = build_actions(&draft, &name);
 
     // **The body scrolls; the action row does not** (review MEDIUM 5).
     //
@@ -724,6 +644,96 @@ fn bind_save_outcome<S>(
             }
         }
     });
+}
+
+/// The Save/Cancel row, and the label a refused Save writes under it.
+///
+/// Returns both because the caller pins them **outside** the body scroller (see
+/// [`build_form`]): Save that is reachable only by scrolling past the app list
+/// you were editing is barely better than Save that is clipped off the bottom.
+fn build_actions(draft: &Rc<RefCell<Draft>>, name: &gtk::Entry) -> (gtk::Box, gtk::Label) {
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    actions.set_halign(gtk::Align::End);
+    actions.set_margin_top(6);
+
+    let cancel_button = gtk::Button::with_label("Cancel");
+    cancel_button.add_css_class("ts-ws-edit-cancel");
+    cancel_button.connect_clicked(|_| cancel());
+    actions.append(&cancel_button);
+
+    let save = gtk::Button::with_label("Save");
+    save.add_css_class("suggested-action");
+    save.add_css_class("ts-ws-edit-save");
+
+    // The line a refused Save puts under the buttons, in the page rather than in
+    // a toast (review MEDIUM 8). Hidden until there is something to say.
+    let refusal_label = gtk::Label::new(None);
+    refusal_label.add_css_class("ts-ws-edit-error");
+    refusal_label.set_xalign(1.0);
+    refusal_label.set_wrap(true);
+    refusal_label.set_visible(false);
+
+    // Which Save this form is waiting for. `None` = not saving; the binding
+    // below ignores every outcome that is not this one, which is what stops a
+    // replayed or someone else's result from closing the page.
+    let pending: Rc<std::cell::Cell<Option<u64>>> = Rc::new(std::cell::Cell::new(None));
+
+    {
+        let draft = Rc::clone(draft);
+        let name = name.downgrade();
+        let save_weak = save.downgrade();
+        let refusal_weak = refusal_label.downgrade();
+        let pending = Rc::clone(&pending);
+        save.connect_clicked(move |_| {
+            if pending.get().is_some() {
+                // Already in flight — a second click is not a second Save.
+                return;
+            }
+            match plan_save(&draft.borrow()) {
+                Ok(plan) => {
+                    // **The form stays up.** It comes down in the outcome
+                    // binding below, and only on success — a write that fails
+                    // (a taken name the merged view knows about, no overlay
+                    // path, a `SetWorkspaceName` that did not land) must not
+                    // have already taken the user's whole draft with it.
+                    let ticket = workspace_stacks::next_save_ticket();
+                    pending.set(Some(ticket));
+                    if let Some(save) = save_weak.upgrade() {
+                        save.set_sensitive(false);
+                        save.set_label("Saving\u{2026}");
+                    }
+                    if let Some(refusal) = refusal_weak.upgrade() {
+                        refusal.set_visible(false);
+                    }
+                    commit(ticket, &plan);
+                }
+                Err(why) => {
+                    // The correction surface is the field, beside the cursor —
+                    // the same call phase 2's Save field made. A toast would put
+                    // the rule somewhere the user is not looking.
+                    let text = refusal(&why);
+                    if let Some(name) = name.upgrade() {
+                        name.add_css_class("error");
+                        name.set_tooltip_text(Some(&text));
+                        name.grab_focus();
+                    }
+                    if let Some(refusal) = refusal_weak.upgrade() {
+                        refusal.set_text(&text);
+                        refusal.set_visible(true);
+                    }
+                }
+            }
+        });
+    }
+    actions.append(&save);
+
+    bind_save_outcome(
+        &save,
+        workspace_stacks::save_outcome(),
+        &pending,
+        &refusal_label,
+    );
+    (actions, refusal_label)
 }
 
 /// The form's title row: back to the cards, and what this form is for.
@@ -868,12 +878,9 @@ fn refusal(why: &SaveError) -> String {
 ///   where niri would have something to do — is refused while Active.
 fn commit(ticket: u64, plan: &SavePlan) {
     match plan.name_workspace {
-        Some(workspace) => workspace_stacks::spawn_save(
-            ticket,
-            workspace,
-            plan.name.clone(),
-            plan.stack.clone(),
-        ),
+        Some(workspace) => {
+            workspace_stacks::spawn_save(ticket, workspace, plan.name.clone(), plan.stack.clone())
+        }
         None => workspace_stacks::spawn_save_edit(
             ticket,
             plan.previous.clone(),
@@ -1512,7 +1519,11 @@ mod tests {
             error: Some("not ours".to_owned()),
         }));
         pump();
-        assert_eq!(pending.get(), Some(7), "an outcome that is not ours was taken");
+        assert_eq!(
+            pending.get(),
+            Some(7),
+            "an outcome that is not ours was taken"
+        );
         assert!(!refusal.is_visible(), "…and it was shown to the user");
 
         // Ours, and failed: the reason is shown and the form stays waiting on
@@ -1686,7 +1697,10 @@ mod model_tests {
             active: rename_is_blocked(StackState::Inactive),
             ..draft("dev", Some("chat"))
         };
-        assert!(plan_save(&free).is_ok(), "Inactive must still allow a rename");
+        assert!(
+            plan_save(&free).is_ok(),
+            "Inactive must still allow a rename"
+        );
     }
 
     /// **Review MEDIUM 8**: a name another stack already has is refused *in the

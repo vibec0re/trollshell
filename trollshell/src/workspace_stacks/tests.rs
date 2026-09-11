@@ -17,10 +17,10 @@ use hytte::services::niri::{Window, WindowLayout, Workspace, WorkspaceAction};
 
 use super::{
     AppStart, AutostartPlan, Launchable, Launched, Layout, Ops, Stack, StackApp, StackState,
-    StartError, StopStep, Workspaces, app_start, autostart_all, autostart_driver, autostart_plan,
-    autostart_tick, column_order_batch, may_stop, missing_apps, move_to_monitor, names_to_release,
-    order_index, plan_start, release_lingering_names, save, start, state_of, stop, stop_plan,
-    stray_moves, Unresolvable,
+    StartError, StopStep, Unresolvable, Workspaces, app_start, autostart_all, autostart_driver,
+    autostart_plan, autostart_tick, column_order_batch, may_stop, missing_apps, move_to_monitor,
+    names_to_release, order_index, plan_start, release_lingering_names, save, start, state_of,
+    stop, stop_plan, stray_moves,
 };
 use crate::launch::Launch;
 

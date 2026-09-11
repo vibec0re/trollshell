@@ -1890,7 +1890,10 @@ mod model_tests {
     /// guessed at.
     #[test]
     fn a_drop_of_something_that_is_not_a_card_is_refused() {
-        assert_eq!(drop_plan("chat", Some(LEFT), None, &context(&[], &[])), None);
+        assert_eq!(
+            drop_plan("chat", Some(LEFT), None, &context(&[], &[])),
+            None
+        );
     }
 
     // ── #1071 §3.6, the in-column reorder (phase 4) ──────────────────────────

@@ -622,9 +622,7 @@ impl Unresolvable {
     /// What to tell the user, in the one warning line.
     fn reason(self) -> &'static str {
         match self {
-            Self::NoEntry => {
-                "no desktop entry and no launch command — set one in Edit"
-            }
+            Self::NoEntry => "no desktop entry and no launch command — set one in Edit",
             Self::NoCommand => {
                 "its desktop entry's Exec is empty once the field codes are \
                  stripped — set a launch command in Edit"
@@ -1960,8 +1958,7 @@ pub(crate) struct SaveOutcome {
 static SAVE_TICKETS: AtomicU64 = AtomicU64::new(1);
 
 /// The outcome of the most recently finished Save.
-static SAVE_OUTCOME: LazyLock<Mutable<Option<SaveOutcome>>> =
-    LazyLock::new(|| Mutable::new(None));
+static SAVE_OUTCOME: LazyLock<Mutable<Option<SaveOutcome>>> = LazyLock::new(|| Mutable::new(None));
 
 /// Claim a ticket for a Save that is about to be spawned.
 pub(crate) fn next_save_ticket() -> u64 {

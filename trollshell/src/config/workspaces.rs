@@ -618,7 +618,7 @@ fn edit_context(previous: Option<&str>) -> EditContext {
 
     // The layers below the writable one: `config_layers` puts the overlay last.
     let layers = xdg::config_layers(WorkspacesConfig::NAME);
-    let base = layers.split_last().map(|(_, base)| base).unwrap_or(&[]);
+    let base = layers.split_last().map_or(&[][..], |(_, base)| base);
     let previous_is_inherited = previous.is_some_and(|previous| {
         normalize_workspace_name(previous).is_some_and(|previous| {
             hytte_config::subsystem::load_from::<WorkspacesConfig>(base)
@@ -1747,7 +1747,14 @@ apps = [
                 },
             ],
         };
-        save_edit_to(&path, Some("chat"), "chat", &edited, &EditContext::default()).expect("saves");
+        save_edit_to(
+            &path,
+            Some("chat"),
+            "chat",
+            &edited,
+            &EditContext::default(),
+        )
+        .expect("saves");
 
         assert_eq!(stack_in(&path, "chat").as_ref(), Some(&edited));
         let body = std::fs::read_to_string(&path).expect("reads back");
@@ -1814,7 +1821,8 @@ apps = [
         two_stacks(&path);
 
         let stack = stack_in(&path, "chat").expect("the stack is there");
-        save_edit_to(&path, Some("chat"), "talk", &stack, &EditContext::default()).expect("renames");
+        save_edit_to(&path, Some("chat"), "talk", &stack, &EditContext::default())
+            .expect("renames");
 
         let loaded =
             subsystem::load_from::<WorkspacesConfig>(std::slice::from_ref(&path)).expect("loads");
@@ -1869,7 +1877,8 @@ apps = [
 
         // …and with the name genuinely free it goes through, so the refusal is
         // the guard rather than the writer simply not working.
-        save_edit_to(&path, Some("chat"), "talk", &stack, &EditContext::default()).expect("renames");
+        save_edit_to(&path, Some("chat"), "talk", &stack, &EditContext::default())
+            .expect("renames");
         assert!(stack_in(&path, "talk").is_some());
     }
 
@@ -1904,14 +1913,11 @@ apps = [
         std::fs::write(&overlay, "[workspace.chat]\nmonitor = \"DP-1\"\n").expect("writes");
 
         let merged = |()| {
-            hytte_config::subsystem::load_from::<WorkspacesConfig>(&[
-                base.clone(),
-                overlay.clone(),
-            ])
-            .expect("loads")
-            .config
-            .parsed()
-            .0
+            hytte_config::subsystem::load_from::<WorkspacesConfig>(&[base.clone(), overlay.clone()])
+                .expect("loads")
+                .config
+                .parsed()
+                .0
         };
         assert!(merged(()).stacks.contains_key("chat"), "the base pins it");
 
@@ -2029,9 +2035,14 @@ apps = [
         let path = dir.path().join("workspaces.toml");
         let body = two_stacks(&path);
 
-        let err =
-            save_edit_to(&path, Some("chat"), "chat--dev", &Stack::default(), &EditContext::default())
-                .expect_err("refused");
+        let err = save_edit_to(
+            &path,
+            Some("chat"),
+            "chat--dev",
+            &Stack::default(),
+            &EditContext::default(),
+        )
+        .expect_err("refused");
         assert!(matches!(err, ConfigError::Invalid(_)), "{err}");
         assert_eq!(
             std::fs::read_to_string(&path).expect("reads back"),

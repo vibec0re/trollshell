@@ -137,8 +137,7 @@ pub(crate) fn is_valid_bus_name(id: &str) -> bool {
 /// reports — so the guard belongs here, at the one place an id becomes a path.
 #[must_use]
 pub(crate) fn spellings(id: &str) -> Vec<String> {
-    if id.is_empty() || id.contains('/') || id.contains('\\') || id.split('.').any(|p| p.is_empty())
-    {
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id.split('.').any(str::is_empty) {
         return Vec::new();
     }
     let lower = id.to_lowercase();
@@ -711,7 +710,10 @@ mod tests {
                 "{code} reached execve as a literal argument"
             );
         }
-        assert_eq!(resolved("prog %d %D %n %N %v %m --flag"), ["prog", "--flag"]);
+        assert_eq!(
+            resolved("prog %d %D %n %N %v %m --flag"),
+            ["prog", "--flag"]
+        );
     }
 
     /// A word that was *only* a field code disappears; one that merely shrinks

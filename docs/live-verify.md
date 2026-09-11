@@ -2898,7 +2898,7 @@ trollshell`. Expect the cards to come back Active and **no notification at
     red and the page says to stop the workspace first. That is deliberate: the
     running apps are in `trollshell-ws-<old>.slice` and in units named after it,
     so a renamed entry would leave them unstoppable from the page.
-  - **…and refused *while starting* too** (#1113's review MEDIUM 2, the window
+  - **…and refused _while starting_ too** (#1113's review MEDIUM 2, the window
     it matters most in). Press **▶** on a stopped stack and immediately press
     **✎** — the Edit button is not disabled while a Start is in flight. Rename
     and Save: refused, the same way. Before the fix this was the one gesture that
@@ -2918,7 +2918,7 @@ trollshell`. Expect the cards to come back Active and **no notification at
     scroller at all and the buttons were clipped off the bottom at six apps.
   - **Add app is not built until you open it.** Open Edit on a stack and watch
     for a stall: the page must appear immediately. The `AppInfo::all()` scan and
-    the row rendering happen on the **first click** of *Add app…*, not while the
+    the row rendering happen on the **first click** of _Add app…_, not while the
     page is being built (#1113's review MEDIUM 6) — which on a desktop with a few
     hundred entries was the difference between an instant page and a visible
     freeze, on every drawer.

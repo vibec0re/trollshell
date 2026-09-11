@@ -137,13 +137,29 @@ pub fn view_of(widget: &gtk::Widget) -> Option<webkit::WebView> {
         .ok()
 }
 
-/// What the embedded page is allowed to do, stated rather than defaulted.
+/// What the embedded page is allowed to do, **stated** rather than inherited.
 ///
-/// Every one of these is off because this window is a **viewer for one page**,
-/// not a browser: there is no second window for a popup to become, no
+/// Every one of these is off because this window is a viewer for one page, not
+/// a browser: there is no second window for a popup to become, no
 /// operator-facing way to dismiss a modal dialog that blocks the whole
 /// process, and no reason for a page served over https to reach a `data:` or
-/// `file:` origin. Leaving them at their defaults would mean the page decides.
+/// `file:` origin.
+///
+/// # These are pins, not changes — measured
+///
+/// **All six already default to `false`** in webkitgtk 2.52.6; a diagnostic
+/// run of `Settings::new()` printed exactly that for each property
+/// (2026-09-11, while fixing #1130 H1). So deleting any line here changes
+/// nothing today, and `the_settings_are_the_ones_we_state` would **not** go
+/// red for it — a fact that test's own doc states rather than implying a
+/// falsification it does not have.
+///
+/// They are worth writing anyway, and worth asserting: the *effective* value
+/// is what matters, and this window embeds content an agent's inputs can
+/// influence. A default that flips in a future webkitgtk — or a `Settings`
+/// built from somewhere else later — then reds the test instead of quietly
+/// widening what that page may do. Stating a policy you already have is the
+/// cheap half of keeping it.
 fn settings() -> webkit::Settings {
     let s = webkit::Settings::new();
     // No popups: `create` is refused below anyway, and this stops the page
@@ -326,14 +342,19 @@ mod gtk_tests {
     /// **The page's permissions are the ones this file states**, read back off
     /// the real `Settings` object rather than trusted to the constructor.
     ///
-    /// This is the half of H1 that *is* observable without a web process, and
-    /// it is not decoration: every one of these defaults to **on** in WebKit,
-    /// so a deleted line here is a page that can open windows, block the
-    /// process behind a modal dialog, or navigate the top level to a `data:`
-    /// URI — inside chrome that names an agent.
+    /// This is the half of H1 that is observable without a web process.
     ///
-    /// Mutation (re-run this round, red): drop any single `set_*` call in
-    /// `settings()` and its assertion reds.
+    /// **Deleting a `set_*` call in `settings()` does NOT red this** — measured
+    /// (the `allow-modal-dialogs` line was removed and the suite stayed green),
+    /// because all six of these already default to `false` in webkitgtk 2.52.6.
+    /// Saying so is the point: the alternative was a doc comment claiming a
+    /// falsification it does not have, which is one of the things #1130's
+    /// review was about.
+    ///
+    /// What it *does* catch is an upstream default flipping, or a `Settings`
+    /// arriving from somewhere that does not state them — either of which
+    /// would widen what an agent-output page may do inside chrome that names
+    /// an agent, with nothing else in the tree to notice.
     #[gtk::test]
     fn the_settings_are_the_ones_we_state() {
         use gtk::glib::object::ObjectExt as _;

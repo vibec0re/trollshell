@@ -81,7 +81,11 @@ The two nixosTest probe binaries (`nix/probe.nix`, `nix/wifi-probe.nix`, #589) a
 
 Since #1115 the package build no longer runs any tests at all (see
 "Packaging" above), so the flake's `checks` output (`flake.nix`) is where
-every test suite runs, plus a fair bit more:
+every test suite runs, plus a fair bit more — since #1102 the three heaviest
+check derivations (`system-tests`, `eds-nixos-test`, `wifi-nm-nixos-test`)
+live in their own `callPackage`-able files under `nix/checks/`, the same
+convention `packages` already follows in `nix/*.nix`, while the rest stay
+inline in `flake.nix` as one-liners.
 
 - `checks.workspace-tests` runs the hermetic internals suite (still
   deliberately without `system-tests`) — the same suite the package build's

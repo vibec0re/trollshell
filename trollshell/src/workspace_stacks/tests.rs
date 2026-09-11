@@ -142,6 +142,9 @@ struct State {
     windows: Vec<Vec<Window>>,
     workspace_reads: usize,
     window_reads: usize,
+    /// The last snapshot [`Script::workspaces`] handed back, for the
+    /// consistency check in that method.
+    last_workspaces: Vec<Workspace>,
     slices_up: BTreeSet<String>,
     /// pid → unit, for `unit_for_pid`.
     units: BTreeMap<u32, String>,
@@ -226,12 +229,60 @@ impl Ops for Script {
         state.calls.push(Call::Workspaces);
         let n = state.workspace_reads;
         state.workspace_reads += 1;
-        Ok(state
+        let snapshot: Vec<Workspace> = state
             .workspaces
             .get(n)
             .or_else(|| state.workspaces.last())
             .cloned()
-            .unwrap_or_default())
+            .unwrap_or_default();
+
+        // A queued snapshot may only take a **name** off a workspace if an
+        // `UnsetName` for it was actually sent.
+        //
+        // This is a guard on the fake, not a rewrite of it, and it is the
+        // second of the two blind spots #1106's re-review found: a canned
+        // sequence like `[lingering, released, …]` hands back "released"
+        // whether or not the housekeeping did anything, so a `launches()`
+        // assertion cannot tell a working release from a missing one. With
+        // this, a test that scripts a released name is asserting that the
+        // release happened.
+        //
+        // Only the Some → None transition is checked. A `SetName` that niri
+        // silently swallowed is a real behaviour some tests script
+        // deliberately, and a workspace disappearing entirely is niri's own
+        // clean-up.
+        let released: BTreeSet<u64> = state
+            .calls
+            .iter()
+            .filter_map(|c| match c {
+                Call::Actions(actions) => Some(actions),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|a| match a {
+                WorkspaceAction::UnsetName { workspace } => Some(*workspace),
+                _ => None,
+            })
+            .collect();
+        for was in &state.last_workspaces {
+            let Some(name) = was.name.as_deref() else {
+                continue;
+            };
+            let gone = snapshot
+                .iter()
+                .any(|now| now.id == was.id && now.name.is_none());
+            assert!(
+                !gone || released.contains(&was.id),
+                "scripted niri is inconsistent: workspace {} lost the name {name:?} \
+                 with no UnsetName sent for it. Either the transaction under test \
+                 skipped the release, or the snapshot queue is lying about a \
+                 release that never happened. Calls so far: {:?}",
+                was.id,
+                state.calls,
+            );
+        }
+        state.last_workspaces = snapshot.clone();
+        Ok(snapshot)
     }
 
     async fn windows(&self) -> Result<Vec<Window>, String> {
@@ -312,6 +363,31 @@ impl Ops for Script {
     async fn apply_layout(&self, layout: Layout) -> Result<(), String> {
         self.0.borrow_mut().calls.push(Call::Layout(layout));
         Ok(())
+    }
+}
+
+/// Hold the `STARTING` mark for `name` the way `spawn_start` and
+/// `spawn_autostart` do — synchronously, **before** the transaction runs — and
+/// take it back off however the test ends.
+///
+/// The second of #1106's re-review blind spots: every release test called
+/// `start` directly, so the one guard under test was never armed on the stack
+/// under test, and a Start that skipped its own housekeeping passed.
+///
+/// `STARTING` is process-global, so the guard is `Drop`-based: a panicking
+/// assertion must not leave a name marked for the rest of the binary.
+struct StartingMark(String);
+
+impl StartingMark {
+    fn hold(name: &str) -> Self {
+        super::STARTING.lock_mut().insert(name.to_owned());
+        Self(name.to_owned())
+    }
+}
+
+impl Drop for StartingMark {
+    fn drop(&mut self) {
+        super::STARTING.lock_mut().remove(&self.0);
     }
 }
 
@@ -1188,18 +1264,33 @@ fn housekeeping_releases_every_stale_name_at_once() {
 ///
 /// This is the §7 housekeeping mutation at the transaction level: with the
 /// release skipped, the plan below sees its own lingering name and fails.
+///
+/// **The mark matters** (#1106 re-review R1). `spawn_start` inserts into
+/// `STARTING` *before* the transaction is scheduled and `run_start` only takes
+/// it off afterwards, so the stack under test is in flight for the whole of its
+/// own Start. Without [`StartingMark`] here, this test ran the transaction in a
+/// world no caller ever produces — and stayed green while a guard that reads
+/// `STARTING` skipped the one name the housekeeping exists to free.
+///
+/// The scripted "released" snapshot is now load-bearing too: `Script::workspaces`
+/// refuses to hand back a snapshot that drops a name unless the `UnsetName`
+/// really was sent.
 #[test]
 fn a_start_releases_the_stale_name_before_planning_its_own() {
-    let lingering = vec![ws(1, 1, LEFT, Some("chat"), true)];
+    // A stack name no other test uses: this one holds the process-global
+    // `STARTING` mark, and the suite runs in parallel.
+    let name = "r1click";
+    let lingering = vec![ws(1, 1, LEFT, Some(name), true)];
     // After housekeeping, niri reports the name gone.
     let released = vec![ws(1, 1, LEFT, None, true)];
-    let named = vec![ws(1, 1, LEFT, Some("chat"), true)];
+    let named = vec![ws(1, 1, LEFT, Some(name), true)];
     let script = Script::default()
         .with_workspaces(&[lingering, released, named])
         .with_windows(&[Vec::new()]);
 
-    let saved = stacked(&[("chat", Stack::default())]);
-    let plan = run(start(&script, "chat", &Stack::default(), &saved)).expect("starts");
+    let _mark = StartingMark::hold(name);
+    let saved = stacked(&[(name, Stack::default())]);
+    let plan = run(start(&script, name, &Stack::default(), &saved)).expect("starts");
 
     assert_eq!(plan.workspace, 1);
     assert!(plan.adopted, "the empty current workspace was adopted");
@@ -1943,19 +2034,25 @@ fn autostart_runs_its_stacks_one_at_a_time_in_order() {
         ("music", autostarting(None, &["spotify"])),
     ]);
     let unnamed = vec![ws(1, 1, LEFT, None, true)];
+    let chat_named = vec![ws(1, 1, LEFT, Some("chat"), true)];
     let script = Script::default()
         // Four `workspaces()` reads per stack, in order: the "is it already on
         // screen" probe, housekeeping, the plan, and the verify — and only the
-        // verify may show the name that was just set. Every other read answers
-        // "one empty, focused, unnamed workspace".
+        // verify may show the name that was just set.
+        //
+        // The world stays consistent with the actions sent, which the scripted
+        // niri now enforces: `chat` keeps its name until `music`'s housekeeping
+        // releases it. That release is correct here — this test calls
+        // `autostart_all` directly, so nothing is in flight and `chat` really
+        // is a finished, empty stack by then.
         .with_workspaces(&[
             unnamed.clone(),                           // chat: probe → Inactive
             unnamed.clone(),                           // chat: housekeeping
             unnamed.clone(),                           // chat: plan
-            vec![ws(1, 1, LEFT, Some("chat"), true)],  // chat: verify
-            unnamed.clone(),                           // music: probe → Inactive
-            unnamed.clone(),                           // music: housekeeping
-            unnamed.clone(),                           // music: plan
+            chat_named.clone(),                        // chat: verify
+            chat_named.clone(),                        // music: probe → Inactive
+            chat_named,                                // music: housekeeping
+            unnamed,                                   // music: plan
             vec![ws(1, 1, LEFT, Some("music"), true)], // music: verify
         ])
         .with_windows(&[Vec::new()]);
@@ -2101,23 +2198,47 @@ fn autostart_skips_a_stack_that_is_already_active() {
 /// no units, is Inactive and **does** autostart.
 #[test]
 fn autostart_still_starts_a_stack_whose_name_is_merely_lingering() {
-    let saved = stacked(&[("chat", autostarting(None, &["firefox"]))]);
-    let lingering = vec![ws_focused(1, 1, LEFT, Some("chat"))];
+    // Unique, for `StartingMark`'s sake — see the Probe A test above.
+    let name = "r1auto";
+    let saved = stacked(&[(name, autostarting(None, &["firefox"]))]);
+    let lingering = vec![ws_focused(1, 1, LEFT, Some(name))];
     let released = vec![ws_focused(1, 1, LEFT, None)];
-    let named = vec![ws_focused(1, 1, LEFT, Some("chat"))];
+    let named = vec![ws_focused(1, 1, LEFT, Some(name))];
     let script = Script::default()
-        // the state probe, then housekeeping, then the plan, then the verify
-        .with_workspaces(&[lingering, released.clone(), released, named])
+        // The probe and the housekeeping both still see the lingering name; the
+        // plan sees it gone, which the scripted niri only permits because the
+        // housekeeping's `UnsetName` was actually sent.
+        .with_workspaces(&[lingering.clone(), lingering, released, named])
         .with_windows(&[Vec::new()]);
-    let entries = vec![("chat".to_owned(), saved.stacks["chat"].clone())];
+    let entries = vec![(name.to_owned(), saved.stacks[name].clone())];
 
+    // `spawn_autostart` marks every queued stack **before** handing off, so the
+    // stack under test is in flight for the whole of its own Start (#1106
+    // re-review R1, Probe D). Without this the transaction runs in a world no
+    // caller produces.
+    let _mark = StartingMark::hold(name);
     run(autostart_all(&script, &entries, &saved));
 
     assert_eq!(
         script.launches(),
-        ["trollshell-ws-chat-0.service"],
+        ["trollshell-ws-r1auto-0.service"],
         "an empty named workspace is Inactive, so this one starts: {:?}",
         script.calls()
+    );
+    assert!(
+        script
+            .actions()
+            .contains(&WorkspaceAction::UnsetName { workspace: 1 }),
+        "…and its own lingering name was released first, in spite of its own          in-flight mark: {:?}",
+        script.actions()
+    );
+    assert!(
+        script.actions().contains(&WorkspaceAction::SetName {
+            workspace: 1,
+            name: name.to_owned()
+        }),
+        "…and then claimed: {:?}",
+        script.actions()
     );
 }
 
@@ -2160,37 +2281,60 @@ fn a_start_in_flight_is_never_swept_by_another_stacks_housekeeping() {
 }
 
 /// …and `release_lingering_names` really reads the live in-flight set, which
-/// the pure test above cannot see.
+/// the pure test above cannot see — **minus the stack it is being run for**.
 ///
-/// Uses a name no other test touches, and takes it back out, because `STARTING`
+/// The self-exclusion is the whole of #1106 re-review R1: both callers mark the
+/// stack before the transaction is scheduled, so a sweep that honoured the raw
+/// set would skip the one name it exists to free.
+///
+/// Names no other test touches, held through a `Drop` guard, because `STARTING`
 /// is process-global.
 #[test]
-fn release_lingering_names_consults_the_live_starting_set() {
-    let name = "f11probe";
-    let stacks = BTreeMap::from([(name.to_owned(), Stack::default())]);
-    let workspaces = vec![ws(1, 1, LEFT, Some(name), false)];
+fn release_lingering_names_guards_other_stacks_but_never_its_own() {
+    let mine = "r1self";
+    let other = "r1other";
+    let stacks = BTreeMap::from([
+        (mine.to_owned(), Stack::default()),
+        (other.to_owned(), Stack::default()),
+    ]);
+    let workspaces = vec![
+        ws(1, 1, LEFT, Some(mine), false),
+        ws(2, 2, LEFT, Some(other), false),
+    ];
 
+    // Nothing in flight: both stale names go.
     let loose = Script::default()
         .with_workspaces(std::slice::from_ref(&workspaces))
         .with_windows(&[Vec::new()]);
-    run(release_lingering_names(&loose, &stacks)).expect("sweeps");
+    run(release_lingering_names(&loose, mine, &stacks)).expect("sweeps");
     assert_eq!(
         loose.actions(),
-        [WorkspaceAction::UnsetName { workspace: 1 }],
-        "with nothing in flight the stale name is released"
+        // `names_to_release` walks `stacks.keys()`, and that is a `BTreeMap`:
+        // `r1other` sorts before `r1self`.
+        [
+            WorkspaceAction::UnsetName { workspace: 2 },
+            WorkspaceAction::UnsetName { workspace: 1 },
+        ],
+        "with nothing in flight both stale names are released — so the \
+         assertions below are not vacuous"
     );
 
-    super::STARTING.lock_mut().insert(name.to_owned());
+    // Both marked, the sweep run for `mine`: `mine`'s own name is still freed
+    // (it is in flight *because* this is its Start), `other`'s is not.
     let guarded = Script::default()
         .with_workspaces(&[workspaces])
         .with_windows(&[Vec::new()]);
-    let outcome = run(release_lingering_names(&guarded, &stacks));
-    super::STARTING.lock_mut().remove(name);
-    outcome.expect("sweeps");
+    {
+        let _self_mark = StartingMark::hold(mine);
+        let _other_mark = StartingMark::hold(other);
+        run(release_lingering_names(&guarded, mine, &stacks)).expect("sweeps");
+    }
 
-    assert!(
-        guarded.actions().is_empty(),
-        "a Start in flight is never swept: {:?}",
+    assert_eq!(
+        guarded.actions(),
+        [WorkspaceAction::UnsetName { workspace: 1 }],
+        "its own name is freed in spite of its own mark; another stack's \
+         in-flight name is left alone: {:?}",
         guarded.calls()
     );
 }

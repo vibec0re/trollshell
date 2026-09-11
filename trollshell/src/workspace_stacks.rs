@@ -201,15 +201,22 @@ fn named<'w>(workspaces: &'w [Workspace], name: &str) -> Option<&'w Workspace> {
 /// not only the one being started. That is deliberate — the whole point is that
 /// the name a Start is about to claim is free, and a stack whose windows are
 /// gone really does have nothing on screen — but it is a **cross-stack side
-/// effect of one stack's transaction**, and during an autostart run the stacks
-/// go one after another (`autostart_all`), so without a guard stack B's
-/// housekeeping would reach stack A.
+/// effect of one stack's transaction**.
 ///
-/// The window is real: A is named the moment its batch lands, and its apps take
-/// until the grace window to open a window — so between A's naming and A's first
-/// window, A looks exactly like a stale name. B's Start, starting in that gap,
-/// would `UnsetName` the name A just claimed. Hence `starting`: a stack with a
-/// Start in flight is never swept, however empty it looks.
+/// The window it can land in is real: a stack is named the moment its batch
+/// lands, and its apps take until the grace window to open a window, so in
+/// between it looks exactly like a stale name. Another stack's Start beginning
+/// in that gap would `UnsetName` the name it just claimed.
+///
+/// **How narrow that is, precisely** (#1106 re-review): an autostart run is
+/// *sequential* — `autostart_all` awaits each `run_start` to completion — so
+/// within one run A's mark is always off before B begins. The only real overlap
+/// is a **manual click on B while A is still in flight**: a user pressing ▶ on
+/// one card during another card's Start, or during an autostart run. Narrow,
+/// but the cost is a stack that silently never comes up, so the guard stays.
+///
+/// The stack this sweep is *for* is excluded by its caller — see
+/// [`release_lingering_names`], which is where getting that wrong cost a HIGH.
 ///
 /// A stack that is *finished* and empty (every app failed to launch) is still
 /// released by the next Start, and that is the correct derivation — it has
@@ -919,21 +926,29 @@ impl Ops for Live {
 ///
 /// Run before a Start, so the name a Start is about to claim is actually free.
 ///
-/// The in-flight set comes from [`STARTING`] — the same handle the cards read —
-/// so a stack whose own Start has named its workspace but whose apps have not
-/// opened a window yet is never swept by the *next* stack's housekeeping. See
-/// [`names_to_release`] for why that window exists and why it matters during an
-/// autostart run.
+/// `name` is the stack this housekeeping is being run *for*, and it is taken
+/// out of the in-flight set before the sweep. That is not a nicety:
+/// [`spawn_start`] and [`spawn_autostart`] both mark the stack **before** the
+/// transaction is scheduled, and [`run_start`] only unmarks it after `start`
+/// returns — so without this the guard covers the one name the housekeeping
+/// exists to free, `plan_start` answers `NameTaken`, and a stack whose windows
+/// the user closed by hand can never be Started again (#1106 re-review R1).
+///
+/// Everything else in [`STARTING`] stays guarded: see [`names_to_release`].
 ///
 /// # Errors
 /// Whatever niri said.
 pub(crate) async fn release_lingering_names(
     ops: &impl Ops,
+    name: &str,
     stacks: &BTreeMap<String, Stack>,
 ) -> Result<(), String> {
     let workspaces = ops.workspaces().await?;
     let windows = ops.windows().await?;
-    let in_flight = STARTING.get_cloned();
+    let mut in_flight = STARTING.get_cloned();
+    // The stack being started is in flight *by construction* — its own caller
+    // put it there. `starting - {self}` is the set this sweep may skip.
+    in_flight.remove(name);
     let mut up = BTreeSet::new();
     for name in stacks.keys() {
         if ops.slice_is_up(name).await {
@@ -986,7 +1001,7 @@ pub(crate) async fn start(
     stack: &Stack,
     saved: &Workspaces,
 ) -> Result<StartPlan, String> {
-    release_lingering_names(ops, &saved.stacks).await?;
+    release_lingering_names(ops, name, &saved.stacks).await?;
 
     let workspaces = ops.workspaces().await?;
     let windows = ops.windows().await?;
@@ -1049,12 +1064,19 @@ pub(crate) async fn start(
 
     // Step 8. Two preconditions, and neither is cosmetic.
     //
-    // * **At least one app arrived.** `hytte-plugin-niri-layouts apply`
-    //   re-proportions the columns of a workspace; on one with none of this
-    //   stack's windows there is nothing of ours to arrange, and running it
+    // * **At least one app arrived, tiled.** `hytte-plugin-niri-layouts apply`
+    //   re-proportions the *columns* of a workspace; with none of this stack's
+    //   columns present there is nothing of ours to arrange, and running it
     //   anyway is how a Start that launched nothing reaches out and rearranges
-    //   a workspace the user owns. An empty column batch *is* "nothing
-    //   arrived": a floating-only or window-less Start produces no pair.
+    //   a workspace the user owns.
+    //
+    //   Read the empty batch precisely: since a floating window takes no pair
+    //   (`column_order_batch`), an empty batch means "no **tiled** app
+    //   arrived", which is not the same as "no app arrived". A stack whose
+    //   windows all opened floating has its apps up and gets no layout —
+    //   correct, since there is no column to proportion, but it is a different
+    //   sentence from the missing-apps warning above and should not be read as
+    //   the same one.
     // * **The focus is re-asserted first.** The CLI acts on whatever workspace
     //   is focused when it runs, and the last thing that asserted focus was the
     //   plan batch — `GRACE` (10 s) plus every launch ago. Ten seconds of a

@@ -1023,7 +1023,17 @@ title` in the stderr tail — worth a deliberate look on first run, since
      the frozen breakpoint threshold correct. `TITLE_CHARS` in
      `trollshell/src/widgets/mpris.rs` is a one-line taste knob if 24 reads
      as too tight or too wide.
-  5. **One expected regression, disclosed.** The mini chip still _requests_
+  5. **Text scaling, without a restart.** Change the system text scale (or
+     the interface font) while the shell is running — the thing
+     `install_scaled_base_font` exists to make work. The media chip must
+     still flip renditions at the width the row actually needs, and the
+     title must not end up clipped mid-word with
+     `journalctl --user -u trollshell | grep "Allocation width too small"`
+     printing a line per allocation. The three numbers this widget freezes
+     (its minimum, its natural, and the breakpoint threshold) are re-derived
+     on exactly those two GTK settings; if this leg fails, that re-derive is
+     what to look at, not the alignment.
+  6. **One expected regression, disclosed.** The mini chip still _requests_
      the full row's width — that request-stability is what makes the blink
      loop structurally impossible — so the space it gives up falls into the
      bar's mid-gap rather than back to the window list. Long **window**

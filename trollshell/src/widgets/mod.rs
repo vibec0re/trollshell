@@ -27,5 +27,4 @@ pub mod tray;
 pub mod volume;
 pub mod vpn;
 pub mod window_list;
-pub mod workspace_manager;
 pub mod workspaces;

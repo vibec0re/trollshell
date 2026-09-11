@@ -238,11 +238,6 @@
 .ts-indicator image {
     -gtk-icon-size: 1.231em;
 }
-/* .ts-workspace-manager (#1108, widgets/workspace_manager.rs) is a plain
- * icon-only chip — no dedicated rule here, same as its model
- * `.ts-settings`: both ride the shared `.ts-indicator` look untouched. The
- * class stays a real selector (not folded away) so a future skin/hover
- * treatment has a hook, same as every other single-icon chip. */
 .ts-volume:hover {
     background: linear-gradient(135deg, #ff006e, #8338ec);
     box-shadow: 0 0 20px rgba(255, 0, 110, 0.7);

@@ -122,8 +122,8 @@
 //! every reconcile relaunch and every key rotation.
 //!
 //! So the value travels over `systemd-run`'s **own environment** instead:
-//! [`invocation::command`] sets each `extra_env` pair with `Command::env` while
-//! the argv it builds emits the **bare**
+//! [`crate::launch::command`] sets each `extra_env` pair with `Command::env`
+//! while the argv it builds emits the **bare**
 //! `--setenv=<VAR>` form, which `systemd-run` documents as "when `=` and
 //! *VALUE* are omitted, the value of the variable with the same name in the
 //! program environment will be used" (`systemd-run(1)`, the option itself
@@ -214,6 +214,7 @@ use anyhow::Context;
 use hytte::services::systemd;
 use serde::Deserialize;
 
+use crate::launch::{self, Launch};
 use crate::secrets::SecretProbe;
 
 /// Relative path of the declarative state file under each XDG config root.
@@ -527,118 +528,58 @@ fn parse_fingerprint(description: &str) -> Option<&str> {
 
 // ── systemd-run launch ───────────────────────────────────────────────────────
 
-/// The `systemd-run` invocation, built in exactly one place.
+/// This plugin's launch, as a [`crate::launch::Launch`].
 ///
-/// **Why this is a module and not two sibling functions (#984, review
-/// MEDIUM-2).** The argv and the process environment are two halves of one
-/// mechanism: the bare `--setenv=<NAME>` the argv carries is meaningful only
-/// because `NAME` is set in the environment, and a secret set in the
-/// environment reaches the unit only because the argv names it. Split them and
-/// the failure is *silent* — on systemd 260.2 a bare `--setenv=K` whose `K` is
-/// absent from `systemd-run`'s own environment sets the child's `K` to the
-/// empty string and exits 0, so a plugin degrades to a blank key with nothing
-/// logged anywhere.
+/// The flag vocabulary itself lives in [`crate::launch`] since #1071 phase 2
+/// (Annika: *"you should consider generalizing on this"*) — including #984's
+/// argv/environment pairing, which that module keeps enforced the same way this
+/// one used to: its argv builder is private and its `command` is the only way
+/// out, so there is still no reachable path that produces an argv without the
+/// matching environment. What stays here is only what is *about a plugin*:
 ///
-/// The first cut of #984 stated that pairing in prose ("`launch` is the only
-/// caller"), which is a convention a future launch path can silently break:
-/// reverting `launch` to `Command::new("systemd-run").args(<argv builder>)`
-/// compiled, ran, and left every launcher test green. So [`args`] is **private
-/// to this module** and [`command`] is the only way out of it — there is no
-/// reachable path that produces an argv without the matching environment, and
-/// that revert is now a compile error rather than a passing test. The argv is
-/// still exactly pinnable: read it back off the built `Command` with
-/// `as_std().get_args()`, which is strictly better than pinning the pure
-/// builder because it asserts on the invocation that actually runs.
-mod invocation {
-    use super::{PluginSpec, spec_fingerprint, systemd, unit_description};
-
-    /// The full `systemd-run` argv (sans the program itself) for one plugin
-    /// launch. Pure — but private, see the module doc:
-    ///
-    /// - `--collect`: release the unit even if it ends failed, so a crash-looped
-    ///   plugin doesn't wedge its unit name (a relaunch would otherwise need a
-    ///   `reset-failed` first).
-    /// - `Restart=on-failure` / `RestartSec=2`: same supervision the static
-    ///   units carried — supervision stays systemd's job.
-    /// - `PartOf=<target>`: stop propagates from session teardown, so plugins
-    ///   die with the session but survive a shell restart. `target` is the
-    ///   state file's (defaulting to [`DEFAULT_TARGET`](super::DEFAULT_TARGET)),
-    ///   so it is the *same* target the shell's own unit binds to rather than a
-    ///   hardcoded guess at it — see the module docs (#707).
-    /// - the spec's declared `env` is passed value-inline as `--setenv=K=V`: it
-    ///   is nix-rendered into the world-readable state file, so the argv
-    ///   discloses nothing new, and an explicit value can't be shadowed by
-    ///   whatever the shell inherited under the same name.
-    /// - `extra_env` (the #392 secret hook) is passed as the **bare**
-    ///   `--setenv=<NAME>` form, with the value supplied through `systemd-run`'s
-    ///   own environment by [`command`] — argv is `0444` in
-    ///   `/proc/<pid>/cmdline` and a secret must not ride it (#984). It still
-    ///   comes **after** the spec's env, and a bare `--setenv=K` still replaces
-    ///   an earlier `--setenv=K=V`, so an injected secret keeps winning over a
-    ///   stale value declared in the spec.
-    /// - `--description=` carries the spec fingerprint (#695) so a later
-    ///   [`reconcile`](super::reconcile) can tell this unit's spec from the
-    ///   currently declared one.
-    /// - `--` terminates option parsing before the config-supplied exec path.
-    fn args(
-        id: &str,
-        spec: &PluginSpec,
-        extra_env: &[(String, String)],
-        target: &str,
-    ) -> Vec<String> {
-        let mut args = vec![
-            "--user".to_owned(),
-            "--quiet".to_owned(),
-            "--collect".to_owned(),
-            format!("--unit={}", systemd::plugin_unit_name(id)),
-            format!(
-                "--description={}",
-                unit_description(id, &spec_fingerprint(spec, target))
-            ),
-            "--property=Restart=on-failure".to_owned(),
-            "--property=RestartSec=2".to_owned(),
-            format!("--property=PartOf={target}"),
-        ];
-        for (k, v) in &spec.env {
-            args.push(format!("--setenv={k}={v}"));
-        }
-        for (k, _) in extra_env {
-            // Bare name only — the value rides `systemd-run`'s environment (#984).
-            args.push(format!("--setenv={k}"));
-        }
-        args.push("--".to_owned());
-        args.push(spec.exec.clone());
-        args
-    }
-
-    /// The `systemd-run` invocation for one plugin launch: [`args`] as argv,
-    /// plus every `extra_env` pair set in the child's **environment**. The only
-    /// item this module exports, by design.
-    ///
-    /// `Command` inherits the shell's environment and adds these on top, which
-    /// is what `systemd-run` needs — it resolves a bare `--setenv=<NAME>` out of
-    /// its own environment. The values land in `/proc/<pid>/environ` (`0400`,
-    /// owner-only) rather than `/proc/<pid>/cmdline` (`0444`, any local user).
-    ///
-    /// Note the env loop is unconditional: a name that is **both** declared in
-    /// `spec.env` and injected must still be set here, because the argv's bare
-    /// `--setenv=<NAME>` overrides the inline `--setenv=<NAME>=<declared>` that
-    /// precedes it. That collision is the shipping claude-bridge configuration
-    /// (`nix/hm-module.nix`'s billing scrub declares `ANTHROPIC_API_KEY = ""`
-    /// alongside the `anthropic` slot), and skipping the `env` call for it would
-    /// hand the plugin the scrubbed empty string.
-    pub(super) fn command(
-        id: &str,
-        spec: &PluginSpec,
-        extra_env: &[(String, String)],
-        target: &str,
-    ) -> tokio::process::Command {
-        let mut cmd = tokio::process::Command::new("systemd-run");
-        cmd.args(args(id, spec, extra_env, target));
-        for (k, v) in extra_env {
-            cmd.env(k, v);
-        }
-        cmd
+/// - `--collect`, `--user`, `--quiet` and `--` are unconditional over there.
+/// - `Restart=on-failure` / `RestartSec=2`: same supervision the static units
+///   carried — supervision stays systemd's job.
+/// - `PartOf=<target>`: stop propagates from session teardown, so plugins die
+///   with the session but survive a shell restart. `target` is the state file's
+///   (defaulting to [`DEFAULT_TARGET`]), so it is the *same* target the shell's
+///   own unit binds to rather than a hardcoded guess at it (#707).
+/// - the spec's declared `env` is passed value-inline as `--setenv=K=V`: it is
+///   nix-rendered into the world-readable state file, so the argv discloses
+///   nothing new, and an explicit value can't be shadowed by whatever the shell
+///   inherited under the same name.
+/// - `extra_env` (the #392 secret hook) goes in [`Launch::secret_env`], which is
+///   rendered as the **bare** `--setenv=<NAME>` form with the value carried on
+///   `systemd-run`'s own environment (#984), after the declared env so an
+///   injected secret still overrides a stale declared value.
+/// - `--description=` carries the spec fingerprint (#695) so a later
+///   [`reconcile`] can tell this unit's spec from the currently declared one.
+///
+/// A plugin unit deliberately has **no slice**: it is supervised and bound to
+/// the session target, which is a stronger relationship than the grouping a
+/// slice gives, and adding one would change the pinned argv for no gain.
+fn plugin_launch(
+    id: &str,
+    spec: &PluginSpec,
+    extra_env: &[(String, String)],
+    target: &str,
+) -> Launch {
+    Launch {
+        unit: systemd::plugin_unit_name(id),
+        description: unit_description(id, &spec_fingerprint(spec, target)),
+        slice: None,
+        properties: vec![
+            "Restart=on-failure".to_owned(),
+            "RestartSec=2".to_owned(),
+            format!("PartOf={target}"),
+        ],
+        env: spec
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        secret_env: extra_env.to_vec(),
+        argv: vec![spec.exec.clone()],
     }
 }
 
@@ -646,7 +587,7 @@ mod invocation {
 /// user unit. `extra_env` is the #392 secret-injection hook (see the module
 /// docs); every current caller builds it via [`resolve_secret_env`], and its
 /// values reach the unit over `systemd-run`'s inherited environment rather than
-/// its argv ([`invocation::command`], #984 — which is the *only* way to build
+/// its argv ([`crate::launch::command`], #984 — which is the *only* way to build
 /// the invocation, so a second launch path cannot bypass the pairing however it
 /// is written).
 ///
@@ -660,10 +601,13 @@ async fn launch(
     target: &str,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(systemd::is_valid_plugin_id(id), "invalid plugin id: {id:?}");
-    let output = invocation::command(id, spec, extra_env, target)
-        .output()
-        .await
-        .context("spawning systemd-run --user")?;
+    let output = launch::command(
+        launch::SYSTEMD_RUN,
+        &plugin_launch(id, spec, extra_env, target),
+    )
+    .output()
+    .await
+    .context("spawning systemd-run --user")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
@@ -1775,16 +1719,25 @@ mod tests {
     // ── Secrets never enter the argv (#984) ──────────────────────────────────
 
     /// The one invocation builder, under a short name. There is deliberately no
-    /// other way to construct it — `invocation::args` is private to its module
-    /// (#984, review MEDIUM-2), so every argv assertion below necessarily
+    /// other way to construct it — `crate::launch::args` is private to its
+    /// module (#984, review MEDIUM-2; the rule moved with the builder in #1071
+    /// phase 2 and is unchanged), so every argv assertion below necessarily
     /// describes a command that also carries the matching environment.
+    ///
+    /// The only thing #1071 changed here is *where* the argv is assembled: this
+    /// helper now maps the plugin's four parameters onto a
+    /// [`Launch`](crate::launch::Launch) and hands that to the shared builder.
+    /// Every assertion below is byte-for-byte what it was.
     fn run_command(
         id: &str,
         spec: &PluginSpec,
         extra_env: &[(String, String)],
         target: &str,
     ) -> tokio::process::Command {
-        invocation::command(id, spec, extra_env, target)
+        launch::command(
+            launch::SYSTEMD_RUN,
+            &plugin_launch(id, spec, extra_env, target),
+        )
     }
 
     /// The argv of the invocation [`launch`] would actually run, read back off
@@ -1797,11 +1750,7 @@ mod tests {
         extra_env: &[(String, String)],
         target: &str,
     ) -> Vec<String> {
-        let cmd = run_command(id, spec, extra_env, target);
-        cmd.as_std()
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect()
+        launch::argv_of(&run_command(id, spec, extra_env, target))
     }
 
     /// The variables a `Command` built by [`run_command`] sets **explicitly** on
@@ -1809,18 +1758,7 @@ mod tests {
     /// environment, which is exactly what we want to pin), as owned strings
     /// sorted by name — `get_envs`'s own order is unspecified.
     fn command_envs(cmd: &tokio::process::Command) -> Vec<(String, Option<String>)> {
-        let mut envs: Vec<(String, Option<String>)> = cmd
-            .as_std()
-            .get_envs()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into_owned(),
-                    v.map(|v| v.to_string_lossy().into_owned()),
-                )
-            })
-            .collect();
-        envs.sort();
-        envs
+        launch::envs_of(cmd)
     }
 
     #[test]

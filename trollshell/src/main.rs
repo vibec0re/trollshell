@@ -10,6 +10,7 @@ mod components;
 mod config;
 mod control;
 mod fullscreen;
+mod launch;
 mod modal;
 mod overlays;
 mod panels;

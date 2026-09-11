@@ -549,6 +549,25 @@ pub fn signal() -> impl Signal<Item = Workspaces> {
     })
 }
 
+/// The stacks as of right now, not as a signal.
+///
+/// For a click handler, which needs one answer rather than a subscription — and
+/// needs it *at click time*: a card carries only a name, so the stack is read
+/// back here rather than captured when the card was built. The file is
+/// live-reloaded and the drawer can sit open across an edit, so a captured
+/// `Stack` could launch a stale app list.
+///
+/// GTK thread only, like every other registry accessor.
+#[must_use]
+pub fn current() -> Workspaces {
+    registry::with(|r| {
+        r.get::<WorkspacesHandles>()
+            .expect("config::workspaces::service() not registered")
+            .stacks
+            .get_cloned()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

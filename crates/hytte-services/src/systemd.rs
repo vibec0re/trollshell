@@ -609,26 +609,42 @@ pub async fn stop_workspace_slice(name: &str) -> Result<()> {
     stop_unit(&workspace_slice_name(name)).await
 }
 
-/// Whether workspace `name`'s slice currently holds a unit that is up.
+/// The workspace name a stack unit belongs to. Inverse of
+/// [`workspace_unit_name`], `\x2d` escape and all. Pure.
 ///
-/// One of the two sources #1071 §3.3 derives `Active` from. Asks for the units
-/// *inside* the slice rather than the slice's own `ActiveState`, because "the
-/// slice has running units" is the question and an empty slice's own state is
-/// systemd's own housekeeping (measured: `trollshell-launch.slice` stays
-/// `loaded active` with zero members).
+/// Returns `None` for anything that is not one of ours — including a
+/// `trollshell-ws-…` name whose tail is not an index, which no
+/// [`workspace_unit_name`] produces.
+#[must_use]
+pub fn parse_workspace_unit(unit: &str) -> Option<String> {
+    let stem = unit
+        .rsplit_once('/')
+        .map_or(unit, |(_, file)| file)
+        .strip_prefix(WS_PREFIX)?
+        .strip_suffix(UNIT_SUFFIX)?;
+    // The index is the last dash-separated field; every dash *before* it in a
+    // name of ours is escaped, so this split cannot cut a name in half.
+    let (name, index) = stem.rsplit_once('-')?;
+    index.parse::<usize>().ok()?;
+    let name = name.replace(r"\x2d", "-");
+    is_valid_workspace_name(&name).then_some(name)
+}
+
+/// Every workspace stack with at least one unit that is up.
 ///
-/// The pattern is built from [`workspace_unit_name`]'s escaped stem, so a stack
-/// called `chat` cannot count a stack called `chat-dev`'s units as its own —
-/// the escape that keeps the slices siblings keeps the globs disjoint too.
+/// One of the two sources #1071 §3.3 derives `Active` from, and **one call for
+/// every stack** rather than one per name: the shell polls this to draw the
+/// cards, and a per-stack fan-out would put a D-Bus round trip per card on a
+/// timer.
+///
+/// Asks for the units *inside* the slices rather than the slices' own
+/// `ActiveState`, because "the slice has running units" is the question and an
+/// empty slice's own state is systemd's housekeeping (measured:
+/// `trollshell-launch.slice` stays `loaded active` with zero members).
 ///
 /// # Errors
 /// Propagates a `hytte_bus` call error.
-pub async fn workspace_slice_is_up(name: &str) -> Result<bool> {
-    anyhow::ensure!(
-        is_valid_workspace_name(name),
-        "invalid workspace name: {name:?}"
-    );
-    let pattern = format!("{WS_PREFIX}{}-*{UNIT_SUFFIX}", name.replace('-', r"\x2d"));
+pub async fn workspace_slices_up() -> Result<std::collections::BTreeSet<String>> {
     let units: Vec<UnitTuple> = call(BusKind::Session, SYSTEMD_NAME)
         .at_path(MANAGER_PATH)
         .iface(MANAGER_IFACE)
@@ -640,12 +656,31 @@ pub async fn workspace_slice_is_up(name: &str) -> Result<bool> {
                 "deactivating".to_owned(),
                 "reloading".to_owned(),
             ],
-            vec![pattern],
+            vec![format!("{WS_PREFIX}*{UNIT_SUFFIX}")],
         ))
         .send()
         .await
-        .context("ListUnitsByPatterns for a workspace slice")?;
-    Ok(!units.is_empty())
+        .context("ListUnitsByPatterns for the workspace slices")?;
+    Ok(units
+        .into_iter()
+        .filter_map(|(name, ..)| parse_workspace_unit(&name))
+        .collect())
+}
+
+/// Whether workspace `name`'s slice currently holds a unit that is up.
+///
+/// [`workspace_slices_up`] filtered to one name — the same single call, so a
+/// Start's housekeeping and the page's poll cannot disagree about what "up"
+/// means.
+///
+/// # Errors
+/// As [`workspace_slices_up`], plus an invalid workspace name.
+pub async fn workspace_slice_is_up(name: &str) -> Result<bool> {
+    anyhow::ensure!(
+        is_valid_workspace_name(name),
+        "invalid workspace name: {name:?}"
+    );
+    Ok(workspace_slices_up().await?.contains(name))
 }
 
 #[cfg(test)]
@@ -1001,5 +1036,55 @@ mod tests {
             "{chat_dev_unit} must not match the glob {chat}*"
         );
         assert!(workspace_unit_name("chat", 0).starts_with(&chat));
+    }
+
+    /// The unit name round-trips, escape and all — which is what lets the
+    /// page's single `ListUnitsByPatterns` poll say *which* stacks are up
+    /// rather than only how many units there are.
+    ///
+    /// The `chat-dev` case is the one that would break a naive
+    /// `split('-').nth(2)`: every dash inside a name of ours is escaped, so the
+    /// **last** dash is always the index separator.
+    #[test]
+    fn a_stack_unit_name_round_trips_through_the_parser() {
+        for (name, index) in [("chat", 0), ("chat-dev", 3), ("a-b-c", 12), ("x", 99)] {
+            let unit = workspace_unit_name(name, index);
+            assert_eq!(
+                parse_workspace_unit(&unit).as_deref(),
+                Some(name),
+                "round trip for {unit}"
+            );
+        }
+    }
+
+    /// …and nothing else parses as one of ours.
+    #[test]
+    fn parse_workspace_unit_rejects_everything_that_is_not_ours() {
+        assert_eq!(parse_workspace_unit("trollshell-plugin-pet.service"), None);
+        assert_eq!(parse_workspace_unit("app-niri-foot-1234.scope"), None);
+        assert_eq!(parse_workspace_unit("trollshell-ws-chat.slice"), None);
+        assert_eq!(
+            parse_workspace_unit("trollshell-ws-chat.service"),
+            None,
+            "no index"
+        );
+        assert_eq!(
+            parse_workspace_unit("trollshell-ws-chat-x.service"),
+            None,
+            "the tail must be a number"
+        );
+        assert_eq!(
+            parse_workspace_unit("trollshell-ws-Chat-0.service"),
+            None,
+            "a name we could never have written"
+        );
+        // A *raw* dash is not a name of ours — we always escape — so a unit
+        // spelled that way names the stack `chat`, not `chat-dev`, and the
+        // parser must not invent the latter.
+        assert_eq!(
+            parse_workspace_unit("trollshell-ws-chat-dev-0.service").as_deref(),
+            Some("chat-dev"),
+            "…but an unescaped one still reads sensibly rather than panicking"
+        );
     }
 }

@@ -50,7 +50,7 @@ const LAYOUT_BIN: &str = "hytte-plugin-niri-layouts";
 
 /// A card's state (#1071 §3.3).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum StackState {
+pub(crate) enum StackState {
     /// The named workspace exists **and** the slice has running units or the
     /// workspace has at least one window.
     Active,
@@ -71,8 +71,53 @@ static STARTING: LazyLock<Mutable<BTreeSet<String>>> =
     LazyLock::new(|| Mutable::new(BTreeSet::new()));
 
 /// Signal of the names with a Start in flight.
-pub fn starting() -> impl Signal<Item = BTreeSet<String>> {
+pub(crate) fn starting() -> impl Signal<Item = BTreeSet<String>> {
     STARTING.signal_cloned()
+}
+
+/// The stacks with at least one unit up, as of the last poll.
+static SLICES_UP: LazyLock<Mutable<BTreeSet<String>>> =
+    LazyLock::new(|| Mutable::new(BTreeSet::new()));
+
+/// Signal of the stacks with at least one unit up — the *other* source
+/// [`state_of`] derives `Active` from.
+pub(crate) fn slices_up() -> impl Signal<Item = BTreeSet<String>> {
+    SLICES_UP.signal_cloned()
+}
+
+/// How often the shell asks systemd which stacks are up.
+///
+/// systemd has no signal for "a unit inside this slice went away" short of
+/// `Subscribe()` plus a `JobRemoved` filter, and the answer only has to be
+/// right within a beat — the *window* half of the derivation is event-driven
+/// and covers every ordinary case; this is what catches the two it cannot
+/// (units lingering after the last window closed, and the first draw after a
+/// shell restart). One `ListUnitsByPatterns` per tick, for every stack at once.
+const SLICE_POLL: Duration = Duration::from_secs(3);
+
+/// Start the slice poll. Called once, from `main.rs`.
+///
+/// A `spawn_supervised` task rather than a `Service` because there is no daemon
+/// state to hold: the answer is a systemd query, and the handle it publishes to
+/// is the same process-global shape [`STARTING`] uses and for the same reason —
+/// it is written from the runtime and read on the GTK thread.
+///
+/// `main.rs` is its only caller, and `main.rs` is not part of the shadow `[lib]`
+/// target (#674/#738) — so inside that target this is an orphan `dead_code`
+/// cannot tell from a genuine one, the same situation `scale`'s own
+/// `#[allow(dead_code)]` in `lib.rs` documents. Scoped to this one item rather
+/// than the module, so anything else here that stops being called still reds.
+#[allow(dead_code)]
+pub(crate) fn spawn_pollers() {
+    hytte::reactive::spawn_supervised("workspace-slices", || async {
+        loop {
+            match systemd::workspace_slices_up().await {
+                Ok(up) => SLICES_UP.set_neq(up),
+                Err(e) => tracing::debug!(error = %e, "workspace slice poll failed"),
+            }
+            tokio::time::sleep(SLICE_POLL).await;
+        }
+    });
 }
 
 /// One card's state, from the two sources #1071 §3.3 derives it from.
@@ -82,7 +127,7 @@ pub fn starting() -> impl Signal<Item = BTreeSet<String>> {
 /// shell restart — and each one offered a Start that would have hit §3.4's
 /// naming hazard.
 #[must_use]
-pub fn state_of(
+pub(crate) fn state_of(
     name: &str,
     workspaces: &[Workspace],
     windows: &[Window],
@@ -131,7 +176,7 @@ fn named<'w>(workspaces: &'w [Workspace], name: &str) -> Option<&'w Workspace> {
 /// Only workspaces that are *named after a known stack*, empty, and whose slice
 /// is down. A workspace the user named by hand is not ours to unname.
 #[must_use]
-pub fn names_to_release(
+pub(crate) fn names_to_release(
     stacks: &BTreeMap<String, Stack>,
     workspaces: &[Workspace],
     windows: &[Window],
@@ -151,7 +196,7 @@ pub fn names_to_release(
 
 /// Why a Start could not be planned.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum StartError {
+pub(crate) enum StartError {
     /// Something already holds the name — including, before housekeeping has
     /// run, this stack's own lingering empty workspace.
     NameTaken,
@@ -173,7 +218,7 @@ impl std::fmt::Display for StartError {
 
 /// What a Start will do, decided from one snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StartPlan {
+pub(crate) struct StartPlan {
     /// The workspace the stack will occupy.
     pub workspace: u64,
     /// The output it is on.
@@ -207,7 +252,7 @@ pub struct StartPlan {
 /// # Errors
 /// [`StartError`], every variant of which is shown on the card rather than
 /// falling through to a launch.
-pub fn plan_start(
+pub(crate) fn plan_start(
     name: &str,
     stack: &Stack,
     workspaces: &[Workspace],
@@ -272,7 +317,7 @@ pub fn plan_start(
 /// slice rather than a walk (#1071 §3.3). No `Restart=`: an app the user closed
 /// has finished, it is not a supervised service.
 #[must_use]
-pub fn app_launch(name: &str, index: usize, app: &StackApp) -> Launch {
+pub(crate) fn app_launch(name: &str, index: usize, app: &StackApp) -> Launch {
     Launch {
         unit: systemd::workspace_unit_name(name, index),
         description: format!("trollshell workspace {name}: {}", app.id),
@@ -328,7 +373,11 @@ fn forwarded_env() -> Vec<(String, String)> {
 /// identity (§3.2). A window already on the target workspace produces no action,
 /// so a settled Start sends an empty batch and `send_actions` opens no socket.
 #[must_use]
-pub fn stray_moves(stack: &Stack, workspace: u64, windows: &[Window]) -> Vec<WorkspaceAction> {
+pub(crate) fn stray_moves(
+    stack: &Stack,
+    workspace: u64,
+    windows: &[Window],
+) -> Vec<WorkspaceAction> {
     let wanted: BTreeSet<&str> = stack.apps.iter().map(|a| a.id.as_str()).collect();
     windows
         .iter()
@@ -343,7 +392,7 @@ pub fn stray_moves(stack: &Stack, workspace: u64, windows: &[Window]) -> Vec<Wor
 
 /// One step of a Stop (#1071 §3.3).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum StopStep {
+pub(crate) enum StopStep {
     /// The window's pid belongs to a unit — niri ≥ 26.04 puts everything it
     /// spawns in an `app-niri-*.scope`, so this covers far more than what this
     /// shell launched.
@@ -363,7 +412,10 @@ pub enum StopStep {
 /// every app this shell launched, and running it first means the walk below only
 /// ever has to deal with what the *compositor* started.
 #[must_use]
-pub fn stop_plan(windows: &[&Window], units: &BTreeMap<u64, Option<String>>) -> Vec<StopStep> {
+pub(crate) fn stop_plan(
+    windows: &[&Window],
+    units: &BTreeMap<u64, Option<String>>,
+) -> Vec<StopStep> {
     windows
         .iter()
         .map(|w| match units.get(&w.id).and_then(Option::as_ref) {
@@ -381,7 +433,7 @@ pub fn stop_plan(windows: &[&Window], units: &BTreeMap<u64, Option<String>>) -> 
 /// falsified against a scripted world: the order of the calls, and what was
 /// checked before what, is the substance of both transactions and neither is
 /// observable from a pure planner alone.
-pub trait Ops {
+pub(crate) trait Ops {
     /// One batch, one socket, in order (`niri::send_actions`).
     fn send_actions(
         &self,
@@ -402,7 +454,7 @@ pub trait Ops {
 }
 
 /// The real world.
-pub struct Live;
+pub(crate) struct Live;
 
 impl Ops for Live {
     async fn send_actions(&self, actions: Vec<WorkspaceAction>) -> Result<(), String> {
@@ -481,7 +533,7 @@ impl Ops for Live {
 ///
 /// # Errors
 /// Whatever niri said.
-pub async fn release_lingering_names(
+pub(crate) async fn release_lingering_names(
     ops: &impl Ops,
     stacks: &BTreeMap<String, Stack>,
 ) -> Result<(), String> {
@@ -517,7 +569,7 @@ pub async fn release_lingering_names(
 ///
 /// # Errors
 /// The first step that failed, as a line for the card.
-pub async fn start(
+pub(crate) async fn start(
     ops: &impl Ops,
     name: &str,
     stack: &Stack,
@@ -601,7 +653,7 @@ async fn reconcile(ops: &impl Ops, stack: &Stack, workspace: u64) {
 /// # Errors
 /// Whatever the slice stop or the final batch said. A single window that would
 /// not stop is logged, not fatal — the rest still go.
-pub async fn stop(ops: &impl Ops, name: &str) -> Result<(), String> {
+pub(crate) async fn stop(ops: &impl Ops, name: &str) -> Result<(), String> {
     ops.stop_slice(name).await?;
 
     let workspaces = ops.workspaces().await?;
@@ -645,7 +697,7 @@ pub async fn stop(ops: &impl Ops, name: &str) -> Result<(), String> {
 ///
 /// The `Mutable` is cleared on every exit path — including the error one —
 /// because a card stuck on `Starting` has a permanently disabled button.
-pub fn spawn_start(name: String, stack: Stack, stacks: BTreeMap<String, Stack>) {
+pub(crate) fn spawn_start(name: String, stack: Stack, stacks: BTreeMap<String, Stack>) {
     if !STARTING.lock_mut().insert(name.clone()) {
         // Already in flight; a second click is not a second Start.
         return;
@@ -665,7 +717,7 @@ pub fn spawn_start(name: String, stack: Stack, stacks: BTreeMap<String, Stack>) 
 }
 
 /// Run a Stop on the runtime.
-pub fn spawn_stop(name: String) {
+pub(crate) fn spawn_stop(name: String) {
     hytte::reactive::runtime::handle().spawn(async move {
         if let Err(e) = stop(&Live, &name).await {
             tracing::warn!(workspace = name, error = %e, "workspace stack did not stop");

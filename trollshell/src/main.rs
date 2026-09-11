@@ -133,6 +133,10 @@ fn main() -> hytte::ui::Result<()> {
         // once each) for the deprecation window. Polls its layers' mtimes, so
         // an edit re-skins the panel with the shell up.
         .with(config::core_leds::service())
+        // The workspace stacks (#1071 phase 2): `workspaces.toml` layered the
+        // same way, polled the same way, and republished into the Workspaces
+        // drawer page — which is also how the page picks up its own Save.
+        .with(config::workspaces::service())
         .with(clock::service())
         .with(wifiscan::service())
         // wifiscan + geoclue feed `places` (the location resolver); `places`
@@ -331,6 +335,14 @@ fn main() -> hytte::ui::Result<()> {
             // still-running plugin is skipped); guarded internally against a
             // re-fired activate.
             plugin_launcher::launch_at_startup();
+
+            // The second half of a workspace stack's Active/Inactive
+            // derivation (#1071 §3.3): which `trollshell-ws-*.slice`s hold a
+            // running unit. One `ListUnitsByPatterns` on a timer, for every
+            // stack at once — systemd has no cheaper signal for "the last unit
+            // in this slice went away", and the window half of the derivation
+            // is event-driven and covers everything but that.
+            workspace_stacks::spawn_pollers();
 
             // Gate netconn's always-on `ss -tunpH` poller on drawer
             // visibility (#50): it only feeds the Connections/Network drawer

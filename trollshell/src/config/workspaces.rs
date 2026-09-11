@@ -596,13 +596,22 @@ pub fn set_stack_monitor_to(
     let name = normalize_workspace_name(name)
         .ok_or_else(|| ConfigError::Invalid(format!("invalid workspace name: {name:?}")))?;
     let existing = hytte_config::subsystem::load_from::<WorkspacesConfig>(&[path.to_path_buf()])?;
-    let mut table = existing
-        .config
-        .workspace
-        .as_ref()
-        .and_then(toml::Value::as_table)
-        .cloned()
-        .unwrap_or_default();
+    // Absent is fine — that is a first save. **Present but not a table** is a
+    // hand-edit slip (`workspace = "chat"`), and an `unwrap_or_default()` there
+    // would hand back a fresh empty table and quietly overwrite whatever the
+    // user wrote. The per-stack guard below refuses exactly this shape one
+    // level down; the outer one has to as well, or the careful guard only
+    // covers the case the careless one has already destroyed (#1106 review
+    // LOW 8).
+    let mut table = match existing.config.workspace.as_ref() {
+        None => toml::Table::new(),
+        Some(toml::Value::Table(table)) => table.clone(),
+        Some(other) => {
+            return Err(ConfigError::Invalid(format!(
+                "workspace is {other}, not a table of stacks; not rewriting it"
+            )));
+        }
+    };
     // A stack the overlay has never mentioned gets a fresh table with one key;
     // a stack it has gets that one key changed and keeps the rest.
     let entry = table
@@ -1361,6 +1370,29 @@ apps = [
         assert_eq!(merged.stacks["chat"].monitor.as_deref(), Some("HDMI-A-1"));
         assert_eq!(merged.stacks["chat"].layout, Layout::Golden);
         assert_eq!(merged.stacks["chat"].apps.len(), 1);
+    }
+
+    /// **Review LOW 8.** A `workspace` key that is not a table at all is a
+    /// hand-edit slip, and the writer refuses rather than replacing it — the
+    /// same treatment the per-stack guard one level down already gave.
+    ///
+    /// Without this the `unwrap_or_default()` handed back a fresh empty table
+    /// and the user's value was gone, which is the one outcome a
+    /// format-preserving writer exists to prevent.
+    #[test]
+    fn a_monitor_rewrite_refuses_a_workspace_key_that_is_not_a_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspaces.toml");
+        let body = "# mine\nworkspace = \"chat\"\n";
+        std::fs::write(&path, body).expect("writes");
+
+        let err = set_stack_monitor_to(&path, "chat", "DP-1").expect_err("refuses");
+        assert!(err.to_string().contains("not a table"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads back"),
+            body,
+            "the user's value is still there, byte for byte"
+        );
     }
 
     /// A name that could never be a workspace is refused before anything is

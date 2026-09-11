@@ -8,7 +8,7 @@
 //! A pure planner cannot show any of that, and a live compositor is not
 //! available on CI.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::time::Duration;
@@ -19,7 +19,7 @@ use super::{
     AutostartPlan, Launched, Layout, Ops, Stack, StackApp, StackState, StartError, StopStep,
     Workspaces, app_launch, autostart_all, autostart_driver, autostart_plan, autostart_tick,
     column_order_batch, may_stop, missing_apps, move_to_monitor, names_to_release, order_index,
-    plan_start, save, start, state_of, stop, stop_plan, stray_moves,
+    plan_start, release_lingering_names, save, start, state_of, stop, stop_plan, stray_moves,
 };
 use crate::launch::Launch;
 
@@ -549,7 +549,7 @@ fn a_stack_whose_windows_vanished_has_its_name_released() {
     let stacks = BTreeMap::from([("chat".to_owned(), Stack::default())]);
     let workspaces = [ws(1, 1, LEFT, Some("chat"), true)];
 
-    let released = names_to_release(&stacks, &workspaces, &[], &|_| false);
+    let released = names_to_release(&stacks, &workspaces, &[], &|_| false, &BTreeSet::new());
     assert_eq!(released, vec![WorkspaceAction::UnsetName { workspace: 1 }]);
 
     // Without the release, this is what the next Start runs into.
@@ -568,16 +568,30 @@ fn a_live_stacks_name_is_never_released() {
     let workspaces = [ws(1, 1, LEFT, Some("chat"), true)];
 
     assert!(
-        names_to_release(&stacks, &workspaces, &[win(9, 1, "x")], &|_| false).is_empty(),
+        names_to_release(
+            &stacks,
+            &workspaces,
+            &[win(9, 1, "x")],
+            &|_| false,
+            &BTreeSet::new()
+        )
+        .is_empty(),
         "it still has a window"
     );
     assert!(
-        names_to_release(&stacks, &workspaces, &[], &|name| name == "chat").is_empty(),
+        names_to_release(
+            &stacks,
+            &workspaces,
+            &[],
+            &|name| name == "chat",
+            &BTreeSet::new()
+        )
+        .is_empty(),
         "its units are still up"
     );
     // A workspace the user named by hand is not ours to unname.
     let unknown = [ws(1, 1, LEFT, Some("scratch"), true)];
-    assert!(names_to_release(&stacks, &unknown, &[], &|_| false).is_empty());
+    assert!(names_to_release(&stacks, &unknown, &[], &|_| false, &BTreeSet::new()).is_empty());
 }
 
 /// #1071 §7: **the name is verified before anything is launched**, and the
@@ -1159,9 +1173,13 @@ fn housekeeping_releases_every_stale_name_at_once() {
         ws(3, 3, LEFT, Some("music"), false),
     ];
     // `dev` still has a window; `music`'s units are up. Only `chat` is stale.
-    let released = names_to_release(&stacks, &workspaces, &[win(9, 2, "x")], &|name| {
-        name == "music"
-    });
+    let released = names_to_release(
+        &stacks,
+        &workspaces,
+        &[win(9, 2, "x")],
+        &|name| name == "music",
+        &BTreeSet::new(),
+    );
     assert_eq!(released, vec![WorkspaceAction::UnsetName { workspace: 1 }]);
 }
 
@@ -1526,6 +1544,9 @@ fn a_start_orders_the_columns_in_one_batch_between_the_launches_and_the_layout()
         WorkspaceAction::MoveColumnToIndex { index: 1 },
         WorkspaceAction::FocusWindow { window: 9 },
         WorkspaceAction::MoveColumnToIndex { index: 2 },
+        // …and the focus the layout CLI needs, last in the same batch
+        // (#1106 review F2).
+        WorkspaceAction::Focus { workspace: 1 },
     ];
     let calls = script.calls();
     let batch = script
@@ -1746,7 +1767,7 @@ fn autostart_takes_the_connected_stacks_in_file_order() {
     let connected = BTreeSet::from([LEFT.to_owned()]);
 
     assert_eq!(
-        autostart_plan(&saved, &connected),
+        autostart_plan(&saved, &connected, &BTreeSet::new()),
         AutostartPlan {
             start: vec!["zoo".to_owned(), "apt".to_owned()],
             skipped: vec![("off".to_owned(), "dp-9".to_owned())],
@@ -1754,20 +1775,64 @@ fn autostart_takes_the_connected_stacks_in_file_order() {
         "`man` does not autostart; `off` names a screen that is not here; and \
          `zoo` comes first because the file says so"
     );
+    assert_eq!(
+        autostart_plan(&saved, &connected, &BTreeSet::from(["zoo".to_owned()])).start,
+        ["apt"],
+        "a stack already handed to a launch never appears again"
+    );
 }
 
-/// The skip is one `info!` line naming the stack and the screen (#1071 §3.5),
-/// and the stack is **not** started somewhere else instead.
+/// **Review LOW 7.** A screen that turns up a beat after niri's first snapshot
+/// still counts: at login `trollshell.service` and `kanshi` come up together,
+/// so the initial enumeration races the display setup.
+///
+/// So the skip is *deferred* while the settle window is open, and only becomes
+/// final — one `info!` line, and the stack latched — once it closes. Three
+/// ticks: inside the window with the screen absent (nothing), inside the window
+/// with the screen present (started), and — on a second latch — the window
+/// expiring with it still absent (the line).
 #[test]
-fn an_absent_monitor_is_skipped_with_one_line() {
+fn an_absent_monitor_waits_out_the_settle_window_then_is_skipped_with_one_line() {
     let saved = stacked(&[("off", autostarting(Some("dp-9"), &["firefox"]))]);
-    let fired = Cell::new(false);
+    let t0 = std::time::Instant::now();
+    let only_left = [ws(1, 1, LEFT, None, true)];
+
+    // 1. Inside the window, screen absent: nothing to launch, nothing final.
+    let mut latch = super::AutostartLatch::default();
+    let (captured, guard) = hytte_config::test_support::capture();
+    assert!(autostart_tick(&mut latch, t0, &only_left, &saved).is_none());
+    assert!(
+        captured
+            .events()
+            .iter()
+            .all(|e| e.level != tracing::Level::INFO),
+        "no verdict yet: {:?}",
+        captured.events()
+    );
+
+    // 2. The screen turns up a second later — still inside the window — and the
+    //    stack starts after all. This is the whole point of LOW 7.
+    let both = [ws(1, 1, LEFT, None, true), ws(2, 1, "dp-9", None, false)];
+    let plan = autostart_tick(&mut latch, t0 + Duration::from_secs(1), &both, &saved)
+        .expect("the screen arrived inside the settle window");
+    assert_eq!(plan.start, ["off"]);
+    drop(guard);
+
+    // 3. On a fresh latch, the same stack with the screen still absent when the
+    //    window closes: one info line, naming the stack and the screen.
+    let mut latch = super::AutostartLatch::default();
     let (captured, _guard) = hytte_config::test_support::capture();
-
-    let plan = autostart_tick(&fired, &[ws(1, 1, LEFT, None, true)], &saved)
-        .expect("niri has reported an output");
-
-    assert!(plan.start.is_empty(), "nothing is started: {plan:?}");
+    assert!(autostart_tick(&mut latch, t0, &only_left, &saved).is_none());
+    assert!(
+        autostart_tick(
+            &mut latch,
+            t0 + super::AUTOSTART_SETTLE + Duration::from_secs(1),
+            &only_left,
+            &saved
+        )
+        .is_none(),
+        "still nothing to start"
+    );
     let lines: Vec<String> = captured
         .events()
         .into_iter()
@@ -1786,35 +1851,42 @@ fn an_absent_monitor_is_skipped_with_one_line() {
     );
 }
 
-/// Nothing happens until niri has reported an output — and then exactly once,
-/// however many more snapshots arrive.
+/// Nothing happens until niri has reported an output — and then exactly once
+/// per stack, however many more snapshots arrive.
 ///
 /// **The §7 mutation**: drop the latch and every workspace or window change for
 /// the rest of the session starts the stacks again.
 #[test]
 fn autostart_waits_for_an_output_and_then_runs_once() {
     let saved = stacked(&[("chat", autostarting(None, &["firefox"]))]);
-    let fired = Cell::new(false);
+    let mut latch = super::AutostartLatch::default();
+    let t0 = std::time::Instant::now();
 
     assert!(
-        autostart_tick(&fired, &[], &saved).is_none(),
+        autostart_tick(&mut latch, t0, &[], &saved).is_none(),
         "niri has reported nothing yet"
     );
     assert!(
-        autostart_tick(&fired, &[ws(1, 1, LEFT, None, true)], &saved).is_some(),
+        autostart_tick(&mut latch, t0, &[ws(1, 1, LEFT, None, true)], &saved).is_some(),
         "the first snapshot with an output fires it"
     );
-    for _ in 0..3 {
+    for n in 0..3 {
         assert!(
-            autostart_tick(&fired, &[ws(1, 1, LEFT, None, true)], &saved).is_none(),
-            "and never again"
+            autostart_tick(
+                &mut latch,
+                t0 + Duration::from_secs(n * 10),
+                &[ws(1, 1, LEFT, None, true)],
+                &saved
+            )
+            .is_none(),
+            "and never again — including long after the settle window"
         );
     }
 }
 
 /// …and the latch really lives outside the per-snapshot closure, which the
-/// pure `autostart_tick` test above cannot see: a `Cell` created *inside*
-/// `for_each` would be `false` on every tick and pass it unchanged.
+/// pure `autostart_tick` test above cannot see: a latch created *inside*
+/// `for_each` would be empty on every tick and pass it unchanged.
 #[test]
 fn the_driver_latches_across_snapshots() {
     use hytte::futures_signals::signal::Mutable;
@@ -1872,16 +1944,19 @@ fn autostart_runs_its_stacks_one_at_a_time_in_order() {
     ]);
     let unnamed = vec![ws(1, 1, LEFT, None, true)];
     let script = Script::default()
-        // Every read answers "one empty, focused, unnamed workspace", except
-        // the verify reads, which must show the name that was just set. The
-        // queue below is per `workspaces()` call, in order.
+        // Four `workspaces()` reads per stack, in order: the "is it already on
+        // screen" probe, housekeeping, the plan, and the verify — and only the
+        // verify may show the name that was just set. Every other read answers
+        // "one empty, focused, unnamed workspace".
         .with_workspaces(&[
-            unnamed.clone(),
-            unnamed.clone(),
-            vec![ws(1, 1, LEFT, Some("chat"), true)],
-            unnamed.clone(),
-            unnamed.clone(),
-            vec![ws(1, 1, LEFT, Some("music"), true)],
+            unnamed.clone(),                           // chat: probe → Inactive
+            unnamed.clone(),                           // chat: housekeeping
+            unnamed.clone(),                           // chat: plan
+            vec![ws(1, 1, LEFT, Some("chat"), true)],  // chat: verify
+            unnamed.clone(),                           // music: probe → Inactive
+            unnamed.clone(),                           // music: housekeeping
+            unnamed.clone(),                           // music: plan
+            vec![ws(1, 1, LEFT, Some("music"), true)], // music: verify
         ])
         .with_windows(&[Vec::new()]);
 
@@ -1978,5 +2053,254 @@ fn a_failed_monitor_write_never_moves_the_workspace() {
         script.position(|c| matches!(c, Call::Actions(_))).is_none(),
         "nothing was moved: {:?}",
         script.calls()
+    );
+}
+
+// ── Review fix round (#1106) ─────────────────────────────────────────────────
+
+/// **Review F1.** A shell restart mid-session must not report a failed Start
+/// for every stack that is already running.
+///
+/// `systemctl --user restart trollshell` is the documented dev loop and the
+/// latch is per process, so the whole autostart set re-fires against stacks
+/// that never stopped. Nothing is double-launched — `plan_start`'s `NameTaken`
+/// precondition holds — but each one used to surface as a toast reading
+/// *"chat did not start: that name is already on a workspace"*.
+#[test]
+fn autostart_skips_a_stack_that_is_already_active() {
+    let saved = stacked(&[("chat", autostarting(None, &["firefox"]))]);
+    let live = vec![ws_focused(1, 1, LEFT, Some("chat"))];
+    let script = Script::default()
+        .with_workspaces(&[live.clone(), live.clone(), live])
+        .with_windows(&[vec![win(9, 1, "firefox")]]);
+    let entries = vec![("chat".to_owned(), saved.stacks["chat"].clone())];
+    let (captured, _guard) = hytte_config::test_support::capture();
+
+    run(autostart_all(&script, &entries, &saved));
+
+    assert!(
+        script.launches().is_empty(),
+        "nothing is launched onto a stack that is already on screen: {:?}",
+        script.calls()
+    );
+    let warns: Vec<String> = captured
+        .events()
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .map(|e| e.message)
+        .collect();
+    assert!(
+        warns.is_empty(),
+        "a shell restart must not report a failed Start for a stack that is \
+         already running: {warns:?}"
+    );
+}
+
+/// …and the skip really is a *derivation*, not "the name is taken": a stack
+/// whose lingering empty workspace still carries its name, with no windows and
+/// no units, is Inactive and **does** autostart.
+#[test]
+fn autostart_still_starts_a_stack_whose_name_is_merely_lingering() {
+    let saved = stacked(&[("chat", autostarting(None, &["firefox"]))]);
+    let lingering = vec![ws_focused(1, 1, LEFT, Some("chat"))];
+    let released = vec![ws_focused(1, 1, LEFT, None)];
+    let named = vec![ws_focused(1, 1, LEFT, Some("chat"))];
+    let script = Script::default()
+        // the state probe, then housekeeping, then the plan, then the verify
+        .with_workspaces(&[lingering, released.clone(), released, named])
+        .with_windows(&[Vec::new()]);
+    let entries = vec![("chat".to_owned(), saved.stacks["chat"].clone())];
+
+    run(autostart_all(&script, &entries, &saved));
+
+    assert_eq!(
+        script.launches(),
+        ["trollshell-ws-chat-0.service"],
+        "an empty named workspace is Inactive, so this one starts: {:?}",
+        script.calls()
+    );
+}
+
+/// **Review F11.** Stack B's housekeeping must not release the name stack A
+/// claimed moments ago.
+///
+/// A Start's housekeeping sweeps *every* stack in the file, and between A's
+/// naming and A's first window A looks exactly like a stale name — so during a
+/// sequential autostart run B would `UnsetName` it. The in-flight set is the
+/// guard.
+#[test]
+fn a_start_in_flight_is_never_swept_by_another_stacks_housekeeping() {
+    let stacks = BTreeMap::from([
+        ("chat".to_owned(), Stack::default()),
+        ("music".to_owned(), Stack::default()),
+    ]);
+    // `chat` is named and still empty — its apps have not opened a window yet.
+    let workspaces = [
+        ws(1, 1, LEFT, Some("chat"), false),
+        ws(2, 2, LEFT, None, true),
+    ];
+
+    assert_eq!(
+        names_to_release(&stacks, &workspaces, &[], &|_| false, &BTreeSet::new()),
+        vec![WorkspaceAction::UnsetName { workspace: 1 }],
+        "with nothing in flight it really is a stale name — so the assertion \
+         below is not vacuous"
+    );
+    assert!(
+        names_to_release(
+            &stacks,
+            &workspaces,
+            &[],
+            &|_| false,
+            &BTreeSet::from(["chat".to_owned()])
+        )
+        .is_empty(),
+        "a stack with a Start in flight keeps the name it just claimed"
+    );
+}
+
+/// …and `release_lingering_names` really reads the live in-flight set, which
+/// the pure test above cannot see.
+///
+/// Uses a name no other test touches, and takes it back out, because `STARTING`
+/// is process-global.
+#[test]
+fn release_lingering_names_consults_the_live_starting_set() {
+    let name = "f11probe";
+    let stacks = BTreeMap::from([(name.to_owned(), Stack::default())]);
+    let workspaces = vec![ws(1, 1, LEFT, Some(name), false)];
+
+    let loose = Script::default()
+        .with_workspaces(std::slice::from_ref(&workspaces))
+        .with_windows(&[Vec::new()]);
+    run(release_lingering_names(&loose, &stacks)).expect("sweeps");
+    assert_eq!(
+        loose.actions(),
+        [WorkspaceAction::UnsetName { workspace: 1 }],
+        "with nothing in flight the stale name is released"
+    );
+
+    super::STARTING.lock_mut().insert(name.to_owned());
+    let guarded = Script::default()
+        .with_workspaces(&[workspaces])
+        .with_windows(&[Vec::new()]);
+    let outcome = run(release_lingering_names(&guarded, &stacks));
+    super::STARTING.lock_mut().remove(name);
+    outcome.expect("sweeps");
+
+    assert!(
+        guarded.actions().is_empty(),
+        "a Start in flight is never swept: {:?}",
+        guarded.calls()
+    );
+}
+
+/// **Review F2.** The layout CLI acts on whatever workspace is focused when it
+/// runs, and by the time it runs nothing has asserted focus for ten seconds and
+/// a launch — so a focus rides the same batch, immediately before the spawn.
+///
+/// The second half is the stronger remedy the review's finding asks for: with
+/// **no** app of the stack on the workspace there is nothing of ours to
+/// arrange, and running the CLI anyway is precisely how a Start that launched
+/// nothing reaches out and re-lays-out a workspace the user switched to. So it
+/// is not spawned at all rather than spawned after a focus.
+#[test]
+fn the_layout_is_spawned_right_after_a_focus_and_never_with_nothing_to_arrange() {
+    let run_with = |windows: Vec<Window>| {
+        let before = vec![ws_focused(1, 1, LEFT, None)];
+        let after = vec![ws_focused(1, 1, LEFT, Some("chat"))];
+        let script = Script::default()
+            .with_workspaces(&[before.clone(), before, after])
+            .with_windows(&[Vec::new(), Vec::new(), windows]);
+        let mut s = stack(&["firefox"]);
+        s.layout = Layout::Split;
+        run(start(&script, "chat", &s, &Workspaces::default())).expect("starts");
+        script
+    };
+
+    let arrived = run_with(vec![win_at(9, 1, "firefox", 1)]);
+    let calls = arrived.calls();
+    let at = calls
+        .iter()
+        .position(|c| *c == Call::Layout(Layout::Split))
+        .expect("every app arrived, so the layout runs");
+    assert!(
+        at > 0
+            && matches!(&calls[at - 1], Call::Actions(a) if a.last()
+                == Some(&WorkspaceAction::Focus { workspace: 1 })),
+        "the layout must be spawned immediately after a focus on its own \
+         workspace: {:?}",
+        calls[at - 1]
+    );
+
+    let empty = run_with(Vec::new());
+    assert!(
+        empty.position(|c| matches!(c, Call::Layout(_))).is_none(),
+        "no app of the stack is on the workspace, so there is nothing to lay \
+         out and the user's own workspace is left alone: {:?}",
+        empty.calls()
+    );
+}
+
+/// **Review F3.** The peer is picked by **rank**, never by a count indexed into
+/// a position-sorted list — the two agree only while niri's order already
+/// matches the file's.
+#[test]
+fn the_saved_order_places_by_rank_not_by_niri_position() {
+    let order = ["dev".to_owned(), "chat".to_owned(), "music".to_owned()];
+    // niri's order on this screen disagrees with the file: `music` sits before
+    // `dev`, so counting "one peer ranks ahead of chat" and taking `peers[0]`
+    // lands `chat` after `music` — the peer it ranks *ahead* of.
+    let workspaces = [
+        ws(1, 1, LEFT, Some("music"), false),
+        ws(2, 2, LEFT, Some("dev"), false),
+        ws(3, 3, LEFT, None, true),
+    ];
+    assert_eq!(
+        order_index("chat", LEFT, 3, &workspaces, &order),
+        Some(3),
+        "chat must land after dev, the only peer it ranks behind"
+    );
+}
+
+/// **Review F4.** A floating window is in no column, so it gets no pair and
+/// consumes no index — otherwise every *tiled* app of the stack shifts one
+/// place right and the "a gap closes up" invariant is a silent lie for an app
+/// that is present and merely floating.
+#[test]
+fn a_floating_window_consumes_no_column_index() {
+    let mut floating = win(9, 1, "pavucontrol");
+    floating.layout.pos_in_scrolling_layout = None;
+    floating.is_floating = true;
+    let windows = [
+        floating,
+        win_at(10, 1, "firefox", 1),
+        win_at(11, 1, "Alacritty", 2),
+    ];
+    let s = stack(&["pavucontrol", "firefox", "Alacritty"]);
+    assert_eq!(
+        column_order_batch(&s, 1, &windows),
+        vec![
+            WorkspaceAction::FocusWindow { window: 10 },
+            WorkspaceAction::MoveColumnToIndex { index: 1 },
+            WorkspaceAction::FocusWindow { window: 11 },
+            WorkspaceAction::MoveColumnToIndex { index: 2 },
+        ]
+    );
+}
+
+/// …and an app whose *only* window floats is simply absent from the batch,
+/// while a second, tiled window of the same app is still found.
+#[test]
+fn a_tiled_window_is_still_found_past_a_floating_one() {
+    let mut floating = win(9, 1, "Alacritty");
+    floating.layout.pos_in_scrolling_layout = None;
+    let windows = [floating, win_at(10, 1, "Alacritty", 1)];
+    assert_eq!(
+        column_order_batch(&stack(&["Alacritty"]), 1, &windows),
+        vec![
+            WorkspaceAction::FocusWindow { window: 10 },
+            WorkspaceAction::MoveColumnToIndex { index: 1 },
+        ]
     );
 }

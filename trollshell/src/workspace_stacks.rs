@@ -21,7 +21,7 @@
 //! pure planners answer "what would this do", and [`start`]/[`stop`] over a
 //! scripted `Ops` answer "and in what order, and what did it check first".
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -190,17 +190,41 @@ fn named<'w>(workspaces: &'w [Workspace], name: &str) -> Option<&'w Workspace> {
 /// with no error anywhere. Releasing the name is what makes Start's "the name is
 /// free" precondition true rather than hoped for.
 ///
-/// Only workspaces that are *named after a known stack*, empty, and whose slice
-/// is down. A workspace the user named by hand is not ours to unname.
+/// Only workspaces that are *named after a known stack*, empty, whose slice is
+/// down, and that have **no Start in flight**. A workspace the user named by
+/// hand is not ours to unname.
+///
+/// # Why this sweeps every stack, and why `starting` is the guard that makes
+/// that safe
+///
+/// A Start's housekeeping releases the stale name of *every* stack in the file,
+/// not only the one being started. That is deliberate — the whole point is that
+/// the name a Start is about to claim is free, and a stack whose windows are
+/// gone really does have nothing on screen — but it is a **cross-stack side
+/// effect of one stack's transaction**, and during an autostart run the stacks
+/// go one after another (`autostart_all`), so without a guard stack B's
+/// housekeeping would reach stack A.
+///
+/// The window is real: A is named the moment its batch lands, and its apps take
+/// until the grace window to open a window — so between A's naming and A's first
+/// window, A looks exactly like a stale name. B's Start, starting in that gap,
+/// would `UnsetName` the name A just claimed. Hence `starting`: a stack with a
+/// Start in flight is never swept, however empty it looks.
+///
+/// A stack that is *finished* and empty (every app failed to launch) is still
+/// released by the next Start, and that is the correct derivation — it has
+/// nothing on screen.
 #[must_use]
 pub(crate) fn names_to_release(
     stacks: &BTreeMap<String, Stack>,
     workspaces: &[Workspace],
     windows: &[Window],
     slice_up: &dyn Fn(&str) -> bool,
+    starting: &BTreeSet<String>,
 ) -> Vec<WorkspaceAction> {
     stacks
         .keys()
+        .filter(|name| !starting.contains(*name))
         .filter_map(|name| {
             let workspace = named(workspaces, name)?;
             let empty = !windows.iter().any(|w| w.workspace_id == Some(workspace.id));
@@ -354,6 +378,25 @@ pub(crate) fn plan_start(
 /// `None` when there are no peers to order against — a first stack has no
 /// "where among the others", and sending a move then would only shuffle the
 /// user's own workspaces for nothing.
+///
+/// # The peer is picked by rank, never by count
+///
+/// The first cut counted how many peers ranked ahead of us and then indexed the
+/// *position*-sorted list by that count. The two agree only while niri's order
+/// already matches the file's, and they stop agreeing the moment anything moves
+/// a workspace — a drag, a Start that placed one while a peer was on another
+/// screen. With `order = [dev, chat, music]` and niri holding `music` at
+/// position 1 and `dev` at position 2, one peer ranks ahead of `chat`, so the
+/// count said "after `peers[0]`" — which is `music`, the peer `chat` ranks
+/// *ahead* of. So: take the **last peer we rank behind** (max by rank) and go
+/// after it, else the **first peer we rank ahead of** (min by rank) and go
+/// where it is.
+///
+/// What this promises when niri's order is already inconsistent with the file
+/// is only that the new workspace lands adjacent to the right peer — it does
+/// not re-sort the peers that were already out of order. Restoring a whole
+/// screen's order is not something a single `MoveWorkspaceToIndex` can do, and
+/// #1071 §3.6 does not ask for it.
 #[must_use]
 pub(crate) fn order_index(
     name: &str,
@@ -389,18 +432,28 @@ pub(crate) fn order_index(
             (peer_rank != usize::MAX).then_some((i + 1, peer_rank))
         })
         .collect();
-    let (first_position, _) = *peers.first()?;
+    if peers.is_empty() {
+        return None;
+    }
 
-    // How many peers the saved order puts ahead of us. Ties (a name that is not
-    // in `order` at all cannot tie — it ranks `usize::MAX` and is not a peer)
-    // are impossible, since `order` is deduped by `names_in_order`.
-    let ahead = peers.iter().filter(|(_, r)| *r < ours).count();
-    Some(match ahead {
-        // Before the first peer — where that peer is now.
-        0 => first_position,
-        // Immediately after the `ahead`-th peer.
-        n => peers[n - 1].0 + 1,
-    })
+    // The last peer the saved order puts ahead of us: go straight after it,
+    // wherever niri currently has it.
+    if let Some((position, _)) = peers
+        .iter()
+        .filter(|(_, r)| *r < ours)
+        .max_by_key(|(_, r)| *r)
+    {
+        return Some(position + 1);
+    }
+    // Nothing ranks ahead of us, so we go before the first peer we rank ahead
+    // of — i.e. take its place. `min_by_key` rather than `peers.first()`: the
+    // peer we belong in front of is the lowest-ranked one, which is not
+    // necessarily the leftmost one on screen.
+    peers
+        .iter()
+        .filter(|(_, r)| *r > ours)
+        .min_by_key(|(_, r)| *r)
+        .map(|(position, _)| *position)
 }
 
 /// The one batch that makes niri's column order the stack's order
@@ -431,9 +484,28 @@ pub(crate) fn order_index(
 /// all simply takes no index, so the next app gets the index it would have had
 /// (the gap closes up).
 ///
+/// **A floating window is not a candidate at all.** `pos_in_scrolling_layout`
+/// is `None` for one (niri-ipc 26.4, `lib.rs:1373`), which is to say it is in
+/// no column — so `MoveColumnToIndex` after focusing it would either no-op or
+/// move whichever column was last active, and it would consume an index either
+/// way, shifting every *tiled* app of the stack one place right. That turns
+/// "a missing app leaves a gap the next ones close up" into a silent lie for an
+/// app that is present and merely floating.
+///
 /// Placing in stack order is an insertion sort against niri: after app *n* has
 /// been moved to index *n*, indices 1..=*n* hold the first *n* apps, so the
 /// next move cannot disturb them.
+///
+/// # Known limit: two apps of the stack in one niri column
+///
+/// niri decides column membership, not the shell. Two of the stack's windows
+/// stacked in one column (rows 1 and 2 of the same `pos_in_scrolling_layout`)
+/// get one `MoveColumnToIndex` each **against the same column**, so the second
+/// immediately moves what the first just placed. A freshly Started workspace
+/// opens each window in its own column, so this needs an adopted workspace or a
+/// niri config that consumes — and the honest fix is not a filter here (which
+/// window should lose?) but the phase-4 Edit form, where a stack can say what
+/// it wants. Documented rather than half-guarded.
 #[must_use]
 pub(crate) fn column_order_batch(
     stack: &Stack,
@@ -459,10 +531,12 @@ pub(crate) fn column_order_batch(
     let mut batch = Vec::new();
     let mut index = 1;
     for app in &stack.apps {
-        let Some(window) = here
-            .iter()
-            .find(|w| !taken.contains(&w.id) && w.app_id.as_deref() == Some(app.id.as_str()))
-        else {
+        let Some(window) = here.iter().find(|w| {
+            !taken.contains(&w.id)
+                && w.app_id.as_deref() == Some(app.id.as_str())
+                // In no column, so there is no column to move. See the doc.
+                && w.layout.pos_in_scrolling_layout.is_some()
+        }) else {
             continue;
         };
         taken.insert(window.id);
@@ -845,6 +919,12 @@ impl Ops for Live {
 ///
 /// Run before a Start, so the name a Start is about to claim is actually free.
 ///
+/// The in-flight set comes from [`STARTING`] — the same handle the cards read —
+/// so a stack whose own Start has named its workspace but whose apps have not
+/// opened a window yet is never swept by the *next* stack's housekeeping. See
+/// [`names_to_release`] for why that window exists and why it matters during an
+/// autostart run.
+///
 /// # Errors
 /// Whatever niri said.
 pub(crate) async fn release_lingering_names(
@@ -853,13 +933,20 @@ pub(crate) async fn release_lingering_names(
 ) -> Result<(), String> {
     let workspaces = ops.workspaces().await?;
     let windows = ops.windows().await?;
+    let in_flight = STARTING.get_cloned();
     let mut up = BTreeSet::new();
     for name in stacks.keys() {
         if ops.slice_is_up(name).await {
             up.insert(name.clone());
         }
     }
-    let actions = names_to_release(stacks, &workspaces, &windows, &|name| up.contains(name));
+    let actions = names_to_release(
+        stacks,
+        &workspaces,
+        &windows,
+        &|name| up.contains(name),
+        &in_flight,
+    );
     ops.send_actions(actions).await
 }
 
@@ -883,7 +970,10 @@ pub(crate) async fn release_lingering_names(
 ///    column order.
 /// 8. **Layout** (§3.4 step 4), once, after all of it — and only once every app
 ///    has a window or the grace window has ended, which is what step 6 waits
-///    for.
+///    for. Only when at least one app actually arrived, and only with the
+///    stack's workspace re-focused in step 7's own batch: the CLI acts on
+///    whatever is focused, and by this point nothing has asserted focus for ten
+///    seconds and a launch.
 ///
 /// # Errors
 /// The first step that failed, as a line for the card. Steps 7 and 8 are
@@ -955,18 +1045,45 @@ pub(crate) async fn start(
 
     // Step 7. Not fatal: the apps are already up, and a stack whose columns
     // are in the wrong order is a cosmetic problem, not a failed Start.
-    let columns = column_order_batch(stack, plan.workspace, &settled);
-    if let Err(e) = ops.send_actions(columns).await {
-        tracing::warn!(workspace = name, error = %e, "column order not applied");
-    }
+    let mut batch = column_order_batch(stack, plan.workspace, &settled);
 
-    // Step 8. `none` is filtered **here** rather than inside the live arm, so
-    // "a stack with no layout spawns nothing" is a property the scripted world
-    // can see (#1071 §7).
-    if stack.layout != Layout::None
-        && let Err(e) = ops.apply_layout(stack.layout).await
-    {
-        tracing::warn!(workspace = name, error = %e, "layout not applied");
+    // Step 8. Two preconditions, and neither is cosmetic.
+    //
+    // * **At least one app arrived.** `hytte-plugin-niri-layouts apply`
+    //   re-proportions the columns of a workspace; on one with none of this
+    //   stack's windows there is nothing of ours to arrange, and running it
+    //   anyway is how a Start that launched nothing reaches out and rearranges
+    //   a workspace the user owns. An empty column batch *is* "nothing
+    //   arrived": a floating-only or window-less Start produces no pair.
+    // * **The focus is re-asserted first.** The CLI acts on whatever workspace
+    //   is focused when it runs, and the last thing that asserted focus was the
+    //   plan batch — `GRACE` (10 s) plus every launch ago. Ten seconds of a
+    //   Start visibly doing nothing is exactly when a user switches away. So a
+    //   `Focus` rides the **same batch**, last, immediately before the spawn;
+    //   and the spawn is conditional on that batch landing, because a focus
+    //   that did not land is not a focus.
+    //
+    // `none` is filtered here rather than inside the live arm, so "a stack with
+    // no layout spawns nothing" is a property the scripted world can see
+    // (#1071 §7).
+    let lays_out = !batch.is_empty() && stack.layout != Layout::None;
+    if lays_out {
+        batch.push(WorkspaceAction::Focus {
+            workspace: plan.workspace,
+        });
+    }
+    match ops.send_actions(batch).await {
+        Ok(()) => {
+            if lays_out && let Err(e) = ops.apply_layout(stack.layout).await {
+                tracing::warn!(workspace = name, error = %e, "layout not applied");
+            }
+        }
+        Err(e) => tracing::warn!(
+            workspace = name,
+            error = %e,
+            "column order not applied; the layout is skipped with it, since its \
+             workspace was never focused"
+        ),
     }
 
     Ok(plan)
@@ -1196,16 +1313,24 @@ pub(crate) struct AutostartPlan {
 /// nobody is watching, and a stack that says `monitor = "DP-1"` piling onto the
 /// laptop panel every time the dock is unplugged is worse than one that waits.
 /// Hot-plug autostart is deliberately out of scope for this phase (#1071 §3.5's
-/// "a follow-up if wanted"), so a stack skipped here stays skipped for the
-/// session and its card keeps its ▶.
+/// "a follow-up if wanted") — but see [`AutostartLatch`] for the *settle*
+/// window, which is not hot-plug: it is the initial enumeration, where kanshi
+/// and the shell come up together under the same target.
+///
+/// `done` is the per-stack latch: a stack already handed to a launch this
+/// process never appears again.
 #[must_use]
-pub(crate) fn autostart_plan(saved: &Workspaces, connected: &BTreeSet<String>) -> AutostartPlan {
+pub(crate) fn autostart_plan(
+    saved: &Workspaces,
+    connected: &BTreeSet<String>,
+    done: &BTreeSet<String>,
+) -> AutostartPlan {
     let mut plan = AutostartPlan::default();
     for name in saved.names_in_order() {
         let Some(stack) = saved.stacks.get(&name) else {
             continue;
         };
-        if !stack.autostart {
+        if !stack.autostart || done.contains(&name) {
             continue;
         }
         match stack.monitor.as_deref() {
@@ -1218,24 +1343,54 @@ pub(crate) fn autostart_plan(saved: &Workspaces, connected: &BTreeSet<String>) -
     plan
 }
 
-/// The autostart decision for one `workspaces()` snapshot, latched.
+/// How long after niri's first non-empty output snapshot a stack whose screen
+/// is missing stays eligible (#1071 §3.5, review LOW 7).
 ///
-/// `None` means "not now": either niri has not reported an output yet (the
+/// At login `trollshell.service` and `kanshi` come up together under
+/// `niri-session.target`, so a kanshi profile that enables `HDMI-A-1` a beat
+/// after niri's first `WorkspacesChanged` would otherwise leave that stack
+/// "not connected" for the whole session. That is the *initial enumeration*
+/// racing the display setup, not hot-plug — §3.5's exclusion is about plugging
+/// a screen in later, and this window closes long before anyone could.
+const AUTOSTART_SETTLE: Duration = Duration::from_secs(5);
+
+/// Which stacks autostart has already dealt with, and when it first saw a
+/// screen (#1071 §3.5).
+///
+/// **Per stack, not one global flag.** A global latch has to answer "has
+/// autostart run?" with one bit, which forces the choice between re-running
+/// everything on the next snapshot and giving up on a stack whose screen
+/// arrived a moment late. Per stack, both are answerable: a stack that has been
+/// launched is done forever (at most once per stack per process, which is what
+/// §3.5's "eager, once" asks for), and a stack still waiting for its screen
+/// stays eligible until [`AUTOSTART_SETTLE`] is up.
+#[derive(Debug, Default)]
+pub(crate) struct AutostartLatch {
+    /// Stacks already handed to a launch, or given up on. Never revisited.
+    done: BTreeSet<String>,
+    /// When the first snapshot naming an output arrived, i.e. when the settle
+    /// window opened.
+    first_seen: Option<std::time::Instant>,
+}
+
+/// The autostart decision for one `workspaces()` snapshot.
+///
+/// `None` means "nothing to launch now": niri has reported no output yet (the
 /// first snapshots after a shell start are empty — the event stream publishes
-/// before it has anything to publish), or autostart has **already run**.
+/// before it has anything to publish), or every autostarting stack is already
+/// `done`, or the ones that are left are still waiting for their screen inside
+/// the settle window.
 ///
 /// The latch is the whole mechanism. `workspaces()` re-fires on every workspace
 /// and window change for the life of the session; without it every one of them
 /// would launch the autostart set again, so opening a window would start the
-/// stacks a second time. Eager and **once**, as §3.5 settles it.
+/// stacks a second time.
 fn autostart_tick(
-    fired: &Cell<bool>,
+    latch: &mut AutostartLatch,
+    now: std::time::Instant,
     workspaces: &[Workspace],
     saved: &Workspaces,
 ) -> Option<AutostartPlan> {
-    if fired.get() {
-        return None;
-    }
     let connected: BTreeSet<String> = workspaces
         .iter()
         .filter_map(|w| w.output.as_deref())
@@ -1244,17 +1399,38 @@ fn autostart_tick(
     if connected.is_empty() {
         return None;
     }
-    fired.set(true);
-    let plan = autostart_plan(saved, &connected);
+    let opened = *latch.first_seen.get_or_insert(now);
+    let settled = now.duration_since(opened) >= AUTOSTART_SETTLE;
+
+    let plan = autostart_plan(saved, &connected, &latch.done);
+
     for (name, monitor) in &plan.skipped {
-        // §3.5: "A stack whose monitor is absent at login is skipped with one
-        // info line." Emitted here rather than in the caller so the decision
-        // and the record of it cannot drift apart.
-        tracing::info!(
-            workspace = name,
-            monitor = monitor,
-            "autostart skipped: the screen this stack names is not connected"
-        );
+        if settled {
+            // §3.5: "A stack whose monitor is absent at login is skipped with
+            // one info line." Emitted at the moment the decision becomes
+            // final — one line per stack, since the stack is `done` after it.
+            tracing::info!(
+                workspace = name,
+                monitor = monitor,
+                "autostart skipped: the screen this stack names is not connected"
+            );
+            latch.done.insert(name.clone());
+        } else {
+            // Still inside the settle window: say so once, at debug, and leave
+            // the stack eligible for the next snapshot.
+            tracing::debug!(
+                workspace = name,
+                monitor = monitor,
+                "autostart waiting: {monitor} is not connected yet"
+            );
+        }
+    }
+
+    if plan.start.is_empty() {
+        return None;
+    }
+    for name in &plan.start {
+        latch.done.insert(name.clone());
     }
     Some(plan)
 }
@@ -1288,13 +1464,23 @@ pub(crate) fn autostart_driver<S>(
 where
     S: Signal<Item = Vec<Workspace>> + 'static,
 {
-    // **Outside** the closure. A latch created per call would be `false` on
-    // every snapshot, which is the same as having none at all: the stacks would
-    // start again every time a window moved.
-    let fired = Cell::new(false);
+    // **Outside** the closure. A latch created per call would be empty on every
+    // snapshot, which is the same as having none at all: the stacks would start
+    // again every time a window moved.
+    //
+    // `RefCell` rather than `Cell`: the latch is a set plus an instant now, and
+    // the closure is `FnMut` on one thread (the GTK main context), so there is
+    // nothing to contend with.
+    let latch = RefCell::new(AutostartLatch::default());
     outputs.for_each(move |workspaces| {
         let file = saved();
-        if let Some(plan) = autostart_tick(&fired, &workspaces, &file) {
+        let plan = autostart_tick(
+            &mut latch.borrow_mut(),
+            std::time::Instant::now(),
+            &workspaces,
+            &file,
+        );
+        if let Some(plan) = plan {
             let entries: Vec<(String, Stack)> = plan
                 .start
                 .iter()
@@ -1349,10 +1535,56 @@ pub(crate) fn spawn_autostart(entries: Vec<(String, Stack)>, saved: Workspaces) 
 /// will not start costs its own card and the rest of the login sequence still
 /// runs. That is also why nothing here returns a `Result`: there is no caller
 /// who could do anything with one.
+///
+/// # A stack that is already on screen is skipped, not started
+///
+/// `systemctl --user restart trollshell` mid-session is the documented dev loop
+/// (CLAUDE.md: *"restarting `trollshell` during dev reconnects without losing
+/// system state"*), and the latch is per **process**, so a restart re-fires the
+/// whole autostart set against stacks that are still running. Nothing is
+/// double-launched — `plan_start`'s `NameTaken` precondition holds — but the
+/// user gets a toast reading *"chat did not start: that name is already on a
+/// workspace"* for every autostarting stack, on a routine action, plus a
+/// pointless round trip each.
+///
+/// So the state is derived per stack **at the moment its turn comes**, not once
+/// for the batch: an earlier stack's Start changes the world the next one is
+/// judged against. [`STARTING`] is deliberately *not* consulted here — every
+/// queued stack is in it, put there by [`spawn_autostart`] — and it does not
+/// need to be, because that same insert is what already filters out a stack a
+/// click has claimed.
 pub(crate) async fn autostart_all(ops: &impl Ops, entries: &[(String, Stack)], saved: &Workspaces) {
     for (name, stack) in entries {
+        if already_on_screen(ops, name).await {
+            tracing::debug!(
+                workspace = name,
+                "autostart skipped: this stack is already on a screen"
+            );
+            // The mark `spawn_autostart` made has to come off, or the card sits
+            // on a spinner with a disabled button for the life of the shell.
+            STARTING.lock_mut().remove(name);
+            continue;
+        }
         run_start(ops, name, stack, saved).await;
     }
+}
+
+/// Whether `name`'s stack is already Active — the same derivation the card
+/// draws from ([`state_of`]), read live.
+///
+/// The empty in-flight set is the load-bearing argument: during an autostart
+/// run every queued stack is marked [`STARTING`], so passing the real set would
+/// make every stack look `Starting` and skip the whole run. See
+/// [`autostart_all`].
+async fn already_on_screen(ops: &impl Ops, name: &str) -> bool {
+    let Ok(workspaces) = ops.workspaces().await else {
+        return false;
+    };
+    let Ok(windows) = ops.windows().await else {
+        return false;
+    };
+    let slice_up = ops.slice_is_up(name).await;
+    state_of(name, &workspaces, &windows, slice_up, &BTreeSet::new()) != StackState::Inactive
 }
 
 // ── Moving a stack to another monitor (#1071 §5) ─────────────────────────────

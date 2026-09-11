@@ -220,6 +220,14 @@ struct Card {
     /// with it, an Inactive one's next Start just reads the file. `None` on an
     /// ephemeral card, which has no stack to rewrite and is not draggable.
     live: Option<u64>,
+    /// The screen `workspaces.toml` records for this stack — **not** the column
+    /// the card is drawn in, which for a stack with no recorded monitor is
+    /// wherever it happens to be running or focused.
+    ///
+    /// What [`drop_plan`] compares against to refuse a card put back where it
+    /// already was. `None` on an ephemeral card and on a saved stack that
+    /// records no screen.
+    monitor: Option<String>,
 }
 
 impl Card {
@@ -332,6 +340,7 @@ fn model(
                 })
                 .collect(),
             live: live.map(|w| w.id),
+            monitor: stack.monitor.clone(),
         };
 
         match stack.monitor.as_deref() {
@@ -382,6 +391,7 @@ fn model(
             // so there is nothing for a drag to rewrite. Its workspace id lives
             // on `Kind::Ephemeral`, where Save uses it.
             live: None,
+            monitor: None,
         });
     }
 
@@ -542,15 +552,9 @@ where
         // page-wide rather than per column. Rebuilt with the model, so it is
         // never more than one revision old — the same currency every other
         // handler on this page has.
-        let live: Rc<BTreeMap<String, u64>> = Rc::new(
-            columns
-                .iter()
-                .flat_map(|c| &c.cards)
-                .filter_map(|card| Some((card.name.clone(), card.workspace_to_move()?)))
-                .collect(),
-        );
+        let droppable = Rc::new(droppable_cards(&columns));
         for column in &columns {
-            columns_box.append(&build_column(column, &meta_cache, &live));
+            columns_box.append(&build_column(column, &meta_cache, &droppable));
         }
     });
 }
@@ -558,7 +562,7 @@ where
 fn build_column(
     column: &Column,
     meta_cache: &MetaCache,
-    live: &Rc<BTreeMap<String, u64>>,
+    droppable: &Rc<BTreeMap<String, Droppable>>,
 ) -> gtk::Widget {
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 8);
     outer.add_css_class("ts-ws-column");
@@ -622,7 +626,7 @@ fn build_column(
     // screen, so there is no connector to record and nowhere for niri to move a
     // workspace to.
     if !column.offline {
-        outer.add_controller(monitor_drop_target(&column.connector, live));
+        outer.add_controller(monitor_drop_target(&column.connector, droppable));
     }
 
     outer.upcast()
@@ -637,7 +641,10 @@ fn build_column(
 ///
 /// `gdk::DragAction::MOVE` rather than `COPY`, which is what it is: a stack
 /// lives on one screen, and the drop moves it rather than duplicating it.
-fn monitor_drop_target(connector: &str, live: &Rc<BTreeMap<String, u64>>) -> gtk::DropTarget {
+fn monitor_drop_target(
+    connector: &str,
+    droppable: &Rc<BTreeMap<String, Droppable>>,
+) -> gtk::DropTarget {
     let target = gtk::DropTarget::new(glib::types::Type::STRING, gdk::DragAction::MOVE);
     // The highlight is on the *column*, so the user can see which screen the
     // card is about to land on while the pointer is still over the gap between
@@ -654,7 +661,7 @@ fn monitor_drop_target(connector: &str, live: &Rc<BTreeMap<String, u64>>) -> gtk
         }
     });
     let connector = connector.to_owned();
-    let live = live.clone();
+    let droppable = droppable.clone();
     target.connect_drop(move |target, value, _, _| {
         if let Some(widget) = target.widget() {
             widget.remove_css_class(COLUMN_DROP_CLASS);
@@ -662,33 +669,95 @@ fn monitor_drop_target(connector: &str, live: &Rc<BTreeMap<String, u64>>) -> gtk
         let Ok(name) = value.get::<String>() else {
             return false;
         };
-        drop_on_monitor(&name, &connector, live.get(&name).copied())
+        // Everything the drop decides is in `drop_plan`, and everything it
+        // *does* is the one line below. The handler holds no logic on purpose:
+        // a GTK drop callback cannot be invoked from a test, so any branch left
+        // in here is a branch nothing can falsify — which is exactly how the
+        // same-screen guard and the Active-workspace hand-off both shipped
+        // unfalsifiable in the first cut (#1106 review F5).
+        let Some(action) = drop_plan(&name, &connector, &droppable) else {
+            return false;
+        };
+        workspace_stacks::spawn_move_to_monitor(action.name, action.monitor, action.workspace);
+        true
     });
     target
 }
 
-/// A card dropped on the column of `connector`: record the screen, and move the
-/// live workspace with it when there is one (#1071 §5).
+/// One card as a drop can see it: what the file records, and what niri has.
 ///
-/// Returns whether the drop changed anything, which is what GTK reports back to
-/// the drag source as success or failure.
+/// Built from the model rather than read back at drop time, and — unlike
+/// [`start_by_name`], which re-reads the file because a card carries no app
+/// list — that is sound here: the model is rebuilt on the config signal itself,
+/// so `monitor` is never staler than one revision of the very file a drop is
+/// about to rewrite.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct Droppable {
+    /// The screen `workspaces.toml` records for this stack, if any.
+    monitor: Option<String>,
+    /// The niri workspace to move with it — `Some` only while Active.
+    workspace: Option<u64>,
+}
+
+/// What a drop on a monitor column should do (#1071 §5). Pure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DropAction {
+    name: String,
+    monitor: String,
+    workspace: Option<u64>,
+}
+
+/// The drop-relevant facts about every card on the page, by stack name.
 ///
-/// The file is re-read **here**, at drop time, for the same reason
-/// [`start_by_name`] re-reads it at click time: the drawer can sit open across
-/// an edit and the page's model is one revision behind at best. It is also what
-/// makes the no-op case cheap — a card dropped back on the screen it already
-/// records writes nothing, so a stray two-pixel drag does not rewrite the
-/// config file.
-fn drop_on_monitor(name: &str, connector: &str, live: Option<u64>) -> bool {
-    let Some(stack) = config_workspaces::current().stacks.get(name).cloned() else {
-        tracing::warn!(workspace = name, "no such stack in workspaces.toml");
-        return false;
-    };
-    if stack.monitor.as_deref() == Some(connector) {
-        return false;
+/// Page-wide rather than per column: a card dropped on a column may have come
+/// from **any** column. Only saved cards appear — an ephemeral one has no entry
+/// in the file for a drop to rewrite.
+fn droppable_cards(columns: &[Column]) -> BTreeMap<String, Droppable> {
+    columns
+        .iter()
+        .flat_map(|c| &c.cards)
+        .filter(|card| matches!(card.kind, Kind::Saved(_)))
+        .map(|card| {
+            (
+                card.name.clone(),
+                Droppable {
+                    monitor: card.monitor.clone(),
+                    workspace: card.workspace_to_move(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Decide a drop of the card `name` onto the column of `connector`.
+///
+/// `None` — nothing to do, which GTK reports back to the drag source as a
+/// refused drop — in exactly two cases:
+///
+/// * the name is not a saved card on this page (an ephemeral card is not
+///   draggable, so this is a drag from somewhere else entirely);
+/// * the stack **already records this screen**. A card picked up and put back
+///   where it was must not rewrite the config file, or every two-pixel
+///   accidental drag rewrites `workspaces.toml`.
+///
+/// Note what is *not* a reason to refuse: a stack with no `monitor` recorded,
+/// dropped on the column it is currently drawn in. That column is where the
+/// focused output happens to be, not a recorded choice, so the drop is the user
+/// saying "here, always" and it writes.
+fn drop_plan(
+    name: &str,
+    connector: &str,
+    droppable: &BTreeMap<String, Droppable>,
+) -> Option<DropAction> {
+    let card = droppable.get(name)?;
+    if card.monitor.as_deref() == Some(connector) {
+        return None;
     }
-    workspace_stacks::spawn_move_to_monitor(name.to_owned(), connector.to_owned(), live);
-    true
+    Some(DropAction {
+        name: name.to_owned(),
+        monitor: connector.to_owned(),
+        workspace: card.workspace,
+    })
 }
 
 /// The drag half: a saved card carries its stack's name (#1071 §5).
@@ -705,13 +774,19 @@ fn card_drag_source(name: &str) -> gtk::DragSource {
     let source = gtk::DragSource::new();
     source.set_actions(gdk::DragAction::MOVE);
     let name = name.to_owned();
-    source.connect_prepare(move |source, _, _| {
+    // `prepare` is the *content* callback and nothing else. Dimming the card
+    // rides `drag-begin`, which is the signal `drag-end` below is paired with —
+    // today returning `Some` from prepare is what begins the drag, so the two
+    // coincide, but a `prepare` that ever returns without a drag beginning
+    // would leave the class on with no `drag-end` to take it off (#1106 review
+    // INFO 10).
+    source.connect_prepare(move |_, _, _| Some(gdk::ContentProvider::for_value(&name.to_value())));
+    source.connect_drag_begin(|source, _| {
         // Dim the card while it is in flight, so the column it came from does
         // not look like it still holds it.
         if let Some(widget) = source.widget() {
             widget.add_css_class(CARD_DRAGGING_CLASS);
         }
-        Some(gdk::ContentProvider::for_value(&name.to_value()))
     });
     source.connect_drag_end(|source, _, _| {
         if let Some(widget) = source.widget() {
@@ -1059,9 +1134,11 @@ mod fixtures {
 #[cfg(test)]
 mod model_tests {
     use super::fixtures::{LEFT, RIGHT, no_stacks, saved, stack, win, ws, ws_focused};
-    use super::{Card, Column, Kind, StackState, model};
+    use super::{
+        Card, Column, DropAction, Droppable, Kind, StackState, drop_plan, droppable_cards, model,
+    };
     use crate::config::workspaces::Workspaces;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// The model with nothing in flight and no slice up — the common case.
     fn built(
@@ -1468,6 +1545,144 @@ mod model_tests {
         assert!(matches!(card.kind, Kind::Ephemeral { workspace: 1 }));
         assert_eq!(card.live, None);
         assert_eq!(card.workspace_to_move(), None);
+    }
+
+    // ── #1071 §5, the drop path (review F5) ──────────────────────────────────
+    //
+    // The GTK handler is three lines and holds no decision, because a
+    // `connect_drop` callback cannot be invoked from a test — so a branch left
+    // inside it is a branch nothing can falsify, which is exactly how the
+    // same-screen guard and the Active-workspace hand-off both shipped
+    // unfalsifiable. Everything the drop decides now lives in `drop_plan` and
+    // `droppable_cards`, and both are here.
+
+    /// A card dropped on a screen it does not already record moves — and takes
+    /// its live workspace with it when it has one.
+    #[test]
+    fn a_drop_on_another_screen_records_it_and_carries_an_active_workspace() {
+        let cards = BTreeMap::from([
+            (
+                "chat".to_owned(),
+                Droppable {
+                    monitor: Some(LEFT.to_owned()),
+                    workspace: Some(7),
+                },
+            ),
+            (
+                "dev".to_owned(),
+                Droppable {
+                    monitor: Some(LEFT.to_owned()),
+                    workspace: None,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            drop_plan("chat", RIGHT, &cards),
+            Some(DropAction {
+                name: "chat".to_owned(),
+                monitor: RIGHT.to_owned(),
+                workspace: Some(7),
+            }),
+            "an Active stack's workspace follows it across screens"
+        );
+        assert_eq!(
+            drop_plan("dev", RIGHT, &cards),
+            Some(DropAction {
+                name: "dev".to_owned(),
+                monitor: RIGHT.to_owned(),
+                workspace: None,
+            }),
+            "an Inactive stack is the file change and nothing else"
+        );
+    }
+
+    /// A card put back on the screen it already records changes nothing — so a
+    /// two-pixel accidental drag does not rewrite `workspaces.toml`.
+    #[test]
+    fn a_drop_on_the_screen_it_already_records_does_nothing() {
+        let cards = BTreeMap::from([(
+            "chat".to_owned(),
+            Droppable {
+                monitor: Some(LEFT.to_owned()),
+                workspace: Some(7),
+            },
+        )]);
+        assert_eq!(drop_plan("chat", LEFT, &cards), None);
+    }
+
+    /// …but a stack that records **no** screen, dropped on the column it is
+    /// merely drawn in, does write: that column is where the focused output
+    /// happens to be, not a recorded choice, so the drop is the user saying
+    /// "here, always".
+    #[test]
+    fn a_drop_pins_a_stack_that_recorded_no_screen() {
+        let cards = BTreeMap::from([(
+            "chat".to_owned(),
+            Droppable {
+                monitor: None,
+                workspace: None,
+            },
+        )]);
+        assert_eq!(
+            drop_plan("chat", LEFT, &cards).map(|a| a.monitor),
+            Some(LEFT.to_owned())
+        );
+    }
+
+    /// A name that is not a saved card on this page is refused rather than
+    /// guessed at.
+    #[test]
+    fn a_drop_of_something_that_is_not_a_card_is_refused() {
+        assert_eq!(drop_plan("chat", LEFT, &BTreeMap::new()), None);
+    }
+
+    /// The map the handler reads is built from the model: an Active card hands
+    /// over its workspace, an Inactive one hands over `None`, and an ephemeral
+    /// card is not in it at all.
+    ///
+    /// This is the other half of what shipped untested — `Card::workspace_to_move`
+    /// was covered and the map that feeds the handler was not.
+    #[test]
+    fn droppable_cards_carries_the_recorded_screen_and_the_active_workspace() {
+        let file = saved(&[
+            ("chat", stack(Some(LEFT), &["firefox"])),
+            ("dev", stack(Some(RIGHT), &["Alacritty"])),
+        ]);
+        let columns = built(
+            &[
+                // `chat` is live with a window → Active.
+                ws_focused(1, 1, LEFT, Some("chat")),
+                // `dev` is named but empty → Inactive, lingering.
+                ws(2, 1, RIGHT, Some("dev")),
+                // …and an unnamed, populated workspace → an ephemeral card.
+                ws(3, 2, LEFT, None),
+            ],
+            &[win(9, 1, "firefox", 1), win(10, 3, "thunderbird", 1)],
+            &file,
+        );
+        let cards = droppable_cards(&columns);
+
+        assert_eq!(
+            cards.keys().collect::<Vec<_>>(),
+            ["chat", "dev"],
+            "saved cards only — an ephemeral card has no entry to rewrite"
+        );
+        assert_eq!(
+            cards["chat"],
+            Droppable {
+                monitor: Some(LEFT.to_owned()),
+                workspace: Some(1),
+            }
+        );
+        assert_eq!(
+            cards["dev"],
+            Droppable {
+                monitor: Some(RIGHT.to_owned()),
+                workspace: None,
+            },
+            "Inactive: the lingering empty workspace is not moved"
+        );
     }
 }
 

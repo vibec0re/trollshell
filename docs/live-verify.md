@@ -2688,8 +2688,23 @@ trollshell-plugin-<id>.service`) while `tr '\0' '\n' < /proc/<pid>/cmdline`
   - **…and a stack whose screen is not plugged in is skipped.** Set
     `monitor = "DP-9"` on an autostarting stack. At login it must **not** start
     anywhere, and the journal must carry exactly one `info` line naming the
-    stack and `DP-9`. Its card keeps its ▶ — hot-plug autostart is deliberately
-    out of scope, so plugging the screen in later does **not** start it.
+    stack and `DP-9` — arriving about **five seconds** after the first screen
+    appears, not immediately. Its card keeps its ▶; plugging the screen in after
+    that line has been logged does **not** start it (hot-plug autostart is
+    deliberately out of scope).
+  - **…but a screen that arrives a beat late still counts.** The five seconds
+    are the settle window (review LOW 7): at login `trollshell.service` and
+    `kanshi` come up together under `niri-session.target`, so niri's first
+    `WorkspacesChanged` can easily predate the kanshi profile enabling a screen.
+    With a kanshi profile that enables a second output, an autostarting stack
+    pinned to that output **must** come up on it. If it lands on `plan.skipped`
+    instead, the settle window has regressed to a latch on the first snapshot.
+  - **…and a restart does not toast you.** The one to run after any change
+    here: with two autostarting stacks **running**, `systemctl --user restart
+trollshell`. Expect the cards to come back Active and **no notification at
+    all**. A toast per stack reading "… did not start: that name is already on a
+    workspace" means the already-on-screen check is gone; nothing is
+    double-launched either way, so the toast is the only symptom.
   - **Card order decides where a started workspace lands.** With
     `order = ["chat", "dev"]` and both pinned to the same screen, start `dev`
     first and then `chat`. `niri msg workspaces` must show `chat` at a **lower
@@ -2715,6 +2730,21 @@ trollshell-plugin-<id>.service`) while `tr '\0' '\n' < /proc/<pid>/cmdline`
   - **In-column reordering is still phase 4.** Dragging a card up or down
     _within_ one column does nothing — §5 puts the order's drag handles in the
     Edit sub-page, which does not exist yet. Only the screen changes.
+  - **A drag can be cancelled by a rebuild, and that is not a bug.** The page
+    rebuilds every column on any of the five signals it maps over, `windows`
+    included, and GTK cancels a drag whose source widget goes away. So a window
+    opening anywhere while a card is mid-flight ends the drag. Drag again. It
+    reads as flakiness and is a rebuild (review INFO 9).
+  - **Two of a stack's apps in one niri column.** A known limit, not a
+    regression (review LOW 6): niri decides column membership, and two of the
+    stack's windows stacked in one column get one `MoveColumnToIndex` each
+    against that same column, so the second immediately moves what the first
+    placed. A freshly Started workspace opens each window in its own column, so
+    you need an adopted workspace or a niri config that consumes to see it. A
+    **floating** window is different and is handled: it takes no column index at
+    all, so the tiled apps around it are not shifted — open a stack app floating
+    (`niri msg action toggle-window-floating`) and confirm the rest still land
+    at 1, 2, 3.
 
 ## Control-center
 

@@ -12,7 +12,7 @@ pub const APP_ID_PREFIX: &str = "mov.vibec0re.trollshell.AgentWindow";
 /// Which tab the window opens on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tab {
-    /// hyperhive's agent page in the WebKitGTK view.
+    /// hyperhive's agent page in the `WebKitGTK` view.
     #[default]
     Agent,
     /// Our own settings page — what the card's pen opens (Annika on #947,
@@ -131,7 +131,7 @@ where
 ///
 /// # Why per-agent, and not one id with a window registry
 ///
-/// GApplication already does single-instance for us: a second process with
+/// `GApplication` already does single-instance for us: a second process with
 /// the same id finds the primary instance over the session bus, hands it the
 /// command line (this app sets
 /// [`HANDLES_COMMAND_LINE`](gtk::gio::ApplicationFlags::HANDLES_COMMAND_LINE),
@@ -141,7 +141,7 @@ where
 /// `--agent other` is simply a different application.
 ///
 /// The alternative — one shared id plus a `HashMap<AgentName, Window>` — costs
-/// a registry, a lifetime for it, and one process whose WebKit crash takes
+/// a registry, a lifetime for it, and one process whose `WebKit` crash takes
 /// every agent's window with it. It would buy one thing back: a single app-id
 /// for niri window rules. That is recoverable with a prefix regex on
 /// [`APP_ID_PREFIX`], which `docs/live-verify.md` spells out, so it is the
@@ -149,12 +149,12 @@ where
 ///
 /// # The mangling
 ///
-/// GLib requires each dot-separated element to be ASCII alphanumeric plus
+/// `GLib` requires each dot-separated element to be ASCII alphanumeric plus
 /// `-`/`_` and to start with a letter, where hyperhive's `Ident` allows a name
 /// to start with a digit or a `-` (`[a-z0-9-]{1,63}`). So every character
 /// outside `[A-Za-z0-9_]` becomes `_` and a leading non-letter is prefixed —
 /// a **total** function, because a name that reached here already passed
-/// [`AgentName::parse`] and must not be able to produce an id GLib rejects at
+/// [`AgentName::parse`] and must not be able to produce an id `GLib` rejects at
 /// `Application::new`, which aborts.
 ///
 /// Two agents can therefore share an id only by colliding under that mangling
@@ -163,10 +163,10 @@ where
 pub fn app_id(agent: &AgentName) -> String {
     let mut suffix = String::with_capacity(agent.as_str().len() + 1);
     let mut chars = agent.as_str().chars();
-    if let Some(first) = chars.next() {
-        if !first.is_ascii_alphabetic() {
-            suffix.push('a');
-        }
+    if let Some(first) = chars.next()
+        && !first.is_ascii_alphabetic()
+    {
+        suffix.push('a');
     }
     for c in agent.as_str().chars() {
         if c.is_ascii_alphanumeric() || c == '_' {
@@ -274,7 +274,7 @@ mod tests {
     /// **The dedup decision**: one id per agent, the same one every time.
     ///
     /// This is the whole of "a second launch for the same agent focuses the
-    /// existing one" that is ours — the rest is GApplication's, which keys its
+    /// existing one" that is ours — the rest is `GApplication`'s, which keys its
     /// single-instance registration on exactly this string.
     ///
     /// Mutation (verified red): put anything per-launch in the id (a pid, a
@@ -287,7 +287,7 @@ mod tests {
         assert!(app_id(&name("stray")).starts_with(APP_ID_PREFIX));
     }
 
-    /// Every id this can produce is one GLib will accept — asked of **GLib**,
+    /// Every id this can produce is one `GLib` will accept — asked of **`GLib`**,
     /// over the whole `Ident` charset including the shapes that need the
     /// mangling (a leading digit, a leading and trailing hyphen, the 63-char
     /// maximum).

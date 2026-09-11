@@ -27,7 +27,7 @@ fn name(s: &str) -> AgentName {
 /// Wait for the next update, with a generous bound so a broken loop fails by
 /// name instead of hanging the suite.
 async fn next(rx: &mut mpsc::UnboundedReceiver<Update>, what: &str) -> Update {
-    tokio::time::timeout(Duration::from_secs(60), rx.recv())
+    tokio::time::timeout(Duration::from_mins(1), rx.recv())
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
         .unwrap_or_else(|| panic!("the feed ended before {what}"))
@@ -176,7 +176,7 @@ async fn each_button_sends_its_verb_once_and_repolls() {
         hive.path().to_path_buf(),
         name("stray"),
         // An hour, so nothing here can be a tick that happened to land.
-        Duration::from_secs(3600),
+        Duration::from_hours(1),
         cmd_rx,
         out_tx,
     ));

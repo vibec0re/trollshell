@@ -371,6 +371,7 @@ mod tests {
 #[cfg(all(test, feature = "system-tests"))]
 mod gtk_tests {
     use super::{Header, Press, Settings};
+    use gtk::prelude::ToggleButtonExt as _;
     use crate::chrome::{Controls, Facts, HeaderModel};
     use crate::feed::AgentState;
     use hytte_plugin_agents::config::AgentsConfig;

@@ -3,7 +3,7 @@
 //! [#947](https://github.com/vibec0re/trollshell/issues/947); spec
 //! `docs/superpowers/specs/2026-09-07-agentic-desktop-design.md` §7).
 //!
-//! **Our chrome, their page.** The body is a WebKitGTK view of hyperhive's own
+//! **Our chrome, their page.** The body is a `WebKitGTK` view of hyperhive's own
 //! per-agent page with `?hide=header,input` appended; everything around it —
 //! the header with the agent's icon, name, short model word and the **live
 //! status read from `host.sock`**, start/stop/pause, and a settings tab — is
@@ -16,7 +16,7 @@
 //! It is the `trollshell-control-center` shape: a separate windowed
 //! GTK4/libadwaita binary, **never linked into the shell**, launched out of
 //! process by the agents plugin through #953's detached `RunCommand` so it
-//! outlives a `trollshell.service` restart. WebKitGTK therefore lands only
+//! outlives a `trollshell.service` restart. `WebKitGTK` therefore lands only
 //! here — the shell links no web engine.
 //!
 //! # Why the window never reads the page's DOM
@@ -30,7 +30,7 @@
 //!
 //! # One window per agent
 //!
-//! The application id carries the agent ([`cli::app_id`]), so GApplication's
+//! The application id carries the agent ([`cli::app_id`]), so `GApplication`'s
 //! own single-instance machinery *is* the feature: a second
 //! `--agent <same name>` finds the running process, hands it the command line
 //! (`HANDLES_COMMAND_LINE`, so the pen's `--tab settings` is honoured rather

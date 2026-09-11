@@ -1,5 +1,5 @@
 //! The `trollshell-agent-window` binary: parse the command line, register the
-//! per-agent application, and build the window when GApplication says to.
+//! per-agent application, and build the window when `GApplication` says to.
 //!
 //! The window itself and everything it shows live in the library crate — see
 //! its module docs for the design, and `cli::app_id` for why the application
@@ -45,10 +45,10 @@ fn main() -> glib::ExitCode {
         )
         .init();
 
-    let argv: Vec<String> = std::env::args().collect();
+    let command_line: Vec<String> = std::env::args().collect();
     // Parsed **here**, before the application exists, because the app id is
     // derived from `--agent` and `Application::new` aborts on an invalid one.
-    let args = match cli::parse(&argv[1..]) {
+    let args = match cli::parse(&command_line[1..]) {
         Ok(args) => args,
         Err(e) => {
             eprintln!("trollshell-agent-window: {e}\n{}", cli::USAGE);
@@ -102,17 +102,17 @@ fn main() -> glib::ExitCode {
         let mut slot = state.borrow_mut();
         let window = slot.get_or_insert_with(|| Window::build(app, &args.agent, &handle));
         window.show_tab(args.tab);
-        window.window.present();
+        window.toplevel.present();
         glib::ExitCode::SUCCESS
     });
 
-    app.run_with_args(&argv)
+    app.run_with_args(&command_line)
 }
 
 /// One agent's window: the chrome, the page, and the lane its buttons write
 /// to.
 struct Window {
-    window: adw::ApplicationWindow,
+    toplevel: adw::ApplicationWindow,
     stack: adw::ViewStack,
     header: ui::Header,
     settings: ui::Settings,
@@ -172,7 +172,7 @@ impl Window {
         body.append(&banner);
         body.append(&stack);
 
-        let window = adw::ApplicationWindow::builder()
+        let toplevel = adw::ApplicationWindow::builder()
             .application(app)
             .default_width(960)
             .default_height(720)
@@ -184,7 +184,7 @@ impl Window {
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let this = Rc::new(Self {
-            window,
+            toplevel,
             stack,
             header,
             settings,

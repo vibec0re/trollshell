@@ -25,14 +25,14 @@
 //! The **system store** is the default, and the right fix on NixOS is to put
 //! the bundle in it:
 //!
-//! ```nix
+//! ```text
 //! security.pki.certificateFiles = [ "/var/lib/hive-tls/trust-bundle.pem" ];
 //! ```
 //!
 //! which this window (and every browser on the machine) then picks up for
 //! free. [`CA_ENV`] is the per-window override for when that is not available
 //! — a hive whose bundle you can read but whose host config you do not own —
-//! and it is deliberately **scoped to the agent's own host**: WebKit is told
+//! and it is deliberately **scoped to the agent's own host**: `WebKit` is told
 //! to accept that one certificate for that one host, never to stop checking.
 //!
 //! There is no "ignore TLS errors" setting anywhere in this window, and
@@ -114,7 +114,7 @@ pub fn policy(ca: Option<&str>, url: &str) -> TlsPolicy {
 }
 
 /// The host part of an `http(s)` URL — no port, no userinfo, IPv6 literal kept
-/// with its brackets (which is the form WebKit's host matching uses).
+/// with its brackets (which is the form `WebKit`'s host matching uses).
 ///
 /// Hand-rolled rather than a `url` crate dependency: this is the only URL
 /// parsing in the window, it runs on one string the hive produced, and a
@@ -158,7 +158,7 @@ mod tests {
     /// else.
     ///
     /// Mutation (verified red): make the policy global — drop the `host` field
-    /// and hand WebKit a session-wide grant, or return `Ignore` from
+    /// and hand `WebKit` a session-wide grant, or return `Ignore` from
     /// `errors_policy` — and both assertions here red. That is the whole
     /// guard: "the CA is trusted programmatically" (spec §7.1) must never
     /// become "TLS errors are ignored".

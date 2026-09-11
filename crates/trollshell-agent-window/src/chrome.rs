@@ -87,6 +87,13 @@ impl HeaderModel {
 }
 
 /// Which of the lifecycle buttons are live, and what the pause toggle shows.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one flag per widget property, the way `AgentStatusRow` carries one per hive flag \
+              (and with the same allow): these are three separate widgets' states plus the \
+              gate, not a state machine — `can_start`/`can_stop` are exclusive but `paused` is \
+              orthogonal to both, so an enum over them would have to enumerate the product"
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Controls {
     /// `Start` is offered — the agent is stopped.

@@ -3,7 +3,7 @@
 //!
 //! The window is `trollshell-agent-window`, a separate GTK4 + libadwaita
 //! binary on the `trollshell-control-center` precedent: our chrome (header,
-//! live status, start/stop/pause, a settings tab) around a WebKitGTK view of
+//! live status, start/stop/pause, a settings tab) around a `WebKitGTK` view of
 //! hyperhive's own agent page. It is **never linked into this plugin** — the
 //! plugin only asks the host to launch it, with
 //! [`Effect::launch`](hytte_plugin::proto::Effect::launch) (#953's detached
@@ -43,7 +43,7 @@ pub const ARG_TAB: &str = "--tab";
 /// The window's two tabs, as its `--tab` argument spells them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
-    /// hyperhive's agent page in the WebKitGTK view — the window's default,
+    /// hyperhive's agent page in the `WebKitGTK` view — the window's default,
     /// and what the agent-page link opens.
     Agent,
     /// The agent's settings, which the card's **pen** opens (Annika on

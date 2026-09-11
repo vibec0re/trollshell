@@ -1,4 +1,4 @@
-//! The URL the WebKitGTK view loads: hyperhive's own agent page, with the
+//! The URL the `WebKitGTK` view loads: hyperhive's own agent page, with the
 //! chrome it would draw for itself suppressed.
 //!
 //! # `?hide=header,input`
@@ -13,7 +13,7 @@
 //! > **`?hide=` on the per-agent page**, comma-separated list of elements to
 //! > suppress: `header` hides the header chrome, `input` the composer/input
 //! > footer, `header,input` both, leaving just the live feed (what P2 wants
-//! > for the WebKitGTK-embedded view). Unknown values in the list are ignored.
+//! > for the `WebKitGTK`-embedded view). Unknown values in the list are ignored.
 //!
 //! So this is **one constant**, and everything else about the page is the
 //! hive's business. The window's own chrome — the header with the live status

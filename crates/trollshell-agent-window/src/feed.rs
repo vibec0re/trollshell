@@ -152,12 +152,11 @@ pub async fn run(
     mut cmds: UnboundedReceiver<Request>,
     out: UnboundedSender<Update>,
 ) {
-    if let Ok(resp) = client::request(&socket, &Request::Urls).await {
-        if let Some(urls) = resp.urls {
-            if out.send(Update::Urls(Box::new(urls))).is_err() {
-                return;
-            }
-        }
+    if let Ok(resp) = client::request(&socket, &Request::Urls).await
+        && let Some(urls) = resp.urls
+        && out.send(Update::Urls(Box::new(urls))).is_err()
+    {
+        return;
     }
 
     let mut last: Option<AgentState> = None;
@@ -174,10 +173,10 @@ pub async fn run(
             biased;
             cmd = cmds.recv() => {
                 let Some(req) = cmd else { return };
-                if let Err(reason) = write(&socket, &req).await {
-                    if out.send(Update::Refused { request: req, reason }).is_err() {
-                        return;
-                    }
+                if let Err(reason) = write(&socket, &req).await
+                    && out.send(Update::Refused { request: req, reason }).is_err()
+                {
+                    return;
                 }
                 if poll_once(&socket, &name, &out, &mut last).await.is_err() {
                     return;
@@ -233,13 +232,14 @@ mod tests {
         AgentName::parse(s).expect("a legal test name")
     }
 
-    fn answer(rows: Vec<AgentStatusRow>) -> Result<Response, HiveError> {
-        Ok(Response {
+    /// One good `AgentStatus` answer, in the shape the client hands over.
+    fn answer(rows: Vec<AgentStatusRow>) -> Response {
+        Response {
             version: 1,
             ok: true,
             agent_statuses: Some(rows),
             ..Response::default()
-        })
+        }
     }
 
     /// The three verbs serialize to the **exact** lines the card sends — the
@@ -307,7 +307,7 @@ mod tests {
                 ..AgentStatusRow::default()
             },
         ];
-        let s = AgentState::of(&answer(rows), &name("stray"));
+        let s = AgentState::of(&Ok(answer(rows)), &name("stray"));
         let agent = s.agent().expect("the roster carries stray");
         assert_eq!(agent.name.as_str(), "stray");
         assert_eq!(agent.status(), Status::Paused);
@@ -321,9 +321,12 @@ mod tests {
             name: "other".to_owned(),
             ..AgentStatusRow::default()
         }];
-        assert_eq!(AgentState::of(&answer(rows), &name("stray")), AgentState::Unknown);
         assert_eq!(
-            AgentState::of(&answer(Vec::new()), &name("stray")),
+            AgentState::of(&Ok(answer(rows)), &name("stray")),
+            AgentState::Unknown
+        );
+        assert_eq!(
+            AgentState::of(&Ok(answer(Vec::new())), &name("stray")),
             AgentState::Unknown
         );
     }

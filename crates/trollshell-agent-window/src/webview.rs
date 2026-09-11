@@ -1,4 +1,4 @@
-//! The embedded engine — **the one place this crate names WebKitGTK**.
+//! The embedded engine — **the one place this crate names `WebKitGTK`**.
 //!
 //! Spec #955 §7.1 decided the engine for v1 (`webkitgtk_6_0` through the
 //! `webkit6` gtk-rs crate) and recorded Servo as a *re-check*, not a someday:
@@ -57,7 +57,7 @@ pub fn page(url: &str, policy: &TlsPolicy) -> gtk::Widget {
         .build();
 
     // Deliberately **not** "accept and reload": that would be trust on first
-    // use with no human in it. Returning `false` lets WebKit render its own
+    // use with no human in it. Returning `false` lets `WebKit` render its own
     // failure page, and the log line names the way out.
     view.connect_load_failed_with_tls_errors(move |_, failing_uri, _cert, errors| {
         tracing::warn!(

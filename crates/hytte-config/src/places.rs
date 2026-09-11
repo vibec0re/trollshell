@@ -2397,4 +2397,213 @@ mine = true
     fn load_from(path: &Path) -> Vec<Place> {
         parse_places(&std::fs::read_to_string(path).expect("readable")).expect("parses")
     }
+
+    // ── Departures endpoint (#1124) ───────────────────────────────────────────
+
+    #[test]
+    fn resolve_departures_endpoint_defaults_to_bvg_when_absent_or_blank() {
+        assert_eq!(
+            resolve_departures_endpoint(None).unwrap(),
+            "https://v6.bvg.transport.rest"
+        );
+        assert_eq!(
+            resolve_departures_endpoint(Some("   ")).unwrap(),
+            "https://v6.bvg.transport.rest"
+        );
+    }
+
+    #[test]
+    fn resolve_departures_endpoint_maps_the_three_short_names() {
+        assert_eq!(
+            resolve_departures_endpoint(Some("bvg")).unwrap(),
+            "https://v6.bvg.transport.rest"
+        );
+        assert_eq!(
+            resolve_departures_endpoint(Some("vbb")).unwrap(),
+            "https://v6.vbb.transport.rest"
+        );
+        assert_eq!(
+            resolve_departures_endpoint(Some("db")).unwrap(),
+            "https://v6.db.transport.rest"
+        );
+    }
+
+    #[test]
+    fn resolve_departures_endpoint_accepts_a_full_url_verbatim() {
+        assert_eq!(
+            resolve_departures_endpoint(Some("https://v6.hvv.transport.rest/")).unwrap(),
+            "https://v6.hvv.transport.rest",
+            "trailing slash trimmed"
+        );
+    }
+
+    #[test]
+    fn resolve_departures_endpoint_rejects_an_unknown_name_with_a_hint() {
+        let err = resolve_departures_endpoint(Some("hamburg")).unwrap_err();
+        assert_eq!(
+            err,
+            PlacesError::Endpoint {
+                value: "hamburg".to_owned()
+            }
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("bvg") && text.contains("vbb") && text.contains("db"),
+            "hint should list the three names, got: {text}"
+        );
+    }
+
+    #[test]
+    fn validate_departures_endpoint_agrees_with_resolve() {
+        assert!(validate_departures_endpoint(None).is_ok());
+        assert!(validate_departures_endpoint(Some("db")).is_ok());
+        assert!(validate_departures_endpoint(Some("hamburg")).is_err());
+    }
+
+    #[test]
+    fn parse_departures_endpoint_reads_absent_present_and_blank() {
+        assert_eq!(parse_departures_endpoint("").unwrap(), None);
+        assert_eq!(
+            parse_departures_endpoint("[[place]]\nname = \"Home\"\n").unwrap(),
+            None,
+            "no [departures] table at all"
+        );
+        assert_eq!(
+            parse_departures_endpoint("[departures]\nendpoint = \"vbb\"\n").unwrap(),
+            Some("vbb".to_owned())
+        );
+        assert_eq!(
+            parse_departures_endpoint("[departures]\nendpoint = \"  \"\n").unwrap(),
+            None,
+            "a blank value reads the same as absent"
+        );
+    }
+
+    #[test]
+    fn parse_departures_endpoint_malformed_is_err() {
+        assert!(parse_departures_endpoint("[departures]\nendpoint = ").is_err());
+    }
+
+    /// A file with no `[departures]` table, an unrelated top-level table and a
+    /// `[[place]]` array — the same shape [`FIXTURE`] in
+    /// `places_byte_identical.rs` pins, kept local here so this file's own
+    /// tests don't depend on an integration test's fixture.
+    const NO_DEPARTURES_TABLE: &str = "# A comment.\n\n[[place]]\nname = \"Home\"\nlat = 1.0\nlon = 2.0\n\n[unrelated]\nkept = true\n";
+
+    #[test]
+    fn render_departures_endpoint_absent_key_leaves_a_table_less_file_untouched() {
+        // The writer's half of the byte-identical promise: nothing to do when
+        // there is no key and nothing was asked for.
+        let rendered = render_departures_endpoint(NO_DEPARTURES_TABLE, None).unwrap();
+        assert_eq!(rendered, NO_DEPARTURES_TABLE);
+    }
+
+    #[test]
+    fn render_departures_endpoint_writes_a_fresh_table_and_preserves_the_rest() {
+        let rendered = render_departures_endpoint(NO_DEPARTURES_TABLE, Some("vbb")).unwrap();
+        assert!(rendered.contains("[departures]"));
+        assert!(rendered.contains("endpoint = \"vbb\""));
+        // Everything else — the comment, the place, the unrelated table —
+        // survives untouched.
+        assert!(rendered.contains("# A comment."));
+        assert!(rendered.contains("name = \"Home\""));
+        assert!(rendered.contains("[unrelated]\nkept = true"));
+        // A reparse gets the same value back.
+        assert_eq!(
+            parse_departures_endpoint(&rendered).unwrap(),
+            Some("vbb".to_owned())
+        );
+    }
+
+    #[test]
+    fn render_departures_endpoint_updates_an_existing_key_and_keeps_its_comment() {
+        let existing = "# a hand comment on the key\n[departures]\nendpoint = \"vbb\" # was vbb\n";
+        let rendered = render_departures_endpoint(existing, Some("db")).unwrap();
+        assert!(rendered.contains("# a hand comment on the key"));
+        assert!(rendered.contains("endpoint = \"db\""));
+        assert!(
+            !rendered.contains("was vbb"),
+            "the trailing value comment does not survive a changed value, matching `station`"
+        );
+    }
+
+    #[test]
+    fn render_departures_endpoint_none_removes_the_key_and_the_table() {
+        let existing = "[departures]\nendpoint = \"vbb\"\n";
+        let rendered = render_departures_endpoint(existing, None).unwrap();
+        assert_eq!(parse_departures_endpoint(&rendered).unwrap(), None);
+        assert!(
+            !rendered.contains("[departures]"),
+            "an emptied table is dropped entirely, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_departures_endpoint_none_keeps_a_departures_table_with_other_keys() {
+        let existing = "[departures]\nendpoint = \"vbb\"\nunrelated_future_key = true\n";
+        let rendered = render_departures_endpoint(existing, None).unwrap();
+        assert_eq!(parse_departures_endpoint(&rendered).unwrap(), None);
+        assert!(
+            rendered.contains("[departures]") && rendered.contains("unrelated_future_key"),
+            "a table with a key this model doesn't own survives, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_departures_endpoint_rejects_an_invalid_value_and_touches_nothing() {
+        let err = render_departures_endpoint(NO_DEPARTURES_TABLE, Some("hamburg")).unwrap_err();
+        assert_eq!(
+            err,
+            PlacesError::Endpoint {
+                value: "hamburg".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn render_departures_endpoint_refuses_a_non_table_departures_key() {
+        let existing = "departures = \"not a table\"\n";
+        assert!(matches!(
+            render_departures_endpoint(existing, Some("vbb")),
+            Err(PlacesError::Encode(_))
+        ));
+    }
+
+    #[test]
+    fn persist_departures_endpoint_to_writes_and_reads_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("places.toml");
+        std::fs::write(&path, NO_DEPARTURES_TABLE).expect("seed");
+
+        persist_departures_endpoint_to(&path, Some("db")).expect("persist");
+        let saved = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            parse_departures_endpoint(&saved).unwrap(),
+            Some("db".to_owned())
+        );
+        // The rest of the file is untouched.
+        assert!(saved.contains("name = \"Home\""));
+        assert!(saved.contains("[unrelated]\nkept = true"));
+
+        // An invalid value is refused and the file is left exactly as it was.
+        let before = std::fs::read_to_string(&path).expect("readable");
+        assert!(persist_departures_endpoint_to(&path, Some("hamburg")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).expect("readable"), before);
+
+        // Unsetting it again round-trips to the table-less shape.
+        persist_departures_endpoint_to(&path, None).expect("unset");
+        let cleared = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(parse_departures_endpoint(&cleared).unwrap(), None);
+        assert!(!cleared.contains("[departures]"));
+    }
+
+    #[test]
+    fn save_departures_endpoint_no_config_path_without_home() {
+        temp_env::with_var_unset("HOME", || {
+            assert_eq!(
+                save_departures_endpoint(Some("vbb")),
+                Err(PlacesError::NoConfigPath)
+            );
+        });
+    }
 }

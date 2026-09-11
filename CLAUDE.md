@@ -83,10 +83,10 @@ Since #1115 the package build no longer runs any tests at all (see
 "Packaging" above), so the flake's `checks` output (`flake.nix`) is where
 every test suite runs, plus a fair bit more:
 
-- `checks.workspace-tests` runs the hermetic internals suite (`cargo test
-  --workspace`, still deliberately without `system-tests`) — the same command
-  the package build's `doCheck` used to run on every `nix build`, now gated
-  here instead (#1115).
+- `checks.workspace-tests` runs the hermetic internals suite (still
+  deliberately without `system-tests`) — the same suite the package build's
+  `doCheck` used to run on every `nix build`, now gated here instead
+  (#1115).
 - `cargo clippy --workspace --all-targets --features system-tests -- -D warnings`
   (the `system-tests` feature is enabled here so the gated integration tests
   and GTK `mod tests` blocks are lint-checked too, not just compiled once and

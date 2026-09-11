@@ -253,7 +253,11 @@ let
   # convention as hyperhive's `cargoArtifactsBinOnly`
   # (`hyperhive/nix/rust.nix:77-94`).
   cargoArtifactsBinOnly = craneLib.buildDepsOnly (
-    commonArgs // { pname = "trollshell-workspace-bin"; doCheck = false; }
+    commonArgs
+    // {
+      pname = "trollshell-workspace-bin";
+      doCheck = false;
+    }
   );
 
   # THE workspace compile — the single cargo invocation that produces every

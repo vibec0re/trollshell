@@ -63,8 +63,8 @@ use hytte_config::subsystem::{ConfigError, InvalidValue, Subsystem, keep};
 use hytte_config::xdg;
 
 /// The layout template applied once, after every app of a stack has launched
-/// (#1071 §3.4 step 4). Applying it is phase 3; the file carries it from phase
-/// 2 so a stack saved now does not need re-editing then.
+/// (#1071 §3.4 step 4). The file has carried it since phase 2; phase 3 is what
+/// spawns `hytte-plugin-niri-layouts apply <layout>` at the end of a Start.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Layout {
     /// Every column the same width.
@@ -119,9 +119,11 @@ pub struct StackApp {
 pub struct Stack {
     /// The connector this stack's workspace lives on. `None` = the focused
     /// monitor at Start time (#1071 §3.1). There is no monitor *field* in the
-    /// UI — a card is moved by dragging it between columns (phase 3).
+    /// UI — a card is moved by dragging it between the page's monitor columns,
+    /// which is what `set_stack_monitor` writes (§5).
     pub monitor: Option<String>,
-    /// Start this stack at session start (#1071 §3.5). Honoured in phase 3.
+    /// Start this stack at session start (#1071 §3.5), eagerly and once, after
+    /// niri reports its outputs — `workspace_stacks::autostart_plan`.
     pub autostart: bool,
     pub layout: Layout,
     /// In stack order, which **is** niri's column order (#1071 §3.4 step 3).
@@ -300,8 +302,9 @@ impl Subsystem for WorkspacesConfig {
 
 /// `order`, as workspace names.
 ///
-/// Whole-key: order is cosmetic (phase 3 acts on it), so a malformed one costs
-/// the ordering and nothing else rather than being silently half-applied.
+/// Whole-key: the order decides card placement and the index a started
+/// workspace is moved to (§3.6), nothing more, so a malformed one costs the
+/// ordering and nothing else rather than being silently half-applied.
 fn parse_order(value: &toml::Value) -> Result<Vec<String>, InvalidValue> {
     let bad = || InvalidValue::of(&ORDER, value);
     let array = value.as_array().ok_or_else(bad)?;
@@ -490,8 +493,9 @@ fn unknown_app_keys(value: &toml::Value) -> Vec<String> {
 /// into the overlay as a side effect of saving a different one. That is the
 /// property `a_save_never_materialises_a_base_stack_into_the_overlay` holds.
 /// `order` is left exactly as the overlay had it, including absent: writing it
-/// would replace a base-pinned order wholesale (arrays replace), and card order
-/// is phase 3's.
+/// would replace a base-pinned order wholesale (arrays replace), and a Save is
+/// not a statement about card order. Dragging a card between the page's
+/// monitor columns goes through `set_stack_monitor` for the same reason.
 ///
 /// **Refuses an existing name.** A Save is how a workspace gets *created*, and
 /// `stack_value` omits every defaulted key, so silently replacing would drop the
@@ -540,6 +544,84 @@ pub fn save_stack_to(path: &std::path::Path, name: &str, stack: &Stack) -> Resul
         .cloned()
         .unwrap_or_default();
     table.insert(name.to_owned(), stack_value(stack));
+    let next = WorkspacesConfig {
+        order: existing.config.order.clone(),
+        workspace: Some(toml::Value::Table(table)),
+    };
+    hytte_config::subsystem::save_overlay_to(path, &next)
+}
+
+/// Record that the stack `name` lives on the connector `monitor` — the file
+/// half of #1071 §5's drag between monitor columns (phase 3).
+///
+/// # Errors
+/// [`ConfigError::NoOverlayPath`] when there is nowhere to write, plus whatever
+/// [`set_stack_monitor_to`] returns.
+pub fn set_stack_monitor(name: &str, monitor: &str) -> Result<(), ConfigError> {
+    let path = xdg::overlay_path(WorkspacesConfig::NAME).ok_or(ConfigError::NoOverlayPath)?;
+    set_stack_monitor_to(&path, name, monitor)
+}
+
+/// [`set_stack_monitor`] against an explicit overlay path, so the round trip is
+/// testable without an `XDG_CONFIG_HOME`.
+///
+/// # Why this is not [`save_stack_to`] with a changed `monitor`
+///
+/// Two reasons, and both are about *not writing keys nobody asked about*.
+///
+/// * `save_stack_to` writes [`stack_value`] — the **whole** stack. Handed the
+///   merged view of a stack a home-manager base pinned, it would copy that
+///   base's `apps`, `layout` and `autostart` down into the overlay, where they
+///   stop tracking the base forever. Dragging a card is not a statement about
+///   any of those.
+/// * `save_stack_to` is also what a *Save* calls, and a Save is a creation: it
+///   may refuse an existing name (its caller does). A drag is the opposite —
+///   it only ever changes a stack that already exists, including one that
+///   exists only in the base, which is why this happily creates the overlay's
+///   `[workspace.<name>]` table when there is none.
+///
+/// Everything else in the file — comments, key order, the other stacks, this
+/// stack's own other keys — is left byte for byte as it was, because the write
+/// goes through the same `toml_edit` patch `save_overlay_to` uses.
+///
+/// # Errors
+/// [`ConfigError::Invalid`] for a name that is not a usable workspace name or
+/// for an existing `[workspace.<name>]` entry that is not a table, plus
+/// whatever the reader and the format-preserving writer report.
+pub fn set_stack_monitor_to(
+    path: &std::path::Path,
+    name: &str,
+    monitor: &str,
+) -> Result<(), ConfigError> {
+    let name = normalize_workspace_name(name)
+        .ok_or_else(|| ConfigError::Invalid(format!("invalid workspace name: {name:?}")))?;
+    let existing = hytte_config::subsystem::load_from::<WorkspacesConfig>(&[path.to_path_buf()])?;
+    // Absent is fine — that is a first save. **Present but not a table** is a
+    // hand-edit slip (`workspace = "chat"`), and an `unwrap_or_default()` there
+    // would hand back a fresh empty table and quietly overwrite whatever the
+    // user wrote. The per-stack guard below refuses exactly this shape one
+    // level down; the outer one has to as well, or the careful guard only
+    // covers the case the careless one has already destroyed (#1106 review
+    // LOW 8).
+    let mut table = match existing.config.workspace.as_ref() {
+        None => toml::Table::new(),
+        Some(toml::Value::Table(table)) => table.clone(),
+        Some(other) => {
+            return Err(ConfigError::Invalid(format!(
+                "workspace is {other}, not a table of stacks; not rewriting it"
+            )));
+        }
+    };
+    // A stack the overlay has never mentioned gets a fresh table with one key;
+    // a stack it has gets that one key changed and keeps the rest.
+    let entry = table
+        .entry(name.clone())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let fields = entry.as_table_mut().ok_or_else(|| {
+        ConfigError::Invalid(format!("workspace.{name} is not a table; not rewriting it"))
+    })?;
+    fields.insert("monitor".to_owned(), monitor.into());
+
     let next = WorkspacesConfig {
         order: existing.config.order.clone(),
         workspace: Some(toml::Value::Table(table)),
@@ -664,7 +746,8 @@ pub fn current() -> Workspaces {
 #[cfg(test)]
 mod tests {
     use super::{
-        Layout, Stack, StackApp, Workspaces, WorkspacesConfig, save_stack_to, stack_value,
+        Layout, Stack, StackApp, Workspaces, WorkspacesConfig, save_stack_to, set_stack_monitor_to,
+        stack_value,
     };
     use hytte_config::subsystem::{self, Subsystem};
     use hytte_config::test_support::capture;
@@ -969,8 +1052,9 @@ apps = [
     /// including `order`, which it must not invent.
     ///
     /// Writing `order` would replace a base-pinned one wholesale (arrays
-    /// replace), and card order is phase 3's. Falsified by dropping the
-    /// `Option` from the schema: a defaulted `order` serialises on every save.
+    /// replace), and a Save is not a statement about card order. Falsified by
+    /// dropping the `Option` from the schema: a defaulted `order` serialises on
+    /// every save.
     #[test]
     fn a_save_adds_its_stack_and_invents_no_order() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1213,5 +1297,126 @@ apps = [
             .parsed()
             .0;
         assert_eq!(merged.stacks.keys().collect::<Vec<_>>(), ["base", "mine"]);
+    }
+
+    // ── #1071 §5: the drag between monitor columns ───────────────────────────
+
+    /// Dragging a card to another screen rewrites **one key** and leaves every
+    /// other byte of the file alone — comments, key order, the other stacks.
+    ///
+    /// Falsified by routing the drag through `save_stack_to` with a modified
+    /// `Stack`: `stack_value` re-emits the whole table, so `dev`'s own
+    /// `# scratch` comment and `chat`'s hand-written `apps` spelling would both
+    /// be reflowed.
+    #[test]
+    fn a_monitor_rewrite_touches_one_key_and_no_other_byte() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspaces.toml");
+        let body = "# my stacks\n\
+                    order = [\"chat\", \"dev\"]\n\
+                    \n\
+                    # the one I actually use\n\
+                    [workspace.chat]\n\
+                    monitor = \"DP-1\"\n\
+                    layout = \"golden\"\n\
+                    apps = [{ id = \"Alacritty\" }]\n\
+                    \n\
+                    # scratch\n\
+                    [workspace.dev]\n\
+                    autostart = true\n";
+        std::fs::write(&path, body).expect("writes");
+
+        set_stack_monitor_to(&path, "chat", "HDMI-A-1").expect("rewrites");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads back"),
+            body.replace("monitor = \"DP-1\"", "monitor = \"HDMI-A-1\""),
+            "one key changed, every other byte as it was"
+        );
+    }
+
+    /// A stack with no `monitor` yet gains one — and, more to the point, a
+    /// stack the **overlay** has never mentioned (it lives in the
+    /// home-manager base) gets an overlay table with that one key, rather than
+    /// having the base's whole stack copied down into the overlay where it
+    /// would stop tracking the base forever.
+    #[test]
+    fn a_monitor_rewrite_never_materialises_a_base_stack() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("base.toml");
+        let overlay = dir.path().join("workspaces.toml");
+        std::fs::write(
+            &base,
+            "[workspace.chat]\nlayout = \"golden\"\napps = [{ id = \"Alacritty\" }]\n",
+        )
+        .expect("writes base");
+        std::fs::write(&overlay, "# mine\n").expect("writes overlay");
+
+        set_stack_monitor_to(&overlay, "chat", "HDMI-A-1").expect("rewrites");
+
+        let written = std::fs::read_to_string(&overlay).expect("reads back");
+        assert!(written.contains("[workspace.chat]"), "{written}");
+        assert!(written.contains("monitor = \"HDMI-A-1\""), "{written}");
+        assert!(
+            !written.contains("golden") && !written.contains("Alacritty"),
+            "the base's own keys stay in the base: {written}"
+        );
+        // …and the merge still produces the base's keys plus the new monitor.
+        let merged = subsystem::load_from::<WorkspacesConfig>(&[base, overlay])
+            .expect("loads")
+            .config
+            .parsed()
+            .0;
+        assert_eq!(merged.stacks["chat"].monitor.as_deref(), Some("HDMI-A-1"));
+        assert_eq!(merged.stacks["chat"].layout, Layout::Golden);
+        assert_eq!(merged.stacks["chat"].apps.len(), 1);
+    }
+
+    /// **Review LOW 8.** A `workspace` key that is not a table at all is a
+    /// hand-edit slip, and the writer refuses rather than replacing it — the
+    /// same treatment the per-stack guard one level down already gave.
+    ///
+    /// Without this the `unwrap_or_default()` handed back a fresh empty table
+    /// and the user's value was gone, which is the one outcome a
+    /// format-preserving writer exists to prevent.
+    #[test]
+    fn a_monitor_rewrite_refuses_a_workspace_key_that_is_not_a_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspaces.toml");
+        let body = "# mine\nworkspace = \"chat\"\n";
+        std::fs::write(&path, body).expect("writes");
+
+        let err = set_stack_monitor_to(&path, "chat", "DP-1").expect_err("refuses");
+        assert!(err.to_string().contains("not a table"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads back"),
+            body,
+            "the user's value is still there, byte for byte"
+        );
+    }
+
+    /// A name that could never be a workspace is refused before anything is
+    /// written — the same guard `save_stack` has, for the same reason: the
+    /// name is also a systemd slice name.
+    #[test]
+    fn a_monitor_rewrite_refuses_an_unusable_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspaces.toml");
+        std::fs::write(&path, "# mine\n").expect("writes");
+
+        set_stack_monitor_to(&path, "chat--dev", "DP-1").expect_err("a doubled dash is refused");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads back"),
+            "# mine\n",
+            "nothing was written"
+        );
+        // Case is folded rather than refused, the way niri matches names.
+        set_stack_monitor_to(&path, "Chat", "DP-1").expect("folds");
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("reads back")
+                .contains("[workspace.chat]"),
+            "the folded name is the one written"
+        );
     }
 }

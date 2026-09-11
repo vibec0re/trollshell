@@ -780,6 +780,23 @@
     opacity: 0.55;
     font-size: 0.9em;
 }
+/* Dragging a card between monitor columns is the ONLY way to set a stack's
+   screen (#1071 §5, phase 3) — there is no monitor field anywhere — so both
+   halves of the gesture need to be visible or the affordance is invisible.
+   The column the pointer is over lights up; the card in flight dims.
+
+   `outline` rather than `border`: a border would change the column's
+   allocation and shove every card a pixel sideways for the length of the drag.
+   `-3px` pulls it inside the column's own box so it does not collide with the
+   neighbouring column's cards. */
+.ts-ws-column-drop {
+    outline: 2px dashed @accent_color;
+    outline-offset: -3px;
+    border-radius: 0.462em;
+}
+.ts-ws-card-dragging {
+    opacity: 0.45;
+}
 /* Network panel: make each PreferencesGroup a single card with its header
    INSIDE the card surface (not libadwaita's floating title above the list).
    libadwaita renders an AdwPreferencesGroup as a `.header` box (title +

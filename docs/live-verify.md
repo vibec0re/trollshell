@@ -2631,11 +2631,10 @@ autostart, layout or apps`, and every other key still applies. Put a bad
     **full height**, and confirm a scrollbar appears and the bottom card is
     reachable by scrolling. If the column just runs off the bottom of the
     screen, the cap is gone again.
-  - **Nothing from phases 3–4 appeared.** No autostart (a stack with
-    `autostart = true` must **not** come up at login yet — the key is accepted
-    and recorded, not acted on), no column-order restore (the apps land in
-    whatever order they open, not the stack's), no drag between columns, and no
-    edit sub-page — the only Edit is the ephemeral card's name field.
+  - **Nothing from phase 4 appeared.** No edit sub-page — the only Edit is the
+    ephemeral card's name field, and it takes the name only. (Autostart, the
+    column-order restore, the layout and the drag between columns landed in
+    phase 3; they have their own rows below.)
   - **The generalised launcher did not change what it launches.** Regression
     check on the two call sites that moved: `systemctl --user status
 trollshell-plugin-<id>.service` still shows `Restart=on-failure`,
@@ -2645,6 +2644,107 @@ trollshell-plugin-<id>.service`) while `tr '\0' '\n' < /proc/<pid>/cmdline`
     on the `systemd-run` process shows the **bare** `--setenv=<NAME>` with no
     value. And a plugin's detached `RunCommand` still lands in
     `trollshell-launch.slice`.
+
+- [ ] **(#1071 phase 3)** Autostart, column order, layout, card order and the
+      drag between screens. Everything here needs a real niri session and a
+      hand-written `~/.config/trollshell/workspaces.toml`; none of it can be
+      checked from a test.
+  - **Column order is the stack order.** Write a stack whose apps are listed in
+    an order the apps will _not_ open in — a slow one first:
+
+    ```toml
+    [workspace.dev]
+    apps = [
+      { id = "firefox" },
+      { id = "Alacritty" },
+    ]
+    ```
+
+    Press **▶**. Alacritty will map first; when Firefox's window arrives, the
+    columns must end up **firefox, Alacritty** left to right. `niri msg windows`
+    reports each window's `pos_in_scrolling_layout` if the eye is not enough.
+    If the order is whatever they opened in, the one batch after the grace
+    window has regressed.
+
+  - **…and a gap closes up.** Put an app in the middle of the list that will
+    never open a window (`{ id = "definitely-not-a-command" }`). The other two
+    must still end up adjacent, in order, with nothing between them — and the
+    journal must carry **one** warning naming the missing app, not one per
+    launch and not none.
+  - **The layout runs once, and only at the end.** Add `layout = "golden"` and
+    watch: the columns must be re-proportioned **after** the last window
+    arrives, in one go. `journalctl --user -u trollshell -f | grep -i layout`
+    should show nothing at all for `layout = "none"` (or a stack with no
+    `layout` key). If `hytte-plugin-niri-layouts` is not on `PATH`, expect one
+    warning and a Start that still succeeds.
+  - **Autostart.** Set `autostart = true` on two stacks and restart the shell
+    (`systemctl --user restart trollshell`). Both must come up **one after the
+    other, in the file's `order`** — not at once. Watching is the test: if two
+    stacks' windows interleave on one workspace, the sequential runner is gone
+    and each Start is fighting the other for the focus.
+  - **…exactly once.** Leave the shell running for a few minutes and open and
+    close windows. The stacks must **not** start again. The tell for a
+    regression here is dramatic: every workspace change relaunches everything.
+  - **…and a stack whose screen is not plugged in is skipped.** Set
+    `monitor = "DP-9"` on an autostarting stack. At login it must **not** start
+    anywhere, and the journal must carry exactly one `info` line naming the
+    stack and `DP-9` — arriving about **five seconds** after the first screen
+    appears, not immediately. Its card keeps its ▶; plugging the screen in after
+    that line has been logged does **not** start it (hot-plug autostart is
+    deliberately out of scope).
+  - **…but a screen that arrives a beat late still counts.** The five seconds
+    are the settle window (review LOW 7): at login `trollshell.service` and
+    `kanshi` come up together under `niri-session.target`, so niri's first
+    `WorkspacesChanged` can easily predate the kanshi profile enabling a screen.
+    With a kanshi profile that enables a second output, an autostarting stack
+    pinned to that output **must** come up on it. If it lands on `plan.skipped`
+    instead, the settle window has regressed to a latch on the first snapshot.
+  - **…and a restart does not toast you.** The one to run after any change
+    here: with two autostarting stacks **running**, `systemctl --user restart
+trollshell`. Expect the cards to come back Active and **no notification at
+    all**. A toast per stack reading "… did not start: that name is already on a
+    workspace" means the already-on-screen check is gone; nothing is
+    double-launched either way, so the toast is the only symptom.
+  - **Card order decides where a started workspace lands.** With
+    `order = ["chat", "dev"]` and both pinned to the same screen, start `dev`
+    first and then `chat`. `niri msg workspaces` must show `chat` at a **lower
+    index than `dev` on that monitor**, and the bar's numbered switcher must
+    agree. The index is counted per screen: starting a stack on `DP-1` must
+    never move anything on `HDMI-A-1`.
+  - **Drag a card to the other screen.** With two monitors, drag a saved card
+    from one column into the other. The column under the pointer outlines while
+    you are over it, the card dims while it is in flight, and on drop:
+    `~/.config/trollshell/workspaces.toml` gains (or changes) that stack's
+    `monitor` key — **and nothing else in the file moves**. `md5sum` the file
+    first, hand-annotate it with comments, and confirm every comment and every
+    other stack is byte-identical afterwards.
+  - **…and an Active stack's workspace goes with it.** Repeat the drag on a
+    **started** stack: its windows must move to the other screen in the same
+    beat (`niri msg workspaces` shows the named workspace's `output` changed).
+    Repeat on a **stopped** one: the file changes and **niri must not move
+    anything** — in particular no workspace should shuffle on either screen.
+    The next ▶ is what puts it on the new screen.
+  - **Dropping a card back on its own column does nothing.** `md5sum` the file,
+    pick up a card and drop it where it already is: the file must be
+    byte-identical. A two-pixel accidental drag must not rewrite config.
+  - **In-column reordering is still phase 4.** Dragging a card up or down
+    _within_ one column does nothing — §5 puts the order's drag handles in the
+    Edit sub-page, which does not exist yet. Only the screen changes.
+  - **A drag can be cancelled by a rebuild, and that is not a bug.** The page
+    rebuilds every column on any of the five signals it maps over, `windows`
+    included, and GTK cancels a drag whose source widget goes away. So a window
+    opening anywhere while a card is mid-flight ends the drag. Drag again. It
+    reads as flakiness and is a rebuild (review INFO 9).
+  - **Two of a stack's apps in one niri column.** A known limit, not a
+    regression (review LOW 6): niri decides column membership, and two of the
+    stack's windows stacked in one column get one `MoveColumnToIndex` each
+    against that same column, so the second immediately moves what the first
+    placed. A freshly Started workspace opens each window in its own column, so
+    you need an adopted workspace or a niri config that consumes to see it. A
+    **floating** window is different and is handled: it takes no column index at
+    all, so the tiled apps around it are not shifted — open a stack app floating
+    (`niri msg action toggle-window-floating`) and confirm the rest still land
+    at 1, 2, 3.
 
 ## Control-center
 

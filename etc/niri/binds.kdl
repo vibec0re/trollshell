@@ -49,6 +49,13 @@ binds {
     // one-liner to test the verb without this keybind.
     Mod+V hotkey-overlay-title="Open Clipboard History" { spawn "busctl" "--user" "call" "mov.vibec0re.trollshell" "/mov/vibec0re/trollshell" "org.gtk.Actions" "Activate" "sava{sv}" "open-page" "1" "s" "clipboard" "0"; }
 
+    // Workspaces page (#1071 phase 1, #1108) — no bar chip (Annika dropped it
+    // on #1108: "the chip can be dropped"), so this is the only way to reach
+    // it besides Settings → More → Workspaces. Commented out — pick your own
+    // chord and uncomment; the same `open-page` verb as the clipboard bind
+    // above, just a different page token.
+    // Mod+W hotkey-overlay-title="Open Workspaces" { spawn "busctl" "--user" "call" "mov.vibec0re.trollshell" "/mov/vibec0re/trollshell" "org.gtk.Actions" "Activate" "sava{sv}" "open-page" "1" "s" "workspaces" "0"; }
+
     // Column layouts (#1019) — the same binary that paints the bar chip also
     // applies one layout and exits, so these are plain `spawn`s with no shell,
     // no D-Bus and no running plugin involved: it reads $NIRI_SOCKET itself.

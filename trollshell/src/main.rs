@@ -461,7 +461,6 @@ fn build_bar(monitor: &Monitor) -> BarHandle {
         ])
         .center([
             widgets::mpris::widget(monitor),
-            widgets::workspace_manager::widget(monitor),
             plugins::bar_center_slot(monitor),
         ])
         .right([

@@ -2254,6 +2254,18 @@ mod tests {
         assert_eq!(Page::from_stack_name("does-not-exist"), None);
     }
 
+    /// #1108 follow-up: with the bar chip gone, the `open-page` command-surface
+    /// verb (`commands.rs`'s only lookup for the string it gets off the wire —
+    /// `Page::from_stack_name(name)`, feeding `open_focused_page`) is the sole
+    /// remaining reachability path to the Workspaces page. `stack_name_round_trips`
+    /// above already proves this for every page in `ALL`; this one is spelled out
+    /// with the literal `"workspaces"` token so a regression there names this page
+    /// specifically, matching the etc/ keybind sample line's argument.
+    #[test]
+    fn open_page_token_reaches_workspaces() {
+        assert_eq!(Page::from_stack_name("workspaces"), Some(Page::Workspaces));
+    }
+
     /// Centering a mid-screen chip: the card's center lands on `center`. With
     /// `chrome_end` inset, the margin is `screen - center - chrome_end -
     /// card/2`, well inside the clamp bounds.
@@ -2831,7 +2843,7 @@ mod tests {
 mod gtk_tests {
     use super::{
         Active, BarGeometry, DRAWER_MAX_WIDTH_WIDE, ModalPanel, PANELS, Page, drawer_open_state,
-        monitor_key, on_page_show, recompute_gates,
+        monitor_key, on_page_show, recompute_gates, toggle,
     };
     use crate::scale::scale;
     use hytte::adw;
@@ -2928,16 +2940,19 @@ mod gtk_tests {
         );
     }
 
-    /// The chip → drawer path end to end: clicking the chip built by
-    /// `widgets::workspace_manager::widget` must land on `Page::Workspaces`
+    /// The generic drawer-opening path end to end (#1108 follow-up: the
+    /// dedicated workspace-manager bar chip was dropped per Annika's call on
+    /// the issue — "the chip can be dropped" — but the page must stay
+    /// reachable and the width fill must still hold when it's opened through
+    /// the same primitive every remaining chip uses). Calling [`toggle`]
+    /// with a plain, chip-less trigger widget must land on `Page::Workspaces`
     /// (not just call *some* toggle) and the page it lands on must carry the
-    /// filled-to-cap width request — the same guarantee as the test above,
-    /// but proven through the real click handler + `modal::toggle` rather
-    /// than by calling `on_page_show` directly, so a regression in the
-    /// chip's own wiring (wrong `Page`, wrong click hookup) fails here even
-    /// if the on-show mechanism above stays correct in isolation.
+    /// filled-to-cap width request — the same guarantee the old chip-click
+    /// test proved, minus the chip: a regression in `toggle`'s own wiring
+    /// for this page fails here even if the on-show mechanism above stays
+    /// correct in isolation.
     #[gtk::test]
-    fn workspace_manager_chip_click_fills_the_drawer_to_the_cap() {
+    fn toggle_opens_workspaces_and_fills_the_drawer_to_the_cap() {
         let monitor = test_monitor();
         let key = monitor_key(&monitor);
         let panel = harness_panel(&monitor);
@@ -2948,16 +2963,15 @@ mod gtk_tests {
             panels.borrow_mut().insert(key.clone(), panel.clone());
         });
 
-        let btn = crate::widgets::workspace_manager::widget(&monitor);
-        let btn = btn
-            .downcast::<gtk::Button>()
-            .expect("workspace_manager::widget returns a Button");
-        btn.emit_clicked();
+        // No chip involved — any widget can be a `toggle` trigger (the
+        // command-surface / keybind entry points pass no chip at all).
+        let trigger = gtk::Button::new();
+        toggle(&monitor, Page::Workspaces, &trigger);
 
         assert_eq!(
             *panel.current.borrow(),
             Some(Active::Builtin(Page::Workspaces)),
-            "clicking the chip must open Page::Workspaces"
+            "toggle must open Page::Workspaces"
         );
         let clamp = panel
             .stack

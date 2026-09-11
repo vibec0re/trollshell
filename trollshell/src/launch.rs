@@ -87,6 +87,15 @@ pub(crate) const SYSTEMD_RUN: &str = "systemd-run";
 /// browser closing slowly is not a stuck shutdown hook, and forcing a 10 s
 /// `SIGKILL` on it would be a regression, not a fix — so it keeps systemd's
 /// default and this constant is never added to its `properties`.
+///
+/// The only production reference is `plugin_launcher::plugin_launch`, which
+/// `lib.rs`'s shadow `[lib]` target (`trollshell/src/lib.rs`'s module doc)
+/// deliberately excludes from its narrower closure — so the plain (non-test)
+/// build of *that* target sees no reference at all and `dead_code` cannot
+/// tell that apart from a genuine orphan (same shape as `lib.rs`'s `scale`
+/// module carve-out). Live in the real binary; `#[cfg(test)]` also uses it
+/// directly, just below.
+#[allow(dead_code)]
 pub(crate) const PLUGIN_TIMEOUT_STOP: &str = "10s";
 
 /// One transient-unit launch, as a request rather than an argv.
@@ -356,7 +365,9 @@ mod tests {
             ..Launch::default()
         });
         assert!(
-            !args.iter().any(|a| a.starts_with("--property=TimeoutStopSec")),
+            !args
+                .iter()
+                .any(|a| a.starts_with("--property=TimeoutStopSec")),
             "a workspace-stack app launch must keep systemd's default stop timeout: {args:?}"
         );
     }

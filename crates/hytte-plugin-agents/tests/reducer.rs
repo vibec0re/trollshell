@@ -62,13 +62,6 @@ fn lines(rx: &mut CmdReceiver<Cmd>) -> Vec<String> {
     out
 }
 
-/// The name of the row unfolded in the card, if any.
-fn opened(m: &Agents) -> Option<&str> {
-    m.opened
-        .as_ref()
-        .map(hytte_plugin_agents::model::AgentName::as_str)
-}
-
 /// Every command queued, including the visibility ones.
 fn cmds(rx: &mut CmdReceiver<Cmd>) -> Vec<Cmd> {
     let mut out = Vec::new();
@@ -295,93 +288,97 @@ fn a_click_on_an_unknown_or_illegal_agent_sends_nothing() {
     assert!(lines(&mut rx).is_empty());
 }
 
-// ── the primary click ────────────────────────────────────────────────────────
+// ── the card's two buttons ───────────────────────────────────────────────────
 
-/// Spec §6.3: the primary click never pauses the loop. In P1 it opens the
-/// plugin's own panel; in P2 it becomes a detached `RunCommand` launching the
-/// chat companion. **What must hold across that swap** is asserted here: no
-/// `SetPaused` on the lane.
+/// **The row itself is not a click target** (Annika, 2026-09-11): her spec is
+/// "click on agent opens agent page in trollshell-webview", which is #950 and
+/// does not exist yet, so nothing on the card answers to the row — only the two
+/// buttons do.
 ///
-/// Falsification: add a `SetPaused` to the `chat:` arm and this goes red.
+/// This asserts the *absence* through the reducer rather than through the tree,
+/// because the tree half is `view.rs`'s
+/// `a_card_row_is_two_lines_with_exactly_the_mocks_two_buttons`: even if a name
+/// button came back, no arm here would route it. The old `chat:` prefix is the
+/// one that used to.
+///
+/// Falsification: re-add a `chat:`/row-activate arm pointing at `open_detail`
+/// and the first assertion reds.
 #[test]
-fn the_primary_click_opens_the_panel_and_never_pauses_the_loop() {
+fn the_row_itself_is_not_a_click_target_until_the_webview_exists() {
     let (mut m, mut rx) = model();
     m.update(status(roster("agent_status_grouped.json")));
 
-    let fx = m.update(click("chat:trollshell-choom"));
+    for retired in ["chat:stray", "details:stray", "stray"] {
+        assert_eq!(
+            m.update(click(retired)),
+            vec![],
+            "{retired} must route nowhere"
+        );
+    }
+    assert_eq!(m.selected, None, "and must not select anything");
+    assert!(lines(&mut rx).is_empty(), "nor ask the hive anything");
+}
+
+/// The **edit** button — Annika's `[optionsedit]` — opens this plugin's page on
+/// that agent, and asks the hive nothing.
+///
+/// `OpenPage(PluginSelf)` names the *page*; #1010's modal dialog changes the
+/// surface the host mounts it on, not this effect, which is why the button can
+/// be wired now and the dialog can land later without touching this arm.
+///
+/// Falsification: point the `ids::EDIT` arm at anything else and the `Effect`
+/// or the `selected` assertion reds.
+#[test]
+fn the_edit_button_opens_this_agents_page() {
+    let (mut m, mut rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+
+    let fx = m.update(click("edit:stray"));
     assert_eq!(fx, vec![Effect::OpenPage(Page::PluginSelf)]);
-    assert!(
-        lines(&mut rx).is_empty(),
-        "the chat surface is used while the loop RUNS — it must not pause it"
-    );
     assert_eq!(
         m.selected
             .as_ref()
             .map(hytte_plugin_agents::model::AgentName::as_str),
-        Some("trollshell-choom")
+        Some("stray")
     );
-}
-
-/// The details button unfolds **in the card**, where the click happened
-/// (@kaesaecracker, #963: "its very weird the panel opens in the top right
-/// after clicking bottom left"). It opens no page, sends no frame, and a second
-/// click on the same row closes it again.
-///
-/// Falsification: point the `ids::DETAILS` arm back at `open_detail` and both
-/// the `Effect` assertion and the `opened` one go red.
-#[test]
-fn the_details_click_unfolds_in_place_and_opens_no_page() {
-    let (mut m, mut rx) = model();
-    m.update(status(roster("agent_status_grouped.json")));
-
-    let fx = m.update(click("details:stray"));
-    assert_eq!(fx, vec![], "the details unfold in place — nothing opens");
     assert!(
         lines(&mut rx).is_empty(),
-        "a disclosure asks the hive nothing"
+        "opening a page is not a hive request"
     );
-    assert_eq!(opened(&m), Some("stray"));
-    assert_eq!(m.selected, None, "unfolding is not selecting");
-
-    // A second click on the same row closes it.
-    m.update(click("details:stray"));
-    assert_eq!(opened(&m), None);
 }
 
-/// One agent open at a time: another row's disclosure **replaces** the open
-/// one rather than adding to it.
+/// The card's lifecycle button sends the hive's **own** `Start`/`Stop` verbs,
+/// scoped to one agent — not `SetPaused`.
 ///
-/// Falsification: make the `ids::DETAILS` arm insert into a set (or simply
-/// always `Some(name)` without the toggle) and one of the two assertions goes
-/// red.
+/// The two are different verbs on `host.sock`, and Annika's mock names
+/// `[startstop]`. `SetPaused` is unchanged and still reachable, from the drawer
+/// page's pause control.
+///
+/// Falsification: make `lifecycle_affordance` ignore the status and always
+/// return `START` and the second frame reds; point either arm at `SetPaused`
+/// and both do.
 #[test]
-fn only_one_row_is_unfolded_at_a_time() {
-    let (mut m, _rx) = model();
+fn the_lifecycle_button_starts_a_stopped_agent_and_stops_a_running_one() {
+    let (mut m, mut rx) = model();
+    // `stray` is the fixture's stopped row; `trollshell-choom` is running.
     m.update(status(roster("agent_status_grouped.json")));
 
-    m.update(click("details:stray"));
-    assert_eq!(opened(&m), Some("stray"));
-    m.update(click("details:trollshell-choom"));
+    m.update(click("start:stray"));
+    m.update(click("stop:trollshell-choom"));
     assert_eq!(
-        opened(&m),
-        Some("trollshell-choom"),
-        "a second row's disclosure replaces the first"
+        lines(&mut rx),
+        vec![
+            serde_json::to_string(&Request::Start {
+                scope: Scope::agent("stray")
+            })
+            .expect("serializes"),
+            serde_json::to_string(&Request::Stop {
+                scope: Scope::agent("trollshell-choom"),
+                graceful: true,
+            })
+            .expect("serializes"),
+        ]
     );
-}
-
-/// An unfold survives the poll cadence — otherwise a row the operator opened
-/// would snap shut every two seconds.
-///
-/// Falsification: clear `opened` unconditionally in `fold_status` and this goes
-/// red.
-#[test]
-fn an_unfolded_row_survives_the_next_poll() {
-    let (mut m, _rx) = model();
-    m.update(status(roster("agent_status_grouped.json")));
-    m.update(click("details:stray"));
-
-    m.update(status(roster("agent_status_grouped.json")));
-    assert_eq!(opened(&m), Some("stray"));
 }
 
 /// `agents-back` — the panel's "all agents" button — clears the selection.
@@ -397,7 +394,7 @@ fn an_unfolded_row_survives_the_next_poll() {
 fn the_all_agents_button_clears_the_selection() {
     let (mut m, mut rx) = model();
     m.update(status(roster("agent_status_grouped.json")));
-    m.update(click("chat:stray"));
+    m.update(click("edit:stray"));
     assert!(m.selected.is_some());
 
     let fx = m.update(click("agents-back"));
@@ -415,7 +412,7 @@ fn the_all_agents_button_clears_the_selection() {
 fn the_title_row_button_opens_the_drawer_at_the_hive_overview() {
     let (mut m, mut rx) = model();
     m.update(status(roster("agent_status_grouped.json")));
-    m.update(click("chat:stray"));
+    m.update(click("edit:stray"));
     assert!(m.selected.is_some());
 
     let fx = m.update(click("agents-overview"));
@@ -425,20 +422,16 @@ fn the_title_row_button_opens_the_drawer_at_the_hive_overview() {
 }
 
 /// A selection whose agent leaves the roster falls back to the overview rather
-/// than pinning a panel to something that no longer exists — and an unfolded
-/// row that vanished stops being unfolded.
+/// than pinning a page to something that no longer exists.
 #[test]
 fn a_selection_that_vanishes_falls_back_to_the_overview() {
     let (mut m, _rx) = model();
     m.update(status(roster("agent_status_grouped.json")));
-    m.update(click("chat:stray"));
-    m.update(click("details:stray"));
+    m.update(click("edit:stray"));
     assert!(m.selected.is_some());
-    assert!(m.opened.is_some());
 
     m.update(status(roster("agent_status_precedence.json")));
     assert_eq!(m.selected, None);
-    assert_eq!(m.opened, None);
 }
 
 // ── the panel's start / stop ─────────────────────────────────────────────────

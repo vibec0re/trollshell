@@ -375,9 +375,70 @@ pub fn agent_url(agent: &Agent) -> Option<&str> {
         .filter(|u| !u.is_empty())
 }
 
+/// The model families this plugin knows how to shorten, each with the exact
+/// spelling the chip renders.
+///
+/// A table rather than "title-case the token", because the canonical spelling
+/// is the product's, not a transformation: `Opus`, not `OPUS` or `opus`.
+const MODEL_FAMILIES: [(&str, &str); 3] =
+    [("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")];
+
+/// The model **family word** for the row's identity chip — never the dated id.
+///
+/// Annika on [#963](https://github.com/vibec0re/trollshell/pull/963),
+/// 2026-09-11: *"keep Model name short — Opus is enough. Not
+/// `opus-5.2-20262981923899321898`"*. The hive reports `active_model` as
+/// whatever the harness is configured with, which is a full model id whose
+/// tail is a build date, a context marker, or both. In 320 px of sidebar that
+/// tail is noise: it is identical for every agent on the same release, and the
+/// one word that actually differs between two rows is the family.
+///
+/// # The rule
+///
+/// Split on every non-alphanumeric character, then:
+///
+/// - if **any** token is a known family (case-insensitively), render that
+///   family's canonical spelling. Scanning every token rather than only the
+///   first is what makes `claude-opus-4-6` — the provider-prefixed spelling
+///   the hive actually sends, see `tests/fixtures/agent_status_grouped.json` —
+///   and a bare `opus-5.2-…` both read `Opus`.
+/// - otherwise the **first** token, with its first character upper-cased and
+///   the rest left exactly as written: `gpt-4o` → `Gpt`, `GLM-4.6` → `GLM`.
+///   Deliberately not a rename table with a fallback of "unknown": a model
+///   this plugin has never heard of should still show something the operator
+///   recognises, and leaving the rest of the token alone is what keeps an
+///   all-caps family name from being mangled into `Glm`.
+///
+/// `None` for an absent, empty or punctuation-only value — the caller then
+/// draws no chip at all rather than an empty one.
+///
+/// Nothing is lost by shortening: the caller puts the **full** id on the
+/// chip's hover, which is this file's standing idiom for a clipped string.
+#[must_use]
+pub fn model_family(raw: &str) -> Option<String> {
+    let tokens: Vec<&str> = raw
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let first = *tokens.first()?;
+    for token in &tokens {
+        if let Some((_, canonical)) = MODEL_FAMILIES
+            .iter()
+            .find(|(needle, _)| token.eq_ignore_ascii_case(needle))
+        {
+            return Some((*canonical).to_owned());
+        }
+    }
+    let mut chars = first.chars();
+    let head = chars.next()?;
+    Some(head.to_uppercase().chain(chars).collect())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Agent, AgentName, Group, Hive, Status, agent_url, group, headers_wanted};
+    use super::{
+        Agent, AgentName, Group, Hive, Status, agent_url, group, headers_wanted, model_family,
+    };
     use crate::config::AgentsConfig;
     use crate::hive::wire::AgentStatusRow;
 
@@ -659,6 +720,58 @@ mod tests {
 
         a.row.url = Some("   ".to_owned());
         assert_eq!(agent_url(&a), None, "a blank url is not a link");
+    }
+
+    /// The family word, from every spelling the hive is known to send and from
+    /// the one Annika wrote out on #963.
+    ///
+    /// The date-suffixed case is hers verbatim, `[100m]` and all: the point of
+    /// the rule is that an unbounded tail cannot reach the chip.
+    ///
+    /// Falsification: match only the **first** token and `claude-opus-4-6` —
+    /// what the fixture actually carries — starts rendering `Claude`; split on
+    /// `-` alone and `opus-5.2-…` renders `Opus` still but `anthropic/…` stops
+    /// resolving.
+    #[test]
+    fn a_model_id_shortens_to_its_family_word() {
+        for (raw, want) in [
+            ("opus-5.2-20262981923899321898[100m]", "Opus"),
+            ("claude-opus-4-6", "Opus"),
+            ("claude-sonnet-4-6", "Sonnet"),
+            ("anthropic/claude-3-5-haiku-20241022", "Haiku"),
+            ("OPUS", "Opus"),
+            ("Sonnet", "Sonnet"),
+        ] {
+            assert_eq!(
+                model_family(raw).as_deref(),
+                Some(want),
+                "{raw} should read {want}"
+            );
+        }
+    }
+
+    /// A family this plugin has never heard of still shows something: the first
+    /// token, first character upper-cased and the **rest left alone**, so an
+    /// all-caps product name is not mangled.
+    ///
+    /// Falsification: lower-case the tail and `GLM-4.6` renders `Glm`;
+    /// title-case the whole token and `gpt-4o` renders `Gpt4o`.
+    #[test]
+    fn an_unknown_model_falls_back_to_its_first_token() {
+        assert_eq!(model_family("gpt-4o").as_deref(), Some("Gpt"));
+        assert_eq!(model_family("GLM-4.6").as_deref(), Some("GLM"));
+        assert_eq!(model_family("mistral").as_deref(), Some("Mistral"));
+    }
+
+    /// Nothing to shorten is no chip, not an empty one.
+    ///
+    /// Falsification: return `Some(String::new())` for the empty case and the
+    /// card grows a blank pill between the name and the buttons.
+    #[test]
+    fn a_model_with_no_word_in_it_has_no_family() {
+        assert_eq!(model_family(""), None);
+        assert_eq!(model_family("   "), None);
+        assert_eq!(model_family("---"), None);
     }
 
     #[test]

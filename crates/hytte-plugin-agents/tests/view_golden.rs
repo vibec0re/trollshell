@@ -157,21 +157,7 @@ fn scenarios() -> Vec<(&'static str, Agents)> {
                 },
             ))));
             m.update(Input::event(
-                "chat:trollshell-choom",
-                hytte_plugin::proto::EventKind::Click,
-            ));
-            m
-        }),
-        // The same roster with one row's details unfolded **in the card** —
-        // @kaesaecracker's second round asked for the click to do something
-        // where it happened, and this pins what that looks like.
-        ("unfolded", {
-            let mut m = seed(GOLDEN_NOW);
-            m.update(Input::App(Msg::Status(Ok(roster(
-                "agent_status_grouped.json",
-            )))));
-            m.update(Input::event(
-                "details:trollshell-choom",
+                "edit:trollshell-choom",
                 hytte_plugin::proto::EventKind::Click,
             ));
             m
@@ -252,7 +238,58 @@ fn node_scenarios() -> Vec<(&'static str, hytte_plugin::proto::Node)> {
                 ctx(hytte_plugin_agents::view::PANEL_VIEWPORT_PX),
             ),
         ),
+        // One pill per state, each as its own artifact (Annika's v1 card,
+        // 2026-09-11). The card-level goldens above already contain rows in
+        // every state, but they contain a whole card around them: these three
+        // are the **row**, so the thing a reviewer diffs when the pill changes
+        // is forty lines rather than four hundred, and the one thing that
+        // differs between them — the state glyph on line 2 and which verb the
+        // lifecycle button offers — is the whole file.
+        (
+            "row_running",
+            pill(AgentStatusRow {
+                name: "trollshell-choom".to_owned(),
+                running: true,
+                active_model: Some("claude-opus-4-6".to_owned()),
+                status_text: Some("Clauding…".to_owned()),
+                url: Some("https://hive.local/agent/trollshell-choom/".to_owned()),
+                ..AgentStatusRow::default()
+            }),
+        ),
+        (
+            "row_paused",
+            pill(AgentStatusRow {
+                name: "trollshell-choom".to_owned(),
+                running: true,
+                paused: true,
+                active_model: Some("claude-sonnet-4-6".to_owned()),
+                status_text: Some("Clauding…".to_owned()),
+                ..AgentStatusRow::default()
+            }),
+        ),
+        (
+            "row_stopped",
+            pill(AgentStatusRow {
+                name: "trollshell-choom".to_owned(),
+                running: false,
+                needs_update: true,
+                active_model: Some("opus-5.2-20262981923899321898".to_owned()),
+                ..AgentStatusRow::default()
+            }),
+        ),
     ]
+}
+
+/// One agent's card row, alone — the smallest tree that is a whole pill.
+///
+/// Built through [`view::card`] rather than by calling the private `agent_row`,
+/// because the row's wrappers (the dense `ListBox`, the group suppression) are
+/// part of what the pill renders as; the golden is then the card with exactly
+/// one row in it.
+fn pill(row: AgentStatusRow) -> hytte_plugin::proto::Node {
+    let mut m = seed(GOLDEN_NOW);
+    m.update(Input::App(Msg::Status(Ok(vec![row]))));
+    hytte_plugin_agents::plugin::card_of(&m)
 }
 
 fn golden_path(name: &str) -> PathBuf {

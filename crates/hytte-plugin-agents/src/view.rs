@@ -2,8 +2,41 @@
 //!
 //! There is no row-activate event (a list is selection-less), so every
 //! interaction is a `Button`, whose `id` is required and is the click target
-//! (`crates/hytte-plugin-proto/src/wire.rs:249-255`). That is why the agent's
-//! name is a button rather than a label.
+//! (`crates/hytte-plugin-proto/src/wire.rs:249-255`).
+//!
+//! # The card is one pill per agent, two lines, and nothing else
+//!
+//! Annika settled the v1 card on
+//! [#963](https://github.com/vibec0re/trollshell/pull/963) (2026-09-11), after
+//! @kaesaecracker's second round of screenshots: *"the view still looks very
+//! cluttered … Maybe we should try one card / pill per agent … deployed…
+//! parent… agent page — too much information to display! Let's keep this slick
+//! two lines."* Her mock, verbatim:
+//!
+//! ```text
+//! [ [icon]  [Name] [Model]                    [startstop] [optionsedit] ]
+//! [ (oO) Clauding...                                                    ]
+//! ```
+//!
+//! So line 1 is the identity and exactly two controls, line 2 is the state
+//! glyph (her `(oO)`) and the harness's own status text. What went, and where
+//! it went:
+//!
+//! | gone from the card | why, and where it lives now |
+//! | --- | --- |
+//! | the chevron + the in-place details unfold | the clutter she named; the same content is the drawer page, which the **edit** button opens |
+//! | the flag chips (`failed` / `needs login` / `paused` / `needs update`) | the first two are already the line-2 glyph; all four stay on the drawer page |
+//! | `deployed` / `parent` / `status set` | dropped outright — the three rows she listed by name |
+//! | the `agent page` link | the drawer page keeps it, as the "open it in the browser instead" fallback to #950's `WebView` |
+//! | the pause/resume button | the drawer page; the mock has two buttons and `[startstop]` is the one she drew |
+//!
+//! **The row itself is deliberately not clickable.** Her spec is "click on
+//! agent opens agent page in trollshell-webview", which is
+//! [#950](https://github.com/vibec0re/trollshell/issues/950) and does not exist
+//! yet. Wiring the click to the drawer page in the meantime would teach the
+//! wrong surface — the exact thing @kaesaecracker objected to ("its very weird
+//! the panel opens in the top right after clicking bottom left") — so the name
+//! is a plain `Text` until the `WebView` is there to receive the click.
 //!
 //! # What this file is built around, as of #966/#969/#971
 //!
@@ -57,7 +90,7 @@ use hytte_plugin::proto::{Dir, Node};
 use crate::config::AgentsConfig;
 use crate::model::{
     Agent, AgentName, ExpandedGroups, Group, Hive, Status, UPDATE_BADGE_CLASS, UPDATE_BADGE_ICON,
-    agent_url, group, headers_wanted,
+    agent_url, group, headers_wanted, model_family,
 };
 
 /// The card's root node id.
@@ -68,36 +101,42 @@ pub const PANEL_ID: &str = "agents-panel";
 pub const BACK_ID: &str = "agents-back";
 /// The card title row's button: open the drawer panel at the hive overview.
 ///
-/// The drawer is now the **only** thing on the card that opens somewhere else,
-/// and it is reached from the card's own title rather than from a row —
+/// The card's title is where a jump to the **hive-level** page belongs —
 /// @kaesaecracker, [#963](https://github.com/vibec0re/trollshell/pull/963):
 /// "its very weird the panel opens in the top right after clicking bottom
-/// left". A row's own details unfold in place ([`ids::DETAILS`]); the panel is
-/// for the hive overview and the full roster, and its title-row button is where
-/// a jump-to-another-surface belongs.
+/// left". A row's own jump is its [`ids::EDIT`] button, which opens that
+/// agent's page; this one opens the overview and the full roster.
 pub const OVERVIEW_ID: &str = "agents-overview";
 
 /// Button id prefixes. Each is `"<prefix><name>"`; the reducer strips the
 /// prefix and re-validates the remainder as an [`AgentName`] rather than
 /// trusting the round trip.
 pub mod ids {
-    /// The row's primary click — the agent's name. Opens the drawer panel on
-    /// that agent (spec §6.3's primary; P2 replaces it with the chat window).
-    pub const CHAT: &str = "chat:";
-    /// The row's pause/resume toggle.
-    pub const PAUSE: &str = "pause:";
-    /// The row's **details** disclosure.
+    /// The row's **edit** button — Annika's `[optionsedit]`, 2026-09-11 on
+    /// [#963](https://github.com/vibec0re/trollshell/pull/963).
     ///
-    /// Was `edit:` until @kaesaecracker pointed out that a pen means *edit*
-    /// and this panel edits nothing (editing is P4/P5; spec §10: "v1 is
-    /// read-only … it is what the hive supports"). It then briefly opened the
-    /// drawer, which is what the second round of screenshots objected to.
-    /// It now unfolds the agent's details **inside the card**, where the click
-    /// happened, one agent at a time.
-    pub const DETAILS: &str = "details:";
-    /// The panel's per-agent start.
+    /// Today it opens this plugin's drawer page on that agent. Its real
+    /// destination is a **modal dialog**, which is
+    /// [#1010](https://github.com/vibec0re/trollshell/issues/1010)'s decision
+    /// and is still waiting on one answer (modal to the shell, or to the
+    /// session), so the effect it emits — `OpenPage(PluginSelf)` — does not
+    /// change when the dialog lands; only where the host puts the page does.
+    ///
+    /// It replaces `chat:`, the old name button. That id's documented future
+    /// was a chat companion window, which is now
+    /// [#950](https://github.com/vibec0re/trollshell/issues/950)'s `WebView` and
+    /// belongs to the **row click**, not to a button — see the module doc.
+    pub const EDIT: &str = "edit:";
+    /// The pause/resume toggle. **Panel only** since the card went to two
+    /// lines: Annika's mock has exactly two buttons per row and start/stop is
+    /// the one she named. `SetPaused` is a different hive verb from
+    /// `Start`/`Stop` and is unchanged on the wire.
+    pub const PAUSE: &str = "pause:";
+    /// Per-agent start — the card's lifecycle button when the agent is
+    /// stopped, and the panel's own.
     pub const START: &str = "start:";
-    /// The panel's per-agent stop.
+    /// Per-agent stop — the card's lifecycle button when the agent is not
+    /// stopped, and the panel's own.
     pub const STOP: &str = "stop:";
     /// A project group's expander header.
     pub const GROUP: &str = "group:";
@@ -194,6 +233,20 @@ const CARD_TEXT_CHARS: i32 = 34;
 /// reports its whole string as its natural width and *widens the drawer*: the
 /// #281 blow-out, one surface over.
 const PANEL_TEXT_CHARS: i32 = 56;
+
+/// The ellipsized width of line 1's model chip.
+///
+/// Every known family word fits (`Sonnet` is the longest at six); the cap is
+/// for the **unknown** fallback, whose first token is whatever a provider
+/// chose and is not bounded by anything this crate controls.
+const MODEL_CHARS: i32 = 10;
+
+/// The wrap width of the status text on line 2 of a card row.
+///
+/// Narrower than [`CARD_TEXT_CHARS`] because line 2 is a `Row`: the state glyph
+/// and, when set, the update badge sit to the left of the text, so the text's
+/// share of the 320 px clamp is smaller than a full-width line's.
+const CARD_STATUS_CHARS: i32 = 30;
 
 /// The ellipsized width of a project group's header.
 ///
@@ -506,7 +559,7 @@ fn status_caption(agent: &Agent) -> Node {
     } else {
         wrapped(
             line,
-            CARD_TEXT_CHARS,
+            CARD_STATUS_CHARS,
             &["dim-label", "caption", "ts-agent-status"],
         )
     }
@@ -531,117 +584,112 @@ fn flag_chips(agent: &Agent) -> Vec<Node> {
     .collect()
 }
 
-/// The hive's own `deployed_sha`, clamped to 12 characters.
+/// The lifecycle button's id prefix, glyph and hover — what the click will
+/// **do**, which is the only reading that stays honest.
 ///
-/// The wire doc says the field is already the first 12 (`hive-sh4re`), so this
-/// is belt and braces against a hive that ever sends the full 40 — a raw sha in
-/// a 320 px card is one string that would push everything else out.
-fn short_sha(agent: &Agent) -> Option<String> {
-    agent
-        .row
-        .deployed_sha
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.chars().take(12).collect())
+/// One button, two verbs, because Annika's mock has one `[startstop]` slot.
+/// Which verb depends on the state the row is already showing: a stopped agent
+/// can only be started, anything else can be stopped. Both are `Scope`d to this
+/// one agent (spec §11 rule one).
+fn lifecycle_affordance(agent: &Agent) -> (&'static str, &'static str, &'static str) {
+    if agent.status() == Status::Stopped {
+        (
+            ids::START,
+            "media-playback-start-symbolic",
+            "start this agent",
+        )
+    } else {
+        (ids::STOP, "media-playback-stop-symbolic", "stop this agent")
+    }
 }
 
-/// One agent, on **two compact lines** (spec §6.1's mock).
+/// The model family as line 1's third item — `Opus`, never
+/// `opus-5.2-20262981923899321898`.
 ///
-/// Line 1 is the identity and the controls; line 2 is the harness's own status,
-/// in full. The one-line row that shipped between the two screenshot rounds was
-/// an overcorrection for a sidebar that could not scroll (#967 fixed that) and
-/// is what @kaesaecracker read as "crammed".
+/// `None` when the hive reports no model, or reports one with no word in it:
+/// the row then simply has no chip, rather than an empty pill between the name
+/// and the buttons. The **full** id is the chip's hover, so shortening loses
+/// nothing — see [`crate::model::model_family`] for the rule.
+fn model_chip(agent: &Agent) -> Option<Node> {
+    let raw = agent.row.active_model.as_deref()?.trim();
+    let family = model_family(raw)?;
+    Some(clipped_titled(
+        family,
+        MODEL_CHARS,
+        raw,
+        &["caption", "dim-label", "ts-agent-model"],
+    ))
+}
+
+/// One agent as a **pill**: two lines, nothing else (Annika, 2026-09-11 —
+/// see the module doc for her mock and for what each removed thing became).
 ///
-/// `open` unfolds this agent's details underneath, in place.
-fn agent_row(agent: &Agent, cfg: &AgentsConfig, open: bool) -> Node {
+/// Line 1: `[runtime icon] [Name] [Model] … [start|stop] [edit]`.
+/// Line 2: the state glyph, the update badge if it is set, and the harness's
+/// own status text in full.
+///
+/// The name is a `Text`, not a `Button`: the row's click belongs to #950's
+/// `WebView` and does not exist yet, and a button that opened the drawer instead
+/// would train the wrong surface.
+fn agent_row(agent: &Agent, cfg: &AgentsConfig) -> Node {
     let name = agent.name.as_str();
     let status = agent.status();
-    let (pause_glyph, pause_hover) = pause_affordance(agent);
+    let (lifecycle_id, lifecycle_glyph, lifecycle_hover) = lifecycle_affordance(agent);
 
     let mut head = vec![
         icon(cfg.icon_for(name), &["ts-agent-runtime"]),
-        button(
-            format!("{}{name}", ids::CHAT),
-            &["flat", "ts-agent-name"],
-            // Clipped, not a bare `Label`: a `Label`'s natural width forces its
-            // container wider (the #281 sidebar blow-out), and an agent name may
-            // be up to 63 bytes.
-            clipped_titled(
-                cfg.label_for(name),
-                NAME_CHARS,
-                name_hover(name, cfg),
-                &["heading"],
-            ),
+        // Clipped, not a bare `Label`: a `Label`'s natural width forces its
+        // container wider (the #281 sidebar blow-out), and an agent name may be
+        // up to 63 bytes.
+        clipped_titled(
+            cfg.label_for(name),
+            NAME_CHARS,
+            name_hover(name, cfg),
+            &["heading", "ts-agent-name"],
         ),
-        icon_titled(
-            status.icon(),
-            status.text(),
-            &["ts-agent-state", status.class()],
-        ),
-        Node::Spacer,
     ];
+    head.extend(model_chip(agent));
+    head.push(Node::Spacer);
+    head.push(icon_button(
+        format!("{lifecycle_id}{name}"),
+        lifecycle_glyph,
+        lifecycle_hover,
+        &["flat", "ts-agent-btn"],
+    ));
+    head.push(icon_button(
+        format!("{}{name}", ids::EDIT),
+        "document-edit-symbolic",
+        "edit this agent",
+        &["flat", "ts-agent-btn"],
+    ));
+
+    let mut tail = vec![icon_titled(
+        status.icon(),
+        status.text(),
+        &["ts-agent-state", status.class()],
+    )];
     if agent.needs_update() {
-        // Spec §6.2's badge row says "(tooltip only)" for its text.
-        head.push(icon_titled(
+        // Spec §6.2's badge row says "(tooltip only)" for its text. It stays on
+        // the card when the other three flag chips did not, because it is the
+        // one flag line 2's glyph does **not** already encode — `Status` has no
+        // `NeedsUpdate` — so dropping it would lose a signal rather than
+        // de-duplicate one.
+        tail.push(icon_titled(
             UPDATE_BADGE_ICON,
             "config commit pending — a rebuild would change this agent's locked rev",
             &["ts-agent-badge", UPDATE_BADGE_CLASS],
         ));
     }
-    head.push(icon_button(
-        format!("{}{name}", ids::PAUSE),
-        pause_glyph,
-        pause_hover,
-        &["flat", "ts-agent-btn"],
-    ));
-    head.push(icon_button(
-        format!("{}{name}", ids::DETAILS),
-        if open {
-            "pan-down-symbolic"
-        } else {
-            "pan-end-symbolic"
-        },
-        if open { "hide details" } else { "details" },
-        &["flat", "ts-agent-btn"],
-    ));
+    tail.push(status_caption(agent));
 
-    let mut children = vec![hrow(6, &["ts-agent-head"], head), status_caption(agent)];
-    if open {
-        children.push(details_block(agent));
-    }
-    vstack(2, &["ts-agent-row"], children)
-}
-
-/// The in-place unfold: the row's own details, inside the card.
-///
-/// Deliberately a **summary**, not the panel: the flags that are on, the
-/// deployment triple, and the agent's page. The panel keeps the hive-level
-/// context (socket, poll age, dashboard) and the full roster.
-fn details_block(agent: &Agent) -> Node {
-    let mut children = Vec::new();
-    let chips = flag_chips(agent);
-    if !chips.is_empty() {
-        children.push(hrow(4, &["ts-agent-chips"], chips));
-    }
-    if let Some(sha) = short_sha(agent) {
-        children.push(detail("deployed", &sha));
-    }
-    children.push(detail(
-        "parent",
-        agent.row.parent.as_deref().unwrap_or("— (root)"),
-    ));
-    if let Some(model) = agent.row.active_model.as_deref() {
-        children.push(detail("model", model));
-    }
-    if let Some(url) = agent_url(agent) {
-        children.push(link_detail(
-            format!("{}{}", ids::OPEN, agent.name.as_str()),
-            "agent page",
-            url,
-        ));
-    }
-    vstack(2, &["ts-agent-details"], children)
+    vstack(
+        2,
+        &["ts-agent-row"],
+        vec![
+            hrow(6, &["ts-agent-head"], head),
+            hrow(6, &["ts-agent-statusline"], tail),
+        ],
+    )
 }
 
 /// The card's one-line summary of the hive, right-pinned in the title row.
@@ -665,12 +713,7 @@ pub fn hive_summary(hive: &Hive) -> String {
 /// (`.ts-plugin-card`, #319) and deliberately no padding, so the root carries
 /// `ts-agents-card` for its own inset.
 #[must_use]
-pub fn card(
-    hive: &Hive,
-    cfg: &AgentsConfig,
-    expanded: &ExpandedGroups,
-    opened: Option<&AgentName>,
-) -> Node {
+pub fn card(hive: &Hive, cfg: &AgentsConfig, expanded: &ExpandedGroups) -> Node {
     let title = hrow(
         6,
         &["ts-agents-title"],
@@ -711,7 +754,7 @@ pub fn card(
         Hive::Up { agents } if agents.is_empty() => {
             vec![notice("system-run-symbolic", "no agents", "dim-label")]
         }
-        Hive::Up { agents } => roster(agents, cfg, expanded, opened),
+        Hive::Up { agents } => roster(agents, cfg, expanded),
     };
 
     Node::Box {
@@ -726,12 +769,14 @@ pub fn card(
 }
 
 /// The roster body: grouped rows, capped at [`MAX_ROWS`].
-fn roster(
-    agents: &[Agent],
-    cfg: &AgentsConfig,
-    expanded: &ExpandedGroups,
-    opened: Option<&AgentName>,
-) -> Vec<Node> {
+///
+/// **The grouping survived the pill round** (Annika, 2026-09-11), because the
+/// thing she called cluttered was what each row carried, not that the rows sit
+/// under a project header — and grouping by multi-repo project is her own
+/// earlier ask (spec §6.3). A header is one collapsible line above a run of
+/// pills and adds nothing per row; with one project it is suppressed entirely
+/// ([`headers_wanted`]), which is the single-hive case.
+fn roster(agents: &[Agent], cfg: &AgentsConfig, expanded: &ExpandedGroups) -> Vec<Node> {
     let groups = group(agents, cfg);
     let headers = headers_wanted(&groups);
     let mut out = Vec::new();
@@ -753,11 +798,7 @@ fn roster(
                 skipped += 1;
                 continue;
             }
-            rows.push(agent_row(
-                agent,
-                cfg,
-                opened.is_some_and(|n| *n == agent.name),
-            ));
+            rows.push(agent_row(agent, cfg));
             drawn += 1;
         }
         if headers {
@@ -933,8 +974,11 @@ fn panel_roster_row(agent: &Agent, cfg: &AgentsConfig) -> Node {
         &["ts-agent-detail"],
         vec![
             icon(cfg.icon_for(name), &["ts-agent-runtime"]),
+            // The roster is how the drawer picks an agent, so this one name
+            // stays a button — and it opens the same page the card's `edit`
+            // does, which is why it carries that id rather than a second one.
             button(
-                format!("{}{name}", ids::CHAT),
+                format!("{}{name}", ids::EDIT),
                 &["flat", "ts-agent-name"],
                 clipped_titled(
                     cfg.label_for(name),
@@ -954,49 +998,69 @@ fn panel_roster_row(agent: &Agent, cfg: &AgentsConfig) -> Node {
     )
 }
 
-/// The selected agent's page: header, status, chips, deployment, links.
-fn agent_page(agent: &Agent, cfg: &AgentsConfig, ctx: PanelContext<'_>) -> Vec<Node> {
+/// The selected agent's page — **the edit page, for now** (Annika,
+/// 2026-09-11: "then opensedit can open edit dialog").
+///
+/// The card's `edit` button opens it, and #1010's modal dialog is where it is
+/// going to live; that is a decision about the *surface* the host mounts a
+/// plugin page on, not about this tree, so nothing here changes when the
+/// dialog lands.
+///
+/// Trimmed to the card's own two lines plus what the card gave up:
+///
+/// - the same pill, wider: identity + model on line 1 with the lifecycle and
+///   pause controls, the state glyph and the status text on line 2;
+/// - the hive's own name when a `[display.<name>].label` renamed the row —
+///   the one place the string every request frame and every log line uses is
+///   still readable;
+/// - the flag chips, which are the card's dropped detail and have room here;
+/// - the `agent page` link, which is #1045's button and, once #950's `WebView`
+///   takes the row click, the "open it in the browser instead" fallback.
+///
+/// `deployed` / `parent` / `model` / `status set` are gone outright: three of
+/// the four are the rows Annika named as too much information, and `model` is
+/// now line 1's chip with the full id on its hover.
+fn agent_page(agent: &Agent, cfg: &AgentsConfig, _ctx: PanelContext<'_>) -> Vec<Node> {
     let name = agent.name.as_str();
     let status = agent.status();
+    let (lifecycle_id, lifecycle_glyph, lifecycle_hover) = lifecycle_affordance(agent);
+    let (pause_glyph, pause_hover) = pause_affordance(agent);
     let mut out = Vec::new();
 
-    out.push(hrow(
-        8,
-        &["ts-agents-panel-head"],
-        vec![
-            icon(cfg.icon_for(name), &["ts-agent-runtime"]),
-            // Bounded, and a `Text` rather than a `Label`: a `Label` neither
-            // wraps nor ellipsizes, so a 63-byte agent name (legal on the wire)
-            // reports its whole self as the header's natural width and widens
-            // the drawer — see [`PANEL_TEXT_CHARS`]. The card guarded this from
-            // the start (#281); the panel header did not until #963's review.
-            clipped_titled(
-                cfg.label_for(name),
-                PANEL_NAME_CHARS,
-                name_hover(name, cfg),
-                &["title-4"],
-            ),
-            icon_titled(
-                status.icon(),
-                status.text(),
-                &["ts-agent-state", status.class()],
-            ),
-            Node::Spacer,
-            // Spec §11 rule one: both frames are scoped to this one agent.
-            icon_button(
-                format!("{}{name}", ids::START),
-                "media-playback-start-symbolic",
-                "start this agent",
-                &["flat", "circular", "ts-agent-btn"],
-            ),
-            icon_button(
-                format!("{}{name}", ids::STOP),
-                "media-playback-stop-symbolic",
-                "stop this agent",
-                &["flat", "circular", "ts-agent-btn"],
-            ),
-        ],
+    let mut head = vec![
+        icon(cfg.icon_for(name), &["ts-agent-runtime"]),
+        // Bounded, and a `Text` rather than a `Label`: a `Label` neither wraps
+        // nor ellipsizes, so a 63-byte agent name (legal on the wire) reports
+        // its whole self as the header's natural width and widens the drawer —
+        // see [`PANEL_TEXT_CHARS`]. The card guarded this from the start
+        // (#281); the panel header did not until #963's review.
+        clipped_titled(
+            cfg.label_for(name),
+            PANEL_NAME_CHARS,
+            name_hover(name, cfg),
+            &["title-4"],
+        ),
+    ];
+    head.extend(model_chip(agent));
+    head.push(Node::Spacer);
+    // Spec §11 rule one: every frame here is scoped to this one agent. The
+    // lifecycle button is the card's, and pause/resume is the control the
+    // two-line card gave up — `SetPaused` is a different hive verb from
+    // `Start`/`Stop`, so this is the only surface that still reaches it.
+    head.push(icon_button(
+        format!("{lifecycle_id}{name}"),
+        lifecycle_glyph,
+        lifecycle_hover,
+        &["flat", "circular", "ts-agent-btn"],
     ));
+    head.push(icon_button(
+        format!("{}{name}", ids::PAUSE),
+        pause_glyph,
+        pause_hover,
+        &["flat", "circular", "ts-agent-btn"],
+    ));
+    out.push(hrow(8, &["ts-agents-panel-head"], head));
+
     if cfg.label_for(name) != name {
         out.push(wrapped(
             name,
@@ -1004,10 +1068,17 @@ fn agent_page(agent: &Agent, cfg: &AgentsConfig, ctx: PanelContext<'_>) -> Vec<N
             &["dim-label", "caption", "ts-mono"],
         ));
     }
-    out.push(wrapped(
-        agent.status_line(),
-        PANEL_TEXT_CHARS,
-        &["dim-label"],
+    out.push(hrow(
+        6,
+        &["ts-agent-statusline"],
+        vec![
+            icon_titled(
+                status.icon(),
+                status.text(),
+                &["ts-agent-state", status.class()],
+            ),
+            wrapped(agent.status_line(), PANEL_TEXT_CHARS, &["dim-label"]),
+        ],
     ));
 
     let chips = flag_chips(agent);
@@ -1015,48 +1086,24 @@ fn agent_page(agent: &Agent, cfg: &AgentsConfig, ctx: PanelContext<'_>) -> Vec<N
         out.push(hrow(4, &["ts-agent-chips"], chips));
     }
 
-    let mut deployment = vec![detail(
-        "parent",
-        agent.row.parent.as_deref().unwrap_or("— (root)"),
-    )];
-    if let Some(sha) = short_sha(agent) {
-        deployment.insert(0, detail("deployed", &sha));
-    }
-    if let Some(model) = agent.row.active_model.as_deref() {
-        deployment.push(detail("model", model));
-    }
-    if let Some(at) = agent
-        .row
-        .status_set_at
-        .as_deref()
-        .and_then(parse_set_at)
-        .filter(|_| ctx.now_unix > 0)
-    {
-        deployment.push(detail("status set", &age(ctx.now_unix, at)));
-    }
-    out.push(section(
-        "deployment",
-        list(false, &["ts-agents-panel-list"], deployment),
-    ));
-
-    // Both rows in this section are links, so both are buttons — a section
-    // where one URL is clickable and its neighbour is not would be the exact
-    // inconsistency #1045 was filed about, one row further down.
-    let mut links = Vec::new();
+    // The one link that survived the trim. Annika dropped "agent page" from
+    // the *card*; this is the surface it moved to, and with the row click
+    // going to #950's `WebView` it is the "open it in the browser instead"
+    // fallback rather than the only way to reach the page. The hive-level
+    // `dashboard` link is not here — it belongs to the overview, which is
+    // where `panel` now emits it, once.
     if let Some(url) = agent_url(agent) {
-        links.push(link_detail(
-            format!("{}{}", ids::OPEN, agent.name.as_str()),
-            "agent page",
-            url,
-        ));
-    }
-    if let Some(home) = hive_home(ctx) {
-        links.push(link_detail(ids::OPEN_DASHBOARD, "dashboard", home));
-    }
-    if !links.is_empty() {
         out.push(section(
             "links",
-            list(false, &["ts-agents-panel-list"], links),
+            list(
+                false,
+                &["ts-agents-panel-list"],
+                vec![link_detail(
+                    format!("{}{}", ids::OPEN, agent.name.as_str()),
+                    "agent page",
+                    url,
+                )],
+            ),
         ));
     }
 
@@ -1125,10 +1172,15 @@ pub fn panel(
 
     children.push(hive_section(hive, ctx));
 
-    // The overview's own links group. The selected-agent page emits its own
-    // (agent page + dashboard), so this is the branch that keeps the dashboard
-    // reachable when no agent page is shown — without either panel showing it
-    // twice.
+    // The hive's dashboard root, and the **only** place it is emitted since the
+    // agent page was trimmed to the agent's own link (Annika, 2026-09-11). It
+    // is hive-level, so the hive overview is where it belongs; it was already
+    // gated on `shown.is_none()` to stop the two pages rendering it twice, and
+    // that gate is now the whole rule rather than half of it.
+    //
+    // It is a `link_detail`, not a `detail`: this row was left a plain,
+    // unclickable label when #1045 turned the agent page's copy into a button,
+    // which is the same dead-URL complaint one surface over.
     if shown.is_none()
         && let Some(home) = hive_home(ctx)
     {
@@ -1137,7 +1189,7 @@ pub fn panel(
             list(
                 false,
                 &["ts-agents-panel-list"],
-                vec![detail("dashboard", home)],
+                vec![link_detail(ids::OPEN_DASHBOARD, "dashboard", home)],
             ),
         ));
     }
@@ -1214,12 +1266,11 @@ mod tests {
         )
     }
 
-    fn card_of(agents: Vec<Agent>, opened: Option<&AgentName>) -> Node {
+    fn card_of(agents: Vec<Agent>) -> Node {
         super::card(
             &Hive::Up { agents },
             &AgentsConfig::default(),
             &ExpandedGroups::new(),
-            opened,
         )
     }
 
@@ -1265,7 +1316,7 @@ mod tests {
         const LINE: &str = "idle — #4077 approved, watching for review assignments";
         assert!(LINE.chars().count() <= STATUS_WRAP_MAX);
 
-        let tree = card_of(vec![running("argus", LINE)], None);
+        let tree = card_of(vec![running("argus", LINE)]);
         let status = find_text(&tree, LINE).expect("the status renders somewhere");
         assert!(
             !status.ellipsize,
@@ -1279,7 +1330,7 @@ mod tests {
         // full either way, but only this way without pushing its container.
         assert_eq!(
             status.max_width_chars,
-            Some(super::CARD_TEXT_CHARS),
+            Some(super::CARD_STATUS_CHARS),
             "line 2 must cap its natural width while still showing everything"
         );
         assert!(
@@ -1314,7 +1365,7 @@ mod tests {
         );
         assert!(long.chars().count() > STATUS_WRAP_MAX);
 
-        let tree = card_of(vec![running("argus", &long)], None);
+        let tree = card_of(vec![running("argus", &long)]);
         let status = find_text(&tree, &long).expect("the status renders");
         assert!(status.ellipsize, "past the wrap budget it must ellipsize");
         assert_eq!(status.max_width_chars, Some(STATUS_CHARS));
@@ -1325,142 +1376,175 @@ mod tests {
         );
     }
 
-    /// The details button unfolds **in place**: the row grows a third child
-    /// holding that agent's details, and no other row does.
+    /// **The card row is a pill: two lines, and exactly two buttons.**
     ///
-    /// Falsification: drop the `if open { children.push(details_block(..)) }`
-    /// arm in `agent_row` and the first assertion goes red; ignore `opened` in
-    /// `roster` (pass `false` unconditionally) and it does too.
+    /// Annika's v1 mock, asserted as a shape rather than as prose
+    /// (2026-09-11, #963):
+    ///
+    /// ```text
+    /// [ [icon]  [Name] [Model]              [startstop] [optionsedit] ]
+    /// [ (oO) Clauding...                                              ]
+    /// ```
+    ///
+    /// Falsification: push a third child onto `agent_row`'s `vstack` and the
+    /// line count reds; put the chevron, the pause button or any of the removed
+    /// detail rows back and the button-id assertion reds; move the state glyph
+    /// back to line 1 and the last assertion does.
     #[test]
-    fn the_open_row_unfolds_its_details_and_only_that_row() {
-        let agents = vec![running("argus", "idle"), running("bosun", "idle")];
-        let opened = AgentName::parse("argus").expect("legal");
+    fn a_card_row_is_two_lines_with_exactly_the_mocks_two_buttons() {
+        let mut a = running("argus", "Clauding…");
+        a.row.active_model = Some("claude-opus-4-6".to_owned());
+        a.row.url = Some("https://hive.local/agent/argus/".to_owned());
+        let tree = card_of(vec![a]);
 
-        let closed = card_of(agents.clone(), None);
+        let row = find_class(&tree, "ts-agent-row").expect("a row renders");
+        let Node::Box { children, .. } = &row else {
+            panic!("the row is a vertical Box, got {row:?}")
+        };
+        assert_eq!(children.len(), 2, "two lines, nothing else: {children:?}");
+
         assert_eq!(
-            count_class(&closed, "ts-agent-details"),
-            0,
-            "nothing is unfolded until a details click"
+            button_ids(&row),
+            vec!["stop:argus".to_owned(), "edit:argus".to_owned()],
+            "line 1 carries the mock's two controls, in her order"
         );
 
-        let open = card_of(agents, Some(&opened));
-        assert_eq!(
-            count_class(&open, "ts-agent-details"),
-            1,
-            "exactly one row unfolds — one agent open at a time"
-        );
-        // …and it is the *right* row: the unfolded block sits inside the row
-        // whose buttons address `argus`.
-        let row = rows_with_class(&open, "ts-agent-row")
-            .into_iter()
-            .find(|r| count_class(r, "ts-agent-details") == 1)
-            .expect("some row unfolded");
+        // Line 1: identity + model. Line 2: the state glyph and the status.
+        let head = find_class(&row, "ts-agent-head").expect("line 1");
+        assert!(find_text(&head, "argus").is_some(), "the name is on line 1");
         assert!(
-            button_ids(&row).iter().any(|id| id == "details:argus"),
-            "the unfolded row must be argus's: {:?}",
-            button_ids(&row)
+            find_text(&head, "Opus").is_some(),
+            "the model family is on line 1: {:?}",
+            texts(&head)
+        );
+        let status = find_class(&row, "ts-agent-statusline").expect("line 2");
+        assert!(
+            find_text(&status, "Clauding…").is_some(),
+            "the harness status is on line 2: {:?}",
+            texts(&status)
+        );
+        assert!(
+            icon_hover(&status, super::Status::Running.icon()).is_some(),
+            "her `(oO)` — the state glyph moved to line 2"
         );
     }
 
-    /// The `agent page` row is a **button** — and it exists at all only when
-    /// there is a URL behind it (#1045).
+    /// The card carries **none** of the detail Annika called too much
+    /// information: no chevron, no unfolded block, no flag chips, no
+    /// `deployed` / `parent` / `agent page` rows.
     ///
-    /// Both halves matter. The first is @kaesaecracker's 2026-09-10 finding:
-    /// the URL rendered and there was no way to follow it. The second is the
-    /// "no dead button" rule — `running()` builds a row whose `url` is `None`,
-    /// and the unfolded details then carry neither a link nor the key that
-    /// labels one, so there is no state in which this draws something
+    /// Stated as an absence because that is what the round did; the positive
+    /// half — that the same content is on the drawer page — is
+    /// `the_agent_page_keeps_what_the_card_gave_up` below.
+    ///
+    /// Falsification: re-render any one of them on the card and exactly one
+    /// assertion here reds.
+    #[test]
+    fn the_card_carries_none_of_the_detail_the_pill_round_removed() {
+        let mut a = agent(
+            "argus",
+            AgentStatusRow {
+                name: "argus".to_owned(),
+                running: true,
+                needs_login: true,
+                parent: Some("bosun".to_owned()),
+                deployed_sha: Some("1bfaf24abcde".to_owned()),
+                url: Some("https://hive.local/agent/argus/".to_owned()),
+                ..AgentStatusRow::default()
+            },
+        );
+        a.row.active_model = Some("claude-opus-4-6".to_owned());
+        let tree = card_of(vec![a]);
+
+        assert_eq!(count_class(&tree, "ts-agent-details"), 0, "no unfold");
+        assert_eq!(count_class(&tree, "ts-agent-chip"), 0, "no flag chips");
+        assert!(
+            icon_hover(&tree, "pan-end-symbolic").is_none()
+                && icon_hover(&tree, "pan-down-symbolic").is_none(),
+            "no chevron"
+        );
+        for gone in ["deployed", "parent", "agent page", "1bfaf24abcde"] {
+            assert!(
+                !texts(&tree).iter().any(|t| t == gone),
+                "{gone} must not be on the card any more: {:?}",
+                texts(&tree)
+            );
+        }
+    }
+
+    /// The drawer page keeps what the card gave up: the flag chips (only the
+    /// ones that are **on**), the pause control, and the `agent page` link as
+    /// a real button (#1045).
+    ///
+    /// "No dead button" is the second half: `running()` builds a row whose
+    /// `url` is `None`, and the page then carries neither the link nor the key
+    /// that labels one — there is no state in which this draws something
     /// clickable that opens nothing.
     ///
-    /// Falsification: put `detail` back at `details_block`'s `agent_url` call
-    /// site and the first assertion reds; drop that site's `if let Some(url)`
-    /// guard (rendering the link with an empty string) and the last two do.
-    #[test]
-    fn the_agent_page_row_is_a_button_only_when_there_is_a_url() {
-        let name = AgentName::parse("argus").expect("legal");
-
-        let mut with_url = running("argus", "idle");
-        with_url.row.url = Some("https://hive.local/agent/argus/".to_owned());
-        let open = card_of(vec![with_url], Some(&name));
-        assert!(
-            button_ids(&open).iter().any(|id| id == "open:argus"),
-            "the URL has to be followable: {:?}",
-            button_ids(&open)
-        );
-
-        let bare = card_of(vec![running("argus", "idle")], Some(&name));
-        assert!(
-            !button_ids(&bare)
-                .iter()
-                .any(|id| id.starts_with(super::ids::OPEN)),
-            "no URL means no button: {:?}",
-            button_ids(&bare)
-        );
-        let mut labelled = false;
-        walk(&bare, &mut |n| {
-            if let Node::Label { text, .. } = n
-                && text == "agent page"
-            {
-                labelled = true;
-            }
-        });
-        assert!(!labelled, "…and no orphaned key either");
-    }
-
-    /// The disclosure glyph says which way the click goes, and carries the
-    /// words the glyph does not.
-    ///
-    /// Falsification: make `agent_row` render one fixed chevron regardless of
-    /// `open` and this goes red.
-    #[test]
-    fn the_disclosure_glyph_flips_with_the_unfold() {
-        let name = AgentName::parse("argus").expect("legal");
-        let closed = card_of(vec![running("argus", "idle")], None);
-        let open = card_of(vec![running("argus", "idle")], Some(&name));
-
-        assert_eq!(
-            icon_hover(&closed, "pan-end-symbolic").as_deref(),
-            Some("details")
-        );
-        assert_eq!(
-            icon_hover(&open, "pan-down-symbolic").as_deref(),
-            Some("hide details")
-        );
-        assert!(
-            icon_hover(&open, "pan-end-symbolic").is_none(),
-            "an unfolded row must not still offer to unfold"
-        );
-    }
-
-    /// Only the flags that are **on** become chips; a clean agent gets none.
-    ///
     /// Falsification: drop the `.filter(|(on, ..)| *on)` in `flag_chips` and
-    /// the clean-agent assertion goes red (four chips instead of zero).
+    /// the clean-agent assertion reds (four chips instead of zero); put
+    /// `detail` back at `agent_page`'s `agent_url` call site and the button
+    /// assertion reds; drop that site's `if let Some(url)` guard and the last
+    /// two do.
     #[test]
-    fn only_the_flags_that_are_on_become_chips() {
+    fn the_agent_page_keeps_what_the_card_gave_up() {
         let name = AgentName::parse("argus").expect("legal");
+        let cfg = AgentsConfig::default();
 
-        let clean = card_of(vec![running("argus", "idle")], Some(&name));
+        let clean = super::panel(
+            &Hive::Up {
+                agents: vec![running("argus", "idle")],
+            },
+            &cfg,
+            Some(&name),
+            ctx(),
+        );
         assert_eq!(
             chip_texts(&clean),
             Vec::<String>::new(),
-            "a healthy agent's details say nothing about flags that are off"
+            "a healthy agent says nothing about flags that are off"
+        );
+        assert!(
+            !button_ids(&clean)
+                .iter()
+                .any(|id| id.starts_with(super::ids::OPEN)),
+            "no URL means no button: {:?}",
+            button_ids(&clean)
+        );
+        assert!(
+            !texts(&clean).iter().any(|t| t == "agent page"),
+            "…and no orphaned key either"
         );
 
-        let flagged = card_of(
-            vec![agent(
-                "argus",
-                AgentStatusRow {
-                    name: "argus".to_owned(),
-                    running: true,
-                    needs_login: true,
-                    needs_update: true,
-                    ..AgentStatusRow::default()
-                },
-            )],
-            Some(&name),
+        let mut flagged = agent(
+            "argus",
+            AgentStatusRow {
+                name: "argus".to_owned(),
+                running: true,
+                needs_login: true,
+                needs_update: true,
+                ..AgentStatusRow::default()
+            },
         );
-        assert_eq!(chip_texts(&flagged), vec!["needs login", "needs update"]);
+        flagged.row.url = Some("https://hive.local/agent/argus/".to_owned());
+        let page = super::panel(
+            &Hive::Up {
+                agents: vec![flagged],
+            },
+            &cfg,
+            Some(&name),
+            ctx(),
+        );
+        assert_eq!(chip_texts(&page), vec!["needs login", "needs update"]);
+        let ids = button_ids(&page);
+        assert!(
+            ids.iter().any(|id| id == "open:argus"),
+            "the URL has to be followable: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id == "pause:argus"),
+            "pause/resume moved here when the card went to two lines: {ids:?}"
+        );
     }
 
     /// A hive bigger than the card can show draws [`MAX_ROWS`] rows and then
@@ -1476,7 +1560,7 @@ mod tests {
             .map(|i| running(&format!("agent-{i}"), "idle"))
             .collect();
 
-        let tree = card_of(agents, None);
+        let tree = card_of(agents);
         assert_eq!(
             count_class(&tree, "ts-agent-row"),
             MAX_ROWS,
@@ -1504,7 +1588,7 @@ mod tests {
 
         let ids = button_ids(&panel);
         for i in 0..MAX_ROWS + 7 {
-            let want = format!("chat:agent-{i}");
+            let want = format!("edit:agent-{i}");
             assert!(ids.contains(&want), "the panel roster must list {want}");
         }
     }
@@ -1535,7 +1619,7 @@ mod tests {
         };
 
         for tree in [
-            super::card(&hive, &cfg, &ExpandedGroups::new(), None),
+            super::card(&hive, &cfg, &ExpandedGroups::new()),
             super::panel(&hive, &cfg, None, ctx()),
         ] {
             let name = find_text(&tree, "choom").expect("the label renders");
@@ -1553,7 +1637,6 @@ mod tests {
             },
             &AgentsConfig::default(),
             &ExpandedGroups::new(),
-            None,
         );
         assert_eq!(
             find_text(&plain, "argus")
@@ -1615,7 +1698,7 @@ mod tests {
         let ids = button_ids(&moved_on);
         assert!(ids.contains(&back));
         assert!(
-            ids.contains(&"chat:bosun".to_owned()),
+            ids.contains(&"edit:bosun".to_owned()),
             "the overview's roster must render when the selection cannot: {ids:?}"
         );
 
@@ -1629,10 +1712,13 @@ mod tests {
             ctx(),
         );
         let ids = button_ids(&resolved);
-        assert!(ids.contains(&"start:argus".to_owned()), "{ids:?}");
+        // `argus` is running, so the lifecycle button offers `stop`; `pause` is
+        // the control the two-line card handed to this page.
+        assert!(ids.contains(&"stop:argus".to_owned()), "{ids:?}");
+        assert!(ids.contains(&"pause:argus".to_owned()), "{ids:?}");
         assert!(ids.contains(&back));
         assert!(
-            !ids.contains(&"chat:argus".to_owned()),
+            !ids.contains(&"edit:argus".to_owned()),
             "the agent page replaces the roster, it does not double it: {ids:?}"
         );
     }
@@ -1696,10 +1782,7 @@ mod tests {
         let selected = AgentName::parse(&long_name).expect("63 bytes is legal");
 
         let surfaces = [
-            (
-                "card",
-                super::card(&hive, &cfg, &ExpandedGroups::new(), Some(&selected)),
-            ),
+            ("card", super::card(&hive, &cfg, &ExpandedGroups::new())),
             (
                 "panel/agent",
                 super::panel(&hive, &cfg, Some(&selected), ctx()),
@@ -1740,7 +1823,7 @@ mod tests {
 
         let drawn = button_ids(&tree)
             .iter()
-            .filter(|id| id.starts_with(ids::CHAT))
+            .filter(|id| id.starts_with(ids::EDIT))
             .count();
         assert_eq!(drawn, PANEL_MAX_ROWS, "the panel roster must cap too");
         assert!(
@@ -1780,7 +1863,6 @@ mod tests {
             },
             &cfg,
             &ExpandedGroups::new(),
-            None,
         );
 
         let mut expanders = 0usize;
@@ -1802,16 +1884,23 @@ mod tests {
         assert_eq!(expanders, 2, "two projects, two expanders");
     }
 
-    /// The hive's dashboard root appears **once** on a panel, not once per
-    /// section. Both the selected agent's `links` group and the hive overview
-    /// want it, and emitting it from both put two `dashboard` rows on the same
-    /// page.
+    /// The hive's dashboard root is **hive-level**, so it belongs to the hive
+    /// overview and to nothing else: once there, never on an agent's page.
     ///
-    /// Falsification: put `detail("dashboard", home)` back into `hive_section`
-    /// and the selected case goes red; drop the `selected.is_none()` links
-    /// branch in `panel` and the overview case does.
+    /// It used to be emitted from both, which put two `dashboard` rows on one
+    /// panel; the fix was a gate, and the pill round turned the gate into the
+    /// whole rule by trimming the agent page's links to the agent's own.
+    ///
+    /// It is also a **button**, not a label: it was left a plain string when
+    /// #1045 turned the agent page's copy into one, which is the same dead-URL
+    /// complaint one surface over.
+    ///
+    /// Falsification: emit it from `agent_page` as well and the second case
+    /// reds; drop the `shown.is_none()` links branch in `panel` and the first
+    /// does; put `detail` back in place of `link_detail` and the button
+    /// assertion does.
     #[test]
-    fn the_dashboard_link_is_emitted_exactly_once_either_way() {
+    fn the_dashboard_link_is_a_button_on_the_overview_and_nowhere_else() {
         let urls = crate::hive::wire::HiveUrls {
             domain: Some("hive.local".to_owned()),
             home: Some("https://hive.local/".to_owned()),
@@ -1826,14 +1915,27 @@ mod tests {
         };
         let name = AgentName::parse("argus").expect("legal");
 
-        for selected in [None, Some(&name)] {
-            let tree = super::panel(&hive, &cfg, selected, with_urls);
-            let seen = texts(&tree).iter().filter(|t| *t == "dashboard").count();
-            assert_eq!(
-                seen, 1,
-                "one dashboard row per panel; selected={selected:?}"
-            );
-        }
+        let overview = super::panel(&hive, &cfg, None, with_urls);
+        assert_eq!(
+            texts(&overview)
+                .iter()
+                .filter(|t| *t == "dashboard")
+                .count(),
+            1,
+            "the overview carries it once"
+        );
+        assert!(
+            button_ids(&overview).contains(&super::ids::OPEN_DASHBOARD.to_owned()),
+            "…and it opens: {:?}",
+            button_ids(&overview)
+        );
+
+        let page = super::panel(&hive, &cfg, Some(&name), with_urls);
+        assert_eq!(
+            texts(&page).iter().filter(|t| *t == "dashboard").count(),
+            0,
+            "an agent's page carries the agent's link, not the hive's"
+        );
     }
 
     /// The panel bounds itself, because the plugin drawer child has no scroller
@@ -1883,19 +1985,27 @@ mod tests {
     #[test]
     fn every_button_prefix_ends_in_a_colon() {
         for prefix in [
-            ids::CHAT,
+            ids::EDIT,
             ids::PAUSE,
-            ids::DETAILS,
             ids::START,
             ids::STOP,
             ids::GROUP,
+            ids::OPEN,
         ] {
             assert!(prefix.ends_with(':'), "{prefix}");
         }
-        // The two whole-id buttons are not prefixes and must not look like one,
-        // or `strip_prefix` would match them against an agent name.
-        for id in [super::BACK_ID, super::OVERVIEW_ID] {
+        // The whole-id buttons are not prefixes and must not look like one, or
+        // `strip_prefix` would match them against an agent name. The dashboard
+        // link is the one that would actually collide: it is the only whole id
+        // that starts with a prefix's own word (`open`), and dropping its dash
+        // for a colon would make `strip_prefix(ids::OPEN)` hand the reducer
+        // `"dashboard"` as an agent name.
+        for id in [super::BACK_ID, super::OVERVIEW_ID, ids::OPEN_DASHBOARD] {
             assert!(!id.contains(':'), "{id}");
+            assert!(
+                id.strip_prefix(ids::OPEN).is_none(),
+                "{id} must not parse as an OPEN target"
+            );
         }
     }
 

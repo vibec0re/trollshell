@@ -54,14 +54,6 @@ pub struct Agents {
     pub urls: Option<HiveUrls>,
     /// The agent whose detail the panel shows, if any.
     pub selected: Option<AgentName>,
-    /// The agent whose details are unfolded **in the card**, if any.
-    ///
-    /// One at a time on purpose: the card is 320 px of a sidebar that also
-    /// holds three other cards, and a roster where every row can be open is a
-    /// roster with no rows visible. A second click on the same row, or a click
-    /// on another row's disclosure, replaces it — the model is the single
-    /// source of truth, exactly as it is for [`Agents::expanded`].
-    pub opened: Option<AgentName>,
     /// Latest unix seconds off the host's clock subscription.
     pub now_unix: i64,
     /// When the last poll answered, in the clock's own unix seconds.
@@ -96,7 +88,6 @@ impl Agents {
             cfg: AgentsConfig::default(),
             urls: None,
             selected: None,
-            opened: None,
             expanded: ExpandedGroups::new(),
             now_unix: 0,
             last_poll_unix: None,
@@ -238,15 +229,6 @@ impl Agents {
                 {
                     self.selected = None;
                 }
-                // …and so does an unfolded row: the card would otherwise hold a
-                // name that no longer has a row to unfold under.
-                if self
-                    .opened
-                    .as_ref()
-                    .is_some_and(|n| self.hive.agent(n).is_none())
-                {
-                    self.opened = None;
-                }
                 effects
             }
         }
@@ -368,29 +350,14 @@ impl Agents {
             }
             return Vec::new();
         }
-        if let Some(rest) = node.strip_prefix(ids::CHAT) {
-            // P1's primary click opens the detail panel. P2 replaces this with
-            // a detached `RunCommand` launching the chat companion (spec §7),
-            // which needs #953; what must NOT change either way is that it
-            // never touches `SetPaused` — the chat surface is designed to be
-            // used while the loop runs.
+        if let Some(rest) = node.strip_prefix(ids::EDIT) {
+            // Annika's `[optionsedit]` (2026-09-11). It opens this plugin's own
+            // page on that agent — and keeps doing exactly that when #1010's
+            // modal lands, because `OpenPage(PluginSelf)` names the page, not
+            // the surface the host mounts it on. Still read-only until #952;
+            // the button is named for where it is going.
             if let Some(name) = AgentName::parse(rest) {
                 return self.open_detail(name);
-            }
-            return Vec::new();
-        }
-        if let Some(rest) = node.strip_prefix(ids::DETAILS) {
-            // Unfolds **in the card**, where the click happened — the one
-            // thing @kaesaecracker's second round asked for by name ("its very
-            // weird the panel opens in the top right after clicking bottom
-            // left"). Read-only either way; real editing waits for #952
-            // (spec §6.3).
-            if let Some(name) = AgentName::parse(rest) {
-                self.opened = if self.opened.as_ref() == Some(&name) {
-                    None
-                } else {
-                    Some(name)
-                };
             }
             return Vec::new();
         }
@@ -581,10 +548,5 @@ impl Plugin for Agents {
 /// assert on the tree rather than on a screenshot.
 #[must_use]
 pub fn card_of(model: &Agents) -> Node {
-    view::card(
-        &model.hive,
-        &model.cfg,
-        &model.expanded,
-        model.opened.as_ref(),
-    )
+    view::card(&model.hive, &model.cfg, &model.expanded)
 }

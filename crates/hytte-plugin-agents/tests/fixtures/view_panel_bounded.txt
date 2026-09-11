@@ -201,20 +201,28 @@ Box {
                                                 tooltip: None,
                                             },
                                             Spacer,
-                                            Text {
-                                                id: None,
-                                                text: "https://hive.local/",
-                                                max_width_chars: Some(
-                                                    28,
-                                                ),
-                                                ellipsize: true,
+                                            Button {
+                                                id: "open-dashboard",
                                                 classes: [
-                                                    "caption",
-                                                    "numeric",
+                                                    "flat",
+                                                    "link",
+                                                    "ts-agent-link",
                                                 ],
-                                                tooltip: Some(
-                                                    "https://hive.local/",
-                                                ),
+                                                child: Text {
+                                                    id: None,
+                                                    text: "https://hive.local/",
+                                                    max_width_chars: Some(
+                                                        28,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "caption",
+                                                        "numeric",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "open https://hive.local/",
+                                                    ),
+                                                },
                                             },
                                         ],
                                         tooltip: None,
@@ -265,7 +273,7 @@ Box {
                                                 tooltip: None,
                                             },
                                             Button {
-                                                id: "chat:trollshell-choom",
+                                                id: "edit:trollshell-choom",
                                                 classes: [
                                                     "flat",
                                                     "ts-agent-name",
@@ -329,7 +337,7 @@ Box {
                                                 tooltip: None,
                                             },
                                             Button {
-                                                id: "chat:nixos-choom",
+                                                id: "edit:nixos-choom",
                                                 classes: [
                                                     "flat",
                                                     "ts-agent-name",
@@ -393,7 +401,7 @@ Box {
                                                 tooltip: None,
                                             },
                                             Button {
-                                                id: "chat:stray",
+                                                id: "edit:stray",
                                                 classes: [
                                                     "flat",
                                                     "ts-agent-name",

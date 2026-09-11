@@ -679,6 +679,26 @@
     background: none;
     box-shadow: none;
 }
+/* Line 1's model chip (#963, Annika's `[Model]`): the family word only, sitting
+ * between the name and the controls. A quiet pill rather than a loud one — the
+ * name is the row's heading and the model is context, so this borrows the
+ * badge's shape at the caption size and takes its tint from `dim-label`
+ * through `currentColor` like every other chip in this block. */
+.ts-agents-card .ts-agent-model,
+.ts-agents-panel .ts-agent-model {
+    padding: 0 0.385em;
+    border-radius: 9999px;
+    background: alpha(currentColor, 0.1);
+}
+/* Line 2: the state glyph (Annika's `(oO)`) and, when set, the update badge,
+ * beside the status text. The glyph carries no rule of its own — it is a plain
+ * symbolic icon tinted by the tone class the plugin sets beside
+ * `.ts-agent-state` (`accent`, `error`, `warning`, `dim-label`) — so all this
+ * row needs is the hairline of space that keeps it off line 1. */
+.ts-agents-card .ts-agent-statusline,
+.ts-agents-panel .ts-agent-statusline {
+    margin-top: 0.077em;
+}
 /* The `agent page` / `dashboard` links (#1045): a detail row whose value opens
  * in the desktop's default handler. Same de-boxing as `.ts-agent-name` — a
  * detail row is dense, and a framed button in it would be taller than the row

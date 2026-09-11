@@ -73,15 +73,20 @@ xvfb-run cargo test --features system-tests -p hytte-ui   # display tests headle
 
 **Adding a new binary means adding a slice, not a `buildPackage` call.** Before #587 the package path ran 15 crane compile derivations — 13 of which existed purely to copy one binary out — because each `buildPackage` inherited `workspace`'s packed `target` dir as `cargoArtifacts` and hoped cargo would find everything fresh; measured, it didn't, and every one of them recompiled the workspace. #587 collapsed that to one compile plus plain `cp`s specifically so nobody adds a 16th crane call.
 
-`doCheck = true` lives on the `workspace` derivation itself: `buildPackage` captures binaries out of cargo's JSON build log in a `postBuild` hook, which runs _before_ the check phase, so `cargo test --workspace` (hermetic, no `system-tests`) runs on every build that forces `workspace` — a cold plugin build runs the same suite `nix build .#trollshell` does, not a separate one. The deps stage (`craneLib.buildDepsOnly`) shares that same `--workspace --locked` scope; it was wrongly `-p trollshell` before #587, fingerprinting a different feature union than the `--workspace` compile and so caching a dependency graph the compile stage couldn't actually reuse.
+Since #1115, `doCheck = false` on the `workspace` derivation: a consumer's `nix build` (this package or any other slice of `workspace`) compiles release only and never runs `cargo test`, so it no longer runs the hermetic internals suite or compiles the dev-dependency graph feeding it — that suite now runs as its own `checks.workspace-tests` (flake.nix), gated by `nix flake check` rather than every build. `buildPackage` still captures binaries out of cargo's JSON build log in a `postBuild` hook that fires at the end of the build phase regardless of `doCheck`, so that capture is unaffected. The deps stage (`craneLib.buildDepsOnly`) shares that same `--workspace --locked` scope; it was wrongly `-p trollshell` before #587, fingerprinting a different feature union than the `--workspace` compile and so caching a dependency graph the compile stage couldn't actually reuse.
 
 The two nixosTest probe binaries (`nix/probe.nix`, `nix/wifi-probe.nix`, #589) are slices too, but — unlike the plugin/shell slices — they `wrapGAppsHook4`-wrap: the EDS VM test needs `GIO_EXTRA_MODULES` for dconf's GSettings backend, which only a GApps wrap injects. Model a new probe-shaped derivation on these two, not on `nix/plugin.nix`.
 
 ### CI (`nix flake check`)
 
-Beyond the package build's `doCheck`, the flake's `checks` output
-(`flake.nix`) gates a fair bit more than tests:
+Since #1115 the package build no longer runs any tests at all (see
+"Packaging" above), so the flake's `checks` output (`flake.nix`) is where
+every test suite runs, plus a fair bit more:
 
+- `checks.workspace-tests` runs the hermetic internals suite (`cargo test
+  --workspace`, still deliberately without `system-tests`) — the same command
+  the package build's `doCheck` used to run on every `nix build`, now gated
+  here instead (#1115).
 - `cargo clippy --workspace --all-targets --features system-tests -- -D warnings`
   (the `system-tests` feature is enabled here so the gated integration tests
   and GTK `mod tests` blocks are lint-checked too, not just compiled once and

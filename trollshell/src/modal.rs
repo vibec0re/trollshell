@@ -435,6 +435,12 @@ impl Page {
 /// collide with a built-in page token.
 const PLUGIN_STACK_CHILD: &str = "__plugin";
 
+/// The fixed stack-child name of the Workspaces **Edit** sub-page (#1071 §5,
+/// phase 4). Same `__` prefix, same reason, same shape as
+/// [`PLUGIN_STACK_CHILD`]: `Page` is `Copy` with unit variants only at ~60
+/// by-value call sites, so a sub-page keyed by *which card* cannot be one.
+const WORKSPACE_EDIT_STACK_CHILD: &str = "__workspace-edit";
+
 /// What a drawer is currently showing: a built-in [`Page`], or a plugin's own
 /// panel (keyed by plugin id). Keeps `Page` `Copy` and untouched (#349 PR2) — the
 /// plugin concept lives only here, not in the 19-variant `Page` enum the shell's
@@ -444,6 +450,16 @@ const PLUGIN_STACK_CHILD: &str = "__plugin";
 enum Active {
     Builtin(Page),
     Plugin(String),
+    /// The Workspaces page's Edit sub-page, keyed by which card it is editing
+    /// (#1071 §5, phase 4) — a stack name, or `#<workspace id>` for an
+    /// ephemeral card. Exactly the shape [`Active::Plugin`] already has, and for
+    /// exactly the same reason: a payload-carrying `Page` variant would make
+    /// `Page` neither `Copy` nor unit-only.
+    ///
+    /// The key is bookkeeping only: which card's form is on screen is published
+    /// by `panels::workspace_edit::open`, because the form needs a whole `Draft`
+    /// and not a name (see that module's doc).
+    WorkspaceEdit(String),
 }
 
 impl Active {
@@ -455,6 +471,7 @@ impl Active {
         match self {
             Self::Builtin(p) => p.stack_name(),
             Self::Plugin(_) => PLUGIN_STACK_CHILD,
+            Self::WorkspaceEdit(_) => WORKSPACE_EDIT_STACK_CHILD,
         }
     }
 
@@ -464,7 +481,7 @@ impl Active {
     fn builtin(&self) -> Option<Page> {
         match self {
             Self::Builtin(p) => Some(*p),
-            Self::Plugin(_) => None,
+            Self::Plugin(_) | Self::WorkspaceEdit(_) => None,
         }
     }
 }
@@ -1028,7 +1045,9 @@ fn ensure_page(stack: &gtk::Stack, page: Page) {
 fn set_stack_active(panel: &ModalPanel, active: &Active) {
     match active {
         Active::Builtin(page) => ensure_page(&panel.stack, *page),
-        Active::Plugin(_) => {}
+        // Both non-`Page` children are added eagerly in `build_pages_stack`, so
+        // there is nothing to build on first use.
+        Active::Plugin(_) | Active::WorkspaceEdit(_) => {}
     }
     panel.stack.set_visible_child_name(active.stack_name());
 }
@@ -1047,6 +1066,10 @@ fn on_active_show(panel: &ModalPanel, active: &Active) {
     match active {
         Active::Builtin(page) => on_page_show(panel, *page),
         Active::Plugin(id) => crate::plugins::set_active_panel(Some(id)),
+        // Nothing: the form is already seeded — `panels::workspace_edit::open`
+        // publishes the whole `Draft` before the switch, because a name alone
+        // would not be enough to rebuild the form (that module's doc says why).
+        Active::WorkspaceEdit(_) => {}
     }
 }
 
@@ -1096,6 +1119,15 @@ fn build_pages_stack() -> gtk::Stack {
     stack.add_named(
         &crate::plugins::plugin_panel_slot(),
         Some(PLUGIN_STACK_CHILD),
+    );
+    // The second eagerly-added child, on the same terms (#1071 §5, phase 4): an
+    // empty region until a card's Edit publishes a draft, contributing zero size
+    // while not visible because `hhomogeneous`/`vhomogeneous` are off. Not a
+    // `Page`, so it sidesteps `build_page`'s exhaustive match; added once under
+    // the fixed name and never rebuilt.
+    stack.add_named(
+        &crate::panels::workspace_edit::edit_slot(),
+        Some(WORKSPACE_EDIT_STACK_CHILD),
     );
     stack
 }
@@ -1329,6 +1361,32 @@ pub fn switch_active(target: Page) {
     // moving into a branch.
     let focused = crate::components::focused_output::current();
     open_on_focused(focused.as_deref(), target);
+}
+
+/// Switch every open drawer to the Workspaces **Edit** sub-page for the card
+/// keyed `key` (#1071 §5, phase 4).
+///
+/// The `Active`-shaped sibling of [`switch_active`], and it stops where that one
+/// keeps going: if no drawer is open there is nothing to do, because this is
+/// only ever reached from a button **on** an open drawer. `switch_active`'s
+/// fallback of opening the page on the focused monitor would be opening a form
+/// seeded by a card nobody is looking at.
+///
+/// The draft itself is published by `panels::workspace_edit::open` before this
+/// is called; `key` is the drawer's own bookkeeping — see [`Active::WorkspaceEdit`].
+pub fn switch_to_workspace_edit(key: &str) {
+    // Snapshot the handles first, then act with no `PANELS` borrow live (#643) —
+    // the same discipline `switch_active` documents: these are runs of GTK calls
+    // and any synchronous emission that re-enters `PANELS` would panic fatally
+    // from inside a glib callback.
+    for panel in live_panels() {
+        if panel.current.borrow().is_some() {
+            let active = Active::WorkspaceEdit(key.to_owned());
+            set_stack_active(&panel, &active);
+            *panel.current.borrow_mut() = Some(active);
+        }
+    }
+    recompute_gates();
 }
 
 /// Begin the retract animation on every open drawer. Used by drawer-content

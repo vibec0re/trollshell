@@ -18,6 +18,7 @@ pub mod power_menu;
 pub mod settings;
 pub mod stats;
 pub mod vpn;
+pub mod workspace_edit;
 pub mod workspaces;
 
 pub use appearance::panel_appearance;

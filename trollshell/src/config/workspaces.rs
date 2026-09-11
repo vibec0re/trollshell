@@ -551,6 +551,181 @@ pub fn save_stack_to(path: &std::path::Path, name: &str, stack: &Stack) -> Resul
     hytte_config::subsystem::save_overlay_to(path, &next)
 }
 
+/// Write the Edit sub-page's form back to the overlay (#1071 §5, phase 4).
+///
+/// This is the writer [`save_stack`] deliberately was not. Phase 2's Save is a
+/// *creation* and refuses a name that already exists, because it had no form
+/// with which to describe the stack it would otherwise be replacing — its own
+/// doc says *"Phase 4's edit form is where an existing stack is changed"*. This
+/// is that form's writer, so it replaces by design.
+///
+/// `previous` is the name the form opened on: `None` for an ephemeral card
+/// (§3.7, where Save is what creates the entry) and `Some(old)` for a saved one.
+/// When `old` differs from `name` this is a **rename** — see [`rename_within`]
+/// for what moves.
+///
+/// Writing the whole `[workspace.<name>]` table is right here, and is exactly
+/// what made it wrong for [`set_stack_monitor`]: a drag says nothing about a
+/// stack's apps, so copying a home-manager base's values down into the overlay
+/// would freeze them; a Save says something about **every** field, because the
+/// user just looked at all of them in the form and pressed Save. What they saw
+/// was the merged view, and what they get is that view pinned — which is the
+/// only reading of "Save" that does not silently discard an edit.
+///
+/// # Errors
+/// [`ConfigError::Invalid`] for an unusable name, a rename onto a name some
+/// other stack already has, or a `workspace` key that is not a table;
+/// [`ConfigError::NoOverlayPath`] when there is nowhere to write.
+pub fn save_edit(previous: Option<&str>, name: &str, stack: &Stack) -> Result<(), ConfigError> {
+    let path = xdg::overlay_path(WorkspacesConfig::NAME).ok_or(ConfigError::NoOverlayPath)?;
+    save_edit_to(&path, previous, name, stack)
+}
+
+/// [`save_edit`] against an explicit overlay path, so the round trip is testable
+/// without an `XDG_CONFIG_HOME`.
+///
+/// # Errors
+/// As [`save_edit`].
+pub fn save_edit_to(
+    path: &std::path::Path,
+    previous: Option<&str>,
+    name: &str,
+    stack: &Stack,
+) -> Result<(), ConfigError> {
+    let name = normalize_workspace_name(name)
+        .ok_or_else(|| ConfigError::Invalid(format!("invalid workspace name: {name:?}")))?;
+    let previous = previous
+        .map(|p| {
+            normalize_workspace_name(p)
+                .ok_or_else(|| ConfigError::Invalid(format!("invalid workspace name: {p:?}")))
+        })
+        .transpose()?;
+
+    let existing = hytte_config::subsystem::load_from::<WorkspacesConfig>(&[path.to_path_buf()])?;
+    let mut table = workspace_table(&existing)?;
+    let mut order = existing.config.order.clone();
+
+    if let Some(previous) = previous.as_deref()
+        && previous != name
+    {
+        // A rename onto a name that is already somebody else's would silently
+        // eat that stack — `Table::insert` replaces. The check is against the
+        // overlay's own table *and* the merged view, for the reason
+        // `save_stack` states: a base-pinned name is taken too.
+        if hytte_config::subsystem::load_or_default::<WorkspacesConfig>()
+            .is_some_and(|config| config.parsed().0.stacks.contains_key(&name))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "a workspace called {name:?} already exists"
+            )));
+        }
+        table.remove(previous);
+        order = rename_within(&order, previous, &name);
+    }
+
+    table.insert(name, stack_value(stack));
+    let next = WorkspacesConfig {
+        order: order_value(&order, &existing),
+        workspace: Some(toml::Value::Table(table)),
+    };
+    hytte_config::subsystem::save_overlay_to(path, &next)
+}
+
+/// Rewrite the card order (#1071 §3.6/§5, phase 4) — the file half of dragging a
+/// card up or down inside one monitor's column.
+///
+/// `names` is the **whole** page's order, every monitor's cards together, in the
+/// order the drag left them. It has to be: `order` is one flat array across
+/// every screen (§4), so writing only the dragged column's names would drop
+/// every other column's.
+///
+/// # Errors
+/// [`ConfigError::NoOverlayPath`] when there is nowhere to write, plus whatever
+/// the reader and the format-preserving writer report.
+pub fn set_order(names: &[String]) -> Result<(), ConfigError> {
+    let path = xdg::overlay_path(WorkspacesConfig::NAME).ok_or(ConfigError::NoOverlayPath)?;
+    set_order_to(&path, names)
+}
+
+/// [`set_order`] against an explicit overlay path, so the round trip is testable
+/// without an `XDG_CONFIG_HOME`.
+///
+/// Touches `order` and nothing else — not the `[workspace.*]` tables, not a
+/// comment, not a byte of whitespace anywhere else — because it goes through the
+/// same `toml_edit` patch [`set_stack_monitor_to`] does.
+///
+/// # Errors
+/// Whatever the reader and the format-preserving writer report.
+pub fn set_order_to(path: &std::path::Path, names: &[String]) -> Result<(), ConfigError> {
+    let existing = hytte_config::subsystem::load_from::<WorkspacesConfig>(&[path.to_path_buf()])?;
+    let order = toml::Value::Array(names.iter().map(|n| n.clone().into()).collect());
+    let next = WorkspacesConfig {
+        order: Some(order),
+        workspace: existing.config.workspace.clone(),
+    };
+    hytte_config::subsystem::save_overlay_to(path, &next)
+}
+
+/// The overlay's `[workspace]` table, or an error if it is something else.
+///
+/// Shared by the two writers that rewrite inside it. **Present but not a table**
+/// is a hand-edit slip (`workspace = "chat"`), and an `unwrap_or_default()`
+/// there hands back a fresh empty table and quietly overwrites whatever the user
+/// wrote (#1106 review LOW 8).
+fn workspace_table(
+    existing: &hytte_config::subsystem::Loaded<WorkspacesConfig>,
+) -> Result<toml::Table, ConfigError> {
+    match existing.config.workspace.as_ref() {
+        None => Ok(toml::Table::new()),
+        Some(toml::Value::Table(table)) => Ok(table.clone()),
+        Some(other) => Err(ConfigError::Invalid(format!(
+            "workspace is {other}, not a table of stacks; not rewriting it"
+        ))),
+    }
+}
+
+/// `order` as it should be written back after a possible rename.
+///
+/// `None` when the overlay had no `order` and the rename changed nothing — which
+/// is the case that keeps a Save from *inventing* an `order` key. Arrays replace
+/// whole (`merge.rs`), so an overlay that carries `order` at all overrides the
+/// base's entirely; writing one the user never asked for would silently discard
+/// a home-manager-pinned card order (#1101's own "design calls worth checking").
+fn order_value(
+    order: &Option<toml::Value>,
+    existing: &hytte_config::subsystem::Loaded<WorkspacesConfig>,
+) -> Option<toml::Value> {
+    if order == &existing.config.order {
+        existing.config.order.clone()
+    } else {
+        order.clone()
+    }
+}
+
+/// `order` with `from` replaced by `to`, **in place**.
+///
+/// In place rather than removed-and-appended: a rename is not a reordering, and
+/// a renamed card that jumped to the bottom of its column would be a second,
+/// invisible edit the user did not make.
+///
+/// Pure, and stated over the raw `toml::Value` because that is what the overlay
+/// holds — a non-array `order` (another hand-edit slip) is returned untouched
+/// rather than replaced, so this writer never destroys a value it cannot read.
+fn rename_within(order: &Option<toml::Value>, from: &str, to: &str) -> Option<toml::Value> {
+    let Some(toml::Value::Array(items)) = order else {
+        return order.clone();
+    };
+    Some(toml::Value::Array(
+        items
+            .iter()
+            .map(|item| match item.as_str() {
+                Some(name) if name.eq_ignore_ascii_case(from) => to.into(),
+                _ => item.clone(),
+            })
+            .collect(),
+    ))
+}
+
 /// Record that the stack `name` lives on the connector `monitor` — the file
 /// half of #1071 §5's drag between monitor columns (phase 3).
 ///
@@ -602,16 +777,8 @@ pub fn set_stack_monitor_to(
     // user wrote. The per-stack guard below refuses exactly this shape one
     // level down; the outer one has to as well, or the careful guard only
     // covers the case the careless one has already destroyed (#1106 review
-    // LOW 8).
-    let mut table = match existing.config.workspace.as_ref() {
-        None => toml::Table::new(),
-        Some(toml::Value::Table(table)) => table.clone(),
-        Some(other) => {
-            return Err(ConfigError::Invalid(format!(
-                "workspace is {other}, not a table of stacks; not rewriting it"
-            )));
-        }
-    };
+    // LOW 8). Shared with `save_edit_to`, which needs the same answer.
+    let mut table = workspace_table(&existing)?;
     // A stack the overlay has never mentioned gets a fresh table with one key;
     // a stack it has gets that one key changed and keeps the rest.
     let entry = table

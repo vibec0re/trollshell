@@ -16,10 +16,11 @@ use std::time::Duration;
 use hytte::services::niri::{Window, WindowLayout, Workspace, WorkspaceAction};
 
 use super::{
-    AutostartPlan, Launched, Layout, Ops, Stack, StackApp, StackState, StartError, StopStep,
-    Workspaces, app_launch, autostart_all, autostart_driver, autostart_plan, autostart_tick,
-    column_order_batch, may_stop, missing_apps, move_to_monitor, names_to_release, order_index,
-    plan_start, release_lingering_names, save, start, state_of, stop, stop_plan, stray_moves,
+    AppStart, AutostartPlan, Launchable, Launched, Layout, Ops, Stack, StackApp, StackState,
+    StartError, StopStep, Workspaces, app_start, autostart_all, autostart_driver, autostart_plan,
+    autostart_tick, column_order_batch, may_stop, missing_apps, move_to_monitor, names_to_release,
+    order_index, plan_start, release_lingering_names, save, start, state_of, stop, stop_plan,
+    stray_moves,
 };
 use crate::launch::Launch;
 
@@ -125,6 +126,12 @@ enum Call {
     SaveStack(String),
     /// A `monitor` rewrite, likewise recorded rather than performed.
     SetMonitor(String, String),
+    /// A `$XDG_DATA_DIRS` desktop-entry lookup, answered from the script
+    /// (#1071 §3.2).
+    DesktopEntry(String),
+    /// A `DBusActivatable=true` entry started through its own entry rather than
+    /// an `Exec` line (#1071 §3.2). Nothing forked, nothing in the slice.
+    Activate(String),
     UnitForPid(u32),
     StopUnit(String),
     StopSlice(String),
@@ -151,6 +158,14 @@ struct State {
     launch_error: Option<String>,
     /// When set, the scripted `workspaces.toml` write fails with it.
     save_error: Option<String>,
+    /// desktop id → the entry `$XDG_DATA_DIRS` would have yielded. Absent = the
+    /// id names no installed entry, which is §3.2's "no desktop entry" case.
+    entries: BTreeMap<String, Launchable>,
+    /// When set, a scripted activation fails with it.
+    activate_error: Option<String>,
+    /// The argv of every launch, in order — `Call::Launch` carries only the unit
+    /// name, and #1071 §3.2 is entirely about what ends up after the `--`.
+    argvs: Vec<Vec<String>>,
 }
 
 #[derive(Clone, Default)]
@@ -170,6 +185,73 @@ impl Script {
     fn with_unit(self, pid: u32, unit: &str) -> Self {
         self.0.borrow_mut().units.insert(pid, unit.to_owned());
         self
+    }
+
+    /// An installed desktop entry per id whose `Exec=` is the id itself.
+    ///
+    /// The dull case, for the tests that are about something else entirely: from
+    /// phase 4 on, an app whose id names **no** entry launches nothing at all
+    /// (#1071 §3.2), so a test asserting that a unit was started has to say that
+    /// the entry exists. It says only that, deliberately — the tests that are
+    /// about §3.2 script real `Exec` lines with [`Script::with_entry`].
+    fn with_plain_entries(self, ids: &[&str]) -> Self {
+        {
+            let mut state = self.0.borrow_mut();
+            for id in ids {
+                state.entries.insert(
+                    (*id).to_owned(),
+                    Launchable {
+                        exec: (*id).to_owned(),
+                        dbus_activatable: false,
+                    },
+                );
+            }
+        }
+        self
+    }
+
+    /// An installed desktop entry whose `Exec=` is `exec` (#1071 §3.2).
+    fn with_entry(self, id: &str, exec: &str) -> Self {
+        self.0.borrow_mut().entries.insert(
+            id.to_owned(),
+            Launchable {
+                exec: exec.to_owned(),
+                dbus_activatable: false,
+            },
+        );
+        self
+    }
+
+    /// An installed desktop entry carrying `DBusActivatable=true`. Its `Exec` is
+    /// still stated, because the point of every test using this is that the
+    /// `Exec` is the thing **not** run.
+    fn with_dbus_entry(self, id: &str, exec: &str) -> Self {
+        self.0.borrow_mut().entries.insert(
+            id.to_owned(),
+            Launchable {
+                exec: exec.to_owned(),
+                dbus_activatable: true,
+            },
+        );
+        self
+    }
+
+    /// The argv of every `systemd-run` launch, in order.
+    fn launch_argvs(&self) -> Vec<Vec<String>> {
+        self.0.borrow().argvs.clone()
+    }
+
+    /// The ids activated through their desktop entry, in order.
+    fn activations(&self) -> Vec<String> {
+        self.0
+            .borrow()
+            .calls
+            .iter()
+            .filter_map(|c| match c {
+                Call::Activate(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn with_slice_up(self, name: &str) -> Self {
@@ -301,7 +383,20 @@ impl Ops for Script {
     async fn launch(&self, launch: &Launch) -> Result<(), String> {
         let mut state = self.0.borrow_mut();
         state.calls.push(Call::Launch(launch.unit.clone()));
+        state.argvs.push(launch.argv.clone());
         state.launch_error.clone().map_or(Ok(()), Err)
+    }
+
+    async fn desktop_entry(&self, id: &str) -> Option<Launchable> {
+        let mut state = self.0.borrow_mut();
+        state.calls.push(Call::DesktopEntry(id.to_owned()));
+        state.entries.get(id).cloned()
+    }
+
+    async fn activate(&self, id: &str) -> Result<(), String> {
+        let mut state = self.0.borrow_mut();
+        state.calls.push(Call::Activate(id.to_owned()));
+        state.activate_error.clone().map_or(Ok(()), Err)
     }
 
     async fn save_stack(&self, name: &str, _stack: &Stack) -> Result<(), String> {
@@ -716,7 +811,8 @@ fn a_start_verifies_then_launches_then_lays_out_once() {
     let settled = vec![win(9, 1, "firefox"), win(10, 1, "Alacritty")];
     let script = Script::default()
         .with_workspaces(&[before.clone(), before, after])
-        .with_windows(&[Vec::new(), Vec::new(), settled]);
+        .with_windows(&[Vec::new(), Vec::new(), settled])
+        .with_plain_entries(&["firefox", "Alacritty"]);
 
     let mut s = stack(&["firefox", "Alacritty"]);
     s.layout = Layout::Golden;
@@ -952,17 +1048,52 @@ fn the_grace_window_moves_a_stray_and_then_settles() {
     );
 }
 
+// ── §3.2: `Exec` resolution (phase 4) ────────────────────────────────────────
+
+/// A stack app with an `exec` override.
+fn overridden(id: &str, exec: &str) -> StackApp {
+    StackApp {
+        id: id.to_owned(),
+        exec: Some(exec.to_owned()),
+    }
+}
+
+/// A stack app that is nothing but a desktop-entry id.
+fn by_id(id: &str) -> StackApp {
+    StackApp {
+        id: id.to_owned(),
+        exec: None,
+    }
+}
+
+/// An installed entry with the given `Exec=`.
+fn entry(exec: &str) -> Launchable {
+    Launchable {
+        exec: exec.to_owned(),
+        dbus_activatable: false,
+    }
+}
+
+/// The argv [`app_start`] resolved, or `None` for anything but a unit launch.
+fn argv_of(start: &AppStart) -> Option<Vec<String>> {
+    match start {
+        AppStart::Unit(launch) => Some(launch.argv.clone()),
+        _ => None,
+    }
+}
+
+/// `&["a", "b"]` as the `Vec<String>` an argv actually is.
+fn owned(words: &[&str]) -> Vec<String> {
+    words.iter().map(|w| (*w).to_owned()).collect()
+}
+
 /// One app's unit name, slice and argv.
 #[test]
 fn an_app_launches_into_the_stacks_own_slice() {
-    let launch = app_launch(
-        "chat",
-        1,
-        &StackApp {
-            id: "Alacritty".to_owned(),
-            exec: Some("alacritty -e weechat".to_owned()),
-        },
-    );
+    let start = app_start("chat", 1, &overridden("Alacritty", "alacritty -e weechat"), None);
+    let AppStart::Unit(launch) = start else {
+        panic!("an override is a unit launch, got {start:?}");
+    };
     assert_eq!(launch.unit, "trollshell-ws-chat-1.service");
     assert_eq!(launch.slice.as_deref(), Some("trollshell-ws-chat.slice"));
     assert_eq!(launch.argv, ["alacritty", "-e", "weechat"]);
@@ -971,20 +1102,193 @@ fn an_app_launches_into_the_stacks_own_slice() {
         "an app the user closed has finished; it is not a supervised service"
     );
     assert!(launch.secret_env.is_empty(), "no keyring injection here");
+}
 
-    let bare = app_launch(
-        "chat",
-        0,
-        &StackApp {
-            id: "firefox".to_owned(),
-            exec: None,
-        },
-    );
+/// #1071 §3.2: *"Restore = the entry's `Exec` with field codes stripped"*.
+///
+/// The table, at the seam a Start actually uses. `desktop_entry`'s own tests
+/// pin the stripper; this pins that the stripper is what a launch goes through —
+/// **the mutation is `app_start` using `entry.exec` unstripped**, which reds
+/// here and nowhere else.
+#[test]
+fn a_resolved_entry_launches_its_exec_with_the_field_codes_stripped() {
+    let cases: [(&str, &[&str]); 5] = [
+        ("firefox %u", &["firefox"]),
+        ("firefox %U", &["firefox"]),
+        ("/usr/bin/nautilus --new-window %F", &["/usr/bin/nautilus", "--new-window"]),
+        ("prog %i %c %k --flag", &["prog", "--flag"]),
+        // `%%` is the spec's escape for a literal percent and survives as one.
+        ("prog 100%% %f", &["prog", "100%"]),
+    ];
+    for (exec, want) in cases {
+        let start = app_start("chat", 0, &by_id("app"), Some(&entry(exec)));
+        assert_eq!(
+            argv_of(&start),
+            Some(owned(want)),
+            "Exec={exec:?} resolved wrongly"
+        );
+    }
+}
+
+/// §3.2: *"or the override verbatim"*.
+///
+/// Verbatim means the field codes are **not** stripped from it: a `%` in a
+/// launch command someone typed is theirs, and this is not an `Exec` line. The
+/// override also wins over the entry entirely — including over a
+/// `DBusActivatable=true` one, which is the whole reason the field exists.
+#[test]
+fn an_override_is_taken_verbatim_and_beats_the_entry() {
+    let start = app_start("chat", 0, &overridden("app", "prog --pct 50%u"), Some(&entry("other")));
     assert_eq!(
-        bare.argv,
-        ["firefox"],
-        "with no override the id is the command until phase 4 resolves entries"
+        argv_of(&start),
+        Some(owned(&["prog", "--pct", "50%u"])),
+        "the override was field-code stripped, or the entry won"
     );
+
+    let dbus = Launchable {
+        exec: "never-run".to_owned(),
+        dbus_activatable: true,
+    };
+    let start = app_start("chat", 0, &overridden("app", "prog"), Some(&dbus));
+    assert_eq!(
+        argv_of(&start),
+        Some(owned(&["prog"])),
+        "a DBusActivatable entry swallowed the user's own launch command"
+    );
+}
+
+/// §3.2: *"a `DBusActivatable=true` entry launches through … `launch` instead
+/// of a raw `Exec`"*.
+///
+/// **The mutation**: treating `DBusActivatable` as an ordinary entry (i.e.
+/// dropping the branch) reds this — the start becomes a `Unit` carrying
+/// `never-run`.
+#[test]
+fn a_dbus_activatable_entry_is_activated_rather_than_executed() {
+    let dbus = Launchable {
+        exec: "never-run %U".to_owned(),
+        dbus_activatable: true,
+    };
+    let start = app_start("chat", 0, &by_id("org.gnome.Nautilus"), Some(&dbus));
+    assert_eq!(
+        start,
+        AppStart::Activate {
+            id: "org.gnome.Nautilus".to_owned()
+        }
+    );
+    assert!(
+        argv_of(&start).is_none(),
+        "a D-Bus activation must not also fork an Exec line"
+    );
+}
+
+/// §3.2: *"A desktop id with no entry and no override → one warning naming it,
+/// Start continues with the rest."*
+///
+/// Phase 2 ran the **id itself** as a command here, so `org.mozilla.firefox`
+/// launched nothing while looking like it had launched something (#1106's own
+/// "Known limits"). There is deliberately no such fallback any more.
+#[test]
+fn an_id_that_names_no_entry_resolves_to_nothing_rather_than_to_itself() {
+    let start = app_start("chat", 0, &by_id("org.mozilla.firefox"), None);
+    assert_eq!(
+        start,
+        AppStart::Unresolved {
+            id: "org.mozilla.firefox".to_owned()
+        },
+        "the bare id was run as a command again"
+    );
+
+    // An entry whose `Exec` is nothing but field codes has no command left
+    // either, and an empty argv is not a launch.
+    let start = app_start("chat", 0, &by_id("app"), Some(&entry("%U")));
+    assert_eq!(start, AppStart::Unresolved { id: "app".to_owned() });
+    // …and neither is an override that is only whitespace.
+    let start = app_start("chat", 0, &overridden("app", "   "), None);
+    assert_eq!(start, AppStart::Unresolved { id: "app".to_owned() });
+}
+
+/// End to end through a real Start: the three kinds side by side, so the
+/// resolution is pinned where the transaction uses it and not only in the pure
+/// function.
+#[test]
+fn a_start_resolves_each_apps_entry_and_launches_activates_or_warns() {
+    let stack = Stack {
+        apps: vec![
+            by_id("org.mozilla.firefox"),
+            by_id("org.gnome.Nautilus"),
+            by_id("never.installed"),
+            overridden("Alacritty", "alacritty -e weechat"),
+        ],
+        ..Stack::default()
+    };
+    let before = vec![ws(1, 1, LEFT, None, true)];
+    let after = vec![ws(1, 1, LEFT, Some("chat"), true)];
+    let script = Script::default()
+        .with_workspaces(&[before.clone(), before, after])
+        .with_entry("org.mozilla.firefox", "firefox --name firefox %u")
+        .with_dbus_entry("org.gnome.Nautilus", "nautilus %U");
+
+    run(start(&script, "chat", &stack, &Workspaces::default())).expect("starts");
+
+    assert_eq!(
+        script.launch_argvs(),
+        vec![
+            vec!["firefox".to_owned(), "--name".to_owned(), "firefox".to_owned()],
+            vec!["alacritty".to_owned(), "-e".to_owned(), "weechat".to_owned()],
+        ],
+        "only the Exec-resolved app and the override forked: {:?}",
+        script.calls()
+    );
+    assert_eq!(script.activations(), ["org.gnome.Nautilus"]);
+    // The unresolved one launched nothing at all, and the apps after it still
+    // ran — §3.2's "Start continues with the rest".
+    assert_eq!(script.launches().len(), 2);
+
+    // An app carrying an override costs no entry lookup: `app_start` would
+    // ignore the answer.
+    let looked_up: Vec<String> = script
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::DesktopEntry(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        looked_up,
+        [
+            "org.mozilla.firefox",
+            "org.gnome.Nautilus",
+            "never.installed"
+        ],
+        "the overridden app was looked up anyway"
+    );
+}
+
+/// A D-Bus activation records **no unit**, because the bus started the process
+/// and it is in nobody's slice — claiming one would make Stop's
+/// `Launched::units` name a unit that does not exist.
+#[test]
+fn an_activated_app_contributes_no_unit_to_the_launch_record() {
+    let stack = Stack {
+        apps: vec![by_id("org.gnome.Nautilus")],
+        ..Stack::default()
+    };
+    let before = vec![ws(1, 1, LEFT, None, true)];
+    let after = vec![ws(1, 1, LEFT, Some("chat"), true)];
+    let script = Script::default()
+        .with_workspaces(&[before.clone(), before, after])
+        .with_dbus_entry("org.gnome.Nautilus", "nautilus %U");
+
+    run(start(&script, "chat", &stack, &Workspaces::default())).expect("starts");
+
+    assert!(
+        script.launches().is_empty(),
+        "an activation forked a systemd-run unit as well: {:?}",
+        script.calls()
+    );
+    assert_eq!(script.activations(), ["org.gnome.Nautilus"]);
 }
 
 // ── §7: Stop ─────────────────────────────────────────────────────────────────
@@ -1624,7 +1928,8 @@ fn a_start_orders_the_columns_in_one_batch_between_the_launches_and_the_layout()
     let settled = vec![win_at(9, 1, "Alacritty", 1), win_at(10, 1, "firefox", 2)];
     let script = Script::default()
         .with_workspaces(&[before.clone(), before, after])
-        .with_windows(&[Vec::new(), Vec::new(), settled]);
+        .with_windows(&[Vec::new(), Vec::new(), settled])
+        .with_plain_entries(&["firefox", "Alacritty"]);
 
     let mut s = stack(&["firefox", "Alacritty"]);
     s.layout = Layout::Golden;
@@ -2055,7 +2360,8 @@ fn autostart_runs_its_stacks_one_at_a_time_in_order() {
             unnamed,                                   // music: plan
             vec![ws(1, 1, LEFT, Some("music"), true)], // music: verify
         ])
-        .with_windows(&[Vec::new()]);
+        .with_windows(&[Vec::new()])
+        .with_plain_entries(&["firefox", "spotify"]);
 
     let entries: Vec<(String, Stack)> = saved
         .names_in_order()
@@ -2209,7 +2515,8 @@ fn autostart_still_starts_a_stack_whose_name_is_merely_lingering() {
         // plan sees it gone, which the scripted niri only permits because the
         // housekeeping's `UnsetName` was actually sent.
         .with_workspaces(&[lingering.clone(), lingering, released, named])
-        .with_windows(&[Vec::new()]);
+        .with_windows(&[Vec::new()])
+        .with_plain_entries(&["firefox"]);
     let entries = vec![(name.to_owned(), saved.stacks[name].clone())];
 
     // `spawn_autostart` marks every queued stack **before** handing off, so the

@@ -9,11 +9,13 @@
 //! *visible* result is a re-render, but its *consequential* result is the JSON
 //! line that reaches `host.sock`, so these pin the bytes.
 
-use hytte_plugin::proto::{Effect, EventKind, Page};
+use hytte_plugin::proto::{Effect, EffectOutcome, EventKind, Page};
 use hytte_plugin::{CmdReceiver, Input, Plugin, cmd_channel};
 use hytte_plugin_agents::Agents;
 use hytte_plugin_agents::hive::client::HiveError;
-use hytte_plugin_agents::hive::wire::{AgentStatusRow, Request, Response, Scope, VersionMismatch};
+use hytte_plugin_agents::hive::wire::{
+    AgentStatusRow, HiveUrls, Request, Response, Scope, VersionMismatch,
+};
 use hytte_plugin_agents::model::{Hive, Status};
 use hytte_plugin_agents::poll::{Cmd, Msg};
 
@@ -717,18 +719,22 @@ fn the_visibility_edge_reaches_the_poll_task() {
 }
 
 /// The manifest is the plugin's whole trust declaration, so it is pinned:
-/// `OpenPage` + `Notify` and nothing else. **`RunCommand` is P2 and `Consent`
-/// is P3** — a P1 that quietly declared either would be granted an authority
-/// the row has not earned yet (spec §11 rules two and three, §13).
+/// `OpenPage` + `Notify` + `OpenUri` and nothing else. **`RunCommand` is P2 and
+/// `Consent` is P3** — a P1 that quietly declared either would be granted an
+/// authority the row has not earned yet (spec §11 rules two and three, §13).
 #[test]
-fn the_manifest_declares_exactly_two_capabilities_and_no_secrets() {
+fn the_manifest_declares_exactly_three_capabilities_and_no_secrets() {
     use hytte_plugin::proto::{Capability, Mount, StateKey};
     let m = Agents::manifest();
     assert_eq!(m.id, "agents");
     assert_eq!(m.mount, Mount::SidebarTop);
     assert_eq!(
         m.capabilities,
-        vec![Capability::OpenPage, Capability::Notify]
+        vec![
+            Capability::OpenPage,
+            Capability::Notify,
+            Capability::OpenUri
+        ]
     );
     assert!(!m.capabilities.contains(&Capability::RunCommand));
     assert!(!m.capabilities.contains(&Capability::Consent));
@@ -738,6 +744,202 @@ fn the_manifest_declares_exactly_two_capabilities_and_no_secrets() {
         "SlotVisible is the #305 gate for the park; Clock drives the panel ages"
     );
     assert!(m.provides.is_empty(), "this plugin serves no datasource");
+}
+
+// ── the link button (#1045) ─────────────────────────────────────────────────
+
+/// The manifest grants the capability the link click's effect **requires** —
+/// asked of the one table that decides it, not restated as a list.
+///
+/// `Effect::required_capability` (`hytte-plugin-proto/src/effect.rs`) is the
+/// single mapping both enforcement points consult: the host's
+/// `session::enforce_capabilities` and, since #1058, the SDK's own
+/// `drop_ungranted_effects` (`hytte-plugin/src/runtime.rs`), whose predicate is
+/// literally `granted.contains(&effect.required_capability())` — which is what
+/// this asserts, over this plugin's real manifest and a real emitted effect.
+///
+/// So the assertion is about a **consequence**, not about a spelling: with the
+/// capability declared the effect survives to the wire; without it the SDK
+/// drops it before framing (#1084) and the click silently does nothing on a
+/// current host, while on a host older than #1045 `Register` still decodes and
+/// the first frame carrying the effect does not — the #437 crash-loop.
+///
+/// Mutation (verified red): delete `Capability::OpenUri` from `manifest()` and
+/// both the `granted` assertion and the manifest test above go red.
+#[test]
+fn the_manifest_grants_what_the_link_click_emits() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+
+    let fx = m.update(click("open:trollshell-choom"));
+    let [effect] = fx.as_slice() else {
+        panic!("a link click emits exactly one effect, got {fx:?}");
+    };
+    let required = effect
+        .required_capability()
+        .expect("OpenUri is a gated effect");
+
+    let granted = Agents::manifest().capabilities;
+    assert!(
+        granted.contains(&required),
+        "the SDK drops an effect whose capability the manifest omits (#1058): \
+         {effect:?} needs {required:?}, manifest grants {granted:?}"
+    );
+}
+
+/// A click on the link emits **exactly one** `OpenUri`, carrying that row's own
+/// URL, and asks the hive nothing.
+///
+/// The URL is the fixture's, read back out of the model — not a string the
+/// node id carried. Falsification: have `open_agent_page` parse a URL out of
+/// `node` instead of looking the agent up and the assertion still passes for
+/// this id but the `a_link_click_on_a_vanished_agent_opens_nothing` sibling
+/// below goes red.
+#[test]
+fn a_link_click_emits_one_open_uri_with_the_rows_own_url() {
+    let (mut m, mut rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+
+    let fx = m.update(click("open:trollshell-choom"));
+    assert_eq!(
+        fx,
+        vec![Effect::OpenUri {
+            id: 0,
+            uri: "https://hive.local/agent/trollshell-choom/".to_owned(),
+        }]
+    );
+    assert!(
+        lines(&mut rx).is_empty(),
+        "following a link is not a hive request"
+    );
+    assert_eq!(m.selected, None, "and it neither selects nor opens a page");
+}
+
+/// Two link clicks take **distinct** correlation tokens.
+///
+/// `EffectResult`'s own docs call the reply-bearing effects one shared id space
+/// and say to allocate from a single counter (#1060): two effects in flight on
+/// the same id cannot be told apart by the host's audit or by the plugin's own
+/// result arm.
+///
+/// Falsification: make `take_effect_id` return a constant (or reset it per
+/// click) and this reds on the second id.
+#[test]
+fn two_link_clicks_take_distinct_correlation_ids() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+
+    let ids: Vec<u64> = ["open:trollshell-choom", "open:nixos-choom"]
+        .into_iter()
+        .map(|node| match m.update(click(node)).as_slice() {
+            [Effect::OpenUri { id, .. }] => *id,
+            other => panic!("expected one OpenUri, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(ids, vec![0, 1]);
+}
+
+/// A link click whose agent the model no longer holds — or whose name is
+/// illegal — opens **nothing**.
+///
+/// This is what makes "the URL comes from the model, never from the id" a
+/// testable property rather than a comment: the id is well-formed and the
+/// prefix matches, and the only reason nothing is emitted is that there is no
+/// agent to read a URL off.
+///
+/// Falsification: carry the URL on the node id (`open:<url>`) and emit it
+/// verbatim, and this goes red.
+#[test]
+fn a_link_click_on_a_vanished_or_illegal_agent_opens_nothing() {
+    let (mut m, mut rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+
+    assert_eq!(m.update(click("open:ghost")), vec![], "no such agent");
+    assert_eq!(
+        m.update(click("open:not a name")),
+        vec![],
+        "the name fails the §11 whitelist before anything else happens"
+    );
+    // …and an agent the hive reports with no `url` at all.
+    m.update(status(vec![AgentStatusRow {
+        name: "trollshell-choom".to_owned(),
+        running: true,
+        ..AgentStatusRow::default()
+    }]));
+    assert_eq!(m.update(click("open:trollshell-choom")), vec![]);
+    assert!(lines(&mut rx).is_empty());
+}
+
+/// The panel's `dashboard` link opens the hive's own root, and only once the
+/// `Urls` answer has landed.
+///
+/// Falsification: point the `OPEN_DASHBOARD` arm at the agent lookup (or drop
+/// the `is_empty` filter) and one of the two halves reds.
+#[test]
+fn the_dashboard_link_opens_the_hives_root_once_urls_have_landed() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+
+    assert_eq!(
+        m.update(click("open-dashboard")),
+        vec![],
+        "nothing to open before the hive said where home is"
+    );
+
+    m.update(Input::App(Msg::Urls(Box::new(HiveUrls {
+        domain: Some("hive.local".to_owned()),
+        home: Some("  https://hive.local/  ".to_owned()),
+    }))));
+    assert_eq!(
+        m.update(click("open-dashboard")),
+        vec![Effect::OpenUri {
+            id: 0,
+            uri: "https://hive.local/".to_owned(),
+        }],
+        "and the stored value is trimmed, not passed through with its padding"
+    );
+}
+
+/// A refused open **says so**; a successful one says nothing.
+///
+/// `EffectOutcome::output` exists for exactly this (`hytte-plugin`'s
+/// `Input::EffectResult` docs: "so a plugin can toast it instead of leaving a
+/// click that silently does nothing"). No correlation table is needed because
+/// `OpenUri` is the only reply-bearing effect P1 emits — P2's `choom` launch is
+/// what will need one.
+///
+/// Falsification: drop the `!outcome.ok` guard and the success half reds; drop
+/// the arm entirely and the refusal half does.
+#[test]
+fn a_refused_open_toasts_its_reason_and_a_successful_one_is_silent() {
+    let (mut m, _rx) = model();
+
+    let refused = m.update(Input::EffectResult {
+        id: 0,
+        outcome: EffectOutcome {
+            ok: false,
+            output: Some("refused scheme: ftp".to_owned()),
+        },
+    });
+    assert_eq!(
+        refused,
+        vec![Effect::Notify {
+            summary: "couldn't open the link".to_owned(),
+            body: "refused scheme: ftp".to_owned(),
+        }]
+    );
+
+    assert_eq!(
+        m.update(Input::EffectResult {
+            id: 1,
+            outcome: EffectOutcome {
+                ok: true,
+                output: None,
+            },
+        }),
+        vec![],
+        "the browser appearing is the feedback; a toast on top of it is noise"
+    );
 }
 
 fn name(s: &str) -> hytte_plugin_agents::model::AgentName {

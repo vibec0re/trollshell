@@ -101,6 +101,20 @@ pub mod ids {
     pub const STOP: &str = "stop:";
     /// A project group's expander header.
     pub const GROUP: &str = "group:";
+    /// The `agent page` link — opens that agent's own URL in the desktop's
+    /// default handler (#1045).
+    ///
+    /// Carries the **agent name**, not the URL: the id travels to the host and
+    /// comes back on the click, and this crate's standing rule is that nothing
+    /// a click hands back is trusted as data (see [`super::ids::PAUSE`]'s
+    /// neighbours in `plugin.rs`, each of which re-parses its name). The URL is
+    /// re-read from the model instead, so a row whose agent has since vanished
+    /// opens nothing rather than opening a stale string.
+    pub const OPEN: &str = "open:";
+    /// The hive dashboard link on the panel — the one link that names no
+    /// agent, so it is a whole id rather than a prefix. Not `OPEN`-prefixed:
+    /// `strip_prefix("open:")` must never match it by accident.
+    pub const OPEN_DASHBOARD: &str = "open-dashboard";
 }
 
 /// The most agent rows the card will draw.
@@ -397,6 +411,50 @@ fn detail(key: &str, value: &str) -> Node {
     )
 }
 
+/// A [`detail`] whose value is a **link button** (#1045).
+///
+/// Same key/value rhythm as every other row — only the value is wrapped in a
+/// [`Node::Button`], so the click has somewhere to land. @kaesaecracker's
+/// 2026-09-10 retest is what this answers: the URL rendered as a plain,
+/// ellipsized string and there was no way to follow it.
+///
+/// # Why there is no disabled variant
+///
+/// Every caller reaches this inside an `if let Some(url)` over
+/// [`agent_url`](crate::model::agent_url) / [`hive_home`], both of which
+/// already fold an absent **and** an all-whitespace value to `None`. A row
+/// with no URL therefore does not render at all — which is the whole of "no
+/// dead button": there is no state in which this draws something clickable
+/// that opens nothing. The pre-#1045 behaviour for that case (no row) is
+/// unchanged.
+///
+/// The hover says `open <url>` rather than repeating the text, because the
+/// text is the URL and the thing a hover has to add is that clicking it does
+/// something.
+fn link_detail(id: impl Into<String>, key: &str, url: &str) -> Node {
+    hrow(
+        6,
+        &["ts-agent-detail"],
+        vec![
+            label(key, &["dim-label", "caption"]),
+            Node::Spacer,
+            button(
+                id,
+                // `link` is GTK's own style class for a button that looks like
+                // a link; `flat` drops the frame, and `ts-agent-link` is this
+                // plugin's scoped rule (see `assets/trollshell/style.css`).
+                &["flat", "link", "ts-agent-link"],
+                clipped_titled(
+                    url,
+                    VALUE_CHARS,
+                    format!("open {url}"),
+                    &["caption", "numeric"],
+                ),
+            ),
+        ],
+    )
+}
+
 /// A titled group: a heading over a list surface.
 fn section(title: &str, body: Node) -> Node {
     vstack(
@@ -577,7 +635,11 @@ fn details_block(agent: &Agent) -> Node {
         children.push(detail("model", model));
     }
     if let Some(url) = agent_url(agent) {
-        children.push(detail("agent page", url));
+        children.push(link_detail(
+            format!("{}{}", ids::OPEN, agent.name.as_str()),
+            "agent page",
+            url,
+        ));
     }
     vstack(2, &["ts-agent-details"], children)
 }
@@ -977,12 +1039,19 @@ fn agent_page(agent: &Agent, cfg: &AgentsConfig, ctx: PanelContext<'_>) -> Vec<N
         list(false, &["ts-agents-panel-list"], deployment),
     ));
 
+    // Both rows in this section are links, so both are buttons — a section
+    // where one URL is clickable and its neighbour is not would be the exact
+    // inconsistency #1045 was filed about, one row further down.
     let mut links = Vec::new();
     if let Some(url) = agent_url(agent) {
-        links.push(detail("agent page", url));
+        links.push(link_detail(
+            format!("{}{}", ids::OPEN, agent.name.as_str()),
+            "agent page",
+            url,
+        ));
     }
     if let Some(home) = hive_home(ctx) {
-        links.push(detail("dashboard", home));
+        links.push(link_detail(ids::OPEN_DASHBOARD, "dashboard", home));
     }
     if !links.is_empty() {
         out.push(section(
@@ -1291,6 +1360,51 @@ mod tests {
             "the unfolded row must be argus's: {:?}",
             button_ids(&row)
         );
+    }
+
+    /// The `agent page` row is a **button** — and it exists at all only when
+    /// there is a URL behind it (#1045).
+    ///
+    /// Both halves matter. The first is @kaesaecracker's 2026-09-10 finding:
+    /// the URL rendered and there was no way to follow it. The second is the
+    /// "no dead button" rule — `running()` builds a row whose `url` is `None`,
+    /// and the unfolded details then carry neither a link nor the key that
+    /// labels one, so there is no state in which this draws something
+    /// clickable that opens nothing.
+    ///
+    /// Falsification: put `detail` back at `details_block`'s `agent_url` call
+    /// site and the first assertion reds; drop that site's `if let Some(url)`
+    /// guard (rendering the link with an empty string) and the last two do.
+    #[test]
+    fn the_agent_page_row_is_a_button_only_when_there_is_a_url() {
+        let name = AgentName::parse("argus").expect("legal");
+
+        let mut with_url = running("argus", "idle");
+        with_url.row.url = Some("https://hive.local/agent/argus/".to_owned());
+        let open = card_of(vec![with_url], Some(&name));
+        assert!(
+            button_ids(&open).iter().any(|id| id == "open:argus"),
+            "the URL has to be followable: {:?}",
+            button_ids(&open)
+        );
+
+        let bare = card_of(vec![running("argus", "idle")], Some(&name));
+        assert!(
+            !button_ids(&bare)
+                .iter()
+                .any(|id| id.starts_with(super::ids::OPEN)),
+            "no URL means no button: {:?}",
+            button_ids(&bare)
+        );
+        let mut labelled = false;
+        walk(&bare, &mut |n| {
+            if let Node::Label { text, .. } = n
+                && text == "agent page"
+            {
+                labelled = true;
+            }
+        });
+        assert!(!labelled, "…and no orphaned key either");
     }
 
     /// The disclosure glyph says which way the click goes, and carries the

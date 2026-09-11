@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::config::AgentsConfig;
 use crate::hive::wire::{HiveUrls, Request, Scope};
 use crate::hive::{AgentStatusRow, HiveError};
-use crate::model::{Agent, AgentName, ExpandedGroups, Hive, Status};
+use crate::model::{Agent, AgentName, ExpandedGroups, Hive, Status, agent_url};
 use crate::poll::{Cmd, Msg, poll_task};
 use crate::view::{self, PanelContext, ids};
 
@@ -72,6 +72,16 @@ pub struct Agents {
     /// The previous poll's alarm flags, per agent — the **edge** detector §8
     /// requires ("a hive with one wedged agent must not toast every 5 s").
     prev_alarms: BTreeMap<String, Alarms>,
+    /// The next correlation token for a reply-bearing effect (#1060).
+    ///
+    /// **One counter, not one per effect kind**, which is the allocation
+    /// contract `Input::EffectResult`'s own docs state: `RunCommand`,
+    /// `OpenUri` and `RequestConsent`'s `request_id` share a single id space,
+    /// so per-kind counters would collide the moment two effects were in
+    /// flight at once. P1 emits only `OpenUri`, and this is still the shared
+    /// counter so P2's `choom` launch and P3's approvals inherit it rather
+    /// than opening a second one.
+    next_effect_id: u64,
     /// The command lane to [`poll_task`].
     cmd_tx: CmdSender<Cmd>,
 }
@@ -91,8 +101,22 @@ impl Agents {
             now_unix: 0,
             last_poll_unix: None,
             prev_alarms: BTreeMap::new(),
+            next_effect_id: 0,
             cmd_tx,
         }
+    }
+
+    /// Take the next correlation token. See [`Agents::next_effect_id`].
+    ///
+    /// `wrapping_add` rather than `+= 1`: the counter is a *token*, not a
+    /// count, so the only thing that matters is that two effects in flight at
+    /// once cannot share a value — and an overflow panic in a release build
+    /// over a click counter would be a worse outcome than the wrap nobody will
+    /// reach (2^64 clicks).
+    fn take_effect_id(&mut self) -> u64 {
+        let id = self.next_effect_id;
+        self.next_effect_id = self.next_effect_id.wrapping_add(1);
+        id
     }
 
     /// Whether the group headed `project` currently draws expanded — the
@@ -288,6 +312,51 @@ impl Agents {
         vec![Effect::OpenPage(Page::PluginSelf)]
     }
 
+    /// Follow one URL through the desktop's default handler (#1045).
+    ///
+    /// The plugin names a **destination** and never a program — that is the
+    /// whole difference between this and the `RunCommand` route, and the
+    /// reason the manifest can stay three narrow capabilities wide. The host
+    /// judges the scheme (`http`/`https`/`file` only) and answers on
+    /// [`Input::EffectResult`].
+    fn open_uri(&mut self, url: String) -> Vec<Effect> {
+        vec![Effect::open_uri(self.take_effect_id(), url)]
+    }
+
+    /// The `agent page` link: **the hive's URL for this agent, as the model
+    /// holds it now** — never the string the node id carried.
+    ///
+    /// Every other arm of [`Agents::click`] re-parses its name for the same
+    /// reason ("the id came back over a socket"), and a URL is the one payload
+    /// where trusting that round trip would matter: it is what the desktop is
+    /// then asked to open. An agent that vanished between the render and the
+    /// click, or a hive whose domain is unconfigured, opens nothing — the same
+    /// silence the row's own `if let Some(url)` already guarantees, since
+    /// neither renders the link in the first place.
+    fn open_agent_page(&mut self, name: &AgentName) -> Vec<Effect> {
+        let Some(url) = self.hive.agent(name).and_then(agent_url).map(str::to_owned) else {
+            return Vec::new();
+        };
+        self.open_uri(url)
+    }
+
+    /// The panel's `dashboard` link — the hive's own root, from the `Urls`
+    /// answer rather than from the clicked id, for [`Agents::open_agent_page`]'s
+    /// reason.
+    fn open_dashboard(&mut self) -> Vec<Effect> {
+        let Some(home) = self
+            .urls
+            .as_ref()
+            .and_then(|u| u.home.as_deref())
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(str::to_owned)
+        else {
+            return Vec::new();
+        };
+        self.open_uri(home)
+    }
+
     /// Route one click. Split out of [`Plugin::update`] so the id-parsing
     /// contract is one readable table.
     fn click(&mut self, node: &str) -> Vec<Effect> {
@@ -324,6 +393,17 @@ impl Agents {
                 };
             }
             return Vec::new();
+        }
+        if let Some(rest) = node.strip_prefix(ids::OPEN) {
+            // The row Mara's 2026-09-10 retest could read but not follow
+            // (#1045). One `OpenUri`, the URL taken from the model.
+            if let Some(name) = AgentName::parse(rest) {
+                return self.open_agent_page(&name);
+            }
+            return Vec::new();
+        }
+        if node == ids::OPEN_DASHBOARD {
+            return self.open_dashboard();
         }
         if node == view::OVERVIEW_ID {
             // The card's title row is the one place that jumps to the drawer,
@@ -373,17 +453,39 @@ impl Plugin for Agents {
     /// edges that park the poll (#305: the push is opt-in via the manifest,
     /// so a poller MUST subscribe to keep being gated).
     ///
-    /// Two capabilities, and only two: `OpenPage` (open its own panel) and
-    /// `Notify` (§8's edge toast). **Not** `RunCommand` — the `choom` argv is
-    /// phase P2 — and **not** `Consent`: approvals are phase P3 precisely
-    /// because the row must be trustworthy before it is allowed to raise a
-    /// modal that approves a config change (spec §13). The plugin declares no
-    /// secret slot; its entire authority is the desktop user's `hive-admin`
-    /// group membership (spec §11 rule four).
+    /// Three capabilities, and only three: `OpenPage` (open its own panel),
+    /// `Notify` (§8's edge toast) and `OpenUri` (#1045 — follow an agent's own
+    /// page link). **Not** `RunCommand` — the `choom` argv is phase P2 — and
+    /// **not** `Consent`: approvals are phase P3 precisely because the row must
+    /// be trustworthy before it is allowed to raise a modal that approves a
+    /// config change (spec §13). The plugin declares no secret slot; its entire
+    /// authority is the desktop user's `hive-admin` group membership (spec §11
+    /// rule four).
+    ///
+    /// # `OpenUri` is declared because the effect is emitted, not for symmetry
+    ///
+    /// Declaring it is **load-bearing**, not documentation: since #1058 the SDK
+    /// itself drops an effect whose gating capability the manifest omits
+    /// (`hytte-plugin/src/runtime.rs`'s `drop_ungranted_effects`, over proto's
+    /// one `Effect::required_capability` table), so omitting it here would make
+    /// every link click a silent no-op on a current host and the #437
+    /// crash-loop on a host older than #1045. `the_manifest_grants_what_the_link_click_emits`
+    /// asserts that pairing through that same table rather than restating the
+    /// list.
+    ///
+    /// It is also the narrowest thing that opens a link: `OpenUri` names a
+    /// *destination* and the host resolves it through the desktop's default
+    /// handler, where `RunCommand` — the other way to reach `xdg-open` — is
+    /// arbitrary argv as the user and the highest-trust capability in the
+    /// vocabulary (#1045's own argument).
     fn manifest() -> Manifest {
         let mut m = Manifest::new(PLUGIN_ID, Mount::SidebarTop);
         m.subscribes = vec![StateKey::Clock, StateKey::SlotVisible];
-        m.capabilities = vec![Capability::OpenPage, Capability::Notify];
+        m.capabilities = vec![
+            Capability::OpenPage,
+            Capability::Notify,
+            Capability::OpenUri,
+        ];
         m
     }
 
@@ -432,6 +534,21 @@ impl Plugin for Agents {
                 }]
             }
             Input::App(Msg::Status(result)) => self.fold_status(result),
+            // A link the desktop would not open (#1045). The only reply-bearing
+            // effect P1 emits is `OpenUri`, so no correlation table is needed —
+            // and the host's own reason is already the sentence worth showing,
+            // which is why `EffectOutcome::output` exists ("so a plugin can
+            // toast it instead of leaving a click that silently does nothing",
+            // `hytte-plugin/src/lib.rs`). A success says nothing: the browser
+            // appearing IS the feedback.
+            Input::EffectResult { outcome, .. } if !outcome.ok => {
+                vec![Effect::Notify {
+                    summary: "couldn't open the link".to_owned(),
+                    body: outcome
+                        .output
+                        .unwrap_or_else(|| "the desktop refused it".to_owned()),
+                }]
+            }
             // `..` is mandatory since #1083 made `Input::Event`
             // `#[non_exhaustive]` and gave it an `output`. The card is
             // per-monitor decoration with no output-dependent behaviour, so

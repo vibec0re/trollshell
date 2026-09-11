@@ -297,20 +297,28 @@ View {
                                                 tooltip: None,
                                             },
                                             Spacer,
-                                            Text {
-                                                id: None,
-                                                text: "https://hive.local/agent/trollshell-choom/",
-                                                max_width_chars: Some(
-                                                    28,
-                                                ),
-                                                ellipsize: true,
+                                            Button {
+                                                id: "open:trollshell-choom",
                                                 classes: [
-                                                    "caption",
-                                                    "numeric",
+                                                    "flat",
+                                                    "link",
+                                                    "ts-agent-link",
                                                 ],
-                                                tooltip: Some(
-                                                    "https://hive.local/agent/trollshell-choom/",
-                                                ),
+                                                child: Text {
+                                                    id: None,
+                                                    text: "https://hive.local/agent/trollshell-choom/",
+                                                    max_width_chars: Some(
+                                                        28,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "caption",
+                                                        "numeric",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "open https://hive.local/agent/trollshell-choom/",
+                                                    ),
+                                                },
                                             },
                                         ],
                                         tooltip: None,

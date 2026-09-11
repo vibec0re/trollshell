@@ -679,6 +679,22 @@
     background: none;
     box-shadow: none;
 }
+/* The `agent page` / `dashboard` links (#1045): a detail row whose value opens
+ * in the desktop's default handler. Same de-boxing as `.ts-agent-name` — a
+ * detail row is dense, and a framed button in it would be taller than the row
+ * — while GTK's own `.link` class (set beside this one) supplies the accent
+ * colour and underline, so the row still reads as a link rather than as a
+ * value that happens to be clickable. `max-width: 100%` keeps the ellipsizing
+ * value inside the row: the button is the child that would otherwise size
+ * itself to the whole URL. */
+.ts-agents-card button.ts-agent-link,
+.ts-agents-panel button.ts-agent-link {
+    min-height: 0;
+    max-width: 100%;
+    padding: 0 0.154em;
+    background: none;
+    box-shadow: none;
+}
 /* Flag chips — only the flags that are ON are drawn, so the pill has to carry
  * its own meaning. Same shape as `.ts-task-badge` / `.ts-net-pill`; the tint
  * comes from the tone class the plugin sets beside this one (`error`,

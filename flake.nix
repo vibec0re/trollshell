@@ -481,38 +481,47 @@
           # WITHOUT `--features system-tests` — the same command
           # `nix/package.nix`'s `workspace` derivation ran under its own
           # `doCheck = true` before #1115 turned that off so a consumer's
-          # `nix build` doesn't pay for it (and so the deps stage feeding it
-          # didn't have to compile the dev-dependency graph for every
-          # consumer either). Same tests, same gate, only moved to where the
-          # gate lives: `nix flake check` already builds the package (#449)
-          # and already runs `system-tests` as its own check below; the
-          # hermetic suite had no check of its own and rode the package
-          # instead.
+          # `nix build` doesn't pay for it (and so the deps stage feeding it,
+          # `cargoArtifactsBinOnly`, doesn't have to compile the
+          # dev-dependency graph for every consumer either — see that file's
+          # `cargoArtifacts`/`cargoArtifactsBinOnly` split). Same tests, same
+          # gate, only moved to where the gate lives: `nix flake check`
+          # already builds the package (#449) and already runs
+          # `system-tests` as its own check below; the hermetic suite had no
+          # check of its own and rode the package instead.
           #
-          # Built via `mkCargoDerivation` directly, mirroring `system-tests`
-          # below rather than `craneLib.cargoTest` (which hardcodes
-          # `checkPhaseCargoCommand`, silently discarding any override) — this
-          # check needs no override today, but matching the sibling's shape
-          # keeps the two easy to compare and leaves room for one later
-          # without a rewrite.
+          # Shape matches hyperhive's own split for the identical problem
+          # (Mara, #1115): `hyperhive/nix/rust.nix:43-94` two named
+          # `buildDepsOnly` caches, one per audience;
+          # `hyperhive/nix/packages/default.nix:61-68` the deploy path takes
+          # the no-test-graph one; `hyperhive/nix/checks.nix:58-73` the check
+          # takes the one WITH the test graph via a plain `craneLib.cargoTest`
+          # rather than `mkCargoDerivation`. Same trade here: `cargoTest`
+          # hardcodes `checkPhaseCargoCommand` to `cargoWithProfile test
+          # ${cargoExtraArgs} ${cargoTestExtraArgs}`, which is fine for a
+          # plain hermetic run — `system-tests` below needs `mkCargoDerivation`
+          # directly only because it wraps that command in `xvfb-run` for a
+          # display, which this check doesn't need.
           #
-          # Its own `buildDepsOnly` artifact, deliberately NOT
-          # `trollshell.passthru.cargoArtifacts`: since #1115 that one is
-          # built with `doCheck = false` and no longer compiles the
-          # dev-dependency graph a `cargo test` run needs (see
-          # `nix/package.nix`'s comment on its own `cargoArtifacts`).
-          # `doCheck = true` here reproduces exactly what that stage used to
-          # cache for the package build pre-#1115 (`buildDepsOnly`'s own
-          # default `cargoTestExtraArgs = "--no-run"` compiles + caches the
-          # dev-dependency graph without running any tests) — just scoped to
-          # this check's own artifact instead of the package's.
-          workspace-tests = craneLib.mkCargoDerivation (
+          # `trollshell.passthru.commonArgs` already carries `cargoExtraArgs =
+          # "--workspace --locked"` (#572, one cargo scope for every stage),
+          # so — unlike hyperhive's own `cargo-test`, which has no such shared
+          # scope and spells `cargoTestExtraArgs = "--workspace";` itself —
+          # nothing further is needed here to get `--workspace`; leaving
+          # `cargoTestExtraArgs` at `cargoTest`'s own default (`""`) matches
+          # how `clippy` above already reuses the same `cargoExtraArgs` and
+          # only adds its own check-specific flags.
+          #
+          # `cargoArtifacts = trollshell.passthru.cargoArtifacts`, NOT
+          # `cargoArtifactsBinOnly`: since #1115 the former is the one built
+          # with `buildDepsOnly`'s own default `doCheck = true` (dev-deps +
+          # test harnesses compiled and cached), same cache `clippy` above
+          # already reuses — the latter has no dev-dependency graph for a
+          # `cargo test` run to build against.
+          workspace-tests = craneLib.cargoTest (
             trollshell.passthru.commonArgs
             // {
-              pnameSuffix = "-workspace-tests";
-              cargoArtifacts = craneLib.buildDepsOnly (
-                trollshell.passthru.commonArgs // { doCheck = true; }
-              );
+              cargoArtifacts = trollshell.passthru.cargoArtifacts;
               # The same icon-theme gate `nix/package.nix`'s `preCheck` carried
               # before #1115 — see
               # `every_icon_name_exists_in_the_adwaita_theme_on_the_search_path`
@@ -528,20 +537,6 @@
                 export XDG_DATA_DIRS="${pkgs.adwaita-icon-theme}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
                 export TROLLSHELL_REQUIRE_ICON_THEME=1
               '';
-              doCheck = true;
-              # No separate build step: `cargo test` compiles as part of the
-              # check phase — same shape as `system-tests` below.
-              # `commonArgs.preBuild` (the libspa-sys writable-vendor-dir
-              # workaround) still runs first via the standard (now-empty)
-              # buildPhase, so the check phase's compile inherits a writable
-              # vendor dir.
-              buildPhaseCargoCommand = "";
-              # `cargoWithProfile` (not a bare `cargo`, unlike `system-tests`
-              # below): this check needs no `xvfb-run`, so there's no exec
-              # boundary a bash function can't cross, and using the helper
-              # keeps this check on the same `--release` profile as the
-              # package build it replaces.
-              checkPhaseCargoCommand = "cargoWithProfile test --workspace --locked";
               # Leaf/terminal check: nothing consumes its target dir. Same
               # `doInstallCargoArtifacts = false` reasoning as `system-tests`
               # below — crane's default packs the whole (multi-GiB) target
@@ -555,9 +550,11 @@
           # whole-file-`#![cfg(feature = "system-tests")]` integration tests
           # in hytte-bus/hytte-reactive/hytte-ui, plus the `#[cfg(all(test,
           # feature = "system-tests"))]` GTK unit-test modules in hytte-ui.
-          # These never compile anywhere else — the workspace compile's own
-          # `doCheck` (nix/package.nix) deliberately omits the feature to stay
-          # hermetic — so this is their only home. Built via
+          # These never compile anywhere else — neither the workspace compile
+          # (which since #1115 runs no `cargo test` at all, `nix/package.nix`)
+          # nor `checks.workspace-tests` above (deliberately without
+          # `--features system-tests`, to stay hermetic) enable this feature
+          # — so this is their only home. Built via
           # `mkCargoDerivation` directly
           # (rather than `craneLib.cargoTest`) because `cargoTest.nix`
           # hardcodes `checkPhaseCargoCommand`, silently discarding any

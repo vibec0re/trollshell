@@ -168,19 +168,19 @@ let
     # the workspace stage was `--workspace`, so the deps cache was largely dead
     # weight; stating the scope once here keeps every stage feature-identical.
     cargoExtraArgs = "--workspace --locked";
-    # #1115: a consumer's `nix build .#trollshell` (or any other slice of
-    # `workspace`) used to run the whole hermetic internals suite as part of
-    # the build, and the deps stage below compiled the dev-dependency graph
-    # so that suite had something to link against. Neither belongs to a
-    # package build: `nix flake check` already builds the package (#449), and
-    # now runs the hermetic suite as its own check — `checks.workspace-tests`
-    # in flake.nix, the `mkCargoDerivation` shape `checks.system-tests`
-    # already used, with its own deps-only artifacts that DO carry the test
-    # graph. Same tests, same gate, only moved to where the gate lives.
-    # `doCheck = false` here is shared by both the deps stage (`cargoArtifacts`
-    # below inherits it from this same `commonArgs`) and this compile stage —
-    # see both for what stops happening as a result.
-    doCheck = false;
+    # #1115: `doCheck` is deliberately NOT set here any more. It used to be
+    # `true` on this shared bundle, so both the deps stage below and the
+    # workspace compile ran the whole hermetic internals suite — meaning a
+    # consumer's `nix build .#trollshell` (or any other slice of `workspace`)
+    # paid for it too, and the deps stage compiled the dev-dependency graph
+    # just to feed that. Neither belongs to a package build: `nix flake
+    # check` already builds the package (#449), and now runs the hermetic
+    # suite as its own check instead — `checks.workspace-tests` in flake.nix.
+    # Same shape hyperhive settled on for the same problem
+    # (`hyperhive/nix/rust.nix:43-94`): two named `buildDepsOnly` caches, one
+    # per audience, rather than one cache and a shared `doCheck`. See
+    # `cargoArtifacts` and `cargoArtifactsBinOnly` below for the two, and
+    # `workspace`'s own `doCheck = false` for the compile stage.
 
     # No compile-time TROLLSHELL_DATA_DIR / HYTTE_UI_DATA_DIR here: both are
     # injected at *runtime* by the wrapper below, pointing at the standalone
@@ -224,21 +224,37 @@ let
     '';
   };
 
-  # The external dependency closure, cached on Cargo.lock changes only. Same
-  # `--workspace --locked` scope as the workspace build above it, so the feature
-  # union matches and the compile stage actually inherits these artifacts.
+  # The external dependency closure for the CHECKS (clippy, `system-tests`,
+  # and — since #1115 — `workspace-tests` in flake.nix), cached on Cargo.lock
+  # changes only. Same `--workspace --locked` scope as `commonArgs`, so the
+  # feature union matches whatever each check compiles against it.
   #
-  # `doCheck = false` (inherited from `commonArgs`, #1115) means this stage
-  # runs only `cargo check` + `cargo build` — no `cargo test --no-run`, so it
-  # no longer compiles or caches the dev-dependency graph. Before #1115 it did
-  # (deliberately: the dummy workspace crates it compiles have no real tests
-  # to run, so `--no-run` bought the compiled-and-cached dev-dependency graph
-  # for free) because the compile stage's own `doCheck = true` needed it.
-  # Now that a consumer build never runs `cargo test` at all, there's nothing
-  # here to seed. `checks.workspace-tests` (flake.nix) has its own deps-only
-  # artifact built with `doCheck = true` for exactly that — the hermetic
-  # suite's own use, not a consumer build's.
+  # `craneLib.buildDepsOnly`'s own default `doCheck = true` is deliberately
+  # left alone here (no override): it adds `--all-targets` to the check
+  # command and a `cargo test --no-run`, so this cache compiles and caches
+  # the dev-dependency graph and every test harness in the workspace — dead
+  # weight for a plain compile, but exactly what a check that runs or lints
+  # tests needs. `cargoArtifactsBinOnly` below is the OTHER audience: no
+  # `doCheck`, no dev-deps, feeding `workspace`'s own compile instead.
+  #
+  # Same split hyperhive made for the same reason
+  # (`hyperhive/nix/rust.nix:43-75`, `cargoArtifacts`): one cache per
+  # audience, because a deploy never runs or links a test binary and
+  # shouldn't pay to compile one.
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+  # The external dependency closure for the PACKAGE build — the audience
+  # `cargoArtifacts` above deliberately doesn't serve. `doCheck = false` here
+  # drops `buildDepsOnly`'s default `--all-targets` + `cargo test --no-run`,
+  # so dev-dependencies and test harnesses are never compiled for a consumer
+  # build at all. Distinct `pname` (rather than sharing `commonArgs`'
+  # `"trollshell"`) so the two caches are told apart in build logs and store
+  # paths, not just in this file — same reasoning and the same distinct-name
+  # convention as hyperhive's `cargoArtifactsBinOnly`
+  # (`hyperhive/nix/rust.nix:77-94`).
+  cargoArtifactsBinOnly = craneLib.buildDepsOnly (
+    commonArgs // { pname = "trollshell-workspace-bin"; doCheck = false; }
+  );
 
   # THE workspace compile — the single cargo invocation that produces every
   # binary this flake ships (#572, implementing kaesaecracker's plan).
@@ -253,9 +269,8 @@ let
   # `--features system-tests` — a genuinely different feature union that by
   # construction cannot be a slice of this build — and, since #1115,
   # `checks.workspace-tests`, which reuses this derivation's own `commonArgs`
-  # (same feature union as this build) but needs its own deps-only artifact
-  # because this one (`cargoArtifacts` above) no longer carries the
-  # dev-dependency graph a `cargo test` run needs.
+  # (same feature union as this build) and the `cargoArtifacts` cache above
+  # (NOT the `cargoArtifactsBinOnly` this compile uses — see both for why).
   #
   # History: #530 introduced an intermediate `cargoBuild` whose packed `target`
   # dir was inherited as `cargoArtifacts` by a `buildPackage` per binary, on the
@@ -269,9 +284,9 @@ let
   # `buildPackage` captures the binaries from cargo's JSON build log in a
   # `postBuild` hook (crane's installFromCargoBuildLogHook), i.e. BEFORE the
   # check phase — the capture never depended on whether a check phase ran at
-  # all. That's why #1115 could turn `doCheck` off here (see `commonArgs`
-  # above) without touching this hook: it already fires at the end of the
-  # build phase, `runHook postBuild`, regardless of `doCheck`.
+  # all. That's why #1115 could turn `doCheck` off below without touching
+  # this hook: it already fires at the end of the build phase, `runHook
+  # postBuild`, regardless of `doCheck`.
   #
   # `dontWrapGApps` keeps `$out/bin` raw, unwrapped ELFs. The GTK apps
   # (trollshell, trollshell-control-center) get wrapped in their own slice
@@ -282,7 +297,16 @@ let
   workspace = craneLib.buildPackage (
     commonArgs
     // {
-      inherit cargoArtifacts;
+      # `cargoArtifactsBinOnly`, NOT `cargoArtifacts` — this is the compile
+      # stage the bin-only cache exists for (see both bindings above). Same
+      # pairing as hyperhive's `workspaceBuild`
+      # (`hyperhive/nix/packages/default.nix:61-68`): the deploy path takes
+      # the no-test-graph cache and sets its own `doCheck = false`
+      # (`buildPackage`'s own default is `args.doCheck or true`, so this has
+      # to be explicit here even though `commonArgs` carries no `doCheck` of
+      # its own any more).
+      cargoArtifacts = cargoArtifactsBinOnly;
+      doCheck = false;
       pname = "trollshell-workspace";
       dontWrapGApps = true;
 
@@ -307,9 +331,9 @@ let
       # dev-dependencies into the build graph (resolver v3), and scoping
       # avoids pulling every OTHER workspace member's dev-deps in too —
       # cheaper than the `cargo test --workspace` compile this replaces, and
-      # there's no longer a cached "dev-deps of every member" artifact in this
-      # derivation's own pipeline (see `cargoArtifacts` above) for a wider
-      # `--workspace --examples` build to matter less by matching anyway.
+      # this derivation sits on `cargoArtifactsBinOnly` (above), which has no
+      # cached "dev-deps of every member" artifact for a wider `--workspace
+      # --examples` build to matter less by matching anyway.
       # `cargoWithProfile` (crane's helper, sourced by `cargoHelperFunctionsHook`
       # into every phase of this derivation, not just build/check) keeps the
       # profile the same `--release` the rest of this derivation uses.
@@ -341,7 +365,7 @@ let
       # runs that suite now.
 
       passthru = {
-        inherit cargoArtifacts commonArgs;
+        inherit cargoArtifacts cargoArtifactsBinOnly commonArgs;
         devInputs = { inherit nativeBuildInputs buildInputs; };
       };
 
@@ -397,9 +421,12 @@ stdenv.mkDerivation {
 
   # `workspace` is what nix/plugin.nix, nix/control-center.nix and (since #588)
   # nix/{probe,wifi-probe}.nix slice their own binaries out of; `commonArgs` +
-  # `cargoArtifacts` are what the leaf flake checks (clippy / system-tests)
-  # reuse, since they compile a different feature set (`--features
-  # system-tests`) and so cannot be a slice of `workspace`.
+  # `cargoArtifacts` are what the leaf flake checks (clippy / system-tests /
+  # since #1115 workspace-tests) reuse instead of `workspace` itself — clippy
+  # and system-tests because they compile a different feature set (`--features
+  # system-tests`) and so cannot be a slice of `workspace`, workspace-tests
+  # because `workspace` sits on `cargoArtifactsBinOnly` (no dev-dependency
+  # graph) rather than `cargoArtifacts` (which has one).
   passthru = workspace.passthru // {
     inherit workspace assets;
   };

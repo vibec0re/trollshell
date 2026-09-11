@@ -1122,11 +1122,39 @@ fn send_update(
 /// needing its own `if` guard. A `shutdown` that resolves to `Err` (the
 /// sender dropped without ever asking — an ordinary session end) also maps to
 /// `None`: only a genuine ask should end up looking like one.
+///
+/// **Clears the slot on any resolution, not just the genuine-ask one**
+/// (#1092 review M3): `tokio::sync::oneshot::Receiver::poll` panics
+/// ("called after complete") on any poll *after* it already returned
+/// `Ready` — including `Ready(Err(_))` — and `serve_inner`'s `loop` builds a
+/// fresh `select!` (and so a fresh call to this function) every iteration.
+/// Without clearing it, an `Err` here (the ordinary-teardown case the doc
+/// above already names as expected) would arm exactly that panic on the
+/// very next iteration — not reachable from the shipped `Infobroker` today
+/// (`cmds.recv()` is `biased` and always resolves first when both channels
+/// close together, ending the loop before this function is ever polled
+/// again — see `serve_inner`'s comment at its call site), but a caller that
+/// clones its `CmdSender` into a task, or a future reorder that drops
+/// `biased`, would panic the broker task on the very next `select!`.
+/// Reproduced live through the public `serve_with_shutdown` seam (a seeded
+/// session, `drop`ping the shutdown sender, then one `Cmd::Revoke`) before
+/// this fix.
 async fn recv_shutdown(
     shutdown: &mut Option<oneshot::Receiver<oneshot::Sender<()>>>,
 ) -> Option<oneshot::Sender<()>> {
     match shutdown {
-        Some(rx) => rx.await.ok(),
+        Some(rx) => {
+            let ack = rx.await.ok();
+            if ack.is_none() {
+                // The sender is gone for good (a oneshot fires at most
+                // once); re-polling `rx` on the next iteration would panic.
+                // `None` is already this function's "nothing to do" answer
+                // for that case, so parking here forever changes nothing an
+                // ordinary caller observes.
+                *shutdown = None;
+            }
+            ack
+        }
         None => std::future::pending().await,
     }
 }
@@ -1676,6 +1704,39 @@ mod tests {
 
     fn store(grants: Vec<Grant>) -> GrantStore {
         GrantStore::from_grants(grants)
+    }
+
+    /// #1092 review M3: `recv_shutdown` must be safe to call again after it
+    /// already resolved to `None` — `serve_inner`'s `loop` builds a fresh
+    /// `select!` (and so a fresh call to this function) every iteration.
+    /// Before the fix, a second call re-polled the same already-completed
+    /// `oneshot::Receiver`, which panics ("called after complete"); the
+    /// bounded `tokio::time::timeout` around the second call is what turns
+    /// "safely pending forever" (this function's documented behaviour once
+    /// there is nothing left to ask) into a passing assertion instead of an
+    /// actual hang — a panic during that `.await` still unwinds straight
+    /// through the timeout and fails this test, since a timeout races a
+    /// deadline, it does not catch a panic.
+    #[tokio::test]
+    async fn recv_shutdown_is_safe_to_call_again_after_the_sender_drops() {
+        let (tx, rx) = oneshot::channel::<oneshot::Sender<()>>();
+        let mut slot = Some(rx);
+        drop(tx);
+
+        assert!(
+            recv_shutdown(&mut slot).await.is_none(),
+            "a dropped sender with no ask must resolve to None, not panic"
+        );
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            recv_shutdown(&mut slot),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "a second call must stay a harmless no-op (pending forever), not panic"
+        );
     }
 
     /// #995: the socket is taken, not seized. A duplicate broker — which the

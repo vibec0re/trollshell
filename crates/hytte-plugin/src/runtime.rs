@@ -19,12 +19,22 @@ use tokio_stream::StreamExt;
 use crate::{Input, Plugin, View};
 
 /// The grace [`Plugin::shutdown`] gets before the process exits regardless
-/// (#1079). Long enough for a well-behaved flush (one small file write, per
-/// the SDK docs' worked example — the infobroker's grant store); short
-/// enough that a plugin stuck in its own hook doesn't sit on top of
-/// systemd's `TimeoutStopSec`, which is the *outer* bound (see `run`'s doc)
-/// — a unit still not gone by then is `SIGKILL`ed, past anything this
-/// runtime controls.
+/// (#1079) — via [`run_shutdown_hook`] wrapping the call in
+/// [`tokio::time::timeout`]. Long enough for a well-behaved flush (one small
+/// file write, per the SDK docs' worked example — the infobroker's grant
+/// store); short enough that a plugin stuck in its own hook doesn't sit on
+/// top of systemd's `TimeoutStopSec` — **only for a hook that actually
+/// `.await`s** (#1092 review M4). A `timeout` can only reclaim control at an
+/// `.await` point, so a hook that blocks the OS thread instead
+/// (`std::fs::write`, `std::thread::sleep`, …) is not preemptable on `run`'s
+/// current-thread runtime: measured, `std::thread::sleep(8s)` in a hook held
+/// the real `SIGTERM` path for 8059 ms against this 2 s bound, while the same
+/// 8 s as an `.await`ed sleep was cut at ~2067 ms as documented. Blocking
+/// work belongs behind [`tokio::task::spawn_blocking`], `.await`ed — see the
+/// crate docs' *Process shutdown* section and `hytte-plugin-infobroker`'s
+/// `GrantStore::drain` for the shape. `TimeoutStopSec` is the *outer* bound
+/// regardless (see `run`'s doc) — a unit still not gone by then is
+/// `SIGKILL`ed, past anything this runtime controls.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// [`watch::Receiver::changed`], but a sender that is simply dropped without
@@ -419,6 +429,14 @@ where
             // notices. Whichever branch actually ends the loop, the shutdown
             // hook still runs exactly once below: `*shutdown.borrow()` is
             // checked unconditionally after the loop, not only here.
+            //
+            // #1092 review L2: what this actually discards is a host frame
+            // the reader task already decoded into `rx` but this loop had not
+            // yet applied — e.g. an infobroker Allow/Revoke click still
+            // sitting in the channel. A click already *applied* (queued on a
+            // writer lane) is unaffected and the shutdown hook still sees it;
+            // one still in flight on the wire when the signal lands is not
+            // recovered by this mechanism.
             biased;
             Some(()) = shutdown_fired(&mut shutdown) => break 'session Ok(()),
             frame = rx.recv() => match frame {
@@ -640,14 +658,16 @@ where
 /// chance, not a blocking one). Factored out so [`session`] and the test
 /// harness drive the exact same bounded path.
 async fn run_shutdown_hook<P: Plugin>(plugin_id: &str, model: &mut P) {
-    eprintln!("[{plugin_id}] shutting down");
-    if tokio::time::timeout(SHUTDOWN_GRACE, model.shutdown())
-        .await
-        .is_err()
-    {
-        eprintln!(
-            "[{plugin_id}] shutdown hook did not finish within {SHUTDOWN_GRACE:?}; exiting anyway"
-        );
+    let started = Instant::now();
+    match tokio::time::timeout(SHUTDOWN_GRACE, model.shutdown()).await {
+        Ok(()) => eprintln!(
+            "[{plugin_id}] shutting down: hook ran in {:.1?}, exiting",
+            started.elapsed()
+        ),
+        Err(_) => eprintln!(
+            "[{plugin_id}] shutting down: hook did not finish within {SHUTDOWN_GRACE:?}; \
+             exiting anyway"
+        ),
     }
 }
 
@@ -693,6 +713,19 @@ async fn reconnect_loop<P, R, W, C, Fut>(
                 // Escalate the log iff we've hit a streak of immediate failures —
                 // the #437 crash-loop signature — so it isn't a silent 5 s spin.
                 let skew = redial.note(lived, outcome.is_ok());
+                backoff.note_session(lived);
+                // `session` already ran the shutdown hook if this is why it
+                // ended (see its doc). Checked *before* logging `outcome`
+                // below, not after (#1092 review L1): a host `Shutdown` and
+                // the process notice both surface as this same `Ok(())`, and
+                // this flag is the only thing that tells them apart —
+                // logging `outcome` first said "host shut down; will
+                // reconnect" on the exact path that neither the host shut
+                // down nor will reconnect.
+                if *shutdown.borrow() {
+                    eprintln!("[{plugin_id}] shutting down; not reconnecting");
+                    return;
+                }
                 match outcome {
                     Ok(()) => eprintln!("[{plugin_id}] host shut down; will reconnect"),
                     Err(e) if skew => eprintln!(
@@ -701,13 +734,6 @@ async fn reconnect_loop<P, R, W, C, Fut>(
                          (schema skew, #437) — update the shell",
                     ),
                     Err(e) => eprintln!("[{plugin_id}] session ended: {e}"),
-                }
-                backoff.note_session(lived);
-                // `session` already ran the shutdown hook if this is why it
-                // ended (see its doc); all that's left here is to stop
-                // looping instead of redialing.
-                if *shutdown.borrow() {
-                    return;
                 }
             }
             Err(e) => {
@@ -738,11 +764,18 @@ async fn reconnect_loop<P, R, W, C, Fut>(
 /// Also installs the `SIGTERM`/`SIGINT` listener for the shutdown lifecycle
 /// (#1079, crate docs' "Process shutdown" section): on either signal a
 /// process-wide flag flips, the live session (if any) finishes its in-flight
-/// frame and runs [`Plugin::shutdown`] under a bounded grace, and this
-/// function exits the process with status 0 instead of reconnecting.
-/// Systemd's own `TimeoutStopSec` on the transient unit
-/// (`trollshell/src/plugin_launcher.rs`) is the *outer* bound on all of
-/// this — a plugin still not gone by then is `SIGKILL`ed.
+/// frame and runs [`Plugin::shutdown`] under [`SHUTDOWN_GRACE`] — which
+/// bounds an `.await`ing hook only, not a thread-blocking one; see that
+/// constant's doc — and this function exits the process with status 0
+/// instead of reconnecting. Systemd's own `TimeoutStopSec` on the transient
+/// unit (`trollshell/src/plugin_launcher.rs`) is the *outer* bound on all of
+/// this — a plugin still not gone by then is `SIGKILL`ed. The listener is
+/// only live once its spawned task is first polled (inside `block_on`
+/// below), so a signal in the sub-millisecond window between process start
+/// and that first poll gets the platform's default disposition (terminate)
+/// rather than this graceful path — measured at under 1 ms in practice (the
+/// `fork`/`exec` gap, not anything this function does), and not otherwise
+/// fixable short of blocking `SIGTERM` before the runtime exists.
 pub fn run<P: Plugin>() -> ! {
     let plugin_id = P::manifest().id;
     let Some(path) = socket_path() else {
@@ -824,8 +857,8 @@ mod tests {
     };
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncWrite, duplex};
@@ -2596,16 +2629,83 @@ mod tests {
         }
     }
 
+    /// PR #1092 review M1: `reconnect_loop`'s post-session exit gate
+    /// (`if *shutdown.borrow() { return; }`, right after a live session ends)
+    /// is what turns "the hook ran" into "the process exits instead of
+    /// redialing" — the *only* path a real `systemctl stop` on a live session
+    /// takes. `session` itself returns `Ok(())` whether a host `Shutdown` or
+    /// the process notice caused it, so this is the one place that tells them
+    /// apart at the `reconnect_loop` level and no other test here reaches it:
+    /// every other shutdown test here drives `session` directly, and
+    /// `shutdown_before_a_session_starts_skips_sources_and_exits` covers only
+    /// the *pre-session* gate.
+    ///
+    /// The host never sends `HostMsg::Shutdown` here — only the process-level
+    /// notice fires, once the session is up — so a connector call count of 1
+    /// after `reconnect_loop` returns proves it exited rather than attempting
+    /// a second connect (a redial).
+    #[tokio::test]
+    async fn shutdown_during_a_live_session_ends_reconnect_loop_without_a_redial() {
+        let (p1, h1) = duplex(64 * 1024);
+        let mut first = Some(p1);
+        let connect_calls = Arc::new(AtomicUsize::new(0));
+        let calls = connect_calls.clone();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let dial_loop = reconnect_loop::<Echo, _, _, _, _>("echo-test", shutdown_rx, move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let next = first.take();
+            async move {
+                match next {
+                    Some(end) => Ok(tokio::io::split(end)),
+                    // A second connect attempt (a redial) parks here forever;
+                    // the outer timeout below turns that into a failure
+                    // instead of a hang.
+                    None => std::future::pending().await,
+                }
+            }
+        });
+
+        let host = async move {
+            let (mut hrd, _hwr) = tokio::io::split(h1);
+            eat_handshake(&mut hrd, "echo-test").await;
+            shutdown_tx.send(true).expect("receiver still alive");
+            // No `HostMsg::Shutdown` — the process-level notice alone must
+            // end both the session and the outer loop.
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(dial_loop, host)
+        })
+        .await
+        .expect(
+            "reconnect_loop must return once a live session ends via shutdown, not redial/hang",
+        );
+
+        assert_eq!(
+            connect_calls.load(Ordering::SeqCst),
+            1,
+            "the process must exit rather than attempt a second connect (redial)"
+        );
+    }
+
     // ── Shutdown (#1079) ─────────────────────────────────────────────────────
 
-    /// (a) `shutdown` runs exactly once, and only *after* the select loop's
-    /// current iteration ("the in-flight frame") has fully finished — never
-    /// interleaved with it, and never a second time for a host message that
-    /// arrives after the notice. `Logged`'s `update` and `shutdown` both push
-    /// into the same log, so the recorded order pins both properties at
-    /// once: the `biased` shutdown-first arm must win the race against the
-    /// snapshot sent right behind the notice, or `"update"` would appear
-    /// twice.
+    /// (a) `shutdown` runs exactly once, and only *after* a frame that
+    /// arrived **before** the signal has already been processed and
+    /// rendered — never a second time for a host message sent **after** the
+    /// notice. `Logged`'s `update` and `shutdown` both push into the same
+    /// log, so the recorded order pins both properties at once: the `biased`
+    /// shutdown-first arm must win the race against the snapshot sent right
+    /// behind the notice, or `"update"` would appear twice.
+    ///
+    /// #1092 review L4: precisely, this pins "a frame that arrived before
+    /// the signal still gets processed" — the host `.await`s the `10:00`
+    /// `Render` before firing `shutdown_tx`, so there is no race on that
+    /// half. It does *not* exercise "a frame already mid-processing when the
+    /// signal lands is not aborted": that holds by construction (the
+    /// `update`/`view`/send step has no `select!` inside it to be preempted
+    /// by), not by anything this test observes.
     ///
     /// Falsification (PR body): skipping the in-flight-frame wait — e.g.
     /// checking `shutdown` before processing the already-selected step —

@@ -39,13 +39,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use hytte_plugin_infobroker::broker::serve_with_grant_loader;
+use hytte_plugin_infobroker::broker::{GrantView, serve_with_grant_loader, serve_with_shutdown};
 use hytte_plugin_infobroker::grants::{Grant, GrantStore, to_toml};
 use hytte_plugin_infobroker::paths::{GRANTS_FILE, SOCKET_FILE, STATE_DIR};
 use hytte_plugin_infobroker::{BrokerMsg, BrokerSnapshot, Cmd, serve};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Set (to any value) only on the re-exec'd child that is meant to actually
 /// run one scenario's `_inner` test; see the module doc.
@@ -1196,6 +1196,124 @@ async fn a_slow_grant_load_does_not_stall_the_sessions_timers_inner() {
     );
 
     drop(cmds_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), session).await;
+
+    // #1024 review M1 / New-5 — see the first scenario for why this line
+    // matters and why the name is derived rather than typed.
+    println!("{SCENARIO_OK_PREFIX}{}", this_fn_name!());
+}
+
+// ── Scenario E: the shutdown hook drains a queued grant save (#1092 review M2) ──
+
+/// PR #1092's review (M2): `broker::serve_inner`'s shutdown arm —
+/// `Some(ack) = recv_shutdown(&mut shutdown) => { state.grants.drain().await;
+/// let _ = ack.send(()); break; }` — had no test at all; the reviewer
+/// measured that guarding the arm off (`, if std::hint::black_box(false)`)
+/// left the whole crate's unit suite green. The PR's own Scope note argued a
+/// real drive needed a subprocess harness "out of scope here" — this file
+/// already is that harness (#1024/#1059's scenarios above), so scenario E
+/// just adds to it.
+///
+/// Drives [`serve_with_shutdown`] the production way (a plain `tokio::spawn`
+/// on this test's current-thread runtime, matching `src/plugin.rs`'s
+/// `sources()`): queues one real `Cmd::Allow` over the SDK-free public API,
+/// waits for the panel snapshot that proves it landed in the broker's
+/// in-memory state, then requests the drain over the shutdown oneshot and
+/// awaits its ack. The ack is the synchronization point —
+/// `GrantStore::drain` (`src/grants.rs`) `.await`s the writer task's own
+/// `spawn_blocking` before `serve_inner` ever calls `ack.send(())` — so a
+/// resolved `ack_rx` already proves the write finished; reloading
+/// `grants.toml` from disk afterward confirms it is the *right* write, not
+/// merely that some file now exists.
+///
+/// RED under the review's mutation (the arm guarded off): nothing ever
+/// services `shutdown_rx`, so `ack_rx` never resolves — the bounded
+/// `tokio::time::timeout` below turns that into a named failure rather than
+/// a hang.
+#[tokio::test]
+async fn shutdown_drains_a_queued_grant_save() {
+    // #1024 review New-6: see the sibling scenarios' identical guard.
+    if in_scenario_child() {
+        return;
+    }
+    let runtime_dir = tempfile::tempdir().expect("XDG_RUNTIME_DIR scratch dir");
+    let state_dir = tempfile::tempdir().expect("XDG_STATE_HOME scratch dir");
+    // #1024 review New-5: derived from this function's own name — see
+    // `this_fn_name!`'s doc.
+    let inner_name = format!("{}_inner", this_fn_name!());
+    run_inner(&inner_name, runtime_dir.path(), state_dir.path());
+}
+
+#[tokio::test]
+async fn shutdown_drains_a_queued_grant_save_inner() {
+    if !in_scenario_child() {
+        return;
+    }
+    let state_dir = std::env::var_os("XDG_STATE_HOME").expect("the harness sets XDG_STATE_HOME");
+    let grants_path = Path::new(&state_dir).join(STATE_DIR).join(GRANTS_FILE);
+
+    let (cmds_tx, cmds_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<BrokerMsg>();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    // Production shape: a plain `tokio::spawn` on this current-thread
+    // runtime, exactly like `src/plugin.rs`'s `sources()` spawns `serve`.
+    let session = tokio::spawn(serve_with_shutdown(cmds_rx, out_tx, shutdown_rx));
+
+    let seed = tokio::time::timeout(GIVE_UP, recv_update(&mut out_rx))
+        .await
+        .expect("the session must seed promptly")
+        .expect("the lane produced a snapshot");
+    assert_eq!(
+        seed.notice, None,
+        "the session must bind cleanly: {:?}",
+        seed.notice
+    );
+    assert!(seed.grants.is_empty(), "starts with no grants");
+
+    cmds_tx
+        .send(Cmd::Allow {
+            agent: "claude".to_owned(),
+            datasource: "departures".to_owned(),
+        })
+        .expect("the broker task is still alive");
+
+    let after_allow = tokio::time::timeout(GIVE_UP, recv_update(&mut out_rx))
+        .await
+        .expect("the Allow must produce a fresh snapshot")
+        .expect("the lane produced a snapshot");
+    assert_eq!(
+        after_allow.grants,
+        vec![GrantView {
+            agent: "claude".to_owned(),
+            datasource: "departures".to_owned(),
+            decision: "always",
+        }],
+        "the Allow must be applied (and queued for a write) before the shutdown request is sent",
+    );
+
+    let (ack_tx, ack_rx) = oneshot::channel();
+    shutdown_tx
+        .send(ack_tx)
+        .expect("the broker task is still alive to receive the shutdown request");
+    tokio::time::timeout(GIVE_UP, ack_rx)
+        .await
+        .expect(
+            "the shutdown ack must arrive within the bound — a guarded-off arm (#1092 review \
+             M2) never answers at all, which this bound turns into a named failure instead of \
+             a hang",
+        )
+        .expect("the broker task must not drop the ack sender without answering");
+
+    // The ack having arrived is the proof `drain` already finished (see the
+    // doc above) — no settle sleep, no poll.
+    let on_disk = GrantStore::load(&grants_path).expect("drain must leave a well-formed file");
+    assert_eq!(
+        on_disk.grants(),
+        &[Grant::always("claude", "departures")],
+        "the queued Allow must have landed on disk before the ack fired",
+    );
+
     let _ = tokio::time::timeout(Duration::from_secs(2), session).await;
 
     // #1024 review M1 / New-5 — see the first scenario for why this line

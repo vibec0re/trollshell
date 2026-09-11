@@ -538,8 +538,13 @@ pub fn workspace_unit_name(name: &str, index: usize) -> String {
 /// answer to an ordinary question. Only a bus-level failure propagates.
 ///
 /// # Errors
-/// Propagates a `hytte_bus` call error — no user manager reachable, the reply
-/// could not be read. A pid systemd simply does not know is `Ok(None)`.
+/// Only the **second** call can fail: reading the unit's `Id` back off the
+/// object path. `GetUnitByPID` itself never propagates — every refusal it can
+/// give is "systemd does not know this pid" in practice, and distinguishing a
+/// `NoUnitForPID` name from a transport failure would need a `BusError` shape
+/// `hytte_bus` deliberately does not expose. Both answers lead to the same
+/// fallback (close the window through niri), so the lookup degrades to
+/// `Ok(None)` with a debug line rather than failing the caller.
 pub async fn unit_for_pid(pid: u32) -> Result<Option<String>> {
     let path: zbus::zvariant::OwnedObjectPath = match call(BusKind::Session, SYSTEMD_NAME)
         .at_path(MANAGER_PATH)
@@ -1021,12 +1026,15 @@ mod tests {
         assert!(longest.len() < 255, "{} bytes: {longest}", longest.len());
     }
 
-    /// A stack's unit glob cannot catch a sibling stack's units.
+    /// One stack's units cannot be mistaken for a sibling's.
     ///
-    /// This is the same escape seen from the other side: `workspace_slice_is_up`
-    /// globs `trollshell-ws-<escaped>-*.service`, and without the escape
-    /// `chat`'s glob would match every one of `chat-dev`'s units and report a
-    /// stopped stack as up.
+    /// The same escape seen from the other side. [`workspace_slices_up`] issues
+    /// **one** `trollshell-ws-*.service` glob and disambiguates in
+    /// [`parse_workspace_unit`] — there is no per-stack glob — but the property
+    /// that makes that work is this one: `chat`'s unit stem is not a
+    /// dash-prefix of `chat-dev`'s, so no amount of prefix matching anywhere can
+    /// confuse them. Without the escape it would be, and a stopped `chat` would
+    /// read as up whenever `chat-dev` was running.
     #[test]
     fn a_stacks_unit_glob_does_not_catch_a_siblings_units() {
         let chat = format!("{WS_PREFIX}{}-", "chat".replace('-', r"\x2d"));

@@ -16,8 +16,8 @@ use std::time::Duration;
 use hytte::services::niri::{Window, WindowLayout, Workspace, WorkspaceAction};
 
 use super::{
-    Layout, Ops, Stack, StackApp, StackState, StartError, StopStep, app_launch, names_to_release,
-    plan_start, start, state_of, stop, stop_plan, stray_moves,
+    Launched, Layout, Ops, Stack, StackApp, StackState, StartError, StopStep, app_launch, may_stop,
+    names_to_release, plan_start, save, start, state_of, stop, stop_plan, stray_moves,
 };
 use crate::launch::Launch;
 
@@ -37,6 +37,11 @@ fn ws(id: u64, idx: u8, output: &str, name: Option<&str>, focused: bool) -> Work
         is_focused: focused,
         active_window_id: None,
     }
+}
+
+/// [`ws`], focused.
+fn ws_focused(id: u64, idx: u8, output: &str, name: Option<&str>) -> Workspace {
+    ws(id, idx, output, name, true)
 }
 
 fn win(id: u64, workspace: u64, app_id: &str) -> Window {
@@ -223,10 +228,12 @@ impl Ops for Script {
     }
 
     async fn stop_slice(&self, name: &str) -> Result<(), String> {
-        self.0
-            .borrow_mut()
-            .calls
-            .push(Call::StopSlice(name.to_owned()));
+        let mut state = self.0.borrow_mut();
+        state.calls.push(Call::StopSlice(name.to_owned()));
+        // systemd's job, granted immediately: the slice is down by the time the
+        // *next* `slice_is_up` asks. A fake that left it up would make
+        // `wait_for_slice_down` spin out its whole bound on every Stop test.
+        state.slices_up.remove(name);
         Ok(())
     }
 
@@ -352,6 +359,45 @@ fn an_empty_current_workspace_is_adopted() {
 
     assert_eq!(plan.workspace, 1, "the current one");
     assert!(plan.adopted);
+}
+
+/// **MEDIUM-1.** The *fallback* leg takes an **empty** workspace too, not just
+/// any unnamed one.
+///
+/// `an_empty_current_workspace_is_adopted` covers the adopt leg; nothing covered
+/// this one, so a future edit could drop a stack onto a populated workspace that
+/// merely happens to have no name.
+///
+/// **Mutation:** drop `&& is_empty(w)` from the trailing-workspace filter →
+/// this reds (the higher-`idx` occupied workspace wins on `max_by_key`).
+#[test]
+fn the_trailing_workspace_must_be_empty_too() {
+    let workspaces = [
+        // Focused and busy, so the adopt leg is out.
+        ws_focused(1, 1, LEFT, None),
+        // Empty and unnamed — the one a Start may take.
+        ws(2, 2, LEFT, None, false),
+        // Higher idx, unnamed, but **occupied**: `max_by_key` would pick this
+        // one without the emptiness filter.
+        ws(3, 3, LEFT, None, false),
+    ];
+    let windows = [win(9, 1, "firefox"), win(10, 3, "mpv")];
+    let plan = plan_start("chat", &Stack::default(), &workspaces, &windows).expect("plans");
+
+    assert_eq!(plan.workspace, 2, "the empty one, not the highest-idx one");
+    assert!(!plan.adopted);
+}
+
+/// …and with no empty workspace at all, a Start refuses rather than landing on
+/// someone's work.
+#[test]
+fn a_start_with_nowhere_to_go_refuses() {
+    let workspaces = [ws_focused(1, 1, LEFT, None), ws(2, 2, LEFT, None, false)];
+    let windows = [win(9, 1, "firefox"), win(10, 2, "mpv")];
+    assert_eq!(
+        plan_start("chat", &Stack::default(), &workspaces, &windows),
+        Err(StartError::NoFreeWorkspace)
+    );
 }
 
 /// A stack's own monitor wins when it is connected, and the focused output is
@@ -560,24 +606,134 @@ fn a_start_verifies_then_launches_then_lays_out_once() {
     );
 }
 
-/// A stray window — one whose `app_id` belongs to the stack but which landed
-/// elsewhere — is moved home inside the grace window, by id.
+/// Nothing was open when the Start began, and no unit has resolved yet — the
+/// `app_id` fallback (rule 3).
+fn fresh() -> Launched {
+    Launched::default()
+}
+
+/// A stray window — one this Start opened that landed elsewhere — is moved
+/// home inside the grace window, by id.
 #[test]
 fn a_stray_window_is_moved_home() {
+    let none = BTreeMap::new();
     assert_eq!(
-        stray_moves(&stack(&["firefox"]), 1, &[win(9, 2, "firefox")]),
+        stray_moves(
+            &stack(&["firefox"]),
+            1,
+            &[win(9, 2, "firefox")],
+            &fresh(),
+            &none
+        ),
         vec![WorkspaceAction::MoveWindow {
             window: 9,
             workspace: 1
         }]
     );
     assert!(
-        stray_moves(&stack(&["firefox"]), 1, &[win(9, 1, "firefox")]).is_empty(),
+        stray_moves(
+            &stack(&["firefox"]),
+            1,
+            &[win(9, 1, "firefox")],
+            &fresh(),
+            &none
+        )
+        .is_empty(),
         "a window already home is not moved"
     );
     assert!(
-        stray_moves(&stack(&["firefox"]), 1, &[win(9, 2, "mpv")]).is_empty(),
+        stray_moves(
+            &stack(&["firefox"]),
+            1,
+            &[win(9, 2, "mpv")],
+            &fresh(),
+            &none
+        )
+        .is_empty(),
         "and a window that is not the stack's is left alone"
+    );
+}
+
+/// **HIGH-1.** A window the user already had open is never moved, however well
+/// its `app_id` matches.
+///
+/// You have Firefox on workspace 2. You press ▶ on a stack that lists
+/// `org.mozilla.firefox`. Before this, the grace window yanked your existing
+/// window onto the stack's workspace — and `MoveWindowToWorkspace` carries focus
+/// with it, so you went too.
+///
+/// **Mutation:** drop the `!launched.before.contains` filter (rule 1) and this
+/// reds; `a_stray_window_is_moved_home` stays green, because there the window is
+/// new.
+#[test]
+fn a_window_that_predates_the_start_is_never_moved() {
+    let mine = win(9, 2, "firefox");
+    let launched = Launched {
+        before: BTreeSet::from([mine.id]),
+        units: BTreeSet::new(),
+    };
+    assert!(
+        stray_moves(
+            &stack(&["firefox"]),
+            1,
+            std::slice::from_ref(&mine),
+            &launched,
+            &BTreeMap::new()
+        )
+        .is_empty(),
+        "the user's own window, of an app the stack happens to list"
+    );
+
+    // …and a *new* window of that same app, opened by this Start, still is.
+    let ours = win(10, 2, "firefox");
+    assert_eq!(
+        stray_moves(
+            &stack(&["firefox"]),
+            1,
+            &[mine, ours],
+            &launched,
+            &BTreeMap::new()
+        ),
+        vec![WorkspaceAction::MoveWindow {
+            window: 10,
+            workspace: 1
+        }],
+        "exactly one of the two moves"
+    );
+}
+
+/// **HIGH-1, the pid leg.** A new window whose pid belongs to one of this
+/// Start's units is moved even when its `app_id` is not in the stack — which is
+/// the ordinary case for an app whose window reports a different `app_id` than
+/// its desktop entry id.
+///
+/// And the converse: a new window in *another* unit is not moved on the strength
+/// of its unit alone.
+#[test]
+fn a_window_in_one_of_this_starts_units_is_moved_whatever_its_app_id() {
+    let ours = win(9, 2, "some-other-app-id");
+    let theirs = win(10, 2, "some-other-app-id");
+    let launched = Launched {
+        before: BTreeSet::new(),
+        units: BTreeSet::from(["trollshell-ws-chat-0.service".to_owned()]),
+    };
+    let unit_of = BTreeMap::from([
+        (9, Some("trollshell-ws-chat-0.service".to_owned())),
+        (10, Some("app-niri-firefox-1234.scope".to_owned())),
+    ]);
+    assert_eq!(
+        stray_moves(
+            &stack(&["firefox"]),
+            1,
+            &[ours, theirs],
+            &launched,
+            &unit_of
+        ),
+        vec![WorkspaceAction::MoveWindow {
+            window: 9,
+            workspace: 1
+        }],
+        "ours by unit; theirs is neither our unit nor our app_id"
     );
 }
 
@@ -677,11 +833,74 @@ fn stop_plans_a_unit_where_there_is_one_and_a_close_by_id_otherwise() {
         (10, None),
     ]);
     assert_eq!(
-        stop_plan(&[&a, &b], &units),
+        stop_plan("chat", &[&a, &b], &units),
         vec![
             StopStep::StopUnit("app-niri-firefox-1234.scope".to_owned()),
             StopStep::Close(10),
         ]
+    );
+}
+
+/// **HIGH-2.** The allowlist, stated as the units it must and must not stop.
+///
+/// The two that matter are not hypothetical. The shell opens links with
+/// `gio::AppInfo::launch_default_for_uri`, and glib 2.88 creates no transient
+/// scope for that — the browser is forked into **`trollshell.service`'s own
+/// cgroup**, so `GetUnitByPID` on its window answers `trollshell.service` and an
+/// unguarded Stop makes the shell stop itself. niri's `StartTransientUnit` has a
+/// fallback path, so anything that missed its scope answers `niri.service` and an
+/// unguarded Stop takes the session down.
+///
+/// **Mutation:** return `true` unconditionally from `may_stop` → this reds on
+/// the first refusal.
+#[test]
+fn may_stop_allows_app_scopes_and_this_stacks_units_and_nothing_else() {
+    // Allowed: a launcher-started application, whatever the launcher.
+    assert!(may_stop("chat", "app-niri-firefox-1234.scope"));
+    assert!(may_stop("chat", "app-fuzzel-mpv-99.scope"));
+    // Allowed: this stack's own units, escaped name and all.
+    assert!(may_stop("chat", "trollshell-ws-chat-0.service"));
+    assert!(may_stop("chat-dev", r"trollshell-ws-chat\x2ddev-2.service"));
+
+    // The two catastrophic ones.
+    assert!(!may_stop("chat", "trollshell.service"), "the shell itself");
+    assert!(!may_stop("chat", "niri.service"), "the compositor");
+
+    // …and everything else that is not this workspace's business.
+    assert!(
+        !may_stop("chat", "trollshell-ws-dev-0.service"),
+        "another stack"
+    );
+    assert!(!may_stop("chat", "trollshell-plugin-pet.service"));
+    assert!(!may_stop("chat", "trollshell-launch-caw-7-4242-3.service"));
+    assert!(!may_stop("chat", "session.slice"));
+    assert!(!may_stop("chat", "dbus.service"));
+    assert!(!may_stop("chat", "pipewire.service"));
+    // An `app-` prefix is not enough on its own: a *service* named that way is
+    // not a launcher scope.
+    assert!(!may_stop("chat", "app-something.service"));
+}
+
+/// …and the planner really routes a refused unit to a close rather than
+/// dropping the window or stopping it anyway.
+#[test]
+fn a_refused_unit_closes_the_window_instead() {
+    let shell_spawned = win(9, 1, "firefox");
+    let ours = win(10, 1, "Alacritty");
+    let units = BTreeMap::from([
+        (9, Some("trollshell.service".to_owned())),
+        (10, Some("trollshell-ws-chat-0.service".to_owned())),
+    ]);
+    assert_eq!(
+        stop_plan("chat", &[&shell_spawned, &ours], &units),
+        vec![
+            StopStep::CloseInstead {
+                window: 9,
+                refused: "trollshell.service".to_owned(),
+            },
+            StopStep::StopUnit("trollshell-ws-chat-0.service".to_owned()),
+        ],
+        "the window still goes; the shell does not"
     );
 }
 
@@ -701,7 +920,8 @@ fn a_stop_takes_the_slice_down_first_then_walks_what_is_left() {
         .with_workspaces(&[workspaces])
         .with_windows(&[windows])
         // window 9's pid is 1009 (see `win`), and systemd knows its scope.
-        .with_unit(1009, "app-niri-firefox-1234.scope");
+        .with_unit(1009, "app-niri-firefox-1234.scope")
+        .with_slice_up("chat");
 
     run(stop(&script, "chat")).expect("stops");
 
@@ -737,6 +957,92 @@ fn a_stop_takes_the_slice_down_first_then_walks_what_is_left() {
     );
 }
 
+/// **MEDIUM-2.** A Stop touches **only this workspace's** windows.
+///
+/// The `workspace_id` filter in `stop`'s `remaining` is the single most
+/// dangerous line in the transaction: without it a Stop walks every window in
+/// the session and stops or closes all of them. The trace test above scripts
+/// only windows that are already on the workspace, so it cannot see the filter
+/// at all.
+///
+/// **Mutation:** delete `.filter(|w| w.workspace_id == Some(workspace))` → this
+/// reds on both assertions; every other Stop test stays green.
+#[test]
+fn a_stop_leaves_windows_on_other_workspaces_alone() {
+    let workspaces = vec![
+        ws(1, 1, LEFT, Some("chat"), true),
+        ws(2, 2, LEFT, Some("dev"), false),
+    ];
+    let windows = vec![
+        win(9, 1, "firefox"),
+        // Another workspace's window, with a unit the allowlist would happily
+        // have stopped if the scoping were gone.
+        win(20, 2, "mpv"),
+        // …and one with no unit at all, which would have been closed.
+        win(21, 2, "bash"),
+    ];
+    let script = Script::default()
+        .with_workspaces(&[workspaces])
+        .with_windows(&[windows])
+        .with_unit(1009, "app-niri-firefox-1234.scope")
+        .with_unit(1020, "app-niri-mpv-5678.scope")
+        .with_slice_up("chat");
+
+    run(stop(&script, "chat")).expect("stops");
+
+    assert_eq!(
+        script
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::StopUnit(_)))
+            .collect::<Vec<_>>(),
+        vec![Call::StopUnit("app-niri-firefox-1234.scope".to_owned())],
+        "only this workspace's unit: {:?}",
+        script.calls()
+    );
+    assert_eq!(
+        script.actions(),
+        vec![WorkspaceAction::UnsetName { workspace: 1 }],
+        "no window on another workspace is closed"
+    );
+}
+
+/// **MEDIUM-3.** The slice is really down before the walk starts.
+///
+/// `StopUnit` is a job *enqueue*: measured on systemd 260.2 it returns a job
+/// path in ~15 ms with the unit still `deactivating`. So "the walk only sees
+/// what the compositor started" — which is how the per-window pass is justified
+/// — needs an actual wait, not just an ordering.
+///
+/// **Mutation:** drop the `wait_for_slice_down` call → the first `SliceIsUp`
+/// after the stop disappears and this reds.
+#[test]
+fn a_stop_waits_for_the_slice_to_be_down_before_walking() {
+    let script = Script::default()
+        .with_workspaces(&[vec![ws(1, 1, LEFT, Some("chat"), true)]])
+        .with_windows(&[vec![win(9, 1, "firefox")]])
+        // Still up when the stop is issued; the fake clears it on `stop_slice`,
+        // the way systemd's job eventually does.
+        .with_slice_up("chat");
+
+    run(stop(&script, "chat")).expect("stops");
+
+    let calls = script.calls();
+    let stop_slice = script
+        .position(|c| matches!(c, Call::StopSlice(_)))
+        .expect("the slice was stopped");
+    let checked = script
+        .position(|c| matches!(c, Call::SliceIsUp(_)))
+        .expect("and the stop waited for it to go down");
+    let walked = script
+        .position(|c| matches!(c, Call::UnitForPid(_)))
+        .expect("then walked the windows");
+    assert!(
+        stop_slice < checked && checked < walked,
+        "stop, wait, then walk: {calls:?}"
+    );
+}
+
 /// A Stop of a stack that is not on screen stops its slice and does nothing
 /// else — no windows to walk, no name to release. It must not fail.
 #[test]
@@ -745,7 +1051,13 @@ fn stopping_an_inactive_stack_is_just_the_slice() {
     run(stop(&script, "chat")).expect("stops");
     assert_eq!(
         script.calls(),
-        vec![Call::StopSlice("chat".to_owned()), Call::Workspaces],
+        vec![
+            Call::StopSlice("chat".to_owned()),
+            // One check, answered "down" straight away — the wait costs a
+            // round trip and no sleep when there was nothing to wait for.
+            Call::SliceIsUp("chat".to_owned()),
+            Call::Workspaces,
+        ],
         "the slice stop is idempotent, so there is nothing to guard"
     );
 }
@@ -814,4 +1126,65 @@ fn a_start_of_a_stack_whose_slice_is_up_finds_its_name_taken() {
     let err = run(start(&script, "chat", &Stack::default(), &stacks)).expect_err("refuses");
     assert!(err.contains("already on a workspace"), "{err}");
     assert!(script.launches().is_empty());
+}
+
+// ── §3.7: Save names the workspace ───────────────────────────────────────────
+
+/// **HIGH-3.** A Save **names the niri workspace**, so the card that was
+/// ephemeral becomes the saved Active one.
+///
+/// §3.7: *"The batch names the niri workspace immediately, so the saved
+/// workspace **is** the Active card."* Writing the file alone leaves the
+/// workspace unnamed, so the page keeps drawing it as an "Unsaved workspace"
+/// card *and* draws the new stack as a second, Inactive card whose ▶ would
+/// launch a second copy of every app.
+///
+/// This half is the precondition: a name niri already holds is refused **before**
+/// the file is touched, because `SetWorkspaceName` would silently no-op and
+/// leave a stack in the file that can never be this workspace.
+#[test]
+fn a_save_verifies_the_name_is_free_before_writing_anything() {
+    let script = Script::default().with_workspaces(&[vec![ws(1, 1, LEFT, Some("chat"), true)]]);
+    let err = run(save(&script, 1, "chat", &Stack::default())).expect_err("refuses");
+    assert!(err.contains("already on a workspace"), "{err}");
+    assert!(
+        script.actions().is_empty(),
+        "nothing was sent to niri: {:?}",
+        script.calls()
+    );
+}
+
+/// …and with the name free, the Save issues the id-addressed `SetName` for
+/// **this** workspace and reads it back, exactly as a Start does.
+///
+/// The file write is the one step this fake cannot host — it goes to the real
+/// `XDG_CONFIG_HOME` — so both outcomes are accepted and each pins its own
+/// invariant: a write that succeeded must be followed by the naming, and a write
+/// that failed must **not** leave the workspace named.
+///
+/// **Mutation:** delete the `send_actions` from `save` → the `Ok` arm reds
+/// wherever an overlay path exists, and the standalone
+/// `a_save_verifies_the_name_is_free_before_writing_anything` still holds the
+/// precondition.
+#[test]
+fn a_save_names_this_workspace_and_verifies_it_landed() {
+    let before = vec![ws(7, 2, LEFT, None, true)];
+    let after = vec![ws(7, 2, LEFT, Some("chat"), true)];
+    let script = Script::default().with_workspaces(&[before, after]);
+
+    match run(save(&script, 7, "chat", &Stack::default())) {
+        Ok(()) => assert_eq!(
+            script.actions(),
+            vec![WorkspaceAction::SetName {
+                workspace: 7,
+                name: "chat".to_owned()
+            }],
+            "named by id, not by focus"
+        ),
+        Err(e) => assert!(
+            script.actions().is_empty(),
+            "a failed write must not leave the workspace named: {e}, {:?}",
+            script.calls()
+        ),
+    }
 }

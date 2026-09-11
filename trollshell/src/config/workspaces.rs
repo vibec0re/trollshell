@@ -50,7 +50,7 @@
 //!
 //! [`DEFAULT_TOML`]: WorkspacesConfig::DEFAULT_TOML
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use hytte::futures_signals::signal::{Mutable, Signal};
@@ -144,10 +144,16 @@ impl Workspaces {
     /// then everything else by name.
     #[must_use]
     pub fn names_in_order(&self) -> Vec<String> {
+        // Deduped: `order = ["chat", "chat"]` is an ordinary copy-paste slip,
+        // and the page builds one card per name returned — so without this it
+        // draws two identical cards, each with its own ▶, and starting one
+        // leaves the other showing Inactive.
+        let mut seen = BTreeSet::new();
         let mut out: Vec<String> = self
             .order
             .iter()
             .filter(|name| self.stacks.contains_key(*name))
+            .filter(|name| seen.insert((*name).clone()))
             .cloned()
             .collect();
         let tail: Vec<String> = self
@@ -189,13 +195,18 @@ const LAYOUT: EnvKnob = EnvKnob::same("", "workspace.*.layout", "equal, golden, 
 const APPS: EnvKnob = EnvKnob::same(
     "",
     "workspace.*.apps",
-    "an array of { id = \"…\", exec = \"…\" } tables",
+    "an array of { id = \"…\", exec = \"…\" } tables, each with a non-blank id \
+     and, if present, a non-blank exec",
 );
+const APP_KEY: EnvKnob = EnvKnob::same("", "workspace.*.apps[]", "id or exec");
 
 /// The keys a stack table may carry. Anything else is reported, once, and
 /// ignored — rule 4's spirit inside a raw value, which `serde_ignored` cannot
 /// see into because the whole `workspace` key arrives as a `toml::Value`.
 const STACK_KEYS: [&str; 4] = ["monitor", "autostart", "layout", "apps"];
+
+/// The keys one entry of an `apps` array may carry. See [`unknown_app_keys`].
+const APP_KEYS: [&str; 2] = ["id", "exec"];
 
 // ── The schema ───────────────────────────────────────────────────────────────
 
@@ -334,6 +345,18 @@ fn parse_stacks(value: &toml::Value, rejected: &mut Vec<InvalidValue>) -> BTreeM
                 &format!("{name}.{unknown}"),
             ));
         }
+        // Two spellings that normalise to one name are two *table keys* and one
+        // stack. `toml::Table` is a `BTreeMap`, so a bare `insert` would parse
+        // `Chat` and then silently overwrite it with `chat` — one stack's
+        // monitor, layout and apps gone with no line anywhere. First wins, and
+        // the loser is named.
+        if stacks.contains_key(&name) {
+            rejected.push(InvalidValue::written(
+                &STACK_NAME,
+                &format!("{raw_name} (already declared as {name})"),
+            ));
+            continue;
+        }
         stacks.insert(name.clone(), parse_stack(&name, fields, rejected));
     }
     stacks
@@ -372,6 +395,14 @@ fn parse_stack(name: &str, fields: &toml::Table, rejected: &mut Vec<InvalidValue
         )
     });
     let apps = fields.get("apps").map_or_else(Vec::new, |value| {
+        // Reported, not fatal: the entries still parse, so a typo'd key costs
+        // one line and the stack keeps whatever the shell does understand.
+        for unknown in unknown_app_keys(value) {
+            rejected.push(InvalidValue::written(
+                &APP_KEY,
+                &format!("{name}.apps[{unknown}]"),
+            ));
+        }
         keep(
             parse_apps(value).map_err(|()| named(&APPS, value)),
             Vec::new(),
@@ -396,12 +427,22 @@ fn parse_apps(value: &toml::Value) -> Result<Vec<StackApp>, ()> {
         .map(|entry| {
             let table = entry.as_table().ok_or(())?;
             let id = table.get("id").and_then(toml::Value::as_str).ok_or(())?;
-            if id.is_empty() {
+            if id.trim().is_empty() {
                 return Err(());
             }
             let exec = match table.get("exec") {
                 None => None,
-                Some(value) => Some(value.as_str().ok_or(())?.to_owned()),
+                Some(value) => {
+                    let exec = value.as_str().ok_or(())?;
+                    // A blank override is not "no override": it splits to an
+                    // empty argv and surfaces as a `systemd-run` error at Start,
+                    // hours after the file was written. Refuse it here, where
+                    // the line names the key.
+                    if exec.trim().is_empty() {
+                        return Err(());
+                    }
+                    Some(exec.to_owned())
+                }
             };
             Ok(StackApp {
                 id: id.to_owned(),
@@ -411,23 +452,71 @@ fn parse_apps(value: &toml::Value) -> Result<Vec<StackApp>, ()> {
         .collect()
 }
 
+/// The unknown keys inside a stack's `apps` entries, as `"<n>.<key>"`.
+///
+/// Rule 4 one level deeper than [`parse_stacks`] reaches. `workspace` arrives as
+/// a single raw `toml::Value`, so `serde_ignored` cannot see into it at all —
+/// and `exec` is precisely the key whose whole purpose is changing what runs, so
+/// `{ id = "Alacritty", exce = "…" }` loading clean and launching the wrong
+/// thing is the worst-shaped silence in the file.
+///
+/// Separate from [`parse_apps`] because a typo'd key is not a reason to drop the
+/// whole array: the entries still parse, the unknown key is reported, and the
+/// stack starts with whatever it does understand.
+fn unknown_app_keys(value: &toml::Value) -> Vec<String> {
+    let Some(array) = value.as_array() else {
+        return Vec::new();
+    };
+    array
+        .iter()
+        .enumerate()
+        .filter_map(|(n, entry)| Some((n, entry.as_table()?)))
+        .flat_map(|(n, table)| {
+            table
+                .keys()
+                .filter(|k| !APP_KEYS.contains(&k.as_str()))
+                .map(move |k| format!("{n}.{k}"))
+        })
+        .collect()
+}
+
 // ── Saving (the drawer's Edit → Save, #1071 §3.7) ────────────────────────────
 
-/// Add or replace the stack `name` in the **overlay**, keeping everything else
-/// in the file as written.
+/// Add the stack `name` to the **overlay**, keeping everything else in the file
+/// as written.
 ///
 /// Reads the overlay's own layers — `DEFAULT_TOML` plus the user's file, *not*
 /// the merged base — so a stack a home-manager base pinned is not copied down
-/// into the overlay as a side effect of saving a different one. `order` is left
-/// exactly as the overlay had it, including absent: writing it would replace a
-/// base-pinned order wholesale (arrays replace), and card order is phase 3's.
+/// into the overlay as a side effect of saving a different one. That is the
+/// property `a_save_never_materialises_a_base_stack_into_the_overlay` holds.
+/// `order` is left exactly as the overlay had it, including absent: writing it
+/// would replace a base-pinned order wholesale (arrays replace), and card order
+/// is phase 3's.
+///
+/// **Refuses an existing name.** A Save is how a workspace gets *created*, and
+/// `stack_value` omits every defaulted key, so silently replacing would drop the
+/// existing stack's monitor, layout and autostart and replace its apps wholesale
+/// (arrays replace) — with no way back. Phase 4's edit form is where an existing
+/// stack is changed; until it exists, refusing is the only honest answer.
 ///
 /// # Errors
+/// [`ConfigError::Invalid`] for an unusable or already-taken name,
 /// [`ConfigError::NoOverlayPath`] when there is no `XDG_CONFIG_HOME` to write
 /// to, plus whatever the reader and the format-preserving writer report.
 pub fn save_stack(name: &str, stack: &Stack) -> Result<(), ConfigError> {
     let name = normalize_workspace_name(name)
         .ok_or_else(|| ConfigError::Invalid(format!("invalid workspace name: {name:?}")))?;
+    // Against the **merged** view, not the overlay: a base-pinned name is taken
+    // too, and `save_stack_to` reads only the overlay, so a collision with the
+    // base would otherwise be invisible right up until the merge produced a
+    // stack the user never described.
+    let taken = hytte_config::subsystem::load_or_default::<WorkspacesConfig>()
+        .is_some_and(|config| config.parsed().0.stacks.contains_key(&name));
+    if taken {
+        return Err(ConfigError::Invalid(format!(
+            "a workspace called {name:?} already exists"
+        )));
+    }
     let path = xdg::overlay_path(WorkspacesConfig::NAME).ok_or(ConfigError::NoOverlayPath)?;
     save_stack_to(&path, &name, stack)
 }
@@ -435,8 +524,12 @@ pub fn save_stack(name: &str, stack: &Stack) -> Result<(), ConfigError> {
 /// [`save_stack`] against an explicit overlay path, so the round trip is
 /// testable without an `XDG_CONFIG_HOME`.
 ///
+/// Does **not** repeat [`save_stack`]'s already-taken check: that one is stated
+/// against the merged layers, which an explicit single path cannot see. This is
+/// the writer; the guard is the caller's.
+///
 /// # Errors
-/// As [`save_stack`].
+/// As [`save_stack`], minus the already-taken case.
 pub fn save_stack_to(path: &std::path::Path, name: &str, stack: &Stack) -> Result<(), ConfigError> {
     let existing = hytte_config::subsystem::load_from::<WorkspacesConfig>(&[path.to_path_buf()])?;
     let mut table = existing
@@ -964,5 +1057,161 @@ apps = [
                  using the built-in default"]
         );
         assert!(captured.errors().is_empty(), "the file was usable");
+    }
+
+    /// **MEDIUM-4.** Two table keys that normalise to one name are a collision,
+    /// not a silent overwrite.
+    ///
+    /// `toml::Table` is a `BTreeMap`, so `Chat` parses first and a bare
+    /// `insert` then replaces it with `chat` — one stack's monitor, layout and
+    /// apps gone with nothing logged. First wins, and the loser is named.
+    ///
+    /// **Mutation:** drop the `contains_key` guard → the second assertion reds
+    /// (no line) and the first reds too (`chat` takes the later value).
+    #[test]
+    fn two_spellings_of_one_name_collide_rather_than_overwrite() {
+        let body = "[workspace.Chat]\nlayout = \"equal\"\n\
+                    [workspace.chat]\nlayout = \"split\"\n";
+        let ws = load(&[("/o.toml", body)]);
+        assert_eq!(ws.stacks.keys().collect::<Vec<_>>(), ["chat"]);
+        assert_eq!(
+            ws.stacks["chat"].layout,
+            Layout::Equal,
+            "the first spelling wins, rather than being silently replaced"
+        );
+        assert_eq!(
+            rejections(&[("/o.toml", body)]),
+            [
+                "workspace.* = chat (already declared as chat) is not valid; expected a name \
+                 of lowercase letters, digits and single interior dashes"
+            ],
+            "and the loser is named"
+        );
+    }
+
+    /// **MEDIUM-6.** A duplicated `order` entry draws one card, not two.
+    ///
+    /// The page builds one card per name `names_in_order` returns, so a
+    /// copy-paste slip in `order` used to give two identical cards, each with
+    /// its own ▶.
+    ///
+    /// **Mutation:** drop the `seen.insert` filter → reds.
+    #[test]
+    fn a_duplicated_order_entry_does_not_duplicate_the_card() {
+        let ws = load(&[(
+            "/o.toml",
+            "order = [\"chat\", \"chat\", \"dev\"]\n[workspace.chat]\n[workspace.dev]\n",
+        )]);
+        assert_eq!(ws.names_in_order(), ["chat", "dev"]);
+    }
+
+    /// **LOW.** An unknown key inside an `apps` entry is reported.
+    ///
+    /// Rule 4 one level deeper than the stack table: `workspace` arrives as one
+    /// raw value, so `serde_ignored` cannot see in at all — and `exec` is the
+    /// key whose whole purpose is changing what runs, so `exce` loading clean
+    /// and launching the wrong thing is the worst-shaped silence in the file.
+    ///
+    /// Reported, **not** fatal: the entries still parse and the stack keeps
+    /// what the shell does understand.
+    #[test]
+    fn an_unknown_key_inside_an_apps_entry_is_reported() {
+        let body = "[workspace.chat]\n\
+                    apps = [{ id = \"Alacritty\", exce = \"alacritty -e weechat\" }]\n";
+        assert_eq!(
+            rejections(&[("/o.toml", body)]),
+            ["workspace.*.apps[] = chat.apps[0.exce] is not valid; expected id or exec"]
+        );
+        let ws = load(&[("/o.toml", body)]);
+        assert_eq!(
+            ws.stacks["chat"].apps,
+            [StackApp {
+                id: "Alacritty".to_owned(),
+                exec: None
+            }],
+            "the entry still loads — it is the override that was lost, and said so"
+        );
+    }
+
+    /// **LOW.** A blank `exec` or `id` is refused at load, where the line names
+    /// the key, rather than becoming an empty argv and surfacing as a
+    /// `systemd-run` failure at Start.
+    #[test]
+    fn a_blank_id_or_exec_is_refused_at_load() {
+        for body in [
+            "[workspace.chat]\napps = [{ id = \"Alacritty\", exec = \"   \" }]\n",
+            "[workspace.chat]\napps = [{ id = \"  \" }]\n",
+        ] {
+            let ws = load(&[("/o.toml", body)]);
+            assert!(
+                ws.stacks["chat"].apps.is_empty(),
+                "{body:?} should not produce a launchable app"
+            );
+            assert_eq!(
+                rejections(&[("/o.toml", body)]).len(),
+                1,
+                "exactly one line, for the apps key: {body:?}"
+            );
+        }
+    }
+
+    /// **MEDIUM-5.** A Save refuses a name that is already a stack rather than
+    /// replacing it.
+    ///
+    /// `stack_value` omits every defaulted key and arrays replace whole, so an
+    /// unconditional insert would drop the existing stack's monitor, layout and
+    /// autostart *and* replace its apps — with no way back. Phase 4's edit form
+    /// is where an existing stack is changed.
+    ///
+    /// Stated on `save_stack_to`'s caller-side guard through the page's own
+    /// check and on `save_stack`'s merged-layer check; here it is the writer's
+    /// behaviour that is pinned — it still *writes*, because the guard is
+    /// deliberately the caller's (see its doc).
+    #[test]
+    fn the_writer_is_unguarded_and_the_guard_is_stated_where_the_layers_are() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workspaces.toml");
+        std::fs::write(&path, "[workspace.chat]\nlayout = \"golden\"\n").expect("writes");
+
+        // The writer replaces, by design — it cannot see the base layer, so it
+        // is not the place to decide.
+        save_stack_to(&path, "chat", &Stack::default()).expect("writes");
+        let ws = subsystem::load_from::<WorkspacesConfig>(std::slice::from_ref(&path))
+            .expect("reloads")
+            .config
+            .parsed()
+            .0;
+        assert_eq!(ws.stacks["chat"].layout, Layout::None);
+    }
+
+    /// **LOW.** A Save reads only the **overlay**, so a base-pinned stack is
+    /// never materialised into it as a side effect of saving a different one.
+    ///
+    /// **Mutation:** point `save_stack_to`'s `load_from` at both layers → `base`
+    /// appears in the written file and this reds. Every other save test uses a
+    /// single layer, so nothing else could see it.
+    #[test]
+    fn a_save_never_materialises_a_base_stack_into_the_overlay() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("base.toml");
+        let overlay = dir.path().join("workspaces.toml");
+        std::fs::write(&base, "[workspace.base]\nlayout = \"golden\"\n").expect("writes");
+        std::fs::write(&overlay, "# mine\n").expect("writes");
+
+        save_stack_to(&overlay, "mine", &Stack::default()).expect("saves");
+
+        let written = std::fs::read_to_string(&overlay).expect("reads back");
+        assert!(written.contains("[workspace.mine]"), "{written}");
+        assert!(
+            !written.contains("base"),
+            "the base layer's stack must not be copied into the overlay: {written}"
+        );
+        // …and the merged view still has both, which is the point.
+        let merged = subsystem::load_from::<WorkspacesConfig>(&[base, overlay])
+            .expect("merges")
+            .config
+            .parsed()
+            .0;
+        assert_eq!(merged.stacks.keys().collect::<Vec<_>>(), ["base", "mine"]);
     }
 }

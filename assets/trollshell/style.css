@@ -726,9 +726,21 @@
 }
 /* "Not on a screen" (#1071 §3.3). The card keeps its place in the column —
    Inactive cards are ordered with the Active ones — and says what it is
-   instead of vanishing. */
+   instead of vanishing.
+
+   Greyed with `filter`, NOT `opacity`: opacity composites, so an `opacity: .55`
+   card holding an `opacity: .35` idle icon renders that icon at **0.19** and
+   its note at 0.30 — past legible and not what either number says. `filter`
+   desaturates and dims the card as one layer, and the nested opacities below
+   then do their own job against it rather than multiplying with it. */
 .ts-ws-card-inactive {
-    opacity: 0.55;
+    filter: grayscale(0.6) brightness(0.82);
+}
+/* …and inside an inactive card the icons stop dimming a second time: the whole
+   card is already the "not running" signal, so the per-icon distinction has
+   nothing left to say. */
+.ts-ws-card-inactive .ts-ws-app-idle {
+    opacity: 1;
 }
 .ts-ws-card-name {
     font-weight: 600;

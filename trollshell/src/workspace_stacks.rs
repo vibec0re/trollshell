@@ -48,6 +48,22 @@ const GRACE_TICK: Duration = Duration::from_millis(500);
 /// binds already assume; absent is one warning, not an error.
 const LAYOUT_BIN: &str = "hytte-plugin-niri-layouts";
 
+/// How long a Stop waits between checks for its slice to go down, and how many
+/// times. `StopUnit` enqueues a job; see [`wait_for_slice_down`].
+const SLICE_STOP_TICK: Duration = Duration::from_millis(200);
+const SLICE_STOP_TICKS: u32 = 25;
+
+/// The ceiling on `Starting`.
+///
+/// `niri-ipc`'s `Socket` has no read timeout and `spawn_blocking` is not
+/// cancellable, so a compositor that accepts a request and never answers parks
+/// the task **and the card's button with it**, for the life of the shell. This
+/// does not rescue the task — nothing can — but it does hand the button back,
+/// so the worst case is a Start the user can retry rather than a card that is
+/// dead until the shell restarts. Generous: it has to outlast a real Start,
+/// which is [`GRACE`] plus however long the apps take to launch.
+const STARTING_CEILING: Duration = Duration::from_secs(90);
+
 /// A card's state (#1071 §3.3).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum StackState {
@@ -366,23 +382,78 @@ fn forwarded_env() -> Vec<(String, String)> {
     .collect()
 }
 
-/// The windows that belong to this stack but landed elsewhere, as the batch that
+/// What a Start knows about its own launch, so the grace window can tell its
+/// windows from the user's (#1071 §3.4 step 2).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Launched {
+    /// Every window id that already existed when the Start began.
+    ///
+    /// The load-bearing half. `app_id` alone identifies an *application*, not a
+    /// launch: a stack listing `org.mozilla.firefox` would otherwise reach out
+    /// and take the Firefox window the user already had open on another
+    /// workspace — and `MoveWindowToWorkspace` carries focus with it, so the
+    /// user gets dragged along too.
+    pub before: BTreeSet<u64>,
+    /// The units this Start asked systemd to start.
+    pub units: BTreeSet<String>,
+}
+
+/// Which off-workspace windows are worth asking systemd about.
+///
+/// The cheap filters, so a grace-window tick resolves a unit for a handful of
+/// windows rather than for every window in the session.
+fn stray_candidates<'w>(
+    workspace: u64,
+    windows: &'w [Window],
+    launched: &Launched,
+) -> Vec<&'w Window> {
+    windows
+        .iter()
+        .filter(|w| w.workspace_id != Some(workspace))
+        .filter(|w| !launched.before.contains(&w.id))
+        .collect()
+}
+
+/// The windows **this Start opened** that landed elsewhere, as the batch that
 /// brings them home (#1071 §3.4 step 2).
 ///
-/// Matched by `app_id` — niri reports it per window and it is the stack's stored
-/// identity (§3.2). A window already on the target workspace produces no action,
-/// so a settled Start sends an empty batch and `send_actions` opens no socket.
+/// Three rules, in order, and the first two are what keep a Start from moving
+/// windows that are not its own:
+///
+/// 1. A window that **already existed** when the Start began is never moved. It
+///    is the user's, whatever it happens to be running.
+/// 2. A window whose pid belongs to **one of this Start's units** is moved. This
+///    is §3.4's pid leg, and it is exact rather than heuristic: the unit name
+///    came from [`app_launch`], so there is nothing to guess.
+/// 3. Otherwise a *new* window whose `app_id` is in the stack is moved — the
+///    fallback for a window that has appeared but whose pid systemd cannot place
+///    yet (a unit still activating, a pid niri has not reported). Scoped to
+///    windows that appeared **after** the Start began, so its worst case is a
+///    window the user opened of the same app inside the same ten seconds rather
+///    than every such window they have ever had open.
+///
+/// A window already on the target workspace produces no action, so a settled
+/// Start sends an empty batch and `send_actions` opens no socket.
 #[must_use]
 pub(crate) fn stray_moves(
     stack: &Stack,
     workspace: u64,
     windows: &[Window],
+    launched: &Launched,
+    unit_of: &BTreeMap<u64, Option<String>>,
 ) -> Vec<WorkspaceAction> {
     let wanted: BTreeSet<&str> = stack.apps.iter().map(|a| a.id.as_str()).collect();
-    windows
-        .iter()
-        .filter(|w| w.workspace_id != Some(workspace))
-        .filter(|w| w.app_id.as_deref().is_some_and(|id| wanted.contains(id)))
+    stray_candidates(workspace, windows, launched)
+        .into_iter()
+        .filter(|w| {
+            // Rule 2.
+            let ours = unit_of
+                .get(&w.id)
+                .and_then(Option::as_ref)
+                .is_some_and(|unit| launched.units.contains(unit));
+            // Rule 3.
+            ours || w.app_id.as_deref().is_some_and(|id| wanted.contains(id))
+        })
         .map(|w| WorkspaceAction::MoveWindow {
             window: w.id,
             workspace,
@@ -393,9 +464,8 @@ pub(crate) fn stray_moves(
 /// One step of a Stop (#1071 §3.3).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StopStep {
-    /// The window's pid belongs to a unit — niri ≥ 26.04 puts everything it
-    /// spawns in an `app-niri-*.scope`, so this covers far more than what this
-    /// shell launched.
+    /// The window's pid belongs to a unit this Stop is **allowed** to stop —
+    /// see [`may_stop`].
     StopUnit(String),
     /// No unit at all (a program started from a nested shell inside a
     /// terminal). niri closes it.
@@ -403,23 +473,76 @@ pub(crate) enum StopStep {
     /// **By id.** `CloseWindow { id: None }` closes the *focused* window, which
     /// during a Stop is very likely not this one — #1071 §7's named mutation.
     Close(u64),
+    /// The window's pid resolves to a unit this Stop **must not** stop. The
+    /// window is closed through niri instead, and the refused unit is named so
+    /// the journal says why.
+    CloseInstead { window: u64, refused: String },
+}
+
+/// Whether a Stop of the stack `name` may stop the unit `unit`.
+///
+/// **This is a guard, not a filter.** The epic assumed the unit behind a window
+/// on a workspace is always an `app-niri-*.scope`. It is not, and two of the
+/// ways it is not are catastrophic:
+///
+/// * The shell opens links with `gio::AppInfo::launch_default_for_uri`, and glib
+///   2.88 creates **no** transient scope for that — the browser it starts is
+///   forked into `trollshell.service`'s own cgroup. Without this guard, ⏹ on a
+///   workspace holding that window is `StopUnit("trollshell.service")`: the
+///   shell stops itself.
+/// * niri's own `StartTransientUnit` has a fallback path, and anything that
+///   missed its scope resolves to `niri.service` — ⏹ then takes the compositor
+///   down, and the session with it.
+///
+/// So the rule is an **allowlist**, not a denylist: only two shapes pass.
+///
+/// * `app-*.scope` — the freedesktop convention for a user application started
+///   by a launcher, which is what `app-niri-*.scope` is an instance of. These
+///   really are "a program on this workspace".
+/// * `trollshell-ws-<escaped>-<n>.service` — **this stack's own** units, and no
+///   other stack's. The slice stop above should already have taken them; this
+///   is the residue of one that outlived its slice job.
+///
+/// Everything else — the shell's unit, the compositor's, a plugin's, another
+/// stack's, a detached `RunCommand`, anything in the user's session slice — is
+/// refused, and the window is closed through niri instead. Pure, so the
+/// allowlist is unit-testable without a bus.
+#[must_use]
+pub(crate) fn may_stop(name: &str, unit: &str) -> bool {
+    // `strip_suffix` rather than `ends_with`, which clippy reads as a
+    // case-insensitive file-extension comparison — systemd unit suffixes are
+    // case-sensitive and `.scope` is not a file extension.
+    if unit.starts_with("app-") && unit.strip_suffix(".scope").is_some() {
+        return true;
+    }
+    // `parse_workspace_unit` reverses the `\x2d` escape, so this compares the
+    // *names* rather than the spellings — and it answers `None` for anything
+    // that is not a stack unit at all, including `trollshell-plugin-*` and
+    // `trollshell-launch-*`.
+    systemd::parse_workspace_unit(unit).is_some_and(|owner| owner == name)
 }
 
 /// What remains to be stopped after the slice is down, given each window's unit
 /// (`None` = systemd knows no unit for its pid).
 ///
 /// The slice stop comes first and is not in this list: it is one call that takes
-/// every app this shell launched, and running it first means the walk below only
-/// ever has to deal with what the *compositor* started.
+/// every app this shell launched. It is a *job enqueue* rather than a
+/// synchronous stop, though, so [`stop`] waits for the slice to actually go down
+/// before walking — see [`wait_for_slice_down`].
 #[must_use]
 pub(crate) fn stop_plan(
+    name: &str,
     windows: &[&Window],
     units: &BTreeMap<u64, Option<String>>,
 ) -> Vec<StopStep> {
     windows
         .iter()
         .map(|w| match units.get(&w.id).and_then(Option::as_ref) {
-            Some(unit) => StopStep::StopUnit(unit.clone()),
+            Some(unit) if may_stop(name, unit) => StopStep::StopUnit(unit.clone()),
+            Some(unit) => StopStep::CloseInstead {
+                window: w.id,
+                refused: unit.clone(),
+            },
             None => StopStep::Close(w.id),
         })
         .collect()
@@ -595,13 +718,25 @@ pub(crate) async fn start(
         ));
     }
 
+    // The pre-launch snapshot is what tells this Start's windows from the
+    // user's in step 6 (#1071 §3.4 step 2). Taken from the *same* `windows`
+    // read the plan was made from, so nothing that opened between the two can
+    // be mistaken for pre-existing.
+    let mut launched = Launched {
+        before: windows.iter().map(|w| w.id).collect(),
+        units: BTreeSet::new(),
+    };
     for (index, app) in stack.apps.iter().enumerate() {
-        if let Err(e) = ops.launch(&app_launch(name, index, app)).await {
+        let unit = app_launch(name, index, app);
+        let unit_name = unit.unit.clone();
+        if let Err(e) = ops.launch(&unit).await {
             tracing::warn!(workspace = name, app = app.id, error = %e, "stack app failed to launch");
+            continue;
         }
+        launched.units.insert(unit_name);
     }
 
-    reconcile(ops, stack, plan.workspace).await;
+    reconcile(ops, stack, plan.workspace, &launched).await;
 
     if let Err(e) = ops.apply_layout(stack.layout).await {
         tracing::warn!(workspace = name, error = %e, "layout not applied");
@@ -610,9 +745,14 @@ pub(crate) async fn start(
     Ok(plan)
 }
 
-/// The grace window: move home any window of the stack that landed elsewhere,
-/// until every app has one or [`GRACE`] is up (#1071 §3.4 step 2).
-async fn reconcile(ops: &impl Ops, stack: &Stack, workspace: u64) {
+/// The grace window: move home the windows **this Start opened** that landed
+/// elsewhere, until every app has one or [`GRACE`] is up (#1071 §3.4 step 2).
+///
+/// `launched` is what makes "this Start's" mean anything — see [`stray_moves`].
+/// A unit is resolved only for the windows the cheap filters leave standing, so
+/// a tick costs a D-Bus round trip per genuinely-new off-workspace window rather
+/// than one per window in the session.
+async fn reconcile(ops: &impl Ops, stack: &Stack, workspace: u64, launched: &Launched) {
     if stack.apps.is_empty() {
         return;
     }
@@ -622,7 +762,15 @@ async fn reconcile(ops: &impl Ops, stack: &Stack, workspace: u64) {
         let Ok(windows) = ops.windows().await else {
             continue;
         };
-        let moves = stray_moves(stack, workspace, &windows);
+        let mut unit_of = BTreeMap::new();
+        for window in stray_candidates(workspace, &windows, launched) {
+            let unit = match window.pid {
+                Some(pid) if pid >= 0 => ops.unit_for_pid(u32::try_from(pid).unwrap_or(0)).await,
+                _ => None,
+            };
+            unit_of.insert(window.id, unit);
+        }
+        let moves = stray_moves(stack, workspace, &windows, launched, &unit_of);
         if !moves.is_empty() {
             let _ = ops.send_actions(moves).await;
         }
@@ -638,14 +786,44 @@ async fn reconcile(ops: &impl Ops, stack: &Stack, workspace: u64) {
     }
 }
 
+/// Wait for `name`'s slice to actually be down, bounded.
+///
+/// `StopUnit` is a **job enqueue**, not a synchronous stop. Measured on systemd
+/// 260.2: the call returns a job path in ~15 ms and the unit is still
+/// `deactivating` at that point. So "the slice is down before the walk" — which
+/// is the reasoning the whole per-window pass rests on, and the reason
+/// [`may_stop`]'s allowlist only has to consider the *compositor's* units — is
+/// not something `stop_slice` gives you on its own.
+///
+/// Polling [`Ops::slice_is_up`] rather than subscribing to `JobRemoved`: the
+/// subscription would need `Manager.Subscribe()` plus a filter for one job path,
+/// and this is a handful of ticks on a path the user is already waiting on.
+/// Bounded, because a unit that ignores SIGTERM would otherwise park the Stop
+/// until systemd's own `TimeoutStopSec` escalation — the walk below is correct
+/// either way, it just re-handles a window or two.
+async fn wait_for_slice_down(ops: &impl Ops, name: &str) {
+    for _ in 0..SLICE_STOP_TICKS {
+        if !ops.slice_is_up(name).await {
+            return;
+        }
+        ops.sleep(SLICE_STOP_TICK).await;
+    }
+    tracing::warn!(
+        workspace = name,
+        "the stack's slice was still up after {:?}; stopping its windows anyway",
+        SLICE_STOP_TICK * SLICE_STOP_TICKS
+    );
+}
+
 /// Stop one stack (#1071 §3.3).
 ///
 /// The slice first — one call that takes every app this shell launched, SIGTERM
 /// then systemd's own escalation, and idempotent (stopping a never-created slice
-/// exits 0, measured). Then, for whatever windows are still on the workspace,
-/// per window: stop its unit if systemd knows one (niri puts everything it
-/// spawns in an `app-niri-*.scope`, so it usually does), else close it through
-/// niri **by id**.
+/// exits 0, measured) — and then a **wait** for it to really be down, because
+/// `StopUnit` only enqueues a job ([`wait_for_slice_down`]). Then, for whatever
+/// windows are still on the workspace, per window: stop its unit if systemd
+/// names one **and this Stop is allowed to stop it** ([`may_stop`]), else close
+/// it through niri **by id**.
 ///
 /// Finally the name is released, so the next Start's `SetWorkspaceName` has a
 /// free name rather than this workspace's lingering one.
@@ -655,12 +833,16 @@ async fn reconcile(ops: &impl Ops, stack: &Stack, workspace: u64) {
 /// not stop is logged, not fatal — the rest still go.
 pub(crate) async fn stop(ops: &impl Ops, name: &str) -> Result<(), String> {
     ops.stop_slice(name).await?;
+    wait_for_slice_down(ops, name).await;
 
     let workspaces = ops.workspaces().await?;
     let Some(workspace) = named(&workspaces, name).map(|w| w.id) else {
         return Ok(());
     };
     let windows = ops.windows().await?;
+    // Scoped to *this* workspace. The single most dangerous line here: without
+    // it the walk below stops or closes every window in the session, which
+    // `a_stop_leaves_windows_on_other_workspaces_alone` is the test for.
     let remaining: Vec<&Window> = windows
         .iter()
         .filter(|w| w.workspace_id == Some(workspace))
@@ -676,7 +858,7 @@ pub(crate) async fn stop(ops: &impl Ops, name: &str) -> Result<(), String> {
     }
 
     let mut closes = Vec::new();
-    for step in stop_plan(&remaining, &units) {
+    for step in stop_plan(name, &remaining, &units) {
         match step {
             StopStep::StopUnit(unit) => {
                 if let Err(e) = ops.stop_unit(&unit).await {
@@ -684,6 +866,18 @@ pub(crate) async fn stop(ops: &impl Ops, name: &str) -> Result<(), String> {
                 }
             }
             StopStep::Close(id) => closes.push(WorkspaceAction::CloseWindow { window: id }),
+            StopStep::CloseInstead { window, refused } => {
+                // Loud on purpose: this is the shell declining to stop
+                // something it could have stopped, and the reason is worth
+                // having in the journal the first time someone wonders why a
+                // window closed instead of its program exiting.
+                tracing::warn!(
+                    workspace = name,
+                    unit = %refused,
+                    "not a unit this workspace may stop; closing the window instead"
+                );
+                closes.push(WorkspaceAction::CloseWindow { window });
+            }
         }
     }
     // The close batch and the name release ride one socket, in that order: the
@@ -703,16 +897,94 @@ pub(crate) fn spawn_start(name: String, stack: Stack, stacks: BTreeMap<String, S
         return;
     }
     hytte::reactive::runtime::handle().spawn(async move {
-        match start(&Live, &name, &stack, &stacks).await {
-            Ok(plan) => tracing::info!(
+        // The ceiling is on the *card*, not on the transaction: a `spawn_blocking`
+        // waiting on a niri that will never answer cannot be cancelled, so this
+        // releases the button and lets the task finish whenever it does. See
+        // `STARTING_CEILING`.
+        let outcome =
+            tokio::time::timeout(STARTING_CEILING, start(&Live, &name, &stack, &stacks)).await;
+        // Released before the reporting, so no `?`-shaped edit can ever leave a
+        // card disabled for the life of the shell.
+        STARTING.lock_mut().remove(&name);
+        match outcome {
+            Ok(Ok(plan)) => tracing::info!(
                 workspace = name,
                 output = plan.output,
                 adopted = plan.adopted,
                 "workspace stack started"
             ),
-            Err(e) => tracing::warn!(workspace = name, error = %e, "workspace stack did not start"),
+            Ok(Err(e)) => {
+                report(&name, &format!("{name} did not start: {e}"));
+            }
+            Err(_) => report(
+                &name,
+                &format!(
+                    "{name} is still starting after {}s — the compositor did not answer",
+                    STARTING_CEILING.as_secs()
+                ),
+            ),
         }
-        STARTING.lock_mut().remove(&name);
+    });
+}
+
+/// Persist an ephemeral workspace as the stack `name`, and **name the niri
+/// workspace in the same breath** (#1071 §3.7).
+///
+/// §3.7: *"The batch names the niri workspace immediately, so the saved
+/// workspace **is** the Active card."* Writing the file alone does not do that —
+/// the workspace stays unnamed, so it keeps rendering as an ephemeral card while
+/// the new stack renders as a second, Inactive one whose ▶ would launch a second
+/// copy of everything. The naming is what collapses the two into one Active
+/// card.
+///
+/// Same precondition as a Start, for the same reason: `SetWorkspaceName`
+/// silently does nothing when the name is taken, so the name is verified free
+/// **before** the file is written. Getting that order wrong would leave a stack
+/// in the file that can never be this workspace.
+///
+/// # Errors
+/// A name niri already holds, a file the writer refused, or a naming that did
+/// not land — each as a line for the user.
+pub(crate) async fn save(
+    ops: &impl Ops,
+    workspace: u64,
+    name: &str,
+    stack: &Stack,
+) -> Result<(), String> {
+    let workspaces = ops.workspaces().await?;
+    if named(&workspaces, name).is_some() {
+        return Err(StartError::NameTaken.to_string());
+    }
+    crate::config::workspaces::save_stack(name, stack).map_err(|e| e.to_string())?;
+
+    ops.send_actions(vec![WorkspaceAction::SetName {
+        workspace,
+        name: name.to_owned(),
+    }])
+    .await?;
+
+    // Same read-back as a Start's step 4, and for the same reason: the action's
+    // reply says nothing about whether the name landed.
+    let after = ops.workspaces().await?;
+    if after
+        .iter()
+        .any(|w| w.id == workspace && w.name.as_deref() == Some(name))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "saved, but niri did not take the name {name:?} — the card will show as stopped"
+        ))
+    }
+}
+
+/// Run a Save on the runtime.
+pub(crate) fn spawn_save(workspace: u64, name: String, stack: Stack) {
+    hytte::reactive::runtime::handle().spawn(async move {
+        match save(&Live, workspace, &name, &stack).await {
+            Ok(()) => tracing::info!(workspace = name, apps = stack.apps.len(), "workspace saved"),
+            Err(e) => report(&name, &format!("{name} was not saved: {e}")),
+        }
     });
 }
 
@@ -720,9 +992,28 @@ pub(crate) fn spawn_start(name: String, stack: Stack, stacks: BTreeMap<String, S
 pub(crate) fn spawn_stop(name: String) {
     hytte::reactive::runtime::handle().spawn(async move {
         if let Err(e) = stop(&Live, &name).await {
-            tracing::warn!(workspace = name, error = %e, "workspace stack did not stop");
+            report(&name, &format!("{name} did not stop: {e}"));
         }
     });
+}
+
+/// Surface a failed Start or Stop to the **user**, not only to the journal.
+///
+/// The transactions build careful messages — `send_actions` names the action
+/// niri refused, `plan_start` says which precondition failed — and before this
+/// every one of them ended in the journal, where a user who pressed a button and
+/// saw nothing happen will not look. `post_local` is the shell's own existing
+/// surface for "something you asked for did not work"; it rate-limits identical
+/// toasts and is a no-op when the notifications service is not registered, which
+/// is why the `tracing::warn!` stays as the durable record.
+pub(crate) fn report(name: &str, message: &str) {
+    tracing::warn!(workspace = name, "{message}");
+    hytte::services::notifications::post_local(
+        "Workspaces",
+        "Workspaces",
+        message,
+        hytte::services::notifications::Urgency::Normal,
+    );
 }
 
 #[cfg(test)]

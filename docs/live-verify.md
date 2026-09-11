@@ -2487,10 +2487,15 @@ switch` repoints atomically to a new store path every rebuild; the running
     order since #1071 phase 2, which appended rather than inserting) are there
     and each still deep-links to its page.
 
-- [ ] **(#1071 phase 2)** The file, the primitives, and Start/Stop. Everything
-      here needs a live niri session **and** a running `systemd --user`; the
-      hermetic suite drives both through scripted fakes, so none of the rows
-      below is reachable on CI.
+- [ ] **(#1071 phase 2)** The file, the primitives, and Start/Stop. Most rows
+      here need a live niri session **and** a running `systemd --user`; the
+      hermetic suite drives both through scripted fakes, so what it proves is
+      that the shell _would_ issue the right calls, not that the compositor and
+      the manager answer them as expected. Four rows below **do** have CI
+      coverage of their logic and are re-checked here only end to end: the
+      no-change save, the layered base, the `chat--dev`/`Chat` half of the name
+      rules, and the card-list scroll — that last one most of all, since its
+      first fix passed its own test while doing nothing in the real drawer.
   - **The file is live.** With the shell up, hand-write
     `~/.config/trollshell/workspaces.toml`:
     `toml
@@ -2558,21 +2563,55 @@ autostart, layout or apps`, and every other key still applies. Put a bad
     it should be **moved onto** the stack's workspace. An app that never opens a
     window at all must not wedge the Start — it finishes at the end of the
     grace window with the others in place.
-  - **A name that did not land never launches.** Name a workspace `chat` by hand
-    (`niri msg action set-workspace-name chat`) on a workspace with windows, so
-    the card reads Active and offers ⏹ rather than ▶. There is no way to press
-    Start into a taken name from the UI; if you can, the card-level refusal has
-    regressed. (The read-back after the batch is what makes this safe, since
-    niri reports success for a `SetWorkspaceName` it silently ignored.)
+  - **A name that did not land never launches.** The refusal lives in the
+    service layer, not on the card: there is no "this button is disabled because
+    the name is taken" state, and a card **does** offer ▶ when its name is held
+    by a lingering empty workspace. So drive it and check the outcome. Name a
+    workspace `chat` by hand on a _different_, empty workspace
+    (`niri msg action set-workspace-name chat`) while a `chat` stack is Inactive,
+    then press **▶** on the card. Expect: **nothing launches**, and a
+    "Workspaces" notification saying the name is already on a workspace. If apps
+    appear anyway, the read-back after the naming batch has regressed — niri
+    reports success for a `SetWorkspaceName` it silently ignored, so that
+    read-back is the only thing standing between this and a stack dropped onto
+    whatever workspace happened to be focused.
+  - **Start and Stop say when they fail.** Every refusal above should surface as
+    a toast, not only a journal line: `journalctl --user -u trollshell -f` and
+    the on-screen notification should say the same thing.
+  - **Start does not steal your windows.** Open Firefox (or whatever an existing
+    stack lists) on workspace 2. Press **▶** on that stack from another
+    workspace. Your existing window must **stay where it is** — only the copies
+    the Start launched land on the new workspace. Before the fix round the grace
+    window matched on `app_id` alone and yanked it across, focus and all.
+  - **Stop does not stop the shell.** The nastiest one, and worth doing once.
+    Open a link from the shell itself (a notification action, or the
+    control-center's help link) so the browser is forked into
+    `trollshell.service`'s own cgroup — confirm with
+    `systemctl --user status trollshell | grep -c firefox` or
+    `busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager GetUnitByPID u <pid>`,
+    which should answer `trollshell.service` rather than an `app-niri-*.scope`.
+    Move that window onto a started stack's workspace and press **⏹**. Expect:
+    the **window closes**, the shell keeps running, and the journal carries
+    _"not a unit this workspace may stop; closing the window instead"_ naming
+    `trollshell.service`. If the shell exits, the allowlist has regressed.
   - **Ephemeral card → Edit → Save.** Open a couple of apps on an **unnamed**
     workspace. A card titled **"Unsaved workspace"** appears in that screen's
     column with the live app icons and a name field — and **no `+` button
-    anywhere on the page** (§3.7). Type `Chat Room` → the field goes red and
-    nothing is written. Type `chat2` → `~/.config/trollshell/workspaces.toml`
-    grows `[workspace.chat2]` with one `apps` entry per app, in niri's
-    left-to-right column order, and **no `order` key** (arrays replace whole, so
-    inventing one would discard a base-pinned order). The card becomes a saved
-    one, with a ⏹ button, without a shell restart.
+    anywhere on the page** (§3.7). Type `Chat Room` → the field goes red, the
+    text you typed is **kept**, and hovering it offers `chat-room`; type one
+    character of a correction and the red clears at once. Type an existing
+    stack's name → red again, saying it already exists. Type `chat2` →
+    `~/.config/trollshell/workspaces.toml` grows `[workspace.chat2]` with one
+    `apps` entry per app, **in niri's left-to-right column order** (open the apps
+    in an order that is not alphabetical and check the file, since that order is
+    what phase 3 restores), and **no `order` key** (arrays replace whole, so
+    inventing one would discard a base-pinned order).
+  - **…and the saved workspace becomes the Active card.** Immediately after that
+    Save, `niri msg workspaces` must show the workspace **named `chat2`**, and
+    the page must show **one** card — saved, Active, with a ⏹ — not two. If you
+    see an "Unsaved workspace" card _and_ a greyed `chat2` card, the
+    `SetWorkspaceName` half of Save has regressed, and pressing ▶ on the greyed
+    one would launch a second copy of everything.
   - **A no-change save touches no bytes.** Hand-annotate the file with comments,
     `md5sum` it, save an unrelated ephemeral workspace, and confirm the existing
     stacks' lines and every comment are byte-identical.
@@ -2584,9 +2623,14 @@ autostart, layout or apps`, and every other key still applies. Put a bad
   - **The trailing column.** Set `monitor = "DP-9"` (a connector you do not
     have). The card moves to a greyed **"Not connected"** column at the right.
     Its ▶ still works and starts the stack on the focused screen.
-  - **The card list scrolls.** Save enough stacks that a column overflows (a
-    dozen on a 1080p screen). The column must scroll rather than clip — before
-    #1071 phase 2 there was no scroller and the overflow was simply unreachable.
+  - **The card list scrolls — in the real drawer.** The row that most needs a
+    live pass: the scroller's first cut had no height cap, so it grew to fit its
+    content and the drawer clipped it exactly as before, while its own test
+    passed by supplying a 220 px window the drawer never supplies. Save enough
+    stacks that a column overflows (a dozen or so on 1080p), open the drawer
+    **full height**, and confirm a scrollbar appears and the bottom card is
+    reachable by scrolling. If the column just runs off the bottom of the
+    screen, the cap is gone again.
   - **Nothing from phases 3–4 appeared.** No autostart (a stack with
     `autostart = true` must **not** come up at login yet — the key is accepted
     and recorded, not acted on), no column-order restore (the apps land in

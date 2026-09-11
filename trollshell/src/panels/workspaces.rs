@@ -84,6 +84,13 @@ const APP_IDLE_CLASS: &str = "ts-ws-app-idle";
 /// CSS class on a card that is not on a screen (#1071 §5).
 const CARD_INACTIVE_CLASS: &str = "ts-ws-card-inactive";
 
+/// Design-baseline height cap for one monitor's card list, in CSS px, before
+/// [`crate::scale::scale`]. Sized like `panels::connections`' list scroller —
+/// tall enough that a realistic stack count never scrolls, short enough that the
+/// drawer can lay the columns out rather than being told to be as tall as the
+/// tallest one.
+const COLUMN_MAX_HEIGHT: i32 = 480;
+
 /// Shown in a monitor's column when that monitor has no cards at all.
 const EMPTY_COLUMN_HINT: &str = "No workspaces on this screen";
 
@@ -107,6 +114,44 @@ const SAVE_PLACEHOLDER: &str = "Name this workspace\u{2026}";
 /// Shown on the Save field when the typed name cannot be a workspace name.
 const NAME_HINT: &str = "Lowercase letters, digits and single dashes — no leading, \
                          trailing or doubled dash, at most 32 characters.";
+
+/// The rule, plus — when there is one — the name the typed one would become.
+///
+/// §3.1 asks the Save entry to "offer the sanitised form". `normalize` only
+/// folds case, deliberately, so the suggestion is computed separately and
+/// *offered* rather than applied: a silent rewrite would hand the user a stack
+/// under a name they did not type, while `niri msg action focus-workspace` still
+/// answers to the one they did.
+fn name_hint(typed: &str) -> String {
+    match sanitise(typed) {
+        Some(suggestion) => format!("{NAME_HINT}\n\nTry \u{201c}{suggestion}\u{201d}."),
+        None => NAME_HINT.to_owned(),
+    }
+}
+
+/// The typed text as the nearest usable workspace name, or `None` when there is
+/// nothing left to suggest.
+///
+/// Lowercase, runs of anything-but-`[a-z0-9]` collapsed to one dash, trimmed of
+/// leading and trailing dashes, clipped to the length the validator allows —
+/// which is exactly the shape [`systemd::is_valid_workspace_name`] accepts, so
+/// the suggestion is always one the field will take.
+fn sanitise(typed: &str) -> Option<String> {
+    let mut out = String::new();
+    for ch in typed.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    // 32 is the validator's cap; clipping can leave a trailing dash, so trim
+    // again rather than assume.
+    let clipped = trimmed.get(..trimmed.len().min(32)).unwrap_or(trimmed);
+    let candidate = clipped.trim_matches('-');
+    (!candidate.is_empty() && candidate != typed).then(|| candidate.to_owned())
+}
 /// One app in a card's stack row.
 ///
 /// Identified by its `app_id` (what niri reports per window, and what #1071
@@ -130,7 +175,11 @@ enum Kind {
     /// A niri workspace with windows on it and no name — the "save current"
     /// case, which §3.7 settles as a card like any other rather than a `+`
     /// button. Its only action is Edit → Save, which is what creates its entry.
-    Ephemeral,
+    ///
+    /// Carries the niri workspace id because Save has to **name that
+    /// workspace**, not merely write a file: §3.7's *"the batch names the niri
+    /// workspace immediately, so the saved workspace is the Active card"*.
+    Ephemeral { workspace: u64 },
 }
 
 /// One card.
@@ -271,8 +320,15 @@ fn model(
         };
         by_output.entry(output).or_default().push(Card {
             name: String::new(),
-            kind: Kind::Ephemeral,
-            apps: open_app_ids(workspace.id, windows)
+            kind: Kind::Ephemeral {
+                workspace: workspace.id,
+            },
+            // `ordered_app_ids`, **not** `open_app_ids`: this list is what a
+            // Save records, and #1071 §3.4 step 3 makes the stack's order be
+            // niri's column order. Collecting through a `BTreeSet` here (as this
+            // did) silently sorted it lexicographically, which is the input
+            // phase 3's `MoveColumnToIndex` would then have restored wrongly.
+            apps: ordered_app_ids(workspace.id, windows)
                 .into_iter()
                 .map(|app_id| StackApp {
                     app_id: app_id.to_owned(),
@@ -310,8 +366,12 @@ fn named_workspace<'w>(workspaces: &'w [Workspace], name: &str) -> Option<&'w Wo
     })
 }
 
-/// The distinct app-ids with a window on `workspace_id`, in niri's column order
-/// (leftmost first), first occurrence winning for a repeated app.
+/// **Membership only**: which app-ids have a window on `workspace_id`.
+///
+/// A set, deliberately — its one caller asks "is this saved app running?", which
+/// is a lookup and not an ordering. Anything that needs the order calls
+/// [`ordered_app_ids`] directly; routing an ordered list through here is how the
+/// ephemeral card's column order got silently sorted alphabetically.
 fn open_app_ids(workspace_id: u64, windows: &[Window]) -> BTreeSet<&str> {
     ordered_app_ids(workspace_id, windows).into_iter().collect()
 }
@@ -468,16 +528,26 @@ fn build_column(column: &Column, meta_cache: &MetaCache) -> gtk::Widget {
 
     // The card list scrolls (phase 1 review, LOW-2). In phase 1 the column held
     // one card per *named* niri workspace, so overflow was academic; §3.7 makes
-    // every workspace a card and §5 puts two buttons on each, so the cards are
-    // both taller and far more numerous — and the drawer *clips* what does not
-    // fit (`modal.rs`: "the fullscreen drawer surface clips whatever still
-    // doesn't fit"), which would make a card unreachable with no affordance
-    // that it exists. `Never` horizontally so a long workspace name ellipsizes
-    // the way it already did rather than growing a second scrollbar.
+    // every workspace a card and §5 puts a button on each, so the cards are both
+    // taller and far more numerous — and the drawer *clips* what does not fit
+    // (`modal.rs`: "the fullscreen drawer surface clips whatever still doesn't
+    // fit"), which would make a card unreachable with no affordance that it
+    // exists. `Never` horizontally so a long workspace name ellipsizes the way
+    // it already did rather than growing a second scrollbar.
+    //
+    // `max_content_height` is what makes any of that happen. With
+    // `propagate_natural_height` and no cap, the scroller requests its whole
+    // content height and the drawer grants it — so the scrollbar never appears
+    // and the clipping is exactly as it was. The first cut of this fix had no
+    // cap and passed only because its test supplied a 220 px window, which the
+    // drawer never does. `scale()`d and `connections.rs`-shaped: this is an
+    // inside-card list scroller, so the cap is meant to grow with the font,
+    // unlike the Stats viewport's real-pixel screen budget (#787).
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
         .propagate_natural_height(true)
+        .max_content_height(crate::scale::scale(COLUMN_MAX_HEIGHT))
         .vexpand(true)
         .child(&cards)
         .build();
@@ -511,7 +581,7 @@ fn build_card(card: &Card, meta_cache: &MetaCache) -> gtk::Widget {
 
     match &card.kind {
         Kind::Saved(state) => header.append(&start_stop_button(&card.name, *state)),
-        Kind::Ephemeral => {}
+        Kind::Ephemeral { .. } => {}
     }
     outer.append(&header);
 
@@ -528,8 +598,8 @@ fn build_card(card: &Card, meta_cache: &MetaCache) -> gtk::Widget {
     }
     outer.append(&apps);
 
-    if matches!(card.kind, Kind::Ephemeral) {
-        outer.append(&save_row(card));
+    if let Kind::Ephemeral { workspace } = card.kind {
+        outer.append(&save_row(card, workspace));
     }
 
     outer.upcast()
@@ -589,7 +659,16 @@ fn start_by_name(name: &str) {
 /// **name only** — the apps come from what is on the workspace right now, and
 /// everything else is defaulted, since the monitor is set by dragging (phase 3)
 /// and the layout/autostart fields live in the edit form (phase 4).
-fn save_row(card: &Card) -> gtk::Widget {
+///
+/// # Two checks here, one on the runtime
+///
+/// The two the field can answer **now** stay here, because a red field beside
+/// the cursor is a better correction surface than a toast: the name has to be a
+/// usable workspace name, and it has to be one no *stack* already has. The third
+/// — that no niri **workspace** already carries it — needs a socket round trip,
+/// so it lives in [`workspace_stacks::save`] along with the write and the
+/// `SetWorkspaceName` that makes the saved workspace *be* this one.
+fn save_row(card: &Card, workspace: u64) -> gtk::Widget {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     row.add_css_class("ts-ws-save");
 
@@ -606,17 +685,37 @@ fn save_row(card: &Card) -> gtk::Widget {
     save.add_css_class("ts-ws-save-button");
     row.append(&save);
 
+    // Clear the red as soon as the user starts correcting. Without this the
+    // field stays red through every keystroke of the fix, since the class was
+    // only ever removed on a *successful* commit.
+    entry.connect_changed(|entry| {
+        entry.remove_css_class("error");
+        entry.set_tooltip_text(None);
+    });
+
     let apps = card.apps.clone();
     let commit = move |entry: &gtk::Entry| {
         let typed = entry.text().to_string();
-        let Some(name) = systemd::normalize_workspace_name(&typed) else {
-            // The field says what is wrong rather than a toast: the correction
-            // is made right here, and `normalize` deliberately refuses rather
-            // than rewrites anything but case (see its doc).
+        let reject = |entry: &gtk::Entry, why: &str| {
             entry.add_css_class("error");
-            entry.set_tooltip_text(Some(NAME_HINT));
+            entry.set_tooltip_text(Some(why));
+        };
+        let Some(name) = systemd::normalize_workspace_name(&typed) else {
+            // `normalize` deliberately refuses rather than rewrites anything but
+            // case, so §3.1's "offers the sanitised form" is offered here — the
+            // field keeps what was typed and the tooltip carries the suggestion,
+            // which is a correction the user can accept or ignore rather than a
+            // silent rewrite of a name they will later type at `niri msg`.
+            reject(entry, &name_hint(&typed));
             return;
         };
+        if config_workspaces::current().stacks.contains_key(&name) {
+            reject(
+                entry,
+                &format!("A workspace called \u{201c}{name}\u{201d} already exists."),
+            );
+            return;
+        }
         entry.remove_css_class("error");
         entry.set_tooltip_text(None);
         let stack = Stack {
@@ -629,16 +728,12 @@ fn save_row(card: &Card) -> gtk::Widget {
                 .collect(),
             ..Stack::default()
         };
-        match config_workspaces::save_stack(&name, &stack) {
-            // Nothing to redraw by hand: the file poll republishes the stacks
-            // and the card comes back saved, with a Start/Stop button.
-            Ok(()) => tracing::info!(workspace = %name, apps = stack.apps.len(), "workspace saved"),
-            Err(e) => {
-                tracing::warn!(workspace = %name, error = %e, "workspace not saved");
-                entry.add_css_class("error");
-                entry.set_tooltip_text(Some(&e.to_string()));
-            }
-        }
+        // Off to the runtime: the remaining checks and the write are I/O, and
+        // the `SetWorkspaceName` that turns this ephemeral card into the saved
+        // one is a niri round trip. Nothing to redraw by hand — the file poll
+        // and the niri event stream both republish, and the card comes back as
+        // one Active saved card rather than two.
+        workspace_stacks::spawn_save(workspace, name, stack);
     };
 
     // Enter in the field and the button do the same thing. `connect_activate`
@@ -942,7 +1037,7 @@ mod model_tests {
         );
         let cards = &find(&columns, LEFT).cards;
         assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0].kind, Kind::Ephemeral);
+        assert_eq!(cards[0].kind, Kind::Ephemeral { workspace: 1 });
         assert_eq!(cards[0].name, "", "it has no name until it is saved");
         assert_eq!(
             app_ids(&cards[0]),
@@ -1056,7 +1151,46 @@ mod model_tests {
         let cards = &find(&columns, LEFT).cards;
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0].name, "chat");
-        assert_eq!(cards[1].kind, Kind::Ephemeral);
+        assert_eq!(cards[1].kind, Kind::Ephemeral { workspace: 2 });
+    }
+
+    /// **MEDIUM-7.** An ephemeral card's apps are in **niri's column order**,
+    /// not alphabetical.
+    ///
+    /// This list is what a Save records, and #1071 §3.4 step 3 makes the stack's
+    /// order *be* niri's column order — so phase 3's `MoveColumnToIndex` would
+    /// restore whatever this gets wrong. Routing it through a `BTreeSet` (as it
+    /// did) sorted it lexicographically with nothing to notice.
+    ///
+    /// The app ids are chosen so lexicographic and column order **disagree**:
+    /// `mpv` sits at column 1 and `a-editor` at column 2, so an alphabetical
+    /// answer is `[a-editor, mpv]` and the right one is `[mpv, a-editor]`.
+    /// Two mutations red here and nowhere else:
+    ///
+    /// * **J:** delete `ordered_app_ids`' `sort_by_key(pos_in_scrolling_layout)`.
+    /// * **K:** reverse the ordered list before it is used.
+    #[test]
+    fn an_ephemeral_cards_apps_follow_niris_columns_not_the_alphabet() {
+        let columns = built(
+            &[ws(1, 1, LEFT, None)],
+            &[win(9, 1, "mpv", 1), win(10, 1, "a-editor", 2)],
+            &no_stacks(),
+        );
+        assert_eq!(
+            app_ids(&find(&columns, LEFT).cards[0]),
+            ["mpv", "a-editor"],
+            "column order, which is the order a Save records"
+        );
+
+        // The same two windows with their columns swapped must come out the
+        // other way round — so the assertion above cannot be satisfied by any
+        // fixed ordering, alphabetical or otherwise.
+        let swapped = built(
+            &[ws(1, 1, LEFT, None)],
+            &[win(9, 1, "mpv", 2), win(10, 1, "a-editor", 1)],
+            &no_stacks(),
+        );
+        assert_eq!(app_ids(&find(&swapped, LEFT).cards[0]), ["a-editor", "mpv"]);
     }
 
     /// Two windows of one app are one icon, and a window with no `app_id`
@@ -1076,6 +1210,35 @@ mod model_tests {
             &no_stacks(),
         );
         assert_eq!(app_ids(&find(&columns, LEFT).cards[0]), ["firefox", "mpv"]);
+    }
+
+    /// §3.1's "offer the sanitised form": the suggestion is always one the
+    /// validator would accept, and there is none when nothing is left.
+    #[test]
+    fn the_save_field_suggests_a_name_the_validator_would_take() {
+        for typed in [
+            "Chat Room",
+            "  dev/2  ",
+            "my_stack",
+            "--weird--",
+            "Ünïcödé chat",
+            &"x".repeat(80),
+        ] {
+            let suggestion = super::sanitise(typed)
+                .unwrap_or_else(|| panic!("{typed:?} should still suggest something"));
+            assert!(
+                hytte::services::systemd::is_valid_workspace_name(&suggestion),
+                "{typed:?} suggested {suggestion:?}, which the field would refuse"
+            );
+        }
+        assert_eq!(
+            super::sanitise("chat"),
+            None,
+            "already usable, nothing to say"
+        );
+        assert_eq!(super::sanitise("---"), None, "nothing survives");
+        assert_eq!(super::sanitise(""), None);
+        assert_eq!(super::sanitise("Chat Room").as_deref(), Some("chat-room"));
     }
 
     /// No outputs at all → no columns, so the page can say it is waiting for
@@ -1457,16 +1620,43 @@ mod tests {
             .expect("the Save button");
         assert!(save.is_sensitive());
 
-        // A name that cannot be a slice is refused in place rather than
-        // rewritten or silently accepted. The write itself needs a registered
-        // registry, so this stops at the validation boundary — the round trip
-        // is `config::workspaces`' own `a_save_adds_its_stack_and_invents_no_order`.
+        // A name that cannot be a slice is refused **in place** — no rewrite, no
+        // silent accept — and the tooltip offers the sanitised form §3.1 asks
+        // for.
+        //
+        // This stops at the validation boundary deliberately, and not only
+        // because the write needs a registry: past it, a *valid* name would
+        // reach `save_stack` and write the developer's own
+        // `~/.config/trollshell/workspaces.toml`. Keep every name this test
+        // types unusable. The write's round trip is `config::workspaces`' own
+        // `a_save_adds_its_stack_and_invents_no_order`, against a tempdir.
         entry.set_text("Chat Room");
         save.emit_clicked();
         pump();
         assert!(
             entry.has_css_class("error"),
             "an unusable name marks the field rather than writing the file"
+        );
+        assert_eq!(
+            entry.text(),
+            "Chat Room",
+            "what was typed is kept — the suggestion is offered, not applied"
+        );
+        assert!(
+            entry
+                .tooltip_text()
+                .is_some_and(|t| t.contains("chat-room")),
+            "…and the sanitised form is what is offered: {:?}",
+            entry.tooltip_text()
+        );
+
+        // The red clears as soon as the correction starts, rather than staying
+        // through every keystroke of the fix.
+        entry.set_text("Chat Roo");
+        pump();
+        assert!(
+            !entry.has_css_class("error"),
+            "the error class is not sticky"
         );
 
         window.destroy();
@@ -1616,34 +1806,46 @@ mod tests {
         window.destroy();
     }
 
-    /// The card list scrolls (phase 1 review, LOW-2): a column with more cards
-    /// than fit must put them inside a scroller rather than let the drawer clip
-    /// them away with no affordance that they exist.
+    /// The card list scrolls (phase 1 review, LOW-2) — **at the height the
+    /// drawer actually gives it**, which is the part the first cut got wrong.
     ///
-    /// Falsified by appending the cards straight into the column: there is no
-    /// `GtkScrolledWindow` ancestor and the last card's bottom falls outside the
-    /// column's own allocation.
+    /// The drawer surface is as tall as the screen and imposes no height on the
+    /// page; it simply *clips* whatever does not fit (`modal.rs`). So a
+    /// `ScrolledWindow` with `propagate_natural_height` and no
+    /// `max_content_height` asks for its whole content height, gets it, never
+    /// shows a scrollbar, and is clipped exactly as before. The first version of
+    /// this test supplied a 220 px window — a constraint the drawer never
+    /// does — and so passed against a fix that did nothing.
+    ///
+    /// This one gives the window **more room than the cap** and asserts the cap
+    /// binds anyway. Falsified two ways: remove `max_content_height` (the
+    /// scroller grows to fit and `upper == page_size`), or append the cards
+    /// straight into the column (no `GtkScrolledWindow` ancestor at all).
     #[gtk::test]
-    fn a_column_of_many_cards_scrolls_instead_of_clipping() {
+    fn a_column_of_many_cards_scrolls_at_the_drawers_own_height() {
         let f = fixture();
-        let many: Vec<(&str, _)> = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]
-            .iter()
-            .map(|name| (*name, stack(Some(LEFT), &["x"])))
-            .collect();
+        let many: Vec<(&str, _)> = [
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
+            "r", "s", "t",
+        ]
+        .iter()
+        .map(|name| (*name, stack(Some(LEFT), &["x"])))
+        .collect();
         f.saved.set(saved(&many));
         f.workspaces.set(vec![ws(1, 1, LEFT, None)]);
         pump();
 
         let window = gtk::Window::new();
         window.set_child(Some(&f.page));
-        // Deliberately short: twelve cards cannot fit, which is the case that
-        // was silently clipped before.
-        window.set_default_size(900, 220);
+        // Taller than `COLUMN_MAX_HEIGHT`, and taller than twenty cards need —
+        // i.e. the drawer's own situation, where nothing external constrains the
+        // page. The cap has to be what produces the scroll.
+        window.set_default_size(900, 1400);
         window.present();
         pump();
 
         let all = cards(&f.page);
-        assert_eq!(all.len(), 12, "every stack is still a card");
+        assert_eq!(all.len(), 20, "every stack is still a card");
 
         let scroller = by_class(&f.page, "ts-ws-scroller")
             .into_iter()
@@ -1653,17 +1855,29 @@ mod tests {
             all[0].is_ancestor(&scroller),
             "the cards are inside the scroller, not beside it"
         );
+        assert!(
+            scroller.max_content_height() > 0,
+            "the scroller is capped, or it just grows to fit and never scrolls"
+        );
 
         // The adjustment is what makes the overflow reachable: more content
         // than page means a scrollbar with somewhere to go.
         let adjustment = scroller.vadjustment();
-        pump_until(500, || adjustment.upper() > adjustment.page_size());
+        pump_until(2000, || adjustment.upper() > adjustment.page_size());
         assert!(
             adjustment.upper() > adjustment.page_size(),
-            "twelve cards in a 220px window must overflow a scrollable area, \
-             not be clipped: upper {} page {}",
+            "twenty cards in a window with room to spare must still overflow a \
+             scrollable area, because the cap binds: upper {} page {} cap {}",
             adjustment.upper(),
-            adjustment.page_size()
+            adjustment.page_size(),
+            scroller.max_content_height(),
+        );
+        assert!(
+            scroller.height() <= scroller.max_content_height() + 1,
+            "…and the scroller itself stays within its cap rather than growing \
+             to its content: {} against {}",
+            scroller.height(),
+            scroller.max_content_height(),
         );
 
         window.destroy();

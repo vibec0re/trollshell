@@ -690,11 +690,13 @@
     margin-bottom: 0.462em;
 }
 
-/* Workspaces drawer page (#1071 phase 1). One column per monitor, side by side,
-   a `.ts-panel` card per named niri workspace, and a strip of app icons on each
-   card. Note these are `ts-ws-*`, NOT `ts-workspaces-*`: `.ts-workspaces` is the
-   BAR's numbered pill strip (see the rules near the top of this file), which the
-   epic's revision 5 leaves untouched. */
+/* Workspaces drawer page (#1071 phases 1–2). One column per monitor, side by
+   side; a `.ts-panel` card per saved stack and per unnamed-but-populated niri
+   workspace; a strip of app icons on each card, plus one Start/Stop button on a
+   saved one and a name field on an ephemeral one. Note these are `ts-ws-*`, NOT
+   `ts-workspaces-*`: `.ts-workspaces` is the BAR's numbered pill strip (see the
+   rules near the top of this file), which the epic's revision 5 leaves
+   untouched. */
 .ts-ws-columns {
     padding: 0.308em 0;
 }
@@ -705,21 +707,67 @@
     color: @accent_color;
     opacity: 0.85;
 }
+/* The trailing column holding stacks whose recorded screen is not connected
+   (#1071 §5). Same title, stated as "not a screen you have". */
+.ts-ws-column-offline {
+    color: @window_fg_color;
+    opacity: 0.55;
+}
+/* The card list scrolls (#1096 review LOW-2): every workspace is a card now, so
+   a column can overflow, and the drawer clips rather than scrolls. No
+   background of its own — the cards are the surfaces. */
+.ts-ws-scroller {
+    background: none;
+}
 /* The card is already a `.ts-panel`; this only tightens it, since a workspace
    card is a name plus one icon row rather than a full section of content. */
 .ts-ws-card {
     padding: 0.538em 0.692em;
 }
+/* "Not on a screen" (#1071 §3.3). The card keeps its place in the column —
+   Inactive cards are ordered with the Active ones — and says what it is
+   instead of vanishing.
+
+   Greyed with `filter`, NOT `opacity`: opacity composites, so an `opacity: .55`
+   card holding an `opacity: .35` idle icon renders that icon at **0.19** and
+   its note at 0.30 — past legible and not what either number says. `filter`
+   desaturates and dims the card as one layer, and the nested opacities below
+   then do their own job against it rather than multiplying with it. */
+.ts-ws-card-inactive {
+    filter: grayscale(0.6) brightness(0.82);
+}
+/* …and inside an inactive card the icons stop dimming a second time: the whole
+   card is already the "not running" signal, so the per-icon distinction has
+   nothing left to say. */
+.ts-ws-card-inactive .ts-ws-app-idle {
+    opacity: 1;
+}
 .ts-ws-card-name {
     font-weight: 600;
     font-size: 1em;
 }
+/* The one Start/Stop button a saved card carries. `flat` keeps it out of the
+   way of the name beside it; a `Starting` card swaps the icon for a spinner and
+   goes insensitive, which libadwaita already dims. */
+.ts-ws-action {
+    min-width: 1.6em;
+    min-height: 1.6em;
+    padding: 0;
+}
 .ts-ws-apps {
     min-height: 1.4em;
 }
-/* An app with a window open on the workspace. Phase 1 renders nothing else, so
-   every icon is lit; phase 2's stopped stack flips the class to `.ts-ws-app-idle`
-   below and this is what it stops looking like. */
+/* The ephemeral card's Edit → Save row (#1071 §3.7): a name field and the
+   button that creates the entry. */
+.ts-ws-save {
+    margin-top: 0.231em;
+}
+.ts-ws-save-entry {
+    font-size: 0.9em;
+}
+/* An app with a window open on the card's workspace. A saved stack's app with
+   no window flips to `.ts-ws-app-idle` below, which is what a stopped stack
+   looks like. */
 .ts-ws-app-running {
     opacity: 1;
 }

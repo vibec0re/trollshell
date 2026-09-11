@@ -19,6 +19,8 @@ use hytte_plugin_proto::{
 };
 use tokio::sync::mpsc;
 
+use crate::launch::Launch;
+
 use super::datasource::DatasourceRouter;
 
 /// Map one wire [`Effect`] onto a real host command. Handles [`Effect::OpenPage`]
@@ -1215,23 +1217,19 @@ pub(super) fn allocate_launch_unit(plugin_id: &str, id: u64) -> String {
     launch_unit_name(plugin_id, id, std::process::id(), seq)
 }
 
-/// The full `systemd-run` argv for one detached launch (#953), sans the
-/// `systemd-run` program itself. Pure, so the exact invocation is pinned by a
-/// unit test rather than only observable on a live session.
+/// One detached launch (#953) as a [`crate::launch::Launch`].
 ///
-/// - `--user`: the session manager, so the unit lands in the user's own tree.
-/// - `--quiet`: no "Running as unit …" chatter on stderr.
-/// - `--collect`: release the unit even when the program ends failed, so a name
-///   is never wedged waiting for a `reset-failed` (same reason
-///   `plugin_launcher::systemd_run_args` passes it).
+/// The flag vocabulary moved into [`crate::launch`] in #1071 phase 2 — `--user`,
+/// `--quiet`, `--collect` and the `--` separator are unconditional over there,
+/// and so is #984's argv/environment pairing. What is *about a detached launch*
+/// stays here:
+///
 /// - `--slice=`: [`LAUNCH_SLICE`], so every surviving unit lands in one subtree
 ///   the user can stop with a single command (#953 L6).
 /// - `--unit=`: the caller's [`allocate_launch_unit`] name — #953 wants the
 ///   program to *show up in `systemctl --user` with a name*.
 /// - `--description=`: a human line in `systemctl --user status`.
 /// - `--setenv=`: the [`FORWARDED_ENV`] variables the *shell* holds, see below.
-/// - `--`: terminates option parsing before the plugin-supplied argv, so an
-///   `argv[0]` of `--now` can't be read as a `systemd-run` flag.
 ///
 /// Deliberately **not** passed: no `Restart=` (a launched terminal that exits
 /// has finished, it is not a supervised service — unlike a plugin), and no
@@ -1256,6 +1254,38 @@ pub(super) fn allocate_launch_unit(plugin_id: &str, id: u64) -> String {
 /// and empty for any variable the shell doesn't have) is passed explicitly.
 /// `--setenv=` overrides the manager's value for those names only; every other
 /// variable still comes from the manager.
+pub(super) fn detached_launch(
+    plugin_id: &str,
+    id: u64,
+    unit: &str,
+    env: &[(String, String)],
+    argv: &[String],
+) -> Launch {
+    Launch {
+        unit: unit.to_owned(),
+        description: format!("trollshell plugin launch: {plugin_id} #{id}"),
+        slice: Some(LAUNCH_SLICE.to_owned()),
+        // Deliberately none: see this function's doc.
+        properties: Vec::new(),
+        env: env.to_vec(),
+        // A detached launch has no secret channel — `RunCommand`'s argv and env
+        // are the plugin's own, and #392's keyring injection is a property of a
+        // *plugin unit*, not of what a plugin asks the host to run.
+        secret_env: Vec::new(),
+        argv: argv.to_vec(),
+    }
+}
+
+/// [`detached_launch`]'s argv, read back off the `Command` that would really
+/// run — the shape #953's exact-argv pins assert on.
+///
+/// Kept as a function of the same five parameters (rather than deleted in
+/// favour of the `Launch` literal) so those pins, which live in
+/// `plugins/tests.rs`, did not have to move when #1071 phase 2 generalised the
+/// builder. It goes through [`crate::launch::command`] like every other launch
+/// path, so what it returns is the invocation that actually runs and not a
+/// second builder that could drift from it.
+#[cfg(test)]
 pub(super) fn launch_argv(
     plugin_id: &str,
     id: u64,
@@ -1263,20 +1293,10 @@ pub(super) fn launch_argv(
     env: &[(String, String)],
     argv: &[String],
 ) -> Vec<String> {
-    let mut out = vec![
-        "--user".to_owned(),
-        "--quiet".to_owned(),
-        "--collect".to_owned(),
-        format!("--slice={LAUNCH_SLICE}"),
-        format!("--unit={unit}"),
-        format!("--description=trollshell plugin launch: {plugin_id} #{id}"),
-    ];
-    for (k, v) in env {
-        out.push(format!("--setenv={k}={v}"));
-    }
-    out.push("--".to_owned());
-    out.extend(argv.iter().cloned());
-    out
+    crate::launch::argv_of(&crate::launch::command(
+        crate::launch::SYSTEMD_RUN,
+        &detached_launch(plugin_id, id, unit, env, argv),
+    ))
 }
 
 /// The environment variables a detached launch forwards from the shell's own
@@ -1399,9 +1419,11 @@ async fn systemd_run_launch_with(
     program: &str,
     timeout: Duration,
 ) -> Result<(), LaunchFailure> {
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.args(launch_argv(plugin_id, id, unit, &forwarded_env(), argv))
-        .stdin(std::process::Stdio::null())
+    let mut cmd = crate::launch::command(
+        program,
+        &detached_launch(plugin_id, id, unit, &forwarded_env(), argv),
+    );
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // Safe *here*, unlike on the launched program: this only bounds the
@@ -1511,7 +1533,7 @@ pub(super) async fn start_detached(
         id,
         unit,
         argv,
-        "systemd-run",
+        crate::launch::SYSTEMD_RUN,
         LAUNCH_CALL_TIMEOUT,
     )
     .await

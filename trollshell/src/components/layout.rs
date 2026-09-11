@@ -18,14 +18,17 @@ use crate::scale::scale;
 /// falling off-screen left) — single source so the two never drift apart.
 pub(crate) const DRAWER_MAX_WIDTH: i32 = 680;
 
-/// Wider drawer max content width for the Stats multicolumn layout (#508). Two
-/// side-by-side history graphs inside the global `DRAWER_MAX_WIDTH` (680) would
-/// each squeeze to ~330px — the opposite of #508's "the panel got smaller"
-/// complaint — so the multicolumn Stats page opts into this via
-/// [`finish_page_clamped`]. `modal.rs`'s centering clamp
-/// (`main_margin_for_center`) uses this as its upper bound too, so a card up to
-/// this wide still centers correctly under its trigger chip. No other page uses
-/// it — every other page stays on `finish_page`/`DRAWER_MAX_WIDTH`.
+/// Wider drawer max content width for the side-by-side-columns pages. Two
+/// columns inside the global `DRAWER_MAX_WIDTH` (680) would each squeeze to
+/// ~330px — the opposite of #508's "the panel got smaller" complaint — so a page
+/// that lays out in columns opts into this via [`finish_page_clamped`].
+/// `modal.rs`'s centering clamp (`main_margin_for_center`) uses this as its
+/// upper bound too, so a card up to this wide still centers correctly under its
+/// trigger chip.
+///
+/// Two pages use it, for the same measurement: the multicolumn Stats page
+/// (#508, two history graphs) and the Workspaces page (#1071, one column per
+/// monitor). Every other page stays on `finish_page`/`DRAWER_MAX_WIDTH`.
 pub(crate) const DRAWER_MAX_WIDTH_WIDE: i32 = 1080;
 
 pub(crate) fn page_box() -> gtk::Box {

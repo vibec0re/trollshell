@@ -1836,7 +1836,8 @@ fn main_margin_for_center(panel: &ModalPanel, center: i32) -> i32 {
     // being measured as if it were 680 wide. Every other page measures well
     // under 680, so widening the ceiling is a no-op for them — the clamp only
     // ever bites on a pathological over-request, and now that ceiling covers the
-    // one page that legitimately reaches past 680.
+    // two pages that legitimately reach past 680 (Stats' multicolumn layout,
+    // #508; the Workspaces page's one column per monitor, #1071).
     let card_extent = card_extent.clamp(scale(360), scale(DRAWER_MAX_WIDTH_WIDE));
 
     clamp_main_margin(

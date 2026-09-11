@@ -43,6 +43,11 @@ pub mod components;
 // dressing from `config::core_leds`, the config-file layering's first live
 // subsystem.
 pub mod config;
+// In the closure since #1071 phase 2: `plugins::effects`' detached `RunCommand`
+// builds its `systemd-run` invocation through the generalised `launch` module,
+// so this lib target has to carry it too (the `main.rs` header's "widening a
+// mirrored module's transitive `crate::` closure" case, #738).
+pub mod launch;
 pub mod modal;
 pub mod overlays;
 pub mod panels;
@@ -56,3 +61,7 @@ pub mod plugins;
 #[allow(dead_code)]
 pub mod scale;
 pub mod widgets;
+// In the closure since #1071 phase 2: `panels::workspaces` puts Start/Stop on
+// its cards, and both transactions live here rather than in the panel because
+// none of either is GTK (see that module's own doc).
+pub mod workspace_stacks;

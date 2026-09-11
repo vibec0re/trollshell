@@ -126,7 +126,7 @@
             description = "trollshell consent-gated agent-bridge broker CLI (#487)";
           };
 
-          # The `hytte-claude-bridge` daemon (#584): a keyless loopback shim
+          # The `hytte-claude-bridge` daemon (#584): a keyless same-uid-socket shim
           # putting an OpenAI-compatible face on headless Claude Code. Since #866
           # it speaks the plugin protocol too (a status chip) and IS driven by
           # `programs.trollshell.plugins` — `nix/hm-module.nix` renders the
@@ -749,7 +749,12 @@
                         pet = {
                           package = stubPlugin;
                           env = {
-                            PET_LLM_URL = "http://127.0.0.1:8787";
+                            # The #993 shape: a same-uid socket, not a port.
+                            # Spelled out rather than referenced through
+                            # `config` (this fixture module takes no arguments)
+                            # — the probe below asserts it equals the read-only
+                            # `claudeBridge.baseUrl` a real config would use.
+                            PET_LLM_URL = "unix://$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock";
                             PET_LLM_TIMEOUT_SECS = "20";
                           };
                         };
@@ -807,7 +812,7 @@
                 # and declare no `trollshell-claude-bridge` unit at all. The
                 # negative is the load-bearing half — a stray unit alongside the
                 # plugin entry would run the bridge twice and the second copy
-                # would fail to bind the port.
+                # would find the socket already live and refuse to start.
                 assert !(units ? trollshell-claude-bridge);
                 assert
                   let
@@ -815,7 +820,12 @@
                   in
                   b.exec == pkgs.lib.getExe stubClaudeBridge
                   && b.enabled
-                  && b.env.CLAUDE_BRIDGE_PORT == "8787"
+                  # #993: no port is rendered at all, because the bridge
+                  # listens on a same-uid socket whose path is not
+                  # configurable. The negative is the load-bearing half — a
+                  # CLAUDE_BRIDGE_PORT back in this env would mean somebody
+                  # restored a listener every local uid can reach.
+                  && !(b.env ? CLAUDE_BRIDGE_PORT)
                   && b.env.CLAUDE_BRIDGE_MODEL == "claude-haiku-4-5"
                   && b.env.CLAUDE_BRIDGE_TIMEOUT_SECS == "15"
                   # The default mode, i.e. one that spawns `claude`…
@@ -847,6 +857,15 @@
                   && b.env.ANTHROPIC_FOUNDRY_AUTH_TOKEN == ""
                   && b.env.ANTHROPIC_FOUNDRY_API_KEY == ""
                   && b.env.ANTHROPIC_CUSTOM_HEADERS == "";
+                # #993, the client half: `claudeBridge.baseUrl` is read-only and
+                # is exactly what a plugin's `*_LLM_URL` has to carry — the
+                # replacement for the two-things-must-agree-on-one-number job
+                # `claudeBridge.port` used to do. `$XDG_RUNTIME_DIR` is left
+                # unexpanded on purpose; logind mints it at login, so nix
+                # cannot know it and `hytte-ai-providers` resolves it in the
+                # consuming plugin's own process.
+                assert pluginsState.plugins.pet.env.PET_LLM_URL == cfg.programs.trollshell.claudeBridge.baseUrl;
+                assert pkgs.lib.hasPrefix "unix://" cfg.programs.trollshell.claudeBridge.baseUrl;
                 assert units ? trollshell-pet-brain;
                 # `builtins.toString` because home-manager's unitOption merge
                 # hands some of these back list-wrapped (ExecStart below is

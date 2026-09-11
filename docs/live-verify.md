@@ -680,6 +680,23 @@ the reducer but cannot prove the hive agrees.
       (`>= 2560` → 75/25), not the golden cut. If that reads wrong on real
       glass, say so on #1052 rather than changing `GOLDEN_BREAKPOINT`
       yourself — Annika hasn't picked a side of that boundary yet.
+- [ ] **(#1129)** Applying a layout reflows the columns it resizes.
+      `SetWindowWidth` changes a column's width, which is not a change niri
+      reflows the workspace layout for — so a column at the right edge can be
+      left sitting there, partly off screen, once its neighbours' widths
+      change around it. On a workspace with a tiled column sitting at (or
+      past) the **right edge** of the screen, click any of the three layout
+      buttons (`equal` / `golden` / `split`): every column should end up fully
+      on screen at the stated width, not merely resized in place. Whatever
+      window had keyboard focus before the click should still have it
+      afterward — confirm by starting the click from a **different** window
+      than the one at the right edge and checking focus didn't jump to the
+      first column. The CLI hat should reflow the same way:
+      `hytte-plugin-niri-layouts apply split` from a terminal should leave no
+      column part off screen either. Try it once on a workspace with **no**
+      tiled columns too (all floating, or empty) — the CLI should still print
+      "no tiled columns" and exit `0`, with no `FocusWindow`/column-move
+      actions in the journal.
 - [ ] **(#1050)** Per-screen chip visibility and per-screen clicks — needs two
       monitors for legs 1–7 and 9; on one screen those are vacuously true, and
       leg 8 is the one-screen case (which is the everyday one).
@@ -1018,6 +1035,26 @@ title` in the stderr tail — worth a deliberate look on first run, since
       job; measured, the cap moved only the natural request — which nothing on a
       both-edges-anchored axis reads — so it was deleted rather than left as a
       live-verify item that could not fail.)
+- [ ] **(#1129)** Closing the sidebar reflows the columns it left behind.
+      Annika found that closing the sidebar (or the layouts plugin applying a
+      layout, below) stops reserving/resizes the strip without moving any
+      column — a tile that was sitting flush against the old edge is left
+      exactly where it was, now partly off screen. Open the sidebar on a
+      workspace with a tiled window at the **right edge** of the reserved
+      strip (drag a window there, or `MoveColumnToFirst`/`Last` it into place
+      first), then close the sidebar: the reflowed column should visibly slide
+      to reclaim the freed width, with no window left sitting half off screen
+      or overlapping the bar/frame. It should not happen while the sidebar is
+      **opening** (niri already reflows its own reserve there) and it must
+      fire only **once** per close, not on every settle tick — watch
+      `RUST_LOG=trollshell=debug` for one `sidebar: exclusive-zone re-assert …`
+      line per close and confirm the nudge doesn't repeat. Try it on a
+      workspace with **no** tiled window (all floating, or empty) too: the
+      close should still commit `exclusive_zone = 0` normally, with no
+      spurious `FocusWindow`/column-move actions in the journal and — check
+      this one specifically — whatever window had keyboard focus before you
+      closed the sidebar should still have it afterward, not the column the
+      nudge itself focused.
 
 ## Audio & media
 

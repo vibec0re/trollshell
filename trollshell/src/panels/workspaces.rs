@@ -3308,6 +3308,9 @@ pub(in crate::panels) mod tests {
     #[gtk::test]
     fn a_saved_card_in_the_offline_column_still_takes_a_drop_for_reordering() {
         let f = fixture();
+        // `model` builds no columns at all — not even the offline one —
+        // unless niri reports at least one connected output.
+        f.workspaces.set(vec![ws(1, 1, LEFT, None)]);
         f.saved
             .set(saved(&[("gone", stack(Some("dp-9"), &["Alacritty"]))]));
         pump();

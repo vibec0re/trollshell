@@ -1734,6 +1734,11 @@ palette = ["amber", "rust"]
         assert_eq!(loaded.config.core.brightness, 3);
         assert!(loaded.config.enabled);
         assert!(loaded.sources.is_empty());
+        assert!(
+            loaded.findings.is_empty(),
+            "a clean file has no `_unset` marker to find: {:?}",
+            loaded.findings
+        );
     }
 
     /// The whole layering, end to end: default, then a nix base, then the
@@ -2344,6 +2349,88 @@ kept = true
         );
     }
 
+    // ── #1018: the same findings, returned as data ───────────────────────────
+
+    /// [`Loaded::findings`] carries the same detection the warning above pins,
+    /// as data — a control-center or `validate` command's only way to see it
+    /// without scraping the journal (#1018).
+    ///
+    /// A separate test from
+    /// [`a_malformed_unset_marker_warns_naming_the_layer`] on purpose: the
+    /// mutation that drops the `findings.push` in [`assemble`] must leave the
+    /// `warn!` call untouched, so this test going red while that one stays
+    /// green is what proves the two paths are separate.
+    #[test]
+    fn a_malformed_unset_finding_is_returned_from_loaded() {
+        let (captured, _guard) = capture();
+
+        let loaded = assembled(&["[core]\n_unset = \"color\"\n"]);
+
+        assert_eq!(
+            loaded.findings,
+            [Finding {
+                layer: "/layer/0.toml".into(),
+                key: "core._unset".into(),
+                kind: FindingKind::MalformedUnset,
+                message: merge::MalformedUnset {
+                    key: "core._unset".into(),
+                    found: "string",
+                }
+                .to_string(),
+            }],
+            "the finding, not just the warning: {:?}",
+            loaded.findings
+        );
+        assert_eq!(
+            unset_warnings(&captured).len(),
+            1,
+            "and the warning still fires beside it, unchanged"
+        );
+    }
+
+    /// The other malformed shape — a well-formed array with non-key-name
+    /// elements — returns one finding per offender, matching the warning's own
+    /// per-offender shape.
+    #[test]
+    fn a_non_key_name_element_finding_is_returned_from_loaded() {
+        let (captured, _guard) = capture();
+
+        let loaded = assembled(&["[core]\n_unset = [\"color\", 3, true]\n"]);
+
+        assert_eq!(
+            loaded.findings,
+            [
+                Finding {
+                    layer: "/layer/0.toml".into(),
+                    key: "core._unset[1]".into(),
+                    kind: FindingKind::MalformedUnset,
+                    message: merge::MalformedUnset {
+                        key: "core._unset[1]".into(),
+                        found: "integer",
+                    }
+                    .to_string(),
+                },
+                Finding {
+                    layer: "/layer/0.toml".into(),
+                    key: "core._unset[2]".into(),
+                    kind: FindingKind::MalformedUnset,
+                    message: merge::MalformedUnset {
+                        key: "core._unset[2]".into(),
+                        found: "boolean",
+                    }
+                    .to_string(),
+                },
+            ],
+            "one finding per offending element: {:?}",
+            loaded.findings
+        );
+        assert_eq!(
+            unset_warnings(&captured).len(),
+            2,
+            "and both warnings still fire beside them, unchanged"
+        );
+    }
+
     /// The warning must be a signal, not noise on every file that uses the
     /// feature: a well-formed marker says nothing.
     ///
@@ -2374,6 +2461,11 @@ kept = true
             loaded.unknown_keys,
             ["core.nope"],
             "the control is the ordinary rule-4 path, unchanged"
+        );
+        assert!(
+            loaded.findings.is_empty(),
+            "no complaint means no finding either: {:?}",
+            loaded.findings
         );
     }
 
@@ -2419,6 +2511,21 @@ kept = true
         assert_eq!(fields.get("key").map(String::as_str), Some("_unset"));
         assert_eq!(fields.get("found").map(String::as_str), Some("string"));
         assert_eq!(loaded.config.color, "amber", "and it removed nothing");
+        assert_eq!(
+            loaded.findings,
+            [Finding {
+                layer: "the built-in default".into(),
+                key: "_unset".into(),
+                kind: FindingKind::MalformedUnset,
+                message: merge::MalformedUnset {
+                    key: "_unset".into(),
+                    found: "string",
+                }
+                .to_string(),
+            }],
+            "the finding names our own bug the same way the warning does: {:?}",
+            loaded.findings
+        );
     }
 
     // ── #1008: the two shapes where `patch` used to lose the marker ─────────
@@ -3110,6 +3217,52 @@ kept = true
         assert_eq!(named.len(), 1, "warned exactly once: {named:#?}");
     }
 
+    /// #1018 composes with #1088: [`merge::inert_unset`] is asked over the
+    /// layers as they stood *before* the merge, and #1088's per-table absence
+    /// rule runs *after* it, over the merged and pruned document — so a table
+    /// that the later rule drops entirely must not take the earlier finding
+    /// with it, and must not report it twice either.
+    ///
+    /// The marker here is `core`'s only content: stripped by rule 1, the block
+    /// carries none of the schema's keys, so [`schema_descends`] and
+    /// `reads_as` both say absent and `core` reads as `None` — the ordinary
+    /// #1088 case. The finding from *before* that pruning must still be there,
+    /// exactly once.
+    ///
+    /// Red if the finding is lost when its table later reads as absent, and
+    /// red if it is somehow reported twice (`inert_unset` running once over
+    /// the whole layer stack, not once per accepted #1088 candidate, is what
+    /// this pins).
+    #[test]
+    fn an_inert_marker_finding_survives_a_table_that_reads_as_absent() {
+        let loaded =
+            assemble::<OptTable>(&layers(&["enabled = true\n\n[core]\n_unset = [\"mystery2\"]\n"]))
+                .expect("assembles");
+
+        assert!(
+            loaded.config.core.is_none(),
+            "the block holds nothing of the schema's once the marker is \
+             stripped, so #1088's rule reads it as absent: {:?}",
+            loaded.config.core
+        );
+        assert_eq!(
+            loaded.findings,
+            [Finding {
+                layer: "/layer/0.toml".into(),
+                key: "core.mystery2".into(),
+                kind: FindingKind::InertUnset,
+                message: merge::InertUnset {
+                    layer: 1,
+                    key: "core.mystery2".into(),
+                }
+                .to_string(),
+            }],
+            "the finding from before the merge must survive the table's own \
+             absence, exactly once: {:?}",
+            loaded.findings
+        );
+    }
+
     /// The boundary, and the reason the rule is not simply "an empty table is
     /// absent": a schema field of type [`toml::Value`] — #1040's shape, so one
     /// bad key never takes its siblings down — *holds* that empty table as its
@@ -3533,6 +3686,44 @@ kept = true
         );
     }
 
+    // ── #1018: the same finding, returned as data ────────────────────────────
+
+    /// [`Loaded::findings`] carries the inert-marker detection too, as data —
+    /// the same split as the malformed shape above (#1018).
+    ///
+    /// A separate test from
+    /// [`an_unset_marker_naming_a_key_no_layer_sets_is_warned_about`] on
+    /// purpose, for the same reason: dropping the `findings.push` in
+    /// [`assemble`] must not touch the `warn!` call, so this one going red
+    /// while that one stays green is what proves the two paths are separate.
+    #[test]
+    fn an_inert_unset_finding_is_returned_from_loaded() {
+        let (captured, _guard) = capture();
+
+        let loaded = assembled(&["[core]\n_unset = [\"colr\", \"color\"]\n"]);
+
+        assert_eq!(
+            loaded.findings,
+            [Finding {
+                layer: "/layer/0.toml".into(),
+                key: "core.colr".into(),
+                kind: FindingKind::InertUnset,
+                message: merge::InertUnset {
+                    layer: 1,
+                    key: "core.colr".into(),
+                }
+                .to_string(),
+            }],
+            "the finding, not just the warning: {:?}",
+            loaded.findings
+        );
+        assert_eq!(
+            inert_warnings(&captured).len(),
+            1,
+            "and the warning still fires beside it, unchanged"
+        );
+    }
+
     /// The noise guard across layers: erasing a key a *lower* layer sets is the
     /// whole point of the feature and must stay silent.
     ///
@@ -3564,6 +3755,11 @@ kept = true
         assert_eq!(
             loaded.config.core.label, None,
             "…and it did erase it, which is what makes the silence correct"
+        );
+        assert!(
+            loaded.findings.is_empty(),
+            "no complaint means no finding either: {:?}",
+            loaded.findings
         );
     }
 
@@ -3605,6 +3801,21 @@ kept = true
         );
         assert_eq!(fields.get("key").map(String::as_str), Some("colr"));
         assert_eq!(loaded.config.color, "amber", "and it removed nothing");
+        assert_eq!(
+            loaded.findings,
+            [Finding {
+                layer: "the built-in default".into(),
+                key: "colr".into(),
+                kind: FindingKind::InertUnset,
+                message: merge::InertUnset {
+                    layer: 0,
+                    key: "colr".into(),
+                }
+                .to_string(),
+            }],
+            "the finding names our own bug the same way the warning does: {:?}",
+            loaded.findings
+        );
     }
 
     // ── #1040 V1: a bad value costs its own key ─────────────────────────────

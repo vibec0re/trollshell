@@ -160,13 +160,33 @@ pub fn panel_settings() -> gtk::Widget {
 
     column.append(&recording);
 
-    // ── More ──────────────────────────────────────────────────────────────
-    // Deep-link rows to drawer pages that don't have a dedicated bar chip.
-    // Each row swaps the currently-open drawer to the target page via
-    // `modal::switch_active` (see modal.rs) so the user stays on the same
-    // monitor's drawer surface; no `&Monitor` is plumbed through here.
+    column.append(&build_more_group());
+
+    finish_page(&column)
+}
+
+/// The "More" group: deep-link rows to drawer pages that don't have a
+/// dedicated bar chip. Each row swaps the currently-open drawer to the target
+/// page via `modal::switch_active` (see modal.rs) so the user stays on the same
+/// monitor's drawer surface; no `&Monitor` is plumbed through here.
+///
+/// A function rather than a block inside [`panel_settings`] because #1071's
+/// fourth row pushed that function past `clippy::too_many_lines`, and this is
+/// the one section of the page that is a plain list with no bindings.
+fn build_more_group() -> adw::PreferencesGroup {
     let more = adw::PreferencesGroup::builder().title("More").build();
 
+    // #1071 phase 1's entry point. The bar keeps its numbered `[1 2 3 …]`
+    // switcher (revision 5 of the epic, Annika 2026-09-10), so the Workspaces
+    // page gets no chip of its own — this row and the `open-page workspaces`
+    // GAction (`commands.rs`, wired for free off `Page::stack_name`) are how it
+    // opens.
+    more.add(&deep_link_row(
+        "Workspaces",
+        Some("Named workspaces per screen"),
+        "view-grid-symbolic",
+        crate::modal::Page::Workspaces,
+    ));
     more.add(&deep_link_row(
         "Wallpaper",
         Some("Pick a desktop background"),
@@ -186,7 +206,5 @@ pub fn panel_settings() -> gtk::Widget {
         crate::modal::Page::Clipboard,
     ));
 
-    column.append(&more);
-
-    finish_page(&column)
+    more
 }

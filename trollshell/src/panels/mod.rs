@@ -18,6 +18,7 @@ pub mod power_menu;
 pub mod settings;
 pub mod stats;
 pub mod vpn;
+pub mod workspaces;
 
 pub use appearance::panel_appearance;
 pub use audio::panel_audio;
@@ -37,3 +38,4 @@ pub use stats::{
     panel_stats_multicolumn, panel_stats_services,
 };
 pub use vpn::panel_vpn;
+pub use workspaces::panel_workspaces;

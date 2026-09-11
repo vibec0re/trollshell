@@ -44,6 +44,10 @@ use hytte::services::systemd;
 use hytte::ui::{MultiSparkline, PixelSurface};
 use hytte_preem::LedMatrix;
 
+// The app-id → desktop-entry resolver used to live in this file; #1071 moved it
+// to `components/` when the Workspaces page became a second consumer. Imported
+// back under its original names so every call site below reads unchanged.
+use crate::components::app_meta::{AppMeta, fallback_icon, resolve_app_meta};
 use crate::components::cast;
 use crate::components::format::{fmt_bytes, fmt_hz, fmt_rate};
 use crate::components::history_row::build_history_row;
@@ -613,102 +617,6 @@ fn build_stats_gpu_card() -> adw::PreferencesGroup {
     group
 }
 
-/// Cached desktop app metadata resolved from `gio::AppInfo`.
-///
-/// Note: `gio::DesktopAppInfo` is not available in gio 0.22 bindings, so we
-/// use the `gio::AppInfo` interface (the abstract interface) via
-/// `gio::AppInfo::all()`, which returns all installed applications with their
-/// ids, display names, and icons. We scan this list lazily (once per new
-/// app-id) and cache the result for the lifetime of the expander widget.
-#[derive(Clone)]
-struct AppMeta {
-    display_name: String,
-    icon: Option<gio::Icon>,
-}
-
-/// Resolve display name and icon for an app-id via a layered `gio::AppInfo`
-/// lookup.
-///
-/// Tries the following strategies in order, stopping at the first hit:
-///
-/// 1. **Exact id match** — `AppInfo::all()` entry whose id equals
-///    `<app_id>.desktop` (or its lowercase variant). Fast for well-behaved
-///    desktop files.
-/// 2. **Case-insensitive id containment** — scans for an entry whose desktop
-///    file id (without the `.desktop` suffix) case-insensitively contains, or
-///    is contained by, the app-id. Catches reverse-DNS mismatches such as
-///    `org.gnome.Nautilus.desktop` for app-id `org.gnome.Nautilus`, and
-///    NixOS wrapper names like `firefox-unwrapped` matching `firefox.desktop`.
-/// 3. **Executable basename match** — entry whose executable file stem
-///    case-insensitively equals the app-id. Catches cgroup scope leaves like
-///    `app-firefox.scope`→`firefox` when the desktop file is `Firefox.desktop`
-///    with executable `/usr/bin/firefox`.
-///
-/// All three layers scan `AppInfo::all()` (or share the same pre-fetched list)
-/// and cache the result so the work happens at most once per unique app-id per
-/// expander lifetime.
-///
-/// Note: `gio::DesktopAppInfo::search` and `startup_wm_class` are not
-/// available in the gio 0.22 bindings used here, so the above heuristics
-/// approximate their behaviour using the `AppInfo` abstract interface.
-fn resolve_app_meta(
-    app_id: &str,
-    meta_cache: &mut HashMap<String, Option<AppMeta>>,
-) -> Option<AppMeta> {
-    if let Some(cached) = meta_cache.get(app_id) {
-        return cached.clone();
-    }
-
-    let app_id_lower = app_id.to_lowercase();
-
-    // Fetch all installed apps once for this lookup.
-    let all = gio::AppInfo::all();
-
-    // Layer 1: exact id match (fast path).
-    let exact = format!("{app_id}.desktop");
-    let exact_lower = format!("{app_id_lower}.desktop");
-    let hit = all.iter().find(|info| {
-        info.id()
-            .is_some_and(|id| id == exact.as_str() || id == exact_lower.as_str())
-    });
-
-    // Layer 2: case-insensitive id containment.
-    // Strips the `.desktop` suffix and checks if the stem contains the app-id
-    // or vice-versa (handles reverse-DNS and wrapper-name mismatches).
-    let hit = hit.or_else(|| {
-        all.iter().find(|info| {
-            info.id().is_some_and(|id| {
-                let stem = id
-                    .as_str()
-                    .strip_suffix(".desktop")
-                    .unwrap_or(id.as_str())
-                    .to_lowercase();
-                stem.contains(app_id_lower.as_str())
-                    || app_id_lower.as_str().contains(stem.as_str())
-            })
-        })
-    });
-
-    // Layer 3: executable basename match.
-    // Catches cases where the desktop file uses a different name but the
-    // binary matches (e.g. `firefox` binary → `Firefox.desktop`).
-    let hit = hit.or_else(|| {
-        all.iter().find(|info| {
-            let exe = info.executable();
-            exe.file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|stem| stem.to_lowercase() == app_id_lower.as_str())
-        })
-    });
-
-    let meta = hit.map(|info| AppMeta {
-        display_name: info.display_name().to_string(),
-        icon: info.icon(),
-    });
-    meta_cache.insert(app_id.to_string(), meta.clone());
-    meta
-}
-
 /// A collapsible "Top apps" list (CPU or RAM) bound to an [`app_usage`] signal.
 /// `value` formats each row's right-hand value. Mirrors
 /// [`build_live_disk_expander`]'s drain-and-rebuild pattern.
@@ -839,9 +747,7 @@ fn rebuild_top_apps(
             // `RefMut` is gone before the fallback icon is constructed.
             let cached =
                 resolve_app_meta(app_id, &mut meta_cache.borrow_mut()).and_then(|m| m.icon);
-            cached.unwrap_or_else(|| {
-                gio::ThemedIcon::new("application-x-executable-symbolic").upcast::<gio::Icon>()
-            })
+            cached.unwrap_or_else(fallback_icon)
         } else {
             // System bucket: generic computer icon.
             gio::ThemedIcon::new("computer-symbolic").upcast::<gio::Icon>()

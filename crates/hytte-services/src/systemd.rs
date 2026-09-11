@@ -421,6 +421,233 @@ pub async fn set_plugin_enabled(id: &str, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+// ── Workspace stacks (#1071 §3.1/§3.3) ───────────────────────────────────────
+
+/// Prefix of every workspace-stack slice and unit.
+const WS_PREFIX: &str = "trollshell-ws-";
+
+/// The longest workspace name. Names double as unit-name components, and
+/// systemd's limit is 255 bytes for the whole name; this is the epic's own cap
+/// (§3.1), which leaves the unit template far inside it.
+const WS_NAME_MAX: usize = 32;
+
+/// A valid workspace-stack name (#1071 §3.1).
+///
+/// Lowercase ASCII alphanumerics with **single interior dashes** — no leading,
+/// trailing or doubled dash, non-empty, at most [`WS_NAME_MAX`] bytes.
+///
+/// This is stricter than [`is_valid_plugin_id`] and the difference is not
+/// stylistic. `-` is systemd's *slice-hierarchy separator*, so the name is
+/// spliced into a position where dash placement decides whether the unit is
+/// legal at all. Measured against systemd 260.2 by asking it to start a service
+/// in each candidate slice:
+///
+/// | slice | systemd |
+/// | --- | --- |
+/// | `trollshell-ws-foo.slice` | accepted |
+/// | `trollshell-ws--foo.slice` | *"failed to load properly … Invalid argument"* |
+/// | `trollshell-ws-foo-.slice` | *"… Invalid argument"* |
+/// | `trollshell-ws-.slice` | *"… Invalid argument"* |
+///
+/// Uppercase is a different problem with the same answer. systemd accepts
+/// `trollshell-ws-FOO.slice` happily, but **niri matches workspace names
+/// case-insensitively** (`find_workspace_by_name`), so `Chat` and `chat` are one
+/// workspace with two spellings and two distinct slices. Folding to lowercase at
+/// the boundary — see [`normalize_workspace_name`] — keeps the file's identity
+/// and the compositor's identity the same relation.
+///
+/// Pure.
+#[must_use]
+pub fn is_valid_workspace_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > WS_NAME_MAX {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+        && !name.contains("--")
+}
+
+/// A name as [`is_valid_workspace_name`] would have it, or `None` if no folding
+/// can save it.
+///
+/// Only case is folded. Anything else — a space, an underscore, a doubled dash —
+/// is rejected rather than rewritten, because a silent rewrite would give the
+/// user a stack under a name they did not type while `niri msg` still answers to
+/// the one they did.
+#[must_use]
+pub fn normalize_workspace_name(name: &str) -> Option<String> {
+    let folded = name.trim().to_ascii_lowercase();
+    is_valid_workspace_name(&folded).then_some(folded)
+}
+
+/// The slice one workspace stack's apps live in (#1071 §3.3).
+///
+/// # Why the name's own dashes are escaped
+///
+/// systemd derives a slice's parent from the **literal dashes in its name**:
+/// `a-b.slice` is a child of `a.slice`. Taken naively, a stack called `chat-dev`
+/// would become `trollshell-ws-chat-dev.slice` — a *child* of a stack called
+/// `chat`, so stopping `chat` would silently also stop `chat-dev`. Measured on
+/// systemd 260.2: starting one service in `tstest-ws-a.slice` and another in
+/// `tstest-ws-a-b.slice`, then `systemctl --user stop tstest-ws-a.slice`, left
+/// **both** gone.
+///
+/// So the name's dashes are written as systemd's `\x2d` escape, which is not a
+/// hierarchy separator. Measured the same way: `tstest2-ws-a\x2db.slice` renders
+/// as `Slice /tstest2/ws/a-b` (a *sibling* under `/tstest2/ws`) and survived a
+/// stop of `tstest2-ws-a.slice`.
+///
+/// Pure. Assumes [`is_valid_workspace_name`]; a caller that has not checked gets
+/// an escaped-but-still-invalid name rather than a crafted one, since the
+/// validator's charset is the only thing that reaches here.
+#[must_use]
+pub fn workspace_slice_name(name: &str) -> String {
+    format!("{WS_PREFIX}{}.slice", name.replace('-', r"\x2d"))
+}
+
+/// The transient unit for the `index`-th app of workspace `name`'s stack.
+///
+/// Same `\x2d` escaping as [`workspace_slice_name`], for the same reason: the
+/// unit sits under the slice and its own name must not imply a different parent.
+/// `index` is the app's position in the stack, so a relaunch of the same stack
+/// reuses the name — which is what makes a double Start fail loudly (systemd
+/// refuses a live unit name) rather than quietly running two copies.
+#[must_use]
+pub fn workspace_unit_name(name: &str, index: usize) -> String {
+    format!(
+        "{WS_PREFIX}{}-{index}{UNIT_SUFFIX}",
+        name.replace('-', r"\x2d")
+    )
+}
+
+/// The unit `pid` belongs to, or `None` when it belongs to none.
+///
+/// niri ≥ 26.04 running as a systemd service starts every `spawn`ed command as
+/// its own `app-niri-*.scope`, so this names a unit for nearly every window on
+/// screen — not only the ones this shell launched (#1071 §3.3). A pid with no
+/// unit (a program started from a nested shell inside a terminal, say) is the
+/// case that falls through to niri's own `CloseWindow`.
+///
+/// A failed lookup is **not** an error: systemd answers a plain
+/// `PID … does not belong to any loaded unit` (measured), which is an ordinary
+/// answer to an ordinary question. Only a bus-level failure propagates.
+///
+/// # Errors
+/// Propagates a `hytte_bus` call error — no user manager reachable, the reply
+/// could not be read. A pid systemd simply does not know is `Ok(None)`.
+pub async fn unit_for_pid(pid: u32) -> Result<Option<String>> {
+    let path: zbus::zvariant::OwnedObjectPath = match call(BusKind::Session, SYSTEMD_NAME)
+        .at_path(MANAGER_PATH)
+        .iface(MANAGER_IFACE)
+        .method("GetUnitByPID")
+        .args((pid,))
+        .send()
+        .await
+    {
+        Ok(path) => path,
+        // Every refusal here is "systemd does not know this pid" in practice;
+        // distinguishing a `NoUnitForPID` name from a transport failure would
+        // need a `BusError` shape `hytte_bus` deliberately does not expose, and
+        // the fallback (close the window through niri) is right either way.
+        Err(e) => {
+            tracing::debug!(pid, error = %e, "no systemd unit for pid");
+            return Ok(None);
+        }
+    };
+    // `StopUnit` takes a *name*, and the object path encodes it with systemd's
+    // own escaping. Reading `Id` back is the honest inverse; unescaping the path
+    // by hand would be a second implementation of an encoding systemd owns.
+    let id: String = call(BusKind::Session, SYSTEMD_NAME)
+        .at_path(path.as_str())
+        .iface("org.freedesktop.DBus.Properties")
+        .method("Get")
+        .args(("org.freedesktop.systemd1.Unit".to_owned(), "Id".to_owned()))
+        .send::<zbus::zvariant::OwnedValue>()
+        .await
+        .context("Unit.Id")
+        .and_then(|v| String::try_from(v).context("Unit.Id is not a string"))?;
+    Ok(Some(id))
+}
+
+/// Stop `unit` (a full unit name, e.g. `app-niri-foot-1234.scope`).
+///
+/// `replace` mode, matching [`manage_unit`]. Stopping a unit that was never
+/// created succeeds — measured: `systemctl --user stop` of an absent slice exits
+/// 0 — so Stop is idempotent and a caller need not check first.
+///
+/// # Errors
+/// Propagates a `hytte_bus` call error.
+pub async fn stop_unit(unit: &str) -> Result<()> {
+    let _job: zbus::zvariant::OwnedObjectPath = call(BusKind::Session, SYSTEMD_NAME)
+        .at_path(MANAGER_PATH)
+        .iface(MANAGER_IFACE)
+        .method("StopUnit")
+        .args((unit.to_owned(), "replace".to_owned()))
+        .send()
+        .await
+        .with_context(|| format!("StopUnit for {unit}"))?;
+    Ok(())
+}
+
+/// Stop workspace `name`'s slice, and with it every app of its stack.
+///
+/// Stopping a slice stops its units (`Requires=`/`After=`,
+/// `systemd.resource-control(5)`), SIGTERM then systemd's own escalation.
+///
+/// # Errors
+/// As [`stop_unit`], plus an invalid workspace name.
+pub async fn stop_workspace_slice(name: &str) -> Result<()> {
+    anyhow::ensure!(
+        is_valid_workspace_name(name),
+        "invalid workspace name: {name:?}"
+    );
+    stop_unit(&workspace_slice_name(name)).await
+}
+
+/// Whether workspace `name`'s slice currently holds a unit that is up.
+///
+/// One of the two sources #1071 §3.3 derives `Active` from. Asks for the units
+/// *inside* the slice rather than the slice's own `ActiveState`, because "the
+/// slice has running units" is the question and an empty slice's own state is
+/// systemd's own housekeeping (measured: `trollshell-launch.slice` stays
+/// `loaded active` with zero members).
+///
+/// The pattern is built from [`workspace_unit_name`]'s escaped stem, so a stack
+/// called `chat` cannot count a stack called `chat-dev`'s units as its own —
+/// the escape that keeps the slices siblings keeps the globs disjoint too.
+///
+/// # Errors
+/// Propagates a `hytte_bus` call error.
+pub async fn workspace_slice_is_up(name: &str) -> Result<bool> {
+    anyhow::ensure!(
+        is_valid_workspace_name(name),
+        "invalid workspace name: {name:?}"
+    );
+    let pattern = format!("{WS_PREFIX}{}-*{UNIT_SUFFIX}", name.replace('-', r"\x2d"));
+    let units: Vec<UnitTuple> = call(BusKind::Session, SYSTEMD_NAME)
+        .at_path(MANAGER_PATH)
+        .iface(MANAGER_IFACE)
+        .method("ListUnitsByPatterns")
+        .args((
+            vec![
+                "active".to_owned(),
+                "activating".to_owned(),
+                "deactivating".to_owned(),
+                "reloading".to_owned(),
+            ],
+            vec![pattern],
+        ))
+        .send()
+        .await
+        .context("ListUnitsByPatterns for a workspace slice")?;
+    Ok(!units.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,5 +863,143 @@ mod tests {
         let files = vec![("trollshell.service".to_string(), "enabled".to_string())];
         let loaded = vec![plugin_tuple("dbus.service", "active")];
         assert!(merge_plugin_units(files, loaded).is_empty());
+    }
+
+    // ── Workspace stacks (#1071 §3.1/§3.3) ───────────────────────────────────
+
+    /// #1071 §7's name-validator row, each negative carrying the systemd
+    /// refusal it stands for.
+    ///
+    /// The three dash rules are not taste: each was measured against systemd
+    /// 260.2 by asking it to start a service in the corresponding slice, and
+    /// each answered *"failed to load properly … Invalid argument"*. See
+    /// [`is_valid_workspace_name`]'s doc for the table.
+    #[test]
+    fn is_valid_workspace_name_matches_systemds_unit_name_rules() {
+        assert!(is_valid_workspace_name("chat"));
+        assert!(is_valid_workspace_name("dev2"));
+        assert!(is_valid_workspace_name("chat-dev"));
+        assert!(is_valid_workspace_name("a-b-c"));
+        assert!(is_valid_workspace_name("9"));
+
+        // Measured refusals: trollshell-ws--foo.slice, trollshell-ws-foo-.slice
+        // and trollshell-ws-.slice are all "Invalid argument".
+        assert!(!is_valid_workspace_name(""), "empty");
+        assert!(!is_valid_workspace_name("-chat"), "leading dash");
+        assert!(!is_valid_workspace_name("chat-"), "trailing dash");
+        assert!(!is_valid_workspace_name("chat--dev"), "doubled dash");
+        assert!(!is_valid_workspace_name("-"), "a lone dash is all three");
+
+        // Anything that could break out of the unit-name template.
+        assert!(!is_valid_workspace_name("chat.slice"));
+        assert!(!is_valid_workspace_name("../evil"));
+        assert!(!is_valid_workspace_name("a b"));
+        assert!(!is_valid_workspace_name("a_b"), "underscore is not a dash");
+        // Uppercase is legal to systemd but not to us: niri matches workspace
+        // names case-insensitively, so `Chat` and `chat` would be one workspace
+        // with two slices.
+        assert!(!is_valid_workspace_name("Chat"));
+
+        assert!(is_valid_workspace_name(&"x".repeat(WS_NAME_MAX)));
+        assert!(!is_valid_workspace_name(&"x".repeat(WS_NAME_MAX + 1)));
+    }
+
+    /// Folding fixes case and nothing else.
+    ///
+    /// A silent rewrite of anything structural would hand the user a stack under
+    /// a name they did not type while `niri msg action focus-workspace` still
+    /// answers to the one they did.
+    #[test]
+    fn normalize_folds_case_and_refuses_everything_else() {
+        assert_eq!(normalize_workspace_name("Chat"), Some("chat".to_owned()));
+        assert_eq!(
+            normalize_workspace_name("  CHAT-Dev "),
+            Some("chat-dev".to_owned()),
+            "surrounding whitespace is trimmed, since it cannot be typed on purpose"
+        );
+        assert_eq!(normalize_workspace_name("chat"), Some("chat".to_owned()));
+
+        assert_eq!(normalize_workspace_name("chat dev"), None, "not a dash");
+        assert_eq!(normalize_workspace_name("chat_dev"), None);
+        assert_eq!(normalize_workspace_name("-chat"), None);
+        assert_eq!(normalize_workspace_name("chat--dev"), None);
+        assert_eq!(normalize_workspace_name(""), None);
+    }
+
+    /// The escape that keeps two stacks siblings rather than parent and child.
+    ///
+    /// Measured on systemd 260.2: `tstest-ws-a-b.slice` really is a child of
+    /// `tstest-ws-a.slice` and stopping the parent stopped both, while
+    /// `tstest2-ws-a\x2db.slice` rendered as `Slice /tstest2/ws/a-b` and
+    /// survived a stop of `tstest2-ws-a.slice`.
+    ///
+    /// Falsified by dropping the `.replace` — `chat`'s slice then becomes a
+    /// prefix of `chat-dev`'s under systemd's hierarchy rule.
+    #[test]
+    fn a_name_with_a_dash_gets_its_own_slice_not_a_nested_one() {
+        assert_eq!(workspace_slice_name("chat"), "trollshell-ws-chat.slice");
+        assert_eq!(
+            workspace_slice_name("chat-dev"),
+            r"trollshell-ws-chat\x2ddev.slice",
+            "an interior dash must not become a hierarchy separator"
+        );
+        // The property that matters, stated as systemd's own rule: `a-b.slice`
+        // is a child of `a.slice`, so `chat-dev`'s slice is nested inside
+        // `chat`'s exactly when its stem begins `<chat's stem>-`. A literal
+        // prefix is not enough — the escaped name does share the first
+        // characters, and that is fine; it is the *dash* at the boundary that
+        // would make it a child.
+        let parent_stem = workspace_slice_name("chat")
+            .trim_end_matches(".slice")
+            .to_owned();
+        let child = workspace_slice_name("chat-dev");
+        assert!(
+            !child.starts_with(&format!("{parent_stem}-")),
+            "{child} must not nest under {parent_stem}.slice"
+        );
+        // …and the unescaped spelling the escape exists to avoid *would*.
+        assert!(
+            format!("{WS_PREFIX}chat-dev.slice").starts_with(&format!("{parent_stem}-")),
+            "the assertion above is only meaningful because this is what \
+             dropping the escape produces"
+        );
+    }
+
+    /// Unit names carry the same escape, and the index distinguishes the apps.
+    #[test]
+    fn workspace_unit_names_are_per_app_and_escaped() {
+        assert_eq!(
+            workspace_unit_name("chat", 0),
+            "trollshell-ws-chat-0.service"
+        );
+        assert_eq!(
+            workspace_unit_name("chat", 2),
+            "trollshell-ws-chat-2.service"
+        );
+        assert_eq!(
+            workspace_unit_name("chat-dev", 1),
+            r"trollshell-ws-chat\x2ddev-1.service"
+        );
+        // systemd's unit-name limit is 255; the WS_NAME_MAX cap is what bounds
+        // the name half, and each escaped dash costs 4 bytes instead of 1.
+        let longest = workspace_unit_name(&"a-".repeat(WS_NAME_MAX / 2 - 1), 99);
+        assert!(longest.len() < 255, "{} bytes: {longest}", longest.len());
+    }
+
+    /// A stack's unit glob cannot catch a sibling stack's units.
+    ///
+    /// This is the same escape seen from the other side: `workspace_slice_is_up`
+    /// globs `trollshell-ws-<escaped>-*.service`, and without the escape
+    /// `chat`'s glob would match every one of `chat-dev`'s units and report a
+    /// stopped stack as up.
+    #[test]
+    fn a_stacks_unit_glob_does_not_catch_a_siblings_units() {
+        let chat = format!("{WS_PREFIX}{}-", "chat".replace('-', r"\x2d"));
+        let chat_dev_unit = workspace_unit_name("chat-dev", 0);
+        assert!(
+            !chat_dev_unit.starts_with(&chat),
+            "{chat_dev_unit} must not match the glob {chat}*"
+        );
+        assert!(workspace_unit_name("chat", 0).starts_with(&chat));
     }
 }

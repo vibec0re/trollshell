@@ -19,7 +19,7 @@
 use anyhow::{Context, Result, anyhow};
 use futures_signals::signal::{Mutable, Signal};
 use hytte_reactive::{Service, registry, runtime, spawn_supervised_blocking};
-use niri_ipc::{Action, Event, Request, Response, WorkspaceReferenceArg, socket::Socket};
+use niri_ipc::{Action, Event, Reply, Request, Response, WorkspaceReferenceArg, socket::Socket};
 use std::thread;
 use std::time::Duration;
 
@@ -546,6 +546,213 @@ fn send_action(action: Action) {
     });
 }
 
+// ── Batched, id-addressed actions (#1071 §3.4) ───────────────────────────────
+
+/// One step of a niri batch, addressed by **id**.
+///
+/// A deliberately narrower vocabulary than [`niri_ipc::Action`]. Almost every
+/// id-addressed action in niri-ipc 26.4 spells its target `Option<u64>`, where
+/// `None` means *the focused one* — `CloseWindow { id: None }` closes whatever
+/// happens to be focused, `SetWorkspaceName { workspace: None }` names whatever
+/// workspace happens to be active. #1071's claim check found that a Start built
+/// out of those is a race against the user's own focus, so the target is
+/// **mandatory here**: the wrong spelling is unrepresentable rather than a
+/// comment asking the next caller not to write it.
+///
+/// It also keeps `niri-ipc` out of the shell binary, the same way the crate
+/// graph keeps `gtk` out — the binary names `WorkspaceAction`, never `Action`.
+///
+/// Lowered to real niri actions by [`lower`], which is the one place a target
+/// could be dropped and is unit-tested for exactly that.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkspaceAction {
+    /// Give workspace `workspace` the name `name`.
+    ///
+    /// **niri silently does nothing if the name is already taken** (measured on
+    /// 26.4; `find_workspace_by_name` matches case-insensitively and the action
+    /// returns `Handled` either way). So a caller must read the workspace list
+    /// back and verify rather than assume — see [`query_workspaces`].
+    SetName { workspace: u64, name: String },
+    /// Remove workspace `workspace`'s name, freeing it for the next
+    /// [`Self::SetName`] (#1071 §3.4's housekeeping).
+    UnsetName { workspace: u64 },
+    /// Focus workspace `workspace`. New windows open on the focused workspace,
+    /// so a launch batch leads with this.
+    Focus { workspace: u64 },
+    /// Move window `window` to workspace `workspace`, taking focus with it.
+    MoveWindow { window: u64, workspace: u64 },
+    /// Close window `window`.
+    CloseWindow { window: u64 },
+}
+
+/// [`WorkspaceAction`] as the `niri-ipc` action it sends.
+///
+/// The one seam where a mandatory id becomes niri's optional one, so it is the
+/// one place that could reintroduce "whatever is focused" — hence pure, and
+/// pinned by [`tests::every_action_names_its_target`].
+fn lower(action: WorkspaceAction) -> Action {
+    match action {
+        WorkspaceAction::SetName { workspace, name } => Action::SetWorkspaceName {
+            name,
+            workspace: Some(WorkspaceReferenceArg::Id(workspace)),
+        },
+        WorkspaceAction::UnsetName { workspace } => Action::UnsetWorkspaceName {
+            reference: Some(WorkspaceReferenceArg::Id(workspace)),
+        },
+        WorkspaceAction::Focus { workspace } => Action::FocusWorkspace {
+            reference: WorkspaceReferenceArg::Id(workspace),
+        },
+        WorkspaceAction::MoveWindow { window, workspace } => Action::MoveWindowToWorkspace {
+            window_id: Some(window),
+            reference: WorkspaceReferenceArg::Id(workspace),
+            focus: true,
+        },
+        WorkspaceAction::CloseWindow { window } => Action::CloseWindow { id: Some(window) },
+    }
+}
+
+/// One niri connection, reusable for many request/reply round trips.
+///
+/// `Socket::send` already takes `&mut self` and niri answers one reply per
+/// non-`EventStream` request, so a connection is a sequence — which is exactly
+/// what a batch needs and what [`send_action`]'s connect-per-action shape
+/// cannot give.
+trait Conn {
+    fn send(&mut self, request: Request) -> Result<Reply, String>;
+}
+
+/// Opens [`Conn`]s.
+///
+/// The seam that makes a batch testable without a socket — and, more to the
+/// point, the seam that lets a test **count connections**, which is the only way
+/// to assert #1071 §3.4's "one socket, in order" as a property rather than as a
+/// comment. A `Conn`-only seam could not tell a batch from five separate sends.
+trait Connector {
+    fn connect(&mut self) -> Result<Box<dyn Conn>, String>;
+}
+
+struct SocketConn(Socket);
+
+impl Conn for SocketConn {
+    fn send(&mut self, request: Request) -> Result<Reply, String> {
+        self.0.send(request).map_err(|e| format!("niri ipc: {e}"))
+    }
+}
+
+struct SocketConnector;
+
+impl Connector for SocketConnector {
+    fn connect(&mut self) -> Result<Box<dyn Conn>, String> {
+        Socket::connect()
+            .map(|s| Box::new(SocketConn(s)) as Box<dyn Conn>)
+            .map_err(|e| format!("cannot reach niri over $NIRI_SOCKET: {e}"))
+    }
+}
+
+/// Send `actions` over **one** connection, in order, checking every reply.
+///
+/// Pure over the [`Connector`] seam. Three properties, each of which
+/// [`send_action`] lacks and #1071 §3.4 needs:
+///
+/// 1. **One connection.** `connect` is called at most once, so the actions
+///    cannot interleave with another caller's the way five independent
+///    `spawn_blocking` connects can.
+/// 2. **In order, fail-fast.** A refused action stops the batch; the remaining
+///    actions are not sent. A Start that could not name its workspace must not
+///    go on to launch apps onto someone else's.
+/// 3. **Every reply checked** — including niri's *inner* refusal
+///    ([`Reply`] is `Result<Response, String>`), which `send_action` drops on
+///    the floor.
+///
+/// An empty batch connects nothing and succeeds.
+fn send_actions_over(
+    connector: &mut impl Connector,
+    actions: Vec<WorkspaceAction>,
+) -> Result<(), String> {
+    if actions.is_empty() {
+        return Ok(());
+    }
+    let mut conn = connector.connect()?;
+    for action in actions {
+        let described = format!("{action:?}");
+        match conn.send(Request::Action(lower(action)))? {
+            Ok(_) => {}
+            Err(refusal) => return Err(format!("niri refused {described}: {refusal}")),
+        }
+    }
+    Ok(())
+}
+
+/// One query over a fresh connection, with both reply layers checked.
+fn query_over<T>(
+    connector: &mut impl Connector,
+    request: Request,
+    extract: impl FnOnce(Response) -> Option<T>,
+) -> Result<T, String> {
+    let described = format!("{request:?}");
+    let mut conn = connector.connect()?;
+    match conn.send(request)? {
+        Ok(response) => extract(response).ok_or_else(|| format!("unexpected reply to {described}")),
+        Err(refusal) => Err(format!("niri refused {described}: {refusal}")),
+    }
+}
+
+/// Send `actions` to niri in order, over one socket, checking every reply
+/// (#1071 §3.4).
+///
+/// Runs the blocking socket work on the tokio runtime's blocking pool and
+/// `await`s it, so the caller learns whether the batch landed — unlike
+/// [`focus_workspace`] and its fire-and-forget siblings, which cannot.
+///
+/// # Errors
+/// The socket could not be opened, a reply could not be read, or niri refused
+/// one of the actions (naming which).
+pub async fn send_actions(actions: Vec<WorkspaceAction>) -> Result<(), String> {
+    runtime::handle()
+        .spawn_blocking(move || send_actions_over(&mut SocketConnector, actions))
+        .await
+        .map_err(|e| format!("niri batch task failed: {e}"))?
+}
+
+/// niri's workspace list, read **directly** rather than off [`workspaces()`].
+///
+/// The read-back #1071 §3.4 verifies a `SetName` with. The signal is fed by the
+/// event stream, so reading it would mean waiting for a `WorkspacesChanged` to
+/// arrive and could not distinguish "the name did not land" from "the event has
+/// not arrived yet"; a direct query answers as of now. It is also reachable from
+/// a tokio task, which the thread-local registry the signal lives in is not.
+///
+/// # Errors
+/// As [`send_actions`], plus a reply that was not a workspace list.
+pub async fn query_workspaces() -> Result<Vec<Workspace>, String> {
+    runtime::handle()
+        .spawn_blocking(|| {
+            query_over(&mut SocketConnector, Request::Workspaces, |r| match r {
+                Response::Workspaces(w) => Some(w),
+                _ => None,
+            })
+        })
+        .await
+        .map_err(|e| format!("niri workspaces task failed: {e}"))?
+}
+
+/// niri's window list, read directly — see [`query_workspaces`] for why a
+/// transaction running on the runtime cannot use the signal.
+///
+/// # Errors
+/// As [`query_workspaces`].
+pub async fn query_windows() -> Result<Vec<Window>, String> {
+    runtime::handle()
+        .spawn_blocking(|| {
+            query_over(&mut SocketConnector, Request::Windows, |r| match r {
+                Response::Windows(w) => Some(w),
+                _ => None,
+            })
+        })
+        .await
+        .map_err(|e| format!("niri windows task failed: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -942,5 +1149,267 @@ mod tests {
         let list = casts.lock_ref();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].stream_id, 2);
+    }
+
+    // ── Batched, id-addressed actions (#1071 §3.4) ───────────────────────────
+
+    /// A scripted niri: records every request, tagged with the **connection**
+    /// it arrived on, and answers from a queued script.
+    ///
+    /// The connection tag is the point. #1071 §3.4's requirement is not "these
+    /// actions were sent" but "these actions were sent *over one socket, in
+    /// order*", and a fake that only saw requests could not tell the two apart.
+    #[derive(Default)]
+    struct Script {
+        /// `(connection index, request)`, in arrival order.
+        seen: Vec<(usize, Request)>,
+        /// How many times a connection was opened.
+        connects: usize,
+        /// Replies, consumed in order. Exhausted → `Ok(Response::Handled)`.
+        replies: std::collections::VecDeque<Reply>,
+        /// When set, `connect` fails with it instead of opening anything.
+        connect_error: Option<String>,
+        /// When set, the first `send` fails at the transport layer with it.
+        transport_error: Option<String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct Fake(std::rc::Rc<std::cell::RefCell<Script>>);
+
+    struct FakeConn {
+        script: std::rc::Rc<std::cell::RefCell<Script>>,
+        index: usize,
+    }
+
+    impl Conn for FakeConn {
+        fn send(&mut self, request: Request) -> Result<Reply, String> {
+            let mut script = self.script.borrow_mut();
+            script.seen.push((self.index, request));
+            if let Some(err) = script.transport_error.take() {
+                return Err(err);
+            }
+            Ok(script.replies.pop_front().unwrap_or(Ok(Response::Handled)))
+        }
+    }
+
+    impl Connector for Fake {
+        fn connect(&mut self) -> Result<Box<dyn Conn>, String> {
+            let mut script = self.0.borrow_mut();
+            if let Some(err) = script.connect_error.take() {
+                return Err(err);
+            }
+            script.connects += 1;
+            let index = script.connects - 1;
+            drop(script);
+            Ok(Box::new(FakeConn {
+                script: self.0.clone(),
+                index,
+            }))
+        }
+    }
+
+    impl Fake {
+        fn connects(&self) -> usize {
+            self.0.borrow().connects
+        }
+
+        /// The actions seen, in arrival order, paired with their connection and
+        /// rendered as the **JSON niri actually receives**.
+        ///
+        /// `niri_ipc::Action` derives no `PartialEq`, so an assertion has to
+        /// pick a representation — and the wire one is the right pick rather
+        /// than a workaround: it is what niri parses, so a niri-ipc upgrade that
+        /// renames a field or changes a tag reds here instead of compiling into
+        /// a request niri silently ignores.
+        fn seen(&self) -> Vec<(usize, String)> {
+            self.0
+                .borrow()
+                .seen
+                .iter()
+                .filter_map(|(conn, request)| match request {
+                    Request::Action(action) => Some((*conn, wire(action))),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn refuse_nth(&self, n: usize, message: &str) {
+            let mut script = self.0.borrow_mut();
+            for _ in 0..n {
+                script.replies.push_back(Ok(Response::Handled));
+            }
+            script.replies.push_back(Err(message.to_owned()));
+        }
+    }
+
+    /// One action as the JSON niri receives — see [`Fake::seen`] for why the
+    /// assertions are stated on the wire rather than on the Rust value.
+    fn wire(action: &Action) -> String {
+        serde_json::to_string(action).expect("an Action serialises")
+    }
+
+    fn batch() -> Vec<WorkspaceAction> {
+        vec![
+            WorkspaceAction::SetName {
+                workspace: 7,
+                name: "chat".to_owned(),
+            },
+            WorkspaceAction::Focus { workspace: 7 },
+            WorkspaceAction::MoveWindow {
+                window: 42,
+                workspace: 7,
+            },
+        ]
+    }
+
+    /// §3.4's first requirement, and the only one a request-only fake could not
+    /// see: the whole batch rides **one** connection, in the order given.
+    ///
+    /// Falsified by connecting per action (`connects` becomes 3) — the
+    /// mutation #1071 §7 names.
+    #[test]
+    fn a_batch_is_one_connection_in_order() {
+        let mut fake = Fake::default();
+        send_actions_over(&mut fake, batch()).expect("the batch lands");
+
+        assert_eq!(fake.connects(), 1, "one socket for the whole batch");
+        let seen = fake.seen();
+        assert!(
+            seen.iter().all(|(conn, _)| *conn == 0),
+            "every action on the same connection: {seen:?}"
+        );
+        assert_eq!(
+            seen.into_iter().map(|(_, a)| a).collect::<Vec<_>>(),
+            vec![
+                r#"{"SetWorkspaceName":{"name":"chat","workspace":{"Id":7}}}"#,
+                r#"{"FocusWorkspace":{"reference":{"Id":7}}}"#,
+                r#"{"MoveWindowToWorkspace":{"window_id":42,"reference":{"Id":7},"focus":true}}"#,
+            ],
+            "in the order given"
+        );
+    }
+
+    /// niri's own refusal is the **inner** `Err` of a `Reply`, which
+    /// `send_action` discards. A batch must stop there and say which action was
+    /// refused — a Start that could not name its workspace must not go on to
+    /// launch apps onto someone else's.
+    #[test]
+    fn a_refused_action_stops_the_batch_and_names_itself() {
+        let mut fake = Fake::default();
+        fake.refuse_nth(1, "no such workspace");
+        let err = send_actions_over(&mut fake, batch()).expect_err("the refusal surfaces");
+
+        assert!(err.contains("no such workspace"), "{err}");
+        assert!(err.contains("Focus"), "names the refused action: {err}");
+        assert_eq!(
+            fake.seen().len(),
+            2,
+            "the third action was never sent: {:?}",
+            fake.seen()
+        );
+    }
+
+    /// A transport failure surfaces too, and also stops the batch.
+    #[test]
+    fn a_transport_failure_stops_the_batch() {
+        let mut fake = Fake::default();
+        fake.0.borrow_mut().transport_error = Some("socket went away".to_owned());
+        let err = send_actions_over(&mut fake, batch()).expect_err("the failure surfaces");
+        assert!(err.contains("socket went away"), "{err}");
+        assert_eq!(fake.seen().len(), 1, "nothing after the failure");
+    }
+
+    /// An unreachable niri fails the batch before anything is sent.
+    #[test]
+    fn an_unopenable_socket_sends_nothing() {
+        let mut fake = Fake::default();
+        fake.0.borrow_mut().connect_error = Some("NIRI_SOCKET is not set".to_owned());
+        let err = send_actions_over(&mut fake, batch()).expect_err("the failure surfaces");
+        assert!(err.contains("NIRI_SOCKET"), "{err}");
+        assert!(fake.seen().is_empty());
+    }
+
+    /// An empty batch opens no socket at all.
+    #[test]
+    fn an_empty_batch_connects_nothing() {
+        let mut fake = Fake::default();
+        send_actions_over(&mut fake, Vec::new()).expect("trivially lands");
+        assert_eq!(fake.connects(), 0);
+    }
+
+    /// The lowering never spells a target `None`, pinned on the **wire**.
+    ///
+    /// `None` means *the focused one* in niri-ipc, and #1071 §3.4's whole point
+    /// is that a Start addressed at "whatever is focused right now" is a race
+    /// against the user. `WorkspaceAction` makes the target mandatory, so
+    /// [`lower`] is the one place it could still be dropped — which is what
+    /// this pins, including §7's named `CloseWindow { id: None }` mutation.
+    ///
+    /// Stated as the JSON niri receives rather than as a Rust value: `Action`
+    /// derives no `PartialEq`, and the wire is the representation that actually
+    /// decides what the compositor does. `{"CloseWindow":{"id":null}}` is a
+    /// *different message* from `{"CloseWindow":{"id":9}}`, and that difference
+    /// is exactly what the mutation introduces.
+    #[test]
+    fn every_action_names_its_target() {
+        assert_eq!(
+            wire(&lower(WorkspaceAction::SetName {
+                workspace: 3,
+                name: "dev".to_owned()
+            })),
+            r#"{"SetWorkspaceName":{"name":"dev","workspace":{"Id":3}}}"#
+        );
+        assert_eq!(
+            wire(&lower(WorkspaceAction::UnsetName { workspace: 3 })),
+            r#"{"UnsetWorkspaceName":{"reference":{"Id":3}}}"#
+        );
+        assert_eq!(
+            wire(&lower(WorkspaceAction::Focus { workspace: 3 })),
+            r#"{"FocusWorkspace":{"reference":{"Id":3}}}"#
+        );
+        assert_eq!(
+            wire(&lower(WorkspaceAction::MoveWindow {
+                window: 9,
+                workspace: 3
+            })),
+            r#"{"MoveWindowToWorkspace":{"window_id":9,"reference":{"Id":3},"focus":true}}"#
+        );
+        // §7: `id: None` here would close the *focused* window instead of the
+        // one the Stop plan named — and would go out as `"id":null`.
+        assert_eq!(
+            wire(&lower(WorkspaceAction::CloseWindow { window: 9 })),
+            r#"{"CloseWindow":{"id":9}}"#
+        );
+    }
+
+    /// A query checks both reply layers and answers as of now.
+    #[test]
+    fn a_query_returns_the_reply_and_rejects_the_wrong_one() {
+        let fake = Fake::default();
+        fake.0
+            .borrow_mut()
+            .replies
+            .push_back(Ok(Response::Workspaces(vec![mk_workspace(
+                1, CONNECTOR, true,
+            )])));
+        let got = query_over(&mut fake.clone(), Request::Workspaces, |r| match r {
+            Response::Workspaces(w) => Some(w),
+            _ => None,
+        })
+        .expect("the list comes back");
+        assert_eq!(got.len(), 1);
+
+        let wrong = Fake::default();
+        wrong
+            .0
+            .borrow_mut()
+            .replies
+            .push_back(Ok(Response::Handled));
+        let err = query_over(&mut wrong.clone(), Request::Workspaces, |r| match r {
+            Response::Workspaces(w) => Some(w),
+            _ => None,
+        })
+        .expect_err("a reply of the wrong shape is an error, not an empty list");
+        assert!(err.contains("unexpected reply"), "{err}");
     }
 }

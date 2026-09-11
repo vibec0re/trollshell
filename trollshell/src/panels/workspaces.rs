@@ -38,22 +38,24 @@
 //! workspace's index; the column order itself stays a property of the connector
 //! set.
 //!
-//! ## Dragging a card between columns (§5, phase 3)
+//! ## Dragging a card (§5/§3.6)
 //!
 //! A card's screen is set by **dragging it into another monitor's column** —
 //! there is no monitor field anywhere in the UI, by design (Annika, on the epic
-//! thread). A saved card carries a [`card_drag_source`]; every *connected*
-//! monitor's column carries a [`monitor_drop_target`]; the drop rewrites the
-//! stack's `monitor` in the overlay and, for an Active stack, moves its live
-//! workspace with it. Reordering *within* a column is not this — §5 puts the
-//! card order's drag handles in the phase-4 Edit sub-page.
+//! thread) — and its place in the order by **dragging it onto another card**.
+//! A saved card carries a [`card_drag_source`] and a [`card_drop_target`]; every
+//! *connected* monitor's column carries a [`monitor_drop_target`]. One
+//! [`drop_plan`] decides both halves, so a drop on a card in another column
+//! records the screen **and** the position. Phase 3 shipped the screen half;
+//! the order half is phase 4, which is where §5 puts it.
 //!
-//! ## What is still phase 4
+//! ## Edit (§5/§3.7, phase 4)
 //!
-//! No edit sub-page: the only Edit here is the ephemeral card's inline name
-//! field, and Save takes the **name only** (§3.7) — the apps come from the
-//! workspace as it is right now and everything else is defaulted. The full
-//! form, the desktop-entry picker and `Exec` field-code stripping are phase 4.
+//! Every card — saved or ephemeral — carries an Edit button that opens
+//! [`crate::panels::workspace_edit`] in the same drawer, content replaced.
+//! Phase 2 put an inline name field and a Save button on the ephemeral card
+//! instead; #1109 retired it ("nightmare to render"), so there is nothing
+//! inline on any card and the form is the only editor.
 //!
 //! ## Testability seam
 //!
@@ -72,15 +74,13 @@ use hytte::futures_signals::signal::Signal;
 use hytte::gtk::{self, gdk, glib, pango, prelude::*};
 use hytte::prelude::*;
 use hytte::services::niri::{self, Window, Workspace};
-use hytte::services::systemd;
 
 use crate::components::app_meta::{MetaCache, fallback_icon, resolve_app_meta};
 use crate::components::layout::{
     DRAWER_MAX_WIDTH_WIDE, finish_page_clamped, page_box, toggle_class,
 };
-use crate::config::workspaces::{
-    self as config_workspaces, Stack, StackApp as SavedApp, Workspaces,
-};
+use crate::config::workspaces::{self as config_workspaces, Layout, Workspaces};
+use crate::panels::workspace_edit;
 use crate::workspace_stacks::{self, StackState, state_of};
 
 /// CSS class on an app icon whose app has at least one window open on the
@@ -94,15 +94,21 @@ const APP_IDLE_CLASS: &str = "ts-ws-app-idle";
 /// CSS class on a card that is not on a screen (#1071 §5).
 const CARD_INACTIVE_CLASS: &str = "ts-ws-card-inactive";
 
+/// CSS class on a card the pointer is dragging another card over — the
+/// in-column reorder's landing marker (#1071 §3.6, phase 4).
+const CARD_DROP_CLASS: &str = "ts-ws-card-drop";
+
 /// CSS class on a monitor column the pointer is dragging a card over (#1071 §5).
 const COLUMN_DROP_CLASS: &str = "ts-ws-column-drop";
 
 /// CSS class on a card while it is being dragged.
 const CARD_DRAGGING_CLASS: &str = "ts-ws-card-dragging";
 
-/// Tooltip on a saved card, since a drag is the only affordance for the screen
-/// a stack lives on (§5 has no monitor field, by design).
-const DRAG_HINT: &str = "Drag this card to another screen's column to move it there.";
+/// Tooltip on a saved card, since a drag is the only affordance for either
+/// thing it can change: the screen a stack lives on (§5 has no monitor field, by
+/// design) and where it sits among its neighbours (§3.6).
+const DRAG_HINT: &str = "Drag this card onto another card to reorder it, or into another screen's \
+                         column to move it there.";
 
 /// Design-baseline height cap for one monitor's card list, in CSS px, before
 /// [`crate::scale::scale`]. Sized like `panels::connections`' list scroller —
@@ -128,50 +134,6 @@ const INACTIVE_HINT: &str = "Not on a screen";
 const OFFLINE_COLUMN_HINT: &str =
     "These stacks name a screen that is not connected. Starting one puts it on the focused screen.";
 
-/// The Save field's placeholder.
-const SAVE_PLACEHOLDER: &str = "Name this workspace\u{2026}";
-
-/// Shown on the Save field when the typed name cannot be a workspace name.
-const NAME_HINT: &str = "Lowercase letters, digits and single dashes — no leading, \
-                         trailing or doubled dash, at most 32 characters.";
-
-/// The rule, plus — when there is one — the name the typed one would become.
-///
-/// §3.1 asks the Save entry to "offer the sanitised form". `normalize` only
-/// folds case, deliberately, so the suggestion is computed separately and
-/// *offered* rather than applied: a silent rewrite would hand the user a stack
-/// under a name they did not type, while `niri msg action focus-workspace` still
-/// answers to the one they did.
-fn name_hint(typed: &str) -> String {
-    match sanitise(typed) {
-        Some(suggestion) => format!("{NAME_HINT}\n\nTry \u{201c}{suggestion}\u{201d}."),
-        None => NAME_HINT.to_owned(),
-    }
-}
-
-/// The typed text as the nearest usable workspace name, or `None` when there is
-/// nothing left to suggest.
-///
-/// Lowercase, runs of anything-but-`[a-z0-9]` collapsed to one dash, trimmed of
-/// leading and trailing dashes, clipped to the length the validator allows —
-/// which is exactly the shape [`systemd::is_valid_workspace_name`] accepts, so
-/// the suggestion is always one the field will take.
-fn sanitise(typed: &str) -> Option<String> {
-    let mut out = String::new();
-    for ch in typed.trim().chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else if !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    let trimmed = out.trim_matches('-');
-    // 32 is the validator's cap; clipping can leave a trailing dash, so trim
-    // again rather than assume.
-    let clipped = trimmed.get(..trimmed.len().min(32)).unwrap_or(trimmed);
-    let candidate = clipped.trim_matches('-');
-    (!candidate.is_empty() && candidate != typed).then(|| candidate.to_owned())
-}
 /// One app in a card's stack row.
 ///
 /// Identified by its `app_id` (what niri reports per window, and what #1071
@@ -199,7 +161,21 @@ enum Kind {
     /// Carries the niri workspace id because Save has to **name that
     /// workspace**, not merely write a file: §3.7's *"the batch names the niri
     /// workspace immediately, so the saved workspace is the Active card"*.
-    Ephemeral { workspace: u64 },
+    Ephemeral {
+        workspace: u64,
+        /// The connector the workspace is on — §3.7's *"record the monitor"*.
+        /// Taken from the workspace rather than from the column so a Save writes
+        /// the screen niri says it is on, not the one the page drew it in.
+        output: String,
+        /// Its windows, in niri's column order: `(app_id, pid)`.
+        ///
+        /// The pid is what §3.7's *"an `app_id` with no entry becomes an app
+        /// with `exec` = the process's command line"* needs, and it has to come
+        /// from **this** snapshot: by the time the Edit form opens, the window
+        /// may be gone, and a `/proc` read against a recycled pid would prefill
+        /// somebody else's command line.
+        windows: Vec<(String, Option<i32>)>,
+    },
 }
 
 /// One card.
@@ -262,8 +238,38 @@ struct Column {
     cards: Vec<Card>,
 }
 
+impl Column {
+    /// The connector a drop landing in this column may record — `None` for the
+    /// trailing "not connected" one (review HIGH 1).
+    ///
+    /// A method rather than an inline `(!offline).then_some(…)` at the one call
+    /// site so the choice is falsifiable: `drop_plan` being right about `None`
+    /// is no help if the thing that decides `None` is untested, and the first
+    /// cut of this fix passed its own `drop_plan` test with the wiring still
+    /// handing `OFFLINE_COLUMN` through.
+    fn drop_connector(&self) -> Option<&str> {
+        (!self.offline).then_some(self.connector.as_str())
+    }
+}
+
 /// Heading of the trailing column for stacks whose monitor is absent.
 const OFFLINE_COLUMN: &str = "Not connected";
+
+/// The whole page: the columns, plus the card order the page is showing.
+///
+/// The order is carried alongside rather than read back off the columns because
+/// the columns have **lost** it: they are grouped by monitor, and `order` is one
+/// flat array across every screen (#1071 §4). Concatenating the columns would
+/// yield a per-monitor order, which is exactly the "global rewrite" a drop must
+/// not perform — dragging a card inside DP-1's column would silently reshuffle
+/// HDMI-A-1's cards in the file.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PageModel {
+    columns: Vec<Column>,
+    /// Every saved stack's name, in the order the file puts them — which is
+    /// what a reorder rewrites.
+    order: Vec<String>,
+}
 
 /// The page's whole model, from one snapshot. Pure — no GTK, no registry.
 ///
@@ -289,13 +295,13 @@ fn model(
     saved: &Workspaces,
     slices_up: &BTreeSet<String>,
     starting: &BTreeSet<String>,
-) -> Vec<Column> {
+) -> PageModel {
     let connected: BTreeSet<&str> = workspaces
         .iter()
         .filter_map(|w| w.output.as_deref())
         .collect();
     if connected.is_empty() {
-        return Vec::new();
+        return PageModel::default();
     }
     let focused = workspaces
         .iter()
@@ -313,7 +319,8 @@ fn model(
 
     // Saved stacks first, in the file's order, so an Inactive one keeps its
     // place among the Active ones.
-    for name in saved.names_in_order() {
+    let order = saved.names_in_order();
+    for name in order.clone() {
         let Some(stack) = saved.stacks.get(&name) else {
             continue;
         };
@@ -356,43 +363,8 @@ fn model(
         }
     }
 
-    // Then the ephemeral ones — an unnamed workspace with windows on it. An
-    // unnamed *empty* workspace is niri's trailing spare, not a card; a named
-    // workspace that no stack knows about is the user's own and is left alone.
-    let mut ephemeral: Vec<&Workspace> = workspaces
-        .iter()
-        .filter(|w| w.name.is_none())
-        .filter(|w| windows.iter().any(|win| win.workspace_id == Some(w.id)))
-        .collect();
-    ephemeral.sort_by_key(|w| w.idx);
-    for workspace in ephemeral {
-        let Some(output) = workspace.output.as_deref() else {
-            continue;
-        };
-        by_output.entry(output).or_default().push(Card {
-            name: String::new(),
-            kind: Kind::Ephemeral {
-                workspace: workspace.id,
-            },
-            // `ordered_app_ids`, **not** `open_app_ids`: this list is what a
-            // Save records, and #1071 §3.4 step 3 makes the stack's order be
-            // niri's column order. Collecting through a `BTreeSet` here (as this
-            // did) silently sorted it lexicographically, which is the input
-            // `workspace_stacks::column_order_batch` would then have restored
-            // wrongly.
-            apps: ordered_app_ids(workspace.id, windows)
-                .into_iter()
-                .map(|app_id| StackApp {
-                    app_id: app_id.to_owned(),
-                    running: true,
-                })
-                .collect(),
-            // Deliberately `None`: an ephemeral card has no entry in the file,
-            // so there is nothing for a drag to rewrite. Its workspace id lives
-            // on `Kind::Ephemeral`, where Save uses it.
-            live: None,
-            monitor: None,
-        });
+    for (output, card) in ephemeral_cards(workspaces, windows) {
+        by_output.entry(output).or_default().push(card);
     }
 
     let mut columns: Vec<Column> = by_output
@@ -410,7 +382,62 @@ fn model(
             cards: offline,
         });
     }
-    columns
+    PageModel { columns, order }
+}
+
+/// The ephemeral cards — an unnamed workspace with windows on it — paired with
+/// the connector each belongs in (#1071 §3.7).
+///
+/// An unnamed *empty* workspace is niri's trailing spare, not a card; a named
+/// workspace that no stack knows about is the user's own and is left alone.
+fn ephemeral_cards<'w>(workspaces: &'w [Workspace], windows: &[Window]) -> Vec<(&'w str, Card)> {
+    let mut unnamed: Vec<&Workspace> = workspaces
+        .iter()
+        .filter(|w| w.name.is_none())
+        .filter(|w| windows.iter().any(|win| win.workspace_id == Some(w.id)))
+        .collect();
+    unnamed.sort_by_key(|w| w.idx);
+    unnamed
+        .into_iter()
+        .filter_map(|workspace| {
+            let output = workspace.output.as_deref()?;
+            let on_workspace = ordered_windows(workspace.id, windows);
+            Some((
+                output,
+                Card {
+                    name: String::new(),
+                    kind: Kind::Ephemeral {
+                        workspace: workspace.id,
+                        output: output.to_owned(),
+                        windows: on_workspace
+                            .iter()
+                            .map(|(app_id, pid)| ((*app_id).to_owned(), *pid))
+                            .collect(),
+                    },
+                    // In **niri's column order**, not a set: this list is what a
+                    // Save records, and #1071 §3.4 step 3 makes the stack's
+                    // order be the column order. Collecting through a
+                    // `BTreeSet` here (as this once did) silently sorted it
+                    // lexicographically, which is the input
+                    // `workspace_stacks::column_order_batch` would then have
+                    // restored wrongly.
+                    apps: on_workspace
+                        .iter()
+                        .map(|(app_id, _)| StackApp {
+                            app_id: (*app_id).to_owned(),
+                            running: true,
+                        })
+                        .collect(),
+                    // Deliberately `None`: an ephemeral card has no entry in the
+                    // file, so there is nothing for a drag to rewrite. Its
+                    // workspace id lives on `Kind::Ephemeral`, where Save uses
+                    // it.
+                    live: None,
+                    monitor: None,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// The workspace carrying `name`, matched the way niri matches it — case
@@ -438,6 +465,23 @@ fn open_app_ids(workspace_id: u64, windows: &[Window]) -> BTreeSet<&str> {
 /// step 3 makes that order niri's column order, so recording it in column order
 /// is what makes a Start reproduce what was saved).
 fn ordered_app_ids(workspace_id: u64, windows: &[Window]) -> Vec<&str> {
+    ordered_windows(workspace_id, windows)
+        .into_iter()
+        .map(|(app_id, _)| app_id)
+        .collect()
+}
+
+/// [`ordered_app_ids`], keeping each app's **pid** alongside its id.
+///
+/// The pid is §3.7's other half: an `app_id` that resolves to no desktop entry
+/// is saved with `exec` = the running process's command line, which needs a pid
+/// to read. Taken from the same snapshot as everything else on the card, because
+/// a pid resolved later may have been recycled onto somebody else's process.
+///
+/// Deduped by app-id, first (leftmost column) wins — the same rule
+/// `ordered_app_ids` applies, since the two must agree about which window an app
+/// is represented by.
+fn ordered_windows(workspace_id: u64, windows: &[Window]) -> Vec<(&str, Option<i32>)> {
     let mut on_workspace: Vec<&Window> = windows
         .iter()
         .filter(|w| w.workspace_id == Some(workspace_id))
@@ -459,7 +503,7 @@ fn ordered_app_ids(workspace_id: u64, windows: &[Window]) -> Vec<&str> {
         .into_iter()
         .filter_map(|w| {
             let app_id = w.app_id.as_deref()?;
-            seen.insert(app_id).then_some(app_id)
+            seen.insert(app_id).then_some((app_id, w.pid))
         })
         .collect()
 }
@@ -508,8 +552,10 @@ where
     // *inputs* cannot be deduped — but the model can, and it is what the
     // rebuild costs. Without this every window-title change on any workspace
     // tears down and rebuilds every card on every monitor. It also matters more
-    // in phase 2 than in phase 1: a rebuild now discards a half-typed name in an
-    // ephemeral card's Save field, and the slice poll ticks every three seconds.
+    // in phase 2 than in phase 1: the slice poll ticks every three seconds and
+    // a rebuild tears down every card on every monitor. (Since #1109 there is no
+    // half-typed name on a card to lose — the Edit form holds its own draft and
+    // is not rebound to any of this; see `panels::workspace_edit`'s module doc.)
     .dedupe_cloned();
 
     bind_columns(&columns_box, combined);
@@ -534,36 +580,32 @@ where
 /// `bind-pins` check (#831) enforces at the source level.
 fn bind_columns<S>(columns_box: &gtk::Box, model: S)
 where
-    S: Signal<Item = Vec<Column>> + 'static,
+    S: Signal<Item = PageModel> + 'static,
 {
     // One cache for the whole page: an app on two workspaces costs one
     // `AppInfo::all()` scan, not one per card. Lives as long as the binding.
     let meta_cache: MetaCache = Rc::new(RefCell::new(HashMap::new()));
-    bind(model, columns_box, move |columns_box, columns| {
+    bind(model, columns_box, move |columns_box, page| {
         while let Some(child) = columns_box.first_child() {
             columns_box.remove(&child);
         }
-        if columns.is_empty() {
+        if page.columns.is_empty() {
             columns_box.append(&hint(NO_OUTPUTS_HINT));
             return;
         }
-        // A card dropped on a column may have come from **any** column, so the
-        // "does this stack have a live workspace to move too" answer has to be
-        // page-wide rather than per column. Rebuilt with the model, so it is
-        // never more than one revision old — the same currency every other
-        // handler on this page has.
-        let droppable = Rc::new(droppable_cards(&columns));
-        for column in &columns {
-            columns_box.append(&build_column(column, &meta_cache, &droppable));
+        // A card dropped on a column or on another card may have come from
+        // **any** column, so the facts a drop decides from have to be page-wide
+        // rather than per column. Rebuilt with the model, so it is never more
+        // than one revision old — the same currency every other handler on this
+        // page has.
+        let context = Rc::new(drop_context(&page));
+        for column in &page.columns {
+            columns_box.append(&build_column(column, &meta_cache, &context));
         }
     });
 }
 
-fn build_column(
-    column: &Column,
-    meta_cache: &MetaCache,
-    droppable: &Rc<BTreeMap<String, Droppable>>,
-) -> gtk::Widget {
+fn build_column(column: &Column, meta_cache: &MetaCache, context: &Rc<DropContext>) -> gtk::Widget {
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 8);
     outer.add_css_class("ts-ws-column");
     outer.set_hexpand(true);
@@ -588,8 +630,12 @@ fn build_column(
     if column.cards.is_empty() {
         cards.append(&hint(EMPTY_COLUMN_HINT));
     } else {
+        // `None` for the offline column: its heading is not a connector (review
+        // HIGH 1). `drop_plan` then declines the monitor half and keeps the
+        // reorder one.
+        let connector = column.drop_connector();
         for card in &column.cards {
-            cards.append(&build_card(card, meta_cache));
+            cards.append(&build_card(card, meta_cache, connector, context));
         }
     }
 
@@ -626,7 +672,7 @@ fn build_column(
     // screen, so there is no connector to record and nowhere for niri to move a
     // workspace to.
     if !column.offline {
-        outer.add_controller(monitor_drop_target(&column.connector, droppable));
+        outer.add_controller(monitor_drop_target(&column.connector, context));
     }
 
     outer.upcast()
@@ -641,10 +687,7 @@ fn build_column(
 ///
 /// `gdk::DragAction::MOVE` rather than `COPY`, which is what it is: a stack
 /// lives on one screen, and the drop moves it rather than duplicating it.
-fn monitor_drop_target(
-    connector: &str,
-    droppable: &Rc<BTreeMap<String, Droppable>>,
-) -> gtk::DropTarget {
+fn monitor_drop_target(connector: &str, context: &Rc<DropContext>) -> gtk::DropTarget {
     let target = gtk::DropTarget::new(glib::types::Type::STRING, gdk::DragAction::MOVE);
     // The highlight is on the *column*, so the user can see which screen the
     // card is about to land on while the pointer is still over the gap between
@@ -661,7 +704,7 @@ fn monitor_drop_target(
         }
     });
     let connector = connector.to_owned();
-    let droppable = droppable.clone();
+    let context = Rc::clone(context);
     target.connect_drop(move |target, value, _, _| {
         if let Some(widget) = target.widget() {
             widget.remove_css_class(COLUMN_DROP_CLASS);
@@ -670,15 +713,69 @@ fn monitor_drop_target(
             return false;
         };
         // Everything the drop decides is in `drop_plan`, and everything it
-        // *does* is the one line below. The handler holds no logic on purpose:
-        // a GTK drop callback cannot be invoked from a test, so any branch left
+        // *does* is `perform_drop`. The handler holds no logic on purpose: a
+        // GTK drop callback cannot be invoked from a test, so any branch left
         // in here is a branch nothing can falsify — which is exactly how the
         // same-screen guard and the Active-workspace hand-off both shipped
         // unfalsifiable in the first cut (#1106 review F5).
-        let Some(action) = drop_plan(&name, &connector, &droppable) else {
+        //
+        // `before: None` — a drop on the column's own background is about the
+        // screen and says nothing about where among the cards it should sit.
+        // This target is only ever attached to a *connected* column, so the
+        // connector is always `Some` here.
+        let Some(action) = drop_plan(&name, Some(&connector), None, &context) else {
             return false;
         };
-        workspace_stacks::spawn_move_to_monitor(action.name, action.monitor, action.workspace);
+        perform_drop(action);
+        true
+    });
+    target
+}
+
+/// A saved card's drop target: the in-column reorder (#1071 §3.6/§5, phase 4).
+///
+/// Phase 3 deliberately shipped without this — its own PR body says *"Dragging a
+/// card up or down within one column does nothing"* — because §5 puts the card
+/// order's handles in this phase. Dropping card A on card B puts A where B is;
+/// dropping it on a card in **another** column does that *and* moves it to that
+/// screen, which is the one case where both halves of [`DropAction`] fire.
+///
+/// The target sits on the card rather than on a thin gap widget between cards
+/// because the cards are the only things the user can aim at, and "drop it on
+/// the card you want to be above" is the rule both halves of a list-reorder drag
+/// can agree on.
+fn card_drop_target(
+    name: &str,
+    connector: Option<&str>,
+    context: &Rc<DropContext>,
+) -> gtk::DropTarget {
+    let target = gtk::DropTarget::new(glib::types::Type::STRING, gdk::DragAction::MOVE);
+    target.connect_enter(|target, _, _| {
+        if let Some(widget) = target.widget() {
+            widget.add_css_class(CARD_DROP_CLASS);
+        }
+        gdk::DragAction::MOVE
+    });
+    target.connect_leave(|target| {
+        if let Some(widget) = target.widget() {
+            widget.remove_css_class(CARD_DROP_CLASS);
+        }
+    });
+    let before = name.to_owned();
+    let connector = connector.map(str::to_owned);
+    let context = Rc::clone(context);
+    target.connect_drop(move |target, value, _, _| {
+        if let Some(widget) = target.widget() {
+            widget.remove_css_class(CARD_DROP_CLASS);
+        }
+        let Ok(dragged) = value.get::<String>() else {
+            return false;
+        };
+        let Some(action) = drop_plan(&dragged, connector.as_deref(), Some(&before), &context)
+        else {
+            return false;
+        };
+        perform_drop(action);
         true
     });
     target
@@ -699,65 +796,161 @@ struct Droppable {
     workspace: Option<u64>,
 }
 
-/// What a drop on a monitor column should do (#1071 §5). Pure.
+/// What a drop should do (#1071 §5). Pure.
+///
+/// Two independent halves, because a drop can do either, both or neither:
+/// dropping a card on another screen's column changes its `monitor`, dropping it
+/// on a card changes the `order`, and dropping it on a card in *another* column
+/// does both. Both `None` is not a `DropAction` at all — see [`drop_plan`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DropAction {
     name: String,
-    monitor: String,
+    /// The screen to record, when the drop changes it.
+    monitor: Option<String>,
+    /// The live workspace to move with it — only ever set alongside `monitor`,
+    /// and only while the stack is Active (phase 3's `workspace_to_move`).
     workspace: Option<u64>,
+    /// The page-wide card order to write, when the drop changes it (#1071 §3.6).
+    order: Option<Vec<String>>,
 }
 
-/// The drop-relevant facts about every card on the page, by stack name.
+/// Everything a drop decides from: the cards, and the order they are in.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DropContext {
+    /// Page-wide rather than per column: a card dropped on a column may have
+    /// come from **any** column. Only saved cards appear — an ephemeral one has
+    /// no entry in the file for a drop to rewrite.
+    cards: BTreeMap<String, Droppable>,
+    /// Every saved stack in the order the file puts them, across every screen.
+    order: Vec<String>,
+}
+
+/// The drop-relevant facts about the whole page.
+fn drop_context(page: &PageModel) -> DropContext {
+    DropContext {
+        cards: page
+            .columns
+            .iter()
+            .flat_map(|c| &c.cards)
+            .filter(|card| matches!(card.kind, Kind::Saved(_)))
+            .map(|card| {
+                (
+                    card.name.clone(),
+                    Droppable {
+                        monitor: card.monitor.clone(),
+                        workspace: card.workspace_to_move(),
+                    },
+                )
+            })
+            .collect(),
+        order: page.order.clone(),
+    }
+}
+
+/// `order` with `name` moved onto the slot `target` currently occupies
+/// (#1071 §3.6).
 ///
-/// Page-wide rather than per column: a card dropped on a column may have come
-/// from **any** column. Only saved cards appear — an ephemeral one has no entry
-/// in the file for a drop to rewrite.
-fn droppable_cards(columns: &[Column]) -> BTreeMap<String, Droppable> {
-    columns
-        .iter()
-        .flat_map(|c| &c.cards)
-        .filter(|card| matches!(card.kind, Kind::Saved(_)))
-        .map(|card| {
-            (
-                card.name.clone(),
-                Droppable {
-                    monitor: card.monitor.clone(),
-                    workspace: card.workspace_to_move(),
-                },
-            )
-        })
-        .collect()
+/// **Remove, then insert at the target's index in the *original* list** — which
+/// is the ordinary "move to index" of a list drag, and reads the way a user
+/// expects in both directions: dragging a card **down** onto its neighbour puts
+/// it after that neighbour, dragging it **up** onto one puts it before. (Taking
+/// the target's index *after* the removal instead would make a one-place
+/// downward drag a no-op, since the card is already immediately before its
+/// successor.)
+///
+/// What it is **not** is "collect this column's names in the new order and
+/// append the rest". `order` is one flat array across every screen (§4), so a
+/// rebuild that grouped by column would reshuffle every *other* monitor's cards
+/// as a side effect of dragging one card inside its own column. Removing one
+/// element and reinserting it is the only rewrite that leaves every other name's
+/// relative position exactly as it was, on every screen, by construction.
+///
+/// `None` when nothing would change — the name is not in the order, the target
+/// is not, or the result equals the input — so an accidental two-pixel drag does
+/// not rewrite `workspaces.toml`.
+fn reorder_onto(order: &[String], name: &str, target: &str) -> Option<Vec<String>> {
+    let from = order.iter().position(|n| n == name)?;
+    let to = order.iter().position(|n| n == target)?;
+    let mut out = order.to_vec();
+    let moved = out.remove(from);
+    // `to` indexes the original list, so after the removal it is at most
+    // `out.len()` — which `Vec::insert` accepts as "append".
+    out.insert(to.min(out.len()), moved);
+    (out != order).then_some(out)
 }
 
-/// Decide a drop of the card `name` onto the column of `connector`.
+/// Decide a drop of the card `name` onto the column of `connector`, optionally
+/// onto the card `before`.
 ///
 /// `None` — nothing to do, which GTK reports back to the drag source as a
-/// refused drop — in exactly two cases:
+/// refused drop — whenever neither half would change anything:
 ///
 /// * the name is not a saved card on this page (an ephemeral card is not
 ///   draggable, so this is a drag from somewhere else entirely);
-/// * the stack **already records this screen**. A card picked up and put back
-///   where it was must not rewrite the config file, or every two-pixel
-///   accidental drag rewrites `workspaces.toml`.
+/// * the stack **already records this screen** and the drop is not on a card, or
+///   is on the card it already sits before. A card picked up and put back where
+///   it was must not rewrite the config file.
 ///
-/// Note what is *not* a reason to refuse: a stack with no `monitor` recorded,
-/// dropped on the column it is currently drawn in. That column is where the
-/// focused output happens to be, not a recorded choice, so the drop is the user
-/// saying "here, always" and it writes.
+/// Note what is *not* a reason to refuse the monitor half: a stack with no
+/// `monitor` recorded, dropped on the column it is currently drawn in. That
+/// column is where the focused output happens to be, not a recorded choice, so
+/// the drop is the user saying "here, always" and it writes.
 fn drop_plan(
     name: &str,
-    connector: &str,
-    droppable: &BTreeMap<String, Droppable>,
+    connector: Option<&str>,
+    before: Option<&str>,
+    context: &DropContext,
 ) -> Option<DropAction> {
-    let card = droppable.get(name)?;
-    if card.monitor.as_deref() == Some(connector) {
+    let card = context.cards.get(name)?;
+    // `connector` is `None` for the trailing "Not connected" column, and that is
+    // the whole of review HIGH 1. That column's heading is the literal string
+    // `OFFLINE_COLUMN`; passing it through as a connector wrote
+    // `monitor = "Not connected"` into `workspaces.toml` — a value no output
+    // will ever match, stranding the card in the greyed column until the file is
+    // hand-edited — and, for an Active stack, sent niri a
+    // `MoveWorkspaceToMonitor { output: "Not connected" }`.
+    //
+    // Phase 3 stated this invariant for the *column* target ("it is not a
+    // screen, so there is no connector to record and nowhere for niri to move a
+    // workspace to"); phase 4's card target routed around it. An `Option` is the
+    // fix rather than a guard because it makes the offline case unrepresentable
+    // at the type level — and it keeps the **reorder** half working there, which
+    // is real: those cards are still ordered.
+    let monitor = connector
+        .filter(|connector| card.monitor.as_deref() != Some(*connector))
+        .map(str::to_owned);
+    // A card dropped on **itself** is not a reorder, and `reorder_onto` would
+    // answer `None` for it anyway — but saying so here keeps the self-drop from
+    // reading as an accident of the pure function.
+    let order = before
+        .filter(|before| *before != name)
+        .and_then(|before| reorder_onto(&context.order, name, before));
+    if monitor.is_none() && order.is_none() {
         return None;
     }
     Some(DropAction {
         name: name.to_owned(),
-        monitor: connector.to_owned(),
-        workspace: card.workspace,
+        // The live workspace rides the monitor half only: there is nothing for
+        // niri to do about a card's position in a list.
+        workspace: monitor.as_ref().and(card.workspace),
+        monitor,
+        order,
     })
+}
+
+/// Perform a decided drop (#1071 §5/§3.6).
+///
+/// The file first, in both halves, for the reason phase 3 states: a write that
+/// failed (a read-only overlay, no `XDG_CONFIG_HOME`) must not leave the
+/// workspace somewhere the file disagrees with, or the card snaps back on the
+/// next poll having moved the user's windows for nothing.
+fn perform_drop(action: DropAction) {
+    if let Some(order) = action.order {
+        workspace_stacks::spawn_set_order(order);
+    }
+    if let Some(monitor) = action.monitor {
+        workspace_stacks::spawn_move_to_monitor(action.name, monitor, action.workspace);
+    }
 }
 
 /// The drag half: a saved card carries its stack's name (#1071 §5).
@@ -796,7 +989,12 @@ fn card_drag_source(name: &str) -> gtk::DragSource {
     source
 }
 
-fn build_card(card: &Card, meta_cache: &MetaCache) -> gtk::Widget {
+fn build_card(
+    card: &Card,
+    meta_cache: &MetaCache,
+    connector: Option<&str>,
+    context: &Rc<DropContext>,
+) -> gtk::Widget {
     // `.ts-panel` is the shell's card surface (`components::layout::section`
     // paints the same one); `.ts-ws-card` is the hook for this page's own
     // spacing and for the greying of a whole Inactive card.
@@ -818,10 +1016,20 @@ fn build_card(card: &Card, meta_cache: &MetaCache) -> gtk::Widget {
     name.set_ellipsize(pango::EllipsizeMode::End);
     header.append(&name);
 
+    // `[start/stop] [edit]`, in Annika's own order (#1109). Every card gets the
+    // Edit button — §3.7 settles that an unnamed workspace is a card like any
+    // other and that **Edit → Save** is what creates its entry; only a saved one
+    // has anything to start or stop.
+    //
+    // Phase 2 put an inline name field and a Save button *on* the ephemeral
+    // card, because there was no form to open yet. #1109 retires it outright —
+    // "nightmare to render", and nothing inline on any card — so there is no
+    // fallback here, just the button.
     match &card.kind {
         Kind::Saved(state) => header.append(&start_stop_button(&card.name, *state)),
         Kind::Ephemeral { .. } => {}
     }
+    header.append(&edit_button(card));
     outer.append(&header);
 
     if let Kind::Saved(StackState::Inactive) = card.kind {
@@ -837,19 +1045,155 @@ fn build_card(card: &Card, meta_cache: &MetaCache) -> gtk::Widget {
     }
     outer.append(&apps);
 
-    if let Kind::Ephemeral { workspace } = card.kind {
-        outer.append(&save_row(card, workspace));
-    }
-
-    // A saved card can be dragged into another screen's column (#1071 §5).
-    // There is no monitor field anywhere in the UI; this *is* the monitor
-    // control, which is Annika's call on the epic thread.
+    // A saved card can be dragged into another screen's column, and — since
+    // phase 4 — onto another card to reorder it (#1071 §5/§3.6). There is no
+    // monitor field anywhere in the UI; this *is* the monitor control, which is
+    // Annika's call on the epic thread.
     if matches!(card.kind, Kind::Saved(_)) {
         outer.set_tooltip_text(Some(DRAG_HINT));
         outer.add_controller(card_drag_source(&card.name));
+        outer.add_controller(card_drop_target(&card.name, connector, context));
     }
 
     outer.upcast()
+}
+
+/// The Edit button — the entry to the #1071 §5 sub-page, on every card.
+///
+/// Builds the whole [`workspace_edit::Draft`] here rather than passing a name,
+/// because *this* is where the three sources have already been joined: the file
+/// says what the stack is, niri says whether it is running and on what, and — for
+/// an ephemeral card — the windows in front of the user are the apps. See
+/// `panels::workspace_edit`'s module doc for why the form does not re-derive
+/// any of it.
+fn edit_button(card: &Card) -> gtk::Button {
+    let button = gtk::Button::from_icon_name("document-edit-symbolic");
+    button.add_css_class("flat");
+    button.add_css_class("ts-ws-edit-open");
+    button.set_tooltip_text(Some(match card.kind {
+        Kind::Saved(_) => "Edit this workspace",
+        Kind::Ephemeral { .. } => "Name and save this workspace",
+    }));
+    let card = card.clone();
+    button.connect_clicked(move |_| {
+        let Some(draft) = draft_for(&card) else {
+            // The stack went out of the file between the model being built and
+            // this click — the file is live-reloaded and the drawer can sit open
+            // across a hand edit. Say so (review LOW 15): returning in silence
+            // leaves the user pressing a dead button.
+            workspace_stacks::report(
+                &card.name,
+                &format!(
+                    "{} is no longer in workspaces.toml, so there is nothing to edit",
+                    card.name
+                ),
+            );
+            return;
+        };
+        // Publish first, switch second: the drawer child is already built and
+        // bound, so a switch ahead of the draft would flash the "nothing is
+        // being edited" hint.
+        let key = draft.key();
+        workspace_edit::open(draft);
+        crate::modal::switch_to_workspace_edit(&key);
+    });
+    button
+}
+
+/// The draft the Edit sub-page opens with, for one card.
+///
+/// `None` for a saved card whose stack has vanished from the file between the
+/// model being built and the button being pressed — the file is live-reloaded
+/// and the drawer can sit open across a hand edit.
+fn draft_for(card: &Card) -> Option<workspace_edit::Draft> {
+    match &card.kind {
+        Kind::Saved(state) => {
+            // Read back rather than captured, the same call `start_by_name`
+            // makes and for the same reason: a captured `Stack` could be a
+            // revision behind the file the Save is about to rewrite.
+            let saved = config_workspaces::current();
+            let stack = saved.stacks.get(&card.name).cloned()?;
+            Some(workspace_edit::Draft {
+                previous: Some(card.name.clone()),
+                name: card.name.clone(),
+                apps: stack.apps,
+                layout: stack.layout,
+                autostart: stack.autostart,
+                monitor: stack.monitor,
+                workspace: card.live,
+                // `Starting` blocks a rename too — see `rename_is_blocked`, and
+                // review MEDIUM 2 for why that window is the one it matters in.
+                active: workspace_edit::rename_is_blocked(*state),
+                taken: other_names(&saved, Some(&card.name)),
+            })
+        }
+        Kind::Ephemeral {
+            workspace,
+            output,
+            windows,
+        } => Some(ephemeral_draft(
+            *workspace,
+            output,
+            other_names(&config_workspaces::current(), None),
+            // §3.7's mapping: the workspace's windows in column order, each
+            // resolved through its desktop entry, with the ones that have none
+            // carrying the running command line for correction. The only impure
+            // step — it reads `$XDG_DATA_DIRS` and `/proc` — which is why it is
+            // taken here and the rest of the draft is built by the pure function
+            // below.
+            workspace_edit::ephemeral_apps_for(
+                &windows
+                    .iter()
+                    .map(|(app_id, pid)| (app_id.clone(), pid.and_then(|p| u32::try_from(p).ok())))
+                    .collect::<Vec<_>>(),
+            ),
+        )),
+    }
+}
+
+/// Every saved stack name **except** `mine`, for the form's fast taken-name
+/// check (review MEDIUM 8).
+///
+/// `mine` is excluded because re-saving a stack under its own name is the
+/// ordinary case; `plan_save` also guards that, so this is belt and braces at
+/// the seam where the set is built rather than where it is read.
+fn other_names(saved: &Workspaces, mine: Option<&str>) -> BTreeSet<String> {
+    saved
+        .stacks
+        .keys()
+        .filter(|name| mine.is_none_or(|mine| !name.eq_ignore_ascii_case(mine)))
+        .cloned()
+        .collect()
+}
+
+/// The draft an **ephemeral** card's Edit opens with, given its apps (#1071
+/// §3.7). Pure.
+///
+/// Split from [`draft_for`] so §3.7's *"record the monitor"* is falsifiable: the
+/// rest of that arm reads `$XDG_DATA_DIRS` and `/proc`, which no test may do.
+fn ephemeral_draft(
+    workspace: u64,
+    output: &str,
+    taken: BTreeSet<String>,
+    apps: Vec<crate::config::workspaces::StackApp>,
+) -> workspace_edit::Draft {
+    workspace_edit::Draft {
+        previous: None,
+        name: String::new(),
+        apps,
+        taken,
+        layout: Layout::None,
+        autostart: false,
+        // §3.7's *"record the monitor"* — the screen **niri** says the workspace
+        // is on, not the column the card happened to be drawn in. For a stack
+        // with no recorded monitor those two differ whenever the focus is
+        // elsewhere, and the file must record where the windows actually are.
+        monitor: Some(output.to_owned()),
+        workspace: Some(workspace),
+        // An ephemeral card is by definition on screen, but `active` only gates
+        // the rename refusal and an ephemeral card has no name to rename *from*.
+        active: false,
+    }
 }
 
 /// The one button a saved card carries, by state (#1071 §5).
@@ -896,109 +1240,6 @@ fn start_by_name(name: &str) {
         return;
     };
     workspace_stacks::spawn_start(name.to_owned(), stack, saved);
-}
-
-/// The ephemeral card's Edit → Save (#1071 §3.7).
-///
-/// Deliberately **not** a `+` button, and deliberately not the phase-4 edit
-/// sub-page either: §3.7 settles that an unnamed workspace is a card like any
-/// other and that Save is what creates its entry. Phase 2's Save takes the
-/// **name only** — the apps come from what is on the workspace right now, and
-/// everything else is defaulted, since the monitor is set by dragging the card
-/// between columns and the layout/autostart fields live in the phase-4 edit
-/// form.
-///
-/// # Two checks here, one on the runtime
-///
-/// The two the field can answer **now** stay here, because a red field beside
-/// the cursor is a better correction surface than a toast: the name has to be a
-/// usable workspace name, and it has to be one no *stack* already has. The third
-/// — that no niri **workspace** already carries it — needs a socket round trip,
-/// so it lives in [`workspace_stacks::save`] along with the write and the
-/// `SetWorkspaceName` that makes the saved workspace *be* this one.
-fn save_row(card: &Card, workspace: u64) -> gtk::Widget {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    row.add_css_class("ts-ws-save");
-
-    let entry = gtk::Entry::builder()
-        .placeholder_text(SAVE_PLACEHOLDER)
-        .hexpand(true)
-        .max_length(32)
-        .build();
-    entry.add_css_class("ts-ws-save-entry");
-    row.append(&entry);
-
-    let save = gtk::Button::with_label("Save");
-    save.add_css_class("suggested-action");
-    save.add_css_class("ts-ws-save-button");
-    row.append(&save);
-
-    // Clear the red as soon as the user starts correcting. Without this the
-    // field stays red through every keystroke of the fix, since the class was
-    // only ever removed on a *successful* commit.
-    entry.connect_changed(|entry| {
-        entry.remove_css_class("error");
-        entry.set_tooltip_text(None);
-    });
-
-    let apps = card.apps.clone();
-    let commit = move |entry: &gtk::Entry| {
-        let typed = entry.text().to_string();
-        let reject = |entry: &gtk::Entry, why: &str| {
-            entry.add_css_class("error");
-            entry.set_tooltip_text(Some(why));
-        };
-        let Some(name) = systemd::normalize_workspace_name(&typed) else {
-            // `normalize` deliberately refuses rather than rewrites anything but
-            // case, so §3.1's "offers the sanitised form" is offered here — the
-            // field keeps what was typed and the tooltip carries the suggestion,
-            // which is a correction the user can accept or ignore rather than a
-            // silent rewrite of a name they will later type at `niri msg`.
-            reject(entry, &name_hint(&typed));
-            return;
-        };
-        if config_workspaces::current().stacks.contains_key(&name) {
-            reject(
-                entry,
-                &format!("A workspace called \u{201c}{name}\u{201d} already exists."),
-            );
-            return;
-        }
-        entry.remove_css_class("error");
-        entry.set_tooltip_text(None);
-        let stack = Stack {
-            apps: apps
-                .iter()
-                .map(|app| SavedApp {
-                    id: app.app_id.clone(),
-                    exec: None,
-                })
-                .collect(),
-            ..Stack::default()
-        };
-        // Off to the runtime: the remaining checks and the write are I/O, and
-        // the `SetWorkspaceName` that turns this ephemeral card into the saved
-        // one is a niri round trip. Nothing to redraw by hand — the file poll
-        // and the niri event stream both republish, and the card comes back as
-        // one Active saved card rather than two.
-        workspace_stacks::spawn_save(workspace, name, stack);
-    };
-
-    // Enter in the field and the button do the same thing. `connect_activate`
-    // takes the entry from GTK; the button's handler holds a weak reference, so
-    // the row is not pinned by its own callback.
-    entry.connect_activate({
-        let commit = commit.clone();
-        move |entry| commit(entry)
-    });
-    let weak = entry.downgrade();
-    save.connect_clicked(move |_| {
-        if let Some(entry) = weak.upgrade() {
-            commit(&entry);
-        }
-    });
-
-    row.upcast()
 }
 
 fn build_app_icon(app: &StackApp, meta_cache: &MetaCache) -> gtk::Image {
@@ -1135,17 +1376,18 @@ mod fixtures {
 mod model_tests {
     use super::fixtures::{LEFT, RIGHT, no_stacks, saved, stack, win, ws, ws_focused};
     use super::{
-        Card, Column, DropAction, Droppable, Kind, StackState, drop_plan, droppable_cards, model,
+        Card, Column, DropAction, DropContext, Droppable, Kind, OFFLINE_COLUMN, PageModel,
+        StackState, drop_context, drop_plan, model, reorder_onto,
     };
     use crate::config::workspaces::Workspaces;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
-    /// The model with nothing in flight and no slice up — the common case.
-    fn built(
+    /// The whole page model with nothing in flight and no slice up.
+    fn page(
         workspaces: &[hytte::services::niri::Workspace],
         windows: &[hytte::services::niri::Window],
         file: &Workspaces,
-    ) -> Vec<Column> {
+    ) -> PageModel {
         model(
             workspaces,
             windows,
@@ -1153,6 +1395,31 @@ mod model_tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
         )
+    }
+
+    /// [`page`]'s columns — the common case, since most rows are about what is
+    /// drawn rather than about the order a drag rewrites.
+    fn built(
+        workspaces: &[hytte::services::niri::Workspace],
+        windows: &[hytte::services::niri::Window],
+        file: &Workspaces,
+    ) -> Vec<Column> {
+        page(workspaces, windows, file).columns
+    }
+
+    /// A [`DropContext`] over these cards, in this page-wide order.
+    fn context(cards: &[(&str, Droppable)], order: &[&str]) -> DropContext {
+        DropContext {
+            cards: cards
+                .iter()
+                .map(|(name, d)| ((*name).to_owned(), d.clone()))
+                .collect(),
+            order: order.iter().map(|n| (*n).to_owned()).collect(),
+        }
+    }
+
+    fn names(order: &[String]) -> Vec<&str> {
+        order.iter().map(String::as_str).collect()
     }
 
     fn connectors(columns: &[Column]) -> Vec<&str> {
@@ -1237,7 +1504,8 @@ mod model_tests {
             // `dev`'s units are up although its windows are gone.
             &BTreeSet::from(["dev".to_owned()]),
             &BTreeSet::from(["music".to_owned()]),
-        );
+        )
+        .columns;
         let kinds: Vec<&Kind> = find(&columns, LEFT).cards.iter().map(|c| &c.kind).collect();
         assert_eq!(
             kinds,
@@ -1287,7 +1555,10 @@ mod model_tests {
         );
         let cards = &find(&columns, LEFT).cards;
         assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0].kind, Kind::Ephemeral { workspace: 1 });
+        assert!(matches!(
+            cards[0].kind,
+            Kind::Ephemeral { workspace: 1, .. }
+        ));
         assert_eq!(cards[0].name, "", "it has no name until it is saved");
         assert_eq!(
             app_ids(&cards[0]),
@@ -1401,7 +1672,10 @@ mod model_tests {
         let cards = &find(&columns, LEFT).cards;
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0].name, "chat");
-        assert_eq!(cards[1].kind, Kind::Ephemeral { workspace: 2 });
+        assert!(matches!(
+            cards[1].kind,
+            Kind::Ephemeral { workspace: 2, .. }
+        ));
     }
 
     /// **MEDIUM-7.** An ephemeral card's apps are in **niri's column order**,
@@ -1462,33 +1736,37 @@ mod model_tests {
         assert_eq!(app_ids(&find(&columns, LEFT).cards[0]), ["firefox", "mpv"]);
     }
 
-    /// §3.1's "offer the sanitised form": the suggestion is always one the
-    /// validator would accept, and there is none when nothing is left.
+    /// §3.7's two extra facts an ephemeral card has to carry so its Save can
+    /// *be* a Save: the screen niri says it is on, and each window's pid.
+    ///
+    /// **The mutation**: dropping the pid (or taking it from a later snapshot)
+    /// reds this — and, downstream, the unknown-`app_id` command line the Edit
+    /// form prefills has nothing to read.
     #[test]
-    fn the_save_field_suggests_a_name_the_validator_would_take() {
-        for typed in [
-            "Chat Room",
-            "  dev/2  ",
-            "my_stack",
-            "--weird--",
-            "Ünïcödé chat",
-            &"x".repeat(80),
-        ] {
-            let suggestion = super::sanitise(typed)
-                .unwrap_or_else(|| panic!("{typed:?} should still suggest something"));
-            assert!(
-                hytte::services::systemd::is_valid_workspace_name(&suggestion),
-                "{typed:?} suggested {suggestion:?}, which the field would refuse"
-            );
-        }
+    fn an_ephemeral_card_carries_its_screen_and_its_windows_pids() {
+        let mut firefox = win(9, 1, "firefox", 1);
+        firefox.pid = Some(4242);
+        let mut mpv = win(10, 1, "mpv", 2);
+        mpv.pid = None;
+        let columns = built(&[ws(1, 1, RIGHT, None)], &[firefox, mpv], &no_stacks());
+        let Kind::Ephemeral {
+            workspace,
+            output,
+            windows,
+        } = &find(&columns, RIGHT).cards[0].kind
+        else {
+            panic!("an unnamed workspace with windows is an ephemeral card");
+        };
+        assert_eq!(*workspace, 1);
         assert_eq!(
-            super::sanitise("chat"),
-            None,
-            "already usable, nothing to say"
+            output, RIGHT,
+            "§3.7 records the monitor niri reports, not the column it was drawn in"
         );
-        assert_eq!(super::sanitise("---"), None, "nothing survives");
-        assert_eq!(super::sanitise(""), None);
-        assert_eq!(super::sanitise("Chat Room").as_deref(), Some("chat-room"));
+        assert_eq!(
+            windows,
+            &[("firefox".to_owned(), Some(4242)), ("mpv".to_owned(), None),],
+            "the windows must arrive in column order, each with its own pid"
+        );
     }
 
     /// No outputs at all → no columns, so the page can say it is waiting for
@@ -1542,7 +1820,7 @@ mod model_tests {
             &no_stacks(),
         );
         let card = &find(&columns, LEFT).cards[0];
-        assert!(matches!(card.kind, Kind::Ephemeral { workspace: 1 }));
+        assert!(matches!(card.kind, Kind::Ephemeral { workspace: 1, .. }));
         assert_eq!(card.live, None);
         assert_eq!(card.workspace_to_move(), None);
     }
@@ -1553,45 +1831,46 @@ mod model_tests {
     // `connect_drop` callback cannot be invoked from a test — so a branch left
     // inside it is a branch nothing can falsify, which is exactly how the
     // same-screen guard and the Active-workspace hand-off both shipped
-    // unfalsifiable. Everything the drop decides now lives in `drop_plan` and
-    // `droppable_cards`, and both are here.
+    // unfalsifiable. Everything the drop decides now lives in `drop_plan`,
+    // `reorder_onto` and `drop_context`, and all three are here.
+
+    /// A card on `monitor`, with `workspace` if it is Active.
+    fn droppable(monitor: Option<&str>, workspace: Option<u64>) -> Droppable {
+        Droppable {
+            monitor: monitor.map(str::to_owned),
+            workspace,
+        }
+    }
 
     /// A card dropped on a screen it does not already record moves — and takes
     /// its live workspace with it when it has one.
     #[test]
     fn a_drop_on_another_screen_records_it_and_carries_an_active_workspace() {
-        let cards = BTreeMap::from([
-            (
-                "chat".to_owned(),
-                Droppable {
-                    monitor: Some(LEFT.to_owned()),
-                    workspace: Some(7),
-                },
-            ),
-            (
-                "dev".to_owned(),
-                Droppable {
-                    monitor: Some(LEFT.to_owned()),
-                    workspace: None,
-                },
-            ),
-        ]);
+        let ctx = context(
+            &[
+                ("chat", droppable(Some(LEFT), Some(7))),
+                ("dev", droppable(Some(LEFT), None)),
+            ],
+            &["chat", "dev"],
+        );
 
         assert_eq!(
-            drop_plan("chat", RIGHT, &cards),
+            drop_plan("chat", Some(RIGHT), None, &ctx),
             Some(DropAction {
                 name: "chat".to_owned(),
-                monitor: RIGHT.to_owned(),
+                monitor: Some(RIGHT.to_owned()),
                 workspace: Some(7),
+                order: None,
             }),
             "an Active stack's workspace follows it across screens"
         );
         assert_eq!(
-            drop_plan("dev", RIGHT, &cards),
+            drop_plan("dev", Some(RIGHT), None, &ctx),
             Some(DropAction {
                 name: "dev".to_owned(),
-                monitor: RIGHT.to_owned(),
+                monitor: Some(RIGHT.to_owned()),
                 workspace: None,
+                order: None,
             }),
             "an Inactive stack is the file change and nothing else"
         );
@@ -1601,14 +1880,11 @@ mod model_tests {
     /// two-pixel accidental drag does not rewrite `workspaces.toml`.
     #[test]
     fn a_drop_on_the_screen_it_already_records_does_nothing() {
-        let cards = BTreeMap::from([(
-            "chat".to_owned(),
-            Droppable {
-                monitor: Some(LEFT.to_owned()),
-                workspace: Some(7),
-            },
-        )]);
-        assert_eq!(drop_plan("chat", LEFT, &cards), None);
+        let ctx = context(&[("chat", droppable(Some(LEFT), Some(7)))], &["chat"]);
+        assert_eq!(drop_plan("chat", Some(LEFT), None, &ctx), None);
+        // …and neither does dropping it on **itself**, which is what a drag
+        // that travelled two pixels lands on.
+        assert_eq!(drop_plan("chat", Some(LEFT), Some("chat"), &ctx), None);
     }
 
     /// …but a stack that records **no** screen, dropped on the column it is
@@ -1617,15 +1893,9 @@ mod model_tests {
     /// "here, always".
     #[test]
     fn a_drop_pins_a_stack_that_recorded_no_screen() {
-        let cards = BTreeMap::from([(
-            "chat".to_owned(),
-            Droppable {
-                monitor: None,
-                workspace: None,
-            },
-        )]);
+        let ctx = context(&[("chat", droppable(None, None))], &["chat"]);
         assert_eq!(
-            drop_plan("chat", LEFT, &cards).map(|a| a.monitor),
+            drop_plan("chat", Some(LEFT), None, &ctx).and_then(|a| a.monitor),
             Some(LEFT.to_owned())
         );
     }
@@ -1634,7 +1904,258 @@ mod model_tests {
     /// guessed at.
     #[test]
     fn a_drop_of_something_that_is_not_a_card_is_refused() {
-        assert_eq!(drop_plan("chat", LEFT, &BTreeMap::new()), None);
+        assert_eq!(
+            drop_plan("chat", Some(LEFT), None, &context(&[], &[])),
+            None
+        );
+    }
+
+    // ── #1071 §3.6, the in-column reorder (phase 4) ──────────────────────────
+
+    /// §3.6: a drop on another card rewrites `order` — and **only** moves the
+    /// dragged name, leaving every other card's relative position exactly as it
+    /// was, on every screen.
+    ///
+    /// **The mutation** the brief names: a "global rewrite" that rebuilds the
+    /// array as *this column's cards in their new order, then the rest*. With
+    /// the two monitors' stacks interleaved below, that yields
+    /// `[c, a, b, x, y]` instead of `[c, a, x, b, y]` — so this reds.
+    #[test]
+    fn a_reorder_moves_one_name_and_rewrites_no_other_monitors_stacks() {
+        // a, b, c on DP-1; x, y on HDMI-A-1; interleaved in the file.
+        let order = ["a", "x", "b", "y", "c"].map(str::to_owned);
+        let moved = reorder_onto(&order, "c", "a").expect("the order changed");
+        assert_eq!(
+            names(&moved),
+            ["c", "a", "x", "b", "y"],
+            "the other screen's stacks were reshuffled"
+        );
+        // The other monitor's names keep both their relative order and their
+        // neighbours among themselves.
+        let others: Vec<&str> = names(&moved)
+            .into_iter()
+            .filter(|n| *n == "x" || *n == "y")
+            .collect();
+        assert_eq!(others, ["x", "y"]);
+    }
+
+    /// A one-place drag reads the way the pointer moved, in **both**
+    /// directions: onto the card below puts it below, onto the card above puts
+    /// it above.
+    ///
+    /// This is what fixes the index: taking the target's position *after* the
+    /// removal instead would make the downward drag a no-op, because a card is
+    /// already immediately before its own successor. Both assertions here failed
+    /// on the first cut of `reorder_onto` for exactly that reason.
+    #[test]
+    fn a_one_place_drag_moves_in_the_direction_it_was_dragged() {
+        let order = ["a", "b", "c"].map(str::to_owned);
+        assert_eq!(
+            names(&reorder_onto(&order, "a", "b").expect("changed")),
+            ["b", "a", "c"],
+            "dragging down onto the next card must land below it"
+        );
+        assert_eq!(
+            names(&reorder_onto(&order, "c", "b").expect("changed")),
+            ["a", "c", "b"],
+            "dragging up onto the previous card must land above it"
+        );
+        // And the long drags, at both ends.
+        assert_eq!(
+            names(&reorder_onto(&order, "a", "c").expect("changed")),
+            ["b", "c", "a"]
+        );
+        assert_eq!(
+            names(&reorder_onto(&order, "c", "a").expect("changed")),
+            ["c", "a", "b"]
+        );
+    }
+
+    /// Nothing to do → no write. A name not in the order, a target not in it,
+    /// and a drop that would reproduce the order are all `None`.
+    #[test]
+    fn a_reorder_that_changes_nothing_writes_nothing() {
+        let order = ["a", "b", "c"].map(str::to_owned);
+        assert_eq!(reorder_onto(&order, "a", "a"), None);
+        assert_eq!(reorder_onto(&order, "zz", "a"), None);
+        assert_eq!(reorder_onto(&order, "a", "zz"), None);
+        assert!(reorder_onto(&[], "a", "b").is_none());
+    }
+
+    /// A drop on a card in **another** column does both halves at once: the
+    /// screen and the position.
+    #[test]
+    fn a_drop_on_a_card_in_another_column_records_the_screen_and_the_order() {
+        let ctx = context(
+            &[
+                ("chat", droppable(Some(LEFT), Some(7))),
+                ("dev", droppable(Some(RIGHT), None)),
+            ],
+            &["chat", "dev"],
+        );
+        let action = drop_plan("chat", Some(RIGHT), Some("dev"), &ctx).expect("both halves");
+        assert_eq!(action.monitor.as_deref(), Some(RIGHT));
+        assert_eq!(action.workspace, Some(7));
+        assert_eq!(names(&action.order.expect("reordered")), ["dev", "chat"]);
+    }
+
+    /// A drop **within** one column is the order alone: no `monitor`, and
+    /// therefore no workspace for niri to move either.
+    ///
+    /// The dragged card is deliberately an **Active** one (review LOW 10 / the
+    /// reviewer's surviving **M11**): with `droppable(Some(LEFT), None)` the
+    /// card had no live workspace, so `workspace == None` held whether or not
+    /// `drop_plan` gated the workspace on the monitor half — the assertion was
+    /// vacuous and dropping the gate survived green.
+    #[test]
+    fn a_drop_within_one_column_rewrites_only_the_order() {
+        let ctx = context(
+            &[
+                ("chat", droppable(Some(LEFT), Some(7))),
+                ("dev", droppable(Some(LEFT), Some(9))),
+            ],
+            &["chat", "dev"],
+        );
+        let action = drop_plan("dev", Some(LEFT), Some("chat"), &ctx).expect("reordered");
+        assert_eq!(
+            action.monitor, None,
+            "an in-column drop is not a screen change"
+        );
+        assert_eq!(
+            action.workspace, None,
+            "there is nothing for niri to do about a position in a list — and \
+             this card really does have a live workspace (9) to have carried"
+        );
+        assert_eq!(names(&action.order.expect("reordered")), ["dev", "chat"]);
+    }
+
+    /// **Review HIGH 1**: the trailing "Not connected" column's heading is not a
+    /// connector, so a drop onto a card there must record **no screen** — and
+    /// must not ask niri to move a workspace to an output that does not exist.
+    ///
+    /// Before the fix `drop_plan` was handed the literal `OFFLINE_COLUMN`, and
+    /// `card.monitor != Some("Not connected")` is true for every real stack, so
+    /// the monitor half fired: `workspaces.toml` got `monitor = "Not connected"`
+    /// (stranding the card in the greyed column until the file was hand-edited)
+    /// and an Active stack got a bogus `MoveWorkspaceToMonitor`. Phase 3 stated
+    /// the invariant for the *column* target; phase 4's card target routed
+    /// around it.
+    ///
+    /// The reorder half still applies — those cards are still ordered.
+    ///
+    /// **The mutation**: taking `connector: &str` again, so the offline column
+    /// passes its heading through, reds this on the first assertion.
+    #[test]
+    fn a_drop_onto_a_card_in_the_offline_column_records_no_screen() {
+        let ctx = context(
+            &[
+                ("chat", droppable(Some("DP-9"), None)),
+                ("dev", droppable(Some("DP-9"), Some(7))),
+            ],
+            &["chat", "dev"],
+        );
+        let action =
+            drop_plan("chat", None, Some("dev"), &ctx).expect("the reorder half still applies");
+        assert_eq!(
+            action.monitor, None,
+            "\"Not connected\" was written to the file as a connector"
+        );
+        assert_eq!(
+            action.workspace, None,
+            "niri was asked to move a workspace to an output that does not exist"
+        );
+        assert_eq!(names(&action.order.expect("reordered")), ["dev", "chat"]);
+
+        // …and a drop there that would reorder nothing does nothing at all,
+        // rather than falling through to a monitor rewrite.
+        assert_eq!(drop_plan("chat", None, None, &ctx), None);
+        assert_eq!(drop_plan("chat", None, Some("chat"), &ctx), None);
+    }
+
+    /// …and the column is what *decides* that `None` — the half `drop_plan`
+    /// cannot see.
+    ///
+    /// The first cut of the HIGH 1 fix passed the `drop_plan` test above with
+    /// the wiring still handing `OFFLINE_COLUMN` through, because that test
+    /// supplies the `None` itself. This is the mutation-sensitive half.
+    ///
+    /// **The mutation**: `build_column` passing `Some(column.connector)`
+    /// unconditionally reds this.
+    #[test]
+    fn only_a_connected_column_offers_a_connector_to_a_drop() {
+        let columns = built(
+            &[ws_focused(1, 1, LEFT, None)],
+            &[],
+            &saved(&[("gone", stack(Some("dp-9"), &["firefox"]))]),
+        );
+        let live = find(&columns, LEFT);
+        let offline = find(&columns, OFFLINE_COLUMN);
+        assert!(
+            offline.offline,
+            "the fixture must produce the trailing column"
+        );
+
+        assert_eq!(live.drop_connector(), Some(LEFT));
+        assert_eq!(
+            offline.drop_connector(),
+            None,
+            "the \"not connected\" heading was offered to a drop as a connector"
+        );
+    }
+
+    /// §3.7: an ephemeral card's Edit opens on a draft that **records the
+    /// screen** and carries the workspace Save has to name — and says nothing
+    /// about a layout, an autostart or a previous name, because it has none.
+    ///
+    /// **The mutation**: dropping the `monitor` (or taking it from the focused
+    /// output rather than the card's own) reds this — and on a machine whose
+    /// focus is elsewhere, that is a Save that files the stack under the wrong
+    /// screen.
+    #[test]
+    fn an_ephemeral_drafts_monitor_is_the_screen_its_workspace_is_on() {
+        let apps = vec![crate::config::workspaces::StackApp {
+            id: "weird-app".to_owned(),
+            exec: Some("/home/me/bin/weird".to_owned()),
+        }];
+        let draft = super::ephemeral_draft(7, RIGHT, BTreeSet::new(), apps.clone());
+        assert_eq!(
+            draft.monitor.as_deref(),
+            Some(RIGHT),
+            "§3.7's 'record the monitor' was dropped"
+        );
+        assert_eq!(draft.workspace, Some(7), "Save has to name this workspace");
+        assert_eq!(draft.apps, apps);
+        assert_eq!(draft.previous, None, "an ephemeral Save is a creation");
+        assert_eq!(draft.name, "", "it has no name until one is typed");
+        assert_eq!(
+            draft.layout,
+            crate::config::workspaces::Layout::None,
+            "§3.7: layout `none` unless known"
+        );
+        assert!(!draft.autostart);
+        // Keyed by workspace id, which cannot collide with a stack name.
+        assert_eq!(draft.key(), "#7");
+    }
+
+    /// The page-wide order a drop rewrites is the one the cards are drawn in —
+    /// the file's order, across every screen, not a column's.
+    #[test]
+    fn the_drop_context_carries_the_files_order_across_every_screen() {
+        let file = saved(&[
+            ("chat", stack(Some(LEFT), &["firefox"])),
+            ("dev", stack(Some(RIGHT), &["Alacritty"])),
+            ("music", stack(Some(LEFT), &["mpv"])),
+        ]);
+        let ctx = drop_context(&page(
+            &[ws_focused(1, 1, LEFT, None), ws(2, 1, RIGHT, None)],
+            &[],
+            &file,
+        ));
+        assert_eq!(
+            names(&ctx.order),
+            ["chat", "dev", "music"],
+            "the order was grouped by column instead of kept flat"
+        );
     }
 
     /// The map the handler reads is built from the model: an Active card hands
@@ -1649,7 +2170,7 @@ mod model_tests {
             ("chat", stack(Some(LEFT), &["firefox"])),
             ("dev", stack(Some(RIGHT), &["Alacritty"])),
         ]);
-        let columns = built(
+        let cards = drop_context(&page(
             &[
                 // `chat` is live with a window → Active.
                 ws_focused(1, 1, LEFT, Some("chat")),
@@ -1660,8 +2181,8 @@ mod model_tests {
             ],
             &[win(9, 1, "firefox", 1), win(10, 3, "thunderbird", 1)],
             &file,
-        );
-        let cards = droppable_cards(&columns);
+        ))
+        .cards;
 
         assert_eq!(
             cards.keys().collect::<Vec<_>>(),
@@ -1687,11 +2208,11 @@ mod model_tests {
 }
 
 #[cfg(all(test, feature = "system-tests"))]
-mod tests {
+pub(in crate::panels) mod tests {
     use super::fixtures::{LEFT, RIGHT, no_stacks, saved, stack, win, ws};
     use super::{
-        APP_IDLE_CLASS, APP_RUNNING_CLASS, CARD_INACTIVE_CLASS, Column, EMPTY_COLUMN_HINT,
-        EPHEMERAL_NAME, NO_OUTPUTS_HINT, OFFLINE_COLUMN, bind_columns, build_panel,
+        APP_IDLE_CLASS, APP_RUNNING_CLASS, CARD_INACTIVE_CLASS, EMPTY_COLUMN_HINT, EPHEMERAL_NAME,
+        NO_OUTPUTS_HINT, OFFLINE_COLUMN, PageModel, bind_columns, build_panel,
     };
     use crate::config::workspaces::Workspaces;
     use hytte::adw;
@@ -1848,7 +2369,15 @@ mod tests {
     /// `is_visible()` is orthogonal to being on screen (#851/#838), which is
     /// exactly how a chip once shipped drawn 250px outside its clipping bin
     /// with both geometry tests green. Nothing here reads that flag.
-    fn assert_inside_and_hittable(outer: &gtk::Widget, inner: &gtk::Widget, what: &str) {
+    ///
+    /// Shared with `panels::workspace_edit`'s tests rather than copied there
+    /// (review MEDIUM 5): one definition of the discipline, so the Edit page's
+    /// geometry assertions cannot drift away from the card page's.
+    pub(in crate::panels) fn assert_inside_and_hittable(
+        outer: &gtk::Widget,
+        inner: &gtk::Widget,
+        what: &str,
+    ) {
         // A child appended after the window was presented has no allocation
         // until the next frame, so wait for one rather than reading a
         // guaranteed-empty rectangle. A genuinely zero-area widget still fails
@@ -2039,10 +2568,17 @@ mod tests {
         window.destroy();
     }
 
-    /// An ephemeral card shows the live windows, deduped, and carries no
-    /// Start/Stop — its only action is the Save field (#1071 §3.7).
+    /// An ephemeral card shows the live windows, deduped, carries no Start/Stop
+    /// — it is already running — and offers **Edit** and nothing else
+    /// (#1071 §3.7 / #1109).
+    ///
+    /// **#1109's own assertion**: nothing inline. Phase 2 put a `gtk::Entry` and
+    /// a Save button on this card; Annika's ruling is that they go entirely, so
+    /// this asserts there is **no entry anywhere on any card** rather than
+    /// merely that the Edit button exists — a fallback left beside the button
+    /// would satisfy the weaker claim.
     #[gtk::test]
-    fn an_ephemeral_card_shows_its_windows_and_offers_a_name_field() {
+    fn an_ephemeral_card_shows_its_windows_and_offers_only_edit() {
         let f = fixture();
         f.workspaces.set(vec![ws(7, 1, LEFT, None)]);
         f.windows.set(vec![
@@ -2069,57 +2605,127 @@ mod tests {
             "there is nothing to Start: it is already running"
         );
 
-        let entry = by_class(&card, "ts-ws-save-entry")
-            .into_iter()
-            .find_map(|w| w.downcast::<gtk::Entry>().ok())
-            .expect("the Save field");
-        assert_inside_and_hittable(&card, entry.upcast_ref(), "the Save field");
-        let save = by_class(&card, "ts-ws-save-button")
+        let edit = by_class(&card, "ts-ws-edit-open")
             .into_iter()
             .find_map(|w| w.downcast::<gtk::Button>().ok())
-            .expect("the Save button");
-        assert!(save.is_sensitive());
+            .expect("every card carries an Edit button (#1109)");
+        assert!(edit.is_sensitive());
+        assert_inside_and_hittable(&card, edit.upcast_ref(), "the Edit button");
 
-        // A name that cannot be a slice is refused **in place** — no rewrite, no
-        // silent accept — and the tooltip offers the sanitised form §3.1 asks
-        // for.
-        //
-        // This stops at the validation boundary deliberately, and not only
-        // because the write needs a registry: past it, a *valid* name would
-        // reach `save_stack` and write the developer's own
-        // `~/.config/trollshell/workspaces.toml`. Keep every name this test
-        // types unusable. The write's round trip is `config::workspaces`' own
-        // `a_save_adds_its_stack_and_invents_no_order`, against a tempdir.
-        entry.set_text("Chat Room");
-        save.emit_clicked();
-        pump();
+        // #1109: "nightmare to render" — nothing inline on any card, and no
+        // fallback beside the button either.
+        let inline: Vec<gtk::Widget> = by_class(&f.page, "ts-ws-card")
+            .into_iter()
+            .flat_map(|card| {
+                fn walk(widget: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+                    if widget.is::<gtk::Entry>() || widget.is::<gtk::Text>() {
+                        out.push(widget.clone());
+                    }
+                    let mut child = widget.first_child();
+                    while let Some(c) = child {
+                        walk(&c, out);
+                        child = c.next_sibling();
+                    }
+                }
+                let mut out = Vec::new();
+                walk(&card, &mut out);
+                out
+            })
+            .collect();
         assert!(
-            entry.has_css_class("error"),
-            "an unusable name marks the field rather than writing the file"
-        );
-        assert_eq!(
-            entry.text(),
-            "Chat Room",
-            "what was typed is kept — the suggestion is offered, not applied"
-        );
-        assert!(
-            entry
-                .tooltip_text()
-                .is_some_and(|t| t.contains("chat-room")),
-            "…and the sanitised form is what is offered: {:?}",
-            entry.tooltip_text()
-        );
-
-        // The red clears as soon as the correction starts, rather than staying
-        // through every keystroke of the fix.
-        entry.set_text("Chat Roo");
-        pump();
-        assert!(
-            !entry.has_css_class("error"),
-            "the error class is not sticky"
+            inline.is_empty(),
+            "#1109: no card may carry an inline text field — found {}",
+            inline.len()
         );
 
         window.destroy();
+    }
+
+    /// Every **saved** card carries an Edit button too, beside its Start/Stop —
+    /// Annika's `[start/stop] [edit]` (#1109).
+    #[gtk::test]
+    fn every_saved_card_carries_an_edit_button_beside_its_action() {
+        let f = fixture();
+        f.workspaces.set(vec![ws(1, 1, LEFT, None)]);
+        f.saved.set(saved(&[
+            ("chat", stack(Some(LEFT), &["firefox"])),
+            ("dev", stack(Some(LEFT), &["Alacritty"])),
+        ]));
+        pump();
+        let window = present(&f.page);
+
+        let all = cards(&f.page);
+        assert_eq!(all.len(), 2);
+        for card in &all {
+            let edit = by_class(card, "ts-ws-edit-open")
+                .into_iter()
+                .find_map(|w| w.downcast::<gtk::Button>().ok())
+                .expect("a saved card carries an Edit button");
+            assert_inside_and_hittable(card, edit.upcast_ref(), "the Edit button");
+            let action = by_class(card, "ts-ws-action")
+                .into_iter()
+                .next()
+                .expect("…and still its Start/Stop");
+
+            // Annika's own spelling is `[start/stop] [edit]` (#1109), and the
+            // **order** is the part review LOW 14 found unasserted — both
+            // existing is what the weaker version checked, which a swap would
+            // have passed.
+            assert!(
+                edit.prev_sibling().as_ref() == Some(&action),
+                "the Edit button must follow the Start/Stop one, not precede it"
+            );
+            let (left, right) = (
+                bounds_in(card, &action, "the Start/Stop button"),
+                bounds_in(card, edit.upcast_ref(), "the Edit button"),
+            );
+            assert!(
+                left.x() < right.x(),
+                "…and be drawn to its right: action at {left:?}, edit at {right:?}"
+            );
+        }
+
+        window.destroy();
+    }
+
+    /// §3.6, phase 4: a saved card takes a drop as well as starting a drag, so a
+    /// card can be dropped **onto** another card to reorder it.
+    ///
+    /// Phase 3 shipped the drag source and the column target; the card target is
+    /// what this phase adds, and without it an in-column drag has nowhere to
+    /// land. Falsified by not attaching `card_drop_target`.
+    #[gtk::test]
+    fn a_saved_card_takes_a_drop_so_it_can_be_reordered_onto() {
+        let f = fixture();
+        f.workspaces.set(vec![ws(1, 1, LEFT, None)]);
+        f.saved.set(saved(&[
+            ("chat", stack(Some(LEFT), &["firefox"])),
+            ("dev", stack(Some(LEFT), &["Alacritty"])),
+        ]));
+        f.windows.set(vec![win(9, 1, "mpv", 1)]);
+        pump();
+
+        let saved_cards: Vec<gtk::Widget> = cards(&f.page)
+            .into_iter()
+            .filter(|c| !by_class(c, "ts-ws-action").is_empty())
+            .collect();
+        assert_eq!(saved_cards.len(), 2, "two saved cards");
+        for card in &saved_cards {
+            assert!(
+                has_drop_target(card),
+                "a saved card must take a drop, or it cannot be reordered onto"
+            );
+            assert!(has_drag_source(card), "…and still start one");
+        }
+
+        // The ephemeral card takes neither: it has no entry in the file, so
+        // there is nothing to reorder and nothing to rewrite.
+        let ephemeral = cards(&f.page)
+            .into_iter()
+            .find(|c| by_class(c, "ts-ws-action").is_empty())
+            .expect("the unnamed workspace is a card too");
+        assert!(!has_drop_target(&ephemeral));
+        assert!(!has_drag_source(&ephemeral));
     }
 
     /// §7: **Inactive is greyed, and `Starting` disables the button.**
@@ -2415,7 +3021,7 @@ mod tests {
         adw::init().expect("libadwaita init");
         let columns_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         let weak = columns_box.downgrade();
-        let model: Mutable<Vec<Column>> = Mutable::new(Vec::new());
+        let model: Mutable<PageModel> = Mutable::new(PageModel::default());
         bind_columns(&columns_box, model.signal_cloned());
         pump();
 

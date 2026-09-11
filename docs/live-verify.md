@@ -2729,9 +2729,9 @@ trollshell`. Expect the cards to come back Active and **no notification at
   - **Dropping a card back on its own column does nothing.** `md5sum` the file,
     pick up a card and drop it where it already is: the file must be
     byte-identical. A two-pixel accidental drag must not rewrite config.
-  - **In-column reordering is still phase 4.** Dragging a card up or down
-    _within_ one column does nothing — §5 puts the order's drag handles in the
-    Edit sub-page, which does not exist yet. Only the screen changes.
+  - **In-column reordering arrived in phase 4.** Dragging a card up or down
+    _within_ one column did nothing through phase 3; see the phase-4 block
+    below for what it does now.
   - **A drag can be cancelled by a rebuild, and that is not a bug.** The page
     rebuilds every column on any of the five signals it maps over, `windows`
     included, and GTK cancels a drag whose source widget goes away. So a window
@@ -2769,6 +2769,169 @@ trollshell`. Expect the cards to come back Active and **no notification at
     the filled width must still hold on the second show, not just the first
     build. Every other page's width must be visually unchanged from before
     #1108 (still shrinking to its own content, not filling any cap).
+- [ ] **(#1071 phase 4, #1109)** The Edit sub-page, the desktop-entry picker,
+      `Exec` resolution and the in-column drag. Needs a real niri session; the
+      `Exec` rows in particular cannot be checked from a test at all, because
+      the suite must never read the machine's real `$XDG_DATA_DIRS`.
+  - **A bare desktop id launches its app now.** _The headline._ Write a stack
+    whose app is an id that is **not** a command:
+
+    ```toml
+    [workspace.web]
+    apps = [{ id = "firefox" }]
+    ```
+
+    Press **▶**. Through phase 3 this launched nothing at all (`exec_argv` ran
+    the id as a command). It must now start the app, and
+    `journalctl --user -u trollshell -f` must show no "nothing to start for
+    this app" line.
+
+  - **…and an id that names nothing says so, once.** Add
+    `{ id = "definitely.not.installed" }` to the same stack. The journal must
+    carry **one** warning naming that id and telling you to set a launch command
+    in Edit — and every **other** app of the stack must still start. That is
+    §3.2's "Start continues with the rest".
+  - **Field codes are stripped.** Pick an entry whose `Exec` carries one
+    (`grep -l '%[uUfF]' /run/current-system/sw/share/applications/*.desktop`).
+    Start a stack naming it and read the launched argv back:
+    `systemctl --user show trollshell-ws-<name>-0.service -p ExecStart` must
+    show the command **without** a literal `%u`/`%F` argument. A `%U` reaching
+    `execve` is the defect; most programs then try to open a file called `%U`.
+  - **A `DBusActivatable` entry is activated, not forked.** Find one
+    (`grep -l 'DBusActivatable=true' …/applications/*.desktop` — most GNOME apps
+    qualify) whose desktop id is a **dotted** name like `org.gnome.Nautilus`, and
+    name it in a stack. On **▶** the app must start, and
+    `systemctl --user list-units 'trollshell-ws-<name>-*'` must show **no unit
+    for it**: the bus started it, so it lives in its own `app-*.service` and not
+    in the stack's slice. Consequence worth checking in the same breath — **⏹
+    reaches it through the per-window walk** rather than through the slice stop,
+    so confirm Stop still closes it.
+  - **…but a `DBusActivatable` entry whose id is not a bus name is launched
+    normally.** The case #1113's review found: GIO takes its D-Bus path only for
+    a valid derived bus name and otherwise **forks the child into
+    `trollshell.service`'s own cgroup** — no slice, dies with the next shell
+    restart. Copy such an entry to
+    `~/.local/share/applications/` under a one-element id (e.g. `Alacritty`) and
+    add `DBusActivatable=true` to it. On ▶ the app must come up **in the stack's
+    slice**: `systemctl --user list-units 'trollshell-ws-<name>-*'` names a unit
+    for it, and `systemd-cgls --user-unit trollshell.service` shows **no** stray
+    child of the shell. That last command is the one that catches a regression
+    here; the app starting either way is not the test.
+  - **…and an activation the bus declines is not reported as a failure.** Worth
+    knowing rather than checking: GIO issues the activation asynchronously and
+    returns success without waiting, so a `DBusActivatable` entry whose name is
+    not actually activatable produces no error line — the app simply never
+    appears and §3.4's grace window names it in the missing-apps warning like any
+    other app that did not arrive.
+  - **An entry whose `TryExec` is missing is skipped by name.** Copy an entry to
+    `~/.local/share/applications/` and set `TryExec=definitely-not-installed`.
+    On ▶ the journal must carry one warning naming that app **and** saying its
+    `TryExec` names a program that is not installed — not a unit start failure,
+    which is what it looked like before.
+  - **An `exec` override wins, verbatim.** Give that same app an
+    `exec = "…"`. It must be forked into `trollshell-ws-<name>-N.service` as
+    written — no activation, and no field-code stripping either (a `%` you type
+    is yours).
+  - **The Edit page opens from a saved card and replaces the drawer.** Click the
+    ✎ on a saved card. Same drawer, content replaced: the name, the app list
+    with an icon, a name and an editable launch command per row, **Add app**,
+    the layout dropdown, the autostart switch — and **no monitor field**. Change
+    every field, then press **Cancel**: `md5sum
+~/.config/trollshell/workspaces.toml` before and after must match byte for
+    byte.
+  - **…and Save with nothing changed is also byte-identical.** Open Edit, change
+    nothing, press **Save**. Same `md5sum`. If the file churns, the writer is
+    emitting defaulted keys.
+  - **Nothing is inline on a card (#1109).** There must be no text entry
+    anywhere on any card — not on a saved one and not on an unnamed one. The
+    only buttons are `[⏵/⏹] [✎]` on a saved card and `[✎]` on an unnamed one.
+  - **Saving an unnamed workspace makes it the Active card.** Open a fresh
+    workspace, start two apps by hand, click its ✎. The form opens with the apps
+    **in niri's column order**; any whose `app_id` has no desktop entry arrives
+    with its running command line already in the launch-command field (§3.7,
+    "shown for correction") — check it against
+    `tr '\0' ' ' < /proc/<pid>/cmdline`. Type a name and press **Save**. You
+    must end up with **one** Active card, not two: `niri msg workspaces` shows
+    that very workspace now carrying the name, and the ephemeral card is gone.
+    Two cards (one Active-unnamed, one Inactive-named) means the naming and the
+    write came apart.
+  - **…and it records the screen it was on.** After that Save, `workspaces.toml`
+    must carry that stack's `monitor` set to the connector the workspace was on
+    — not the focused one, if they differ.
+  - **The picker lists applications and searches them.** In Edit press
+    **Add app…**. A searchable list of installed applications, each with its
+    icon, display name and desktop id. Type to narrow — by name _and_ by id
+    (`nautilus` must find "Files"). Pick one: a row appears at the bottom of the
+    app list. Save, and `workspaces.toml` carries `{ id = "<that id>" }`.
+  - **…and it hides what a menu hides.** An entry with `NoDisplay=true` must
+    **not** be offered, even when you type its name exactly. Find one with
+    `grep -l 'NoDisplay=true' …/applications/*.desktop` and try.
+  - **App order is niri's column order, and the handles set it.** In Edit, drag
+    an app row by its handle onto another row. The list reorders; press Save and
+    `workspaces.toml`'s `apps` array is in that order. Press ▶ on a stopped
+    stack and the columns open left to right in the list's order.
+  - **Removing an app removes that one.** Press a row's − and confirm the row
+    that vanishes is the one you pressed, and that pressing − again takes the
+    right one. The row indices are re-issued on every redraw; a stale index
+    takes the wrong row on the second press.
+  - **Reordering cards by drag, within a column.** `md5sum` the file. Drag a
+    card **onto another card in the same column**. The card under the pointer
+    outlines; on drop only `order` changes. Two things to check by eye: every
+    comment and every `[workspace.*]` table is untouched, and — with stacks on
+    **two** screens interleaved in `order` — the _other_ screen's names keep
+    their relative order. Dragging a card down onto its neighbour must land it
+    **below** that neighbour, and up onto its neighbour **above** it.
+  - **…and a drop on a card in another column does both.** The stack's `monitor`
+    changes **and** its place in `order` does, and an Active stack's workspace
+    moves screens in the same beat.
+  - **…but a drop inside the "Not connected" column records no screen.** #1113's
+    review HIGH. Give two stacks `monitor = "DP-9"` (or unplug a screen) so the
+    trailing greyed column appears with both cards in it, `md5sum` the file, and
+    drag one **onto the other**. `order` must change and `monitor` must **not** —
+    in particular the file must never gain `monitor = "Not connected"`, and
+    `niri msg workspaces` must show nothing moved. Dropping on that column's
+    empty background must do nothing at all.
+  - **Renaming.** With a stack **stopped**, change its name in Edit and Save:
+    the `[workspace.<old>]` table becomes `[workspace.<new>]` and `order` has
+    the new name **in the old one's slot**, not appended at the end. With the
+    stack **started**, the same rename must be **refused** — the name field goes
+    red and the page says to stop the workspace first. That is deliberate: the
+    running apps are in `trollshell-ws-<old>.slice` and in units named after it,
+    so a renamed entry would leave them unstoppable from the page.
+  - **…and refused _while starting_ too** (#1113's review MEDIUM 2, the window
+    it matters most in). Press **▶** on a stopped stack and immediately press
+    **✎** — the Edit button is not disabled while a Start is in flight. Rename
+    and Save: refused, the same way. Before the fix this was the one gesture that
+    got through, and the grace window is up to ten seconds wide.
+  - **An invalid name is refused with the sanitised form offered.** Type
+    `Chat Room!` and Save: the field goes red, keeps what you typed, and the page
+    offers `chat-room`. Nothing is written. Type `chat--dev` — also refused; a
+    doubled dash is an invalid systemd unit, measured in #1101.
+  - **A name another stack already has is refused in the form.** Type an existing
+    stack's name and Save. The page must say so **and stay open with everything
+    you typed still there** — the app list, the launch commands, the layout. A
+    toast plus an empty drawer means the write result is being discovered after
+    the form has already been thrown away (#1113's review MEDIUM 8).
+  - **Save and Cancel stay on screen with a long list.** Add ten apps to a stack
+    on a 768-tall panel. The app list scrolls; the **Save/Cancel row does not
+    move** and needs no scrolling to reach. Before the fix the page had no
+    scroller at all and the buttons were clipped off the bottom at six apps.
+  - **Add app is not built until you open it.** Open Edit on a stack and watch
+    for a stall: the page must appear immediately. The `AppInfo::all()` scan and
+    the row rendering happen on the **first click** of _Add app…_, not while the
+    page is being built (#1113's review MEDIUM 6) — which on a desktop with a few
+    hundred entries was the difference between an instant page and a visible
+    freeze, on every drawer.
+  - **The form survives the refresh poll.** Open Edit, type half a name and half
+    a launch command, then wait ten seconds (the config poll and the slice poll
+    both tick) and `touch ~/.config/trollshell/workspaces.toml` to force a
+    reload. Both half-typed values must still be there. A form that blanks
+    itself every few seconds is the regression this row exists for.
+  - **Edit on a stack that has gone says so.** With the drawer open on the
+    Workspaces page, delete a stack from `workspaces.toml` by hand and press its
+    **✎** before the poll rebuilds the card. Expect a notification saying it is
+    no longer in the file — not a button that does nothing (#1113's review
+    LOW 15).
 
 ## Control-center
 

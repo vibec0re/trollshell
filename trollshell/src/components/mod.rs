@@ -4,10 +4,12 @@
 //! implementation details of the trollshell binary.
 
 pub mod app_meta;
+pub mod app_picker;
 pub mod cast;
 pub mod chip;
 pub mod connection_row;
 pub mod deep_link_row;
+pub mod desktop_entry;
 pub mod diff;
 pub mod focus;
 pub mod focused_output;

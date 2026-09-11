@@ -24,12 +24,14 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use hytte::futures_signals::signal::{Mutable, Signal, SignalExt};
 use hytte::services::niri::{self, Window, Workspace, WorkspaceAction};
 use hytte::services::systemd;
 
+use crate::components::desktop_entry::{self, Launchable};
 use crate::config::workspaces::{Layout, Stack, StackApp, Workspaces};
 use crate::launch::{self, Launch};
 
@@ -574,13 +576,72 @@ pub(crate) fn missing_apps(stack: &Stack, workspace: u64, windows: &[Window]) ->
         .collect()
 }
 
-/// The `Launch` for one app of `name`'s stack.
+/// How one app of a stack is started (#1071 §3.2, phase 4).
+///
+/// Three answers, and each is a different *mechanism* rather than a different
+/// argv — which is the whole reason this is an enum and not a `Vec<String>`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AppStart {
+    /// `systemd-run --user` into the stack's own slice. The ordinary case, and
+    /// the only one Stop can take down with a single slice stop.
+    Unit(Box<Launch>),
+    /// The entry says `DBusActivatable=true` **and** its id is a usable D-Bus
+    /// name, so it is started by asking that name to activate rather than by
+    /// running an `Exec` line (§3.2).
+    ///
+    /// Carries the desktop id, which is what `gio` needs to find the entry
+    /// again. **Not** in the stack's slice — the bus (or systemd, on its behalf)
+    /// owns the process, so Stop reaches it through §3.3's per-window walk
+    /// instead. See [`Ops::activate`], which also spells out what its `Ok`
+    /// actually means.
+    Activate { id: String },
+    /// Nothing to run. §3.2: *one warning naming it, Start continues with the
+    /// rest.*
+    Unresolved { id: String, why: Unresolvable },
+}
+
+/// Why an app of a stack could not be turned into something to run.
+///
+/// Carried on [`AppStart::Unresolved`] so the one warning §3.2 asks for can say
+/// which of these it was — "nothing to start" and "the program in `TryExec` is
+/// not installed" send the user to different fixes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Unresolvable {
+    /// The id names no installed desktop entry, and the stack gives no `exec`
+    /// override.
+    NoEntry,
+    /// There is an entry (or an override) but it yields an empty argv — an
+    /// `Exec` that was nothing but field codes, or an override of whitespace.
+    NoCommand,
+    /// The entry's `TryExec` names a program that is not on `PATH`, which is
+    /// the entry's own way of saying it is not installed (review LOW 12).
+    NotInstalled,
+}
+
+impl Unresolvable {
+    /// What to tell the user, in the one warning line.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::NoEntry => "no desktop entry and no launch command — set one in Edit",
+            Self::NoCommand => {
+                "its desktop entry's Exec is empty once the field codes are \
+                 stripped — set a launch command in Edit"
+            }
+            Self::NotInstalled => {
+                "its desktop entry's TryExec names a program that is not \
+                 installed — install it, or set a launch command in Edit"
+            }
+        }
+    }
+}
+
+/// The `Launch` for one app of `name`'s stack, given `argv`.
 ///
 /// Every app goes in the stack's own slice, so Stop is one `StopUnit` on the
 /// slice rather than a walk (#1071 §3.3). No `Restart=`: an app the user closed
 /// has finished, it is not a supervised service.
 #[must_use]
-pub(crate) fn app_launch(name: &str, index: usize, app: &StackApp) -> Launch {
+pub(crate) fn app_launch(name: &str, index: usize, app: &StackApp, argv: Vec<String>) -> Launch {
     Launch {
         unit: systemd::workspace_unit_name(name, index),
         description: format!("trollshell workspace {name}: {}", app.id),
@@ -594,21 +655,92 @@ pub(crate) fn app_launch(name: &str, index: usize, app: &StackApp) -> Launch {
         // A stack app is the user's own program; #392's keyring injection is a
         // property of a *plugin* unit.
         secret_env: Vec::new(),
-        argv: exec_argv(app),
+        argv,
     }
 }
 
-/// The argv for one app.
+/// How to start one app of `name`'s stack, given its desktop entry (#1071 §3.2).
 ///
-/// Phase 2 launches the `exec` override verbatim (shell-word split) or, with no
-/// override, the desktop-entry **id** as a command. Resolving the entry's own
-/// `Exec` and stripping its field codes (`%u`, `%F`, …) is phase 4 (#1071 §6),
-/// and until then an entry whose id is not also a command is exactly the case
-/// the Edit form's per-app launch command exists for.
-fn exec_argv(app: &StackApp) -> Vec<String> {
-    app.exec.as_deref().map_or_else(
-        || vec![app.id.clone()],
-        |exec| exec.split_whitespace().map(str::to_owned).collect(),
+/// Pure — the entry is handed in, resolved by [`Ops::desktop_entry`] — so the
+/// whole of §3.2 is falsifiable without a `$XDG_DATA_DIRS` full of `.desktop`
+/// files. The precedence, in order:
+///
+/// 1. **An `exec` override wins over everything**, including
+///    `DBusActivatable=true`. It is the one field in which the user has said, in
+///    their own words, how this app is to be started; an override that silently
+///    lost to the entry's own activation would be a field that does nothing on
+///    exactly the entries whose default behaviour someone wanted to change.
+///    It is taken **verbatim** — field codes are *not* stripped from it, because
+///    a `%` a user typed is theirs and this is not an `Exec` line.
+/// 2. **`TryExec` names a missing program** → [`Unresolvable::NotInstalled`].
+///    The entry's own way of saying it is not installed, and GIO refuses to
+///    build a `GDesktopAppInfo` for it at all (review LOW 12).
+/// 3. `DBusActivatable=true` **and** the id is a usable D-Bus name →
+///    [`AppStart::Activate`]. Both halves are required; see below.
+/// 4. Otherwise the entry's `Exec`, split and with §3.2's field codes stripped.
+///    An `Exec` that strips down to nothing at all is
+///    [`AppStart::Unresolved`] — there is no command left to run, and reporting
+///    that is better than launching an empty argv.
+/// 5. No entry and no override → [`AppStart::Unresolved`].
+///
+/// # Why `DBusActivatable` alone is not enough (review MEDIUM 7)
+///
+/// GIO takes its D-Bus path only when the derived app id is a **valid bus
+/// name**; otherwise it silently falls through to `launch_uris_with_spawn`,
+/// which forks the child into *this shell's own cgroup* — measured, and recorded
+/// on [`may_stop`]. So an entry declaring `DBusActivatable=true` under a
+/// one-element id like `Alacritty` would not be activated at all: it would be
+/// forked under `trollshell.service`, in no slice, dying with the next shell
+/// restart and sharing the shell's resource accounting.
+///
+/// Checking the id here means that entry takes the ordinary launcher into the
+/// stack's own slice instead — which is what the user expects and, unlike the
+/// fork, is something Stop can take down.
+///
+/// Note what is **not** here: phase 2's fallback of running the desktop id
+/// itself as a command. `id = "org.mozilla.firefox"` is not a program, so that
+/// fallback launched nothing while looking like it had launched something
+/// (#1106's body, "Known limits"). An id that *is* also a command still works —
+/// its entry's `Exec` names it.
+#[must_use]
+pub(crate) fn app_start(
+    name: &str,
+    index: usize,
+    app: &StackApp,
+    entry: Option<&Launchable>,
+) -> AppStart {
+    let unit = |argv: Vec<String>, why: Unresolvable| {
+        if argv.is_empty() {
+            AppStart::Unresolved {
+                id: app.id.clone(),
+                why,
+            }
+        } else {
+            AppStart::Unit(Box::new(app_launch(name, index, app, argv)))
+        }
+    };
+
+    if let Some(exec) = app.exec.as_deref() {
+        return unit(desktop_entry::exec_words(exec), Unresolvable::NoCommand);
+    }
+    let Some(entry) = entry else {
+        return AppStart::Unresolved {
+            id: app.id.clone(),
+            why: Unresolvable::NoEntry,
+        };
+    };
+    if entry.try_exec_missing {
+        return AppStart::Unresolved {
+            id: app.id.clone(),
+            why: Unresolvable::NotInstalled,
+        };
+    }
+    if entry.dbus_activatable && desktop_entry::is_valid_bus_name(&app.id) {
+        return AppStart::Activate { id: app.id.clone() };
+    }
+    unit(
+        desktop_entry::strip_field_codes(&desktop_entry::exec_words(&entry.exec)),
+        Unresolvable::NoCommand,
     )
 }
 
@@ -829,6 +961,25 @@ pub(crate) trait Ops {
     /// resolves its own path through `xdg::overlay_path`, so a transaction test
     /// that reached it would write the **developer's real** `~/.config`.
     fn set_monitor(&self, name: &str, monitor: &str) -> impl Future<Output = Result<(), String>>;
+    /// The installed desktop entry for a stack app's id (#1071 §3.2).
+    ///
+    /// On the seam for the same reason the two writers are: the real one reads
+    /// `$XDG_DATA_DIRS`, so a transaction test that reached it would resolve
+    /// against **whatever is installed on the machine running the suite** — and
+    /// a table of field codes checked against a Firefox that may or may not be
+    /// there is not a test. Behind `Ops` a scripted world states the entries and
+    /// §3.2 becomes falsifiable.
+    fn desktop_entry(&self, id: &str) -> impl Future<Output = Option<Launchable>>;
+    /// Start a `DBusActivatable=true` entry through its own desktop entry
+    /// (#1071 §3.2).
+    ///
+    /// Separate from [`Ops::launch`] because it is a different mechanism, not a
+    /// different argv: nothing is forked here, the bus is asked to activate the
+    /// application's well-known name and whoever owns that name starts it. The
+    /// process therefore does **not** land in this stack's slice, and Stop
+    /// reaches it through §3.3's per-window walk like any other window the shell
+    /// did not launch.
+    fn activate(&self, id: &str) -> impl Future<Output = Result<(), String>>;
     fn unit_for_pid(&self, pid: u32) -> impl Future<Output = Option<String>>;
     fn stop_unit(&self, unit: &str) -> impl Future<Output = Result<(), String>>;
     fn stop_slice(&self, name: &str) -> impl Future<Output = Result<(), String>>;
@@ -876,6 +1027,41 @@ impl Ops for Live {
 
     async fn set_monitor(&self, name: &str, monitor: &str) -> Result<(), String> {
         crate::config::workspaces::set_stack_monitor(name, monitor).map_err(|e| e.to_string())
+    }
+
+    /// Plain file IO — `glib::KeyFile` over `$XDG_DATA_DIRS`, no `GObject` and no
+    /// main-loop affinity — so it runs on the runtime thread the transaction is
+    /// already on. See `components::desktop_entry`'s module doc.
+    async fn desktop_entry(&self, id: &str) -> Option<Launchable> {
+        desktop_entry::launchable(id)
+    }
+
+    /// The one call in this file that has to run on the **GTK main thread**.
+    ///
+    /// `gio::AppInfo` is a `GObject` interface, not `Send`, and its `launch` is
+    /// what carries GIO's own D-Bus-activation logic — the desktop id → bus
+    /// name → `org.freedesktop.Application.Activate` walk, plus its fallback to
+    /// the entry's `Exec` when activation fails. Hand-rolling that over
+    /// `hytte-bus` would be a second implementation of someone else's spec for
+    /// the sake of staying on this thread.
+    ///
+    /// So it hops: `MainContext::invoke` is `g_main_context_invoke_full`, which
+    /// is documented thread-safe and is the supported way in. The await cannot
+    /// deadlock — every caller of this reaches it from a task that was
+    /// fire-and-forget `spawn`ed off the main thread, so the main loop is never
+    /// itself waiting on the transaction. A dropped sender (no main loop at all,
+    /// which is the case in a unit-test binary) resolves to an error rather than
+    /// hanging, which is also why nothing in the suite reaches `Live`.
+    async fn activate(&self, id: &str) -> Result<(), String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let id = id.to_owned();
+        hytte::gtk::glib::MainContext::default().invoke(move || {
+            // The receiver is gone only if the transaction was dropped, which is
+            // not this closure's problem — the launch has already happened.
+            drop(tx.send(desktop_entry::activate(&id)));
+        });
+        rx.await
+            .map_err(|_| "the GTK main loop never ran the activation".to_owned())?
     }
 
     async fn unit_for_pid(&self, pid: u32) -> Option<String> {
@@ -1031,13 +1217,45 @@ pub(crate) async fn start(
         units: BTreeSet::new(),
     };
     for (index, app) in stack.apps.iter().enumerate() {
-        let unit = app_launch(name, index, app);
-        let unit_name = unit.unit.clone();
-        if let Err(e) = ops.launch(&unit).await {
-            tracing::warn!(workspace = name, app = app.id, error = %e, "stack app failed to launch");
-            continue;
+        // #1071 §3.2, phase 4. The entry is resolved *per app* rather than once
+        // up front so a stack whose every app carries an `exec` override costs
+        // no `$XDG_DATA_DIRS` walk at all — `app_start` takes `None` happily,
+        // and an override wins over the entry anyway.
+        let entry = match app.exec {
+            Some(_) => None,
+            None => ops.desktop_entry(&app.id).await,
+        };
+        match app_start(name, index, app, entry.as_ref()) {
+            AppStart::Unit(unit) => {
+                let unit_name = unit.unit.clone();
+                if let Err(e) = ops.launch(&unit).await {
+                    tracing::warn!(workspace = name, app = app.id, error = %e, "stack app failed to launch");
+                    continue;
+                }
+                launched.units.insert(unit_name);
+            }
+            AppStart::Activate { id } => {
+                // No unit is recorded: the bus started it, so it is in nobody's
+                // slice and `Launched::units` — which exists to tell this
+                // Start's windows from the user's — would be claiming one that
+                // does not exist. The `before` snapshot still identifies its
+                // window as new, which is the leg that matters (§3.4 step 2).
+                if let Err(e) = ops.activate(&id).await {
+                    tracing::warn!(workspace = name, app = app.id, error = %e, "stack app failed to activate");
+                }
+            }
+            AppStart::Unresolved { id, why } => {
+                // §3.2's *"one warning naming it, Start continues with the
+                // rest"* — one line, naming the app **and** which of the three
+                // reasons it was, since they send the user to different fixes.
+                tracing::warn!(
+                    workspace = name,
+                    app = id,
+                    "nothing to start for this app: {}",
+                    why.reason()
+                );
+            }
         }
-        launched.units.insert(unit_name);
     }
 
     reconcile(ops, stack, plan.workspace, &launched).await;
@@ -1705,12 +1923,110 @@ pub(crate) async fn save(
 }
 
 /// Run a Save on the runtime.
-pub(crate) fn spawn_save(workspace: u64, name: String, stack: Stack) {
+pub(crate) fn spawn_save(ticket: u64, workspace: u64, name: String, stack: Stack) {
     hytte::reactive::runtime::handle().spawn(async move {
-        match save(&Live, workspace, &name, &stack).await {
-            Ok(()) => tracing::info!(workspace = name, apps = stack.apps.len(), "workspace saved"),
-            Err(e) => report(&name, &format!("{name} was not saved: {e}")),
+        let result = save(&Live, workspace, &name, &stack).await;
+        if result.is_ok() {
+            tracing::info!(workspace = name, apps = stack.apps.len(), "workspace saved");
         }
+        finish_save(ticket, &name, result);
+    });
+}
+
+/// How a Save ended, for the form that asked (review MEDIUM 8).
+///
+/// A Save is the one action on this page whose failure the user must not have to
+/// discover from a toast *after* the drawer has gone back to the cards and taken
+/// their whole draft with it. The write happens on the runtime, so the result
+/// comes back the way every other cross-thread fact in this shell does: a
+/// process-global `Mutable` the GTK side binds to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SaveOutcome {
+    /// Which Save this is the answer to — see [`next_save_ticket`].
+    pub ticket: u64,
+    /// `None` on success; otherwise the line to show the user, inline.
+    pub error: Option<String>,
+}
+
+/// The ticket source.
+///
+/// A form must not act on an outcome that is not its own, and it must not act on
+/// a *stale* one either — a `Mutable`'s signal replays on subscribe, so a form
+/// built after some earlier Save would otherwise immediately see that Save's
+/// result and act on it. A monotonic ticket settles both: the form records the
+/// one it is waiting for and ignores every other.
+static SAVE_TICKETS: AtomicU64 = AtomicU64::new(1);
+
+/// The outcome of the most recently finished Save.
+static SAVE_OUTCOME: LazyLock<Mutable<Option<SaveOutcome>>> = LazyLock::new(|| Mutable::new(None));
+
+/// Claim a ticket for a Save that is about to be spawned.
+pub(crate) fn next_save_ticket() -> u64 {
+    SAVE_TICKETS.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Subscribe to Save outcomes (review MEDIUM 8).
+pub(crate) fn save_outcome() -> impl Signal<Item = Option<SaveOutcome>> {
+    SAVE_OUTCOME.signal_cloned()
+}
+
+/// Publish one, and report a failure to the journal and the user as before.
+///
+/// The toast stays: a form may have been closed, or the drawer retracted, by the
+/// time a niri round trip finishes, and the journal is the durable record either
+/// way. What is new is that the form can *also* see it.
+fn finish_save(ticket: u64, name: &str, result: Result<(), String>) {
+    let error = match result {
+        Ok(()) => None,
+        Err(e) => {
+            let message = format!("{name} was not saved: {e}");
+            report(name, &message);
+            Some(message)
+        }
+    };
+    SAVE_OUTCOME.set(Some(SaveOutcome { ticket, error }));
+}
+
+/// Rewrite the card order, on the runtime — the file half of #1071 §3.6's
+/// in-column drag (phase 4).
+///
+/// Not behind [`Ops`], for [`spawn_save_edit`]'s reason: one write, nothing
+/// before it and nothing after, so there is no ordering to falsify. The decision
+/// is `panels::workspaces::reorder_before` (pure, tested) and the writer is
+/// `config::workspaces::set_order_to` (tested against a `tempdir`).
+pub(crate) fn spawn_set_order(order: Vec<String>) {
+    hytte::reactive::runtime::handle().spawn(async move {
+        if let Err(e) = crate::config::workspaces::set_order(&order) {
+            report("order", &format!("the workspace order was not saved: {e}"));
+        }
+    });
+}
+
+/// Write the Edit sub-page's form back to `workspaces.toml`, on the runtime
+/// (#1071 §5, phase 4).
+///
+/// Deliberately **not** behind [`Ops`], unlike the two writers beside it, and
+/// the difference is not an oversight. `save_stack` and `set_monitor` are on the
+/// seam because they are steps *inside* a transaction whose ordering is the
+/// thing under test — a Save must write before it names, a monitor drag must
+/// write before it moves. This is the whole transaction: one write, nothing
+/// before it and nothing after. There is no order to falsify, so the decision
+/// (`panels::workspace_edit::plan_save`) is tested pure and the writer
+/// (`config::workspaces::save_edit_to`) is tested against a `tempdir`, and
+/// nothing in the suite reaches this function — which is what keeps it from ever
+/// touching the developer's real `~/.config/trollshell`.
+pub(crate) fn spawn_save_edit(ticket: u64, previous: Option<String>, name: String, stack: Stack) {
+    hytte::reactive::runtime::handle().spawn(async move {
+        let result = crate::config::workspaces::save_edit(previous.as_deref(), &name, &stack)
+            .map_err(|e| e.to_string());
+        if result.is_ok() {
+            tracing::info!(
+                workspace = name,
+                apps = stack.apps.len(),
+                "workspace stack saved"
+            );
+        }
+        finish_save(ticket, &name, result);
     });
 }
 

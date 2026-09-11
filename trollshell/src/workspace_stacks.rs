@@ -566,6 +566,16 @@ pub(crate) trait Ops {
     fn windows(&self) -> impl Future<Output = Result<Vec<Window>, String>>;
     /// Run one `systemd-run --user` invocation to completion.
     fn launch(&self, launch: &Launch) -> impl Future<Output = Result<(), String>>;
+    /// Persist a stack to `workspaces.toml`.
+    ///
+    /// On the seam rather than called through directly, and that is not a
+    /// stylistic choice: [`crate::config::workspaces::save_stack`] resolves its
+    /// own path through `xdg::overlay_path`, so a transaction test that reached
+    /// it would write the **developer's real** `~/.config/trollshell/`. It did,
+    /// once, before this moved (#1101 re-review). Behind `Ops` the write is part
+    /// of the world like every other side effect here, and a test cannot perform
+    /// it by construction rather than by remembering not to.
+    fn save_stack(&self, name: &str, stack: &Stack) -> impl Future<Output = Result<(), String>>;
     fn unit_for_pid(&self, pid: u32) -> impl Future<Output = Option<String>>;
     fn stop_unit(&self, unit: &str) -> impl Future<Output = Result<(), String>>;
     fn stop_slice(&self, name: &str) -> impl Future<Output = Result<(), String>>;
@@ -605,6 +615,10 @@ impl Ops for Live {
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         ))
+    }
+
+    async fn save_stack(&self, name: &str, stack: &Stack) -> Result<(), String> {
+        crate::config::workspaces::save_stack(name, stack).map_err(|e| e.to_string())
     }
 
     async fn unit_for_pid(&self, pid: u32) -> Option<String> {
@@ -955,7 +969,7 @@ pub(crate) async fn save(
     if named(&workspaces, name).is_some() {
         return Err(StartError::NameTaken.to_string());
     }
-    crate::config::workspaces::save_stack(name, stack).map_err(|e| e.to_string())?;
+    ops.save_stack(name, stack).await?;
 
     ops.send_actions(vec![WorkspaceAction::SetName {
         workspace,

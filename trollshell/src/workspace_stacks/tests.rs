@@ -87,6 +87,9 @@ enum Call {
     Workspaces,
     Windows,
     Launch(String),
+    /// A `workspaces.toml` write, **recorded rather than performed**. See
+    /// `Ops::save_stack`'s doc for why the write is on the seam at all.
+    SaveStack(String),
     UnitForPid(u32),
     StopUnit(String),
     StopSlice(String),
@@ -108,6 +111,8 @@ struct State {
     /// pid → unit, for `unit_for_pid`.
     units: BTreeMap<u32, String>,
     launch_error: Option<String>,
+    /// When set, the scripted `workspaces.toml` write fails with it.
+    save_error: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -211,6 +216,16 @@ impl Ops for Script {
         let mut state = self.0.borrow_mut();
         state.calls.push(Call::Launch(launch.unit.clone()));
         state.launch_error.clone().map_or(Ok(()), Err)
+    }
+
+    async fn save_stack(&self, name: &str, _stack: &Stack) -> Result<(), String> {
+        // Records; never writes. This is the whole point of the seam — see
+        // `Ops::save_stack` — so do not "improve" this into a real write behind
+        // a tempdir either: the transaction has no business knowing where the
+        // file is, and a test that owns a path is a test that can leak one.
+        let mut state = self.0.borrow_mut();
+        state.calls.push(Call::SaveStack(name.to_owned()));
+        state.save_error.clone().map_or(Ok(()), Err)
     }
 
     async fn unit_for_pid(&self, pid: u32) -> Option<String> {
@@ -1154,37 +1169,154 @@ fn a_save_verifies_the_name_is_free_before_writing_anything() {
     );
 }
 
-/// …and with the name free, the Save issues the id-addressed `SetName` for
-/// **this** workspace and reads it back, exactly as a Start does.
+/// …and with the name free, the Save writes, then issues the id-addressed
+/// `SetName` for **this** workspace, then reads it back — in that order.
 ///
-/// The file write is the one step this fake cannot host — it goes to the real
-/// `XDG_CONFIG_HOME` — so both outcomes are accepted and each pins its own
-/// invariant: a write that succeeded must be followed by the naming, and a write
-/// that failed must **not** leave the workspace named.
+/// This test used to accept *either* outcome, because `save` called
+/// `config::workspaces::save_stack` directly and that resolves its own path
+/// through `xdg::overlay_path`. Two things were wrong with that, and the second
+/// is the one that mattered:
 ///
-/// **Mutation:** delete the `send_actions` from `save` → the `Ok` arm reds
-/// wherever an overlay path exists, and the standalone
-/// `a_save_verifies_the_name_is_free_before_writing_anything` still holds the
-/// precondition.
+/// 1. It wrote the developer's **real** `~/.config/trollshell/workspaces.toml`.
+/// 2. Having written it once, every later run took the `Err` arm — whose
+///    assertion "no actions were sent" is **true by construction** — so deleting
+///    the `SetName` send left the suite green on any box that had run it before.
+///    A test that only reds on a virgin machine is not a test.
+///
+/// The write is on the [`Ops`] seam now, so this asserts unconditionally.
+///
+/// **Mutation:** delete the `send_actions` from `save` → red here, on a virgin
+/// box and a pre-run one alike.
 #[test]
-fn a_save_names_this_workspace_and_verifies_it_landed() {
+fn a_save_writes_then_names_this_workspace_and_verifies_it_landed() {
     let before = vec![ws(7, 2, LEFT, None, true)];
     let after = vec![ws(7, 2, LEFT, Some("chat"), true)];
     let script = Script::default().with_workspaces(&[before, after]);
 
-    match run(save(&script, 7, "chat", &Stack::default())) {
-        Ok(()) => assert_eq!(
-            script.actions(),
-            vec![WorkspaceAction::SetName {
-                workspace: 7,
-                name: "chat".to_owned()
-            }],
-            "named by id, not by focus"
+    run(save(&script, 7, "chat", &Stack::default())).expect("saves");
+
+    assert_eq!(
+        script.actions(),
+        vec![WorkspaceAction::SetName {
+            workspace: 7,
+            name: "chat".to_owned()
+        }],
+        "named by id, not by focus"
+    );
+
+    let calls = script.calls();
+    let saved = script
+        .position(|c| matches!(c, Call::SaveStack(_)))
+        .expect("the stack was written");
+    let named = script
+        .position(|c| matches!(c, Call::Actions(_)))
+        .expect("and then named");
+    assert_eq!(calls[saved], Call::SaveStack("chat".to_owned()));
+    assert!(saved < named, "write before naming: {calls:?}");
+    // The read-back is the *last* workspace query, after the naming.
+    let reads: Vec<usize> = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| matches!(c, Call::Workspaces))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        reads.len(),
+        2,
+        "one free-name check, one read-back: {calls:?}"
+    );
+    assert!(
+        reads[1] > named,
+        "the read-back follows the naming: {calls:?}"
+    );
+}
+
+/// A naming that did not land is reported rather than shrugged off.
+///
+/// `SetWorkspaceName` reports success either way, so the read-back is the only
+/// thing that can tell. Here niri never takes the name.
+///
+/// **Mutation:** drop the read-back check from `save` → red.
+#[test]
+fn a_save_whose_naming_did_not_land_says_so() {
+    let unnamed = vec![ws(7, 2, LEFT, None, true)];
+    let script = Script::default().with_workspaces(&[unnamed.clone(), unnamed]);
+
+    let err = run(save(&script, 7, "chat", &Stack::default())).expect_err("reports");
+    assert!(err.contains("did not take the name"), "{err}");
+    assert!(
+        err.contains("saved"),
+        "…while saying the file half did happen, since it did: {err}"
+    );
+}
+
+/// A write that fails leaves the workspace **unnamed**.
+///
+/// The file and the name are one operation from the user's side; half of it is
+/// worse than none, because a named workspace with no stack behind it is a card
+/// that vanishes on the next reload.
+#[test]
+fn a_failed_write_never_names_the_workspace() {
+    let script = Script::default().with_workspaces(&[vec![ws(7, 2, LEFT, None, true)]]);
+    script.0.borrow_mut().save_error = Some("read-only file system".to_owned());
+
+    let err = run(save(&script, 7, "chat", &Stack::default())).expect_err("reports");
+    assert!(err.contains("read-only"), "{err}");
+    assert!(
+        script.actions().is_empty(),
+        "nothing was named: {:?}",
+        script.calls()
+    );
+}
+
+/// **The guard.** No test in this module may touch the real config directory.
+///
+/// The re-review of #1101 found `save` reaching `xdg::overlay_path` through
+/// `config::workspaces::save_stack`, which wrote a real
+/// `~/.config/trollshell/workspaces.toml` on the reviewer's machine. The seam
+/// makes that structurally impossible now; this asserts it, so a future edit
+/// that calls the module function directly again reds here instead of appearing
+/// in someone's home directory.
+///
+/// Stated as a before/after on the real overlay path rather than on a mock: the
+/// question is literally "did the suite write that file", and only the file can
+/// answer it.
+#[test]
+fn the_save_transaction_never_touches_the_real_config_directory() {
+    let real = hytte_config::xdg::overlay_path("workspaces");
+    let before = real
+        .as_ref()
+        .map(|p| (p.exists(), std::fs::metadata(p).ok()));
+
+    // Every shape of Save, including the ones that go furthest.
+    let ok = Script::default().with_workspaces(&[
+        vec![ws(7, 2, LEFT, None, true)],
+        vec![ws(7, 2, LEFT, Some("chat"), true)],
+    ]);
+    run(save(&ok, 7, "chat", &Stack::default())).expect("saves");
+    let taken = Script::default().with_workspaces(&[vec![ws(1, 1, LEFT, Some("chat"), true)]]);
+    let _ = run(save(&taken, 1, "chat", &Stack::default()));
+
+    let after = real
+        .as_ref()
+        .map(|p| (p.exists(), std::fs::metadata(p).ok()));
+    match (&before, &after) {
+        (Some((false, _)), Some((exists, _))) => assert!(
+            !exists,
+            "the suite created {real:?} — the write escaped the Ops seam"
         ),
-        Err(e) => assert!(
-            script.actions().is_empty(),
-            "a failed write must not leave the workspace named: {e}, {:?}",
-            script.calls()
+        (Some((true, Some(b))), Some((true, Some(a)))) => assert_eq!(
+            b.modified().ok(),
+            a.modified().ok(),
+            "the suite modified {real:?} — the write escaped the Ops seam"
         ),
+        // No `XDG_CONFIG_HOME` at all (a sandboxed CI runner): there is no real
+        // path to protect, and `Script` still recorded rather than wrote.
+        _ => {}
     }
+    assert!(
+        ok.calls().contains(&Call::SaveStack("chat".to_owned())),
+        "…and the write really was attempted, so this is not vacuous: {:?}",
+        ok.calls()
+    );
 }

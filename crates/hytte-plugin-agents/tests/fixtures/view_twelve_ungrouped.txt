@@ -1,0 +1,2388 @@
+View {
+    tree: Box {
+        id: Some(
+            "agents-root",
+        ),
+        dir: Vertical,
+        spacing: 0,
+        scroll: false,
+        classes: [
+            "ts-agents-card",
+        ],
+        children: [
+            Row {
+                id: None,
+                classes: [
+                    "ts-agents-title",
+                ],
+                spacing: 6,
+                children: [
+                    Label {
+                        id: None,
+                        text: "AGENTS",
+                        classes: [
+                            "ts-agents-heading",
+                        ],
+                        tooltip: None,
+                    },
+                    Spacer,
+                    Label {
+                        id: None,
+                        text: "up · 12",
+                        classes: [
+                            "dim-label",
+                            "caption",
+                            "numeric",
+                        ],
+                        tooltip: None,
+                    },
+                    Button {
+                        id: "agents-overview",
+                        classes: [
+                            "flat",
+                            "ts-agent-btn",
+                        ],
+                        child: Icon {
+                            id: None,
+                            name: "view-list-symbolic",
+                            classes: [],
+                            tooltip: Some(
+                                "hive overview and the full roster",
+                            ),
+                        },
+                    },
+                ],
+                tooltip: None,
+            },
+            ListBox {
+                id: None,
+                classes: [
+                    "boxed-list",
+                    "ts-agents-list",
+                ],
+                dense: true,
+                children: [
+                    Box {
+                        id: None,
+                        dir: Vertical,
+                        spacing: 2,
+                        scroll: false,
+                        classes: [
+                            "ts-agent-row",
+                        ],
+                        children: [
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-head",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "system-run-symbolic",
+                                        classes: [
+                                            "ts-agent-runtime",
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "agent-0",
+                                        max_width_chars: Some(
+                                            20,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "heading",
+                                            "ts-agent-name",
+                                        ],
+                                        tooltip: Some(
+                                            "agent-0",
+                                        ),
+                                    },
+                                    Spacer,
+                                    Button {
+                                        id: "stop:agent-0",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "media-playback-stop-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "stop this agent",
+                                            ),
+                                        },
+                                    },
+                                    Button {
+                                        id: "edit:agent-0",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "document-edit-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "edit this agent",
+                                            ),
+                                        },
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-statusline",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "media-playback-start-symbolic",
+                                        classes: [
+                                            "ts-agent-state",
+                                            "accent",
+                                        ],
+                                        tooltip: Some(
+                                            "running",
+                                        ),
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "working on task 0 of a rather long description",
+                                        max_width_chars: Some(
+                                            30,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "dim-label",
+                                            "caption",
+                                            "ts-agent-status",
+                                        ],
+                                        tooltip: Some(
+                                            "working on task 0 of a rather long description",
+                                        ),
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                    Box {
+                        id: None,
+                        dir: Vertical,
+                        spacing: 2,
+                        scroll: false,
+                        classes: [
+                            "ts-agent-row",
+                        ],
+                        children: [
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-head",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "system-run-symbolic",
+                                        classes: [
+                                            "ts-agent-runtime",
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "agent-1",
+                                        max_width_chars: Some(
+                                            20,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "heading",
+                                            "ts-agent-name",
+                                        ],
+                                        tooltip: Some(
+                                            "agent-1",
+                                        ),
+                                    },
+                                    Spacer,
+                                    Button {
+                                        id: "stop:agent-1",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "media-playback-stop-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "stop this agent",
+                                            ),
+                                        },
+                                    },
+                                    Button {
+                                        id: "edit:agent-1",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "document-edit-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "edit this agent",
+                                            ),
+                                        },
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-statusline",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "media-playback-start-symbolic",
+                                        classes: [
+                                            "ts-agent-state",
+                                            "accent",
+                                        ],
+                                        tooltip: Some(
+                                            "running",
+                                        ),
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "working on task 1 of a rather long description",
+                                        max_width_chars: Some(
+                                            30,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "dim-label",
+                                            "caption",
+                                            "ts-agent-status",
+                                        ],
+                                        tooltip: Some(
+                                            "working on task 1 of a rather long description",
+                                        ),
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                    Box {
+                        id: None,
+                        dir: Vertical,
+                        spacing: 2,
+                        scroll: false,
+                        classes: [
+                            "ts-agent-row",
+                        ],
+                        children: [
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-head",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "system-run-symbolic",
+                                        classes: [
+                                            "ts-agent-runtime",
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "agent-2",
+                                        max_width_chars: Some(
+                                            20,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "heading",
+                                            "ts-agent-name",
+                                        ],
+                                        tooltip: Some(
+                                            "agent-2",
+                                        ),
+                                    },
+                                    Spacer,
+                                    Button {
+                                        id: "stop:agent-2",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "media-playback-stop-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "stop this agent",
+                                            ),
+                                        },
+                                    },
+                                    Button {
+                                        id: "edit:agent-2",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "document-edit-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "edit this agent",
+                                            ),
+                                        },
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-statusline",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "media-playback-start-symbolic",
+                                        classes: [
+                                            "ts-agent-state",
+                                            "accent",
+                                        ],
+                                        tooltip: Some(
+                                            "running",
+                                        ),
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "working on task 2 of a rather long description",
+                                        max_width_chars: Some(
+                                            30,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "dim-label",
+                                            "caption",
+                                            "ts-agent-status",
+                                        ],
+                                        tooltip: Some(
+                                            "working on task 2 of a rather long description",
+                                        ),
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                    Box {
+                        id: None,
+                        dir: Vertical,
+                        spacing: 2,
+                        scroll: false,
+                        classes: [
+                            "ts-agent-row",
+                        ],
+                        children: [
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-head",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "system-run-symbolic",
+                                        classes: [
+                                            "ts-agent-runtime",
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "agent-3",
+                                        max_width_chars: Some(
+                                            20,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "heading",
+                                            "ts-agent-name",
+                                        ],
+                                        tooltip: Some(
+                                            "agent-3",
+                                        ),
+                                    },
+                                    Spacer,
+                                    Button {
+                                        id: "stop:agent-3",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "media-playback-stop-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "stop this agent",
+                                            ),
+                                        },
+                                    },
+                                    Button {
+                                        id: "edit:agent-3",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "document-edit-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "edit this agent",
+                                            ),
+                                        },
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-statusline",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "media-playback-start-symbolic",
+                                        classes: [
+                                            "ts-agent-state",
+                                            "accent",
+                                        ],
+                                        tooltip: Some(
+                                            "running",
+                                        ),
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "working on task 3 of a rather long description",
+                                        max_width_chars: Some(
+                                            30,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "dim-label",
+                                            "caption",
+                                            "ts-agent-status",
+                                        ],
+                                        tooltip: Some(
+                                            "working on task 3 of a rather long description",
+                                        ),
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                    Box {
+                        id: None,
+                        dir: Vertical,
+                        spacing: 2,
+                        scroll: false,
+                        classes: [
+                            "ts-agent-row",
+                        ],
+                        children: [
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-head",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "system-run-symbolic",
+                                        classes: [
+                                            "ts-agent-runtime",
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "agent-4",
+                                        max_width_chars: Some(
+                                            20,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "heading",
+                                            "ts-agent-name",
+                                        ],
+                                        tooltip: Some(
+                                            "agent-4",
+                                        ),
+                                    },
+                                    Spacer,
+                                    Button {
+                                        id: "stop:agent-4",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "media-playback-stop-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "stop this agent",
+                                            ),
+                                        },
+                                    },
+                                    Button {
+                                        id: "edit:agent-4",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "document-edit-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "edit this agent",
+                                            ),
+                                        },
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-statusline",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "media-playback-start-symbolic",
+                                        classes: [
+                                            "ts-agent-state",
+                                            "accent",
+                                        ],
+                                        tooltip: Some(
+                                            "running",
+                                        ),
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "working on task 4 of a rather long description",
+                                        max_width_chars: Some(
+                                            30,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "dim-label",
+                                            "caption",
+                                            "ts-agent-status",
+                                        ],
+                                        tooltip: Some(
+                                            "working on task 4 of a rather long description",
+                                        ),
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                    Box {
+                        id: None,
+                        dir: Vertical,
+                        spacing: 2,
+                        scroll: false,
+                        classes: [
+                            "ts-agent-row",
+                        ],
+                        children: [
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-head",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "system-run-symbolic",
+                                        classes: [
+                                            "ts-agent-runtime",
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "agent-5",
+                                        max_width_chars: Some(
+                                            20,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "heading",
+                                            "ts-agent-name",
+                                        ],
+                                        tooltip: Some(
+                                            "agent-5",
+                                        ),
+                                    },
+                                    Spacer,
+                                    Button {
+                                        id: "stop:agent-5",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "media-playback-stop-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "stop this agent",
+                                            ),
+                                        },
+                                    },
+                                    Button {
+                                        id: "edit:agent-5",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "document-edit-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "edit this agent",
+                                            ),
+                                        },
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-statusline",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "media-playback-start-symbolic",
+                                        classes: [
+                                            "ts-agent-state",
+                                            "accent",
+                                        ],
+                                        tooltip: Some(
+                                            "running",
+                                        ),
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "working on task 5 of a rather long description",
+                                        max_width_chars: Some(
+                                            30,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "dim-label",
+                                            "caption",
+                                            "ts-agent-status",
+                                        ],
+                                        tooltip: Some(
+                                            "working on task 5 of a rather long description",
+                                        ),
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                    Box {
+                        id: None,
+                        dir: Vertical,
+                        spacing: 2,
+                        scroll: false,
+                        classes: [
+                            "ts-agent-row",
+                        ],
+                        children: [
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-head",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "system-run-symbolic",
+                                        classes: [
+                                            "ts-agent-runtime",
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "agent-6",
+                                        max_width_chars: Some(
+                                            20,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "heading",
+                                            "ts-agent-name",
+                                        ],
+                                        tooltip: Some(
+                                            "agent-6",
+                                        ),
+                                    },
+                                    Spacer,
+                                    Button {
+                                        id: "stop:agent-6",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "media-playback-stop-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "stop this agent",
+                                            ),
+                                        },
+                                    },
+                                    Button {
+                                        id: "edit:agent-6",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "document-edit-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "edit this agent",
+                                            ),
+                                        },
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-statusline",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "media-playback-start-symbolic",
+                                        classes: [
+                                            "ts-agent-state",
+                                            "accent",
+                                        ],
+                                        tooltip: Some(
+                                            "running",
+                                        ),
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "working on task 6 of a rather long description",
+                                        max_width_chars: Some(
+                                            30,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "dim-label",
+                                            "caption",
+                                            "ts-agent-status",
+                                        ],
+                                        tooltip: Some(
+                                            "working on task 6 of a rather long description",
+                                        ),
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                    Box {
+                        id: None,
+                        dir: Vertical,
+                        spacing: 2,
+                        scroll: false,
+                        classes: [
+                            "ts-agent-row",
+                        ],
+                        children: [
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-head",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "system-run-symbolic",
+                                        classes: [
+                                            "ts-agent-runtime",
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "agent-7",
+                                        max_width_chars: Some(
+                                            20,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "heading",
+                                            "ts-agent-name",
+                                        ],
+                                        tooltip: Some(
+                                            "agent-7",
+                                        ),
+                                    },
+                                    Spacer,
+                                    Button {
+                                        id: "stop:agent-7",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "media-playback-stop-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "stop this agent",
+                                            ),
+                                        },
+                                    },
+                                    Button {
+                                        id: "edit:agent-7",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "document-edit-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "edit this agent",
+                                            ),
+                                        },
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-statusline",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "media-playback-start-symbolic",
+                                        classes: [
+                                            "ts-agent-state",
+                                            "accent",
+                                        ],
+                                        tooltip: Some(
+                                            "running",
+                                        ),
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "working on task 7 of a rather long description",
+                                        max_width_chars: Some(
+                                            30,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "dim-label",
+                                            "caption",
+                                            "ts-agent-status",
+                                        ],
+                                        tooltip: Some(
+                                            "working on task 7 of a rather long description",
+                                        ),
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                    Box {
+                        id: None,
+                        dir: Vertical,
+                        spacing: 2,
+                        scroll: false,
+                        classes: [
+                            "ts-agent-row",
+                        ],
+                        children: [
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-head",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "system-run-symbolic",
+                                        classes: [
+                                            "ts-agent-runtime",
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "agent-8",
+                                        max_width_chars: Some(
+                                            20,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "heading",
+                                            "ts-agent-name",
+                                        ],
+                                        tooltip: Some(
+                                            "agent-8",
+                                        ),
+                                    },
+                                    Spacer,
+                                    Button {
+                                        id: "stop:agent-8",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "media-playback-stop-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "stop this agent",
+                                            ),
+                                        },
+                                    },
+                                    Button {
+                                        id: "edit:agent-8",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "document-edit-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "edit this agent",
+                                            ),
+                                        },
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-statusline",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "media-playback-start-symbolic",
+                                        classes: [
+                                            "ts-agent-state",
+                                            "accent",
+                                        ],
+                                        tooltip: Some(
+                                            "running",
+                                        ),
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "working on task 8 of a rather long description",
+                                        max_width_chars: Some(
+                                            30,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "dim-label",
+                                            "caption",
+                                            "ts-agent-status",
+                                        ],
+                                        tooltip: Some(
+                                            "working on task 8 of a rather long description",
+                                        ),
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                    Box {
+                        id: None,
+                        dir: Vertical,
+                        spacing: 2,
+                        scroll: false,
+                        classes: [
+                            "ts-agent-row",
+                        ],
+                        children: [
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-head",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "system-run-symbolic",
+                                        classes: [
+                                            "ts-agent-runtime",
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "agent-9",
+                                        max_width_chars: Some(
+                                            20,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "heading",
+                                            "ts-agent-name",
+                                        ],
+                                        tooltip: Some(
+                                            "agent-9",
+                                        ),
+                                    },
+                                    Spacer,
+                                    Button {
+                                        id: "stop:agent-9",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "media-playback-stop-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "stop this agent",
+                                            ),
+                                        },
+                                    },
+                                    Button {
+                                        id: "edit:agent-9",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "document-edit-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "edit this agent",
+                                            ),
+                                        },
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-statusline",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "media-playback-start-symbolic",
+                                        classes: [
+                                            "ts-agent-state",
+                                            "accent",
+                                        ],
+                                        tooltip: Some(
+                                            "running",
+                                        ),
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "working on task 9 of a rather long description",
+                                        max_width_chars: Some(
+                                            30,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "dim-label",
+                                            "caption",
+                                            "ts-agent-status",
+                                        ],
+                                        tooltip: Some(
+                                            "working on task 9 of a rather long description",
+                                        ),
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                    Box {
+                        id: None,
+                        dir: Vertical,
+                        spacing: 2,
+                        scroll: false,
+                        classes: [
+                            "ts-agent-row",
+                        ],
+                        children: [
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-head",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "system-run-symbolic",
+                                        classes: [
+                                            "ts-agent-runtime",
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "agent-10",
+                                        max_width_chars: Some(
+                                            20,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "heading",
+                                            "ts-agent-name",
+                                        ],
+                                        tooltip: Some(
+                                            "agent-10",
+                                        ),
+                                    },
+                                    Spacer,
+                                    Button {
+                                        id: "stop:agent-10",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "media-playback-stop-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "stop this agent",
+                                            ),
+                                        },
+                                    },
+                                    Button {
+                                        id: "edit:agent-10",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "document-edit-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "edit this agent",
+                                            ),
+                                        },
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-statusline",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "media-playback-start-symbolic",
+                                        classes: [
+                                            "ts-agent-state",
+                                            "accent",
+                                        ],
+                                        tooltip: Some(
+                                            "running",
+                                        ),
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "working on task 10 of a rather long description",
+                                        max_width_chars: Some(
+                                            30,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "dim-label",
+                                            "caption",
+                                            "ts-agent-status",
+                                        ],
+                                        tooltip: Some(
+                                            "working on task 10 of a rather long description",
+                                        ),
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                    Box {
+                        id: None,
+                        dir: Vertical,
+                        spacing: 2,
+                        scroll: false,
+                        classes: [
+                            "ts-agent-row",
+                        ],
+                        children: [
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-head",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "system-run-symbolic",
+                                        classes: [
+                                            "ts-agent-runtime",
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "agent-11",
+                                        max_width_chars: Some(
+                                            20,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "heading",
+                                            "ts-agent-name",
+                                        ],
+                                        tooltip: Some(
+                                            "agent-11",
+                                        ),
+                                    },
+                                    Spacer,
+                                    Button {
+                                        id: "stop:agent-11",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "media-playback-stop-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "stop this agent",
+                                            ),
+                                        },
+                                    },
+                                    Button {
+                                        id: "edit:agent-11",
+                                        classes: [
+                                            "flat",
+                                            "ts-agent-btn",
+                                        ],
+                                        child: Icon {
+                                            id: None,
+                                            name: "document-edit-symbolic",
+                                            classes: [],
+                                            tooltip: Some(
+                                                "edit this agent",
+                                            ),
+                                        },
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                            Row {
+                                id: None,
+                                classes: [
+                                    "ts-agent-statusline",
+                                ],
+                                spacing: 6,
+                                children: [
+                                    Icon {
+                                        id: None,
+                                        name: "media-playback-start-symbolic",
+                                        classes: [
+                                            "ts-agent-state",
+                                            "accent",
+                                        ],
+                                        tooltip: Some(
+                                            "running",
+                                        ),
+                                    },
+                                    Text {
+                                        id: None,
+                                        text: "working on task 11 of a rather long description",
+                                        max_width_chars: Some(
+                                            30,
+                                        ),
+                                        ellipsize: true,
+                                        classes: [
+                                            "dim-label",
+                                            "caption",
+                                            "ts-agent-status",
+                                        ],
+                                        tooltip: Some(
+                                            "working on task 11 of a rather long description",
+                                        ),
+                                    },
+                                ],
+                                tooltip: None,
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                ],
+            },
+        ],
+        tooltip: None,
+    },
+    panel: Some(
+        Box {
+            id: Some(
+                "agents-panel",
+            ),
+            dir: Vertical,
+            spacing: 0,
+            scroll: false,
+            classes: [
+                "ts-agents-panel",
+            ],
+            children: [
+                Box {
+                    id: None,
+                    dir: Vertical,
+                    spacing: 8,
+                    scroll: false,
+                    classes: [
+                        "ts-agents-panel-body",
+                    ],
+                    children: [
+                        Box {
+                            id: None,
+                            dir: Vertical,
+                            spacing: 4,
+                            scroll: false,
+                            classes: [
+                                "ts-agents-section",
+                            ],
+                            children: [
+                                Label {
+                                    id: None,
+                                    text: "hive",
+                                    classes: [
+                                        "heading",
+                                    ],
+                                    tooltip: None,
+                                },
+                                ListBox {
+                                    id: None,
+                                    classes: [
+                                        "boxed-list",
+                                        "ts-agents-panel-list",
+                                    ],
+                                    dense: false,
+                                    children: [
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Label {
+                                                    id: None,
+                                                    text: "state",
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "up — 12 agent(s)",
+                                                    max_width_chars: Some(
+                                                        28,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "caption",
+                                                        "numeric",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "up — 12 agent(s)",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Label {
+                                                    id: None,
+                                                    text: "socket",
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "/run/hyperhive/host.sock",
+                                                    max_width_chars: Some(
+                                                        28,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "caption",
+                                                        "numeric",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "/run/hyperhive/host.sock",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Label {
+                                                    id: None,
+                                                    text: "last poll",
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "just now",
+                                                    max_width_chars: Some(
+                                                        28,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "caption",
+                                                        "numeric",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "just now",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                    ],
+                                },
+                            ],
+                            tooltip: None,
+                        },
+                        Box {
+                            id: None,
+                            dir: Vertical,
+                            spacing: 4,
+                            scroll: false,
+                            classes: [
+                                "ts-agents-section",
+                            ],
+                            children: [
+                                Label {
+                                    id: None,
+                                    text: "roster",
+                                    classes: [
+                                        "heading",
+                                    ],
+                                    tooltip: None,
+                                },
+                                ListBox {
+                                    id: None,
+                                    classes: [
+                                        "boxed-list",
+                                        "ts-agents-panel-list",
+                                    ],
+                                    dense: false,
+                                    children: [
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Icon {
+                                                    id: None,
+                                                    name: "system-run-symbolic",
+                                                    classes: [
+                                                        "ts-agent-runtime",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Button {
+                                                    id: "edit:agent-0",
+                                                    classes: [
+                                                        "flat",
+                                                        "ts-agent-name",
+                                                    ],
+                                                    child: Text {
+                                                        id: None,
+                                                        text: "agent-0",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
+                                                        classes: [],
+                                                        tooltip: Some(
+                                                            "agent-0",
+                                                        ),
+                                                    },
+                                                },
+                                                Icon {
+                                                    id: None,
+                                                    name: "media-playback-start-symbolic",
+                                                    classes: [
+                                                        "ts-agent-state",
+                                                        "accent",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "running",
+                                                    ),
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "working on task 0 of a rather long description",
+                                                    max_width_chars: Some(
+                                                        34,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "working on task 0 of a rather long description",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Icon {
+                                                    id: None,
+                                                    name: "system-run-symbolic",
+                                                    classes: [
+                                                        "ts-agent-runtime",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Button {
+                                                    id: "edit:agent-1",
+                                                    classes: [
+                                                        "flat",
+                                                        "ts-agent-name",
+                                                    ],
+                                                    child: Text {
+                                                        id: None,
+                                                        text: "agent-1",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
+                                                        classes: [],
+                                                        tooltip: Some(
+                                                            "agent-1",
+                                                        ),
+                                                    },
+                                                },
+                                                Icon {
+                                                    id: None,
+                                                    name: "media-playback-start-symbolic",
+                                                    classes: [
+                                                        "ts-agent-state",
+                                                        "accent",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "running",
+                                                    ),
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "working on task 1 of a rather long description",
+                                                    max_width_chars: Some(
+                                                        34,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "working on task 1 of a rather long description",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Icon {
+                                                    id: None,
+                                                    name: "system-run-symbolic",
+                                                    classes: [
+                                                        "ts-agent-runtime",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Button {
+                                                    id: "edit:agent-2",
+                                                    classes: [
+                                                        "flat",
+                                                        "ts-agent-name",
+                                                    ],
+                                                    child: Text {
+                                                        id: None,
+                                                        text: "agent-2",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
+                                                        classes: [],
+                                                        tooltip: Some(
+                                                            "agent-2",
+                                                        ),
+                                                    },
+                                                },
+                                                Icon {
+                                                    id: None,
+                                                    name: "media-playback-start-symbolic",
+                                                    classes: [
+                                                        "ts-agent-state",
+                                                        "accent",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "running",
+                                                    ),
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "working on task 2 of a rather long description",
+                                                    max_width_chars: Some(
+                                                        34,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "working on task 2 of a rather long description",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Icon {
+                                                    id: None,
+                                                    name: "system-run-symbolic",
+                                                    classes: [
+                                                        "ts-agent-runtime",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Button {
+                                                    id: "edit:agent-3",
+                                                    classes: [
+                                                        "flat",
+                                                        "ts-agent-name",
+                                                    ],
+                                                    child: Text {
+                                                        id: None,
+                                                        text: "agent-3",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
+                                                        classes: [],
+                                                        tooltip: Some(
+                                                            "agent-3",
+                                                        ),
+                                                    },
+                                                },
+                                                Icon {
+                                                    id: None,
+                                                    name: "media-playback-start-symbolic",
+                                                    classes: [
+                                                        "ts-agent-state",
+                                                        "accent",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "running",
+                                                    ),
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "working on task 3 of a rather long description",
+                                                    max_width_chars: Some(
+                                                        34,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "working on task 3 of a rather long description",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Icon {
+                                                    id: None,
+                                                    name: "system-run-symbolic",
+                                                    classes: [
+                                                        "ts-agent-runtime",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Button {
+                                                    id: "edit:agent-4",
+                                                    classes: [
+                                                        "flat",
+                                                        "ts-agent-name",
+                                                    ],
+                                                    child: Text {
+                                                        id: None,
+                                                        text: "agent-4",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
+                                                        classes: [],
+                                                        tooltip: Some(
+                                                            "agent-4",
+                                                        ),
+                                                    },
+                                                },
+                                                Icon {
+                                                    id: None,
+                                                    name: "media-playback-start-symbolic",
+                                                    classes: [
+                                                        "ts-agent-state",
+                                                        "accent",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "running",
+                                                    ),
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "working on task 4 of a rather long description",
+                                                    max_width_chars: Some(
+                                                        34,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "working on task 4 of a rather long description",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Icon {
+                                                    id: None,
+                                                    name: "system-run-symbolic",
+                                                    classes: [
+                                                        "ts-agent-runtime",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Button {
+                                                    id: "edit:agent-5",
+                                                    classes: [
+                                                        "flat",
+                                                        "ts-agent-name",
+                                                    ],
+                                                    child: Text {
+                                                        id: None,
+                                                        text: "agent-5",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
+                                                        classes: [],
+                                                        tooltip: Some(
+                                                            "agent-5",
+                                                        ),
+                                                    },
+                                                },
+                                                Icon {
+                                                    id: None,
+                                                    name: "media-playback-start-symbolic",
+                                                    classes: [
+                                                        "ts-agent-state",
+                                                        "accent",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "running",
+                                                    ),
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "working on task 5 of a rather long description",
+                                                    max_width_chars: Some(
+                                                        34,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "working on task 5 of a rather long description",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Icon {
+                                                    id: None,
+                                                    name: "system-run-symbolic",
+                                                    classes: [
+                                                        "ts-agent-runtime",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Button {
+                                                    id: "edit:agent-6",
+                                                    classes: [
+                                                        "flat",
+                                                        "ts-agent-name",
+                                                    ],
+                                                    child: Text {
+                                                        id: None,
+                                                        text: "agent-6",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
+                                                        classes: [],
+                                                        tooltip: Some(
+                                                            "agent-6",
+                                                        ),
+                                                    },
+                                                },
+                                                Icon {
+                                                    id: None,
+                                                    name: "media-playback-start-symbolic",
+                                                    classes: [
+                                                        "ts-agent-state",
+                                                        "accent",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "running",
+                                                    ),
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "working on task 6 of a rather long description",
+                                                    max_width_chars: Some(
+                                                        34,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "working on task 6 of a rather long description",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Icon {
+                                                    id: None,
+                                                    name: "system-run-symbolic",
+                                                    classes: [
+                                                        "ts-agent-runtime",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Button {
+                                                    id: "edit:agent-7",
+                                                    classes: [
+                                                        "flat",
+                                                        "ts-agent-name",
+                                                    ],
+                                                    child: Text {
+                                                        id: None,
+                                                        text: "agent-7",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
+                                                        classes: [],
+                                                        tooltip: Some(
+                                                            "agent-7",
+                                                        ),
+                                                    },
+                                                },
+                                                Icon {
+                                                    id: None,
+                                                    name: "media-playback-start-symbolic",
+                                                    classes: [
+                                                        "ts-agent-state",
+                                                        "accent",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "running",
+                                                    ),
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "working on task 7 of a rather long description",
+                                                    max_width_chars: Some(
+                                                        34,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "working on task 7 of a rather long description",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Icon {
+                                                    id: None,
+                                                    name: "system-run-symbolic",
+                                                    classes: [
+                                                        "ts-agent-runtime",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Button {
+                                                    id: "edit:agent-8",
+                                                    classes: [
+                                                        "flat",
+                                                        "ts-agent-name",
+                                                    ],
+                                                    child: Text {
+                                                        id: None,
+                                                        text: "agent-8",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
+                                                        classes: [],
+                                                        tooltip: Some(
+                                                            "agent-8",
+                                                        ),
+                                                    },
+                                                },
+                                                Icon {
+                                                    id: None,
+                                                    name: "media-playback-start-symbolic",
+                                                    classes: [
+                                                        "ts-agent-state",
+                                                        "accent",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "running",
+                                                    ),
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "working on task 8 of a rather long description",
+                                                    max_width_chars: Some(
+                                                        34,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "working on task 8 of a rather long description",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Icon {
+                                                    id: None,
+                                                    name: "system-run-symbolic",
+                                                    classes: [
+                                                        "ts-agent-runtime",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Button {
+                                                    id: "edit:agent-9",
+                                                    classes: [
+                                                        "flat",
+                                                        "ts-agent-name",
+                                                    ],
+                                                    child: Text {
+                                                        id: None,
+                                                        text: "agent-9",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
+                                                        classes: [],
+                                                        tooltip: Some(
+                                                            "agent-9",
+                                                        ),
+                                                    },
+                                                },
+                                                Icon {
+                                                    id: None,
+                                                    name: "media-playback-start-symbolic",
+                                                    classes: [
+                                                        "ts-agent-state",
+                                                        "accent",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "running",
+                                                    ),
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "working on task 9 of a rather long description",
+                                                    max_width_chars: Some(
+                                                        34,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "working on task 9 of a rather long description",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Icon {
+                                                    id: None,
+                                                    name: "system-run-symbolic",
+                                                    classes: [
+                                                        "ts-agent-runtime",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Button {
+                                                    id: "edit:agent-10",
+                                                    classes: [
+                                                        "flat",
+                                                        "ts-agent-name",
+                                                    ],
+                                                    child: Text {
+                                                        id: None,
+                                                        text: "agent-10",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
+                                                        classes: [],
+                                                        tooltip: Some(
+                                                            "agent-10",
+                                                        ),
+                                                    },
+                                                },
+                                                Icon {
+                                                    id: None,
+                                                    name: "media-playback-start-symbolic",
+                                                    classes: [
+                                                        "ts-agent-state",
+                                                        "accent",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "running",
+                                                    ),
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "working on task 10 of a rather long description",
+                                                    max_width_chars: Some(
+                                                        34,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "working on task 10 of a rather long description",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Icon {
+                                                    id: None,
+                                                    name: "system-run-symbolic",
+                                                    classes: [
+                                                        "ts-agent-runtime",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Button {
+                                                    id: "edit:agent-11",
+                                                    classes: [
+                                                        "flat",
+                                                        "ts-agent-name",
+                                                    ],
+                                                    child: Text {
+                                                        id: None,
+                                                        text: "agent-11",
+                                                        max_width_chars: Some(
+                                                            32,
+                                                        ),
+                                                        ellipsize: true,
+                                                        classes: [],
+                                                        tooltip: Some(
+                                                            "agent-11",
+                                                        ),
+                                                    },
+                                                },
+                                                Icon {
+                                                    id: None,
+                                                    name: "media-playback-start-symbolic",
+                                                    classes: [
+                                                        "ts-agent-state",
+                                                        "accent",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "running",
+                                                    ),
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "working on task 11 of a rather long description",
+                                                    max_width_chars: Some(
+                                                        34,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "working on task 11 of a rather long description",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                    ],
+                                },
+                            ],
+                            tooltip: None,
+                        },
+                    ],
+                    tooltip: None,
+                },
+            ],
+            tooltip: None,
+        },
+    ),
+    hidden_on: [],
+}

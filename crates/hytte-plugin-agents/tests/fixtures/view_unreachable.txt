@@ -1,0 +1,266 @@
+View {
+    tree: Box {
+        id: Some(
+            "agents-root",
+        ),
+        dir: Vertical,
+        spacing: 0,
+        scroll: false,
+        classes: [
+            "ts-agents-card",
+        ],
+        children: [
+            Row {
+                id: None,
+                classes: [
+                    "ts-agents-title",
+                ],
+                spacing: 6,
+                children: [
+                    Label {
+                        id: None,
+                        text: "AGENTS",
+                        classes: [
+                            "ts-agents-heading",
+                        ],
+                        tooltip: None,
+                    },
+                    Spacer,
+                    Label {
+                        id: None,
+                        text: "no hive",
+                        classes: [
+                            "dim-label",
+                            "caption",
+                            "numeric",
+                        ],
+                        tooltip: None,
+                    },
+                    Button {
+                        id: "agents-overview",
+                        classes: [
+                            "flat",
+                            "ts-agent-btn",
+                        ],
+                        child: Icon {
+                            id: None,
+                            name: "view-list-symbolic",
+                            classes: [],
+                            tooltip: Some(
+                                "hive overview and the full roster",
+                            ),
+                        },
+                    },
+                ],
+                tooltip: None,
+            },
+            ListBox {
+                id: None,
+                classes: [
+                    "boxed-list",
+                    "ts-agents-list",
+                ],
+                dense: true,
+                children: [
+                    Row {
+                        id: None,
+                        classes: [
+                            "ts-agents-notice",
+                        ],
+                        spacing: 6,
+                        children: [
+                            Icon {
+                                id: None,
+                                name: "network-offline-symbolic",
+                                classes: [
+                                    "ts-agent-state",
+                                    "dim-label",
+                                ],
+                                tooltip: None,
+                            },
+                            Text {
+                                id: None,
+                                text: "permission denied — needs `hive-admin` group (re-login after adding)",
+                                max_width_chars: Some(
+                                    34,
+                                ),
+                                ellipsize: false,
+                                classes: [
+                                    "dim-label",
+                                    "caption",
+                                ],
+                                tooltip: None,
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                ],
+            },
+        ],
+        tooltip: None,
+    },
+    panel: Some(
+        Box {
+            id: Some(
+                "agents-panel",
+            ),
+            dir: Vertical,
+            spacing: 0,
+            scroll: false,
+            classes: [
+                "ts-agents-panel",
+            ],
+            children: [
+                Box {
+                    id: None,
+                    dir: Vertical,
+                    spacing: 8,
+                    scroll: false,
+                    classes: [
+                        "ts-agents-panel-body",
+                    ],
+                    children: [
+                        Box {
+                            id: None,
+                            dir: Vertical,
+                            spacing: 4,
+                            scroll: false,
+                            classes: [
+                                "ts-agents-section",
+                            ],
+                            children: [
+                                Label {
+                                    id: None,
+                                    text: "hive",
+                                    classes: [
+                                        "heading",
+                                    ],
+                                    tooltip: None,
+                                },
+                                ListBox {
+                                    id: None,
+                                    classes: [
+                                        "boxed-list",
+                                        "ts-agents-panel-list",
+                                    ],
+                                    dense: false,
+                                    children: [
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Label {
+                                                    id: None,
+                                                    text: "state",
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "unreachable — permission denied — needs `hive-admin` group (re-login after adding)",
+                                                    max_width_chars: Some(
+                                                        28,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "caption",
+                                                        "numeric",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "unreachable — permission denied — needs `hive-admin` group (re-login after adding)",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Label {
+                                                    id: None,
+                                                    text: "socket",
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "/run/hyperhive/host.sock",
+                                                    max_width_chars: Some(
+                                                        28,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "caption",
+                                                        "numeric",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "/run/hyperhive/host.sock",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                        Row {
+                                            id: None,
+                                            classes: [
+                                                "ts-agent-detail",
+                                            ],
+                                            spacing: 6,
+                                            children: [
+                                                Label {
+                                                    id: None,
+                                                    text: "last poll",
+                                                    classes: [
+                                                        "dim-label",
+                                                        "caption",
+                                                    ],
+                                                    tooltip: None,
+                                                },
+                                                Spacer,
+                                                Text {
+                                                    id: None,
+                                                    text: "never",
+                                                    max_width_chars: Some(
+                                                        28,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "caption",
+                                                        "numeric",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "never",
+                                                    ),
+                                                },
+                                            ],
+                                            tooltip: None,
+                                        },
+                                    ],
+                                },
+                            ],
+                            tooltip: None,
+                        },
+                    ],
+                    tooltip: None,
+                },
+            ],
+            tooltip: None,
+        },
+    ),
+    hidden_on: [],
+}

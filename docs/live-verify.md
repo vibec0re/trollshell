@@ -390,6 +390,144 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       newer wire vocabulary … update the shell" warn, instead of crash-looping
       silently.
 
+## Agents (hyperhive)
+
+Everything here needs a **hive on the laptop** — i.e. #949's
+`services.hyperhive.deploy.singleHostSwarm` deployed — plus the desktop user in
+`services.hyperhive.adminUsers`. Nothing in CI can reach any of it: P1 is
+tested end to end against a fake `host.sock`
+(`crates/hytte-plugin-agents/tests/fake_socket.rs`), which proves the wire and
+the reducer but cannot prove the hive agrees.
+
+- [ ] **(#947 P1)** The card is framed and the rows have room. Enable the
+      plugin
+      (`programs.trollshell.plugins.agents.package = trollshell.packages.${system}.hytte-plugin-agents;`),
+      open the sidebar, and confirm: a title row reading `AGENTS` on the left
+      and `up · N` plus a list button on the right, in the same all-caps
+      caption treatment and the same inset as the `TASKS` card above it; and
+      **one pill per agent, two lines and nothing else** (Annika's v1, #963
+      2026-09-11) — line 1 `[runtime icon] [Name] [Model]` on the left with
+      `[start|stop] [edit]` on the right, line 2 the state glyph and the
+      harness's status text **in full**, dim. A status long enough to be cut
+      (past ~88 characters) must show the whole string on hover. **Note:** the
+      padding, the caption treatment, the list fill and the compact buttons are
+      shell-side CSS (`assets/trollshell/style.css`), so they need a shell
+      rebuild — restarting only the plugin picks up the node-tree half and
+      leaves the rows flush and roomy.
+- [ ] **(#947 P1)** The card carries **none** of the old detail. Confirm there
+      is no chevron, that nothing unfolds inside the card, and that no
+      `deployed` / `parent` / `agent page` row appears on it. This is the
+      clutter Annika removed; if any of it is back, the plugin is stale.
+- [ ] **(#947 P1)** **The model reads `Opus`, not the dated id.** On a live
+      hive the harness reports something like `claude-opus-4-6` or
+      `opus-5.2-2026…`; the chip must show the family word only. Hover it and
+      confirm the **full** id is the tooltip — the shortening must lose
+      nothing. A model whose family this build has never heard of shows its
+      first token capitalised, which is a read-only check unless you can point
+      an agent at one.
+- [ ] **(#947 P1)** **The row itself does nothing.** Click an agent's name, its
+      icon, its status line and the blank space between them, and confirm
+      nothing happens — no drawer, no page. Her spec is "click on agent opens
+      agent page in trollshell-webview", which is #950 and is not built; the
+      row is deliberately inert until it is, so that nobody learns the wrong
+      surface. Only the two buttons respond.
+- [ ] **(#947 P1)** **Start/stop is the hive's own verb.** On a stopped agent
+      the left button offers `start`; on any other, `stop`. Click it and
+      confirm the agent really starts/stops hive-side (`hivectl list-agents`)
+      within a poll or two. This is `Start`/`Stop`, a **different** hive verb
+      from `SetPaused` — pause/resume is on the drawer page, not on the card.
+- [ ] **(#947 P1)** The drawer is reached from the **title row** or the **edit
+      button**. The list button beside `up · N` opens the plugin's page at the
+      hive overview — state, socket, last-poll age, a clickable `dashboard`
+      link, and the **full, uncapped** roster. A row's `edit` button opens that
+      agent's page instead. **Expect it top right:** that is the drawer, and it
+      is a **placeholder** — Annika settled on #947 (2026-09-11) that the edit
+      button's real destination is the agent's own #950 companion window on its
+      **settings tab**, the same window the row click opens on the agent page.
+      (#1010's modal is for every _other_ plugin page and does not govern this
+      one.) Nothing else on a row leaves the sidebar.
+- [ ] **(#947 P1)** The agent page is the same pill, plus what the card gave
+      up. With an agent selected, confirm: a header with the runtime icon, the
+      name at title size, the **model chip**, and `[start|stop]` + `[pause]` as
+      round icon buttons with hover text; the state glyph and the status line
+      under it; **only the flags that are on** as chips (a healthy agent shows
+      none — no `failed no / paused no` rows); a `links` group with exactly one
+      row, `agent page`; and `all agents` returning to the overview. There must
+      be **no** `deployment` group — no sha, parent, model row or status age.
+      A roster long enough to overflow the drawer must scroll **inside the
+      page** rather than running off the bottom.
+- [ ] **(#947 P1 / #1045)** **The agent page link actually opens.** On the
+      agent's page, click the `agent page` value — it is a link button now, not
+      a label (@kaesaecracker, 2026-09-10: "there is no way to open agent term
+      url"). The browser must open the hive's URL for that agent. This is the
+      plugin half of #1045's host arm, so the journal lines in that section's
+      happy path apply verbatim; check the same for the overview's `dashboard`
+      link. A hive with no domain configured renders **no** link row at all —
+      never a button that opens nothing. If the desktop refuses the URL, expect
+      exactly one toast reading `couldn't open the link` with the host's own
+      reason as the body, rather than a click that silently does nothing.
+- [ ] **(#947 P1)** Group expanders. With two or more `[display.*].project`
+      values, each group is an expander with a `live/total` count; a group
+      whose agents are **all stopped** starts collapsed. Clicking a header
+      toggles it, and the choice must survive the next poll rather than
+      springing back open.
+- [ ] **(#947 P1)** On a hive with more than 20 agents the card draws 20 rows
+      and a `+N more — open the panel for the full roster` line rather than
+      growing without limit, and the panel's overview really does list all of
+      them. If you have fewer than 20, this is a read-only check of the code
+      path. The cap is **belt-and-braces since #967** — the sidebar scrolls, so
+      it is no longer what keeps the pet card reachable; what it bounds is how
+      much node tree a runaway hive makes the plugin serialise every two
+      seconds.
+- [ ] **(#947 P1)** The status line is the harness's own text. Have an agent
+      call its `set_status` tool and confirm the row's second line changes to
+      that string within one poll (2 s by default) — not "running". A stopped
+      or paused agent must show its state word instead, never a stale text from
+      before the stop.
+- [ ] **(#947 P1)** **Pause actually parks a live agent.** Pause is on the
+      **agent's page** (the card's two buttons are start/stop and edit). Click
+      pause on a running agent; the row should flip immediately (optimistic) and stay
+      paused after the next poll. Confirm hive-side that the harness pause
+      marker exists (`hivectl list-agents` shows it paused) and that the agent
+      drives no further turns. Click again to resume and confirm both ends
+      agree. A refused write must un-stick the row within one poll rather than
+      leaving it claiming a pause that never happened — **and must say why**:
+      drive a refusal on purpose (stop `hive-c0re` between the click and the
+      write, or click an agent the hive has since destroyed) and confirm
+      exactly one toast reading `hive refused: pause <label>` with the hive's
+      own message as the body. Without it the button just flips and snaps back,
+      which reads as broken rather than refused.
+- [ ] **(#947 P1)** Grouping. Give two agents different
+      `[display.<name>].project` values in `~/.config/trollshell/agents.toml`
+      and confirm two group headers appear; collapse them to one project and
+      confirm the header disappears entirely; leave one agent unlabelled and
+      confirm it lands under `ungrouped` rather than vanishing. The file should
+      be picked up on the next poll with no restart.
+- [ ] **(#947 P1)** **A `needs_login` flip raises exactly one toast.** Expire
+      an agent's claude session (or otherwise drive it into `needs_login`) with
+      the sidebar **open** and confirm one notification, then confirm no
+      further toasts while it stays in that state. Same for a `failed` unit.
+      Note the known limitation to check against your taste: the poll parks
+      while the sidebar is closed (spec §5.4), so no toast fires from a closed
+      sidebar — if that is wrong, say so on #947 and it is a one-line change.
+- [ ] **(#947 P1)** Start / stop are scoped to one agent. From an agent's page
+      in the drawer, use the round start and stop buttons and check
+      `hivectl list-agents` before and after that **nothing else moved** (the
+      §11 rule-one footgun: an unscoped frame would have started the whole
+      hive; CI can only prove the bytes).
+- [ ] **(#947 P1)** No hive, no crash. Stop `hive-c0re` and confirm the card
+      shows one "no hive" row with a reason, keeps its cadence, and recovers on
+      its own when the daemon comes back — without restarting the plugin.
+      Then remove the user from `hive-admin` (or test as another user) and
+      confirm the row says permission, not "not running".
+- [ ] **(#947 P1)** **Re-record the wire fixtures.** The fixtures under
+      `crates/hytte-plugin-agents/tests/fixtures/*.json` were derived by hand
+      from hyperhive's struct definitions, not recorded from a live daemon
+      (spec §12 asks for a recording; there was no hive to record from). With a
+      hive up, capture real `AgentStatus` / `List` / `Urls` answers and diff
+      them against the committed files. **A difference is a finding, not a
+      formatting nit** — see that directory's `README.md`.
+
 ## Plugins & launcher
 
 - [ ] **(#489)** Plugins now launch via `systemd-run --user` transient units

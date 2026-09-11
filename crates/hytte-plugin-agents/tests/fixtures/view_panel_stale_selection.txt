@@ -1,0 +1,296 @@
+Box {
+    id: Some(
+        "agents-panel",
+    ),
+    dir: Vertical,
+    spacing: 0,
+    scroll: false,
+    classes: [
+        "ts-agents-panel",
+    ],
+    children: [
+        Scrolled {
+            id: None,
+            max_height: 560,
+            classes: [
+                "ts-agents-viewport",
+            ],
+            child: Box {
+                id: None,
+                dir: Vertical,
+                spacing: 8,
+                scroll: false,
+                classes: [
+                    "ts-agents-panel-body",
+                ],
+                children: [
+                    Row {
+                        id: None,
+                        classes: [
+                            "ts-agents-notice",
+                        ],
+                        spacing: 6,
+                        children: [
+                            Icon {
+                                id: None,
+                                name: "dialog-information-symbolic",
+                                classes: [
+                                    "ts-agent-state",
+                                    "dim-label",
+                                ],
+                                tooltip: None,
+                            },
+                            Text {
+                                id: None,
+                                text: "choom is not in the hive's current roster",
+                                max_width_chars: Some(
+                                    34,
+                                ),
+                                ellipsize: false,
+                                classes: [
+                                    "dim-label",
+                                    "caption",
+                                ],
+                                tooltip: None,
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                    Row {
+                        id: None,
+                        classes: [
+                            "ts-agents-panel-actions",
+                        ],
+                        spacing: 6,
+                        children: [
+                            Spacer,
+                            Button {
+                                id: "agents-back",
+                                classes: [
+                                    "flat",
+                                ],
+                                child: Label {
+                                    id: None,
+                                    text: "all agents",
+                                    classes: [],
+                                    tooltip: None,
+                                },
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                    Box {
+                        id: None,
+                        dir: Vertical,
+                        spacing: 4,
+                        scroll: false,
+                        classes: [
+                            "ts-agents-section",
+                        ],
+                        children: [
+                            Label {
+                                id: None,
+                                text: "hive",
+                                classes: [
+                                    "heading",
+                                ],
+                                tooltip: None,
+                            },
+                            ListBox {
+                                id: None,
+                                classes: [
+                                    "boxed-list",
+                                    "ts-agents-panel-list",
+                                ],
+                                dense: false,
+                                children: [
+                                    Row {
+                                        id: None,
+                                        classes: [
+                                            "ts-agent-detail",
+                                        ],
+                                        spacing: 6,
+                                        children: [
+                                            Label {
+                                                id: None,
+                                                text: "state",
+                                                classes: [
+                                                    "dim-label",
+                                                    "caption",
+                                                ],
+                                                tooltip: None,
+                                            },
+                                            Spacer,
+                                            Text {
+                                                id: None,
+                                                text: "unreachable — connection refused",
+                                                max_width_chars: Some(
+                                                    28,
+                                                ),
+                                                ellipsize: true,
+                                                classes: [
+                                                    "caption",
+                                                    "numeric",
+                                                ],
+                                                tooltip: Some(
+                                                    "unreachable — connection refused",
+                                                ),
+                                            },
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Row {
+                                        id: None,
+                                        classes: [
+                                            "ts-agent-detail",
+                                        ],
+                                        spacing: 6,
+                                        children: [
+                                            Label {
+                                                id: None,
+                                                text: "socket",
+                                                classes: [
+                                                    "dim-label",
+                                                    "caption",
+                                                ],
+                                                tooltip: None,
+                                            },
+                                            Spacer,
+                                            Text {
+                                                id: None,
+                                                text: "/run/hive/host.sock",
+                                                max_width_chars: Some(
+                                                    28,
+                                                ),
+                                                ellipsize: true,
+                                                classes: [
+                                                    "caption",
+                                                    "numeric",
+                                                ],
+                                                tooltip: Some(
+                                                    "/run/hive/host.sock",
+                                                ),
+                                            },
+                                        ],
+                                        tooltip: None,
+                                    },
+                                    Row {
+                                        id: None,
+                                        classes: [
+                                            "ts-agent-detail",
+                                        ],
+                                        spacing: 6,
+                                        children: [
+                                            Label {
+                                                id: None,
+                                                text: "last poll",
+                                                classes: [
+                                                    "dim-label",
+                                                    "caption",
+                                                ],
+                                                tooltip: None,
+                                            },
+                                            Spacer,
+                                            Text {
+                                                id: None,
+                                                text: "1m ago",
+                                                max_width_chars: Some(
+                                                    28,
+                                                ),
+                                                ellipsize: true,
+                                                classes: [
+                                                    "caption",
+                                                    "numeric",
+                                                ],
+                                                tooltip: Some(
+                                                    "1m ago",
+                                                ),
+                                            },
+                                        ],
+                                        tooltip: None,
+                                    },
+                                ],
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                    Box {
+                        id: None,
+                        dir: Vertical,
+                        spacing: 4,
+                        scroll: false,
+                        classes: [
+                            "ts-agents-section",
+                        ],
+                        children: [
+                            Label {
+                                id: None,
+                                text: "links",
+                                classes: [
+                                    "heading",
+                                ],
+                                tooltip: None,
+                            },
+                            ListBox {
+                                id: None,
+                                classes: [
+                                    "boxed-list",
+                                    "ts-agents-panel-list",
+                                ],
+                                dense: false,
+                                children: [
+                                    Row {
+                                        id: None,
+                                        classes: [
+                                            "ts-agent-detail",
+                                        ],
+                                        spacing: 6,
+                                        children: [
+                                            Label {
+                                                id: None,
+                                                text: "dashboard",
+                                                classes: [
+                                                    "dim-label",
+                                                    "caption",
+                                                ],
+                                                tooltip: None,
+                                            },
+                                            Spacer,
+                                            Button {
+                                                id: "open-dashboard",
+                                                classes: [
+                                                    "flat",
+                                                    "link",
+                                                    "ts-agent-link",
+                                                ],
+                                                child: Text {
+                                                    id: None,
+                                                    text: "https://hive.local/",
+                                                    max_width_chars: Some(
+                                                        28,
+                                                    ),
+                                                    ellipsize: true,
+                                                    classes: [
+                                                        "caption",
+                                                        "numeric",
+                                                    ],
+                                                    tooltip: Some(
+                                                        "open https://hive.local/",
+                                                    ),
+                                                },
+                                            },
+                                        ],
+                                        tooltip: None,
+                                    },
+                                ],
+                            },
+                        ],
+                        tooltip: None,
+                    },
+                ],
+                tooltip: None,
+            },
+        },
+    ],
+    tooltip: None,
+}

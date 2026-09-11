@@ -835,10 +835,15 @@ const REQUIRED_TABLE_MESSAGE: &str = "table has no key this schema owns, but the
 /// schema walks, so `[core.a]` with nothing of `Core`'s in it reads as absent
 /// and the entry goes. For a struct field, "absent" is a shape the schema
 /// declared; a map key is the user's own content and has no `None` to
-/// round-trip into, so the two are not the same question. No `Subsystem` in
-/// this workspace has a map-typed field, which is the only reason this is
-/// written down rather than fixed: the first author to type one should decide
-/// it deliberately.
+/// round-trip into, so the two are not the same question. This was written down
+/// rather than fixed so that the first author to type a map would decide it
+/// deliberately; `hytte-plugin-agents`' `agents.toml` is that first one
+/// (`crates/hytte-plugin-agents/src/config.rs`, `AgentsConfig::display`, #947),
+/// and it **took the drop** — an all-`None` entry there is a no-op by
+/// construction, so materialising it would only give the writer a row to
+/// round-trip that changes nothing. A later map whose entries are *not*
+/// no-ops when empty is free to argue the other way; this rule is the default,
+/// not a verdict.
 ///
 /// # Passes
 ///

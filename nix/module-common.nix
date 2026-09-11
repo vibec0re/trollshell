@@ -734,7 +734,7 @@ self:
                   session-wide via `programs.trollshell.weather.fallbackCity`
                   instead of per-plugin here).
 
-                The full inventory — swept from source, all 13 bundled
+                The full inventory — swept from source, all 14 bundled
                 plugins including the ones with zero knobs — is published at
                 <https://vibec0re.github.io/trollshell/plugin-env.html>
                 (source: `docs/plugin-env.md`). An absolute URL rather than a
@@ -780,6 +780,16 @@ self:
             package = trollshell.packages.''${system}.hytte-plugin-pet;
             env.PET_NAME = "nisse";
           };
+
+          # The hyperhive agents sidebar (#947). `package` is REQUIRED and
+          # has no default — this option is an attrsOf submodule, so there is
+          # no `programs.trollshell.plugins.agents.enable` to find in the
+          # rendered docs until you write the entry yourself. Writing it is
+          # what turns the plugin on.
+          agents = {
+            package = trollshell.packages.''${system}.hytte-plugin-agents;
+            env.RUST_LOG = "hytte_plugin_agents=debug";
+          };
         }
       '';
       description = ''
@@ -824,10 +834,34 @@ self:
 
             plugins.pet.package = trollshell.packages.''${system}.hytte-plugin-pet;
 
-        The bundled ids are: audio-widget, bar-clock-demo, caw, clock-demo,
-        departures, infobroker, niri-layouts, pet, preem-demo, terminal,
-        timer, usage, weather (each output named `hytte-plugin-<id>`). Their
-        per-plugin runtime knobs go through `env` / `secrets` above.
+        The bundled ids are: agents, audio-widget, bar-clock-demo, caw,
+        clock-demo, departures, infobroker, niri-layouts, pet, preem-demo,
+        terminal, timer, usage, weather (each output named
+        `hytte-plugin-<id>`). Their per-plugin runtime knobs go through
+        `env` / `secrets` above.
+
+        **There is no per-plugin `enable` option to find.** This option is an
+        `attrsOf` submodule, so `programs.trollshell.plugins.<id>` does not
+        exist in the rendered option docs until you write the attr — there is
+        nothing to grep for, and `package` is mandatory with no default.
+        Enabling a bundled plugin *is* writing its entry:
+
+            programs.trollshell.plugins.agents = {
+              package = trollshell.packages.''${system}.hytte-plugin-agents;
+            };
+
+        (The `enable` field inside a submodule defaults to `true`, and exists
+        to turn a declared entry off again without deleting it.)
+
+        `agents` (#947) is worth two extra notes. It reads
+        `~/.config/trollshell/agents.toml` — socket path, poll cadence,
+        per-agent display and grouping — and takes no `env` beyond `RUST_LOG`
+        and no `secrets` at all. Reaching the hive is the desktop user's
+        membership of the `hive-admin` group
+        (`services.hyperhive.adminUsers`) against hyperhive's
+        `0660 root:hive-admin` socket: no root, no polkit, nothing this module
+        grants. Outside that group the card renders one "no hive — permission
+        denied" row, which is the correct unprivileged outcome.
       '';
     };
 

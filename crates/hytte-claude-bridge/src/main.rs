@@ -492,13 +492,20 @@ fn main() -> ExitCode {
     // The chip is the secondary duty. With no `XDG_RUNTIME_DIR` there is no host
     // socket to dial *ever*, and the SDK would exit the process over it — which
     // would take the API down with it. Park on the HTTP runtime instead.
+    //
+    // **Since #993 that branch is unreachable in practice**: the API listens
+    // under `$XDG_RUNTIME_DIR` too, so `start` has already refused (and `main`
+    // returned FAILURE) if the variable is missing. It is kept rather than
+    // replaced by an `unreachable!()` for the reason it was written: the two
+    // resolvers are separate (`socket::socket_path` here,
+    // `hytte_plugin_proto::socket_path` in the SDK), and if they ever disagree
+    // the API must **not** go down with the chip. A daemon that panics on the
+    // disagreement would do exactly that.
     if plugin::host_socket_available() {
         // Diverges: the SDK owns this thread for the rest of the process.
         plugin::run()
     } else {
-        tracing::warn!(
-            "XDG_RUNTIME_DIR unset; no trollshell host socket to dial — serving HTTP with no bar chip"
-        );
+        tracing::warn!("no trollshell host socket to dial — serving the API with no bar chip");
         rt.block_on(std::future::pending::<ExitCode>())
     }
 }

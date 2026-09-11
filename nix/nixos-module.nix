@@ -288,7 +288,7 @@ in
               hytte-claude-bridge user service is currently implemented only by
               the home-manager module — nix/nixos-module.nix declares no unit
               for it, so this setting has no effect here and nothing would
-              listen on the loopback port your plugins point at. The bridge
+              listen on the socket your plugins point at. The bridge
               drives a per-user, already-logged-in `claude` CLI, which a
               system-level module has no handle on. See #694. Move this to your
               home-manager programs.trollshell.claudeBridge config, or install

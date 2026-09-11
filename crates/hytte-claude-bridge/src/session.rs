@@ -206,7 +206,9 @@ fn fnv1a_field(hash: u64, field: &str) -> u64 {
 /// as two transcripts do. That is not a weakness worth closing here, because a
 /// caller who wants another caller's session can simply *send its `user`
 /// string* — identity is asserted, never authenticated, exactly as it is in the
-/// `OpenAI` field this borrows. The bridge listens on loopback only.
+/// `OpenAI` field this borrows. Every caller that can reach the socket is the
+/// same uid (#993), which is what makes an unauthenticated identity field
+/// adequate here and would not make it adequate on a shared endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
     /// Derived from the conversation's transcript — the pre-#704 fallback.

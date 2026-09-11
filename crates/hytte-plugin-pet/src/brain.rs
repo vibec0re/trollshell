@@ -14,6 +14,14 @@
 //! - a **local `llama-server`** — opt in with `$PET_LLM_URL` (e.g.
 //!   `http://127.0.0.1:8080`; see `etc/systemd/user/trollshell-pet-brain.service`).
 //!
+//! That same `$PET_LLM_URL` is how the pet rides a Claude Code subscription
+//! through `hytte-claude-bridge` (#584), which since #993 listens on a same-uid
+//! socket rather than a loopback port: the URL is
+//! `unix://$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock`
+//! (`programs.trollshell.claudeBridge.baseUrl` renders exactly that), and
+//! [`hytte_ai_providers::chat`] dials it over a `UnixStream`. Nothing in this
+//! module changed for it — a `Provider` is still just a base URL.
+//!
 //! With **no key and no `$PET_LLM_URL`** the brain resolves to canned-only up
 //! front (a keyless cloud call would only 401, so it never attempts one — see
 //! [`resolve_provider`]). Rate-limiting, unreachability, and nonsense (or empty)

@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, watch};
 
 use crate::backend::{Backend, Conversation as _, Turn};
@@ -416,7 +415,11 @@ fn error_response(status: u16, message: &str) -> (u16, Vec<u8>) {
 /// (#866) — at the connection boundary rather than inside [`Bridge::handle`], so
 /// a malformed request the parser rejects is counted too, and so the unit tests
 /// below (which call `handle` directly) never touch the process-global board.
-pub async fn serve_connection(bridge: &Bridge, mut stream: TcpStream) {
+///
+/// Generic over the stream since #993: the socket underneath is a
+/// [`UnixStream`](tokio::net::UnixStream) now rather than a `TcpStream`, and
+/// nothing above it changed — same protocol, same bytes, same statuses.
+pub async fn serve_connection(bridge: &Bridge, mut stream: impl http::Stream) {
     let (status, body) = match http::read_request(&mut stream).await {
         Ok((head, body)) => bridge.handle(&head, &body).await,
         Err(f) => error_response(f.status, &f.message),

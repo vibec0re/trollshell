@@ -1,11 +1,12 @@
 //! `hytte-claude-bridge` — an OpenAI-compatible face on headless Claude Code,
-//! served on loopback so the existing hytte LLM plugins can ride a Claude
-//! subscription **with zero changes to pet or caw** (`Provider` is already just
-//! a base URL). Issue #584.
+//! served on a same-uid Unix socket so the existing hytte LLM plugins can ride
+//! a Claude subscription **with zero changes to pet or caw** (`Provider` is
+//! already just a base URL). Issues #584, #993.
 //!
-//! One route, `POST /v1/chat/completions`, bound to `127.0.0.1:8787` — loopback
-//! only, never `0.0.0.0`, because this runs on somebody's personal credentials.
-//! (Port 8080 belongs to `trollshell-pet-brain.service`'s llama-server.)
+//! One route, `POST /v1/chat/completions`, bound to
+//! `$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock` — the path is not
+//! configurable, so no environment mistake can move the endpoint somewhere a
+//! second account can reach. See [`socket`].
 //!
 //! # It is also a hytte plugin (#866)
 //!
@@ -34,16 +35,32 @@
 //! its *own* token would 401 every single request, forever. Keyless inbound is
 //! the only shape that works.
 //!
-//! The corresponding control lives in the unit, not here:
-//! `etc/systemd/user/trollshell-claude-bridge.service` sets a dummy
-//! `OPENROUTER_API_KEY=local-bridge`. `load_key_from` checks the env override
-//! *before* the key file, so that dummy value is what stops a real cloud key
-//! being shipped to a loopback port. It is a security control; treat it as one.
+//! The corresponding control lives in the plugin's declared env, not here: the
+//! home-manager module sets a dummy `OPENROUTER_API_KEY=local-bridge` on the
+//! *consuming* plugin. `load_key_from` checks the env override *before* the key
+//! file, so that dummy value is what stops a real cloud key being shipped to a
+//! local endpoint. It is a security control; treat it as one.
 //!
-//! Loopback-only binding is the other half of that: with no inbound auth,
-//! reachability *is* the authorization boundary. That matters *more* in
-//! `CLAUDE_BRIDGE_MODE=api`, where anything that can reach the port spends real
-//! money — which is exactly why the IP is hard-coded and not configurable.
+//! # The authorization boundary is the SOCKET'S FILE MODE (#993)
+//!
+//! With no inbound auth, whoever can reach the endpoint is authorized — so the
+//! whole question is who that is, and the answer must be *this uid and nobody
+//! else*.
+//!
+//! Until #993 this bound `127.0.0.1:8787`, and every artefact that stated the
+//! boundary checked only the LAN direction. TCP loopback carries **no file
+//! mode**: every other local account, and every container sharing the host
+//! network namespace (the #947/#949 hive agents, directly), could POST a
+//! completion billed to the owner's subscription — real credits in
+//! `CLAUDE_BRIDGE_MODE=api` — and could hold [`bridge`]'s two permits to starve
+//! pet and caw while doing it.
+//!
+//! It now binds a Unix socket at `0600` inside a `0700` directory under
+//! `$XDG_RUNTIME_DIR`: the boundary #956 settled for the plugin socket, where
+//! the kernel enforces same-uid-only on `connect(2)` and nothing has to be
+//! documented, remembered, or checked per request. With no `$XDG_RUNTIME_DIR`
+//! there is **no fallback of any kind** — the daemon refuses to serve, because
+//! quietly falling back to a port is the defect itself. See [`socket`].
 //!
 //! # Outbound, the bridge holds a key only in `api` mode
 //!
@@ -84,7 +101,7 @@
 //!
 //! | variable | default | meaning |
 //! | --- | --- | --- |
-//! | `CLAUDE_BRIDGE_PORT` | `8787` | loopback port (the address is not configurable) |
+//! | `XDG_RUNTIME_DIR` | set by logind | where the socket lives; unset ⇒ the daemon refuses to serve. The path *within* it is not configurable (#993), and `CLAUDE_BRIDGE_PORT` is gone with the port it named |
 //! | `CLAUDE_BRIDGE_MODEL` | unset | the model; empty leaves claude's own default, or [`messages::DEFAULT_MODEL`] in `api` mode |
 //! | `CLAUDE_BRIDGE_MODE` | `subscription` | `subscription` (persisted session), `reprompt`, or `api` (#730) |
 //! | `CLAUDE_BRIDGE_TIMEOUT_SECS` | `8` | per-request budget; must stay under the client's 10s |
@@ -117,10 +134,10 @@ mod messages;
 mod plugin;
 mod retired;
 mod session;
+mod socket;
 mod status;
 mod wire;
 
-use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -128,9 +145,6 @@ use std::time::Duration;
 
 use backend::{Backend, Reprompt, Subscription};
 use bridge::Bridge;
-
-/// The port the design settled on. 8080 is llama-server's.
-const DEFAULT_PORT: u16 = 8787;
 
 /// Per-request budget. Under `hytte-ai-providers`' 10s global timeout on
 /// purpose: the client must see a clean 504 it can fall back from, not a
@@ -190,7 +204,10 @@ impl Mode {
 /// Everything read out of the environment at startup.
 #[derive(Debug, Clone)]
 struct Settings {
-    port: u16,
+    /// Where to listen — `None` when `$XDG_RUNTIME_DIR` is unset, which is a
+    /// refusal to serve rather than a fallback (#993). Resolved here, once, so
+    /// nothing below has to reach for the environment to be testable.
+    socket: Option<PathBuf>,
     mode: Mode,
     model: String,
     thinking: messages::Thinking,
@@ -201,9 +218,12 @@ struct Settings {
 impl Settings {
     fn from_env() -> Self {
         Self {
-            port: env_nonempty("CLAUDE_BRIDGE_PORT")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_PORT),
+            socket: socket::socket_path(
+                env_nonempty("XDG_RUNTIME_DIR")
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .as_deref(),
+            ),
             mode: Mode::parse(env_nonempty("CLAUDE_BRIDGE_MODE").as_deref()),
             model: env_nonempty("CLAUDE_BRIDGE_MODEL").unwrap_or_default(),
             thinking: messages::Thinking::parse(env_nonempty("CLAUDE_BRIDGE_THINKING").as_deref()),
@@ -293,17 +313,10 @@ fn state_dir() -> PathBuf {
         .join("hytte-claude-bridge")
 }
 
-/// The listen address. The IP is **hard-coded loopback** — only the port is
-/// configurable, so no environment mistake can expose an unauthenticated
-/// endpoint on a LAN.
-fn bind_addr(port: u16) -> SocketAddr {
-    SocketAddr::from((Ipv4Addr::LOCALHOST, port))
-}
-
 /// Everything that has to succeed before the bridge can answer a request: the
-/// backend, the retired-session map, and the bound loopback listener.
+/// backend, the retired-session map, and the bound same-uid socket.
 struct Serving {
-    listener: tokio::net::TcpListener,
+    socket: socket::BridgeSocket,
     bridge: Arc<Bridge>,
     /// Whether the bridge holds an outbound credential of its own — true only in
     /// [`Mode::Api`], which has already refused to start if no key resolved. The
@@ -313,7 +326,7 @@ struct Serving {
 }
 
 /// Bring the HTTP half up: run the billing guard where it applies, build the
-/// backend, and bind the loopback listener. `None` on any failure — each one is
+/// backend, and bind the same-uid socket. `None` on any failure — each one is
 /// logged here, and `main` turns it into [`ExitCode::FAILURE`].
 async fn start(settings: &Settings) -> Option<Serving> {
     // Fail closed before anything else — but only where the guard means
@@ -369,21 +382,14 @@ async fn start(settings: &Settings) -> Option<Serving> {
         Some(settings.state_dir.join(retired::FILE)),
     ));
 
-    let addr = bind_addr(settings.port);
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            tracing::error!(%addr, error = %e, "could not bind");
-            return None;
-        }
-    };
+    let socket = socket::bind_listener(settings.socket.as_deref()).await?;
     let billing = if settings.mode.spawns_claude() {
         "claude subscription (no key held)"
     } else {
         "metered Anthropic API credits (keyed)"
     };
     tracing::info!(
-        %addr,
+        socket = %settings.socket.as_deref().unwrap_or(std::path::Path::new("?")).display(),
         mode = ?settings.mode,
         model = %if settings.mode.spawns_claude() {
             if settings.model.is_empty() { "<claude default>".to_owned() } else { settings.model.clone() }
@@ -393,11 +399,11 @@ async fn start(settings: &Settings) -> Option<Serving> {
         budget_s = settings.budget.as_secs(),
         state_dir = %settings.state_dir.display(),
         billing,
-        "hytte-claude-bridge listening (no inbound auth; loopback only)",
+        "hytte-claude-bridge listening (no inbound auth; same-uid socket, 0600)",
     );
 
     Some(Serving {
-        listener,
+        socket,
         bridge,
         keyed,
     })
@@ -426,9 +432,9 @@ async fn supervise_http(http: tokio::task::JoinHandle<()>) {
 /// keeps serving whatever the plugin face is doing — including while the shell
 /// is down and the SDK is sitting in its dial backoff. If it ever *stops*,
 /// [`supervise_http`] ends the process.
-async fn accept_loop(listener: tokio::net::TcpListener, bridge: Arc<Bridge>) {
+async fn accept_loop(socket: socket::BridgeSocket, bridge: Arc<Bridge>) {
     loop {
-        match listener.accept().await {
+        match socket.accept().await {
             Ok((stream, _peer)) => {
                 let bridge = Arc::clone(&bridge);
                 tokio::spawn(async move { bridge::serve_connection(&bridge, stream).await });
@@ -480,36 +486,46 @@ fn main() -> ExitCode {
         mode: settings.mode,
         keyed: serving.keyed,
     });
-    let http = rt.spawn(accept_loop(serving.listener, serving.bridge));
+    let http = rt.spawn(accept_loop(serving.socket, serving.bridge));
     rt.spawn(supervise_http(http));
 
     // The chip is the secondary duty. With no `XDG_RUNTIME_DIR` there is no host
     // socket to dial *ever*, and the SDK would exit the process over it — which
     // would take the API down with it. Park on the HTTP runtime instead.
+    //
+    // **Since #993 that branch is unreachable in practice**: the API listens
+    // under `$XDG_RUNTIME_DIR` too, so `start` has already refused (and `main`
+    // returned FAILURE) if the variable is missing. It is kept rather than
+    // replaced by an `unreachable!()` for the reason it was written: the two
+    // resolvers are separate (`socket::socket_path` here,
+    // `hytte_plugin_proto::socket_path` in the SDK), and if they ever disagree
+    // the API must **not** go down with the chip. A daemon that panics on the
+    // disagreement would do exactly that.
     if plugin::host_socket_available() {
         // Diverges: the SDK owns this thread for the rest of the process.
         plugin::run()
     } else {
-        tracing::warn!(
-            "XDG_RUNTIME_DIR unset; no trollshell host socket to dial — serving HTTP with no bar chip"
-        );
+        tracing::warn!("no trollshell host socket to dial — serving the API with no bar chip");
         rt.block_on(std::future::pending::<ExitCode>())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_BUDGET, Mode, Settings, bind_addr};
+    use super::{DEFAULT_BUDGET, Mode, Settings};
     use std::time::Duration;
 
-    /// The listen address must never be routable. Only the port is
-    /// configurable; the IP is not reachable from the environment at all.
-    #[test]
-    fn the_bind_address_is_always_loopback() {
-        for port in [8787u16, 1, 65535] {
-            let addr = bind_addr(port);
-            assert!(addr.ip().is_loopback(), "{addr} is not loopback");
-            assert_eq!(addr.port(), port);
+    /// A `Settings` whose only interesting field is the one under test.
+    /// `socket: None` is deliberate here — none of these tests listens, and
+    /// where the daemon *does* listen is pinned in `crate::socket`.
+    fn settings(mode: Mode) -> Settings {
+        Settings {
+            socket: None,
+            mode,
+            model: String::new(),
+            thinking: crate::messages::Thinking::default(),
+            budget: DEFAULT_BUDGET,
+            state_dir: std::path::PathBuf::from("/tmp"),
         }
     }
 
@@ -559,14 +575,7 @@ mod tests {
     /// does for the CLI, because the Messages API requires the field.
     #[test]
     fn the_api_mode_always_resolves_a_concrete_model() {
-        let mut settings = Settings {
-            port: 8787,
-            mode: Mode::Api,
-            model: String::new(),
-            thinking: crate::messages::Thinking::default(),
-            budget: DEFAULT_BUDGET,
-            state_dir: std::path::PathBuf::from("/tmp"),
-        };
+        let mut settings = settings(Mode::Api);
         assert_eq!(settings.api_model(), crate::messages::DEFAULT_MODEL);
         settings.model = "claude-haiku-4-5".to_owned();
         assert_eq!(settings.api_model(), "claude-haiku-4-5");
@@ -582,14 +591,7 @@ mod tests {
     /// way because the Messages API has no such default.
     #[test]
     fn an_empty_model_omits_the_cli_flag() {
-        let mut settings = Settings {
-            port: 8787,
-            mode: Mode::Subscription,
-            model: String::new(),
-            thinking: crate::messages::Thinking::default(),
-            budget: DEFAULT_BUDGET,
-            state_dir: std::path::PathBuf::from("/tmp"),
-        };
+        let mut settings = settings(Mode::Subscription);
         assert_eq!(settings.model_arg(), None);
         settings.model = "haiku".to_owned();
         assert_eq!(settings.model_arg(), Some("haiku".to_owned()));
@@ -600,14 +602,7 @@ mod tests {
     /// uncancelled.
     #[test]
     fn the_inner_budget_stays_under_the_request_budget() {
-        let settings = Settings {
-            port: 8787,
-            mode: Mode::Api,
-            model: String::new(),
-            thinking: crate::messages::Thinking::default(),
-            budget: DEFAULT_BUDGET,
-            state_dir: std::path::PathBuf::from("/tmp"),
-        };
+        let settings = settings(Mode::Api);
         assert!(settings.inner_budget() < DEFAULT_BUDGET);
         // …and never zero, however small the outer budget gets.
         let tight = Settings {

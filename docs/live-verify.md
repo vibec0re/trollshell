@@ -662,22 +662,41 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
 ## Claude bridge (`hytte-claude-bridge`)
 
 - [ ] **(#666)** New standalone binary + systemd unit: a keyless,
-      loopback-only (`127.0.0.1:8787`) OpenAI-compatible shim over headless
+      same-uid-socket (`$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock`, `0600`
+      since #993) OpenAI-compatible shim over headless
       `claude`, so an LLM-backed plugin (`pet`, `caw`) can ride a Claude Code
       subscription instead of a paid API key with a one-line `Environment=`
       change on _its own_ unit. This is a brand-new service nobody has run
       live yet, so every check below is genuinely first-run, not a
       regression check.
-  1. **Starts and refuses correctly.** With `plugins.claude-bridge` enabled (or a hand-written `plugins.json` entry), restart it via the control-center's Plugins tab, or the `Control.ReloadPlugins` D-Bus call (see `etc/systemd/user/README.md`'s "How a config change reaches a running plugin" section), then check `journalctl --user -u trollshell-plugin-claude-bridge` — expect `hytte-claude-bridge listening (no inbound auth; loopback only)`. Then run it by hand with `ANTHROPIC_API_KEY=x hytte-claude-bridge` — expect a refusal naming the offending variable, exit 1 (the billing guard that stops metered credits leaking in from an inherited env).
+  1. **Starts and refuses correctly.** With `plugins.claude-bridge` enabled (or a hand-written `plugins.json` entry), restart it via the control-center's Plugins tab, or the `Control.ReloadPlugins` D-Bus call (see `etc/systemd/user/README.md`'s "How a config change reaches a running plugin" section), then check `journalctl --user -u trollshell-plugin-claude-bridge` — expect `hytte-claude-bridge listening (no inbound auth; same-uid socket, 0600)`. Then run it by hand with `ANTHROPIC_API_KEY=x hytte-claude-bridge` — expect a refusal naming the offending variable, exit 1 (the billing guard that stops metered credits leaking in from an inherited env).
   2. **A round trip:**
-     `curl -s localhost:8787/v1/chat/completions -H 'content-type: application/json' -d '{"messages":[{"role":"system","content":"you are a cat"},{"role":"user","content":"say hi"}]}'`
+     `curl -s --unix-socket "$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock" http://localhost/v1/chat/completions -H 'content-type: application/json' -d '{"messages":[{"role":"system","content":"you are a cat"},{"role":"user","content":"say hi"}]}'`
      — expect a `chat.completion` body with text in
      `choices[0].message.content`, inside 8s.
-  3. **Not reachable off-box** — from another host on the LAN,
-     `curl http://<box>:8787/…` must fail to connect. The bridge validates no
-     bearer token at all (it structurally can't — see the PR body), so
-     loopback-only is the entire authorization boundary; the IP is
-     hard-coded, only the port is configurable.
+  3. **(#993) Not reachable by a second local account.** This replaced the old
+     "not reachable off-box on the LAN" step, because the LAN direction was
+     never the hole. The bridge validates no bearer token at all (it
+     structurally can't — see the PR body) and it spends the owner's Claude
+     subscription, so whoever can reach the socket is authorized. Three
+     observations, in order.
+     First the modes:
+     `stat -c '%a %U' "$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock" "$XDG_RUNTIME_DIR/trollshell"`
+     → `600 <you>` and `700 <you>`.
+     Then, as a **second local user** (`sudo -u nobody -- …`, or any other
+     account on the box):
+     `curl -sv --unix-socket /run/user/<your-uid>/trollshell/claude-bridge.sock http://localhost/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}]}'`
+     → must fail with **permission denied** on `connect()`, not a
+     `chat.completion`. Before #993 the equivalent
+     `curl 127.0.0.1:8787/…` from that account returned a completion billed
+     to you.
+     Finally `ss -ltnp | grep 8787` → **nothing**: no TCP port is bound any
+     more, on loopback or anywhere else.
+     One caveat worth stating out loud for the #947/#949 hive agents: a
+     container sharing the host network namespace now sees no endpoint at all,
+     but one that also bind-mounts your `$XDG_RUNTIME_DIR` is the same uid by
+     construction and is _inside_ the boundary. Check what your cage actually
+     mounts before concluding either way.
   4. **The delta rule for real:** send turn 1, then turn 2 carrying
      `[system, user, assistant(reply), user]`. Check
      `~/.claude/projects/<slug>/` — there should be **one** `.jsonl` with a
@@ -693,7 +712,11 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
 title` in the stderr tail — worth a deliberate look on first run, since
      a silent drift here would read as "the bridge is broken" rather than
      naming the actual cause.
-  6. **pet end-to-end:** set `PET_LLM_URL=http://127.0.0.1:8787` and
+  6. **pet end-to-end:** set
+     `PET_LLM_URL='unix://$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock'`
+     (single-quoted — the variable is expanded by the plugin, not by nix or
+     your shell; `programs.trollshell.claudeBridge.baseUrl` renders exactly
+     this) and
      `OPENROUTER_API_KEY=local-bridge` on the `pet` plugin's declared env
      (`programs.trollshell.plugins.pet.env`, or the matching entry in
      `~/.config/trollshell/plugins.json` plus `Control.ReloadPlugins`) and

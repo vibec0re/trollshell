@@ -1140,6 +1140,7 @@ version = "0.1.0"
 dependencies = [
  "hive-claude",
  "httparse",
+ "hytte-ai-providers",
  "hytte-plugin",
  "serde",
  "serde_json",

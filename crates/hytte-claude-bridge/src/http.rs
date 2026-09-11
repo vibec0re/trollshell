@@ -19,8 +19,19 @@
 
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+
+/// Anything one request can be read off and one response written back to.
+///
+/// Generic since #993 only because the socket underneath changed from a
+/// `TcpStream` to a `UnixStream`: **the bytes on it did not**. Keeping the
+/// stream a parameter rather than swapping one concrete type for another is
+/// what lets the parser tests below stay byte-for-byte the ones written against
+/// `ureq`'s output, and lets a test drive a whole request/response over
+/// `tokio::io::duplex` with no socket at all.
+pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> Stream for S {}
 
 /// The one route this bridge serves.
 pub const ROUTE: &str = "/v1/chat/completions";
@@ -128,7 +139,7 @@ pub fn parse_head(buf: &[u8]) -> Result<Option<Head>, Failure> {
 }
 
 /// Read one complete request off `stream`, bounded by [`READ_TIMEOUT`].
-pub async fn read_request(stream: &mut TcpStream) -> Result<(Head, Vec<u8>), Failure> {
+pub async fn read_request(stream: &mut impl Stream) -> Result<(Head, Vec<u8>), Failure> {
     let read = async {
         let mut buf = Vec::with_capacity(4096);
         let mut chunk = [0u8; 4096];
@@ -184,7 +195,7 @@ pub fn response_bytes(status: u16, body: &[u8]) -> Vec<u8> {
 }
 
 /// Write a response and close the write half.
-pub async fn write_response(stream: &mut TcpStream, status: u16, body: &[u8]) {
+pub async fn write_response(stream: &mut impl Stream, status: u16, body: &[u8]) {
     let bytes = response_bytes(status, body);
     if let Err(e) = stream.write_all(&bytes).await {
         tracing::debug!(error = %e, "response write failed");
@@ -217,11 +228,13 @@ fn reason(status: u16) -> &'static str {
 mod tests {
     use super::{ROUTE, parse_head, response_bytes};
 
-    /// The exact head `ureq` 3 sends for `chat()`.
+    /// The exact head `ureq` 3 sends for `chat()` — since #993 over a Unix
+    /// socket, which changes only the `Host:` placeholder the client fills in
+    /// (`hytte_ai_providers::unix`), never the request line or the framing.
     #[test]
     fn parses_a_ureq_shaped_request() {
         let raw = b"POST /v1/chat/completions HTTP/1.1\r\n\
-                    host: 127.0.0.1:8787\r\n\
+                    host: localhost\r\n\
                     content-type: application/json\r\n\
                     content-length: 17\r\n\
                     \r\n\

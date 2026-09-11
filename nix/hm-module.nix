@@ -592,7 +592,7 @@ in
         };
       }
 
-      # hytte-claude-bridge (#584/#694/#866) — the keyless loopback
+      # hytte-claude-bridge (#584/#694/#866/#993) — the keyless same-uid-socket
       # OpenAI-compatible shim over headless Claude Code.
       #
       # It used to be a hand-declared user unit here, mirroring swaybg/wlsunset.
@@ -611,7 +611,8 @@ in
       # launcher creates (trollshell-plugin-claude-bridge), so the launcher's
       # "declared *and* hand-installed" guard does not see the pair: a machine
       # that both uses this module and has that file installed would run the
-      # bridge twice, and the second copy would fail to bind the port. Pick one.
+      # bridge twice, and the second copy would find the socket already live and
+      # refuse to start (#993). Pick one.
       #
       # Writing into `programs.trollshell.plugins` rather than straight into the
       # rendered JSON is what keeps the entry overridable: the values below are
@@ -653,7 +654,11 @@ in
             {
               RUST_LOG = "hytte_claude_bridge=info";
               CLAUDE_BRIDGE_MODE = cb.mode;
-              CLAUDE_BRIDGE_PORT = toString cb.port;
+              # No CLAUDE_BRIDGE_PORT since #993: the bridge listens on
+              # $XDG_RUNTIME_DIR/trollshell/claude-bridge.sock (0600 in a 0700
+              # dir) and the path is deliberately not configurable, so there is
+              # no number for nix to render. Point a plugin at it with
+              # `claudeBridge.baseUrl`.
               CLAUDE_BRIDGE_TIMEOUT_SECS = toString cb.timeoutSeconds;
               # The billing/redirect scrub — see the block comment above.
               # Empty, not absent: `--setenv=K=` overrides whatever the user

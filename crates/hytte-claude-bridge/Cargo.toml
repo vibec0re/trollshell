@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "A loopback shim that puts an OpenAI-compatible face on either headless Claude Code (keyless, rides a subscription) or the Anthropic Messages API (keyed, metered), so the hytte LLM plugins can use either unchanged (issues #584, #730)"
+description = "A same-uid-socket shim that puts an OpenAI-compatible face on either headless Claude Code (keyless, rides a subscription) or the Anthropic Messages API (keyed, metered), so the hytte LLM plugins can use either unchanged (issues #584, #730)"
 
 [lints]
 workspace = true
@@ -30,13 +30,21 @@ hive-claude.workspace = true
 # A `path` dep, matching every other consumer of this SDK in the workspace (it
 # is deliberately not a `[workspace.dependencies]` entry).
 hytte-plugin = { path = "../hytte-plugin" }
+# The client crate — for its socket-path constants ONLY (#993), not for its
+# HTTP client. `hytte_ai_providers::bridge_socket_path_in` is the one definition
+# of where this daemon listens and where pet/caw dial, and a path two ends must
+# agree on byte-for-byte is a wire contract, not a value to restate (the
+# `hytte_plugin_proto::topology` argument). GTK-free, and every package it
+# resolves (ureq, serde, serde_json) is already a direct dependency below, so
+# the edge adds no `Cargo.lock` entry.
+hytte-ai-providers = { path = "../hytte-ai-providers" }
 # The whole HTTP server. One route does not justify axum/hyper/tower (~20 new
 # lock entries, none of which are in `Cargo.lock` today); `httparse` already is
 # (via `ureq-proto`), so promoting it to a direct dependency costs nothing.
 httparse.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
-# `net` for the loopback listener, `io-util` for the request read/response
+# `net` for the same-uid socket listener, `io-util` for the request read/response
 # write, `sync` for the load-shed semaphore + single-flight watch channels,
 # `time` for the request budget, `rt-multi-thread`/`macros` for the runtime.
 # (`process` comes in through hive-claude.)

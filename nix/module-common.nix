@@ -27,6 +27,32 @@ self:
   # the two real modules, which each import this exactly once.
   key = "trollshell-module-common";
 
+  # Options this module used to declare, so a config that still sets one fails
+  # with a sentence instead of "The option … does not exist". These ride the
+  # `key` above, so they are collapsed to a single declaration exactly like the
+  # rest of the module.
+  imports = [
+    (lib.mkRemovedOptionModule [ "programs" "trollshell" "claudeBridge" "port" ] ''
+      The claude bridge no longer listens on a TCP port (#993). It binds a
+      same-uid Unix socket at $XDG_RUNTIME_DIR/trollshell/claude-bridge.sock
+      (0600 inside a 0700 directory) instead, because a loopback port carries
+      no file mode: every other account on the machine, and anything sharing
+      the host network namespace, could reach a keyless endpoint that spends
+      your Claude subscription.
+
+      The path is deliberately not configurable, so there is nothing to set
+      here. Point a plugin at the bridge with the read-only
+      programs.trollshell.claudeBridge.baseUrl instead:
+
+        programs.trollshell.plugins.pet.env.PET_LLM_URL =
+          config.programs.trollshell.claudeBridge.baseUrl;
+
+      (and drop any hand-written PET_LLM_URL/CAW_LLM_URL naming 127.0.0.1:8787,
+      which now gets a connection refused and degrades the plugin to its canned
+      output.)
+    '')
+  ];
+
   options.programs.trollshell = {
     enable = lib.mkEnableOption "trollshell — hytte-based Wayland desktop shell";
 
@@ -282,11 +308,19 @@ self:
       };
     };
 
-    # The Claude bridge (#584/#694): a keyless, loopback-only OpenAI-compatible
-    # shim in front of headless Claude Code (`claude --print`), so the
-    # LLM-backed plugins can ride a Claude Code subscription instead of a
-    # metered provider — `hytte_ai_providers::Provider` is just a base URL, so
-    # pointing a plugin at http://127.0.0.1:<port> is the whole integration.
+    # The Claude bridge (#584/#694/#993): a keyless OpenAI-compatible shim in
+    # front of headless Claude Code (`claude --print`), so the LLM-backed
+    # plugins can ride a Claude Code subscription instead of a metered provider
+    # — `hytte_ai_providers::Provider` is just a base URL, so pointing a plugin
+    # at `claudeBridge.baseUrl` is the whole integration.
+    #
+    # Since #993 that base URL names a SAME-UID UNIX SOCKET
+    # (unix://$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock, 0600 in a 0700
+    # dir), not 127.0.0.1:8787. The route is keyless and spends somebody's
+    # Claude subscription, so reachability is the authorization boundary, and a
+    # loopback port carries no file mode — every local uid and every host-netns
+    # container was inside it. `port` is retired; see the mkRemovedOptionModule
+    # at the top of this file.
     #
     # HOME-MANAGER-ONLY, same reasoning nightlight documents above (#657): the
     # bridge is rendered by nix/hm-module.nix, and a NixOS-only deployment has no
@@ -323,11 +357,19 @@ self:
     # the comment block in etc/systemd/user/trollshell-claude-bridge.service.
     claudeBridge = {
       enable = lib.mkEnableOption ''
-        the hytte-claude-bridge daemon (#584): a keyless loopback
-        OpenAI-compatible shim over headless Claude Code, so the LLM-backed
-        plugins (pet, caw) can ride a Claude Code subscription with no code
-        change — point one at it with
-        `plugins.pet.env.PET_LLM_URL = "http://127.0.0.1:8787"`.
+        the hytte-claude-bridge daemon (#584): a keyless OpenAI-compatible shim
+        over headless Claude Code, so the LLM-backed plugins (pet, caw) can ride
+        a Claude Code subscription with no code change — point one at it with
+        `plugins.pet.env.PET_LLM_URL = config.programs.trollshell.claudeBridge.baseUrl`.
+
+        Since #993 it listens on a **same-uid Unix socket**
+        (`$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock`, `0600` inside a
+        `0700` directory), not on `127.0.0.1:8787`. It validates no bearer token
+        at all and it spends your Claude subscription, so reachability is the
+        authorization boundary — and a loopback port is reachable by every other
+        account on the box and by anything sharing the host network namespace,
+        while a socket's file mode is enforced by the kernel. The path is not
+        configurable, and `claudeBridge.port` is gone with the port it named.
 
         Since #866 this renders as a **plugin entry**, not a hand-declared
         systemd unit: enabling it defines `plugins.claude-bridge`, so the shell's
@@ -341,7 +383,7 @@ self:
         `WantedBy = <session target>` and came up on its own; a plugin entry is
         launched by `trollshell`'s launcher at startup instead, so with the shell
         disabled or crash-looping nothing brings the bridge up and anything
-        pointed at `127.0.0.1:<port>` gets a connection refused. Once launched it
+        pointed at the socket gets a connection refused. Once launched it
         does outlive the shell — the transient unit is `PartOf` the session
         target, not the shell — so `systemctl --user restart trollshell` leaves
         the endpoint answering with only the chip gone. If you need the bridge
@@ -367,20 +409,33 @@ self:
         description = "The hytte-claude-bridge package the user service runs.";
       };
 
-      port = lib.mkOption {
-        type = lib.types.port;
-        default = 8787;
-        example = 8788;
+      baseUrl = lib.mkOption {
+        type = lib.types.str;
+        readOnly = true;
+        default = "unix://$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock";
         description = ''
-          Loopback port the bridge listens on (`CLAUDE_BRIDGE_PORT`). The
-          address is not configurable — it is always 127.0.0.1.
+          The `*_LLM_URL` value that points a plugin at this bridge — read-only,
+          because where the bridge listens is not configurable (#993).
 
-          A first-class option rather than an env line because two things have
-          to agree on one number: this, and the `*_LLM_URL` of every plugin
-          pointed at the bridge (`plugins.pet.env.PET_LLM_URL`).
+          This replaces the old `port` option, and for the same reason that one
+          existed: two things have to agree on one value, this and the
+          `*_LLM_URL` of every plugin pointed at the bridge. Reference it rather
+          than retyping it:
 
-          8787, not 8080 — 8080 belongs to `petBrain` below (the llama-server
-          brain), and the two backends are meant to be swappable, not exclusive.
+          ```nix
+          programs.trollshell.plugins.pet.env.PET_LLM_URL =
+            config.programs.trollshell.claudeBridge.baseUrl;
+          ```
+
+          `$XDG_RUNTIME_DIR` is **not** expanded by nix — it cannot be, since it
+          is `/run/user/<uid>` and logind mints it at login. It is expanded by
+          `hytte-ai-providers` inside the consuming plugin's own process, where
+          systemd has already set it; see that crate's `unix` module. So this one
+          string is correct for every user on every machine.
+
+          Nothing here listens on a TCP port any more: 8080 still belongs to
+          `petBrain` below (the llama-server brain), and the two backends stay
+          swappable by editing this one URL.
         '';
       };
 
@@ -533,10 +588,15 @@ self:
         example = 8081;
         description = ''
           Port llama-server listens on (`--port`). First class for the same
-          reason `claudeBridge.port` is: the pet's `PET_LLM_URL` has to name the
-          same number. 8080 is llama-server's own default and is deliberately
-          distinct from `claudeBridge.port` (8787) so both backends can be
-          declared at once and swapped by editing one URL.
+          reason `claudeBridge.baseUrl` is: the pet's `PET_LLM_URL` has to name
+          the same endpoint. 8080 is llama-server's own default, and since #993
+          the bridge occupies no port at all, so both backends can be declared
+          at once and swapped by editing one URL.
+
+          A TCP port is the right shape *here* and the wrong one for the bridge:
+          llama-server is a local model with no credential and nothing to spend,
+          while the bridge answers on somebody's Claude subscription — which is
+          why only one of the two moved to a same-uid socket.
         '';
       };
 

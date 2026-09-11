@@ -312,9 +312,10 @@ to set.
 `hytte-claude-bridge` is a small daemon that puts an OpenAI-compatible face on
 headless Claude Code (#584), so the LLM-backed plugins can ride a Claude Code
 subscription instead of a metered cloud key. It serves exactly one route,
-`POST /v1/chat/completions`, on **`127.0.0.1:8787` — loopback only** (8080 is
-`trollshell-pet-brain.service`'s llama-server; the two are meant to be
-swappable). Each `claude`-backed request spawns `claude --print` and returns
+`POST /v1/chat/completions`, on **`$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock`
+— a same-uid Unix socket, `0600` inside a `0700` directory** (#993). The pet
+brain's llama-server still uses port 8080; the two backends are meant to be
+swappable. Each `claude`-backed request spawns `claude --print` and returns
 its answer as `choices[0].message.content`.
 
 Since #866 it also wears the widget-plugin protocol's hat: it links
@@ -343,19 +344,38 @@ declared env (`programs.trollshell.plugins.pet.env`, or the matching
 
 ```nix
 programs.trollshell.plugins.pet.env = {
-  PET_LLM_URL = "http://127.0.0.1:8787";
+  PET_LLM_URL = config.programs.trollshell.claudeBridge.baseUrl;
   OPENROUTER_API_KEY = "local-bridge";
 };
 ```
+
+`baseUrl` is read-only and renders
+`unix://$XDG_RUNTIME_DIR/trollshell/claude-bridge.sock`. The variable is **not**
+expanded by nix — it cannot be, since logind mints `/run/user/<uid>` at login —
+but by `hytte-ai-providers` inside the plugin's own process, so the one string
+is right for every user. A hand-written `plugins.json` carries that same literal.
 
 That second line is a **security control, not cosmetics**. The bridge is
 _keyless_ — it validates no bearer token at all, because `brain.rs` resolves
 `load_key("openrouter")` _before_ `PET_LLM_API_KEY`, so a bridge demanding its
 own token would 401 every request forever. `load_key` checks the
 `OPENROUTER_API_KEY` env override _before_ `~/.config/trollshell/openrouter.key`,
-so the dummy value is what stops the real cloud key being shipped to a loopback
-port. With no auth, reachability is the authorization boundary — hence the
-loopback bind.
+so the dummy value is what stops the real cloud key being shipped to a local
+endpoint.
+
+**Who can reach it (#993).** With no inbound auth, whoever can reach the
+endpoint is authorized, so that set has to be exactly one uid. It used to be
+`127.0.0.1:8787`, and TCP loopback carries no file mode: every other account on
+the box — and anything sharing the host network namespace, a container included
+— could POST a completion billed to your Claude subscription, real credits in
+`api` mode, and could hold both of the bridge's two concurrency permits while
+doing it. The socket's `0600`/`0700` modes are enforced by the kernel on
+`connect(2)` instead, which is the same boundary the plugin host socket has had
+since #956. The path is not configurable and there is no port to fall back to:
+with `$XDG_RUNTIME_DIR` unset the daemon refuses to serve rather than opening
+one. To check it on a live box, see `docs/live-verify.md`'s "Claude bridge"
+section — as a second local user, `curl --unix-socket …` must come back
+permission denied, and `ss -ltnp | grep 8787` must find nothing.
 
 **The billing/redirect scrub, carried across, not dropped.** The retired
 unit's
@@ -396,7 +416,7 @@ on the plugin entry. `CLAUDE_BRIDGE_MODE` picks between **three** backends:
 | `reprompt`                         | a one-off `claude` session per turn, with the bridge holding the transcript and nothing persisted to disk                |
 | `api` (also `api-key`, `messages`) | no `claude` child at all: `POST /v1/messages` against the Anthropic API, **billed per token** (#730/#751)                |
 
-`api` mode is the one mode where reaching the loopback port spends money, and
+`api` mode is the one mode where reaching the socket spends money, and
 it's the reason the empty-env scrub above matters. That mode needs a real
 Anthropic key, and on the declarative path the only source is the login
 keyring's `anthropic` secret (store it in the control-center's AI Keys tab):
@@ -455,7 +475,9 @@ programs.trollshell.claudeBridge = {
   # picks — usually Opus — which routinely overruns the 8s budget below and
   # comes back to the plugin as a 504.
   model = "claude-haiku-4-5";
-  # port = 8787;           # default; must match the plugin's *_LLM_URL
+  # There is no `port` option since #993 — the bridge listens on a same-uid
+  # socket whose path is not configurable. Point a plugin at it with
+  # `config.programs.trollshell.claudeBridge.baseUrl` (read-only).
   # timeoutSeconds = 8;    # default; see "Two timeouts" above
   # mode = "subscription"; # default; "api" is the one that declares the
                             # anthropic secret slot
@@ -463,7 +485,7 @@ programs.trollshell.claudeBridge = {
 
 # The client half, on the plugin that talks to it.
 programs.trollshell.plugins.pet.env = {
-  PET_LLM_URL = "http://127.0.0.1:8787";
+  PET_LLM_URL = config.programs.trollshell.claudeBridge.baseUrl;
   OPENROUTER_API_KEY = "local-bridge";
 };
 ```

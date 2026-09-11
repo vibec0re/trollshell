@@ -11,7 +11,8 @@
 //!
 //! # It changes nothing above it
 //!
-//! The bridge still serves one loopback route, `POST /v1/chat/completions`, and
+//! The bridge still serves one route, `POST /v1/chat/completions`, on its
+//! same-uid socket (#993), and
 //! still answers the exact single-choice envelope `hytte_ai_providers::chat`
 //! parses. Pet and caw consume the bridge purely as a `Provider` base URL, so
 //! **neither needs a code change** — this backend is picked with
@@ -548,8 +549,8 @@ fn load_key_from(env_override: Option<String>, config_dir: Option<PathBuf>) -> O
 /// The message printed before exiting when this mode has no key.
 ///
 /// Fail closed, matching [`crate::envguard`]: a bridge that will not start is
-/// loud, whereas one that binds 8787 and 502s every request looks like the
-/// plugin is broken.
+/// loud, whereas one that binds the socket and 502s every request looks like
+/// the plugin is broken.
 ///
 /// Loud is only worth anything if the remedy works. This is the string an
 /// operator reads in `systemctl status`, i.e. read *under the shipped unit*,

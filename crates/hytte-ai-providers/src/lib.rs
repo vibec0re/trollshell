@@ -32,9 +32,24 @@
 //! whole request is bounded by [`ChatOpts::timeout`] ([`DEFAULT_TIMEOUT`]
 //! unless the caller raises it) — read that constant before wiring a backend
 //! that has a per-request budget of its own; the two have to be ordered.
+//!
+//! A base URL may also name a **Unix socket** (`unix://…`, #993) — that is how
+//! `hytte-claude-bridge` is reached since it stopped listening on a uid-blind
+//! loopback port. Same HTTP, same request bytes, different socket; see [`unix`]
+//! for the URL shape and [`BRIDGE_BASE_URL`] for the canonical value.
+
+mod unix;
+
+pub use unix::{
+    BRIDGE_BASE_URL, BRIDGE_SOCKET_DIR, BRIDGE_SOCKET_FILE, UNIX_SCHEME, bridge_socket_path,
+    bridge_socket_path_in,
+};
 
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// The one route this crate speaks, appended to every provider's base URL.
+pub const ROUTE: &str = "/v1/chat/completions";
 
 /// Default global budget for one [`chat`] round trip — connect, send **and**
 /// read, not just the read.
@@ -228,23 +243,34 @@ struct ChatChoiceMessage {
 /// `provider.user` likewise (#704) — both are omitted from the wire when
 /// unset, never sent as null.
 ///
+/// A `unix://` base URL (#993) is dialled over a [`UnixStream`] instead of a
+/// TCP socket — everything above the socket, request bytes included, is
+/// unchanged. A socket URL that cannot be resolved is an `Err` naming why;
+/// there is deliberately **no** fall back to a loopback port, because that is
+/// the uid-blind reachability #993 closed. See [`unix`].
+///
+/// [`UnixStream`]: std::os::unix::net::UnixStream
+///
 /// Blocking — run it on a `spawn_blocking` thread. 2s connect timeout; the
 /// whole round trip is bounded by [`ChatOpts::timeout`] ([`DEFAULT_TIMEOUT`]
 /// by default).
 pub fn chat(provider: &Provider, messages: &[Message], opts: &ChatOpts) -> Result<String, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let config = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(2)))
         .timeout_global(Some(opts.timeout))
         // Don't collapse a 4xx/5xx into a bare status error — we want to read
         // the endpoint's JSON error body (OpenRouter explains *why*: an invalid
         // or restricted model, an auth problem…) and surface it in the message.
         .http_status_as_error(false)
-        .build()
-        .into();
-    let url = format!(
-        "{}/v1/chat/completions",
-        provider.base_url.trim_end_matches('/')
-    );
+        .build();
+    let (agent, url) = match unix::socket_target(&provider.base_url) {
+        Some(Ok(path)) => (unix::agent(config, path), unix::request_url(ROUTE)),
+        Some(Err(why)) => return Err(format!("bad {UNIX_SCHEME} base url: {why}")),
+        None => (
+            ureq::Agent::from(config),
+            format!("{}{ROUTE}", provider.base_url.trim_end_matches('/')),
+        ),
+    };
     let body = ChatRequest {
         model: provider.model.as_deref(),
         messages,
@@ -374,6 +400,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::path::Path;
     use std::sync::{Mutex, PoisonError};
 
     /// Every test that binds an ephemeral port (`fake_server`,
@@ -688,6 +715,130 @@ mod tests {
             started.elapsed(),
         );
         drop(listener);
+    }
+
+    /// A private temp directory for one test's socket, named after the test so
+    /// two cannot collide. Unix socket paths are capped at ~108 bytes, so this
+    /// stays short. No `tempfile` dev-dependency — same hand-rolled shape the
+    /// key-file test below uses.
+    fn socket_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hytte-ai-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    /// A one-shot fake `OpenAI`-compatible server **on a Unix socket**: the
+    /// twin of [`fake_server`], captures the request and replies with
+    /// `resp_body`. Returns `(base_url, handle→raw request)`.
+    fn fake_unix_server(
+        dir: &Path,
+        resp_body: &'static str,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let path = dir.join("bridge.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let raw = capture_unix_request(&mut sock);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{resp_body}",
+                resp_body.len(),
+            );
+            sock.write_all(resp.as_bytes()).expect("write response");
+            raw
+        });
+        (format!("unix://{}", path.display()), handle)
+    }
+
+    /// [`capture_request`] for a `UnixStream` (the helper above is typed to
+    /// `TcpStream`; the logic is the same bytes either way).
+    fn capture_unix_request(sock: &mut std::os::unix::net::UnixStream) -> String {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            if let Some(hdr_end) = window_pos(&buf, b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..hdr_end]);
+                if buf.len() >= hdr_end + 4 + content_length(&head) {
+                    break;
+                }
+            }
+            let n = sock.read(&mut tmp).expect("read request");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// **The #993 round trip.** A `unix://` base URL must complete a real chat
+    /// completion over a real Unix socket, sending the *same* request the TCP
+    /// path sends — same route, same JSON body — because
+    /// `hytte-claude-bridge`'s parser is written against exactly those bytes.
+    ///
+    /// This is also the falsifier for "route the socket URL over TCP anyway":
+    /// there is no host to connect to in a `unix://` URL, so that mutation
+    /// cannot produce a reply at all.
+    #[test]
+    fn chat_round_trips_over_a_unix_socket() {
+        let dir = socket_dir("roundtrip");
+        let (base, handle) =
+            fake_unix_server(&dir, r#"{"choices":[{"message":{"content":"meow"}}]}"#);
+        let provider = Provider {
+            base_url: base,
+            api_key: Some("local-bridge".to_owned()),
+            model: None,
+            user: Some("pet".to_owned()),
+        };
+        let out = chat(&provider, &[Message::user("hey")], &ChatOpts::default())
+            .expect("chat succeeds over the socket");
+        assert_eq!(out, "meow");
+
+        let raw = handle.join().expect("server thread");
+        let (head, body) = split_request(&raw);
+        assert!(
+            head.starts_with("POST /v1/chat/completions "),
+            "the route is unchanged over a socket: {head:?}"
+        );
+        let head_lc = head.to_ascii_lowercase();
+        assert!(
+            head_lc.contains("host: localhost"),
+            "a socket has no host; the placeholder authority is what ships: {head:?}"
+        );
+        let json: serde_json::Value = serde_json::from_str(body).expect("body is json");
+        assert_eq!(json["messages"][0]["content"], "hey");
+        assert_eq!(json["user"], "pet");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A socket URL that names nothing resolvable is an **error**, never a
+    /// quiet fall back to a loopback port — the fallback would re-open the
+    /// uid-blind hole #993 closed.
+    #[test]
+    fn chat_refuses_an_unresolvable_socket_url_instead_of_falling_back() {
+        let err = chat(
+            &Provider::llama("unix://trollshell/relative.sock"),
+            &[Message::user("x")],
+            &ChatOpts::default(),
+        )
+        .expect_err("a relative socket path names nothing");
+        assert!(err.contains("unix://"), "{err}");
+        assert!(err.contains("absolute"), "{err}");
+    }
+
+    /// A socket path with nothing listening is a clean transport error the
+    /// caller can fall back from, exactly like a refused TCP connect.
+    #[test]
+    fn chat_reports_an_absent_socket() {
+        let dir = socket_dir("absent");
+        let err = chat(
+            &Provider::llama(format!("unix://{}", dir.join("nobody.sock").display())),
+            &[Message::user("x")],
+            &ChatOpts::default(),
+        )
+        .expect_err("nothing is listening there");
+        assert!(err.starts_with("http:"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

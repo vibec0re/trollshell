@@ -50,15 +50,39 @@ use super::style::{DisplayStyle, Emission, mix};
 /// pitch, so nothing that predates the knob changed a byte.
 pub const DEFAULT_DOT_PX: usize = 4;
 
-/// The smallest dot pitch the kit will render. Below 2 px a "dot" is a single
-/// pixel with no room for a falloff at all, so the widget stops being a dot
-/// matrix and becomes a bitmap.
+/// The smallest dot pitch the kit will render.
+///
+/// **At this pitch the widget is a bitmap font, not a dot matrix** — and that
+/// is the floor's real meaning, not a statement about 1 px. The falloff
+/// plateau reaches `s ≤ 1/2` and all four pixels of a 2×2 cell sit exactly
+/// there, so a dot is a solid `255` block and two adjacent lit font pixels
+/// merge with **no seam at all**: the top row of an `8` comes out as one 6 px
+/// bar rather than three separated dots. That is deliberate (a 2×2 cell has no
+/// room for a rim, and a dimmed one would read as a grey smear rather than as
+/// dots) and it is the right trade for a 32 px bar, where 18 px of legible 5×7
+/// glyphs beats 27 px that does not fit. But if what you want is *visible
+/// dots*, [`MIN_DOT_PX`]` + 1` is the smallest pitch that has them.
 pub const MIN_DOT_PX: usize = 2;
 
 /// The largest dot pitch the kit will render — 8 px is already a chunkier dot
 /// than any skin reads well at, and the wire's own strip bound
 /// (`MAX_STRIP_DIM`) is derived against it.
 pub const MAX_DOT_PX: usize = 8;
+
+/// The wire's mirror of the three pitch constants must agree with the kit's.
+///
+/// Pinned from **this** side because the arrow only points one way:
+/// `hytte-preem` depends on `hytte-plugin-proto` (for `Frame::into_node`),
+/// while the proto is the language-neutral schema anchor and can never see the
+/// kit. The proto's `MAX_STRIP_DIM` budget is stated in terms of these two
+/// agreeing — a strip's character budget is derived against `dot_matrix_pitch_px`
+/// and enforced against what this crate actually renders — so the agreement is
+/// an invariant, not a coincidence worth restating in prose.
+const _: () = {
+    assert!(DEFAULT_DOT_PX == hytte_plugin_proto::DEFAULT_DOT_PX as usize);
+    assert!(MIN_DOT_PX == hytte_plugin_proto::MIN_DOT_PX as usize);
+    assert!(MAX_DOT_PX == hytte_plugin_proto::MAX_DOT_PX as usize);
+};
 
 /// Intensity of a fully-lit dot pixel (0..=255).
 const CORE: u16 = 255;
@@ -324,7 +348,15 @@ impl DotMatrix {
         if let Some(bloom) = palette.bloom {
             lit.bloom(bloom);
         }
-        lit.composite(&mut frame, palette.ink, palette.mask);
+        // The CRT comb is re-phased onto *this* surface's dot grid — one dark
+        // line in the seam below each dot row, which is what the pass has
+        // always meant and what a fixed 4-row comb stops being at any other
+        // pitch (`Mask::with_pitch`). A no-op at the default pitch.
+        lit.composite(
+            &mut frame,
+            palette.ink,
+            palette.mask.map(|mask| mask.with_pitch(dot)),
+        );
         frame
     }
 }
@@ -343,7 +375,7 @@ pub fn dot_matrix(text: &str, style: DisplayStyle) -> Frame {
 #[cfg(test)]
 mod tests {
     use super::super::DisplayStyle;
-    use super::{DEFAULT_DOT_PX, DotMatrix, Dots, MAX_DOT_PX, MIN_DOT_PX, dot_matrix};
+    use super::{DEFAULT_DOT_PX, DotMatrix, Dots, MAX_DOT_PX, MIN_DOT_PX, dot_matrix, font};
 
     /// The dot pitch the whole kit shipped with before #1091 made it a knob.
     const DOT: usize = DEFAULT_DOT_PX;
@@ -547,6 +579,53 @@ mod tests {
         }
         // A 2 px dot is solid: four pixels, no room for a rim.
         assert_eq!(Dots::new(MIN_DOT_PX).falloff[0][0], 255);
+    }
+
+    /// #1091, the CRT comb: **one dark line per dot row, in the seam below it,
+    /// at every pitch** — the thing the pass has always promised, which a comb
+    /// pinned to 4 rows stops delivering the moment the grid is not 4 px.
+    ///
+    /// Read off the render rather than off `Mask`'s fields, and isolated from
+    /// the falloff by comparing a cell's **last** sub-row against its **first**:
+    /// the falloff is vertically symmetric, so those two carry identical light
+    /// before the pass, and any difference between them is the comb. With the
+    /// comb re-phased, the last sub-row is combed in *every* cell and so is
+    /// always the darker of the two.
+    ///
+    /// **Falsified** by ignoring the pitch (`Mask::with_pitch` returning `self`,
+    /// or the call site dropping the `.map`): at pitch 3 the comb walks —
+    /// glyph row 0 gets it on sub-row 0, rows 1 and 5 on the bright *core*, and
+    /// row 3 not at all, the ~19-point row-to-row beat #1094's review measured.
+    /// Rows 0/1/4/5 then fail this. Pitches 2, 6 and 8 fail it too; only 4 —
+    /// the shipped alignment — passes, which is exactly why the byte-identity
+    /// tests could not see this.
+    #[test]
+    fn the_crt_comb_lands_in_the_dot_seam_at_every_pitch() {
+        // An uncovered char renders the NOTDEF box, whose leftmost column is
+        // lit on all seven glyph rows — so cell 0, font column 0 gives seven
+        // cells that differ only in where they sit vertically.
+        for px in MIN_DOT_PX..=MAX_DOT_PX {
+            let f = DotMatrix::new(DisplayStyle::Crt).dot_px(px).render("💕");
+            let sub_row_light = |row: usize, sub: usize| -> u32 {
+                let y = px + row * px + sub;
+                (0..px)
+                    .map(|dx| {
+                        let p = f.at(px + dx, y);
+                        u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2])
+                    })
+                    .sum()
+            };
+            for row in 0..font::GLYPH_H {
+                let first = sub_row_light(row, 0);
+                let last = sub_row_light(row, px - 1);
+                assert!(
+                    last < first,
+                    "dot_px {px}, glyph row {row}: the comb must dim the cell's \
+                     last sub-row ({last}) below its first ({first}), which \
+                     carries the same falloff light"
+                );
+            }
+        }
     }
 
     /// The host invariant across styles, inputs and pitches, empty string

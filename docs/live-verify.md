@@ -1056,21 +1056,35 @@ audio feed, not the raster.
   1. **The bar does not grow.** Its height stays wherever `assets/trollshell/style.css`
      puts it — if the bar gets taller, the chip is asking for more than 32 px
      and the pitch did not reach the kit.
-  2. **The text is still legible at 2 px per dot.** Each font pixel is a solid
-     2×2 block at that pitch (there is no room for a rim, so the falloff
-     plateau covers the whole cell by design) — it should read as a chunky
-     small ticker, not as a grey smear. Compare against `dot_px = 3` (27 px,
-     which does _not_ fit a 32 px bar once the chip has any padding) to judge
-     whether 2 is the one to ship in the bar.
-  3. **Nothing that did not ask for a pitch moved.** The sidebar preem-demo card
+  2. **Is a 5×7 bitmap font acceptable here?** That is the real question, not
+     "are the dots visible". At pitch 2 the falloff plateau covers the whole
+     2×2 cell, so a dot is a solid block and two adjacent lit font pixels merge
+     with **no seam**: the top of an `8` is one 6 px bar, not three dots. It is
+     deliberate (a 2×2 cell has no room for a rim, and a dimmed one would read
+     as a grey smear) and documented on `MIN_DOT_PX` — but it means what lands
+     in the bar is legible pixel-font text rather than a visible dot matrix.
+     Compare against `dot_px = 3`, the smallest pitch that still reads as
+     separated dots, which is 27 px and so leaves nothing for chip padding in a
+     32 px bar. Judging that trade is the whole point of this item.
+  3. **The ticker behaves differently at a finer pitch, and both are correct.**
+     The finer grid fits more dot columns in the same window (94 at pitch 2
+     where 4 fits 46), so expect these rather than reporting them as bugs:
+     - A **short message stops scrolling.** A 10-char title that scrolls in a
+       192 px window at pitch 4 fits the grid at 3 and at 2, so it holds
+       static. Use a longer message if you want to watch it move.
+     - A fixed `speed_dots_per_sec` is **half the on-screen speed**: the scroll
+       steps whole dots, so 12 dots/s is 48 px/s at pitch 4 and 24 px/s at
+       pitch 2. Scale the speed with the pitch if you want the rate held.
+  4. **Nothing that did not ask for a pitch moved.** The sidebar preem-demo card
      still renders its 36 px dot-matrix and marquee rows exactly as before —
      the byte-identity tests cover this, but it is the cheapest possible
      eyeball check that the defaults really are untouched.
-  4. **On the CRT skin the scanline comb is deliberately still 4 rows**, not the
-     widget's own pitch (`Mask::CRT` documents why: the tube is the skin's, and
-     it masks the scope and gauge too). At `dot_px = 2` the comb therefore no
-     longer lands in the dot seams. Judge whether that reads acceptably or
-     wants a follow-up — it is a known, documented cost, not a regression.
+  5. **On the CRT skin the comb follows the pitch.** It should read as a raster
+     at 2 and at 3 exactly as it does at 4 — one dark line per dot row, sitting
+     in the seam _below_ each row, with no brightness beat from one glyph row to
+     the next. A comb that skips a row, or that darkens a dot's bright middle
+     instead of the gap under it, means the re-phasing (`Mask::with_pitch`) is
+     not reaching this surface.
 - [ ] **(#397)** Split-flap and nixie boards (the two bottom rows of the
       preem-demo card, `HH:MM:SS` on both, deliberately running in slow motion
       so the mechanisms are legible at the shell's ~1 Hz heartbeat):

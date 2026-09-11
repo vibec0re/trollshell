@@ -1759,8 +1759,27 @@ const FLIP_BOARD_HEIGHT_FPX: u32 = 11;
 /// [`MAX_STRIP_DIM`] budget honest now that the pitch is a knob (#1091): at
 /// [`MAX_DOT_PX`] a character is 48 px, so a budget computed against 24 would
 /// admit a strip **twice** the bound.
+///
+/// It **clamps its own argument** rather than documenting a precondition.
+/// [`PreemWidget::clamp_in_place`] does clamp the pitch before calling this, and
+/// the order matters there for a different reason (the budget has to be derived
+/// from the pitch the shell will actually render at) — but an unclamped
+/// argument reaching here must not be a *panic*: `dot_px * 6` overflows in
+/// debug at `u32::MAX`, and a `0` divides by zero one line later in
+/// `clamp_strip_text`. Clamping here makes the helper total, so the ordering is
+/// a correctness question and never a soundness one, and the release path is
+/// safe on its own. `the_strip_budget_survives_an_unclamped_pitch` drives both
+/// ends through the public clamp.
 const fn dot_matrix_pitch_px(dot_px: u32) -> u32 {
-    (DOT_MATRIX_FONT_PITCH_PX) * dot_px
+    // `Ord::clamp` is not const.
+    let px = if dot_px < MIN_DOT_PX {
+        MIN_DOT_PX
+    } else if dot_px > MAX_DOT_PX {
+        MAX_DOT_PX
+    } else {
+        dot_px
+    };
+    DOT_MATRIX_FONT_PITCH_PX * px
 }
 
 /// A dot-matrix char cell's advance in **font pixels**: `GLYPH_W + SPACING`.

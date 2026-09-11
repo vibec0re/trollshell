@@ -1144,6 +1144,50 @@ fn the_dot_pitch_clamps_into_range() {
     }
 }
 
+/// The strip budget is **total** on a pitch nobody clamped: `0` and `u32::MAX`
+/// off the wire come out at the floor's and the ceiling's budget rather than
+/// panicking.
+///
+/// This is the ordering inside `clamp_in_place` — pitch first, then the budget
+/// derived from it — stated as an assertion. Before #1094's review it was
+/// pinned only by *arithmetic*: swapping the two statements made
+/// `preem_worst_case_footprint_is_bounded` and
+/// [`the_dot_pitch_clamps_into_range`] go red, but through a multiply overflow
+/// in `dot_matrix_pitch_px` and a divide-by-zero in `clamp_strip_text` — debug
+/// panics, invisible in release. `dot_matrix_pitch_px` now clamps its own
+/// argument, so the ordering is a correctness question with a test rather than
+/// a soundness one with a `debug_assert`'s worth of luck.
+///
+/// **Falsified** by dropping the clamp inside `dot_matrix_pitch_px` *and*
+/// reordering: `0` divides by zero, `u32::MAX` overflows the multiply.
+#[test]
+fn the_strip_budget_survives_an_unclamped_pitch() {
+    for (asked, effective) in [(0, MIN_DOT_PX), (u32::MAX, MAX_DOT_PX)] {
+        let clamped = PreemWidget::DotMatrix {
+            config: DotMatrixConfig {
+                dot_px: asked,
+                ..DotMatrixConfig::default()
+            },
+            state: DotMatrixState {
+                text: "x".repeat(MAX_TEXT_LEN),
+            },
+        }
+        .clamped();
+        let PreemWidget::DotMatrix { config, state } = clamped else {
+            unreachable!()
+        };
+        assert_eq!(config.dot_px, effective, "pitch asked for {asked}");
+        let chars = u32::try_from(state.text.chars().count()).expect("char count fits");
+        assert_eq!(
+            chars,
+            MAX_STRIP_DIM / (6 * effective),
+            "the budget for {asked} is the one its clamped pitch earns"
+        );
+        let width = 2 * config.dot_px + chars * 6 * config.dot_px - config.dot_px;
+        assert!(width <= MAX_STRIP_DIM, "{asked}: {width} px past the bound");
+    }
+}
+
 /// Neither new key reaches the wire unless it is set, so a plugin built against
 /// the pre-widening proto and a shell built against this one exchange identical
 /// frames — the other half of "compatible addition", and the reason

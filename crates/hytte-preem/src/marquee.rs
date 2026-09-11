@@ -156,9 +156,25 @@ impl Marquee {
     ///
     /// The same hardware knob [`DotMatrix::dot_px`](super::DotMatrix::dot_px)
     /// turns, and it moves the *height* — `9 * px`, so 18 px at 2 and 36 at the
-    /// default — while [`window_px`](Self::window_px) stays the width. A finer
-    /// pitch also fits more dot columns in the same window, so the same message
-    /// scrolls through fewer wraps (#1091).
+    /// default — while [`window_px`](Self::window_px) stays the width (#1091).
+    ///
+    /// # Two things it changes that are not the height
+    ///
+    /// A finer pitch fits **more dot columns** inside the same window — 94 at
+    /// pitch 2 where 4 fits 46, in a 192 px window. That does *not* change the
+    /// loop [`period`](MarqueeStrip::period), which is `bitmap.len() +
+    /// gap_dots` and so is in dots and pitch-independent. What it changes is
+    /// the two things a bar ticker meets first:
+    ///
+    /// - **A message that scrolls at one pitch can hold static at a finer
+    ///   one.** The [hold rule](self#short-text-holds) compares the message
+    ///   against the *grid*, so a 10-char title that scrolls in a 192 px window
+    ///   at pitch 4 fits the grid at 3 and at 2, and stops moving. That is the
+    ///   rule working, not a dropped pitch.
+    /// - **A fixed dots-per-second is a slower ticker.**
+    ///   [`window`](MarqueeStrip::window) steps whole *dots*, so a shell
+    ///   integrating 12 dots/s moves 48 px/s at pitch 4 and 24 px/s at pitch 2.
+    ///   Scale the speed with the pitch if you want the on-screen rate held.
     #[must_use]
     pub fn dot_px(mut self, px: usize) -> Self {
         self.dots = Dots::new(px);
@@ -331,7 +347,14 @@ impl MarqueeStrip {
         if let Some(bloom) = palette.bloom {
             lit.bloom(bloom);
         }
-        lit.composite(&mut out, palette.ink, palette.mask);
+        // Re-phased onto this strip's dot grid, exactly as the static display
+        // does it — the two surfaces share the hardware, so they share the
+        // tube's alignment to it (`Mask::with_pitch`). A no-op at the default.
+        lit.composite(
+            &mut out,
+            palette.ink,
+            palette.mask.map(|mask| mask.with_pitch(self.dots.dot())),
+        );
         out
     }
 }
@@ -765,6 +788,57 @@ mod tests {
         assert_eq!(at(1), at(MIN_DOT_PX));
         assert_eq!(at(9), at(MAX_DOT_PX));
         assert_eq!(at(usize::MAX), at(MAX_DOT_PX));
+    }
+
+    /// The **lit** pass stamps on the strip's own pitch, not on the default —
+    /// measured through where the light lands vertically, which is a different
+    /// mechanism from [`a_lit_dot_matches_the_static_display_at_every_pitch`]'s
+    /// per-pixel comparison and the reason this exists as a second test.
+    ///
+    /// `MarqueeStrip::window` re-deriving `Dots::default()` instead of reading
+    /// `self.dots` was the one mutation #1094's review found with a **single**
+    /// covering test, and the shell-side parity test cannot close it: its
+    /// oracle comes from the same kit, and the height it asserts comes from the
+    /// baked backdrop, which `render` builds from the right pitch either way.
+    /// Here the backdrop is the *reference* being subtracted, so only the lit
+    /// pass can move the answer: at pitch 3 a default-pitch stamp puts the top
+    /// dot row at y 4 instead of 3 and runs the bottom one off the 27 px
+    /// buffer.
+    ///
+    /// LCD, so no bloom can spread light off the grid, and the NOTDEF box
+    /// (whose leftmost column is lit on every glyph row) so the top and bottom
+    /// rows are both guaranteed to carry light.
+    #[test]
+    fn the_lit_pass_stamps_on_the_strips_own_pitch() {
+        for px in MIN_DOT_PX..=MAX_DOT_PX {
+            let strip = Marquee::new(DisplayStyle::Lcd)
+                .dot_px(px)
+                .window_px(96)
+                .render("💕");
+            assert!(
+                !strip.scrolls(),
+                "one glyph holds in a 96 px window at {px}"
+            );
+            let want = Marquee::new(DisplayStyle::Lcd)
+                .dot_px(px)
+                .window_px(96)
+                .render("")
+                .window(0);
+            let f = strip.window(0);
+            let lit_rows: Vec<usize> = (0..f.height())
+                .filter(|&y| (0..f.width()).any(|x| f.at(x, y) != want.at(x, y)))
+                .collect();
+            assert_eq!(
+                lit_rows.first().copied(),
+                Some(px),
+                "dot_px {px}: light starts at the bezel, i.e. one dot cell down"
+            );
+            assert_eq!(
+                lit_rows.last().copied(),
+                Some(8 * px - 1),
+                "dot_px {px}: …and ends on the last row of the seventh dot row"
+            );
+        }
     }
 
     /// The grid geometry follows the pitch at every pitch: whole dot cells

@@ -929,15 +929,15 @@ const BAND_DIV: usize = 9;
 /// the dot grid's seams because a dot surface puts its grid origin at its
 /// bezel and the bezel **is** one dot cell (`Dots::pad`) — so the origin is a
 /// whole number of comb pitches iff the comb's pitch is the surface's own dot
-/// pitch. Pin that here rather than in a test that could be deleted.
-///
-/// Since #1091 a dot surface can be built at a *different* pitch, and the comb
-/// does not follow it: see [`Mask::CRT`] for why the tube is resolved from the
-/// skin rather than from the widget, and what that costs.
+/// pitch. Since #1091 the two dot surfaces guarantee that themselves, by
+/// re-phasing with [`Mask::with_pitch`]; what this pins is the *other*
+/// direction — that a surface which states no pitch is combed on the grid a
+/// default-pitch dot surface renders, so the two agree at the default and the
+/// byte-identity tests stay meaningful.
 const _: () = assert!(MASK_COMB_PITCH == DEFAULT_DOT_PX);
 
-/// The CRT comb's pitch in emission rows — the kit's *default* dot pitch, which
-/// is the grid every surface that does not state one renders on.
+/// The CRT comb's default pitch in emission rows — the kit's default dot pitch,
+/// which is the grid every surface that does not state one renders on.
 const MASK_COMB_PITCH: usize = 4;
 
 /// The CRT pass's two screen-space masks, multiplied into the lit layer by
@@ -988,19 +988,10 @@ impl Mask {
     /// `pitch - 1` is taken because it reads as the dark gap *below* each
     /// illuminated line, which is where a raster's retrace sits.
     ///
-    /// # It does not follow a widget's own dot pitch (#1091)
-    ///
-    /// The tube is resolved from the [`DisplayStyle`] — it is a property of the
-    /// *glass*, and it is multiplied into the lit layer of the
-    /// [`Scope`](super::Scope), the [`Gauge`](super::Gauge) and the
-    /// [`FlipBoard`](super::FlipBoard) too, none of which has a dot pitch at
-    /// all. So a `dot_px(2)` ticker on the CRT skin gets the same 4-row comb
-    /// every other surface gets, and its seams no longer line up with the dot
-    /// rows. What it costs is that specific alignment on that specific skin;
-    /// what threading a per-widget pitch into a screen-space pass would cost is
-    /// a pitch argument on every `composite` in the kit. The mask stays
-    /// screen-space, which is the same call `a_lit_dot_matches_the_static_display`
-    /// already documents for masked skins.
+    /// This is the **default** comb, for every surface that has no dot grid of
+    /// its own. A dot surface re-phases it onto its own pitch with
+    /// [`with_pitch`](Self::with_pitch) — see there for why that is not the
+    /// same as making the tube per-widget.
     ///
     /// **`scanline_keep` = 150/256 ≈ 0.59**: a 41 % dip, one row in four, so
     /// the comb is unmistakable while the surface loses only
@@ -1017,6 +1008,46 @@ impl Mask {
         scanline_keep: 150,
         corner_keep: 115,
     };
+
+    /// The same tube with its comb re-phased onto a `dot` px dot grid (#1091).
+    ///
+    /// The comb's whole design is *one dark line per dot row, in the seam below
+    /// it* — [`CRT`](Self::CRT) spells that reasoning out against the shipped
+    /// 4 px cell. A fixed 4-row comb over a grid of any other pitch stops being
+    /// a raster and becomes **interference**: at `dot_px = 3` it lands on the
+    /// dot *core* of glyph rows 1 and 5, misses row 3 entirely, and beats
+    /// row-to-row by ~19 points of summed light across a 7-row glyph. So a dot
+    /// surface re-phases, and gets back exactly what the CRT skin has always
+    /// promised: `phase == pitch - 1` is the cell's last sub-row on every
+    /// pitch, which is what `the_crt_comb_lands_in_the_dot_seam_at_every_pitch`
+    /// pins.
+    ///
+    /// # This does not make the tube per-widget
+    ///
+    /// Everything else about the pass — `scanline_keep`, `corner_keep`, the
+    /// vignette's whole geometry — is still the *glass*, resolved from the
+    /// [`DisplayStyle`] and identical on every surface. Only the comb's
+    /// **phase** follows the dot grid it is combing, and only the two surfaces
+    /// that *have* a dot grid call this: `dot_matrix.rs` and `marquee.rs`, at
+    /// their `composite` call sites. The [`Scope`](super::Scope),
+    /// [`Gauge`](super::Gauge), [`FlipBoard`](super::FlipBoard),
+    /// [`SevenSeg`](super::seven_seg), [`LedStrip`](super::LedStrip) and
+    /// [`LedMatrix`](super::LedMatrix) composites are untouched and keep
+    /// [`CRT`](Self::CRT) as it stands; [`Emission::composite`] already takes an
+    /// `Option<Mask>`, so nothing in the kit grew a pitch argument.
+    ///
+    /// Total on a `0` pitch (which no caller can produce — `Dots::dot` is
+    /// clamped to `MIN_DOT_PX..=MAX_DOT_PX`) because `pitch` is a modulus and a
+    /// `0` there would divide by zero in [`MaskCols::row`].
+    pub(crate) const fn with_pitch(self, dot: usize) -> Self {
+        let pitch = if dot == 0 { self.pitch } else { dot };
+        Self {
+            pitch,
+            phase: pitch - 1,
+            scanline_keep: self.scanline_keep,
+            corner_keep: self.corner_keep,
+        }
+    }
 
     /// Resolve the pass for one `w`×`h` buffer — everything that depends on
     /// the geometry rather than on the pixel, done once per composite. See

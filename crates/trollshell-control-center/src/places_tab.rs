@@ -239,8 +239,8 @@ impl Editor {
     ///
     /// Returns whether the save landed; a failure toasts and leaves both the
     /// file and the displayed text untouched.
-    fn save_departures_endpoint(&self, next: Option<String>) -> bool {
-        match places::save_departures_endpoint(next.as_deref()) {
+    fn save_departures_endpoint(&self, next: Option<&str>) -> bool {
+        match places::save_departures_endpoint(next) {
             Ok(()) => {
                 let reloaded = places::load_departures_endpoint();
                 self.departures_endpoint_row
@@ -925,7 +925,7 @@ pub(crate) fn build_page() -> (adw::ToastOverlay, glib::SourceId) {
     {
         let editor = editor.clone();
         departures_endpoint_row.connect_apply(move |entry| {
-            editor.save_departures_endpoint(endpoint_from_entry(&entry.text()));
+            editor.save_departures_endpoint(endpoint_from_entry(&entry.text()).as_deref());
         });
     }
 

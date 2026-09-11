@@ -271,18 +271,39 @@ mod tests {
         }
     }
 
-    /// **The dedup decision**: one id per agent, the same one every time.
+    /// **The dedup decision**: the id is a pure function of the agent's name —
+    /// the same string in every process, for ever.
     ///
     /// This is the whole of "a second launch for the same agent focuses the
-    /// existing one" that is ours — the rest is `GApplication`'s, which keys its
-    /// single-instance registration on exactly this string.
+    /// existing one" that is ours; the rest is `GApplication`'s, which keys its
+    /// single-instance registration on exactly this string. So the assertion
+    /// has to be the **exact** string, not two calls compared to each other:
+    /// a per-launch component (a pid, a timestamp, a counter) is identical
+    /// within one process and would sail through a self-comparison while
+    /// breaking the feature entirely — measured, on the mutation below.
     ///
-    /// Mutation (verified red): put anything per-launch in the id (a pid, a
-    /// timestamp) and the stability assertion goes red; drop the agent from it
-    /// and the distinctness one does.
+    /// Mutation (verified red): append `std::process::id()` — or anything else
+    /// that is not the name — and the first assertion reds. (The
+    /// self-comparison this test used to make stayed **green** on that
+    /// mutation, which is why it is no longer the assertion.) Drop the agent
+    /// from the id and the distinctness assertion reds.
     #[test]
     fn one_app_id_per_agent_stable_across_launches() {
-        assert_eq!(app_id(&name("stray")), app_id(&name("stray")));
+        assert_eq!(
+            app_id(&name("stray")),
+            "mov.vibec0re.trollshell.AgentWindow.stray",
+            "the id is the prefix and the mangled name, and nothing else — \
+             anything per-launch here means a second window per launch"
+        );
+        assert_eq!(
+            app_id(&name("trollshell-choom")),
+            "mov.vibec0re.trollshell.AgentWindow.trollshell_choom"
+        );
+        assert_eq!(
+            app_id(&name("9-lives")),
+            "mov.vibec0re.trollshell.AgentWindow.a9_lives",
+            "the leading-letter fix is part of the pure function too"
+        );
         assert_ne!(app_id(&name("stray")), app_id(&name("nixos-choom")));
         assert!(app_id(&name("stray")).starts_with(APP_ID_PREFIX));
     }

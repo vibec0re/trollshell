@@ -879,7 +879,7 @@ fn refusal(why: &SaveError) -> String {
 fn commit(ticket: u64, plan: &SavePlan) {
     match plan.name_workspace {
         Some(workspace) => {
-            workspace_stacks::spawn_save(ticket, workspace, plan.name.clone(), plan.stack.clone())
+            workspace_stacks::spawn_save(ticket, workspace, plan.name.clone(), plan.stack.clone());
         }
         None => workspace_stacks::spawn_save_edit(
             ticket,

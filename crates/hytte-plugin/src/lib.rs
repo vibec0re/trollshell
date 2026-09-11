@@ -44,6 +44,53 @@
 //! (#195: the host persists nothing, the plugin's transient UI state is
 //! re-derivable) applied symmetrically to the plugin side.
 //!
+//! # Process shutdown (#1079)
+//!
+//! Don't confuse this with the per-session "Shutdown ≡ disconnect" above,
+//! which the *host* sends and which the runtime answers by redialing —
+//! [`run`] never exits over it. This section is the other lifecycle
+//! entirely: the *process* exiting, which only happens when the launcher
+//! (`systemd-run --user`, `trollshell/src/plugin_launcher.rs`) stops the
+//! plugin's transient unit, sending `SIGTERM` (or `SIGINT` under a manual
+//! `Ctrl-C`).
+//!
+//! [`run`] installs a listener for both signals (from roughly the moment
+//! `main` starts the runtime — see the caveat on the pre-install window
+//! below). On the first signal it flips a shutdown flag; the session loop
+//! finishes whatever frame is already in flight (it does not abort
+//! mid-write), then, instead of redialing, calls [`Plugin::shutdown`] under
+//! a 2 s inner grace, and the process exits 0 either way. A signal arriving
+//! before any session ever connected (still dialing, or sleeping out the
+//! reconnect backoff) skips straight to exit — no session, so no model to
+//! flush and [`sources`](Plugin::sources) is never called. A plugin with
+//! nothing to flush needs no code at all — the default [`Plugin::shutdown`]
+//! is a no-op, so the process still exits promptly.
+//!
+//! **The 2 s grace bounds an `.await`ing hook, not a blocking one** (#1092
+//! review M4): it wraps [`Plugin::shutdown`] in [`tokio::time::timeout`],
+//! which can only reclaim control at an `.await` point — a hook that instead
+//! blocks the OS thread (`std::fs::write`, `std::thread::sleep`, a
+//! synchronous network call) cannot be preempted on `run`'s current-thread
+//! runtime, because there is no other worker to notice the timeout has
+//! elapsed. Measured: a hook that calls `std::thread::sleep` for 8 s held the
+//! real `SIGTERM` path for **8059 ms against a 2000 ms grace** — the timeout
+//! never fired at all. A hook that instead `.await`s an 8 s sleep is cut
+//! correctly at ~2067 ms. **Do file I/O the way `hytte-plugin-infobroker`'s
+//! `GrantStore::drain` does it** (`crates/hytte-plugin-infobroker/src/grants.rs`)
+//! — offload the blocking step to [`tokio::task::spawn_blocking`] and
+//! `.await` the `JoinHandle` — never call a blocking function directly from
+//! `shutdown`.
+//!
+//! Systemd's own `TimeoutStopSec` on the transient unit is the outer bound on
+//! all of this — if a stuck hook (or a stuck in-flight frame) still hasn't
+//! let the process exit by then, systemd escalates to `SIGKILL`, past
+//! anything this runtime can do about it. As of #1079,
+//! `trollshell/src/plugin_launcher.rs` does not set `TimeoutStopSec` on the
+//! units it starts, so that bound is in practice the service manager's own
+//! `DefaultTimeoutStopSec` (90 s on a stock systemd) rather than anything
+//! tuned to this 2 s inner grace — tracked separately on #419's lane, not a
+//! change this crate makes.
+//!
 //! # Self-driven re-renders
 //!
 //! A plugin that re-renders on its own schedule (a timer, an external fetch)
@@ -428,6 +475,7 @@
 //! a blank explicit tooltip **suppresses** the `Text` default rather than
 //! falling back to it — which is what makes it an opt-out rather than a no-op.
 
+use std::future::Future;
 use std::time::Duration;
 
 use hytte_plugin_proto::{
@@ -973,6 +1021,26 @@ pub trait Plugin: Sized {
     /// one `Render` frame. A chip/card-only plugin returns `node.into()`; see
     /// the crate-level *Opening your own panel* section for the paneled shape.
     fn view(&self) -> View;
+
+    /// Flush pending state before the process exits (#1079): called once,
+    /// after the session loop finishes whatever frame was already in flight,
+    /// when [`run`] notices `SIGTERM`/`SIGINT` — see the crate-level
+    /// *Shutdown* section for the full lifecycle **and the grace period's
+    /// contract** (it bounds an `.await`, not a blocking call — read that
+    /// section before writing this hook). The default implementation does
+    /// nothing, so a plugin with no durable state to flush needs no change at
+    /// all; one that persists something (a grant store, a timer's saved
+    /// state, a fetch cache) `.await`s its own writer here instead of racing
+    /// the process exit against it — through [`tokio::task::spawn_blocking`]
+    /// if the write itself is a blocking call, never called directly.
+    ///
+    /// Written as `-> impl Future` rather than `async fn` so the signature
+    /// carries no implicit `Send`/`Sync` leakage (`clippy`/rustc's
+    /// `async_fn_in_trait` lint) — an ordinary `async fn shutdown(&mut self)
+    /// { … }` body in an implementation still satisfies this.
+    fn shutdown(&mut self) -> impl Future<Output = ()> {
+        async {}
+    }
 }
 
 #[cfg(test)]

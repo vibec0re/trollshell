@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::Utc;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::grants::{Decision, GrantStore};
 use crate::paths;
@@ -1113,6 +1113,52 @@ fn send_update(
     let _ = out.send(BrokerMsg::Update { snapshot, toast });
 }
 
+/// [`serve_inner`]'s shutdown arm (#1079), normalized to one future: `Some`
+/// when the SDK's shutdown hook asks this session to drain the grant store
+/// (the payload is the ack sender to reply on once that is done), forever
+/// pending when there is no shutdown wiring at all — plain `serve`/
+/// `serve_with_grant_loader` and every existing test that calls them
+/// directly — so that `select!` branch simply never fires there rather than
+/// needing its own `if` guard. A `shutdown` that resolves to `Err` (the
+/// sender dropped without ever asking — an ordinary session end) also maps to
+/// `None`: only a genuine ask should end up looking like one.
+///
+/// **Clears the slot on any resolution, not just the genuine-ask one**
+/// (#1092 review M3): `tokio::sync::oneshot::Receiver::poll` panics
+/// ("called after complete") on any poll *after* it already returned
+/// `Ready` — including `Ready(Err(_))` — and `serve_inner`'s `loop` builds a
+/// fresh `select!` (and so a fresh call to this function) every iteration.
+/// Without clearing it, an `Err` here (the ordinary-teardown case the doc
+/// above already names as expected) would arm exactly that panic on the
+/// very next iteration — not reachable from the shipped `Infobroker` today
+/// (`cmds.recv()` is `biased` and always resolves first when both channels
+/// close together, ending the loop before this function is ever polled
+/// again — see `serve_inner`'s comment at its call site), but a caller that
+/// clones its `CmdSender` into a task, or a future reorder that drops
+/// `biased`, would panic the broker task on the very next `select!`.
+/// Reproduced live through the public `serve_with_shutdown` seam (a seeded
+/// session, `drop`ping the shutdown sender, then one `Cmd::Revoke`) before
+/// this fix.
+async fn recv_shutdown(
+    shutdown: &mut Option<oneshot::Receiver<oneshot::Sender<()>>>,
+) -> Option<oneshot::Sender<()>> {
+    match shutdown {
+        Some(rx) => {
+            let ack = rx.await.ok();
+            if ack.is_none() {
+                // The sender is gone for good (a oneshot fires at most
+                // once); re-polling `rx` on the next iteration would panic.
+                // `None` is already this function's "nothing to do" answer
+                // for that case, so parking here forever changes nothing an
+                // ordinary caller observes.
+                *shutdown = None;
+            }
+            ack
+        }
+        None => std::future::pending().await,
+    }
+}
+
 /// Sleep until the nearest parked deadline, or forever when nothing is parked —
 /// the timeout arm of [`serve`]'s `select!`.
 async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
@@ -1322,11 +1368,62 @@ fn load_grants() -> GrantStore {
     )
 }
 
-/// [`serve`], with the synchronous grant-load step supplied by the caller.
-/// `serve` *is* `serve_with_grant_loader(cmds, out, load_grants)`; everything
-/// [`serve`]'s doc says applies here unchanged.
+/// [`serve`], with the synchronous grant-load step supplied by the caller —
+/// see [`serve_inner`] (this function's whole body, `shutdown: None`) for why
+/// the seam is public and what it guards against. `serve` *is*
+/// `serve_with_grant_loader(cmds, out, load_grants)`; everything [`serve`]'s
+/// doc says applies here unchanged.
+#[doc(hidden)]
+pub async fn serve_with_grant_loader<L>(
+    cmds: mpsc::UnboundedReceiver<Cmd>,
+    out: mpsc::UnboundedSender<BrokerMsg>,
+    load_grants: L,
+) where
+    L: FnOnce() -> GrantStore + Send + 'static,
+{
+    serve_inner(cmds, out, load_grants, None).await;
+}
+
+/// Like [`serve`], but wired to the SDK's shutdown hook (#1079, the
+/// `hytte-plugin-infobroker` **binary**'s `Infobroker::shutdown` in
+/// `src/plugin.rs`): `shutdown` is a oneshot whose payload is itself an ack
+/// sender — the caller `send`s an ack channel on it to *request* the drain,
+/// and this loop `send`s back on that ack once [`GrantStore::drain`]
+/// (including its in-flight `spawn_blocking`) has actually finished, then
+/// ends the session rather than continuing to serve. `#[doc(hidden)]` rather
+/// than `pub(crate)`: `src/plugin.rs` is a separate bin crate over this same
+/// package's library (same shape as `serve`/`serve_with_grant_loader`), so it
+/// needs real `pub` visibility — this is still not a seam anything outside
+/// that one caller should reach for, and this library stays SDK-free either
+/// way (`shutdown` is an ordinary `tokio::sync::oneshot` pair, nothing
+/// SDK-shaped).
+#[doc(hidden)]
+pub async fn serve_with_shutdown(
+    cmds: mpsc::UnboundedReceiver<Cmd>,
+    out: mpsc::UnboundedSender<BrokerMsg>,
+    shutdown: oneshot::Receiver<oneshot::Sender<()>>,
+) {
+    serve_inner(cmds, out, load_grants, Some(shutdown)).await;
+}
+
+/// [`serve`]'s doc, unabridged: `serve` is `serve_with_grant_loader(cmds, out,
+/// load_grants)` is `serve_inner(cmds, out, load_grants, None)`, and
+/// [`serve_with_shutdown`] is the same body with a live shutdown channel.
+/// Split out of the public `serve_with_grant_loader` name (#1079) so adding
+/// the shutdown wiring didn't have to touch that function's signature or its
+/// existing external callers (`tests/serve_socket_handover.rs` included).
 ///
-/// # Why the seam is public (#1059)
+/// A session without a socket **still runs**: it seeds the panel (with a
+/// [`BrokerSnapshot::notice`] saying why it is not serving) and keeps draining
+/// the command lane. Returning early instead left the duplicate's chip painting
+/// a default snapshot with dead buttons.
+///
+/// SDK-free: `cmds`/`out` are plain tokio channels (the plugin passes the SDK's
+/// per-session lane ends, which are exactly these types), so this whole module
+/// never links the plugin runtime — `shutdown` is the same story, an ordinary
+/// `tokio::sync::oneshot` pair rather than anything SDK-shaped.
+///
+/// # Why the grant-loader seam is public (#1059)
 ///
 /// The property this parameter exists to test is "a slow synchronous step
 /// inside `serve` does not stop the runtime's timers", and it is invisible
@@ -1373,15 +1470,16 @@ fn load_grants() -> GrantStore {
 /// whose task does the `spawn_blocking` write in submission order
 /// (see [`crate::grants::GrantStore::save`]), and `write_response` offloads
 /// `encode_response` past [`LARGE_RESPONSE_ROWS`] the same way.
-// One cohesive `select!` loop (accept / command / timeout) over the parked-request
-// state (consent + query maps); splitting its arms into helpers would scatter that
-// shared state for no readability gain — same stance as the host's `handle_conn`.
+// One cohesive `select!` loop (accept / command / shutdown / timeout) over the
+// parked-request state (consent + query maps); splitting its arms into helpers
+// would scatter that shared state for no readability gain — same stance as
+// the host's `handle_conn`.
 #[allow(clippy::too_many_lines)]
-#[doc(hidden)]
-pub async fn serve_with_grant_loader<L>(
+async fn serve_inner<L>(
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
     out: mpsc::UnboundedSender<BrokerMsg>,
     load_grants: L,
+    mut shutdown: Option<oneshot::Receiver<oneshot::Sender<()>>>,
 ) where
     L: FnOnce() -> GrantStore + Send + 'static,
 {
@@ -1504,6 +1602,20 @@ pub async fn serve_with_grant_loader<L>(
                     }
                 }
             }
+            // #1079: the SDK's shutdown hook asking this session to drain the
+            // grant store before the process exits — see `recv_shutdown`.
+            // `Some` only for a genuine ask (the ack sender); an ordinary
+            // session end (the model dropping its `shutdown_req` sender
+            // without ever calling `shutdown`) resolves to `None`, which the
+            // `Some(ack) = …` pattern guard disables rather than treats as a
+            // shutdown — the `cmd = cmds.recv()` arm above already handles
+            // that ordinary teardown, and it is listed first (`biased`) so it
+            // wins the tie when both channels close in the same moment.
+            Some(ack) = recv_shutdown(&mut shutdown) => {
+                state.grants.drain().await;
+                let _ = ack.send(());
+                break;
+            }
             accepted = accept_or_park(listener) => {
                 match accepted {
                     Ok((stream, _addr)) => match state.handle_conn(stream).await {
@@ -1592,6 +1704,39 @@ mod tests {
 
     fn store(grants: Vec<Grant>) -> GrantStore {
         GrantStore::from_grants(grants)
+    }
+
+    /// #1092 review M3: `recv_shutdown` must be safe to call again after it
+    /// already resolved to `None` — `serve_inner`'s `loop` builds a fresh
+    /// `select!` (and so a fresh call to this function) every iteration.
+    /// Before the fix, a second call re-polled the same already-completed
+    /// `oneshot::Receiver`, which panics ("called after complete"); the
+    /// bounded `tokio::time::timeout` around the second call is what turns
+    /// "safely pending forever" (this function's documented behaviour once
+    /// there is nothing left to ask) into a passing assertion instead of an
+    /// actual hang — a panic during that `.await` still unwinds straight
+    /// through the timeout and fails this test, since a timeout races a
+    /// deadline, it does not catch a panic.
+    #[tokio::test]
+    async fn recv_shutdown_is_safe_to_call_again_after_the_sender_drops() {
+        let (tx, rx) = oneshot::channel::<oneshot::Sender<()>>();
+        let mut slot = Some(rx);
+        drop(tx);
+
+        assert!(
+            recv_shutdown(&mut slot).await.is_none(),
+            "a dropped sender with no ask must resolve to None, not panic"
+        );
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            recv_shutdown(&mut slot),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "a second call must stay a harmless no-op (pending forever), not panic"
+        );
     }
 
     /// #995: the socket is taken, not seized. A duplicate broker — which the

@@ -12,10 +12,44 @@ use hytte_plugin_proto::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
-use tokio::sync::mpsc;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt;
 
 use crate::{Input, Plugin, View};
+
+/// The grace [`Plugin::shutdown`] gets before the process exits regardless
+/// (#1079) — via [`run_shutdown_hook`] wrapping the call in
+/// [`tokio::time::timeout`]. Long enough for a well-behaved flush (one small
+/// file write, per the SDK docs' worked example — the infobroker's grant
+/// store); short enough that a plugin stuck in its own hook doesn't sit on
+/// top of systemd's `TimeoutStopSec` — **only for a hook that actually
+/// `.await`s** (#1092 review M4). A `timeout` can only reclaim control at an
+/// `.await` point, so a hook that blocks the OS thread instead
+/// (`std::fs::write`, `std::thread::sleep`, …) is not preemptable on `run`'s
+/// current-thread runtime: measured, `std::thread::sleep(8s)` in a hook held
+/// the real `SIGTERM` path for 8059 ms against this 2 s bound, while the same
+/// 8 s as an `.await`ed sleep was cut at ~2067 ms as documented. Blocking
+/// work belongs behind [`tokio::task::spawn_blocking`], `.await`ed — see the
+/// crate docs' *Process shutdown* section and `hytte-plugin-infobroker`'s
+/// `GrantStore::drain` for the shape. `TimeoutStopSec` is the *outer* bound
+/// regardless (see `run`'s doc) — a unit still not gone by then is
+/// `SIGKILL`ed, past anything this runtime controls.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// [`watch::Receiver::changed`], but a sender that is simply dropped without
+/// ever sending (no signal ever fired, and none can now — `run`'s protocol
+/// only ever sends `true`, at most once) resolves to `None` instead of
+/// `Err`, rather than looking like a fired signal. A `select!` branch built
+/// on this can therefore never mistake "the listener task is gone" for "it
+/// asked us to shut down" — the bug a first cut of this had, where every
+/// test's `never_shuts_down()` receiver's sender is dropped immediately and
+/// every `session`/`reconnect_loop` call read that as an instant shutdown.
+/// Given the protocol, an `Ok` here already means the flag is `true`; there
+/// is nothing left to check.
+async fn shutdown_fired(shutdown: &mut watch::Receiver<bool>) -> Option<()> {
+    shutdown.changed().await.ok()
+}
 
 /// Reconnect backoff bounds: start small, cap so we never hammer the socket.
 const BACKOFF_BASE: Duration = Duration::from_millis(100);
@@ -218,9 +252,19 @@ enum Step<M> {
 }
 
 /// Drive one connected session: handshake, seed render, then the
-/// read→update→render loop. `Ok(())` means the host sent `Shutdown`; any
-/// transport failure (EOF = the host went away) surfaces as `Err`. Either way
-/// the caller redials — see the crate docs on why `Shutdown` does not exit.
+/// read→update→render loop. `Ok(())` means the host sent `Shutdown` **or**
+/// `shutdown` fired (#1079) — either way the caller checks `*shutdown.borrow()`
+/// to tell them apart, since only the second means "exit, don't redial". Any
+/// transport failure (EOF = the host went away) surfaces as `Err`, same
+/// caveat. See the crate docs on why a host `Shutdown` alone does not exit.
+///
+/// `shutdown` is [`run`]'s process-wide notice (a real `SIGTERM`/`SIGINT` in
+/// production; a test fires it directly — see "the fake-host socketpair
+/// tests" below). Whenever this function returns with the flag set, it has
+/// already run [`Plugin::shutdown`] under [`SHUTDOWN_GRACE`] — regardless of
+/// which branch ended the loop, so a host `Shutdown` frame racing the signal
+/// on the same poll can never skip the hook (see `run_shutdown_hook`'s call
+/// site below).
 ///
 /// Generic over the I/O halves (not `UnixStream`) so the whole loop is
 /// hermetically testable over `tokio::io::duplex`.
@@ -228,7 +272,11 @@ enum Step<M> {
 // every host frame → dedup); the length is the host-frame vocabulary, not
 // branching complexity — splitting it would scatter the loop for no gain.
 #[allow(clippy::too_many_lines)]
-async fn session<P, R, W>(rd: R, mut wr: W) -> Result<(), ProtoError>
+async fn session<P, R, W>(
+    rd: R,
+    mut wr: W,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), ProtoError>
 where
     P: Plugin,
     R: AsyncRead + Send + Unpin + 'static,
@@ -374,6 +422,23 @@ where
 
     let result = 'session: loop {
         let step = tokio::select! {
+            // #1079: checked first (`biased`) so a process shutdown notice
+            // always wins a tie against a simultaneously-ready host frame —
+            // deterministically, not by the macro's default random pick —
+            // rather than possibly rendering one more update before the loop
+            // notices. Whichever branch actually ends the loop, the shutdown
+            // hook still runs exactly once below: `*shutdown.borrow()` is
+            // checked unconditionally after the loop, not only here.
+            //
+            // #1092 review L2: what this actually discards is a host frame
+            // the reader task already decoded into `rx` but this loop had not
+            // yet applied — e.g. an infobroker Allow/Revoke click still
+            // sitting in the channel. A click already *applied* (queued on a
+            // writer lane) is unaffected and the shutdown hook still sees it;
+            // one still in flight on the wire when the signal lands is not
+            // recovered by this mechanism.
+            biased;
+            Some(()) = shutdown_fired(&mut shutdown) => break 'session Ok(()),
             frame = rx.recv() => match frame {
                 Some(Ok(HostMsg::StateSnapshot { snapshot })) => Step::Update(Input::Snapshot(snapshot)),
                 // `output` (#1050, the monitor whose copy of the mirrored card
@@ -573,18 +638,56 @@ where
     // Stop reading; the caller drops the write half, which half-closes the
     // socket and lets the host reap the connection.
     reader.abort();
+    // #1079: unconditional, not just on the `shutdown.changed()` branch above —
+    // a host `Shutdown` or a transport error can end the loop on the very same
+    // poll the flag flipped (`biased` only orders the *tie*, it can't stop the
+    // other branch from having already been mid-flight), and either way a
+    // requested shutdown must still run the hook exactly once. `borrow()` reads
+    // the current value regardless of whether *this* receiver ever observed a
+    // `changed()` — see `run_shutdown_hook`'s doc for the grace itself.
+    if *shutdown.borrow() {
+        run_shutdown_hook(&plugin_id, &mut model).await;
+    }
     // Keeps the `!Send` marker live across every await above — see its comment.
     drop(thread_bound);
     result
 }
 
+/// Run `model.shutdown()` under [`SHUTDOWN_GRACE`], eprintln-ing rather than
+/// panicking if it overruns — the process exits either way (#1079: a bounded
+/// chance, not a blocking one). Factored out so [`session`] and the test
+/// harness drive the exact same bounded path.
+async fn run_shutdown_hook<P: Plugin>(plugin_id: &str, model: &mut P) {
+    let started = Instant::now();
+    match tokio::time::timeout(SHUTDOWN_GRACE, model.shutdown()).await {
+        Ok(()) => eprintln!(
+            "[{plugin_id}] shutting down: hook ran in {:.1?}, exiting",
+            started.elapsed()
+        ),
+        Err(_) => eprintln!(
+            "[{plugin_id}] shutting down: hook did not finish within {SHUTDOWN_GRACE:?}; \
+             exiting anyway"
+        ),
+    }
+}
+
 /// The connect→session→backoff loop, factored from [`run`] so a test can
 /// drive it with an in-memory connector and pin the runtime's headline
 /// decision: a session ending `Ok` (host `Shutdown`) **redials** — it never
-/// terminates the loop (see the crate docs on why exiting would strand a
-/// `Restart=on-failure` unit). A failed connect backs off the same way.
-async fn reconnect_loop<P, R, W, C, Fut>(plugin_id: &str, mut connect: C) -> !
-where
+/// terminates the loop on its own (see the crate docs on why exiting would
+/// strand a `Restart=on-failure` unit). A failed connect backs off the same
+/// way. The one thing that *does* end the loop is `shutdown` firing (#1079):
+/// checked (`biased`) against both the connect attempt and the backoff sleep,
+/// so a signal arriving with no session up yet returns immediately — no
+/// connect, no session, so [`Plugin::sources`] is never called — and one
+/// arriving during a live session is handled by [`session`] itself (which
+/// already ran the shutdown hook by the time it returns); either way this
+/// function returns instead of looping again.
+async fn reconnect_loop<P, R, W, C, Fut>(
+    plugin_id: &str,
+    mut shutdown: watch::Receiver<bool>,
+    mut connect: C,
+) where
     P: Plugin,
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Unpin,
@@ -594,14 +697,35 @@ where
     let mut backoff = Backoff::new();
     let mut redial = Redial::new();
     loop {
-        match connect().await {
+        let connected = tokio::select! {
+            biased;
+            Some(()) = shutdown_fired(&mut shutdown) => {
+                eprintln!("[{plugin_id}] shutdown requested; exiting before a session started");
+                return;
+            }
+            result = connect() => result,
+        };
+        match connected {
             Ok((rd, wr)) => {
                 let started = Instant::now();
-                let outcome = session::<P, _, _>(rd, wr).await;
+                let outcome = session::<P, _, _>(rd, wr, shutdown.clone()).await;
                 let lived = started.elapsed();
                 // Escalate the log iff we've hit a streak of immediate failures —
                 // the #437 crash-loop signature — so it isn't a silent 5 s spin.
                 let skew = redial.note(lived, outcome.is_ok());
+                backoff.note_session(lived);
+                // `session` already ran the shutdown hook if this is why it
+                // ended (see its doc). Checked *before* logging `outcome`
+                // below, not after (#1092 review L1): a host `Shutdown` and
+                // the process notice both surface as this same `Ok(())`, and
+                // this flag is the only thing that tells them apart —
+                // logging `outcome` first said "host shut down; will
+                // reconnect" on the exact path that neither the host shut
+                // down nor will reconnect.
+                if *shutdown.borrow() {
+                    eprintln!("[{plugin_id}] shutting down; not reconnecting");
+                    return;
+                }
                 match outcome {
                     Ok(()) => eprintln!("[{plugin_id}] host shut down; will reconnect"),
                     Err(e) if skew => eprintln!(
@@ -611,13 +735,19 @@ where
                     ),
                     Err(e) => eprintln!("[{plugin_id}] session ended: {e}"),
                 }
-                backoff.note_session(lived);
             }
             Err(e) => {
                 eprintln!("[{plugin_id}] connect failed: {e}");
             }
         }
-        tokio::time::sleep(backoff.delay()).await;
+        tokio::select! {
+            biased;
+            Some(()) = shutdown_fired(&mut shutdown) => {
+                eprintln!("[{plugin_id}] shutdown requested during backoff; exiting");
+                return;
+            }
+            () = tokio::time::sleep(backoff.delay()) => {}
+        }
     }
 }
 
@@ -630,6 +760,22 @@ where
 /// connection. Exits the process (status 1) only on unrecoverable setup:
 /// `XDG_RUNTIME_DIR` unset (then there is nothing to dial, ever) or the
 /// tokio runtime failing to build.
+///
+/// Also installs the `SIGTERM`/`SIGINT` listener for the shutdown lifecycle
+/// (#1079, crate docs' "Process shutdown" section): on either signal a
+/// process-wide flag flips, the live session (if any) finishes its in-flight
+/// frame and runs [`Plugin::shutdown`] under [`SHUTDOWN_GRACE`] — which
+/// bounds an `.await`ing hook only, not a thread-blocking one; see that
+/// constant's doc — and this function exits the process with status 0
+/// instead of reconnecting. Systemd's own `TimeoutStopSec` on the transient
+/// unit (`trollshell/src/plugin_launcher.rs`) is the *outer* bound on all of
+/// this — a plugin still not gone by then is `SIGKILL`ed. The listener is
+/// only live once its spawned task is first polled (inside `block_on`
+/// below), so a signal in the sub-millisecond window between process start
+/// and that first poll gets the platform's default disposition (terminate)
+/// rather than this graceful path — measured at under 1 ms in practice (the
+/// `fork`/`exec` gap, not anything this function does), and not otherwise
+/// fixable short of blocking `SIGTERM` before the runtime exists.
 pub fn run<P: Plugin>() -> ! {
     let plugin_id = P::manifest().id;
     let Some(path) = socket_path() else {
@@ -649,20 +795,57 @@ pub fn run<P: Plugin>() -> ! {
         }
     };
 
-    rt.block_on(reconnect_loop::<P, _, _, _, _>(&plugin_id, move || {
-        let path = path.clone();
-        async move {
-            let stream = UnixStream::connect(&path).await?;
-            Ok(stream.into_split())
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Scheduled now, actually polled once `block_on` below starts driving
+    // this runtime — a plain `Runtime::spawn` needs no "inside `block_on`"
+    // context of its own.
+    rt.spawn(async move {
+        // A signal type that fails to install (a platform/sandbox oddity) just
+        // never fires; the other one, if it installed, still can. Both
+        // failing means this task quietly does nothing — no signal handling,
+        // same as pre-#1079.
+        let term = signal(SignalKind::terminate());
+        let int = signal(SignalKind::interrupt());
+        match (term, int) {
+            (Ok(mut term), Ok(mut int)) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = int.recv() => {}
+                }
+            }
+            (Ok(mut term), Err(_)) => {
+                term.recv().await;
+            }
+            (Err(_), Ok(mut int)) => {
+                int.recv().await;
+            }
+            (Err(_), Err(_)) => return,
         }
-    }))
+        // A closed receiver (the runtime is already tearing down some other
+        // way) makes this a no-op, which is fine — there is nothing left to
+        // notify.
+        let _ = shutdown_tx.send(true);
+    });
+
+    rt.block_on(reconnect_loop::<P, _, _, _, _>(
+        &plugin_id,
+        shutdown_rx,
+        move || {
+            let path = path.clone();
+            async move {
+                let stream = UnixStream::connect(&path).await?;
+                Ok(stream.into_split())
+            }
+        },
+    ));
+    std::process::exit(0);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BACKOFF_BASE, BACKOFF_CAP, Backoff, IMMEDIATE_FAILURE, Redial, SKEW_WARN_AFTER,
-        reconnect_loop, session,
+        BACKOFF_BASE, BACKOFF_CAP, Backoff, IMMEDIATE_FAILURE, Redial, SHUTDOWN_GRACE,
+        SKEW_WARN_AFTER, reconnect_loop, session,
     };
     use crate::display::{Marquee, StyleName};
     use crate::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
@@ -674,9 +857,19 @@ mod tests {
     };
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncWrite, duplex};
+    use tokio::sync::watch;
+
+    /// A shutdown notice that never fires — the test stand-in for a plugin
+    /// process's whole life with no `SIGTERM`/`SIGINT`, for every test that
+    /// isn't itself about the #1079 shutdown lifecycle.
+    fn never_shuts_down() -> watch::Receiver<bool> {
+        watch::channel(false).1
+    }
 
     // ── Test plugins ─────────────────────────────────────────────────────────
 
@@ -1447,7 +1640,7 @@ mod tests {
             drop(hrd);
         };
 
-        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_err(), "EOF must surface as a session error");
     }
 
@@ -1487,7 +1680,7 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok(), "Shutdown ends the session cleanly");
     }
 
@@ -1579,7 +1772,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Poisoned, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(
+            session::<Poisoned, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok(), "Shutdown ends the session cleanly");
     }
 
@@ -1634,7 +1830,7 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok(), "Shutdown ends the session cleanly");
     }
 
@@ -1713,7 +1909,8 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Paneled, _, _>(prd, pwr), host);
+        let (result, ()) =
+            tokio::join!(session::<Paneled, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok(), "Shutdown ends the session cleanly");
     }
 
@@ -1784,7 +1981,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<HiddenOn, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(
+            session::<HiddenOn, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok(), "Shutdown ends the session cleanly");
     }
 
@@ -1815,7 +2015,7 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok());
     }
 
@@ -1882,7 +2082,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Attributed, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(
+            session::<Attributed, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok(), "Shutdown ends the session cleanly");
     }
 
@@ -1916,7 +2119,7 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok());
     }
 
@@ -1957,7 +2160,8 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Ticker, _, _>(prd, pwr), host);
+        let (result, ()) =
+            tokio::join!(session::<Ticker, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok());
     }
 
@@ -1990,7 +2194,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<FragileTicker, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(
+            session::<FragileTicker, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok());
     }
 
@@ -2025,7 +2232,7 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok());
     }
 
@@ -2067,7 +2274,8 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Watcher, _, _>(prd, pwr), host);
+        let (result, ()) =
+            tokio::join!(session::<Watcher, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok());
     }
 
@@ -2109,7 +2317,7 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Meter, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(session::<Meter, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok());
     }
 
@@ -2145,7 +2353,7 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok());
     }
 
@@ -2191,7 +2399,7 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok());
     }
 
@@ -2217,7 +2425,7 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok());
     }
 
@@ -2256,7 +2464,7 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(result.is_ok());
     }
 
@@ -2298,7 +2506,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Commander, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(
+            session::<Commander, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok());
     }
 
@@ -2332,7 +2543,10 @@ mod tests {
                 send(&mut hwr, &HostMsg::Shutdown).await;
             };
 
-            let (result, ()) = tokio::join!(session::<Commander, _, _>(prd, pwr), host);
+            let (result, ()) = tokio::join!(
+                session::<Commander, _, _>(prd, pwr, never_shuts_down()),
+                host
+            );
             assert!(
                 result.is_ok(),
                 "a fresh per-session command lane round-trips"
@@ -2366,7 +2580,7 @@ mod tests {
             drop(hrd);
         };
 
-        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(session::<Echo, _, _>(prd, pwr, never_shuts_down()), host);
         assert!(
             result.is_err(),
             "a failed mid-session write surfaces as a session error"
@@ -2387,15 +2601,16 @@ mod tests {
         // any further attempt parks forever.
         let mut pending = vec![p2, p1];
 
-        let dial_loop = reconnect_loop::<Echo, _, _, _, _>("echo-test", move || {
-            let next = pending.pop();
-            async move {
-                match next {
-                    Some(end) => Ok(tokio::io::split(end)),
-                    None => std::future::pending().await,
+        let dial_loop =
+            reconnect_loop::<Echo, _, _, _, _>("echo-test", never_shuts_down(), move || {
+                let next = pending.pop();
+                async move {
+                    match next {
+                        Some(end) => Ok(tokio::io::split(end)),
+                        None => std::future::pending().await,
+                    }
                 }
-            }
-        });
+            });
 
         let host = async move {
             let (mut hrd1, mut hwr1) = tokio::io::split(h1);
@@ -2410,8 +2625,324 @@ mod tests {
 
         tokio::select! {
             () = host => {}
-            () = dial_loop => unreachable!("reconnect_loop never returns"),
+            () = dial_loop => unreachable!("reconnect_loop never returns with a live shutdown notice that never fires"),
         }
+    }
+
+    /// PR #1092 review M1: `reconnect_loop`'s post-session exit gate
+    /// (`if *shutdown.borrow() { return; }`, right after a live session ends)
+    /// is what turns "the hook ran" into "the process exits instead of
+    /// redialing" — the *only* path a real `systemctl stop` on a live session
+    /// takes. `session` itself returns `Ok(())` whether a host `Shutdown` or
+    /// the process notice caused it, so this is the one place that tells them
+    /// apart at the `reconnect_loop` level and no other test here reaches it:
+    /// every other shutdown test here drives `session` directly, and
+    /// `shutdown_before_a_session_starts_skips_sources_and_exits` covers only
+    /// the *pre-session* gate.
+    ///
+    /// The host never sends `HostMsg::Shutdown` here — only the process-level
+    /// notice fires, once the session is up — so a connector call count of 1
+    /// after `reconnect_loop` returns proves it exited rather than attempting
+    /// a second connect (a redial).
+    #[tokio::test]
+    async fn shutdown_during_a_live_session_ends_reconnect_loop_without_a_redial() {
+        let (p1, h1) = duplex(64 * 1024);
+        let mut first = Some(p1);
+        let connect_calls = Arc::new(AtomicUsize::new(0));
+        let calls = connect_calls.clone();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let dial_loop = reconnect_loop::<Echo, _, _, _, _>("echo-test", shutdown_rx, move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let next = first.take();
+            async move {
+                match next {
+                    Some(end) => Ok(tokio::io::split(end)),
+                    // A second connect attempt (a redial) parks here forever;
+                    // the outer timeout below turns that into a failure
+                    // instead of a hang.
+                    None => std::future::pending().await,
+                }
+            }
+        });
+
+        let host = async move {
+            let (mut hrd, _hwr) = tokio::io::split(h1);
+            eat_handshake(&mut hrd, "echo-test").await;
+            shutdown_tx.send(true).expect("receiver still alive");
+            // No `HostMsg::Shutdown` — the process-level notice alone must
+            // end both the session and the outer loop.
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(dial_loop, host)
+        })
+        .await
+        .expect(
+            "reconnect_loop must return once a live session ends via shutdown, not redial/hang",
+        );
+
+        assert_eq!(
+            connect_calls.load(Ordering::SeqCst),
+            1,
+            "the process must exit rather than attempt a second connect (redial)"
+        );
+    }
+
+    // ── Shutdown (#1079) ─────────────────────────────────────────────────────
+
+    /// (a) `shutdown` runs exactly once, and only *after* a frame that
+    /// arrived **before** the signal has already been processed and
+    /// rendered — never a second time for a host message sent **after** the
+    /// notice. `Logged`'s `update` and `shutdown` both push into the same
+    /// log, so the recorded order pins both properties at once: the `biased`
+    /// shutdown-first arm must win the race against the snapshot sent right
+    /// behind the notice, or `"update"` would appear twice.
+    ///
+    /// #1092 review L4: precisely, this pins "a frame that arrived before
+    /// the signal still gets processed" — the host `.await`s the `10:00`
+    /// `Render` before firing `shutdown_tx`, so there is no race on that
+    /// half. It does *not* exercise "a frame already mid-processing when the
+    /// signal lands is not aborted": that holds by construction (the
+    /// `update`/`view`/send step has no `select!` inside it to be preempted
+    /// by), not by anything this test observes.
+    ///
+    /// Falsification (PR body): skipping the in-flight-frame wait — e.g.
+    /// checking `shutdown` before processing the already-selected step —
+    /// reds this by reordering the log (`shutdown` before the first
+    /// `update`, or `update` appearing twice).
+    #[tokio::test]
+    async fn shutdown_runs_the_hook_exactly_once_after_the_in_flight_frame() {
+        static LOG: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+
+        struct Logged;
+
+        impl Plugin for Logged {
+            type Msg = std::convert::Infallible;
+            type Cmd = std::convert::Infallible;
+
+            fn manifest() -> Manifest {
+                Manifest::new("shutdown-order-test", Mount::SidebarTop)
+            }
+
+            fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+                Self
+            }
+
+            fn update(&mut self, _input: Input<Self::Msg>) -> Vec<Effect> {
+                LOG.lock().unwrap().push("update");
+                Vec::new()
+            }
+
+            fn view(&self) -> View {
+                Node::Label {
+                    id: Some("logged-lbl".to_owned()),
+                    text: LOG.lock().unwrap().len().to_string(),
+                    classes: Vec::new(),
+                    tooltip: None,
+                }
+                .into()
+            }
+
+            async fn shutdown(&mut self) {
+                LOG.lock().unwrap().push("shutdown");
+            }
+        }
+
+        // Falsification note (PR body): without the `biased` shutdown-first
+        // arm, the race between the "11:00" frame and the shutdown notice is
+        // *probabilistic* — a single trial can pass by luck (measured: 1 red
+        // in 5 with `biased` removed). Looping many independent sessions is
+        // what makes this a reliable falsifier: the fixed tree passes every
+        // trial deterministically (`biased` always breaks the tie the same
+        // way), while the mutation reds within a handful of trials.
+        for _ in 0..20 {
+            LOG.lock().unwrap().clear();
+
+            let (plugin_end, host_end) = duplex(64 * 1024);
+            let (prd, pwr) = tokio::io::split(plugin_end);
+            let (mut hrd, mut hwr) = tokio::io::split(host_end);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let host = async move {
+                eat_handshake(&mut hrd, "shutdown-order-test").await;
+                send(&mut hwr, &snapshot("10:00")).await;
+                assert!(
+                    matches!(next_plugin_frame(&mut hrd).await, PluginMsg::Render { .. }),
+                    "the update from before the signal must still render normally"
+                );
+                shutdown_tx.send(true).expect("receiver still alive");
+                // Sent right after the notice: the biased shutdown-first arm
+                // must win this race every time, so this must never reach
+                // `update`.
+                send(&mut hwr, &snapshot("11:00")).await;
+            };
+
+            let (result, ()) = tokio::join!(session::<Logged, _, _>(prd, pwr, shutdown_rx), host);
+            assert!(result.is_ok(), "a shutdown notice ends the session cleanly");
+
+            let log = LOG.lock().unwrap();
+            assert_eq!(
+                log.as_slice(),
+                &["update", "shutdown"],
+                "shutdown must run exactly once, after the one update the signal didn't race out"
+            );
+        }
+    }
+
+    /// (b) A `shutdown` hook that overruns [`SHUTDOWN_GRACE`] is cut off — the
+    /// session still ends rather than hanging on a stuck plugin.
+    /// `start_paused` auto-advances `Hanger::shutdown`'s sleep past the grace
+    /// without this test taking real minutes.
+    ///
+    /// Falsification (PR body): removing the grace (`run_shutdown_hook`
+    /// awaiting `model.shutdown()` directly instead of through
+    /// `tokio::time::timeout`) makes `session` hang forever here — this
+    /// test's own outer `tokio::time::timeout` is what turns that into a
+    /// fast, named failure instead of a 75-minute CI hang.
+    #[tokio::test(start_paused = true)]
+    async fn a_hook_that_overruns_the_grace_is_cut_off() {
+        struct Hanger;
+
+        impl Plugin for Hanger {
+            type Msg = std::convert::Infallible;
+            type Cmd = std::convert::Infallible;
+
+            fn manifest() -> Manifest {
+                Manifest::new("hanger-test", Mount::SidebarTop)
+            }
+
+            fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+                Self
+            }
+
+            fn update(&mut self, _input: Input<Self::Msg>) -> Vec<Effect> {
+                Vec::new()
+            }
+
+            fn view(&self) -> View {
+                Node::Label {
+                    id: Some("hanger-lbl".to_owned()),
+                    text: "x".to_owned(),
+                    classes: Vec::new(),
+                    tooltip: None,
+                }
+                .into()
+            }
+
+            async fn shutdown(&mut self) {
+                // Far past SHUTDOWN_GRACE; under `start_paused` this advances
+                // virtually, so the test itself stays fast.
+                tokio::time::sleep(SHUTDOWN_GRACE * 100).await;
+            }
+        }
+
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, _hwr) = tokio::io::split(host_end);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let host = async move {
+            eat_handshake(&mut hrd, "hanger-test").await;
+            shutdown_tx.send(true).expect("receiver still alive");
+        };
+
+        let (result, ()) = tokio::time::timeout(Duration::from_mins(1), async {
+            tokio::join!(session::<Hanger, _, _>(prd, pwr, shutdown_rx), host)
+        })
+        .await
+        .expect("session must return once the grace elapses, not hang on the stuck shutdown hook");
+        assert!(result.is_ok(), "the session still ends cleanly");
+    }
+
+    /// (c) A plugin that never overrides `shutdown` (the default no-op) exits
+    /// promptly — the grace exists for a hook that does real work, not as a
+    /// mandatory delay every plugin pays.
+    #[tokio::test]
+    async fn a_default_shutdown_hook_exits_promptly() {
+        let (plugin_end, host_end) = duplex(64 * 1024);
+        let (prd, pwr) = tokio::io::split(plugin_end);
+        let (mut hrd, _hwr) = tokio::io::split(host_end);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let host = async move {
+            eat_handshake(&mut hrd, "echo-test").await;
+            shutdown_tx.send(true).expect("receiver still alive");
+        };
+
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(session::<Echo, _, _>(prd, pwr, shutdown_rx), host)
+        })
+        .await
+        .expect("a plugin with no shutdown override must not delay the exit at all");
+        assert!(result.is_ok());
+    }
+
+    /// (d) A shutdown notice that fires before any session ever connects (the
+    /// dial/backoff phase) makes `reconnect_loop` exit without ever calling
+    /// `connect` to completion or, therefore, [`Plugin::sources`] — there is
+    /// no model in that case, so there is nothing to flush it from.
+    #[tokio::test]
+    async fn shutdown_before_a_session_starts_skips_sources_and_exits() {
+        static SOURCES_CALLED: AtomicBool = AtomicBool::new(false);
+
+        struct NeverConnects;
+
+        impl Plugin for NeverConnects {
+            type Msg = std::convert::Infallible;
+            type Cmd = std::convert::Infallible;
+
+            fn manifest() -> Manifest {
+                Manifest::new("never-connects-test", Mount::SidebarTop)
+            }
+
+            fn init(_cmds: CmdSender<Self::Cmd>) -> Self {
+                Self
+            }
+
+            fn sources(_cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
+                SOURCES_CALLED.store(true, Ordering::SeqCst);
+                None
+            }
+
+            fn update(&mut self, _input: Input<Self::Msg>) -> Vec<Effect> {
+                Vec::new()
+            }
+
+            fn view(&self) -> View {
+                Node::Label {
+                    id: Some("never-lbl".to_owned()),
+                    text: "x".to_owned(),
+                    classes: Vec::new(),
+                    tooltip: None,
+                }
+                .into()
+            }
+        }
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        shutdown_tx.send(true).expect("receiver still alive");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            reconnect_loop::<NeverConnects, _, _, _, _>("never-connects-test", shutdown_rx, || {
+                std::future::pending::<
+                    std::io::Result<(
+                        tokio::io::ReadHalf<tokio::io::DuplexStream>,
+                        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+                    )>,
+                >()
+            }),
+        )
+        .await
+        .expect(
+            "reconnect_loop must exit promptly on a pre-session shutdown notice, not hang dialing",
+        );
+
+        assert!(
+            !SOURCES_CALLED.load(Ordering::SeqCst),
+            "no session ever started, so sources() must never be called"
+        );
     }
 
     // ── Backoff (pure) ───────────────────────────────────────────────────────
@@ -2520,7 +3051,10 @@ mod tests {
         let (plugin_end, host_end) = duplex(64 * 1024);
         let (prd, pwr) = tokio::io::split(plugin_end);
         let (hrd, hwr) = tokio::io::split(host_end);
-        let (result, ()) = tokio::join!(session::<Scroller, _, _>(prd, pwr), host(hrd, hwr));
+        let (result, ()) = tokio::join!(
+            session::<Scroller, _, _>(prd, pwr, never_shuts_down()),
+            host(hrd, hwr)
+        );
         result.expect("the host shut the session down cleanly");
     }
 
@@ -2799,7 +3333,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Linker<false>, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(
+            session::<Linker<false>, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok());
     }
 
@@ -2835,7 +3372,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<Linker<true>, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(
+            session::<Linker<true>, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok());
     }
 
@@ -2906,7 +3446,10 @@ mod tests {
             send(&mut hwr, &HostMsg::Shutdown).await;
         };
 
-        let (result, ()) = tokio::join!(session::<SilentLinker, _, _>(prd, pwr), host);
+        let (result, ()) = tokio::join!(
+            session::<SilentLinker, _, _>(prd, pwr, never_shuts_down()),
+            host
+        );
         assert!(result.is_ok());
     }
 }

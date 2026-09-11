@@ -167,6 +167,17 @@ pub fn panel_settings() -> gtk::Widget {
     // monitor's drawer surface; no `&Monitor` is plumbed through here.
     let more = adw::PreferencesGroup::builder().title("More").build();
 
+    // #1071 phase 1's entry point. The bar keeps its numbered `[1 2 3 …]`
+    // switcher (revision 5 of the epic, Annika 2026-09-10), so the Workspaces
+    // page gets no chip of its own — this row and the `open-page workspaces`
+    // GAction (`commands.rs`, wired for free off `Page::stack_name`) are how it
+    // opens.
+    more.add(&deep_link_row(
+        "Workspaces",
+        Some("Named workspaces per screen"),
+        "view-grid-symbolic",
+        crate::modal::Page::Workspaces,
+    ));
     more.add(&deep_link_row(
         "Wallpaper",
         Some("Pick a desktop background"),

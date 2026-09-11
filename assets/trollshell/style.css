@@ -689,6 +689,49 @@
     color: @accent_color;
     margin-bottom: 0.462em;
 }
+
+/* Workspaces drawer page (#1071 phase 1). One column per monitor, side by side,
+   a `.ts-panel` card per named niri workspace, and a strip of app icons on each
+   card. Note these are `ts-ws-*`, NOT `ts-workspaces-*`: `.ts-workspaces` is the
+   BAR's numbered pill strip (see the rules near the top of this file), which the
+   epic's revision 5 leaves untouched. */
+.ts-ws-columns {
+    padding: 0.308em 0;
+}
+.ts-ws-column-title {
+    font-weight: 600;
+    font-size: 0.85em;
+    letter-spacing: 0.04em;
+    color: @accent_color;
+    opacity: 0.85;
+}
+/* The card is already a `.ts-panel`; this only tightens it, since a workspace
+   card is a name plus one icon row rather than a full section of content. */
+.ts-ws-card {
+    padding: 0.538em 0.692em;
+}
+.ts-ws-card-name {
+    font-weight: 600;
+    font-size: 1em;
+}
+.ts-ws-apps {
+    min-height: 1.4em;
+}
+/* An app with a window open on the workspace. Phase 1 renders nothing else, so
+   every icon is lit; phase 2's stopped stack flips the class to `.ts-ws-app-idle`
+   below and this is what it stops looking like. */
+.ts-ws-app-running {
+    opacity: 1;
+}
+.ts-ws-app-idle {
+    opacity: 0.35;
+}
+/* Both the per-column "no named workspaces" hint and the page-level
+   "waiting for niri" one. */
+.ts-ws-empty {
+    opacity: 0.55;
+    font-size: 0.9em;
+}
 /* Network panel: make each PreferencesGroup a single card with its header
    INSIDE the card surface (not libadwaita's floating title above the list).
    libadwaita renders an AdwPreferencesGroup as a `.header` box (title +

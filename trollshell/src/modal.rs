@@ -324,6 +324,13 @@ pub enum Page {
     Displays,
     Clipboard,
     Calendar,
+    /// The read-only workspace-stacks page (#1071 phase 1): one column per
+    /// monitor, a card per *named* niri workspace. A unit variant like every
+    /// other, deliberately — #1071 §5 settles that the edit sub-page phase 4
+    /// adds rides [`Active::Plugin`]'s keyed shape rather than a
+    /// payload-carrying `Page`, so this enum stays `Copy` at its ~60 by-value
+    /// call sites.
+    Workspaces,
     Settings,
 }
 
@@ -362,7 +369,7 @@ impl Page {
     /// Every drawer page. The single source for reverse lookups
     /// ([`Page::from_stack_name`]); the string mapping still lives only in
     /// [`Page::stack_name`], so a page's token is defined in exactly one place.
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 21] = [
         Self::Media,
         Self::Network,
         Self::Vpn,
@@ -382,6 +389,7 @@ impl Page {
         Self::Displays,
         Self::Clipboard,
         Self::Calendar,
+        Self::Workspaces,
         Self::Settings,
     ];
 
@@ -406,6 +414,7 @@ impl Page {
             Self::Displays => "displays",
             Self::Clipboard => "clipboard",
             Self::Calendar => "calendar",
+            Self::Workspaces => "workspaces",
             Self::Settings => "settings",
         }
     }
@@ -987,6 +996,7 @@ fn build_page(page: Page) -> gtk::Widget {
         Page::Displays => panels::panel_displays(),
         Page::Clipboard => panels::panel_clipboard(),
         Page::Calendar => panels::panel_calendar(),
+        Page::Workspaces => panels::panel_workspaces(),
         Page::Settings => panels::panel_settings(),
     }
 }
@@ -2046,9 +2056,54 @@ mod tests {
     /// deep-links and the niri command surface.
     #[test]
     fn all_has_stable_count() {
-        // 15 core pages + the 5 per-resource `Stats*` split variants (#508
-        // restored #307's split alongside the combined page).
-        assert_eq!(Page::ALL.len(), 20);
+        // 16 core pages + the 5 per-resource `Stats*` split variants (#508
+        // restored #307's split alongside the combined page). The 16th is
+        // `Workspaces` (#1071 phase 1).
+        assert_eq!(Page::ALL.len(), 21);
+    }
+
+    /// #1071 phase 1: adding `Page::Workspaces` must *append* to the page set,
+    /// not reshuffle it. `ALL` is the only ordered artifact the drawer has —
+    /// `EAGER_PAGES` is empty and `build_pages_stack` adds children in
+    /// first-open order — so "the other pages' order is undisturbed" is a
+    /// statement about this array and no other.
+    ///
+    /// Spelled as the pre-#1071 list rather than `ALL.len() - 1` so a reorder
+    /// that keeps the count fails here too.
+    #[test]
+    fn the_pre_existing_pages_keep_their_order() {
+        const BEFORE: [Page; 20] = [
+            Page::Media,
+            Page::Network,
+            Page::Vpn,
+            Page::Connections,
+            Page::Bluetooth,
+            Page::Stats,
+            Page::StatsCpu,
+            Page::StatsMemory,
+            Page::StatsGpu,
+            Page::StatsDisks,
+            Page::StatsServices,
+            Page::Audio,
+            Page::Power,
+            Page::PowerMenu,
+            Page::Notifications,
+            Page::Appearance,
+            Page::Displays,
+            Page::Clipboard,
+            Page::Calendar,
+            Page::Settings,
+        ];
+        let surviving: Vec<Page> = Page::ALL
+            .into_iter()
+            .filter(|p| *p != Page::Workspaces)
+            .collect();
+        assert_eq!(surviving, BEFORE);
+        assert!(
+            Page::ALL.contains(&Page::Workspaces),
+            "the Workspaces page must be in ALL or `from_stack_name` can never \
+             resolve its `open-page` token"
+        );
     }
 
     /// Each page's `stack_name` is the key `ensure_page` hands to

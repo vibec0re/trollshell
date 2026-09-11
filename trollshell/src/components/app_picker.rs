@@ -243,6 +243,29 @@ mod tests {
         }
     }
 
+    /// Type `query` into the picker's search field, wait for the debounced
+    /// `search-changed` to settle on `expect`, and read the rows back.
+    ///
+    /// Waiting for the **expected** list rather than for "anything but what was
+    /// there" is not belt-and-braces, it is the only condition that works:
+    /// `set_text` deletes the old text and inserts the new, and
+    /// `GtkSearchEntry` emits `search-changed` *immediately* — no debounce — when
+    /// the text becomes empty. So every retype passes through a transient
+    /// unfiltered list, which a "has it changed yet?" wait happily returns.
+    ///
+    /// It cannot mask a real failure: on a timeout this returns whatever is
+    /// actually there and the caller's `assert_eq!` prints the diff.
+    fn typed(
+        popover: &gtk::Popover,
+        search: &gtk::SearchEntry,
+        query: &str,
+        expect: &[&str],
+    ) -> Vec<String> {
+        search.set_text(query);
+        pump_until(2000, || offered(popover) == expect);
+        offered(popover)
+    }
+
     fn entry(id: &str, name: &str, show: bool) -> PickerEntry {
         PickerEntry {
             id: id.to_owned(),
@@ -328,33 +351,35 @@ mod tests {
         assert_eq!(offered(&popover).len(), 3);
 
         let search = search(&popover);
-        /// Type `query` and wait for the debounced `search-changed` to land.
-        fn typed(popover: &gtk::Popover, search: &gtk::SearchEntry, query: &str) -> Vec<String> {
-            search.set_text(query);
-            let before = offered(popover);
-            pump_until(2000, || offered(popover) != before);
-            offered(popover)
-        }
+        let all = ["org.mozilla.firefox", "org.gnome.Nautilus", "Alacritty"];
 
         assert_eq!(
-            typed(&popover, &search, "fire"),
+            typed(&popover, &search, "fire", &["org.mozilla.firefox"]),
             ["org.mozilla.firefox"],
             "typing did not narrow the rendered rows"
         );
 
         // By id, for an application whose display name shares nothing with it.
-        assert_eq!(typed(&popover, &search, "nautilus"), ["org.gnome.Nautilus"]);
+        assert_eq!(
+            typed(&popover, &search, "nautilus", &["org.gnome.Nautilus"]),
+            ["org.gnome.Nautilus"]
+        );
+        // …and by name, for that same entry.
+        assert_eq!(
+            typed(&popover, &search, "files", &["org.gnome.Nautilus"]),
+            ["org.gnome.Nautilus"]
+        );
 
         // Clearing it brings the whole (still-filtered) list back — and the
         // hidden entry is still not among them.
-        assert_eq!(
-            typed(&popover, &search, ""),
-            ["org.mozilla.firefox", "org.gnome.Nautilus", "Alacritty"]
-        );
+        assert_eq!(typed(&popover, &search, "", &all), all);
 
         // A query nothing matches renders no rows at all rather than a stale
         // list.
-        assert!(typed(&popover, &search, "no-such-application").is_empty());
+        assert!(
+            typed(&popover, &search, "no-such-application", &[]).is_empty(),
+            "a query that matches nothing left the previous rows up"
+        );
     }
 
     /// §5: *"selecting appends an app to the stack"* — the row hands its **id**

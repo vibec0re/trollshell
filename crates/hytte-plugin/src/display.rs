@@ -577,14 +577,31 @@ pub struct DotMatrix {
 }
 
 impl DotMatrix {
-    /// A dot-matrix strip in `style`.
+    /// A dot-matrix strip in `style`, at the kit's default dot pitch.
     #[must_use]
     pub fn new(style: StyleName) -> Self {
         Self {
             config: DotMatrixConfig {
                 style: style_ref(style),
+                ..DotMatrixConfig::default()
             },
         }
+    }
+
+    /// The dot pitch in buffer pixels — the edge of the square cell each font
+    /// pixel becomes, and **the strip's height**: `9 * px`, so 18 at `2`
+    /// against the default's 36 (#1091).
+    ///
+    /// A **config** change, so in state mode moving it rebuilds the shell's
+    /// renderer. Stated rather than clamped here, like
+    /// [`FlipBoard::glyph_px`]: the kit's `DotMatrix::dot_px` clamps the raster
+    /// arm and `PreemWidget::clamped` clamps the wire, so one number out of
+    /// range renders the nearest legal pitch on both arms instead of two
+    /// clamps that can drift apart.
+    #[must_use]
+    pub fn dot_px(mut self, px: u32) -> Self {
+        self.config.dot_px = px;
+        self
     }
 
     /// Switch the skin (a **config** change: in state mode the shell rebuilds
@@ -661,7 +678,11 @@ impl DotMatrix {
                     text: text.to_owned(),
                 },
             },
-            || kit::dot_matrix(text, display_style(self.config.style.style)),
+            || {
+                kit::DotMatrix::new(display_style(self.config.style.style))
+                    .dot_px(dim(self.config.dot_px))
+                    .render(text)
+            },
         )
     }
 }
@@ -998,6 +1019,16 @@ impl Marquee {
         self
     }
 
+    /// The dot pitch in buffer pixels — the **height** knob, `9 * px`, so 18 at
+    /// `2` where [`window_px`](Self::window_px) stays the width (#1091). The
+    /// same knob [`DotMatrix::dot_px`] turns, and stated rather than clamped for
+    /// that method's reason.
+    #[must_use]
+    pub fn dot_px(mut self, px: u32) -> Self {
+        self.config.dot_px = px;
+        self
+    }
+
     /// Scroll speed in dots per second. `0.0` parks the message.
     #[must_use]
     pub fn speed_dots_per_sec(mut self, speed: f32) -> Self {
@@ -1129,6 +1160,7 @@ impl Marquee {
                 kit::Marquee::new(display_style(self.config.style.style))
                     .window_px(dim(self.config.window_px))
                     .gap_dots(dim(self.config.gap_dots))
+                    .dot_px(dim(self.config.dot_px))
                     .render(text)
                     .window(self.scroll_dots())
             },

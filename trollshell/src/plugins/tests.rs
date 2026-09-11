@@ -3603,6 +3603,7 @@ fn dot_matrix_renders_at_parity_with_the_kit() {
             vocab::PreemWidget::DotMatrix {
                 config: vocab::DotMatrixConfig {
                     style: vocab::StyleRef::new(style),
+                    ..vocab::DotMatrixConfig::default()
                 },
                 state: vocab::DotMatrixState {
                     text: "PREEM 42".into(),
@@ -3799,6 +3800,7 @@ fn marquee_renders_at_parity_with_the_kit_before_and_after_a_scroll() {
                 window_px: 192,
                 gap_dots: 6,
                 speed_dots_per_sec: 20.0,
+                ..vocab::MarqueeConfig::default()
             },
             state: vocab::MarqueeState { text: text.into() },
         },
@@ -4739,6 +4741,7 @@ fn a_moved_frame_is_a_new_allocation() {
                 window_px: 192,
                 gap_dots: 6,
                 speed_dots_per_sec: 20.0,
+                ..vocab::MarqueeConfig::default()
             },
             state: vocab::MarqueeState {
                 text: "A LONG SCROLLING MESSAGE".into(),
@@ -4774,6 +4777,7 @@ fn a_config_or_kind_change_rebuilds_the_instance() {
             vocab::PreemWidget::DotMatrix {
                 config: vocab::DotMatrixConfig {
                     style: vocab::StyleRef::new(style),
+                    ..vocab::DotMatrixConfig::default()
                 },
                 state: vocab::DotMatrixState { text: "A".into() },
             },
@@ -5936,6 +5940,7 @@ fn only_animated_widgets_keep_the_clock_awake() {
                     window_px: 192,
                     gap_dots: 6,
                     speed_dots_per_sec: speed,
+                    ..vocab::MarqueeConfig::default()
                 },
                 state: vocab::MarqueeState {
                     text: "A LONG SCROLLING MESSAGE".into(),
@@ -6552,6 +6557,7 @@ fn marquee_scroll_direction_follows_the_speeds_sign() {
                     window_px: 192,
                     gap_dots: 6,
                     speed_dots_per_sec: speed,
+                    ..vocab::MarqueeConfig::default()
                 },
                 state: vocab::MarqueeState { text: text.into() },
             },
@@ -6606,6 +6612,7 @@ fn advance_all_names_only_the_scopes_that_moved() {
                     window_px: 192,
                     gap_dots: 6,
                     speed_dots_per_sec: 20.0,
+                    ..vocab::MarqueeConfig::default()
                 },
                 state: vocab::MarqueeState {
                     text: "A LONG SCROLLING MESSAGE".into(),
@@ -6656,6 +6663,7 @@ fn tick_marquee(speed: f32) -> wire::Node {
                 window_px: 192,
                 gap_dots: 6,
                 speed_dots_per_sec: speed,
+                ..vocab::MarqueeConfig::default()
             },
             state: vocab::MarqueeState {
                 text: "A LONG SCROLLING MESSAGE".into(),
@@ -7053,7 +7061,10 @@ fn ink_probe(id: &str, style: vocab::StyleRef) -> wire::Node {
     preem_node(
         Some(id),
         vocab::PreemWidget::DotMatrix {
-            config: vocab::DotMatrixConfig { style },
+            config: vocab::DotMatrixConfig {
+                style,
+                ..vocab::DotMatrixConfig::default()
+            },
             state: vocab::DotMatrixState { text: "88".into() },
         },
     )
@@ -7906,6 +7917,7 @@ fn a_pinned_field_survives_a_marquee_text_change() {
                     window_px: 192,
                     gap_dots: 6,
                     speed_dots_per_sec: 20.0,
+                    ..vocab::MarqueeConfig::default()
                 },
                 state: vocab::MarqueeState { text: text.into() },
             },
@@ -7944,7 +7956,10 @@ fn state_pair_of(kind: &str, style: vocab::StyleRef, b: bool) -> vocab::PreemWid
     let text = if b { "BBBB" } else { "AAAA" }.to_owned();
     match kind {
         "dm" => vocab::PreemWidget::DotMatrix {
-            config: vocab::DotMatrixConfig { style },
+            config: vocab::DotMatrixConfig {
+                style,
+                ..vocab::DotMatrixConfig::default()
+            },
             state: vocab::DotMatrixState { text },
         },
         "seg" => vocab::PreemWidget::SevenSeg {

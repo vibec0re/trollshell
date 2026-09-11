@@ -907,9 +907,7 @@ pub(crate) fn reflow_batch(workspace: u64, windows: &[Window]) -> Vec<WorkspaceA
         WorkspaceAction::MoveColumnToFirst,
     ];
     if let Some(focused) = windows.iter().find(|w| w.is_focused) {
-        batch.push(WorkspaceAction::FocusWindow {
-            window: focused.id,
-        });
+        batch.push(WorkspaceAction::FocusWindow { window: focused.id });
     }
     batch
 }

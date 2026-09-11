@@ -633,6 +633,17 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
     card
 }
 
+/// The three widgets [`drive_exclusive_zone_on_settle`]/`reassert_if_settled`
+/// act on together, bundled into one clonable value so those two functions
+/// stay under clippy's `too_many_arguments` now that #1129 added the reflow
+/// tracking (`last_zone`, `key`) alongside them.
+#[derive(Clone)]
+struct ZoneSurface {
+    window: gtk::Window,
+    revealer: gtk::Revealer,
+    card: gtk::Box,
+}
+
 /// Drive open/close transitions from the shared mutable. The surface stays
 /// alive across toggles (see module note on z-order); we flip the revealer,
 /// the exclusive zone, AND the surface's input region in lockstep. Niri
@@ -695,9 +706,11 @@ fn wire_open_subscription(
         // (queue_draw) so the FINAL committed surface state carries the right
         // zone. NEEDS LIVE NIRI RE-TEST.
         drive_exclusive_zone_on_settle(
-            &window,
-            &revealer,
-            &card,
+            &ZoneSurface {
+                window: window.clone(),
+                revealer: revealer.clone(),
+                card: card.clone(),
+            },
             &open_state_for_zone,
             &zone_tick,
             &last_zone,
@@ -788,9 +801,7 @@ where
 /// reflow this monitor's active workspace: see [`should_reflow_after_close`]
 /// for the exact condition and `last_zone`'s role in it.
 fn drive_exclusive_zone_on_settle(
-    window: &gtk::Window,
-    revealer: &gtk::Revealer,
-    card: &gtk::Box,
+    surface: &ZoneSurface,
     open_state: &Mutable<bool>,
     tick_slot: &Rc<RefCell<Option<glib::SourceId>>>,
     last_zone: &Rc<Cell<i32>>,
@@ -801,13 +812,16 @@ fn drive_exclusive_zone_on_settle(
     // floor, lock in the zone, and force a commit. Returns whether it settled
     // (i.e. the caller can stop).
     fn reassert_if_settled(
-        window: &gtk::Window,
-        revealer: &gtk::Revealer,
-        card: &gtk::Box,
+        surface: &ZoneSurface,
         last_zone: &Cell<i32>,
         key: &str,
         open: bool,
     ) -> bool {
+        let ZoneSurface {
+            window,
+            revealer,
+            card,
+        } = surface;
         if revealer.is_child_revealed() != open {
             return false;
         }
@@ -870,12 +884,10 @@ fn drive_exclusive_zone_on_settle(
         true
     }
 
-    if reassert_if_settled(window, revealer, card, last_zone, key, open) {
+    if reassert_if_settled(surface, last_zone, key, open) {
         return;
     }
-    let window = window.clone();
-    let revealer = revealer.clone();
-    let card = card.clone();
+    let surface = surface.clone();
     let open_state = open_state.clone();
     let last_zone = last_zone.clone();
     let key = key.to_owned();
@@ -884,7 +896,7 @@ fn drive_exclusive_zone_on_settle(
         if open_state.get() != open {
             return glib::ControlFlow::Break;
         }
-        if reassert_if_settled(&window, &revealer, &card, &last_zone, &key, open) {
+        if reassert_if_settled(&surface, &last_zone, &key, open) {
             glib::ControlFlow::Break
         } else {
             glib::ControlFlow::Continue

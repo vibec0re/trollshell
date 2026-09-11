@@ -550,238 +550,20 @@
           # Run the `system-tests` cargo-feature bucket (#232): the
           # whole-file-`#![cfg(feature = "system-tests")]` integration tests
           # in hytte-bus/hytte-reactive/hytte-ui, plus the `#[cfg(all(test,
-          # feature = "system-tests"))]` GTK unit-test modules in hytte-ui.
-          # These never compile anywhere else — neither the workspace compile
-          # (which since #1115 runs no `cargo test` at all, `nix/package.nix`)
-          # nor `checks.workspace-tests` above (deliberately without
-          # `--features system-tests`, to stay hermetic) enable this feature
-          # — so this is their only home. Built via
-          # `mkCargoDerivation` directly
-          # (rather than `craneLib.cargoTest`) because `cargoTest.nix`
-          # hardcodes `checkPhaseCargoCommand`, silently discarding any
-          # override — we need that command to wrap `cargo test` in
-          # `xvfb-run` for the GTK tests (hytte-ui's `app_smoke`/`bind`/
-          # widget-tree & multi-sparkline tests) to have a display.
-          # hytte-bus's tests spawn their own ephemeral `dbus-daemon`
-          # (crates/hytte-bus/tests/common/mod.rs), so that binary needs to
-          # be on PATH too — neither it nor `xvfb-run` are in the package's
-          # buildInputs, so both are supplied explicitly here. (Also in
-          # nix/devshell.nix's `packages`, #684, so the same command works
-          # locally — but this sandboxed check never sees the devShell.)
-          # Reuses the same cargoArtifacts as the package build/clippy: the
-          # `system-tests` feature is `[]` (no extra deps), so the cached
-          # dependency graph is unaffected — only the workspace members
-          # themselves (not covered by cargoArtifacts, which only caches
-          # true external deps) need recompiling against the extra feature.
-          system-tests = craneLib.mkCargoDerivation (
-            trollshell.passthru.commonArgs
-            // {
-              pnameSuffix = "-system-tests";
-              cargoArtifacts = trollshell.passthru.cargoArtifacts;
-              # `mesa` (llvmpipe) since #1036: gives the three GL-context
-              # tests in `hytte-ui` (`gl_surface.rs`) a real, software
-              # `GdkGLContext` under `xvfb-run`, so they run instead of
-              # skipping. Verified in the #1036 spike
-              # (https://github.com/vibec0re/trollshell/issues/1036#issuecomment-5620514934):
-              # 54 of `mesa`'s 60 closure paths are already pulled in by
-              # bindgen's clang/llvm dep (the shared bulk is `llvm-21.1.8-lib`),
-              # so the marginal closure delta is 6 new paths / ~274 MiB, not
-              # the full ~1057 MiB `mesa` closure.
-              #
-              # `systemd` since #1082: `systemd-run` is on `$PATH` here for the
-              # `trollshell/src/plugins/tests.rs` detached-launch tests
-              # (`plugin_launcher.rs`'s #419 launch path). The sandbox has no
-              # `systemd --user` manager and no session bus, so `systemd-run`
-              # always fails to connect and every detached launch takes the
-              # direct-spawn fallback (`FallbackReason::NoUserManager`) — see
-              # the doc comments on `detached_launch_falls_back_without_a_user_manager`
-              # and its two siblings for which shape each one exercises there.
-              nativeCheckInputs = [
-                pkgs.dbus
-                pkgs.xvfb-run
-                pkgs.mesa
-                pkgs.systemd
-              ];
-              doCheck = true;
-              # Leaf/terminal check: nothing consumes its target dir. crane
-              # defaults `doInstallCargoArtifacts = true`, which packs the whole
-              # ~2.2GiB target dir into a `target.tar.zst` — and that pack step
-              # was OOM-ing CI's disk ("No space left on device" / "zstd: error
-              # 70" in the artifact-install after every test already passed),
-              # systematically failing PRs on runners with tight disks. Turning
-              # it off stops producing the tarball entirely (#530: less artifact
-              # churn overall).
-              doInstallCargoArtifacts = false;
-              # No separate build step: `cargo test` compiles as part of the
-              # check phase. `commonArgs.preBuild` (the libspa-sys writable-
-              # vendor-dir workaround) still runs first via the standard
-              # (now-empty) buildPhase, same as it does for the `clippy` and
-              # `cargoTest`-shaped checks — so the check phase's compile
-              # inherits a writable vendor dir.
-              buildPhaseCargoCommand = "";
-              # A fresh writable $HOME: GTK/glib want to write font/icon
-              # caches, and default stdenv HOME is deliberately unwritable.
-              # xvfb-run allocates its own virtual display, so no manual
-              # Xvfb/DISPLAY wiring is needed. Call the real `cargo` binary
-              # directly (not the `cargoWithProfile` shell helper) because
-              # xvfb-run execs its argv directly rather than through a
-              # shell, so a bash *function* wouldn't resolve — the plain
-              # `cargo` binary is on PATH via mkCargoDerivation's own
-              # nativeBuildInputs and env vars (CARGO_HOME, vendoring) are
-              # inherited by the child process either way.
-              preCheck = ''
-                export HOME="$(mktemp -d)"
-                export XDG_DATA_DIRS="${pkgs.adwaita-icon-theme}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
-                export TROLLSHELL_REQUIRE_ICON_THEME=1
-                # llvmpipe (#1036): `__EGL_VENDOR_LIBRARY_FILENAMES` is the
-                # load-bearing one — glvnd's default vendor dirs
-                # (`/usr/share/glvnd/egl_vendor.d`,
-                # `/run/opengl-driver/share/…`) don't exist in the sandbox, so
-                # without it `eglInitialize` finds no vendor and the three
-                # GL-context tests in `hytte-ui` (`gl_surface.rs`) skip.
-                # `LIBGL_DRIVERS_PATH` points llvmpipe at its own `swrast_dri.so`.
-                # Deliberately NOT exporting `LD_LIBRARY_PATH="${pkgs.mesa}/lib"`
-                # here: `libEGL_mesa.so.0`'s own RUNPATH already carries
-                # `${pkgs.mesa}/lib` absolutely, so it isn't load-bearing —
-                # confirmed by re-running the three tests under llvmpipe
-                # without it (exit 0, still 3/3 pass; PR #1077 review LOW-5).
-                export LIBGL_ALWAYS_SOFTWARE=1
-                export LIBGL_DRIVERS_PATH="${pkgs.mesa}/lib/dri"
-                export __EGL_VENDOR_LIBRARY_FILENAMES="${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json"
-                # A skip is indistinguishable from a pass in captured output
-                # (same reasoning as `TROLLSHELL_REQUIRE_ICON_THEME` above):
-                # this build means the three tests to run for real, so a
-                # missing/refused GL context must fail the check, not skip it.
-                export TROLLSHELL_REQUIRE_GL=1
-                # #1082, on the same precedent: `pkgs.systemd` above puts
-                # `systemd-run` on `$PATH`, so
-                # `detached_launch_falls_back_without_a_user_manager`'s own
-                # "is systemd-run on PATH at all" probe must find it here — a
-                # miss would mean this check's `nativeCheckInputs` regressed,
-                # and a silent skip would hide exactly that. This variable's
-                # reach is that one `assert!` — its two siblings
-                # (`detached_launch_returns_at_once_…`,
-                # `two_launches_with_one_effect_id_both_start`) have no skip
-                # branch to gate: they run and pass regardless of whether
-                # `systemd-run` is on `$PATH` at all, since
-                # `assert_launched_then_clean_up` accepts and classifies
-                # whichever `LaunchReport` fallback the sandbox produces
-                # (`NoSystemdRun` or `NoUserManager`).
-                export TROLLSHELL_REQUIRE_SYSTEMD_RUN=1
-                # #1080, on the GL env above: `preem_gl_diff` (the #893 stage B
-                # CPU/GL parity harness) runs through the same llvmpipe context
-                # as the three `hytte-ui` GL tests. Under llvmpipe every case
-                # has measured bit-exact since #1078 — `max |Δ| 0` of 255 on
-                # every channel, all twelve cases — so `TROLLSHELL_PARITY_EXACT=1`
-                # pins the harness to that zero for *this* run: a case that
-                # clears the on-glass ceiling (mean 2 / p99 8 / max 32, #893)
-                # but is not bit-exact still fails, named `FAIL(exact)`
-                # (`trollshell/examples/preem_gl_diff.rs`). The ceiling itself
-                # is untouched — a real driver still only has to clear it, not
-                # match llvmpipe byte for byte. A case that only fails the
-                # exact check still prints its own `PASS <case>` line before
-                # the `FAIL(exact) <case>` one right after it (#1089 review,
-                # INFO-2) — the exit code and the `-- summary --` block's
-                # `PASS all N case(s)`/`FAIL M of N` line are the verdict; a
-                # `grep '^PASS'` count over the transcript is not.
-                #
-                # This pin rides whatever Mesa `nixpkgs` resolves to today
-                # (26.2.1 as of #1080) — it is not a hash-pinned llvmpipe
-                # build. A `nix flake update` that moves Mesa can therefore red
-                # this exact-mode check on a PR that never touched a shader,
-                # and it will look exactly like a renderer regression (#1089
-                # review, INFO-5). If that happens: re-measure on the new Mesa
-                # first (the `docs/live-verify.md` headless recipe, or just
-                # read this check's own `FAIL(exact)` numbers) before
-                # suspecting the diff — and the fix is to re-measure, never to
-                # raise the ceiling `#893`/`#1078` settled for real hardware.
-                export TROLLSHELL_PARITY_EXACT=1
-              '';
-              checkPhaseCargoCommand = ''
-                xvfb-run -a cargo test --workspace --locked --features system-tests
-
-                # #1080: the CPU/GL parity harness (#893 stage B), built and run
-                # in the same phase and the same llvmpipe env as the GL-context
-                # tests above, so a shader or kit change that breaks parity
-                # ships red here instead of shipping silently until someone
-                # runs the `docs/live-verify.md` recipe by hand. The dedicated
-                # `cargo build` below is a deliberate no-op, not a hedge
-                # against an uncompiled example: `cargo test` already builds
-                # every example (measured — deleting the binary and re-running
-                # `cargo test -p trollshell --features system-tests --no-run`
-                # alone puts it straight back), so a broken example fails on
-                # the `cargo test` line above, not here (#1089 review, LOW-2).
-                # What this line actually buys is independence from `cargo
-                # test`'s own target selection: it guarantees the binary
-                # exists at the exact path the `find` below expects, on this
-                # line's own terms, rather than as a side effect this check
-                # would silently lose the day `cargo test`'s target set ever
-                # changes.
-                #
-                # `--workspace --features system-tests`, matching the `cargo
-                # test` invocation above byte for byte, and deliberately not
-                # `-p trollshell`: `hytte-ui`/`hytte-services`/`hytte-bus`/
-                # `hytte-reactive` all carry their own `system-tests` feature,
-                # which `--workspace` activates on every member that defines
-                # it the same way the preceding `cargo test` did — `-p
-                # trollshell` would only turn it on for `trollshell` itself,
-                # leaving every dependency at a *different* (default) feature
-                # set than what `cargo test` just built, and cargo would
-                # recompile the whole graph a second time to reconcile them.
-                # Measured in the sandbox: an earlier version of this line used
-                # `-p trollshell` (no `--workspace`), and gtk4/hytte-*/
-                # trollshell's own lib all rebuilt from scratch under the
-                # mismatched feature set — an extra 1 minute 38 seconds
-                # (`Finished … target(s) in 1m 38s`) that `--workspace` above
-                # avoids entirely.
-                #
-                # `cargo run` has no `--workspace` (only `-p`), so run the
-                # produced binary directly instead — the same `find … -print
-                # -quit` idiom `nix/package.nix`'s `postInstall` uses to
-                # harvest the `probe`/`wifi_probe` examples, for the same
-                # reason (`-quit` avoids a `find | head` pipeline racing
-                # stdenv's `set -eu -o pipefail`, and it doesn't assume
-                # `CARGO_TARGET_DIR`).
-                #
-                # `PREEM_GL_DIFF_OUT` is the harness's own override point
-                # (default `gates/`, the repo's scratch directory) — pointed at
-                # `$out/parity` so the per-case `.gl.ppm`/`.cpu.ppm`/
-                # `.delta.pgm` evidence lands in the check's own output and is
-                # there on a green build (`result/parity`). On a *red* build
-                # `$out` is never registered as a valid store path — measured
-                # on nix 2.34.8, `--keep-failed` preserves the build's scratch
-                # directory, not `$out`, and the partial `$out` written before
-                # the failure is not reachable through it either (#1089
-                # review, LOW-1) — so the durable record of a red run is the
-                # `-L` transcript's `FAIL(exact) <case>`/`FAIL(ceiling) <case>`
-                # lines (kept in CI's own log), not a store path.
-                cargo build --workspace --locked --features system-tests --example preem_gl_diff
-                exampleBin="$(find "''${CARGO_TARGET_DIR:-target}" -type f -name preem_gl_diff -path '*/examples/*' -print -quit)"
-                if [ -z "$exampleBin" ]; then
-                  echo "ERROR: example binary 'preem_gl_diff' was not built." >&2
-                  exit 1
-                fi
-                mkdir -p "$out/parity"
-                PREEM_GL_DIFF_OUT="$out/parity" xvfb-run -a "$exampleBin"
-                # #1078 item 5 left this open for #1080 to decide ("Noted for
-                # #1080 to decide what the CI wiring asserts"), and up to here
-                # this line only asserted the harness's own exit status. That
-                # misses one shape: a run that exercised **zero** cases still
-                # prints `PASS all 0 case(s)` and exits 0 (#1089 review,
-                # LOW-3) — no live path reaches that today (the case list is
-                # the fixed 4 skins × 3 idle points and this line passes no
-                # argv), but a future `--skins` regression that silently
-                # empties the list would ship green through the exit code
-                # alone. Assert the evidence instead of trusting the exit
-                # code: exactly 12 cases means exactly 12 `.gl.ppm` files.
-                gl_ppm_count="$(find "$out/parity" -maxdepth 1 -name '*.gl.ppm' -type f | wc -l)"
-                if [ "$gl_ppm_count" -ne 12 ]; then
-                  echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected 12 — a case-count regression, not a parity failure." >&2
-                  exit 1
-                fi
-              '';
-            }
-          );
+          # feature = "system-tests"))]` GTK unit-test modules in hytte-ui,
+          # PLUS the #893 stage B CPU/GL parity harness. Split out to
+          # nix/checks/system-tests.nix (#1102), mirroring how `packages`
+          # already lives under `nix/*.nix` — see that file for the full
+          # rationale (why mkCargoDerivation, the llvmpipe/systemd preCheck,
+          # the parity gate). This call passes exactly what the block used
+          # to close over here: `craneLib` and the two
+          # `trollshell.passthru.*` values it read off the package
+          # derivation (`pkgs` is auto-supplied by `callPackage`).
+          system-tests = pkgs.callPackage ./nix/checks/system-tests.nix {
+            inherit craneLib;
+            commonArgs = trollshell.passthru.commonArgs;
+            cargoArtifacts = trollshell.passthru.cargoArtifacts;
+          };
 
           # Evaluate homeModules.default against a real home-manager module set so
           # the config bodies (systemd user units, session vars, the swaybg gate,
@@ -1523,177 +1305,23 @@
             '';
 
           # The "lean heavy on nix" counterpart to the Rust ephemeral-EDS
-          # harness (#49): boot a real NixOS VM with evolution-data-server
-          # configured declaratively, seed a fixture task list + calendar, and
-          # run the hytte-ecal probe against it end-to-end. The probe also
-          # creates FREQ=DAILY;COUNT=5 VEVENTs (one with an EXDATE) and expands
-          # them, so this gates the RRULE-expansion fix for #29 and its
-          # EXDATE/RDATE follow-up, plus a TZID=Europe/Berlin event whose
-          # absolute instant guards the zoned-time fix (#522). Verified to run
-          # under TCG (no KVM needed);
-          # GitHub's Linux runners have /dev/kvm for speed.
-          eds-nixos-test = pkgs.testers.runNixOSTest {
-            name = "eds-nixos-test";
-            nodes.machine =
-              { ... }:
-              {
-                users.users.alice = {
-                  isNormalUser = true;
-                  uid = 1000;
-                };
-                # Three-line EDS module: installs the package, wires its D-Bus
-                # session activation service files, and its systemd user units.
-                services.gnome.evolution-data-server.enable = true;
-                programs.dconf.enable = true; # EDS GSettings backend
-                services.gnome.gnome-keyring.enable = true; # EDS credential store
-                environment.systemPackages = [ probe ];
-                virtualisation.graphics = false;
-              };
-            testScript = ''
-              machine.wait_for_unit("multi-user.target")
-
-              # Seed the fixture task-list + calendar sources into alice's home.
-              machine.succeed("mkdir -p /home/alice/.config/evolution/sources")
-              machine.copy_from_host(
-                  "${taskSource}",
-                  "/home/alice/.config/evolution/sources/test-tasks.source",
-              )
-              machine.copy_from_host(
-                  "${calSource}",
-                  "/home/alice/.config/evolution/sources/test-calendar.source",
-              )
-              machine.succeed("chown -R alice:users /home/alice/.config")
-              # Store-copied files land read-only (0444); EDS's source
-              # registry rewrites .source files on first open to add runtime
-              # keys, which fails ("Permission denied") on a read-only file —
-              # benign for the auto-provisioned lists but it left the seeded
-              # *calendar* unwritable, so creating an event on it failed. Make
-              # the fixtures writable.
-              machine.succeed("chmod -R u+w /home/alice/.config/evolution")
-
-              # Bring up alice's user session (creates /run/user/1000/bus).
-              machine.succeed("loginctl enable-linger alice")
-              machine.wait_for_unit("user@1000.service")
-              machine.wait_for_file("/run/user/1000/bus")
-
-              # Run the probe as alice; EDS D-Bus-activates on first connect.
-              schemas = "${pkgs.evolution-data-server}/share/gsettings-schemas"
-              output = machine.wait_until_succeeds(
-                  "su -s /bin/sh alice -c '"
-                  + "export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus; "
-                  + "export HOME=/home/alice XDG_RUNTIME_DIR=/run/user/1000; "
-                  + "export GSETTINGS_SCHEMA_DIR=$(ls -d " + schemas + "/*/glib-2.0/schemas | head -1); "
-                  + "probe'",
-                  timeout=180,
-              )
-              # EDS auto-provisions a default "Personal" list, so the count
-              # isn't 1 — assert our seeded fixture is enumerated and the FFI
-              # create/remove roundtrip actually worked.
-              assert "Test Tasks" in output, output
-              assert "created uid: hytte-ecal-probe-1" in output, output
-              assert "removed hytte-ecal-probe-1" in output, output
-
-              # Live view push (#33): the probe opens a CalClientView over the
-              # task list, then from a *second* client connection (standing in
-              # for Endeavour) creates + modifies a task. EDS must push the
-              # objects-added/-modified notifications to the view — exercising
-              # get_view_sync → view_start → the GObject signal trampoline →
-              # the boxed Rust callback, pumped via a private GMainContext. A
-              # missing push would bail the probe (so wait_until_succeeds would
-              # fail); the explicit count line is the positive signal. The probe
-              # watches whichever task list EDS lists first (ordering isn't
-              # guaranteed — could be the auto-provisioned "Personal" or our
-              # "Test Tasks"), so don't pin the name here.
-              assert "watching '" in output, output
-              assert "editor created uid: hytte-ecal-live-1" in output, output
-              assert "editor modified uid: hytte-ecal-live-1" in output, output
-              assert "live view push count:" in output, output
-              # At least the create + modify pushes landed (initial population +
-              # 2). Parse the final count and assert it advanced past the
-              # initial-population baseline. (The match can't be None here — the
-              # assert above already required the line — but guard it so the
-              # test driver's type checker is satisfied.)
-              import re
-              m = re.search(r"live view push count: (\d+)", output)
-              assert m is not None, output
-              push_count = int(m.group(1))
-              assert push_count >= 2, f"expected >=2 view pushes, got {push_count}: {output}"
-
-              # Recurrence expansion (#29): the probe seeds a
-              # FREQ=DAILY;COUNT=5 VEVENT and expands it over a one-month
-              # window. All 5 occurrences must materialise — the whole point
-              # of the fix (the old master-only path would surface just 1).
-              assert "Test Calendar" in output, output
-              assert "created recurring uid:" in output, output
-              assert "recurring instance count: 5" in output, output
-              assert "removed recurring" in output, output
-
-              # EXDATE exclusion (#29 follow-up): the probe seeds a second
-              # FREQ=DAILY;COUNT=5 series with an EXDATE cancelling Jun 3.
-              # Correct expansion drops that one occurrence (4, not 5) and the
-              # cancelled instant must be absent — exactly the user-visible bug
-              # this fix closes (a cancelled standup still showing up).
-              assert "created exdate uid:" in output, output
-              assert "exdate instance count: 4" in output, output
-              assert "exdate cancelled occurrence present: false" in output, output
-              assert "removed exdate" in output, output
-
-              # Zoned time (#522): a `DTSTART;TZID=Europe/Berlin:…123000` event
-              # (12:30 CEST) round-tripped through EDS must expand to the
-              # *absolute* instant 10:30 UTC = start_unix 1784889000 — never
-              # 1784896200 (12:30 UTC), the +2h double-shift that surfaced a
-              # 12:30 event as 14:30 in the Upcoming list. This is the honest
-              # end-to-end guard against the pre-fix bug and against #388
-              # regressing in reverse; it exercises the real backend store, not
-              # just the hermetic string parser.
-              assert "created tzid uid:" in output, output
-              assert "tzid instance count: 1" in output, output
-              assert "tzid instance start_unix: 1784889000" in output, (
-                  "TZID=Europe/Berlin 12:30 must resolve to 10:30 UTC "
-                  "(1784889000), not 12:30 UTC (1784896200): " + output
-              )
-              assert "tzid instance start_unix: 1784896200" not in output, output
-              assert "removed tzid" in output, output
-            '';
+          # harness (#49). Split out to nix/checks/eds-nixos-test.nix
+          # (#1102), mirroring how `packages` already lives under
+          # `nix/*.nix` — see that file for the full rationale and the test
+          # script. This call passes the module fixtures the block used to
+          # close over here (`pkgs` is auto-supplied by `callPackage`).
+          eds-nixos-test = pkgs.callPackage ./nix/checks/eds-nixos-test.nix {
+            inherit probe taskSource calSource;
           };
 
           # The "lean heavy on nix" harness for the NetworkManager Wi-Fi
-          # backend (#96): boot a real NixOS VM with NetworkManager and a pair
-          # of virtual Wi-Fi radios (mac80211_hwsim), then drive wifi_nm
-          # end-to-end via the wifi_probe example — backend detection, device
-          # discovery, a live RequestScan, and a state read. mac80211_hwsim
-          # gives NM a real (simulated) wlan device so the whole D-Bus path
-          # exercises against a live daemon, not a mock. Mirrors
-          # eds-nixos-test; runs under TCG (no KVM needed).
-          wifi-nm-nixos-test = pkgs.testers.runNixOSTest {
-            name = "wifi-nm-nixos-test";
-            nodes.machine =
-              { ... }:
-              {
-                networking.networkmanager.enable = true;
-                # Two virtual 802.11 radios; NM manages the resulting wlan
-                # interfaces, giving the probe a real device + AP scan path.
-                boot.kernelModules = [ "mac80211_hwsim" ];
-                boot.extraModprobeConfig = "options mac80211_hwsim radios=2";
-                environment.systemPackages = [ wifiProbe ];
-                virtualisation.graphics = false;
-              };
-            testScript = ''
-              machine.wait_for_unit("multi-user.target")
-              machine.wait_for_unit("NetworkManager.service")
-              # Wait until NM has a Wi-Fi device registered (hwsim + NM takeover).
-              machine.wait_until_succeeds(
-                  "nmcli -t -f DEVICE,TYPE device | grep ':wifi'", timeout=60
-              )
-
-              # Run the probe as root on the system bus — drives wifi_nm against
-              # the live NetworkManager.
-              output = machine.wait_until_succeeds("wifi_probe", timeout=180)
-              assert "backend=NetworkManager" in output, output
-              assert "device=" in output, output
-              assert "scan=" in output, output
-              assert "networks=" in output, output
-            '';
+          # backend (#96). Split out to nix/checks/wifi-nm-nixos-test.nix
+          # (#1102), mirroring how `packages` already lives under
+          # `nix/*.nix` — see that file for the full rationale and the test
+          # script. This call passes the one module fixture the block used
+          # to close over here (`pkgs` is auto-supplied by `callPackage`).
+          wifi-nm-nixos-test = pkgs.callPackage ./nix/checks/wifi-nm-nixos-test.nix {
+            inherit wifiProbe;
           };
         }
         // bundledPlugins

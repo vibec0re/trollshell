@@ -687,12 +687,15 @@ fn build_column(column: &Column, meta_cache: &MetaCache, context: &Rc<DropContex
     if column.cards.is_empty() {
         cards.append(&hint(EMPTY_COLUMN_HINT));
     } else {
-        // `None` for the offline column: its heading is not a connector (review
-        // HIGH 1). `drop_plan` then declines the monitor half and keeps the
-        // reorder one.
-        let connector = column.drop_connector();
+        // The offline column's heading is not a connector (review HIGH 1) —
+        // `build_card` asks `column` itself rather than being handed a
+        // precomputed value, so there is exactly one place this is decided
+        // (#1121 gap A: the fix round's own re-verification found the
+        // original call site — `Some(column.connector.as_str())` here —
+        // untested, because `Column::drop_connector`'s own test supplies the
+        // `None` itself and never exercises this loop).
         for card in &column.cards {
-            cards.append(&build_card(card, meta_cache, connector, context));
+            cards.append(&build_card(card, meta_cache, column, context));
         }
     }
 
@@ -1049,7 +1052,7 @@ fn card_drag_source(name: &str) -> gtk::DragSource {
 fn build_card(
     card: &Card,
     meta_cache: &MetaCache,
-    connector: Option<&str>,
+    column: &Column,
     context: &Rc<DropContext>,
 ) -> gtk::Widget {
     // `.ts-panel` is the shell's card surface (`components::layout::section`
@@ -1095,10 +1098,24 @@ fn build_card(
         outer.append(&note);
     }
 
-    let apps = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    // #1119: the icons are double-size now (`build_app_icon`), so a busy
+    // stack's apps no longer all fit in one row at a column's width. A
+    // `gtk::FlowBox` wraps the overflow onto a second row instead of clipping
+    // past the card's edge or shrinking to squeeze in, which is what a plain
+    // `gtk::Box` would do. `max_children_per_line` is left generously high
+    // rather than pinned to a small count, so wrapping is driven by the
+    // column's actual width — the point of the feature — not by an arbitrary
+    // per-row cap that would wrap a card that still had room.
+    let apps = gtk::FlowBox::new();
     apps.add_css_class("ts-ws-apps");
+    apps.set_selection_mode(gtk::SelectionMode::None);
+    apps.set_row_spacing(6);
+    apps.set_column_spacing(6);
+    apps.set_min_children_per_line(1);
+    apps.set_max_children_per_line(32);
+    apps.set_halign(gtk::Align::Start);
     for app in &card.apps {
-        apps.append(&build_app_icon(app, meta_cache));
+        apps.insert(&build_app_icon(app, meta_cache), -1);
     }
     outer.append(&apps);
 
@@ -1109,7 +1126,11 @@ fn build_card(
     if matches!(card.kind, Kind::Saved(_)) {
         outer.set_tooltip_text(Some(DRAG_HINT));
         outer.add_controller(card_drag_source(&card.name));
-        outer.add_controller(card_drop_target(&card.name, connector, context));
+        outer.add_controller(card_drop_target(
+            &card.name,
+            column.drop_connector(),
+            context,
+        ));
     }
 
     outer.upcast()
@@ -1311,7 +1332,10 @@ fn build_app_icon(app: &StackApp, meta_cache: &MetaCache) -> gtk::Image {
     );
 
     let img = gtk::Image::from_gicon(&icon);
-    img.set_icon_size(gtk::IconSize::Normal);
+    // #1119: double-size (32 px) so a stack's apps read at a glance; the
+    // `.ts-ws-apps` `FlowBox` above is what keeps the extra width from
+    // overrunning the card.
+    img.set_icon_size(gtk::IconSize::Large);
     img.set_valign(gtk::Align::Center);
     // Plain text, not markup — see `build_column`.
     img.set_tooltip_text(Some(&tooltip));
@@ -2364,7 +2388,7 @@ mod model_tests {
 
 #[cfg(all(test, feature = "system-tests"))]
 pub(in crate::panels) mod tests {
-    use super::fixtures::{LEFT, RIGHT, no_stacks, output_at, saved, stack, win, ws};
+    use super::fixtures::{LEFT, RIGHT, no_stacks, output_at, saved, stack, win, ws, ws_focused};
     use super::{
         APP_IDLE_CLASS, APP_RUNNING_CLASS, CARD_INACTIVE_CLASS, DisplayOutput, EMPTY_COLUMN_HINT,
         EPHEMERAL_NAME, NO_OUTPUTS_HINT, OFFLINE_COLUMN, PageModel, bind_columns, build_panel,
@@ -3265,6 +3289,44 @@ pub(in crate::panels) mod tests {
         );
     }
 
+    /// #1121 gap A: the offline column's own **cards** still take a drop —
+    /// the reorder half applies there even though the monitor half does not
+    /// (`build_column`'s comment on the loop above; `drop_plan` declines the
+    /// monitor half on a `None` connector and keeps the reorder one).
+    ///
+    /// This is the wiring the re-verification of #1113 found untested: a
+    /// mutation that has `build_card` reach for
+    /// `Some(column.connector.as_str())` instead of asking `column` itself
+    /// leaves every existing test green, because `Column::drop_connector`'s
+    /// own test (`only_a_connected_column_offers_a_connector_to_a_drop`)
+    /// supplies the `None` itself rather than exercising this call site, and
+    /// `has_drop_target` cannot distinguish *which* connector a card's drop
+    /// target closes over — only whether one is attached at all. The reshape
+    /// (`build_card` takes `&Column` and calls `drop_connector()` itself, one
+    /// call site) is what actually closes the gap; this test pins that the
+    /// reorder half the reshape must not break stays working.
+    #[gtk::test]
+    fn a_saved_card_in_the_offline_column_still_takes_a_drop_for_reordering() {
+        let f = fixture();
+        f.saved
+            .set(saved(&[("gone", stack(Some("dp-9"), &["Alacritty"]))]));
+        pump();
+
+        let all = columns(&f.page);
+        let offline = all.last().expect("at least the offline column");
+        assert_eq!(
+            label_text(offline, "ts-ws-column-title"),
+            OFFLINE_COLUMN,
+            "the fixture must produce the trailing offline column"
+        );
+        let its_cards = cards(offline);
+        assert_eq!(its_cards.len(), 1, "the one offline stack's card");
+        assert!(
+            has_drop_target(&its_cards[0]),
+            "the offline column's card must still accept a drop for reordering"
+        );
+    }
+
     /// A saved card is draggable; an ephemeral one is not (#1071 §5 — there is
     /// no file entry for a drop to rewrite).
     #[gtk::test]
@@ -3319,6 +3381,60 @@ pub(in crate::panels) mod tests {
             names,
             ["zoo", "music", "apt"],
             "the file's order, with the Inactive cards keeping their places"
+        );
+    }
+
+    /// #1119: the double-size icons wrap onto a second row instead of
+    /// clipping past the card's edge or shrinking to squeeze in.
+    ///
+    /// 330 px is the width `build_column`'s own doc comment measures for a
+    /// two-screen drawer column ("would squeeze a two-screen setup to ~330px
+    /// a column") — comfortably narrower than twelve 32 px icons plus their
+    /// spacing need in one row, so the wrap is not a near thing.
+    ///
+    /// **The mutation**: building `.ts-ws-apps` as a plain `gtk::Box` instead
+    /// of a `gtk::FlowBox` reds this — the twelfth icon renders past the
+    /// card's right edge instead of wrapping, which `assert_inside_and_hittable`
+    /// catches, and every icon lands on one row, which the row-count assertion
+    /// catches independently.
+    #[gtk::test]
+    fn a_crowded_stack_wraps_its_icons_onto_a_second_row() {
+        let f = fixture();
+        f.workspaces.set(vec![ws_focused(1, 1, LEFT, None)]);
+        f.saved.set(saved(&[(
+            "chat",
+            stack(
+                Some(LEFT),
+                &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"],
+            ),
+        )]));
+        pump();
+
+        let window = gtk::Window::new();
+        window.set_child(Some(&f.page));
+        window.set_default_size(330, 600);
+        window.present();
+        pump();
+
+        let column = &columns(&f.page)[0];
+        let card = &cards(column)[0];
+        let apps = icons(card);
+        assert_eq!(apps.len(), 12, "all twelve apps must be on the card");
+
+        for (i, icon) in apps.iter().enumerate() {
+            assert_inside_and_hittable(card, icon, &format!("icon {i}"));
+        }
+
+        let ys: Vec<f32> = apps
+            .iter()
+            .map(|icon| bounds_in(card, icon, "an app icon").y())
+            .collect();
+        let (min_y, max_y) = ys
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), &y| (lo.min(y), hi.max(y)));
+        assert!(
+            max_y - min_y > 1.0,
+            "all twelve icons landed on one row (y {min_y}..{max_y}) — nothing wrapped"
         );
     }
 }

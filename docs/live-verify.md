@@ -2931,6 +2931,17 @@ trollshell`. Expect the cards to come back Active and **no notification at
       columns re-order to follow. Two monitors at the same x (stacked
       vertically) should order top to bottom.
 
+- [ ] **(#1119)** Stack-row app icons are double-size and wrap. Open the
+      Workspaces page and give one stack enough apps that they cannot all fit
+      in one row at the card's width (six or more on a normal laptop panel is
+      usually enough). The icons must render at roughly twice their old size,
+      and the overflow must wrap onto a second row **inside the card** — not
+      clip past its right edge and not shrink to squeeze everything into one
+      row. Hovering an icon still shows its app's name, and the running/idle
+      glow is unchanged. The Edit form's own app list (the one with the drag
+      handles) is a different, unrelated list — confirm its row size did not
+      change.
+
 ## Control-center
 
 - [ ] **(#515)** AI Keys tab: set an OpenRouter key → the row flips to "Key

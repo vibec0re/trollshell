@@ -2940,6 +2940,28 @@ mod gtk_tests {
         );
     }
 
+    /// #1121 gap D, adopted from the #1113 re-verification: the Edit sub-page
+    /// is a **different stack child**, so it needs the same cap or the drawer
+    /// jumps narrower the moment the pencil is pressed and back on Save/Cancel
+    /// (commit `2ee4e53`). `on_page_show_fills_the_workspaces_clamp_to_the_cap`
+    /// above only exercises the `Page` side; nothing covered the `Active` one.
+    ///
+    /// **The mutation**: dropping `apply_workspace_edit_width_cap(panel)` from
+    /// `on_active_show`'s `Active::WorkspaceEdit` arm reds this.
+    #[gtk::test]
+    fn on_active_show_fills_the_edit_sub_page_to_the_cap() {
+        let monitor = test_monitor();
+        let panel = harness_panel(&monitor);
+        let slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        panel
+            .stack
+            .add_named(&slot, Some(super::WORKSPACE_EDIT_STACK_CHILD));
+
+        super::on_active_show(&panel, &Active::WorkspaceEdit("chat".to_owned()));
+
+        assert_eq!(slot.width_request(), scale(DRAWER_MAX_WIDTH_WIDE));
+    }
+
     /// The generic drawer-opening path end to end (#1108 follow-up: the
     /// dedicated workspace-manager bar chip was dropped per Annika's call on
     /// the issue — "the chip can be dropped" — but the page must stay

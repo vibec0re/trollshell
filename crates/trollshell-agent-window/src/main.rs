@@ -2,23 +2,18 @@
 //! per-agent application, and build the window when `GApplication` says to.
 //!
 //! The window itself and everything it shows live in the library crate — see
-//! its module docs for the design, and `cli::app_id` for why the application
-//! id carries the agent.
+//! its module docs for the design, `cli::app_id` for why the application id
+//! carries the agent, and `window.rs` for the chrome.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use adw::prelude::*;
 use gtk::gio;
 use gtk::glib;
+use gtk::prelude::*;
 
-use hytte_plugin_agents::config::AgentsConfig;
-use hytte_plugin_agents::hive::wire::{HiveUrls, Request};
-use hytte_plugin_agents::model::{AgentName, agent_url};
-
-use trollshell_agent_window::chrome::{Controls, Facts, HeaderModel};
-use trollshell_agent_window::feed::{self, AgentState, Update};
-use trollshell_agent_window::{cli, page, tls, ui, webview};
+use trollshell_agent_window::window::Window;
+use trollshell_agent_window::cli;
 
 /// Default `tracing` level when `RUST_LOG` is unset — `INFO`, matching the
 /// shell (#746) and the control center (#780). `fmt::init()`'s own fallback is
@@ -30,10 +25,6 @@ const DEFAULT_LOG_LEVEL: tracing_subscriber::filter::LevelFilter =
 /// Exit code for a command line this window cannot use.
 const EXIT_USAGE: u8 = 2;
 
-/// What the window shows before the hive has a page URL for this agent.
-const NO_PAGE: &str = "This hive publishes no page for this agent yet — its domain is unconfigured, or the agent is \
-     not on its roster. The header above still follows the agent's live status.";
-
 fn main() -> glib::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -43,10 +34,20 @@ fn main() -> glib::ExitCode {
         )
         .init();
 
-    let command_line: Vec<String> = std::env::args().collect();
+    // `args_os` + `to_string_lossy`, not `args`: the latter **panics** on a
+    // non-UTF-8 argument, which is the one input this binary works hardest to
+    // answer with a usage line (#1130 L5). The `command_line` arm below
+    // already did it this way; these two now agree.
+    let command_line: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+
     // Parsed **here**, before the application exists, because the app id is
     // derived from `--agent` and `Application::new` aborts on an invalid one.
-    let args = match cli::parse(&command_line[1..]) {
+    // `get(1..)` rather than `[1..]`: an argv with no argv[0] at all is
+    // reachable through a hand-rolled `execv`, and panicking on it would be
+    // the same failure as above with a different cause.
+    let args = match cli::parse(command_line.get(1..).unwrap_or_default()) {
         Ok(args) => args,
         Err(e) => {
             eprintln!("trollshell-agent-window: {e}\n{}", cli::USAGE);
@@ -100,213 +101,9 @@ fn main() -> glib::ExitCode {
         let mut slot = state.borrow_mut();
         let window = slot.get_or_insert_with(|| Window::build(app, &args.agent, &handle));
         window.show_tab(args.tab);
-        window.toplevel.present();
+        window.present();
         glib::ExitCode::SUCCESS
     });
 
     app.run_with_args(&command_line)
-}
-
-/// One agent's window: the chrome, the page, and the lane its buttons write
-/// to.
-struct Window {
-    toplevel: adw::ApplicationWindow,
-    stack: adw::ViewStack,
-    header: ui::Header,
-    settings: ui::Settings,
-    banner: adw::Banner,
-    /// Rebuilt once, when the hive first hands over a URL for this agent —
-    /// the row carries it (hyperhive#4073) and a fresh hive may not have one
-    /// yet.
-    page_slot: gtk::Box,
-    page_loaded: RefCell<bool>,
-    cfg: AgentsConfig,
-    name: AgentName,
-    urls: RefCell<Option<HiveUrls>>,
-    last: RefCell<AgentState>,
-    cmds: tokio::sync::mpsc::UnboundedSender<Request>,
-}
-
-impl Window {
-    fn build(
-        app: &adw::Application,
-        name: &AgentName,
-        runtime: &tokio::runtime::Handle,
-    ) -> Rc<Self> {
-        let cfg = hytte_plugin_agents::config::load();
-
-        let header = ui::Header::new();
-        let settings = ui::Settings::new();
-        let banner = adw::Banner::new("");
-        banner.set_revealed(false);
-
-        let page_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        page_slot.set_hexpand(true);
-        page_slot.set_vexpand(true);
-
-        let stack = adw::ViewStack::new();
-        stack.add_titled_with_icon(
-            &page_slot,
-            Some(cli::Tab::Agent.as_str()),
-            "Agent",
-            "utilities-terminal-symbolic",
-        );
-        stack.add_titled_with_icon(
-            &settings.root,
-            Some(cli::Tab::Settings.as_str()),
-            "Settings",
-            "emblem-system-symbolic",
-        );
-
-        let switcher = adw::ViewSwitcher::builder()
-            .stack(&stack)
-            .policy(adw::ViewSwitcherPolicy::Wide)
-            .build();
-        let bar = adw::HeaderBar::builder().title_widget(&switcher).build();
-
-        let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        body.append(&bar);
-        body.append(&header.root);
-        body.append(&banner);
-        body.append(&stack);
-
-        let toplevel = adw::ApplicationWindow::builder()
-            .application(app)
-            .default_width(960)
-            .default_height(720)
-            .title(format!("{} — agent", cfg.label_for(name.as_str())))
-            .content(&body)
-            .build();
-
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let this = Rc::new(Self {
-            toplevel,
-            stack,
-            header,
-            settings,
-            banner,
-            page_slot,
-            page_loaded: RefCell::new(false),
-            cfg,
-            name: name.clone(),
-            urls: RefCell::new(None),
-            last: RefCell::new(AgentState::Connecting),
-            cmds: cmd_tx,
-        });
-
-        let press = Rc::clone(&this);
-        this.header.connect(move |p| press.on_press(p));
-        this.apply();
-
-        runtime.spawn(feed::run(
-            std::path::PathBuf::from(&this.cfg.socket),
-            name.clone(),
-            this.cfg.poll_interval(),
-            cmd_rx,
-            out_tx,
-        ));
-
-        // `tokio::sync::mpsc`'s `recv()` is executor-agnostic, so the GTK main
-        // context can await it directly — no bridging channel, and the updates
-        // land on the thread that owns the widgets by construction.
-        let pump = Rc::clone(&this);
-        glib::spawn_future_local(async move {
-            while let Some(update) = out_rx.recv().await {
-                pump.on_update(update);
-            }
-        });
-
-        this
-    }
-
-    /// Switch to one tab. Silently a no-op if the stack has no such child,
-    /// which cannot happen — `Tab` and the child names are one enum.
-    fn show_tab(&self, tab: cli::Tab) {
-        self.stack.set_visible_child_name(tab.as_str());
-    }
-
-    fn on_press(&self, press: ui::Press) {
-        let req = match press {
-            ui::Press::Start => feed::start(&self.name),
-            ui::Press::Stop => feed::stop(&self.name),
-            ui::Press::SetPaused(paused) => feed::set_paused(&self.name, paused),
-        };
-        self.banner.set_revealed(false);
-        if self.cmds.send(req).is_err() {
-            tracing::warn!("the hive client is gone; this window is no longer live");
-        }
-    }
-
-    fn on_update(&self, update: Update) {
-        match update {
-            Update::State(state) => {
-                *self.last.borrow_mut() = state;
-                self.apply();
-            }
-            Update::Urls(urls) => {
-                *self.urls.borrow_mut() = Some(*urls);
-                self.apply();
-            }
-            Update::Refused { request, reason } => {
-                self.banner.set_title(&ui::refusal(&request, &reason));
-                self.banner.set_revealed(true);
-            }
-        }
-    }
-
-    /// Push the current state through the whole chrome.
-    fn apply(&self) {
-        let state = self.last.borrow();
-        self.header.apply(
-            &HeaderModel::of(&self.name, &self.cfg, &state),
-            &Controls::of(&state),
-        );
-        self.settings.apply(
-            &Facts::agent(&self.name, &state),
-            &Facts::hive(&self.cfg, self.urls.borrow().as_ref()),
-        );
-        self.load_page(&state);
-    }
-
-    /// Mount the embedded page the first time the hive gives this agent a URL.
-    ///
-    /// Once only: a reload on every poll would throw away the scroll position
-    /// and any half-typed message on the page, twice a second.
-    fn load_page(&self, state: &AgentState) {
-        if *self.page_loaded.borrow() {
-            return;
-        }
-        let Some(url) = state.agent().and_then(agent_url) else {
-            if self.page_slot.first_child().is_none() {
-                let hint = gtk::Label::builder()
-                    .label(NO_PAGE)
-                    .wrap(true)
-                    .justify(gtk::Justification::Center)
-                    .margin_top(48)
-                    .margin_start(24)
-                    .margin_end(24)
-                    .valign(gtk::Align::Start)
-                    .build();
-                hint.add_css_class("dim-label");
-                self.page_slot.append(&hint);
-            }
-            return;
-        };
-
-        let embedded = page::embed_url(url);
-        let policy = tls::policy(std::env::var(tls::CA_ENV).ok().as_deref(), &embedded);
-        tracing::info!(
-            url = %embedded,
-            tls_host = ?policy.scoped_host(),
-            "loading the agent's page"
-        );
-
-        while let Some(child) = self.page_slot.first_child() {
-            self.page_slot.remove(&child);
-        }
-        self.page_slot.append(&webview::page(&embedded, &policy));
-        *self.page_loaded.borrow_mut() = true;
-    }
 }

@@ -572,18 +572,48 @@ whole point of the window.
       and check `hivectl list-agents` before and after that nothing else moved
       — the §11 rule-one footgun again, and this is a second writer on the same
       socket.
-- [ ] **(#950)** **TLS.** A default hyperhive gateway serves a self-signed leaf
-      under a host-held CA, and the machine's trust store does not carry it, so
-      expect a TLS failure page on first run. The fix in order of preference:
-      add the hive's anchor to the **system** store —
-      `security.pki.certificateFiles = [ "/var/lib/hive-tls/trust-bundle.pem" ];`
-      (the bundle, **not** `ca.pem`: the hive CA is an intermediate) — and the
-      window picks it up like any other client. Failing that, launch it with
-      `TROLLSHELL_AGENT_WINDOW_CA=/var/lib/hive-tls/trust-bundle.pem`, which
-      trusts that certificate **for the agent's host only**. Confirm in both
-      cases that the page loads _and_ that an unrelated https host in the same
-      window still fails on a bad certificate — this window never turns TLS
-      checking off.
+- [ ] **(#950)** **TLS — the inline error state names the way out.** A default
+      hyperhive gateway serves a self-signed leaf under a host-held CA and this
+      machine's trust store does not carry it, so **expect the window to open
+      on an error state** rather than the page. Confirm that state names the
+      failing host and all three routes (not WebKit's bare "load failed"), then
+      take the first one that applies:
+
+  1. **The hive is on this machine** — the `singleHostSwarm` case, i.e. yours.
+     Reference hyperhive's own option rather than typing the path (Mara's ask
+     on #948), so the two sides cannot drift if that directory moves:
+
+     ```nix
+     security.pki.certificateFiles = [
+       "${config.services.hyperhive.deploy.hive-controller.tls.stateDir}/trust-bundle.pem"
+     ];
+     ```
+
+  2. **A remote hive, or a host you do not configure.** Copy that file over and
+     name it literally — `/var/lib/hive-tls` is only that option's default, so
+     spelling it out is the fallback, not the example to copy.
+  3. **Last resort**, when neither is available: launch with
+     `TROLLSHELL_AGENT_WINDOW_CERT=<pem>`, which pins one certificate for the
+     agent's host only. ⚠️ It must be the certificate the gateway **presents**
+     — its leaf, **not** the bundle — because
+     `allow_tls_certificate_for_host` pins a certificate rather than adding an
+     anchor. `openssl s_client -connect <host>:443 -showcerts </dev/null |
+     openssl x509` produces it. Pointing it at `trust-bundle.pem` gets you an
+     INFO line saying it worked and an error page anyway (#1130 M3).
+
+  Whichever you use, confirm the page then loads _and_ that an unrelated https
+  host with a bad certificate still fails in the same window — this window
+  never turns TLS checking off.
+
+- [ ] **(#950)** **The view stays on the hive.** With the page loaded, follow a
+      link in the agent's feed that points off the hive (or set
+      `window.location` from WebKit's inspector if the feed has none): the
+      **window must not move** — the link opens in your browser instead, and a
+      journal line says so. Same for a `target="_blank"` link: one browser tab,
+      no second WebKit window, and no silently-dead click. Then follow a link
+      _within_ the hive and confirm that one does load in place. This is the H1
+      guard from #1130's review: the embedded page is agent output, and this
+      window has no address bar to contradict a header that says "agent X".
 - [ ] **(#950)** **Without the window, nothing regresses.** Set
       `programs.trollshell.agentWindow.enable = false;`, rebuild, restart the
       plugin, and confirm the card's link opens the **browser** again and the

@@ -132,16 +132,6 @@ let
     gtk4
     libadwaita
     gtk4-layer-shell
-    # WebKitGTK 6.0 — `webkit6-sys`'s pkg-config lookup (`webkitgtk-6.0.pc`),
-    # for the #950 companion window (crates/trollshell-agent-window) and
-    # nothing else. It is in the workspace's buildInputs because there is one
-    # `craneLib.buildPackage` for the whole workspace (#572/#587), so every
-    # native dependency any member needs lives here; it does **not** put a web
-    # engine into the shell's runtime closure, because the shell's binary does
-    # not link it. The devShell inherits this list through
-    # `passthru.devInputs`, so a `cargo build` in the shell finds the same .pc
-    # file the sandbox does.
-    webkitgtk_6_0
     gsettings-desktop-schemas
     adwaita-icon-theme
     hicolor-icon-theme
@@ -159,6 +149,31 @@ let
     pipewire
   ];
 
+  # `buildInputs` PLUS WebKitGTK 6.0 — `webkit6-sys`'s pkg-config lookup
+  # (`webkitgtk-6.0.pc`), needed by exactly one workspace member, the #950
+  # companion window (crates/trollshell-agent-window).
+  #
+  # **The split is load-bearing, and it is the fix for #1130's M1.** It has to
+  # be in the *compile* inputs, because there is one `craneLib.buildPackage`
+  # for the whole workspace (#572/#587) and that one compile builds this member
+  # too. But `buildInputs` is also the list the GTK **slices** hand to
+  # `wrapGAppsHook4`, and `wrap-gapps-hook.sh` propagates `GI_TYPELIB_PATH`
+  # verbatim — webkitgtk ships `lib/girepository-1.0/{WebKit,JavaScriptCore,
+  # WebKitWebProcessExtension}-6.0.typelib`, so it lands in that variable, so
+  # the wrapper script *references the store path*, so it is a runtime
+  # dependency of the wrapped binary. Measured on the #1130 branch before this
+  # split: `nix why-depends .#trollshell …webkitgtk-…abi=6.0` reported a DIRECT
+  # reference, and the marginal closure was **one path, 167 MiB**, on both the
+  # shell and the control center — neither of which ever loads a web engine.
+  #
+  # So: the compile, the devShell and the agent-window slice take `webInputs`;
+  # the `trollshell` slice, `nix/control-center.nix` and the two probes take
+  # the plain `buildInputs`. `checks.shell-has-no-web-engine`
+  # (nix/checks/shell-has-no-web-engine.nix) asserts the result against the
+  # shell's real closure, naming the ABI — a bare `webkitgtk` grep is red on
+  # `main` already, via evolution-data-server's 4.1.
+  webInputs = buildInputs ++ [ webkitgtk_6_0 ];
+
   # Args shared between the deps-only build (cached on Cargo.lock changes only)
   # and the single workspace compile. The bindgen consumer (pipewire-sys/
   # libspa-sys) runs during the deps build, so bindgenHook (which populates
@@ -166,7 +181,10 @@ let
   commonArgs = {
     pname = "trollshell";
     version = "0.1.0";
-    inherit src nativeBuildInputs buildInputs;
+    inherit src nativeBuildInputs;
+    # The compile needs every member's native deps; see `webInputs` above for
+    # why the wrappers must not inherit this same list.
+    buildInputs = webInputs;
 
     # strictDeps stays off (crane's default): the bindgen build scripts read the
     # pipewire headers from buildInputs, simplest with one shared include path.
@@ -381,7 +399,12 @@ let
 
       passthru = {
         inherit cargoArtifacts cargoArtifactsBinOnly commonArgs;
-        devInputs = { inherit nativeBuildInputs buildInputs; };
+        # `buildInputs` is what a **wrapper** should see; `webInputs` adds
+        # WebKitGTK and is for the compile, the devShell and the one slice that
+        # ships a web engine. See `webInputs`' comment above — handing the
+        # wrong one to `wrapGAppsHook4` is #1130's M1, and it costs 167 MiB of
+        # closure on a binary that never loads it.
+        devInputs = { inherit nativeBuildInputs buildInputs webInputs; };
       };
 
       meta = {

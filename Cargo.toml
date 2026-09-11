@@ -52,7 +52,18 @@ repository = "https://git.hannig.cc/choom/trollshell"
 # hytte-plugin-weather). Per the issue's own escape hatch ("either add a
 # pinned-1.85 check or drop the claim"), this bumps the floor to the version
 # the code actually requires rather than rewriting call sites across 5 crates.
-rust-version = "1.91"
+#
+# **1.92 since #1130**, and this one is not a floor that drifted — it is
+# enforced. `webkit6` (the #950 companion window's engine) pulls `soup3` /
+# `soup3-sys` 0.9.0, both of which declare `rust-version = "1.92"`, and cargo
+# **hard-errors at build time** when the active toolchain is below a package's
+# declared floor ("package `soup3 v0.9.0` cannot be built because it requires
+# rustc 1.92 or newer"). `resolver.incompatible-rust-versions` is not what
+# matters here — that steers version *selection* while a lockfile is being
+# generated, and this lockfile is pinned. So a 1.91 toolchain cannot build this
+# workspace at all, and leaving the declaration at 1.91 would have made it
+# provably false rather than merely stale.
+rust-version = "1.92"
 
 # hytte-ecal and hytte-gl hand-mirror this table (crates/hytte-ecal/Cargo.toml,
 # crates/hytte-gl/Cargo.toml) instead of `[lints] workspace = true`, because

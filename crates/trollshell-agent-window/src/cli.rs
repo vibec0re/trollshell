@@ -220,7 +220,7 @@ mod tests {
     /// so a change on either side breaks this rather than shipping a launcher
     /// the window cannot read.
     ///
-    /// Mutation (verified red): rename a flag on either side.
+    /// Mutation (verified red, #1130 review M10): rename a flag on either side.
     #[test]
     fn the_plugins_own_argv_parses_on_both_tabs() {
         use hytte_plugin_agents::window;
@@ -282,7 +282,7 @@ mod tests {
     /// within one process and would sail through a self-comparison while
     /// breaking the feature entirely — measured, on the mutation below.
     ///
-    /// Mutation (verified red): append `std::process::id()` — or anything else
+    /// Mutation (verified red, #1130 review M4): append `std::process::id()` — or anything else
     /// that is not the name — and the first assertion reds. (The
     /// self-comparison this test used to make stayed **green** on that
     /// mutation, which is why it is no longer the assertion.) Drop the agent
@@ -316,7 +316,7 @@ mod tests {
     /// `Application::new` aborts the process on an invalid id, so a name that
     /// passed `AgentName::parse` producing one would be a crash on click.
     ///
-    /// Mutation (verified red): drop the leading-letter prefix and the
+    /// Mutation (verified red, #1130 review M5): drop the leading-letter prefix and the
     /// `9-lives` case reds; drop the `-` → `_` mapping and every hyphenated
     /// name does.
     #[test]

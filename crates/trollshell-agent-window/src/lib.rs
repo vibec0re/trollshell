@@ -44,3 +44,4 @@ pub mod page;
 pub mod tls;
 pub mod ui;
 pub mod webview;
+pub mod window;

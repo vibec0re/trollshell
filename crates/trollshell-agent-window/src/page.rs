@@ -54,13 +54,121 @@ pub fn embed_url(base: &str) -> String {
     out
 }
 
+/// May `candidate` load **in this window**, or must it go to the browser?
+///
+/// # Why this exists
+///
+/// The embedded page is hyperhive's **agent turn stream**: rendered model
+/// output and tool output, which is content the agent's own inputs can
+/// influence — a hostile file it read, a page it fetched, a prompt-injected
+/// tool result. Without a policy handler the page owns the viewport after the
+/// first load: one `<a href>` or one `window.location =` moves this window to
+/// an arbitrary origin **in place**, inside chrome that still reads
+/// `<agent> — agent · running` with a start/stop/pause row under it and no
+/// address bar to contradict it. The host-scoped TLS grant is no help — it
+/// correctly does not apply to the attacker's host, so a valid public
+/// certificate there loads clean.
+///
+/// So this window navigates to **exactly one origin**: the one it was opened
+/// for. Everything else is handed to the desktop's default handler and
+/// cancelled in the view, which keeps a legitimate link in the feed working —
+/// just not here.
+///
+/// This is the half of Mara's "never depend on the page's DOM" that the
+/// `?hide=` contract does not cover: the window does not read the DOM, but it
+/// does hand the DOM its viewport.
+///
+/// # The predicate
+///
+/// Scheme **and** host must match, and the scheme must be `https` — the hive's
+/// own URL always is (`https://<domain>/agent/<name>/`, hyperhive#4073), so
+/// admitting `http` would only ever admit a downgrade. `file:`, `data:` and
+/// every other scheme are refused by the same test.
+///
+/// [`crate::tls::host_of`] strips the port with the userinfo, so a page on
+/// `hive.local:8443` and a link to `hive.local:9999` compare equal here. That
+/// is deliberate and it is the weaker half of the rule: a second service on
+/// another port of the *same host* is the hive operator's own machine, where
+/// this window's premise ("the hive is trusted") already holds, and the
+/// attacker this guards against controls a different **name**.
+#[must_use]
+pub fn navigable_in_place(embedded: &str, candidate: &str) -> bool {
+    candidate.starts_with("https://")
+        && crate::tls::host_of(embedded).is_some()
+        && crate::tls::host_of(candidate) == crate::tls::host_of(embedded)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{HIDE_QUERY, embed_url};
+    use super::{HIDE_QUERY, embed_url, navigable_in_place};
+
+    /// **Only the agent's own origin loads in our chrome.** The reviewer's
+    /// test, taken verbatim and then widened.
+    ///
+    /// Mutation (re-run this round, red): make `navigable_in_place` return
+    /// `true` unconditionally — the allow-all this window shipped with — and
+    /// every negative case here reds.
+    #[test]
+    fn only_the_agents_own_origin_loads_in_our_chrome() {
+        let page = "https://hive.local/agent/stray/?hide=header,input";
+        assert!(navigable_in_place(page, "https://hive.local/agent/stray/turn/3"));
+        assert!(!navigable_in_place(page, "https://evil.example/login"));
+        assert!(!navigable_in_place(page, "http://hive.local/agent/stray/"));
+        assert!(!navigable_in_place(page, "file:///etc/passwd"));
+    }
+
+    /// The shapes an attacker actually reaches for: a subdomain of the hive's
+    /// name, the hive's name as a **subdomain** of theirs, and the schemes a
+    /// rendered turn stream can carry.
+    ///
+    /// `https://hive.local.evil.example/` is the one the review names by
+    /// hand — a prefix test would admit it.
+    #[test]
+    fn a_lookalike_host_is_not_the_hive() {
+        let page = "https://hive.local/agent/stray/?hide=header,input";
+        for hostile in [
+            "https://hive.local.evil.example/login",
+            "https://evil.example/hive.local/login",
+            "https://hive.local@evil.example/login",
+            "https://xn--hive-local/",
+            "data:text/html,<h1>hi",
+            "javascript:alert(1)",
+            "about:blank",
+            "",
+        ] {
+            assert!(
+                !navigable_in_place(page, hostile),
+                "{hostile} must not load in this window"
+            );
+        }
+        // …and the hive's own pages still do, including a bare root and a
+        // deep link with its own query.
+        for ours in [
+            "https://hive.local/",
+            "https://hive.local/agent/other/",
+            "https://hive.local/agent/stray/?tab=todos",
+        ] {
+            assert!(navigable_in_place(page, ours), "{ours} is the hive");
+        }
+    }
+
+    /// A page URL with no host of its own admits **nothing** — the window
+    /// would otherwise have no origin to compare against and a naive
+    /// `None == None` would let every hostless URI through.
+    ///
+    /// Mutation (re-run this round, red): drop the
+    /// `host_of(embedded).is_some()` conjunct and the `file:` pair passes.
+    #[test]
+    fn a_page_with_no_origin_admits_nothing() {
+        for page in ["", "not a url", "file:///tmp/x"] {
+            assert!(!navigable_in_place(page, "https://hive.local/"));
+            assert!(!navigable_in_place(page, "file:///tmp/x"));
+        }
+    }
 
     /// The ordinary case: the hive's `https://<domain>/agent/<name>/`.
     ///
-    /// Mutation (verified red): drop the parameter (return `base` unchanged)
+    /// Mutation (verified red, #1130 review M1): drop the parameter (return `base` unchanged)
     /// and this reds — which is the point, because the window would then embed
     /// hyperhive's full page inside our chrome and draw two headers.
     #[test]
@@ -73,7 +181,7 @@ mod tests {
 
     /// A URL that **already** carries a query gets `&`, not a second `?`.
     ///
-    /// Mutation (verified red): hard-code `?` and this reds; the server would
+    /// Falsification: hard-code `?` and this reds; the server would
     /// see one parameter named `…?hide` and hide nothing.
     #[test]
     fn an_existing_query_gets_an_ampersand() {
@@ -91,7 +199,7 @@ mod tests {
     /// A fragment stays at the end — a query written after one never reaches
     /// the server.
     ///
-    /// Mutation (verified red): append unconditionally and the parameter lands
+    /// Falsification: append unconditionally and the parameter lands
     /// inside the fragment.
     #[test]
     fn a_fragment_stays_last() {

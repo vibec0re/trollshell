@@ -81,18 +81,41 @@ pub fn argv(name: &str, tab: Tab) -> Vec<String> {
     out
 }
 
-/// Is [`BINARY`] on this process's `PATH`, as an executable file?
+/// Is [`BINARY`] on **this process's** `PATH`, as an executable file?
 ///
-/// The plugin runs as its own `trollshell-plugin-agents` user unit, so its
-/// `PATH` is the systemd user manager's — the same one the host's
-/// `systemd-run --user` launch will resolve the program against. Looking it
-/// up here therefore answers the question the launch will actually ask.
+/// # The assumption, stated as an assumption (#1130 L4)
+///
+/// This is the *plugin's* environment. The launch resolves the program
+/// somewhere else: in the **user manager's** environment on the
+/// `systemd-run --user` path, and in **trollshell's** on the no-manager
+/// fallback (`trollshell/src/plugins/effects.rs`'s `start_detached`). In the
+/// normal deployment all three are the same environment — the plugin is itself
+/// a `systemd-run --user` transient unit the shell started — and that is why
+/// asking here answers the question the launch will ask.
+///
+/// It is an equality that **can** break, in both directions, and neither break
+/// is observable from here: a legacy static unit under `etc/` with its own
+/// `Environment=PATH=`, or a plugin started by hand from a shell, gives either
+/// a false positive (a click that silently does nothing, because the unit
+/// fails at exec where nobody is listening — the very case this design says it
+/// cannot observe) or a false negative (a permanent browser fallback).
+///
+/// So [`Probe::available`]'s warning prints the `PATH` it actually searched:
+/// an operator comparing that line with `systemctl --user show-environment`
+/// can see the mismatch, which is the most this side can offer without
+/// reaching into another process's environment.
 #[must_use]
 pub fn on_path() -> bool {
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };
     std::env::split_paths(&paths).any(|dir| is_executable(&dir.join(BINARY)))
+}
+
+/// The `PATH` [`on_path`] searched, for the warning to quote.
+#[must_use]
+fn searched_path() -> String {
+    std::env::var("PATH").unwrap_or_else(|_| "<unset>".to_owned())
 }
 
 /// An existing regular file with at least one execute bit.
@@ -158,11 +181,18 @@ impl Probe {
         let lookup = self.lookup;
         let found = *self.cached.get_or_insert_with(lookup);
         if self.claim_warning(found) {
+            // The searched `PATH` goes in the line because it is **this
+            // process's**, and the launch will resolve somewhere else — see
+            // [`on_path`]'s docs. An operator with a click that does nothing
+            // can compare this against `systemctl --user show-environment`.
             tracing::warn!(
                 binary = BINARY,
-                "the agent companion window is not on PATH; agent pages open in the browser and \
-                 the pen opens the drawer page instead (install it with \
-                 programs.trollshell.agentWindow.enable)"
+                searched_path = %searched_path(),
+                "the agent companion window is not on this plugin's PATH; agent pages open in \
+                 the browser and the pen opens the drawer page instead (install it with \
+                 programs.trollshell.agentWindow.enable). The launch would resolve it in the \
+                 systemd user manager's environment, which is normally the same one — compare \
+                 with `systemctl --user show-environment` if it is not"
             );
         }
         found

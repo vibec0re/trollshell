@@ -7,7 +7,11 @@ pkgs.mkShell {
   # and the packaged build never drift. Use the raw passthru lists rather than
   # trollshell.nativeBuildInputs — the latter carries crane's vendoring hooks,
   # which warn noisily ("cargoVendorDir not set") when sourced in a shell.
-  inherit (trollshell.devInputs) nativeBuildInputs buildInputs;
+  inherit (trollshell.devInputs) nativeBuildInputs;
+  # `webInputs`: the devShell compiles every member, including the one that
+  # needs `webkitgtk-6.0.pc` (#950). The GTK *wrappers* deliberately take the
+  # narrower `buildInputs` instead — see nix/package.nix (#1130 M1).
+  buildInputs = trollshell.devInputs.webInputs;
 
   # crane builds the package on nixpkgs' rust but doesn't expose it as a
   # buildInput, so the dev shell pulls the toolchain in directly.

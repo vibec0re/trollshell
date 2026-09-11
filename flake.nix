@@ -210,6 +210,15 @@
             inherit workspace revision;
           };
 
+          # The #950 companion window, mirroring the `packages` output. Wired
+          # in here — the I1 gap the #1130 review measured — now that #1127 has
+          # landed and this region is stable: it is the one output whose
+          # **wrapper** derivation (nix/agent-window.nix) nothing else builds,
+          # and the wrapper is exactly where M1's closure bug lived.
+          trollshell-agent-window = pkgs.callPackage ./nix/agent-window.nix {
+            inherit workspace revision;
+          };
+
           # The 14 per-plugin packages (#558), mirroring the `packages` output.
           # Merged into `checks` below so `nix flake check` actually *builds*
           # each one — the same reason #449 wired the two existing packages into
@@ -324,9 +333,19 @@
           inherit
             trollshell
             trollshell-control-center
+            trollshell-agent-window
             hytte-infobroker
             hytte-claude-bridge
             ;
+
+          # The shell's runtime closure must carry no WebKitGTK 6.0 (#1130 M1).
+          # A `runCommand` over `exportReferencesGraph` — no compile, so it is
+          # red in seconds, and it reads nix's own answer about the closure
+          # rather than re-deriving one. See nix/checks/ for the whole story,
+          # including why it names the ABI.
+          shell-has-no-web-engine = pkgs.callPackage ./nix/checks/shell-has-no-web-engine.nix {
+            inherit trollshell trollshell-control-center;
+          };
 
           # Lint the entire workspace with pedantic-clean Clippy. Reuses
           # cargoArtifacts from the package build so dependencies aren't

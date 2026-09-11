@@ -181,11 +181,27 @@ impl Header {
         }
     }
 
+    /// Press Start as a human would — through the widget, so the `clicked`
+    /// handler [`Header::connect`] installed is what runs.
+    ///
+    /// The two `press_*_for_test` helpers exist so `window.rs`'s display tests
+    /// can drive the wiring between a button and the command lane, which
+    /// nothing covered before #1130's review (L2).
+    #[cfg(all(test, feature = "system-tests"))]
+    pub fn press_start_for_test(&self) {
+        self.start.emit_clicked();
+    }
+
+    /// Press Stop. See [`Header::press_start_for_test`].
+    #[cfg(all(test, feature = "system-tests"))]
+    pub fn press_stop_for_test(&self) {
+        self.stop.emit_clicked();
+    }
+
     /// The status line as shown.
     ///
-    /// These three read-backs exist only for [`gtk_tests`], and carry that
-    /// module's gate so a plain build does not compile an accessor nothing
-    /// calls.
+    /// These read-backs exist only for the display tests, and carry their gate
+    /// so a plain build does not compile an accessor nothing calls.
     #[cfg(all(test, feature = "system-tests"))]
     pub fn status_text(&self) -> String {
         self.status.text().to_string()
@@ -296,6 +312,27 @@ impl Settings {
         }
     }
 
+    /// The rows as this page **tracks** them — the bookkeeping, not the
+    /// widget tree.
+    ///
+    /// Handed to the display tests so they can ask the *container* what became
+    /// of a row after a rebuild. That distinction is the whole of #1130's M4:
+    /// `row_text` below reads back from these same vectors, so it can only
+    /// ever confirm the bookkeeping, and dropping the `group.remove(&row)`
+    /// call while keeping the drain left it green while every old
+    /// `ActionRow` leaked into the group — seven more rows per poll on a page
+    /// that rebuilds on every state change. This is the #851 shape again:
+    /// assert against the container, not against your own `Vec`.
+    #[cfg(all(test, feature = "system-tests"))]
+    pub fn tracked_rows(&self) -> Vec<adw::ActionRow> {
+        self.agent_rows
+            .borrow()
+            .iter()
+            .chain(self.hive_rows.borrow().iter())
+            .cloned()
+            .collect()
+    }
+
     /// Every row's `title: subtitle` — the display tests' read-back, and so
     /// carrying their gate.
     #[cfg(all(test, feature = "system-tests"))]
@@ -315,23 +352,73 @@ impl Default for Settings {
     }
 }
 
-/// The banner shown when a verb was refused, or `None` to clear it.
+/// The banner shown when a verb was refused.
+///
+/// Each arm names the **button the operator pressed**, not the wire's
+/// spelling, so the sentence is about the thing they just did.
 #[must_use]
 pub fn refusal(request: &hytte_plugin_agents::hive::wire::Request, reason: &str) -> String {
-    let verb = match request {
-        hytte_plugin_agents::hive::wire::Request::Start { .. } => "start",
-        hytte_plugin_agents::hive::wire::Request::Stop { .. } => "stop",
-        hytte_plugin_agents::hive::wire::Request::SetPaused { paused: true, .. } => "pause",
-        hytte_plugin_agents::hive::wire::Request::SetPaused { paused: false, .. } => "resume",
-        _ => "ask the hive to",
-    };
-    format!("couldn't {verb} this agent: {reason}")
+    use hytte_plugin_agents::hive::wire::Request;
+    match request {
+        Request::Start { .. } => format!("couldn't start this agent: {reason}"),
+        Request::Stop { .. } => format!("couldn't stop this agent: {reason}"),
+        Request::SetPaused { paused: true, .. } => {
+            format!("couldn't pause this agent: {reason}")
+        }
+        Request::SetPaused { paused: false, .. } => {
+            format!("couldn't resume this agent: {reason}")
+        }
+        // Unreachable for the three verbs this window sends — but it is a
+        // sentence, so it parses. The old spelling interpolated a verb phrase
+        // into a slot shaped for a bare verb and read "couldn't ask the hive
+        // to this agent" (#1130 L6).
+        _ => format!("the hive refused that: {reason}"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::refusal;
     use hytte_plugin_agents::hive::wire::{Request, Scope};
+
+    /// Every arm is a sentence that parses, including the one no verb this
+    /// window sends can reach.
+    ///
+    /// Mutation (re-run this round, red): restore the old `_ => "ask the hive
+    /// to"` arm, which produced "couldn't ask the hive to this agent" — the
+    /// grammar half of #1130 L6.
+    #[test]
+    fn every_refusal_arm_is_a_sentence() {
+        use hytte_plugin_agents::hive::wire::Request;
+        let all = [
+            Request::Start {
+                scope: Scope::agent("stray"),
+            },
+            Request::Stop {
+                scope: Scope::agent("stray"),
+                graceful: true,
+            },
+            Request::SetPaused {
+                name: "stray".to_owned(),
+                paused: true,
+            },
+            Request::SetPaused {
+                name: "stray".to_owned(),
+                paused: false,
+            },
+            // The `_` arm.
+            Request::AgentStatus,
+        ];
+        for req in all {
+            let s = refusal(&req, "the reason");
+            assert!(s.ends_with("the reason"), "{s}");
+            assert!(
+                !s.contains("to this agent"),
+                "a verb phrase in a bare-verb slot does not parse: {s}"
+            );
+            assert!(s.starts_with("couldn't ") || s.starts_with("the hive "), "{s}");
+        }
+    }
 
     /// A refusal names the verb the operator pressed, not the wire's spelling.
     #[test]
@@ -373,7 +460,7 @@ mod gtk_tests {
     use super::{Header, Press, Settings};
     use crate::chrome::{Controls, Facts, HeaderModel};
     use crate::feed::AgentState;
-    use gtk::prelude::ToggleButtonExt as _;
+    use gtk::prelude::{ToggleButtonExt as _, WidgetExt as _};
     use hytte_plugin_agents::config::AgentsConfig;
     use hytte_plugin_agents::hive::wire::AgentStatusRow;
     use hytte_plugin_agents::model::{Agent, AgentName};
@@ -404,7 +491,7 @@ mod gtk_tests {
     /// rather than both showing.
     ///
     /// This is the widget half of "a status change updates the header"; the
-    /// socket half is `tests/feed.rs`. Mutation (verified red): drop the
+    /// socket half is `tests/feed.rs`. Falsification: drop the
     /// `set_text` in `Header::apply` and the second assertion reds while the
     /// pure `chrome` tests stay green — which is exactly the gap this covers.
     #[gtk::test]
@@ -446,7 +533,7 @@ mod gtk_tests {
     /// it; without the echo guard each one would fire `toggled` and send
     /// another `SetPaused`, which is a feedback loop against a daemon.
     ///
-    /// Mutation (verified red): delete the `echo` guard in `Header::apply` and
+    /// Mutation (verified red, #1130 review M14): delete the `echo` guard in `Header::apply` and
     /// the first assertion reds.
     #[gtk::test]
     fn a_polled_pause_state_does_not_send_a_command() {
@@ -475,11 +562,55 @@ mod gtk_tests {
         assert_eq!(presses.borrow().as_slice(), [Press::SetPaused(false)]);
     }
 
-    /// The settings page shows every fact, and a rebuild leaves no stale row
-    /// behind.
+    /// **A rebuild takes the old rows out of the group**, not just out of our
+    /// `Vec`. The reviewer's test (#1130 M4), taken as supplied.
     ///
-    /// Mutation (verified red): skip the removal loop in `Settings::apply` and
-    /// the row count doubles.
+    /// `Settings::apply` runs on every state change, so a rebuild that only
+    /// drained the bookkeeping would leak seven `ActionRow`s into the
+    /// `PreferencesGroup` per poll — and the sibling test below could not see
+    /// it, because it reads back from the same vectors the drain empties.
+    ///
+    /// Mutation (re-run this round, red): the reviewer's **M12** — replace the
+    /// removal loop with `tracked.borrow_mut().clear();`, keeping the
+    /// bookkeeping perfect — and this reds while the sibling stays green,
+    /// which is exactly the gap it was written for.
+    #[gtk::test]
+    fn a_rebuild_takes_the_old_rows_out_of_the_group() {
+        let settings = Settings::new();
+        let cfg = AgentsConfig::default();
+
+        settings.apply(
+            &Facts::agent(&name("stray"), &AgentState::Connecting),
+            &Facts::hive(&cfg, None),
+        );
+        let first = settings.tracked_rows();
+        assert!(
+            !first.is_empty() && first.iter().all(|r| r.parent().is_some()),
+            "the first apply must actually put the rows in the group"
+        );
+
+        let state = up(AgentStatusRow {
+            name: "stray".to_owned(),
+            running: true,
+            ..AgentStatusRow::default()
+        });
+        settings.apply(
+            &Facts::agent(&name("stray"), &state),
+            &Facts::hive(&cfg, None),
+        );
+        assert!(
+            first.iter().all(|r| r.parent().is_none()),
+            "a rebuilt group must drop its old rows from the widget tree, not just from our Vec"
+        );
+        assert!(
+            settings.tracked_rows().iter().all(|r| r.parent().is_some()),
+            "…and the new ones must be in it"
+        );
+    }
+
+    /// The settings page shows every fact, and the tracked count does not
+    /// grow — the bookkeeping half, kept beside the widget-tree half above so
+    /// a reader can see which is which.
     #[gtk::test]
     fn the_settings_page_rebuilds_without_stale_rows() {
         let settings = Settings::new();

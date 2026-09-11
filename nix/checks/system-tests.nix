@@ -95,6 +95,30 @@ craneLib.mkCargoDerivation (
     # inherited by the child process either way.
     preCheck = ''
       export HOME="$(mktemp -d)"
+      # #1130: `trollshell-agent-window`'s display tests construct a
+      # `webkit::WebView`. WebKitGTK sandboxes its own subprocesses with
+      # `bwrap`, which needs nested user namespaces — a nix build sandbox has
+      # none, so constructing the view **aborts the whole test binary**
+      # (`bwrap: Can't mount proc on /newroot/proc: Operation not permitted`,
+      # then `Failed to fully launch dbus-proxy`, SIGABRT). Measured here, in a
+      # container with the same restriction.
+      #
+      # This turns WebKit's sandbox off **for the test derivation only** — it
+      # is an environment variable in a check's `preCheck`, and reaches nothing
+      # that ships: the packaged window (nix/agent-window.nix) sets no such
+      # variable and runs a fully sandboxed engine on a real desktop.
+      #
+      # It does not buy a *working* web process, and nothing here pretends
+      # otherwise: with the sandbox off the process still terminates
+      # (`web-process-terminated: Crashed`, measured), so no page ever loads
+      # and no navigation policy is ever dispatched under this check. The tests
+      # that run here are the ones that need only the widget — the settings the
+      # view carries, the stack's shape, the session's ephemerality. The
+      # end-to-end "a foreign link does not move the window" assertion is a
+      # live-verify item (docs/live-verify.md, #950), and `webview.rs`'s
+      # `gtk_tests` module doc records the whole measurement so nobody re-adds
+      # a test that cannot run.
+      export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
       export XDG_DATA_DIRS="${pkgs.adwaita-icon-theme}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
       export TROLLSHELL_REQUIRE_ICON_THEME=1
       # llvmpipe (#1036): `__EGL_VENDOR_LIBRARY_FILENAMES` is the

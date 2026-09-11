@@ -152,14 +152,11 @@ pub async fn run(
     mut cmds: UnboundedReceiver<Request>,
     out: UnboundedSender<Update>,
 ) {
-    if let Ok(resp) = client::request(&socket, &Request::Urls).await
-        && let Some(urls) = resp.urls
-        && out.send(Update::Urls(Box::new(urls))).is_err()
-    {
+    let mut last: Option<AgentState> = None;
+    let mut urls = UrlsFetch::default();
+    if urls.attempt(&socket, &out).await.is_err() {
         return;
     }
-
-    let mut last: Option<AgentState> = None;
     if poll_once(&socket, &name, &out, &mut last).await.is_err() {
         return;
     }
@@ -173,9 +170,20 @@ pub async fn run(
             biased;
             cmd = cmds.recv() => {
                 let Some(req) = cmd else { return };
-                if let Err(reason) = write(&socket, &req).await
-                    && out.send(Update::Refused { request: req, reason }).is_err()
-                {
+                if let Err(reason) = write(&socket, &req).await {
+                    if out.send(Update::Refused { request: req, reason }).is_err() {
+                        return;
+                    }
+                    // **Force the next poll to re-emit.** A refusal means the
+                    // controls are showing what the operator *asked for* and
+                    // the hive said no — most visibly the pause toggle, which
+                    // GTK has already flipped. The reconciling state is by
+                    // definition the state we last sent, so the dedup in
+                    // `poll_once` would swallow it and leave the window
+                    // claiming a pause the daemon never made (#1130 M2).
+                    last = None;
+                }
+                if urls.attempt(&socket, &out).await.is_err() {
                     return;
                 }
                 if poll_once(&socket, &name, &out, &mut last).await.is_err() {
@@ -183,11 +191,67 @@ pub async fn run(
                 }
             }
             _ = ticker.tick() => {
+                if urls.attempt(&socket, &out).await.is_err() {
+                    return;
+                }
                 if poll_once(&socket, &name, &out, &mut last).await.is_err() {
                     return;
                 }
             }
         }
+    }
+}
+
+/// The `Urls` answer, fetched once — but **retried** until it lands.
+///
+/// It used to be a single attempt before the loop, which meant a window opened
+/// while the hive was down showed `—` for Domain and Dashboard on the Settings
+/// tab for the rest of the session, even after the header went green (#1130
+/// L6). It is still once per *success*: the hive's domain does not change under
+/// a running window, and re-asking every two seconds for a value that never
+/// moves is the kind of chatter the poll's own dedup exists to avoid.
+///
+/// Backoff is in **polls**, not in time, because this rides the caller's ticker
+/// and has no timer of its own: 1, 2, 4, 8 … up to [`UrlsFetch::MAX_SKIP`]
+/// polls between attempts. At the default two-second cadence that settles at
+/// roughly one attempt a minute, which is the right order for "the hive came
+/// back".
+#[derive(Debug, Default)]
+struct UrlsFetch {
+    /// `true` once the hive has answered with urls; nothing is asked after.
+    done: bool,
+    /// Polls still to skip before the next attempt.
+    skip: u32,
+    /// How many to skip after the next failure.
+    backoff: u32,
+}
+
+impl UrlsFetch {
+    /// The ceiling on the backoff, in polls.
+    const MAX_SKIP: u32 = 32;
+
+    /// Ask, if this attempt is due. `Err(())` means the GTK side is gone.
+    async fn attempt(
+        &mut self,
+        socket: &std::path::Path,
+        out: &UnboundedSender<Update>,
+    ) -> Result<(), ()> {
+        if self.done {
+            return Ok(());
+        }
+        if self.skip > 0 {
+            self.skip -= 1;
+            return Ok(());
+        }
+        if let Ok(resp) = client::request(socket, &Request::Urls).await
+            && let Some(urls) = resp.urls
+        {
+            self.done = true;
+            return out.send(Update::Urls(Box::new(urls))).map_err(|_| ());
+        }
+        self.backoff = (self.backoff.saturating_mul(2)).clamp(1, Self::MAX_SKIP);
+        self.skip = self.backoff;
+        Ok(())
     }
 }
 
@@ -246,7 +310,7 @@ mod tests {
     /// bytes `hive::wire`'s own test pins, restated here because this window is
     /// a second writer on the same socket and a divergence would be silent.
     ///
-    /// Mutation (verified red): drop `graceful`, or build the scope any other
+    /// Mutation (verified red, #1130 review M6): drop `graceful`, or build the scope any other
     /// way, and the line changes.
     #[test]
     fn the_three_verbs_put_their_pinned_bytes_on_the_socket() {
@@ -291,7 +355,7 @@ mod tests {
     /// The window's agent is picked **out of the roster by name**, not taken
     /// as the first row — a hive serves every agent on one answer.
     ///
-    /// Mutation (verified red): take `rows[0]` and the second assertion reds.
+    /// Mutation (verified red, #1130 review M18): take `rows[0]` and the second assertion reds.
     #[test]
     fn the_state_is_this_windows_agent_and_not_the_first_row() {
         let rows = vec![

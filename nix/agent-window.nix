@@ -47,7 +47,9 @@ stdenv.mkDerivation {
   dontBuild = true;
 
   nativeBuildInputs = [ wrapGAppsHook4 ];
-  inherit (workspace.passthru.devInputs) buildInputs;
+  # `webInputs`, not `buildInputs`: this is the one slice that ships a web
+  # engine, so its wrap is the one that may reference it (#1130 M1).
+  buildInputs = workspace.passthru.devInputs.webInputs;
 
   installPhase = ''
     runHook preInstall

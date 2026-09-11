@@ -11,7 +11,7 @@
 
 #![allow(dead_code, reason = "each test binary uses a different part of this")]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -25,8 +25,17 @@ pub struct FakeHive {
     _dir: tempfile::TempDir,
     path: PathBuf,
     seen: Arc<Mutex<Vec<String>>>,
+    /// `cmd` → the reason it is refused with `ok:false`. See
+    /// [`FakeHive::refusing`].
+    refusals: Table,
+    /// `cmd` → a verbatim reply line, for the verbs a test wants to script by
+    /// hand (see [`FakeHive::with_urls`]).
+    replies: Table,
     task: tokio::task::JoinHandle<()>,
 }
+
+/// A `cmd` → string table the serving task shares with the handle.
+type Table = Arc<Mutex<HashMap<String, String>>>;
 
 impl Drop for FakeHive {
     fn drop(&mut self) {
@@ -44,18 +53,60 @@ impl FakeHive {
         let path = dir.path().join("host.sock");
         let listener = UnixListener::bind(&path).expect("bind the fake host.sock");
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let replies: VecDeque<String> = script.iter().map(|s| (*s).to_owned()).collect();
+        let refusals: Table = Arc::new(Mutex::new(HashMap::new()));
+        let replies: Table = Arc::new(Mutex::new(HashMap::new()));
+        let queue: VecDeque<String> = script.iter().map(|s| (*s).to_owned()).collect();
         let task = tokio::spawn(accept_loop(
             listener,
-            Arc::new(Mutex::new(replies)),
+            Arc::new(Mutex::new(queue)),
             Arc::clone(&seen),
+            Arc::clone(&refusals),
+            Arc::clone(&replies),
         ));
         Self {
             _dir: dir,
             path,
             seen,
+            refusals,
+            replies,
             task,
         }
+    }
+
+    /// Answer the `urls` verb with a real `HiveUrls`.
+    ///
+    /// Without this the fake answers `urls` with a bare success carrying **no
+    /// urls field**, which is what a hive that cannot answer looks like — and
+    /// since #1130 L6 that is retried rather than given up on, so a test that
+    /// wants the once-and-done path has to say so.
+    #[must_use]
+    pub fn with_urls(self, domain: &str, home: &str) -> Self {
+        self.replies
+            .lock()
+            .expect("the reply table is never poisoned")
+            .insert(
+                "urls".to_owned(),
+                format!(
+                    r#"{{"version":1,"ok":true,"urls":{{"domain":"{domain}","home":"{home}"}}}}"#
+                ),
+            );
+        self
+    }
+
+    /// Answer `cmd` with `{"ok":false,"error":"<reason>"}` — **a hive that
+    /// says no**, which nothing could express before #1130's review: the fake
+    /// answered every non-`agent_status` verb with a bare success, so the
+    /// whole refusal path was unreachable from a test.
+    ///
+    /// Takes `self` so a test reads as one sentence
+    /// (`FakeHive::script(…).refusing("set_paused", "agent busy")`).
+    #[must_use]
+    pub fn refusing(self, cmd: &str, reason: &str) -> Self {
+        self.refusals
+            .lock()
+            .expect("the refusal table is never poisoned")
+            .insert(cmd.to_owned(), reason.to_owned());
+        self
     }
 
     /// The socket path a client dials.
@@ -87,6 +138,8 @@ async fn accept_loop(
     listener: UnixListener,
     script: Arc<Mutex<VecDeque<String>>>,
     seen: Arc<Mutex<Vec<String>>>,
+    refusals: Table,
+    replies: Table,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -94,7 +147,7 @@ async fn accept_loop(
         };
         // One request/response per connection, exactly like the real daemon
         // and what the client's one-connection-per-request model expects.
-        serve_one(stream, &script, &seen).await;
+        serve_one(stream, &script, &seen, &refusals, &replies).await;
     }
 }
 
@@ -102,6 +155,8 @@ async fn serve_one(
     stream: UnixStream,
     script: &Arc<Mutex<VecDeque<String>>>,
     seen: &Arc<Mutex<Vec<String>>>,
+    refusals: &Table,
+    replies: &Table,
 ) {
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
@@ -118,7 +173,27 @@ async fn serve_one(
         .expect("the recorder is never poisoned")
         .push(line);
 
-    let reply = if cmd == "agent_status" {
+    let refused = refusals
+        .lock()
+        .expect("the refusal table is never poisoned")
+        .get(&cmd)
+        .cloned();
+
+    let scripted = replies
+        .lock()
+        .expect("the reply table is never poisoned")
+        .get(&cmd)
+        .cloned();
+
+    let reply = if let Some(reason) = refused {
+        // The hive's own shape for a no: `ok:false` plus a sentence
+        // (`hive-host-sock`'s `HostResponse`). `client::request` turns it into
+        // `HiveError::Refused` carrying exactly this string.
+        let escaped = reason.replace('\\', r"\\").replace('"', r#"\""#);
+        format!(r#"{{"version":1,"ok":false,"error":"{escaped}"}}"#)
+    } else if let Some(line) = scripted {
+        line
+    } else if cmd == "agent_status" {
         let mut q = script.lock().expect("the script is never poisoned");
         if q.len() > 1 {
             q.pop_front().unwrap_or_default()

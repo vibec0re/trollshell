@@ -237,7 +237,7 @@ mod tests {
     use crate::feed::AgentState;
     use hytte_plugin_agents::config::{AgentsConfig, Display};
     use hytte_plugin_agents::hive::wire::{AgentStatusRow, HiveUrls};
-    use hytte_plugin_agents::model::{Agent, AgentName};
+    use hytte_plugin_agents::model::{Agent, AgentName, Status};
 
     fn name(s: &str) -> AgentName {
         AgentName::parse(s).expect("a legal test name")
@@ -264,7 +264,7 @@ mod tests {
     /// The header carries the harness's own words and the **short** model,
     /// with the full id kept for the hover.
     ///
-    /// Mutation (verified red): show `active_model` verbatim and the
+    /// Falsification: show `active_model` verbatim and the
     /// `model_word` assertion reds — the chip would read
     /// `claude-opus-5-20262981` in a header sized for `Opus`.
     #[test]
@@ -280,7 +280,7 @@ mod tests {
     /// `agents.toml`'s display block drives this window too — the same label
     /// and icon the sidebar card shows, from the same `AgentsConfig`.
     ///
-    /// Mutation (verified red): read `name.as_str()` directly instead of
+    /// Falsification: read `name.as_str()` directly instead of
     /// `cfg.label_for` and both assertions red.
     #[test]
     fn the_display_config_the_card_reads_names_this_window_too() {
@@ -333,11 +333,26 @@ mod tests {
     }
 
     /// Start and Stop are mutually exclusive, keyed on the same `Stopped` test
-    /// the card uses, and neither is live until the hive has answered.
+    /// the card uses, and neither is live until the hive has answered —
+    /// pinned across **all five** `Status` rows.
     ///
-    /// Mutation (verified red): key `can_start` on `!running` instead of
-    /// `Status::Stopped` and the paused case reds — a paused agent is running,
-    /// and offering it `Start` would be a no-op button.
+    /// All five, and not the three the fixtures happened to cover, because of
+    /// #1130's **M15**: `let stopped = !agent.row.running;` passed the whole
+    /// suite. The two predicates agree everywhere the old test looked — the
+    /// paused fixture is `running: true`, where both say "not stopped" — and
+    /// diverge exactly on `failed` and `needs_login` with `running: false`,
+    /// the two rows nothing covered. Driving the table off [`Status::ALL`] is
+    /// what makes "iterate the enum" the assertion rather than a habit.
+    ///
+    /// Worth stating because it surprised the reviewer too: a **`Failed`**
+    /// agent is offered **Stop**, not Start. That is P1's rule — the card's
+    /// `lifecycle_affordance` keys on the same `Status::Stopped` — so if it is
+    /// wrong it is wrong in both surfaces, and this test is where the two are
+    /// held together.
+    ///
+    /// Mutation (re-run this round, red): the reviewer's **M15**, keying
+    /// `stopped` on `!row.running`, now reds on the `Failed` and `NeedsLogin`
+    /// rows.
     #[test]
     fn the_lifecycle_buttons_are_exclusive_and_dead_until_the_hive_answers() {
         for state in [
@@ -351,32 +366,74 @@ mod tests {
             assert!(!c.live && !c.can_start && !c.can_stop, "{state:?}");
         }
 
-        let c = Controls::of(&up(running()));
+        // One row per `Status`, built so `Status::of` collapses to it — the
+        // same precedence the card renders (`failed > needs_login > paused >
+        // running > stopped`).
+        let rows: [(Status, AgentStatusRow); 5] = [
+            (
+                Status::Failed,
+                AgentStatusRow {
+                    failed: true,
+                    running: false,
+                    ..running()
+                },
+            ),
+            (
+                Status::NeedsLogin,
+                AgentStatusRow {
+                    needs_login: true,
+                    running: false,
+                    ..running()
+                },
+            ),
+            (
+                Status::Paused,
+                AgentStatusRow {
+                    paused: true,
+                    ..running()
+                },
+            ),
+            (Status::Stopped, AgentStatusRow {
+                running: false,
+                ..running()
+            }),
+            (Status::Running, running()),
+        ];
+        let covered: Vec<Status> = rows.iter().map(|(s, _)| *s).collect();
         assert_eq!(
-            (c.live, c.can_start, c.can_stop, c.paused),
-            (true, false, true, false)
+            covered,
+            Status::ALL.to_vec(),
+            "every Status row must be pinned here, in precedence order — that is what M15 \
+             slipped through"
         );
 
-        let stopped = AgentStatusRow {
-            running: false,
-            ..running()
-        };
-        let c = Controls::of(&up(stopped));
-        assert_eq!(
-            (c.live, c.can_start, c.can_stop, c.paused),
-            (true, true, false, false)
-        );
+        for (expected, row) in rows {
+            let state = up(row);
+            let status = state.agent().expect("built as Up").status();
+            assert_eq!(status, expected, "the fixture collapses to {expected:?}");
 
-        let paused = AgentStatusRow {
-            paused: true,
-            ..running()
-        };
-        let c = Controls::of(&up(paused));
-        assert_eq!(
-            (c.live, c.can_start, c.can_stop, c.paused),
-            (true, false, true, true),
-            "a paused agent is running — it is offered Stop, not Start"
-        );
+            let c = Controls::of(&state);
+            assert!(c.live, "{expected:?}: the hive has answered");
+            assert_eq!(
+                c.can_start,
+                expected == Status::Stopped,
+                "{expected:?}: Start is offered exactly when the agent is stopped"
+            );
+            assert_eq!(
+                c.can_stop,
+                expected != Status::Stopped,
+                "{expected:?}: Stop is offered exactly when it is not"
+            );
+            assert!(
+                !(c.can_start && c.can_stop),
+                "{expected:?}: the two are mutually exclusive"
+            );
+            assert_eq!(
+                c.paused,
+                expected == Status::Paused,
+                "{expected:?}: the toggle follows the hive"
+            );
+        }
     }
 
     /// The settings page shows what the hive says, and a dash where it says

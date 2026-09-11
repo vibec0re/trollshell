@@ -2799,12 +2799,35 @@ trollshell`. Expect the cards to come back Active and **no notification at
     `execve` is the defect; most programs then try to open a file called `%U`.
   - **A `DBusActivatable` entry is activated, not forked.** Find one
     (`grep -l 'DBusActivatable=true' …/applications/*.desktop` — most GNOME apps
-    qualify) and name it in a stack. On **▶** the app must start, and
+    qualify) whose desktop id is a **dotted** name like `org.gnome.Nautilus`, and
+    name it in a stack. On **▶** the app must start, and
     `systemctl --user list-units 'trollshell-ws-<name>-*'` must show **no unit
     for it**: the bus started it, so it lives in its own `app-*.service` and not
     in the stack's slice. Consequence worth checking in the same breath — **⏹
     reaches it through the per-window walk** rather than through the slice stop,
     so confirm Stop still closes it.
+  - **…but a `DBusActivatable` entry whose id is not a bus name is launched
+    normally.** The case #1113's review found: GIO takes its D-Bus path only for
+    a valid derived bus name and otherwise **forks the child into
+    `trollshell.service`'s own cgroup** — no slice, dies with the next shell
+    restart. Copy such an entry to
+    `~/.local/share/applications/` under a one-element id (e.g. `Alacritty`) and
+    add `DBusActivatable=true` to it. On ▶ the app must come up **in the stack's
+    slice**: `systemctl --user list-units 'trollshell-ws-<name>-*'` names a unit
+    for it, and `systemd-cgls --user-unit trollshell.service` shows **no** stray
+    child of the shell. That last command is the one that catches a regression
+    here; the app starting either way is not the test.
+  - **…and an activation the bus declines is not reported as a failure.** Worth
+    knowing rather than checking: GIO issues the activation asynchronously and
+    returns success without waiting, so a `DBusActivatable` entry whose name is
+    not actually activatable produces no error line — the app simply never
+    appears and §3.4's grace window names it in the missing-apps warning like any
+    other app that did not arrive.
+  - **An entry whose `TryExec` is missing is skipped by name.** Copy an entry to
+    `~/.local/share/applications/` and set `TryExec=definitely-not-installed`.
+    On ▶ the journal must carry one warning naming that app **and** saying its
+    `TryExec` names a program that is not installed — not a unit start failure,
+    which is what it looked like before.
   - **An `exec` override wins, verbatim.** Give that same app an
     `exec = "…"`. It must be forked into `trollshell-ws-<name>-N.service` as
     written — no activation, and no field-code stripping either (a `%` you type
@@ -2861,22 +2884,54 @@ trollshell`. Expect the cards to come back Active and **no notification at
   - **…and a drop on a card in another column does both.** The stack's `monitor`
     changes **and** its place in `order` does, and an Active stack's workspace
     moves screens in the same beat.
+  - **…but a drop inside the "Not connected" column records no screen.** #1113's
+    review HIGH. Give two stacks `monitor = "DP-9"` (or unplug a screen) so the
+    trailing greyed column appears with both cards in it, `md5sum` the file, and
+    drag one **onto the other**. `order` must change and `monitor` must **not** —
+    in particular the file must never gain `monitor = "Not connected"`, and
+    `niri msg workspaces` must show nothing moved. Dropping on that column's
+    empty background must do nothing at all.
   - **Renaming.** With a stack **stopped**, change its name in Edit and Save:
     the `[workspace.<old>]` table becomes `[workspace.<new>]` and `order` has
     the new name **in the old one's slot**, not appended at the end. With the
     stack **started**, the same rename must be **refused** — the name field goes
-    red and its tooltip says to stop the workspace first. That is deliberate:
-    the running apps are in `trollshell-ws-<old>.slice` and in units named after
-    it, so a renamed entry would leave them unstoppable from the page.
+    red and the page says to stop the workspace first. That is deliberate: the
+    running apps are in `trollshell-ws-<old>.slice` and in units named after it,
+    so a renamed entry would leave them unstoppable from the page.
+  - **…and refused *while starting* too** (#1113's review MEDIUM 2, the window
+    it matters most in). Press **▶** on a stopped stack and immediately press
+    **✎** — the Edit button is not disabled while a Start is in flight. Rename
+    and Save: refused, the same way. Before the fix this was the one gesture that
+    got through, and the grace window is up to ten seconds wide.
   - **An invalid name is refused with the sanitised form offered.** Type
-    `Chat Room!` and Save: the field goes red, keeps what you typed, and the
-    tooltip offers `chat-room`. Nothing is written. Type `chat--dev` — also
-    refused; a doubled dash is an invalid systemd unit, measured in #1101.
+    `Chat Room!` and Save: the field goes red, keeps what you typed, and the page
+    offers `chat-room`. Nothing is written. Type `chat--dev` — also refused; a
+    doubled dash is an invalid systemd unit, measured in #1101.
+  - **A name another stack already has is refused in the form.** Type an existing
+    stack's name and Save. The page must say so **and stay open with everything
+    you typed still there** — the app list, the launch commands, the layout. A
+    toast plus an empty drawer means the write result is being discovered after
+    the form has already been thrown away (#1113's review MEDIUM 8).
+  - **Save and Cancel stay on screen with a long list.** Add ten apps to a stack
+    on a 768-tall panel. The app list scrolls; the **Save/Cancel row does not
+    move** and needs no scrolling to reach. Before the fix the page had no
+    scroller at all and the buttons were clipped off the bottom at six apps.
+  - **Add app is not built until you open it.** Open Edit on a stack and watch
+    for a stall: the page must appear immediately. The `AppInfo::all()` scan and
+    the row rendering happen on the **first click** of *Add app…*, not while the
+    page is being built (#1113's review MEDIUM 6) — which on a desktop with a few
+    hundred entries was the difference between an instant page and a visible
+    freeze, on every drawer.
   - **The form survives the refresh poll.** Open Edit, type half a name and half
     a launch command, then wait ten seconds (the config poll and the slice poll
     both tick) and `touch ~/.config/trollshell/workspaces.toml` to force a
     reload. Both half-typed values must still be there. A form that blanks
     itself every few seconds is the regression this row exists for.
+  - **Edit on a stack that has gone says so.** With the drawer open on the
+    Workspaces page, delete a stack from `workspaces.toml` by hand and press its
+    **✎** before the poll rebuilds the card. Expect a notification saying it is
+    no longer in the file — not a button that does nothing (#1113's review
+    LOW 15).
 
 ## Control-center
 

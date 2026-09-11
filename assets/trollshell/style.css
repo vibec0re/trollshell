@@ -841,6 +841,19 @@
     min-height: 1.6em;
     padding: 0;
 }
+/* The form body scrolls and the action row below it does not (#1113 review
+   MEDIUM 5), so Save and Cancel stay on screen however long the app list is.
+   No background of its own — the page is the surface. */
+.ts-ws-edit-scroller {
+    background: none;
+}
+/* Why a Save was refused, under the buttons. Shown in the page rather than only
+   as a toast, because the draft is still here to correct. */
+.ts-ws-edit-error {
+    color: @error_color;
+    font-size: 0.9em;
+    margin-top: 0.231em;
+}
 /* The Add-app picker's popover (#1071 §5). Width is set here rather than in
    Rust so it scales with the font like the rest of the drawer. */
 .ts-ws-picker {

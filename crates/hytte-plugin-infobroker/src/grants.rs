@@ -1497,16 +1497,38 @@ mod tests {
     ///
     /// One writer thread alternates between two very differently-sized,
     /// content-distinguishable snapshots (`small`/`large`) many times over,
-    /// while this thread polls the file and — whenever it can read *and*
-    /// parse it — asserts the result is exactly one of those two snapshots.
-    /// Checking against the *known values*, not just "did it parse", is the
-    /// point: an interrupted `std::fs::write`'s `O_TRUNC` can leave a reader
-    /// looking at a perfectly valid-TOML *empty* file, which `parse_grants`
-    /// accepts (`empty_body_is_an_empty_store`) — a plain "parse succeeded"
-    /// check would miss exactly that failure mode.
+    /// while this thread makes a bounded number of read attempts and —
+    /// whenever it can read *and* parse the file — asserts the result is
+    /// exactly one of those two snapshots. Checking against the *known
+    /// values*, not just "did it parse", is the point: an interrupted
+    /// `std::fs::write`'s `O_TRUNC` can leave a reader looking at a
+    /// perfectly valid-TOML *empty* file, which `parse_grants` accepts
+    /// (`empty_body_is_an_empty_store`) — a plain "parse succeeded" check
+    /// would miss exactly that failure mode.
+    ///
+    /// #1117: the original shape bounded the reader by a 10s wall-clock
+    /// deadline and polled `std::fs::read_to_string` in a *tight* loop with
+    /// no yield between attempts. On a real desktop that reader still loses
+    /// races to the scheduler often enough to work, but inside a
+    /// CPU-constrained sandbox (one core, no preemption headroom) the
+    /// unyielding reader thread can monopolize the only CPU and starve the
+    /// writer thread of the scheduler time it needs to make its 20,000
+    /// writes — reproduced locally as a 125s run under `taskset -c 0 nice -n
+    /// 19` against a same-core `yes` burner, versus 3.6s uncontended. Every
+    /// wait here is now a **fixed step count**, not a wall-clock budget:
+    /// the writer's iteration count is small, the reader's read-attempt
+    /// count is capped, and `std::thread::yield_now()` between attempts
+    /// hands the scheduler back to the writer instead of spinning past it.
+    /// A `Barrier` gives the two threads a deterministic rendezvous after
+    /// the writer's warm-up, so the reader's bounded attempts land inside
+    /// the writer's busiest stretch rather than racing its thread-spawn
+    /// startup.
     #[test]
     fn write_atomic_never_exposes_a_torn_file_to_a_concurrent_reader() {
-        const ITERATIONS: usize = 20_000;
+        const WARMUP_ITERATIONS: usize = 150;
+        const WRITER_ITERATIONS: usize = 3_500;
+        const READ_ATTEMPTS: usize = 2_000;
+        const MIN_RACED_READS: usize = 15;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("grants.toml");
@@ -1527,44 +1549,69 @@ mod tests {
         // not "file doesn't exist yet".
         write_atomic(&path, &small).expect("seed write");
 
+        // Deterministic handoff (#1117): the writer warms up alone — its
+        // thread spawn and first writes settle — then rendezvouses with the
+        // main thread here before doing the rest of its writes. The main
+        // thread starts its bounded read attempts only once released, so
+        // they land squarely inside the writer's ongoing loop instead of
+        // spending the attempt budget on the writer's startup.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_barrier = std::sync::Arc::clone(&barrier);
+
         let writer_path = path.clone();
         let (small_w, large_w) = (small.clone(), large.clone());
         let writer = std::thread::spawn(move || {
-            for i in 0..ITERATIONS {
+            for i in 0..WARMUP_ITERATIONS {
+                let body = if i % 2 == 0 { &small_w } else { &large_w };
+                write_atomic(&writer_path, body).expect("write_atomic");
+            }
+            writer_barrier.wait();
+            for i in WARMUP_ITERATIONS..WRITER_ITERATIONS {
                 let body = if i % 2 == 0 { &small_w } else { &large_w };
                 write_atomic(&writer_path, body).expect("write_atomic");
             }
         });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        barrier.wait();
+
         let mut reads = 0usize;
-        while !writer.is_finished() && std::time::Instant::now() < deadline {
+        let mut attempts = 0usize;
+        while attempts < READ_ATTEMPTS && !writer.is_finished() {
+            attempts += 1;
             let Ok(text) = std::fs::read_to_string(&path) else {
-                continue; // a transient read error is not tearing; keep polling
+                std::thread::yield_now(); // transient read error, not tearing; keep polling
+                continue;
             };
             // Only reachable if `write_atomic` regresses to a non-atomic
             // truncate-then-write; a real rename(2) never exposes this.
             assert!(
                 !text.is_empty(),
-                "read a fully empty grants.toml mid-write — a torn (truncated) write"
+                "read a fully empty grants.toml mid-write on attempt {attempts} — \
+                 a torn (truncated) write"
             );
-            reads += 1;
             match parse_grants(&text) {
-                Ok(grants) => assert!(
-                    grants == small_grants || grants == large_grants,
-                    "read {} grants (first: {:?}) — neither the old nor the new snapshot, \
-                     i.e. a torn write",
-                    grants.len(),
-                    grants.first().map(|g| &g.agent),
+                Ok(grants) => {
+                    assert!(
+                        grants == small_grants || grants == large_grants,
+                        "attempt {attempts}: read {} grants (first: {:?}) — neither the old \
+                         nor the new snapshot, i.e. a torn write",
+                        grants.len(),
+                        grants.first().map(|g| &g.agent),
+                    );
+                    reads += 1;
+                }
+                Err(e) => panic!(
+                    "attempt {attempts}: read invalid TOML mid-write (a torn write): \
+                     {e}\n---\n{text}"
                 ),
-                Err(e) => panic!("read invalid TOML mid-write (a torn write): {e}\n---\n{text}"),
             }
+            std::thread::yield_now();
         }
         writer.join().expect("writer thread panicked");
         assert!(
-            reads > 50,
-            "the reader only raced the writer {reads} times — widen the fixture or \
-             iteration count so this test actually contends",
+            reads > MIN_RACED_READS,
+            "the reader only raced the writer {reads} times in {attempts} attempts — widen \
+             the fixture or iteration count so this test actually contends",
         );
     }
 }

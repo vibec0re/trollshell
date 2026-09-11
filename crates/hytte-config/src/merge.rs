@@ -65,7 +65,11 @@
 //! [`crate::subsystem::assemble`] logs it **naming the layer file**. The
 //! detection lives here, next to the code that honours the marker; the
 //! reporting lives there, where the file name is — the same split, for the
-//! same reason, as rule 4's unknown keys.
+//! same reason, as rule 4's unknown keys. Since #1018 `assemble` also returns
+//! the finding as data, on [`crate::subsystem::Loaded::findings`], the way
+//! rule 4 returns unknown keys on `unknown_keys` — this module still never
+//! sees a layer name, so the pairing happens where [`crate::subsystem`]
+//! already computes one for the `warn!`.
 //!
 //! # A marker that names nothing
 //!

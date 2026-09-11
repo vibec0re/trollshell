@@ -87,6 +87,12 @@
 //! either. [`crate::merge::inert_unset`] finds a name no layer sets and
 //! [`assemble`] warns, same split, same reason (#1008).
 //!
+//! Since #1018, the third and fourth shapes are also returned as data, on
+//! [`Loaded::findings`], the way the first two are on [`Loaded::unknown_keys`]
+//! — so a settings UI can show a typo'd `_unset` without scraping the journal.
+//! The `warn!` calls are unchanged; the `Vec` is filled from the same two
+//! loops, not a second pass.
+//!
 //! # Why the writer patches instead of re-rendering
 //!
 //! Same reason as `places` (#703): once the control center can edit a file a
@@ -381,6 +387,56 @@ pub fn warn_rejected_value(subsystem: &str, key: &str, invalid: &str) {
     tracing::warn!(subsystem, key, "{}", rejected_value_message(invalid));
 }
 
+/// Which [`crate::merge::UNSET_KEY`] problem a [`Finding`] reports.
+///
+/// `#[non_exhaustive]`: every [`Finding`] is built inside this crate, from
+/// [`crate::merge::MalformedUnset`]/[`crate::merge::InertUnset`], and a third
+/// marker shape is plausible the same way a third field on either of those is
+/// (their own docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FindingKind {
+    /// A [`crate::merge::UNSET_KEY`] marker whose shape
+    /// [`crate::merge::merge_into`] could not honour — from a
+    /// [`crate::merge::MalformedUnset`].
+    MalformedUnset,
+    /// A well-formed [`crate::merge::UNSET_KEY`] name that matched no key any
+    /// layer sets — from a [`crate::merge::InertUnset`].
+    InertUnset,
+}
+
+/// One `_unset`-marker problem [`assemble`] found, attributed to the layer it
+/// came from — the same information the `warn!` beside it logs, kept as data
+/// for a caller with no journal to scrape (#1018).
+///
+/// [`crate::merge`] never sees a file name (its module docs lean on that), so
+/// this type — not [`crate::merge::MalformedUnset`]/[`crate::merge::InertUnset`]
+/// themselves — is where the layer is attached: `assemble` already renders a
+/// layer name once per finding for the `warn!` field, and this pairs the same
+/// string with the same finding rather than teaching `merge` a new concept.
+///
+/// `#[non_exhaustive]`: every construction site is inside this crate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Finding {
+    /// Which layer the marker was found in: a path, or "the built-in
+    /// default" — rendered exactly like the `warn!`'s `layer` field beside
+    /// it.
+    pub layer: String,
+    /// Dotted path: the marker's own path for [`FindingKind::MalformedUnset`]
+    /// ([`crate::merge::MalformedUnset::key`]), the *named* key's path for
+    /// [`FindingKind::InertUnset`] ([`crate::merge::InertUnset::key`]).
+    pub key: String,
+    /// Which problem this is.
+    pub kind: FindingKind,
+    /// The one-line sentence [`crate::merge::MalformedUnset`]'s or
+    /// [`crate::merge::InertUnset`]'s own `Display` renders — not the `warn!`
+    /// message text, which is a fixed constant naming neither the key nor the
+    /// layer; this is the sentence a UI with no structured-log fields to read
+    /// would want to show instead.
+    pub message: String,
+}
+
 /// A loaded subsystem config, plus what the load learned on the way.
 #[derive(Clone, Debug)]
 pub struct Loaded<S> {
@@ -392,6 +448,11 @@ pub struct Loaded<S> {
     /// Dotted paths of keys no layer's schema knows. Warned, never fatal;
     /// returned as well so a settings UI can surface them.
     pub unknown_keys: Vec<String>,
+    /// Malformed and inert `_unset` markers found while assembling the
+    /// layers — see [`Finding`]. Warned exactly as before (#988/#1008); this
+    /// is the same information returned as data, the way rule 4's typos are
+    /// on `unknown_keys` (#1018).
+    pub findings: Vec<Finding>,
 }
 
 /// Why a layered load or save failed.
@@ -588,6 +649,13 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
         tables.push(parse_layer(body, Some(path))?);
     }
 
+    // #1018: the findings returned in `Loaded::findings` below are built from
+    // these same two loops, not a second pass over the layers — one `push`
+    // beside each `warn!`, so the two can never drift apart on *which*
+    // markers were found, only (if a mutation drops one) on whether this
+    // `Vec` or the journal hears about it.
+    let mut findings: Vec<Finding> = Vec::new();
+
     // #988: a `_unset` the merge cannot honour is dropped either way, so it
     // has to be *said* — otherwise the user gets the inherited value back with
     // no signal at all, which is the invisible failure the module docs above
@@ -596,13 +664,20 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
     // attribute to a file.
     for (path, table) in paths.iter().zip(&tables) {
         for bad in merge::malformed_unset(table) {
+            let layer = layer_name(*path);
             tracing::warn!(
                 subsystem = S::NAME,
-                layer = %layer_name(*path),
+                layer = %layer,
                 key = %bad.key,
                 found = bad.found,
                 "{MALFORMED_UNSET_MESSAGE}"
             );
+            findings.push(Finding {
+                layer,
+                key: bad.key.clone(),
+                kind: FindingKind::MalformedUnset,
+                message: bad.to_string(),
+            });
         }
     }
 
@@ -612,12 +687,19 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
     // marker is stripped before the schema is shown the table, so the name
     // inside it never reaches `serde_ignored`.
     for inert in merge::inert_unset(&tables) {
+        let layer = layer_name(paths[inert.layer]);
         tracing::warn!(
             subsystem = S::NAME,
-            layer = %layer_name(paths[inert.layer]),
+            layer = %layer,
             key = %inert.key,
             "{INERT_UNSET_MESSAGE}"
         );
+        findings.push(Finding {
+            layer,
+            key: inert.key.clone(),
+            kind: FindingKind::InertUnset,
+            message: inert.to_string(),
+        });
     }
 
     let merged = merge::merge_all(tables);
@@ -642,6 +724,7 @@ pub fn assemble<S: Subsystem>(layers: &[(PathBuf, String)]) -> Result<Loaded<S>,
         config,
         sources: layers.iter().map(|(path, _)| path.clone()).collect(),
         unknown_keys,
+        findings,
     })
 }
 

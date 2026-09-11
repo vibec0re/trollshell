@@ -19,12 +19,15 @@
 //!    here rather than silently bricking every deployed plugin.
 
 use hytte_plugin_proto::{
-    AccentRole, Cls, DotMatrixConfig, DotMatrixState, FlipBoardConfig, FlipBoardState, GaugeConfig,
+    AccentRole, Cls, DEFAULT_DOT_PX, DotMatrixConfig, DotMatrixState, FlipBoardConfig,
+    FlipBoardState, GaugeConfig,
     GaugeRange, GaugeState, HostMsg, LedStripConfig, LedStripState, MAX_BUFFER_DIM, MAX_CELLS,
-    MAX_DAMPING, MAX_FLIP_DURATION_SECS, MAX_FLIP_STAGGER_SECS, MAX_FREQUENCY_HZ, MAX_GAP_DOTS,
+    MAX_DAMPING, MAX_DOT_PX, MAX_FLIP_DURATION_SECS, MAX_FLIP_STAGGER_SECS, MAX_FREQUENCY_HZ,
+    MAX_GAP_DOTS,
     MAX_LEDS, MAX_MARQUEE_SPEED_DPS, MAX_PEAK_HOLD_RATE, MAX_RASTER_PIXELS, MAX_SCALE,
     MAX_SCOPE_SAMPLES, MAX_STRIP_DIM, MAX_SWEEP_DEG, MAX_TEXT_LEN, MIN_DAMPING,
-    MIN_FLIP_DURATION_SECS, MIN_FREQUENCY_HZ, MIN_SWEEP_DEG, Manifest, MarqueeConfig, MarqueeState,
+    MIN_DOT_PX, MIN_FLIP_DURATION_SECS, MIN_FREQUENCY_HZ, MIN_SWEEP_DEG, Manifest, MarqueeConfig,
+    MarqueeState,
     Mechanism, Mount, Node, PREEM_VOCAB, PeakHoldConfig, PluginMsg, PreemWidget, ScopeConfig,
     ScopeState, SevenSegConfig, SevenSegState, StyleName, StyleRef, TextBoxConfig, TextBoxState,
     TextBoxWidth, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body, preem,
@@ -60,6 +63,9 @@ fn all_widgets() -> Vec<PreemWidget> {
         PreemWidget::DotMatrix {
             config: DotMatrixConfig {
                 style: StyleRef::new(StyleName::Vfd),
+                // Non-default on purpose, like every other field here: a
+                // dropped `dot_px` has to show up as an inequality.
+                dot_px: 2,
             },
             state: DotMatrixState {
                 text: "12:34".into(),
@@ -104,6 +110,7 @@ fn all_widgets() -> Vec<PreemWidget> {
                 style: StyleRef::new(StyleName::Vfd).with_accent(AccentRole::Neutral),
                 window_px: 268,
                 gap_dots: 8,
+                dot_px: 3,
                 speed_dots_per_sec: 24.5,
             },
             state: MarqueeState {
@@ -433,14 +440,25 @@ fn wire_defaults_match_the_documented_kit_values() {
         "led_strip.rs:36 DEFAULT_LEDS"
     );
     assert_eq!(
+        DotMatrixConfig::default(),
+        DotMatrixConfig {
+            style: StyleRef::default(),
+            dot_px: DEFAULT_DOT_PX,
+        },
+        "dot_matrix.rs's DEFAULT_DOT_PX — 4, the pitch every pre-#1091 frame \
+         rendered at"
+    );
+    assert_eq!(
         MarqueeConfig::default(),
         MarqueeConfig {
             style: StyleRef::default(),
             window_px: 192,
             gap_dots: 6,
+            dot_px: DEFAULT_DOT_PX,
             speed_dots_per_sec: 12.0,
         },
-        "marquee.rs:80-84 for window_px/gap_dots; speed_dots_per_sec has no kit \
+        "marquee.rs:80-84 for window_px/gap_dots; dot_px is dot_matrix.rs's \
+         DEFAULT_DOT_PX (#1091); speed_dots_per_sec has no kit \
          default (#882 invented the field) — 12.0 is the #929 taste call, down \
          from the audio widget's own ≈20 dots/s (main.rs:134-144), which the \
          widget still sets explicitly and does not follow this default"
@@ -826,6 +844,302 @@ fn a_text_box_config_written_before_the_notdef_key_decodes_unset() {
         },
         "…and nothing else moved",
     );
+}
+
+// ── #1091: the dot pitch ─────────────────────────────────────────────────────
+
+/// A pitch nobody moved costs **no bytes**, which is what keeps every committed
+/// golden fixture byte-identical across #1091 and is why
+/// `golden_bytes_are_pinned` was not regenerated for this change.
+///
+/// Anchored on the encoded key (`\xa6dot_px`) rather than on a loose substring,
+/// with a positive control on the same widget so an anchor that matches nothing
+/// cannot pass for the wrong reason — the idiom
+/// [`an_unpinned_palette_adds_no_key_to_the_wire`] established.
+///
+/// **Falsified** by dropping `skip_serializing_if` from either field: the
+/// default-pitch encoding starts writing an explicit `4` and both the absence
+/// scan here and `golden_bytes_are_pinned` go red.
+#[test]
+fn a_default_dot_px_never_reaches_the_wire() {
+    let key: &[u8] = b"\xa6dot_px";
+    let carries = |widget: &PreemWidget| encode(widget).windows(key.len()).any(|w| w == key);
+
+    let default_pitch = [
+        PreemWidget::DotMatrix {
+            config: DotMatrixConfig::default(),
+            state: DotMatrixState {
+                text: "12:34".into(),
+            },
+        },
+        PreemWidget::Marquee {
+            config: MarqueeConfig::default(),
+            state: MarqueeState {
+                text: "Roygbiv".into(),
+            },
+        },
+    ];
+    for widget in default_pitch {
+        assert!(
+            !carries(&widget),
+            "{}'s default-pitch encoding must not carry a `dot_px` key",
+            widget.kind()
+        );
+    }
+
+    let moved_pitch = [
+        PreemWidget::DotMatrix {
+            config: DotMatrixConfig {
+                dot_px: MIN_DOT_PX,
+                ..DotMatrixConfig::default()
+            },
+            state: DotMatrixState {
+                text: "12:34".into(),
+            },
+        },
+        PreemWidget::Marquee {
+            config: MarqueeConfig {
+                dot_px: MIN_DOT_PX,
+                ..MarqueeConfig::default()
+            },
+            state: MarqueeState {
+                text: "Roygbiv".into(),
+            },
+        },
+    ];
+    for widget in moved_pitch {
+        assert!(
+            carries(&widget),
+            "{}'s moved-pitch encoding must carry exactly that key, or the check above is blind",
+            widget.kind()
+        );
+    }
+
+    // Every *other* widget is untouched by #1091 and must stay keyless too —
+    // the mistake would be adding the field to the shared `StyleRef`.
+    for widget in all_widgets() {
+        if matches!(
+            widget,
+            PreemWidget::DotMatrix { .. } | PreemWidget::Marquee { .. }
+        ) {
+            continue;
+        }
+        assert!(
+            !carries(&widget),
+            "{} has no dot pitch and must not carry the key",
+            widget.kind()
+        );
+    }
+}
+
+/// Backward: a peer built before #1091 writes no `dot_px` key at all, and the
+/// field's `serde(default)` supplies [`DEFAULT_DOT_PX`] — the pitch that peer
+/// was in fact rendering at — rather than failing the frame or reading `0`.
+///
+/// **Falsified** by giving either field a default of anything but 4: an
+/// already-deployed plugin's ticker would silently change size on glass.
+#[test]
+fn a_config_written_before_the_dot_px_key_decodes_at_the_default_pitch() {
+    #[derive(serde::Serialize)]
+    struct PreDotMatrix {
+        style: StyleRef,
+    }
+    #[derive(serde::Serialize)]
+    struct PreMarquee {
+        style: StyleRef,
+        window_px: u32,
+        gap_dots: u32,
+        speed_dots_per_sec: f32,
+    }
+
+    let bytes = rmp_serde::to_vec_named(&PreDotMatrix {
+        style: StyleRef::new(StyleName::Vfd),
+    })
+    .expect("the pre-#1091 dot-matrix config encodes");
+    assert!(
+        !bytes.windows(6).any(|w| w == b"dot_px"),
+        "an old frame carries no key"
+    );
+    let back = decode_body::<DotMatrixConfig>(&bytes).expect("a pre-#1091 config still decodes");
+    assert_eq!(
+        back,
+        DotMatrixConfig {
+            style: StyleRef::new(StyleName::Vfd),
+            dot_px: DEFAULT_DOT_PX,
+        },
+        "an absent pitch is the pitch that peer rendered at"
+    );
+
+    let bytes = rmp_serde::to_vec_named(&PreMarquee {
+        style: StyleRef::new(StyleName::Lcd).with_accent(AccentRole::Neutral),
+        window_px: 268,
+        gap_dots: 8,
+        speed_dots_per_sec: 24.5,
+    })
+    .expect("the pre-#1091 marquee config encodes");
+    let back = decode_body::<MarqueeConfig>(&bytes).expect("a pre-#1091 config still decodes");
+    assert_eq!(
+        back,
+        MarqueeConfig {
+            style: StyleRef::new(StyleName::Lcd).with_accent(AccentRole::Neutral),
+            window_px: 268,
+            gap_dots: 8,
+            dot_px: DEFAULT_DOT_PX,
+            speed_dots_per_sec: 24.5,
+        },
+        "…and nothing else moved"
+    );
+}
+
+/// Forward — the direction [`VOCAB`] exists for. A plugin rebuilt on the new
+/// SDK asks for a 2 px pitch against a shell that predates the field. The
+/// named-map encoding has no `deny_unknown_fields`, so the old decoder *skips*
+/// the key and draws the widget exactly as it did before, rather than failing
+/// the whole frame. That is what puts an appended **field** on the additive side
+/// where an appended **variant** would need a `VOCAB` bump.
+#[test]
+fn an_older_host_skips_the_dot_px_it_has_never_heard_of() {
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    struct PreMarquee {
+        style: StyleRef,
+        window_px: u32,
+        gap_dots: u32,
+        speed_dots_per_sec: f32,
+    }
+
+    let config = MarqueeConfig {
+        dot_px: MIN_DOT_PX,
+        ..MarqueeConfig::default()
+    };
+    let body = encode_body(&config);
+    assert!(
+        body.windows(6).any(|w| w == b"dot_px"),
+        "the new frame does carry it"
+    );
+    let old: PreMarquee = decode_body(&body).expect("a pre-#1091 host still decodes the frame");
+    assert_eq!(
+        old,
+        PreMarquee {
+            style: StyleRef::default(),
+            window_px: 192,
+            gap_dots: 6,
+            speed_dots_per_sec: 12.0,
+        },
+        "the unknown key is skipped, not fatal"
+    );
+}
+
+/// A moved pitch round-trips as itself on both widgets, across the whole legal
+/// range — the basic thing the two compat tests above are compat *about*.
+#[test]
+fn a_moved_dot_px_round_trips() {
+    for px in MIN_DOT_PX..=MAX_DOT_PX {
+        let dm = PreemWidget::DotMatrix {
+            config: DotMatrixConfig {
+                style: StyleRef::new(StyleName::Vfd),
+                dot_px: px,
+            },
+            state: DotMatrixState {
+                text: "12:34".into(),
+            },
+        };
+        assert_eq!(
+            decode::<PreemWidget>(&encode(&dm)).expect("dot matrix decodes"),
+            dm,
+            "dot_px {px}"
+        );
+        let mq = PreemWidget::Marquee {
+            config: MarqueeConfig {
+                dot_px: px,
+                ..MarqueeConfig::default()
+            },
+            state: MarqueeState {
+                text: "Roygbiv".into(),
+            },
+        };
+        assert_eq!(
+            decode::<PreemWidget>(&encode(&mq)).expect("marquee decodes"),
+            mq,
+            "dot_px {px}"
+        );
+    }
+}
+
+/// The pitch clamps into `MIN_DOT_PX..=MAX_DOT_PX` on both widgets — `0` and
+/// `1` come up to 2, `9` and `u32::MAX` come down to 8 — matching the kit's own
+/// `Dots::new`, and the dot matrix's character budget is derived against the
+/// **clamped** pitch so the strip bound holds at every pitch.
+///
+/// **Falsified** by deriving the budget from a fixed 24 px pitch: at
+/// `MAX_DOT_PX` a character is 48 px, so the strip would come out twice
+/// [`MAX_STRIP_DIM`].
+#[test]
+fn the_dot_pitch_clamps_into_range() {
+    for (asked, want) in [
+        (0, MIN_DOT_PX),
+        (1, MIN_DOT_PX),
+        (MIN_DOT_PX, MIN_DOT_PX),
+        (DEFAULT_DOT_PX, DEFAULT_DOT_PX),
+        (MAX_DOT_PX, MAX_DOT_PX),
+        (MAX_DOT_PX + 1, MAX_DOT_PX),
+        (u32::MAX, MAX_DOT_PX),
+    ] {
+        let dm = PreemWidget::DotMatrix {
+            config: DotMatrixConfig {
+                dot_px: asked,
+                ..DotMatrixConfig::default()
+            },
+            state: DotMatrixState::default(),
+        }
+        .clamped();
+        let PreemWidget::DotMatrix { config, .. } = dm else {
+            unreachable!()
+        };
+        assert_eq!(config.dot_px, want, "dot matrix asked for {asked}");
+
+        let mq = PreemWidget::Marquee {
+            config: MarqueeConfig {
+                dot_px: asked,
+                ..MarqueeConfig::default()
+            },
+            state: MarqueeState::default(),
+        }
+        .clamped();
+        let PreemWidget::Marquee { config, .. } = mq else {
+            unreachable!()
+        };
+        assert_eq!(config.dot_px, want, "marquee asked for {asked}");
+    }
+
+    // The strip budget follows the pitch: at 8 px a character is 48 px wide, so
+    // the surviving text is half what the default pitch allows, and either way
+    // the rendered strip stays inside MAX_STRIP_DIM.
+    for px in [MIN_DOT_PX, DEFAULT_DOT_PX, MAX_DOT_PX] {
+        let clamped = PreemWidget::DotMatrix {
+            config: DotMatrixConfig {
+                dot_px: px,
+                ..DotMatrixConfig::default()
+            },
+            state: DotMatrixState {
+                text: "x".repeat(MAX_TEXT_LEN),
+            },
+        }
+        .clamped();
+        let PreemWidget::DotMatrix { config, state } = clamped else {
+            unreachable!()
+        };
+        let chars = u32::try_from(state.text.chars().count()).expect("char count fits");
+        let width = 2 * config.dot_px + chars * 6 * config.dot_px - config.dot_px;
+        assert!(
+            width <= MAX_STRIP_DIM,
+            "a {px} px pitch renders {chars} chars as {width} px, past MAX_STRIP_DIM"
+        );
+        assert_eq!(
+            chars,
+            MAX_STRIP_DIM / (6 * px),
+            "the budget is derived against the clamped pitch, not a fixed 24"
+        );
+    }
 }
 
 /// Neither new key reaches the wire unless it is set, so a plugin built against
@@ -1262,9 +1576,11 @@ fn preem_worst_case_footprint_is_bounded() {
     const GLYPH_H: u32 = 7; // font.rs:33
     const SPACING: u32 = 1; // font.rs:35
     const LINE_GAP: u32 = 2; // font.rs:37
-    // The dot-matrix "virtual pixel": every font pixel is a DOT×DOT dot.
-    const DOT: u32 = 4; // dot_matrix.rs:31
-    const DOT_PAD: u32 = 4; // dot_matrix.rs:34 (= DOT)
+    // The dot-matrix "virtual pixel": every font pixel is a dot_px×dot_px dot,
+    // and the bezel is one of those cells on each side (`Dots::pad`). Since
+    // #1091 both follow the config's `dot_px` rather than a const, so the two
+    // dot arms below read it off the widget — a fixed 4 here would validate the
+    // model against itself at exactly the pitch that cannot overflow.
     // Seven-segment metrics — its own grid, unrelated to the font's.
     const SEG_DIGIT_W: u32 = 30; // seven_seg.rs:26
     const SEG_DIGIT_H: u32 = 54; // seven_seg.rs:28
@@ -1287,15 +1603,16 @@ fn preem_worst_case_footprint_is_bounded() {
             // that shipped in the first version of this test, where both strip
             // arms were `(chars * 6, 7)` and so validated the model against
             // itself.
-            PreemWidget::DotMatrix { state, .. } => {
+            PreemWidget::DotMatrix { config, state } => {
+                let dot = config.dot_px;
                 let n = u32::try_from(state.text.chars().count()).unwrap_or(u32::MAX);
-                let advance = (GLYPH_W + SPACING) * DOT; // 24
+                let advance = (GLYPH_W + SPACING) * dot; // 6*dot_px
                 let w = if n == 0 {
-                    2 * DOT_PAD
+                    2 * dot
                 } else {
-                    2 * DOT_PAD + n * advance - SPACING * DOT // 24n + 4
+                    2 * dot + n * advance - SPACING * dot // 6*dot*n + dot
                 };
-                (w, 2 * DOT_PAD + GLYPH_H * DOT) // 36 high
+                (w, 2 * dot + GLYPH_H * dot) // 9*dot_px high
             }
             // A seven-segment readout shares *nothing* with the font grid — it
             // has its own cell metrics entirely (seven_seg.rs:24-34). The
@@ -1329,8 +1646,15 @@ fn preem_worst_case_footprint_is_bounded() {
                     + config.leds.saturating_sub(1) * STRIP_GAP,
                 2 * STRIP_PAD + STRIP_CELL_H,
             ),
-            // window_px is already the final width; the height is fixed.
-            PreemWidget::Marquee { config, .. } => (config.window_px, 2 * 2 + GLYPH_H * 2),
+            // `window_px` is already the final width whatever the pitch — a
+            // finer pitch buys more dot columns inside the same buffer, never a
+            // wider one — so only the height follows `dot_px`. It reads it off
+            // the config for #1091's reason above; the old `2 * 2 + GLYPH_H * 2`
+            // was an 18 px understatement of the 36 px the kit actually draws,
+            // which weakened this bound by half on the one axis it could see.
+            PreemWidget::Marquee { config, .. } => {
+                (config.window_px, 2 * config.dot_px + GLYPH_H * config.dot_px)
+            }
             PreemWidget::Scope { config, .. } => {
                 (config.cols * config.scale, config.rows * config.scale)
             }
@@ -1350,6 +1674,18 @@ fn preem_worst_case_footprint_is_bounded() {
 
     // Every knob pinned to its most expensive legal value.
     let worst: Vec<PreemWidget> = vec![
+        // `dot_px` at `u32::MAX` is the expensive knob since #1091: it
+        // multiplies **both** axes, so the default-pitch entry below cannot see
+        // it. Both are listed — the clamped pitch is the one this bounds.
+        PreemWidget::DotMatrix {
+            config: DotMatrixConfig {
+                dot_px: u32::MAX,
+                ..DotMatrixConfig::default()
+            },
+            state: DotMatrixState {
+                text: "8".repeat(MAX_TEXT_LEN * 4),
+            },
+        },
         PreemWidget::DotMatrix {
             config: DotMatrixConfig::default(),
             state: DotMatrixState {
@@ -1388,6 +1724,7 @@ fn preem_worst_case_footprint_is_bounded() {
             config: MarqueeConfig {
                 window_px: u32::MAX,
                 gap_dots: u32::MAX,
+                dot_px: u32::MAX,
                 speed_dots_per_sec: f32::INFINITY,
                 ..MarqueeConfig::default()
             },

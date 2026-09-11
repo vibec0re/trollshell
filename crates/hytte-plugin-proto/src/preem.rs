@@ -223,10 +223,10 @@ pub const MAX_TEXT_LEN: usize = 2048;
 /// The *area* of a strip stays bounded by [`MAX_RASTER_PIXELS`] like everything
 /// else; this only relaxes the per-axis rule where the geometry justifies it.
 /// It is not a knob a plugin sets — `clamp_strip_text` derives each strip's
-/// character budget from it and that widget's own pitch
-/// ([`DOT_MATRIX_PITCH_PX`] / [`SEVEN_SEG_PITCH_PX`]), and
-/// `preem_worst_case_footprint_is_bounded` checks the arithmetic against the
-/// kit's real geometry.
+/// character budget from it and that widget's own pitch (`dot_matrix_pitch_px`,
+/// itself a function of [`DotMatrixConfig::dot_px`] since #1091, and the fixed
+/// `SEVEN_SEG_PITCH_PX`), and `preem_worst_case_footprint_is_bounded` checks
+/// the arithmetic against the kit's real geometry.
 pub const MAX_STRIP_DIM: u32 = 16_384;
 
 /// Cap on [`ScopeState::samples`] **per update**.
@@ -320,6 +320,27 @@ pub const MAX_SUBDIVISIONS: u32 = 32;
 /// It extends the rasterised strip, so it is bounded like a dimension. Kit
 /// default 6.
 pub const MAX_GAP_DOTS: u32 = 1024;
+
+/// The dot pitch a [`DotMatrix`](PreemWidget::DotMatrix) or a
+/// [`Marquee`](PreemWidget::Marquee) renders at when the wire does not say —
+/// the kit's `DEFAULT_DOT_PX`, and every pre-#1091 frame's pitch.
+pub const DEFAULT_DOT_PX: u32 = 4;
+
+/// Floor on [`DotMatrixConfig::dot_px`] / [`MarqueeConfig::dot_px`], mirroring
+/// the kit's `MIN_DOT_PX`. Below 2 px a "dot" is one pixel with no room for a
+/// falloff, so the widget stops being a dot matrix.
+pub const MIN_DOT_PX: u32 = 2;
+
+/// Cap on [`DotMatrixConfig::dot_px`] / [`MarqueeConfig::dot_px`], mirroring the
+/// kit's `MAX_DOT_PX`.
+///
+/// It is a real allocation bound and not just taste: a dot strip's width is
+/// `6*dot_px` per character and its height is `9*dot_px`, so the pitch
+/// multiplies **both** axes. `clamp_strip_text` derives the dot matrix's
+/// character budget against the *clamped* pitch rather than against a fixed 24
+/// px (see [`MAX_STRIP_DIM`]) — capping the pitch and the character count
+/// independently would bound neither, the same trap [`fit_scale`] exists for.
+pub const MAX_DOT_PX: u32 = 8;
 
 /// Cap on the magnitude of [`MarqueeConfig::speed_dots_per_sec`].
 ///
@@ -652,12 +673,50 @@ impl StyleRef {
 
 /// **Config** for [`PreemWidget::DotMatrix`] — a change rebuilds the renderer.
 ///
-/// The kit's `dot_matrix(text, style)` is pure, so the skin is its only knob.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// The kit's `DotMatrix` builder is pure, so the skin and the dot pitch are its
+/// only knobs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DotMatrixConfig {
     /// The skin to draw in.
     pub style: StyleRef,
+    /// The dot pitch in buffer pixels — the edge of the square cell every font
+    /// pixel becomes. Default [`DEFAULT_DOT_PX`], clamped to
+    /// [`MIN_DOT_PX`]`..=`[`MAX_DOT_PX`].
+    ///
+    /// **This is the display's height.** A dot-matrix strip is
+    /// `2*dot_px + GLYPH_H*dot_px` = `9*dot_px` buffer pixels tall — the bezel
+    /// is one dot cell on each side — and each character advances `6*dot_px`.
+    /// There is no `scale` on this widget precisely because the pitch already
+    /// *is* the size knob: 36 px at the default, 27 at `3`, 18 at `2`, which is
+    /// what fits a readout inside a 32 px bar (#1091).
+    ///
+    /// # Why this does not bump `VOCAB`
+    ///
+    /// It is an appended **field**, not an appended variant. The framing is a
+    /// named-field `MessagePack` map with no `deny_unknown_fields`, so an older
+    /// shell decoding a frame that carries `dot_px` *skips the key* and renders
+    /// the widget exactly as it did before — degraded to the default pitch,
+    /// never a failed decode. An appended **variant** is the other case: an
+    /// unknown variant kills the decode and crash-loops the session, which is
+    /// what [`VOCAB`](crate::VOCAB) exists to negotiate. Going the other way, a
+    /// pre-#1091 peer omits the key and `serde(default)` supplies
+    /// [`DEFAULT_DOT_PX`]. Both directions are the same additive case #953 and
+    /// #1068 landed under, and like those this field carries
+    /// `skip_serializing_if`, so a frame that does not ask for a pitch is byte
+    /// for byte the frame it was before the field existed — which is what keeps
+    /// every committed golden fixture untouched.
+    #[serde(default = "default_dot_px", skip_serializing_if = "is_default_dot_px")]
+    pub dot_px: u32,
+}
+
+impl Default for DotMatrixConfig {
+    fn default() -> Self {
+        Self {
+            style: StyleRef::default(),
+            dot_px: DEFAULT_DOT_PX,
+        }
+    }
 }
 
 /// **State** for [`PreemWidget::DotMatrix`] — a change re-renders the text.
@@ -912,6 +971,18 @@ pub struct MarqueeConfig {
     /// The blank seam appended after the message before it loops, in **dots**.
     /// Default `6` (the kit's `GLYPH_W + SPACING`).
     pub gap_dots: u32,
+    /// The dot pitch in buffer pixels — the same hardware knob
+    /// [`DotMatrixConfig::dot_px`] turns, and the marquee's **height**:
+    /// `9*dot_px`, so 18 px at `2` against the default's 36 (#1091). Default
+    /// [`DEFAULT_DOT_PX`], clamped to [`MIN_DOT_PX`]`..=`[`MAX_DOT_PX`].
+    ///
+    /// [`window_px`](Self::window_px) stays the width, in final buffer pixels;
+    /// a finer pitch fits more dot columns inside the same window, so the same
+    /// message crosses it in more steps. Same additive-field rules and the same
+    /// `skip_serializing_if` as [`DotMatrixConfig::dot_px`] — see that field
+    /// for why neither bumps [`VOCAB`](crate::VOCAB).
+    #[serde(default = "default_dot_px", skip_serializing_if = "is_default_dot_px")]
+    pub dot_px: u32,
     /// Scroll speed in **dots per second** (#882 taste call 2).
     ///
     /// Today a plugin steps whole dots per clock beat — the audio widget's
@@ -939,6 +1010,7 @@ impl Default for MarqueeConfig {
             style: StyleRef::default(),
             window_px: 192,
             gap_dots: 6,
+            dot_px: DEFAULT_DOT_PX,
             speed_dots_per_sec: 12.0,
         }
     }
@@ -1528,8 +1600,12 @@ impl PreemWidget {
             // A dot-matrix / seven-segment readout lays its whole message out
             // on one line, so the *character count* is a buffer dimension and
             // MAX_TEXT_LEN alone does not bound it — see `clamp_strip_text`.
-            Self::DotMatrix { state, .. } => {
-                clamp_strip_text(&mut state.text, DOT_MATRIX_PITCH_PX);
+            Self::DotMatrix { config, state } => {
+                // The pitch first: it is a multiplier on the character budget
+                // below, so clamping the text against an unclamped pitch would
+                // bound nothing.
+                config.dot_px = config.dot_px.clamp(MIN_DOT_PX, MAX_DOT_PX);
+                clamp_strip_text(&mut state.text, dot_matrix_pitch_px(config.dot_px));
             }
             Self::SevenSeg { state, .. } => {
                 clamp_strip_text(&mut state.text, SEVEN_SEG_PITCH_PX);
@@ -1571,6 +1647,11 @@ impl PreemWidget {
                 // so capping it directly is the whole bound on this axis.
                 config.window_px = config.window_px.clamp(1, MAX_BUFFER_DIM);
                 config.gap_dots = config.gap_dots.min(MAX_GAP_DOTS);
+                // The pitch only reaches the *height* here (`9*dot_px`, at most
+                // 72), because `window_px` already bounds the width whatever
+                // the pitch — a finer pitch buys more dot columns inside the
+                // same buffer, never a wider one.
+                config.dot_px = config.dot_px.clamp(MIN_DOT_PX, MAX_DOT_PX);
                 config.speed_dots_per_sec = if config.speed_dots_per_sec.is_finite() {
                     config
                         .speed_dots_per_sec
@@ -1666,13 +1747,40 @@ const FLIP_BEZEL_FPX: u32 = 2;
 const FLIP_BOARD_HEIGHT_FPX: u32 = 11;
 
 /// Per-character horizontal advance of a [`DotMatrix`](PreemWidget::DotMatrix),
-/// in **buffer pixels**.
+/// in **buffer pixels**, at a dot pitch of `dot_px`.
 ///
-/// `(GLYPH_W + SPACING) * DOT` = 6 × 4 = 24. The `DOT` factor is the trap: the
-/// kit does not render one buffer pixel per font pixel — every font pixel
-/// becomes a `DOT`×`DOT` round dot (`dot_matrix.rs:30-31`), so reasoning at the
-/// bare 6 px font pitch under-counts a strip's width by **4×**.
-const DOT_MATRIX_PITCH_PX: u32 = 24;
+/// `(GLYPH_W + SPACING) * dot_px` = `6 * dot_px`, i.e. 24 at the default pitch.
+/// The `dot_px` factor is the trap: the kit does not render one buffer pixel
+/// per font pixel — every font pixel becomes a `dot_px`×`dot_px` round dot
+/// (`dot_matrix.rs`'s `Dots`), so reasoning at the bare 6 px font pitch
+/// under-counts a strip's width by the whole pitch.
+///
+/// Taking the pitch as an argument rather than baking 24 in is what keeps the
+/// [`MAX_STRIP_DIM`] budget honest now that the pitch is a knob (#1091): at
+/// [`MAX_DOT_PX`] a character is 48 px, so a budget computed against 24 would
+/// admit a strip **twice** the bound.
+const fn dot_matrix_pitch_px(dot_px: u32) -> u32 {
+    (DOT_MATRIX_FONT_PITCH_PX) * dot_px
+}
+
+/// A dot-matrix char cell's advance in **font pixels**: `GLYPH_W + SPACING`.
+const DOT_MATRIX_FONT_PITCH_PX: u32 = 6;
+
+/// [`DotMatrixConfig::dot_px`] / [`MarqueeConfig::dot_px`]'s serde default.
+fn default_dot_px() -> u32 {
+    DEFAULT_DOT_PX
+}
+
+/// `skip_serializing_if` for the two `dot_px` fields: a pitch nobody moved
+/// costs no bytes, so every frame written before #1091 — and every frame that
+/// does not ask for a pitch since — is byte-identical.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if hands the field by reference"
+)]
+fn is_default_dot_px(dot_px: &u32) -> bool {
+    *dot_px == DEFAULT_DOT_PX
+}
 
 /// Per-character horizontal advance of a [`SevenSeg`](PreemWidget::SevenSeg),
 /// in **buffer pixels**.

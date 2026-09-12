@@ -10277,6 +10277,7 @@ mod text_kinds_gl {
             });
         }
     }
+}
 // ── #1165: plugin-host containment, round 2 ──────────────────────────────────
 //
 // One module rather than tests interleaved into the sections above, because

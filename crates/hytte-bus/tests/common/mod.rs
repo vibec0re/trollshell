@@ -7,7 +7,7 @@
 //! Skips with a clear `panic!("dbus-daemon not on PATH")` if the binary
 //! is missing — surface the dependency loudly rather than silently.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -69,13 +69,11 @@ impl Drop for BusGuard {
     }
 }
 
-/// Spawn a fresh dbus-daemon, return a connection to it plus a guard
-/// that kills the daemon on drop.
-pub async fn ephemeral_bus() -> (Connection, BusGuard) {
-    let tmp = TempDir::new().expect("create tempdir for dbus-daemon");
-    let socket: PathBuf = tmp.path().join("bus");
-    let address = format!("unix:path={}", socket.display());
-
+/// Write the `dbus-daemon` session config listening on `address` into `tmp`,
+/// returning the config file's path. Split out of [`ephemeral_bus`] so
+/// [`restart_on_same_address`] (#1175) can reuse the identical config — same
+/// address, same policy — for a *second* daemon boot in the same `TempDir`.
+fn write_session_conf(tmp: &TempDir, address: &str) -> PathBuf {
     let config = tmp.path().join("session.conf");
     std::fs::write(
         &config,
@@ -97,10 +95,19 @@ pub async fn ephemeral_bus() -> (Connection, BusGuard) {
         ),
     )
     .expect("write dbus-daemon config");
+    config
+}
 
+/// Spawn `dbus-daemon` against `config` and block until it has printed its
+/// listen address (proof it is up and accepting connections). Shared by
+/// [`ephemeral_bus`] (first boot) and [`restart_on_same_address`] (#1175: a
+/// second boot on the identical socket path, standing in for a real
+/// system/session `dbus-daemon` restarting under its supervisor while the
+/// address it's configured to listen on stays fixed).
+async fn spawn_daemon(config: &Path) -> Child {
     let mut child = Command::new("dbus-daemon")
         .arg("--config-file")
-        .arg(&config)
+        .arg(config)
         .arg("--print-address=1")
         .arg("--nofork")
         .stdout(Stdio::piped())
@@ -122,12 +129,28 @@ pub async fn ephemeral_bus() -> (Connection, BusGuard) {
         "unexpected dbus-daemon address: {printed}"
     );
 
-    // Connect once via Builder::address to confirm the daemon is reachable.
-    let conn = Builder::address(address.as_str())
+    child
+}
+
+/// Connect to `address`, confirming a daemon is actually listening there.
+async fn connect(address: &str) -> Connection {
+    Builder::address(address)
         .expect("parse bus address")
         .build()
         .await
-        .expect("connect to ephemeral bus");
+        .expect("connect to ephemeral bus")
+}
+
+/// Spawn a fresh dbus-daemon, return a connection to it plus a guard
+/// that kills the daemon on drop.
+pub async fn ephemeral_bus() -> (Connection, BusGuard) {
+    let tmp = TempDir::new().expect("create tempdir for dbus-daemon");
+    let socket: PathBuf = tmp.path().join("bus");
+    let address = format!("unix:path={}", socket.display());
+
+    let config = write_session_conf(&tmp, &address);
+    let child = spawn_daemon(&config).await;
+    let conn = connect(&address).await;
 
     (
         conn,
@@ -137,4 +160,36 @@ pub async fn ephemeral_bus() -> (Connection, BusGuard) {
             address,
         },
     )
+}
+
+/// Kill the `dbus-daemon` behind `guard` and boot a fresh one listening on
+/// the **identical** socket path (#1175) — standing in for a real
+/// system/session bus restarting under its supervisor while every consumer's
+/// configured address stays the same. Any `zbus::Connection` opened against
+/// the old daemon (including the one returned by the original
+/// [`ephemeral_bus`] call) is now talking to a dead peer and stays that way —
+/// this does not, and cannot, reach into an existing `Connection` and fix it
+/// up. The `Connection` this returns is a brand new one, freshly dialled
+/// against the new daemon; the returned `BusGuard` (same `TempDir`, new
+/// child) replaces the caller's old guard, which must not be used again.
+#[allow(dead_code)] // not every test binary that pulls in `common` needs a restart
+pub async fn restart_on_same_address(mut guard: BusGuard) -> (Connection, BusGuard) {
+    if let Some(mut child) = guard.child.take() {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+
+    // dbus-daemon doesn't reliably unlink its own socket file on a SIGKILL;
+    // remove any stale one so the fresh daemon can bind the identical path
+    // instead of failing with EADDRINUSE.
+    if let Some(socket_path) = guard.address.strip_prefix("unix:path=") {
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    let config = guard._tmp.path().join("session.conf");
+    let child = spawn_daemon(&config).await;
+    let conn = connect(&guard.address).await;
+
+    guard.child = Some(child);
+    (conn, guard)
 }

@@ -661,7 +661,34 @@ impl WeakDuePicker {
     /// The picker, or `None` once its widgets have been freed — which is the
     /// whole point: a handler that fires during teardown does nothing rather
     /// than keeping the tree alive to be able to.
+    ///
+    /// The `None` arm **logs**. It is expected during teardown and nothing is
+    /// wrong when it happens then, hence `debug!` rather than `warn!` — but
+    /// the upgrade is all-or-nothing across nine handles, so if the invariant
+    /// behind it ever breaks the failure mode is a visible, clickable,
+    /// completely **inert** due picker, and a log line is the difference
+    /// between diagnosing that in one `RUST_LOG=trollshell=debug` run and
+    /// staring at a chip that silently does nothing. The invariant: a strong
+    /// [`DuePicker`] always lives in a *sibling's* handler while the popover
+    /// is mounted (the Add/Save button's closure holds one), so an upgrade can
+    /// only fail once the popover itself is gone.
     fn upgrade(&self) -> Option<DuePicker> {
+        let picker = self.try_upgrade();
+        if picker.is_none() {
+            tracing::debug!(
+                "tasks: a due-picker handler fired after the picker's widgets were freed — \
+                 ignoring. Expected while a popover is being torn down; if it appears while the \
+                 popover is on screen the picker is inert, and the sibling strong handle that \
+                 should have kept it alive is gone (#1176)"
+            );
+        }
+        picker
+    }
+
+    /// All nine widget handles, or nothing. See [`Self::upgrade`], which is
+    /// the entry point every handler uses; this half exists only so the `?`
+    /// chain stays a chain and the `None` arm has somewhere to be logged.
+    fn try_upgrade(&self) -> Option<DuePicker> {
         Some(DuePicker {
             container: self.container.upgrade()?,
             mode: Rc::clone(&self.mode),
@@ -1975,8 +2002,8 @@ mod lifetime_tests {
         let anchor = gtk::MenuButton::new();
         let popover = build_create_popover(&anchor, &lists, &monitor);
         anchor.set_popover(Some(&popover));
-        let entry: gtk::Entry = find_descendant(popover.upcast_ref())
-            .expect("the create popover builds a gtk::Entry");
+        let entry: gtk::Entry =
+            find_descendant(popover.upcast_ref()).expect("the create popover builds a gtk::Entry");
         let cancel = action_button(&popover, "Cancel");
         let add = action_button(&popover, "Add");
 

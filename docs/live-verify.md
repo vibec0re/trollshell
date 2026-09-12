@@ -4078,8 +4078,12 @@ trollshell`. Expect the cards to come back Active and **no notification at
 
 ## Widget lifetimes (#1176)
 
-Four refcount cycles that `nix/lint-bind-pins.py` was structurally blind to
-before #1176, because none of them is a `bind*` call site. Nothing here
+Refcount cycles that `nix/lint-bind-pins.py` was structurally blind to before
+#1176, because none of them is a `bind*` call site. The lint now reports the
+ancestor and self shapes; three shapes stay outside it and are held by tests
+instead — a popover built through `Popup`'s builder chain, a containment edge
+whose child argument is a call, and a cycle assembled from two _sibling_
+captures (each of which is individually the correct carve-out). Nothing here
 changes what anything looks like or does — every item is "the same UI, minus a
 leak" — so the checks below are all **memory** checks plus one confirmation
 that the widgets still work at all. `RES` here means the shell's own RSS:
@@ -4118,22 +4122,41 @@ that the widgets still work at all. `RES` here means the shell's own RSS:
       working seek bar.
 - [ ] **(#1176 item 3)** Hot-plug a monitor a few times with the sidebar
       showing (calendar + tasks). Each cycle used to leak the whole 6×7 day
-      grid — 42 buttons with their labels and dot rows — because every day
-      cell's click handler held the `State` that owns all 42 cells. RSS
-      should return to roughly its pre-hotplug value after each cycle.
-      Functionally: click a day (the month view moves, the upcoming list
-      re-anchors, the matching row flashes), page the month back and forth,
-      and open a task's due picker to confirm the No date / Today / Tomorrow /
-      Pick… chips and the calendar underneath all still drive the summary
-      line.
+      grid — 42 buttons with their labels and dot rows — **and** the upcoming
+      events list with it, through _two_ separate strong captures in
+      `wire_day_clicks`: the `State` that owns all 42 cells (a plain refcount
+      cycle), and the `group`, which is the events bind's own target, so 42
+      strong clones of it meant that bind could never end and therefore never
+      released the `State` either. RSS should return to roughly its
+      pre-hotplug value after each cycle. Functionally: click a day (the month
+      view moves, the upcoming list re-anchors, the matching row flashes),
+      page the month back and forth, and open a task's due picker to confirm
+      the No date / Today / Tomorrow / Pick… chips and the calendar underneath
+      all still drive the summary line. Both handles upgrade together, so the
+      failure mode to watch for is a month grid where **every** day is
+      unclickable, not one bad day.
 - [ ] **(#1176 item 3, per row tap)** Tap several task rows in a row to open
       and dismiss their edit popovers, and use the ⊕ Add popover a few times.
       Each popover builds a `DuePicker`, which used to hand strong self-clones
-      to its own chips' handlers and so could never be freed. RSS flat across
-      a dozen open/dismiss cycles. Confirm Save, Cancel and Delete each still
-      apply and close the popover, and that Add still creates a task and
-      returns focus to the ⊕ button (that last one is the `anchor` handle
-      that went weak).
+      to its own chips' handlers — and its entry used to sit in its own
+      `connect_activate` handler list, which kept that picker alive through
+      the closure whatever the chips did. RSS flat across a dozen
+      open/dismiss cycles. Confirm Save, Cancel and Delete each still apply
+      and close the popover; that **Enter in the entry** still commits (that
+      is the handler that now takes the entry as its own argument, so it is
+      the one to check rather than assume); that Add still creates a task and
+      returns focus to the ⊕ button (that last one is the `anchor` handle that
+      went weak); and that typing in the entry still enables the greyed-out
+      Add button (the Add button's handle on the entry is weak now, so this is
+      the pair that must both work).
+- [ ] **(#1176, an inert holder would be silent)** Run with
+      `RUST_LOG=trollshell=debug` for a session that hot-plugs a monitor and
+      opens/closes the sidebar and a few task popovers. `WeakDuePicker` and
+      `WeakState` log one `debug!` line on a failed upgrade. Lines during a
+      teardown are expected and harmless. A line while the calendar or a due
+      picker is **on screen** is the diagnosable form of the one failure mode
+      these weak handles can have: a visible, clickable, completely inert
+      control.
 - [ ] **(#1176 item 4)** Click a day in the sidebar calendar that has an
       event, and confirm the matching row in the upcoming list still flashes
       its highlight and that the highlight **clears** after ~1.5 s. The timer

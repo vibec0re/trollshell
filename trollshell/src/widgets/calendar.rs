@@ -103,7 +103,32 @@ impl State {
 
 impl WeakState {
     /// The state, or `None` once the grid it renders into has been freed.
+    ///
+    /// The `None` arm **logs**, for the reason `widgets/tasks.rs`'s
+    /// `WeakDuePicker::upgrade` does: it is expected during teardown and
+    /// nothing is wrong then, hence `debug!` rather than `warn!` — but the
+    /// upgrade is all-or-nothing across `cells` and `month_label`, and if the
+    /// invariant behind it ever breaks the failure mode is a month grid whose
+    /// every day is silently unclickable. The invariant: the two binds and the
+    /// header's prev/next handlers keep a strong [`State`] alive for the whole
+    /// time the block is mounted, so an upgrade can only fail after the column
+    /// is gone.
     fn upgrade(&self) -> Option<State> {
+        let state = self.try_upgrade();
+        if state.is_none() {
+            tracing::debug!(
+                "calendar: a day-cell handler fired after the grid was freed — ignoring. \
+                 Expected while a sidebar block is being torn down; if it appears while the \
+                 calendar is on screen every day in the grid is a no-op (#1176)"
+            );
+        }
+        state
+    }
+
+    /// Both widget handles, or nothing. See [`Self::upgrade`] — this half
+    /// exists only so the `?` chain stays a chain and the `None` arm has
+    /// somewhere to be logged.
+    fn try_upgrade(&self) -> Option<State> {
         Some(State {
             viewed: Rc::clone(&self.viewed),
             selected: Rc::clone(&self.selected),

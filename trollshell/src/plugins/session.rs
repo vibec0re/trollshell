@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 use hytte::services::pipewire;
 use hytte_plugin_proto::{
     AudioSpectrum, Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, HostMsg,
-    LogLevel, MAX_BODY_TEXT_BYTES, MAX_DISPLAY_TEXT_BYTES, Manifest, Mount, NowPlaying, PluginMsg,
-    ProtoError, StateKey, StateSnapshot, UpcomingEvent, VOCAB, read_frame, write_frame,
+    LogLevel, MAX_BODY_TEXT_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_PLUGIN_ID_BYTES, Manifest, Mount,
+    NowPlaying, PluginMsg, ProtoError, StateKey, StateSnapshot, UpcomingEvent, VOCAB, read_frame,
+    write_frame,
 };
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
@@ -748,6 +749,18 @@ impl LogGate {
 ///
 /// Host-scoped (not process-global) for the reason `live_ids` is: the
 /// per-connection tests stay isolated from one another.
+///
+/// **Bounded by construction, in both dimensions, since #1165 review round
+/// 2:** at most [`MAX_TRACKED_EFFECT_BUCKETS`] entries
+/// ([`spend_effect_tokens`]'s refusal past that count), each keyed by a
+/// `String` no longer than [`MAX_PLUGIN_ID_BYTES`](hytte_plugin_proto::MAX_PLUGIN_ID_BYTES)
+/// bytes — `serve_conn` refuses a `Register` over that cap before a
+/// connection's id can ever reach this map. Before the id cap, the entry count
+/// was bounded but an entry's own key was not, so the worst case was
+/// `MAX_TRACKED_EFFECT_BUCKETS` × an unbounded id — "bounds entries, not
+/// bytes", the same shape the outbound queue's own #1165 fix closed one file
+/// over. [`super::effects`]'s `LAUNCH_BUDGETS` is the sibling table with the
+/// same shape and the same fix.
 pub(super) type EffectBuckets = Arc<Mutex<std::collections::HashMap<String, EffectRateLimiter>>>;
 
 /// How many plugin ids the host will keep a bucket for at once (#1165 item 4).
@@ -761,6 +774,12 @@ pub(super) type EffectBuckets = Arc<Mutex<std::collections::HashMap<String, Effe
 /// **refused** rather than tracked. Refusing is the safe direction — reaching
 /// this at all takes a thousand plugin ids actively spending effects, which is
 /// the abuse, not a deployment.
+///
+/// With [`MAX_PLUGIN_ID_BYTES`](hytte_plugin_proto::MAX_PLUGIN_ID_BYTES)
+/// bounding every key, this table's worst-case retained memory is
+/// `MAX_TRACKED_EFFECT_BUCKETS × MAX_PLUGIN_ID_BYTES` bytes of keys — 64 KiB —
+/// plus one fixed-size [`EffectRateLimiter`] per entry, not the unbounded
+/// figure a round-1 id cap would have left this at.
 pub(super) const MAX_TRACKED_EFFECT_BUCKETS: usize = 1024;
 
 /// Forget every bucket that has refilled to its full burst as of `now` (#1165
@@ -1110,6 +1129,24 @@ pub(super) async fn serve_conn(
     // outright (the connection is dropped, nothing is mounted).
     if plugin_id.is_empty() {
         tracing::warn!("plugin Register carried an empty id; dropping the connection");
+        return;
+    }
+    // #1165 review round 2 HIGH-1: an id is a *key* (it names the region
+    // mailbox, `live_ids`, the audit log, and — since this same round —
+    // `EffectBuckets`/`LAUNCH_BUDGETS`), so an over-cap one is refused
+    // outright here, on the same terms as the empty-id check above, rather
+    // than truncated like a display string. A truncated id would silently
+    // become a *different* plugin colliding with (or shadowing) whatever
+    // already holds that prefix. This is also what stops an unbounded id from
+    // ever reaching `gtk::Label::new` as a notification's app name
+    // (`effects.rs`'s `Effect::Notify` arm) or costing the two per-id host
+    // tables an unbounded key.
+    if plugin_id.len() > MAX_PLUGIN_ID_BYTES {
+        tracing::warn!(
+            bytes = plugin_id.len(),
+            cap = MAX_PLUGIN_ID_BYTES,
+            "plugin Register carried an id over the host's cap; dropping the connection",
+        );
         return;
     }
     // #436: one live connection per plugin id on this host. A second Register

@@ -10293,7 +10293,7 @@ mod containment_r2 {
         capped_effect_payload, capped_effect_strings,
     };
     use super::*;
-    use hytte_plugin_proto::{MAX_BODY_TEXT_BYTES, MAX_DISPLAY_TEXT_BYTES};
+    use hytte_plugin_proto::{MAX_BODY_TEXT_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_PLUGIN_ID_BYTES};
 
     /// Every WARN line the capture holds that carries `field`.
     fn warns_with(captured: &hytte_config::test_support::Captured, field: &str) -> usize {
@@ -11059,5 +11059,100 @@ mod containment_r2 {
 
         let failing = execute_command("p", 3, &["sh".into(), "-c".into(), "exit 3".into()]).await;
         assert!(!failing.ok, "…and a real non-zero exit is still reported");
+    }
+
+    // ── Adversarial review round 2, HIGH-1: `Manifest.id` is a bounded key ──
+
+    /// An id over [`MAX_PLUGIN_ID_BYTES`] is refused at the `Register`
+    /// handshake, on the same "refuse, don't truncate" posture the empty-id
+    /// check already takes and for the same reason: an id is a *key* (the
+    /// region mailbox, `live_ids`, the audit log, and the two per-id
+    /// effect-budget tables), so a truncated one would silently become a
+    /// different plugin colliding with whatever already holds that prefix.
+    ///
+    /// This is also what closes the crasher the round-2 review found: an
+    /// uncapped id rides `Effect::Notify` as the notification app name and
+    /// reaches `gtk::Label::new` on the GTK main thread (measured there:
+    /// 1.57 s for an 8 MiB id) — the very effect this PR's item 1 caps two of
+    /// three arguments of.
+    ///
+    /// **Falsified** by deleting the `plugin_id.len() > MAX_PLUGIN_ID_BYTES`
+    /// branch in `serve_conn`: the connection is accepted and the middle
+    /// assertion reds.
+    #[tokio::test]
+    async fn an_over_cap_plugin_id_is_rejected() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+        let bar_center = ctx.bar_center.clone();
+
+        let (host, plugin) = UnixStream::pair().expect("socketpair");
+        tokio::spawn(async move { handle_conn(host, &ctx).await });
+        let (mut prd, mut pwr) = plugin.into_split();
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Register {
+                manifest: Manifest::new("a".repeat(MAX_PLUGIN_ID_BYTES + 1), Mount::BarCenter),
+            },
+        )
+        .await
+        .expect("Register with an over-cap id");
+
+        let dropped = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_frame::<HostMsg, _>(&mut prd),
+        )
+        .await
+        .expect("the over-cap-id connection is dropped within 5s");
+        assert!(
+            dropped.is_err(),
+            "an over-cap id Register is rejected (EOF)",
+        );
+        assert!(
+            bar_center.lock_ref().is_empty(),
+            "no card is parked for an over-cap id",
+        );
+    }
+
+    /// The boundary is pinned on both sides, mirroring the display-text and
+    /// datasource-payload cap tests: exactly [`MAX_PLUGIN_ID_BYTES`] is
+    /// accepted and mounts normally.
+    #[tokio::test]
+    async fn an_at_cap_plugin_id_is_accepted() {
+        let (_clock_tx, clock_rx) = watch::channel(None);
+        let (_vis_tx, vis_rx) = watch::channel(false);
+        let (ctx, _effects_rx) = ctx_with(clock_rx, vis_rx);
+        let bar_center = ctx.bar_center.clone();
+
+        let (host, plugin) = UnixStream::pair().expect("socketpair");
+        tokio::spawn(async move { handle_conn(host, &ctx).await });
+        let (_prd, mut pwr) = plugin.into_split();
+        let id = "a".repeat(MAX_PLUGIN_ID_BYTES);
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Register {
+                manifest: Manifest::new(id.clone(), Mount::BarCenter),
+            },
+        )
+        .await
+        .expect("Register at exactly the cap");
+        write_frame(
+            &mut pwr,
+            &PluginMsg::Render {
+                tree: wire::Node::Label {
+                    id: Some("t".into()),
+                    text: "chip".into(),
+                    classes: vec![],
+                    tooltip: None,
+                },
+                panel: None,
+                hidden_on: Vec::new(),
+                effects: Vec::new(),
+            },
+        )
+        .await
+        .expect("Render");
+        let cards = wait_for_region(&bar_center).await;
+        assert_eq!(cards[0].plugin_id, id, "an at-cap id registers normally");
     }
 }

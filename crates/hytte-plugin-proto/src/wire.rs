@@ -1419,6 +1419,49 @@ pub const MAX_TREE_DEPTH: usize = 64;
 /// plugin tree for the life of the shell process.
 pub const MAX_PREEM_NODES_PER_TREE: usize = 64;
 
+// ── plugin id cap (#1165 review round 2) ─────────────────────────────────────
+//
+// Round 1 checked [`Manifest::id`](crate::manifest::Manifest::id) for
+// emptiness only (`trollshell/src/plugins/session.rs`'s `plugin_id.is_empty()`
+// gate, #436), so an id is otherwise unbounded — up to
+// [`MAX_FRAME_LEN`](crate::MAX_FRAME_LEN) itself, since it rides the same
+// `Register` frame. Every cap this file states elsewhere bounds a *node* or an
+// *effect*; none of them look at the identifier the connection registers
+// under, so an oversized id sailed past all of them. The round-2 review found
+// two consequences: the id rides `Effect::Notify` verbatim as the
+// notification's app name and reaches `gtk::Label::new` on the GTK main thread
+// uncapped (measured: an 8 MiB id costs 1.57 s there — the #1165 headline
+// freeze, reached through the very effect this vocabulary's caps exist to
+// bound), and it keys two host tables (`EffectBuckets`,
+// `trollshell::plugins::effects`' `LAUNCH_BUDGETS`) that deliberately outlive
+// the connection — bounded in *entries* by
+// `MAX_TRACKED_EFFECT_BUCKETS`, but not in the bytes an entry's key can cost.
+
+/// The longest [`Manifest::id`](crate::manifest::Manifest::id) the host will
+/// accept, in bytes.
+///
+/// **64** — the same "generous, and still a small number" this vocabulary
+/// already uses for [`MAX_TREE_DEPTH`] and [`MAX_PREEM_NODES_PER_TREE`]. A
+/// plugin id is an *identifier* (`departures`, `caw`, `agents`, `pet`), not a
+/// sentence: every bundled plugin's is under 16 bytes, so 64 is four times the
+/// longest plausible hand-picked name — headroom for a reverse-DNS-flavoured
+/// or per-agent id, not a budget for prose.
+///
+/// **Refused at the `Register` handshake, never truncated** — unlike
+/// [`MAX_DISPLAY_TEXT_BYTES`]. An id is a *key*: it names the region mailbox,
+/// the live-connection guard (`IdGuard`), the audit log, and (since this cap)
+/// the two per-id host tables above, so a truncated id would silently become a
+/// *different* plugin colliding with (or shadowing) whatever already holds
+/// that prefix — the same argument [`MAX_DISPLAY_TEXT_BYTES`]'s doc makes for
+/// refusing an over-long `provider`/`scope` rather than cutting it. The host
+/// drops the connection with one warning and mounts nothing, on the same terms
+/// as the existing empty-id refusal.
+///
+/// Bounding this is also what bounds the two per-id tables' worst-case memory:
+/// each holds at most `MAX_TRACKED_EFFECT_BUCKETS` entries, and now no entry's
+/// key can exceed this many bytes.
+pub const MAX_PLUGIN_ID_BYTES: usize = 64;
+
 // ── float sanitisation (#904) ───────────────────────────────────────────────
 
 /// The `min` a [`Node::Slider`] with a **degenerate** stated range falls back

@@ -36,6 +36,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use crate::wifi::{Adapter, Station, StationState, WifiNetwork};
@@ -1108,30 +1109,54 @@ async fn refresh_vpn_profiles(vpn: &Mutable<Vec<VpnProfile>>) {
     }
 }
 
+/// Depth of the queue carrying "re-read NM state" wakes to the watcher loop.
+///
+/// Small on purpose, for [`arm_refresh`]'s reason: every entry asks for the
+/// same full re-read, so a full queue is not backpressure to wait on — it is
+/// a refresh already pending, which will observe whatever the dropped wake
+/// was about. Mirrors `networkd_nm`'s `DEVICE_WAKE_QUEUE` and bluetooth's
+/// `RESYNC_WAKE_QUEUE`.
+const REFRESH_WAKE_QUEUE: usize = 8;
+
 /// Handle one item from `run_nm_wifi_watcher`'s four unconditional-refresh
 /// subscriptions (device/manager `PropertiesChanged`, `AccessPointAdded`,
-/// `AccessPointRemoved`): re-read NM state for both an ordinary emission and
-/// a `Resubscribed`/`Lagged` marker (#1201) — before #1201 these were read
-/// via `events()`, which cannot represent either marker, so a subscription
-/// that silently rebuilt mid-gap left the Wi-Fi panel stale with nothing to
-/// notice it. `refresh` is `FnOnce` (see
-/// `bluetooth::devices::bluetooth_marker_or_event`'s doc for the general
-/// reason `FnMut`/`AsyncFnMut` would be the wrong choice for a closure like
-/// this) — injectable so a test can stand in for the real
-/// [`refresh_nm_state`] round trip with a counter.
-async fn handle_wifi_refresh_item<Refresh, Fut>(
-    item: SignalItem,
-    what: &'static str,
-    refresh: Refresh,
-) where
-    Refresh: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = ()>,
-{
+/// `AccessPointRemoved`): ask for a re-read of NM state for both an ordinary
+/// emission and a `Resubscribed`/`Lagged` marker (#1201) — before #1201 these
+/// were read via `events()`, which cannot represent either marker, so a
+/// subscription that silently rebuilt mid-gap left the Wi-Fi panel stale with
+/// nothing to notice it.
+///
+/// The ask goes through a wake channel rather than straight into
+/// [`refresh_nm_state`] (#1201 review M3). A single system-bus reconnect
+/// hands every subscription on the shared connection its own `Resubscribed`,
+/// so all four of these fire at once — and `refresh_nm_state` is the most
+/// expensive re-read in this crate: station properties, the AP list, a
+/// `GetAll` per AP, saved connections, wired and VPN profiles. With thirty
+/// APs in range that was four passes of well over a hundred round trips for
+/// one blip, each producing the same answer. The loop drains the queue before
+/// refreshing, so a burst costs one pass (plus one for whatever arrives while
+/// it runs).
+fn arm_refresh(item: &SignalItem, what: &'static str, wake: &mpsc::Sender<()>) {
     if matches!(item, SignalItem::Resubscribed | SignalItem::Lagged { .. }) {
         tracing::info!(what, "wifi_nm: resubscribed; refreshing state");
     } else {
         tracing::debug!(what, "wifi_nm: refreshing state");
     }
+    if wake.try_send(()).is_err() {
+        tracing::debug!(what, "wifi_nm: a refresh is already pending; dropping this wake");
+    }
+}
+
+/// One coalesced refresh: drain every wake queued behind the one just
+/// received, then re-read once. See [`arm_refresh`] for what this bounds.
+///
+/// `refresh` is injectable so a test can count re-reads without NM.
+async fn drain_and_refresh<F, Fut>(wake_rx: &mut mpsc::Receiver<()>, refresh: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    while wake_rx.try_recv().is_ok() {}
     refresh().await;
 }
 
@@ -1250,27 +1275,30 @@ pub(crate) async fn run_nm_wifi_watcher(
         let mut ap_removed_items = ap_removed_sub.items();
         let mut device_removed_items = device_removed_sub.items();
 
+        // The four refresh subscriptions above all ask for the same full
+        // re-read, so they ask through one wake the loop drains — see
+        // `arm_refresh`. This loop owns the sender, so the receiver never
+        // closes while it lives.
+        let (refresh_tx, mut refresh_rx) = mpsc::channel::<()>(REFRESH_WAKE_QUEUE);
+
         tracing::info!(path = %device_path, "wifi_nm: watching device");
 
         loop {
             tokio::select! {
                 Some(item) = device_items.next() => {
-                    handle_wifi_refresh_item(item, "device PropertiesChanged", || {
-                        refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn)
-                    }).await;
+                    arm_refresh(&item, "device PropertiesChanged", &refresh_tx);
                 }
                 Some(item) = manager_items.next() => {
-                    handle_wifi_refresh_item(item, "manager PropertiesChanged", || {
-                        refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn)
-                    }).await;
+                    arm_refresh(&item, "manager PropertiesChanged", &refresh_tx);
                 }
                 Some(item) = ap_added_items.next() => {
-                    handle_wifi_refresh_item(item, "AccessPointAdded", || {
-                        refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn)
-                    }).await;
+                    arm_refresh(&item, "AccessPointAdded", &refresh_tx);
                 }
                 Some(item) = ap_removed_items.next() => {
-                    handle_wifi_refresh_item(item, "AccessPointRemoved", || {
+                    arm_refresh(&item, "AccessPointRemoved", &refresh_tx);
+                }
+                Some(()) = refresh_rx.recv() => {
+                    drain_and_refresh(&mut refresh_rx, || {
                         refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn)
                     }).await;
                 }
@@ -2739,46 +2767,81 @@ mod tests {
     /// and `AccessPoint{Added,Removed}` subscriptions were read via `events()`,
     /// which cannot represent either marker, so a subscription that silently
     /// rebuilt mid-gap left the Wi-Fi panel stale with nothing to notice it.
-    /// Pushing one marker through `handle_wifi_refresh_item` must call
-    /// `refresh` exactly once — for both `Resubscribed` and a broadcast
-    /// `Lagged`.
+    /// Pushing one marker through `arm_refresh` must ask for exactly one
+    /// re-read — for both `Resubscribed` and a broadcast `Lagged`.
     ///
     /// Falsifiable: reverting to an `events()`-shaped filter (only refreshing
-    /// on `SignalItem::Event`) drops both counts to 0.
+    /// on `SignalItem::Event`) leaves the wake queue empty.
     #[tokio::test(flavor = "current_thread")]
     async fn refresh_item_reacts_to_marker_exactly_once() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        {
-            let calls = calls.clone();
-            handle_wifi_refresh_item(SignalItem::Resubscribed, "test", || {
-                let calls = calls.clone();
-                async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                }
-            })
-            .await;
+        for item in [SignalItem::Resubscribed, SignalItem::Lagged { skipped: 3 }] {
+            let (tx, mut rx) = mpsc::channel::<()>(REFRESH_WAKE_QUEUE);
+            arm_refresh(&item, "test", &tx);
+            assert!(rx.try_recv().is_ok(), "a marker must ask for a re-read");
+            assert!(rx.try_recv().is_err(), "exactly one, not two");
         }
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "Resubscribed must refresh exactly once"
-        );
+    }
 
-        let calls = Arc::new(AtomicUsize::new(0));
+    /// An ordinary emission asks for the same re-read (byte-identical to
+    /// before #1201) — the marker arms are additions, not a replacement.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_item_reacts_to_an_ordinary_emission_too() {
+        let body = zbus::Message::signal("/t", "t.I", "Ping")
+            .expect("signal builder")
+            .build(&42u32)
+            .expect("build signal message");
+        let item = SignalItem::Event(hytte_bus::SignalEvent {
+            body,
+            sender: None,
+            timestamp: std::time::SystemTime::now(),
+        });
+        let (tx, mut rx) = mpsc::channel::<()>(REFRESH_WAKE_QUEUE);
+        arm_refresh(&item, "test", &tx);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    // ── #1201 review M3: one re-read per burst, not one per subscription ────
+
+    /// One system-bus reconnect gives each of the four refresh subscriptions
+    /// its own `Resubscribed`, and `refresh_nm_state` is the most expensive
+    /// re-read in this crate (station + AP list + a `GetAll` per AP + saved
+    /// connections + wired + VPN). The wake arm must collapse that burst into
+    /// one pass.
+    ///
+    /// Falsifiable: deleting the `while wake_rx.try_recv().is_ok() {}` drain
+    /// in `drain_and_refresh` leaves the other three wakes queued, so the
+    /// "nothing left to re-read" assertion fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_burst_of_markers_costs_one_refresh() {
+        let (tx, mut rx) = mpsc::channel::<()>(REFRESH_WAKE_QUEUE);
+        for what in [
+            "device PropertiesChanged",
+            "manager PropertiesChanged",
+            "AccessPointAdded",
+            "AccessPointRemoved",
+        ] {
+            arm_refresh(&SignalItem::Resubscribed, "test", &tx);
+            assert!(!tx.is_closed(), "{what} armed a wake");
+        }
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        rx.recv().await.expect("a wake is queued");
         {
-            let calls = calls.clone();
-            handle_wifi_refresh_item(SignalItem::Lagged { skipped: 3 }, "test", || {
-                let calls = calls.clone();
-                async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                }
+            let reads = reads.clone();
+            drain_and_refresh(&mut rx, || async move {
+                reads.fetch_add(1, Ordering::SeqCst);
             })
             .await;
         }
+
         assert_eq!(
-            calls.load(Ordering::SeqCst),
+            reads.load(Ordering::SeqCst),
             1,
-            "Lagged must refresh exactly once"
+            "four markers must cost one refresh_nm_state pass, not four"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "and leave nothing queued to re-read again"
         );
     }
 

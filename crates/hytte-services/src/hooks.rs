@@ -165,6 +165,13 @@ fn resolve_path(event: &str) -> Option<PathBuf> {
 /// would turn "printed more than the budget" into "hangs until
 /// `HOOK_TIMEOUT` kills it", discarding the very output the budget exists
 /// to preserve (see the `chatty_stdout_is_capped_at_budget` test).
+///
+/// That discard loop also stops on a read **error**, not only on EOF
+/// (#1192 review, NIT-3): `while matches!(…, Ok(n) if n > 0)` exits on
+/// `Err(_)` too, leaving the pipe unread. That is deliberate — retrying a
+/// broken pipe read would spin — and it is bounded from the other side by
+/// `kill_on_drop(true)` plus `HOOK_TIMEOUT`, so the writer cannot be left
+/// blocked indefinitely either way.
 async fn drain<R>(stream: Option<R>, budget: usize) -> (Vec<u8>, bool)
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -499,12 +506,22 @@ mod tests {
     /// `drain` keeps draining (and discarding) past the cap instead of
     /// stopping — the script still finishes normally well inside
     /// `HOOK_TIMEOUT`, rather than hanging on a full pipe until killed.
+    ///
+    /// **2 MB, not 50 MB** (#1192 review, LOW-3). The budget is 64 KiB, so
+    /// 2 MB is 32× over it — everything this test asserts (the cap, the
+    /// `truncated` flag, the "didn't hang on a full pipe" timing) holds
+    /// identically, while the work done under a **500 ms** `cfg(test)`
+    /// `HOOK_TIMEOUT` drops 25-fold. At 50 MB a slow enough run would have
+    /// the hook killed instead, the `ran` INFO would never fire, and the
+    /// test would hang in `wait_for` rather than failing cleanly — an
+    /// unnecessary flake to carry into `nix flake check`, which runs this
+    /// beside two nixosTest VMs and the workspace clippy.
     #[tokio::test(flavor = "current_thread")]
     async fn chatty_stdout_is_capped_at_budget() {
         TestHome::with(|home| async move {
             home.write_script(
                 "theme-changed",
-                "#!/bin/sh\nhead -c 50000000 /dev/zero\nexit 0\n",
+                "#!/bin/sh\nhead -c 2000000 /dev/zero\nexit 0\n",
                 0o755,
             );
             let (cap, _guard) = capture();
@@ -546,7 +563,7 @@ mod tests {
                 captured.len(),
                 super::HOOK_OUTPUT_BUDGET,
                 "captured stdout should be capped at the budget, not the full \
-                 50 MB the script printed",
+                 2 MB the script printed",
             );
             assert_eq!(
                 stdout_event.fields.get("truncated").map(String::as_str),

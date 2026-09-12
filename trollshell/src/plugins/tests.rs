@@ -3995,6 +3995,18 @@ fn mapped_gl(
     scope: &Scope,
     node: &wire::Node,
 ) -> (u32, u32, Arc<hytte::ui::gl_surface::GlUniforms>) {
+    mapped_gl_for(scope, node, super::preem_gl::SCOPE)
+}
+
+/// [`mapped_gl`] for a named pipeline — the gauge is the second (#1143), and
+/// *which* program a node names is part of what these tests hold: `hytte-ui`
+/// keys its compiled resources on it (#979), so a kind emitting another kind's
+/// program name would draw the wrong pipeline's shaders and never say so.
+fn mapped_gl_for(
+    scope: &Scope,
+    node: &wire::Node,
+    expected: hytte::ui::gl_surface::GlProgram,
+) -> (u32, u32, Arc<hytte::ui::gl_surface::GlUniforms>) {
     match to_ui_node(scope, Grants::none(), node) {
         UiNode::GlSurface {
             width,
@@ -4005,9 +4017,8 @@ fn mapped_gl(
             ..
         } => {
             assert_eq!(
-                program,
-                super::preem_gl::SCOPE,
-                "a preem Scope names the registered scope pipeline",
+                program, expected,
+                "a preem widget's GL arm names its own registered pipeline",
             );
             assert_eq!(
                 classes,
@@ -4558,6 +4569,235 @@ fn an_accent_change_re_tints_a_gl_scope_without_rebuilding_it() {
             "a re-tint is a cache drop, never a renderer rebuild",
         );
         tint_in_process_surfaces(None);
+    });
+}
+
+// ── the `Gauge` GL arm (#1143) ───────────────────────────────────────────────
+//
+// The same three shell-side contracts the `Scope` arm has above, on the same
+// seam: which arm a build takes, what node it emits, and what a failed context
+// does about it. The pixels are the parity harness's and live-verify's.
+
+/// A `Gauge` widget at a known geometry, for the tests below. `scale = 1`, so
+/// the GL arm's native grid and the kit's logical one are the same number and
+/// a size assertion says something about the *mapping* rather than about the
+/// upscale.
+fn gl_gauge_widget(target: f32) -> vocab::PreemWidget {
+    vocab::PreemWidget::Gauge {
+        config: vocab::GaugeConfig {
+            style: vocab::StyleRef::new(vocab::StyleName::Crt),
+            cols: 144,
+            rows: 64,
+            scale: 1,
+            ..vocab::GaugeConfig::default()
+        },
+        state: vocab::GaugeState { target },
+    }
+}
+
+/// **The kill switch reaches the gauge too**, and it restores the kit's own
+/// bytes exactly — the mirror of
+/// `the_cpu_arm_still_emits_the_kits_own_bytes_as_a_pixels_node`, which is the
+/// `Scope`'s version of this contract.
+///
+/// The whole preem suite runs on the CPU arm by default (`preem_gl`'s
+/// `TEST_ARM`), which is why every other gauge parity assertion in this file
+/// keeps measuring the kit; this one pins the *node kind* as well, so a gauge
+/// that silently took the GL arm under the switch would be caught here rather
+/// than by a blank chip.
+///
+/// **Falsified** by dropping the `preem_gl::arm() == Arm::Gl` guard from
+/// `build`'s gauge arm: the first assertion reports a `GlSurface`.
+#[test]
+fn the_cpu_arm_still_emits_the_kits_own_gauge_bytes_as_a_pixels_node() {
+    let _ink = preem_ink_lock();
+    let key = Scope::detached("gauge-kill-switch-cpu");
+    let node = preem_node(Some("gg"), gl_gauge_widget(0.7));
+
+    assert!(
+        matches!(
+            to_ui_node(&key, Grants::none(), &node),
+            UiNode::Pixels { .. }
+        ),
+        "with the kill switch on, a Gauge is a raster surface",
+    );
+    let mut oracle = kit::Gauge::with_size(144, 64).scale(1);
+    oracle.set_target(0.7);
+    assert_eq!(
+        mapped_pixels(&key, &node),
+        kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
+        "the CPU arm is the kit, byte for byte",
+    );
+}
+
+/// The GL arm emits a `GlSurface` the CPU arm would have sized **identically**,
+/// naming the gauge's own pipeline, with the **native** buffer as its grid.
+///
+/// The size agreement is the same layout argument the scope's version makes: a
+/// kill-switch flip is a node-kind change, so it rebuilds the widget, and a
+/// rebuild that also resized would reflow the whole card.
+///
+/// The *grid* is where the two kinds deliberately differ, and it is the whole of
+/// #1090: a `Scope`'s offscreen passes run at the pre-upscale grid, while a
+/// `Gauge`'s run at `cols * scale` — the resolution the dial is actually shown
+/// at, instead of a quarter of it replicated.
+///
+/// **Falsified** by pointing `gauge_surface`'s `grid` at `(cols, rows)`: the
+/// last assertion goes red while every `scale = 1` parity case stays green.
+#[test]
+fn the_gl_gauge_emits_its_own_pipeline_at_the_native_grid() {
+    let _ink = preem_ink_lock();
+    let node = preem_node(Some("gg"), gl_gauge_widget(0.7));
+
+    let cpu = Scope::detached("gauge-gl-size-cpu");
+    let (cpu_w, cpu_h, _) = mapped_pixels(&cpu, &node);
+
+    super::preem_gl::with_gl_arm(|| {
+        let gl = Scope::detached("gauge-gl-size-gl");
+        let (gl_w, gl_h, uniforms) =
+            mapped_gl_for(&gl, &node, super::preem_gl::GAUGE);
+        assert_eq!(
+            (gl_w, gl_h),
+            (cpu_w, cpu_h),
+            "same natural size on both arms",
+        );
+        assert_eq!((gl_w, gl_h), (144, 64), "cols * scale by rows * scale");
+        assert_eq!(
+            uniforms.grid,
+            (144, 64),
+            "a gauge's offscreen passes run at the **native** buffer, not the \
+             pre-upscale grid the scope uses",
+        );
+        assert_eq!(
+            uniforms.step_seq, 0,
+            "a gauge carries no cross-frame GPU state, so nothing counts steps",
+        );
+        assert!(
+            uniforms.data.is_none(),
+            "and no data strip: every shape is analytic",
+        );
+    });
+}
+
+/// **`animates()` is the same expression on both gauge arms** — and here that
+/// is not a re-derivation but the same field: both hold the one `kit::Gauge`,
+/// so #926's frame-clock park cannot depend on which renderer drew the dial.
+///
+/// Stepped in lockstep through a whole swing and compared at every step, so a
+/// divergence anywhere in the sequence fails rather than only at the ends.
+///
+/// **Falsified** by giving `GaugeGl` its own `animates()` arm that answers
+/// `true` (or `false`) unconditionally.
+#[test]
+fn both_gauge_arms_animate_and_park_in_lockstep() {
+    let _ink = preem_ink_lock();
+    let node = preem_node(Some("gg"), gl_gauge_widget(0.9));
+
+    let cpu = Scope::detached("gauge-lockstep-cpu");
+    let _ = to_ui_node(&cpu, Grants::none(), &node);
+    let gl = Scope::detached("gauge-lockstep-gl");
+    super::preem_gl::with_gl_arm(|| {
+        let _ = to_ui_node(&gl, Grants::none(), &node);
+    });
+
+    let cpu_only = std::slice::from_ref(&cpu);
+    let gl_only = std::slice::from_ref(&gl);
+    assert!(
+        preem_render::any_animating_in(cpu_only),
+        "the premise: a needle pointed at 0.9 has somewhere to go",
+    );
+    // Long enough for a 2 Hz spring at 0.5 damping to arrive and stop, plus a
+    // tail past the park so the *parked* state is compared too.
+    let mut parked_at = None;
+    for step in 0..240 {
+        let cpu_animates = preem_render::any_animating_in(cpu_only);
+        let gl_animates = preem_render::any_animating_in(gl_only);
+        assert_eq!(
+            cpu_animates, gl_animates,
+            "step {step}: the two arms disagree about whether the gauge animates",
+        );
+        if !cpu_animates && parked_at.is_none() {
+            parked_at = Some(step);
+        }
+        let moved = preem_render::advance_all(preem_render::ANIM_STEP_SECS);
+        assert_eq!(
+            moved.contains(&cpu),
+            moved.contains(&gl),
+            "step {step}: the two arms disagree about whether the gauge moved",
+        );
+    }
+    assert!(
+        parked_at.is_some(),
+        "the needle never settled, so the park was never actually observed",
+    );
+}
+
+/// A `Gauge` whose GL context fails is rebuilt onto the kit **by the hook**,
+/// without waiting for a mapping pass — the `Scope`'s
+/// `a_settled_gl_scope_falls_back_without_waiting_for_a_frame_that_never_comes`
+/// contract, and the reason `rebuild_gl_renderers_on_cpu` had to stop naming
+/// one renderer variant (#1143).
+///
+/// A **settled** gauge is the case that needs it: a needle already on its
+/// target answers `animates()` with `false`, #926's clock parks, `apply`'s
+/// `gl_lost` rebuild is never re-entered, and the chip would stay blank until
+/// the plugin sent a new target — which a gauge showing a steady reading may
+/// never do.
+///
+/// **Falsified** by making `Renderer::is_gl` answer `false` for `GaugeGl` (the
+/// `builds` assertion goes red — the hook walks past the instance), or by
+/// dropping the `rebuild_gl_renderers_on_cpu()` call from `preem_gl::install`'s
+/// hook.
+#[test]
+fn a_settled_gl_gauge_falls_back_without_waiting_for_a_frame_that_never_comes() {
+    let _ink = preem_ink_lock();
+    super::preem_gl::install();
+    super::preem_gl::with_gl_arm(|| {
+        let key = Scope::detached("gauge-context-lost-settled");
+        let node = preem_node(Some("gg"), gl_gauge_widget(0.0));
+
+        assert!(
+            matches!(
+                to_ui_node(&key, Grants::none(), &node),
+                UiNode::GlSurface { .. }
+            ),
+            "the GL arm is chosen while a context is still possible",
+        );
+        // The premise, and the reason the animating path cannot save this one:
+        // a needle built pointing at its own resting value never moves.
+        assert!(
+            !preem_render::any_animating_in(std::slice::from_ref(&key)),
+            "a settled gauge never animates, so nothing will re-map it",
+        );
+        let before = preem_render::probe(&key, Some("gg")).expect("the instance exists");
+
+        hytte::ui::gl_surface::abandon_gl("no GL in this test");
+
+        let after = preem_render::probe(&key, Some("gg")).expect("the instance survives");
+        assert_eq!(
+            after.0,
+            before.0 + 1,
+            "the failure hook rebuilt the renderer itself, not the next re-map",
+        );
+        assert_eq!(
+            after.1, before.1,
+            "…and did it without an apply, so no widget state was touched",
+        );
+
+        assert!(
+            matches!(
+                to_ui_node(&key, Grants::none(), &node),
+                UiNode::Pixels { .. }
+            ),
+            "a lost context drops even a settled gauge to the raster arm",
+        );
+        let mut oracle = kit::Gauge::with_size(144, 64).scale(1);
+        oracle.set_target(0.0);
+        assert_eq!(
+            mapped_pixels(&key, &node),
+            kit_pixels(&oracle.render(kit::DisplayStyle::Crt)),
+            "and what it draws is the kit's own frame, byte for byte",
+        );
     });
 }
 

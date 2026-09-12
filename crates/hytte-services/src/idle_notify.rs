@@ -589,14 +589,6 @@ fn reset_after_observer_error(state: &Mutable<IdleState>, dimmed: &Arc<AtomicBoo
     restore_dim_if_dimmed(dimmed);
 }
 
-/// Drive [`run`] forever on the dedicated observer thread, reconnecting with
-/// capped exponential backoff whenever it exits with an error (compositor
-/// restart, protocol/dispatch error, connect failure) instead of dying on the
-/// first one — this thread is the only thing standing between "idle" and
-/// "never dims/locks/suspends" (#431). Each error exit first runs
-/// [`reset_after_observer_error`]. A clean return means the compositor
-/// advertises no `ext_idle_notifier_v1` at all — retrying cannot change that,
-/// so the manager stays off (already logged inside [`run`]).
 /// Start the observer on a supervised blocking thread (#1170).
 ///
 /// `dimmed` is created **here**, outside the supervised closure, so it survives
@@ -635,6 +627,19 @@ fn supervise_observer<F>(
     });
 }
 
+/// Drive [`run`] forever on the dedicated observer thread, reconnecting with
+/// capped exponential backoff whenever it exits with an error (compositor
+/// restart, protocol/dispatch error, connect failure) instead of dying on the
+/// first one — this thread is the only thing standing between "idle" and
+/// "never dims/locks/suspends" (#431). Each error exit first runs
+/// [`reset_after_observer_error`].
+///
+/// **A clean return is a real outcome here**, unlike the other three supervised
+/// bodies #1170 touched: it means the compositor advertises no
+/// `ext_idle_notifier_v1` at all, which retrying cannot change, so the manager
+/// stays off (already logged inside [`run`]). On such a host the supervisor
+/// stops the task and its health row goes away — a correct absence from the
+/// Stats drawer, not a missing subsystem.
 fn run_observer_with_reconnect(state: &Mutable<IdleState>, dimmed: &Arc<AtomicBool>) {
     let mut backoff = RetryBackoff::default();
     loop {

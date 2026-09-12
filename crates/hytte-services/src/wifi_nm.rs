@@ -31,7 +31,7 @@
 
 use futures_signals::signal::Mutable;
 use futures_util::StreamExt;
-use hytte_bus::BusKind;
+use hytte_bus::{BusKind, SignalItem};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1108,6 +1108,72 @@ async fn refresh_vpn_profiles(vpn: &Mutable<Vec<VpnProfile>>) {
     }
 }
 
+/// Handle one item from `run_nm_wifi_watcher`'s four unconditional-refresh
+/// subscriptions (device/manager `PropertiesChanged`, `AccessPointAdded`,
+/// `AccessPointRemoved`): re-read NM state for both an ordinary emission and
+/// a `Resubscribed`/`Lagged` marker (#1201) — before #1201 these were read
+/// via `events()`, which cannot represent either marker, so a subscription
+/// that silently rebuilt mid-gap left the Wi-Fi panel stale with nothing to
+/// notice it. `refresh` is `FnOnce` (see
+/// `bluetooth::devices::bluetooth_marker_or_event`'s doc for the general
+/// reason `FnMut`/`AsyncFnMut` would be the wrong choice for a closure like
+/// this) — injectable so a test can stand in for the real
+/// [`refresh_nm_state`] round trip with a counter.
+async fn handle_wifi_refresh_item<Refresh, Fut>(item: SignalItem, what: &'static str, refresh: Refresh)
+where
+    Refresh: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if matches!(item, SignalItem::Resubscribed | SignalItem::Lagged { .. }) {
+        tracing::info!(what, "wifi_nm: resubscribed; refreshing state");
+    } else {
+        tracing::debug!(what, "wifi_nm: refreshing state");
+    }
+    refresh().await;
+}
+
+/// Handle one item from the manager's `DeviceRemoved` subscription for
+/// `device_path`: on an ordinary emission, reset only when the removed path
+/// matches ours (byte-identical to before #1201). On a `Resubscribed`/
+/// `Lagged` marker, a removal notice for exactly this device may have been
+/// lost while the subscription was down, so re-check liveness directly with
+/// `still_present` instead of waiting on an emission that will never come.
+/// Returns `true` when the caller should clear state and re-discover.
+/// `still_present` is injectable so a test can stand in for the real
+/// `GetDevices` round trip with a counter.
+async fn device_removed_should_reset<StillPresent, Fut>(
+    item: SignalItem,
+    device_path: &str,
+    still_present: StillPresent,
+) -> bool
+where
+    StillPresent: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    match item {
+        SignalItem::Event(evt) => {
+            // The DeviceRemoved signal body is a single object path `o`.
+            // Accept any decode failure gracefully and always re-discover —
+            // re-discovery is cheap and idempotent.
+            let removed_path = evt
+                .body
+                .body()
+                .deserialize::<zbus::zvariant::OwnedObjectPath>()
+                .ok()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_default();
+            removed_path.is_empty() || removed_path == device_path
+        }
+        SignalItem::Resubscribed | SignalItem::Lagged { .. } => {
+            tracing::info!(
+                path = device_path,
+                "wifi_nm: DeviceRemoved resubscribed; re-checking whether the device is still present"
+            );
+            !still_present().await
+        }
+    }
+}
+
 // ── Main watcher task ─────────────────────────────────────────────────────────
 
 /// Main NM watcher loop. Discovers the first Wi-Fi device, reads initial state,
@@ -1175,41 +1241,43 @@ pub(crate) async fn run_nm_wifi_watcher(
             .signal("DeviceRemoved")
             .start();
 
-        let mut device_events = device_sub.events();
-        let mut manager_events = manager_sub.events();
-        let mut ap_added_events = ap_added_sub.events();
-        let mut ap_removed_events = ap_removed_sub.events();
-        let mut device_removed_events = device_removed_sub.events();
+        let mut device_items = device_sub.items();
+        let mut manager_items = manager_sub.items();
+        let mut ap_added_items = ap_added_sub.items();
+        let mut ap_removed_items = ap_removed_sub.items();
+        let mut device_removed_items = device_removed_sub.items();
 
         tracing::info!(path = %device_path, "wifi_nm: watching device");
 
         loop {
             tokio::select! {
-                Some(_) = device_events.next() => {
-                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn).await;
+                Some(item) = device_items.next() => {
+                    handle_wifi_refresh_item(item, "device PropertiesChanged", || {
+                        refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn)
+                    }).await;
                 }
-                Some(_) = manager_events.next() => {
-                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn).await;
+                Some(item) = manager_items.next() => {
+                    handle_wifi_refresh_item(item, "manager PropertiesChanged", || {
+                        refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn)
+                    }).await;
                 }
-                Some(_) = ap_added_events.next() => {
-                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn).await;
+                Some(item) = ap_added_items.next() => {
+                    handle_wifi_refresh_item(item, "AccessPointAdded", || {
+                        refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn)
+                    }).await;
                 }
-                Some(_) = ap_removed_events.next() => {
-                    refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn).await;
+                Some(item) = ap_removed_items.next() => {
+                    handle_wifi_refresh_item(item, "AccessPointRemoved", || {
+                        refresh_nm_state(&device_path, &station, &networks, &adapter, &wired, &vpn)
+                    }).await;
                 }
-                Some(evt) = device_removed_events.next() => {
-                    // The DeviceRemoved signal body is a single object path `o`.
-                    // Accept any decode failure gracefully and always re-discover —
-                    // re-discovery is cheap and idempotent.
-                    let removed_path = evt
-                        .body
-                        .body()
-                        .deserialize::<zbus::zvariant::OwnedObjectPath>()
-                        .ok()
-                        .map(|p| p.as_str().to_string())
-                        .unwrap_or_default();
-                    let matches = removed_path.is_empty() || removed_path == device_path;
-                    if matches {
+                Some(item) = device_removed_items.next() => {
+                    let should_reset = device_removed_should_reset(item, &device_path, || async {
+                        get_devices()
+                            .await
+                            .is_ok_and(|devices| devices.iter().any(|p| p.as_str() == device_path))
+                    }).await;
+                    if should_reset {
                         tracing::warn!(
                             path = %device_path,
                             "wifi_nm: device removed — clearing state and re-discovering"
@@ -2656,6 +2724,111 @@ mod tests {
         assert_eq!(
             prop_object_path(&props, "Connection").as_deref(),
             Some("/org/fd/NM/Settings/3"),
+        );
+    }
+
+    // ── #1201: the four refresh subscriptions and DeviceRemoved react to
+    //    Resubscribed/Lagged, not just to an ordinary emission ─────────────
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Before #1201, `run_nm_wifi_watcher`'s device/manager `PropertiesChanged`
+    /// and `AccessPoint{Added,Removed}` subscriptions were read via `events()`,
+    /// which cannot represent either marker, so a subscription that silently
+    /// rebuilt mid-gap left the Wi-Fi panel stale with nothing to notice it.
+    /// Pushing one marker through `handle_wifi_refresh_item` must call
+    /// `refresh` exactly once — for both `Resubscribed` and a broadcast
+    /// `Lagged`.
+    ///
+    /// Falsifiable: reverting to an `events()`-shaped filter (only refreshing
+    /// on `SignalItem::Event`) drops both counts to 0.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_item_reacts_to_marker_exactly_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = calls.clone();
+            handle_wifi_refresh_item(SignalItem::Resubscribed, "test", || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Resubscribed must refresh exactly once"
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = calls.clone();
+            handle_wifi_refresh_item(SignalItem::Lagged { skipped: 3 }, "test", || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Lagged must refresh exactly once"
+        );
+    }
+
+    /// `DeviceRemoved`'s marker branch re-checks liveness directly instead of
+    /// waiting on an emission that a lost subscription will never deliver
+    /// (#1201): a still-present device must not reset, and a gone one must —
+    /// each re-checked exactly once, whichever marker fired.
+    ///
+    /// Falsifiable: making the `Resubscribed | Lagged { .. }` arm always
+    /// return `false` (never resets) or dropping the `still_present` call
+    /// reds this test.
+    #[tokio::test(flavor = "current_thread")]
+    async fn device_removed_rechecks_liveness_exactly_once_per_marker() {
+        let checks = Arc::new(AtomicUsize::new(0));
+        {
+            let checks = checks.clone();
+            let reset = device_removed_should_reset(SignalItem::Resubscribed, "/dev/x", move || {
+                let checks = checks.clone();
+                async move {
+                    checks.fetch_add(1, Ordering::SeqCst);
+                    true // still present
+                }
+            })
+            .await;
+            assert!(!reset, "a still-present device must not reset");
+        }
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            1,
+            "Resubscribed must re-check presence exactly once"
+        );
+
+        let checks = Arc::new(AtomicUsize::new(0));
+        {
+            let checks = checks.clone();
+            let reset = device_removed_should_reset(
+                SignalItem::Lagged { skipped: 2 },
+                "/dev/x",
+                move || {
+                    let checks = checks.clone();
+                    async move {
+                        checks.fetch_add(1, Ordering::SeqCst);
+                        false // gone
+                    }
+                },
+            )
+            .await;
+            assert!(reset, "a gone device must reset");
+        }
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            1,
+            "Lagged must re-check presence exactly once"
         );
     }
 }

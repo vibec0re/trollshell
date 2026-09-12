@@ -799,6 +799,53 @@ mod tests {
         value.trim().to_owned()
     }
 
+    /// **Every logical length the shader draws with is multiplied by the
+    /// upscale**, and the factor it is multiplied by is the upscale uniform.
+    ///
+    /// The fourth of the arm's scale-only decisions, and the one no other gate
+    /// can see (#1148 review, HIGH-2). The pivot offset is pinned by
+    /// [`the_face_scales_onto_the_native_pixel_centres`], the bloom radius by
+    /// the golden uniform table, and the CRT mask's logical pitch by the
+    /// harness's box-averaged case — that one fails `FAIL(interior)`, because a
+    /// comb at the wrong pitch moves flat pixels. A tick drawn at half its
+    /// width does **not** move a flat pixel: a major tick is 1.7 logical px
+    /// wide, so it is all ramp and all of it lands in the harness's edge bin,
+    /// inside the budget. Measured: with `s` pinned to `1.0`, all 28 harness
+    /// cases pass and the whole unit suite is green.
+    ///
+    /// So it is pinned here, in the source, in the two ways it can break:
+    /// `s` stopping being the upscale, and a use of a length losing its `* s`.
+    /// A source scan is a weak instrument and this is the case that earns one —
+    /// the alternative is no check at all on a change that halves every tick on
+    /// every dial on the glass.
+    ///
+    /// **Falsified** by `float s = u_upscale;` -> `float s = 1.0;` (the first
+    /// assertion), or by dropping the `* s` from any of the half-widths (the
+    /// second).
+    #[test]
+    fn the_shader_scales_every_logical_length_it_draws_with() {
+        assert!(
+            LIT_FRAG.contains("float s = u_upscale;"),
+            "gauge.frag's face resolves its half-widths against `s`; `s` must be the \
+             upscale uniform, or every tick and arc is drawn at its logical width on a \
+             native-resolution grid",
+        );
+        // The declaration block is where these are *defined* in logical px; it
+        // is every line after it that has to carry them into native ones.
+        let body = LIT_FRAG
+            .split_once("const float F32_EPSILON")
+            .map_or(LIT_FRAG, |(_, rest)| rest);
+        for name in ["ARC_HW", "VALUE_HW_BONUS", "MAJOR_HW", "MINOR_HW", "BLADE_TIP"] {
+            for line in body.lines().filter(|line| line.contains(name)) {
+                assert!(
+                    line.contains("* s") || line.contains("* u_upscale"),
+                    "gauge.frag draws with {name} without scaling it into native pixels: \
+                     {line}",
+                );
+            }
+        }
+    }
+
     /// **Every constant `gauge.frag` shares with the kit is the kit's value**,
     /// parsed back out of the shipped GLSL rather than restated beside it.
     ///

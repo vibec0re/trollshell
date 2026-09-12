@@ -413,12 +413,19 @@ impl ReconnectReporter {
 /// Every retry policy this crate **ships**, so the `every_shipped_policy_*`
 /// tests below see all of them.
 ///
-/// **A new shipped policy belongs in this list.** These are the only tests that
-/// look at real numbers rather than a test-local schedule, and #665 exists
-/// precisely because the second policy shipped without them: its own test
-/// compared `step`'s delay against `policy.backoff(attempt)` — the very
-/// expression `step` computes internally — so `initial: Duration::ZERO` kept the
-/// whole suite green while turning the retry into a tight `error!` flood.
+/// **A new shipped policy belongs in this list**, and since #1170's review that
+/// is *enforced* rather than merely asked for: `the_shipped_list_is_every_policy_in_the_crate`
+/// scans the crate's own source for module-level `Policy` declarations and
+/// fails if the two sets differ in either direction. Before that the doc said
+/// "belongs in this list" and nothing checked, which is the same shape #665
+/// exists to close — a hand-synced invariant that had already failed once.
+///
+/// These are the only tests that look at real numbers rather than a test-local
+/// schedule, and #665 exists precisely because the second policy shipped
+/// without them: its own test compared `step`'s delay against
+/// `policy.backoff(attempt)` — the very expression `step` computes internally —
+/// so `initial: Duration::ZERO` kept the whole suite green while turning the
+/// retry into a tight `error!` flood.
 #[cfg(test)]
 const SHIPPED: &[(&str, Policy)] = &[
     ("wifi::PROBE_RETRY", crate::wifi::PROBE_RETRY),
@@ -775,5 +782,118 @@ mod tests {
                  quiet in the journal"
             );
         }
+    }
+
+    /// [`SHIPPED`] is every `Policy` this crate declares — checked against the
+    /// source rather than trusted.
+    ///
+    /// The two tests above cover a policy that is *in* the list; one that was
+    /// forgotten was invisible, and `SHIPPED`'s doc asked for the sync with
+    /// nothing enforcing it. That is exactly the shape #665 exists to close: a
+    /// hand-maintained invariant that had already failed once. The repo's usual
+    /// answer to "a rule about source text" is a `runCommand` scan under
+    /// `nix/` (`lint-bind-pins.py`, `lint-glsl.py`); this one is a unit test
+    /// instead because the rule is about *this crate's* source only, it needs no
+    /// cross-file parsing, and it wants to fail next to the list it is about.
+    ///
+    /// **The scan rule, stated so it can be argued with.** A shipped policy is
+    /// a `const`/`static` of type `Policy` declared at **module level**, i.e.
+    /// starting at column 0 — which is what makes an indented test-local ramp
+    /// (`geoclue`'s `FAST_RETRY`, `wifi`'s and this file's equivalents) not a
+    /// shipped one, without needing to parse `mod tests` or track brace depth
+    /// past doc comments full of braces. A `#[cfg(test)]` on the line above
+    /// excludes it too. The expected label is `<module>::<NAME>`, with `<module>`
+    /// the file stem, or the directory name for a `mod.rs` — which is why
+    /// `wifi/mod.rs`'s entry reads `wifi::PROBE_RETRY`.
+    ///
+    /// Falsify by deleting any entry from `SHIPPED`, or by adding a module-level
+    /// `Policy` const anywhere in the crate without listing it.
+    #[test]
+    fn the_shipped_list_is_every_policy_in_the_crate() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut declared = Vec::new();
+        collect_policy_decls(&src, &mut declared);
+        declared.sort();
+
+        let mut listed: Vec<String> = SHIPPED.iter().map(|(name, _)| (*name).to_owned()).collect();
+        listed.sort();
+
+        assert!(
+            !declared.is_empty(),
+            "the source scan found no policies at all, so it is asserting nothing — did the \
+             crate layout move out from under `CARGO_MANIFEST_DIR/src`?"
+        );
+        assert_eq!(
+            declared, listed,
+            "`SHIPPED` and the crate's module-level `Policy` declarations disagree. Anything in \
+             the left column and not the right ships without the `every_shipped_policy_*` \
+             invariants; anything in the right and not the left is a stale entry"
+        );
+    }
+
+    /// Every `<module>::<NAME>` a module-level `Policy` declaration under `dir`
+    /// would be called in [`SHIPPED`]. See the test above for the rule.
+    fn collect_policy_decls(dir: &std::path::Path, out: &mut Vec<String>) {
+        let entries = std::fs::read_dir(dir).expect("the crate's own src/ is readable");
+        for entry in entries {
+            let path = entry.expect("a readable dir entry").path();
+            if path.is_dir() {
+                collect_policy_decls(&path, out);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let stem = path.file_stem().expect("a .rs file has a stem");
+            let module = if stem == "mod" {
+                path.parent()
+                    .and_then(std::path::Path::file_name)
+                    .expect("a mod.rs lives in a directory")
+            } else {
+                stem
+            }
+            .to_string_lossy()
+            .into_owned();
+
+            let text = std::fs::read_to_string(&path).expect("the crate's own source is UTF-8");
+            let mut previous = "";
+            for line in text.lines() {
+                if is_module_level_policy_decl(line) && previous.trim() != "#[cfg(test)]" {
+                    let name = line
+                        .split_once("const ")
+                        .or_else(|| line.split_once("static "))
+                        .and_then(|(_, rest)| rest.split_once(':'))
+                        .expect("the decl matcher already saw both halves")
+                        .0
+                        .trim();
+                    out.push(format!("{module}::{name}"));
+                }
+                previous = line;
+            }
+        }
+    }
+
+    /// Whether `line` declares a module-level `const`/`static` of type `Policy`.
+    fn is_module_level_policy_decl(line: &str) -> bool {
+        let Some(rest) = line
+            .strip_prefix("const ")
+            .or_else(|| line.strip_prefix("static "))
+            .or_else(|| {
+                line.strip_prefix("pub ")
+                    .or_else(|| line.strip_prefix("pub(crate) "))
+                    .or_else(|| line.strip_prefix("pub(super) "))
+                    .and_then(|r| r.strip_prefix("const ").or_else(|| r.strip_prefix("static ")))
+            })
+        else {
+            // Not column 0, or not a const/static: indented items are inside
+            // something, and the only thing shipped policies are inside is the
+            // module itself.
+            return false;
+        };
+        let Some((_, ty)) = rest.split_once(':') else {
+            return false;
+        };
+        let ty = ty.split('=').next().unwrap_or(ty).trim();
+        ty == "Policy" || ty == "retry::Policy"
     }
 }

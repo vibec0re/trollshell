@@ -576,6 +576,14 @@ fn drop_cookies_for_vanished_owner(
 /// primitive `mpris`/`tray` already use to watch their own peers, rather
 /// than a bespoke second watcher; runs for the process lifetime under
 /// `spawn_supervised`.
+///
+/// The subscription is deliberately **unfiltered** (no `arg0` match rule),
+/// so this task wakes on every name change on the session bus. That is the
+/// standard shape for this — a per-owner `arg0=':1.NN'` rule added at
+/// `Inhibit` time and removed at `UnInhibit` would be one broker round trip
+/// per cookie to save a body that exits in two string comparisons (#1192
+/// review, NIT-1) — but it is a choice, not an oversight: revisit it if
+/// this ever shows up in a profile.
 async fn watch_owner_changes(
     state: &Mutex<HashMap<u32, Inhibitor>>,
     inhibitors: &Mutable<Vec<Inhibitor>>,
@@ -586,33 +594,74 @@ async fn watch_owner_changes(
         .iface("org.freedesktop.DBus")
         .signal("NameOwnerChanged")
         .start();
-    let mut events = subscription.events();
-    while let Some(event) = events.next().await {
-        let Ok((name, _old_owner, new_owner)) =
-            event.body.body().deserialize::<(String, String, String)>()
-        else {
-            continue;
-        };
-        if !new_owner.is_empty() {
-            continue; // a name gaining an owner is not a departure
-        }
-        // For a direct connection dropping, `name` here IS the vanished
-        // unique bus name (":1.NN") — the same value `header.sender()`
-        // captured in `ScreenSaverIface::inhibit`.
-        let dead = drop_cookies_for_vanished_owner(owners, &name);
-        if dead.is_empty() {
-            continue;
-        }
-        for cookie in &dead {
-            tracing::debug!(
-                cookie,
-                sender = %name,
-                "screensaver: caller vanished, dropping Inhibit cookie",
-            );
-            remove_inhibitor(state, *cookie);
-        }
-        publish_inhibitors(state, inhibitors);
+    let messages = subscription.events().map(|event| event.body);
+    run_owner_watch(messages, state, inhibitors, owners).await;
+    // `subscription` is the live handle — dropping the last one tears the
+    // subscription down — so keep it alive across the whole loop, explicitly.
+    drop(subscription);
+}
+
+/// The watcher loop, taking its event source as a plain stream of D-Bus
+/// messages.
+///
+/// Split from [`watch_owner_changes`] for one reason: `hytte_bus::signals`
+/// subscribes on the **process-global pooled** session connection, which a
+/// test cannot point at the ephemeral `dbus-daemon` it spawned (that would
+/// need `DBUS_SESSION_BUS_ADDRESS` set before the pool initialises, i.e.
+/// `std::env::set_var`, i.e. `unsafe`, which this crate forbids). With the
+/// stream as a parameter, the gated `system_tests` module below drives this
+/// exact loop — decode, departure check, cookie drop, republish — against a
+/// real broker, over a real `Inhibit` call made by a real second connection
+/// that then really dies. Before that the only tests were on
+/// [`drop_cookies_for_vanished_owner`], a pure `HashMap` filter: inverting
+/// the departure check below left all three of them green (#1192 review,
+/// MEDIUM-1).
+async fn run_owner_watch<S>(
+    mut messages: S,
+    state: &Mutex<HashMap<u32, Inhibitor>>,
+    inhibitors: &Mutable<Vec<Inhibitor>>,
+    owners: &Mutex<HashMap<u32, String>>,
+) where
+    S: futures_util::Stream<Item = zbus::Message> + Unpin,
+{
+    while let Some(message) = messages.next().await {
+        handle_name_owner_changed(&message, state, inhibitors, owners);
     }
+}
+
+/// Apply one `NameOwnerChanged` message: ignore anything that isn't a
+/// departure, otherwise drop every cookie the departed name owned and
+/// republish the inhibitor list.
+fn handle_name_owner_changed(
+    message: &zbus::Message,
+    state: &Mutex<HashMap<u32, Inhibitor>>,
+    inhibitors: &Mutable<Vec<Inhibitor>>,
+    owners: &Mutex<HashMap<u32, String>>,
+) {
+    let Ok((name, _old_owner, new_owner)) =
+        message.body().deserialize::<(String, String, String)>()
+    else {
+        return;
+    };
+    if !new_owner.is_empty() {
+        return; // a name gaining an owner is not a departure
+    }
+    // For a direct connection dropping, `name` here IS the vanished
+    // unique bus name (":1.NN") — the same value `header.sender()`
+    // captured in `ScreenSaverIface::inhibit`.
+    let dead = drop_cookies_for_vanished_owner(owners, &name);
+    if dead.is_empty() {
+        return;
+    }
+    for cookie in &dead {
+        tracing::debug!(
+            cookie,
+            sender = %name,
+            "screensaver: caller vanished, dropping Inhibit cookie",
+        );
+        remove_inhibitor(state, *cookie);
+    }
+    publish_inhibitors(state, inhibitors);
 }
 
 // ── D-Bus interface ───────────────────────────────────────────────────────────
@@ -838,5 +887,406 @@ mod tests {
             "the cookie should be gone after its owner vanished",
         );
         assert!(owners.lock().unwrap().is_empty());
+    }
+}
+
+// ── Real-bus coverage for the dead-caller cleanup (#1171) ─────────────────────
+//
+// Spawn an ephemeral `dbus-daemon`, mount the real `ScreenSaverIface` on it,
+// subscribe to `NameOwnerChanged` the way `watch_owner_changes` does, then
+// have a *second connection* call `Inhibit` over the wire and die. Everything
+// between the wire and the inhibitor list runs for real: zbus's method
+// dispatch, `#[zbus(header)]`'s sender capture, the `(s, s, s)` signal decode,
+// the departure check, the cookie drop, the republish.
+//
+// This exists because the three hermetic tests above all exercise
+// `drop_cookies_for_vanished_owner` — a ten-line pure `HashMap` filter — and
+// nothing else. Measured in #1192's review: inverting the departure check in
+// `handle_name_owner_changed` (`if !new_owner.is_empty()` → `if
+// new_owner.is_empty()`), which restores exactly the bug #1171 filed, left all
+// three green.
+//
+// Gated behind the `system-tests` cargo feature (whole-module `cfg`) so the
+// default `cargo test` doesn't even compile it, keeping the default run
+// hermetic. `wifi/nm_agent.rs`'s `system_tests` module is the template — the
+// `BusGuard`/`ephemeral_bus` harness below is that one, same shape — including
+// why the interface is staged on the connection *builder* rather than mounted
+// on an already-built connection (a zbus object-server startup race that
+// silently swallows the first method call, #756). Run with:
+//   cargo test -p hytte-services --features system-tests --lib screensaver
+#[cfg(all(test, feature = "system-tests"))]
+mod system_tests {
+    use super::{
+        Arc, AtomicU32, HashMap, Inhibitor, Mutable, Mutex, OwnersMap, PATH_CANONICAL,
+        ScreenSaverIface, StreamExt, run_owner_watch,
+    };
+
+    use std::path::PathBuf;
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::{Child, Command};
+    use zbus::Connection;
+    use zbus::connection::Builder;
+
+    /// Upper bound on any single round trip (or on waiting for the watcher to
+    /// react to a departure). A liveness guard, not a latency assertion — the
+    /// same reasoning, and the same number, as `wifi::nm_agent`'s budget: this
+    /// runs inside `nix flake check` next to two nixosTest VMs and the whole
+    /// workspace clippy, where CPU contention is the normal condition.
+    const DBUS_REPLY_BUDGET: Duration = Duration::from_secs(30);
+
+    const SCREENSAVER_IFACE: &str = "org.freedesktop.ScreenSaver";
+    const INTROSPECTABLE_IFACE: &str = "org.freedesktop.DBus.Introspectable";
+
+    /// Kills the spawned `dbus-daemon` on drop. Mirrors `hytte-bus`'s
+    /// `BusGuard`: SIGKILL + a `block_in_place` wait so the socket `TempDir`
+    /// outlives the process (hence the multi-thread runtime requirement on
+    /// every test here).
+    struct BusGuard {
+        child: Option<Child>,
+        _tmp: TempDir,
+        address: String,
+    }
+
+    impl Drop for BusGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.start_kill();
+                tokio::task::block_in_place(|| {
+                    let handle = tokio::runtime::Handle::current();
+                    let _ = handle.block_on(child.wait());
+                });
+            }
+        }
+    }
+
+    /// Spawn a fresh `dbus-daemon` and return a guard that kills it on drop.
+    async fn ephemeral_bus() -> BusGuard {
+        let tmp = TempDir::new().expect("create tempdir for dbus-daemon");
+        let socket: PathBuf = tmp.path().join("bus");
+        let address = format!("unix:path={}", socket.display());
+
+        let config = tmp.path().join("session.conf");
+        std::fs::write(
+            &config,
+            format!(
+                r#"<?xml version="1.0"?>
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>{address}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"#
+            ),
+        )
+        .expect("write dbus-daemon config");
+
+        let mut child = Command::new("dbus-daemon")
+            .arg("--config-file")
+            .arg(&config)
+            .arg("--print-address=1")
+            .arg("--nofork")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn dbus-daemon — install package `dbus` if missing");
+
+        let stdout = child.stdout.take().expect("dbus-daemon stdout");
+        let mut lines = BufReader::new(stdout).lines();
+        let printed = tokio::time::timeout(DBUS_REPLY_BUDGET, lines.next_line())
+            .await
+            .expect("dbus-daemon address timeout")
+            .expect("dbus-daemon read address")
+            .expect("dbus-daemon closed stdout");
+        assert!(
+            printed.contains("unix:path="),
+            "unexpected dbus-daemon address: {printed}"
+        );
+
+        BusGuard {
+            child: Some(child),
+            _tmp: tmp,
+            address,
+        }
+    }
+
+    /// The handles the iface and the watcher share, plus the iface itself —
+    /// built exactly the way `Service::start` builds them.
+    struct Fixture {
+        iface: ScreenSaverIface,
+        state: Arc<Mutex<HashMap<u32, Inhibitor>>>,
+        inhibitors: Mutable<Vec<Inhibitor>>,
+        owners: OwnersMap,
+    }
+
+    fn fixture() -> Fixture {
+        let state = Arc::new(Mutex::new(HashMap::new()));
+        let inhibitors = Mutable::new(Vec::new());
+        let next_cookie = Arc::new(AtomicU32::new(1));
+        let owners: OwnersMap = Arc::new(Mutex::new(HashMap::new()));
+        let iface = ScreenSaverIface {
+            state: state.clone(),
+            inhibitors: inhibitors.clone(),
+            next_cookie,
+            owners: owners.clone(),
+        };
+        Fixture {
+            iface,
+            state,
+            inhibitors,
+            owners,
+        }
+    }
+
+    /// Host `iface` on a fresh connection to `guard`'s bus, returning the
+    /// connection (bind it — it is the only thing keeping the object mounted)
+    /// and its unique name, which is what a client addresses it by.
+    ///
+    /// `.serve_at(...)` on the **builder**, never `object_server().at(...)`
+    /// on a built connection: see `wifi/nm_agent.rs`'s `mount_and_proxy` for
+    /// the zbus startup race that makes the difference (#756).
+    async fn mount(guard: &BusGuard, iface: ScreenSaverIface) -> (Connection, String) {
+        let server = Builder::address(guard.address.as_str())
+            .expect("parse ephemeral bus address")
+            .serve_at(PATH_CANONICAL, iface)
+            .expect("stage ScreenSaverIface at PATH_CANONICAL")
+            .build()
+            .await
+            .expect("connect screensaver host to ephemeral bus");
+        let dest = server
+            .unique_name()
+            .expect("server has a unique name")
+            .to_string();
+        (server, dest)
+    }
+
+    /// Subscribe to the broker's `NameOwnerChanged` and hand back the stream
+    /// `run_owner_watch` consumes. `MessageStream::for_match_rule` awaits the
+    /// `AddMatch` round trip, so **by the time this returns the subscription
+    /// is live** — which is what lets the departure test below be
+    /// deterministic rather than racing the broker.
+    async fn name_owner_changed(
+        conn: &Connection,
+    ) -> impl futures_util::Stream<Item = zbus::Message> + Unpin + use<> {
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .sender("org.freedesktop.DBus")
+            .expect("valid sender")
+            .path("/org/freedesktop/DBus")
+            .expect("valid path")
+            .interface("org.freedesktop.DBus")
+            .expect("valid interface")
+            .member("NameOwnerChanged")
+            .expect("valid member")
+            .build();
+        let stream = zbus::MessageStream::for_match_rule(rule, conn, None)
+            .await
+            .expect("subscribe to NameOwnerChanged on the ephemeral bus");
+        Box::pin(stream.filter_map(|m| std::future::ready(m.ok())))
+    }
+
+    /// Open a second connection and return it with its unique bus name — the
+    /// value `#[zbus(header)]`'s `header.sender()` records against a cookie.
+    async fn client(guard: &BusGuard) -> (Connection, String) {
+        let conn = Builder::address(guard.address.as_str())
+            .expect("parse ephemeral bus address")
+            .build()
+            .await
+            .expect("connect client to ephemeral bus");
+        let name = conn
+            .unique_name()
+            .expect("client has a unique name")
+            .to_string();
+        (conn, name)
+    }
+
+    /// Call `Inhibit(application, reason) -> u32` over the wire.
+    ///
+    /// The typing here is the point: the argument tuple is `(&str, &str)`
+    /// (`ss`) and the reply is bound to `u32` (`u`), so this call *is* a wire
+    /// signature assertion — a handler that grew or lost an argument would
+    /// fail to dispatch rather than silently keep working. #1171 added a
+    /// `#[zbus(header)] header: Header<'_>` parameter to that handler, and
+    /// zbus header parameters are out-of-band rather than wire arguments;
+    /// this is part of what proves it stayed that way (see also
+    /// `inhibit_is_still_two_strings_in_one_uint_out`).
+    async fn inhibit(conn: &Connection, dest: &str, application: &str, reason: &str) -> u32 {
+        let proxy = zbus::Proxy::new(conn, dest.to_string(), PATH_CANONICAL, SCREENSAVER_IFACE)
+            .await
+            .expect("build ScreenSaver proxy");
+        tokio::time::timeout(
+            DBUS_REPLY_BUDGET,
+            proxy.call("Inhibit", &(application, reason)),
+        )
+        .await
+        .expect("Inhibit timed out — wire signature regression?")
+        .expect("Inhibit call failed")
+    }
+
+    /// Poll `inhibitors` until it is empty, or fail on the budget.
+    async fn wait_until_no_inhibitors(inhibitors: &Mutable<Vec<Inhibitor>>, why: &str) {
+        let polled = tokio::time::timeout(DBUS_REPLY_BUDGET, async {
+            while !inhibitors.get_cloned().is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            polled.is_ok(),
+            "{why}; still holding {:?}",
+            inhibitors.get_cloned(),
+        );
+    }
+
+    /// #1171's whole point, end to end on a real broker: an app takes an
+    /// `Inhibit` cookie and dies without calling `UnInhibit`; the cookie must
+    /// go with it.
+    ///
+    /// **Falsification (measured):** invert the departure check in
+    /// `handle_name_owner_changed` — `if !new_owner.is_empty()` → `if
+    /// new_owner.is_empty()` — and this test fails on
+    /// `wait_until_no_inhibitors`. The three hermetic tests above stay green,
+    /// which is why this file needed a real bus at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cookie_dies_with_the_connection_that_took_it() {
+        let guard = ephemeral_bus().await;
+        let fx = fixture();
+        let (server, dest) = mount(&guard, fx.iface.clone()).await;
+
+        // Subscribe BEFORE anyone can call Inhibit: `for_match_rule` awaits
+        // AddMatch, so there is no window where a departure could be missed.
+        let messages = name_owner_changed(&server).await;
+        let (watch_state, watch_inhibitors, watch_owners) =
+            (fx.state.clone(), fx.inhibitors.clone(), fx.owners.clone());
+        let watcher = tokio::spawn(async move {
+            run_owner_watch(messages, &watch_state, &watch_inhibitors, &watch_owners).await;
+        });
+
+        let (client_conn, client_name) = client(&guard).await;
+        let cookie = inhibit(&client_conn, &dest, "Firefox", "Playing video").await;
+
+        assert_eq!(
+            fx.inhibitors.get_cloned().len(),
+            1,
+            "the Inhibit call should have registered exactly one inhibitor",
+        );
+        assert_eq!(
+            fx.owners
+                .lock()
+                .expect("owners poisoned")
+                .get(&cookie)
+                .map(String::as_str),
+            Some(client_name.as_str()),
+            "the cookie must be recorded against the *caller's* unique name",
+        );
+
+        // The app dies without calling UnInhibit.
+        drop(client_conn);
+
+        wait_until_no_inhibitors(
+            &fx.inhibitors,
+            "the dead caller's cookie should have been dropped",
+        )
+        .await;
+        assert!(
+            fx.owners.lock().expect("owners poisoned").is_empty(),
+            "the owners map must not leak the dead caller's entry either",
+        );
+        assert!(
+            fx.state.lock().expect("state poisoned").is_empty(),
+            "the inhibitor map must be empty too, not just its published view",
+        );
+
+        watcher.abort();
+    }
+
+    /// A live caller's cookies survive an *unrelated* connection's death —
+    /// the other half of the departure check, and what would catch a watcher
+    /// that drops everything on any name change.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unrelated_departure_leaves_a_live_cookie_alone() {
+        let guard = ephemeral_bus().await;
+        let fx = fixture();
+        let (server, dest) = mount(&guard, fx.iface.clone()).await;
+
+        let messages = name_owner_changed(&server).await;
+        let (watch_state, watch_inhibitors, watch_owners) =
+            (fx.state.clone(), fx.inhibitors.clone(), fx.owners.clone());
+        let watcher = tokio::spawn(async move {
+            run_owner_watch(messages, &watch_state, &watch_inhibitors, &watch_owners).await;
+        });
+
+        let (keeper, _keeper_name) = client(&guard).await;
+        let first = inhibit(&keeper, &dest, "mpv", "Playing video").await;
+
+        // A different connection comes and goes.
+        let (bystander, bystander_name) = client(&guard).await;
+        drop(bystander);
+
+        // A fresh call from the still-live keeper is a round trip through the
+        // same broker the departure went through, so by the time it returns
+        // the watcher has had the `NameOwnerChanged` dispatched to it; the
+        // short sleep covers the watcher task's own scheduling.
+        let second = inhibit(&keeper, &dest, "mpv", "Still playing").await;
+        assert_ne!(first, second, "cookies must be unique");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let live = fx.inhibitors.get_cloned();
+        assert_eq!(
+            live.len(),
+            2,
+            "a bystander ({bystander_name}) leaving must not drop a live caller's cookies: {live:?}",
+        );
+
+        watcher.abort();
+    }
+
+    /// `Inhibit`'s published wire signature is `ss` → `u`, and the
+    /// `#[zbus(header)]` parameter #1171 added did not become a third
+    /// argument. `a_cookie_dies_with_the_connection_that_took_it` already
+    /// makes the typed call; this asserts the same thing where a real client
+    /// looks it up, so a regression reads as "the signature changed" rather
+    /// than "the call hangs".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inhibit_is_still_two_strings_in_one_uint_out() {
+        let guard = ephemeral_bus().await;
+        let fx = fixture();
+        let (server, dest) = mount(&guard, fx.iface.clone()).await;
+        let _ = &server;
+        let (client_conn, _name) = client(&guard).await;
+
+        let proxy = zbus::Proxy::new(&client_conn, dest, PATH_CANONICAL, INTROSPECTABLE_IFACE)
+            .await
+            .expect("build Introspectable proxy");
+        let xml: String = tokio::time::timeout(DBUS_REPLY_BUDGET, proxy.call("Introspect", &()))
+            .await
+            .expect("Introspect timed out")
+            .expect("Introspect call failed");
+
+        let method = xml
+            .split_once(r#"<method name="Inhibit">"#)
+            .and_then(|(_, rest)| rest.split_once("</method>"))
+            .map(|(body, _)| body.to_string())
+            .unwrap_or_else(|| panic!("no Inhibit method in introspection XML:\n{xml}"));
+
+        let in_args = method.matches(r#"direction="in""#).count();
+        let string_in_args = method.matches(r#"type="s" direction="in""#).count();
+        let uint_out_args = method.matches(r#"type="u" direction="out""#).count();
+        assert_eq!(
+            (in_args, string_in_args, uint_out_args),
+            (2, 2, 1),
+            "Inhibit must stay `ss` -> `u`; a #[zbus(header)] parameter is \
+             out-of-band and must not appear as an argument:\n{method}",
+        );
     }
 }

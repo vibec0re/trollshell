@@ -475,8 +475,25 @@ async fn handle_noc_msg(
                 } else {
                     tracing::debug!(%dest, %new_owner,
                         "proxy watcher: peer back; rebuilding");
-                    let _ = do_rebuild_proxy_cache(inner).await;
-                    inner.liveness.set(ProxyState::Live);
+                    // `Live` is a claim about the *cache*: it says a
+                    // `BusProxy::call` will find a `zbus::Proxy` there. Until
+                    // #1173 this arm discarded the rebuild's `Result` and
+                    // announced it regardless, so a peer that came back while
+                    // the bus was mid-reconnect left `liveness()` reporting
+                    // `Live` while every call returned `Transient` out of an
+                    // empty cache — and nothing ever retracted it, because the
+                    // watcher went straight back to draining a stream that had
+                    // no further transition to deliver.
+                    match do_rebuild_proxy_cache(inner).await {
+                        Ok(()) => inner.liveness.set(ProxyState::Live),
+                        Err(e) => {
+                            tracing::debug!(error = %e, %dest,
+                                "proxy watcher: peer back but the rebuild failed; \
+                                 staying Reconnecting and retrying on the outer loop");
+                            mark_reconnecting(inner).await;
+                            return true;
+                        }
+                    }
                 }
             }
             false

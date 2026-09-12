@@ -13,7 +13,7 @@
 use futures_signals::signal::SignalExt;
 use futures_util::StreamExt;
 use hytte_bus::test_support::SharedConnection;
-use hytte_bus::{PropState, property_with};
+use hytte_bus::{PropState, ProxyState, property_with, proxy_with};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -363,5 +363,88 @@ async fn a_failing_resubscribe_marks_stale_exactly_once() {
         "a failing re-subscribe must publish Stale on the edge only; \
          {:?} of retries produced this many emissions",
         WINDOW
+    );
+}
+
+// ── Item 3: Live is a claim about the cache, so only a rebuild may make it ───
+
+/// A proxy whose rebuild fails must not announce `Live`.
+///
+/// `handle_noc_msg`'s peer-back arm discarded the rebuild's `Result` and set
+/// `Live` regardless, so `liveness()` said "connected" while every
+/// `BusProxy::call` returned `Transient` from the empty cache — the state is a
+/// claim about the cache being populated, and nothing checked it.
+///
+/// Arranging a failing rebuild needs the connection the *watcher* reads from
+/// to be gone while the connection its `NameOwnerChanged` stream rides stays
+/// up. Those are separable: the stream holds its own handle on the
+/// `zbus::Connection`, while `with_conn` reads `SharedConnection`'s cached one.
+/// So the test drops the cached connection (`drop_connection_for_test`, no
+/// supervisor to put it back) and then re-owns the peer's name, which delivers
+/// a real peer-back NOC on the still-live stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_proxy_rebuild_does_not_announce_live() {
+    let (conn, guard) = daemon::ephemeral_bus().await;
+    let address = guard.address.clone();
+    let server = serve_counter(&address, 42).await;
+
+    // Keep the underlying zbus connection alive independently of
+    // `SharedConnection`'s cache, so dropping the cache cannot take the
+    // watcher's NOC stream down with it.
+    let _keepalive = conn.clone();
+    let shared = SharedConnection::for_test_session(conn);
+
+    let proxy = proxy_with(&shared, COUNTER_NAME)
+        .at_path(COUNTER_PATH)
+        .iface(COUNTER_NAME)
+        .build()
+        .await
+        .expect("build proxy against a live peer");
+
+    let mut liveness = proxy.liveness().to_stream();
+    wait_for(
+        &mut liveness,
+        Duration::from_secs(20),
+        "the proxy to go Live",
+        |s| matches!(s, ProxyState::Live),
+    )
+    .await;
+
+    // The peer quits: NOC with an empty new owner, cache cleared, PeerGone.
+    drop(server);
+    wait_for(
+        &mut liveness,
+        Duration::from_secs(20),
+        "PeerGone after the peer quit",
+        |s| matches!(s, ProxyState::PeerGone),
+    )
+    .await;
+
+    // Now take the shared connection away. No supervisor is running, so it
+    // stays away and every rebuild from here on fails.
+    shared.drop_connection_for_test().await;
+
+    // The peer comes back — a real NOC on the watcher's still-live stream.
+    let _server_again = serve_counter(&address, 42).await;
+
+    let observed = wait_for(
+        &mut liveness,
+        Duration::from_secs(20),
+        "the watcher to react to the peer coming back",
+        |s| matches!(s, ProxyState::Live | ProxyState::Reconnecting),
+    )
+    .await;
+    assert_eq!(
+        observed,
+        ProxyState::Reconnecting,
+        "the peer came back but the cached proxy could not be rebuilt, so the \
+         watcher must not claim Live — every call would return Transient"
+    );
+    assert!(
+        proxy
+            .call::<_, u32>("Whatever", ())
+            .await
+            .is_err_and(|e| e.is_transient()),
+        "a proxy that is not Live must fail its calls transiently"
     );
 }

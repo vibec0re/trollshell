@@ -178,6 +178,17 @@ const BIN_MIN_WIDTH_PX: i32 = 360;
 /// The bin's own minimum height — the other half of the same contract.
 const BIN_MIN_HEIGHT_PX: i32 = 200;
 
+/// How tall the "Unassigned approvals" group may grow before it scrolls
+/// (#1149 N1, this round's review HIGH).
+///
+/// Measured against the row it holds: an unassigned row is ~84 px (three
+/// subtitle lines), so this is about two and a half rows — enough that the
+/// common case (one or two orphans) never scrolls at all, and small enough
+/// that at the window's own 560 px the roster keeps the clear majority of the
+/// sidebar. Everything past it is reachable by scrolling instead of being
+/// allocated off the bottom of the window, which is what it did before.
+const UNASSIGNED_MAX_HEIGHT_PX: i32 = 220;
+
 // ── The pure layer: one wire snapshot → what the widgets show ────────────────
 
 /// Fold one `AgentStatus` round trip into the roster state the tab renders.
@@ -884,9 +895,39 @@ fn build_tab(cfg: AgentsConfig) -> (adw::BreakpointBin, AgentsState) {
         .build();
     unassigned_group.set_visible(false);
 
+    // **In a scroller of its own, capped** (this round's review, HIGH). In a
+    // plain `Box` the group had no scroller and no cap, so every row cost the
+    // roster ~84 px until the roster hit its own floor, and past four rows the
+    // group's own rows were allocated *below the window* with no scrollbar to
+    // reach them. That defeats exactly what N1 is for: one agent renamed out
+    // of `agents.toml` orphans its whole queue at once, not one row, so the
+    // feature stops working at the size that triggers it.
+    //
+    // `propagate_natural_height` + `max_content_height` is "as tall as the
+    // rows need, up to the cap"; a `ScrolledWindow`'s minimum height is its
+    // own, not its child's, so under pressure it shrinks rather than pushing
+    // anything off-screen. `Automatic` horizontally for `list_scroller`'s
+    // reason above.
+    let unassigned_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(UNASSIGNED_MAX_HEIGHT_PX)
+        .vexpand(false)
+        .child(&unassigned_group)
+        .build();
+    unassigned_scroller.set_visible(false);
+    // One visibility, two widgets: `render_unassigned` still toggles the
+    // group, and an empty scroller must not sit on the roster's height
+    // budget. A property binding rather than a second `set_visible` call so
+    // there is no way to hide one and leave the other showing.
+    unassigned_group
+        .bind_property("visible", &unassigned_scroller, "visible")
+        .sync_create()
+        .build();
+
     let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar_box.append(&list_scroller);
-    sidebar_box.append(&unassigned_group);
+    sidebar_box.append(&unassigned_scroller);
 
     let sidebar_toolbar = adw::ToolbarView::new();
     sidebar_toolbar.add_top_bar(&crate::plugins_tab::tab_header_bar());
@@ -3239,6 +3280,16 @@ mod gtk_tests {
         dismiss(&window);
     }
 
+    /// Put the tab in a window `width` × `height` px and let GTK allocate it.
+    fn present_sized(bin: &adw::BreakpointBin, width: i32, height: i32) -> gtk::Window {
+        let window = gtk::Window::new();
+        window.set_child(Some(bin));
+        window.set_default_size(width, height);
+        window.present();
+        pump();
+        window
+    }
+
     /// Put the tab in a window `width` px wide and let GTK allocate it. The
     /// window is returned so the caller keeps it alive — a destroyed window
     /// unmaps the tree, and these assertions are about a mapped tree.
@@ -4172,6 +4223,108 @@ mod gtk_tests {
                 "{name}'s row is drawn outside its scroller: {bounds:?} in {w}×{h}"
             );
         }
+        dismiss(&window);
+    }
+
+    /// **A full Unassigned queue scrolls; it does not push rows past the
+    /// window, and it does not crush the roster** (#1149 N1, this round's
+    /// review HIGH).
+    ///
+    /// The group used to sit in a plain `Box` under the roster scroller with
+    /// no scroller and no cap of its own, so each ~84 px row came out of the
+    /// roster's height until the roster hit its floor, after which the group's
+    /// own rows were allocated **below the window** with no scrollbar to reach
+    /// them — at the control-center's own default size, from about five rows.
+    /// That is N1's own trigger: one agent renamed out of `agents.toml`
+    /// orphans its whole queue at once.
+    ///
+    /// The existing behaviour test cannot see any of this — it asserts
+    /// `unassigned_group.is_visible()` and reads text back out of
+    /// `state.unassigned_rows`, i.e. its own bookkeeping. #851 is the standing
+    /// lesson: `is_visible()` is orthogonal to being on screen, so this
+    /// asserts the **allocation**, against the window.
+    ///
+    /// Three claims, because "inside the window" alone would pass for a group
+    /// squeezed to nothing or one whose rows are simply unreachable:
+    /// the scrolled container is inside the window, the rows past the cap are
+    /// reachable (`upper > page_size`, i.e. there is something to scroll to
+    /// rather than content quietly lost), and the roster still has room for
+    /// more than one agent row.
+    ///
+    /// Mutation (run, verified red): mount `unassigned_group` straight into
+    /// `sidebar_box` again, with no `ScrolledWindow` — the containment
+    /// assertion reds with the group's bottom edge ~2.5× the window height.
+    #[gtk::test]
+    fn a_full_unassigned_queue_scrolls_instead_of_leaving_the_window() {
+        let (bin, state) = build_tab(cfg());
+        // The control-center's own default is 760 × 560; 480 is a window an
+        // operator can genuinely have, and the review's measurements were
+        // taken at it.
+        let window = present_sized(&bin, 760, 480);
+        apply(&state, &["argus", "beta", "gamma"]);
+
+        let queue: Vec<Approval> = (1..=12)
+            .map(|id| approval(id, "", ApprovalStatus::Pending))
+            .collect();
+        apply_unassigned(&state, Some(Ok(queue)));
+        pump_until(
+            || {
+                state
+                    .unassigned_rows
+                    .borrow()
+                    .first()
+                    .is_some_and(|r| r.height() > 0)
+            },
+            5,
+        );
+        assert_eq!(state.unassigned_rows.borrow().len(), 12);
+
+        // The container whose extent is what an operator can actually see.
+        // Falling back to the group itself (rather than unwrapping) is what
+        // makes the mutation above red on the geometry rather than on a
+        // missing widget.
+        let container: gtk::Widget = state
+            .unassigned_group
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .unwrap_or_else(|| state.unassigned_group.clone().upcast());
+        let bounds = container
+            .compute_bounds(&window)
+            .expect("the group is mounted in the window");
+        // The allocation is in pixels and fits an f32 exactly at any size a
+        // window has; the cast is the only way to compare it with a
+        // `graphene::Rect`.
+        #[allow(clippy::cast_precision_loss)]
+        let window_height = window.height() as f32;
+        assert!(
+            bounds.y() >= -0.5 && bounds.y() + bounds.height() <= window_height + 0.5,
+            "the Unassigned group is allocated past the window: {bounds:?} in a window \
+             {window_height} px tall"
+        );
+
+        let scroller: gtk::ScrolledWindow = container
+            .downcast()
+            .expect("the group must live in a scroller of its own");
+        let adjustment = scroller.vadjustment();
+        assert!(
+            adjustment.upper() > adjustment.page_size() + 0.5,
+            "twelve rows must overflow the cap and be reachable by scrolling, not silently \
+             clipped: upper {} page {}",
+            adjustment.upper(),
+            adjustment.page_size()
+        );
+
+        let row_height = state.by_name.borrow()["argus"].row.height();
+        assert!(row_height > 0, "the roster was never allocated");
+        let roster = state
+            .list
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .expect("the sidebar list lives in a scroller");
+        assert!(
+            roster.height() > row_height * 2,
+            "the Unassigned group crushed the roster: {} px left for {} px rows",
+            roster.height(),
+            row_height
+        );
         dismiss(&window);
     }
 

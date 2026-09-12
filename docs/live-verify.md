@@ -759,6 +759,77 @@ about the same queue.
       Settings entry grows a badge with the count and the attention dot —
       this is the only signal an operator watching the turn stream gets.
 
+### The control-center Agents tab (#947 P4, spec §10)
+
+Open with `trollshell-control-center` and pick the **Agents** tab (fourth,
+after Plugins / Places / AI Keys). It needs a hive on `agents.toml`'s `socket`
+— but, unlike everything else in that window, it does **not** need the shell
+running: it dials `host.sock` itself and adds no `Control` method, so the
+connection banner can say "trollshell isn't running" while this tab is fully
+live. That asymmetry is itself worth one look.
+
+CI proves the row and detail mapping from a wire snapshot, the sidebar's
+order, the unreachable states, the retarget-not-rebuild identity of every
+widget across a poll, the adaptive collapse, and the client's request bytes
+against a scripted `UnixListener`. It cannot prove anything about a real
+hive's values, about how any of it _reads_ at 760 px, or that either link
+opens what it claims.
+
+- [ ] **(#947 P4)** **The roster matches the sidebar card.** With both the
+      Agents plugin's sidebar card and this tab open, confirm they list the
+      same agents **in the same order** (named projects alphabetically, the
+      ungrouped bucket last, the hive's own order inside a group). This is the
+      one default Annika may veto — if the flat list wants the card's project
+      headers after all, that is a finding, not a bug.
+- [ ] **(#947 P4)** **Every reported fact is the hive's.** Pick an agent and
+      diff the six rows (Status / Status set / Model / Parent / Deployed /
+      Project) against `hivectl`'s own answer for it. `Status set` must lead
+      with the **raw** RFC 3339 timestamp and trail a relative age; `Model`
+      must be the full id, not the card's shortened family word.
+- [ ] **(#947 P4)** **The five flags are the raw flags.** Find (or make) an
+      agent that is both `running` and `failed` and confirm the tab shows
+      **both** as `yes` — the sidebar card collapses that to one word by
+      precedence and this tab deliberately does not.
+- [ ] **(#947 P4)** **The agent-page link opens the companion window.** With
+      `trollshell-agent-window` on `PATH`, click **Agent page** and confirm the
+      companion window opens for that agent — and that closing the
+      control-center afterwards leaves the window running (it is spawned
+      detached through `gio::Subprocess`, not parented).
+- [ ] **(#947 P4)** **…and the browser when it is not.** Start the
+      control-center from a shell with `trollshell-agent-window` removed from
+      `PATH` and confirm the same click opens the agent's URL in the browser
+      instead, with exactly **one** "not on this plugin's PATH" warning in the
+      log however many times it is clicked.
+- [ ] **(#947 P4)** **The config-repo link goes to the forge.** Confirm the
+      **Config repo** row carries the hive's `HiveUrls.forge` verbatim and
+      opens it. On a hive with no public forge URL the row must read `—` and
+      be **insensitive** — never a dead click, and never a guessed
+      `forge.<domain>`.
+- [ ] **(#947 P4)** **`HiveUrls.forge` is really there.** This PR is the first
+      thing in the tree to read that key. Capture a live `Urls` answer and
+      confirm `forge` is present and spelled as
+      `crates/hytte-plugin-agents/tests/fixtures/urls.json` records it — if it
+      is absent on the real hive, the row will silently never appear.
+- [ ] **(#947 P4)** **An unreachable hive says which socket.** Stop
+      `hive-c0re` and confirm the tab shows one row titled _"Hive unreachable"_
+      whose subtitle carries both the client's reason and the socket path, plus
+      the same on the detail status page — never an empty list. Then remove the
+      user from `hive-admin` and confirm it says permission, not "not running".
+      Restart the daemon and confirm the roster comes back **on its own**, with
+      the selection you had before the outage restored.
+- [ ] **(#947 P4)** **The poll is invisible.** Leave the tab open on a selected
+      agent for a minute at the default 2 s cadence and confirm nothing
+      flickers, the selection never moves, and the scroll position holds.
+      Narrow the window past ~520 px, drill into an agent, and confirm the same
+      is true of the **pushed** page.
+- [ ] **(#947 P4)** **It is read-only.** Confirm there is no switch, no
+      pause/start/stop and no editable field anywhere on the tab — P5's write
+      path is still open on #952, and anything that writes here is a bug.
+- [ ] **(#947 P4)** **The cadence is `agents.toml`'s.** Set
+      `poll_seconds = 30` and confirm this tab slows down with the sidebar card
+      (both read the same file; a restart of the control-center is expected —
+      the tab reads the config once at window build).
+
 ## Plugins & launcher
 
 - [ ] **(#489)** Plugins now launch via `systemd-run --user` transient units

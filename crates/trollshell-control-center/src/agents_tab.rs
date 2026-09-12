@@ -791,7 +791,9 @@ fn build_detail() -> AgentDetail {
 
     let links_group = adw::PreferencesGroup::builder()
         .title("Links")
-        .description("Opened outside this window: the agent's own page, and the forge the hive publishes.")
+        .description(
+            "Opened outside this window: the agent's own page, and the forge the hive publishes.",
+        )
         .build();
     let agent_page = link_row("Agent page", "go-next-symbolic");
     let config_repo = link_row("Config repo", "go-next-symbolic");
@@ -1770,21 +1772,29 @@ mod tests {
             home: Some("https://hive.local/".to_owned()),
             forge: None,
         };
-        assert_eq!(detail_of(&a, &cfg, Some(&domain_only), now()).config_repo, None);
+        assert_eq!(
+            detail_of(&a, &cfg, Some(&domain_only), now()).config_repo,
+            None
+        );
 
         let with_forge = HiveUrls {
             forge: Some("  https://forge.hive.local/  ".to_owned()),
             ..domain_only
         };
         assert_eq!(
-            detail_of(&a, &cfg, Some(&with_forge), now()).config_repo.as_deref(),
+            detail_of(&a, &cfg, Some(&with_forge), now())
+                .config_repo
+                .as_deref(),
             Some("https://forge.hive.local/")
         );
 
         // An agent the hive publishes no URL for gets no link — the hive's
         // domain being unconfigured is exactly when one would be dead.
         let no_url = agent(row("argus"));
-        assert_eq!(detail_of(&no_url, &cfg, Some(&with_forge), now()).agent_page, None);
+        assert_eq!(
+            detail_of(&no_url, &cfg, Some(&with_forge), now()).agent_page,
+            None
+        );
     }
 
     /// The detail model is a pure function of its inputs: the same snapshot
@@ -2077,7 +2087,9 @@ mod gtk_tests {
 
         // Drill into the second agent.
         let row = state.by_name.borrow()["beta"].row.clone();
-        state.list.select_row(Some(row.upcast_ref::<gtk::ListBoxRow>()));
+        state
+            .list
+            .select_row(Some(row.upcast_ref::<gtk::ListBoxRow>()));
         pump();
         state.split.set_show_content(true);
         pump();
@@ -2102,7 +2114,9 @@ mod gtk_tests {
         let window = present(&bin, 400);
         apply(&state, &["argus", "beta"]);
         let row = state.by_name.borrow()["beta"].row.clone();
-        state.list.select_row(Some(row.upcast_ref::<gtk::ListBoxRow>()));
+        state
+            .list
+            .select_row(Some(row.upcast_ref::<gtk::ListBoxRow>()));
         pump();
         state.split.set_show_content(true);
         pump();
@@ -2139,11 +2153,11 @@ mod gtk_tests {
         assert_eq!(titles[0], "Hive unreachable");
 
         let description = state.detail.empty.description().unwrap_or_default();
-        assert!(
-            description.contains("/run/test/host.sock"),
-            "{description}"
+        assert!(description.contains("/run/test/host.sock"), "{description}");
+        assert_eq!(
+            state.detail.stack.visible_child_name().as_deref(),
+            Some("empty")
         );
-        assert_eq!(state.detail.stack.visible_child_name().as_deref(), Some("empty"));
         dismiss(&window);
     }
 
@@ -2265,7 +2279,9 @@ mod gtk_tests {
         let window = present(&bin, 900);
         apply(&state, &["argus", "beta"]);
         let row = state.by_name.borrow()["beta"].row.clone();
-        state.list.select_row(Some(row.upcast_ref::<gtk::ListBoxRow>()));
+        state
+            .list
+            .select_row(Some(row.upcast_ref::<gtk::ListBoxRow>()));
         pump();
 
         apply(&state, &["argus"]);
@@ -2324,5 +2340,4 @@ mod gtk_tests {
         }
         false
     }
-
 }

@@ -1160,6 +1160,31 @@ where
     refresh().await;
 }
 
+/// Read a `GetDevices` reply as a liveness verdict for `device_path`.
+///
+/// Only an answer that *omits* the path means the device is gone. An `Err` is
+/// a failed question, not a negative answer — the original
+/// `get_devices().await.is_ok_and(…)` made an NM hiccup at reconnect mean
+/// **removed**, so a device that was still there had its station, network list
+/// and adapter cleared, the panel went blank for a discovery cycle, and the
+/// log said "device removed" about a device that had not been (#1201 review
+/// L8). Treating `Err` as "still present" costs nothing: the four refresh
+/// subscriptions re-read NM anyway, and a genuine NM restart takes the whole
+/// connection down, which is a reconnect rather than an `Err` here.
+fn still_present(reply: &Result<Vec<OwnedObjectPath>, hytte_bus::BusError>, device_path: &str) -> bool {
+    match reply {
+        Ok(devices) => devices.iter().any(|p| p.as_str() == device_path),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                path = device_path,
+                "wifi_nm: GetDevices failed while re-checking the device; assuming still present"
+            );
+            true
+        }
+    }
+}
+
 /// Handle one item from the manager's `DeviceRemoved` subscription for
 /// `device_path`: on an ordinary emission, reset only when the removed path
 /// matches ours (byte-identical to before #1201). On a `Resubscribed`/
@@ -1304,9 +1329,7 @@ pub(crate) async fn run_nm_wifi_watcher(
                 }
                 Some(item) = device_removed_items.next() => {
                     let should_reset = device_removed_should_reset(item, &device_path, || async {
-                        get_devices()
-                            .await
-                            .is_ok_and(|devices| devices.iter().any(|p| p.as_str() == device_path))
+                        still_present(&get_devices().await, &device_path)
                     }).await;
                     if should_reset {
                         tracing::warn!(
@@ -2798,6 +2821,41 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<()>(REFRESH_WAKE_QUEUE);
         arm_refresh(&item, "test", &tx);
         assert!(rx.try_recv().is_ok());
+    }
+
+    // ── #1201 review L8: an unanswered GetDevices is not a removal ──────────
+
+    /// A `GetDevices` that failed says nothing about the device, so it must not
+    /// blank the panel and log a removal for a device that is still there.
+    /// Only an answer that omits our path is a removal.
+    ///
+    /// Falsifiable: `get_devices().await.is_ok_and(…)` — the original — reads
+    /// the `Err` case as `false`, so the first assertion flips.
+    #[test]
+    fn a_failed_getdevices_is_not_a_removal() {
+        let transient = Err(hytte_bus::BusError::Transient {
+            source: zbus::Error::FDO(Box::new(zbus::fdo::Error::Disconnected(
+                "bus mid-reconnect".to_owned(),
+            ))),
+        });
+        assert!(
+            still_present(&transient, "/org/fd/NM/Devices/2"),
+            "NM not answering must mean 'still there', not 'removed'"
+        );
+
+        let present = Ok(vec![
+            OwnedObjectPath::try_from("/org/fd/NM/Devices/1").expect("valid path"),
+            OwnedObjectPath::try_from("/org/fd/NM/Devices/2").expect("valid path"),
+        ]);
+        assert!(still_present(&present, "/org/fd/NM/Devices/2"));
+
+        let gone = Ok(vec![
+            OwnedObjectPath::try_from("/org/fd/NM/Devices/1").expect("valid path"),
+        ]);
+        assert!(
+            !still_present(&gone, "/org/fd/NM/Devices/2"),
+            "an answer that omits the device is the one thing that means removed"
+        );
     }
 
     // ── #1201 review M3: one re-read per burst, not one per subscription ────

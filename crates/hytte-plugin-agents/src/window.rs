@@ -322,41 +322,33 @@ mod tests {
     }
 
     /// The `"-leading-hyphen"` fixture (`model.rs`'s `AgentName` test names it
-    /// "a P2 argv concern, not this type's") round-trips through the **real**
-    /// `trollshell-agent-window` parser, not a copy of it — `cli::parse` is
-    /// reached as a dev-dependency so a rename on either side breaks this
-    /// rather than shipping a launcher the window cannot read (the same
-    /// argument as that crate's own `the_plugins_own_argv_parses_on_both_tabs`,
-    /// which asserts the same fact from the window's side).
+    /// "a P2 argv concern, not this type's") is safe **because of the shape
+    /// of the argv**, and this pins that shape byte for byte: the name travels
+    /// as its own element after `--agent`, never joined with `=` and never
+    /// preceded by anything that could read it as a flag.
     ///
-    /// [`argv`] passes the name as its **own** `Vec` element (`--agent`, then
-    /// `name`, two entries) rather than joining them with `=` into one. That
-    /// matters here because `trollshell-agent-window::cli::parse` is
-    /// hand-rolled, not `clap`: on seeing `"--agent"` it unconditionally takes
-    /// the *next* token as the value — it never re-examines that token for a
+    /// Why the shape matters: `trollshell-agent-window::cli::parse` is
+    /// hand-rolled, not `clap`. On the token `"--agent"` it takes the *next*
+    /// token as the value unconditionally, without re-examining it for a
     /// leading `-`, so a name starting with one is never reinterpreted as a
-    /// flag. `--agent=<name>` would in fact **break** this parser, since it
-    /// only ever matches the token `"--agent"` exactly and has no `=`-splitting
-    /// arm; a joined token falls through to its `Unknown` arm instead.
-    ///
-    /// Falsification (verified red, restored after): join the two elements
-    /// into one `format!("{ARG_AGENT}={name}")` entry — the assertion below
-    /// then reds with `Err(Unknown("--agent=-leading-hyphen"))` instead of the
-    /// expected `Ok`, which is exactly the breakage this test exists to catch
-    /// on either side of the argv/parser contract.
+    /// flag — and `--agent=<name>` would in fact *break* it (no `=`-splitting
+    /// arm; the joined token falls to its `Unknown` arm, verified red while
+    /// this test was written). The parser side of the same contract is
+    /// `trollshell-agent-window`'s `the_plugins_own_argv_parses_on_both_tabs`,
+    /// which feeds this builder's output — this fixture included — through the
+    /// real parser; it lives there rather than here because a dev-dependency
+    /// from this crate back onto the window would link the web engine into
+    /// this crate's test build.
     #[test]
-    fn a_leading_hyphen_name_round_trips_through_the_real_window_parser() {
-        for (tab, want_tab) in [
-            (Tab::Agent, trollshell_agent_window::cli::Tab::Agent),
-            (Tab::Settings, trollshell_agent_window::cli::Tab::Settings),
-        ] {
-            let av = argv("-leading-hyphen", tab);
-            assert_eq!(av[0], BINARY);
-            let parsed = trollshell_agent_window::cli::parse(&av[1..])
-                .expect("the real window parser accepts a leading-hyphen name");
-            assert_eq!(parsed.agent.as_str(), "-leading-hyphen");
-            assert_eq!(parsed.tab, want_tab);
-        }
+    fn a_leading_hyphen_name_is_its_own_argv_element() {
+        assert_eq!(
+            argv("-leading-hyphen", Tab::Agent),
+            [BINARY, ARG_AGENT, "-leading-hyphen"]
+        );
+        assert_eq!(
+            argv("-leading-hyphen", Tab::Settings),
+            [BINARY, ARG_AGENT, "-leading-hyphen", ARG_TAB, "settings"]
+        );
     }
 
     /// The real probe resolves **once**: a second call does not re-scan.

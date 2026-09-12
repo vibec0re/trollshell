@@ -1309,7 +1309,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "trollshell-agent-window",
 ]
 
 [[package]]

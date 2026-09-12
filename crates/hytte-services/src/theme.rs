@@ -17,15 +17,25 @@
 //!    is written unconditionally; with no qt[56]ct platform theme loaded
 //!    it costs nothing.
 //!
-//! gsettings calls are spawned detached (we don't wait on them); file
-//! updates are synchronous and preserve every unrelated key/section the
-//! user already had. Failures on any one fan-out target are logged and the
-//! others still run — best-effort, because partial coverage is strictly
-//! better than aborting the whole switch on (e.g.) a missing qt6ct dir.
+//! Every subprocess and every ini-file write runs on the `hytte_reactive`
+//! tokio runtime, never on the GTK main thread (#1171) — `set()` only
+//! updates the in-memory current-theme handle synchronously (a cheap
+//! `Mutable::set`, no I/O) before handing the actual fan-out to
+//! [`runtime::handle()`]. `tokio::process::Command::status()`/`::output()`
+//! await the child to completion, so unlike the old fire-and-forget
+//! `std::process::Command::spawn()` (never `.wait()`ed) this can't leak a
+//! zombie per gsettings call either. Failures on any one fan-out target are
+//! logged and the others still run — best-effort, because partial coverage
+//! is strictly better than aborting the whole switch on (e.g.) a missing
+//! qt6ct dir.
 
+use futures_signals::signal::Mutable;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use hytte_reactive::runtime;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Theme {
@@ -53,16 +63,62 @@ impl Theme {
     }
 }
 
-/// Read the current theme from `org.gnome.desktop.interface color-scheme`.
-/// Returns `Theme::Dark` on any error or if the value is `default`
-/// (externally set, "follow system") — trollshell sessions don't have a
-/// system to follow, so dark is the canonical fallback matching
+// ── Cross-thread current-theme handle ──────────────────────────────────────
+//
+// `hytte_reactive::registry` is thread-local to the GTK main thread; `set()`
+// used to run its whole body (including a blocking subprocess call) on
+// whatever thread called it — the GTK thread for every caller today
+// (`panels/settings.rs`). Fixing that means the fan-out has to move to the
+// tokio runtime, which rules out the registry as the home for the
+// current-theme value. A process-global `Mutable` (the same shape
+// `brightness.rs`'s `DEVICE` uses for its write-target device) is
+// cross-thread-safe and needs no `Service`/`App::with` registration, so
+// `current()`/`set()` keep working exactly as free functions.
+static CURRENT: OnceLock<Mutable<Theme>> = OnceLock::new();
+
+/// The shared current-theme handle. Seeded exactly once, the first time
+/// anything asks for it, by spawning an async `gsettings get` on the tokio
+/// runtime — never a blocking read on the caller's thread. Until that seed
+/// read completes (a handful of milliseconds), [`current`] reports the
+/// `Theme::Dark` fallback rather than block; `set()` keeps this handle in
+/// sync going forward without ever re-querying gsettings.
+fn current_handle() -> &'static Mutable<Theme> {
+    CURRENT.get_or_init(|| {
+        let mutable = Mutable::new(Theme::Dark);
+        let writer = mutable.clone();
+        runtime::handle().spawn(async move {
+            writer.set(read_current().await);
+        });
+        mutable
+    })
+}
+
+/// Current theme, as last known by this process. Never blocks and never
+/// spawns a subprocess itself — see [`current_handle`] for how the value is
+/// seeded and kept in sync. On any `gsettings` error, or a `default` value
+/// (externally set, "follow system" — trollshell sessions don't have a
+/// system to follow), the seed read resolves to `Theme::Dark`, matching
 /// `adw::ColorScheme::PreferDark` defaults.
 #[must_use]
 pub fn current() -> Theme {
-    let output = std::process::Command::new("gsettings")
+    current_handle().get()
+}
+
+/// Async `gsettings get org.gnome.desktop.interface color-scheme`, run on
+/// the tokio runtime. Never called from the GTK thread directly — only via
+/// [`current_handle`]'s seed spawn.
+///
+/// **Main-thread guarantee is by construction, not by test:** this `fn` is
+/// `async` and only ever reached through `runtime::handle().spawn(...)`
+/// (here and in [`set`]/[`do_set`]) — there is no synchronous call path from
+/// `current()`/`set()` into a `Command` at all, so nothing short of a new
+/// call site added directly into `current()` or `set()` could reintroduce a
+/// blocking subprocess call on whatever thread calls them.
+async fn read_current() -> Theme {
+    let output = tokio::process::Command::new("gsettings")
         .args(["get", "org.gnome.desktop.interface", "color-scheme"])
-        .output();
+        .output()
+        .await;
     match output {
         Ok(out) if out.status.success() => {
             // gsettings get prints quoted strings, e.g. `'prefer-dark'\n`.
@@ -89,19 +145,36 @@ pub fn current() -> Theme {
 
 /// Apply `theme` across every toolkit family. See module docs for the
 /// fan-out targets and the rationale for best-effort failure handling.
+///
+/// Updates the cross-thread current-theme handle synchronously (cheap, no
+/// I/O) before returning, so a caller that immediately re-reads [`current`]
+/// sees the new value even though the actual fan-out is still running on the
+/// tokio runtime.
 pub fn set(theme: Theme) {
-    spawn_gsettings(&[
+    current_handle().set(theme);
+    runtime::handle().spawn(async move {
+        do_set(theme).await;
+    });
+}
+
+/// The actual fan-out, run entirely on the tokio runtime (#1171) — every
+/// subprocess spawn and every ini-file write happens here, never on the GTK
+/// main thread.
+async fn do_set(theme: Theme) {
+    run_gsettings(&[
         "set",
         "org.gnome.desktop.interface",
         "color-scheme",
         theme.color_scheme(),
-    ]);
-    spawn_gsettings(&[
+    ])
+    .await;
+    run_gsettings(&[
         "set",
         "org.gnome.desktop.interface",
         "gtk-theme",
         theme.gtk_theme(),
-    ]);
+    ])
+    .await;
 
     if let Err(e) = update_gtk_settings_ini("gtk-3.0", theme) {
         tracing::warn!(error = %e, "theme: gtk-3.0 settings.ini update failed");
@@ -128,9 +201,21 @@ pub fn set(theme: Theme) {
     );
 }
 
-fn spawn_gsettings(args: &[&str]) {
-    if let Err(e) = std::process::Command::new("gsettings").args(args).spawn() {
-        tracing::warn!(error = %e, args = ?args, "theme: gsettings spawn failed");
+/// Run one `gsettings` mutation to completion on the tokio runtime.
+/// `.status().await` (rather than the old `std::process::Command::spawn()`,
+/// never `.wait()`ed) both keeps this off the GTK thread and reaps the child
+/// immediately instead of leaking a zombie until process exit.
+async fn run_gsettings(args: &[&str]) {
+    match tokio::process::Command::new("gsettings")
+        .args(args)
+        .status()
+        .await
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            tracing::warn!(code = ?status.code(), args = ?args, "theme: gsettings exited non-zero");
+        }
+        Err(e) => tracing::warn!(error = %e, args = ?args, "theme: gsettings spawn failed"),
     }
 }
 

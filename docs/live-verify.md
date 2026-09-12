@@ -810,7 +810,7 @@ opens what it claims.
 - [ ] **(#947 P4)** **A failed launch is visible.** With
       `trollshell-agent-window` on `PATH` at startup, remove it, then click
       **Agent page**: a toast must say the window could not be opened, and the
-      *next* click must take the browser route (the probe re-resolves after a
+      _next_ click must take the browser route (the probe re-resolves after a
       failure).
 - [ ] **(#947 P4)** **The config-repo link goes to the forge.** Confirm the
       **Config repo** row carries the hive's `HiveUrls.forge` verbatim and

@@ -1171,15 +1171,21 @@ fn toast(state: &AgentsState, text: &str) {
 #[derive(Clone)]
 struct Actions {
     /// Start the companion window. `Err` carries an operator-facing reason.
-    launch: Rc<dyn Fn(&[String]) -> Result<(), String>>,
+    launch: Launch,
     /// Hand a URL to the desktop.
-    open_uri: Rc<dyn Fn(&str)>,
+    open_uri: Open,
 }
+
+/// [`Actions::launch`]'s type, named so the field is readable.
+type Launch = Rc<dyn Fn(&[String]) -> Result<(), String>>;
+
+/// [`Actions::open_uri`]'s type — see [`Launch`].
+type Open = Rc<dyn Fn(&str)>;
 
 impl Default for Actions {
     fn default() -> Self {
         Self {
-            launch: Rc::new(|argv| launch_detached(argv)),
+            launch: Rc::new(launch_detached),
             open_uri: Rc::new(open_uri),
         }
     }
@@ -1194,7 +1200,7 @@ const SYSTEMD_RUN: &str = "systemd-run";
 ///
 /// No `--unit=`: systemd allocates `run-u<N>.service` itself, so a second
 /// launch for the same agent never collides with the first one's unit (the
-/// window is single-instance per agent through GApplication, and that second
+/// window is single-instance per agent through `GApplication`, and that second
 /// launch is what forwards `--tab` to the running window — a fixed unit name
 /// would have systemd refuse it instead). `--collect` reaps a unit that failed
 /// at exec so a run of misses does not accumulate failed units; `--quiet`
@@ -1231,7 +1237,10 @@ fn launch_detached(argv: &[String]) -> Result<(), String> {
     let unit = systemd_run_argv(argv);
     match spawn(&unit) {
         Ok(()) => {
-            tracing::info!(?argv, "launched the agent companion window as a transient user unit");
+            tracing::info!(
+                ?argv,
+                "launched the agent companion window as a transient user unit"
+            );
             Ok(())
         }
         Err(e) => {
@@ -1358,13 +1367,14 @@ fn refresh_urls(state: &AgentsState) {
                         refresh_detail(&state);
                     }
                 }
-                // The hive answered, just not with URLs — that is an answer,
-                // and asking again would get the same one.
-                Err(HiveError::Refused { .. } | HiveError::Protocol { .. }) => {}
-                // A version this build refuses to guess at is not going to
-                // change under a running window either.
-                Err(HiveError::Version(_)) => {}
+                // Only a transport failure is worth another go. A hive that
+                // **answered** — refusing the verb, speaking a dialect this
+                // build cannot parse, or announcing a version it refuses to
+                // guess at — would answer the same way next tick.
                 Err(HiveError::Unreachable { .. }) => state.urls_wanted.set(true),
+                Err(
+                    HiveError::Refused { .. } | HiveError::Protocol { .. } | HiveError::Version(_),
+                ) => {}
             }
         },
     );
@@ -2299,7 +2309,10 @@ mod tests {
             Route::Browser("https://hive/a/argus".to_owned())
         );
         assert_eq!(route_for(Some("argus"), false, None), Route::Nothing);
-        assert_eq!(route_for(None, true, Some("https://hive/a/x")), Route::Nothing);
+        assert_eq!(
+            route_for(None, true, Some("https://hive/a/x")),
+            Route::Nothing
+        );
     }
 
     /// The **Agent page** row is live whenever either destination exists, and
@@ -3059,7 +3072,12 @@ mod gtk_tests {
         pump();
         let expected = format!("{hostile} (/run/test/host.sock)");
         assert_eq!(
-            state.detail.empty.description().unwrap_or_default().as_str(),
+            state
+                .detail
+                .empty
+                .description()
+                .unwrap_or_default()
+                .as_str(),
             glib::markup_escape_text(&expected).as_str(),
             "the status page's description is not escaped"
         );
@@ -3167,7 +3185,10 @@ mod gtk_tests {
                 "argus".to_owned(),
             ]]
         );
-        assert!(seen.opened.borrow().is_empty(), "the browser was opened too");
+        assert!(
+            seen.opened.borrow().is_empty(),
+            "the browser was opened too"
+        );
 
         // No window on this desktop: the browser, and only where the hive
         // named a destination.
@@ -3306,11 +3327,7 @@ mod gtk_tests {
         // …and it is asked exactly once, however many good polls follow —
         // including one that answers with no `urls` block at all would be
         // enough to stop it (#1147 review, LOW 8).
-        let asked = hive
-            .seen()
-            .iter()
-            .filter(|l| l.contains("urls"))
-            .count();
+        let asked = hive.seen().iter().filter(|l| l.contains("urls")).count();
         apply(&state, &["argus"]);
         apply(&state, &["argus"]);
         pump_until(|| false, 1);
@@ -3420,10 +3437,7 @@ mod gtk_tests {
         // An allocation is handed out on a frame-clock tick, not by draining
         // the queue — so this waits for one rather than assuming `pump` was
         // enough.
-        pump_until(
-            || state.by_name.borrow()["gamma"].row.height() > 0,
-            5,
-        );
+        pump_until(|| state.by_name.borrow()["gamma"].row.height() > 0, 5);
 
         let scroller = state
             .list

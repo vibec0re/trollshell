@@ -90,10 +90,17 @@ fn build_clipboard_row(entry: &ClipEntry) -> adw::ActionRow {
     delete_btn.add_css_class("flat");
     delete_btn.add_css_class("destructive-action");
     let id_for_delete = entry.id;
-    let popover_for_delete = popover.clone();
+    // Weak, not a strong clone (#1176): `delete_btn` is a descendant of the
+    // popover it dismisses (`popover → popover_box → delete_btn`), so a
+    // strong capture here closes a refcount cycle GTK never breaks and every
+    // row `reactive_list` retires leaks its whole menu subtree. Same idiom as
+    // `panels/bluetooth.rs`'s device menu and `components/app_picker.rs`.
+    let popover_for_delete = popover.downgrade();
     delete_btn.connect_clicked(move |_| {
         clipboard::delete(id_for_delete);
-        popover_for_delete.popdown();
+        if let Some(popover) = popover_for_delete.upgrade() {
+            popover.popdown();
+        }
     });
     popover_box.append(&delete_btn);
     popover.set_child(Some(&popover_box));
@@ -107,4 +114,83 @@ fn build_clipboard_row(entry: &ClipEntry) -> adw::ActionRow {
     });
 
     row
+}
+
+/// #1176 regression coverage. `reactive_list` rebuilds this whole list on
+/// every `clipboard::history()` emission, so a row that cannot be freed is a
+/// leak per entry per refresh — and the row's "⋮" menu is exactly that shape:
+/// the Delete button lives *inside* the popover it dismisses, so a strong
+/// `popover.clone()` in its handler closes a cycle GTK never breaks.
+///
+/// Needs a real display server (`adw::ActionRow` and `gtk::Popover` have to be
+/// constructible), hence the `system-tests` gate.
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use super::{ClipEntry, ClipKind, build_clipboard_row};
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// Falsified by restoring `let popover_for_delete = popover.clone();` and
+    /// the bare `popover_for_delete.popdown()` body: the popover then upgrades
+    /// long after its row is gone.
+    #[gtk::test]
+    fn a_clipboard_row_menu_dies_with_its_row() {
+        adw::init().expect("libadwaita init");
+        let entry = ClipEntry {
+            id: 7,
+            preview: "hello".to_owned(),
+            kind: ClipKind::Text,
+        };
+
+        let row = build_clipboard_row(&entry);
+        let menu_btn = find_menu_button(row.upcast_ref())
+            .expect("the row carries a ⋮ menu button in its suffix");
+        let popover = menu_btn
+            .popover()
+            .expect("the menu button carries the actions popover");
+        let weak_popover = popover.downgrade();
+        let weak_box = popover
+            .child()
+            .expect("the popover holds its button box")
+            .downgrade();
+        drop(popover);
+        drop(menu_btn);
+
+        drop(row);
+        pump();
+
+        assert!(
+            weak_popover.upgrade().is_none(),
+            "the row's ⋮ popover must be freed with the row: a strong `popover.clone()` captured \
+             by the Delete handler — which lives on a button *inside* that popover — is a cycle \
+             GTK never breaks, so every `clipboard::history()` refresh leaks one menu subtree \
+             per entry (#1176)"
+        );
+        assert!(
+            weak_box.upgrade().is_none(),
+            "the popover's child box must go with it, not just the popover"
+        );
+    }
+
+    /// Depth-first search for the `gtk::MenuButton` in a row's suffix box —
+    /// `AdwActionRow` wraps suffixes in boxes whose exact nesting is libadwaita's
+    /// business, so walking for the type is sturdier than indexing children.
+    fn find_menu_button(widget: &gtk::Widget) -> Option<gtk::MenuButton> {
+        if let Ok(btn) = widget.clone().downcast::<gtk::MenuButton>() {
+            return Some(btn);
+        }
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            if let Some(found) = find_menu_button(&w) {
+                return Some(found);
+            }
+            child = w.next_sibling();
+        }
+        None
+    }
 }

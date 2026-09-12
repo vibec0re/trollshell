@@ -366,8 +366,13 @@ fn build_text_entry_row(numeric_only: bool) -> gtk::Box {
     submit_btn.add_css_class("suggested-action");
     let entry_for_submit = entry.clone();
     submit_btn.connect_clicked(move |_| submit_entry(&entry_for_submit, numeric_only));
-    let entry_for_activate = entry.clone();
-    entry.connect_activate(move |_| submit_entry(&entry_for_activate, numeric_only));
+    // The handler's own argument *is* this entry, so taking it costs nothing
+    // and a strong `entry.clone()` here would be the `bind`-pin defect one
+    // layer down (#224/#831/#1176): the entry's handler list would own the
+    // entry, so the prompt row could never be freed and every `prompt()`
+    // emission would leak one. `submit_btn`'s capture above is a *different*
+    // widget's handler holding this entry (the carve-out) and stays a clone.
+    entry.connect_activate(move |entry| submit_entry(entry, numeric_only));
     row.append(&submit_btn);
 
     let cancel_btn = gtk::Button::with_label("Cancel");
@@ -474,6 +479,17 @@ fn build_device_row(dev: &Device, is_busy: bool) -> adw::ActionRow {
 /// Per-device "⋮" popover menu. Holds Trust/Untrust and Forget so the
 /// row's primary activation gesture can stay focused on connect/pair
 /// without surfacing destructive controls in the click target.
+///
+/// Both buttons dismiss the menu through a **weak** handle on the popover
+/// (#1176). A strong `popover.clone()` captured by a handler on one of the
+/// popover's own descendants is a refcount cycle GTK never breaks —
+/// `popover → pop_box → trust_btn → closure → popover` — so the whole
+/// four-widget subtree outlives its row. That matters here more than
+/// anywhere else in the tree: `bind_device_groups` rebuilds *every* row on
+/// *every* `bluetooth::devices()` emission, and an active scan emits several
+/// times a second, so the leak is per device per emission with nobody
+/// clicking anything. The idiom is `components/app_picker.rs`'s
+/// (`picker_row` takes a `glib::WeakRef<gtk::Popover>`).
 fn build_device_menu(dev: &Device, is_busy: bool) -> gtk::MenuButton {
     let menu_btn = gtk::MenuButton::new();
     menu_btn.set_icon_name("view-more-symbolic");
@@ -494,10 +510,12 @@ fn build_device_menu(dev: &Device, is_busy: bool) -> gtk::MenuButton {
     trust_btn.add_css_class("flat");
     let path_t = dev.path.clone();
     let was_trusted = dev.trusted;
-    let popover_for_trust = popover.clone();
+    let popover_for_trust = popover.downgrade();
     trust_btn.connect_clicked(move |_| {
         bluetooth::set_trusted(&path_t, !was_trusted);
-        popover_for_trust.popdown();
+        if let Some(popover) = popover_for_trust.upgrade() {
+            popover.popdown();
+        }
     });
     pop_box.append(&trust_btn);
 
@@ -505,10 +523,12 @@ fn build_device_menu(dev: &Device, is_busy: bool) -> gtk::MenuButton {
     forget_btn.add_css_class("flat");
     forget_btn.add_css_class("destructive-action");
     let path_f = dev.path.clone();
-    let popover_for_forget = popover.clone();
+    let popover_for_forget = popover.downgrade();
     forget_btn.connect_clicked(move |_| {
         bluetooth::remove_device(&path_f);
-        popover_for_forget.popdown();
+        if let Some(popover) = popover_for_forget.upgrade() {
+            popover.popdown();
+        }
     });
     pop_box.append(&forget_btn);
 
@@ -520,9 +540,19 @@ fn build_device_menu(dev: &Device, is_busy: bool) -> gtk::MenuButton {
 /// #772 regression coverage: the two hand-rolled `bind` call sites in this
 /// file (device groups, pair-prompt banner) must hold their container only
 /// weakly, exactly like `reactive_list`'s own #761/#771 regression test.
+///
+/// Since #1176 it also covers the **other** direction of the same contract:
+/// a `connect_*` handler on a widget that captures a strong clone of one of
+/// that widget's own ancestors. `bind`'s `WeakRef` is useless if the widget
+/// tree underneath it cannot be freed, and a popover dismissed from a button
+/// inside itself is a cycle no `bind` is involved in at all — which is
+/// exactly why `nix/lint-bind-pins.py` could not see it before #1176.
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
-    use super::{Device, PairPrompt, bind_device_groups, bind_pair_prompt_banner};
+    use super::{
+        Device, PairPrompt, bind_device_groups, bind_pair_prompt_banner, build_device_menu,
+        build_text_entry_row,
+    };
     use hytte::adw::{self, prelude::*};
     use hytte::futures_signals::signal::Mutable;
     use hytte::gtk;
@@ -577,6 +607,80 @@ mod tests {
              the apply closure (rather than taking the closure's own `prompt_box` argument from \
              `bind`) would keep this alive for the life of the binding, defeating #224's \
              WeakRef contract"
+        );
+    }
+
+    /// A device's "⋮" menu must die with its row (#1176 item 1).
+    ///
+    /// `menu_btn → popover → pop_box → trust_btn` is the ownership chain, and
+    /// the Trust/Forget handlers close it back to `popover` when they capture
+    /// a strong clone to `popdown()` with. GTK cannot break a refcount cycle,
+    /// so every row `bind_device_groups` retires — once per device per
+    /// `devices()` emission, several times a second during a scan — leaks the
+    /// whole four-widget subtree.
+    ///
+    /// Falsified by putting either `popover.clone()` back: the popover then
+    /// upgrades after its menu button is gone.
+    #[gtk::test]
+    fn a_device_menu_dies_with_its_button() {
+        adw::init().expect("libadwaita init");
+        let dev = Device {
+            path: "/org/bluez/hci0/dev_AA".to_owned(),
+            alias: "Headphones".to_owned(),
+            paired: true,
+            trusted: true,
+            ..Device::default()
+        };
+
+        let menu_btn = build_device_menu(&dev, false);
+        let popover = menu_btn
+            .popover()
+            .expect("build_device_menu sets a popover on the menu button");
+        let pop_box = popover.child().expect("the popover holds its button box");
+        let weak_popover = popover.downgrade();
+        let weak_box = pop_box.downgrade();
+        drop(popover);
+        drop(pop_box);
+
+        drop(menu_btn);
+        pump();
+
+        assert!(
+            weak_popover.upgrade().is_none(),
+            "the device menu's popover must be freed with its menu button: a strong \
+             `popover.clone()` captured by the Trust/Forget handlers — which live on buttons \
+             *inside* that popover — is a cycle GTK never breaks, so an active scan leaks one \
+             of these per device per `devices()` emission (#1176)"
+        );
+        assert!(
+            weak_box.upgrade().is_none(),
+            "the popover's whole child subtree must go with it, not just the popover"
+        );
+    }
+
+    /// The pair-prompt PIN/passkey row must die with its prompt (#1176 item
+    /// 3): the entry cloned itself into its **own** `connect_activate`
+    /// handler, so the entry's handler list held the entry.
+    ///
+    /// Falsified by restoring `let entry_for_activate = entry.clone();` and
+    /// the `submit_entry(&entry_for_activate, …)` body — the entry then
+    /// upgrades after the row is dropped.
+    #[gtk::test]
+    fn a_pin_entry_dies_with_its_row() {
+        adw::init().expect("libadwaita init");
+        let row = build_text_entry_row(false);
+        let entry = row.first_child().expect("the row leads with its entry");
+        let weak_entry = entry.downgrade();
+        drop(entry);
+
+        drop(row);
+        pump();
+
+        assert!(
+            weak_entry.upgrade().is_none(),
+            "the PIN entry must be freed with its row: a strong `entry.clone()` captured by the \
+             entry's own `connect_activate` handler keeps it alive forever, and a pair prompt \
+             rebuilds this row on every `prompt()` emission (#1176)"
         );
     }
 }

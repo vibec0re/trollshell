@@ -271,6 +271,13 @@ fn build_network_row(net: &wifi::WifiNetwork) -> adw::ActionRow {
     row
 }
 
+/// Per-network "⋮" menu. Every button dismisses the popover through a
+/// **weak** handle (#1176): the button is a descendant of the popover it
+/// closes (`popover → popover_box → button`), so a strong `popover.clone()`
+/// closes a refcount cycle GTK never breaks — and this list is rebuilt on
+/// every scan result, so the leak is per network per rescan. Same fix and
+/// same reasoning as `panels/bluetooth.rs`'s device menu;
+/// `nix/lint-bind-pins.py` now reports the shape.
 fn build_network_row_menu(net: &wifi::WifiNetwork) -> gtk::MenuButton {
     let menu_btn = gtk::MenuButton::new();
     menu_btn.set_icon_name("view-more-symbolic");
@@ -289,46 +296,54 @@ fn build_network_row_menu(net: &wifi::WifiNetwork) -> gtk::MenuButton {
     let known_path_opt = net.known_network_path.clone();
 
     if net.connected {
-        let pop_for_disc = popover.clone();
+        let pop_for_disc = popover.downgrade();
         let disconnect_btn = gtk::Button::with_label("Disconnect");
         disconnect_btn.add_css_class("flat");
         disconnect_btn.add_css_class("destructive-action");
         disconnect_btn.connect_clicked(move |_| {
             wifi::disconnect();
-            pop_for_disc.popdown();
+            if let Some(pop) = pop_for_disc.upgrade() {
+                pop.popdown();
+            }
         });
         popover_box.append(&disconnect_btn);
 
         if let Some(known_path) = known_path_opt {
-            let pop_for_forget = popover.clone();
+            let pop_for_forget = popover.downgrade();
             let forget_btn = gtk::Button::with_label("Forget");
             forget_btn.add_css_class("flat");
             forget_btn.add_css_class("destructive-action");
             forget_btn.connect_clicked(move |_| {
                 wifi::forget(&known_path);
-                pop_for_forget.popdown();
+                if let Some(pop) = pop_for_forget.upgrade() {
+                    pop.popdown();
+                }
             });
             popover_box.append(&forget_btn);
         }
     } else {
-        let pop_for_conn = popover.clone();
+        let pop_for_conn = popover.downgrade();
         let connect_path = net_path;
         let connect_btn = gtk::Button::with_label("Connect");
         connect_btn.add_css_class("flat");
         connect_btn.connect_clicked(move |_| {
             wifi::connect_network(&connect_path);
-            pop_for_conn.popdown();
+            if let Some(pop) = pop_for_conn.upgrade() {
+                pop.popdown();
+            }
         });
         popover_box.append(&connect_btn);
 
         if let Some(known_path) = known_path_opt {
-            let pop_for_forget = popover.clone();
+            let pop_for_forget = popover.downgrade();
             let forget_btn = gtk::Button::with_label("Forget");
             forget_btn.add_css_class("flat");
             forget_btn.add_css_class("destructive-action");
             forget_btn.connect_clicked(move |_| {
                 wifi::forget(&known_path);
-                pop_for_forget.popdown();
+                if let Some(pop) = pop_for_forget.upgrade() {
+                    pop.popdown();
+                }
             });
             popover_box.append(&forget_btn);
         }

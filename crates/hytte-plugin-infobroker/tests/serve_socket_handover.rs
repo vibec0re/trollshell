@@ -34,6 +34,7 @@
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -420,6 +421,15 @@ fn head_and_tail_leaves_short_output_verbatim() {
 /// the child" (`in_scenario_child()` false, so the `_inner` test returns
 /// immediately) — both exit 0 with no scenario ever having run.
 fn run_inner(inner_test_name: &str, runtime_dir: &Path, state_dir: &Path) {
+    // #1169: `prepare_dir` now *refuses* to bind through a socket parent that
+    // is not already `0700`, rather than tightening it — and
+    // `tempfile::tempdir()` creates at the ambient umask (`0755` in this
+    // suite's environment), not `mkdir`'s `0700`. Give the child the `0700`
+    // shape `$XDG_RUNTIME_DIR` actually has in production, since every
+    // scenario here is about the handover, not about `prepare_dir`'s own
+    // check (see `broker.rs`'s unit tests for that).
+    std::fs::set_permissions(runtime_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("chmod XDG_RUNTIME_DIR scratch dir to 0700");
     let args = [
         "--exact",
         "--nocapture",

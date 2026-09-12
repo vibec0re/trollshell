@@ -531,7 +531,13 @@ self:
           injects it as `ANTHROPIC_API_KEY` at spawn, which the bridge reads
           before falling back to `~/.config/trollshell/anthropic.key`. That file
           keeps working, and is still the only source under the hand-installed
-          static unit, which scrubs the variable.
+          static unit, which scrubs the variable — but since #1169 it is
+          refused unless its mode denies group/other any access (`0600`/`0400`;
+          `chmod 600` it). The keyring/env path above is unaffected, since it
+          never touches the file. The check follows symlinks, so a key
+          declared via home-manager's `home.file` — a symlink into the Nix
+          store at `0444` — is refused too; use agenix/sops-nix or a real
+          `0600` file instead.
 
           The retired unit's `UnsetEnvironment=` scrub is carried across, not
           dropped: a transient unit has no such setting, so the home-manager

@@ -287,13 +287,23 @@ variables — two via `load_key`, one via `owner`:
 | Variable                                     | Default                   | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | -------------------------------------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `<NAME>_API_KEY` (e.g. `OPENROUTER_API_KEY`) | unset                     | Overrides the on-disk key file for provider `<name>` (upper-cased). This is exactly the variable `plugins.<id>.secrets = [ "<name>" ]` injects at spawn from the login keyring — the recommended way to supply a key. Wins over the file when set.                                                                                                                                                                                                                                                                          |
-| `XDG_CONFIG_HOME`                            | unset (→ `$HOME/.config`) | Base directory `load_key` reads the `<name>.key` file from: `$XDG_CONFIG_HOME/trollshell/<name>.key`, e.g. `openrouter.key`. Standard XDG var, not plugin-specific.                                                                                                                                                                                                                                                                                                                                                         |
+| `XDG_CONFIG_HOME`                            | unset (→ `$HOME/.config`) | Base directory `load_key` reads the `<name>.key` file from: `$XDG_CONFIG_HOME/trollshell/<name>.key`, e.g. `openrouter.key`. Standard XDG var, not plugin-specific. Since #1169, a key file that grants any access to group or other (mode & 0o077 != 0 — anything looser than `0600`/`0400`) is refused rather than read; `chmod 600` it.                                                                                                                                                                                  |
 | `TROLLSHELL_OWNER`                           | unset (→ `"your human"`)  | How a plugin persona refers to whoever is running the shell. Resolved by `hytte_ai_providers::owner` (trimmed, blank counts as unset, neutral `DEFAULT_OWNER` fallback, **never** guessed from `$USER`/GECOS) and read by both `caw` and `pet` — set it once for the session, not per plugin (#696/#706). Usually set session-wide via `programs.trollshell.ownerName` rather than per-plugin here — that Nix option is what actually sets this var for both plugins' launch (null, the default, leaves it unset entirely). |
 
 For pet/caw specifically, the OpenRouter key precedence is therefore:
 `OPENROUTER_API_KEY` env → `~/.config/trollshell/openrouter.key` file →
 the plugin's own `PET_LLM_API_KEY`/`CAW_LLM_API_KEY` env fallback (last
 resort, not recommended — see each plugin's table above).
+
+**The `<NAME>_API_KEY` env override is unaffected by the mode check above** —
+`plugins.<id>.secrets = [ "<name>" ]`'s keyring injection (#392) never touches
+the file, so the recommended deployment path keeps working exactly as before.
+The check only ever applies to the on-disk `<name>.key` fallback. One
+consequence worth knowing about before it surprises you: `load_key` stats the
+file with `metadata` (which follows symlinks), so a key declared via
+home-manager's `home.file` — a symlink into the Nix store at `0444` — is now
+refused too. That refusal is correct (the store is world-readable), but the
+fix is agenix/sops-nix or a real `0600` file, not a `home.file` symlink.
 
 **A note on `*_LLM_MODEL` with no value set:** when the OpenRouter path is
 selected (a key is resolved and no `*_LLM_URL` override is set) but

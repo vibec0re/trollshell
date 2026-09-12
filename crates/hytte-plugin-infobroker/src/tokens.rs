@@ -140,7 +140,7 @@ impl TokenStore {
         self.prune(now_unix);
         self.tokens
             .iter()
-            .find(|t| t.value == value)
+            .find(|t| tokens_match(&t.value, value))
             .map(|t| TokenAuthority {
                 agent: t.agent.clone(),
                 scope: t.scope,
@@ -156,7 +156,7 @@ impl TokenStore {
         if let Some(t) = self
             .tokens
             .iter_mut()
-            .find(|t| t.value == value && t.scope == TokenScope::Once && !t.spent)
+            .find(|t| tokens_match(&t.value, value) && t.scope == TokenScope::Once && !t.spent)
         {
             t.spent = true;
             true
@@ -185,6 +185,31 @@ impl TokenStore {
         self.prune(now_unix);
         &self.tokens
     }
+}
+
+/// Constant-time equality for a stored token value against a client-supplied
+/// bearer `value` (#1169). This socket is local, same-uid-only (#995's
+/// `bind_socket` — see [`crate::broker`]), so the timing channel a naive
+/// `==` opens is a same-uid one, not a network attacker's — but closing it
+/// costs four lines, so there is no reason to leave a bearer comparison
+/// short-circuiting on the first differing byte.
+///
+/// No new dependency (`subtle` is not a direct dependency of this crate, and
+/// this workspace adds no `Cargo.lock` entry for a fix this small): a length
+/// check — revealing *how long* a token is leaks nothing a fixed-length
+/// `random_value` doesn't already fix — followed by an XOR-fold over every
+/// byte pair, so the number of operations depends only on the length, never
+/// on *where* a mismatch falls.
+fn tokens_match(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// 16 bytes of OS randomness, hex-encoded to a 32-char token. Reads exactly 16
@@ -226,6 +251,23 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_750_000_000;
+
+    /// #1169: the compare is by value, not by identity — equal tokens match
+    /// regardless of length or content, one differing byte anywhere refuses,
+    /// and a length mismatch refuses without even reaching the fold.
+    ///
+    /// Falsification: revert `tokens_match` to `a == b` and this test alone
+    /// stays green (the *behaviour* is unchanged — this doesn't measure
+    /// timing) — it exists so the mechanism's presence is pinned by a call
+    /// site, not so the test itself proves constant time.
+    #[test]
+    fn tokens_match_by_value() {
+        assert!(tokens_match("abcdef0123456789", "abcdef0123456789"));
+        assert!(!tokens_match("abcdef0123456789", "abcdef0123456780"));
+        assert!(!tokens_match("abcdef0123456789", "abcdef012345678"));
+        assert!(!tokens_match("short", "muchlonger"));
+        assert!(tokens_match("", ""));
+    }
 
     #[test]
     fn mint_then_resolve_within_ttl() {

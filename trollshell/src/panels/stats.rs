@@ -1841,7 +1841,12 @@ fn build_failed_units_group() -> adw::PreferencesGroup {
 /// Entries are live, not historical (#721): a task whose supervisor has stopped
 /// has no row at all, and nothing here survives a shell restart. This answers
 /// "is anything flapping *right now*", which is the question the bar chip that
-/// leads here also answers.
+/// leads here also answers. That stays true of the `Returned` rows
+/// `hytte_reactive::health` began keeping in #1174: the supervisor clears the
+/// panic streak as it marks a row `Returned`, so a task that flapped and then
+/// stopped drops out of [`is_flapping`] here and off the chip together. A
+/// history view of stopped tasks would be a different card with a different
+/// title, not an extra row under this one.
 fn build_flapping_tasks_group() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
         .title("Flapping shell tasks")
@@ -1918,6 +1923,12 @@ fn flapping_tasks() -> impl Signal<Item = Vec<TaskHealth>> {
 /// the tasks this group renders: the two predicates drifting apart would leave
 /// the group unreachable in `split` layout, where that chip is the only route
 /// to this card.
+///
+/// It keys on the streak alone, and still can after #1174 gave a stopped task a
+/// surviving `TaskState::Returned` row, because `hytte_reactive::health` clears
+/// the streak on that transition — "panicking now" is false for something that
+/// is not running. Reading `state` here too would restate an invariant the
+/// publisher already holds, in two places that would then have to agree.
 pub(crate) fn is_flapping(consecutive_panics: u32) -> bool {
     consecutive_panics > 0
 }
@@ -1950,9 +1961,12 @@ fn flapping_subtitle(
         TaskState::Restarting => "Restarting".to_owned(),
         TaskState::Running => "Running".to_owned(),
         // Terminal (#1174): the task returned and nothing is supervising it
-        // any more. Reachable here if it had a nonzero panic streak (see
-        // `is_flapping`) at the moment it returned — `flapping_tasks` filters
-        // on that streak, not on `state`.
+        // any more. Not reachable through `flapping_tasks` — the supervisor
+        // clears the panic streak as it marks a row `Returned`, so the filter
+        // drops it — but the arm is not dead code either: it is this
+        // function's answer if a caller ever renders a `Returned` row (a
+        // stopped-tasks history view would), and writing it out costs one line
+        // where a fallback would silently mislabel one.
         TaskState::Returned => "Returned".to_owned(),
     });
     let panic_word = if consecutive_panics == 1 {
@@ -2275,10 +2289,14 @@ mod tests {
         );
     }
 
-    /// A task that flapped and then returned (#1174) can still reach this
-    /// group — `flapping_tasks` filters on the panic streak, not on `state` —
-    /// so `Returned` needs its own row text rather than falling out of the
-    /// match.
+    /// `Returned` (#1174) gets its own row text rather than falling out of the
+    /// match. No row on *this* card reaches it — the supervisor clears the
+    /// panic streak as it marks a row `Returned`, so `flapping_tasks` drops it,
+    /// which is the point of
+    /// `hytte_reactive::health::tests::a_returned_task_keeps_its_panic_history_but_not_its_streak`
+    /// — but the wording is what a stopped-tasks view would print, and pinning
+    /// it here is what keeps a future `_ =>` fallback from quietly relabelling
+    /// it.
     #[test]
     fn flapping_subtitle_says_returned_for_a_terminated_task() {
         assert_eq!(

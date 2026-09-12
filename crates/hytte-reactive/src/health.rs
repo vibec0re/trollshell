@@ -101,6 +101,11 @@ pub enum TaskState {
     /// than dropped (see the module docs on the live-not-historical
     /// exception, and [`crate::supervisor`]'s module docs on why this is not
     /// treated as an error worth restarting from).
+    ///
+    /// A row in this state always reads
+    /// [`consecutive_panics`](TaskHealth::consecutive_panics) `== 0` — the
+    /// streak means "panicking now", and nothing is running. Its lifetime
+    /// [`panics`](TaskHealth::panics) total survives as history.
     Returned,
 }
 
@@ -128,6 +133,10 @@ pub struct TaskHealth {
     /// This is the flapping number, and the one worth showing: `panics` alone
     /// cannot tell "crashed once an hour ago, fine since" from "crashing every
     /// 30 seconds right now".
+    ///
+    /// It says *panicking now*, so it is also cleared when supervision ends by
+    /// a clean return ([`TaskState::Returned`]) — a task that is not running
+    /// cannot be flapping, whatever its `panics` total remembers.
     pub consecutive_panics: u32,
     /// When the last panic happened, or `None` if there has not been one.
     ///
@@ -241,10 +250,19 @@ pub(crate) fn stopped(id: TaskId) {
 /// mark it [`TaskState::Returned`] and leave the row in place, rather than
 /// dropping it the way [`stopped`] does. See the module docs on why this one
 /// path is the deliberate exception to "entries are live, not historical".
+///
+/// The [`TaskHealth::consecutive_panics`] streak is **cleared** on the way
+/// through, while the lifetime `panics` total is kept. The streak's whole
+/// meaning is "panicking *now*" (it is the field [`TaskHealth::panics`] exists
+/// to be contrasted with), and a task that is not running is not panicking now;
+/// leaving it set was measured to pin the shell's Services chip on for the rest
+/// of the session, because that chip and the Flapping card it opens both filter
+/// on exactly this field and nothing ever clears a `Returned` row.
 pub(crate) fn returned(id: TaskId) {
     with_task(id, |task| {
         task.state = TaskState::Returned;
         task.backoff = Duration::ZERO;
+        task.consecutive_panics = 0;
     });
 }
 
@@ -273,7 +291,7 @@ fn with_task(id: TaskId, f: impl FnOnce(&mut TaskHealth)) {
 
 #[cfg(test)]
 mod tests {
-    use super::{TaskState, panicked, register, run_started, snapshot, stopped};
+    use super::{TaskState, panicked, register, returned, run_started, snapshot, stopped};
     use std::time::Duration;
 
     /// Entries for one test's tasks. The table is process-global and cargo runs
@@ -354,6 +372,47 @@ mod tests {
         let mine = tagged("test-health-streak");
         assert_eq!(mine[0].state, TaskState::Running);
         assert_eq!(mine[0].backoff, Duration::ZERO);
+
+        stopped(id);
+    }
+
+    /// A task that flapped and then *returned* is not flapping any more, and
+    /// its row has to say so: the streak is what "flapping now" is read from
+    /// (the shell's Services chip and its Flapping card both filter on exactly
+    /// that field), and nothing ever clears a `Returned` row, so a surviving
+    /// streak is a red badge on the bar for the rest of the session.
+    ///
+    /// The lifetime total is the half that *is* history and stays.
+    #[test]
+    fn a_returned_task_keeps_its_panic_history_but_not_its_streak() {
+        let id = register("test-health-return-clears-streak");
+        panicked(id, Duration::from_secs(1), false);
+        panicked(id, Duration::from_secs(2), false);
+
+        let before = tagged("test-health-return-clears-streak");
+        assert_eq!(
+            before[0].consecutive_panics, 2,
+            "precondition: the streak is live while the task is restarting"
+        );
+
+        returned(id);
+
+        let after = tagged("test-health-return-clears-streak");
+        assert_eq!(after.len(), 1, "the row is kept, not dropped");
+        assert_eq!(after[0].state, TaskState::Returned);
+        assert_eq!(
+            after[0].consecutive_panics, 0,
+            "a task that is not running cannot be flapping"
+        );
+        assert_eq!(
+            after[0].panics, 2,
+            "the lifetime total is history and survives the return"
+        );
+        assert_eq!(after[0].backoff, Duration::ZERO);
+        assert!(
+            after[0].last_panic.is_some(),
+            "when it last panicked is history too"
+        );
 
         stopped(id);
     }

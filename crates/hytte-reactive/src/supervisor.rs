@@ -1036,6 +1036,67 @@ mod tests {
         );
     }
 
+    /// A task that flaps and *then* returns must not stay on the shell's
+    /// "something is wrong right now" surfaces forever.
+    ///
+    /// End to end through the real supervisor, because the seam this pins is a
+    /// cross-crate one: `trollshell`'s Services bar chip and its Flapping card
+    /// both filter on [`crate::health::TaskHealth::consecutive_panics`] alone
+    /// (`panels::stats::is_flapping`), and nothing ever clears a `Returned`
+    /// row. A streak that survived the return would therefore pin a red badge
+    /// on the bar — and a `flapping` pill on a row whose own subtitle reads
+    /// `Returned` — for the rest of the session. `mpris-player` reaching that
+    /// state is an ordinary afternoon: a player emits metadata that panics the
+    /// parser, and the user closes the tab before the 30 s healthy-run
+    /// threshold resets the streak.
+    ///
+    /// [`NEVER_RESET`] rather than [`ZERO_BACKOFF`] so the streak actually
+    /// accumulates: a zero `reset_after` makes every run healthy by definition
+    /// and pins `consecutive_panics` at 1, which would still be non-zero but
+    /// would not show the two-panic history the assertions below read.
+    #[test]
+    fn a_task_that_flapped_before_returning_is_no_longer_flapping() {
+        const NAME: &str = "test-return-clears-streak";
+
+        install_error_counter();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_factory = Arc::clone(&calls);
+
+        runtime::handle().block_on(async move {
+            supervise(
+                NAME,
+                move || {
+                    let calls = Arc::clone(&calls_factory);
+                    async move {
+                        let n = calls.fetch_add(1, Ordering::SeqCst);
+                        assert!(n >= 2, "panic on the first two runs, then return");
+                    }
+                },
+                NEVER_RESET,
+                None,
+            )
+            .await;
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "two panics then a return");
+
+        let row = health::snapshot()
+            .into_iter()
+            .find(|task| task.name == NAME)
+            .expect("a returned task's row is kept, not dropped");
+        assert_eq!(row.state, health::TaskState::Returned);
+        assert_eq!(
+            row.consecutive_panics, 0,
+            "the streak is what both shell surfaces read as \"flapping now\"; a task that has \
+             stopped running is not flapping, and nothing would ever clear this row"
+        );
+        assert_eq!(
+            row.panics, 2,
+            "the lifetime total is history and stays — it is what makes the row worth keeping"
+        );
+    }
+
     /// The supervisor publishes what it knows to [`crate::health`]: a run
     /// counter that ticks before each run, panic counters that tick after each
     /// panic, and — since the task under test ends by *returning* — an entry

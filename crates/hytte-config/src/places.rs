@@ -379,19 +379,44 @@ pub fn warn_unsatisfiable_fingerprints(places: &[Place]) {
     }
 }
 
-/// File modification time, or `None` when it can't be stat'd (missing or
-/// unreadable). [`ConfigWatcher`] compares this across polls to detect edits.
-fn mtime(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+/// A layer's on-disk fingerprint: its mtime **and a content hash** — `None`
+/// when it can't be stat'd or read (missing or unreadable, the ordinary
+/// no-config-yet case). [`ConfigWatcher`] compares this across polls to
+/// detect edits.
+///
+/// A bare mtime — what this compared before #1162 lens 7 item 1 — misses a
+/// rewrite that lands inside the same timestamp granule as the previous read
+/// and lands at the same length, and misses it **permanently**: the stamp is
+/// replaced unconditionally on every poll, so the movement is never seen
+/// again once that poll passes. Coarse-granularity filesystems (a network
+/// mount, a FAT stick `$XDG_CONFIG_DIRS` might point at) make the window
+/// routine rather than theoretical. Hashing the body closes it the same way
+/// `subsystem::watch::stamp` (#1081 M5) closes it for the nine subsystems that
+/// followed `places`: reimplemented here rather than imported, because that
+/// module sits behind the crate's `watch` cargo feature — off by default so
+/// `trollshell-control-center`, which builds a [`ConfigWatcher`] of its own
+/// (`places_tab.rs`), never gains the tokio/futures-signals runtime that
+/// feature pulls in for a settings app that has no other use for one.
+///
+/// `std::collections::hash_map::DefaultHasher` is deliberately not a
+/// cryptographic hash — its output is unspecified across Rust releases, which
+/// is fine here because a stamp is only ever compared against another stamp
+/// read by this same process, never persisted or compared cross-process.
+fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&bytes, &mut hasher);
+    Some((meta.modified().ok()?, std::hash::Hasher::finish(&hasher)))
 }
 
-/// Watches `places.toml` for live reload by polling its mtime. Remembers the
-/// last-seen mtime so a poll only re-reads the file when it actually moved, and
-/// content-checks the reparse so a `touch` or no-op save doesn't churn a
-/// re-resolve.
+/// Watches `places.toml` for live reload by polling its [`stamp`] — mtime plus
+/// a content hash. Remembers the last-seen stamp so a poll only re-reads the
+/// file when it actually moved, and content-checks the reparse so a `touch`
+/// or no-op save doesn't churn a re-resolve.
 pub struct ConfigWatcher {
     path: Option<PathBuf>,
-    last: Option<SystemTime>,
+    last: Option<(SystemTime, u64)>,
 }
 
 impl Default for ConfigWatcher {
@@ -401,22 +426,23 @@ impl Default for ConfigWatcher {
 }
 
 impl ConfigWatcher {
-    /// Start watching from *now*: the file's current mtime is taken as the
+    /// Start watching from *now*: the file's current stamp is taken as the
     /// baseline, so the first [`poll`](Self::poll) reports only edits made
     /// after construction rather than replaying the state at startup.
     #[must_use]
     pub fn new() -> Self {
         let path = config_path();
-        let last = path.as_deref().and_then(mtime);
+        let last = path.as_deref().and_then(stamp);
         Self { path, last }
     }
 
-    /// Reload and return the fresh places when the file's mtime has moved since
-    /// the previous poll *and* the parsed list differs from `current`; otherwise
-    /// `None` (unchanged mtime, no config path, or an identical reparse).
+    /// Reload and return the fresh places when the file's stamp has moved
+    /// since the previous poll *and* the parsed list differs from `current`;
+    /// otherwise `None` (unchanged stamp, no config path, or an identical
+    /// reparse).
     pub fn poll(&mut self, current: &[Place]) -> Option<Vec<Place>> {
         let path = self.path.as_deref()?;
-        let now = mtime(path);
+        let now = stamp(path);
         if now == self.last {
             return None;
         }
@@ -1452,6 +1478,63 @@ mod tests {
             // mtime moves but content is identical → no spurious republish.
             set_mtime(3);
             assert!(watcher.poll(&reloaded).is_none());
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1162 lens 7 item 1: a rewrite that lands at the **same length** and is
+    /// then explicitly reset to the **same mtime** as the previous poll must
+    /// still be detected. An mtime-only watcher (what `places::ConfigWatcher`
+    /// was before this fix) would see no movement at all here and lose the
+    /// edit forever — not just until the next poll, since the stamp is
+    /// replaced unconditionally either way.
+    ///
+    /// Falsification: reverting [`stamp`] to compare mtime alone turns this
+    /// red (`poll` returns `None` instead of the `Home2` reload) while
+    /// leaving `config_watcher_reloads_only_on_changed_content` above green,
+    /// which is exactly the gap #1162 named.
+    #[test]
+    fn config_watcher_detects_a_same_length_same_mtime_rewrite() {
+        use std::time::UNIX_EPOCH;
+
+        let root = std::env::temp_dir().join(format!("hytte-places-hash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".config/trollshell")).unwrap();
+
+        temp_env::with_var("HOME", Some(root.as_os_str()), || {
+            let cfg = root.join(".config/trollshell/places.toml");
+            let one = "[[place]]\nname = \"Home1\"\nlat = 1.0\nlon = 2.0\n";
+            let two = "[[place]]\nname = \"Home2\"\nlat = 1.0\nlon = 2.0\n";
+            assert_eq!(
+                one.len(),
+                two.len(),
+                "the rewrite must not itself move the length"
+            );
+
+            let set_mtime = |secs: u64| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&cfg)
+                    .unwrap()
+                    .set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+                    .unwrap();
+            };
+
+            std::fs::write(&cfg, one).unwrap();
+            set_mtime(1);
+            let mut watcher = ConfigWatcher::new();
+            let current = load_places();
+            assert_eq!(current[0].name, "Home1");
+
+            // Same length, same mtime granule as the baseline poll — only the
+            // content actually moved.
+            std::fs::write(&cfg, two).unwrap();
+            set_mtime(1);
+            let reloaded = watcher
+                .poll(&current)
+                .expect("content changed even though mtime and length did not");
+            assert_eq!(reloaded[0].name, "Home2");
         });
 
         let _ = std::fs::remove_dir_all(&root);

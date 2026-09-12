@@ -27,6 +27,15 @@ path = "src/cli.rs"
 # The plugin runtime SDK (used only by the plugin binary — the shared library is
 # SDK-free so the CLI stays lean). Re-exports the proto vocabulary + tokio_stream.
 hytte-plugin = { path = "../hytte-plugin" }
+# `grants.rs`'s atomic writer used to hand-copy `hytte_config::file::
+# write_atomic`'s tmp+fsync+rename+mode-preserving sequence rather than link
+# the crate (#1162 lens 7 item 4: that note predates this dependency).
+# GTK-free leaf (serde/serde_ignored/toml/toml_edit/tracing only, no default
+# features here — `watch` stays off, so no tokio/futures-signals beyond what
+# this crate already pulls in on its own account); every package it resolves
+# is already in `Cargo.lock` via the workspace's other `hytte-config`
+# consumers, so this adds no new resolved package.
+hytte-config = { path = "../hytte-config" }
 # `hytte-infobroker` (the CLI binary, `cli.rs`) parses its argv with clap
 # (#1116) rather than by hand, so nix can generate shell completions from the
 # same `Command` tree at build time (`nix/plugin.nix`'s hidden `completions

@@ -196,12 +196,6 @@ fn write_path(service: &str, path: &Path, body: &str) -> bool {
 /// goes through here. No logging and no service scope — the caller decides
 /// what a failure means and how to report it.
 ///
-/// Not literally every persisted config file: `fullscreen_inhibit`'s
-/// `~/.config/trollshell/fullscreen-inhibit.toml` still writes with a bare,
-/// non-atomic `std::fs::write` plus a hand-rolled `create_dir_all`, so it
-/// still carries the #733 tearing bug for that one file. Known, out of #739's
-/// lane, tracked separately.
-///
 /// The body lands in a temp file in the same directory as the target, is
 /// `fsync`ed, and is then `rename(2)`d over it, so no reader ever observes a
 /// zero-length or partially-written config, and a crash mid-write leaves the

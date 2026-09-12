@@ -432,17 +432,19 @@ pub fn map_status(status: u16, body: &str) -> Failure {
             400,
             format!("the Anthropic API rejected the request: {detail}"),
         ),
-        // Lead with the file, not the variable: the shipped unit's
-        // `UnsetEnvironment=` scrubs ANTHROPIC_API_KEY on purpose (#752), so
-        // "set ANTHROPIC_API_KEY" is advice that provably cannot work there.
-        // It is still named, because when it *is* set it silently outranks the
-        // file — which is the other way to stare at a stale key.
+        // Lead with the file, not the variable: the plugin launcher's
+        // rendered `env` entry scrubs ANTHROPIC_API_KEY on purpose (#752,
+        // #1162 lens 7 item 2 — there is no shipped unit to point at any
+        // more, see `missing_key_refusal`'s doc), so "set ANTHROPIC_API_KEY"
+        // is advice that provably cannot work there. It is still named,
+        // because when it *is* set it silently outranks the file — which is
+        // the other way to stare at a stale key.
         401 => (
             502,
             format!(
                 "the Anthropic API rejected the key — replace the one in {KEY_PATH_HINT} \
                  (an ANTHROPIC_API_KEY in the environment overrides that file, but the \
-                 shipped unit strips it): {detail}"
+                 plugin launcher scrubs it): {detail}"
             ),
         ),
         403 => (
@@ -572,26 +574,37 @@ fn load_key_from(env_override: Option<String>, config_dir: Option<PathBuf>) -> O
 /// The message printed before exiting when this mode has no key.
 ///
 /// Fail closed, matching [`crate::envguard`]: a bridge that will not start is
-/// loud, whereas one that binds the socket and 502s every request looks like
-/// the plugin is broken.
+/// loud, whereas one that binds the socket and refuses every request looks
+/// like the plugin is broken.
 ///
-/// Loud is only worth anything if the remedy works. This is the string an
-/// operator reads in `systemctl status`, i.e. read *under the shipped unit*,
-/// which scrubs `ANTHROPIC_API_KEY` — so it leads with the key file and demotes
-/// the env override to what it is (#752).
+/// Loud is only worth anything if the remedy works, and the remedy has moved
+/// twice since this string was first written (#1162 lens 7 item 2). #890
+/// retired the hand-declared `trollshell-claude-bridge.service` unit — the
+/// bridge now wears the plugin hat (`programs.trollshell.plugins.claude-bridge`,
+/// `trollshell/src/plugin_launcher.rs`) and starts as a transient
+/// `trollshell-plugin-claude-bridge` unit instead, so there is no shipped
+/// unit whose `systemctl status` an operator would read this in any more
+/// (`crate::envguard`'s doc has the same correction for its own scrub). #993
+/// retired the `127.0.0.1:8787` TCP listener in favour of the same-uid Unix
+/// socket [`hytte_ai_providers::BRIDGE_BASE_URL`] names. So this leads with
+/// the key file and demotes the env override to what it is (#752), naming the
+/// launcher that actually scrubs `ANTHROPIC_API_KEY` (the home-manager
+/// module's rendered `env` entry, not a retired `UnsetEnvironment=` line) and
+/// the socket that would otherwise advertise a backend nothing can key.
 #[must_use]
 pub fn missing_key_refusal() -> String {
     format!(
         "refusing to start: CLAUDE_BRIDGE_MODE=api needs an Anthropic API key and there is none.\n\
-         Put one in {KEY_PATH_HINT} — under the shipped systemd unit that is the path that \
-         works, because its UnsetEnvironment= line scrubs ANTHROPIC_API_KEY from this process \
-         on purpose, so an inherited key can never quietly redirect the claude modes onto \
-         metered billing. ANTHROPIC_API_KEY still overrides the file when it survives (a \
-         cargo run, say), but it is a development convenience, not a way to configure the \
-         unit.\n\
+         Put one in {KEY_PATH_HINT} — when the plugin launcher starts this from \
+         `programs.trollshell.plugins.claude-bridge`, that is the path that works, because its \
+         rendered environment scrubs ANTHROPIC_API_KEY from this process on purpose, so an \
+         inherited key can never quietly redirect the claude modes onto metered billing. \
+         ANTHROPIC_API_KEY still overrides the file when it survives (a cargo run, say), but it \
+         is a development convenience, not a way to configure the plugin.\n\
          Or drop CLAUDE_BRIDGE_MODE=api to run the keyless subscription path instead.\n\
-         Binding the port without a key would advertise a backend that answers every request \
-         with a 502."
+         Binding {} without a key would advertise a backend that answers every request with a \
+         refusal.",
+        hytte_ai_providers::BRIDGE_BASE_URL,
     )
 }
 
@@ -1078,7 +1091,7 @@ mod tests {
     }
 
     /// The refusal names both ways to configure a key and says what refusing
-    /// buys — it is the only thing a human will see in `systemctl status`.
+    /// buys — it is the only thing a human will see in the plugin's own logs.
     #[test]
     fn the_missing_key_refusal_names_both_sources() {
         let msg = super::missing_key_refusal();
@@ -1087,15 +1100,39 @@ mod tests {
         assert!(msg.contains("CLAUDE_BRIDGE_MODE=api"), "{msg}");
     }
 
+    /// #1162 lens 7 item 2: the refusal used to point an operator at a
+    /// `systemctl status` of `trollshell-claude-bridge.service` (retired by
+    /// #890) and at binding `127.0.0.1:8787` (retired by #993, in favour of a
+    /// Unix socket). Both are gone from the tree; the message must not send
+    /// anyone looking for either.
+    ///
+    /// Falsification: restoring either literal string to `missing_key_refusal`
+    /// turns this red immediately.
+    #[test]
+    fn the_missing_key_refusal_names_neither_retired_mechanism() {
+        let msg = super::missing_key_refusal();
+        assert!(!msg.contains("8787"), "{msg}");
+        assert!(!msg.contains("trollshell-claude-bridge.service"), "{msg}");
+        // And it names what replaced them.
+        assert!(
+            msg.contains("plugin launcher") || msg.contains("plugins.claude-bridge"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(hytte_ai_providers::BRIDGE_BASE_URL),
+            "the socket path constant should be named directly: {msg}"
+        );
+    }
+
     /// …and it names them in the order that works (#752).
     ///
-    /// The shipped unit carries `UnsetEnvironment=ANTHROPIC_API_KEY`, so an
-    /// operator who follows "set `ANTHROPIC_API_KEY`" restarts into the identical
-    /// refusal with nothing to go on. Both operator-facing key strings must
-    /// therefore reach the **file** first, and mention the variable only as the
-    /// thing the unit strips.
+    /// The plugin launcher's rendered `env` entry scrubs `ANTHROPIC_API_KEY`
+    /// on purpose, so an operator who follows "set `ANTHROPIC_API_KEY`"
+    /// restarts into the identical refusal with nothing to go on. Both
+    /// operator-facing key strings must therefore reach the **file** first,
+    /// and mention the variable only as the thing the launcher strips.
     #[test]
-    fn the_key_advice_leads_with_the_source_the_shipped_unit_honours() {
+    fn the_key_advice_leads_with_the_source_the_launcher_honours() {
         let refusal = super::missing_key_refusal();
         let rejected = map_status(
             401,

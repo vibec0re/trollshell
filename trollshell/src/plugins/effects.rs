@@ -114,17 +114,7 @@ pub(super) fn broker_effect(
     // name is allocated and before the audit line is written, so a refused
     // launch never names a unit nobody started (the #964 M-2 defect, applied to
     // the new refusal path).
-    if let Some(id) = detached_launch_id(effect)
-        && !launch_budget_allows(plugin_id, std::time::Instant::now())
-    {
-        record_audit(plugin_id, effect, AuditDecision::DroppedRateCap, None);
-        tracing::warn!(
-            plugin = %plugin_id, id,
-            burst = LAUNCH_BURST,
-            per_minute = LAUNCH_PER_MINUTE,
-            "plugin exceeded the host's detached-launch budget; refused",
-        );
-        refuse_detached_launch(plugin_id, id, outbound);
+    if over_launch_budget(plugin_id, effect, outbound) {
         return;
     }
     // #953 M1 / #964 item 2: allocated *here*, before the audit record, and
@@ -1312,9 +1302,7 @@ thread_local! {
 pub(super) fn detached_launch_id(effect: &Effect) -> Option<u64> {
     match effect {
         Effect::RunCommand {
-            id,
-            detached: true,
-            ..
+            id, detached: true, ..
         } => Some(*id),
         _ => None,
     }
@@ -1336,6 +1324,32 @@ fn launch_budget_allows(plugin_id: &str, now: std::time::Instant) -> bool {
             .expect("present, or inserted just above")
             .allow(now)
     })
+}
+
+/// The detached-launch budget gate (#1165 item 8): `true` when `effect` is a
+/// detached launch this plugin may not make right now, in which case the
+/// refusal has already been audited, logged and sent back — the caller returns
+/// without brokering it.
+///
+/// Pulled out of [`broker_effect`] only to keep that function under clippy's
+/// line cap, the same reason [`dispatch_detached_run_command`] is a separate
+/// function; the reasoning lives with the constants above.
+fn over_launch_budget(plugin_id: &str, effect: &Effect, outbound: &mpsc::Sender<HostMsg>) -> bool {
+    let Some(id) = detached_launch_id(effect) else {
+        return false;
+    };
+    if launch_budget_allows(plugin_id, std::time::Instant::now()) {
+        return false;
+    }
+    record_audit(plugin_id, effect, AuditDecision::DroppedRateCap, None);
+    tracing::warn!(
+        plugin = %plugin_id, id,
+        burst = LAUNCH_BURST,
+        per_minute = LAUNCH_PER_MINUTE,
+        "plugin exceeded the host's detached-launch budget; refused",
+    );
+    refuse_detached_launch(plugin_id, id, outbound);
+    true
 }
 
 /// Tell the plugin its detached launch was refused (#1165 item 8), as the

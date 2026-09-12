@@ -392,21 +392,30 @@ pub(super) fn capped_effect_strings(
             cut(scope, MAX_DISPLAY_TEXT_BYTES);
             cut(detail, MAX_BODY_TEXT_BYTES);
         }
-        // No human-facing strings at all: these carry enum payloads the host
-        // maps onto its own actions.
-        Effect::OpenPage(_) | Effect::Niri(_) | Effect::Media(_) | Effect::Audio(_) => {}
-        // `argv` is a program invocation, not a display string: nothing renders
-        // it, and `execve`'s own `ARG_MAX` is the bound that actually applies.
-        Effect::RunCommand { .. } => {}
-        // Capped in the broker by `MAX_URI_BYTES` (#1045), which refuses rather
-        // than truncates — a cut URI is a different destination, so truncation
-        // would be the wrong degradation here.
-        Effect::OpenUri { .. } => {}
-        // The datasource legs carry opaque JSON and identifiers, not display
-        // strings; their bound is `MAX_DATASOURCE_PAYLOAD_BYTES`, applied by
-        // `capped_effect_payload`, and it refuses rather than cuts — for the
-        // same reason as a URI (#1165 item 7).
-        Effect::DatasourceQuery { .. } | Effect::DatasourceResult { .. } => {}
+        // The rest carry nothing this cap applies to. Listed rather than
+        // caught by `_`, so an effect variant that grows a human-facing string
+        // is a compile error here — one arm because clippy reads identical
+        // bodies as a mistake, with the per-variant reasons written out:
+        //
+        // - `OpenPage`/`Niri`/`Media`/`Audio` carry enum payloads the host maps
+        //   onto its own actions; there is no plugin string at all.
+        // - `RunCommand`'s `argv` is a program invocation, not a display
+        //   string: nothing renders it, and `execve`'s own `ARG_MAX` is the
+        //   bound that actually applies.
+        // - `OpenUri` is capped in the broker by `MAX_URI_BYTES` (#1045), which
+        //   *refuses* rather than truncates — a cut URI is a different
+        //   destination, so truncating would be the wrong degradation.
+        // - The datasource legs carry opaque JSON and identifiers; their bound
+        //   is `MAX_DATASOURCE_PAYLOAD_BYTES` in `capped_effect_payload`, and
+        //   it refuses for the same reason as a URI (#1165 item 7).
+        Effect::OpenPage(_)
+        | Effect::Niri(_)
+        | Effect::Media(_)
+        | Effect::Audio(_)
+        | Effect::RunCommand { .. }
+        | Effect::OpenUri { .. }
+        | Effect::DatasourceQuery { .. }
+        | Effect::DatasourceResult { .. } => {}
     }
     let message = (longest > 0 && warned.insert(std::mem::discriminant(&effect))).then(|| {
         format!(
@@ -484,7 +493,7 @@ pub(super) fn capped_effect_payload(
         Effect::DatasourceResult { outcome, .. } => {
             let over = match outcome {
                 DatasourceOutcome::Ready(payload) => {
-                    (payload.len() > MAX_DATASOURCE_PAYLOAD_BYTES).then(|| payload.len())
+                    (payload.len() > MAX_DATASOURCE_PAYLOAD_BYTES).then_some(payload.len())
                 }
                 // A failure's `message` is a human line, so it is cut rather
                 // than refused — the requester learning *that* it failed

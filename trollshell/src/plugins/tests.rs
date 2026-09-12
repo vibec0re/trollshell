@@ -10866,7 +10866,10 @@ mod containment_r2 {
             query("j".repeat(MAX_DATASOURCE_PAYLOAD_BYTES + 1)),
             &mut warned,
         );
-        assert!(effect.is_none(), "an over-cap query is refused, not forwarded");
+        assert!(
+            effect.is_none(),
+            "an over-cap query is refused, not forwarded"
+        );
         assert!(message.is_some(), "and named once");
         let (effect, message) = capped_effect_payload(
             query("j".repeat(MAX_DATASOURCE_PAYLOAD_BYTES + 1)),
@@ -10899,7 +10902,10 @@ mod containment_r2 {
         );
         assert!(message.is_some(), "the refusal is named");
         match effect.expect("the result still goes back to the requester") {
-            Effect::DatasourceResult { request_id, outcome } => {
+            Effect::DatasourceResult {
+                request_id,
+                outcome,
+            } => {
                 assert_eq!(request_id, 7, "on the same correlation");
                 assert!(
                     matches!(
@@ -11004,11 +11010,7 @@ mod containment_r2 {
         let outcome = execute_command(
             "p",
             1,
-            &[
-                "sh".into(),
-                "-c".into(),
-                "yes | head -c 50000000".into(),
-            ],
+            &["sh".into(), "-c".into(), "yes | head -c 50000000".into()],
         )
         .await;
         let elapsed = started.elapsed();

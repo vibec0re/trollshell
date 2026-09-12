@@ -85,6 +85,12 @@
 //! `AdwNavigationPage:title` needs neither: it renders through `AdwWindowTitle`,
 //! whose labels declare no `use-markup` and so are plain text.
 //!
+//! `adw::Toast:title` is the odd one out in this census, not because it needs
+//! a third mechanism but because it needs **none**: Adw-1.gir documents that
+//! toast titles use Pango markup by default, but the one caller
+//! ([`toast`]) never puts wire text there — its argument is a GIO error's own
+//! message, not a string the hive or an agent wrote (#1147 review, NIT N4).
+//!
 //! # Why the poll is a `glib` timer and not a task
 //!
 //! The tab has no runtime of its own: [`crate::spawn_on_runtime`] puts one
@@ -1196,7 +1202,39 @@ impl Default for Actions {
 /// because a NixOS profile and an FHS distro put it in different places.
 const SYSTEMD_RUN: &str = "systemd-run";
 
-/// The argv that starts `inner` as a **transient user unit**.
+/// The environment variables a detached launch forwards from this process's
+/// own environment (#1147 review N2) — **copied**, not reinvented, from the
+/// shell's own list: `trollshell/src/plugins/effects.rs`'s `FORWARDED_ENV`,
+/// documented there (#953 L5) as load-bearing precisely because the session's
+/// `systemctl --user import-environment` (`etc/niri/session.kdl`) does not
+/// carry `NIRI_SOCKET` or `DISPLAY`, and a hand-started dev loop inside a
+/// nested compositor inherits the *outer* session's variables instead of
+/// this process's own — landing the companion window on the wrong
+/// compositor. Two forwarders have to agree on what "the display" means, so
+/// this is the same four names, not a second list to keep in sync by hand.
+const FORWARDED_ENV: [&str; 4] = [
+    "WAYLAND_DISPLAY",
+    "NIRI_SOCKET",
+    "DISPLAY",
+    "XDG_RUNTIME_DIR",
+];
+
+/// Read [`FORWARDED_ENV`] out of this process's environment, skipping
+/// anything unset or empty (so a launch never asserts an empty `DISPLAY=`
+/// over the manager's real one) — mirrors `effects.rs`'s `forwarded_env`.
+/// Order follows [`FORWARDED_ENV`] so the argv is deterministic.
+fn forwarded_env() -> Vec<(String, String)> {
+    FORWARDED_ENV
+        .iter()
+        .filter_map(|name| {
+            let value = std::env::var(name).ok()?;
+            (!value.is_empty()).then(|| ((*name).to_owned(), value))
+        })
+        .collect()
+}
+
+/// The argv that starts `inner` as a **transient user unit**, with `env`
+/// forwarded via `--setenv=` (#1147 review N2; see [`FORWARDED_ENV`]).
 ///
 /// No `--unit=`: systemd allocates `run-u<N>.service` itself, so a second
 /// launch for the same agent never collides with the first one's unit (the
@@ -1205,15 +1243,20 @@ const SYSTEMD_RUN: &str = "systemd-run";
 /// would have systemd refuse it instead). `--collect` reaps a unit that failed
 /// at exec so a run of misses does not accumulate failed units; `--quiet`
 /// keeps the "Running as unit" line out of the control-center's own stderr.
+/// `--setenv=` entries are emitted before the `--` terminator, the same
+/// position `trollshell/src/launch.rs`'s `args` uses.
 #[must_use]
-pub(crate) fn systemd_run_argv(inner: &[String]) -> Vec<String> {
+pub(crate) fn systemd_run_argv(inner: &[String], env: &[(String, String)]) -> Vec<String> {
     let mut argv = vec![
         SYSTEMD_RUN.to_owned(),
         "--user".to_owned(),
         "--collect".to_owned(),
         "--quiet".to_owned(),
-        "--".to_owned(),
     ];
+    for (k, v) in env {
+        argv.push(format!("--setenv={k}={v}"));
+    }
+    argv.push("--".to_owned());
     argv.extend_from_slice(inner);
     argv
 }
@@ -1227,34 +1270,77 @@ pub(crate) fn systemd_run_argv(inner: &[String]) -> Vec<String> {
 /// control-center takes the companion window with it. A transient unit is the
 /// user manager's child, not ours.
 ///
-/// The direct `gio::Subprocess` spawn stays as the **fallback** for a session
-/// with no user manager (or no `systemd-run` on `PATH`) — it still outlives
-/// this process, GIO reaps it rather than leaving a zombie, and it is the same
-/// fallback shape `trollshell/src/plugins/effects.rs`'s `start_detached` takes
-/// for the same case. `Err` is returned only when *neither* worked, and it is
-/// what raises the toast.
+/// # `systemd-run`'s own exit is read (#1147 review N1)
+///
+/// `gio::Subprocess::newv` succeeding only proves the **helper** could be
+/// exec'd — it says nothing about whether the unit it asked for actually
+/// started. Measured: `systemd-run --user --collect --quiet -- <missing
+/// binary>` exits 1 *after* `newv` has already returned `Ok`, printing
+/// `Failed to find executable …` to stderr; a session with no user manager
+/// fails the same way, `newv` succeeding and the child later refusing on
+/// `Failed to connect to … bus`. Both looked identical to the code that used
+/// to stop at `newv`'s result, which is why a stale probe (the companion
+/// window resolved on `PATH` once, since removed) used to launch silently
+/// and successfully as far as this function was concerned. So this reads the
+/// child's exit before calling anything launched: `gio::Subprocess::communicate_utf8`
+/// (the synchronous form — there is no async runtime here to drive the
+/// `_async`/`_future` pair, and a helper this short-lived, which only hands a
+/// start job to the manager and returns, does not need one) drains its
+/// stderr and waits for it to exit, so `is_successful()` is valid the moment
+/// it returns. **Both** failure shapes above are now a genuine `Err`, exactly
+/// like an exec error, and reach the very same toast / probe-reset /
+/// browser-fallback path in [`open_agent_page`] — neither one falls back to
+/// a direct spawn, because `systemd-run` genuinely ran and had its say.
+///
+/// The direct `gio::Subprocess` spawn stays as the **fallback** only for the
+/// one case that is *not* a verdict from `systemd-run` at all: `newv` itself
+/// failing to exec the helper — missing from `PATH`, or not executable. It
+/// still outlives this process, GIO reaps it rather than leaving a zombie, and
+/// it is the same fallback shape `trollshell/src/plugins/effects.rs`'s
+/// `start_detached` takes for that one case.
 fn launch_detached(argv: &[String]) -> Result<(), String> {
-    let unit = systemd_run_argv(argv);
-    match spawn(&unit) {
-        Ok(()) => {
-            tracing::info!(
-                ?argv,
-                "launched the agent companion window as a transient user unit"
-            );
-            Ok(())
-        }
+    let unit = systemd_run_argv(argv, &forwarded_env());
+    let as_os: Vec<&std::ffi::OsStr> = unit.iter().map(AsRef::as_ref).collect();
+    let child = match gtk::gio::Subprocess::newv(
+        &as_os,
+        gtk::gio::SubprocessFlags::STDOUT_SILENCE | gtk::gio::SubprocessFlags::STDERR_PIPE,
+    ) {
+        Ok(child) => child,
         Err(e) => {
-            // `systemd-run` itself is missing or not executable. A session
-            // without a user manager fails later than this (the unit start
-            // fails, not the spawn), which this side deliberately does not
-            // wait around for — see the module doc on why a launch verdict is
-            // not evidence the program exists.
+            // `systemd-run` itself is missing or not executable — the one
+            // case that still falls back to spawning the program directly.
             tracing::warn!(error = %e, "no usable systemd-run; spawning the companion window directly");
-            spawn(argv).map(|()| {
+            return spawn(argv).map(|()| {
                 tracing::info!(?argv, "launched the agent companion window directly");
-            })
+            });
         }
+    };
+    let stderr = match child.communicate_utf8(None, gtk::gio::Cancellable::NONE) {
+        Ok((_, stderr)) => stderr,
+        Err(e) => return Err(e.message().to_owned()),
+    };
+    if child.is_successful() {
+        tracing::info!(
+            ?argv,
+            "launched the agent companion window as a transient user unit"
+        );
+        return Ok(());
     }
+    let detail = stderr
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "systemd-run --user exited with status {}",
+                child.exit_status()
+            )
+        });
+    tracing::warn!(
+        ?argv,
+        error = %detail,
+        "systemd-run --user did not start the agent companion window",
+    );
+    Err(detail)
 }
 
 /// Spawn one argv through GIO, silencing the child's stdio so a chatty
@@ -1264,6 +1350,11 @@ fn launch_detached(argv: &[String]) -> Result<(), String> {
 /// child itself — a window the operator closes must not leave a zombie
 /// parented to a settings app that may outlive it by hours — and because it
 /// does not kill the child when this window goes away.
+///
+/// Used only for [`launch_detached`]'s one fallback: the program spawned here
+/// is the long-running companion window itself (not `systemd-run`), so unlike
+/// that function's own check, this never waits on the child — doing so would
+/// block until the operator closes the window.
 fn spawn(argv: &[String]) -> Result<(), String> {
     let as_os: Vec<&std::ffi::OsStr> = argv.iter().map(AsRef::as_ref).collect();
     gtk::gio::Subprocess::newv(
@@ -2344,13 +2435,46 @@ mod tests {
             "--agent".to_owned(),
             "argus".to_owned(),
         ];
-        let argv = systemd_run_argv(&inner);
+        let argv = systemd_run_argv(&inner, &[]);
         assert_eq!(argv[0], "systemd-run");
         assert!(argv.contains(&"--user".to_owned()), "{argv:?}");
         assert!(argv.contains(&"--collect".to_owned()), "{argv:?}");
         assert!(
             !argv.iter().any(|a| a.starts_with("--unit")),
             "a fixed unit name would refuse the second launch: {argv:?}"
+        );
+        let sep = argv
+            .iter()
+            .position(|a| a == "--")
+            .expect("the argv is terminated before the program");
+        assert_eq!(&argv[sep + 1..], inner.as_slice());
+    }
+
+    /// `--setenv=` carries the forwarded display environment, in the same
+    /// `--setenv=K=V` shape `trollshell/src/launch.rs`'s `args` emits, and
+    /// still before the `--` terminator (#1147 review N2).
+    #[test]
+    fn the_detached_launch_forwards_the_given_environment() {
+        let inner = vec![
+            "trollshell-agent-window".to_owned(),
+            "--agent".to_owned(),
+            "argus".to_owned(),
+        ];
+        let env = vec![
+            ("WAYLAND_DISPLAY".to_owned(), "wayland-1".to_owned()),
+            (
+                "NIRI_SOCKET".to_owned(),
+                "/run/user/1000/niri.sock".to_owned(),
+            ),
+        ];
+        let argv = systemd_run_argv(&inner, &env);
+        assert!(
+            argv.contains(&"--setenv=WAYLAND_DISPLAY=wayland-1".to_owned()),
+            "{argv:?}"
+        );
+        assert!(
+            argv.contains(&"--setenv=NIRI_SOCKET=/run/user/1000/niri.sock".to_owned()),
+            "{argv:?}"
         );
         let sep = argv
             .iter()
@@ -2457,7 +2581,7 @@ mod gtk_tests {
 
     use super::{
         ABSENT, Actions, AgentsState, AgentsView, FACT_LABELS, build_tab, flags_of_labels,
-        on_status, refresh, start_poll,
+        launch_detached, on_status, refresh, start_poll,
     };
     use hytte_plugin_agents::config::{AgentsConfig, Display};
     use hytte_plugin_agents::hive::client::HiveError;
@@ -3272,6 +3396,32 @@ mod gtk_tests {
         dismiss(&window);
     }
 
+    /// The exact #1147 review N1 scenario: `systemd-run --user` finds a
+    /// missing target binary and exits 1 — *after* `gio::Subprocess::newv`
+    /// has already succeeded. Before the fix, [`launch_detached`] read only
+    /// `newv`'s result and returned `Ok(())` here, which is the silent dead
+    /// click M7 was filed about. `systemd-run` is a real system dependency
+    /// (a live `systemd --user` manager), which is why this is
+    /// `system-tests`-gated rather than run by default — it needs no
+    /// display, so it is a plain `#[test]`, not `#[gtk::test]`.
+    #[test]
+    fn a_launch_that_fails_inside_systemd_run_is_a_failed_launch() {
+        let result = launch_detached(&["/nonexistent-1147-review-n1".to_owned()]);
+        assert!(
+            result.is_err(),
+            "systemd-run's own non-zero exit was not surfaced as a failed launch"
+        );
+    }
+
+    /// The mirror of the test above: a target `systemd-run` *can* start is a
+    /// successful launch, so the fix does not turn every launch into a
+    /// failure.
+    #[test]
+    fn a_launch_that_succeeds_inside_systemd_run_is_a_launch() {
+        let result = launch_detached(&["true".to_owned()]);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
     /// Every widget the overlay holds, including the toasts it is showing —
     /// `AdwToastOverlay` exposes no accessor for its queue, so the count of
     /// its children is the observable.
@@ -3461,6 +3611,33 @@ mod gtk_tests {
             rosters_asked(&hive) >= 3,
             "the timer stopped after {} roster request(s)",
             rosters_asked(&hive)
+        );
+        dismiss(&window);
+    }
+
+    /// A round trip that **fails** still releases the in-flight slot — the
+    /// production code drops it unconditionally, but a one-slot guard whose
+    /// release is conditional is a permanent freeze, and nothing else in the
+    /// suite drives a hive that ever answers with an error (#1147 review,
+    /// MEDIUM/coverage N3).
+    ///
+    /// `cfg()`'s socket does not exist, so this drives the real failure path
+    /// — a connection refusal — rather than a scripted one.
+    ///
+    /// Mutation (run, verified red): leak the slot on any failed round trip
+    /// (`if answer.is_ok() { drop(slot); } else { std::mem::forget(slot); }`)
+    /// and the second assertion reds — the tab never polls again.
+    #[gtk::test]
+    fn a_failed_round_trip_releases_the_slot() {
+        let (bin, state) = build_tab(cfg());
+        let window = present(&bin, 900);
+
+        refresh(&state);
+        assert!(state.in_flight.get(), "the slot was not claimed at all");
+        pump_until(|| !state.in_flight.get(), 5);
+        assert!(
+            !state.in_flight.get(),
+            "a failed round trip never released the in-flight slot"
         );
         dismiss(&window);
     }

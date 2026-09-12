@@ -1,7 +1,7 @@
 //! The crate's one retry ramp: 250 ms doubling to a 30 s ceiling, indexed by
 //! **attempt number** rather than by the last delay.
 //!
-//! Two loops in this crate drive their own retry rate because nothing else
+//! Several loops in this crate drive their own retry rate because nothing else
 //! will wake them — a bus that is down publishes no events to wait on:
 //!
 //! - [`connection`](crate::connection)'s supervisor, reconnecting a
@@ -10,6 +10,15 @@
 //! - [`own`](crate::own)'s acquisition-error streak, retrying everything on
 //!   the way to a `RequestName` *reply* — connect, subscribe, build the
 //!   `DBusProxy`, and `RequestName` itself.
+//! - Since #1173, the **subscription-rebuild** loops, through
+//!   [`back_off_resubscribe`]: `property`'s `PropertiesChanged`, `signals`'
+//!   `receive_signal`, `proxy`'s `NameOwnerChanged` subscribe and its
+//!   cached-proxy rebuild, and `export`'s mount rebuild. Each carried its own
+//!   hand-written `sleep(250 ms)` — the very spin this module was written to
+//!   retire, still running at 4 Hz for the whole length of an outage, in the
+//!   one crate that owns the ramp. (Deliberately not counted here: naming a
+//!   number invites it to drift out of sync with the call sites the way an
+//!   earlier revision of this doc did.)
 //!
 //! They shipped as two implementations of the same 250 ms → 30 s ladder, in
 //! two different shapes: the supervisor's was a duration cursor (`next_ms`,
@@ -178,6 +187,15 @@ impl RetryStep {
 #[derive(Debug, Default)]
 pub(crate) struct FailureStreak {
     attempts: u32,
+    /// `Some((what, dest))` once [`back_off_resubscribe`] has warned that this
+    /// streak crossed the edge into "not just a blip" — set there, taken (and
+    /// retracted) by [`Self::reset`]. Every other user of this type
+    /// (`connection`'s supervisor, `own`'s acquisition streak) never calls
+    /// `back_off_resubscribe`, so this stays `None` for them and `reset`
+    /// behaves exactly as before — each already owns its own paired
+    /// loss/recovery lines (`log_connection_lost`/`log_connected`,
+    /// `log_give_up`/`log_recovered`) and must not gain a second one here.
+    edge: Option<(&'static str, String)>,
 }
 
 impl FailureStreak {
@@ -192,14 +210,103 @@ impl FailureStreak {
     }
 
     /// Forget the streak — something worked.
+    ///
+    /// If [`back_off_resubscribe`] had warned about this streak (see
+    /// [`Self::edge`]), this is the retraction: the same both-halves pairing
+    /// `own.rs`'s `log_recovered` and `connection.rs`'s `log_connected` use
+    /// for their own streaks, at `info!` since unlike those two this is not
+    /// closing a `warn!`-level incident report so much as confirming a repair
+    /// nothing else in the crate would otherwise say out loud.
     pub(crate) fn reset(&mut self) {
+        if let Some((what, dest)) = self.edge.take() {
+            tracing::info!(
+                what,
+                dest,
+                attempts = self.attempts,
+                "bus subscription re-established; the earlier report that it \
+                 could not be is now closed"
+            );
+        }
         self.attempts = 0;
     }
 }
 
+/// Back off from one failed attempt to (re)establish a subscription.
+///
+/// The loops that rebuild a subscription after the bus or the peer went
+/// away — [`property`](crate::property)'s `PropertiesChanged`,
+/// [`signals`](crate::signals)' `receive_signal`, [`proxy`](crate::proxy)'s
+/// `NameOwnerChanged` subscribe and its cached-proxy rebuild, and
+/// [`export`](crate::export)'s mount rebuild — each shipped its own
+/// `sleep(Duration::from_millis(250))`. That is the 4 Hz spin this module
+/// exists to retire, kept alive in as many places because every one of them
+/// wrote the sleep out by hand rather than reaching for the ramp (#1173).
+/// This is the one way in, so there is nothing left to drift: record the
+/// failure on the caller's streak, say what happened at [`logs_at`]'s cadence
+/// rather than once per attempt, and sleep [`delay_for`]'s delay for it.
+///
+/// The streak belongs to the loop, not to this call, and must outlive the
+/// loop's iterations — otherwise a bus that will not answer resets to 250 ms
+/// every time round and the ramp buys nothing. Callers clear it with
+/// [`FailureStreak::reset`] the moment a subscribe succeeds, so a blip costs at
+/// most one extra step rather than the 30 s ceiling.
+///
+/// `what` names the step that failed and is `&'static str` on purpose: it is a
+/// constant per call site, never a formatted string built at the retry
+/// cadence.
+///
+/// **Level: `warn!` on the edge — the streak's first failure — and `debug!`
+/// on every later cadence hit.** Before this, every line here was `debug!`,
+/// so a subscription that could not be rebuilt said nothing at the shell's
+/// default `INFO` (#766) for as long as the outage lasted; `proxy`'s
+/// replaced match-rule failure, by contrast, was `warn!` on every attempt.
+/// The edge is the one line worth surfacing on its own: it is the moment a
+/// consumer's fold actually goes stale, and it does not need
+/// [`RetryStep::is_serious`]'s five-attempt climb to earn that, because
+/// unlike `own.rs`'s acquisition streak there is no `connection.rs`-level
+/// `warn!` already covering "a peer-specific rebuild failed with the bus
+/// itself up" (a policy change, a peer that stopped exporting). Once warned,
+/// [`FailureStreak::reset`] retracts it at `info!` the moment a rebuild
+/// succeeds — so a streak this warned about is provably closed in the
+/// journal, not left to be inferred from silence.
+pub(crate) async fn back_off_resubscribe(
+    streak: &mut FailureStreak,
+    what: &'static str,
+    dest: &str,
+    // `+ Sync` so the reference survives the `sleep` below without making the
+    // caller's whole subscription task `!Send` — every one of them is spawned
+    // onto the multi-thread runtime.
+    error: &(dyn std::fmt::Display + Sync),
+) {
+    let step = streak.record();
+    if step.log {
+        if step.attempt == 1 {
+            streak.edge = Some((what, dest.to_string()));
+            tracing::warn!(
+                what,
+                dest,
+                error = %error,
+                attempt = step.attempt,
+                retry_in_ms = step.delay.as_millis(),
+                "bus subscription could not be established; retrying"
+            );
+        } else {
+            tracing::debug!(
+                what,
+                dest,
+                error = %error,
+                attempt = step.attempt,
+                retry_in_ms = step.delay.as_millis(),
+                "bus subscription could not be established; retrying"
+            );
+        }
+    }
+    tokio::time::sleep(step.delay).await;
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FailureStreak, RAMP_BASE, RAMP_CAP, delay_for, logs_at};
+    use super::{FailureStreak, RAMP_BASE, RAMP_CAP, back_off_resubscribe, delay_for, logs_at};
     use std::time::Duration;
 
     // ── #653: the ramp, as a pure function of the attempt number ────────────
@@ -388,5 +495,35 @@ mod tests {
         b.record();
         b.reset();
         assert_eq!(b.record().delay, Duration::from_millis(250));
+    }
+
+    // ── back_off_resubscribe: warn on the edge, retract on reset ─────────────
+
+    /// The first failure of a streak marks the edge (and, separately, is the
+    /// one this module's `logs_at` cadence always makes loud); a later
+    /// cadence hit does not re-mark it, and `reset` both clears and retracts
+    /// it. `FailureStreak::edge` is private, so this test — in the same
+    /// module — asserts the mechanism directly rather than needing a tracing
+    /// capture harness this crate does not otherwise carry.
+    #[tokio::test(start_paused = true)]
+    async fn back_off_resubscribe_marks_the_edge_once_and_reset_retracts_it() {
+        let mut streak = FailureStreak::default();
+        assert!(streak.edge.is_none(), "a fresh streak has no edge yet");
+
+        back_off_resubscribe(&mut streak, "test", "dest", &"boom").await;
+        assert!(
+            streak.edge.is_some(),
+            "the streak's first failure must mark the edge"
+        );
+
+        back_off_resubscribe(&mut streak, "test", "dest", &"boom").await;
+        assert!(
+            streak.edge.is_some(),
+            "a later cadence hit must not clear an edge it did not open"
+        );
+
+        streak.reset();
+        assert!(streak.edge.is_none(), "reset must retract the edge");
+        assert_eq!(streak.attempts, 0);
     }
 }

@@ -240,7 +240,8 @@ impl OwnNameBuilder {
 }
 
 /// Internal entry point taking a `SharedConnection` directly. Production
-/// callers use `own_name(...)` (Task 12 wires the global session/system).
+/// callers use [`crate::own_name`], which resolves its [`crate::BusKind`]
+/// argument to the process-wide session or system singleton.
 #[doc(hidden)]
 #[must_use]
 pub fn own_name_with(shared: &SharedConnection, name: impl Into<String>) -> OwnNameBuilder {

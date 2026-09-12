@@ -49,7 +49,7 @@ use anyhow::{Context, Result};
 use futures_signals::map_ref;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use futures_util::StreamExt;
-use hytte_bus::{BusKind, BusProxy, ProxyState, call, proxy, signals};
+use hytte_bus::{BusKind, BusProxy, ProxyState, SignalItem, call, proxy, signals};
 use hytte_reactive::{Service, registry, runtime, spawn_supervised, spawn_supervised_bounded};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -553,29 +553,31 @@ impl State {
         }
     }
 
-    /// Re-read one player's properties and update the map. Returns `false`
-    /// when the player should be dropped (property read failed).
-    async fn refresh_player(&self, bus_name: &str) -> bool {
-        match read_player_props(bus_name).await {
-            Ok(mut player) => {
-                let mut map = self.map.lock().await;
-                // `Position` is intentionally not part of `PropertiesChanged`
-                // per MPRIS spec, so `read_player_props` always returns 0 for
-                // it. Preserve whatever the position poller last published so
-                // a property change (e.g. CanGoNext flipping) doesn't snap
-                // the seek bar back to 0.
-                if let Some(prev) = map.get(bus_name) {
-                    player.position_us = prev.position_us;
-                }
-                map.insert(bus_name.to_string(), player);
-                true
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, bus_name, "player property read failed, removing");
-                self.map.lock().await.remove(bus_name);
-                false
-            }
+    /// Re-read one player's properties and update the map.
+    ///
+    /// `read_player_props` is infallible by construction — every property it
+    /// reads defaults independently rather than failing the whole read (see
+    /// its doc) — so there is no failure case here to report, and this used
+    /// to return `bool` for one that could never actually happen: the
+    /// `Err` arm was dead code, and the `state.unregister(&bus_name).await;
+    /// return;` its callers held for it was unreachable. Removed rather than
+    /// kept "in case a future error path returns" — the honest way to add
+    /// one back is to let a property genuinely propagate a transient error
+    /// (see the doc on [`spawn_player_tasks`]'s initial read for why that
+    /// window is real and what closing it would take), not to leave an arm
+    /// standing that nothing can currently reach.
+    async fn refresh_player(&self, bus_name: &str) {
+        let mut player = read_player_props(bus_name).await;
+        let mut map = self.map.lock().await;
+        // `Position` is intentionally not part of `PropertiesChanged`
+        // per MPRIS spec, so `read_player_props` always returns 0 for
+        // it. Preserve whatever the position poller last published so
+        // a property change (e.g. CanGoNext flipping) doesn't snap
+        // the seek bar back to 0.
+        if let Some(prev) = map.get(bus_name) {
+            player.position_us = prev.position_us;
         }
+        map.insert(bus_name.to_string(), player);
     }
 
     /// Rebuild and publish the player list. The active player is derived
@@ -607,6 +609,66 @@ impl State {
 
 // ── Per-player watcher task ───────────────────────────────────────────────────
 
+/// How many times a player's setup is retried while the bus keeps answering
+/// "mid-reconnect", before the player is given up.
+///
+/// **Why it is retried at all.** A player is discovered exactly once — from
+/// `ListNames` at startup, or from a single `NameOwnerChanged` when it
+/// appears — and the broker never re-announces a name that is already owned.
+/// So a setup step that returns on its first failure returns forever: the
+/// player goes on running and holding its name, and this service never watches
+/// it again. Both of the steps below fail on a bus blip, and a blip at startup
+/// is the likely case, since that is when the shell brings up every service at
+/// once (#1173).
+///
+/// **Why it is bounded.** A task that cannot give up is a task that leaks: a
+/// name that was on the bus at `ListNames` and is gone by the time the bus
+/// comes back would keep a retry loop alive for the life of the process. At
+/// [`retry::ReconnectBackoff`]'s ramp — 500 ms doubling to a 30 s ceiling —
+/// eight attempts is about a minute of a session bus that will not answer,
+/// which is far past any blip and still bounded.
+const PLAYER_SETUP_ATTEMPTS: u32 = 8;
+
+/// Run `step` until it succeeds, fails in a way a retry cannot fix, or spends
+/// [`PLAYER_SETUP_ATTEMPTS`]. Backs off on the crate's reconnect ramp.
+///
+/// Only *transient* failures are retried. A permanent one — the player does
+/// not implement the interface, the name is malformed — will answer the same
+/// way for as long as the budget lasts, so retrying it is pure latency.
+async fn setup_step<T, F, Fut>(what: &'static str, bus_name: &str, mut step: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, hytte_bus::BusError>>,
+{
+    let mut backoff = retry::ReconnectBackoff::new();
+    for attempt in 1..=PLAYER_SETUP_ATTEMPTS {
+        match step().await {
+            Ok(v) => return Some(v),
+            Err(e) if !e.is_transient() => {
+                tracing::debug!(error = %e, bus_name, what,
+                    "mpris player setup failed permanently; dropping this player");
+                return None;
+            }
+            Err(e) => {
+                // `Duration::ZERO`: the "run" that just ended was a failed
+                // attempt, so it never stayed up long enough to earn a reset.
+                let delay = backoff.delay_after_run(Duration::ZERO);
+                tracing::debug!(error = %e, bus_name, what, attempt, ?delay,
+                    "mpris player setup hit a bus blip; retrying");
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+    tracing::warn!(
+        bus_name,
+        what,
+        "mpris player setup kept failing transiently; giving up on this player \
+         (nothing re-announces a name that is already owned, so it will not be \
+         watched again this session)"
+    );
+    None
+}
+
 /// Spawn per-player tasks: one watches `PropertiesChanged`, another polls
 /// `Position`, and a third watches the [`BusProxy`] liveness signal for
 /// `PeerGone`.
@@ -614,29 +676,41 @@ async fn spawn_player_tasks(state: State, bus_name: String) {
     // Register in discovery order first.
     state.register(&bus_name).await;
 
-    // Initial property read.
-    if !state.refresh_player(&bus_name).await {
+    // Build the long-lived proxy BEFORE the first property read — the reverse
+    // of the order this ran in until #1173.
+    //
+    // `build()` fails exactly when `SharedConnection` has no live connection,
+    // which makes it the one step here that can *tell* whether the bus is up:
+    // `read_player_props` swallows every per-property error into a default, so
+    // a read taken during a blip does not fail, it silently publishes a blank
+    // player (no identity, Stopped, every Can* false) and leaves the drawer
+    // showing it. Succeeding here means there is a connection for the reads
+    // that follow.
+    let Some(player_proxy) = setup_step("proxy", &bus_name, || {
+        proxy(BusKind::Session, bus_name.as_str())
+            .at_path(MPRIS_PATH)
+            .iface(PLAYER_IFACE)
+            .build()
+    })
+    .await
+    else {
         state.unregister(&bus_name).await;
         return;
-    }
-    state.publish().await;
-
-    // Build a long-lived proxy for this player. The proxy monitors
-    // NameOwnerChanged for this exact bus name, giving us PeerGone when the
-    // player exits.
-    let player_proxy = match proxy(BusKind::Session, bus_name.as_str())
-        .at_path(MPRIS_PATH)
-        .iface(PLAYER_IFACE)
-        .build()
-        .await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::debug!(error = %e, bus_name, "failed to build BusProxy for player");
-            state.unregister(&bus_name).await;
-            return;
-        }
     };
+
+    // Initial property read. `build()` succeeding just above proves the bus
+    // was up a moment ago, but a blip in the window between that and this
+    // `Get` still surfaces as a blank player published for one cycle (no
+    // identity, `Stopped`, every `Can*` false) rather than a failure this
+    // task could react to — see the doc above and `read_player_props`'s.
+    // Accepted by design here: the window is one `Get` round trip, it
+    // self-heals on the very next `PropertiesChanged` this task subscribes to
+    // below (or on `watch_liveness`'s `PeerGone` if the player is actually
+    // gone), and closing it for real would mean letting a property like
+    // `Identity` propagate a transient error through `setup_step` too —
+    // a bigger change than this dead-arm cleanup (#1197 review).
+    state.refresh_player(&bus_name).await;
+    state.publish().await;
 
     // Subscribe to PropertiesChanged for this player.
     let props_changed = signals(BusKind::Session, bus_name.as_str())
@@ -683,31 +757,56 @@ async fn watch_liveness(state: State, bus_name: String, player_proxy: BusProxy) 
 }
 
 /// Watch `PropertiesChanged` for a player. Re-reads all properties on each
-/// emission for the `org.mpris.MediaPlayer2.Player` interface.
+/// emission for the `org.mpris.MediaPlayer2.Player` interface — and on each
+/// [`SignalItem::Resubscribed`] or [`SignalItem::Lagged`] marker.
+///
+/// This state is a **fold** over emissions: `refresh_player` is only ever
+/// called because a `PropertiesChanged` said something moved. Between a
+/// subscription dying and its replacement going up there is no match rule for
+/// the broker to route through and nothing is replayed, so every change the
+/// player made in that window is lost — and a paused player that never changes
+/// again leaves the drawer showing a track that finished during the outage,
+/// indefinitely. So this is `items()` rather than `events()`: these markers
+/// are the only notice a consumer gets that its history has a hole, and the
+/// correct reaction to either is the same one an emission gets (#1173).
 async fn watch_properties(state: State, bus_name: String, sub: hytte_bus::SignalSubscription) {
-    let mut events = sub.events();
-    while let Some(event) = events.next().await {
-        // Decode body: (interface_name, changed_properties, invalidated_properties)
-        let Ok((iface, _changed, _invalidated)) =
-            event
-                .body
-                .body()
-                .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
-        else {
-            continue;
-        };
+    let mut items = sub.items();
+    while let Some(item) = items.next().await {
+        match item {
+            SignalItem::Resubscribed => {
+                tracing::debug!(
+                    bus_name,
+                    "PropertiesChanged re-subscribed; re-reading player properties"
+                );
+            }
+            SignalItem::Lagged { skipped } => {
+                tracing::debug!(
+                    bus_name,
+                    skipped,
+                    "PropertiesChanged consumer lagged behind the broadcast \
+                     channel; re-reading player properties"
+                );
+            }
+            SignalItem::Event(event) => {
+                // Decode body: (interface_name, changed_properties, invalidated_properties)
+                let Ok((iface, _changed, _invalidated)) =
+                    event
+                        .body
+                        .body()
+                        .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+                else {
+                    continue;
+                };
 
-        // Only react to changes on the Player interface.
-        if iface != PLAYER_IFACE {
-            continue;
+                // Only react to changes on the Player interface.
+                if iface != PLAYER_IFACE {
+                    continue;
+                }
+            }
         }
 
-        let still_alive = state.refresh_player(&bus_name).await;
+        state.refresh_player(&bus_name).await;
         state.publish().await;
-        if !still_alive {
-            tracing::debug!(bus_name, "player disappeared mid-watch");
-            return;
-        }
     }
 
     tracing::debug!(bus_name, "PropertiesChanged stream ended for player");
@@ -913,7 +1012,12 @@ where
     })
 }
 
-async fn read_player_props(bus_name: &str) -> Result<Player> {
+/// Read every player property, defaulting each one independently on failure
+/// (see the call sites below) rather than failing the whole read — so this is
+/// infallible by construction and returns `Player` directly rather than a
+/// `Result` nothing can actually put an `Err` into. See [`State::refresh_player`]
+/// for what that means for the caller.
+async fn read_player_props(bus_name: &str) -> Player {
     let identity: String = get_property(bus_name, MPRIS_IFACE, "Identity")
         .await
         .unwrap_or_default();
@@ -935,7 +1039,7 @@ async fn read_player_props(bus_name: &str) -> Result<Player> {
 
     let (title, artists, album, art_url, length_us, track_id) = read_metadata(bus_name).await;
 
-    Ok(Player {
+    Player {
         bus_name: bus_name.to_string(),
         identity,
         status,
@@ -949,7 +1053,7 @@ async fn read_player_props(bus_name: &str) -> Result<Player> {
         position_us: 0,
         length_us,
         track_id,
-    })
+    }
 }
 
 /// Extract track metadata from the `Metadata` property. Returns
@@ -974,7 +1078,8 @@ async fn read_metadata(bus_name: &str) -> (String, String, String, String, u64, 
 
 #[cfg(test)]
 mod tests {
-    use super::{ART_CACHE_CAP, ArtCache};
+    use super::{ART_CACHE_CAP, ArtCache, PLAYER_SETUP_ATTEMPTS, setup_step};
+    use std::cell::Cell;
 
     /// Store an entry whose payload is the URL's own bytes, so a `get` can
     /// assert it got the right entry back without index→byte casts (which trip
@@ -1026,5 +1131,71 @@ mod tests {
         assert_eq!(cache.order.len(), 1);
         assert_eq!(cache.entries.len(), 1);
         assert_eq!(cache.get("same"), Some(vec![2]));
+    }
+
+    // ── #1173: a player found during a bus blip is still watched ─────────────
+
+    fn transient() -> hytte_bus::BusError {
+        hytte_bus::BusError::Transient {
+            source: zbus::Error::FDO(Box::new(zbus::fdo::Error::Disconnected(
+                "bus mid-reconnect".to_owned(),
+            ))),
+        }
+    }
+
+    fn permanent() -> hytte_bus::BusError {
+        hytte_bus::BusError::Permanent {
+            reason: "no such interface".to_owned(),
+            dbus_name: Some("org.freedesktop.DBus.Error.UnknownInterface".to_owned()),
+        }
+    }
+
+    /// A blip must not cost the player: the step is retried and the setup goes
+    /// on. Before #1173 both setup steps returned on the first error, and since
+    /// the broker never re-announces a name that is already owned, that return
+    /// was permanent — the player kept running and was never watched again.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_failure_is_retried() {
+        let calls = Cell::new(0u32);
+        let got = setup_step("test", "org.mpris.MediaPlayer2.x", || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            std::future::ready(if n == 3 { Ok(n) } else { Err(transient()) })
+        })
+        .await;
+        assert_eq!(got, Some(3));
+        assert_eq!(calls.get(), 3, "no attempt after the one that worked");
+    }
+
+    /// A permanent failure is not retried: it will answer the same way for as
+    /// long as the budget lasts, so a retry is pure latency.
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_failure_is_not_retried() {
+        let calls = Cell::new(0u32);
+        let got: Option<u32> = setup_step("test", "org.mpris.MediaPlayer2.x", || {
+            calls.set(calls.get() + 1);
+            std::future::ready(Err(permanent()))
+        })
+        .await;
+        assert!(got.is_none());
+        assert_eq!(
+            calls.get(),
+            1,
+            "a permanent answer must be the last attempt"
+        );
+    }
+
+    /// The budget is real: a bus that never comes back must not leave a retry
+    /// loop alive for the life of the process.
+    #[tokio::test(start_paused = true)]
+    async fn the_budget_is_spent_and_the_player_given_up() {
+        let calls = Cell::new(0u32);
+        let got: Option<u32> = setup_step("test", "org.mpris.MediaPlayer2.x", || {
+            calls.set(calls.get() + 1);
+            std::future::ready(Err(transient()))
+        })
+        .await;
+        assert!(got.is_none());
+        assert_eq!(calls.get(), PLAYER_SETUP_ATTEMPTS);
     }
 }

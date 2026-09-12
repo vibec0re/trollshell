@@ -96,6 +96,10 @@ temp-env = { version = "0.3.6", features = ["async_closure"] }
 # ephemeral-bus harness (BusGuard::drop calls block_in_place, which requires a
 # multi-thread runtime; the daemon is spawned via tokio::process and its address
 # read with io-util). They're inert for the default (hermetic) test run.
+# `test-util` is what lets `mpris`'s `setup_step` tests run under
+# `start_paused`: the retry budget walks a 500 ms → 30 s ramp, so spending it
+# for real would cost a minute. It resolves no new package (tokio's
+# `test-util = ["rt", "sync", "time"]`, all already on).
 tokio = { workspace = true, features = [
   "macros",
   "rt",
@@ -103,5 +107,6 @@ tokio = { workspace = true, features = [
   "process",
   "io-util",
   "time",
+  "test-util",
 ] }
 tracing-subscriber = { workspace = true, features = ["registry"] }

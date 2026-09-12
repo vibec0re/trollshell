@@ -2049,20 +2049,29 @@ session.
       including its `NOTDEF` fallback, the skin's un-halved halo), the node
       shape, the strip's sharing across mapping passes and its re-encode on a
       new line, the kill switch, the context-failure rebuild, and — under
-      llvmpipe in `checks.system-tests` — sixteen dot-matrix parity cases (four
-      skins × blank / readout / notdef / dense). All sixteen came out
-      **byte-identical** on Mesa 26.2.2 (max |Δ| 0 of 255 on every channel), so
-      they are pinned there with the scope's; the ceiling (mean 2 / p99 8 /
-      max 32) is what a real driver answers to.
+      llvmpipe in `checks.system-tests` — **twenty** dot-matrix parity cases
+      (four skins × blank / readout / notdef / dense / coarse). All twenty came
+      out **byte-identical** on Mesa 26.2.2 (max |Δ| 0 of 255 on every
+      channel), so they are pinned there with the scope's and the gauge's; the
+      ceiling (mean 2 / p99 8 / max 32) is what a real driver answers to.
+      `coarse` is the `MAX_DOT_PX` end of the pitch clamp and is there for one
+      specific reason: its short side is 72, the only value in the clamp where
+      the CRT vignette's `short / BAND_DIV` differs between 9 and 8, so it is
+      what compares the shader's copy of that constant against the kit's.
 
-      A seventeenth-through-twentieth case renders the same readout into an
-      area **twice** its natural size and box-averages the readback back down,
-      which is the only thing in CI that exercises the improvement at all.
-      Those four are **measured, not gated**: mean 3.3–6.1 / max 19–39 of 255,
-      entirely in the `edge` region, with the **field byte-identical** on every
-      skin. Over the ceiling, and correctly so — supersampling a convex falloff
-      adds light at the rim, which is the point. The field is what they are
-      gated on.
+      Four more cases render the same readout into an area **twice** its
+      natural size and box-average the readback back down, which is the only
+      thing in CI that exercises the improvement at all — and, since
+      `GlSurface`'s allocation is in *device* pixels, the only thing that
+      exercises the path a `scale_factor >= 2` monitor takes even at the
+      natural size. They are **gated, not merely measured** (#1150 review):
+      #893's ceiling is not their standard, because supersampling a convex
+      falloff adds light at the rim and that is the point — instead every pixel
+      off a rasterisation edge must be **bit-identical** (`FAIL(interior)`) and
+      the edge region must stay inside the dot matrix's own budget, mean 16 /
+      max 64 (`FAIL(edges)`), against a measured worst of 10.641 / 39. The two
+      blank-frame guards bind on them too, which is what an all-black blit now
+      trips on all four.
 
       What only glass can answer is what neither of those can see.
 
@@ -2070,8 +2079,11 @@ session.
      a card with a dot-matrix readout (`hytte-plugin-preem-demo`, or any plugin
      with one — the timer, the departures board). At its natural size this
      should be **indistinguishable** from before, and that is the expected
-     result, not a disappointment: it is what the sixteen bit-exact cases say.
-     Anything visibly different at 1:1 is a bug.
+     result, not a disappointment: it is what the twenty bit-exact cases say —
+     **on a 1x screen**. On a HiDPI one the snap does not fire (the allocation
+     is in device pixels), so the dots are drawn at the screen's resolution and
+     a very close look may show rounder rims than the kit's. That is the
+     improvement, not a regression; the `x2` cases are what bound it.
   2. **The dots are round when the chip is stretched.** The improvement shows
      where CSS or layout gives the surface more room than its grid — widen the
      card, or put a readout in a container that stretches it. The GL arm should

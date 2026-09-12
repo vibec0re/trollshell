@@ -3012,3 +3012,22 @@ fn dots(offset: f32, period: usize) -> usize {
     // lose a sign.
     (offset.floor() as usize) % period
 }
+
+/// Both halves of the **GL seam** for one widget, built the way [`apply`]
+/// builds it: `(is_gl, gl_surface(..).is_some())`.
+///
+/// Test-only and here rather than in `plugins::tests` because [`Renderer`] and
+/// both of its methods are private to this module. The test that reads it —
+/// `every_gl_renderer_answers_both_halves_of_the_gl_seam` — is what
+/// [`Renderer::is_gl`]'s doc promises, and #1148's review found that promise
+/// was prose and nothing else. An arm answering `true` to the first and `None`
+/// to the second rasterises nothing and is never rebuilt onto the kit: a
+/// permanently blank chip, with no warning and no fallback.
+///
+/// `None` when `build` declines the widget (the `force_unsupported` test knob).
+#[cfg(test)]
+pub(super) fn gl_seam_for(widget: &vocab::PreemWidget) -> Option<(bool, bool)> {
+    let renderer = build(widget)?;
+    let style = display_style(widget.style());
+    Some((renderer.is_gl(), renderer.gl_surface(style).is_some()))
+}

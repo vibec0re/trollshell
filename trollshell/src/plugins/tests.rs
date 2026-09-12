@@ -4578,6 +4578,138 @@ fn an_accent_change_re_tints_a_gl_scope_without_rebuilding_it() {
 // seam: which arm a build takes, what node it emits, and what a failed context
 // does about it. The pixels are the parity harness's and live-verify's.
 
+/// One of **every** `PreemWidget` variant, at its vocabulary defaults.
+///
+/// The `match` below is the forcing function and is deliberately exhaustive
+/// with no catch-all: a widget kind added to the vocabulary does not compile
+/// until it is named here, and the length assertion then stays red until it has
+/// an actual sample in the list.
+fn every_preem_widget() -> Vec<vocab::PreemWidget> {
+    use vocab::PreemWidget as W;
+    let all = vec![
+        W::DotMatrix {
+            config: vocab::DotMatrixConfig::default(),
+            state: vocab::DotMatrixState::default(),
+        },
+        W::SevenSeg {
+            config: vocab::SevenSegConfig::default(),
+            state: vocab::SevenSegState::default(),
+        },
+        W::TextBox {
+            config: vocab::TextBoxConfig::default(),
+            state: vocab::TextBoxState::default(),
+        },
+        W::LedStrip {
+            config: vocab::LedStripConfig::default(),
+            state: vocab::LedStripState::default(),
+        },
+        W::Marquee {
+            config: vocab::MarqueeConfig::default(),
+            state: vocab::MarqueeState::default(),
+        },
+        W::Scope {
+            config: vocab::ScopeConfig::default(),
+            state: vocab::ScopeState::default(),
+        },
+        W::Gauge {
+            config: vocab::GaugeConfig::default(),
+            state: vocab::GaugeState::default(),
+        },
+        W::FlipBoard {
+            config: vocab::FlipBoardConfig::default(),
+            state: vocab::FlipBoardState::default(),
+        },
+    ];
+    let mut kinds = 0;
+    for widget in &all {
+        kinds += match widget {
+            W::DotMatrix { .. }
+            | W::SevenSeg { .. }
+            | W::TextBox { .. }
+            | W::LedStrip { .. }
+            | W::Marquee { .. }
+            | W::Scope { .. }
+            | W::Gauge { .. }
+            | W::FlipBoard { .. } => 1,
+        };
+    }
+    assert_eq!(
+        kinds, 8,
+        "a widget kind was added to the vocabulary without a sample here",
+    );
+    all
+}
+
+/// **Every renderer answers both halves of the GL seam the same way** —
+/// `Renderer::is_gl()` and `Renderer::gl_surface()` agree, on every widget kind,
+/// under both arms.
+///
+/// `Renderer::is_gl`'s doc has promised this test since #1143 and #1148's review
+/// found the promise was prose: `grep` returned the comment and nothing else.
+/// For the two GL kinds that exist today other tests happen to cover both
+/// directions, so nothing was broken — but #1144's dot matrix stacks on this
+/// branch and its author reads that sentence as a guarantee before adding a
+/// third arm.
+///
+/// The two halves are asked at different call sites and neither fails loudly on
+/// its own. An arm answering `true` here and `None` there hands the reconciler
+/// no node at all and is never rebuilt onto the kit by the context-failure hook:
+/// a permanently blank chip. The reverse — `false` here, `Some` there — draws on
+/// the GPU while `apply`'s `gl_lost` check believes it is a raster arm, so a
+/// lost context leaves it frozen on its last frame.
+///
+/// Driven off the *widget* vocabulary rather than off a hand list of `Renderer`
+/// variants, which is what makes it cover a new GL arm the day `build` starts
+/// returning one: there is nothing here for #1144 to remember to update.
+///
+/// **Falsified** three ways, each a one-line edit to `preem_render`: drop
+/// `GaugeGl` from `is_gl` (the first assertion goes red), drop the `GaugeGl` arm
+/// from `gl_surface` so it falls into the `_ => None` catch-all (the same
+/// assertion, the other way round), or make `build` never take the GL arm (the
+/// last assertion goes red, which is what stops this test from passing
+/// vacuously).
+#[test]
+fn every_gl_renderer_answers_both_halves_of_the_gl_seam() {
+    let _ink = preem_ink_lock();
+    let widgets = every_preem_widget();
+
+    for widget in &widgets {
+        let (is_gl, has_surface) =
+            preem_render::gl_seam_for(widget).expect("every vocabulary widget builds");
+        assert!(
+            !is_gl && !has_surface,
+            "{}: the CPU arm draws on neither half of the GL seam, got is_gl={is_gl} \
+             gl_surface={has_surface}",
+            widget.kind(),
+        );
+    }
+
+    let mut on_the_gpu = Vec::new();
+    super::preem_gl::with_gl_arm(|| {
+        for widget in &widgets {
+            let (is_gl, has_surface) =
+                preem_render::gl_seam_for(widget).expect("every vocabulary widget builds");
+            assert_eq!(
+                is_gl,
+                has_surface,
+                "{}: is_gl() says {is_gl} and gl_surface() says {has_surface} — an arm that \
+                 answers the two halves differently either draws nothing at all or is never \
+                 rebuilt onto the kit when the context goes",
+                widget.kind(),
+            );
+            if is_gl {
+                on_the_gpu.push(widget.kind());
+            }
+        }
+    });
+
+    assert!(
+        on_the_gpu.contains(&"scope") && on_the_gpu.contains(&"gauge"),
+        "the premise: under the GL arm the two kinds that have one draw on the GPU, got \
+         {on_the_gpu:?}",
+    );
+}
+
 /// A `Gauge` widget at a known geometry, for the tests below. `scale = 1`, so
 /// the GL arm's native grid and the kit's logical one are the same number and
 /// a size assertion says something about the *mapping* rather than about the

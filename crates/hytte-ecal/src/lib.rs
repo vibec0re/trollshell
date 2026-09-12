@@ -24,8 +24,10 @@
 
 pub mod sys;
 
+use std::collections::HashSet;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 
@@ -42,7 +44,17 @@ use anyhow::{Context as _, Result, anyhow, bail};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventInstance {
     /// iCalendar serialisation of the component this occurrence belongs to.
-    pub ical: String,
+    ///
+    /// **Shared, not cloned** (#1179): every occurrence of one series points
+    /// at the same allocation, because the string is identical across them by
+    /// construction — it is the *master* component's serialisation, the same
+    /// bytes for occurrence 1 and occurrence 60 000. It is an [`Arc`] rather
+    /// than an `Rc` because expansion runs on the EDS worker thread and the
+    /// instances are handed to the UI thread.
+    ///
+    /// Read it as a `&str` (`&inst.ical` coerces); construct one from a
+    /// `String`/`&str` with `.into()`.
+    pub ical: Arc<str>,
     /// Occurrence start, POSIX seconds since the Unix epoch (UTC).
     pub start_unix: i64,
     /// Occurrence end, POSIX seconds since the Unix epoch (UTC).
@@ -495,6 +507,30 @@ impl CalClient {
     }
 }
 
+/// Hard ceiling on how many occurrences a single component may contribute to
+/// one expansion (#1179). A `FREQ=MINUTELY` invite over the calendar's 43-day
+/// window is 61 380 occurrences and every one of them costs the *consumer*
+/// work too (`hytte-services` re-parses `EventInstance::ical` per instance),
+/// so this is a budget on the whole pipeline, not just on this function. No
+/// UI in this tree can show 10 000 rows; a series that hits this cap is
+/// truncated, with one `warn!` naming its UID.
+pub const MAX_OCCURRENCES_PER_COMPONENT: usize = 10_000;
+
+/// The other half of the #1179 work budget: the number of *bytes* of iCal
+/// metadata one component's occurrences may commit downstream, counted as
+/// `occurrences × ical.len()`. The string itself is shared (one [`Arc<str>`]
+/// per component), so this does not bound *this* crate's allocation — it
+/// bounds the parsing every consumer does per instance, which a component
+/// with a large VEVENT body would otherwise blow past long before
+/// [`MAX_OCCURRENCES_PER_COMPONENT`] binds. Whichever cap binds first wins.
+pub const EXPANSION_BYTES_BUDGET: usize = 4 * 1024 * 1024;
+
+/// Hard ceiling on recurrence-iterator steps for one component — the
+/// original #29 guard, kept: it bounds a *pathological rule* (one whose
+/// occurrences never reach `end_unix`), which the occurrence budget above
+/// cannot, since such a rule emits nothing while still looping.
+const MAX_RECUR_ITERATIONS: u32 = 100_000;
+
 /// Expand one master `comp` over `[start_unix, end_unix)` (POSIX UTC
 /// seconds), pushing each occurrence into `out`.
 ///
@@ -523,6 +559,24 @@ impl CalClient {
 ///   deduped against the RRULE-expanded starts and skipped if it coincides
 ///   with an `EXDATE` (per RFC, EXDATE wins). RDATE can stand alone (no
 ///   RRULE), adding occurrences alongside DTSTART.
+///
+/// ## Bounded work (#1179)
+///
+/// The window is not by itself a bound on *work*: `FREQ=MINUTELY` over the
+/// 43-day window the calendar service asks for is 61 380 occurrences, and
+/// before #1179 each of those was checked against the emitted ones with a
+/// linear `Vec::contains` and carried its own clone of the component's iCal
+/// string — 1.9 × 10⁹ comparisons and ~9 MB of duplicated string, measured at
+/// **13.6 s** for one such invite, on every refresh, per source. Three things
+/// bound it now:
+///
+/// - the emitted set is a [`HashSet`] keyed by the occurrence's
+///   `(start, end)`, so dedup is O(1) per occurrence rather than O(n);
+/// - the iCal string is one [`Arc<str>`] shared by every occurrence of the
+///   component, so the per-occurrence cost is a refcount bump;
+/// - [`MAX_OCCURRENCES_PER_COMPONENT`] and [`EXPANSION_BYTES_BUDGET`] cap what
+///   one component may contribute, whichever binds first, and truncation logs
+///   exactly one `warn!` naming the component's UID.
 ///
 /// # Safety
 ///
@@ -555,47 +609,35 @@ unsafe fn expand_component(
     }
 
     // The component's iCal serialisation (metadata: UID/SUMMARY/LOCATION/…),
-    // identical across a series' occurrences.
-    let ical = unsafe { component_ical_string(comp) };
+    // identical across a series' occurrences — so it is materialised **once**
+    // and every occurrence shares this one allocation (#1179).
+    let ical: Arc<str> = Arc::from(unsafe { component_ical_string(comp) });
 
     // Recurrence-set modifiers, normalised to UTC seconds the same way every
     // occurrence is, so comparisons are apples-to-apples regardless of DATE
-    // vs DATE-TIME / TZID. EXDATE is a membership set; RDATE a list of extra
-    // starts.
-    let exdates = unsafe { collect_property_times(comp, sys::I_CAL_EXDATE_PROPERTY, false) };
+    // vs DATE-TIME / TZID. EXDATE is a membership set (hashed: it is probed
+    // once per occurrence, so a linear scan here is quadratic in the same way
+    // the emitted-set scan was); RDATE a list of extra starts, kept ordered
+    // because emission order is part of this function's output contract.
+    let exdates: HashSet<i64> =
+        unsafe { collect_property_times(comp, sys::I_CAL_EXDATE_PROPERTY, false) }
+            .into_iter()
+            .collect();
     let rdates = unsafe { collect_property_times(comp, sys::I_CAL_RDATE_PROPERTY, true) };
 
-    // `emitted` tracks occurrence starts we've already pushed, so RDATE
-    // doesn't double up one the RRULE (or DTSTART) already produced.
-    let mut emitted: Vec<i64> = Vec::new();
-    let mut emit = |out: &mut Vec<EventInstance>, occ_unix: i64| {
-        // EXDATE excludes; the window bounds the rest. An occurrence is kept
-        // when it starts before the window end and its end is at/after the
-        // window start (so it overlaps the window).
-        if exdates.contains(&occ_unix) {
-            return;
-        }
-        if occ_unix >= end_unix || occ_unix + duration < start_unix {
-            return;
-        }
-        if emitted.contains(&occ_unix) {
-            return;
-        }
-        emitted.push(occ_unix);
-        out.push(EventInstance {
-            ical: ical.clone(),
-            start_unix: occ_unix,
-            end_unix: occ_unix + duration,
-            all_day,
-        });
-    };
+    let mut emit = Emitter::new(ical, exdates, duration, all_day, start_unix, end_unix);
+
+    // Set once the work budget (or the iteration guard) cut the expansion
+    // short, so the `warn!` below fires exactly once per component however
+    // many occurrences were dropped.
+    let mut truncated = false;
 
     // RRULE present?
     let rrule_prop =
         unsafe { sys::i_cal_component_get_first_property(comp, sys::I_CAL_RRULE_PROPERTY) };
     if rrule_prop.is_null() {
         // No RRULE: DTSTART is the (sole) base occurrence; RDATE may add more.
-        emit(out, dtstart_unix);
+        truncated |= !emit.emit(out, dtstart_unix);
     } else {
         // Recurring: iterate occurrences from DTSTART.
         let rule = unsafe { sys::i_cal_property_get_rrule(rrule_prop) };
@@ -607,7 +649,8 @@ unsafe fn expand_component(
                 let mut guard = 0u32;
                 loop {
                     guard += 1;
-                    if guard > 100_000 {
+                    if guard > MAX_RECUR_ITERATIONS {
+                        truncated = true;
                         break;
                     }
                     let occ = unsafe { sys::i_cal_recur_iterator_next(iter) };
@@ -624,7 +667,12 @@ unsafe fn expand_component(
                     if occ_unix >= end_unix {
                         break; // past the window ⇒ done
                     }
-                    emit(out, occ_unix);
+                    if !emit.emit(out, occ_unix) {
+                        // Budget spent: stop stepping the iterator instead of
+                        // running it to the end of the window for nothing.
+                        truncated = true;
+                        break;
+                    }
                 }
                 unsafe { sys::i_cal_recur_iterator_free(iter) }
             }
@@ -636,10 +684,124 @@ unsafe fn expand_component(
     // RDATE: extra one-off occurrences within the window, deduped against the
     // RRULE-expanded set and subject to the same EXDATE exclusion.
     for rd in rdates {
-        emit(out, rd);
+        if !emit.emit(out, rd) {
+            truncated = true;
+            break;
+        }
+    }
+
+    if truncated {
+        tracing::warn!(
+            uid = uid_from_ical(&emit.ical).unwrap_or("(no UID)"),
+            emitted = emit.emitted.len(),
+            max_occurrences = emit.max_occurrences,
+            "hytte-ecal: recurrence expansion truncated — this component alone \
+             would fill the window with occurrences; showing the first ones only",
+        );
     }
 
     unsafe { sys::g_object_unref(dtstart) }
+}
+
+/// Accumulates one component's occurrences into the caller's output vector,
+/// applying — in this order — EXDATE exclusion, the query window, dedup, and
+/// the #1179 work budget. Split out of [`expand_component`] so the budget
+/// lives in one readable place (and so that function stays under clippy's
+/// `too_many_lines`); it holds no raw pointer and needs no `unsafe`.
+struct Emitter {
+    /// The component's serialisation, shared by every occurrence it emits.
+    ical: Arc<str>,
+    /// Cancelled starts (EXDATE), hashed because this is probed once per
+    /// occurrence — a linear scan here is quadratic in the same way the
+    /// emitted-set scan was before #1179.
+    exdates: HashSet<i64>,
+    /// `(start, end)` of every occurrence already pushed, so an RDATE doesn't
+    /// double up one the RRULE (or DTSTART) already produced.
+    emitted: HashSet<(i64, i64)>,
+    /// `DTEND − DTSTART`, applied to every occurrence of the series.
+    duration: i64,
+    all_day: bool,
+    window_start: i64,
+    window_end: i64,
+    /// Whichever of [`MAX_OCCURRENCES_PER_COMPONENT`] and
+    /// [`EXPANSION_BYTES_BUDGET`] binds first for this component's body size.
+    max_occurrences: usize,
+}
+
+impl Emitter {
+    fn new(
+        ical: Arc<str>,
+        exdates: HashSet<i64>,
+        duration: i64,
+        all_day: bool,
+        window_start: i64,
+        window_end: i64,
+    ) -> Self {
+        // At least one occurrence, so a component with an absurdly large body
+        // still yields its first instance rather than vanishing.
+        let max_occurrences = MAX_OCCURRENCES_PER_COMPONENT
+            .min(EXPANSION_BYTES_BUDGET / ical.len().max(1))
+            .max(1);
+        Self {
+            ical,
+            exdates,
+            emitted: HashSet::new(),
+            duration,
+            all_day,
+            window_start,
+            window_end,
+            max_occurrences,
+        }
+    }
+
+    /// Push the occurrence starting at `occ_unix`, if it survives the filters.
+    ///
+    /// Returns `false` **only** once the work budget is spent, so a caller
+    /// stops iterating instead of spinning the recurrence iterator for
+    /// occurrences it would discard. A merely filtered-out occurrence (EXDATE,
+    /// outside the window, duplicate) returns `true`: it consumed no budget.
+    fn emit(&mut self, out: &mut Vec<EventInstance>, occ_unix: i64) -> bool {
+        // EXDATE excludes; the window bounds the rest. An occurrence is kept
+        // when it starts before the window end and its end is at/after the
+        // window start (so it overlaps the window).
+        if self.exdates.contains(&occ_unix) {
+            return true;
+        }
+        let end_unix = occ_unix + self.duration;
+        if occ_unix >= self.window_end || end_unix < self.window_start {
+            return true;
+        }
+        if self.emitted.contains(&(occ_unix, end_unix)) {
+            return true;
+        }
+        if self.emitted.len() >= self.max_occurrences {
+            return false;
+        }
+        self.emitted.insert((occ_unix, end_unix));
+        out.push(EventInstance {
+            ical: Arc::clone(&self.ical),
+            start_unix: occ_unix,
+            end_unix,
+            all_day: self.all_day,
+        });
+        true
+    }
+}
+
+/// The value of the first `UID:` property line in an iCal serialisation, for
+/// log lines only (the expansion budget's `warn!` has to name *which*
+/// component it truncated, and the component pointer is long gone by the time
+/// a human reads the log).
+///
+/// Deliberately a string scan over the serialisation we already hold rather
+/// than another libical accessor: it costs no FFI surface, and the worst case
+/// for a wrong answer is a mislabelled warning. A folded (continued) UID is
+/// reported as its first line.
+fn uid_from_ical(ical: &str) -> Option<&str> {
+    ical.lines()
+        .find_map(|line| line.strip_prefix("UID:"))
+        .map(str::trim_end)
+        .filter(|uid| !uid.is_empty())
 }
 
 /// Collect every value of the repeated date-valued property `kind` on `comp`
@@ -1810,5 +1972,129 @@ mod tests {
                 "occurrence {i} carries the component's serialisation verbatim",
             );
         }
+    }
+
+    /// Every occurrence of one series must share **one** `Arc<str>`, not carry
+    /// its own copy of the same bytes. Equality alone cannot see the
+    /// difference — this asserts pointer identity, so re-introducing a
+    /// per-occurrence copy (`Arc::from(ical.to_string())` inside the loop)
+    /// fails here even though every field still compares equal (#1179).
+    #[test]
+    fn occurrences_of_one_series_share_a_single_ical_allocation() {
+        let inst = super::expand_ical_for_test(FIXTURE_DAILY, JUN_START, JUL_START).unwrap();
+        assert!(inst.len() >= 2, "need at least two occurrences to compare");
+        for (i, e) in inst.iter().enumerate().skip(1) {
+            assert!(
+                std::sync::Arc::ptr_eq(&inst[0].ical, &e.ical),
+                "occurrence {i} allocated its own copy of the series' iCal string",
+            );
+        }
+    }
+
+    // ── Bounded expansion work (#1179) ────────────────────────────────────
+
+    #[test]
+    fn uid_is_read_out_of_an_ical_serialisation_for_the_truncation_warning() {
+        assert_eq!(super::uid_from_ical(FIXTURE_DAILY), Some("fixture-daily"));
+        // No UID property at all, and an empty one, both decline rather than
+        // naming something wrong in a log line.
+        assert_eq!(
+            super::uid_from_ical("BEGIN:VEVENT\r\nSUMMARY:x\r\nEND:VEVENT\r\n"),
+            None
+        );
+        assert_eq!(super::uid_from_ical("UID:\r\n"), None);
+        // Not confused by a property whose *name* ends in UID.
+        assert_eq!(
+            super::uid_from_ical("X-MY-UID:nope\r\nUID:real\r\n"),
+            Some("real")
+        );
+    }
+
+    /// The #1179 crasher, as a test. `FREQ=MINUTELY` over the 43-day window
+    /// the calendar service actually asks for (`WINDOW_DAYS` unioned with the
+    /// 6-week grid, `hytte-services`' `calendar.rs`) is 61 380 occurrences.
+    /// Before the fix each one was checked against every already-emitted one
+    /// with a linear `Vec::contains` and carried its own clone of the
+    /// component's iCal string: 1.9 × 10⁹ comparisons and ~9 MB of duplicated
+    /// string, **measured at 13.6 s** on this tree — per source, on every
+    /// refresh, with the calendar `Mutable` the panel binds to waiting on it.
+    ///
+    /// The elapsed bound here is deliberately loose (CI is slow and shares a
+    /// box); it is three orders of magnitude under the pre-fix number, which
+    /// is the only resolution this needs to have.
+    #[test]
+    fn minutely_rule_over_the_calendar_window_expands_in_bounded_work() {
+        use std::time::{Duration, Instant};
+
+        // 43 days from Jun 1 — the widest window `calendar.rs` composes.
+        let window_end = JUN_START + 43 * 86_400;
+        let ical = "BEGIN:VEVENT\r\nUID:minutely-1\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART:20260601T090000Z\r\nDTEND:20260601T090500Z\r\n\
+                     SUMMARY:Tick\r\nRRULE:FREQ=MINUTELY\r\nEND:VEVENT\r\n";
+
+        let started = Instant::now();
+        let inst = super::expand_ical_for_test(ical, JUN_START, window_end).unwrap();
+        let elapsed = started.elapsed();
+
+        // Capped, not merely finished: the naive expansion is 61 380.
+        assert!(
+            inst.len() <= super::MAX_OCCURRENCES_PER_COMPONENT,
+            "expansion returned {} occurrences, over the {} cap",
+            inst.len(),
+            super::MAX_OCCURRENCES_PER_COMPONENT,
+        );
+        assert!(
+            inst.len() < 61_380,
+            "the minutely series was not truncated at all ({} occurrences)",
+            inst.len(),
+        );
+        assert!(!inst.is_empty(), "truncation must not swallow the series");
+
+        // Truncation keeps a *prefix* — the first occurrences in order, one
+        // per minute from DTSTART — not an arbitrary subset.
+        for (i, e) in inst.iter().enumerate() {
+            let minute = i64::try_from(i).unwrap();
+            assert_eq!(
+                e.start_unix,
+                ANCHOR_0900 + minute * 60,
+                "occurrence {i} is not the {i}th minute of the series",
+            );
+        }
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "expansion took {elapsed:?} — the O(n²) dedup or the per-occurrence \
+             clone is back (#1179 measured 13.6 s before the fix)",
+        );
+    }
+
+    /// The bytes budget, not the count cap, is what binds for a component with
+    /// a large body: `EXPANSION_BYTES_BUDGET / ical.len()` occurrences. Pinned
+    /// with a VEVENT padded past 419 bytes (4 MiB / 10 000), so a change that
+    /// drops the bytes half of the budget shows up here rather than only on a
+    /// calendar full of fat invites.
+    #[test]
+    fn a_large_component_is_capped_by_the_bytes_budget_not_the_count() {
+        let padding = "X".repeat(8_000);
+        let ical = format!(
+            "BEGIN:VEVENT\r\nUID:fat-1\r\nDTSTAMP:20260601T090000Z\r\n\
+             DTSTART:20260601T090000Z\r\nDTEND:20260601T090500Z\r\n\
+             SUMMARY:Fat\r\nDESCRIPTION:{padding}\r\nRRULE:FREQ=MINUTELY\r\nEND:VEVENT\r\n"
+        );
+        let window_end = JUN_START + 43 * 86_400;
+        let inst = super::expand_ical_for_test(&ical, JUN_START, window_end).unwrap();
+
+        let len = inst[0].ical.len();
+        assert!(len > 8_000, "the fixture's body did not survive parsing");
+        let expected = super::EXPANSION_BYTES_BUDGET / len;
+        assert!(
+            expected < super::MAX_OCCURRENCES_PER_COMPONENT,
+            "fixture too small to make the bytes budget the binding cap",
+        );
+        assert_eq!(
+            inst.len(),
+            expected,
+            "a {len}-byte component must cap at EXPANSION_BYTES_BUDGET / {len}",
+        );
     }
 }

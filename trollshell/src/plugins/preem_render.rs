@@ -27,10 +27,26 @@
 //! arms unchanged; the GL arm caches an `Arc<GlUniforms>` where the CPU arm
 //! caches an `Arc<[u8]>`, and both settle a re-map on an `Arc::ptr_eq`.
 //!
+//! # …and a second one, on the same seam (#1143)
+//!
+//! A [`Gauge`](vocab::PreemWidget::Gauge) takes [`Renderer::GaugeGl`] by the
+//! same rule, and it is the reason the seam is kind-generic rather than
+//! `Scope`-shaped: the arm decision, the context-failure rebuild
+//! ([`Renderer::is_gl`]) and the `Option` payload type
+//! ([`preem_gl::KitSurface`]) all stopped naming one widget, so #1144's dot
+//! matrix is one `build` arm and one pipeline.
+//!
+//! Where it differs from `ScopeGl` is instructive: a gauge has **no**
+//! cross-frame GPU state, so `GaugeGl` holds the very `kit::Gauge` the CPU arm
+//! holds and the two share their `update`/`advance`/`animates` arms outright.
+//! What moves to the GPU is only the rasterisation — and that is the point,
+//! because doing it at the surface's native resolution instead of at a logical
+//! 144 × 64 replicated ×2 is what fixes #1090's smeared needle.
+//!
 //! The CPU arm is still the reference and is still gated byte-exactly. It is
 //! taken when `TROLLSHELL_PREEM_RENDERER=cpu` is set (the kill switch — read
 //! once at the first build), when the widget kind has no GL arm (everything but
-//! `Scope` today), or when a GL context could not be created. See
+//! `Scope` and `Gauge` today), or when a GL context could not be created. See
 //! [`preem_gl`](super::preem_gl) for all three.
 //!
 //! # What this module owns
@@ -683,6 +699,27 @@ enum Renderer {
     Gauge {
         gauge: kit::Gauge,
     },
+    /// The **GPU** arm of [`Gauge`](Self::Gauge) (#1143), on the
+    /// [`ScopeGl`](Self::ScopeGl) seam and the default since #865's "start with
+    /// the dotmatrix and gauge", with the same kill switch and the same
+    /// context-failure fallback.
+    ///
+    /// **It holds the same `kit::Gauge` the CPU arm does**, and that is the
+    /// whole of its animation story: a gauge's only state is its needle's
+    /// spring, which is closed-form, frame-rate independent and costs a handful
+    /// of multiplies a tick. There is nothing to win by moving it to the GPU
+    /// and a `Needle` accessor to lose — so `update`, `advance` and `animates`
+    /// share one arm with the CPU renderer rather than carrying a verbatim
+    /// copy the way the two `Scope` arms must (a phosphor *is* GPU state).
+    ///
+    /// The config rides along because the uniform mapping needs the dial's
+    /// dimensions every pass and `kit::Gauge` exposes no accessor for them.
+    GaugeGl {
+        /// The already-clamped config the uniforms are rebuilt from.
+        config: vocab::GaugeConfig,
+        /// The needle's physics — the CPU arm's field, unchanged.
+        gauge: kit::Gauge,
+    },
     FlipBoard {
         board: kit::FlipBoard,
     },
@@ -703,9 +740,9 @@ enum Cached {
     /// `(program, width, height, uniforms)` for a [`UiNode::GlSurface`].
     ///
     /// The program travels with the payload rather than being re-derived at
-    /// the node, so a second GL kind (a gauge, after #930/#931 settles) adds an
-    /// arm here instead of an `if` in `map_widget` that the compiler cannot
-    /// check.
+    /// the node — which is what let the second GL kind (#1143's gauge) add a
+    /// `build` arm and a `gl_surface` arm and nothing here at all, instead of
+    /// an `if` in `map_widget` that the compiler cannot check.
     Gl(GlProgram, u32, u32, Arc<GlUniforms>),
 }
 
@@ -1347,7 +1384,8 @@ fn report(scope: &Scope, id: Option<&str>, widget: &vocab::PreemWidget, mapped: 
 /// update state otherwise, and no-op when nothing moved (the multi-monitor
 /// case).
 fn apply(instance: &mut Instance, widget: &vocab::PreemWidget) {
-    // **The CPU fallback** (#893). A `ScopeGl` whose `GtkGLArea` could not get
+    // **The CPU fallback** (#893, per kind since #1143). A GL renderer whose
+    // `GtkGLArea` could not get
     // a context can never draw anything, so it is rebuilt onto the kit — which
     // `build` does on its own, because `preem_gl::arm()` consults the same
     // latch. Checked here rather than in the short-circuit below because a
@@ -1357,8 +1395,8 @@ fn apply(instance: &mut Instance, widget: &vocab::PreemWidget) {
     //
     // The phosphor restarts from black. That is the honest outcome: the GL arm
     // never drew a trail to inherit.
-    let gl_lost =
-        matches!(instance.renderer, Some(Renderer::ScopeGl { .. })) && preem_gl::arm() == Arm::Cpu;
+    let gl_lost = instance.renderer.as_ref().is_some_and(Renderer::is_gl)
+        && preem_gl::arm() == Arm::Cpu;
     // `same_widget`, not `==`: derived `PartialEq` is not reflexive over a
     // non-finite float, and a short-circuit that never fires is a permanent
     // 20 Hz loop rather than a missed optimisation. See `sanitize_in_place`.
@@ -1617,8 +1655,9 @@ fn state_animates(state: &ScopeState) -> bool {
         .any(|instance| instance.renderer.as_ref().is_some_and(Renderer::animates))
 }
 
-/// Rebuild every `ScopeGl` instance onto the CPU kit, now — the GL
-/// context-failure path (#893).
+/// Rebuild every GL instance onto the CPU kit, now — the GL
+/// context-failure path (#893; kind-generic since #1143, via
+/// [`Renderer::is_gl`]).
 ///
 /// [`apply`]'s `gl_lost` already does this on the next mapping pass, which is
 /// enough for an *animating* scope because a pass is coming. A settled one gets
@@ -1641,7 +1680,7 @@ pub(super) fn rebuild_gl_renderers_on_cpu() {
     STORE.with_borrow_mut(|store| {
         for state in store.values_mut() {
             for instance in state.instances.values_mut() {
-                if matches!(instance.renderer, Some(Renderer::ScopeGl { .. })) {
+                if instance.renderer.as_ref().is_some_and(Renderer::is_gl) {
                     instance.renderer = build(&instance.applied);
                     instance.builds = instance.builds.saturating_add(1);
                     instance.cached = None;
@@ -2229,6 +2268,20 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
                 .frequency(config.frequency_hz)
                 .damping(config.damping);
             gauge.set_target(state.target);
+            // GL by default (#1143), the CPU kit under the kill switch or once
+            // a context has failed — the same `preem_gl::arm` decision the
+            // `Scope` above takes, consulted per *build* so an instance rebuilt
+            // after a context failure lands on the CPU arm (see `apply`).
+            //
+            // The needle is built either way and handed straight over: the
+            // spring is the state, it is CPU-side on both arms, and a gauge
+            // whose renderer flips must not restart mid-swing.
+            if preem_gl::arm() == Arm::Gl {
+                return Renderer::GaugeGl {
+                    config: *config,
+                    gauge,
+                };
+            }
             Renderer::Gauge { gauge }
         }
         W::FlipBoard { config, state } => {
@@ -2322,8 +2375,29 @@ impl Renderer {
                 // frame rather than never.
                 | (Self::ScopeGl { .. }, W::Scope { .. })
                 | (Self::Gauge { .. }, W::Gauge { .. })
+                // …and the same for the two `Gauge` arms (#1143).
+                | (Self::GaugeGl { .. }, W::Gauge { .. })
                 | (Self::FlipBoard { .. }, W::FlipBoard { .. })
         )
+    }
+
+    /// Whether this renderer draws on the **GPU**, and so hands the reconciler
+    /// a [`UiNode::GlSurface`] instead of pixels.
+    ///
+    /// The kind-generic spelling of what was `matches!(…, Renderer::ScopeGl)`
+    /// at two call sites before #1143 — [`apply`]'s `gl_lost` check and
+    /// [`rebuild_gl_renderers_on_cpu`]. Both are asking "can this instance
+    /// still draw if GL is gone", which is a question about the *arm*, and a
+    /// second kind answering it by being named in two `matches!` patterns is
+    /// exactly how the third kind gets missed in one of them.
+    ///
+    /// Kept in lockstep with [`gl_surface`](Self::gl_surface) by
+    /// `every_gl_renderer_answers_both_halves_of_the_gl_seam` in
+    /// `plugins::tests`: an arm that answers `true` here and `None` there would
+    /// rasterise nothing and never be rebuilt onto the kit — a permanently
+    /// blank chip.
+    fn is_gl(&self) -> bool {
+        matches!(self, Self::ScopeGl { .. } | Self::GaugeGl { .. })
     }
 
     /// Point the renderer at `widget`'s new **state**, keeping the animation it
@@ -2396,7 +2470,13 @@ impl Renderer {
                 *pending = Some(state.samples.clone());
                 *idle = 0;
             }
-            (Self::Gauge { gauge }, W::Gauge { state, .. }) => gauge.set_target(state.target),
+            // **One arm for both gauge renderers.** The spring is the state and
+            // it is CPU-side on both, so there is nothing for the GL arm to do
+            // differently — unlike `Scope`, whose GPU arm has to record which
+            // step consumes a batch.
+            (Self::Gauge { gauge } | Self::GaugeGl { gauge, .. }, W::Gauge { state, .. }) => {
+                gauge.set_target(state.target);
+            }
             (Self::FlipBoard { board }, W::FlipBoard { state, .. }) => board.set_text(&state.text),
             // Unreachable: `apply` rebuilds on a kind mismatch rather than
             // calling this. Dropping the update is the harmless outcome if that
@@ -2556,7 +2636,8 @@ impl Renderer {
             // scope's first tick** (the `None` baseline branch of
             // [`advance_scopes`]) and on every duplicate `frame_time` two
             // in-phase mounts hand it. Found by the #926 review, probes P2/P4.
-            Self::Gauge { gauge } => {
+            // Both gauge arms, one expression — see `update`.
+            Self::Gauge { gauge } | Self::GaugeGl { gauge, .. } => {
                 if gauge.is_settled() || !advances(dt) {
                     return false;
                 }
@@ -2619,7 +2700,9 @@ impl Renderer {
                 settle_steps,
                 ..
             } => pending.is_some() || (*fades && *idle < *settle_steps),
-            Self::Gauge { gauge } => !gauge.is_settled(),
+            // …and the same property for the gauge, for free rather than by
+            // construction: both arms read the one `kit::Gauge` they share.
+            Self::Gauge { gauge } | Self::GaugeGl { gauge, .. } => !gauge.is_settled(),
             Self::FlipBoard { board } => !board.is_settled(),
         }
     }
@@ -2627,9 +2710,9 @@ impl Renderer {
     /// Rasterise the current frame in `style`, or `None` for a renderer that
     /// does not rasterise at all.
     ///
-    /// The `Option` is the GL seam and nothing else: [`Self::ScopeGl`] draws in
+    /// The `Option` is the GL seam and nothing else: a GL arm draws in
     /// a shader from uniforms, so there is no CPU frame to hand back and
-    /// inventing an empty one would make a GL scope render as a blank chip
+    /// inventing an empty one would make it render as a blank chip
     /// rather than fail loudly. [`Instance::surface`] asks
     /// [`gl_surface`](Self::gl_surface) first and only falls through to here.
     fn render(&self, style: kit::DisplayStyle) -> Option<kit::Frame> {
@@ -2650,7 +2733,7 @@ impl Renderer {
             } => strip.render(*level, peak_for(*explicit_peak, hold.as_ref())),
             Self::Marquee { strip, offset, .. } => strip.window(dots(*offset, strip.period())),
             Self::Scope { scope, .. } => scope.render(style),
-            Self::ScopeGl { .. } => return None,
+            Self::ScopeGl { .. } | Self::GaugeGl { .. } => return None,
             Self::Gauge { gauge } => gauge.render(style),
             Self::FlipBoard { board } => board.render(style),
         })
@@ -2672,7 +2755,7 @@ impl Renderer {
     /// the GPU", and the honest answer for an arm that does not is `None`. A
     /// new GPU arm that forgot to answer here would render nothing at all —
     /// loudly — rather than render subtly wrongly.
-    fn gl_surface(&self, style: kit::DisplayStyle) -> Option<(GlProgram, preem_gl::ScopeSurface)> {
+    fn gl_surface(&self, style: kit::DisplayStyle) -> Option<(GlProgram, preem_gl::KitSurface)> {
         match self {
             Self::ScopeGl {
                 config,
@@ -2687,6 +2770,19 @@ impl Renderer {
                     samples,
                     *batch_step,
                     *step_seq,
+                    &kit::palette_snapshot(style),
+                ),
+            )),
+            // The needle's deflection and velocity are the two numbers the
+            // whole picture is a function of; the mapping takes them and no
+            // `kit::Gauge` at all, which is what keeps it pure and hermetically
+            // testable (`preem_gl::gauge`).
+            Self::GaugeGl { config, gauge } => Some((
+                preem_gl::GAUGE,
+                preem_gl::gauge_surface(
+                    *config,
+                    gauge.fraction(),
+                    gauge.needle().velocity(),
                     &kit::palette_snapshot(style),
                 ),
             )),

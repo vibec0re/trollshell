@@ -1,8 +1,16 @@
 //! `preem_gl_diff` — the GL/CPU parity harness for #893 stage B.
 //!
-//! Renders the same `Scope` state through **both** arms and prints the
+//! Renders the same kit-widget state through **both** arms and prints the
 //! per-channel delta, so the ceiling the spec proposes — mean ≤ 2/255,
 //! p99 ≤ 8/255, max ≤ 32/255 — is a measurement rather than a hope.
+//!
+//! Two kinds since #1143: the `Scope` (four skins × three fade depths) and the
+//! `Gauge` (four skins × three needle positions). The gauge cases run at
+//! `scale = 1` on purpose — the GL gauge's grid is the *native* buffer, so at
+//! any other scale the two arms are rasterising at different resolutions by
+//! design and a per-pixel delta would be measuring the improvement rather than
+//! a regression. See `preem_gl::gauge`, and `preem_gl::parity`'s `Kind` for why
+//! the `TROLLSHELL_PARITY_EXACT=1` pin stays scope-only.
 //!
 //! ```sh
 //! nix develop --command cargo run -p trollshell --example preem_gl_diff
@@ -113,15 +121,37 @@ mod program;
 // mounted there — where `cargo test -p trollshell --lib` actually runs it.
 #[path = "../src/plugins/preem_gl/parity.rs"]
 mod parity;
+// The gauge's pipeline and mapping (#1143), included the same way and for the
+// same reason. It is a sibling of `program` in the shell too, and reaches it
+// through `super::program::…`, which resolves here as well because both land
+// one module down from a crate root.
+#[path = "../src/plugins/preem_gl/gauge.rs"]
+mod gauge;
 
-/// Logical grid the cases run at. Small enough to keep the whole comparison on
-/// screen at 1× and wide enough that the graticule's 12-column pitch repeats.
-const COLS: u32 = 48;
-const ROWS: u32 = 24;
+/// Logical grid the **scope** cases run at. Small enough to keep the whole
+/// comparison on screen at 1× and wide enough that the graticule's 12-column
+/// pitch repeats.
+const SCOPE_COLS: u32 = 48;
+const SCOPE_ROWS: u32 = 24;
 /// Integer upscale, so the natural size is a clean multiple of the grid.
-const SCALE: u32 = 2;
+const SCOPE_SCALE: u32 = 2;
 /// Phosphor persistence — the kit's default, a ~17-step settle.
 const PERSISTENCE: u16 = 184;
+
+/// Logical grid the **gauge** cases run at — the kit's own default face, the
+/// one #931 tuned and #1090 was reported against.
+const GAUGE_COLS: u32 = 144;
+const GAUGE_ROWS: u32 = 64;
+/// **`1`, and that is the whole design of the gauge comparison.**
+///
+/// The GL gauge's offscreen grid is the *native* buffer (`cols * scale`), not
+/// the logical one, because drawing the dial at the size it is shown at is the
+/// point of the arm — see `preem_gl::gauge`. At any other scale the two arms
+/// are therefore rasterising at different resolutions on purpose and a
+/// per-pixel delta would be measuring the improvement rather than a
+/// regression. At `scale = 1` they draw the same picture at the same
+/// resolution, which is the one place a parity number means something.
+const GAUGE_SCALE: u32 = 1;
 
 /// Whether any case failed, for [`main`]'s exit status.
 ///
@@ -143,7 +173,8 @@ fn main() -> glib::ExitCode {
 
     println!("=== preem_gl_diff — #893 stage B parity harness ===");
     println!(
-        "grid {COLS}x{ROWS} scale {SCALE} persistence {PERSISTENCE}; \
+        "scope {SCOPE_COLS}x{SCOPE_ROWS} scale {SCOPE_SCALE} persistence {PERSISTENCE}; \
+         gauge {GAUGE_COLS}x{GAUGE_ROWS} scale {GAUGE_SCALE}; \
          ceiling mean {} / p99 {} / max {} per channel",
         parity::CEILING_MEAN,
         parity::CEILING_P99,
@@ -152,8 +183,10 @@ fn main() -> glib::ExitCode {
     let exact = parity_exact();
     if exact {
         println!(
-            "TROLLSHELL_PARITY_EXACT=1: any case with a non-zero delta on any \
-             channel fails as FAIL(exact), even inside the ceiling above"
+            "TROLLSHELL_PARITY_EXACT=1: a **scope** case with a non-zero delta on \
+             any channel fails as FAIL(exact), even inside the ceiling above. \
+             Gauge cases are held to the ceiling only (#1143) — see \
+             `preem_gl::parity`'s `Kind`."
         );
     }
 
@@ -213,13 +246,89 @@ USAGE:
     Ok(skins)
 }
 
-/// One comparison: a skin plus how many animation steps to run before reading.
-struct Case {
-    style: kit::DisplayStyle,
-    /// Extra idle steps after the debut batch, so the phosphor trail — the one
-    /// thing the GL arm reimplements as a recurrence — is measured mid-fade
-    /// rather than only at full intensity.
-    idle_steps: u32,
+/// One comparison: a kit widget, a skin, and the state to drive it into.
+enum Case {
+    /// A `Scope` after its debut batch plus `idle_steps` idle ones.
+    Scope {
+        style: kit::DisplayStyle,
+        /// Extra idle steps after the debut batch, so the phosphor trail — the
+        /// one thing the GL arm reimplements as a recurrence — is measured
+        /// mid-fade rather than only at full intensity.
+        idle_steps: u32,
+    },
+    /// A `Gauge` with its needle driven into one of three positions (#1143).
+    Gauge {
+        style: kit::DisplayStyle,
+        needle: NeedleAt,
+    },
+}
+
+/// Where a gauge case's needle is when the frame is taken.
+///
+/// Three positions, chosen to cover what the shader has to get right: the
+/// motion-blur fan **off** and **on** (it is the needle's own geometry
+/// max-combined, so at rest it must vanish exactly rather than fatten the
+/// blade), the lit value arc empty and full, and the overtravel stop.
+#[derive(Clone, Copy)]
+enum NeedleAt {
+    /// Settled at rest, low on the scale: no fan, a short value arc.
+    Rest,
+    /// Mid-sweep toward full scale: the fan is spread, the arc is partly lit.
+    Sweeping,
+    /// Slammed to full scale and overshooting into the mechanical stop.
+    Pegged,
+}
+
+impl NeedleAt {
+    /// The word in the case label and on its evidence files.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Rest => "rest",
+            Self::Sweeping => "sweep",
+            Self::Pegged => "pegged",
+        }
+    }
+
+    /// The target to point the needle at, and how many 60 Hz frames to run
+    /// before the frame is taken. `None` frames means [`kit::Gauge::settle`] —
+    /// parked on the reading with zero velocity, which is what makes the fan
+    /// provably absent rather than merely small.
+    fn drive(self) -> (f32, Option<u32>) {
+        match self {
+            Self::Rest => (0.3, None),
+            // ~120 ms into a 2 Hz spring: past the halfway point and still
+            // moving fast, so every blade of the fan is separated.
+            Self::Sweeping => (0.85, Some(7)),
+            // Full scale from rest overshoots past 1.0 into the overtravel,
+            // which is where the drawn angle is clamped and the physics is not.
+            Self::Pegged => (1.0, Some(16)),
+        }
+    }
+}
+
+impl Case {
+    /// Which per-kind ceiling this case is held to — see `parity::Kind`.
+    fn kind(&self) -> parity::Kind {
+        match self {
+            Self::Scope { .. } => parity::Kind::Scope,
+            Self::Gauge { .. } => parity::Kind::Gauge,
+        }
+    }
+
+    /// `(logical cols, logical rows, integer upscale)`.
+    fn geometry(&self) -> (u32, u32, u32) {
+        match self {
+            Self::Scope { .. } => (SCOPE_COLS, SCOPE_ROWS, SCOPE_SCALE),
+            Self::Gauge { .. } => (GAUGE_COLS, GAUGE_ROWS, GAUGE_SCALE),
+        }
+    }
+
+    /// The natural size in logical pixels — what the area is sized to, and what
+    /// the CPU reference frame comes out at.
+    fn natural(&self) -> (u32, u32) {
+        let (cols, rows, scale) = self.geometry();
+        (cols * scale, rows * scale)
+    }
 }
 
 /// How many renders of the **same** state to issue before reading the
@@ -270,30 +379,42 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
     // The same registration `plugins::install` does in the shell, with the same
     // pipeline constant — the harness drives the shipping pipeline, not a copy.
     hytte::ui::gl_surface::register(program::SCOPE, program::SCOPE_PIPELINE);
+    hytte::ui::gl_surface::register(gauge::GAUGE, gauge::GAUGE_PIPELINE);
 
     let cases: Vec<Case> = skins
         .iter()
         .flat_map(|style| {
-            [0_u32, 1, 5].into_iter().map(move |idle_steps| Case {
+            let scopes = [0_u32, 1, 5].into_iter().map(move |idle_steps| Case::Scope {
                 style: *style,
                 idle_steps,
-            })
+            });
+            let gauges = [NeedleAt::Rest, NeedleAt::Sweeping, NeedleAt::Pegged]
+                .into_iter()
+                .map(move |needle| Case::Gauge {
+                    style: *style,
+                    needle,
+                });
+            scopes.chain(gauges)
         })
         .collect();
 
     let area = GlSurface::new();
-    let natural = (COLS * SCALE, ROWS * SCALE);
-    let width = i32::try_from(natural.0).unwrap_or(i32::MAX);
-    let height = i32::try_from(natural.1).unwrap_or(i32::MAX);
-    area.set_size_request(width, height);
     area.set_halign(gtk::Align::Center);
     area.set_valign(gtk::Align::Center);
+    // The window has to hold the **largest** case, because the size request
+    // moves per case (the two kinds run at different grids) and an area GTK
+    // could not give its requested size would be compared against a reference
+    // of a different shape. `measure` says so out loud if that ever happens.
+    let widest = cases.iter().map(|case| case.natural().0).max().unwrap_or(1);
+    let tallest = cases.iter().map(|case| case.natural().1).max().unwrap_or(1);
+    let width = i32::try_from(widest).unwrap_or(i32::MAX);
+    let height = i32::try_from(tallest).unwrap_or(i32::MAX);
 
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("preem_gl_diff")
-        .default_width(width + 32)
-        .default_height(height + 32)
+        .default_width(width + 64)
+        .default_height(height + 64)
         .child(&area)
         .build();
     window.present();
@@ -443,8 +564,36 @@ impl Runner {
     }
 }
 
-/// The sample batch every case stamps — a wave with steep segments, so the
-/// polyline join (the part `GL_LINES` would have got wrong) is exercised.
+/// The gauge a case drives, in the state its frame is taken in.
+///
+/// **One builder for both arms.** The needle's spring is deterministic, so
+/// `drive` and `measure` each call this and get the identical state — which is
+/// what makes the comparison a comparison of *renderers* rather than of two
+/// needles that happen to be near each other. It mirrors `preem_render::build`'s
+/// own builder chain, `range` before `set_target` included.
+fn gauge_state(config: vocab::GaugeConfig, needle: NeedleAt) -> kit::Gauge {
+    let mut dial = kit::Gauge::with_size(config.cols as usize, config.rows as usize)
+        .scale(config.scale as usize)
+        .sweep_deg(config.sweep_deg)
+        .ticks(config.divisions as usize, config.subdivisions as usize)
+        .range(config.range.low, config.range.high)
+        .frequency(config.frequency_hz)
+        .damping(config.damping);
+    let (target, frames) = needle.drive();
+    dial.set_target(target);
+    match frames {
+        None => dial.settle(),
+        Some(frames) => {
+            for _ in 0..frames {
+                dial.advance(1.0 / 60.0);
+            }
+        }
+    }
+    dial
+}
+
+/// The sample batch every scope case stamps — a wave with steep segments, so
+/// the polyline join (the part `GL_LINES` would have got wrong) is exercised.
 fn samples() -> Vec<f32> {
     (0..32_u8)
         .map(|i| {
@@ -454,44 +603,88 @@ fn samples() -> Vec<f32> {
         .collect()
 }
 
-fn config(style: kit::DisplayStyle) -> vocab::ScopeConfig {
+/// The wire style reference naming the same skin the kit enum does.
+fn style_ref(style: kit::DisplayStyle) -> vocab::StyleRef {
     let name = vocab::StyleName::ALL
         .into_iter()
         .find(|candidate| candidate.name() == style.name())
         .unwrap_or_default();
+    vocab::StyleRef::new(name)
+}
+
+fn scope_config(style: kit::DisplayStyle) -> vocab::ScopeConfig {
     vocab::ScopeConfig {
-        style: vocab::StyleRef::new(name),
-        cols: COLS,
-        rows: ROWS,
-        scale: SCALE,
+        style: style_ref(style),
+        cols: SCOPE_COLS,
+        rows: SCOPE_ROWS,
+        scale: SCOPE_SCALE,
         persistence: PERSISTENCE,
+    }
+}
+
+fn gauge_config(style: kit::DisplayStyle) -> vocab::GaugeConfig {
+    vocab::GaugeConfig {
+        style: style_ref(style),
+        cols: GAUGE_COLS,
+        rows: GAUGE_ROWS,
+        scale: GAUGE_SCALE,
+        ..vocab::GaugeConfig::default()
     }
 }
 
 /// One case's name in the transcript and on its evidence files.
 fn label(case: &Case) -> String {
-    format!("{}.idle{}", case.style.name(), case.idle_steps)
+    match case {
+        Case::Scope { style, idle_steps } => format!("scope.{}.idle{idle_steps}", style.name()),
+        Case::Gauge { style, needle } => format!("gauge.{}.{}", style.name(), needle.name()),
+    }
 }
 
 /// Push a case's state at the surface and ask for a frame.
 fn drive(area: &GlSurface, case: &Case) {
-    let batch: std::sync::Arc<[f32]> = std::sync::Arc::from(&samples()[..]);
-    // The debut batch is step 0; `idle_steps` more steps carry it into the
-    // fade, exactly as `Renderer::ScopeGl::advance` counts them.
-    let step_seq = 1 + u64::from(case.idle_steps);
-    let surface = program::scope_surface(
-        config(case.style),
-        &batch,
-        Some(0),
-        step_seq,
-        &kit::palette_snapshot(case.style),
+    let (program, width, height, uniforms) = match case {
+        Case::Scope { style, idle_steps } => {
+            let batch: std::sync::Arc<[f32]> = std::sync::Arc::from(&samples()[..]);
+            // The debut batch is step 0; `idle_steps` more steps carry it into
+            // the fade, exactly as `Renderer::ScopeGl::advance` counts them.
+            let step_seq = 1 + u64::from(*idle_steps);
+            let surface = program::scope_surface(
+                scope_config(*style),
+                &batch,
+                Some(0),
+                step_seq,
+                &kit::palette_snapshot(*style),
+            );
+            (
+                program::SCOPE,
+                surface.width,
+                surface.height,
+                surface.uniforms,
+            )
+        }
+        Case::Gauge { style, needle } => {
+            let config = gauge_config(*style);
+            let dial = gauge_state(config, *needle);
+            let surface = gauge::gauge_surface(
+                config,
+                dial.fraction(),
+                dial.needle().velocity(),
+                &kit::palette_snapshot(*style),
+            );
+            (
+                gauge::GAUGE,
+                surface.width,
+                surface.height,
+                surface.uniforms,
+            )
+        }
+    };
+    // Per case, because the two kinds run at different grids — see `activate`.
+    area.set_size_request(
+        i32::try_from(width).unwrap_or(i32::MAX),
+        i32::try_from(height).unwrap_or(i32::MAX),
     );
-    area.set_state(
-        program::SCOPE,
-        surface.width,
-        surface.height,
-        &std::sync::Arc::new(surface.uniforms),
-    );
+    area.set_state(program, width, height, &std::sync::Arc::new(uniforms));
 }
 
 /// Read the area's framebuffer back. See [`SETTLE_RENDERS`] for *when* this is
@@ -549,18 +742,27 @@ fn capture(area: &GlSurface, label: &str) -> Result<Capture, String> {
 /// — see [`parity::Verdict`] for the five ways it can fail.
 fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool) -> bool {
     let label = label(case);
+    let (_, _, upscale) = case.geometry();
 
-    // The CPU reference: the same batches through the kit.
-    let mut oracle = kit::Scope::with_size(COLS as usize, ROWS as usize)
-        .scale(SCALE as usize)
-        .persistence(PERSISTENCE);
-    oracle.advance(&samples());
-    for _ in 0..case.idle_steps {
-        oracle.advance(&[]);
-    }
-    let reference = oracle.render(case.style);
+    // The CPU reference: the same state through the kit, which is the oracle.
+    let reference = match case {
+        Case::Scope { style, idle_steps } => {
+            let mut oracle = kit::Scope::with_size(SCOPE_COLS as usize, SCOPE_ROWS as usize)
+                .scale(SCOPE_SCALE as usize)
+                .persistence(PERSISTENCE);
+            oracle.advance(&samples());
+            for _ in 0..*idle_steps {
+                oracle.advance(&[]);
+            }
+            oracle.render(*style)
+        }
+        Case::Gauge { style, needle } => {
+            gauge_state(gauge_config(*style), *needle).render(*style)
+        }
+    };
 
-    let expected = (COLS * SCALE * shot.scale, ROWS * SCALE * shot.scale);
+    let natural = case.natural();
+    let expected = (natural.0 * shot.scale, natural.1 * shot.scale);
     if shot.alloc != expected {
         println!(
             "INFO {label}: allocation {}x{} is not the natural size {}x{} — \
@@ -579,10 +781,14 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
         shot.alloc,
         (reference.width(), reference.height()),
         shot.scale,
-        SCALE as usize,
+        upscale as usize,
     );
     let stats = parity::compare(&shot.raw, reference.data(), layout);
-    let verdict = stats.verdict();
+    // **The per-kind verdict** (#1143): the #893 ceiling and the blank-frame
+    // guards on both kinds, the `TROLLSHELL_PARITY_EXACT=1` zero pin and the
+    // per-column peak-row check on the scope alone. See `parity::Kind` for why
+    // the gauge is not held to a measurement taken of a different rasteriser.
+    let verdict = parity::case_verdict(&stats, case.kind(), exact);
     println!(
         "{} {label}: worst channel mean {:.3} p99 {:.0} max {:.0} of 255 \
          over {} px; peak-row mismatches {}/{}",
@@ -624,28 +830,20 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
     write_evidence(evidence, &label, shot, layout, &reference, &deltas);
 
     // #1080's 0-pinned assertion (#1078 review, INFO-1): the ceiling is loose
-    // on purpose, for a driver this harness has never measured. Under
-    // llvmpipe every case has come out bit-exact, so with
-    // `TROLLSHELL_PARITY_EXACT=1` a case that clears the ceiling but is not
-    // bit-exact is *still* a failure — named separately from `verdict`'s own
-    // labels so a transcript can tell "outside the ceiling" from "inside the
-    // ceiling, but not the zero this sandbox is pinned to" at a glance. `max
-    // == 0.0` on every channel is equivalent to "every compared pixel had
-    // `|Δ| == 0`", since mean/p99 are drawn from that same non-negative
-    // distribution and cannot exceed its max.
-    let bit_exact = stats.channels.iter().all(|c| c.max == 0.0);
-    if exact && verdict.is_pass() && !bit_exact {
+    // on purpose, for a driver this harness has never measured. Under llvmpipe
+    // every *scope* case has come out bit-exact, so the pin says so — and says
+    // so only for the kind it was measured on, which is what `case_verdict`
+    // decides above.
+    if verdict == parity::Verdict::NotBitExact {
         println!(
-            "FAIL(exact) {label}: TROLLSHELL_PARITY_EXACT=1 — inside the ceiling \
-             but not bit-exact (worst channel mean {:.3} p99 {:.0} max {:.0} of \
-             255), and llvmpipe has never measured anything but 0",
-            stats.worst_mean(),
-            stats.worst_p99(),
-            stats.worst_max(),
+            "      TROLLSHELL_PARITY_EXACT=1 — inside the ceiling but not \
+             bit-exact, and llvmpipe has never measured anything but 0 for a \
+             {} case",
+            case.kind().label(),
         );
     }
 
-    verdict.is_pass() && (!exact || bit_exact)
+    verdict.is_pass()
 }
 
 /// The classification aid, and the reason a transcript from this harness can be

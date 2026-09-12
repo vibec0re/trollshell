@@ -104,7 +104,7 @@ pub(crate) enum Verdict {
     /// no `GLArea::error()` and a live context.
     ///
     /// **This is a split of [`Self::UndrawnFramebuffer`], not new coverage, and
-    /// the distinction matters to anyone editing [`Stats::verdict`].** An
+    /// the distinction matters to anyone editing [`Stats::verdict_for`].** An
     /// all-zero readback is a strict subset of "one flat colour", and `uniform`
     /// was already checked ahead of the ceiling before #1072, so M2's "a case,
     /// not a pass" was satisfied without this variant — measured: deleting the
@@ -124,6 +124,99 @@ pub(crate) enum Verdict {
     /// [`peak_row_tolerance`] — a beam drawn somewhere else, not a rounding
     /// disagreement.
     BeamMoved,
+    /// Inside the ceiling, but not **bit-exact**, under
+    /// `TROLLSHELL_PARITY_EXACT=1` — and for a [`Kind`] that env pins (#1080).
+    ///
+    /// Named separately from [`Self::OverCeiling`] so a transcript can tell
+    /// "outside the ceiling" from "inside the ceiling, but not the zero this
+    /// sandbox is pinned to" at a glance.
+    NotBitExact,
+}
+
+/// Which kit widget a case is measuring, because the two are **not** held to
+/// the same standard (#1143).
+///
+/// The ceiling (mean ≤ 2 / p99 ≤ 8 / max ≤ 32 per channel) is #893's, and it
+/// is what Annika agreed to on that thread. What `TROLLSHELL_PARITY_EXACT=1`
+/// adds on top is a *measurement*, not a design target: under llvmpipe the
+/// scope's twelve cases have come out bit-exact since #1078, so CI pins them
+/// at 0 and a 1–6/255 regression that still clears the ceiling fails anyway
+/// (#1080).
+///
+/// The gauge cannot be held to that and should not be. Annika's word on #865
+/// was "does not have to be pixel perfect identical — could be even better",
+/// and the GL gauge is a **different rasteriser**: the kit walks a bounding box
+/// per shape accumulating `u16` coverage, this evaluates the same distance
+/// fields per fragment in `highp float`. They agree to within rounding, not to
+/// the bit, and pretending otherwise would mean either loosening the *scope's*
+/// pin — throwing away the sharpest regression detector in the tree — or
+/// tuning the gauge's shader against llvmpipe's last bit, which is not a
+/// property any other driver would reproduce.
+///
+/// So the pin is per kind, and this enum is where that is written down once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// `preem.scope` — pinned bit-exact under `TROLLSHELL_PARITY_EXACT=1`, and
+    /// structurally checked with the per-column peak-row test.
+    Scope,
+    /// `preem.gauge` (#1143) — the #893 ceiling and nothing tighter.
+    Gauge,
+}
+
+impl Kind {
+    /// Whether `TROLLSHELL_PARITY_EXACT=1` holds this kind to a zero delta.
+    ///
+    /// **Only what has been measured at zero.** See the type docs.
+    pub(crate) fn pinned_exact(self) -> bool {
+        matches!(self, Self::Scope)
+    }
+
+    /// Whether the per-column **peak-row** check applies.
+    ///
+    /// It is a beam test, and it says so in its own name: "a column's
+    /// brightest row moved" is a structural statement about a trace that has
+    /// exactly one bright row per column. A dial's brightest row in a column is
+    /// whichever of the arc, a tick, the needle and the hub happens to win
+    /// there, and two of those can tie at the same intensity — so on a gauge
+    /// the statistic measures which shape `argmax` saw first, not whether the
+    /// picture moved. The ceiling and the blank-framebuffer guards do the work
+    /// for a gauge; inventing a second structural check for it without a
+    /// failure to calibrate against would be inventing a flake.
+    pub(crate) fn checks_peak_rows(self) -> bool {
+        matches!(self, Self::Scope)
+    }
+
+    /// The word the transcript prints.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Scope => "scope",
+            Self::Gauge => "gauge",
+        }
+    }
+}
+
+/// The full verdict for one case: the shared ceiling and guards, plus the
+/// per-kind exact pin (#1143).
+///
+/// Split from [`Stats::verdict_for`] rather than folded into it because the two
+/// answer different questions: that one is "do these two buffers agree", a
+/// property of the pixels alone, and this one is "does this *case* pass",
+/// which also depends on which widget it is and on an environment variable.
+/// Keeping the pixel statistic free of both is what lets the tests below drive
+/// it on synthetic buffers.
+pub(crate) fn case_verdict(stats: &Stats, kind: Kind, exact: bool) -> Verdict {
+    let verdict = stats.verdict_for(kind);
+    if !verdict.is_pass() {
+        return verdict;
+    }
+    // `max == 0.0` on every channel is equivalent to "every compared pixel had
+    // `|Δ| == 0`": mean and p99 are drawn from that same non-negative
+    // distribution and cannot exceed its max.
+    let bit_exact = stats.channels.iter().all(|c| c.max == 0.0);
+    if exact && kind.pinned_exact() && !bit_exact {
+        return Verdict::NotBitExact;
+    }
+    Verdict::Pass
 }
 
 impl Verdict {
@@ -135,6 +228,7 @@ impl Verdict {
             Self::UndrawnFramebuffer => "FAIL(blank)",
             Self::OverCeiling => "FAIL(ceiling)",
             Self::BeamMoved => "FAIL(beam)",
+            Self::NotBitExact => "FAIL(exact)",
         }
     }
 
@@ -217,10 +311,15 @@ impl Stats {
         self.channels.iter().map(|c| c.max).fold(0.0, f64::max)
     }
 
-    /// The verdict, in the order a reader wants to be told: a blank
-    /// framebuffer first (because it makes every other number meaningless),
-    /// then the ceiling, then the structural check.
-    pub(crate) fn verdict(&self) -> Verdict {
+    /// The pixel verdict for one kind, in the order a reader wants to be told:
+    /// a blank framebuffer first (because it makes every other number
+    /// meaningless), then the ceiling, then the structural check — which is
+    /// the scope's alone (see [`Kind::checks_peak_rows`]).
+    ///
+    /// It takes a [`Kind`] and **not** the `TROLLSHELL_PARITY_EXACT` flag: this
+    /// is a property of the two buffers, which is what lets the tests below
+    /// drive it on synthetic ones. [`case_verdict`] is the whole answer.
+    pub(crate) fn verdict_for(&self, kind: Kind) -> Verdict {
         // "Drew nothing at all" first, then "drew one flat colour": the second
         // is the general case of the first, and the first is the one #1070's
         // M2 says must never be reported as anything else.
@@ -238,7 +337,7 @@ impl Stats {
         {
             return Verdict::OverCeiling;
         }
-        if self.peak_row_mismatches > 0 {
+        if kind.checks_peak_rows() && self.peak_row_mismatches > 0 {
             return Verdict::BeamMoved;
         }
         Verdict::Pass
@@ -466,9 +565,124 @@ fn distribution(deltas: &mut [u8]) -> ChannelStats {
 #[cfg(test)]
 mod tests {
     use super::{
-        CEILING_MAX, CEILING_MEAN, ChannelStats, Layout, Stats, Verdict, compare, distribution,
-        peak_row_tolerance,
+        CEILING_MAX, CEILING_MEAN, CEILING_P99, ChannelStats, Kind, Layout, Stats, Verdict, case_verdict,
+        compare, distribution, peak_row_tolerance,
     };
+
+    /// A `Stats` whose **worst pixel** is `delta` 255ths off on every channel,
+    /// with nothing else wrong — the shape a real near-miss has, where a
+    /// handful of anti-aliased edge pixels disagree and the rest of the frame
+    /// is clean.
+    fn inside_by(delta: f64) -> Stats {
+        let channel = ChannelStats {
+            // A hundredth of the worst pixel: a frame where one pixel in a
+            // hundred is off by `delta`, which is well inside the mean ceiling
+            // for every `delta` this test uses, and exactly `0` at `0`.
+            mean: delta / 100.0,
+            p99: delta.min(CEILING_P99),
+            max: delta,
+        };
+        Stats {
+            channels: [channel, channel, channel],
+            pixels: 1,
+            peak_row_mismatches: 0,
+            uniform: false,
+            all_zero: false,
+            worst: None,
+        }
+    }
+
+    /// **The pin is per kind** (#1143): `TROLLSHELL_PARITY_EXACT=1` holds the
+    /// scope to a zero delta and does not touch the gauge.
+    ///
+    /// This is the whole of Annika's "does not have to be pixel perfect
+    /// identical" on #865, made into an assertion rather than a convention. A
+    /// gauge case five 255ths off passes under the same env that fails a scope
+    /// case one 255th off — and without the split, honouring her word would
+    /// have meant dropping the scope's pin, which is the sharpest regression
+    /// detector the GL renderer has.
+    ///
+    /// **Falsified** three ways, each moving exactly one assertion: make
+    /// [`Kind::pinned_exact`] answer `true` for the gauge (the first goes red);
+    /// make it answer `false` for the scope, or drop the `exact &&` guard from
+    /// [`case_verdict`] (the second and the third).
+    #[test]
+    fn the_exact_pin_binds_the_scope_and_not_the_gauge() {
+        assert_eq!(
+            case_verdict(&inside_by(5.0), Kind::Gauge, true),
+            Verdict::Pass,
+            "a gauge case five 255ths off is inside the ceiling, and the ceiling \
+             is the whole contract for it",
+        );
+        assert_eq!(
+            case_verdict(&inside_by(1.0), Kind::Scope, true),
+            Verdict::NotBitExact,
+            "a scope case one 255th off is inside the ceiling and still fails, \
+             because llvmpipe has never measured anything but 0",
+        );
+        assert_eq!(
+            case_verdict(&inside_by(1.0), Kind::Scope, false),
+            Verdict::Pass,
+            "…and without the env it is the ceiling alone, on both kinds",
+        );
+        assert_eq!(
+            case_verdict(&inside_by(0.0), Kind::Scope, true),
+            Verdict::Pass,
+            "a bit-exact scope case passes the pin",
+        );
+    }
+
+    /// The ceiling still binds **both** kinds, and every guard ahead of it
+    /// still fires ahead of the pin — a breach is reported as a breach, not as
+    /// "not bit-exact", whichever way round the two are.
+    #[test]
+    fn the_ceiling_and_the_blank_guards_come_before_the_pin() {
+        let over = inside_by(CEILING_MAX + 1.0);
+        for kind in [Kind::Scope, Kind::Gauge] {
+            assert_eq!(
+                case_verdict(&over, kind, true),
+                Verdict::OverCeiling,
+                "{} is still held to #893's ceiling",
+                kind.label(),
+            );
+        }
+        let blank = Stats {
+            uniform: true,
+            all_zero: true,
+            ..inside_by(0.0)
+        };
+        assert_eq!(
+            case_verdict(&blank, Kind::Gauge, true),
+            Verdict::RendersNothing,
+            "a gauge that drew nothing is bit-exactly nothing — the guard, not the pin",
+        );
+    }
+
+    /// The **peak-row** check is the scope's alone (#1143): it is a statement
+    /// about a trace with one bright row per column, and a dial's brightest row
+    /// in a column is whichever of the arc, a tick, the needle and the hub wins
+    /// there — two of which can tie, making the statistic a report on which
+    /// shape `argmax` saw first.
+    ///
+    /// **Falsified** by making [`Kind::checks_peak_rows`] answer `true` for the
+    /// gauge: the first assertion reports `FAIL(beam)`.
+    #[test]
+    fn the_peak_row_check_is_the_beams_and_the_gauge_does_not_take_it() {
+        let moved = Stats {
+            peak_row_mismatches: 3,
+            ..inside_by(0.0)
+        };
+        assert_eq!(
+            case_verdict(&moved, Kind::Gauge, true),
+            Verdict::Pass,
+            "a gauge is not a beam",
+        );
+        assert_eq!(
+            case_verdict(&moved, Kind::Scope, true),
+            Verdict::BeamMoved,
+            "…and the scope keeps the check unchanged",
+        );
+    }
 
     /// A `w`×`h` top-down RGBA8 frame from a per-pixel colour function.
     fn frame(w: usize, h: usize, colour: impl Fn(usize, usize) -> [u8; 3]) -> Vec<u8> {
@@ -538,7 +752,7 @@ mod tests {
         assert!((stats.channels[2].mean - 0.0).abs() < 1e-9, "B is exact");
         assert!((stats.worst_mean() - 6.0).abs() < 1e-9, "the worst channel");
         assert_eq!(
-            stats.verdict(),
+            stats.verdict_for(Kind::Scope),
             Verdict::OverCeiling,
             "6 > the ceiling of 2, on one channel"
         );
@@ -555,7 +769,7 @@ mod tests {
         let cpu = frame(w, h, trace(2));
         let gl = flipped(w, h, trace(2));
         let stats = compare(&gl, &cpu, layout(w, h));
-        assert_eq!(stats.verdict(), Verdict::Pass);
+        assert_eq!(stats.verdict_for(Kind::Scope), Verdict::Pass);
         assert_eq!(stats.peak_row_mismatches, 0);
         assert!(!stats.uniform);
         for (channel, name) in stats.channels.iter().zip(super::CHANNELS) {
@@ -584,7 +798,7 @@ mod tests {
         let stats = compare(&flat, &cpu, layout(w, h));
         assert!(stats.uniform, "every pixel the same colour");
         assert!(!stats.all_zero, "…but not zero");
-        assert_eq!(stats.verdict(), Verdict::UndrawnFramebuffer);
+        assert_eq!(stats.verdict_for(Kind::Scope), Verdict::UndrawnFramebuffer);
     }
 
     /// **"Renders nothing" is a failure, and it is named** — #1070's review
@@ -617,7 +831,7 @@ mod tests {
 
         let bright = compare(&black, &frame(w, h, trace(4)), layout(w, h));
         assert!(bright.all_zero, "every compared pixel is 0,0,0");
-        assert_eq!(bright.verdict(), Verdict::RendersNothing);
+        assert_eq!(bright.verdict_for(Kind::Scope), Verdict::RendersNothing);
 
         // The dangerous half: a nearly-black reference, where the *deltas*
         // cannot tell "drew the dark skin correctly" from "drew nothing" —
@@ -633,7 +847,7 @@ mod tests {
         );
         assert_eq!(dark.peak_row_mismatches, 0, "…and no beam moved");
         assert_eq!(
-            dark.verdict(),
+            dark.verdict_for(Kind::Scope),
             Verdict::RendersNothing,
             "…yet it drew nothing, and that is a failure"
         );
@@ -641,7 +855,7 @@ mod tests {
         // A readback that never arrived at all reads the same way: the GL arm
         // put no pixels in front of the comparison either way.
         let nothing = compare(&[], &frame(w, h, trace(4)), layout(w, h));
-        assert_eq!(nothing.verdict(), Verdict::RendersNothing);
+        assert_eq!(nothing.verdict_for(Kind::Scope), Verdict::RendersNothing);
     }
 
     /// The worst pixel is reported with its coordinates, its channel and both
@@ -778,7 +992,7 @@ mod tests {
             "…while every channel stays inside the ceiling: {:?}",
             stats.channels
         );
-        assert_eq!(stats.verdict(), Verdict::BeamMoved);
+        assert_eq!(stats.verdict_for(Kind::Scope), Verdict::BeamMoved);
     }
 
     /// A peak that moved by less than the glow's own height is rounding, not a
@@ -867,7 +1081,7 @@ mod tests {
         // Exactly on the boundary: still rounding.
         let inside = compare(&flipped(w, h, dim(20 + tolerance)), &cpu, layout);
         assert_eq!(inside.peak_row_mismatches, 0);
-        assert_eq!(inside.verdict(), Verdict::Pass);
+        assert_eq!(inside.verdict_for(Kind::Scope), Verdict::Pass);
         // One reference row further: structural.
         let outside = compare(&flipped(w, h, dim(20 + tolerance + 1)), &cpu, layout);
         assert_eq!(
@@ -875,7 +1089,7 @@ mod tests {
             u32::try_from(w).expect("w"),
             "every column"
         );
-        assert_eq!(outside.verdict(), Verdict::BeamMoved);
+        assert_eq!(outside.verdict_for(Kind::Scope), Verdict::BeamMoved);
     }
 
     /// The device scale point-samples the readback back down, so a 2× capture
@@ -897,7 +1111,7 @@ mod tests {
                 peak_row_tolerance: 2,
             },
         );
-        assert_eq!(stats.verdict(), Verdict::Pass);
+        assert_eq!(stats.verdict_for(Kind::Scope), Verdict::Pass);
         assert_eq!(stats.pixels, w * h);
     }
 
@@ -949,7 +1163,7 @@ mod tests {
             uniform: false,
             ..Stats::default()
         };
-        assert_eq!(stats.verdict(), Verdict::Pass);
+        assert_eq!(stats.verdict_for(Kind::Scope), Verdict::Pass);
     }
 
     /// Every verdict prints a distinct word, and only one of them is a pass —
@@ -962,6 +1176,7 @@ mod tests {
             Verdict::UndrawnFramebuffer,
             Verdict::OverCeiling,
             Verdict::BeamMoved,
+            Verdict::NotBitExact,
         ];
         let labels: Vec<&str> = all.iter().map(|v| v.label()).collect();
         let mut unique = labels.clone();

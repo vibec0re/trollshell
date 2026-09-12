@@ -38,10 +38,10 @@ Exactly what the shell compiles, assembled the same way:
   * the version/precision header is read out of `crates/hytte-ui/src/
     gl_surface.rs`'s `GLSL_HEADER` const rather than repeated here, so a
     dialect change cannot leave the check validating the old one;
-  * a body that is spliced by `program.rs`'s `concat!` (the blur's
-    `BLUR_DIR`) is compiled once per splice, with the splice text, because
-    that body does not compile on its own — and compiling it "as written"
-    would be checking a source that never ships;
+  * a body that is spliced by a `concat!` in any `*.rs` beside the shaders
+    (the blur's `BLUR_DIR`, the gauge's `LAYER`) is compiled once per splice,
+    with the splice text, because that body does not compile on its own — and
+    compiling it "as written" would be checking a source that never ships;
   * every other body is compiled as-is, at the stage its extension names;
   * **#893's shader widget** the same way: its vertex stage
     (`shader_*.vert`, anywhere under `crates/hytte-ui/src/`) compiles as
@@ -80,7 +80,7 @@ recurrence — used to be green.
 WHAT IT DOES NOT CHECK
 ----------------------
 Each stage is compiled **alone**, so the vertex↔fragment varying interface is
-not validated: `fullscreen.vert`'s `out vec2 v_uv` against `scope_blur.frag`'s
+not validated: `fullscreen.vert`'s `out vec2 v_uv` against `blur.frag`'s
 `in vec2 v_uv` would still link at runtime with a mismatched type or a missing
 declaration on one side. Linking the pairs here would mean teaching this script
 the pipeline's pass table, which lives in `program.rs` as Rust — the same
@@ -237,8 +237,8 @@ MIN_WIDGET_BODIES = 1  # the preem demo's spectrum.frag
 # `scope_decay.frag` carries the whole `(v * retained) >> 8` phosphor
 # recurrence, and with a floor of five against six files its deletion was
 # green.
-MIN_SHADERS = 6
-# Compilations, not files: `scope_blur.frag` is one body compiled twice. A
+MIN_SHADERS = 7
+# Compilations, not files: `blur.frag` is one body compiled twice. A
 # splice that stops being found (a moved `include_str!` path, a `concat!` this
 # script's parser stops recognising) drops this — today that shows up as a
 # compile failure only because the body happens not to build without its
@@ -249,9 +249,9 @@ MIN_SHADERS = 6
 # with two compilations of slack: the whole point of a floor at the current
 # count is that it cannot tolerate a deletion, and the two per-group floors
 # below do not add up to this one on their own.
-MIN_COMPILATIONS = 9
+MIN_COMPILATIONS = 11
 # Distinct bodies that must be spliced rather than compiled as written.
-MIN_SPLICED_BODIES = 1
+MIN_SPLICED_BODIES = 2
 
 # `glslangValidator` names the stage by extension. `.glsl` is deliberately
 # **absent**: it names no stage, so this script could not compile one, and
@@ -366,17 +366,27 @@ def concat_bodies(text: str) -> list[str]:
 
 
 def read_splices() -> dict[str, list[str]]:
-    """Prefix text spliced ahead of a shader body by `program.rs`'s `concat!`.
+    """Prefix text spliced ahead of a shader body by a `concat!` in this dir.
 
-    `scope_blur.frag` is the live case: it is one body compiled twice, with
+    `blur.frag` is the original case: it is one body compiled twice, with
     `const ivec2 BLUR_DIR = …;` prepended, because `GlUniforms` is one bag
     applied to every pass and there is nowhere to say "this pass is the
     horizontal one". Such a body does **not** compile on its own, so checking
-    it as written would be checking a source that never ships.
+    it as written would be checking a source that never ships. `gauge.frag`
+    (#1143) is the second, with `const int LAYER = …;`.
+
+    **Every `*.rs` in `SHADER_DIR`, not just `program.rs`** — the scan was
+    named-file-scoped while the scope was the only pipeline, and the second
+    pipeline landing in its own `gauge.rs` beside it would have gone back to
+    compiling a spliced body as written (which is to say: failing, loudly, on
+    an identifier the splice defines — the lucky failure mode, not a guarantee).
+    The same reasoning as the tree-wide `.frag` walk above: agree with where
+    the code actually is, by construction.
     """
-    if not PROGRAM_SOURCE.is_file():
+    sources = sorted(SHADER_DIR.glob("*.rs"))
+    if PROGRAM_SOURCE not in sources:
         fail(f"{PROGRAM_SOURCE} is missing — wrong root, or the module moved")
-    text = PROGRAM_SOURCE.read_text(encoding="utf-8")
+    text = "\n".join(path.read_text(encoding="utf-8") for path in sources)
     splices: dict[str, list[str]] = {}
     for body in concat_bodies(text):
         included = re.findall(r'include_str!\(\s*"([^"]+)"\s*\)', body)
@@ -423,7 +433,7 @@ def main() -> int:
     if spliced < MIN_SPLICED_BODIES:
         fail(
             f"{spliced} spliced shader bodies, expected ≥ {MIN_SPLICED_BODIES} — the "
-            f"`concat!` scan of {PROGRAM_SOURCE} found nothing, so a body that only "
+            f"`concat!` scan of {SHADER_DIR}/*.rs found too few, so a body that only "
             "compiles with its prefix would be compiled as written"
         )
 

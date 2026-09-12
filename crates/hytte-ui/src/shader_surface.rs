@@ -1182,7 +1182,8 @@ mod imp {
             };
 
             window.destroy();
-            let required = std::env::var_os("TROLLSHELL_REQUIRE_GL").is_some_and(|want| want == "1");
+            let required =
+                std::env::var_os("TROLLSHELL_REQUIRE_GL").is_some_and(|want| want == "1");
             assert!(
                 !required,
                 "TROLLSHELL_REQUIRE_GL=1, but no realised shader surface is available for \

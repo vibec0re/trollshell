@@ -762,7 +762,7 @@ mod imp {
     use super::{
         BuildKey, DataFailure, GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline,
         GlProgram, GlTarget, GlUniforms, GlValue, PIPELINE_BUILD_REFUSED,
-        PROGRAM_UNREGISTERED_REFUSED, PROGRAMS, SAMPLER_NAMES, RefusedBuilds, WarnLatch,
+        PROGRAM_UNREGISTERED_REFUSED, PROGRAMS, RefusedBuilds, SAMPLER_NAMES, WarnLatch,
         abandon_gl, fit_rect, fresh_last_drawn, gdk, glib, last_drawn_after, refuse_data_strip,
         resources_reusable, steps_owed, warn_on_target_failure,
     };
@@ -998,9 +998,7 @@ mod imp {
 
             // The idempotence rule, decided by `steps_owed` — see there.
             let (steps, reset) = steps_owed(self.last_drawn.get(), state.step_seq);
-            if reset
-                && let Err(error) = resources.clear_accumulator(&gl)
-            {
+            if reset && let Err(error) = resources.clear_accumulator(&gl) {
                 // Nothing was wiped, so nothing may be replayed onto it:
                 // `last_drawn` stays ahead of `step_seq` and the next render
                 // tries the wipe again. See `RENDER_TARGET_REFUSED`.
@@ -1444,8 +1442,8 @@ mod imp {
     mod tests {
         use super::{
             Arc, BUILD_ATTEMPTS, GlBlend, GlDraw, GlInput, GlPass, GlPipeline, GlProgram,
-            GlSurface, GlTarget, GlUniforms, GlValue, PROGRAMS, RefCell, Resources, WarnLatch,
-            gdk, glib, hgl,
+            GlSurface, GlTarget, GlUniforms, GlValue, PROGRAMS, RefCell, Resources, WarnLatch, gdk,
+            glib, hgl,
         };
         use gtk::prelude::*;
         use gtk::subclass::prelude::ObjectSubclassIsExt;
@@ -1804,7 +1802,11 @@ mod imp {
             assert!(!surface.ensure_resources(&gl, &pipeline, program, (8, 4), 0));
             assert_eq!(BUILD_ATTEMPTS.get(), 2, "a new grid is a new question");
             assert!(!surface.ensure_resources(&gl, &pipeline, program, (8, 4), 1));
-            assert_eq!(BUILD_ATTEMPTS.get(), 2, "…asked exactly once, like the first");
+            assert_eq!(
+                BUILD_ATTEMPTS.get(),
+                2,
+                "…asked exactly once, like the first"
+            );
         }
 
         /// **#1180 item 9.** A **realised widget** draws a real pipeline end
@@ -1875,9 +1877,9 @@ mod imp {
                 draw: GlDraw::FullScreen,
             }];
 
-            let Some((window, surface, gl)) =
-                realised_surface_or_skip("a_realised_surface_renders_every_pass_without_a_gl_error")
-            else {
+            let Some((window, surface, gl)) = realised_surface_or_skip(
+                "a_realised_surface_renders_every_pass_without_a_gl_error",
+            ) else {
                 return;
             };
 
@@ -1976,7 +1978,8 @@ mod imp {
             };
 
             window.destroy();
-            let required = std::env::var_os("TROLLSHELL_REQUIRE_GL").is_some_and(|want| want == "1");
+            let required =
+                std::env::var_os("TROLLSHELL_REQUIRE_GL").is_some_and(|want| want == "1");
             assert!(
                 !required,
                 "TROLLSHELL_REQUIRE_GL=1, but no realised GL surface is available for \
@@ -2053,11 +2056,11 @@ impl Default for GlSurface {
 mod tests {
     use super::{
         BuildKey, DATA_STRIP_REFUSED, DataFailure, GlProgram, GlUniforms, GlValue,
-        MAX_STEPS_PER_RENDER, PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED,
-        REFUSED_BUILDS, RENDER_TARGET_REFUSED, RefusedBuilds, WARNED_LENGTHS, WarnLatch,
-        abandon_gl, fit_rect, framebuffer_status_key, fresh_last_drawn, gl_abandoned, hgl,
-        last_drawn_after, refuse_data_strip, resources_reusable, steps_owed,
-        warn_on_data_failure, warn_on_target_failure,
+        MAX_STEPS_PER_RENDER, PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED, REFUSED_BUILDS,
+        RENDER_TARGET_REFUSED, RefusedBuilds, WARNED_LENGTHS, WarnLatch, abandon_gl, fit_rect,
+        framebuffer_status_key, fresh_last_drawn, gl_abandoned, hgl, last_drawn_after,
+        refuse_data_strip, resources_reusable, steps_owed, warn_on_data_failure,
+        warn_on_target_failure,
     };
     use std::cell::RefCell;
     use std::sync::Arc;
@@ -2126,7 +2129,11 @@ mod tests {
         );
 
         warn_on_target_failure(&latch, &incomplete);
-        assert_eq!(latch.borrow().said.len(), 1, "the first refusal is reported");
+        assert_eq!(
+            latch.borrow().said.len(),
+            1,
+            "the first refusal is reported"
+        );
         warn_on_target_failure(&latch, &incomplete);
         assert_eq!(latch.borrow().said.len(), 1, "…once");
         warn_on_target_failure(&latch, &unsupported);
@@ -2156,7 +2163,10 @@ mod tests {
         let mut refused = RefusedBuilds::default();
 
         assert!(!refused.refused(((4, 4), scope)), "nothing is refused yet");
-        assert!(refused.remember(((4, 4), scope)), "the first refusal is news");
+        assert!(
+            refused.remember(((4, 4), scope)),
+            "the first refusal is news"
+        );
         assert!(!refused.remember(((4, 4), scope)), "…and only once");
         assert!(refused.refused(((4, 4), scope)));
 

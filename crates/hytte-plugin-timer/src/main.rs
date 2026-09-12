@@ -57,9 +57,7 @@ use std::time::Duration;
 
 use hytte_plugin::display::{SevenSeg, StyleName};
 use hytte_plugin::proto::{Capability, Dir, Effect, EventKind, Manifest, Mount, Node, Page};
-use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
-use tokio_stream::StreamExt as _;
-use tokio_stream::wrappers::IntervalStream;
+use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View, tick_stream};
 
 /// Stable plugin id — the host's mount-region ownership key, the audit-log
 /// subject, and the notification app name.
@@ -97,7 +95,9 @@ const MAX_SECS: u32 = 24 * 60 * 60;
 const STYLE: StyleName = StyleName::Vfd;
 
 /// The timer's own message: a single 1 Hz heartbeat from [`Plugin::sources`].
-#[derive(Debug)]
+///
+/// `Clone` is required by [`tick_stream`], which emits a clone each period.
+#[derive(Clone, Debug)]
 enum TimerMsg {
     /// One second elapsed — advance a running countdown.
     Tick,
@@ -301,11 +301,10 @@ impl Plugin for Timer {
     }
 
     /// A 1 Hz tick, created per session and dropped on disconnect. The command
-    /// receiver goes unused. `tokio::time::interval` fires immediately then every
+    /// receiver goes unused. [`tick_stream`] fires immediately then every
     /// second — the leading tick is a harmless no-op on an idle timer.
     fn sources(_cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
-        let ticks = IntervalStream::new(tokio::time::interval(TICK)).map(|_| TimerMsg::Tick);
-        Some(Box::pin(ticks))
+        Some(Box::pin(tick_stream(TICK, TimerMsg::Tick)))
     }
 
     /// Fold one input. Pure and panic-free over any host-sent value; re-rendering

@@ -10,11 +10,13 @@
 //!
 //! # The gate
 //!
-//! [`poll_task`] is the I/O side of the visibility gate. It owns a fetch
-//! interval and drains the command lane fed by the reducer's
-//! [`crate::Cmd::SetVisible`]. While hidden it parks (no ticks, no HTTP); on a
-//! hidden→visible edge ([`on_visibility`]) it fires an immediate refresh — the
-//! native board's open-edge poll — then re-polls every [`REFRESH_WHILE_OPEN`].
+//! [`poll_task`] is the I/O side of the visibility gate, driven by the
+//! reducer's [`crate::Cmd::SetVisible`]. While hidden it parks (no ticks, no
+//! HTTP); on a hidden→visible edge it fires an immediate refresh — the native
+//! board's open-edge poll — then re-polls every [`REFRESH_WHILE_OPEN`]. Since
+//! #1168 the loop is the SDK's [`hytte_plugin::poll::gated`] rather than a
+//! copy of it: this file, `usage` and `agents` had each written the same
+//! dozen lines, and the helper's docs are where the reasoning now lives.
 //!
 //! # Station config
 //!
@@ -31,7 +33,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use hytte_plugin::CmdReceiver;
+use hytte_plugin::{CmdReceiver, poll};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -429,15 +431,6 @@ fn fetch_once() -> Result<Vec<Row>, String> {
 
 // ── The visibility-gated poll task ───────────────────────────────────────────
 
-/// The visibility-gate transition: given the current visible state and a
-/// requested one, return the next state and whether an **immediate** refresh is
-/// owed (a hidden→visible edge — the native board's open-edge poll). Pure, so
-/// the gate is unit-testable without a runtime or a live fetch.
-fn on_visibility(current: bool, requested: bool) -> (bool, bool) {
-    let refresh_now = requested && !current;
-    (requested, refresh_now)
-}
-
 /// Run a `spawn_blocking` fetch and forward the result as a [`BoardMsg`].
 async fn fetch_and_send(msg_tx: &mpsc::UnboundedSender<BoardMsg>) {
     let result = tokio::task::spawn_blocking(fetch_once)
@@ -449,41 +442,25 @@ async fn fetch_and_send(msg_tx: &mpsc::UnboundedSender<BoardMsg>) {
     let _ = msg_tx.send(BoardMsg::Fetched(result));
 }
 
-/// The I/O side of the visibility gate (the `sources()` task). Owns the fetch
-/// interval and drains the command lane: it parks while hidden, does an
-/// immediate refresh on becoming visible, then re-polls every
-/// [`REFRESH_WHILE_OPEN`] until hidden. Exits when the lane closes (the session
-/// is tearing down).
-pub(crate) async fn poll_task(mut cmds: CmdReceiver<Cmd>, msg_tx: mpsc::UnboundedSender<BoardMsg>) {
-    let mut visible = false;
-    let mut interval = tokio::time::interval(REFRESH_WHILE_OPEN);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    loop {
-        tokio::select! {
-            // Prefer visibility changes over interval ticks, so a close parks
-            // the poller promptly rather than firing one more fetch first.
-            biased;
-            cmd = cmds.recv() => {
-                let Some(Cmd::SetVisible(requested)) = cmd else {
-                    return; // lane closed → session teardown
-                };
-                let (next_visible, refresh_now) = on_visibility(visible, requested);
-                visible = next_visible;
-                if refresh_now {
-                    // Reset so the next scheduled tick lands a clean interval
-                    // after this immediate refresh, not off the interval's
-                    // already-elapsed first tick.
-                    interval.reset();
-                    fetch_and_send(&msg_tx).await;
-                }
-            }
-            // Disabled while hidden — the poller parks (no ticks, no HTTP).
-            _ = interval.tick(), if visible => {
-                fetch_and_send(&msg_tx).await;
-            }
-        }
-    }
+/// The I/O side of the visibility gate (the `sources()` task): park while
+/// hidden, refresh immediately on becoming visible, then re-poll every
+/// [`REFRESH_WHILE_OPEN`] until hidden again. Returns when the lane closes
+/// (the session is tearing down).
+///
+/// The loop itself is [`hytte_plugin::poll::gated`] since #1168 — it was
+/// hand-written here, in `usage` and in `agents`, and the three copies agreed
+/// down to the comments on the `biased;` and the `, if visible` guard. What
+/// each of those buys is documented on the helper.
+pub(crate) async fn poll_task(cmds: CmdReceiver<Cmd>, msg_tx: mpsc::UnboundedSender<BoardMsg>) {
+    // An irrefutable pattern on purpose: a second `Cmd` variant would fail to
+    // compile here rather than being silently read as a visibility flip.
+    poll::gated(
+        cmds,
+        REFRESH_WHILE_OPEN,
+        |&Cmd::SetVisible(visible)| visible,
+        || fetch_and_send(&msg_tx),
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -771,16 +748,13 @@ mod tests {
     }
 
     // ── The visibility gate ───────────────────────────────────────────────────
-
-    #[test]
-    fn on_visibility_refreshes_only_on_the_hidden_to_visible_edge() {
-        // Open → become visible AND owe an immediate refresh.
-        assert_eq!(on_visibility(false, true), (true, true));
-        // Already visible, a redundant push → no extra refresh.
-        assert_eq!(on_visibility(true, true), (true, false));
-        // Close → park, no refresh.
-        assert_eq!(on_visibility(true, false), (false, false));
-        // Stay hidden → nothing.
-        assert_eq!(on_visibility(false, false), (false, false));
-    }
+    //
+    // The gate's own transitions moved to the SDK with the loop (#1168): the
+    // four assertions this file's `on_visibility_refreshes_only_on_the_hidden_
+    // to_visible_edge` made are now
+    // `hytte_plugin::poll`'s `only_the_hidden_to_visible_edge_refreshes`,
+    // which drives them through the real `Gate` on a paused clock instead of
+    // through a pure function — the same four transitions, one level closer
+    // to the loop that has to honour them. Nothing about this plugin's gate is
+    // left here to test: `poll_task` is now the SDK call plus the fetch.
 }

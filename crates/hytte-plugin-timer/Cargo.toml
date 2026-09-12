@@ -19,12 +19,9 @@ path = "src/main.rs"
 # and the preem raster kit. No gtk / adw / hytte-ui — a plugin never links the
 # shell.
 hytte-plugin = { path = "../hytte-plugin" }
-# The timer's own 1 Hz cadence: `IntervalStream` sits behind the `time` feature,
-# which the SDK's `tokio_stream` re-export deliberately doesn't enable.
-tokio-stream = { workspace = true, features = ["time"] }
-# `tokio::time::interval` for that stream. `rt` + `time` only — the timer holds
-# no channels of its own (its command lane is `Infallible`).
-tokio = { workspace = true, default-features = false, features = [
-  "rt",
-  "time",
-] }
+# No `tokio` / `tokio-stream` of its own (#1168): the timer's 1 Hz cadence is
+# `hytte_plugin::tick_stream`, which exists precisely so a fixed-cadence plugin
+# needs neither a direct async-runtime dependency nor the `time`-feature
+# wrapper. (It had both, spelling the `IntervalStream` incantation by hand
+# under a comment claiming the SDK's `tokio_stream` re-export does not enable
+# `time` — it does.)

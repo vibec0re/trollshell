@@ -97,6 +97,11 @@
 //! arrives in [`update`](Plugin::update) as [`Input::App`]. Sources are
 //! created per session and dropped on disconnect — spawn nothing global.
 //!
+//! Two shapes of that are common enough to be in the SDK rather than in each
+//! plugin: [`tick_stream`] for a fixed cadence, and the [`poll`] module for a
+//! fetch that should **park** while the plugin's mount surface is hidden and
+//! refresh the instant it opens (#1168).
+//!
 //! # Commands: the outbound I/O lane
 //!
 //! [`update`](Plugin::update) returns shell [`Effect`]s — actions the *host*
@@ -491,6 +496,7 @@ pub use hytte_preem as preem;
 
 pub mod display;
 pub mod nodes;
+pub mod poll;
 pub mod shader;
 
 mod runtime;

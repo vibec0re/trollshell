@@ -545,6 +545,29 @@ where
                     Step::Update(Input::App(m))
                 } else {
                     src_done = true;
+                    // #1168 item 6: every other way this loop can stop taking
+                    // input says so on stderr (the reader's EOF, `Shutdown`,
+                    // the signal path); a `sources()` stream ending was the
+                    // one that did not, and it is the one an author is least
+                    // likely to have meant. Every `sources()` in the tree is
+                    // an endless stream — a `tick_stream`, a channel the
+                    // plugin's own I/O task owns — so `None` here almost
+                    // always means that task died (a panic, a dropped sender)
+                    // and the plugin is now deaf to its own I/O for the rest
+                    // of the session while still rendering host events, which
+                    // looks like "the chip froze" and nothing else. Once per
+                    // session: `src_done` keeps the stream from being polled
+                    // again, so this cannot repeat.
+                    //
+                    // `eprintln!` rather than `tracing::warn!` for the reason
+                    // documented on `drop_ungranted_effects` — no plugin
+                    // binary installs a subscriber, so a `tracing` line here
+                    // would reach nobody; stderr is what systemd routes to
+                    // the journal. There is no "source index" to name: a
+                    // plugin returns exactly one stream (it merges its own).
+                    eprintln!(
+                        "[{plugin_id}] sources() stream ended; no further app messages this session"
+                    );
                     continue;
                 }
             },

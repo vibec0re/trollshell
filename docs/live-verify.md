@@ -2224,7 +2224,14 @@ session.
       the edge region must stay inside the dot matrix's own budget, mean 16 /
       max 64 (`FAIL(edges)`), against a measured worst of 10.641 / 39. The two
       blank-frame guards bind on them too, which is what an all-black blit now
-      trips on all four.
+      trips on all four. What that gate cannot see, stated: on a dot matrix
+      every pixel of a falloff dot is an `edge` by the region split's
+      4-neighbour rule, so all four cases report `lit[n=0]` and the
+      bit-identical clause is about the flat field only — the lattice, the
+      falloff, the bloom and the comb are held by the edge budget alone.
+      Measured, a scale-only dot-radius drift of +10 % is caught on one skin
+      of four (oled, edge mean 18.260 > 16) and one of +5 % on none; a
+      scale-only halo drift of +25 % on none (edge mean ≤ 12.245, max ≤ 48).
 
       What only glass can answer is what neither of those can see.
 

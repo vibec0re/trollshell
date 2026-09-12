@@ -339,7 +339,12 @@ void main() {
     // `dot_matrix.*.readoutx2` cases instead, which are box-averaged back down
     // and held to a bit-identical interior plus an edge budget — see
     // `preem_gl::parity`'s `Sampling` and `Kind::edge_budget`. Neither branch
-    // is untested; they are tested by different cases.
+    // is untested; they are tested by different cases — and not to the same
+    // strength: the snap is pinned bit-exact, while on the continuous branch
+    // every pixel of a falloff dot is an `edge` to the region split (the four
+    // `readoutx2` cases report `lit[n=0]`), so a scale-only drift in the dot
+    // radius or the halo has only the edge budget to answer to (+5 % radius
+    // and +25 % halo both clear it; see `parity::case_verdict`'s doc).
     //
     // **And nobody should believe the harness is protecting the snap itself**
     // (#1150 review, LOW-2). Deleting this `if` does not move a single pixel

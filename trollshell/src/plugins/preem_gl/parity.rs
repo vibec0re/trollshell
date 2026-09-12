@@ -392,14 +392,20 @@ pub(crate) enum Sampling {
 ///   bit-identical**, and the edge region is inside its own budget. The GL arm
 ///   drew at twice the density and the harness averaged it back down, so the
 ///   edges are *supposed* to differ — that is #1090's fix — while nothing else
-///   is. Measured on llvmpipe, all four shipping-scale cases come out with the
-///   flat field and the small lit-interior bin at `max |Δ| 0` and everything
-///   else in the edge bin — "small" meaning 46, 47, 46 and 3 pixels of 9216:
-///   a 1.7-logical-px tick has no interior to speak of, so this is mostly a
-///   statement about the field. The residual hole, stated: a scale-only drift
-///   *inside* an expression that still carries `* s` (a tick or an arc 50 %
-///   wider at the shipping scale) moves only edge pixels and clears the
-///   budget; neither the source scan nor the region split sees it.
+///   is. Measured on llvmpipe, the four gauge shipping-scale cases come out
+///   with the flat field and the small lit-interior bin at `max |Δ| 0` and
+///   everything else in the edge bin — "small" meaning 46, 47, 46 and 3 pixels
+///   of 9216: a 1.7-logical-px tick has no interior to speak of, so this is
+///   mostly a statement about the field. On the four dot-matrix cases it is a
+///   statement about the field *only*: every pixel of a falloff dot is an
+///   `edge` by [`Regions`]' 4-neighbour rule, so they report `lit[n=0]`, and
+///   the lattice, the falloff, the bloom and the comb are held by the edge
+///   budget alone. The residual hole, stated for both: a scale-only drift
+///   *inside* an expression that still carries `* s` moves only edge pixels
+///   and clears the budget — a tick or an arc 50 % wider on the gauge; a dot
+///   radius 5 % larger (caught on no skin; 10 % on one, oled) or a halo 25 %
+///   stronger (caught on none, edge mean ≤ 12.245 / max ≤ 48 against 16 / 64)
+///   on the dot matrix; neither the source scan nor the region split sees it.
 ///   #893's ceiling is deliberately **not** applied here: it is a statement
 ///   about rounding between two renders of one picture, and half the frame's
 ///   pixels are edges on a dial.

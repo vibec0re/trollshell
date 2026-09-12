@@ -21,6 +21,46 @@ pub struct SignalEvent {
     pub timestamp: SystemTime,
 }
 
+/// One item on a subscription's stream: an emission, or the notice that the
+/// subscription behind it was rebuilt.
+///
+/// **Why an in-stream marker rather than a side channel** (#1173, closing the
+/// half of #433 that was closed by *deleting* `missed_emissions` instead of
+/// wiring it). Between a subscription dying and its replacement going up, every
+/// emission the peer made is gone: the broker had no match rule to route it
+/// through, and D-Bus replays nothing. A consumer whose state is a fold over
+/// those emissions — `upower`, `mpris`, `bluetooth`, `networkd_nm`, … — is
+/// silently wrong from that point until the peer happens to emit again, which
+/// for a `PropertiesChanged` fold can be never. The one correct reaction is to
+/// re-read the state the fold was tracking, and the consumer is the only party
+/// that knows what that is.
+///
+/// A marker on the *same broadcast channel as the events* is totally ordered
+/// with them: everything a consumer reads after it came from the new
+/// `AddMatch`, and everything before it from the old one. A separate `Signal`
+/// or counter would deliver the same fact out of band, so a consumer could
+/// re-`Get` and then apply an event it had already folded in, or fold a new
+/// event before learning that its history had a hole — the ordering would have
+/// to be re-established by the consumer, once per consumer.
+///
+/// It is ignorable by default: [`SignalSubscription::events`] keeps its
+/// `SignalEvent` item type and drops markers, so every existing consumer
+/// compiles and behaves exactly as before. [`SignalSubscription::items`] is the
+/// opt-in.
+#[derive(Clone)]
+pub enum SignalItem {
+    /// One signal emission from the peer.
+    Event(SignalEvent),
+    /// The subscription was torn down and rebuilt — bus reconnect, broker
+    /// restart, or the stream simply ending. Emissions made while it was down
+    /// were never delivered and never will be; re-read whatever state this
+    /// subscription feeds.
+    ///
+    /// Emitted only for a *re*-subscription: the first one has no history to
+    /// have missed.
+    Resubscribed,
+}
+
 /// Handle on a live signal subscription. Cloning is cheap and does not cancel;
 /// dropping the last clone tears down the subscription (push-based, via
 /// [`HandleTracker`]).
@@ -47,7 +87,7 @@ impl Drop for SignalSubscription {
 }
 
 struct SubInner {
-    sender: tokio::sync::broadcast::Sender<Arc<SignalEvent>>,
+    sender: tokio::sync::broadcast::Sender<Arc<SignalItem>>,
     /// A oneshot receiver that resolves when the internal task exits.
     /// Exposed via `task_done_receiver()` for integration tests.
     task_done_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -58,17 +98,39 @@ impl SignalSubscription {
     /// independent receiver; backpressure is handled by zbus' broadcast
     /// channel (slow consumers may lag).
     ///
+    /// [`SignalItem::Resubscribed`] markers are dropped here — this is the
+    /// ignore-by-default half of #1173. Use [`Self::items`] to see them.
+    ///
     /// `+ use<>` for the reason `OwnNameSignal::signal_cloned` carries it
     /// (#750): without it the opaque type captures `&self` under Rust 2024's
     /// rules and is never `'static`, so it could not be spawned onto a task or
     /// stored. The stream owns its `broadcast::Receiver` and borrows nothing.
     pub fn events(&self) -> impl futures_util::Stream<Item = SignalEvent> + Unpin + use<> {
+        let mut items = self.items();
+        Box::pin(async_stream::stream! {
+            while let Some(item) = items.next().await {
+                if let SignalItem::Event(evt) = item {
+                    yield evt;
+                }
+            }
+        })
+    }
+
+    /// Stream of emissions **and** [`SignalItem::Resubscribed`] markers, in the
+    /// order the subscription task produced them. Each call returns an
+    /// independent receiver.
+    ///
+    /// Reach for this when the consumer folds emissions into state that goes
+    /// stale if any are missed — see [`SignalItem`] for the argument. A
+    /// consumer that just reacts to each emission in isolation wants
+    /// [`Self::events`].
+    pub fn items(&self) -> impl futures_util::Stream<Item = SignalItem> + Unpin + use<> {
         use tokio::sync::broadcast::error::RecvError;
         let mut rx = self.inner.sender.subscribe();
         Box::pin(async_stream::stream! {
             loop {
                 match rx.recv().await {
-                    Ok(evt) => yield (*evt).clone(),
+                    Ok(item) => yield (*item).clone(),
                     // A burst overflowed the broadcast channel and this
                     // consumer fell behind. The receiver is still usable — the
                     // next `recv()` yields the oldest event still buffered — so
@@ -107,7 +169,7 @@ struct RunCtx {
     path: String,
     iface: String,
     signal_name: String,
-    tx: tokio::sync::broadcast::Sender<Arc<SignalEvent>>,
+    tx: tokio::sync::broadcast::Sender<Arc<SignalItem>>,
     /// Live-handle tracker. When every `SignalSubscription` clone has been
     /// dropped, `all_dropped()` becomes true — the definitive signal that no
     /// consumer will ever call `events()` again and the task can exit.
@@ -214,7 +276,7 @@ enum DrainOutcome {
 struct DrainCtx<'a> {
     shared: &'a SharedConnection,
     current_epoch: u64,
-    tx: &'a tokio::sync::broadcast::Sender<Arc<SignalEvent>>,
+    tx: &'a tokio::sync::broadcast::Sender<Arc<SignalItem>>,
     /// Live-handle tracker — `all_dropped()` means every subscription handle
     /// has been dropped. Also the push-based drop wakeup (`dropped()`).
     tracker: &'a HandleTracker,
@@ -242,7 +304,7 @@ async fn drain_signal_stream(
                         sender: msg.header().sender().map(ToString::to_string),
                         timestamp: SystemTime::now(),
                     };
-                    let _ = dc.tx.send(Arc::new(event));
+                    let _ = dc.tx.send(Arc::new(SignalItem::Event(event)));
                 } else {
                     tracing::debug!(dest = dc.dest, path = dc.path, iface = dc.iface,
                         signal_name = dc.signal_name, "signal stream ended; will re-subscribe");
@@ -290,6 +352,9 @@ async fn run_subscription(ctx: RunCtx) {
     // that will not answer actually backs off instead of resetting to 250 ms
     // every time round. Cleared by a successful subscribe.
     let mut streak = FailureStreak::default();
+    // Whether a subscription has ever been established, so the `Resubscribed`
+    // marker is emitted for the re-subscriptions only.
+    let mut subscribed_before = false;
 
     loop {
         // Exit cleanly if all handles have been dropped (checked at each reconnect boundary).
@@ -348,6 +413,18 @@ async fn run_subscription(ctx: RunCtx) {
         let stream = match stream_result {
             Ok(s) => {
                 streak.reset();
+                // Tell consumers the subscription behind them is a new one, so
+                // a fold over emissions can re-read the state it was tracking
+                // (#1173). Deliberately *after* the subscribe succeeded and
+                // *before* any event from it is pushed, so the marker and the
+                // events it precedes are one ordered sequence on one channel.
+                // Never on the first subscription — there is no history to have
+                // missed. `send` failing means nobody is listening, which is
+                // fine.
+                if subscribed_before {
+                    let _ = tx.send(Arc::new(SignalItem::Resubscribed));
+                }
+                subscribed_before = true;
                 s
             }
             Err(e) => {
@@ -390,25 +467,25 @@ async fn run_subscription(ctx: RunCtx) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SignalEvent, SignalSubscription, SubInner};
+    use super::{SignalEvent, SignalItem, SignalSubscription, SubInner};
     use futures_util::StreamExt;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
     use tokio::sync::broadcast;
 
-    fn event(value: u32) -> Arc<SignalEvent> {
+    fn event(value: u32) -> Arc<SignalItem> {
         let body = zbus::Message::signal("/t", "t.I", "Ping")
             .expect("signal builder")
             .build(&value)
             .expect("build signal message");
-        Arc::new(SignalEvent {
+        Arc::new(SignalItem::Event(SignalEvent {
             body,
             sender: None,
             timestamp: SystemTime::now(),
-        })
+        }))
     }
 
-    fn subscription(tx: broadcast::Sender<Arc<SignalEvent>>) -> SignalSubscription {
+    fn subscription(tx: broadcast::Sender<Arc<SignalItem>>) -> SignalSubscription {
         let (_done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         SignalSubscription {
             inner: Arc::new(SubInner {
@@ -429,7 +506,7 @@ mod tests {
     /// every downstream subscriber.
     #[tokio::test]
     async fn events_survive_broadcast_lag() {
-        let (tx, _keep) = broadcast::channel::<Arc<SignalEvent>>(4);
+        let (tx, _keep) = broadcast::channel::<Arc<SignalItem>>(4);
         let sub = subscription(tx.clone());
         let mut events = sub.events();
 

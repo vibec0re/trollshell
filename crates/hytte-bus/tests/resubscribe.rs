@@ -13,7 +13,7 @@
 use futures_signals::signal::SignalExt;
 use futures_util::StreamExt;
 use hytte_bus::test_support::SharedConnection;
-use hytte_bus::{PropState, ProxyState, property_with, proxy_with};
+use hytte_bus::{PropState, ProxyState, SignalItem, property_with, proxy_with, signals_with};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -447,4 +447,70 @@ async fn a_failed_proxy_rebuild_does_not_announce_live() {
             .is_err_and(|e| e.is_transient()),
         "a proxy that is not Live must fail its calls transiently"
     );
+}
+
+// ── Item 4: the consumer can see that the subscription was rebuilt ───────────
+
+/// `signals()` must tell a consumer when it re-subscribed.
+///
+/// Between a subscription dying and its replacement going up, every emission
+/// the peer made is gone — the broker had no match rule to route it through,
+/// and there is no replay. A consumer whose state is a fold over those
+/// emissions (`upower`, `mpris`, `bluetooth`, …) is silently wrong from that
+/// point on, and #433 item 2 was closed by *deleting* the `missed_emissions`
+/// counter rather than by wiring anything to it.
+///
+/// The marker rides the same broadcast channel as the events, so it is totally
+/// ordered with them: everything a consumer reads after it came from the new
+/// `AddMatch`. `events()` keeps its item type and drops markers, so every
+/// existing consumer compiles and behaves exactly as before; `items()` is the
+/// opt-in that surfaces them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resubscribe_reaches_the_consumer_as_a_marker() {
+    let (conn_a, guard_a) = daemon::ephemeral_bus().await;
+    let address = guard_a.address.clone();
+    let _server_a = serve_counter(&address, 42).await;
+
+    let shared = SharedConnection::for_test_session(conn_a);
+    shared.spawn_supervisor_for_test();
+
+    let sub = signals_with(&shared, "org.freedesktop.DBus")
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .signal("NameOwnerChanged")
+        .start();
+    let mut items = sub.items();
+
+    // Give the first subscription a moment to be established: a marker is only
+    // emitted for a *re*-subscribe, so a race here would make the assertion
+    // below vacuous.
+    let seen_before = Arc::new(AtomicUsize::new(0));
+    {
+        let seen = seen_before.clone();
+        let mut probe = sub.items();
+        tokio::spawn(async move {
+            while let Some(item) = probe.next().await {
+                if matches!(item, SignalItem::Resubscribed) {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        seen_before.load(Ordering::Relaxed),
+        0,
+        "the first subscription is not a re-subscription"
+    );
+
+    let (conn_b, _guard_b) = daemon::restart_on_same_address(guard_a).await;
+    shared.arm_reconnect_for_test(conn_b);
+
+    wait_for(
+        &mut items,
+        Duration::from_secs(60),
+        "a Resubscribed marker after the broker restarted",
+        |i| matches!(i, SignalItem::Resubscribed),
+    )
+    .await;
 }

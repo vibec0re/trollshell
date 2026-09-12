@@ -49,7 +49,7 @@ use anyhow::{Context, Result};
 use futures_signals::map_ref;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use futures_util::StreamExt;
-use hytte_bus::{BusKind, BusProxy, ProxyState, call, proxy, signals};
+use hytte_bus::{BusKind, BusProxy, ProxyState, SignalItem, call, proxy, signals};
 use hytte_reactive::{Service, registry, runtime, spawn_supervised, spawn_supervised_bounded};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -683,23 +683,44 @@ async fn watch_liveness(state: State, bus_name: String, player_proxy: BusProxy) 
 }
 
 /// Watch `PropertiesChanged` for a player. Re-reads all properties on each
-/// emission for the `org.mpris.MediaPlayer2.Player` interface.
+/// emission for the `org.mpris.MediaPlayer2.Player` interface — and on each
+/// [`SignalItem::Resubscribed`] marker.
+///
+/// This state is a **fold** over emissions: `refresh_player` is only ever
+/// called because a `PropertiesChanged` said something moved. Between a
+/// subscription dying and its replacement going up there is no match rule for
+/// the broker to route through and nothing is replayed, so every change the
+/// player made in that window is lost — and a paused player that never changes
+/// again leaves the drawer showing a track that finished during the outage,
+/// indefinitely. So this is `items()` rather than `events()`: the marker is the
+/// only notice a consumer gets that its history has a hole, and the correct
+/// reaction to it is the same one an emission gets (#1173).
 async fn watch_properties(state: State, bus_name: String, sub: hytte_bus::SignalSubscription) {
-    let mut events = sub.events();
-    while let Some(event) = events.next().await {
-        // Decode body: (interface_name, changed_properties, invalidated_properties)
-        let Ok((iface, _changed, _invalidated)) =
-            event
-                .body
-                .body()
-                .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
-        else {
-            continue;
-        };
+    let mut items = sub.items();
+    while let Some(item) = items.next().await {
+        match item {
+            SignalItem::Resubscribed => {
+                tracing::debug!(
+                    bus_name,
+                    "PropertiesChanged re-subscribed; re-reading player properties"
+                );
+            }
+            SignalItem::Event(event) => {
+                // Decode body: (interface_name, changed_properties, invalidated_properties)
+                let Ok((iface, _changed, _invalidated)) =
+                    event
+                        .body
+                        .body()
+                        .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+                else {
+                    continue;
+                };
 
-        // Only react to changes on the Player interface.
-        if iface != PLAYER_IFACE {
-            continue;
+                // Only react to changes on the Player interface.
+                if iface != PLAYER_IFACE {
+                    continue;
+                }
+            }
         }
 
         let still_alive = state.refresh_player(&bus_name).await;

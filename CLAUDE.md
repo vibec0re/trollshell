@@ -73,10 +73,11 @@ xvfb-run cargo test --features system-tests -p hytte-ui   # display tests headle
   `crates/trollshell-agent-window/src/webview.rs`'s `gtk_tests` module doc.
 - `hytte-services`'s gated test round-trips the NetworkManager secret agent
   (`wifi::nm_agent`'s `GetSecrets`) against a real `dbus-daemon` too.
-- The Nix package (`nix/package.nix`) sets `doCheck = true`: every
-  `nix build .#trollshell` runs the hermetic internals suite
-  (`cargo test --workspace`, deliberately **without** `system-tests`) as part
-  of the build.
+- The hermetic internals suite (`cargo test --workspace`, deliberately
+  **without** `system-tests`) runs as `checks.workspace-tests` (flake.nix),
+  gated by `nix flake check` — not by `nix build .#trollshell`, since
+  `nix/package.nix` sets `doCheck = false` on the `workspace` derivation
+  (#1115; see "Packaging" below).
 
 ### Packaging (`nix/package.nix`)
 

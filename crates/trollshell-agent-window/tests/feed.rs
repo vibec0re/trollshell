@@ -760,7 +760,10 @@ async fn a_burst_of_presentation_edges_inside_one_cadence_costs_one_poll() {
     cmd_tx
         .send(feed::set_paused(&name("stray"), false))
         .expect("the loop is listening");
-    until("the probe's reconciling poll", || polls(&hive) > after_first).await;
+    until("the probe's reconciling poll", || {
+        polls(&hive) > after_first
+    })
+    .await;
     for _ in 0..20 {
         tokio::task::yield_now().await;
     }

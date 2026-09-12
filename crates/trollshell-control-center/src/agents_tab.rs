@@ -2344,8 +2344,8 @@ mod tests {
     use super::{
         ABSENT, DetailModel, FACT_LABELS, Route, RowModel, agent_page_is_live, detail_of, flags_of,
         flags_of_labels, hive_of, ordered, placeholder, route_for, rows_of, same_agent_set,
-        status_set, systemd_run_argv, unassigned_approvals, unassigned_destination, unassigned_subtitle,
-        user_manager_unreachable,
+        status_set, systemd_run_argv, unassigned_approvals, unassigned_destination,
+        unassigned_subtitle, user_manager_unreachable,
     };
     use hytte_plugin_agents::config::{AgentsConfig, Display};
     use hytte_plugin_agents::hive::client::HiveError;

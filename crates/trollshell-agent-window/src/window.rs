@@ -95,7 +95,9 @@ pub(crate) fn watch_presentation(
         let state_tx = sender.clone();
         let weak = w.downgrade();
         toplevel.connect_state_notify(move |t| {
-            let mapped = weak.upgrade().is_some_and(|w: adw::ApplicationWindow| w.is_mapped());
+            let mapped = weak
+                .upgrade()
+                .is_some_and(|w: adw::ApplicationWindow| w.is_mapped());
             let _ = state_tx.send(mapped && presenting(t.state()));
         });
         let _ = sender.send(w.is_mapped() && presenting(toplevel.state()));

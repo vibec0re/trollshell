@@ -65,12 +65,35 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 /// receiver (it writes the wakeup byte, pushes onto the queue and returns
 /// `Ok(())`), so not even `send_command`'s receiver-dropped warning could fire.
 ///
-/// **Supervised** since #1170 (the residual of #430): the reconnect loop below
-/// only ever covered `run_once` returning, and `run_once` is where every
-/// registry/param callback runs over daemon-supplied pods. A panic in one took
-/// the thread — and with it sink/source/stream volume, the mute toggle and the
-/// spectrum tap — out for the session, with no log line and nothing to restart
-/// it. **What a restart re-does:** `pw::init()` (guarded by [`PW_INIT`], so the
+/// **Supervised** since #1170 (the residual of #430) — but read the scope
+/// carefully, because it is narrower than the obvious reading and the boundary
+/// is structural rather than a matter of degree.
+///
+/// **A panic inside a `PipeWire` callback is not covered, and cannot be.**
+/// pipewire-rs 0.10 dispatches every listener through an `unsafe extern "C"`
+/// trampoline — `registry_events_global` (the registry walk),
+/// `core_events_error` (the quit path's listener), `node_events_param` (the
+/// `Props` pods) and `loop_`'s `call_closure` (the `IoSource` behind
+/// `pw::channel`, i.e. [`handle_command`]). Since Rust 1.81 a panic that would
+/// unwind out of an `extern "C"` frame is a guaranteed **process abort**, not
+/// UB and not an unwind: it takes the whole shell down, `spawn_supervised_blocking`
+/// never sees a `JoinError::is_panic()`, and no `catch_unwind` is reachable
+/// from behind those trampolines. The only lever on that class is keeping every
+/// callback body total — which is why `decode_props`, `parse_default_name` and
+/// friends are written to return `Option`/defaults rather than index or unwrap.
+///
+/// **What supervision does cover is the Rust side of the thread**: the session
+/// prologue (`MainLoopRc::new`, `ContextRc::new`, `connect_rc`,
+/// `get_registry_rc`, `AudioState::new`), the reconnect loop in
+/// [`run_sessions`], and the channel bookkeeping around it. Those frames unwind
+/// normally, and a panic in one used to take sink/source/stream volume, the
+/// mute toggle and the spectrum tap out for the session with no log line and
+/// nothing to restart them. `a_panicking_mainloop_thread_restarts_with_a_live_command_channel`
+/// pins that half; the callback half has no test **by construction**, since the
+/// abort would take the test binary with it — that absence is the finding, not
+/// an oversight.
+///
+/// **What a restart re-does:** `pw::init()` (guarded by [`PW_INIT`], so the
 /// library is initialised exactly once per process however many times the
 /// closure re-runs), a fresh mainloop/context/core/registry, and a full
 /// registry walk that re-emits every snapshot. The state it republishes lives
@@ -86,10 +109,29 @@ pub(super) fn spawn_mainloop(handles: PipewireHandles) {
         tracing::warn!("audio_native: spawn_mainloop called twice; ignoring second start");
         return;
     }
-    let rx = initial_slot();
-    spawn_supervised_blocking("pipewire", move || {
+    supervise_sessions("pipewire", initial_slot(), move |slot| {
+        run_sessions(slot, &handles);
+    });
+}
+
+/// Run `body` on a supervised blocking thread, handing it the receiver slot on
+/// every run.
+///
+/// Split out of [`spawn_mainloop`] with the name and the body injected, for
+/// `idle_notify::supervise_observer`'s reason: it is the only way to supervise a
+/// body that panics without a live `PipeWire`, and it keeps `PW_INIT` — the
+/// one piece of per-process setup a restart must *not* repeat — on the path the
+/// test exercises rather than beside it.
+fn supervise_sessions<F>(
+    name: &'static str,
+    slot: Mutex<Option<pw::channel::Receiver<Command>>>,
+    body: F,
+) where
+    F: Fn(&Mutex<Option<pw::channel::Receiver<Command>>>) + Send + Sync + 'static,
+{
+    spawn_supervised_blocking(name, move || {
         PW_INIT.call_once(pw::init);
-        run_sessions(&rx, &handles);
+        body(&slot);
     });
 }
 
@@ -1106,12 +1148,13 @@ pub(super) fn send_command(cmd: Command) {
 mod tests {
     use super::{
         COMMAND_TX, Command, PW_INIT, SessionEnd, initial_slot, pw, reconnect_after,
-        run_sessions_with, send_command, session_receiver,
+        run_sessions_with, send_command, session_receiver, supervise_sessions,
     };
     use crate::retry;
     use hytte_reactive::test_lock::TEST_LOCK;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1413,5 +1456,126 @@ mod tests {
             ],
             "the mainloop did not wait `reconnect_after`'s ramp between sessions"
         );
+    }
+
+    /// #1170's item 2 for the audio thread, scoped to **what supervision here
+    /// can actually catch**: a panic on the Rust side of the thread — the
+    /// session prologue and the loop around it — restarts, and the restarted
+    /// run's command path is live.
+    ///
+    /// The scope is the whole point, and it is `spawn_mainloop`'s doc restated
+    /// as an executable claim. A panic inside a `PipeWire` callback **aborts the
+    /// process** (pipewire-rs dispatches every listener through an
+    /// `unsafe extern "C"` trampoline, and Rust 1.81 made an unwind out of one a
+    /// guaranteed abort), so it has no test and can have none: writing one would
+    /// abort this binary rather than fail an assertion. What *is* testable is
+    /// the body `spawn_supervised_blocking` actually owns, which is what this
+    /// panics.
+    ///
+    /// The restart contract has a second half the `eds_retry` twin does not:
+    /// the panicking run unwinds **holding the receiver**, so the next one finds
+    /// the slot empty and has to re-establish the channel — asserted here at the
+    /// wire, by attaching the restarted run's receiver to a real mainloop and
+    /// checking a command sent afterwards arrives. `send(...).is_ok()` proves
+    /// nothing: it is `Ok(())` with no receiver at all.
+    ///
+    /// Two mechanisms hang on this, and deleting either reddens it:
+    ///
+    /// * `supervise_sessions`' `spawn_supervised_blocking` — a plain
+    ///   `std::thread::spawn` gives no second run at all;
+    /// * `session_receiver`'s re-publish — `.expect()`ing the empty slot instead
+    ///   turns the restart into an unbounded panic loop and no command arrives.
+    #[test]
+    fn a_panicking_mainloop_thread_restarts_with_a_live_command_channel() {
+        const NAME: &str = "test-pipewire-restart";
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let attached_runs = Arc::new(AtomicUsize::new(0));
+        let seen: Arc<Mutex<Vec<Command>>> = Arc::new(Mutex::new(Vec::new()));
+
+        supervise_sessions(NAME, initial_slot(), {
+            let runs = Arc::clone(&runs);
+            let attached_runs = Arc::clone(&attached_runs);
+            let seen = Arc::clone(&seen);
+            move |slot| {
+                let run = runs.fetch_add(1, Ordering::SeqCst);
+                // Taking the receiver first is what makes the panic lose it,
+                // which is the state `session_receiver` has to recover from.
+                let rx = session_receiver(slot);
+                assert!(run > 0, "{NAME}: the first run panics, deliberately");
+
+                let mainloop =
+                    pw::main_loop::MainLoopRc::new(None).expect("a mainloop needs no daemon");
+                let seen = Arc::clone(&seen);
+                let _attached = rx.attach(mainloop.loop_(), move |cmd| {
+                    seen.lock().unwrap_or_else(PoisonError::into_inner).push(cmd);
+                });
+                attached_runs.fetch_add(1, Ordering::SeqCst);
+                // Block on the loop forever rather than return: a clean return
+                // would stop the supervisor and drop the health row this test
+                // reads. `Infinite` is an epoll wait, not a spin.
+                loop {
+                    mainloop.loop_().iterate(pw::loop_::Timeout::Infinite);
+                }
+            }
+        });
+
+        // Wait for the restarted run to be *attached* before sending: the
+        // command must go to the channel run 2 published, not the one run 1
+        // took to its grave.
+        assert!(
+            wait_until(Duration::from_secs(15), || attached_runs
+                .load(Ordering::SeqCst)
+                >= 1),
+            "no second run after the panic: runs={}, health={:?}",
+            runs.load(Ordering::SeqCst),
+            health_of(NAME)
+        );
+        send_command(Command::SetSinkMute {
+            name: "probe".into(),
+            mute: true,
+        });
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                seen.lock().unwrap_or_else(PoisonError::into_inner).len() == 1
+            }),
+            "the restarted run's command path is dead: {:?}",
+            seen.lock().unwrap_or_else(PoisonError::into_inner)
+        );
+
+        let health = health_of(NAME).expect("the supervisor publishes a live health row");
+        assert_eq!(health.panics, 1, "the restart is not on the health record");
+        assert!(
+            health.runs >= 2,
+            "health says {} run(s); the Stats drawer would not show the restart",
+            health.runs
+        );
+    }
+
+    /// Poll `cond` until it holds or `within` elapses; returns whether it held.
+    ///
+    /// The supervisor's first restart delay is a real 1s sleep with no seam to
+    /// shorten it from outside `hytte-reactive`, so the restart test waits for
+    /// wall clock. Polling rather than sleeping a fixed time keeps a fast
+    /// machine at ~1s and a loaded one passing. (`eds_retry`'s tests carry the
+    /// same helper for the same reason; it is four lines and crossing the module
+    /// boundary to share it would mean publishing a test helper.)
+    fn wait_until(within: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        cond()
+    }
+
+    /// The health row a supervisor keeps for `name`, if it is still live.
+    fn health_of(name: &str) -> Option<hytte_reactive::TaskHealth> {
+        hytte_reactive::health::snapshot()
+            .into_iter()
+            .find(|h| h.name == name)
     }
 }

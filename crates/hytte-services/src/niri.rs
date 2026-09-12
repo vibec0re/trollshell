@@ -82,23 +82,37 @@ impl Service for NiriService {
         // the rest of the session with nothing to restart them. The loop is
         // restart-safe: every run reconnects from scratch and the compositor,
         // not this process, holds the state it republishes.
-        spawn_supervised_blocking("niri", move || {
-            listen_sessions(
-                || {
-                    listen_once(
-                        &ws_writer,
-                        &win_list_writer,
-                        &win_focus_writer,
-                        &casts_writer,
-                        &screenshot_writer,
-                    )
-                },
-                thread::sleep,
-            );
-        });
+        supervise_listener(
+            "niri",
+            move || {
+                listen_once(
+                    &ws_writer,
+                    &win_list_writer,
+                    &win_focus_writer,
+                    &casts_writer,
+                    &screenshot_writer,
+                )
+            },
+            thread::sleep,
+        );
 
         handles
     }
+}
+
+/// Run [`listen_sessions`] on a supervised blocking thread.
+///
+/// The seam exists for `idle_notify::supervise_observer`'s reason: it is the
+/// only way to supervise a body that panics without a live compositor, so the
+/// restart contract this thread relies on — a panic under `listen_once` gives a
+/// second run, with a fresh reporter and a fresh dial — is pinned by a test
+/// rather than only argued in the comment above.
+fn supervise_listener<L, S>(name: &'static str, listen: L, sleep: S)
+where
+    L: Fn() -> Result<()> + Send + Sync + 'static,
+    S: Fn(Duration) + Send + Sync + 'static,
+{
+    spawn_supervised_blocking(name, move || listen_sessions(&listen, &sleep));
 }
 
 /// Redial the event stream forever, reconnecting on a capped ramp.
@@ -1029,6 +1043,7 @@ pub fn reflow_workspace(workspace: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
 
     // ── The reconnect ramp and its latched warn (#1170 item 4) ───────────────
@@ -1150,6 +1165,68 @@ mod tests {
                 Duration::from_secs(8),
             ],
             "the listen loop did not wait `reconnect_after`'s ramp between redials"
+        );
+    }
+
+    /// #1170's item 2 for the niri thread: panic under `listen_once` and the
+    /// next run dials again.
+    ///
+    /// niri's is the *simple* case of the four, and worth having precisely
+    /// because it is: `niri-ipc` is pure Rust with no `extern "C"` trampoline
+    /// anywhere on the dispatch path (unlike `audio_native`'s, where a callback
+    /// panic aborts the process instead — see `loop_.rs`'s `spawn_mainloop`), so
+    /// a panic in `apply_event` over compositor-supplied data really does unwind
+    /// into the supervisor, and restarting really is the whole fix.
+    ///
+    /// Deleting `supervise_listener`'s `spawn_supervised_blocking` — going back
+    /// to the bare `std::thread::spawn` #654 replaced — gives no second run at
+    /// all and reddens this.
+    #[test]
+    fn a_panicking_listen_run_restarts() {
+        const NAME: &str = "test-niri-restart";
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let second_run_started = Arc::new(AtomicUsize::new(0));
+        supervise_listener(
+            NAME,
+            {
+                let runs = Arc::clone(&runs);
+                let second = Arc::clone(&second_run_started);
+                move || {
+                    let run = runs.fetch_add(1, Ordering::SeqCst);
+                    assert!(run > 0, "{NAME}: the first dial panics, deliberately");
+                    second.fetch_add(1, Ordering::SeqCst);
+                    // Keep the run alive so the supervisor stays live and its
+                    // health row is still there to read; a clean return would
+                    // stop it and drop the row.
+                    loop {
+                        thread::park();
+                    }
+                }
+            },
+            |_| {},
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && second_run_started.load(Ordering::SeqCst) == 0 {
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let health = hytte_reactive::health::snapshot()
+            .into_iter()
+            .find(|h| h.name == NAME)
+            .expect("the supervisor publishes a live health row");
+        assert_eq!(
+            second_run_started.load(Ordering::SeqCst),
+            1,
+            "the panicking dial was never retried: runs={}, health={health:?}",
+            runs.load(Ordering::SeqCst)
+        );
+        assert_eq!(health.panics, 1, "the restart is not on the health record");
+        assert!(
+            health.runs >= 2,
+            "health says {} run(s); the Stats drawer would not show the restart",
+            health.runs
         );
     }
 

@@ -325,14 +325,22 @@ async fn run_property<T>(
 
         // Brief pause before re-subscribing to avoid a tight loop on bus
         // disconnect / invalidation.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
-/// Retry the cold `Get` until it succeeds, backing off differently for
-/// transient (bus mid-reconnect — retry promptly) versus permanent
-/// (`ServiceUnknown`/`AccessDenied` — retry rarely, so a doomed call doesn't
-/// hammer the bus at 2 Hz forever).
+/// Retry the cold `Get` until it succeeds, backing off transient (bus
+/// mid-reconnect) and permanent (`ServiceUnknown`/`AccessDenied`) failures on
+/// one shared [`FailureStreak`] — the crate's ramp, the same primitive every
+/// other subscription-rebuild loop in this file uses. Until this was written,
+/// the transient arm was the one loop in the crate still hand-rolling its own
+/// `sleep(500 ms)`: flat and unbounded, so a peer that kept answering
+/// transiently with the bus itself up spun there at 2 Hz forever — the exact
+/// spin the ramp exists to retire everywhere else. Both arms now start at the
+/// ramp's 250 ms base (close enough to the old flat rate that an actual blip
+/// still clears promptly) and, like the permanent arm always did, back off
+/// the same way if the condition does not clear — capped and log-thinned at
+/// [`crate::backoff::logs_at`]'s cadence rather than once a call.
 ///
 /// The caller's `PropertiesChanged` subscription stays live across every retry,
 /// so a change landing mid-Get is buffered and still replayed by
@@ -353,8 +361,7 @@ where
         + TryFrom<OwnedValue, Error = zbus::zvariant::Error>
         + for<'v> TryFrom<Value<'v>, Error = zbus::zvariant::Error>,
 {
-    let mut perm_backoff = Duration::from_millis(500);
-    let mut warned_permanent = false;
+    let mut failures = FailureStreak::default();
     loop {
         if ctx.tracker.all_dropped() {
             tracing::debug!(
@@ -373,25 +380,31 @@ where
         match cold_get::<T>(ctx).await {
             Ok(v) => return Some(v),
             Err(e) if e.is_transient() => {
-                tracing::debug!(error = %e, dest = ctx.dest, path = ctx.path,
-                    iface = ctx.iface, name = ctx.name,
-                    "property Get failed (transient); will retry");
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                let step = failures.record();
+                if step.log {
+                    tracing::debug!(error = %e, dest = ctx.dest, path = ctx.path,
+                        iface = ctx.iface, name = ctx.name, attempt = step.attempt,
+                        retry_in_ms = step.delay.as_millis(),
+                        "property Get failed (transient); will retry");
+                }
+                tokio::time::sleep(step.delay).await;
             }
             Err(e) => {
-                if warned_permanent {
-                    tracing::debug!(error = %e, dest = ctx.dest, path = ctx.path,
-                        iface = ctx.iface, name = ctx.name,
-                        retry_in_ms = perm_backoff.as_millis(),
-                        "property Get still permanently failing");
-                } else {
-                    warned_permanent = true;
-                    tracing::warn!(error = %e, dest = ctx.dest, path = ctx.path,
-                        iface = ctx.iface, name = ctx.name,
-                        "property Get permanently failing; backing off retries");
+                let step = failures.record();
+                if step.log {
+                    if step.attempt == 1 {
+                        tracing::warn!(error = %e, dest = ctx.dest, path = ctx.path,
+                            iface = ctx.iface, name = ctx.name,
+                            retry_in_ms = step.delay.as_millis(),
+                            "property Get permanently failing; backing off retries");
+                    } else {
+                        tracing::debug!(error = %e, dest = ctx.dest, path = ctx.path,
+                            iface = ctx.iface, name = ctx.name, attempt = step.attempt,
+                            retry_in_ms = step.delay.as_millis(),
+                            "property Get still permanently failing");
+                    }
                 }
-                tokio::time::sleep(perm_backoff).await;
-                perm_backoff = (perm_backoff * 2).min(Duration::from_mins(1));
+                tokio::time::sleep(step.delay).await;
             }
         }
     }

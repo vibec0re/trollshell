@@ -6,14 +6,14 @@
 //!
 //! Three kinds since #1144: the `Scope` (four skins × three fade depths), the
 //! `Gauge` (four skins × three needle positions, plus one at the **shipping**
-//! upscale) and the `DotMatrix` (four skins × four displays, plus one of them
-//! again stretched). The three-per-skin gauge cases and the four-per-skin
-//! dot-matrix ones run 1:1, where the GL arm's native grid and the kit's
-//! logical one are the same number and the two can be compared pixel against
-//! pixel — that is where `TROLLSHELL_PARITY_EXACT=1` pins all three kinds at
-//! zero. The dot matrix has no `scale` on the widget at all — the dot pitch is
-//! its size knob (#1091) — so what its four 1:1 cases vary instead is the
-//! *line* and the *pitch*, which is where its own arithmetic lives; see
+//! upscale) and the `DotMatrix` (four skins × five displays, plus one of them
+//! again stretched) — 52 cases. The three-per-skin gauge cases and the
+//! five-per-skin dot-matrix ones run 1:1, where the GL arm's native grid and
+//! the kit's logical one are the same number and the two can be compared pixel
+//! against pixel — that is where `TROLLSHELL_PARITY_EXACT=1` pins all three
+//! kinds at zero. The dot matrix has no `scale` on the widget at all — the dot
+//! pitch is its size knob (#1091) — so what its five 1:1 cases vary instead is
+//! the *line* and the *pitch*, which is where its own arithmetic lives; see
 //! `DisplayAt`.
 //!
 //! # The supersampled cases, and the standard they answer to
@@ -120,9 +120,11 @@
 //! skin otherwise hides comfortably inside the ceiling. See `preem_gl::parity`
 //! for all of them and their tests.
 //!
-//! Measured under llvmpipe on 2026-09-10 (Mesa 26.2.2, GLES 3.2), every one of
-//! the twelve cases came out **bit-exact**: max |Δ| 0 of 255 on R, G and B.
-//! Treat any non-zero number from this harness as real.
+//! Measured under llvmpipe on 2026-09-12 (Mesa 26.2.2, GLES 3.2), every one of
+//! the **44 1:1** cases came out **bit-exact**: max |Δ| 0 of 255 on R, G and B.
+//! Treat any non-zero number from this harness as real. The eight supersampled
+//! cases are not in that count and never could be — see above for what they
+//! answer to instead.
 //!
 //! # `TROLLSHELL_PARITY_EXACT` — the 0-pinned assertion (#1080)
 //!
@@ -292,7 +294,8 @@ fn main() -> glib::ExitCode {
         "scope {SCOPE_COLS}x{SCOPE_ROWS} scale {SCOPE_SCALE} persistence {PERSISTENCE}; \
          gauge {GAUGE_COLS}x{GAUGE_ROWS} scale {GAUGE_SCALE} and {GAUGE_SUPERSAMPLE} \
          (box-averaged down); \
-         dot matrix pitch {DOT_PX} (and {DENSE_DOT_PX}); \
+         dot matrix pitch {DOT_PX} (and {DENSE_DOT_PX}, {COARSE_DOT_PX}, \
+         one readout at x{STRETCH}); \
          ceiling mean {} / p99 {} / max {} per channel",
         parity::CEILING_MEAN,
         parity::CEILING_P99,

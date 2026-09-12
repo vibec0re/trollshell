@@ -357,17 +357,21 @@ pub(crate) fn move_app(apps: &[StackApp], from: usize, to: usize) -> Vec<StackAp
 /// the best available guess and is sitting in an editable field precisely
 /// because it is a guess.
 ///
-/// Deduped by app-id, first occurrence wins, so two windows of one app are one
-/// entry in the stack — the card's row already shows them as one icon.
+/// **Not deduped** (#1133): one entry per window, in column order — two
+/// Alacritty windows are two `StackApp` entries, each independently editable
+/// and each carrying its own window's command line, because #1071 §3.2's
+/// stack is an ordered list of apps in which the same `app_id` may appear as
+/// often as it has windows. (Before #1133 this deduped by app-id, first
+/// occurrence wins, on the premise that the card's row showed one icon per
+/// app-id; that premise is what #1133 changes — see
+/// `panels::workspaces::StackApp`.)
 #[must_use]
 pub(crate) fn ephemeral_apps(
     windows: &[(String, Option<String>)],
     known: &BTreeSet<String>,
 ) -> Vec<StackApp> {
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
     windows
         .iter()
-        .filter(|(app_id, _)| seen.insert(app_id.as_str()))
         .map(|(app_id, cmdline)| StackApp {
             id: app_id.clone(),
             exec: if known.contains(app_id) {
@@ -1987,11 +1991,15 @@ mod model_tests {
         );
     }
 
-    /// Column order is preserved and two windows of one app are one entry — the
-    /// card's row already shows them as one icon, and the stack is a list of
-    /// apps, not of windows.
+    /// Column order is preserved and two windows of one app are **two**
+    /// entries (#1133), each carrying its own window's command line — the
+    /// stack is a list of apps, one per window, not deduped by app-id.
+    ///
+    /// **The mutation**: reintroducing the pre-#1133 dedup (`seen.insert` as a
+    /// filter) reds this — `ids` comes back `["b", "a"]` instead of
+    /// `["b", "a", "b"]`, and `apps[2]`'s command line is lost entirely.
     #[test]
-    fn an_ephemeral_saves_apps_are_deduped_in_column_order() {
+    fn an_ephemeral_saves_apps_are_one_entry_per_window_in_column_order() {
         let known = BTreeSet::new();
         let windows = vec![
             ("b".to_owned(), Some("b-cmd".to_owned())),
@@ -1999,11 +2007,16 @@ mod model_tests {
             ("b".to_owned(), Some("b-cmd-2".to_owned())),
         ];
         let apps = ephemeral_apps(&windows, &known);
-        assert_eq!(ids(&apps), ["b", "a"], "the column order was sorted away");
         assert_eq!(
-            apps[0].exec.as_deref(),
-            Some("b-cmd"),
-            "the second window of an app overwrote the first's command line"
+            ids(&apps),
+            ["b", "a", "b"],
+            "one entry per window, column order preserved — not deduped"
+        );
+        assert_eq!(apps[0].exec.as_deref(), Some("b-cmd"));
+        assert_eq!(
+            apps[2].exec.as_deref(),
+            Some("b-cmd-2"),
+            "the second window of the same app-id keeps its own command line"
         );
     }
 

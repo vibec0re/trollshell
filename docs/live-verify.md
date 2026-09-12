@@ -3117,6 +3117,19 @@ trollshell`. Expect the cards to come back Active and **no notification at
       handles) is a different, unrelated list — confirm its row size did not
       change.
 
+- [ ] **(#1133)** Two windows of the same app are two independent stack
+      entries, not one collapsed onto them. Open two Alacritty windows on one
+      workspace, Edit → Save that workspace under a name. The Edit form and the
+      card row must both show **two** Alacritty icons, not one. Hit **⏹**
+      (Stop) — both windows close. Hit **▶** (Start) — **two** new Alacritty
+      windows open (`niri msg windows | grep -c Alacritty` on that workspace
+      reads 2), each its own `trollshell-ws-<name>-<n>.service`
+      (`systemctl --user list-units 'trollshell-ws-<name>-*'`), not one unit
+      shared between them. Close one of the two Alacritty windows by hand: the
+      card's row keeps two icons, but only the first glows — the second dims,
+      confirming the glow is per-window-instance and not "is this app-id open
+      anywhere on the workspace at all".
+
 ## Control-center
 
 - [ ] **(#515)** AI Keys tab: set an OpenRouter key → the row flips to "Key

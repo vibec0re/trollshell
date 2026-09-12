@@ -581,8 +581,13 @@ impl State {
     /// (see the doc on [`spawn_player_tasks`]'s initial read for why that
     /// window is real and what closing it would take), not to leave an arm
     /// standing that nothing can currently reach.
-    async fn refresh_player(&self, bus_name: &str) {
-        let mut player = read_player_props(bus_name).await;
+    ///
+    /// `identity` is `Some` only for the first read of a player, where
+    /// [`spawn_player_tasks`] has just paid for that property to probe the
+    /// bus: passing it on saves a second identical `Get` (#1201 review L6).
+    /// Every later read passes `None` and reads it with the rest.
+    async fn refresh_player(&self, bus_name: &str, identity: Option<String>) {
+        let mut player = read_player_props(bus_name, identity).await;
         let mut map = self.map.lock().await;
         // `Position` is intentionally not part of `PropertiesChanged`
         // per MPRIS spec, so `read_player_props` always returns 0 for
@@ -697,13 +702,33 @@ async fn cancelled(cancel: &mut CancelRx) {
 /// which is far past any blip and still bounded.
 const PLAYER_SETUP_ATTEMPTS: u32 = 8;
 
+/// Why a [`setup_step`] gave up.
+///
+/// The two cases say different things about the player and the bus, and a
+/// caller can reasonably treat them differently — the `Identity` probe does
+/// (see [`spawn_player_tasks`]), which is why this is not an `Option`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SetupFail {
+    /// The peer answered, and answered in a way no retry can change: it does
+    /// not implement the interface, or the property has the wrong type. The
+    /// bus is fine; this player is not conformant.
+    Permanent,
+    /// The whole [`PLAYER_SETUP_ATTEMPTS`] budget went on transient failures —
+    /// about a minute of a session bus that will not answer.
+    Exhausted,
+}
+
 /// Run `step` until it succeeds, fails in a way a retry cannot fix, or spends
 /// [`PLAYER_SETUP_ATTEMPTS`]. Backs off on the crate's reconnect ramp.
 ///
 /// Only *transient* failures are retried. A permanent one — the player does
 /// not implement the interface, the name is malformed — will answer the same
 /// way for as long as the budget lasts, so retrying it is pure latency.
-async fn setup_step<T, F, Fut>(what: &'static str, bus_name: &str, mut step: F) -> Option<T>
+async fn setup_step<T, F, Fut>(
+    what: &'static str,
+    bus_name: &str,
+    mut step: F,
+) -> Result<T, SetupFail>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, hytte_bus::BusError>>,
@@ -711,11 +736,11 @@ where
     let mut backoff = retry::ReconnectBackoff::new();
     for attempt in 1..=PLAYER_SETUP_ATTEMPTS {
         match step().await {
-            Ok(v) => return Some(v),
+            Ok(v) => return Ok(v),
             Err(e) if !e.is_transient() => {
                 tracing::debug!(error = %e, bus_name, what,
-                    "mpris player setup failed permanently; dropping this player");
-                return None;
+                    "mpris player setup failed permanently");
+                return Err(SetupFail::Permanent);
             }
             Err(e) => {
                 // `Duration::ZERO`: the "run" that just ended was a failed
@@ -731,10 +756,10 @@ where
         bus_name,
         what,
         "mpris player setup kept failing transiently; giving up on this player \
-         (nothing re-announces a name that is already owned, so it will not be \
-         watched again this session)"
+         (the broker does not re-announce a name that is already owned, so only \
+         a later `ListNames` re-read can pick it up again)"
     );
-    None
+    Err(SetupFail::Exhausted)
 }
 
 /// Spawn per-player tasks: one watches `PropertiesChanged`, another polls
@@ -755,7 +780,7 @@ async fn spawn_player_tasks(state: State, bus_name: String, cancel: CancelRx) {
     // player (no identity, Stopped, every Can* false) and leaves the drawer
     // showing it. Succeeding here means there is a connection for the reads
     // that follow.
-    let Some(player_proxy) = setup_step("proxy", &bus_name, || {
+    let Ok(player_proxy) = setup_step("proxy", &bus_name, || {
         proxy(BusKind::Session, bus_name.as_str())
             .at_path(MPRIS_PATH)
             .iface(PLAYER_IFACE)
@@ -769,26 +794,52 @@ async fn spawn_player_tasks(state: State, bus_name: String, cancel: CancelRx) {
 
     // Probe `Identity` through `setup_step` before the initial property read.
     // `build()` succeeding just above proves the bus was up a moment ago, but
-    // a blip in the window between that and the first `Get` used to surface
-    // as a blank player published for one cycle (no identity, `Stopped`,
-    // every `Can*` false): `read_player_props` defaults every property
-    // independently on failure (see its doc), so it can never itself report
-    // a blip in that window. `Identity` is a real property call to the same
-    // object in the same window, and routing it through `setup_step` gives
-    // that window the same treatment `build()` above already gets: a
-    // transient failure is retried on the reconnect ramp instead of
-    // publishing a default, and a permanent one behaves like a failed proxy
-    // build — unregister and give up on this player (#1197 review, #1201).
-    let Some(_identity) = setup_step("initial identity", &bus_name, || {
+    // a blip in the window between that and the first `Get` **narrows** rather
+    // than closes: `read_player_props` defaults every property independently
+    // on failure (see its doc), so it can never itself report a blip, and a
+    // blip in the window that is left still publishes a blank player for one
+    // cycle. `Identity` is a real property call to the same object in the same
+    // window, so routing it through `setup_step` gives the first `Get` the
+    // same treatment `build()` gets — a transient failure is retried on the
+    // reconnect ramp instead of publishing a default. Closing the window
+    // outright would mean letting `read_player_props` propagate a transient
+    // error, which is a bigger change than #1197's review asked for.
+    //
+    // The probed string is then *used* (#1201 review L6): `refresh_player`
+    // takes it instead of issuing a second, identical `Get` one line later.
+    //
+    // The two failures are not the same failure, and only one of them is this
+    // player's fault:
+    //
+    // * `Exhausted` — a minute of a session bus that will not answer. Nothing
+    //   below would work either, so give up; a later `ListNames` re-read
+    //   rediscovers the player once the bus is back (see
+    //   `reconcile_players`).
+    // * `Permanent` — the peer answered, and answered badly: no `Identity`
+    //   property, or one that is not a string. The bus is fine and the player
+    //   is real, so it keeps its row with an empty identity, exactly as it did
+    //   before #1197 added this probe. Dropping it would make a
+    //   non-conformant player invisible rather than merely unnamed.
+    let identity = match setup_step("initial identity", &bus_name, || {
         get_property::<String>(bus_name.as_str(), MPRIS_IFACE, "Identity")
     })
     .await
-    else {
-        state.unregister(&bus_name).await;
-        return;
+    {
+        Ok(identity) => Some(identity),
+        Err(SetupFail::Permanent) => {
+            tracing::debug!(
+                bus_name,
+                "mpris player has no readable Identity; watching it anyway, unnamed"
+            );
+            None
+        }
+        Err(SetupFail::Exhausted) => {
+            state.unregister(&bus_name).await;
+            return;
+        }
     };
 
-    state.refresh_player(&bus_name).await;
+    state.refresh_player(&bus_name, identity).await;
     state.publish().await;
 
     // Subscribe to PropertiesChanged for this player.
@@ -949,7 +1000,9 @@ where
             }
         }
 
-        state.refresh_player(bus_name).await;
+        // `None`: a re-read reads `Identity` with everything else — only the
+        // very first read has a probed value to reuse.
+        state.refresh_player(bus_name, None).await;
         state.publish().await;
     }
 }
@@ -1310,10 +1363,17 @@ where
 /// infallible by construction and returns `Player` directly rather than a
 /// `Result` nothing can actually put an `Err` into. See [`State::refresh_player`]
 /// for what that means for the caller.
-async fn read_player_props(bus_name: &str) -> Player {
-    let identity: String = get_property(bus_name, MPRIS_IFACE, "Identity")
-        .await
-        .unwrap_or_default();
+///
+/// `identity`, when given, is a value the caller already read (and retried) —
+/// the first read of a player passes the string its bus probe paid for rather
+/// than asking the same question again (#1201 review L6).
+async fn read_player_props(bus_name: &str, identity: Option<String>) -> Player {
+    let identity: String = match identity {
+        Some(known) => known,
+        None => get_property(bus_name, MPRIS_IFACE, "Identity")
+            .await
+            .unwrap_or_default(),
+    };
 
     let status_str: String = get_property(bus_name, PLAYER_IFACE, "PlaybackStatus")
         .await
@@ -1371,7 +1431,7 @@ async fn read_metadata(bus_name: &str) -> (String, String, String, String, u64, 
 
 #[cfg(test)]
 mod tests {
-    use super::{ART_CACHE_CAP, ArtCache, PLAYER_SETUP_ATTEMPTS, setup_step};
+    use super::{ART_CACHE_CAP, ArtCache, PLAYER_SETUP_ATTEMPTS, SetupFail, setup_step};
     use std::cell::Cell;
 
     /// Store an entry whose payload is the URL's own bytes, so a `get` can
@@ -1456,21 +1516,26 @@ mod tests {
             std::future::ready(if n == 3 { Ok(n) } else { Err(transient()) })
         })
         .await;
-        assert_eq!(got, Some(3));
+        assert_eq!(got, Ok(3));
         assert_eq!(calls.get(), 3, "no attempt after the one that worked");
     }
 
     /// A permanent failure is not retried: it will answer the same way for as
     /// long as the budget lasts, so a retry is pure latency.
+    ///
+    /// It must also be *distinguishable* from a spent budget (#1201 review
+    /// L6): the `Identity` probe keeps a player that answered badly and drops
+    /// one whose bus never answered, and it cannot tell them apart from an
+    /// `Option`.
     #[tokio::test(start_paused = true)]
     async fn a_permanent_failure_is_not_retried() {
         let calls = Cell::new(0u32);
-        let got: Option<u32> = setup_step("test", "org.mpris.MediaPlayer2.x", || {
+        let got: Result<u32, SetupFail> = setup_step("test", "org.mpris.MediaPlayer2.x", || {
             calls.set(calls.get() + 1);
             std::future::ready(Err(permanent()))
         })
         .await;
-        assert!(got.is_none());
+        assert_eq!(got, Err(SetupFail::Permanent));
         assert_eq!(
             calls.get(),
             1,
@@ -1483,12 +1548,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_budget_is_spent_and_the_player_given_up() {
         let calls = Cell::new(0u32);
-        let got: Option<u32> = setup_step("test", "org.mpris.MediaPlayer2.x", || {
+        let got: Result<u32, SetupFail> = setup_step("test", "org.mpris.MediaPlayer2.x", || {
             calls.set(calls.get() + 1);
             std::future::ready(Err(transient()))
         })
         .await;
-        assert!(got.is_none());
+        assert_eq!(
+            got,
+            Err(SetupFail::Exhausted),
+            "spending the budget is not the same failure as a bad answer"
+        );
         assert_eq!(calls.get(), PLAYER_SETUP_ATTEMPTS);
     }
 

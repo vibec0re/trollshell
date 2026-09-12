@@ -466,6 +466,27 @@ unsafe extern "C" {
     /// ([`i_cal_time_is_null_time`]) when the series is exhausted.
     pub fn i_cal_recur_iterator_next(iter: *mut ICalRecurIterator) -> *mut ICalTime;
 
+    /// Re-anchor a freshly-created iterator so its next step yields the first
+    /// occurrence at or after `start`, without emitting the ones before it
+    /// (#1195). This is how an hourly series whose `DTSTART` is years in the
+    /// past is expanded over a 43-day window in ~1 000 steps instead of
+    /// ~100 000.
+    ///
+    /// Borrows both arguments (the iterator keeps no reference to `start`, so
+    /// the caller may release it straight after). **Returns zero on failure**,
+    /// which libical documents for exactly one case: an RRULE carrying
+    /// `COUNT`, where skipping would change which occurrences the count
+    /// selects. Callers must treat a zero return as "iterate from `DTSTART`
+    /// after all" rather than assume the iterator moved — see
+    /// `lib.rs`'s `skip_iterator_to_window`.
+    ///
+    /// libical spells `start` as "a value between DTSTART and UNTIL"; a value
+    /// before `DTSTART` is outside that contract, so the caller checks.
+    pub fn i_cal_recur_iterator_set_start(
+        iter: *mut ICalRecurIterator,
+        start: *mut ICalTime,
+    ) -> c_int;
+
     /// Free a recurrence iterator created by [`i_cal_recur_iterator_new`].
     pub fn i_cal_recur_iterator_free(iter: *mut ICalRecurIterator);
 }

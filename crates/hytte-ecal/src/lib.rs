@@ -583,11 +583,15 @@ impl CalClient {
     /// meeting over a 30-day window returns ~30 instances). Non-recurring
     /// events in the window come back as a single instance.
     ///
-    /// The window bounds expansion: a `FREQ=DAILY` series with no
-    /// `UNTIL`/`COUNT` is naturally capped by the range you pass, never
-    /// expanded unboundedly. It is **not** the only bound — a sub-hourly rule
-    /// fills any window with more occurrences than a UI can use, so each
-    /// component is additionally capped by
+    /// The window bounds expansion at **both** ends. A `FREQ=DAILY` series
+    /// with no `UNTIL`/`COUNT` is capped at the top by the range you pass,
+    /// never expanded unboundedly; and the iterator is fast-forwarded to
+    /// `start_unix` before it is stepped (#1195), so a rule whose `DTSTART`
+    /// is years in the past costs its in-window occurrences rather than its
+    /// whole history — which is what used to make such a series come back
+    /// *empty*. Neither is the only bound: a sub-hourly rule fills any window
+    /// with more occurrences than a UI can use, so each component is
+    /// additionally capped by
     /// [`MAX_OCCURRENCES_PER_COMPONENT`]/[`EXPANSION_BYTES_BUDGET`] and
     /// truncated with one `warn!` (#1179).
     ///
@@ -670,11 +674,109 @@ pub const MAX_OCCURRENCES_PER_COMPONENT: usize = 10_000;
 /// [`MAX_OCCURRENCES_PER_COMPONENT`] binds. Whichever cap binds first wins.
 pub const EXPANSION_BYTES_BUDGET: usize = 4 * 1024 * 1024;
 
-/// Hard ceiling on recurrence-iterator steps for one component — the
-/// original #29 guard, kept: it bounds a *pathological rule* (one whose
-/// occurrences never reach `end_unix`), which the occurrence budget above
-/// cannot, since such a rule emits nothing while still looping.
+/// Hard ceiling on recurrence-iterator steps for one component — the original
+/// #29 guard, kept as the backstop for a rule that emits nothing while still
+/// looping, which the occurrence budget above cannot bound.
+///
+/// It counts *steps*, so until #1195 it bounded the wrong quantity: the
+/// iterator was always driven from `DTSTART`, so a `FREQ=HOURLY` series whose
+/// `DTSTART` is 2014 burned ~105 000 steps just crossing the twelve years
+/// between there and the window, tripped this cap **before emitting
+/// anything**, and returned 0 occurrences over the calendar's 43-day window
+/// for a rule that has 1 032 of them — i.e. every long-standing hourly event
+/// was simply absent from the panel. (#1190's doc claimed the guard only
+/// bounded rules that never reach the window; that was false there too.)
+/// [`skip_iterator_to_window`] now moves the iterator to the window before the
+/// loop starts, so what this counts is in-window steps and the occurrence
+/// budget is what binds in practice.
+///
+/// It still binds on the one path where the skip cannot be applied — an RRULE
+/// carrying `COUNT`, which libical refuses to fast-forward because starting
+/// late would change which occurrences the count selects. Such a rule is
+/// finite by construction; only a `COUNT` above this cap is truncated by it.
 const MAX_RECUR_ITERATIONS: u32 = 100_000;
+
+/// How far *before* the window start [`skip_iterator_to_window`] asks libical
+/// to re-anchor the iterator (#1195).
+///
+/// The skip target is an absolute instant, but the rule it re-anchors is
+/// evaluated in `DTSTART`'s own frame — which may be a named zone, may be
+/// floating (resolved against the viewer's local zone, #388), and for a DATE
+/// value carries no time-of-day at all. Rather than reproduce libical's
+/// internal conversion and be wrong at one edge, the skip deliberately
+/// undershoots by two days: comfortably more than the ±14 h of real-world UTC
+/// offset plus a day of DATE rounding, and cheap — the occurrences it
+/// over-generates are dropped by [`Emitter::emit`]'s window check, at most
+/// 2 880 extra steps even for `FREQ=MINUTELY`. Correctness of the *output*
+/// never rests on this number being exactly right, only on it being large
+/// enough: the emitted set is filtered against the real window either way.
+const SKIP_BACKOFF_SECS: i64 = 2 * 86_400;
+
+/// Why an expansion stopped short of the window's full occurrence set, so the
+/// single `warn!` at the end of [`expand_component`] names the cause rather
+/// than guessing — the two have opposite remedies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Truncation {
+    /// [`MAX_OCCURRENCES_PER_COMPONENT`] or [`EXPANSION_BYTES_BUDGET`] spent —
+    /// the component really does have more occurrences in the window than any
+    /// UI in this tree can show.
+    Budget,
+    /// [`MAX_RECUR_ITERATIONS`] steps without reaching the end of the window.
+    /// Since #1195 this is reachable only for a `COUNT` rule (the one shape
+    /// [`skip_iterator_to_window`] cannot fast-forward) whose count exceeds
+    /// the cap.
+    IterationGuard,
+}
+
+/// Fast-forward a freshly-created recurrence iterator to the query window, so
+/// the expansion loop's steps are in-window steps (#1195).
+///
+/// Returns `true` when the iterator was moved. `false` means "iterate from
+/// `DTSTART` as before" and is not an error; it happens for three reasons:
+/// the series starts inside (or just before) the window already, so there is
+/// nothing to skip; the skip time could not be built; or libical **refused**,
+/// which it does for an RRULE carrying `COUNT`, where starting late would
+/// change which occurrences the count selects.
+///
+/// # Safety
+///
+/// `iter` must be a live `ICalRecurIterator*` that has not been stepped yet —
+/// libical re-anchors the rule's state, so a partially-consumed iterator would
+/// silently restart. Borrowed: freed by the caller, never here.
+unsafe fn skip_iterator_to_window(
+    iter: *mut sys::ICalRecurIterator,
+    dtstart_unix: i64,
+    window_start: i64,
+) -> bool {
+    let Some(target) = window_start.checked_sub(SKIP_BACKOFF_SECS) else {
+        return false;
+    };
+    if target <= dtstart_unix {
+        // The series already starts at or after the target. libical's contract
+        // for this call is a time between DTSTART and UNTIL, and there would be
+        // nothing to gain anyway.
+        return false;
+    }
+    // SAFETY: `i_cal_timezone_get_utc_timezone` is nullary and returns
+    // libical's process-wide singleton — borrowed, never unref'd.
+    let utc = unsafe { sys::i_cal_timezone_get_utc_timezone() };
+    // SAFETY: the constructor takes a plain `time_t`, a DATE flag (0 — this is
+    // an absolute instant, not an all-day value) and the borrowed singleton
+    // above; it returns a **new** `ICalTime` ref this scope owns and releases
+    // on every path below.
+    let start = unsafe { sys::i_cal_time_new_from_timet_with_zone(target, 0, utc) };
+    if start.is_null() {
+        return false;
+    }
+    // SAFETY: `iter` is the live, unstepped iterator this function's contract
+    // guarantees, and `start` the live time just built — borrowed for the call
+    // only (the iterator copies the value out; its `sys` declaration says so).
+    let moved = unsafe { sys::i_cal_recur_iterator_set_start(iter, start) };
+    // SAFETY: the new ref taken above, released exactly once on this (the only
+    // remaining) exit path and never read after.
+    unsafe { sys::g_object_unref(start) }
+    moved != 0
+}
 
 /// Expand one master `comp` over `[start_unix, end_unix)` (POSIX UTC
 /// seconds), pushing each occurrence into `out`.
@@ -683,11 +785,15 @@ const MAX_RECUR_ITERATIONS: u32 = 100_000;
 ///   if its DTSTART falls before `end_unix` (the calendar service does the
 ///   has-it-ended filtering).
 /// - **Recurring** (RRULE present): drive libical's core recurrence iterator
-///   (`i_cal_recur_iterator_new` / `_next`) from DTSTART, emitting one
-///   instance per occurrence inside `[start_unix, end_unix)` and stopping
-///   once occurrences pass `end_unix` (so an unbounded series is window-
-///   capped). Per-occurrence duration is `DTEND − DTSTART` (or 0 if absent;
-///   the service fabricates a UI duration).
+///   (`i_cal_recur_iterator_new` / `_next`), emitting one instance per
+///   occurrence inside `[start_unix, end_unix)` and stopping once occurrences
+///   pass `end_unix` (so an unbounded series is window-capped). The iterator
+///   is re-anchored on the window before the first step via
+///   [`skip_iterator_to_window`] (#1195), so the occurrences between `DTSTART`
+///   and the window are never generated at all; it falls back to stepping
+///   from `DTSTART` for the one rule shape libical will not fast-forward, an
+///   RRULE carrying `COUNT`. Per-occurrence duration is `DTEND − DTSTART` (or
+///   0 if absent; the service fabricates a UI duration).
 ///
 /// On top of the RRULE/DTSTART occurrences, the component's recurrence-set
 /// modifiers are applied (RFC 5545 §3.8.5):
@@ -722,6 +828,15 @@ const MAX_RECUR_ITERATIONS: u32 = 100_000;
 /// - [`MAX_OCCURRENCES_PER_COMPONENT`] and [`EXPANSION_BYTES_BUDGET`] cap what
 ///   one component may contribute, whichever binds first, and truncation logs
 ///   exactly one `warn!` naming the component's UID.
+///
+/// A fourth bound arrived with #1195, and it is the one that decides whether
+/// the component appears at all: the iterator is skipped to the window before
+/// the loop starts, so the work is proportional to the occurrences *in* the
+/// window rather than to the age of the series. Without it a `FREQ=HOURLY`
+/// rule with a 2014 `DTSTART` spent its whole [`MAX_RECUR_ITERATIONS`] budget
+/// on occurrences nobody asked for and returned **nothing** — every
+/// long-standing hourly event missing from the panel, with a `warn!` that read
+/// like a truncation rather than a disappearance.
 ///
 /// # Safety
 ///
@@ -801,8 +916,9 @@ unsafe fn expand_component(
 
     // Set once the work budget (or the iteration guard) cut the expansion
     // short, so the `warn!` below fires exactly once per component however
-    // many occurrences were dropped.
-    let mut truncated = false;
+    // many occurrences were dropped. First cause wins — it is the one that
+    // stopped the loop.
+    let mut truncated: Option<Truncation> = None;
 
     // RRULE present?
     //
@@ -814,7 +930,9 @@ unsafe fn expand_component(
         unsafe { sys::i_cal_component_get_first_property(comp, sys::I_CAL_RRULE_PROPERTY) };
     if rrule_prop.is_null() {
         // No RRULE: DTSTART is the (sole) base occurrence; RDATE may add more.
-        truncated |= !emit.emit(out, dtstart_unix);
+        if !emit.emit(out, dtstart_unix) {
+            truncated = truncated.or(Some(Truncation::Budget));
+        }
     } else {
         // Recurring: iterate occurrences from DTSTART.
         // SAFETY: `rrule_prop` is the non-null property ref we hold; reading
@@ -829,13 +947,29 @@ unsafe fn expand_component(
             // from.
             let iter = unsafe { sys::i_cal_recur_iterator_new(rule, dtstart) };
             if !iter.is_null() {
+                // Skip straight to the window before stepping (#1195). Without
+                // this the loop below walks every occurrence since DTSTART:
+                // for an hourly series begun in 2014 that is ~105 000 steps
+                // before the first one the window wants, which trips
+                // MAX_RECUR_ITERATIONS and hands back an *empty* series. The
+                // call returns false when there is nothing to skip or when
+                // libical refuses (a COUNT rule), in which case the guard
+                // below is doing its original job.
+                //
+                // SAFETY: `iter` is the non-null iterator created directly
+                // above and not yet stepped — exactly what this callee
+                // requires; it borrows `iter` and frees nothing it did not
+                // itself create.
+                unsafe { skip_iterator_to_window(iter, dtstart_unix, start_unix) };
                 // A defensive cap: even with the time-window stop condition, a
-                // pathological rule shouldn't loop forever.
+                // pathological rule shouldn't loop forever. After a successful
+                // skip it counts in-window steps, so the occurrence budget
+                // binds long before it does.
                 let mut guard = 0u32;
                 loop {
                     guard += 1;
                     if guard > MAX_RECUR_ITERATIONS {
-                        truncated = true;
+                        truncated = truncated.or(Some(Truncation::IterationGuard));
                         break;
                     }
                     // SAFETY: `iter` is the non-null iterator we own and have
@@ -865,7 +999,7 @@ unsafe fn expand_component(
                     if !emit.emit(out, occ_unix) {
                         // Budget spent: stop stepping the iterator instead of
                         // running it to the end of the window for nothing.
-                        truncated = true;
+                        truncated = truncated.or(Some(Truncation::Budget));
                         break;
                     }
                 }
@@ -886,19 +1020,28 @@ unsafe fn expand_component(
     // RRULE-expanded set and subject to the same EXDATE exclusion.
     for rd in rdates {
         if !emit.emit(out, rd) {
-            truncated = true;
+            truncated = truncated.or(Some(Truncation::Budget));
             break;
         }
     }
 
-    if truncated {
-        tracing::warn!(
+    match truncated {
+        None => {}
+        Some(Truncation::Budget) => tracing::warn!(
             uid = uid_from_ical(&emit.ical).unwrap_or("(no UID)"),
             emitted = emit.emitted.len(),
             max_occurrences = emit.max_occurrences,
             "hytte-ecal: recurrence expansion truncated — this component alone \
              would fill the window with occurrences; showing the first ones only",
-        );
+        ),
+        Some(Truncation::IterationGuard) => tracing::warn!(
+            uid = uid_from_ical(&emit.ical).unwrap_or("(no UID)"),
+            emitted = emit.emitted.len(),
+            max_iterations = MAX_RECUR_ITERATIONS,
+            "hytte-ecal: recurrence expansion hit the iteration guard before \
+             covering the window — a COUNT rule too long to fast-forward past \
+             (#1195); the occurrences after the cap are missing",
+        ),
     }
 
     // SAFETY: the new `dtstart` ref taken at the top, released exactly once on
@@ -2518,6 +2661,310 @@ mod tests {
             inst.len(),
             expected,
             "a {len}-byte component must cap at EXPANSION_BYTES_BUDGET / {len}",
+        );
+    }
+
+    // ── Skipping to the window before iterating (issue #1195) ─────────────
+    //
+    // `MAX_RECUR_ITERATIONS` counts iterator *steps*, and the iterator was
+    // always driven from `DTSTART`. So the guard bounded the wrong quantity:
+    // a rule old enough to need more than 100 000 steps to reach the window
+    // was cut off *before emitting anything*, and every long-standing hourly
+    // (or minutely) event was silently absent from the calendar panel rather
+    // than merely truncated. `skip_iterator_to_window` re-anchors the
+    // iterator on the window first, so the steps the guard counts are
+    // in-window steps.
+    //
+    // These fixtures all start in **2014** — ~105 000 hours before the
+    // window, i.e. just past the old cap, which is what made the defect
+    // invisible for shorter histories.
+
+    /// 2014-01-01T09:00:00Z, the `DTSTART` the fixtures below share.
+    fn dtstart_2014() -> i64 {
+        use chrono::{TimeZone as _, Utc};
+        Utc.with_ymd_and_hms(2014, 1, 1, 9, 0, 0)
+            .unwrap()
+            .timestamp()
+    }
+
+    /// The widest window `hytte-services`' `calendar.rs` composes: 43 days
+    /// from `JUN_START`. Both ends land on an exact hour, so an hourly series
+    /// has exactly `43 × 24` occurrences inside it.
+    const WINDOW_43D_END: i64 = JUN_START + 43 * 86_400;
+
+    /// The headline of #1195: a `FREQ=HOURLY` rule whose `DTSTART` is 2014
+    /// must yield the window's **full** 43 × 24 = 1 032 occurrences.
+    ///
+    /// Measured on `origin/main` (and on #1190, whose doc claimed otherwise):
+    /// **0**. Twelve years of hourly occurrences is ~105 000 iterator steps,
+    /// just past `MAX_RECUR_ITERATIONS`, so the loop gave up in 2025 and the
+    /// component contributed nothing at all. 1 032 is comfortably under
+    /// `MAX_OCCURRENCES_PER_COMPONENT`, so nothing here is truncated either —
+    /// the answer is the whole series, not a capped prefix.
+    #[test]
+    fn an_hourly_rule_that_started_in_2014_yields_the_windows_full_1032_occurrences() {
+        let ical = "BEGIN:VEVENT\r\nUID:hourly-2014\r\nDTSTAMP:20140101T090000Z\r\n\
+                     DTSTART:20140101T090000Z\r\nDTEND:20140101T093000Z\r\n\
+                     SUMMARY:Long-standing\r\nRRULE:FREQ=HOURLY\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, WINDOW_43D_END).unwrap();
+
+        assert_eq!(
+            inst.len(),
+            43 * 24,
+            "a 2014 hourly rule must expand to the window's own hours; 0 here is \
+             the #1195 defect (the iteration guard tripped before the window)",
+        );
+        assert!(
+            inst.len() < super::MAX_OCCURRENCES_PER_COMPONENT,
+            "fixture must sit under the occurrence budget, or this tests truncation",
+        );
+        // Exactly the hourly grid of the window, in order, 30 minutes each.
+        for (i, e) in inst.iter().enumerate() {
+            let hour = i64::try_from(i).unwrap();
+            assert_eq!(e.start_unix, JUN_START + hour * 3_600, "occurrence {i}");
+            assert_eq!(e.end_unix, e.start_unix + 1_800, "occurrence {i} duration");
+            assert!(!e.all_day);
+        }
+    }
+
+    /// The same rule started *inside* the window is the control: it differs
+    /// from the 2014 one only by the nine hours before its own 09:00 `DTSTART`
+    /// on day one (1 023 vs 1 032). That is the whole of the difference the
+    /// age of a series may make — before #1195 it was 1 023 vs nothing.
+    #[test]
+    fn an_old_hourly_rule_and_a_fresh_one_differ_only_by_the_hours_before_dtstart() {
+        let old = "BEGIN:VEVENT\r\nUID:hourly-2014\r\nDTSTAMP:20140101T090000Z\r\n\
+                    DTSTART:20140101T090000Z\r\nDTEND:20140101T093000Z\r\n\
+                    SUMMARY:Old\r\nRRULE:FREQ=HOURLY\r\nEND:VEVENT\r\n";
+        let fresh = "BEGIN:VEVENT\r\nUID:hourly-2026\r\nDTSTAMP:20260601T090000Z\r\n\
+                      DTSTART:20260601T090000Z\r\nDTEND:20260601T093000Z\r\n\
+                      SUMMARY:Fresh\r\nRRULE:FREQ=HOURLY\r\nEND:VEVENT\r\n";
+
+        let old = super::expand_ical_for_test(old, JUN_START, WINDOW_43D_END).unwrap();
+        let fresh = super::expand_ical_for_test(fresh, JUN_START, WINDOW_43D_END).unwrap();
+
+        assert_eq!(fresh.len(), 1_023, "43 × 24 less the 9 hours before 09:00");
+        assert_eq!(
+            old.len(),
+            fresh.len() + 9,
+            "the only occurrences the 2014 rule adds are the 9 hours of day one \
+             that the 2026 rule has not started for yet",
+        );
+        // And from 09:00 on day one they are the same instants.
+        assert_eq!(
+            old[9..].iter().map(|e| e.start_unix).collect::<Vec<_>>(),
+            fresh.iter().map(|e| e.start_unix).collect::<Vec<_>>(),
+        );
+    }
+
+    /// `EXDATE` is applied to a skipped series exactly as to an unskipped one
+    /// — the skip moves the iterator, it does not bypass the recurrence-set
+    /// modifiers, which are read off the component and matched per occurrence.
+    #[test]
+    fn exdate_still_excludes_occurrences_of_a_skipped_series() {
+        let ical = "BEGIN:VEVENT\r\nUID:daily-2014\r\nDTSTAMP:20140101T090000Z\r\n\
+                     DTSTART:20140101T090000Z\r\nDTEND:20140101T093000Z\r\n\
+                     SUMMARY:Old standup\r\nRRULE:FREQ=DAILY\r\n\
+                     EXDATE:20260603T090000Z\r\nEXDATE:20260610T090000Z\r\n\
+                     END:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
+
+        assert_eq!(inst.len(), 28, "30 days of June less the two EXDATEs");
+        let starts: Vec<i64> = inst.iter().map(|e| e.start_unix).collect();
+        assert_eq!(starts[0], ANCHOR_0900, "June 1 survives");
+        for excluded in [ANCHOR_0900 + 2 * 86_400, ANCHOR_0900 + 9 * 86_400] {
+            assert!(
+                !starts.contains(&excluded),
+                "EXDATE {excluded} was not applied to the skipped series",
+            );
+        }
+    }
+
+    /// The skip target is an absolute UTC instant, but libical re-anchors the
+    /// rule in `DTSTART`'s own frame. `SKIP_BACKOFF_SECS` exists so that a
+    /// conversion this crate does not reproduce cannot cost an occurrence: a
+    /// `TZID=Europe/Berlin` series started in 2014 must still produce every
+    /// one of June's hours. (Two days of backoff against ±14 h of possible
+    /// offset; the over-generated occurrences are dropped by the window
+    /// filter.)
+    #[test]
+    fn a_zoned_series_started_in_2014_keeps_every_in_window_occurrence() {
+        let ical = berlin_calendar(
+            "UID:hourly-berlin-2014\r\nDTSTAMP:20140101T083000Z\r\n\
+             DTSTART;TZID=Europe/Berlin:20140101T093000\r\n\
+             DTEND;TZID=Europe/Berlin:20140101T094500\r\nSUMMARY:Zoned\r\n\
+             RRULE:FREQ=HOURLY\r\n",
+        );
+        let inst = super::expand_ical_for_test(&ical, JUN_START, JUL_START).unwrap();
+
+        // Berlin is CEST (UTC+2) for all of June, and the series sits on the
+        // half hour, so June's occurrences are the UTC grid …:30 — 24 a day,
+        // 30 days. The 2026-05-31T23:30Z occurrence ends at 23:45, before the
+        // window, so it is correctly excluded.
+        assert_eq!(inst.len(), 30 * 24, "June's half-hourly Berlin grid");
+        for (i, e) in inst.iter().enumerate() {
+            let hour = i64::try_from(i).unwrap();
+            assert_eq!(
+                e.start_unix,
+                JUN_START + 1_800 + hour * 3_600,
+                "occurrence {i} drifted — the skip landed in the wrong frame",
+            );
+        }
+    }
+
+    /// libical refuses to fast-forward an RRULE carrying `COUNT` (starting
+    /// late would change which occurrences the count selects), so such a rule
+    /// is still expanded from `DTSTART` — and must still come out right. A
+    /// 60-day count begun a month before the window contributes its
+    /// in-window tail and nothing else.
+    #[test]
+    fn a_count_rule_libical_will_not_skip_is_still_expanded_correctly() {
+        let ical = "BEGIN:VEVENT\r\nUID:daily-count\r\nDTSTAMP:20260501T090000Z\r\n\
+                     DTSTART:20260501T090000Z\r\nDTEND:20260501T093000Z\r\n\
+                     SUMMARY:Sixty days\r\nRRULE:FREQ=DAILY;COUNT=60\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, WINDOW_43D_END).unwrap();
+
+        // DTSTART is May 1; occurrences 31..59 of the count fall on or after
+        // June 1, and the count runs out well inside the window.
+        assert_eq!(inst.len(), 29, "occurrences 31..=59 of a 60-day count");
+        assert_eq!(inst[0].start_unix, ANCHOR_0900, "the June 1 occurrence");
+        for (i, e) in inst.iter().enumerate() {
+            let day = i64::try_from(i).unwrap();
+            assert_eq!(e.start_unix, ANCHOR_0900 + day * 86_400, "occurrence {i}");
+        }
+    }
+
+    /// A series that ended before the window contributes nothing: the skip
+    /// must not resurrect it by re-anchoring past its `UNTIL`.
+    #[test]
+    fn a_series_that_ended_before_the_window_stays_empty_after_the_skip() {
+        let ical = "BEGIN:VEVENT\r\nUID:hourly-until\r\nDTSTAMP:20140101T090000Z\r\n\
+                     DTSTART:20140101T090000Z\r\nDTEND:20140101T093000Z\r\n\
+                     SUMMARY:Finished\r\nRRULE:FREQ=HOURLY;UNTIL=20150101T000000Z\r\n\
+                     END:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, WINDOW_43D_END).unwrap();
+        assert!(
+            inst.is_empty(),
+            "a rule whose UNTIL is eleven years before the window emitted {} \
+             occurrences",
+            inst.len(),
+        );
+        assert!(
+            dtstart_2014() < JUN_START,
+            "fixture sanity: the series really does predate the window",
+        );
+    }
+
+    /// The residue #1195 deliberately leaves, pinned so it is a known shape
+    /// rather than a surprise: a `COUNT` rule is the one thing libical will
+    /// not fast-forward, so `MAX_RECUR_ITERATIONS` still binds on it from
+    /// `DTSTART`. A 200 000-hour count begun in 2014 runs out of steps ~2025,
+    /// before the window — nothing is emitted, and the expansion stays cheap
+    /// and logs the iteration-guard `warn!` rather than the budget one.
+    ///
+    /// The fix for this, if a real calendar ever produces one, is to compute
+    /// the skip arithmetically for the simple frequencies instead of asking
+    /// libical; it is not worth the second recurrence implementation until
+    /// something needs it.
+    #[test]
+    fn a_count_rule_too_long_to_fast_forward_is_still_bounded_by_the_guard() {
+        use std::time::{Duration, Instant};
+
+        let ical = "BEGIN:VEVENT\r\nUID:hourly-huge-count\r\nDTSTAMP:20140101T090000Z\r\n\
+                     DTSTART:20140101T090000Z\r\nDTEND:20140101T093000Z\r\n\
+                     SUMMARY:Pathological\r\nRRULE:FREQ=HOURLY;COUNT=200000\r\n\
+                     END:VEVENT\r\n";
+        let started = Instant::now();
+        let inst = super::expand_ical_for_test(ical, JUN_START, WINDOW_43D_END).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            inst.is_empty(),
+            "documented residue: 100 000 hourly steps from 2014 stop in 2025, \
+             short of the window — got {} occurrences instead, which means the \
+             skip now applies to COUNT rules and this test should become an \
+             equality on the real occurrence set",
+            inst.len(),
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the iteration guard no longer bounds a COUNT rule ({elapsed:?})",
+        );
+    }
+
+    /// The external fact the `COUNT` fallback rests on, pinned rather than
+    /// quoted from a header: libical **refuses** to re-anchor an iterator for
+    /// an RRULE carrying `COUNT` (starting late would change which occurrences
+    /// the count selects) and accepts one for a rule without it. Every
+    /// expansion-level assertion above would still pass if
+    /// `i_cal_recur_iterator_set_start` silently did nothing on a COUNT rule
+    /// — or silently restarted the count — so this reads the return value
+    /// directly. Change the answer here and `MAX_RECUR_ITERATIONS`'s doc,
+    /// `Truncation::IterationGuard` and the residue test below all become
+    /// wrong at once.
+    #[test]
+    fn libical_refuses_to_skip_a_count_rule_and_accepts_one_without() {
+        /// Build the iterator `expand_component` builds for a given RRULE and
+        /// report what `skip_iterator_to_window` says about skipping it to
+        /// June 2026.
+        fn iterator_skips(recurrence_rule: &str) -> bool {
+            let ical = format!(
+                "BEGIN:VEVENT\r\nUID:probe\r\nDTSTAMP:20140101T090000Z\r\n\
+                 DTSTART:20140101T090000Z\r\nDTEND:20140101T093000Z\r\n\
+                 SUMMARY:Probe\r\nRRULE:{recurrence_rule}\r\nEND:VEVENT\r\n"
+            );
+            let comp = super::parse_vevent(&ical).unwrap();
+            // SAFETY: `comp.raw` is the live VEVENT just parsed, owned by this
+            // scope until the `drop` below; the accessor returns a **new**
+            // `ICalTime` ref, released at the end.
+            let dtstart = unsafe { sys::i_cal_component_get_dtstart(comp.raw) };
+            // SAFETY: the same live component and libical's RRULE
+            // `ICalPropertyKind` discriminant; a **new** property ref (or
+            // null), released at the end.
+            let prop = unsafe {
+                sys::i_cal_component_get_first_property(comp.raw, sys::I_CAL_RRULE_PROPERTY)
+            };
+            assert!(!prop.is_null(), "fixture has an RRULE");
+            // SAFETY: `prop` is that non-null property; reading its value
+            // yields a **new** `ICalRecurrence` ref, released at the end.
+            let rule = unsafe { sys::i_cal_property_get_rrule(prop) };
+            assert!(!rule.is_null(), "fixture's RRULE parses");
+            // SAFETY: both arguments are live and stay borrowed until after
+            // the iterator is freed below, which is what libical requires of
+            // the rule and start time an iterator is built from.
+            let iter = unsafe { sys::i_cal_recur_iterator_new(rule, dtstart) };
+            assert!(!iter.is_null(), "iterator constructs");
+
+            // SAFETY: `iter` is the live iterator just built and not yet
+            // stepped — exactly this callee's contract.
+            let skipped = unsafe { super::skip_iterator_to_window(iter, 0, JUN_START) };
+
+            // SAFETY: the iterator this scope owns, freed exactly once and
+            // never stepped after.
+            unsafe { sys::i_cal_recur_iterator_free(iter) }
+            // SAFETY: the new `ICalRecurrence` ref above, released exactly
+            // once and only after the iterator built from it is freed.
+            unsafe { sys::g_object_unref(rule) }
+            // SAFETY: the new property ref above, released exactly once.
+            unsafe { sys::g_object_unref(prop) }
+            // SAFETY: the new `ICalTime` ref above, released exactly once and
+            // only after the iterator that borrowed it is freed.
+            unsafe { sys::g_object_unref(dtstart) }
+            drop(comp);
+            skipped
+        }
+
+        assert!(
+            iterator_skips("FREQ=HOURLY"),
+            "libical must accept the skip for a plain rule — without it the \
+             whole of #1195 is a no-op that happens to still pass its \
+             expansion tests only if nothing else changed",
+        );
+        assert!(
+            !iterator_skips("FREQ=HOURLY;COUNT=200000"),
+            "libical accepted a skip on a COUNT rule; the fallback path, its \
+             warn! and MAX_RECUR_ITERATIONS's doc are all written around the \
+             refusal",
         );
     }
 }

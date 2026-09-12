@@ -2513,12 +2513,19 @@ mod gtk_tests {
     ) -> Scripted {
         let dir = tempfile::tempdir().expect("a tempdir");
         let path = dir.path().join("host.sock");
-        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+        let runtime = hytte_reactive::runtime::handle();
+        // Binding a `UnixListener` registers it with a reactor, and a
+        // `#[gtk::test]` thread is in none — so the bind happens inside the
+        // shared runtime's context, the same one the tab's own client uses.
+        let listener = {
+            let _guard = runtime.enter();
+            tokio::net::UnixListener::bind(&path).expect("bind")
+        };
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
         let reply = Arc::new(reply);
         let served = seen.clone();
-        hytte_reactive::runtime::handle().spawn(async move {
+        runtime.spawn(async move {
             let mut n = 0usize;
             while let Ok((stream, _)) = listener.accept().await {
                 let reply = reply.clone();
@@ -2550,6 +2557,15 @@ mod gtk_tests {
             path,
             seen,
         }
+    }
+
+    /// How many `AgentStatus` round trips the daemon has been asked for — the
+    /// `Urls` request rides a good answer and is counted separately.
+    fn rosters_asked(hive: &Scripted) -> usize {
+        hive.seen()
+            .iter()
+            .filter(|line| line.contains("agent_status"))
+            .count()
     }
 
     /// One `AgentStatus` answer line carrying exactly these agents.
@@ -3339,7 +3355,7 @@ mod gtk_tests {
         pump_until(|| row_titles(&state) == ["stale"], 10);
 
         assert_eq!(
-            hive.seen().len(),
+            rosters_asked(&hive),
             1,
             "a slow hive stacked round trips: {:?}",
             hive.seen()
@@ -3351,7 +3367,7 @@ mod gtk_tests {
         refresh(&state);
         pump_until(|| row_titles(&state) == ["fresh"], 10);
         assert_eq!(row_titles(&state), ["fresh"]);
-        assert_eq!(hive.seen().len(), 2);
+        assert_eq!(rosters_asked(&hive), 2);
         dismiss(&window);
     }
 
@@ -3372,13 +3388,13 @@ mod gtk_tests {
         let window = present(&bin, 900);
 
         let poll = start_poll(&state, Duration::from_millis(20));
-        pump_until(|| hive.seen().len() >= 3, 10);
+        pump_until(|| rosters_asked(&hive) >= 3, 10);
         poll.remove();
 
         assert!(
-            hive.seen().len() >= 3,
-            "the timer stopped after {} request(s)",
-            hive.seen().len()
+            rosters_asked(&hive) >= 3,
+            "the timer stopped after {} roster request(s)",
+            rosters_asked(&hive)
         );
         dismiss(&window);
     }
@@ -3401,7 +3417,13 @@ mod gtk_tests {
         let (bin, state) = build_tab(cfg());
         let window = present(&bin, 360);
         apply(&state, &["argus", "beta", "gamma"]);
-        pump();
+        // An allocation is handed out on a frame-clock tick, not by draining
+        // the queue — so this waits for one rather than assuming `pump` was
+        // enough.
+        pump_until(
+            || state.by_name.borrow()["gamma"].row.height() > 0,
+            5,
+        );
 
         let scroller = state
             .list

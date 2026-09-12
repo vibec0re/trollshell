@@ -12,11 +12,11 @@ and the load fails behind a log line that says it worked. The test asserts the
 two are different certificates, so the prose in `src/tls.rs` is written against
 something rather than against a plausible-sounding guess.
 
-| file | what it is |
-| --- | --- |
-| `hive-ca.pem` | a self-signed CA, shaped like the hive CA `nix/host-modules/hive-tls.nix` mints (`CA:TRUE, pathlen:0`, `keyCertSign,cRLSign`) |
-| `gateway-leaf.pem` | a leaf for `hive.local` issued by it — what a gateway actually presents |
-| `trust-bundle.pem` | the anchor bundle a *trust store* wants: **CA first**, never the leaf |
+| file               | what it is                                                                                                                    |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `hive-ca.pem`      | a self-signed CA, shaped like the hive CA `nix/host-modules/hive-tls.nix` mints (`CA:TRUE, pathlen:0`, `keyCertSign,cRLSign`) |
+| `gateway-leaf.pem` | a leaf for `hive.local` issued by it — what a gateway actually presents                                                       |
+| `trust-bundle.pem` | the anchor bundle a _trust store_ wants: **CA first**, never the leaf                                                         |
 
 **No private keys are here.** They were deleted by the generator; nothing in
 this directory can sign anything, and none of these certificates is trusted by

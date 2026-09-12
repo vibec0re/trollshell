@@ -50,7 +50,7 @@ const TLS_FAILED: &str = "tls-failed";
 #[must_use]
 pub fn page(url: &str, policy: &TlsPolicy) -> gtk::Widget {
     // **Ephemeral**, not `NetworkSession::default()`: the default is the
-    // persistent one, which accumulates cookies, cache and IndexedDB under
+    // persistent one, which accumulates cookies, cache and `IndexedDB` under
     // `$XDG_{DATA,CACHE}_HOME` per app-id for ever, with nothing in this
     // window to clear it or mention it. A window that is opened to look at an
     // agent should not be quietly hoarding that agent's storage; the login the
@@ -97,10 +97,10 @@ pub fn page(url: &str, policy: &TlsPolicy) -> gtk::Widget {
     install_policy(&view, url, std::rc::Rc::new(elsewhere));
 
     // Deliberately **not** "accept and reload": that would be trust on first
-    // use with no human in it. Returning `false` lets WebKit render its own
+    // use with no human in it. Returning `false` lets `WebKit` render its own
     // failure page underneath, and we put ours in front of it — the operator
     // has no other source of instructions here, since the window has no
-    // address bar and WebKit's own text says only that the load failed.
+    // address bar and `WebKit`'s own text says only that the load failed.
     let sink = stack.clone();
     let error = failed.clone();
     view.connect_load_failed_with_tls_errors(move |_, failing_uri, _cert, errors| {
@@ -204,11 +204,11 @@ fn failure_state() -> adw::StatusPage {
 /// # Why `on_refuse` is a parameter
 ///
 /// [`page`] passes [`elsewhere`], and that is the only production value. It is
-/// injectable because **an ignored policy decision is silent**: WebKit aborts
+/// injectable because **an ignored policy decision is silent**: `WebKit` aborts
 /// the load and emits no `load-failed`, no `load-changed`, nothing — and
 /// `WebViewExt::uri` is set by `load_uri` *before* any decision, so it reads
 /// back the refused URI either way (measured, both). With no observable in the
-/// view, the only way to test the real handler through WebKit's real dispatch
+/// view, the only way to test the real handler through `WebKit`'s real dispatch
 /// is to watch what it hands out, which is what the display tests below do.
 fn install_policy(view: &webkit::WebView, embedded: &str, on_refuse: std::rc::Rc<dyn Fn(&str)>) {
     let origin = embedded.to_owned();
@@ -271,7 +271,8 @@ fn elsewhere(uri: &str) {
         tracing::warn!(%uri, "refused: only http(s) links leave this window");
         return;
     }
-    if let Err(e) = gtk::gio::AppInfo::launch_default_for_uri(uri, None::<&gtk::gio::AppLaunchContext>)
+    if let Err(e) =
+        gtk::gio::AppInfo::launch_default_for_uri(uri, None::<&gtk::gio::AppLaunchContext>)
     {
         tracing::warn!(%uri, error = %e, "the desktop could not open it");
     }
@@ -309,7 +310,7 @@ mod gtk_tests {
     /// environment this repo's CI has. Measured, in this container and with the
     /// same constraints the nix build sandbox imposes:
     ///
-    /// - With WebKit's sandbox on, creating a `WebView` **aborts the whole test
+    /// - With `WebKit`'s sandbox on, creating a `WebView` **aborts the whole test
     ///   binary**: `bwrap: Can't mount proc on /newroot/proc: Operation not
     ///   permitted`, then `Failed to fully launch dbus-proxy`, SIGABRT. Nested
     ///   user namespaces are not available here.
@@ -336,7 +337,7 @@ mod gtk_tests {
     /// | --- | --- |
     /// | which URIs may load in place | `page::navigable_in_place`'s tests — hermetic, and the mutation reds |
     /// | the page cannot open windows or reach `data:`/`file:` | [`the_settings_are_the_ones_we_state`] below, on the real `Settings` object |
-    /// | the handler is installed and refuses through WebKit's dispatch | **live-verify** (`docs/live-verify.md`, "The view stays on the hive") — it needs a machine with a working web process |
+    /// | the handler is installed and refuses through `WebKit`'s dispatch | **live-verify** (`docs/live-verify.md`, "The view stays on the hive") — it needs a machine with a working web process |
     ///
     /// [`the_settings_are_the_ones_we_state`]: gtk_tests::the_settings_are_the_ones_we_state
     /// **The page's permissions are the ones this file states**, read back off
@@ -382,7 +383,7 @@ mod gtk_tests {
         );
     }
 
-    /// …and the view is built **with** those settings, not with WebKit's
+    /// …and the view is built **with** those settings, not with `WebKit`'s
     /// defaults — the wiring the test above cannot see.
     ///
     /// Mutation (re-run this round, red): drop `.settings(&settings())` from
@@ -392,7 +393,8 @@ mod gtk_tests {
         use gtk::glib::object::ObjectExt as _;
         let w = page("https://hive.local/agent/stray/", &TlsPolicy::SystemStore);
         let view = view_of(&w).expect("the page widget carries the view");
-        let s = webkit::prelude::WebViewExt::settings(&view).expect("the view was built with settings");
+        let s =
+            webkit::prelude::WebViewExt::settings(&view).expect("the view was built with settings");
         assert!(!s.is_javascript_can_open_windows_automatically());
         assert!(!s.property::<bool>("allow-modal-dialogs"));
         assert!(!s.property::<bool>("allow-top-navigation-to-data-urls"));
@@ -414,7 +416,7 @@ mod gtk_tests {
         );
     }
 
-    /// The session is **ephemeral**: no cookies, cache or IndexedDB left under
+    /// The session is **ephemeral**: no cookies, cache or `IndexedDB` left under
     /// `$XDG_{DATA,CACHE}_HOME` after the window closes (#1130 L6).
     ///
     /// Mutation (re-run this round, red): go back to

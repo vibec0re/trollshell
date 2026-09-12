@@ -416,7 +416,10 @@ mod tests {
                 !s.contains("to this agent"),
                 "a verb phrase in a bare-verb slot does not parse: {s}"
             );
-            assert!(s.starts_with("couldn't ") || s.starts_with("the hive "), "{s}");
+            assert!(
+                s.starts_with("couldn't ") || s.starts_with("the hive "),
+                "{s}"
+            );
         }
     }
 

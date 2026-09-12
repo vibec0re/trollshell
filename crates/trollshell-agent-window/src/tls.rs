@@ -52,7 +52,7 @@
 //! certificate present in @info"*, and the `load-failed-with-tls-errors` doc
 //! spells out where that value is meant to come from: *"to continue loading
 //! use `…allow_tls_certificate_for_host()` with the certificate \[from the
-//! signal\] and the host of failing_uri"* — i.e. the server's own certificate
+//! signal\] and the host of `failing_uri`"* — i.e. the server's own certificate
 //! (`WebKit-6.0.gir:10812-10820` and `:28594-28601`). It is an exception for
 //! one certificate, not a trust anchor.
 //!
@@ -317,19 +317,12 @@ mod tests {
     /// layer down, where it actually lives — **the first PEM block of the
     /// bundle is not the leaf**. That is precisely what `from_file` would read
     /// ("the first certificate, with the rest as its issuer chain") and
-    /// precisely what WebKit then fails to match against the server's own.
+    /// precisely what `WebKit` then fails to match against the server's own.
     ///
     /// Mutation (re-run this round, red): compare `gateway-leaf.pem` with
     /// itself — i.e. assert the thing the old docs implied — and it reds.
     #[test]
     fn a_bundle_is_not_the_certificate_the_gateway_presents() {
-        let fixture = |name: &str| {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures")
-                .join(name);
-            std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("missing fixture {} ({e})", path.display()))
-        };
         /// The first PEM block — what `gio::TlsCertificate::from_file` takes as
         /// *the* certificate, treating everything after it as the chain.
         fn first_block(pem: &str) -> &str {
@@ -342,6 +335,14 @@ mod tests {
                 + start;
             &pem[start..end]
         }
+
+        let fixture = |name: &str| {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(name);
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("missing fixture {} ({e})", path.display()))
+        };
 
         let bundle = fixture("trust-bundle.pem");
         let leaf = fixture("gateway-leaf.pem");
@@ -362,7 +363,10 @@ mod tests {
         // …and the leaf compared with itself *is* equal, so the assertion above
         // is about the bundle and not about the comparison being unable to say
         // yes.
-        assert_eq!(first_block(&leaf), first_block(&fixture("gateway-leaf.pem")));
+        assert_eq!(
+            first_block(&leaf),
+            first_block(&fixture("gateway-leaf.pem"))
+        );
     }
 
     /// The inline error state names the failing host and **both** routes, and
@@ -370,7 +374,7 @@ mod tests {
     ///
     /// Mutation (re-run this round, red): drop either route, or the host, and
     /// this reds. A TLS failure is the one moment the operator has no other
-    /// source of instructions — the window has no address bar and WebKit's own
+    /// source of instructions — the window has no address bar and `WebKit`'s own
     /// error page says only "load failed".
     #[test]
     fn the_failure_state_names_the_host_and_both_routes() {

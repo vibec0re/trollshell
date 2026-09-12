@@ -25,8 +25,7 @@ use crate::feed::{self, AgentState, Update};
 use crate::{cli, page, tls, ui, webview};
 
 /// What the window shows before the hive has a page URL for this agent.
-pub const NO_PAGE: &str =
-    "This hive publishes no page for this agent yet — its domain is unconfigured, or the agent is \
+pub const NO_PAGE: &str = "This hive publishes no page for this agent yet — its domain is unconfigured, or the agent is \
      not on its roster. The header above still follows the agent's live status.";
 
 /// One agent's window.
@@ -290,10 +289,10 @@ mod gtk_tests {
     use super::{NO_PAGE, Window};
     use crate::cli::Tab;
     use crate::feed::{AgentState, Update};
+    use gtk::prelude::*;
     use hytte_plugin_agents::config::AgentsConfig;
     use hytte_plugin_agents::hive::wire::{AgentStatusRow, HiveUrls, Request, Scope};
     use hytte_plugin_agents::model::{Agent, AgentName};
-    use gtk::prelude::*;
     use std::rc::Rc;
     use tokio::sync::mpsc;
 

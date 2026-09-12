@@ -393,10 +393,13 @@ mod tests {
                     ..running()
                 },
             ),
-            (Status::Stopped, AgentStatusRow {
-                running: false,
-                ..running()
-            }),
+            (
+                Status::Stopped,
+                AgentStatusRow {
+                    running: false,
+                    ..running()
+                },
+            ),
             (Status::Running, running()),
         ];
         let covered: Vec<Status> = rows.iter().map(|(s, _)| *s).collect();

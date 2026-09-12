@@ -578,7 +578,6 @@ whole point of the window.
       on an error state** rather than the page. Confirm that state names the
       failing host and all three routes (not WebKit's bare "load failed"), then
       take the first one that applies:
-
   1. **The hive is on this machine** — the `singleHostSwarm` case, i.e. yours.
      Reference hyperhive's own option rather than typing the path (Mara's ask
      on #948), so the two sides cannot drift if that directory moves:
@@ -598,7 +597,7 @@ whole point of the window.
      — its leaf, **not** the bundle — because
      `allow_tls_certificate_for_host` pins a certificate rather than adding an
      anchor. `openssl s_client -connect <host>:443 -showcerts </dev/null |
-     openssl x509` produces it. Pointing it at `trust-bundle.pem` gets you an
+openssl x509` produces it. Pointing it at `trust-bundle.pem` gets you an
      INFO line saying it worked and an error page anyway (#1130 M3).
 
   Whichever you use, confirm the page then loads _and_ that an unrelated https

@@ -111,7 +111,10 @@ mod tests {
     #[test]
     fn only_the_agents_own_origin_loads_in_our_chrome() {
         let page = "https://hive.local/agent/stray/?hide=header,input";
-        assert!(navigable_in_place(page, "https://hive.local/agent/stray/turn/3"));
+        assert!(navigable_in_place(
+            page,
+            "https://hive.local/agent/stray/turn/3"
+        ));
         assert!(!navigable_in_place(page, "https://evil.example/login"));
         assert!(!navigable_in_place(page, "http://hive.local/agent/stray/"));
         assert!(!navigable_in_place(page, "file:///etc/passwd"));

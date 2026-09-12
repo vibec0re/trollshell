@@ -12,8 +12,8 @@ use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 
-use trollshell_agent_window::window::Window;
 use trollshell_agent_window::cli;
+use trollshell_agent_window::window::Window;
 
 /// Default `tracing` level when `RUST_LOG` is unset — `INFO`, matching the
 /// shell (#746) and the control center (#780). `fmt::init()`'s own fallback is

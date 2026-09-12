@@ -426,6 +426,9 @@ async fn the_hives_urls_are_fetched_once() {
 /// per poll" assertion does.
 #[tokio::test(start_paused = true)]
 async fn urls_are_retried_with_backoff_until_the_hive_answers() {
+    /// Enough polls that a per-poll ask and a backed-off one are far apart.
+    const POLLS: usize = 40;
+
     // No `with_urls`: the fake answers the verb with a bare success carrying
     // no urls, which is what a hive that cannot answer looks like.
     let hive = FakeHive::script(&[&roster(r#"{"name":"stray","running":true}"#)]);
@@ -440,7 +443,6 @@ async fn urls_are_retried_with_backoff_until_the_hive_answers() {
     ));
     let _seed = next_state(&mut out_rx, "the seed poll").await;
 
-    const POLLS: usize = 40;
     for _ in 0..POLLS {
         one_cadence(&hive, CADENCE).await;
     }

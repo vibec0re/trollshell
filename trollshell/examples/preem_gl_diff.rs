@@ -1160,7 +1160,10 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
             channel.mean,
             channel.p99,
             channel.max,
-            if channel.inside_ceiling() || !gated {
+            // The ceiling is only this case's contract at 1:1; a supersampled
+            // case answers to the region split instead, so the annotation
+            // would be pointing at a number nothing is judging.
+            if channel.inside_ceiling() || case.sampling() != parity::Sampling::OneToOne {
                 ""
             } else {
                 "   <-- outside the ceiling"

@@ -1873,7 +1873,12 @@
     font-variant-numeric: tabular-nums;
 }
 
-.ts-sparkline {
+/* The shell's override of the library's `.hytte-sparkline` default (#1180
+   item 7). The widget carries a `hytte-` class now, because `hytte-ui` is
+   where it is built and its stylesheet is what has to be able to style it;
+   this rule restates the two properties at the user stylesheet's higher
+   priority, so tuning the shell's sparkline stays a change in this file. */
+.hytte-sparkline {
     color: @accent_color;
     min-height: 1.846em;
 }

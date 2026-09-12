@@ -133,42 +133,60 @@ pub(crate) enum Verdict {
     NotBitExact,
 }
 
-/// Which kit widget a case is measuring, because the two are **not** held to
-/// the same standard (#1143).
+/// Which kit widget a case is measuring, because the two do **not** take the
+/// same structural checks (#1143).
 ///
 /// The ceiling (mean ≤ 2 / p99 ≤ 8 / max ≤ 32 per channel) is #893's, and it
-/// is what Annika agreed to on that thread. What `TROLLSHELL_PARITY_EXACT=1`
-/// adds on top is a *measurement*, not a design target: under llvmpipe the
-/// scope's twelve cases have come out bit-exact since #1078, so CI pins them
-/// at 0 and a 1–6/255 regression that still clears the ceiling fails anyway
-/// (#1080).
+/// is what Annika agreed to on that thread — it is what every real driver
+/// faces, and nothing here touches it. What `TROLLSHELL_PARITY_EXACT=1` adds
+/// on top is a *measurement*, not a design target: it is exported in exactly
+/// one place, `nix/checks/system-tests.nix`, inside the llvmpipe sandbox, so
+/// it is a regression detector for one pinned software rasteriser and costs
+/// nothing on hardware.
 ///
-/// The gauge cannot be held to that and should not be. Annika's word on #865
-/// was "does not have to be pixel perfect identical — could be even better",
-/// and the GL gauge is a **different rasteriser**: the kit walks a bounding box
-/// per shape accumulating `u16` coverage, this evaluates the same distance
-/// fields per fragment in `highp float`. They agree to within rounding, not to
-/// the bit, and pretending otherwise would mean either loosening the *scope's*
-/// pin — throwing away the sharpest regression detector in the tree — or
-/// tuning the gauge's shader against llvmpipe's last bit, which is not a
-/// property any other driver would reproduce.
+/// **Both kinds are pinned there** (#1148 review, HIGH-1). The gauge was not,
+/// on the argument that it is a different rasteriser — the kit walks a
+/// bounding box per shape accumulating `u16` coverage, the shader evaluates
+/// the same distance fields per fragment in `highp float` — and that Annika's
+/// "does not have to be pixel perfect identical" on #865 said so. Both halves
+/// were wrong about *this* variable. Annika's word was permission for the GL
+/// arm to look different on glass, which the ceiling already grants; and the
+/// twelve gauge cases have measured `max |Δ| 0` on every channel under
+/// llvmpipe since the day the arm landed, so the sensitivity is there to be
+/// had. Without the pin the review's 9 % widening of every minor tick
+/// (`gauge.frag`'s `MINOR_HW`, 0.55 → 0.60) reported worst-channel mean 0.044
+/// / p99 2 / max 3 and shipped green — ~45× inside a ceiling built for a GPU
+/// nobody has run this on.
 ///
-/// So the pin is per kind, and this enum is where that is written down once.
+/// A pin is only ever as good as the measurement under it, and the Mesa-bump
+/// risk is real: `nix flake update` can red this on a PR that touched no
+/// shader. That risk was accepted for the scope in #1080 and
+/// `nix/checks/system-tests.nix` already documents the response (re-measure on
+/// the new Mesa; never raise the ceiling).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
     /// `preem.scope` — pinned bit-exact under `TROLLSHELL_PARITY_EXACT=1`, and
     /// structurally checked with the per-column peak-row test.
     Scope,
-    /// `preem.gauge` (#1143) — the #893 ceiling and nothing tighter.
+    /// `preem.gauge` (#1143) — pinned bit-exact too, since #1148's review; no
+    /// peak-row check, which is a beam statistic.
     Gauge,
 }
 
 impl Kind {
     /// Whether `TROLLSHELL_PARITY_EXACT=1` holds this kind to a zero delta.
     ///
-    /// **Only what has been measured at zero.** See the type docs.
+    /// **Only what has been measured at zero** — which, since #1148's review,
+    /// is both of them. See the type docs.
+    ///
+    /// An exhaustive `match` rather than a `matches!`, deliberately: a third
+    /// kind (#1144) must not inherit an answer by falling off the end of a
+    /// pattern. Whoever adds it has to look at their own llvmpipe numbers and
+    /// say which of the two this is, and the compiler makes them.
     pub(crate) fn pinned_exact(self) -> bool {
-        matches!(self, Self::Scope)
+        match self {
+            Self::Scope | Self::Gauge => true,
+        }
     }
 
     /// Whether the per-column **peak-row** check applies.
@@ -195,16 +213,53 @@ impl Kind {
     }
 }
 
+/// How a case's two buffers were brought to the same grid before comparing
+/// (#1148 review, HIGH-2).
+///
+/// The exact pin is a statement about **one** comparison: the GL arm and the
+/// kit rasterising the same picture at the same resolution, pixel against
+/// pixel. A supersampled case is a different question — the GL arm rendered at
+/// `factor` times the kit's grid and the harness box-averaged it back down —
+/// and box-averaging a differently-anti-aliased render is not an operation
+/// that can land on the kit's last bit, nor should it: the whole point of
+/// rendering at `scale = 2` is that the edges are *not* the kit's. So those
+/// cases take the #893 ceiling and stop there, whatever [`Kind::pinned_exact`]
+/// says.
+///
+/// It is a property of the case rather than of the kind for the same reason
+/// `Kind` exists at all: one widget can be measured both ways, and the gauge is
+/// (`scale = 1` bit-exact, `scale = 2` under the ceiling).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sampling {
+    /// One GL pixel per kit pixel: the comparison the exact pin is about.
+    OneToOne,
+    /// The GL arm rendered `factor`× the kit's grid on each axis and the
+    /// readback was box-averaged back down — see [`box_downsample`].
+    Supersampled(u32),
+}
+
+impl Sampling {
+    /// Whether this comparison is one the exact pin can meaningfully hold.
+    pub(crate) fn can_be_bit_exact(self) -> bool {
+        self == Self::OneToOne
+    }
+}
+
 /// The full verdict for one case: the shared ceiling and guards, plus the
-/// per-kind exact pin (#1143).
+/// per-kind exact pin (#1143) where the comparison admits one (#1148).
 ///
 /// Split from [`Stats::verdict_for`] rather than folded into it because the two
 /// answer different questions: that one is "do these two buffers agree", a
 /// property of the pixels alone, and this one is "does this *case* pass",
-/// which also depends on which widget it is and on an environment variable.
-/// Keeping the pixel statistic free of both is what lets the tests below drive
-/// it on synthetic buffers.
-pub(crate) fn case_verdict(stats: &Stats, kind: Kind, exact: bool) -> Verdict {
+/// which also depends on which widget it is, how it was sampled, and on an
+/// environment variable. Keeping the pixel statistic free of all three is what
+/// lets the tests below drive it on synthetic buffers.
+pub(crate) fn case_verdict(
+    stats: &Stats,
+    kind: Kind,
+    sampling: Sampling,
+    exact: bool,
+) -> Verdict {
     let verdict = stats.verdict_for(kind);
     if !verdict.is_pass() {
         return verdict;
@@ -213,10 +268,60 @@ pub(crate) fn case_verdict(stats: &Stats, kind: Kind, exact: bool) -> Verdict {
     // `|Δ| == 0`": mean and p99 are drawn from that same non-negative
     // distribution and cannot exceed its max.
     let bit_exact = stats.channels.iter().all(|c| c.max == 0.0);
-    if exact && kind.pinned_exact() && !bit_exact {
+    if exact && kind.pinned_exact() && sampling.can_be_bit_exact() && !bit_exact {
         return Verdict::NotBitExact;
     }
     Verdict::Pass
+}
+
+/// Box-average a bottom-up RGBA8 framebuffer readback down by `factor` on each
+/// axis, for the supersampled comparison [`Sampling::Supersampled`] names.
+///
+/// Returns the averaged buffer and its new `(width, height)`, in the **same**
+/// bottom-up convention, so the result drops straight into a [`Layout`] with no
+/// other change. Row order is a reversal and blocks of `factor` rows stay
+/// blocks under it as long as the height divides, which it does: the GL grid is
+/// the kit's grid times the integer upscale.
+///
+/// Rounding is half-up over the block (`+ n/2` before the divide), which is the
+/// kit's own convention in `mix` — the harness must not introduce a bias of its
+/// own to the thing it is measuring.
+///
+/// A `factor` of `0` or `1`, or an allocation that does not divide by it, hands
+/// the buffer back untouched: this is a harness, and silently reshaping a
+/// framebuffer it did not understand is exactly how #1072 measured nothing for
+/// twelve cases.
+pub(crate) fn box_downsample(gl: &[u8], alloc: (u32, u32), factor: u32) -> (Vec<u8>, (u32, u32)) {
+    let (w, h) = (alloc.0 as usize, alloc.1 as usize);
+    let n = factor as usize;
+    if n <= 1 || w % n != 0 || h % n != 0 || gl.len() < w * h * 4 {
+        return (gl.to_vec(), alloc);
+    }
+    let (out_w, out_h) = (w / n, h / n);
+    let taps = (n * n) as u32;
+    let mut out = Vec::with_capacity(out_w * out_h * 4);
+    for by in 0..out_h {
+        for bx in 0..out_w {
+            for channel in 0..4 {
+                let mut sum = 0_u32;
+                for dy in 0..n {
+                    for dx in 0..n {
+                        let i = (((by * n + dy) * w) + bx * n + dx) * 4 + channel;
+                        sum += u32::from(gl[i]);
+                    }
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                out.push(((sum + taps / 2) / taps).min(255) as u8);
+            }
+        }
+    }
+    (
+        out,
+        (
+            u32::try_from(out_w).unwrap_or(0),
+            u32::try_from(out_h).unwrap_or(0),
+        ),
+    )
 }
 
 impl Verdict {
@@ -565,8 +670,8 @@ fn distribution(deltas: &mut [u8]) -> ChannelStats {
 #[cfg(test)]
 mod tests {
     use super::{
-        CEILING_MAX, CEILING_MEAN, CEILING_P99, ChannelStats, Kind, Layout, Stats, Verdict,
-        case_verdict, compare, distribution, peak_row_tolerance,
+        CEILING_MAX, CEILING_MEAN, CEILING_P99, ChannelStats, Kind, Layout, Sampling, Stats,
+        Verdict, box_downsample, case_verdict, compare, distribution, peak_row_tolerance,
     };
 
     /// A `Stats` whose **worst pixel** is `delta` 255ths off on every channel,
@@ -592,43 +697,55 @@ mod tests {
         }
     }
 
-    /// **The pin is per kind** (#1143): `TROLLSHELL_PARITY_EXACT=1` holds the
-    /// scope to a zero delta and does not touch the gauge.
+    /// **`TROLLSHELL_PARITY_EXACT=1` pins both kinds at a 1:1 grid** (#1148
+    /// review, HIGH-1), and pins neither where the comparison was
+    /// supersampled (HIGH-2).
     ///
-    /// This is the whole of Annika's "does not have to be pixel perfect
-    /// identical" on #865, made into an assertion rather than a convention. A
-    /// gauge case five 255ths off passes under the same env that fails a scope
-    /// case one 255th off — and without the split, honouring her word would
-    /// have meant dropping the scope's pin, which is the sharpest regression
-    /// detector the GL renderer has.
+    /// The pin used to be the scope's alone, on the reading that Annika's "does
+    /// not have to be pixel perfect identical" (#865) applied to it. It did
+    /// not: that variable is exported in one place, the llvmpipe sandbox
+    /// (`nix/checks/system-tests.nix`), so it never reaches the glass her word
+    /// was about, and the gauge's twelve `scale = 1` cases have measured
+    /// `max |Δ| 0` from the day the arm landed. Unpinned, a 9 % widening of
+    /// every minor tick reported a worst-channel max of 3 against a ceiling of
+    /// 32 and shipped green.
     ///
-    /// **Falsified** three ways, each moving exactly one assertion: make
-    /// [`Kind::pinned_exact`] answer `true` for the gauge (the first goes red);
-    /// make it answer `false` for the scope, or drop the `exact &&` guard from
-    /// [`case_verdict`] (the second and the third).
+    /// What the ceiling alone still governs is the `scale = 2` comparison,
+    /// where the GL frame is box-averaged down from a render the kit never
+    /// made. That one cannot be bit-exact by construction, and asking it to be
+    /// would be asking the improvement not to happen.
+    ///
+    /// **Falsified** four ways, each moving exactly one assertion: make
+    /// [`Kind::pinned_exact`] answer `false` for either kind (the first two);
+    /// drop the `exact &&` guard from [`case_verdict`] (the third); drop its
+    /// `sampling.can_be_bit_exact()` guard (the last).
     #[test]
-    fn the_exact_pin_binds_the_scope_and_not_the_gauge() {
+    fn the_exact_pin_binds_both_kinds_at_one_to_one_and_neither_supersampled() {
+        for kind in [Kind::Scope, Kind::Gauge] {
+            assert_eq!(
+                case_verdict(&inside_by(1.0), kind, Sampling::OneToOne, true),
+                Verdict::NotBitExact,
+                "a {} case one 255th off is inside the ceiling and still fails, \
+                 because llvmpipe has never measured anything but 0",
+                kind.label(),
+            );
+            assert_eq!(
+                case_verdict(&inside_by(0.0), kind, Sampling::OneToOne, true),
+                Verdict::Pass,
+                "a bit-exact {} case passes the pin",
+                kind.label(),
+            );
+        }
         assert_eq!(
-            case_verdict(&inside_by(5.0), Kind::Gauge, true),
-            Verdict::Pass,
-            "a gauge case five 255ths off is inside the ceiling, and the ceiling \
-             is the whole contract for it",
-        );
-        assert_eq!(
-            case_verdict(&inside_by(1.0), Kind::Scope, true),
-            Verdict::NotBitExact,
-            "a scope case one 255th off is inside the ceiling and still fails, \
-             because llvmpipe has never measured anything but 0",
-        );
-        assert_eq!(
-            case_verdict(&inside_by(1.0), Kind::Scope, false),
+            case_verdict(&inside_by(1.0), Kind::Scope, Sampling::OneToOne, false),
             Verdict::Pass,
             "…and without the env it is the ceiling alone, on both kinds",
         );
         assert_eq!(
-            case_verdict(&inside_by(0.0), Kind::Scope, true),
+            case_verdict(&inside_by(5.0), Kind::Gauge, Sampling::Supersampled(2), true),
             Verdict::Pass,
-            "a bit-exact scope case passes the pin",
+            "a supersampled case is held to the ceiling and nothing tighter — it is a \
+             box-average of a render the kit never made",
         );
     }
 
@@ -639,12 +756,14 @@ mod tests {
     fn the_ceiling_and_the_blank_guards_come_before_the_pin() {
         let over = inside_by(CEILING_MAX + 1.0);
         for kind in [Kind::Scope, Kind::Gauge] {
-            assert_eq!(
-                case_verdict(&over, kind, true),
-                Verdict::OverCeiling,
-                "{} is still held to #893's ceiling",
-                kind.label(),
-            );
+            for sampling in [Sampling::OneToOne, Sampling::Supersampled(2)] {
+                assert_eq!(
+                    case_verdict(&over, kind, sampling, true),
+                    Verdict::OverCeiling,
+                    "{} is still held to #893's ceiling",
+                    kind.label(),
+                );
+            }
         }
         let blank = Stats {
             uniform: true,
@@ -652,7 +771,7 @@ mod tests {
             ..inside_by(0.0)
         };
         assert_eq!(
-            case_verdict(&blank, Kind::Gauge, true),
+            case_verdict(&blank, Kind::Gauge, Sampling::OneToOne, true),
             Verdict::RendersNothing,
             "a gauge that drew nothing is bit-exactly nothing — the guard, not the pin",
         );
@@ -673,15 +792,87 @@ mod tests {
             ..inside_by(0.0)
         };
         assert_eq!(
-            case_verdict(&moved, Kind::Gauge, true),
+            case_verdict(&moved, Kind::Gauge, Sampling::OneToOne, true),
             Verdict::Pass,
             "a gauge is not a beam",
         );
         assert_eq!(
-            case_verdict(&moved, Kind::Scope, true),
+            case_verdict(&moved, Kind::Scope, Sampling::OneToOne, true),
             Verdict::BeamMoved,
             "…and the scope keeps the check unchanged",
         );
+    }
+
+    /// [`box_downsample`] averages each `factor`×`factor` block, keeps the
+    /// bottom-up row order, and hands the buffer back untouched when it cannot
+    /// do either.
+    ///
+    /// The three properties the `scale = 2` harness cases rest on. The middle
+    /// one is the one that would fail silently: a downsample that reversed the
+    /// rows would still produce a plausible-looking frame, and every delta
+    /// would then be measured against a vertically mirrored dial — which on a
+    /// gauge, whose face is roughly top-heavy but not symmetric, reads as a
+    /// large-but-not-absurd number rather than as an obvious bug.
+    ///
+    /// **Falsified** by averaging `n` columns but only one row (the gradient
+    /// assertion goes red), by iterating the output rows in reverse (the same
+    /// one), or by dropping the `w % n != 0` guard (the last assertion panics
+    /// on an out-of-range index instead of returning).
+    #[test]
+    fn the_box_downsample_averages_blocks_and_keeps_the_row_order() {
+        // 4×4 RGBA, bottom-up, with a distinct value per row so a flip shows.
+        let mut buf = Vec::new();
+        for y in 0..4_u8 {
+            for _ in 0..4 {
+                buf.extend_from_slice(&[y * 10, y * 10 + 1, y * 10 + 2, 255]);
+            }
+        }
+        let (out, alloc) = box_downsample(&buf, (4, 4), 2);
+        assert_eq!(alloc, (2, 2), "each axis halves");
+        assert_eq!(out.len(), 2 * 2 * 4, "…and so does the buffer");
+        // Rows 0 and 1 average to 5 on R; rows 2 and 3 to 25. Bottom-up order
+        // means the first output row is still the first input block.
+        assert_eq!(out[0], 5, "the first block is the average of input rows 0-1");
+        assert_eq!(
+            out[2 * 4], 25,
+            "and the second output row is input rows 2-3, not 0-1 mirrored",
+        );
+        assert_eq!(out[3], 255, "alpha rides through the same average");
+
+        let (same, alloc) = box_downsample(&buf, (4, 4), 1);
+        assert_eq!((same.len(), alloc), (buf.len(), (4, 4)), "factor 1 is a copy");
+        let (odd, alloc) = box_downsample(&buf, (4, 4), 3);
+        assert_eq!(
+            (odd.len(), alloc),
+            (buf.len(), (4, 4)),
+            "a factor the allocation does not divide by is refused, not guessed",
+        );
+    }
+
+    /// Box-averaging a frame that is already the replication of a smaller one
+    /// recovers the smaller one **exactly**.
+    ///
+    /// This is the arithmetic the `scale = 2` cases lean on: the kit renders
+    /// logically and replicates, so its own native frame downsamples back to
+    /// its logical frame with no residue, and every 255th the harness then
+    /// reports is the GL arm's own. Half-up rounding is what makes it exact
+    /// here — every block is four copies of one value, so the sum is `4v` and
+    /// `(4v + 2) / 4 == v` for every `v` in `0..=255`.
+    #[test]
+    fn a_replicated_frame_downsamples_back_to_itself() {
+        let logical: Vec<u8> = (0..(3 * 2 * 4)).map(|i| (i * 7 % 256) as u8).collect();
+        let (w, h) = (3_usize, 2_usize);
+        let mut native = vec![0_u8; w * 2 * h * 2 * 4];
+        for y in 0..h * 2 {
+            for x in 0..w * 2 {
+                let src = ((y / 2) * w + x / 2) * 4;
+                let dst = (y * w * 2 + x) * 4;
+                native[dst..dst + 4].copy_from_slice(&logical[src..src + 4]);
+            }
+        }
+        let (back, alloc) = box_downsample(&native, (6, 4), 2);
+        assert_eq!(alloc, (3, 2));
+        assert_eq!(back, logical, "a 2× replication box-averages back to itself");
     }
 
     /// A `w`×`h` top-down RGBA8 frame from a per-pixel colour function.

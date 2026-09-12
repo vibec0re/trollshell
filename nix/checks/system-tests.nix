@@ -184,13 +184,18 @@ craneLib.mkCargoDerivation (
       # suspecting the diff — and the fix is to re-measure, never to
       # raise the ceiling `#893`/`#1078` settled for real hardware.
       #
-      # Since #1143 the pin is **per kind**, and that decision lives in
-      # the harness (`preem_gl::parity`'s `Kind`), not here: this
-      # variable still means "hold what has been measured at zero to
-      # zero", and the gauge arm has never been measured there because
-      # it is a different rasteriser answering Annika's "does not have
-      # to be pixel perfect identical" on #865. Gauge cases are held to
-      # the #893 ceiling and nothing tighter; scope cases are unchanged.
+      # Since #1143 the pin is **per case**, and that decision lives in
+      # the harness (`preem_gl::parity`'s `Kind` and `Sampling`), not
+      # here: this variable still means "hold what has been measured at
+      # zero to zero". #1143 read Annika's "does not have to be pixel
+      # perfect identical" (#865) as excusing the gauge from it and
+      # #1148's review corrected that — her word was about the glass,
+      # which only ever faces the ceiling, while this variable is
+      # exported nowhere but the three lines above. Both kinds are
+      # pinned at the 1:1 grid, where both have measured `max |Δ| 0`.
+      # What is held to the ceiling alone is the box-averaged
+      # `scale = 2` gauge comparison, which is a render the kit never
+      # made and so cannot be bit-exact by construction.
       export TROLLSHELL_PARITY_EXACT=1
     '';
     checkPhaseCargoCommand = ''
@@ -270,21 +275,23 @@ craneLib.mkCargoDerivation (
       # empties the list would ship green through the exit code
       # alone. Assert the evidence instead of trusting the exit
       # code: the case list is 4 skins × (3 scope fade depths + 3
-      # gauge needle positions), so exactly 24 cases means exactly
-      # 24 `.gl.ppm` files. It was 12 until #1143 added the gauge
-      # arm; bump it with the case list, in the same commit, for
-      # the reason the number is asserted at all.
+      # gauge needle positions + 1 gauge at the shipping upscale), so
+      # exactly 28 cases means exactly 28 `.gl.ppm` files. It was 12
+      # until #1143 added the gauge arm and 24 until #1148's review
+      # added the `scale = 2` case; bump it with the case list, in
+      # the same commit, for the reason the number is asserted at all.
       #
       # Nothing here needs a per-kind knob: `TROLLSHELL_PARITY_EXACT=1`
       # still means "pin what has been measured at zero", and *which*
-      # kinds those are is the harness's own decision
-      # (`preem_gl::parity`'s `Kind`) rather than this file's. The
-      # scope stays pinned bit-exact; the gauge is held to #893's
-      # ceiling, because Annika's word on #865 was that it does not
-      # have to be pixel-perfect identical.
+      # cases those are is the harness's own decision
+      # (`preem_gl::parity`'s `Kind` and `Sampling`) rather than this
+      # file's. Both kinds are pinned bit-exact where the two arms
+      # rasterise at the same resolution; the box-averaged `scale = 2`
+      # gauge cases are held to #893's ceiling, which is the only
+      # standard a supersampled comparison can meet.
       gl_ppm_count="$(find "$out/parity" -maxdepth 1 -name '*.gl.ppm' -type f | wc -l)"
-      if [ "$gl_ppm_count" -ne 24 ]; then
-        echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected 24 — a case-count regression, not a parity failure." >&2
+      if [ "$gl_ppm_count" -ne 28 ]; then
+        echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected 28 — a case-count regression, not a parity failure." >&2
         exit 1
       fi
     '';

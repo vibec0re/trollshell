@@ -5,12 +5,22 @@
 //! p99 ≤ 8/255, max ≤ 32/255 — is a measurement rather than a hope.
 //!
 //! Two kinds since #1143: the `Scope` (four skins × three fade depths) and the
-//! `Gauge` (four skins × three needle positions). The gauge cases run at
-//! `scale = 1` on purpose — the GL gauge's grid is the *native* buffer, so at
-//! any other scale the two arms are rasterising at different resolutions by
-//! design and a per-pixel delta would be measuring the improvement rather than
-//! a regression. See `preem_gl::gauge`, and `preem_gl::parity`'s `Kind` for why
-//! the `TROLLSHELL_PARITY_EXACT=1` pin stays scope-only.
+//! `Gauge` (four skins × three needle positions, plus one at the **shipping**
+//! upscale). The three-per-skin gauge cases run at `scale = 1`, where the GL
+//! arm's native grid and the kit's logical one are the same number and the two
+//! can be compared pixel against pixel — that is where
+//! `TROLLSHELL_PARITY_EXACT=1` pins both kinds at zero.
+//!
+//! The fourth gauge case per skin runs at `scale = 2`, which is
+//! `GaugeConfig::default()` and therefore every dial on the glass (#1148
+//! review, HIGH-2). It cannot be compared naively — the GL arm is rasterising
+//! at twice the resolution *on purpose*, which is the whole of #1090's fix — so
+//! the harness box-averages the native readback back down to the kit's logical
+//! grid (`parity::box_downsample`) and holds the result to #893's ceiling. A
+//! supersampled render averaged down should land inside a single-sample render
+//! of the same picture; a dropped half-pixel offset, an unscaled length, a
+//! doubled mask pitch or a mis-scaled bloom is what breaks that. See
+//! `preem_gl::gauge` and `preem_gl::parity`'s `Kind`/`Sampling`.
 //!
 //! ```sh
 //! nix develop --command cargo run -p trollshell --example preem_gl_diff
@@ -142,16 +152,37 @@ const PERSISTENCE: u16 = 184;
 /// one #931 tuned and #1090 was reported against.
 const GAUGE_COLS: u32 = 144;
 const GAUGE_ROWS: u32 = 64;
-/// **`1`, and that is the whole design of the gauge comparison.**
+/// The upscale the **1:1** gauge cases run at.
 ///
 /// The GL gauge's offscreen grid is the *native* buffer (`cols * scale`), not
 /// the logical one, because drawing the dial at the size it is shown at is the
-/// point of the arm — see `preem_gl::gauge`. At any other scale the two arms
-/// are therefore rasterising at different resolutions on purpose and a
-/// per-pixel delta would be measuring the improvement rather than a
-/// regression. At `scale = 1` they draw the same picture at the same
-/// resolution, which is the one place a parity number means something.
+/// point of the arm — see `preem_gl::gauge`. At `scale = 1` the two arms draw
+/// the same picture at the same resolution, which is the one place a *pixel
+/// against pixel* number means something, and it is where
+/// `TROLLSHELL_PARITY_EXACT=1` pins them both at zero.
 const GAUGE_SCALE: u32 = 1;
+
+/// The upscale the **supersampled** gauge cases run at — `GaugeConfig`'s own
+/// default, which is what every dial on the glass actually uses (#1148 review,
+/// HIGH-2).
+///
+/// Without these, nothing in CI ever rendered the gauge in the configuration it
+/// ships in: `Dial::scaled`'s half-pixel offset, the `u_upscale` on every
+/// length, the bloom radius's `* scale` and the CRT mask's logical-pitch
+/// division are all the identity at `scale = 1`, so four separate scale-only
+/// decisions went unrendered by every gate.
+///
+/// Comparing them naively would indeed measure the improvement rather than a
+/// regression — a sharper edge is *supposed* to differ from a smeared one — so
+/// the harness does not compare them naively. It renders GL at the native grid,
+/// box-averages each `GAUGE_SUPERSAMPLE`² block back down to the kit's logical
+/// frame (`parity::box_downsample`) and holds the result to #893's ceiling. A
+/// supersampled render averaged back down should land inside a single-sample
+/// render of the same picture: that is a genuine invariant rather than a
+/// measurement of the improvement, and it is exactly what a dropped
+/// `(scale - 1) / 2`, an unscaled length, a doubled mask pitch or a mis-scaled
+/// bloom breaks.
+const GAUGE_SUPERSAMPLE: u32 = 2;
 
 /// Whether any case failed, for [`main`]'s exit status.
 ///
@@ -174,7 +205,8 @@ fn main() -> glib::ExitCode {
     println!("=== preem_gl_diff — #893 stage B parity harness ===");
     println!(
         "scope {SCOPE_COLS}x{SCOPE_ROWS} scale {SCOPE_SCALE} persistence {PERSISTENCE}; \
-         gauge {GAUGE_COLS}x{GAUGE_ROWS} scale {GAUGE_SCALE}; \
+         gauge {GAUGE_COLS}x{GAUGE_ROWS} scale {GAUGE_SCALE} and {GAUGE_SUPERSAMPLE} \
+         (box-averaged down); \
          ceiling mean {} / p99 {} / max {} per channel",
         parity::CEILING_MEAN,
         parity::CEILING_P99,
@@ -183,10 +215,12 @@ fn main() -> glib::ExitCode {
     let exact = parity_exact();
     if exact {
         println!(
-            "TROLLSHELL_PARITY_EXACT=1: a **scope** case with a non-zero delta on \
-             any channel fails as FAIL(exact), even inside the ceiling above. \
-             Gauge cases are held to the ceiling only (#1143) — see \
-             `preem_gl::parity`'s `Kind`."
+            "TROLLSHELL_PARITY_EXACT=1: a **1:1** case of either kind with a \
+             non-zero delta on any channel fails as FAIL(exact), even inside \
+             the ceiling above. The supersampled gauge cases (.x{GAUGE_SUPERSAMPLE}) \
+             are held to the ceiling only — a box-average of a render the kit \
+             never made cannot be bit-exact. See `preem_gl::parity`'s `Kind` \
+             and `Sampling`."
         );
     }
 
@@ -260,6 +294,10 @@ enum Case {
     Gauge {
         style: kit::DisplayStyle,
         needle: NeedleAt,
+        /// The integer upscale the GL arm renders at. [`GAUGE_SCALE`] compares
+        /// pixel against pixel; [`GAUGE_SUPERSAMPLE`] compares a box-averaged
+        /// native frame against the kit's logical one.
+        scale: u32,
     },
 }
 
@@ -315,19 +353,40 @@ impl Case {
         }
     }
 
-    /// `(logical cols, logical rows, integer upscale)`.
-    fn geometry(&self) -> (u32, u32, u32) {
+    /// How the two buffers are brought to one grid — see `parity::Sampling`.
+    ///
+    /// Every scope case and the `scale = 1` gauge cases compare pixel against
+    /// pixel. The gauge's shipping-scale cases render `factor`× larger and are
+    /// box-averaged down, which is a comparison the exact pin cannot apply to.
+    fn sampling(&self) -> parity::Sampling {
         match self {
-            Self::Scope { .. } => (SCOPE_COLS, SCOPE_ROWS, SCOPE_SCALE),
-            Self::Gauge { .. } => (GAUGE_COLS, GAUGE_ROWS, GAUGE_SCALE),
+            Self::Gauge { scale, .. } if *scale > 1 => parity::Sampling::Supersampled(*scale),
+            _ => parity::Sampling::OneToOne,
         }
     }
 
-    /// The natural size in logical pixels — what the area is sized to, and what
-    /// the CPU reference frame comes out at.
+    /// `(logical cols, logical rows, integer upscale)` — the upscale the **GL**
+    /// arm renders at.
+    fn geometry(&self) -> (u32, u32, u32) {
+        match self {
+            Self::Scope { .. } => (SCOPE_COLS, SCOPE_ROWS, SCOPE_SCALE),
+            Self::Gauge { scale, .. } => (GAUGE_COLS, GAUGE_ROWS, *scale),
+        }
+    }
+
+    /// The natural size in logical pixels — what the area is sized to.
     fn natural(&self) -> (u32, u32) {
         let (cols, rows, scale) = self.geometry();
         (cols * scale, rows * scale)
+    }
+
+    /// The size the **CPU reference frame** comes out at, which is the natural
+    /// size for a 1:1 case and the logical grid for a supersampled one.
+    fn reference_scale(&self) -> u32 {
+        match self.sampling() {
+            parity::Sampling::OneToOne => self.geometry().2,
+            parity::Sampling::Supersampled(_) => 1,
+        }
     }
 }
 
@@ -395,8 +454,19 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
                 .map(move |needle| Case::Gauge {
                     style: *style,
                     needle,
+                    scale: GAUGE_SCALE,
                 });
-            scopes.chain(gauges)
+            // One supersampled case per skin, at the needle position that puts
+            // the most anti-aliased edge on the face: the blade is at an
+            // arbitrary angle, the fan is spread across four blades, and the
+            // value arc has both of its ends on screen. See
+            // [`GAUGE_SUPERSAMPLE`].
+            let shipping = std::iter::once(Case::Gauge {
+                style: *style,
+                needle: NeedleAt::Sweeping,
+                scale: GAUGE_SUPERSAMPLE,
+            });
+            scopes.chain(gauges).chain(shipping)
         })
         .collect();
 
@@ -624,12 +694,12 @@ fn scope_config(style: kit::DisplayStyle) -> vocab::ScopeConfig {
     }
 }
 
-fn gauge_config(style: kit::DisplayStyle) -> vocab::GaugeConfig {
+fn gauge_config(style: kit::DisplayStyle, scale: u32) -> vocab::GaugeConfig {
     vocab::GaugeConfig {
         style: style_ref(style),
         cols: GAUGE_COLS,
         rows: GAUGE_ROWS,
-        scale: GAUGE_SCALE,
+        scale,
         ..vocab::GaugeConfig::default()
     }
 }
@@ -638,7 +708,18 @@ fn gauge_config(style: kit::DisplayStyle) -> vocab::GaugeConfig {
 fn label(case: &Case) -> String {
     match case {
         Case::Scope { style, idle_steps } => format!("scope.{}.idle{idle_steps}", style.name()),
-        Case::Gauge { style, needle } => format!("gauge.{}.{}", style.name(), needle.name()),
+        // The upscale is in the name only where it is not the 1:1 comparison,
+        // so the twelve pinned cases keep the labels #1143's transcripts carry.
+        Case::Gauge {
+            style,
+            needle,
+            scale,
+        } if *scale == GAUGE_SCALE => format!("gauge.{}.{}", style.name(), needle.name()),
+        Case::Gauge {
+            style,
+            needle,
+            scale,
+        } => format!("gauge.{}.{}.x{scale}", style.name(), needle.name()),
     }
 }
 
@@ -664,8 +745,12 @@ fn drive(area: &GlSurface, case: &Case) {
                 surface.uniforms,
             )
         }
-        Case::Gauge { style, needle } => {
-            let config = gauge_config(*style);
+        Case::Gauge {
+            style,
+            needle,
+            scale,
+        } => {
+            let config = gauge_config(*style, *scale);
             let dial = gauge_state(config, *needle);
             let surface = gauge::gauge_surface(
                 config,
@@ -744,9 +829,11 @@ fn capture(area: &GlSurface, label: &str) -> Result<Capture, String> {
 /// — see [`parity::Verdict`] for the five ways it can fail.
 fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool) -> bool {
     let label = label(case);
-    let (_, _, upscale) = case.geometry();
+    let upscale = case.reference_scale();
 
     // The CPU reference: the same state through the kit, which is the oracle.
+    // A supersampled case takes the kit's **logical** frame — `reference_scale`
+    // is 1 there — because that is what the GL readback is averaged down to.
     let reference = match case {
         Case::Scope { style, idle_steps } => {
             let mut oracle = kit::Scope::with_size(SCOPE_COLS as usize, SCOPE_ROWS as usize)
@@ -758,7 +845,9 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
             }
             oracle.render(*style)
         }
-        Case::Gauge { style, needle } => gauge_state(gauge_config(*style), *needle).render(*style),
+        Case::Gauge { style, needle, .. } => {
+            gauge_state(gauge_config(*style, upscale), *needle).render(*style)
+        }
     };
 
     let natural = case.natural();
@@ -772,23 +861,41 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
         );
     }
 
+    // A supersampled case is box-averaged onto the kit's grid **before**
+    // anything is measured, so every statistic below — the ceiling, the region
+    // split, the delta map, the evidence images — is computed on one pair of
+    // buffers of one shape (#1148 review, HIGH-2). The device scale folds into
+    // the same divide: `factor` device pixels per reference pixel on each axis,
+    // averaged in one pass, which leaves the layout at a device scale of 1.
+    let (gl_raw, gl_alloc, device_scale) = match case.sampling() {
+        parity::Sampling::OneToOne => (
+            std::borrow::Cow::Borrowed(&shot.raw[..]),
+            shot.alloc,
+            shot.scale,
+        ),
+        parity::Sampling::Supersampled(factor) => {
+            let (raw, alloc) = parity::box_downsample(&shot.raw, shot.alloc, factor * shot.scale);
+            (std::borrow::Cow::Owned(raw), alloc, 1)
+        }
+    };
+
     // `for_capture` rather than a struct literal: the beam tolerance is
     // `parity::peak_row_tolerance`'s to compute, and it is the number that
     // decides `FAIL(beam)` in a transcript pasted on #893. Written out here it
     // drifted — it carried a stray device-scale factor, which made the verdict
     // depend on the monitor the harness ran on.
     let layout = parity::Layout::for_capture(
-        shot.alloc,
+        gl_alloc,
         (reference.width(), reference.height()),
-        shot.scale,
+        device_scale,
         upscale as usize,
     );
-    let stats = parity::compare(&shot.raw, reference.data(), layout);
-    // **The per-kind verdict** (#1143): the #893 ceiling and the blank-frame
-    // guards on both kinds, the `TROLLSHELL_PARITY_EXACT=1` zero pin and the
-    // per-column peak-row check on the scope alone. See `parity::Kind` for why
-    // the gauge is not held to a measurement taken of a different rasteriser.
-    let verdict = parity::case_verdict(&stats, case.kind(), exact);
+    let stats = parity::compare(&gl_raw, reference.data(), layout);
+    // **The per-case verdict**: the #893 ceiling and the blank-frame guards on
+    // every case, the per-column peak-row check on the scope alone (#1143), and
+    // the `TROLLSHELL_PARITY_EXACT=1` zero pin on both kinds where the
+    // comparison is 1:1 (#1148). See `parity::Kind` and `parity::Sampling`.
+    let verdict = parity::case_verdict(&stats, case.kind(), case.sampling(), exact);
     println!(
         "{} {label}: worst channel mean {:.3} p99 {:.0} max {:.0} of 255 \
          over {} px; peak-row mismatches {}/{}",
@@ -825,20 +932,20 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
         );
     }
 
-    let deltas = parity::delta_map(&shot.raw, reference.data(), layout);
+    let deltas = parity::delta_map(&gl_raw, reference.data(), layout);
     print_regions(&deltas, &reference);
-    write_evidence(evidence, &label, shot, layout, &reference, &deltas);
+    write_evidence(evidence, &label, &gl_raw, layout, &reference, &deltas);
 
     // #1080's 0-pinned assertion (#1078 review, INFO-1): the ceiling is loose
     // on purpose, for a driver this harness has never measured. Under llvmpipe
-    // every *scope* case has come out bit-exact, so the pin says so — and says
-    // so only for the kind it was measured on, which is what `case_verdict`
-    // decides above.
+    // every 1:1 case of both kinds has come out bit-exact, so the pin says so
+    // — and says so only for a comparison that can be, which is what
+    // `case_verdict` decides above.
     if verdict == parity::Verdict::NotBitExact {
         println!(
             "      TROLLSHELL_PARITY_EXACT=1 — inside the ceiling but not \
              bit-exact, and llvmpipe has never measured anything but 0 for a \
-             {} case",
+             1:1 {} case",
             case.kind().label(),
         );
     }
@@ -928,7 +1035,7 @@ fn print_regions(deltas: &[u8], reference: &kit::Frame) {
 fn write_evidence(
     dir: &std::path::Path,
     label: &str,
-    shot: &Capture,
+    gl: &[u8],
     layout: parity::Layout,
     reference: &kit::Frame,
     deltas: &[u8],
@@ -939,7 +1046,7 @@ fn write_evidence(
         cpu.extend_from_slice(&pixel[..3]);
     }
     let files: [(&str, Vec<u8>); 3] = [
-        ("gl.ppm", ppm(w, h, &parity::gl_image(&shot.raw, layout))),
+        ("gl.ppm", ppm(w, h, &parity::gl_image(gl, layout))),
         ("cpu.ppm", ppm(w, h, &cpu)),
         ("delta.pgm", pgm(w, h, deltas)),
     ];

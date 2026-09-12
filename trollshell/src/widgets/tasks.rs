@@ -369,19 +369,34 @@ fn build_create_popover(
     });
 
     // Cancel: just close the popover and reset state.
-    let popover_for_cancel = popover.clone();
+    //
+    // The popover handle is **weak** (#1176). `cancel` is a descendant of the
+    // popover (`popover → column → actions → cancel`), so a strong
+    // `popover.clone()` here closes a refcount cycle GTK never breaks and the
+    // whole popover subtree outlives the sidebar block that built it — one
+    // copy per monitor hot-plug. `entry`/`due_picker` are *siblings*, not
+    // ancestors, so capturing those strongly is not a cycle and stays as it
+    // was (the `bind`-pin carve-out, applied to `connect_*`).
+    let popover_for_cancel = popover.downgrade();
     let entry_for_cancel = entry.clone();
     let due_picker_for_cancel = due_picker.clone();
     cancel.connect_clicked(move |_| {
-        popover_for_cancel.popdown();
+        if let Some(popover) = popover_for_cancel.upgrade() {
+            popover.popdown();
+        }
         entry_for_cancel.set_text("");
         due_picker_for_cancel.reset();
     });
 
     // Create.
-    let popover_for_create = popover.clone();
+    //
+    // Both the popover and the `anchor` are weak, for the same reason: the
+    // anchor is the `gtk::MenuButton` this popover is *set on*
+    // (`build_header`'s `add_btn.set_popover(…)`), so a strong capture makes
+    // `add_btn → popover → column → create → do_create → add_btn`.
+    let popover_for_create = popover.downgrade();
     let entry_for_create = entry.clone();
-    let anchor_for_create = anchor.clone();
+    let anchor_for_create = anchor.downgrade();
     let due_picker_for_create = due_picker.clone();
     let lists_for_create = lists_track.clone();
     let list_picker_for_create = list_picker.clone();
@@ -406,8 +421,12 @@ fn build_create_popover(
         drop(lists);
         entry_for_create.set_text("");
         due_picker_for_create.reset();
-        popover_for_create.popdown();
-        anchor_for_create.grab_focus();
+        if let Some(popover) = popover_for_create.upgrade() {
+            popover.popdown();
+        }
+        if let Some(anchor) = anchor_for_create.upgrade() {
+            anchor.grab_focus();
+        }
     };
     let do_create_for_button = do_create.clone();
     create.connect_clicked(move |_| do_create_for_button());
@@ -501,7 +520,13 @@ fn open_edit_popover(parent: &gtk::Widget, task: &Task, monitor: &Monitor) {
         .build();
     let popover = popup.popover().clone();
 
-    let popover_for_save = popover.clone();
+    // Weak popover handles throughout (#1176): every one of these buttons is
+    // a descendant of the popover it dismisses (`popover → column → actions →
+    // save|cancel|delete`), so a strong clone is a cycle GTK never breaks and
+    // the popover — plus its entry, due picker and dismiss catcher — survives
+    // the row tap that built it, once per tap. `unparent_on_close` retires the
+    // popover from the row but cannot free it while its own children hold it.
+    let popover_for_save = popover.downgrade();
     let entry_for_save = entry.clone();
     let due_picker_for_save = due_picker.clone();
     let list_uid_for_save = task.list_uid.clone();
@@ -517,7 +542,9 @@ fn open_edit_popover(parent: &gtk::Widget, task: &Task, monitor: &Monitor) {
             summary,
             due_picker_for_save.value(),
         );
-        popover_for_save.popdown();
+        if let Some(popover) = popover_for_save.upgrade() {
+            popover.popdown();
+        }
     };
     let do_save_for_button = do_save.clone();
     save.connect_clicked(move |_| do_save_for_button());
@@ -525,15 +552,21 @@ fn open_edit_popover(parent: &gtk::Widget, task: &Task, monitor: &Monitor) {
     let do_save_for_entry = do_save;
     entry.connect_activate(move |_| do_save_for_entry());
 
-    let popover_for_cancel = popover.clone();
-    cancel.connect_clicked(move |_| popover_for_cancel.popdown());
+    let popover_for_cancel = popover.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(popover) = popover_for_cancel.upgrade() {
+            popover.popdown();
+        }
+    });
 
-    let popover_for_delete = popover.clone();
+    let popover_for_delete = popover.downgrade();
     let list_uid_for_delete = task.list_uid.clone();
     let uid_for_delete = task.uid.clone();
     delete.connect_clicked(move |_| {
         tasks::delete_task(&list_uid_for_delete, &uid_for_delete);
-        popover_for_delete.popdown();
+        if let Some(popover) = popover_for_delete.upgrade() {
+            popover.popdown();
+        }
     });
 
     popup.show();
@@ -560,6 +593,50 @@ struct DuePicker {
     chip_today: gtk::ToggleButton,
     chip_tomorrow: gtk::ToggleButton,
     chip_pick: gtk::ToggleButton,
+}
+
+/// Handler-side view of [`DuePicker`] holding every widget weakly (#1176).
+///
+/// [`DuePicker`] is `Clone` and five of its own widgets' handlers need it —
+/// four `connect_toggled`, one `connect_day_selected` — so a strong clone on
+/// that side means the container is reachable from its own children's handler
+/// lists. GTK breaks no refcount cycle, so the picker (and the popover column
+/// it sits in) would leak once per row tap. The two `Rc` cells stay strong
+/// deliberately: they hold no widget, so they close no cycle, and keeping
+/// them means [`Self::upgrade`] can hand back a whole `DuePicker` instead of
+/// a parallel set of accessors. Same shape as `widgets/mpris.rs`'s
+/// `Refreeze`, which weakens its handles for the same reason.
+struct WeakDuePicker {
+    container: glib::WeakRef<gtk::Box>,
+    mode: Rc<RefCell<DueMode>>,
+    selected: Rc<RefCell<Option<NaiveDate>>>,
+    summary_label: glib::WeakRef<gtk::Label>,
+    calendar: glib::WeakRef<gtk::Calendar>,
+    calendar_wrap: glib::WeakRef<gtk::Revealer>,
+    chip_none: glib::WeakRef<gtk::ToggleButton>,
+    chip_today: glib::WeakRef<gtk::ToggleButton>,
+    chip_tomorrow: glib::WeakRef<gtk::ToggleButton>,
+    chip_pick: glib::WeakRef<gtk::ToggleButton>,
+}
+
+impl WeakDuePicker {
+    /// The picker, or `None` once its widgets have been freed — which is the
+    /// whole point: a handler that fires during teardown does nothing rather
+    /// than keeping the tree alive to be able to.
+    fn upgrade(&self) -> Option<DuePicker> {
+        Some(DuePicker {
+            container: self.container.upgrade()?,
+            mode: Rc::clone(&self.mode),
+            selected: Rc::clone(&self.selected),
+            summary_label: self.summary_label.upgrade()?,
+            calendar: self.calendar.upgrade()?,
+            calendar_wrap: self.calendar_wrap.upgrade()?,
+            chip_none: self.chip_none.upgrade()?,
+            chip_today: self.chip_today.upgrade()?,
+            chip_tomorrow: self.chip_tomorrow.upgrade()?,
+            chip_pick: self.chip_pick.upgrade()?,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -624,39 +701,53 @@ impl DuePicker {
             chip_pick: pick_btn.clone(),
         };
 
-        // Hook up the chips.
-        let p = picker.clone();
+        // Hook up the chips — through [`WeakDuePicker`], never `picker.clone()`
+        // (#1176). Each of these handlers hangs off a widget the picker itself
+        // holds, so a strong self-clone closes `container → chips → chip_none →
+        // handler → picker → container`, a refcount cycle GTK never breaks: the
+        // whole picker would outlive the popover that built it, once per task
+        // row tap and once per Add-button press.
+        let p = picker.downgrade();
         none_btn.connect_toggled(move |b| {
-            if b.is_active() {
+            if b.is_active()
+                && let Some(p) = p.upgrade()
+            {
                 p.set_mode(DueMode::None);
             }
         });
-        let p = picker.clone();
+        let p = picker.downgrade();
         today_btn.connect_toggled(move |b| {
-            if b.is_active() {
+            if b.is_active()
+                && let Some(p) = p.upgrade()
+            {
                 p.set_mode(DueMode::Today);
             }
         });
-        let p = picker.clone();
+        let p = picker.downgrade();
         tomorrow_btn.connect_toggled(move |b| {
-            if b.is_active() {
+            if b.is_active()
+                && let Some(p) = p.upgrade()
+            {
                 p.set_mode(DueMode::Tomorrow);
             }
         });
-        let p = picker.clone();
+        let p = picker.downgrade();
         pick_btn.connect_toggled(move |b| {
-            if b.is_active() {
+            if b.is_active()
+                && let Some(p) = p.upgrade()
+            {
                 p.set_mode(DueMode::Pick);
             }
         });
 
-        let p = picker.clone();
+        let p = picker.downgrade();
         calendar.connect_day_selected(move |c| {
             let y = c.year();
             let m = c.month() + 1; // gtk::Calendar months are 0-indexed
             let d = c.day();
             if let (Ok(m_u32), Ok(d_u32)) = (u32::try_from(m), u32::try_from(d))
                 && let Some(date) = NaiveDate::from_ymd_opt(y, m_u32, d_u32)
+                && let Some(p) = p.upgrade()
             {
                 *p.selected.borrow_mut() = Some(date);
                 p.refresh_summary();
@@ -668,6 +759,22 @@ impl DuePicker {
 
     fn widget(&self) -> &gtk::Box {
         &self.container
+    }
+
+    /// A handle this picker's own widgets may hold — see [`WeakDuePicker`].
+    fn downgrade(&self) -> WeakDuePicker {
+        WeakDuePicker {
+            container: self.container.downgrade(),
+            mode: Rc::clone(&self.mode),
+            selected: Rc::clone(&self.selected),
+            summary_label: self.summary_label.downgrade(),
+            calendar: self.calendar.downgrade(),
+            calendar_wrap: self.calendar_wrap.downgrade(),
+            chip_none: self.chip_none.downgrade(),
+            chip_today: self.chip_today.downgrade(),
+            chip_tomorrow: self.chip_tomorrow.downgrade(),
+            chip_pick: self.chip_pick.downgrade(),
+        }
     }
 
     fn set_mode(&self, mode: DueMode) {
@@ -843,9 +950,14 @@ fn month(m: u32) -> &'static str {
 /// #632/#638/#643/#644/#663/#673 fixed at roughly 50 sites, and here the fix
 /// is invisible: it is *the semicolons*.
 ///
-/// [`DuePicker`] is `#[derive(Clone)]` and clones itself into five of its own
-/// widget handlers (four `connect_toggled`, one `connect_day_selected`), so
-/// `mode` and `selected` are anything but closure-private. Two of the calls
+/// [`DuePicker`] hands itself to five of its own widget handlers (four
+/// `connect_toggled`, one `connect_day_selected`), so `mode` and `selected`
+/// are anything but closure-private. Since #1176 it hands them a
+/// [`WeakDuePicker`] rather than a `#[derive(Clone)]` self-clone — that fixed
+/// a refcount cycle, and changes nothing here: the two `Rc` cells are shared
+/// across the weak handle exactly as they were, and a handler that re-enters
+/// during a live edit upgrades successfully (its own widget is alive, or it
+/// would not be emitting). Two of the calls
 /// [`DuePicker::set_value`] makes re-enter those handlers **synchronously**:
 ///
 /// 1. `self.calendar.select_day(&gdt)` re-enters the `connect_day_selected`
@@ -1195,7 +1307,7 @@ mod reentrancy_tests {
     /// tests — running it per test would repeat all of that per test.
     /// `#[gtk::test]` runs every test in this binary on one thread, so the
     /// cache needs no locking and cannot be raced regardless of test order.
-    fn test_monitor() -> Monitor {
+    pub(super) fn test_monitor() -> Monitor {
         if let Some(monitor) = TEST_MONITOR.with(|cell| cell.borrow().clone()) {
             return monitor;
         }
@@ -1509,6 +1621,115 @@ mod reentrancy_tests {
             rows_track.borrow().len(),
             MAX_VISIBLE_TASKS,
             "the outer call's row write-back must also land, not just the overflow row's"
+        );
+    }
+}
+
+/// Widget-lifetime coverage for #1176: nothing this module builds may be kept
+/// alive by a handler hanging off one of its own descendants.
+///
+/// Two shapes live here, both of which `nix/lint-bind-pins.py` was blind to
+/// before #1176 because neither is a `bind*` call:
+///
+/// 1. **The create popover's anchor.** `do_create` captured `anchor.clone()`
+///    — the `gtk::MenuButton` the popover is *set on* — so
+///    `add_btn → popover → column → create → do_create → add_btn` closed a
+///    cycle, one per sidebar block, i.e. one per monitor hot-plug.
+/// 2. **[`DuePicker`]'s self-clones.** It is `#[derive(Clone)]` and hands a
+///    clone of itself to five of its own widgets' handlers, each of which
+///    then owns the container those widgets hang from. Every task row tap
+///    builds one.
+///
+/// ## Why the popover itself is not asserted here
+///
+/// `build_create_popover` calls `hytte::ui::attach_dismiss_catcher`, which —
+/// as of this writing — captures a strong `popover.clone()` in the popover's
+/// *own* `connect_show` handler (`crates/hytte-ui/src/popup.rs`). That is the
+/// same defect one crate down, it is owned by #1180, and until it lands no
+/// assertion about this popover being freed could pass no matter what this
+/// file does. The anchor is asserted instead precisely because it isolates
+/// this module's half: with `anchor.clone()` restored the anchor is reachable
+/// from that immortal popover and never dies; with `downgrade()` it dies the
+/// moment the test drops it. The popdown handles (`popover_for_cancel`,
+/// `popover_for_create`, and `open_edit_popover`'s three) are weak for the
+/// same reason, and get their end-to-end coverage from the sibling popovers
+/// that have no dismiss catcher — `panels/bluetooth.rs`'s device menu and
+/// `panels/clipboard.rs`'s row menu — plus the `bind-pins` scan, which now
+/// reports the shape at every site including these.
+///
+/// Needs a real display server, hence the `system-tests` gate.
+#[cfg(all(test, feature = "system-tests"))]
+mod lifetime_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk;
+    use hytte::services::tasks::TaskList;
+
+    use super::reentrancy_tests::test_monitor;
+    use super::{DuePicker, build_create_popover};
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// Falsified by restoring `let anchor_for_create = anchor.clone();` and
+    /// the bare `anchor_for_create.grab_focus()` body.
+    #[gtk::test]
+    fn the_create_popover_does_not_pin_its_anchor() {
+        adw::init().expect("libadwaita init");
+        let monitor = test_monitor();
+        let lists: Rc<RefCell<Vec<TaskList>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let anchor = gtk::MenuButton::new();
+        let popover = build_create_popover(&anchor, &lists, &monitor);
+        anchor.set_popover(Some(&popover));
+        let weak_anchor = anchor.downgrade();
+
+        drop(popover);
+        drop(anchor);
+        pump();
+
+        assert!(
+            weak_anchor.upgrade().is_none(),
+            "the add-task popover must not pin the menu button it hangs from: the anchor owns \
+             the popover, so a strong `anchor.clone()` inside `do_create` — a closure the \
+             popover's own Add button holds — is a cycle GTK never breaks, and the sidebar \
+             leaks one per monitor hot-plug (#1176)"
+        );
+    }
+
+    /// Falsified by restoring any of the five `let p = picker.clone();`
+    /// captures in `DuePicker::new` (the four chips and the calendar): the
+    /// picker's container then outlives every reference to it.
+    #[gtk::test]
+    fn a_due_picker_dies_with_its_last_reference() {
+        adw::init().expect("libadwaita init");
+        let picker = DuePicker::new();
+        let weak_container = picker.widget().downgrade();
+        let weak_chip = picker.chip_none.downgrade();
+        let weak_calendar = picker.calendar.downgrade();
+
+        drop(picker);
+        pump();
+
+        assert!(
+            weak_container.upgrade().is_none(),
+            "the due picker's container must die with the picker: `DuePicker` is `Clone` and \
+             hands itself to its own chips' `connect_toggled` handlers, so a strong clone there \
+             means `container → chips → chip_none → handler → picker → container` — a cycle GTK \
+             never breaks, built fresh on every task row tap (#1176)"
+        );
+        assert!(
+            weak_chip.upgrade().is_none(),
+            "the chips must go with the container, not merely be unparented from it"
+        );
+        assert!(
+            weak_calendar.upgrade().is_none(),
+            "the `gtk::Calendar` must go too — `connect_day_selected` captured the picker that \
+             holds it"
         );
     }
 }

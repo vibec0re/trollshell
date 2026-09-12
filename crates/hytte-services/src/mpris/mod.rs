@@ -599,6 +599,14 @@ impl State {
         }
     }
 
+    /// Whether `bus_name` already has a per-player watcher — used by the
+    /// `NameOwnerChanged` re-discovery pass (#1201) to skip a name it is
+    /// already tracking rather than spawn a second `spawn_player_tasks` for
+    /// the same player.
+    async fn is_registered(&self, bus_name: &str) -> bool {
+        self.order.lock().await.contains(&bus_name.to_string())
+    }
+
     /// Remove a bus name from tracking and publish.
     async fn unregister(&self, bus_name: &str) {
         self.map.lock().await.remove(bus_name);
@@ -698,17 +706,27 @@ async fn spawn_player_tasks(state: State, bus_name: String) {
         return;
     };
 
-    // Initial property read. `build()` succeeding just above proves the bus
-    // was up a moment ago, but a blip in the window between that and this
-    // `Get` still surfaces as a blank player published for one cycle (no
-    // identity, `Stopped`, every `Can*` false) rather than a failure this
-    // task could react to — see the doc above and `read_player_props`'s.
-    // Accepted by design here: the window is one `Get` round trip, it
-    // self-heals on the very next `PropertiesChanged` this task subscribes to
-    // below (or on `watch_liveness`'s `PeerGone` if the player is actually
-    // gone), and closing it for real would mean letting a property like
-    // `Identity` propagate a transient error through `setup_step` too —
-    // a bigger change than this dead-arm cleanup (#1197 review).
+    // Probe `Identity` through `setup_step` before the initial property read.
+    // `build()` succeeding just above proves the bus was up a moment ago, but
+    // a blip in the window between that and the first `Get` used to surface
+    // as a blank player published for one cycle (no identity, `Stopped`,
+    // every `Can*` false): `read_player_props` defaults every property
+    // independently on failure (see its doc), so it can never itself report
+    // a blip in that window. `Identity` is a real property call to the same
+    // object in the same window, and routing it through `setup_step` gives
+    // that window the same treatment `build()` above already gets: a
+    // transient failure is retried on the reconnect ramp instead of
+    // publishing a default, and a permanent one behaves like a failed proxy
+    // build — unregister and give up on this player (#1197 review, #1201).
+    let Some(_identity) = setup_step("initial identity", &bus_name, || {
+        get_property::<String>(bus_name.as_str(), MPRIS_IFACE, "Identity")
+    })
+    .await
+    else {
+        state.unregister(&bus_name).await;
+        return;
+    };
+
     state.refresh_player(&bus_name).await;
     state.publish().await;
 
@@ -893,20 +911,36 @@ async fn poll_position(state: State, bus_name: String) {
     }
 }
 
-// ── Main listen loop ──────────────────────────────────────────────────────────
+/// Spawn `spawn_player_tasks` for `bus_name`, supervised and bounded.
+///
+/// Supervised: `spawn_player_tasks` reads + parses this player's (untrusted)
+/// metadata, so it's the real panic surface. Bounded (#1174): a clean
+/// completion means the player closed, which is this task finishing its job —
+/// no restart, and none of the `warn!`-plus-kept-row that `spawn_supervised`
+/// gives an unexpected return. One per player over a session is a lot of
+/// both.
+fn spawn_player(state: &State, bus_name: String) {
+    let state2 = state.clone();
+    spawn_supervised_bounded("mpris-player", move || {
+        let state = state2.clone();
+        let bus_name = bus_name.clone();
+        async move {
+            spawn_player_tasks(state, bus_name).await;
+        }
+    });
+}
 
-async fn listen(players: &Mutable<Vec<Player>>, active: &Mutable<bool>) -> Result<()> {
-    let state = State::new(players.clone(), active.clone());
-
-    // Subscribe to NameOwnerChanged on the session bus BEFORE listing current
-    // names, so we don't miss any registrations during the startup window.
-    let owner_changes = signals(BusKind::Session, "org.freedesktop.DBus")
-        .at_path("/org/freedesktop/DBus")
-        .iface("org.freedesktop.DBus")
-        .signal("NameOwnerChanged")
-        .start();
-
-    // List all current names and register existing MPRIS players.
+/// List every current session-bus name and spawn a watcher for each MPRIS
+/// player not already tracked. Used both for the startup snapshot and for the
+/// [`SignalItem::Resubscribed`]/[`SignalItem::Lagged`] re-read (#1201): the
+/// `NameOwnerChanged` subscription this feeds is a fold exactly like
+/// [`watch_properties`]'s — a hole in its history means a player that
+/// appeared during the gap is never discovered at all, and one that quit
+/// stays in the drawer forever (nothing re-announces a name that already
+/// went away). `is_registered` skips a name already being watched, so a
+/// re-read after a brief gap costs one `ListNames` round trip rather than a
+/// second `spawn_player_tasks` racing the first.
+async fn discover_players(state: &State) -> Result<()> {
     let names: Vec<String> = call(BusKind::Session, "org.freedesktop.DBus")
         .at_path("/org/freedesktop/DBus")
         .iface("org.freedesktop.DBus")
@@ -917,30 +951,49 @@ async fn listen(players: &Mutable<Vec<Player>>, active: &Mutable<bool>) -> Resul
         .context("ListNames")?;
 
     for name in names {
-        if name.starts_with("org.mpris.MediaPlayer2.") {
-            tracing::debug!(name, "found existing mpris player");
-            let state2 = state.clone();
-            let bus_name = name.clone();
-            // Supervised: `spawn_player_tasks` reads + parses this player's
-            // (untrusted) metadata, so it's the real panic surface. Bounded
-            // (#1174): a clean completion means the player closed, which is
-            // this task finishing its job — no restart, and none of the
-            // `warn!`-plus-kept-row that `spawn_supervised` gives an
-            // unexpected return. One per player over a session is a lot of
-            // both.
-            spawn_supervised_bounded("mpris-player", move || {
-                let state = state2.clone();
-                let bus_name = bus_name.clone();
-                async move {
-                    spawn_player_tasks(state, bus_name).await;
-                }
-            });
+        if name.starts_with("org.mpris.MediaPlayer2.") && !state.is_registered(&name).await {
+            tracing::debug!(name, "found mpris player");
+            spawn_player(state, name);
         }
     }
 
-    // Process NameOwnerChanged events.
-    let mut events = owner_changes.events();
-    while let Some(event) = events.next().await {
+    Ok(())
+}
+
+// ── Main listen loop ──────────────────────────────────────────────────────────
+
+/// Drive the `NameOwnerChanged` items stream: dispatch each ordinary
+/// emission through the existing per-name register/unregister logic
+/// (byte-identical to before #1201), and call `rediscover` once per
+/// [`SignalItem::Resubscribed`]/[`SignalItem::Lagged`] marker instead of
+/// dropping it — before #1201 this subscription was read via `events()`,
+/// which cannot represent either marker, so a bus blip left a player that
+/// appeared during the gap undiscovered for the rest of the session and one
+/// that quit still shown (nothing re-announces a name that is already
+/// gone). `rediscover` is injectable so a test can stand in for
+/// [`discover_players`]'s real `ListNames` round trip with a counter — aside
+/// from that seam, this is exactly what used to run inline in [`listen`].
+async fn run_owner_change_loop<S, Rediscover, Fut>(
+    state: &State,
+    mut items: S,
+    mut rediscover: Rediscover,
+) where
+    S: futures_util::Stream<Item = SignalItem> + Unpin,
+    Rediscover: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    while let Some(item) = items.next().await {
+        let event = match item {
+            SignalItem::Resubscribed | SignalItem::Lagged { .. } => {
+                tracing::info!("mpris NameOwnerChanged resubscribed; re-discovering players");
+                if let Err(e) = rediscover().await {
+                    tracing::warn!(error = %e, "mpris: re-discovery after resubscribe failed");
+                }
+                continue;
+            }
+            SignalItem::Event(event) => event,
+        };
+
         let Ok((name, _old_owner, new_owner)) =
             event.body.body().deserialize::<(String, String, String)>()
         else {
@@ -962,19 +1015,26 @@ async fn listen(players: &Mutable<Vec<Player>>, active: &Mutable<bool>) -> Resul
         } else {
             // New player appeared.
             tracing::debug!(name, "mpris player appeared");
-            let state2 = state.clone();
-            let bus_name = name.clone();
-            // Supervised (and bounded) — same rationale as the
-            // startup-discovery spawn above.
-            spawn_supervised_bounded("mpris-player", move || {
-                let state = state2.clone();
-                let bus_name = bus_name.clone();
-                async move {
-                    spawn_player_tasks(state, bus_name).await;
-                }
-            });
+            spawn_player(state, name);
         }
     }
+}
+
+async fn listen(players: &Mutable<Vec<Player>>, active: &Mutable<bool>) -> Result<()> {
+    let state = State::new(players.clone(), active.clone());
+
+    // Subscribe to NameOwnerChanged on the session bus BEFORE listing current
+    // names, so we don't miss any registrations during the startup window.
+    let owner_changes = signals(BusKind::Session, "org.freedesktop.DBus")
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .signal("NameOwnerChanged")
+        .start();
+
+    // List all current names and register existing MPRIS players.
+    discover_players(&state).await?;
+
+    run_owner_change_loop(&state, owner_changes.items(), || discover_players(&state)).await;
 
     Ok(())
 }
@@ -1197,5 +1257,65 @@ mod tests {
         .await;
         assert!(got.is_none());
         assert_eq!(calls.get(), PLAYER_SETUP_ATTEMPTS);
+    }
+
+    // ── #1201: NameOwnerChanged re-discovers on Resubscribed/Lagged ─────────
+
+    use super::{State, run_owner_change_loop};
+    use futures_signals::signal::Mutable;
+    use hytte_bus::SignalItem;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Before #1201 this loop was driven by `events()`, which cannot
+    /// represent either marker, so a bus blip here left the player list
+    /// stale until something else happened to poke it. Pushing exactly one
+    /// marker through `run_owner_change_loop` must call `rediscover` exactly
+    /// once — for both spellings of "history has a hole" (#1173's
+    /// `Resubscribed`, and the review's `Lagged` fix).
+    ///
+    /// Falsifiable: deleting the `Resubscribed | Lagged { .. }` arm (or
+    /// making it a no-op) drops both counts to 0.
+    #[tokio::test(flavor = "current_thread")]
+    async fn owner_change_loop_rediscovers_exactly_once_per_marker() {
+        let state = State::new(Mutable::new(Vec::new()), Mutable::new(true));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = calls.clone();
+            let items = futures_util::stream::iter(vec![SignalItem::Resubscribed]);
+            run_owner_change_loop(&state, items, move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Resubscribed must re-discover exactly once"
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = calls.clone();
+            let items = futures_util::stream::iter(vec![SignalItem::Lagged { skipped: 7 }]);
+            run_owner_change_loop(&state, items, move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Lagged must re-discover exactly once"
+        );
     }
 }

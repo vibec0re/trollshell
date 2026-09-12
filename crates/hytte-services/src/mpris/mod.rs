@@ -56,6 +56,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
+use tokio::sync::watch;
 use zbus::zvariant::OwnedValue;
 
 use crate::retry;
@@ -541,6 +542,19 @@ struct State {
     /// shared `State` — rather than being threaded straight into each
     /// poller task individually.
     active: Mutable<bool>,
+    /// One cancellation channel per tracked player, so [`Self::unregister`]
+    /// can actually stop that player's three tasks (see [`cancelled`]).
+    ///
+    /// Without it, "unregister" only meant "drop the row": the
+    /// `PropertiesChanged` watcher stayed subscribed and its next
+    /// [`SignalItem::Resubscribed`] marker re-ran `refresh_player`, which
+    /// re-inserted the player into `map` — and, since #1197's per-player
+    /// re-read, published it as a **blank** row (no identity, `Stopped`,
+    /// every `Can*` false) for the rest of the session. The liveness watcher
+    /// stayed parked on a proxy that never reports `PeerGone` for an unowned
+    /// name, too. That is the half of the gap [`reconcile_players`]'s prune
+    /// closes, and this is what makes the prune stick (#1201 review).
+    cancels: Arc<AsyncMutex<HashMap<String, watch::Sender<bool>>>>,
 }
 
 impl State {
@@ -550,6 +564,7 @@ impl State {
             order: Arc::new(AsyncMutex::new(Vec::new())),
             players,
             active,
+            cancels: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
@@ -604,21 +619,60 @@ impl State {
     /// a full task set: two proxies, two `PropertiesChanged` subscriptions,
     /// two position pollers and two liveness watchers for the rest of the
     /// session, with nothing to notice (`unregister` is idempotent too).
-    async fn register(&self, bus_name: &str) -> bool {
+    ///
+    /// The [`CancelRx`] it hands back on success is the player's teardown
+    /// signal, and there is exactly one per registration — which is the other
+    /// reason this cannot be silently idempotent.
+    async fn register(&self, bus_name: &str) -> Option<CancelRx> {
+        // `order` is held across the `cancels` insert so a name is never in
+        // one map without the other (both this and `unregister` take them in
+        // this order, so they cannot deadlock).
         let mut order = self.order.lock().await;
         if order.iter().any(|n| n == bus_name) {
-            return false;
+            return None;
         }
+        let (tx, rx) = watch::channel(false);
+        self.cancels.lock().await.insert(bus_name.to_string(), tx);
         order.push(bus_name.to_string());
-        true
+        Some(rx)
     }
 
-    /// Remove a bus name from tracking and publish.
+    /// Snapshot the tracked bus names, in registration order.
+    ///
+    /// Taken by [`discover_players`] *before* it asks `ListNames`, because
+    /// only a name that was already tracked when the question was asked may
+    /// be pruned by the answer — see [`reconcile_players`].
+    async fn tracked(&self) -> Vec<String> {
+        self.order.lock().await.clone()
+    }
+
+    /// Remove a bus name from tracking, stop its tasks, and publish.
     async fn unregister(&self, bus_name: &str) {
         self.map.lock().await.remove(bus_name);
         self.order.lock().await.retain(|k| k != bus_name);
+        // Both halves of this are cancellation (see `cancelled`): the flag
+        // going true, and the sender being dropped by `remove`.
+        if let Some(cancel) = self.cancels.lock().await.remove(bus_name) {
+            let _ = cancel.send(true);
+        }
         self.publish().await;
     }
+}
+
+/// A per-player teardown signal, handed out by [`State::register`] and
+/// resolved by [`cancelled`].
+type CancelRx = watch::Receiver<bool>;
+
+/// Resolve once this player has been unregistered.
+///
+/// Two things reach here and both mean the same thing: [`State::unregister`]
+/// flips the flag to `true`, and it also drops the sender, which makes
+/// `wait_for` return `Err`. Either way the player is gone, and the task that
+/// awaited this must stop — a subscription, a poller and a liveness watcher
+/// that outlive their row are exactly how a pruned player came back as a
+/// blank one (see [`State::cancels`]).
+async fn cancelled(cancel: &mut CancelRx) {
+    let _ = cancel.wait_for(|gone| *gone).await;
 }
 
 // ── Per-player watcher task ───────────────────────────────────────────────────
@@ -686,9 +740,10 @@ where
 /// Spawn per-player tasks: one watches `PropertiesChanged`, another polls
 /// `Position`, and a third watches the [`BusProxy`] liveness signal for
 /// `PeerGone`.
-async fn spawn_player_tasks(state: State, bus_name: String) {
+async fn spawn_player_tasks(state: State, bus_name: String, cancel: CancelRx) {
     // Registration already happened, synchronously, at the call site — see
-    // [`Spawner::spawn_if_new`] for why it cannot happen here.
+    // [`Spawner::spawn_if_new`] for why it cannot happen here; `cancel` is
+    // the receiver that registration handed out.
 
     // Build the long-lived proxy BEFORE the first property read — the reverse
     // of the order this ran in until #1173.
@@ -748,8 +803,9 @@ async fn spawn_player_tasks(state: State, bus_name: String) {
         let state2 = state.clone();
         let bus2 = bus_name.clone();
         let proxy2 = player_proxy.clone();
+        let cancel2 = cancel.clone();
         runtime::handle().spawn(async move {
-            watch_liveness(state2, bus2, proxy2).await;
+            watch_liveness(state2, bus2, proxy2, cancel2).await;
         });
     }
 
@@ -757,21 +813,45 @@ async fn spawn_player_tasks(state: State, bus_name: String) {
     {
         let state2 = state.clone();
         let bus2 = bus_name.clone();
+        let cancel2 = cancel.clone();
         runtime::handle().spawn(async move {
-            poll_position(state2, bus2).await;
+            poll_position(state2, bus2, cancel2).await;
         });
     }
 
     // Run PropertiesChanged watcher in this task.
-    watch_properties(state, bus_name, props_changed).await;
+    watch_properties(state, bus_name, props_changed, cancel).await;
 }
 
 /// Watch the `BusProxy` liveness signal. When `PeerGone` fires, unregister
 /// the player. The watcher exits after `PeerGone` — the NOC subscription in
 /// the main loop will handle re-discovery if the player comes back.
-async fn watch_liveness(state: State, bus_name: String, player_proxy: BusProxy) {
+///
+/// It also exits when the player is unregistered some other way, which is not
+/// a courtesy: `PeerGone` is **not** a reliable notice here. A proxy rebuild
+/// after a reconnect is `zbus::Proxy::new_owned`, which succeeds for a name
+/// nobody owns, so liveness goes straight back to `Live` for a player that
+/// quit during the gap and this watcher would park forever holding a proxy
+/// for a peer that is gone (#1201 review).
+async fn watch_liveness(
+    state: State,
+    bus_name: String,
+    player_proxy: BusProxy,
+    mut cancel: CancelRx,
+) {
     let mut liveness_stream = player_proxy.liveness().to_stream();
-    while let Some(state_val) = liveness_stream.next().await {
+    loop {
+        let state_val = tokio::select! {
+            biased;
+            () = cancelled(&mut cancel) => {
+                tracing::debug!(bus_name, "mpris player unregistered; dropping its liveness watcher");
+                return;
+            }
+            next = liveness_stream.next() => match next {
+                Some(v) => v,
+                None => return,
+            },
+        };
         if state_val == ProxyState::PeerGone {
             tracing::debug!(bus_name, "mpris player proxy: PeerGone");
             state.unregister(&bus_name).await;
@@ -793,9 +873,49 @@ async fn watch_liveness(state: State, bus_name: String, player_proxy: BusProxy) 
 /// indefinitely. So this is `items()` rather than `events()`: these markers
 /// are the only notice a consumer gets that its history has a hole, and the
 /// correct reaction to either is the same one an emission gets (#1173).
-async fn watch_properties(state: State, bus_name: String, sub: hytte_bus::SignalSubscription) {
-    let mut items = sub.items();
-    while let Some(item) = items.next().await {
+///
+/// Stops when the player is unregistered, which is load-bearing rather than
+/// tidy: the markers keep arriving for the life of the process, so a watcher
+/// that outlived its row would keep re-reading a player that is gone and
+/// (since #1197) keep publishing it back as a blank row. See
+/// [`State::cancels`].
+async fn watch_properties(
+    state: State,
+    bus_name: String,
+    sub: hytte_bus::SignalSubscription,
+    cancel: CancelRx,
+) {
+    // `sub` is held by this scope, not moved into the driver: dropping the
+    // last handle is what tears the match rule down, so it must outlive the
+    // loop and die with it.
+    drive_property_items(&state, &bus_name, sub.items(), cancel).await;
+    tracing::debug!(bus_name, "PropertiesChanged stream ended for player");
+}
+
+/// The body of [`watch_properties`], over an injected item stream so the
+/// teardown above is a testable property and not a hopeful comment.
+///
+/// The stream type is also the guard on the `items()`/`events()` choice this
+/// fold depends on: `events()` yields `SignalEvent`, which does not fit here.
+async fn drive_property_items<S>(state: &State, bus_name: &str, mut items: S, mut cancel: CancelRx)
+where
+    S: futures_util::Stream<Item = SignalItem> + Unpin,
+{
+    loop {
+        let item = tokio::select! {
+            biased;
+            () = cancelled(&mut cancel) => {
+                tracing::debug!(
+                    bus_name,
+                    "mpris player unregistered; dropping its PropertiesChanged subscription"
+                );
+                return;
+            }
+            next = items.next() => match next {
+                Some(item) => item,
+                None => return,
+            },
+        };
         match item {
             SignalItem::Resubscribed => {
                 tracing::debug!(
@@ -829,11 +949,9 @@ async fn watch_properties(state: State, bus_name: String, sub: hytte_bus::Signal
             }
         }
 
-        state.refresh_player(&bus_name).await;
+        state.refresh_player(bus_name).await;
         state.publish().await;
     }
-
-    tracing::debug!(bus_name, "PropertiesChanged stream ended for player");
 }
 
 /// Per-player position poller task. Ticks every 250 ms while the player is
@@ -849,7 +967,7 @@ async fn watch_properties(state: State, bus_name: String, sub: hytte_bus::Signal
 /// takes one eager poll immediately on resume, via `reset_immediately`, so
 /// the seek bar snaps to the true position the instant the panel opens
 /// rather than waiting up to 250 ms for the next tick.
-async fn poll_position(state: State, bus_name: String) {
+async fn poll_position(state: State, bus_name: String, mut cancel: CancelRx) {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -860,14 +978,24 @@ async fn poll_position(state: State, bus_name: String) {
         // reactivated, reset the interval so the following tick fires right
         // away instead of waiting out whatever was left of the last 250 ms
         // window before we parked.
+        //
+        // Unregistration wins over both waits: the self-exit below only runs
+        // on a tick, so a poller parked on the gate (or on a 250 ms tick)
+        // for a player that just went away would linger until the panel is
+        // next opened.
         if !state.active.get() {
-            let _ = state.active.signal().wait_for(true).await;
-            interval.reset_immediately();
+            tokio::select! {
+                biased;
+                () = cancelled(&mut cancel) => return,
+                _ = state.active.signal().wait_for(true) => interval.reset_immediately(),
+            }
         }
 
         // Wait for the next tick, but bail out early if we get gated
         // inactive mid-wait — no point holding the timer while parked.
         tokio::select! {
+            biased;
+            () = cancelled(&mut cancel) => return,
             _ = interval.tick() => {}
             _ = state.active.signal().wait_for(false) => {
                 continue;
@@ -925,13 +1053,14 @@ async fn poll_position(state: State, bus_name: String) {
 /// no restart, and none of the `warn!`-plus-kept-row that `spawn_supervised`
 /// gives an unexpected return. One per player over a session is a lot of
 /// both.
-fn spawn_player(state: &State, bus_name: String) {
+fn spawn_player(state: &State, bus_name: String, cancel: CancelRx) {
     let state2 = state.clone();
     spawn_supervised_bounded("mpris-player", move || {
         let state = state2.clone();
         let bus_name = bus_name.clone();
+        let cancel = cancel.clone();
         async move {
-            spawn_player_tasks(state, bus_name).await;
+            spawn_player_tasks(state, bus_name, cancel).await;
         }
     });
 }
@@ -948,15 +1077,17 @@ fn spawn_player(state: &State, bus_name: String) {
 /// without a session bus — including through `run_owner_change_loop`, so the
 /// gate is exercised where the race actually happens.
 #[derive(Clone)]
-struct Spawner(Arc<dyn Fn(&State, String) + Send + Sync>);
+struct Spawner(Arc<dyn Fn(&State, String, CancelRx) + Send + Sync>);
 
 impl Spawner {
     /// The production spawner: one supervised, bounded [`spawn_player`] task
     /// set per player.
     fn player() -> Self {
-        Self(Arc::new(|state: &State, bus_name: String| {
-            spawn_player(state, bus_name);
-        }))
+        Self(Arc::new(
+            |state: &State, bus_name: String, cancel: CancelRx| {
+                spawn_player(state, bus_name, cancel);
+            },
+        ))
     }
 
     /// Register `bus_name` and spawn its task set **only** if this call is the
@@ -966,14 +1097,14 @@ impl Spawner {
     /// point: a duplicate is refused before a proxy, a subscription, a poller
     /// and a liveness watcher exist, not after.
     async fn spawn_if_new(&self, state: &State, bus_name: String) -> bool {
-        if !state.register(&bus_name).await {
+        let Some(cancel) = state.register(&bus_name).await else {
             tracing::debug!(
                 bus_name,
                 "mpris player is already watched; not spawning a second task set"
             );
             return false;
-        }
-        (self.0)(state, bus_name);
+        };
+        (self.0)(state, bus_name, cancel);
         true
     }
 }
@@ -981,17 +1112,20 @@ impl Spawner {
 /// The session-bus name prefix every MPRIS player owns.
 const PLAYER_NAME_PREFIX: &str = "org.mpris.MediaPlayer2.";
 
-/// List every current session-bus name and spawn a watcher for each MPRIS
-/// player not already tracked. Used both for the startup snapshot and for the
-/// [`SignalItem::Resubscribed`]/[`SignalItem::Lagged`] re-read (#1201): the
-/// `NameOwnerChanged` subscription this feeds is a fold exactly like
-/// [`watch_properties`]'s — a hole in its history means a player that
+/// Ask the broker for every current session-bus name and reconcile the
+/// tracked player set against the answer. Used both for the startup snapshot
+/// and for the [`SignalItem::Resubscribed`]/[`SignalItem::Lagged`] re-read
+/// (#1201): the `NameOwnerChanged` subscription this feeds is a fold exactly
+/// like [`watch_properties`]'s — a hole in its history means a player that
 /// appeared during the gap is never discovered at all, and one that quit
-/// stays in the drawer forever (nothing re-announces a name that already
-/// went away). [`Spawner::spawn_if_new`] skips a name already being watched,
-/// so a re-read after a brief gap costs one `ListNames` round trip rather
-/// than a second `spawn_player_tasks` racing the first.
+/// stays in the drawer forever (nothing re-announces a name that already went
+/// away).
+///
+/// The tracked set is snapshotted **before** the round trip; see
+/// [`reconcile_players`] for what that snapshot is for.
 async fn discover_players(state: &State, spawner: &Spawner) -> Result<()> {
+    let tracked_before = state.tracked().await;
+
     let names: Vec<String> = call(BusKind::Session, "org.freedesktop.DBus")
         .at_path("/org/freedesktop/DBus")
         .iface("org.freedesktop.DBus")
@@ -1001,13 +1135,52 @@ async fn discover_players(state: &State, spawner: &Spawner) -> Result<()> {
         .await
         .context("ListNames")?;
 
+    reconcile_players(state, &names, &tracked_before, spawner).await;
+
+    Ok(())
+}
+
+/// Reconcile the tracked player set against a full `ListNames` snapshot:
+/// start watching every MPRIS name that is not tracked yet, and **stop**
+/// tracking every name that is tracked but absent from the reply.
+///
+/// The prune is the half of the re-read that #1201 first shipped without, and
+/// it is the user-visible half. `ListNames` is the only thing that ever
+/// re-answers "is this player still here": the broker does not re-announce a
+/// name that already went away, and the per-player liveness watcher cannot
+/// stand in for it (a proxy rebuild after a reconnect succeeds for an unowned
+/// name, so it reports `Live`, never `PeerGone` — see [`watch_liveness`]). So
+/// without this, a player that quit during a bus gap kept its row for the
+/// rest of the session, and #1197's per-player re-read repainted that row
+/// blank on every later marker.
+///
+/// Only names in `tracked_before` — the snapshot taken before `ListNames` was
+/// asked — are candidates for pruning. A player discovered by the
+/// `NameOwnerChanged` arm *while* the round trip was in flight is missing
+/// from the reply too, and dropping it would be the very bug the re-read
+/// exists to fix.
+async fn reconcile_players(
+    state: &State,
+    names: &[String],
+    tracked_before: &[String],
+    spawner: &Spawner,
+) {
     for name in names.iter().filter(|n| n.starts_with(PLAYER_NAME_PREFIX)) {
         if spawner.spawn_if_new(state, name.clone()).await {
             tracing::debug!(name = %name, "found mpris player");
         }
     }
 
-    Ok(())
+    for gone in tracked_before
+        .iter()
+        .filter(|tracked| !names.iter().any(|live| live == *tracked))
+    {
+        tracing::info!(
+            bus_name = %gone,
+            "mpris player is no longer on the bus; unregistering (its release was missed)"
+        );
+        state.unregister(gone).await;
+    }
 }
 
 // ── Main listen loop ──────────────────────────────────────────────────────────
@@ -1321,7 +1494,10 @@ mod tests {
 
     // ── #1201: NameOwnerChanged re-discovers on Resubscribed/Lagged ─────────
 
-    use super::{PLAYER_NAME_PREFIX, Spawner, State, run_owner_change_loop};
+    use super::{
+        CancelRx, Duration, PLAYER_NAME_PREFIX, Player, Spawner, State, cancelled,
+        drive_property_items, reconcile_players, run_owner_change_loop,
+    };
     use futures_signals::signal::Mutable;
     use hytte_bus::{SignalEvent, SignalItem};
     use std::sync::Arc;
@@ -1333,7 +1509,7 @@ mod tests {
         let spawns = Arc::new(AtomicUsize::new(0));
         let counter = spawns.clone();
         (
-            Spawner(Arc::new(move |_state, _bus_name| {
+            Spawner(Arc::new(move |_state, _bus_name, _cancel| {
                 counter.fetch_add(1, Ordering::SeqCst);
             })),
             spawns,
@@ -1463,6 +1639,167 @@ mod tests {
             state.order.lock().await.len(),
             1,
             "and exactly one tracking entry"
+        );
+    }
+
+    // ── #1201 review HIGH 1: the re-read prunes as well as adds ─────────────
+
+    /// Register a player and give it a published row, the way a live
+    /// `spawn_player_tasks` would. Returns its teardown receiver.
+    async fn seed_player(state: &State, bus_name: &str) -> CancelRx {
+        let cancel = state
+            .register(bus_name)
+            .await
+            .expect("fresh name registers");
+        state.map.lock().await.insert(
+            bus_name.to_string(),
+            Player {
+                bus_name: bus_name.to_string(),
+                identity: "Seeded".to_string(),
+                ..Player::default()
+            },
+        );
+        state.publish().await;
+        cancel
+    }
+
+    /// The `ListNames` re-read must remove a player that is no longer on the
+    /// bus, not just add ones that are. A player that quit during a bus gap
+    /// is never re-announced (the broker only announces changes) and its
+    /// liveness watcher cannot see it either (`Proxy::new_owned` succeeds for
+    /// an unowned name, so the rebuilt proxy reports `Live`) — so this reply
+    /// is the only notice the service will ever get, and before the review's
+    /// fix it was ignored. #1197's per-player re-read then repainted the
+    /// surviving row blank on every later marker.
+    ///
+    /// Falsifiable: deleting the prune loop in `reconcile_players` leaves the
+    /// row published and the teardown signal unsent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_departed_player_is_pruned_and_its_tasks_torn_down() {
+        let players = Mutable::new(Vec::new());
+        let state = State::new(players.clone(), Mutable::new(true));
+        let (spawner, spawns) = counting_spawner();
+        let name = format!("{PLAYER_NAME_PREFIX}x");
+
+        let mut cancel = seed_player(&state, &name).await;
+        assert_eq!(players.get_cloned().len(), 1, "seeded row is published");
+
+        // The re-read's reply does not mention it any more.
+        let tracked_before = state.tracked().await;
+        reconcile_players(&state, &[], &tracked_before, &spawner).await;
+
+        assert!(
+            players.get_cloned().is_empty(),
+            "a player absent from ListNames must lose its row"
+        );
+        assert!(state.tracked().await.is_empty(), "and its tracking entry");
+        assert!(
+            state.map.lock().await.is_empty(),
+            "and its cached properties, so a later re-read cannot resurrect it"
+        );
+        assert!(
+            state.cancels.lock().await.is_empty(),
+            "and its teardown channel"
+        );
+        // Every per-player task awaits exactly this, so its resolving is what
+        // "the subscription, the poller and the liveness watcher are gone"
+        // means here.
+        tokio::time::timeout(Duration::from_secs(1), cancelled(&mut cancel))
+            .await
+            .expect("unregistering a player must cancel its tasks");
+        assert_eq!(spawns.load(Ordering::SeqCst), 0, "nothing to spawn");
+    }
+
+    /// The teardown signal is only worth anything if the tasks honour it, and
+    /// the `PropertiesChanged` watcher is the one that matters: its markers
+    /// keep arriving for the life of the process, and since #1197 each one
+    /// re-reads and re-publishes the player — which is what turned a stale
+    /// row into a blank one. Driven over a stream that never yields, so
+    /// cancellation is the only thing that can end it.
+    ///
+    /// Falsifiable: deleting the `cancelled` arm from `drive_property_items`
+    /// makes this hang until the timeout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unregistering_stops_the_properties_watcher() {
+        let state = State::new(Mutable::new(Vec::new()), Mutable::new(true));
+        let name = format!("{PLAYER_NAME_PREFIX}x");
+        let cancel = seed_player(&state, &name).await;
+
+        let both = async {
+            tokio::join!(
+                drive_property_items(
+                    &state,
+                    &name,
+                    futures_util::stream::pending::<SignalItem>(),
+                    cancel
+                ),
+                state.unregister(&name),
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(1), both)
+            .await
+            .expect("the properties watcher must exit when its player is unregistered");
+    }
+
+    /// The prune is scoped to the snapshot taken *before* `ListNames` was
+    /// asked, because a player the NOC arm discovered while that round trip
+    /// was in flight is missing from the reply too — and dropping it would be
+    /// the very bug the re-read exists to fix.
+    ///
+    /// Falsifiable: pruning against the live `order` instead of
+    /// `tracked_before` drops the newcomer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_player_that_appeared_during_the_round_trip_survives_the_prune() {
+        let players = Mutable::new(Vec::new());
+        let state = State::new(players.clone(), Mutable::new(true));
+        let (spawner, _spawns) = counting_spawner();
+
+        // Snapshot first (empty), then the newcomer registers, then the reply
+        // — which predates it — comes back.
+        let tracked_before = state.tracked().await;
+        let name = format!("{PLAYER_NAME_PREFIX}late");
+        let _cancel = seed_player(&state, &name).await;
+
+        reconcile_players(&state, &[], &tracked_before, &spawner).await;
+
+        assert_eq!(
+            state.tracked().await,
+            vec![name],
+            "a player discovered during the round trip must not be pruned by it"
+        );
+        assert_eq!(players.get_cloned().len(), 1);
+    }
+
+    /// A player still on the bus keeps its row and does not gain a second
+    /// task set — the two halves of the reconcile must not fight each other.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_present_player_is_neither_pruned_nor_respawned() {
+        let players = Mutable::new(Vec::new());
+        let state = State::new(players.clone(), Mutable::new(true));
+        let (spawner, spawns) = counting_spawner();
+        let name = format!("{PLAYER_NAME_PREFIX}x");
+
+        let _cancel = seed_player(&state, &name).await;
+        let tracked_before = state.tracked().await;
+
+        reconcile_players(
+            &state,
+            &[
+                "org.freedesktop.DBus".to_string(),
+                name.clone(),
+                "org.example.NotAPlayer".to_string(),
+            ],
+            &tracked_before,
+            &spawner,
+        )
+        .await;
+
+        assert_eq!(state.tracked().await, vec![name]);
+        assert_eq!(players.get_cloned().len(), 1);
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            0,
+            "already watched, and a non-MPRIS name is not a player"
         );
     }
 

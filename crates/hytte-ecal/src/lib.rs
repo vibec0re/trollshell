@@ -29,9 +29,10 @@
 //! `clippy::undocumented_unsafe_blocks` is `deny` for this crate (#1195, from
 //! the root lints table its `Cargo.toml` mirrors), and that lint reads the
 //! comment directly above each block and nothing else. A grouped comment
-//! covering three blocks at once therefore does not compile, which is the
-//! point: a future block arriving without a justification fails `cargo check`
-//! rather than a reviewer's sampling.
+//! covering three blocks at once therefore fails that lint, which is the
+//! point: a future block arriving without a justification fails `cargo
+//! clippy` (the `nix flake check` gate — a plain `cargo check` does not see
+//! this lint at all) rather than a reviewer's sampling.
 //!
 //! Three premises recur on nearly every call, so they are stated once here
 //! and referred to by name (**P1**/**P2**/**P3**) rather than retyped a

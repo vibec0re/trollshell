@@ -50,8 +50,10 @@ all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 disallowed_methods = "deny"
 # Mirrored from root (#1195): an `unsafe` block with no `// SAFETY:` line above
-# it fails `cargo check` here, so the 129 lines #1179 wrote are a rule rather
-# than a convention a future block can quietly skip.
+# it fails `cargo clippy` here (a restriction-group lint rustc itself never
+# sees — measured, `cargo check` alone stays green), so the 129 lines #1179
+# wrote are a rule the `nix flake check` clippy row enforces rather than a
+# convention a future block can quietly skip.
 undocumented_unsafe_blocks = "deny"
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"

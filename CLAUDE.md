@@ -42,7 +42,8 @@ For quick feedback while iterating, `cargo clippy -p <crate> --lib` is much fast
 ### Tests
 
 Tests split into two buckets via the `system-tests` cargo feature (defined in
-`hytte-bus`, `hytte-reactive`, `hytte-services`, `hytte-ui`). **Internals**
+`hytte-bus`, `hytte-reactive`, `hytte-services`, `hytte-ui`, `trollshell`,
+`trollshell-agent-window`, `trollshell-control-center`). **Internals**
 (pure logic) run by default; **real-system** tests (those needing a
 `dbus-daemon` or a display server) are gated behind the feature so the default
 run stays hermetic.

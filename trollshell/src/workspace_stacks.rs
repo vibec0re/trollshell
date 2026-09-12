@@ -560,19 +560,32 @@ pub(crate) fn column_order_batch(
 ///
 /// What the grace window's one warning names (#1071 §3.4 step 4) and what
 /// decides whether the layout waited for everything or ran out of patience.
+///
+/// Count-aware, not membership (#1133): two `Alacritty` entries with only one
+/// `Alacritty` window on the workspace report the **second** entry missing,
+/// not neither — a plain "is this id present at all" set would read the pair
+/// as fully arrived the moment the first window opened.
 #[must_use]
 pub(crate) fn missing_apps(stack: &Stack, workspace: u64, windows: &[Window]) -> Vec<String> {
-    let here: BTreeSet<&str> = windows
+    let mut here: BTreeMap<&str, usize> = BTreeMap::new();
+    for id in windows
         .iter()
         .filter(|w| w.workspace_id == Some(workspace))
         .filter_map(|w| w.app_id.as_deref())
-        .collect();
+    {
+        *here.entry(id).or_insert(0) += 1;
+    }
+
+    let mut claimed: BTreeMap<&str, usize> = BTreeMap::new();
     stack
         .apps
         .iter()
-        .map(|a| a.id.as_str())
-        .filter(|id| !here.contains(id))
-        .map(str::to_owned)
+        .filter(|a| {
+            let ordinal = claimed.entry(a.id.as_str()).or_insert(0);
+            *ordinal += 1;
+            *ordinal > here.get(a.id.as_str()).copied().unwrap_or(0)
+        })
+        .map(|a| a.id.clone())
         .collect()
 }
 

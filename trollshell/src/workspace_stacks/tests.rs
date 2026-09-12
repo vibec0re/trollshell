@@ -1422,6 +1422,47 @@ fn a_start_resolves_each_apps_entry_and_launches_activates_or_warns() {
     );
 }
 
+/// #1133: the same `app_id` twice in a stack is two independent launches, not
+/// one — a workspace saved with two Alacritty windows must Start two, not
+/// collapse them onto a single unit the way a naive "one launch per unique
+/// `app_id`" would.
+///
+/// **The mutation**: launching by unique `app_id` (e.g. a `HashSet`/`BTreeSet`
+/// guard before the loop, or keying the unit by `app.id` instead of `index`)
+/// reds this — `script.launches()` would come back with one entry, or two
+/// entries sharing one unit name, instead of two distinct ones.
+#[test]
+fn a_start_launches_every_entry_even_when_the_app_id_repeats() {
+    let stack = Stack {
+        apps: vec![by_id("Alacritty"), by_id("Alacritty")],
+        ..Stack::default()
+    };
+    let before = vec![ws(1, 1, LEFT, None, true)];
+    let after = vec![ws(1, 1, LEFT, Some("term"), true)];
+    let script = Script::default()
+        .with_workspaces(&[before.clone(), before, after])
+        .with_plain_entries(&["Alacritty"]);
+
+    run(start(&script, "term", &stack, &Workspaces::default())).expect("starts");
+
+    let launches = script.launches();
+    assert_eq!(
+        launches.len(),
+        2,
+        "two entries of the same app-id must produce two launches: {launches:?}"
+    );
+    assert_ne!(
+        launches[0], launches[1],
+        "each entry gets its own unit — collapsing to one would leave Stop \
+         unable to tell them apart: {launches:?}"
+    );
+    assert_eq!(
+        script.launch_argvs(),
+        vec![vec!["Alacritty".to_owned()], vec!["Alacritty".to_owned()]],
+        "both entries actually ran the entry's Exec, not a warned-and-skipped no-op"
+    );
+}
+
 /// A D-Bus activation records **no unit**, because the bus started the process
 /// and it is in nobody's slice — claiming one would make Stop's
 /// `Launched::units` name a unit that does not exist.
@@ -2122,6 +2163,39 @@ fn two_entries_of_one_app_take_two_windows() {
     );
 }
 
+/// #1133: a stack with two entries of one app claims the two **leftmost**
+/// windows of that app-id and leaves a third one a stray — the stack has
+/// nowhere to put it (there is no third entry), so it is neither focused nor
+/// moved by this batch. `reconcile`'s stray-window walk is what a window
+/// outside the stack's own workspace goes through instead; this is the
+/// column-order side of the same "which window is whose" question, for a
+/// window already on the right workspace.
+#[test]
+fn two_entries_of_one_app_leave_a_third_window_a_stray() {
+    let windows = [
+        win_at(11, 1, "Alacritty", 3),
+        win_at(12, 1, "Alacritty", 1),
+        win_at(13, 1, "Alacritty", 2),
+    ];
+    let batch = column_order_batch(&stack(&["Alacritty", "Alacritty"]), 1, &windows);
+    assert_eq!(
+        batch,
+        [
+            // Column 1, leftmost, taken by the first entry.
+            WorkspaceAction::FocusWindow { window: 12 },
+            WorkspaceAction::MoveColumnToIndex { index: 1 },
+            // Column 2, next, taken by the second entry.
+            WorkspaceAction::FocusWindow { window: 13 },
+            WorkspaceAction::MoveColumnToIndex { index: 2 },
+        ]
+    );
+    assert!(
+        !batch.contains(&WorkspaceAction::FocusWindow { window: 11 }),
+        "the third Alacritty window has no entry to claim it and must be left \
+         a stray, not folded into either move: {batch:?}"
+    );
+}
+
 /// End to end: the ordering rides **one** batch, after the last launch and
 /// before the layout.
 ///
@@ -2212,6 +2286,29 @@ fn missing_apps_names_what_never_arrived() {
         "a window on another workspace is not this stack's"
     );
     assert!(missing_apps(&stack(&["firefox"]), 1, &windows).is_empty());
+}
+
+/// #1133: two entries of the same app-id are counted, not merely checked for
+/// presence — with only one window open, the **second** entry is missing, not
+/// neither.
+///
+/// **The mutation**: reverting to a membership `BTreeSet<&str>` (does this
+/// id have *any* window at all) reds this — it would report no app missing
+/// the moment the first `Alacritty` window opened.
+#[test]
+fn missing_apps_counts_duplicate_entries_rather_than_checking_membership() {
+    let one_window = [win(9, 1, "Alacritty")];
+    assert_eq!(
+        missing_apps(&stack(&["Alacritty", "Alacritty"]), 1, &one_window),
+        ["Alacritty"],
+        "one window open, two entries: the second has not arrived"
+    );
+
+    let two_windows = [win(9, 1, "Alacritty"), win(10, 1, "Alacritty")];
+    assert!(
+        missing_apps(&stack(&["Alacritty", "Alacritty"]), 1, &two_windows).is_empty(),
+        "both windows open: nothing missing"
+    );
 }
 
 /// An app that never opened a window does not stop the layout: §3.4 step 4 is

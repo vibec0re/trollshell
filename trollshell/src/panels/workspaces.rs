@@ -74,7 +74,7 @@
 //! seam `widgets::workspaces::bind_workspace_pills` and
 //! `panels::bluetooth::bind_device_groups` carve for the same reason.
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use hytte::futures_signals::map_ref;
@@ -143,18 +143,19 @@ const INACTIVE_HINT: &str = "Not on a screen";
 const OFFLINE_COLUMN_HINT: &str =
     "These stacks name a screen that is not connected. Starting one puts it on the focused screen.";
 
-/// One app in a card's stack row.
-///
-/// Identified by its `app_id` (what niri reports per window, and what #1071
-/// §3.2 makes the stack's stored identity) rather than by window, so N windows
-/// of one app are one icon.
+/// One entry in a card's stack row — one per **window**, not one per app-id
+/// (#1133): a workspace with two Alacritty windows is two entries, each with
+/// its own icon, because #1071 §3.2's stored identity is an *ordered list of
+/// apps* and the same `app_id` may appear in it as often as it has windows.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StackApp {
     /// The Wayland app-id, resolved to an icon and a display name at render
     /// time. Compositor-supplied, so never rendered as markup.
     app_id: String,
-    /// At least one window of this app is open on the card's workspace. A saved
-    /// stack whose app is not running renders dim (#1071 §5).
+    /// This entry's window is open on the card's workspace. For a saved stack,
+    /// "this entry's window" is positional: the n-th entry of an `app_id`
+    /// glows when the n-th open window of that `app_id` exists — see
+    /// [`open_app_counts`]. A dim icon renders dim (#1071 §5).
     running: bool,
 }
 
@@ -357,18 +358,29 @@ fn model(
             slices_up.contains(&name),
             starting,
         );
-        let open: BTreeSet<&str> = live
-            .map(|w| open_app_ids(w.id, windows))
+        let open_counts: BTreeMap<&str, usize> = live
+            .map(|w| open_app_counts(w.id, windows))
             .unwrap_or_default();
+        // Per-instance glow (#1133): the n-th entry of an `app_id` in the
+        // file's list lights up when the n-th open window of that `app_id`
+        // exists, so `seen` counts each id's ordinal as the map runs in stack
+        // order — not membership, which would light every entry of a
+        // half-open pair.
+        let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
         let card = Card {
             name: name.clone(),
             kind: Kind::Saved(state),
             apps: stack
                 .apps
                 .iter()
-                .map(|app| StackApp {
-                    app_id: app.id.clone(),
-                    running: open.contains(app.id.as_str()),
+                .map(|app| {
+                    let ordinal = seen.entry(app.id.as_str()).or_insert(0);
+                    *ordinal += 1;
+                    let open = open_counts.get(app.id.as_str()).copied().unwrap_or(0);
+                    StackApp {
+                        app_id: app.id.clone(),
+                        running: *ordinal <= open,
+                    }
                 })
                 .collect(),
             live: live.map(|w| w.id),
@@ -503,20 +515,30 @@ fn named_workspace<'w>(workspaces: &'w [Workspace], name: &str) -> Option<&'w Wo
     })
 }
 
-/// **Membership only**: which app-ids have a window on `workspace_id`.
+/// How many open windows of each app-id are on `workspace_id`, for a saved
+/// card's per-instance glow (#1133).
 ///
-/// A set, deliberately — its one caller asks "is this saved app running?", which
-/// is a lookup and not an ordering. Anything that needs the order calls
-/// [`ordered_app_ids`] directly; routing an ordered list through here is how the
-/// ephemeral card's column order got silently sorted alphabetically.
-fn open_app_ids(workspace_id: u64, windows: &[Window]) -> BTreeSet<&str> {
-    ordered_app_ids(workspace_id, windows).into_iter().collect()
+/// A count, deliberately: the n-th entry of an `app_id` in the file's list
+/// lights up when the n-th open window of that `app_id` exists, and that only
+/// needs *how many* are open, not *which* window backs which entry — that
+/// question is `column_order_batch`'s, at Start time, over a live niri, not
+/// the drawer's at render time.
+fn open_app_counts(workspace_id: u64, windows: &[Window]) -> BTreeMap<&str, usize> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for app_id in ordered_app_ids(workspace_id, windows) {
+        *counts.entry(app_id).or_insert(0) += 1;
+    }
+    counts
 }
 
-/// As [`open_app_ids`], but keeping niri's column order — what an ephemeral
-/// card's row shows, and what a Save records as the stack order (#1071 §3.4
-/// step 3 makes that order niri's column order, so recording it in column order
-/// is what makes a Start reproduce what was saved).
+/// The workspace's windows, resolved to app-ids in **niri's column order** —
+/// what an ephemeral card's row shows, and what a Save records as the stack
+/// order (#1071 §3.4 step 3 makes that order niri's column order, so recording
+/// it in column order is what makes a Start reproduce what was saved).
+///
+/// **Not deduped** (#1133): two windows of one app-id are two entries, because
+/// the stack itself now records one entry per window — a workspace with two
+/// Alacritty windows saves, and shows, two Alacritty entries.
 fn ordered_app_ids(workspace_id: u64, windows: &[Window]) -> Vec<&str> {
     ordered_windows(workspace_id, windows)
         .into_iter()
@@ -531,9 +553,10 @@ fn ordered_app_ids(workspace_id: u64, windows: &[Window]) -> Vec<&str> {
 /// to read. Taken from the same snapshot as everything else on the card, because
 /// a pid resolved later may have been recycled onto somebody else's process.
 ///
-/// Deduped by app-id, first (leftmost column) wins — the same rule
-/// `ordered_app_ids` applies, since the two must agree about which window an app
-/// is represented by.
+/// **Not deduped** (#1133): every window on the workspace contributes its own
+/// entry, in column order — routing this through a dedup (as it once did) is
+/// how two windows of one app collapsed into a single stack entry that could
+/// only ever be Started or shown once.
 fn ordered_windows(workspace_id: u64, windows: &[Window]) -> Vec<(&str, Option<i32>)> {
     let mut on_workspace: Vec<&Window> = windows
         .iter()
@@ -551,13 +574,9 @@ fn ordered_windows(workspace_id: u64, windows: &[Window]) -> Vec<(&str, Option<i
         )
     });
 
-    let mut seen: HashSet<&str> = HashSet::new();
     on_workspace
         .into_iter()
-        .filter_map(|w| {
-            let app_id = w.app_id.as_deref()?;
-            seen.insert(app_id).then_some((app_id, w.pid))
-        })
+        .filter_map(|w| w.app_id.as_deref().map(|app_id| (app_id, w.pid)))
         .collect()
 }
 
@@ -1721,6 +1740,42 @@ mod model_tests {
         );
     }
 
+    /// #1133: a stack with **two** entries of the same app-id glows **per
+    /// instance** — the first entry lights up with one window open, the
+    /// second stays dim until a *second* window of that app-id exists.
+    ///
+    /// **The mutation**: glowing by set membership (`open.contains(app_id)`,
+    /// the pre-#1133 rule) reds this — both entries would read `true` with
+    /// only one Alacritty window open.
+    #[test]
+    fn a_saved_cards_second_instance_of_an_app_glows_only_with_a_second_window() {
+        let file = saved(&[("term", stack(Some(LEFT), &["Alacritty", "Alacritty"]))]);
+
+        let one_window = built(
+            &[ws(1, 1, LEFT, Some("term"))],
+            &[win(9, 1, "Alacritty", 1)],
+            &file,
+        );
+        let card = &find(&one_window, LEFT).cards[0];
+        assert_eq!(
+            card.apps.iter().map(|a| a.running).collect::<Vec<_>>(),
+            [true, false],
+            "one window open: only the first entry glows"
+        );
+
+        let two_windows = built(
+            &[ws(1, 1, LEFT, Some("term"))],
+            &[win(9, 1, "Alacritty", 1), win(10, 1, "Alacritty", 2)],
+            &file,
+        );
+        let card = &find(&two_windows, LEFT).cards[0];
+        assert_eq!(
+            card.apps.iter().map(|a| a.running).collect::<Vec<_>>(),
+            [true, true],
+            "two windows open: both entries glow"
+        );
+    }
+
     /// §3.7: an unnamed workspace **with windows on it** is an ephemeral card,
     /// carrying its live apps in niri's column order.
     #[test]
@@ -1894,10 +1949,14 @@ mod model_tests {
         assert_eq!(app_ids(&find(&swapped, LEFT).cards[0]), ["a-editor", "mpv"]);
     }
 
-    /// Two windows of one app are one icon, and a window with no `app_id`
+    /// Two windows of one app are **two** entries (#1133 — an app can appear
+    /// as many times as it has windows), and a window with no `app_id`
     /// contributes none — there is nothing to resolve a desktop entry from.
+    ///
+    /// **The mutation**: deduping `app_ids` (or `apps`) by `app_id` reds this —
+    /// `firefox` would appear once instead of twice.
     #[test]
-    fn an_ephemeral_cards_apps_are_deduped_and_skip_anonymous_windows() {
+    fn an_ephemeral_cards_apps_are_one_per_window_and_skip_anonymous_windows() {
         let mut anonymous = win(1, 1, "x", 1);
         anonymous.app_id = None;
         let columns = built(
@@ -1910,7 +1969,10 @@ mod model_tests {
             ],
             &no_stacks(),
         );
-        assert_eq!(app_ids(&find(&columns, LEFT).cards[0]), ["firefox", "mpv"]);
+        assert_eq!(
+            app_ids(&find(&columns, LEFT).cards[0]),
+            ["firefox", "firefox", "mpv"]
+        );
     }
 
     /// §3.7's two extra facts an ephemeral card has to carry so its Save can
@@ -2784,9 +2846,9 @@ pub(in crate::panels) mod tests {
         window.destroy();
     }
 
-    /// An ephemeral card shows the live windows, deduped, carries no Start/Stop
-    /// — it is already running — and offers **Edit** and nothing else
-    /// (#1071 §3.7 / #1109).
+    /// An ephemeral card shows the live windows, one icon per window (#1133),
+    /// carries no Start/Stop — it is already running — and offers **Edit** and
+    /// nothing else (#1071 §3.7 / #1109).
     ///
     /// **#1109's own assertion**: nothing inline. Phase 2 put a `gtk::Entry` and
     /// a Save button on this card; Annika's ruling is that they go entirely, so
@@ -2813,8 +2875,9 @@ pub(in crate::panels) mod tests {
         );
         assert_eq!(
             icons(&card).len(),
-            2,
-            "two windows of one app are one icon — the stack is a set of apps"
+            3,
+            "one icon per window (#1133) — two Term windows are two icons, \
+             not one; the stack is a list of apps, one per window"
         );
         assert!(
             by_class(&card, "ts-ws-action").is_empty(),

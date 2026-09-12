@@ -42,7 +42,8 @@ For quick feedback while iterating, `cargo clippy -p <crate> --lib` is much fast
 ### Tests
 
 Tests split into two buckets via the `system-tests` cargo feature (defined in
-`hytte-bus`, `hytte-reactive`, `hytte-services`, `hytte-ui`). **Internals**
+`hytte-bus`, `hytte-reactive`, `hytte-services`, `hytte-ui`, `trollshell`,
+`trollshell-agent-window`, `trollshell-control-center`). **Internals**
 (pure logic) run by default; **real-system** tests (those needing a
 `dbus-daemon` or a display server) are gated behind the feature so the default
 run stays hermetic.
@@ -72,10 +73,11 @@ xvfb-run cargo test --features system-tests -p hytte-ui   # display tests headle
   `crates/trollshell-agent-window/src/webview.rs`'s `gtk_tests` module doc.
 - `hytte-services`'s gated test round-trips the NetworkManager secret agent
   (`wifi::nm_agent`'s `GetSecrets`) against a real `dbus-daemon` too.
-- The Nix package (`nix/package.nix`) sets `doCheck = true`: every
-  `nix build .#trollshell` runs the hermetic internals suite
-  (`cargo test --workspace`, deliberately **without** `system-tests`) as part
-  of the build.
+- The hermetic internals suite (`cargo test --workspace`, deliberately
+  **without** `system-tests`) runs as `checks.workspace-tests` (flake.nix),
+  gated by `nix flake check` — not by `nix build .#trollshell`, since
+  `nix/package.nix` sets `doCheck = false` on the `workspace` derivation
+  (#1115; see "Packaging" below).
 
 ### Packaging (`nix/package.nix`)
 
@@ -215,7 +217,7 @@ cargo clippy --workspace --all-targets        # must be clean
 cargo fmt --all
 ```
 
-Edition 2024, MSRV **1.92** (`rust-version.workspace = true` in every member since #453 — wiring up the inheritance is what surfaced `clippy::incompatible_msrv` violations against the previously-fictional 1.85 and forced the first bump; not independently CI-gated beyond that clippy check — the devShell/crane toolchain floats on nixpkgs' current rustc, ~1.95). **1.92 rather than 1.91 since #1130**, and unlike the previous value this one is enforced by cargo rather than merely declared: `webkit6` pulls `soup3`/`soup3-sys` 0.9.0, which declare `rust-version = "1.92"`, and cargo hard-errors at _build_ time on a toolchain below a package's declared floor — so a 1.91 toolchain cannot build this workspace at all. (`resolver.incompatible-rust-versions` is a red herring there: it steers version selection while a lockfile is generated, and this one is pinned.) The nix build and devShell use nixpkgs' rust toolchain (via crane); there is no `rust-toolchain.toml` pin.
+Edition 2024, MSRV **1.92** (`rust-version.workspace = true` on every member since #453 — #1184 closes the one gap, `hytte-plugin-infobroker`, that had drifted from the rule; wiring up the inheritance is what surfaced `clippy::incompatible_msrv` violations against the previously-fictional 1.85 and forced the first bump; not independently CI-gated beyond that clippy check — the devShell/crane toolchain floats on nixpkgs' current rustc, ~1.95). **1.92 rather than 1.91 since #1130**, and unlike the previous value this one is enforced by cargo rather than merely declared: `webkit6` pulls `soup3`/`soup3-sys` 0.9.0, which declare `rust-version = "1.92"`, and cargo hard-errors at _build_ time on a toolchain below a package's declared floor — so a 1.91 toolchain cannot build this workspace at all. (`resolver.incompatible-rust-versions` is a red herring there: it steers version selection while a lockfile is generated, and this one is pinned.) The nix build and devShell use nixpkgs' rust toolchain (via crane); there is no `rust-toolchain.toml` pin.
 
 Shared dependency versions/feature baselines live in the root `Cargo.toml`'s `[workspace.dependencies]`; members inherit with `dep.workspace = true` rather than hand-repinning (#453). Every dependency comes from crates.io — the workspace has **no** git dependencies. `hive-claude` (`crates/hytte-claude-bridge` only) was the last one: a forge rev pin (#666) that crane resolved at eval time via `builtins.fetchGit`, rev-reproducible but not hash-pinned/substitutable the way a locked flake input is, so a cold `nix flake check` depended on that forge being reachable. #757 took the published 0.1.0 instead, closing #671 — keep it that way, and reach for a flake input over a bare rev pin if a git dependency is ever unavoidable. `deny.toml` (repo root) holds a `cargo-deny` advisories+licenses config, run locally — it isn't wired into `nix flake check` (the advisory-db fetch needs network, which sandboxed nix builds don't have):
 

@@ -29,6 +29,10 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
+    # Bounded on the nix-flake-check.yml precedent (#1011): a pure `nix
+    # build` of a docs derivation should be minutes, not hours, so a hang
+    # gets a verdict instead of GitHub's default 360-minute limit.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31

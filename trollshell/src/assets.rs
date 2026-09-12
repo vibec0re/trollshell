@@ -1,6 +1,7 @@
 //! Bundled asset path resolution.
 //!
-//! Resolution order, highest priority first:
+//! Resolution order, highest priority first — the same three-tier shape
+//! [`crate::revision`] uses:
 //!
 //! 1. `TROLLSHELL_DATA_DIR` env at runtime (override, e.g. for testing).
 //! 2. `TROLLSHELL_DATA_DIR` env at compile time (set by the Nix derivation
@@ -8,21 +9,35 @@
 //! 3. `CARGO_MANIFEST_DIR` (dev fallback — the asset sources live in the
 //!    top-level `assets/trollshell/` dir, i.e. `../assets/trollshell`
 //!    relative to this crate's `Cargo.toml`).
+//!
+//! An empty value at either env tier is treated as unset rather than
+//! propagated, mirroring [`crate::revision`]'s "never empty" contract.
 
 use std::path::PathBuf;
 
 use hytte::gtk;
 use hytte::gtk::gdk;
 
-const COMPILED_BASE: &str = match option_env!("TROLLSHELL_DATA_DIR") {
-    Some(s) => s,
-    None => concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/trollshell"),
-};
+/// Dev fallback: the asset sources live next to this crate's `Cargo.toml`.
+const MANIFEST_FALLBACK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/trollshell");
+
+/// Pick the effective base directory across the three tiers. Split out as a
+/// pure function for the same reason [`crate::revision::resolve`] is: the
+/// runtime tier can't be driven from a test (the workspace forbids `unsafe`,
+/// so `std::env::set_var` is unavailable) and the compile-time tier is baked
+/// in before any test runs.
+fn resolve_with(runtime: Option<&str>, compile_time: Option<&str>) -> PathBuf {
+    let base = runtime
+        .filter(|s| !s.is_empty())
+        .or_else(|| compile_time.filter(|s| !s.is_empty()))
+        .unwrap_or(MANIFEST_FALLBACK);
+    PathBuf::from(base)
+}
 
 #[must_use]
 pub fn path(rel: &str) -> PathBuf {
-    let base = std::env::var("TROLLSHELL_DATA_DIR").unwrap_or_else(|_| COMPILED_BASE.to_string());
-    PathBuf::from(base).join(rel)
+    let runtime = std::env::var("TROLLSHELL_DATA_DIR").ok();
+    resolve_with(runtime.as_deref(), option_env!("TROLLSHELL_DATA_DIR")).join(rel)
 }
 
 /// The bundled icon directory — `icons/` under the resolved data dir.
@@ -54,5 +69,55 @@ pub fn icons_dir() -> PathBuf {
 pub fn install_icon_search_path() {
     if let Some(display) = gdk::Display::default() {
         gtk::IconTheme::for_display(&display).add_search_path(icons_dir());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{MANIFEST_FALLBACK, resolve_with};
+
+    #[test]
+    fn runtime_tier_wins_when_set() {
+        assert_eq!(
+            resolve_with(Some("/runtime/dir"), Some("/compiled/dir")),
+            PathBuf::from("/runtime/dir")
+        );
+    }
+
+    #[test]
+    fn unset_or_empty_runtime_falls_through_to_compiled() {
+        assert_eq!(
+            resolve_with(None, Some("/compiled/dir")),
+            PathBuf::from("/compiled/dir")
+        );
+        assert_eq!(
+            resolve_with(Some(""), Some("/compiled/dir")),
+            PathBuf::from("/compiled/dir")
+        );
+    }
+
+    /// Mirrors `revision::tests::empty_compile_time_bake_still_yields_dev`: an
+    /// empty value at either upper tier must not propagate an empty base — it
+    /// falls all the way to the manifest-dir dev fallback.
+    #[test]
+    fn empty_or_unset_both_tiers_fall_through_to_manifest_fallback() {
+        assert_eq!(resolve_with(None, None), PathBuf::from(MANIFEST_FALLBACK));
+        assert_eq!(
+            resolve_with(Some(""), Some("")),
+            PathBuf::from(MANIFEST_FALLBACK)
+        );
+    }
+
+    /// The end-to-end shape contract every caller ([`super::path`],
+    /// [`super::icons_dir`]) relies on: whichever tier wins, `rel` is joined
+    /// onto the resolved base unchanged. Env-independent (true regardless of
+    /// what `TROLLSHELL_DATA_DIR` happens to be in the environment running
+    /// this test), unlike `revision::revision_is_never_empty`'s equivalent.
+    #[test]
+    fn path_ends_with_the_requested_rel() {
+        assert!(super::path("icons/cpu.svg").ends_with("icons/cpu.svg"));
+        assert!(super::path("style.css").ends_with("style.css"));
     }
 }

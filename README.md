@@ -31,8 +31,11 @@ heavier settings/management (picking the weather place, toggling plugin
 units, …) over a D-Bus link to the running shell — gnome-control-center-style,
 never linked into the shell itself.
 
-See `docs/superpowers/specs/2026-04-24-hytte-trollshell-design.md` for
-the founding design and the dated specs/plans alongside it for each feature.
+Design lives in GitHub discussions, epics and issues (since #1076) — a
+feature is specced on its thread, and a build issue links the epic or
+discussion it came from. `docs/superpowers/{specs,plans}/` is the April 2026
+archive of the original design; it documents the intent of the subsystems
+that date from then, but nothing has been added to it since.
 
 ## Build & run
 
@@ -163,9 +166,9 @@ standalone swaybg toggle (gently deprecated in favor of `backend = "swaybg"`).
 - `crates/hytte-plugin-proto/` + `crates/hytte-plugin/` — the plugin side
   (out-of-process, never linked into the shell): a GTK-free wire protocol and
   the Rust plugin runtime SDK a plugin binary depends on.
-- `crates/hytte-plugin-*/` (nine binaries: `clock-demo`, `bar-clock-demo`,
-  `pet`, `preem-demo`, `timer`, `terminal`, `caw`, `departures`, `weather`) —
-  the plugin binaries themselves, each its own systemd user unit.
+- `crates/hytte-plugin-*/` — the plugin binaries themselves, each its own
+  systemd user unit; the count drifts, so trust `ls crates/hytte-plugin-*`
+  over any number written here.
 - `crates/trollshell-control-center/` — the external settings/management
   companion app (see "What it does" above); a separate GTK4/libadwaita
   binary, not linked into the shell.

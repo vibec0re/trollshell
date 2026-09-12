@@ -394,14 +394,23 @@ fn build_create_popover(
     // anchor is the `gtk::MenuButton` this popover is *set on*
     // (`build_header`'s `add_btn.set_popover(…)`), so a strong capture makes
     // `add_btn → popover → column → create → do_create → add_btn`.
+    //
+    // `do_create` takes the entry as its **own argument** rather than
+    // capturing a clone (#1176 item 3). The handler below hangs off `entry`
+    // itself, so a captured `entry.clone()` would put the entry in its own
+    // handler list — the `panels/bluetooth.rs` self-pin one file over, and
+    // the reason the whole `DuePicker` this closure holds used to leak once
+    // per Add-button press: an immortal entry keeps everything its handler
+    // owns immortal too. The Add *button*'s handler is a **different**
+    // widget's, so the clone it needs is the sibling carve-out and stays a
+    // clone.
     let popover_for_create = popover.downgrade();
-    let entry_for_create = entry.clone();
     let anchor_for_create = anchor.downgrade();
     let due_picker_for_create = due_picker.clone();
     let lists_for_create = lists_track.clone();
     let list_picker_for_create = list_picker.clone();
-    let do_create = move || {
-        let summary = entry_for_create.text().trim().to_string();
+    let do_create = move |entry: &gtk::Entry| {
+        let summary = entry.text().trim().to_string();
         if summary.is_empty() {
             return;
         }
@@ -419,7 +428,7 @@ fn build_create_popover(
         };
         let _ = tasks::create_task(list.uid.clone(), summary, due_picker_for_create.value());
         drop(lists);
-        entry_for_create.set_text("");
+        entry.set_text("");
         due_picker_for_create.reset();
         if let Some(popover) = popover_for_create.upgrade() {
             popover.popdown();
@@ -428,11 +437,25 @@ fn build_create_popover(
             anchor.grab_focus();
         }
     };
+    // The Add button's handle on the entry is **weak**, which is not the
+    // sibling carve-out it looks like. `entry.connect_changed` above holds a
+    // strong `create` (it toggles the button's sensitivity), so a strong
+    // `entry.clone()` here closes `entry → create → entry`: a two-widget
+    // refcount cycle in which each capture is, on its own, the perfectly
+    // correct sibling shape. Measured — with a strong clone here the entry
+    // and the whole `DuePicker` behind it survive the popover exactly as
+    // they did before this fix. `nix/lint-bind-pins.py` cannot see this one
+    // (it reads ancestry, and these two are siblings); the test below is what
+    // holds it.
     let do_create_for_button = do_create.clone();
-    create.connect_clicked(move |_| do_create_for_button());
+    let entry_for_button = entry.downgrade();
+    create.connect_clicked(move |_| {
+        if let Some(entry) = entry_for_button.upgrade() {
+            do_create_for_button(&entry);
+        }
+    });
 
-    let do_create_for_entry = do_create;
-    entry.connect_activate(move |_| do_create_for_entry());
+    entry.connect_activate(move |entry| do_create(entry));
 
     // Reset state every time the popover opens; sync the list picker
     // to whatever the current `lists_track` contains.
@@ -526,13 +549,18 @@ fn open_edit_popover(parent: &gtk::Widget, task: &Task, monitor: &Monitor) {
     // the popover — plus its entry, due picker and dismiss catcher — survives
     // the row tap that built it, once per tap. `unparent_on_close` retires the
     // popover from the row but cannot free it while its own children hold it.
+    // `do_save` takes the entry as its own argument for the reason
+    // `build_create_popover`'s `do_create` does (#1176 item 3) — and this is
+    // the site that shape costs the most, because `open_edit_popover` runs
+    // **once per task row tap**: a captured `entry.clone()` would leave every
+    // tapped row's entry in its own handler list, and with it the whole
+    // `DuePicker` this closure holds.
     let popover_for_save = popover.downgrade();
-    let entry_for_save = entry.clone();
     let due_picker_for_save = due_picker.clone();
     let list_uid_for_save = task.list_uid.clone();
     let uid_for_save = task.uid.clone();
-    let do_save = move || {
-        let summary = entry_for_save.text().trim().to_string();
+    let do_save = move |entry: &gtk::Entry| {
+        let summary = entry.text().trim().to_string();
         if summary.is_empty() {
             return;
         }
@@ -546,11 +574,21 @@ fn open_edit_popover(parent: &gtk::Widget, task: &Task, monitor: &Monitor) {
             popover.popdown();
         }
     };
+    // Weak for the reason `build_create_popover`'s Add button is weak, taken
+    // here pre-emptively: this entry has no `connect_changed` holding `save`
+    // today, so a strong clone would close no cycle *yet* — and that is
+    // exactly the kind of edge a later "disable Save on an empty summary"
+    // would add without anyone re-deriving the two-hop argument. The upgrade
+    // costs one branch on a button press.
     let do_save_for_button = do_save.clone();
-    save.connect_clicked(move |_| do_save_for_button());
+    let entry_for_button = entry.downgrade();
+    save.connect_clicked(move |_| {
+        if let Some(entry) = entry_for_button.upgrade() {
+            do_save_for_button(&entry);
+        }
+    });
 
-    let do_save_for_entry = do_save;
-    entry.connect_activate(move |_| do_save_for_entry());
+    entry.connect_activate(move |entry| do_save(entry));
 
     let popover_for_cancel = popover.downgrade();
     cancel.connect_clicked(move |_| {
@@ -1640,22 +1678,31 @@ mod reentrancy_tests {
 ///    then owns the container those widgets hang from. Every task row tap
 ///    builds one.
 ///
-/// ## Why the popover itself is not asserted here
+/// 3. **The create/edit row's entry.** `do_create` and `do_save` captured
+///    `entry.clone()` and were installed on the entry's *own*
+///    `connect_activate`, so the entry sat in its own handler list — and
+///    since both closures also hold a strong [`DuePicker`], an immortal
+///    entry made the whole picker immortal with it. Both now take the entry
+///    as the closure's own argument; the Add/Save *button*'s handler is a
+///    different widget's, so its clone is the sibling carve-out.
 ///
-/// `build_create_popover` calls `hytte::ui::attach_dismiss_catcher`, which —
-/// as of this writing — captures a strong `popover.clone()` in the popover's
-/// *own* `connect_show` handler (`crates/hytte-ui/src/popup.rs`). That is the
-/// same defect one crate down, it is owned by #1180, and until it lands no
-/// assertion about this popover being freed could pass no matter what this
-/// file does. The anchor is asserted instead precisely because it isolates
-/// this module's half: with `anchor.clone()` restored the anchor is reachable
-/// from that immortal popover and never dies; with `downgrade()` it dies the
-/// moment the test drops it. The popdown handles (`popover_for_cancel`,
-/// `popover_for_create`, and `open_edit_popover`'s three) are weak for the
-/// same reason, and get their end-to-end coverage from the sibling popovers
-/// that have no dismiss catcher — `panels/bluetooth.rs`'s device menu and
-/// `panels/clipboard.rs`'s row menu — plus the `bind-pins` scan, which now
-/// reports the shape at every site including these.
+/// ## The popover itself
+///
+/// `build_create_popover` calls `hytte::ui::attach_dismiss_catcher`, which
+/// used to capture a strong `popover.clone()` in the popover's *own*
+/// `connect_show` handler (`crates/hytte-ui/src/popup.rs`) — the same defect
+/// one crate down. **#1199 fixed it**, so an assertion about this popover
+/// being freed can now pass, and
+/// `the_create_row_does_not_pin_its_entry_or_due_picker` below makes it: it
+/// is the precondition for that test's other two, since an immortal popover
+/// would keep the whole column alive no matter what this file does. The
+/// anchor stays asserted separately because it isolates this module's half:
+/// with `anchor.clone()` restored the anchor never dies; with `downgrade()`
+/// it dies the moment the test drops it. `open_edit_popover`'s popdown
+/// handles get their end-to-end coverage from the sibling popovers —
+/// `panels/bluetooth.rs`'s device menu and `panels/clipboard.rs`'s row menu,
+/// both live-path tested — plus the `bind-pins` scan, which reports the shape
+/// at every site it can resolve an ancestor for.
 ///
 /// Needs a real display server, hence the `system-tests` gate.
 #[cfg(all(test, feature = "system-tests"))]
@@ -1730,6 +1777,101 @@ mod lifetime_tests {
             weak_calendar.upgrade().is_none(),
             "the `gtk::Calendar` must go too — `connect_day_selected` captured the picker that \
              holds it"
+        );
+    }
+
+    /// The first descendant of `root` (depth-first, `root` itself included)
+    /// that is a `W`.
+    ///
+    /// The real-row probe below needs handles to two widgets
+    /// `build_create_popover` keeps private — the entry and the due picker's
+    /// `gtk::Calendar` — and walking the tree is how a test reaches them
+    /// without adding a test-only accessor to the production builder. Both
+    /// call sites `.expect(..)`, so a walk that finds nothing fails the test
+    /// instead of leaving it to pass vacuously on an absent widget.
+    fn find_descendant<W: IsA<gtk::Widget>>(root: &gtk::Widget) -> Option<W> {
+        if let Some(w) = root.downcast_ref::<W>() {
+            return Some(w.clone());
+        }
+        let mut child = root.first_child();
+        while let Some(c) = child {
+            if let Some(found) = find_descendant::<W>(&c) {
+                return Some(found);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+
+    /// The **real create row** — entry, due picker and popover built together
+    /// by the production builder — which is the shape item 3 of #1176 names
+    /// and the one `a_due_picker_dies_with_its_last_reference` above cannot
+    /// see: that test drops a bare `DuePicker::new()`, which has no entry
+    /// beside it to pin it.
+    ///
+    /// Falsified by restoring the pair
+    ///
+    /// ```ignore
+    /// let entry_for_create = entry.clone();   // captured by `do_create`
+    /// let do_create_for_entry = do_create;
+    /// entry.connect_activate(move |_| do_create_for_entry());
+    /// ```
+    ///
+    /// `entry`'s own handler list then owns a closure that owns `entry`, so
+    /// the entry outlives its column — and because the same closure holds a
+    /// strong [`DuePicker`], so does the whole picker (container, four chips,
+    /// revealer, `gtk::Calendar`, summary label), once per Add-button press
+    /// and once per task row tap. Measured on the unfixed tree with #1199
+    /// present, so the dismiss catcher is not the cause:
+    /// `popover alive=false  entry alive=true  due-picker calendar alive=true`.
+    #[gtk::test]
+    fn the_create_row_does_not_pin_its_entry_or_due_picker() {
+        adw::init().expect("libadwaita init");
+        let monitor = test_monitor();
+        let lists: Rc<RefCell<Vec<TaskList>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let anchor = gtk::MenuButton::new();
+        let popover = build_create_popover(&anchor, &lists, &monitor);
+        anchor.set_popover(Some(&popover));
+
+        let entry: gtk::Entry = find_descendant(popover.upcast_ref())
+            .expect("the create popover builds a gtk::Entry — without it this probe is vacuous");
+        let calendar: gtk::Calendar = find_descendant(popover.upcast_ref()).expect(
+            "the create popover's DuePicker builds a gtk::Calendar — without it this probe is \
+             vacuous",
+        );
+
+        let weak_popover = popover.downgrade();
+        let weak_entry = entry.downgrade();
+        let weak_calendar = calendar.downgrade();
+
+        drop(entry);
+        drop(calendar);
+        drop(popover);
+        drop(anchor);
+        pump();
+
+        assert!(
+            weak_popover.upgrade().is_none(),
+            "the create popover must be freed once its anchor and the builder's handle are gone \
+             — this is the assertion #1199 made possible (the dismiss catcher used to hold it \
+             strongly in its own `connect_show`); if it fails, the two below cannot mean \
+             anything, because an immortal popover keeps the whole column alive"
+        );
+        assert!(
+            weak_entry.upgrade().is_none(),
+            "the entry must not pin itself: `do_create` takes the entry as its own argument, so \
+             the only strong clone lives in the *sibling* Add button's handler (the carve-out). \
+             A strong clone inside `do_create` puts the entry in its own handler list and it \
+             never dies (#1176 item 3)"
+        );
+        assert!(
+            weak_calendar.upgrade().is_none(),
+            "the due picker's `gtk::Calendar` must go with the row: an entry pinned by its own \
+             handler also pins everything that handler holds, and `do_create` holds a strong \
+             `DuePicker`. This is the assertion \
+             `a_due_picker_dies_with_its_last_reference` cannot make — it has no entry beside \
+             the picker to pin it"
         );
     }
 }

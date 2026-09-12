@@ -143,44 +143,118 @@ Two things the rule needs to be worth having, both measured on the tree:
     button's sibling, so it closes no cycle and is not reported, while the
     *entry's own* `connect_activate` capturing the same clone was a cycle.
 
-Measured across the three roots when the rule landed: **205** `connect_*`
-handlers with a closure argument, **12** of them pinning — the four sites
-#1176 names, plus nine more of the identical popover-menu shape in
-`panels/vpn.rs`, `panels/network/wifi.rs` and `panels/network/wired.rs` that
-nobody had looked at, all fixed in the same PR, and one in
-`crates/hytte-ui/src/popup.rs` (below). Zero false positives.
+THE COUNTS, MEASURED
+--------------------
+Every number here was produced by running this script over the three roots
+extracted with `git archive`, not derived by hand. The rule's credibility
+rests on them and `MIN_CONNECT_SITES` cites them, so they name the revision
+they were taken at.
 
-What it misses, measured the same way by reverting all of #1176's fixes and
-re-running: **`open_edit_popover`'s three popdown handles in
-`widgets/tasks.rs`**. Its popover comes out of `hytte::ui::Popup`'s *builder*
-— `Popup::new(parent).child(column).build()` — so the `popover → column` edge
-is never spelled as `popover.set_child(&column)` and the graph has no path
-from those buttons up to the popover. Modelling a builder chain means
-resolving what the chain's terminal `build()` was bound to, which is a
-different kind of analysis from reading one method call, so it is not done:
-those three are fixed by hand and documented at the site. This is the
-under-reporting direction on purpose — a lint that invents an ancestor would
-be worse than one that misses a builder — but it means "0 pin(s)" is not the
-same claim as "no cycles in the tree", and a reviewer of a *new* popover built
-through `Popup` has to check it by reading.
+Against **`main` at `e4fab60d`** — i.e. #1176's fixes absent, #1199's dismiss
+catcher fix present — this file as it now stands reports **18 pin(s)** across
+**211** `connect_*` handlers with a closure argument and **171** `bind*` call
+sites, in 138 files:
 
-THE SELF CASE IS NOT COVERED (YET)
-----------------------------------
-`ancestors_of` deliberately excludes the receiver itself, so
+    rule (a), proper ancestors — 14
+      panels/bluetooth.rs        :498 :509        (device menu popdowns)
+      panels/clipboard.rs        :94              (row menu popdown)
+      panels/vpn.rs              :197 :209
+      panels/network/wifi.rs     :296 :307 :318 :329
+      panels/network/wired.rs    :98  :110 :124
+      widgets/tasks.rs           :375 :413        (create popover popdowns)
+    rule (a), the self case —  3
+      panels/bluetooth.rs        :370             (entry's own connect_activate)
+      widgets/tasks.rs           :416 :526        (do_create / do_save)
+    rule (b), field pin —      1
+      panels/media.rs            :368             (bind target is w.title)
+
+Zero false positives; the two carve-outs above stay unflagged.
+
+Two corrections to the numbers this header carried when the rule first
+landed, both found by re-running rather than re-reading. It claimed **205**
+`connect_*` handlers and **12** pins. The handler count was 209 at the
+branch's original base and is 211 today — never 205. And 12 was both wrong
+and enumerated inconsistently ("the four sites #1176 names, plus nine more …,
+and one in `popup.rs`" adds to fourteen, and the `popup.rs` one was not
+reportable by the rule as then written at all, since it is a self case). The
+rule as *first* written — proper ancestors plus rule (b), aliases followed
+through `.clone()` only — reports **15** at that same base, not 12. The
+itemised table above supersedes both figures.
+
+WHAT IT MISSES — three blind spots, all in the under-reporting direction
+-----------------------------------------------------------------------
+A lint that invents an ancestor would be worse than one that misses a parent,
+so every gap below fails to report rather than over-report. The consequence is
+that **"0 pin(s)" is not the same claim as "no cycles in the tree"**, and a
+reviewer of new widget-building code still has to read it.
+
+1. **A popover built through a builder chain.** `open_edit_popover`'s three
+   popdown handles in `widgets/tasks.rs` come off `hytte::ui::Popup`'s
+   *builder* — `Popup::new(parent).child(column).build()` — so the
+   `popover → column` edge is never spelled as `popover.set_child(&column)`
+   and the graph has no path from those buttons up to the popover. Modelling a
+   builder chain means resolving what the chain's terminal `build()` was bound
+   to, which is a different kind of analysis from reading one method call.
+   Measured size of this gap: **one** builder call site in the three roots
+   (`widgets/tasks.rs`), owning **three** handlers. Every other `popdown()` in
+   the tree is either already weak (`components/app_picker.rs`,
+   `widgets/tray.rs`, `crates/hytte-ui/src/popup.rs`) or reachable by rule (a).
+
+2. **A containment edge whose child argument is not a bare local.**
+   `first_ident_arg` returns `None` for anything but an identifier, so
+   `add_btn.set_popover(Some(&build_create_popover(…)))` contributes no
+   `popover → add_btn` edge at all — the child is a *call*. `containment_edges`
+   is also per-function, so an edge spelled in `build_header` could not help a
+   handler installed inside `build_create_popover` even if the argument were a
+   local. That is why the `anchor` half of #1176 item 1 — `do_create` holding
+   a strong `anchor.clone()` — is not reportable here and is held instead by
+   `the_create_popover_does_not_pin_its_anchor` in `widgets/tasks.rs`.
+
+3. **A cycle assembled from two sibling captures.** Ancestry is a *one-way*
+   relation, so a cycle that runs through no ancestor edge is invisible:
+
+       let create_for_changed = create.clone();
+       entry.connect_changed(move |_| create_for_changed.set_sensitive(…));
+       let entry_for_button = entry.clone();
+       create.connect_clicked(move |_| do_create(&entry_for_button));
+
+   `entry` and `create` are siblings, so each capture on its own is the
+   carve-out this script is careful *not* to flag — and together they are
+   `entry → create → entry`, a refcount cycle GTK never breaks. This is live
+   in `widgets/tasks.rs`'s create popover, which is why the Add button's
+   handle on the entry is a `WeakRef` rather than the clone the sibling rule
+   would allow; the comment at that site says so, and a test holds it. Closing
+   this gap needs a cycle search over a capture graph, not an ancestor walk.
+
+THE SELF CASE — covered since #1176
+-----------------------------------
+`ancestors_of` returns the receiver along with its proper ancestors, so
 
     entry.connect_activate(move |_| submit_entry(&entry_for_activate, …));
 
-— a widget cloned into its *own* handler, which pins it through its own
-handler list — is **not** reported. It is the same defect (and the same fix:
-take the handler's own widget argument, which `panels/bluetooth.rs` now does),
-and switching `ancestors_of` to include the node would find it. The reason it
-does not is timing, not principle: the only other instance in the tree is
-`attach_dismiss_catcher` in `crates/hytte-ui/src/popup.rs`, which captures a
-strong `popover.clone()` inside the popover's own `connect_show`, and that site
-is owned by #1180. Turning the self case on before #1180 lands would make
-`main` red on a file this PR must not touch. There is a self-test fixture below
-pinning the current (uncovered) behaviour, so flipping the rule fails it loudly
-and whoever flips it updates the expectation on purpose.
+— a widget cloned into its *own* handler, pinned through its own handler list
+— **is** reported. It is the same defect as an ancestor pin and has the same
+fix: take the handler's own widget argument, which `panels/bluetooth.rs` now
+does. The bare receiver name is excluded at the call site
+(`clone_aliases(…) - {ancestor}`), which is what keeps the *fixed* spelling
+clean: a handler whose parameter is named `entry` mentions `entry` in its body
+precisely because it is doing the right thing.
+
+This was deferred when the rule landed, for timing rather than principle: the
+tree's other instance was `attach_dismiss_catcher` in
+`crates/hytte-ui/src/popup.rs`, owned by #1180, and turning the case on before
+it landed would have made `main` red on a file #1176 must not touch. **#1199
+fixed that site** (`df69488f`), so the deferral is spent and the case is on.
+Two self-test fixtures below pin both directions — the defect reports 1, the
+argument-taking fix reports 0.
+
+Following a plain **move** rebind matters as much as the case itself here, and
+is measured: with the self case on but `clone_aliases` following `.clone()`
+only, #1176's own `let do_create_for_entry = do_create;` sites report **0**,
+because `do_create_for_entry` never enters the alias set, `expand_named_closures`
+never folds `do_create`'s body in, and the handler text the scanner matches
+against mentions no captured name at all. With both, they report **2**. See
+`MOVE_ALIAS_RE`.
 
 THE FIELD SHAPE (#1176) — rule (b)
 ----------------------------------
@@ -301,18 +375,21 @@ BIND_FNS = (
 # Anti-vacuity floor. If `bind` is ever renamed, re-exported under a new name,
 # or this file's call regex is broken by a refactor, the honest failure mode is
 # "0 sites scanned, 0 hits, exit 0" — a permanently green check that guards
-# nothing. There were 157 call sites across the three roots when this was
-# written; the floor sits far enough below that ordinary churn never trips it
-# and far enough above zero that a broken scan cannot pass.
+# nothing. There were 157 call sites across the three roots when #831 wrote
+# this; **171** today (measured at `e4fab60d`). The floor sits far enough below
+# that ordinary churn never trips it and far enough above zero that a broken
+# scan cannot pass.
 MIN_CALL_SITES = 100
 
 # The same anti-vacuity floor for the `connect_*` scan added by #1176. There
-# were 205 `connect_*` handlers with a closure argument across the three roots
-# when it was written (of 222 `.connect_*(` occurrences — the rest are
-# field/method receivers like `self.calendar.connect_day_selected`, which
-# CONNECT_RE rejects because they are not local bindings this scan can resolve
-# a clone against). The floor sits far enough below 205 that ordinary churn
-# never trips it and far enough above zero that a broken scan cannot pass.
+# are **211** `connect_*` handlers with a closure argument across the three
+# roots (measured at `e4fab60d`; the figure of 205 this comment carried when
+# the rule landed was never right — it was 209 at the branch's own base). The
+# rest of the `.connect_*(` occurrences are field/method receivers like
+# `self.calendar.connect_day_selected`, which CONNECT_RE rejects because they
+# are not local bindings this scan can resolve a clone against. The floor sits
+# far enough below 211 that ordinary churn never trips it and far enough above
+# zero that a broken scan cannot pass.
 MIN_CONNECT_SITES = 150
 
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -382,20 +459,43 @@ def match_delim(src: str, start: int, open_c: str, close_c: str) -> int:
     return -1
 
 
-def clone_aliases(prefix: str, target: str) -> set[str]:
-    """Every name that is `target` by a chain of `.clone()`s, `target` included.
+# `let a = w.clone();` — a second strong ref under a new name. Deliberately
+# not anchored on a trailing `;`: `let a = w.clone().upcast();` still yields a
+# handle to `w`, and narrowing this would lose sites the rule already reports.
+CLONE_ALIAS_RE = re.compile(
+    rf"let\s+(?:mut\s+)?({IDENT})\s*(?::[^=;]*)?=\s*({IDENT})\s*\.\s*clone\s*\(\s*\)"
+)
 
-    Transitive because `let a = w.clone(); let b = a.clone();` is still `w`.
-    Iterates to a fixed point rather than assuming declaration order.
+# `let a = w;` — a plain **move**: the *same* ref under a new name, which is
+# just as strong. #1176's own `let do_create_for_entry = do_create;` is this
+# shape, and following only `.clone()` is why the rule as first shipped
+# reported nothing at `widgets/tasks.rs:434`/`:552`: `do_create_for_entry`
+# never entered the alias set, so `expand_named_closures` never folded
+# `do_create`'s body in, and the handler text the scanner matched against
+# mentioned no captured name at all.
+#
+# The trailing `;` is load-bearing — it is what stops this matching the head
+# of a longer expression (`let a = b.field;`, `let a = b(x);`, `let a = b as
+# c;`), each of which binds something that is *not* `b`. `mut` is allowed on
+# both patterns because `let mut a = b;` moves exactly as `let a = b;` does.
+MOVE_ALIAS_RE = re.compile(rf"let\s+(?:mut\s+)?({IDENT})\s*(?::[^=;]*)?=\s*({IDENT})\s*;")
+
+
+def clone_aliases(prefix: str, target: str) -> set[str]:
+    """Every name that is `target` by a chain of clones and moves, `target` included.
+
+    Transitive because `let a = w.clone(); let b = a.clone();` is still `w`,
+    and so is `let c = b;`. Iterates to a fixed point over both spellings
+    rather than assuming declaration order.
     """
     aliases = {target}
-    pattern = re.compile(rf"let\s+({IDENT})\s*(?::[^=;]*)?=\s*({IDENT})\s*\.\s*clone\s*\(\s*\)")
     while True:
         grew = False
-        for m in pattern.finditer(prefix):
-            if m.group(2) in aliases and m.group(1) not in aliases:
-                aliases.add(m.group(1))
-                grew = True
+        for pattern in (CLONE_ALIAS_RE, MOVE_ALIAS_RE):
+            for m in pattern.finditer(prefix):
+                if m.group(2) in aliases and m.group(1) not in aliases:
+                    aliases.add(m.group(1))
+                    grew = True
         if not grew:
             return aliases
 
@@ -544,11 +644,15 @@ def containment_edges(body: str) -> dict[str, set[str]]:
 
 
 def ancestors_of(edges: dict[str, set[str]], node: str) -> set[str]:
-    """Every transitive parent of `node` — **proper** ancestors only.
+    """Every transitive parent of `node`, **and `node` itself**.
 
-    `node` itself is deliberately excluded; see "THE SELF CASE IS NOT COVERED
-    (YET)" in the header for why, and for the one site in this tree that
-    would otherwise be reported.
+    Including the node is what covers the *self* case — a widget cloned into
+    its own handler, pinned through its own handler list. It reads oddly as
+    "ancestors" and is deliberate: the receiver is the one name for which a
+    captured strong clone is a cycle for the same reason an ancestor's is, so
+    the caller's `clone_aliases(...) - {ancestor}` filter does the rest (the
+    bare receiver name is usually the handler's own parameter, which is the
+    fix, not the defect). See "THE SELF CASE" in the header.
     """
     seen: set[str] = set()
     stack = [node]
@@ -557,7 +661,7 @@ def ancestors_of(edges: dict[str, set[str]], node: str) -> set[str]:
             if parent not in seen:
                 seen.add(parent)
                 stack.append(parent)
-    return seen - {node}
+    return seen | {node}
 
 
 def closure_body(text: str, bar: int) -> str:
@@ -971,8 +1075,8 @@ SELF_TEST_CASES: tuple[tuple[str, int, str], ...] = (
         """,
     ),
     (
-        "KNOWN GAP — the self case is not reported (flip to 1 with #1180)",
-        0,
+        "the SELF case — a widget cloned into its own handler (#1176)",
+        1,
         """
         fn build_text_entry_row() -> gtk::Box {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -981,6 +1085,39 @@ SELF_TEST_CASES: tuple[tuple[str, int, str], ...] = (
             entry.connect_activate(move |_| submit_entry(&entry_for_activate));
             row.append(&entry);
             row
+        }
+        """,
+    ),
+    (
+        "the self case FIXED — taking the handler's own argument is clean",
+        0,
+        """
+        fn build_text_entry_row() -> gtk::Box {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let entry = gtk::Entry::new();
+            entry.connect_activate(move |entry| submit_entry(entry));
+            row.append(&entry);
+            row
+        }
+        """,
+    ),
+    (
+        "a MOVE rebind reaches the named closure's captures just as a clone does",
+        1,
+        """
+        fn build_create_popover() -> gtk::Popover {
+            let popover = gtk::Popover::new();
+            let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            let entry = gtk::Entry::new();
+            let entry_for_create = entry.clone();
+            let do_create = move || {
+                tasks::create_task(entry_for_create.text());
+            };
+            let do_create_for_entry = do_create;
+            entry.connect_activate(move |_| do_create_for_entry());
+            column.append(&entry);
+            popover.set_child(Some(&column));
+            popover
         }
         """,
     ),

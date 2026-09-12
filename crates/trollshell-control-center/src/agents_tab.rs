@@ -1287,17 +1287,36 @@ pub(crate) fn systemd_run_argv(inner: &[String], env: &[(String, String)]) -> Ve
 /// `_async`/`_future` pair, and a helper this short-lived, which only hands a
 /// start job to the manager and returns, does not need one) drains its
 /// stderr and waits for it to exit, so `is_successful()` is valid the moment
-/// it returns. **Both** failure shapes above are now a genuine `Err`, exactly
-/// like an exec error, and reach the very same toast / probe-reset /
-/// browser-fallback path in [`open_agent_page`] — neither one falls back to
-/// a direct spawn, because `systemd-run` genuinely ran and had its say.
+/// it returns.
 ///
-/// The direct `gio::Subprocess` spawn stays as the **fallback** only for the
-/// one case that is *not* a verdict from `systemd-run` at all: `newv` itself
-/// failing to exec the helper — missing from `PATH`, or not executable. It
-/// still outlives this process, GIO reaps it rather than leaving a zombie, and
-/// it is the same fallback shape `trollshell/src/plugins/effects.rs`'s
-/// `start_detached` takes for that one case.
+/// # …but the two failure shapes above are not the same verdict
+///
+/// N1's own fix conflated them: every non-zero exit became a flat `Err`,
+/// which is right for "the target program doesn't exist" but wrong for
+/// "there is nobody to ask" — a session with no `systemd --user` manager
+/// (CI's nix sandbox: `systemd-run` has been on `$PATH` since #1082, but
+/// nothing runs `systemd --user` there) makes `systemd-run --user` itself
+/// exit non-zero on a bus-connect failure for *every* launch, so a launch
+/// that would otherwise succeed got reported as failed. This is exactly the
+/// shape `trollshell/src/plugins/effects.rs`'s `classify_systemd_run_failure`
+/// (#953 H1) already solved once for the plugin host: match the stderr
+/// *family* — [`user_manager_unreachable`] — and treat only that one as "the
+/// manager was never reached", not a verdict from a manager that ran. Any
+/// **other** non-zero exit (a missing target executable, a bad argv, a
+/// unit-name collision) stays a hard `Err`, exactly like an exec error, and
+/// reaches the same toast / probe-reset / browser-fallback path in
+/// [`open_agent_page`] — that is the behaviour N1 was actually about, and it
+/// is unchanged.
+///
+/// The direct `gio::Subprocess` spawn stays as the **fallback** for a session
+/// with no user manager, restoring the promise this module's doc made before
+/// N1 narrowed it too far — the same two-case shape
+/// `trollshell/src/plugins/effects.rs`'s `start_detached_with` takes
+/// (`FallbackReason::{NoSystemdRun,NoUserManager}`): `newv` itself failing to
+/// exec the helper (missing from `PATH`, or not executable) falls back
+/// immediately below, and so does a `systemd-run` that ran and reported
+/// [`user_manager_unreachable`]. It still outlives this process, GIO reaps it
+/// rather than leaving a zombie.
 fn launch_detached(argv: &[String]) -> Result<(), String> {
     let unit = systemd_run_argv(argv, &forwarded_env());
     let as_os: Vec<&std::ffi::OsStr> = unit.iter().map(AsRef::as_ref).collect();
@@ -1307,8 +1326,9 @@ fn launch_detached(argv: &[String]) -> Result<(), String> {
     ) {
         Ok(child) => child,
         Err(e) => {
-            // `systemd-run` itself is missing or not executable — the one
-            // case that still falls back to spawning the program directly.
+            // `systemd-run` itself is missing or not executable — one of the
+            // two cases that still fall back to spawning the program
+            // directly (see the module doc above).
             tracing::warn!(error = %e, "no usable systemd-run; spawning the companion window directly");
             return spawn(argv).map(|()| {
                 tracing::info!(?argv, "launched the agent companion window directly");
@@ -1335,12 +1355,44 @@ fn launch_detached(argv: &[String]) -> Result<(), String> {
                 child.exit_status()
             )
         });
+    if user_manager_unreachable(&detail) {
+        // `systemd-run` ran and never reached a manager — the other case that
+        // falls back, see the module doc above.
+        tracing::warn!(
+            ?argv,
+            detail = %detail,
+            "systemd user manager unavailable; spawning the agent companion window directly",
+        );
+        return spawn(argv).map(|()| {
+            tracing::info!(?argv, "launched the agent companion window directly");
+        });
+    }
     tracing::warn!(
         ?argv,
         error = %detail,
         "systemd-run --user did not start the agent companion window",
     );
     Err(detail)
+}
+
+/// Whether a non-zero `systemd-run --user` exit means the session has no
+/// reachable user manager, rather than `systemd-run` refusing the launch for
+/// a reason unrelated to the manager's reachability (a missing target
+/// executable, a bad argv, a unit-name collision).
+///
+/// Mirrors `trollshell/src/plugins/effects.rs`'s
+/// `classify_systemd_run_failure` (#953 H1) rather than reinventing it: the
+/// match is the stderr **family**, `"Failed to connect to"` + `"bus"`, not one
+/// exact sentence — systemd has worded the bus-connect failure differently
+/// release to release (`Failed to connect to bus: No medium found`, `…
+/// Connection refused`, systemd 260's `Failed to connect to user scope bus
+/// via local transport: …`), and matching only the literal wording of one of
+/// them is how a fallback like this becomes unreachable the moment the
+/// wording changes underneath it — which is exactly what happened here once
+/// already (#1147 review N1's own fix dropped the fallback entirely rather
+/// than narrowing the match).
+fn user_manager_unreachable(stderr: &str) -> bool {
+    stderr.contains("Failed to connect to") && stderr.contains("bus")
 }
 
 /// Spawn one argv through GIO, silencing the child's stdio so a chatty
@@ -1351,9 +1403,11 @@ fn launch_detached(argv: &[String]) -> Result<(), String> {
 /// parented to a settings app that may outlive it by hours — and because it
 /// does not kill the child when this window goes away.
 ///
-/// Used only for [`launch_detached`]'s one fallback: the program spawned here
-/// is the long-running companion window itself (not `systemd-run`), so unlike
-/// that function's own check, this never waits on the child — doing so would
+/// Used only for [`launch_detached`]'s two fallback calls (no usable
+/// `systemd-run`; a `systemd-run` that ran and reported
+/// [`user_manager_unreachable`]): the program spawned here is the
+/// long-running companion window itself (not `systemd-run`), so unlike that
+/// function's own check, this never waits on the child — doing so would
 /// block until the operator closes the window.
 fn spawn(argv: &[String]) -> Result<(), String> {
     let as_os: Vec<&std::ffi::OsStr> = argv.iter().map(AsRef::as_ref).collect();
@@ -1912,7 +1966,7 @@ mod tests {
     use super::{
         ABSENT, DetailModel, FACT_LABELS, Route, RowModel, agent_page_is_live, detail_of, flags_of,
         flags_of_labels, hive_of, ordered, placeholder, route_for, rows_of, same_agent_set,
-        status_set, systemd_run_argv,
+        status_set, systemd_run_argv, user_manager_unreachable,
     };
     use hytte_plugin_agents::config::{AgentsConfig, Display};
     use hytte_plugin_agents::hive::client::HiveError;
@@ -2481,6 +2535,26 @@ mod tests {
             .position(|a| a == "--")
             .expect("the argv is terminated before the program");
         assert_eq!(&argv[sep + 1..], inner.as_slice());
+    }
+
+    /// The three shapes [`user_manager_unreachable`] has to tell apart, pinned
+    /// as a pure unit test so the discriminator itself is falsifiable without
+    /// a real `systemd-run` (the `gtk_tests` scenarios below need one; this
+    /// does not). A bus-connect failure is the one case that means "nobody to
+    /// ask"; a missing-executable message and an empty string are both a
+    /// verdict from a manager that *did* run, or no output at all, and must
+    /// stay `false` or a bad launch would silently be retried as if it had
+    /// never happened.
+    #[test]
+    fn user_manager_unreachable_matches_the_bus_connect_family_only() {
+        assert!(user_manager_unreachable(
+            "Failed to connect to user scope bus via local transport: \
+             $DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined"
+        ));
+        assert!(!user_manager_unreachable(
+            "Failed to find executable /nonexistent-1147-review-n1: No such file or directory"
+        ));
+        assert!(!user_manager_unreachable(""));
     }
 
     // ── the socket itself ───────────────────────────────────────────────────
@@ -3398,12 +3472,23 @@ mod gtk_tests {
 
     /// The exact #1147 review N1 scenario: `systemd-run --user` finds a
     /// missing target binary and exits 1 — *after* `gio::Subprocess::newv`
-    /// has already succeeded. Before the fix, [`launch_detached`] read only
+    /// has already succeeded. Before the N1 fix, [`launch_detached`] read only
     /// `newv`'s result and returned `Ok(())` here, which is the silent dead
-    /// click M7 was filed about. `systemd-run` is a real system dependency
-    /// (a live `systemd --user` manager), which is why this is
-    /// `system-tests`-gated rather than run by default — it needs no
-    /// display, so it is a plain `#[test]`, not `#[gtk::test]`.
+    /// click M7 was filed about.
+    ///
+    /// This one **stays red-on-mutation regardless of the environment the
+    /// test runs in**: with a live `systemd --user` manager (this box),
+    /// `systemd-run` itself reports "Failed to find executable" and
+    /// `user_manager_unreachable` correctly says no, so `launch_detached`
+    /// never takes the fallback and returns the manager's own `Err`. Without
+    /// one (CI's nix sandbox), `systemd-run` fails earlier on the bus-connect
+    /// error, `user_manager_unreachable` says yes, and `launch_detached`
+    /// *does* fall back — to `spawn`-ing `/nonexistent-1147-review-n1`
+    /// directly, which fails for the same underlying reason (the path does
+    /// not exist) and is still an `Err`. Either environment, this assertion
+    /// holds. `system-tests`-gated because it needs a real `systemd-run` on
+    /// `$PATH`; needs no display, so it is a plain `#[test]`, not
+    /// `#[gtk::test]`.
     #[test]
     fn a_launch_that_fails_inside_systemd_run_is_a_failed_launch() {
         let result = launch_detached(&["/nonexistent-1147-review-n1".to_owned()]);
@@ -3416,6 +3501,19 @@ mod gtk_tests {
     /// The mirror of the test above: a target `systemd-run` *can* start is a
     /// successful launch, so the fix does not turn every launch into a
     /// failure.
+    ///
+    /// This is the test the fallback in [`launch_detached`] exists for: with a
+    /// live `systemd --user` manager (this box), `systemd-run --user --
+    /// true` starts the transient unit and this succeeds via the **normal**
+    /// path (`child.is_successful()`). Without a user manager (CI's nix
+    /// sandbox, or a manual run under `DBUS_SESSION_BUS_ADDRESS=/nonexistent
+    /// XDG_RUNTIME_DIR=/nonexistent`), `systemd-run` itself fails to connect
+    /// to the bus before ever asking to start anything, and this succeeds via
+    /// the **fallback** path instead (`user_manager_unreachable` says yes,
+    /// `spawn` runs `true` directly). Before this fix, the fallback branch did
+    /// not exist and this test went red in exactly that second environment —
+    /// which is what CI's `system-tests` check runs under (#1082: `systemd`
+    /// on `$PATH`, no `systemd --user`).
     #[test]
     fn a_launch_that_succeeds_inside_systemd_run_is_a_launch() {
         let result = launch_detached(&["true".to_owned()]);

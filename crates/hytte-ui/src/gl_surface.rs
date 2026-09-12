@@ -296,13 +296,33 @@ thread_local! {
     static ABANDONED: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// Register `pipeline` under `program`, replacing any previous registration.
+/// Register `pipeline` under `program`.
 ///
-/// Call once per program at host startup, on the GTK main thread, before any
-/// [`Node::GlSurface`](crate::widget_tree::Node::GlSurface) naming it is
+/// Call **once per program at host startup**, on the GTK main thread, before
+/// any [`Node::GlSurface`](crate::widget_tree::Node::GlSurface) naming it is
 /// reconciled. A surface whose program is unregistered keeps whatever it last
 /// successfully drew and says so once (see [`PROGRAM_UNREGISTERED_REFUSED`]),
 /// rather than failing the render.
+///
+/// **A later call replaces the entry in this table, but it does not retract a
+/// refusal any surface has already latched against that name** (PR #1199
+/// review, LOW 6). A surface's [`BuildKey`] is `((cols, rows), GlProgram)` —
+/// the program *name*, not the pipeline behind it — so a pipeline that was
+/// refused, fixed, and re-registered under the same name is never handed back
+/// to the driver: the surface still believes that key will not build.
+///
+/// This is a documented limit, not a bug, because there is nothing here to
+/// fix it with: the latches live per surface, in widget state this
+/// module-level table cannot reach, and adding a registry generation to the
+/// key would invalidate every surface's latch on a call that in practice
+/// happens once, before any surface exists. The one call site in the tree
+/// (`trollshell/src/plugins/preem_gl/mod.rs`) registers a `'static` pipeline
+/// at startup and never replaces it. **If a host ever needs live
+/// re-registration, the honest fix is to key the latch on the pipeline
+/// identity rather than to hope; until then, treat this as
+/// register-once-never-replace.** (Unrealizing a surface does clear its
+/// latch — see `imp::GlSurface::unrealize` — so "re-register and re-map" is
+/// the workaround that exists today.)
 pub fn register(program: GlProgram, pipeline: GlPipeline) {
     PROGRAMS.with_borrow_mut(|programs| programs.insert(program, pipeline));
 }
@@ -468,6 +488,13 @@ fn resources_reusable(
 /// than hashed (unlike `shader_surface`'s source key, which stands in for a
 /// megabyte of GLSL) because it is two `u32`s and a `&'static str`: there is
 /// no collision question to close.
+///
+/// **The whole input to that call *as the surface can see it*.** The
+/// `GlProgram` is a name, and [`register`] resolves names against a
+/// process-wide table this key does not read, so a pipeline replaced under a
+/// name a surface has already latched is not retried — see `register`'s doc,
+/// which narrows the contract to register-once-never-replace rather than
+/// pretending otherwise (PR #1199 review, LOW 6).
 type BuildKey = ((u32, u32), GlProgram);
 
 /// How many distinct refused build keys a [`RefusedBuilds`] remembers.

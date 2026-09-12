@@ -730,16 +730,8 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
     // moves per case (the two kinds run at different grids) and an area GTK
     // could not give its requested size would be compared against a reference
     // of a different shape. `measure` says so out loud if that ever happens.
-    let widest = cases
-        .iter()
-        .map(|case| case.natural().0)
-        .max()
-        .unwrap_or(1);
-    let tallest = cases
-        .iter()
-        .map(|case| case.natural().1)
-        .max()
-        .unwrap_or(1);
+    let widest = cases.iter().map(|case| case.natural().0).max().unwrap_or(1);
+    let tallest = cases.iter().map(|case| case.natural().1).max().unwrap_or(1);
     let width = i32::try_from(widest).unwrap_or(i32::MAX);
     let height = i32::try_from(tallest).unwrap_or(i32::MAX);
 
@@ -1243,34 +1235,7 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
         stats.peak_row_mismatches,
         reference.width(),
     );
-    for (channel, name) in stats.channels.iter().zip(parity::CHANNELS) {
-        println!(
-            "      {name}: mean {:.3} p99 {:.0} max {:.0} of 255{}",
-            channel.mean,
-            channel.p99,
-            channel.max,
-            // The ceiling is only this case's contract at 1:1; a supersampled
-            // case answers to the region split instead, so the annotation
-            // would be pointing at a number nothing is judging.
-            if channel.inside_ceiling() || case.sampling() != parity::Sampling::OneToOne {
-                ""
-            } else {
-                "   <-- outside the ceiling"
-            },
-        );
-    }
-    if let Some(worst) = stats.worst {
-        println!(
-            "      worst pixel ({}, {}) on {}: |Δ| {} — gl {:?} vs cpu {:?}",
-            worst.x,
-            worst.y,
-            parity::CHANNELS[worst.channel],
-            worst.delta,
-            worst.gl,
-            worst.cpu,
-        );
-    }
-
+    print_channels(&stats, case.sampling());
     print_regions(&split);
     write_evidence(evidence, &label, &gl_raw, layout, &reference, &deltas);
 
@@ -1289,6 +1254,41 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
     }
 
     verdict.is_pass()
+}
+
+/// Print the three per-channel distributions and the worst pixel.
+///
+/// Split out of [`measure`], which is at the workspace's `too_many_lines`
+/// ceiling — and this is the part of it that is about the transcript rather
+/// than about the comparison.
+fn print_channels(stats: &parity::Stats, sampling: parity::Sampling) {
+    for (channel, name) in stats.channels.iter().zip(parity::CHANNELS) {
+        println!(
+            "      {name}: mean {:.3} p99 {:.0} max {:.0} of 255{}",
+            channel.mean,
+            channel.p99,
+            channel.max,
+            // The ceiling is only a case's contract at 1:1; a supersampled
+            // case answers to the region split instead, so the annotation
+            // would be pointing at a number nothing is judging.
+            if channel.inside_ceiling() || sampling != parity::Sampling::OneToOne {
+                ""
+            } else {
+                "   <-- outside the ceiling"
+            },
+        );
+    }
+    if let Some(worst) = stats.worst {
+        println!(
+            "      worst pixel ({}, {}) on {}: |Δ| {} — gl {:?} vs cpu {:?}",
+            worst.x,
+            worst.y,
+            parity::CHANNELS[worst.channel],
+            worst.delta,
+            worst.gl,
+            worst.cpu,
+        );
+    }
 }
 
 /// Print the **edge / field / lit** split, the classification aid that lets a

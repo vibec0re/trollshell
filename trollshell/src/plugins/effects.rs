@@ -2055,7 +2055,10 @@ mod tests {
         launch_with_timeout, open_uri_with, start_detached_with, truncate_on_char_boundary,
         truncate_uri_for_log,
     };
-    use hytte_plugin_proto::{AudioAction, Effect, HostMsg, MediaAction, NiriAction, Page};
+    use hytte_plugin_proto::{
+        AudioAction, ConsentChoices, ConsentDecision, Effect, HostMsg, MediaAction, NiriAction,
+        Page,
+    };
     use std::cell::{Cell, RefCell};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
@@ -3380,6 +3383,68 @@ mod tests {
             short,
             "a URI under the cap round-trips unchanged — no marker on what was \
              never cut",
+        );
+    }
+
+    /// #1140 review, HIGH-1 — the reviewer's test, verbatim in substance.
+    ///
+    /// Nothing pinned that the broker forwards the effect's **own** `choices`:
+    /// hardcoding `ConsentChoices::Grant` here shipped green, and would turn
+    /// every hive approval card into the four-button grant whose 60 s timeout
+    /// denies. The overlay's no-output arm is what makes the two cards
+    /// distinguishable on the channel without a display — a grant answers
+    /// `Deny` immediately, an approval answers nothing — so this asserts the
+    /// pass-through by its consequence rather than by reading a field back.
+    ///
+    /// Falsification: replace `*choices` with `ConsentChoices::Grant` in
+    /// `broker_effect`'s `RequestConsent` arm and the first assertion fails,
+    /// because the approval card would have been answered on the plugin's
+    /// behalf.
+    #[test]
+    fn the_broker_passes_the_effects_own_choice_set_through() {
+        let router = DatasourceRouter::default();
+        let (tx, mut rx) = mpsc::channel::<HostMsg>(4);
+
+        broker_effect(
+            "agents",
+            &Effect::RequestConsent {
+                request_id: 1,
+                agent: "choom".to_owned(),
+                datasource: String::new(),
+                scope: "merge a reviewed config PR".to_owned(),
+                detail: "request #7".to_owned(),
+                choices: ConsentChoices::Approval,
+            },
+            &tx,
+            &router,
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an approval card must not be answered on the plugin's behalf (§6.5)"
+        );
+
+        broker_effect(
+            "infobroker",
+            &Effect::RequestConsent {
+                request_id: 2,
+                agent: "claude".to_owned(),
+                datasource: "departures".to_owned(),
+                scope: "*".to_owned(),
+                detail: "next departures".to_owned(),
+                choices: ConsentChoices::Grant,
+            },
+            &tx,
+            &router,
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(HostMsg::ConsentDecision {
+                    request_id: 2,
+                    decision: ConsentDecision::Deny
+                })
+            ),
+            "a grant card with no output still denies (#487)"
         );
     }
 }

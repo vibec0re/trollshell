@@ -147,6 +147,45 @@ pub(crate) const fn card(choices: ConsentChoices) -> &'static [Choice] {
     }
 }
 
+/// Everything [`request`] needs to know about *which* card it is drawing,
+/// resolved once, up front.
+///
+/// This type exists to make one class of regression unrepresentable rather than
+/// merely tested. Before it, three separate call sites inside `request` — the
+/// no-monitor fallback, `Esc`, and the 60 s timer — each decided for themselves
+/// what an unanswered prompt sends, and each could be independently changed to
+/// `ConsentDecision::Deny` with the whole suite green (#1140's review, HIGH-1).
+/// That is the §6.5 regression in one line, three times over: a durable deny of
+/// a queued hive config-merge that nobody looked at.
+///
+/// Now `on_silence` is computed **once** from [`ConsentChoices::unanswered`] and
+/// the three sites read this field. `request`'s body consequently names no
+/// [`ConsentDecision`] variant at all, which
+/// [`request_never_names_a_decision_of_its_own`] asserts over this file's own
+/// source — crude, on the `nix/lint-bind-pins.py` precedent, and the only thing
+/// that reaches the two sites living inside the widget half.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CardPlan {
+    /// The buttons, left to right.
+    pub(crate) buttons: &'static [Choice],
+    /// Which of them takes the keyboard focus, if any.
+    pub(crate) focus: Option<usize>,
+    /// The card's bold first line.
+    pub(crate) title: &'static str,
+    /// What a prompt nobody answered sends — `None` means *nothing at all*.
+    pub(crate) on_silence: Option<ConsentDecision>,
+}
+
+/// Resolve the whole card from the requester's choice set.
+pub(crate) fn plan(choices: ConsentChoices) -> CardPlan {
+    CardPlan {
+        buttons: card(choices),
+        focus: keyboard_default(choices),
+        title: title_for(choices),
+        on_silence: choices.unanswered(),
+    }
+}
+
 /// Which button (as an index into [`card`]) takes the keyboard focus when the
 /// prompt appears, if any.
 ///
@@ -269,13 +308,18 @@ pub fn request(
         window.close();
     }
 
+    // The one place this function decides anything about the card. Every site
+    // below reads `plan`; none names a decision of its own.
+    let plan = plan(choices);
+
     let Some(monitor) = focused_monitor() else {
-        // No output to prompt on. A grant is denied straight away rather than
-        // stranding the agent; an approval sends nothing, because the whole
-        // point of `ConsentChoices::Approval` is that a decision nobody made is
-        // not a decision (spec §6.5) — the requester's own badge is what
-        // surfaces it instead.
-        match choices.unanswered() {
+        // No output to prompt on — which is silence of the most literal kind,
+        // so it follows the same rule the timeout does. A grant is denied
+        // straight away rather than stranding the agent; an approval sends
+        // nothing, because the whole point of `ConsentChoices::Approval` is
+        // that a decision nobody made is not a decision (spec §6.5) — the
+        // requester's own badge is what surfaces it instead.
+        match plan.on_silence {
             Some(decision) => {
                 tracing::warn!(request_id, %agent, "consent prompt: no monitor to show on; denying");
                 let _ = outbound.try_send(HostMsg::ConsentDecision {
@@ -311,7 +355,7 @@ pub fn request(
     root.set_margin_top(18);
     root.set_margin_bottom(18);
 
-    let title = gtk::Label::new(Some(title_for(choices)));
+    let title = gtk::Label::new(Some(plan.title));
     title.add_css_class("ts-consent-title");
     title.set_xalign(0.0);
     root.append(&title);
@@ -381,7 +425,8 @@ pub fn request(
     buttons.set_halign(gtk::Align::End);
     buttons.set_margin_top(6);
 
-    let widgets: Vec<gtk::Button> = card(choices)
+    let widgets: Vec<gtk::Button> = plan
+        .buttons
         .iter()
         .map(|choice| {
             let btn = gtk::Button::with_label(choice.label);
@@ -405,7 +450,7 @@ pub fn request(
         let resolve = resolve.clone();
         key_ctrl.connect_key_pressed(move |_, key, _, _| {
             if key == gdk::Key::Escape {
-                resolve(choices.unanswered());
+                resolve(plan.on_silence);
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -417,7 +462,7 @@ pub fn request(
     {
         let resolve = resolve.clone();
         let id = glib::timeout_add_local_once(PROMPT_TIMEOUT, move || {
-            resolve(choices.unanswered());
+            resolve(plan.on_silence);
         });
         timeout.set(Some(id));
     }
@@ -428,7 +473,7 @@ pub fn request(
     // `keyboard_default`. The `set_focus(None)` is not redundant: GTK focuses
     // the first focusable child of a freshly-presented window on its own, which
     // on the approval card would be `Deny`.
-    match keyboard_default(choices).and_then(|i| widgets.get(i)) {
+    match plan.focus.and_then(|i| widgets.get(i)) {
         Some(btn) => {
             btn.grab_focus();
         }
@@ -488,7 +533,120 @@ fn render_card(choices: ConsentChoices) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsentChoices, ConsentDecision, ask_line, card, keyboard_default, render_card};
+    use super::{
+        ConsentChoices, ConsentDecision, HostMsg, ask_line, card, keyboard_default, plan,
+        render_card, request,
+    };
+    use tokio::sync::mpsc;
+
+    /// #1140 review, HIGH-1 — the reviewer's test, verbatim in substance.
+    ///
+    /// The no-monitor arm is the one branch of [`request`] that returns before a
+    /// single GTK call, so it is reachable from a plain `#[test]` with no
+    /// display, no compositor and no mounted `Monitor` — which makes it the one
+    /// place the *runtime* silence rule can be pinned hermetically. With
+    /// `MONITORS` empty (its state in any test thread) every call takes it.
+    ///
+    /// Falsification: make that arm deny unconditionally — the exact mutation
+    /// the review shipped green — and the second half fails, because an
+    /// approval nobody could be shown would answer `Deny { id }` to the hive.
+    #[test]
+    fn the_no_monitor_arm_follows_the_silence_rule() {
+        let (tx, mut rx) = mpsc::channel::<HostMsg>(4);
+        request(1, "a", "", "s", "d", ConsentChoices::Grant, tx.clone());
+        match rx.try_recv() {
+            Ok(HostMsg::ConsentDecision {
+                request_id,
+                decision,
+            }) => {
+                assert_eq!(request_id, 1);
+                assert_eq!(decision, ConsentDecision::Deny);
+            }
+            other => panic!("a grant with no output must deny (#487), got {other:?}"),
+        }
+
+        request(2, "a", "", "s", "d", ConsentChoices::Approval, tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "an approval with no output must answer nothing (§6.5)"
+        );
+    }
+
+    /// The structural half of HIGH-1, on the `nix/lint-bind-pins.py` precedent:
+    /// a source scan, because the `Esc` and 60 s-timeout call sites live inside
+    /// the widget half and no hermetic test can reach them.
+    ///
+    /// After the [`CardPlan`](super::CardPlan) refactor, `request` decides
+    /// nothing for itself — every silence path reads `plan.on_silence`. So the
+    /// invariant that is actually checkable is *`request` names no
+    /// `ConsentDecision` variant at all*, and each of the three mutations the
+    /// review shipped green (`consent.rs:278`, `:408`, `:420`, all of the form
+    /// "resolve `Some(ConsentDecision::Deny)` here instead") reintroduces one.
+    ///
+    /// `HostMsg::ConsentDecision { … }` is a *struct variant of another enum*
+    /// and contains no `ConsentDecision::`, so the needle is unambiguous.
+    ///
+    /// Its limit, stated rather than papered over: a mutation that reaches the
+    /// same wrong outcome without naming a variant (say, hardcoding
+    /// `ConsentChoices::Grant` into the `plan(…)` call) is invisible here —
+    /// that one is caught by `the_no_monitor_arm_follows_the_silence_rule`
+    /// instead, which is why both exist.
+    #[test]
+    fn request_never_names_a_decision_of_its_own() {
+        let body = request_fn_body();
+        assert!(
+            !body.contains("ConsentDecision::"),
+            "`request` must route every decision through `plan`, but its body names one directly:\n{body}"
+        );
+        // …and the scan is only worth anything if it is actually looking at the
+        // function. Mutation-test the scanner itself: the body must contain the
+        // three reads it is asserting *about*.
+        assert_eq!(
+            body.matches("plan.on_silence").count(),
+            3,
+            "the no-monitor arm, `Esc` and the timeout each read the plan; found:\n{body}"
+        );
+    }
+
+    /// `request`'s body, brace-matched out of this file's own source.
+    ///
+    /// Brace matching rather than a regex, for `lint-bind-pins.py`'s reason:
+    /// the body contains closures, nested blocks and `match` arms, none of
+    /// which a line-oriented pattern survives.
+    fn request_fn_body() -> String {
+        let src = include_str!("consent.rs");
+        let start = src
+            .find("pub fn request(")
+            .expect("this file defines `pub fn request`");
+        let open = start + src[start..].find('{').expect("`request` has a body") + 1;
+        let mut depth = 1usize;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[open..open + i].to_owned();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("`request`'s body is unbalanced");
+    }
+
+    /// The plan is the single resolution point, so it must agree with the four
+    /// accessors it is built from — otherwise the golden pins a table the
+    /// widgets no longer read.
+    #[test]
+    fn the_plan_is_exactly_the_tables_it_resolves() {
+        for choices in [ConsentChoices::Grant, ConsentChoices::Approval] {
+            let p = plan(choices);
+            assert_eq!(p.buttons, card(choices), "{choices:?}");
+            assert_eq!(p.focus, keyboard_default(choices), "{choices:?}");
+            assert_eq!(p.on_silence, choices.unanswered(), "{choices:?}");
+        }
+    }
 
     /// #487's card, pinned literally. #947 P3 made the buttons table-driven and
     /// added a second card; this is the assertion that the first one did not

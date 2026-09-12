@@ -16,12 +16,13 @@
 //! - Commands open a fresh short-lived socket (cheap unix-socket connect)
 //!   so they don't have to share the long-lived event-stream socket.
 
+use crate::retry;
 use anyhow::{Context, Result, anyhow};
 use futures_signals::signal::{Mutable, Signal};
 use hytte_reactive::{Service, registry, runtime, spawn_supervised_blocking};
 use niri_ipc::{Action, Event, Reply, Request, Response, WorkspaceReferenceArg, socket::Socket};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Re-export the niri-ipc data types consumers need so trollshell etc.
 // don't have to depend on niri-ipc directly.
@@ -81,24 +82,121 @@ impl Service for NiriService {
         // the rest of the session with nothing to restart them. The loop is
         // restart-safe: every run reconnects from scratch and the compositor,
         // not this process, holds the state it republishes.
-        spawn_supervised_blocking("niri", move || {
-            loop {
-                match listen_once(
+        supervise_listener(
+            "niri",
+            move || {
+                listen_once(
                     &ws_writer,
                     &win_list_writer,
                     &win_focus_writer,
                     &casts_writer,
                     &screenshot_writer,
-                ) {
-                    Ok(()) => tracing::warn!("niri event stream closed, reconnecting in 1s"),
-                    Err(e) => tracing::warn!(error = ?e, "niri ipc error, reconnecting in 1s"),
-                }
-                thread::sleep(Duration::from_secs(1));
-            }
-        });
+                )
+            },
+            thread::sleep,
+        );
 
         handles
     }
+}
+
+/// Run [`listen_sessions`] on a supervised blocking thread.
+///
+/// The seam exists for `idle_notify::supervise_observer`'s reason: it is the
+/// only way to supervise a body that panics without a live compositor, so the
+/// restart contract this thread relies on — a panic under `listen_once` gives a
+/// second run, with a fresh reporter and a fresh dial — is pinned by a test
+/// rather than only argued in the comment above.
+fn supervise_listener<L, S>(name: &'static str, listen: L, sleep: S)
+where
+    L: Fn() -> Result<()> + Send + Sync + 'static,
+    S: Fn(Duration) + Send + Sync + 'static,
+{
+    spawn_supervised_blocking(name, move || listen_sessions(&listen, &sleep));
+}
+
+/// Redial the event stream forever, reconnecting on a capped ramp.
+///
+/// Reconnect on `retry::RECONNECT_RETRY`'s ramp with the streak latched, rather
+/// than a flat 1s with a `warn!` per attempt (#1170 item 4). The case that
+/// matters is a **missing** `NIRI_SOCKET`: `Socket::connect` fails instantly, so
+/// the old loop was 1 Hz of identical warnings, forever, on a condition nothing
+/// here can fix.
+///
+/// Never returns: the only way out is a panic, which is what the supervisor
+/// above is for.
+///
+/// **Both parameters exist so the wait can be asserted.** `reconnect_after`
+/// returns the delay and this loop has to actually wait it — one statement that
+/// is the entire content of #1170 item 4, and that a test reading only
+/// `reconnect_after`'s return value is blind to. With the waiter injected, a
+/// counting stub records what the loop waited between attempts.
+fn listen_sessions<L, S>(listen: L, sleep: S)
+where
+    L: Fn() -> Result<()>,
+    S: Fn(Duration),
+{
+    let mut reporter = retry::ReconnectReporter::new();
+    loop {
+        let started = Instant::now();
+        let outcome = listen();
+        let (_report, delay) = reconnect_after(&mut reporter, started.elapsed(), outcome.as_ref());
+        sleep(delay);
+    }
+}
+
+/// Record a finished `listen_once` and say how long to wait before redialling.
+///
+/// The cadence is [`retry::ReconnectReporter`]'s — a run that stayed up at least
+/// its reset threshold is healthy, anything shorter is a failure streak — and
+/// the wording is this call site's, per `retry`'s mechanism/judgement split.
+/// The shape is #668/#669's: warn once on the edge into failure, `debug!` while
+/// nothing changes, `info!` to retract it.
+///
+/// **A run's health, not its `Result`, decides.** A `NIRI_SOCKET` that is not
+/// there fails instantly with an `Err`; a niri that restarts mid-session gives
+/// an `Err` too but only after hours; and an event stream that closes cleanly
+/// after hours is an `Ok`. Only the elapsed time separates "we are stuck" from
+/// "that was one hiccup", which is also exactly what the ramp resets on — so
+/// the two can never disagree.
+///
+/// Returns the report alongside the delay so the tests can read the cadence
+/// without a subscriber; the loop only needs the delay.
+fn reconnect_after(
+    reporter: &mut retry::ReconnectReporter,
+    ran_for: Duration,
+    outcome: Result<&(), &anyhow::Error>,
+) -> (retry::Report, Duration) {
+    let (report, delay) = reporter.record(ran_for);
+    let retry_in_secs = delay.as_secs_f64();
+    let cause = match outcome {
+        Ok(()) => "the event stream closed".to_owned(),
+        Err(e) => format!("{e:#}"),
+    };
+    match report {
+        retry::Report::Opened => tracing::warn!(
+            cause,
+            retry_in_secs,
+            "niri: cannot hold an IPC event stream (is NIRI_SOCKET set and is niri running?). \
+             Workspaces, windows, casts and the frame overlay are stale until it comes back. \
+             Redialling with backoff; this line will not repeat until it does"
+        ),
+        retry::Report::Repeating => {
+            tracing::debug!(cause, retry_in_secs, "niri: still no IPC event stream");
+        }
+        retry::Report::Recovered => {
+            tracing::info!("niri: IPC event stream held again; workspaces and windows are live");
+        }
+        // A stream that ran healthily and then ended — a niri restart, say.
+        // Worth a line each time: nothing is outstanding for the latch to
+        // retract, and these are rare by construction.
+        retry::Report::Quiet => tracing::warn!(
+            cause,
+            retry_in_secs,
+            "niri: IPC event stream ended, reconnecting"
+        ),
+    }
+    (report, delay)
 }
 
 fn listen_once(
@@ -945,6 +1043,225 @@ pub fn reflow_workspace(workspace: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    // ── The reconnect ramp and its latched warn (#1170 item 4) ───────────────
+
+    /// A failed dial, the shape `Socket::connect` gives when `NIRI_SOCKET` is
+    /// unset or nothing is listening on it.
+    fn missing_socket() -> anyhow::Error {
+        anyhow!("connect to NIRI_SOCKET: No such file or directory (os error 2)")
+    }
+
+    /// #1170's item 4, stated exactly: five consecutive missing-socket attempts
+    /// are worth one loud line.
+    ///
+    /// The ramp is asserted alongside it, because the two are the same decision
+    /// in `ReconnectReporter`: a cadence that spoke on every attempt would have
+    /// to treat every attempt as a fresh incident, and reset the delay too.
+    ///
+    /// Falsify by dropping the reporter and going back to
+    /// `warn!(…); thread::sleep(Duration::from_secs(1))`: five `Opened`s and
+    /// five identical 1s delays (measured).
+    #[test]
+    fn five_missing_socket_attempts_log_one_warn_and_climb_one_ramp() {
+        let mut reporter = retry::ReconnectReporter::new();
+        let err = missing_socket();
+        let instant = Duration::from_millis(1);
+
+        let turns: Vec<(retry::Report, Duration)> = (0..5)
+            .map(|_| reconnect_after(&mut reporter, instant, Err(&err)))
+            .collect();
+
+        let loud = turns
+            .iter()
+            .filter(|(r, _)| *r == retry::Report::Opened)
+            .count();
+        assert_eq!(
+            loud, 1,
+            "a missing NIRI_SOCKET warns per attempt, forever: {turns:?}"
+        );
+        assert_eq!(
+            turns[0].0,
+            retry::Report::Opened,
+            "the outage is not reported at all until later; the first attempt must be the loud one"
+        );
+
+        let delays: Vec<Duration> = turns.iter().map(|(_, d)| *d).collect();
+        assert!(
+            delays[0] > Duration::ZERO,
+            "the first redial is immediate, i.e. a hot loop"
+        );
+        for pair in delays.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "the ramp is flat across a streak: {delays:?}"
+            );
+        }
+    }
+
+    /// #1170's item 4, the **wiring** rather than the helper: the loop has to
+    /// actually wait the delay `reconnect_after` computed.
+    ///
+    /// The two tests above assert what `reconnect_after` *returns*, which is why
+    /// `thread::sleep(delay);` could be deleted from this loop (and from
+    /// `audio_native`'s twin) with the whole crate's suite green and clippy
+    /// silent — the 1 Hz redial storm this item exists to kill, reintroducible
+    /// for free. Five turns through `listen_sessions` with a counting stub in
+    /// the waiter's place, asserting the waits themselves.
+    ///
+    /// Costs no wall clock: the stub records and returns, so the 15.5s the real
+    /// ramp would spend here never happens.
+    ///
+    /// Falsify by dropping `sleep(delay);` from `listen_sessions` (bind
+    /// `_delay` so it still compiles): nothing is recorded and this fails.
+    #[test]
+    fn the_listen_loop_waits_the_redial_delay_it_computed() {
+        /// Enough turns to watch the ramp climb, and well short of the 30s
+        /// ceiling so a clamp bug shows as a wrong value, not a repeated one.
+        const TURNS: usize = 5;
+
+        let recorded: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+        let waits = Arc::clone(&recorded);
+        thread::spawn(move || {
+            listen_sessions(
+                || Err(missing_socket()),
+                move |delay| {
+                    let mut v = waits.lock().unwrap_or_else(PoisonError::into_inner);
+                    v.push(delay);
+                    let done = v.len() >= TURNS;
+                    drop(v);
+                    if done {
+                        // `listen_sessions` never returns by design; park the
+                        // thread rather than spin it for the rest of the binary
+                        // (`park` may wake spuriously, hence the loop).
+                        loop {
+                            thread::park();
+                        }
+                    }
+                },
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && recorded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len()
+                < TURNS
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let waited = recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            waited,
+            vec![
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+            ],
+            "the listen loop did not wait `reconnect_after`'s ramp between redials"
+        );
+    }
+
+    /// #1170's item 2 for the niri thread: panic under `listen_once` and the
+    /// next run dials again.
+    ///
+    /// niri's is the *simple* case of the four, and worth having precisely
+    /// because it is: `niri-ipc` is pure Rust with no `extern "C"` trampoline
+    /// anywhere on the dispatch path (unlike `audio_native`'s, where a callback
+    /// panic aborts the process instead — see `loop_.rs`'s `spawn_mainloop`), so
+    /// a panic in `apply_event` over compositor-supplied data really does unwind
+    /// into the supervisor, and restarting really is the whole fix.
+    ///
+    /// Deleting `supervise_listener`'s `spawn_supervised_blocking` — going back
+    /// to the bare `std::thread::spawn` #654 replaced — gives no second run at
+    /// all and reddens this.
+    #[test]
+    fn a_panicking_listen_run_restarts() {
+        const NAME: &str = "test-niri-restart";
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let second_run_started = Arc::new(AtomicUsize::new(0));
+        supervise_listener(
+            NAME,
+            {
+                let runs = Arc::clone(&runs);
+                let second = Arc::clone(&second_run_started);
+                move || {
+                    let run = runs.fetch_add(1, Ordering::SeqCst);
+                    assert!(run > 0, "{NAME}: the first dial panics, deliberately");
+                    second.fetch_add(1, Ordering::SeqCst);
+                    // Keep the run alive so the supervisor stays live and its
+                    // health row is still there to read; a clean return would
+                    // stop it and drop the row.
+                    loop {
+                        thread::park();
+                    }
+                }
+            },
+            |_| {},
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && second_run_started.load(Ordering::SeqCst) == 0 {
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let health = hytte_reactive::health::snapshot()
+            .into_iter()
+            .find(|h| h.name == NAME)
+            .expect("the supervisor publishes a live health row");
+        assert_eq!(
+            second_run_started.load(Ordering::SeqCst),
+            1,
+            "the panicking dial was never retried: runs={}, health={health:?}",
+            runs.load(Ordering::SeqCst)
+        );
+        assert_eq!(health.panics, 1, "the restart is not on the health record");
+        assert!(
+            health.runs >= 2,
+            "health says {} run(s); the Stats drawer would not show the restart",
+            health.runs
+        );
+    }
+
+    /// The other half: the streak is *one* incident, so the ramp does not reset
+    /// mid-outage — which is the same fact as the warn not repeating, since
+    /// both read `ReconnectReporter`'s one notion of a healthy run.
+    #[test]
+    fn a_held_stream_resets_the_ramp_and_a_short_one_does_not() {
+        let mut reporter = retry::ReconnectReporter::new();
+        let err = missing_socket();
+        let instant = Duration::from_millis(1);
+
+        let (_, first) = reconnect_after(&mut reporter, instant, Err(&err));
+        for _ in 0..4 {
+            reconnect_after(&mut reporter, instant, Err(&err));
+        }
+        // A stream that held for the reset threshold prices its own redial at
+        // the bottom of the ramp again (#806's ordering) *and* retracts the
+        // warning — one fact, two consequences.
+        let (report, after_healthy) =
+            reconnect_after(&mut reporter, Duration::from_mins(1), Ok(&()));
+        assert_eq!(
+            after_healthy, first,
+            "a long-lived stream's own reconnect still paid the streak's ratcheted delay"
+        );
+        assert_eq!(
+            report,
+            retry::Report::Recovered,
+            "the outage was never retracted, so a journal shows every death and no recovery"
+        );
+    }
 
     const MON_W: f64 = 1920.0;
     const MON_H: f64 = 1080.0;

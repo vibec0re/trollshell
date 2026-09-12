@@ -17,11 +17,80 @@
 //!    on error and, when *every* known source keeps failing, rebuild the
 //!    whole session ([`SourceFailureStreak`] decides when).
 //!
+//! Since #1170 it also owns the third: a **panic** on either worker thread.
+//! Both were bare `std::thread::spawn`s, so an unwind killed the thread and
+//! froze the service for the session with no log line — the residual #430 left
+//! behind. [`spawn_eds_worker`] is the one place that supervision lives.
+//!
 //! Everything here is pure logic + std channels — hermetically testable,
 //! no EDS required.
 
+use hytte_reactive::spawn_supervised_blocking;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+/// Run an EDS worker body on a supervised blocking thread, handing it the
+/// service's one `Receiver` on every run.
+///
+/// The two services' `Service::start` used to `std::thread::spawn` their worker
+/// directly. A panic under `run_worker` — libecal FFI, an iCal parse of
+/// whatever a `CalDAV` server returned — killed the thread, and with it every
+/// later refresh: the `Mutable`s froze at their last value for the session, and
+/// the only tell was a stderr line. `hytte_reactive::spawn_supervised_blocking`
+/// is the crate's answer to exactly that (`niri.rs` states the argument
+/// verbatim), and this is the EDS-shaped wrapper over it.
+///
+/// # Why the receiver is behind a mutex
+///
+/// The `Receiver` must outlive any one run — a restart that lost it would drop
+/// every queued op and could never get another, since `SENDER` is a `OnceLock`
+/// set once at registration. It cannot simply be *captured*, because
+/// `spawn_supervised_blocking` takes an `Fn() + Send + Sync` (it re-runs the
+/// closure from a fresh blocking thread per run) and `mpsc::Receiver` is `Send`
+/// but not `Sync`. A `Mutex` makes it `Sync` and hands the run exclusive use;
+/// only one run exists at a time, so the lock is never contended.
+///
+/// **The poison tolerance is load-bearing, not boilerplate.** A panicking run
+/// unwinds while this guard is held, which poisons the mutex; a plain
+/// `.unwrap()` would panic the restarted run too, so *every* run after the
+/// first would die on the lock rather than on the bug — measured:
+/// `panics: 4, consecutive_panics: 4, backoff: 8s` where the tolerant version
+/// picks the queued op up on run 2.
+///
+/// Two things that reading "poison-tolerant lock" as a hazard being accepted
+/// would get wrong:
+///
+/// * **There is no state to expose.** The lock wraps a `mpsc::Receiver` and
+///   nothing else. A `Receiver` carries no invariant across messages, so a
+///   panic mid-`recv` cannot leave it half-updated; the poison flag here is
+///   pure collateral from unwinding through the guard, not a signal about the
+///   data. Poison tolerance is dangerous where the guarded value has a
+///   multi-field invariant — this is the other case.
+/// * **The panic loop it avoids is slow, not hot.** The supervisor's ramp is
+///   1 → 2 → 4 → 8 → … → 30 s, so the `.unwrap()` variant costs one panic and
+///   one `error!` per 30 s in the steady state. Unbounded, and the service
+///   never comes back — but not a burning core, and worth knowing before
+///   triaging one.
+///
+/// **One op is still lost per panic**: the one already `recv`'d when the panic
+/// hit is gone with the run that took it. Ops still queued survive, which is
+/// what the shared `Arc<Mutex<Receiver>>` buys. For `calendar` that costs a
+/// refresh, which the next one repairs; for `tasks` it can be an `Op::Create`
+/// or `Op::Delete`, i.e. a user write that silently does not happen. Recovering
+/// that would mean acknowledging ops rather than consuming them, which is a
+/// different design and not one #1170 bought.
+pub(crate) fn spawn_eds_worker<T, F>(name: &'static str, rx: mpsc::Receiver<T>, body: F)
+where
+    T: Send + 'static,
+    F: Fn(&mpsc::Receiver<T>) + Send + Sync + 'static,
+{
+    let rx = Arc::new(Mutex::new(rx));
+    spawn_supervised_blocking(name, move || {
+        let rx = rx.lock().unwrap_or_else(PoisonError::into_inner);
+        body(&rx);
+    });
+}
 
 /// First retry delay after a failed EDS worker init.
 pub(crate) const INIT_BACKOFF_START: Duration = Duration::from_secs(1);
@@ -102,8 +171,102 @@ impl SourceFailureStreak {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    /// Poll `cond` until it holds or `within` elapses; returns whether it held.
+    ///
+    /// The supervisor's first restart delay is a real 1s sleep and there is no
+    /// seam to shorten it from outside `hytte-reactive`, so the restart tests
+    /// have to wait for wall clock. They poll rather than sleep a fixed time so
+    /// a fast machine finishes in ~1s and a loaded one still passes.
+    fn wait_until(within: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        cond()
+    }
+
+    /// The health row a supervisor keeps for `name`, if it is still live.
+    fn health_of(name: &str) -> Option<hytte_reactive::TaskHealth> {
+        hytte_reactive::health::snapshot()
+            .into_iter()
+            .find(|h| h.name == name)
+    }
+
+    /// #1170's item 2 for both EDS workers: panic a run, and the *next* run
+    /// starts with the same receiver and the ops queued meanwhile still on it.
+    ///
+    /// One test rather than two because `calendar` and `tasks` reach
+    /// supervision through this one function; each service's own `start` is
+    /// asserted by the compiler calling it.
+    ///
+    /// Three mechanisms hang on this, and deleting any of them reddens it:
+    ///
+    /// * the `spawn_supervised_blocking` call — without it the panic ends the
+    ///   thread and there is no second run at all;
+    /// * the shared `Arc<Mutex<Receiver>>` — capture a fresh receiver per run
+    ///   and the queued op is gone (and, with `SENDER` set once, unrecoverable);
+    /// * `unwrap_or_else(PoisonError::into_inner)` — the panic unwinds holding
+    ///   that guard, so a plain `.unwrap()` makes every restarted run panic on
+    ///   the lock instead, and this test times out rather than seeing run 2.
+    #[test]
+    fn a_panicking_eds_worker_restarts_with_the_same_receiver() {
+        const NAME: &str = "test-eds-worker-restart";
+
+        let (tx, rx) = mpsc::channel::<u32>();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        spawn_eds_worker(NAME, rx, {
+            let runs = Arc::clone(&runs);
+            let seen = Arc::clone(&seen);
+            move |rx| {
+                let run = runs.fetch_add(1, Ordering::SeqCst);
+                assert!(run > 0, "{NAME}: first run panics, deliberately");
+                // Second run: drain forever, so the supervisor stays live (a
+                // clean return would stop it and drop its health row) and the
+                // test can read both the ops and the row.
+                while let Ok(op) = rx.recv() {
+                    seen.lock().unwrap_or_else(PoisonError::into_inner).push(op);
+                }
+            }
+        });
+
+        // Queued while run 1 is panicking / the supervisor is backing off.
+        tx.send(7).expect("the receiver outlives the panicked run");
+
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                seen.lock().unwrap_or_else(PoisonError::into_inner).len() == 1
+            }),
+            "no second run picked the queued op up: runs={}, health={:?}",
+            runs.load(Ordering::SeqCst),
+            health_of(NAME)
+        );
+        assert_eq!(
+            *seen.lock().unwrap_or_else(PoisonError::into_inner),
+            vec![7],
+            "the op queued during the outage was lost or duplicated"
+        );
+
+        let health = health_of(NAME).expect("the supervisor publishes a live health row");
+        assert_eq!(health.panics, 1, "the restart is not on the health record");
+        assert!(
+            health.runs >= 2,
+            "health says {} run(s); the Stats drawer would not show the restart",
+            health.runs
+        );
+
+        // Let the second run end so its blocking thread is not held for the
+        // rest of the binary.
+        drop(tx);
+    }
 
     #[test]
     fn backoff_doubles_and_caps() {

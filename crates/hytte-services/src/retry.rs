@@ -300,15 +300,132 @@ impl ReconnectBackoff {
     }
 }
 
+// ── Log cadence over a failure streak (#1170) ────────────────────────────────
+
+/// What a finished attempt should *say*, given what the attempts before it
+/// already said.
+///
+/// Mechanism, on this module's split: the latch decides **whether** a given
+/// attempt is worth a line and at what standing, never **what** the line says —
+/// the wording, the fields and the level stay at the call site, exactly as
+/// [`Policy::step`] leaves the "which outcomes are retryable" judgement there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Report {
+    /// The first failure of a streak. Say it loudly, once — and say that it
+    /// will not repeat, because it will not.
+    Opened,
+    /// The streak continues. `debug!`; the condition is already on the record
+    /// and the ramp is already slowing the retries down.
+    Repeating,
+    /// It worked again after a streak. Retract the warning, at the level that
+    /// opened it (see `hytte_bus::own`'s `log_recovered`: a filter that shows
+    /// an incident opening must show it closing).
+    Recovered,
+    /// It worked, and nothing was outstanding. The call site may still have
+    /// something of its own to say about the run that just ended — this only
+    /// says the *streak* narrative has nothing to add.
+    Quiet,
+}
+
+/// A latch over a run of consecutive failures, so a permanent condition costs
+/// one line rather than one line per attempt.
+///
+/// The shape is `hytte_bus::own`'s (#668/#669): open loudly on the edge into
+/// failure, stay quiet while nothing changes, and speak again only to retract.
+/// #1170 needed it at three call sites at once — `geoclue`'s resolve loop,
+/// `niri`'s reconnect and the `PipeWire` mainloop's — which is why it is a type
+/// here and not a `bool` in each of them.
+pub(crate) struct FailureLatch {
+    /// `true` once a failure has been reported and no success has retracted it.
+    open: bool,
+}
+
+impl FailureLatch {
+    pub(crate) const fn new() -> Self {
+        Self { open: false }
+    }
+
+    /// Record one attempt's verdict and get back what to say about it.
+    pub(crate) const fn record(&mut self, healthy: bool) -> Report {
+        match (healthy, self.open) {
+            (true, true) => {
+                self.open = false;
+                Report::Recovered
+            }
+            (true, false) => Report::Quiet,
+            (false, false) => {
+                self.open = true;
+                Report::Opened
+            }
+            (false, true) => Report::Repeating,
+        }
+    }
+}
+
+/// [`ReconnectBackoff`] with [`FailureLatch`] bolted on: the two things every
+/// `reconnect-forever` loop has to decide after a run ends — how long to wait,
+/// and whether to say anything — answered together from the one fact both
+/// depend on, how long the run stayed up.
+///
+/// Deriving "healthy" from that single input is what keeps the two answers
+/// consistent: a run the ramp treats as healthy is exactly the run that
+/// retracts the warning, so a loop cannot reset its delay while still claiming
+/// the peer is down (or the reverse). The threshold is
+/// [`RECONNECT_RESET_AFTER`], the same one the ramp already applies.
+///
+/// **Note what "recovered" costs.** A run's health is only known when it
+/// *ends*, so [`Report::Recovered`] lands at the end of the first healthy run
+/// rather than at its start. For a reconnect loop that is the honest place for
+/// it — the alternative is claiming recovery from a connection that has not yet
+/// proved it will last — but it does mean a peer that comes back and then stays
+/// up for hours has its retraction logged hours later, alongside that run's own
+/// end-of-session line.
+pub(crate) struct ReconnectReporter {
+    latch: FailureLatch,
+    backoff: ReconnectBackoff,
+    reset_after: Duration,
+}
+
+impl ReconnectReporter {
+    /// A reporter on the shipped reconnect ramp and threshold.
+    pub(crate) const fn new() -> Self {
+        Self::with(ReconnectBackoff::new(), RECONNECT_RESET_AFTER)
+    }
+
+    /// The same over an arbitrary ramp/threshold, so the tests can assert the
+    /// mechanism without wall-clock sleeps or the shipped numbers.
+    const fn with(backoff: ReconnectBackoff, reset_after: Duration) -> Self {
+        Self {
+            latch: FailureLatch::new(),
+            backoff,
+            reset_after,
+        }
+    }
+
+    /// Record a finished run: how long it stayed up decides both the delay
+    /// before the next one and what this one is worth saying.
+    pub(crate) fn record(&mut self, ran_for: Duration) -> (Report, Duration) {
+        let report = self.latch.record(ran_for >= self.reset_after);
+        (report, self.backoff.delay_after_run(ran_for))
+    }
+}
+
 /// Every retry policy this crate **ships**, so the `every_shipped_policy_*`
 /// tests below see all of them.
 ///
-/// **A new shipped policy belongs in this list.** These are the only tests that
-/// look at real numbers rather than a test-local schedule, and #665 exists
-/// precisely because the second policy shipped without them: its own test
-/// compared `step`'s delay against `policy.backoff(attempt)` — the very
-/// expression `step` computes internally — so `initial: Duration::ZERO` kept the
-/// whole suite green while turning the retry into a tight `error!` flood.
+/// **A new shipped policy belongs in this list**, and since #1170's review that
+/// is *enforced* rather than merely asked for: `the_shipped_list_is_every_policy_in_the_crate`
+/// scans the crate's own source for module-level `Policy` declarations and
+/// fails if the two sets differ in either direction. Before that the doc said
+/// "belongs in this list" and nothing checked, which is the same shape #665
+/// exists to close — a hand-synced invariant that had already failed once.
+///
+/// These are the only tests that look at real numbers rather than a test-local
+/// schedule, and #665 exists precisely because the second policy shipped
+/// without them: its own test compared `step`'s delay against
+/// `policy.backoff(attempt)` — the very expression `step` computes internally —
+/// so `initial: Duration::ZERO` kept the whole suite green while turning the
+/// retry into a tight `error!` flood.
 #[cfg(test)]
 const SHIPPED: &[(&str, Policy)] = &[
     ("wifi::PROBE_RETRY", crate::wifi::PROBE_RETRY),
@@ -317,11 +434,15 @@ const SHIPPED: &[(&str, Policy)] = &[
         "networkd::STARTUP_REFRESH_RETRY",
         crate::networkd::STARTUP_REFRESH_RETRY,
     ),
+    ("geoclue::RESOLVE_RETRY", crate::geoclue::RESOLVE_RETRY),
 ];
 
 #[cfg(test)]
 mod tests {
-    use super::{Policy, RECONNECT_RESET_AFTER, RECONNECT_RETRY, ReconnectBackoff, SHIPPED, Step};
+    use super::{
+        FailureLatch, Policy, RECONNECT_RESET_AFTER, RECONNECT_RETRY, ReconnectBackoff,
+        ReconnectReporter, Report, SHIPPED, Step,
+    };
     use std::time::Duration;
 
     /// A *bounded* policy with tiny delays, so the give-up path stays reachable
@@ -510,6 +631,89 @@ mod tests {
         );
     }
 
+    // ── The failure latch (#1170) ────────────────────────────────────────────
+
+    /// #1170's item 4, stated as the mechanism: five consecutive missing-socket
+    /// attempts are worth exactly one loud line.
+    #[test]
+    fn a_streak_of_failures_opens_once_and_then_stays_quiet() {
+        let mut latch = FailureLatch::new();
+        let reports: Vec<Report> = (0..5).map(|_| latch.record(false)).collect();
+        assert_eq!(
+            reports.iter().filter(|r| **r == Report::Opened).count(),
+            1,
+            "a permanent condition must cost one loud line, not one per attempt (#1170)"
+        );
+        assert_eq!(
+            reports,
+            vec![
+                Report::Opened,
+                Report::Repeating,
+                Report::Repeating,
+                Report::Repeating,
+                Report::Repeating
+            ]
+        );
+    }
+
+    /// The retraction fires once, and the latch re-arms: a peer that flaps is
+    /// reported every time it goes down, not only the first time.
+    #[test]
+    fn recovery_is_reported_once_and_the_latch_re_arms() {
+        let mut latch = FailureLatch::new();
+        assert_eq!(latch.record(false), Report::Opened);
+        assert_eq!(latch.record(true), Report::Recovered);
+        assert_eq!(
+            latch.record(true),
+            Report::Quiet,
+            "a second healthy run re-announced a recovery nobody was waiting for"
+        );
+        assert_eq!(
+            latch.record(false),
+            Report::Opened,
+            "the latch did not re-arm, so the next outage would be silent"
+        );
+    }
+
+    /// A healthy first run says nothing at all — the latch must not open on
+    /// success, which would invert every level at every call site.
+    #[test]
+    fn a_healthy_run_with_nothing_outstanding_is_quiet() {
+        let mut latch = FailureLatch::new();
+        assert_eq!(latch.record(true), Report::Quiet);
+        assert_eq!(latch.record(true), Report::Quiet);
+    }
+
+    /// The reporter reads "healthy" off the *same* elapsed time the ramp resets
+    /// on, so a loop can never reset its delay while still claiming the peer is
+    /// down. `bounded()` stands in for the shipped ramp, with a 100ms stand-in
+    /// threshold.
+    #[test]
+    fn the_reporter_ties_the_retraction_to_the_ramp_reset() {
+        let threshold = Duration::from_millis(100);
+        let mut reporter =
+            ReconnectReporter::with(ReconnectBackoff::with(bounded(), threshold), threshold);
+        let fast = Duration::from_millis(1);
+
+        assert_eq!(reporter.record(fast), (Report::Opened, bounded().initial));
+        assert_eq!(
+            reporter.record(fast),
+            (Report::Repeating, Duration::from_millis(20)),
+            "the streak must climb the ramp while staying quiet"
+        );
+        // A run that reaches the threshold both retracts the warning and
+        // re-prices its own reconnect at the bottom of the ramp (#806).
+        assert_eq!(
+            reporter.record(threshold),
+            (Report::Recovered, bounded().initial),
+            "the retraction and the ramp reset disagreed about the same run"
+        );
+        assert_eq!(
+            reporter.record(threshold),
+            (Report::Quiet, bounded().initial)
+        );
+    }
+
     // ── The shipped constants (#665) ─────────────────────────────────────────
     //
     // Every assertion below compares against a *literal* — a field of the policy
@@ -578,5 +782,121 @@ mod tests {
                  quiet in the journal"
             );
         }
+    }
+
+    /// [`SHIPPED`] is every `Policy` this crate declares — checked against the
+    /// source rather than trusted.
+    ///
+    /// The two tests above cover a policy that is *in* the list; one that was
+    /// forgotten was invisible, and `SHIPPED`'s doc asked for the sync with
+    /// nothing enforcing it. That is exactly the shape #665 exists to close: a
+    /// hand-maintained invariant that had already failed once. The repo's usual
+    /// answer to "a rule about source text" is a `runCommand` scan under
+    /// `nix/` (`lint-bind-pins.py`, `lint-glsl.py`); this one is a unit test
+    /// instead because the rule is about *this crate's* source only, it needs no
+    /// cross-file parsing, and it wants to fail next to the list it is about.
+    ///
+    /// **The scan rule, stated so it can be argued with.** A shipped policy is
+    /// a `const`/`static` of type `Policy` declared at **module level**, i.e.
+    /// starting at column 0 — which is what makes an indented test-local ramp
+    /// (`geoclue`'s `FAST_RETRY`, `wifi`'s and this file's equivalents) not a
+    /// shipped one, without needing to parse `mod tests` or track brace depth
+    /// past doc comments full of braces. A `#[cfg(test)]` on the line above
+    /// excludes it too. The expected label is `<module>::<NAME>`, with `<module>`
+    /// the file stem, or the directory name for a `mod.rs` — which is why
+    /// `wifi/mod.rs`'s entry reads `wifi::PROBE_RETRY`.
+    ///
+    /// Falsify by deleting any entry from `SHIPPED`, or by adding a module-level
+    /// `Policy` const anywhere in the crate without listing it.
+    #[test]
+    fn the_shipped_list_is_every_policy_in_the_crate() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut declared = Vec::new();
+        collect_policy_decls(&src, &mut declared);
+        declared.sort();
+
+        let mut listed: Vec<String> = SHIPPED.iter().map(|(name, _)| (*name).to_owned()).collect();
+        listed.sort();
+
+        assert!(
+            !declared.is_empty(),
+            "the source scan found no policies at all, so it is asserting nothing — did the \
+             crate layout move out from under `CARGO_MANIFEST_DIR/src`?"
+        );
+        assert_eq!(
+            declared, listed,
+            "`SHIPPED` and the crate's module-level `Policy` declarations disagree. Anything in \
+             the left column and not the right ships without the `every_shipped_policy_*` \
+             invariants; anything in the right and not the left is a stale entry"
+        );
+    }
+
+    /// Every `<module>::<NAME>` a module-level `Policy` declaration under `dir`
+    /// would be called in [`SHIPPED`]. See the test above for the rule.
+    fn collect_policy_decls(dir: &std::path::Path, out: &mut Vec<String>) {
+        let entries = std::fs::read_dir(dir).expect("the crate's own src/ is readable");
+        for entry in entries {
+            let path = entry.expect("a readable dir entry").path();
+            if path.is_dir() {
+                collect_policy_decls(&path, out);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let stem = path.file_stem().expect("a .rs file has a stem");
+            let module = if stem == "mod" {
+                path.parent()
+                    .and_then(std::path::Path::file_name)
+                    .expect("a mod.rs lives in a directory")
+            } else {
+                stem
+            }
+            .to_string_lossy()
+            .into_owned();
+
+            let text = std::fs::read_to_string(&path).expect("the crate's own source is UTF-8");
+            let mut previous = "";
+            for line in text.lines() {
+                if is_module_level_policy_decl(line) && previous.trim() != "#[cfg(test)]" {
+                    let name = line
+                        .split_once("const ")
+                        .or_else(|| line.split_once("static "))
+                        .and_then(|(_, rest)| rest.split_once(':'))
+                        .expect("the decl matcher already saw both halves")
+                        .0
+                        .trim();
+                    out.push(format!("{module}::{name}"));
+                }
+                previous = line;
+            }
+        }
+    }
+
+    /// Whether `line` declares a module-level `const`/`static` of type `Policy`.
+    fn is_module_level_policy_decl(line: &str) -> bool {
+        let Some(rest) = line
+            .strip_prefix("const ")
+            .or_else(|| line.strip_prefix("static "))
+            .or_else(|| {
+                line.strip_prefix("pub ")
+                    .or_else(|| line.strip_prefix("pub(crate) "))
+                    .or_else(|| line.strip_prefix("pub(super) "))
+                    .and_then(|r| {
+                        r.strip_prefix("const ")
+                            .or_else(|| r.strip_prefix("static "))
+                    })
+            })
+        else {
+            // Not column 0, or not a const/static: indented items are inside
+            // something, and the only thing shipped policies are inside is the
+            // module itself.
+            return false;
+        };
+        let Some((_, ty)) = rest.split_once(':') else {
+            return false;
+        };
+        let ty = ty.split('=').next().unwrap_or(ty).trim();
+        ty == "Policy" || ty == "retry::Policy"
     }
 }

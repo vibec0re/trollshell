@@ -17,10 +17,13 @@
 //! `weather`'s tokio task can read it without touching the thread-local
 //! registry).
 
-use futures_signals::signal::{Mutable, Signal};
+use crate::networkd::{Link, OperationalState};
+use crate::retry;
+use futures_signals::signal::{Mutable, Signal, SignalExt};
 use futures_util::StreamExt;
 use hytte_bus::{BusKind, call};
 use hytte_reactive::{Service, registry, shared, spawn_supervised};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -44,6 +47,63 @@ const GEOCLUE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const GEOCODE_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const GEOCODE_READ_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Retry ramp for a resolve attempt that came back with nothing (#1170).
+///
+/// **Unbounded**, for `networkd::STARTUP_REFRESH_RETRY`'s reason rather than a
+/// new one: whatever made the boot-time attempt fail — `GeoClue2` not yet
+/// activated, the host still offline, the geocoding endpoint unreachable — is
+/// transient by nature, and until this existed a single failure at boot froze
+/// weather, nightlight's auto sunset and places at "no location" for the whole
+/// session, because [`refresh`] had no caller anywhere in the workspace. There
+/// is no attempt count at which giving up would be the better answer.
+///
+/// The failure it cannot distinguish is a host with neither `GeoClue2` nor
+/// `TROLLSHELL_WEATHER_CITY` — a genuinely sourceless machine, where this ramp
+/// settles into one failed `GetClient` every 30 s forever. That is cheap (the
+/// name is not on the bus, so the call fails without a round trip to anything)
+/// and it is what makes a `GeoClue2` that is dbus-activated two minutes into
+/// the session get picked up at all. It stays *quiet* rather than becoming a
+/// 30 s log flood via [`retry::FailureLatch`] — see [`log_no_location`].
+pub(crate) const RESOLVE_RETRY: retry::Policy = retry::Policy {
+    max_attempts: None,
+    initial: Duration::from_secs(1),
+    max_backoff: Duration::from_secs(30),
+};
+
+/// How long a resolved location is trusted before the loop asks again, absent
+/// any other wake.
+///
+/// The floor under every other wake source, not a poll: `refresh()` and the
+/// link-up edge answer "something changed, ask now", and this answers "nothing
+/// told us, and a location is not a fact that stays true". Without it a
+/// successful resolve parked the loop on a `Notify` with no timer, so a fix
+/// taken in Stockholm survived a move to a network in Berlin for the rest of
+/// the session as long as the edge watcher happened not to fire — the same
+/// permanence #1170's item 1 is about, reached from the other side.
+///
+/// Six hours because the cost side is a single `GetClient` round trip to a
+/// daemon on the same machine, and the benefit side is bounded by how wrong a
+/// stale fix can be: weather, sunrise/sunset and the places list all tolerate
+/// being a few hours behind a move, and none of them tolerates being a *session*
+/// behind one. Short enough that a laptop opened in a new city is right by
+/// lunchtime; long enough that it is not a poll in any meaningful sense (4 calls
+/// a day). It is deliberately **not** injected into [`run_resolve_loop`] the way
+/// the ramp is: `tokio::test(start_paused = true)` advances virtual time
+/// automatically, so the shipped constant costs its test nothing.
+pub(crate) const PERIODIC_RESOLVE_EVERY: Duration = Duration::from_hours(6);
+
+/// How often the link-up watcher re-checks whether `networkd` has published its
+/// cross-thread handle yet, and how many times before it stops asking.
+///
+/// Every service's `start` runs synchronously on the main thread while the
+/// `App` is built, and this task is spawned from inside one of them, so the
+/// window in which `networkd` has not published yet is sub-millisecond in
+/// practice. The budget is three orders of magnitude wider than that, and its
+/// expiry is the accurate answer for the other case: a shell that composes
+/// `geoclue` without `networkd` at all, where no amount of waiting would help.
+const LINK_PROBE_EVERY: Duration = Duration::from_millis(500);
+const LINK_PROBE_ATTEMPTS: u32 = 20;
 
 /// Where a [`LocationSnapshot`] came from. `Configured` already carries a
 /// human name in `label_hint`; `GeoClue` does not, so `weather` reverse-
@@ -148,6 +208,12 @@ impl Service for GeoclueService {
         spawn_supervised("geoclue", move || {
             resolve_loop(location.clone(), notify.clone(), place_override.clone())
         });
+        // The one caller of `refresh()` in the tree (#1170). Its own task, so a
+        // panic in the watcher cannot take the resolve loop with it and vice
+        // versa; restart-safe because it owns nothing but a subscription.
+        spawn_supervised("geoclue-link-watch", || {
+            link_up_watcher(wait_for_link_edge_shared)
+        });
         handles
     }
 }
@@ -171,6 +237,13 @@ pub fn current() -> impl Signal<Item = LocationState> {
 
 /// Re-run resolution: cancel any cached result and try `GeoClue2` + the env
 /// var again. Lets consumers recover from a transient failure.
+///
+/// In-tree its caller is [`link_up_watcher`], which fires it on every link-up
+/// edge; a shell author can also call it from a "refresh location" affordance.
+/// It is *not* the only thing that re-resolves — [`run_resolve_loop`] also
+/// retries a failed attempt on the [`RESOLVE_RETRY`] ramp all by itself, which
+/// is what keeps a boot-time failure from being permanent on a host with no
+/// `networkd` (#1170).
 pub fn refresh() {
     if let Some(s) = shared::get::<Shared>() {
         s.notify.notify_one();
@@ -221,30 +294,265 @@ pub(crate) fn shared_location() -> Option<Mutable<LocationState>> {
     shared::get::<Shared>().map(|s| s.location.clone())
 }
 
-/// Resolve once at boot, then again on every [`refresh`]. We take a single
-/// location per attempt (no live re-subscription) — matches the design's
-/// "first `LocationUpdated` wins" rule.
+/// Resolve once at boot, then again on every [`refresh`], on every link-up edge
+/// and — while the last attempt found nothing — on the [`RESOLVE_RETRY`] ramp.
+/// We take a single location per attempt (no live re-subscription) — matches the
+/// design's "first `LocationUpdated` wins" rule.
+///
+/// Until #1170 this parked on the `Notify` after the *first* attempt whatever it
+/// returned, and nothing in the workspace called [`refresh`], so a boot-time
+/// failure was permanent for the session.
 async fn resolve_loop(
     location: Mutable<LocationState>,
     notify: Arc<Notify>,
     place_override: Mutable<PlaceOverride>,
 ) {
+    run_resolve_loop(
+        location,
+        notify,
+        place_override,
+        |ov| async move { resolve_once(&ov).await },
+        RESOLVE_RETRY,
+    )
+    .await;
+}
+
+/// [`resolve_loop`]'s body, with the resolver and the ramp injected.
+///
+/// Never returns. The seam exists so the retry and wake behaviour can be
+/// asserted without `GeoClue2`, a network or a wall-clock wait: `resolve_loop`
+/// supplies the real two, the tests supply a counting resolver and a
+/// millisecond-scale ramp.
+async fn run_resolve_loop<R, RFut>(
+    location: Mutable<LocationState>,
+    notify: Arc<Notify>,
+    place_override: Mutable<PlaceOverride>,
+    resolve: R,
+    policy: retry::Policy,
+) where
+    R: Fn(PlaceOverride) -> RFut,
+    RFut: Future<Output = Option<LocationSnapshot>>,
+{
+    let mut latch = retry::FailureLatch::new();
+    // 1-based and counts the attempt that produced the outcome being weighed,
+    // per `retry::Policy::step`. Reset by a success, so an outage that heals
+    // and returns is priced from the bottom of the ramp.
+    let mut attempt: u32 = 1;
+
     loop {
-        if let Some(loc) = resolve_once(&place_override.get_cloned()).await {
-            location.set(LocationState::Resolved(loc));
-        } else {
-            tracing::info!(
-                "geoclue: no location (GeoClue2 unavailable, TROLLSHELL_WEATHER_CITY unset?)"
-            );
-            // Don't clobber a previously-resolved fix on a transient re-resolve
-            // failure; only surface Unavailable if we never had one (i.e.
-            // genuinely no source at boot).
-            if !matches!(location.get_cloned(), LocationState::Resolved(_)) {
-                location.set(LocationState::Unavailable);
+        let outcome = resolve(place_override.get_cloned()).await;
+        let verdict = policy.step(&outcome.as_ref().ok_or(()), attempt);
+        let report = latch.record(outcome.is_some());
+
+        let retry_in = match (outcome, verdict) {
+            (Some(loc), _) => {
+                if report == retry::Report::Recovered {
+                    tracing::info!(
+                        failed_attempts = attempt.saturating_sub(1),
+                        "geoclue: location resolved after earlier attempts found none"
+                    );
+                }
+                location.set(LocationState::Resolved(loc));
+                attempt = 1;
+                None
             }
+            (None, verdict) => {
+                log_no_location(report, attempt, verdict);
+                // Don't clobber a previously-resolved fix on a transient
+                // re-resolve failure; only surface Unavailable if we never had
+                // one (i.e. genuinely no source at boot).
+                if !matches!(location.get_cloned(), LocationState::Resolved(_)) {
+                    location.set(LocationState::Unavailable);
+                }
+                attempt = attempt.saturating_add(1);
+                match verdict {
+                    retry::Step::Retry { after } => Some(after),
+                    // `Proceed` cannot follow an `Err`, and `GiveUp` cannot
+                    // follow an unbounded policy; either way there is no timer
+                    // to arm and the loop falls back to the periodic wake.
+                    retry::Step::Proceed | retry::Step::GiveUp => None,
+                }
+            }
+        };
+
+        // Whichever comes first: a `refresh()` — from the control-center, or
+        // from [`link_up_watcher`] when the primary link becomes usable — the
+        // retry delay while the last attempt found nothing, or
+        // [`PERIODIC_RESOLVE_EVERY`].
+        //
+        // **The park is never unbounded**, which is #1170's other half. Until
+        // this, a *successful* resolve armed no timer at all and the loop slept
+        // on the notify forever; with `refresh()`'s only in-tree caller being an
+        // edge watcher, a shell that resolved a fix and then had nothing fire
+        // kept that fix for the rest of the session — the same permanence as a
+        // boot-time failure, from the other side.
+        //
+        // **Exactly one extra resolve per burst**, and that is `Notify`'s doing
+        // rather than a counter here: `notify_one` stores *at most one* permit,
+        // so however many edges and `refresh()` calls land while a resolve is in
+        // flight, the `notified()` below returns once and the loop resolves
+        // once. One resolve is in flight at a time by construction — this is a
+        // single task and the `await` above is the only resolver call site.
+        let after = retry_in.unwrap_or(PERIODIC_RESOLVE_EVERY);
+        tokio::select! {
+            () = notify.notified() => {}
+            () = tokio::time::sleep(after) => {}
         }
-        notify.notified().await;
     }
+}
+
+/// What a resolve that found nothing is worth saying, given the ones before it.
+///
+/// The condition is usually **static** — no `GeoClue2` on this host, no
+/// configured city — so the streak is latched the way `hytte_bus::own` latches a
+/// contested bus name (#668): one `info!` naming both the cause and the fact
+/// that it will not repeat, then `debug!` for as long as nothing changes.
+fn log_no_location(report: retry::Report, attempt: u32, verdict: retry::Step) {
+    let retry_in_secs = match verdict {
+        retry::Step::Retry { after } => after.as_secs_f64(),
+        retry::Step::Proceed | retry::Step::GiveUp => 0.0,
+    };
+    match report {
+        retry::Report::Opened => tracing::info!(
+            attempt,
+            retry_in_secs,
+            "geoclue: no location (GeoClue2 unavailable, TROLLSHELL_WEATHER_CITY unset?). \
+             Retrying with backoff, on every refresh() and whenever the network link \
+             returns; this line will not repeat until a location resolves"
+        ),
+        retry::Report::Repeating => {
+            tracing::debug!(attempt, retry_in_secs, "geoclue: still no location");
+        }
+        // Unreachable: this is the no-location arm, so the latch cannot have
+        // just recorded a success. Kept total rather than `unreachable!()` —
+        // a wrong log level is a better failure than a panicked service task.
+        retry::Report::Recovered | retry::Report::Quiet => {
+            tracing::debug!(attempt, "geoclue: no location");
+        }
+    }
+}
+
+/// Call [`refresh`] every time the host lands on a usable network, forever.
+///
+/// This is the caller [`refresh`] never had (#1170): a resolve that failed
+/// because the host was offline should not sit out the ramp once the link
+/// demonstrably came back. It is a *separate* supervised task rather than a
+/// third arm of [`run_resolve_loop`]'s `select!` so the resolve loop keeps one
+/// wake source and stays testable without `networkd`, and so the public
+/// [`refresh`] is the one path an out-of-band re-resolve ever takes.
+///
+/// `next_edge` is injected for the same reason the resolver is: the tests drive
+/// a local `Mutable<Option<Link>>` instead of the process-global bag.
+async fn link_up_watcher<W, WFut>(next_edge: W)
+where
+    W: Fn() -> WFut,
+    WFut: Future<Output = ()>,
+{
+    loop {
+        next_edge().await;
+        tracing::debug!("geoclue: the primary link is routable; re-resolving the location");
+        refresh();
+    }
+}
+
+/// Resolve on the next [`LinkEdge`], reading `networkd`'s cross-thread handle.
+///
+/// Parks forever rather than returning if `networkd::service()` was never
+/// registered — a future that resolved would turn the caller's loop into a
+/// spin. See [`LINK_PROBE_ATTEMPTS`] for why the wait is bounded but the park
+/// is not.
+async fn wait_for_link_edge_shared() {
+    for _ in 0..LINK_PROBE_ATTEMPTS {
+        if let Some(primary) = crate::networkd::shared_primary() {
+            wait_for_link_edge(&primary).await;
+            return;
+        }
+        tokio::time::sleep(LINK_PROBE_EVERY).await;
+    }
+    tracing::debug!(
+        "geoclue: networkd::service() is not registered, so there is no link edge to \
+         re-resolve on; the retry ramp and the periodic re-resolve still run"
+    );
+    std::future::pending::<()>().await;
+}
+
+/// The primary link reduced to the two facts that decide whether the location
+/// is worth asking about again: **which** link it is, and whether the host can
+/// actually reach anything over it.
+///
+/// `networkd::refresh` picks `primary` as the highest-`priority()` link, which
+/// includes `Dormant` (1) and `Carrier`/`DegradedCarrier` (2) — carrier present,
+/// no address, no route. Watching `Option::is_some`, as this did until #1170's
+/// review, therefore got both halves wrong:
+///
+/// 1. **Too early.** Carrier comes up before DHCP answers, so the edge fired
+///    against a host with no route; the resolve failed and — since `is_some`
+///    was already true — no second edge ever came when the link reached
+///    `Routable`. The watcher added nothing over the ramp in exactly the case
+///    it was written for.
+/// 2. **A roam was invisible.** `primary` stays `Some` across a Wi-Fi roam or a
+///    DHCP renewal onto a different network, so no edge fired at all.
+///
+/// `Routable` rather than `priority() >= 4` (which would also take `Degraded`,
+/// i.e. IPv6-only or link-local-only): "the network is usable" is the question,
+/// and `Degraded` is the state where it provably is not, for the IP version
+/// geocoding is about to use. A host that only ever reaches `Degraded` still
+/// gets the ramp and [`PERIODIC_RESOLVE_EVERY`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LinkEdge {
+    idx: i32,
+    name: String,
+    routable: bool,
+}
+
+/// Project the primary link onto its [`LinkEdge`]. `None` when there is no
+/// primary link at all, which is itself a distinct value to change away from.
+fn link_edge(primary: Option<&Link>) -> Option<LinkEdge> {
+    primary.map(|l| LinkEdge {
+        idx: l.idx,
+        name: l.name.clone(),
+        routable: l.operational == OperationalState::Routable,
+    })
+}
+
+/// Resolve on the next change of [`LinkEdge`] that lands on a routable link.
+///
+/// Three things have to hold at once and this is the smallest shape that gets
+/// all three:
+///
+/// * **An already-routable link is not an edge.** A `futures_signals` signal
+///   replays its current value to every new subscriber, and `link_up_watcher`
+///   re-arms this future after each fire — so without dropping that first value
+///   every re-arm would resolve again immediately, i.e. a hot loop. The
+///   `changes.next()` before the loop is that drop, and deleting it does not
+///   redden a test: it makes the watcher spin, allocating a subscription per
+///   turn, and the binary climbs to tens of GB of RSS within a minute.
+/// * **Routability changing is an edge.** `Carrier` → `Routable` (DHCP
+///   answered) and `Routable` → `Carrier` → `Routable` (a roam that bounced the
+///   route) both change the projection, so both wake the caller.
+/// * **A different link taking over is an edge.** The `idx`/`name` in the key
+///   are what make a roam onto another interface — or a Wi-Fi link replacing an
+///   ethernet one — a fresh question rather than a continuation.
+///
+/// `dedupe_cloned` is what turns "the value was republished" into "the value
+/// changed": `networkd` re-publishes `primary` on every poll, so without it
+/// every poll tick would read as an edge.
+async fn wait_for_link_edge(primary: &Mutable<Option<Link>>) {
+    let mut changes = primary
+        .signal_ref(|p| link_edge(p.as_ref()))
+        .dedupe_cloned()
+        .to_stream();
+    // The replayed current value says where we are, not that we moved.
+    let _ = changes.next().await;
+    while let Some(edge) = changes.next().await {
+        if edge.is_some_and(|e| e.routable) {
+            return;
+        }
+    }
+    // The `Mutable` is gone (only reachable in a test that drops it). Park
+    // rather than return: a return here would read to `link_up_watcher` as an
+    // edge and spin it.
+    std::future::pending::<()>().await;
 }
 
 async fn resolve_once(ov: &PlaceOverride) -> Option<LocationSnapshot> {
@@ -508,5 +816,478 @@ mod tests {
     #[test]
     fn parse_geocode_garbage_is_err() {
         assert!(parse_geocode("not json").is_err());
+    }
+
+    // ── The resolve loop's retry and its link-up wake (#1170) ───────────────
+    //
+    // Everything below drives `run_resolve_loop` / `link_up_watcher` directly:
+    // no `GeoClue2`, no bus, no network, and a millisecond-scale ramp so the
+    // whole block costs a few milliseconds of wall clock.
+
+    use hytte_reactive::test_lock::TEST_LOCK;
+    use std::sync::PoisonError;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// The test ramp: the same *shape* as `RESOLVE_RETRY` (unbounded, doubling,
+    /// capped) three orders of magnitude faster. Deliberately not the shipped
+    /// constant — tuning that must not redden these, and `retry.rs`'s
+    /// `every_shipped_policy_*` tests own the real numbers.
+    const FAST_RETRY: retry::Policy = retry::Policy {
+        max_attempts: None,
+        initial: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(4),
+    };
+
+    fn a_fix() -> LocationSnapshot {
+        LocationSnapshot {
+            lat: 59.33,
+            lon: 18.06,
+            label_hint: Some("Stockholm".into()),
+            source: LocationSource::Configured,
+        }
+    }
+
+    /// A primary link in a given operational state, the shape `networkd`'s
+    /// `refresh` publishes.
+    fn link_in(idx: i32, name: &str, operational: OperationalState) -> Link {
+        Link {
+            idx,
+            name: name.into(),
+            operational,
+            ..Link::default()
+        }
+    }
+
+    /// The routable primary link — the state that means "the host can reach
+    /// something", and therefore the only one that is worth re-resolving on.
+    fn a_link() -> Link {
+        link_in(1, "wlan0", OperationalState::Routable)
+    }
+
+    /// Poll `waiter` for `within` and say whether it fired.
+    ///
+    /// Each call is also what *advances* the watcher past the value currently on
+    /// the `Mutable`: a `futures_signals` signal coalesces to its latest value,
+    /// so a test that set `Carrier` and then `Routable` without polling in
+    /// between would show the watcher only the second one and prove nothing
+    /// about the transition. Every step below therefore goes through here.
+    async fn fired_within(
+        waiter: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
+        within: Duration,
+    ) -> bool {
+        tokio::time::timeout(within, waiter).await.is_ok()
+    }
+
+    /// Long enough for the signal machinery to deliver a change on a loaded
+    /// machine; short enough that four of these are still milliseconds.
+    const SETTLE: Duration = Duration::from_millis(40);
+
+    /// #1170's item 1, first half: the boot-time failure is no longer
+    /// permanent. A resolver that finds nothing twice and then succeeds must
+    /// leave the state `Resolved` on its own — no `refresh()`, no link-up edge,
+    /// nothing external at all.
+    ///
+    /// Falsify by deleting the `Some(after)` arm of `run_resolve_loop`'s final
+    /// `match` (park on the notify whatever happened, which is what shipped
+    /// before #1170): the resolver is called exactly once and this reads
+    /// `Resolving`.
+    #[tokio::test]
+    async fn a_resolver_that_fails_twice_then_succeeds_ends_resolved() {
+        let location = Mutable::new(LocationState::default());
+        let notify = Arc::new(Notify::new());
+        let calls = Arc::new(AtomicU32::new(0));
+
+        let resolve = {
+            let calls = calls.clone();
+            move |_ov| {
+                let calls = calls.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    (n >= 2).then(a_fix)
+                }
+            }
+        };
+
+        // The loop never returns; bound it and read the state it left behind.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_resolve_loop(
+                location.clone(),
+                notify,
+                Mutable::new(PlaceOverride::default()),
+                resolve,
+                FAST_RETRY,
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the loop must retry a failed resolve on its own ramp"
+        );
+        assert!(
+            matches!(location.get_cloned(), LocationState::Resolved(_)),
+            "three attempts, the third of which found a fix, and the state is still \
+             {:?}",
+            location.get_cloned()
+        );
+    }
+
+    /// While it is still failing the state says `Unavailable` rather than
+    /// staying on the boot-time `Resolving` — the split `LocationState` exists
+    /// for, and the reason `weather` can show an error instead of a spinner
+    /// forever.
+    #[tokio::test]
+    async fn a_failing_resolver_publishes_unavailable_while_it_retries() {
+        let location = Mutable::new(LocationState::default());
+        let calls = Arc::new(AtomicU32::new(0));
+        let resolve = {
+            let calls = calls.clone();
+            move |_ov| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    None
+                }
+            }
+        };
+
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            run_resolve_loop(
+                location.clone(),
+                Arc::new(Notify::new()),
+                Mutable::new(PlaceOverride::default()),
+                resolve,
+                FAST_RETRY,
+            ),
+        )
+        .await;
+
+        assert_eq!(location.get_cloned(), LocationState::Unavailable);
+        assert!(
+            calls.load(Ordering::SeqCst) > 1,
+            "the ramp stopped after one attempt"
+        );
+    }
+
+    /// #1170's item 1, second half: the offline → online edge triggers exactly
+    /// **one** extra resolve, through the real public [`refresh`].
+    ///
+    /// The whole path is live here — `link_up_watcher` → `refresh()` →
+    /// `shared::get::<Shared>()` → `Notify` → the resolve loop's wake — with
+    /// only the edge source swapped for a local `Mutable` (production reads
+    /// `networkd::shared_primary()`).
+    ///
+    /// "Exactly one" is the load-bearing half: `wait_for_link_edge`'s dropped
+    /// first value is what stops a signal's replay of its current value from
+    /// re-firing the edge every time the watcher re-arms.
+    ///
+    /// **Falsifying this one needs care.** Deleting `wait_for_link_edge`'s
+    /// `let _ = changes.next().await;` does not redden it — it makes the watcher
+    /// spin, allocating a fresh signal subscription per turn, and the test
+    /// binary climbs to tens of GB of RSS within a minute (measured while
+    /// writing this). That runaway *is* the falsification; run it under a memory
+    /// cap, or kill it on sight.
+    ///
+    /// Sync + `block_on` rather than `#[tokio::test]`: this one takes
+    /// `TEST_LOCK` (it writes the process-global `shared` map), and a `std`
+    /// guard must not be held across an `await`.
+    #[test]
+    fn the_offline_to_online_edge_triggers_exactly_one_extra_resolve() {
+        // The `shared` map is process-global, so it must be cleared even when an
+        // assertion below unwinds — otherwise this test's `Shared` stays
+        // published for every later test in the binary. A drop guard rather than
+        // a trailing statement (and rather than a `scopeguard` dependency, which
+        // would be a new resolved package for four lines).
+        struct ResetShared;
+        impl Drop for ResetShared {
+            fn drop(&mut self) {
+                hytte_reactive::shared::reset_for_tests();
+            }
+        }
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _reset = ResetShared;
+
+        hytte_reactive::runtime::handle().block_on(async {
+            let location = Mutable::new(LocationState::default());
+            let notify = Arc::new(Notify::new());
+            shared::insert(Shared {
+                location: location.clone(),
+                notify: notify.clone(),
+                place_override: Mutable::new(PlaceOverride::default()),
+            });
+
+            let calls = Arc::new(AtomicU32::new(0));
+            let resolve = {
+                let calls = calls.clone();
+                move |_ov| {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Some(a_fix())
+                    }
+                }
+            };
+
+            // Offline at the start, so the edge is still ahead of us.
+            let primary: Mutable<Option<Link>> = Mutable::new(None);
+            let loop_task = tokio::spawn(run_resolve_loop(
+                location,
+                notify,
+                Mutable::new(PlaceOverride::default()),
+                resolve,
+                FAST_RETRY,
+            ));
+            let watcher = tokio::spawn({
+                let primary = primary.clone();
+                async move { link_up_watcher(|| wait_for_link_edge(&primary)).await }
+            });
+
+            // The boot resolve lands and the loop parks (a success arms no timer).
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "the boot resolve");
+
+            primary.set(Some(a_link()));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "the link came back and the location was not re-resolved"
+            );
+
+            // Still online: nothing further happens, however long we wait.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "the link-up edge re-fired while the link never went down"
+            );
+
+            // …and it re-arms: down then up is a second edge, not a second no-op.
+            primary.set(None);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            primary.set(Some(a_link()));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 3, "the edge did not re-arm");
+
+            loop_task.abort();
+            watcher.abort();
+        });
+    }
+
+    /// A link that is already routable when the watcher starts is not an edge.
+    /// Without this, a shell booting online would re-resolve immediately after
+    /// the boot resolve, every time.
+    #[tokio::test]
+    async fn an_already_up_link_is_not_an_edge() {
+        let primary: Mutable<Option<Link>> = Mutable::new(Some(a_link()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), wait_for_link_edge(&primary))
+                .await
+                .is_err(),
+            "a link that never went down reported a link-up edge"
+        );
+    }
+
+    // ── What counts as an edge (#1170 review, MEDIUM-4) ──────────────────────
+    //
+    // `networkd::refresh` picks the highest-`priority()` link as `primary`,
+    // which includes `Dormant` and `Carrier` — carrier up, no address, no route.
+    // The four tests below pin the rule that replaced `Option::is_some`:
+    // a *change* of (which link, is it routable) that lands on routable.
+
+    /// Carrier without a route is not the network coming up. DHCP has not
+    /// answered yet, so a resolve here reaches nothing — and under the old
+    /// `Option::is_some` rule the appearance of that link was the *only* edge
+    /// the watcher ever saw on a cold boot, with no second one when the link
+    /// actually became usable.
+    ///
+    /// Both steps matter and only the first falsifies the old rule: a link
+    /// **appearing** at `Dormant` (`None` → `Some`) is what `is_some` fired on,
+    /// and `Dormant` → `Carrier` is what a naive "operational changed" rule
+    /// would fire on instead. Neither is the host coming online.
+    #[tokio::test]
+    async fn a_link_that_only_gains_carrier_is_not_an_edge() {
+        let primary: Mutable<Option<Link>> = Mutable::new(None);
+        let waiter = wait_for_link_edge(&primary);
+        tokio::pin!(waiter);
+        assert!(
+            !fired_within(&mut waiter, SETTLE).await,
+            "the replayed value"
+        );
+
+        // The interface shows up with carrier pending — `is_some` fired here.
+        primary.set(Some(link_in(1, "wlan0", OperationalState::Dormant)));
+        assert!(
+            !fired_within(&mut waiter, SETTLE).await,
+            "a link merely existing reported the host online"
+        );
+
+        // Carrier, still no address and no route.
+        primary.set(Some(link_in(1, "wlan0", OperationalState::Carrier)));
+        assert!(
+            !fired_within(&mut waiter, SETTLE).await,
+            "a link with carrier but no route reported the host online"
+        );
+    }
+
+    /// …and reaching `Routable` is. This is the moment a resolve can succeed,
+    /// and under the old rule it produced no edge at all.
+    #[tokio::test]
+    async fn a_link_becoming_routable_is_an_edge() {
+        let primary = Mutable::new(Some(link_in(1, "wlan0", OperationalState::Carrier)));
+        let waiter = wait_for_link_edge(&primary);
+        tokio::pin!(waiter);
+        assert!(
+            !fired_within(&mut waiter, SETTLE).await,
+            "the replayed value"
+        );
+
+        primary.set(Some(link_in(1, "wlan0", OperationalState::Routable)));
+        assert!(
+            fired_within(&mut waiter, SETTLE).await,
+            "DHCP answered and nothing re-resolved"
+        );
+    }
+
+    /// A roam that bounces the route on the *same* interface — the Wi-Fi case
+    /// this rule exists for. `primary` stays `Some` throughout, so the old rule
+    /// saw nothing and the loop kept the previous city for the session.
+    #[tokio::test]
+    async fn routability_bouncing_on_one_link_is_a_fresh_edge() {
+        let primary = Mutable::new(Some(link_in(1, "wlan0", OperationalState::Routable)));
+        let waiter = wait_for_link_edge(&primary);
+        tokio::pin!(waiter);
+        assert!(
+            !fired_within(&mut waiter, SETTLE).await,
+            "the replayed value"
+        );
+
+        // Associating with the new AP: carrier held, route gone.
+        primary.set(Some(link_in(1, "wlan0", OperationalState::Carrier)));
+        assert!(
+            !fired_within(&mut waiter, SETTLE).await,
+            "losing the route is not itself a reason to re-resolve"
+        );
+
+        // DHCP on the new network answers.
+        primary.set(Some(link_in(1, "wlan0", OperationalState::Routable)));
+        assert!(
+            fired_within(&mut waiter, SETTLE).await,
+            "a roam that bounced routability produced no edge"
+        );
+    }
+
+    /// A different link taking over — ethernet plugged in, or a second radio —
+    /// is a different network, so it is a fresh question even though both the
+    /// old and the new primary are routable and `primary` never went `None`.
+    #[tokio::test]
+    async fn another_link_taking_over_is_an_edge() {
+        let primary = Mutable::new(Some(link_in(1, "wlan0", OperationalState::Routable)));
+        let waiter = wait_for_link_edge(&primary);
+        tokio::pin!(waiter);
+        assert!(
+            !fired_within(&mut waiter, SETTLE).await,
+            "the replayed value"
+        );
+
+        primary.set(Some(link_in(2, "eth0", OperationalState::Routable)));
+        assert!(
+            fired_within(&mut waiter, SETTLE).await,
+            "a second link became primary and nothing re-resolved"
+        );
+    }
+
+    /// The floor under everything else: a successful resolve used to park the
+    /// loop on a `Notify` with no timer at all, so a shell that resolved in one
+    /// city and then saw no edge kept that fix for the whole session.
+    ///
+    /// `start_paused` means the six hours cost no wall clock — tokio advances
+    /// virtual time as soon as every task is idle — which is why
+    /// [`PERIODIC_RESOLVE_EVERY`] is used here as shipped rather than injected.
+    ///
+    /// Falsify by restoring `None => notify.notified().await` as the park: the
+    /// resolver is called once and this reads 1.
+    #[tokio::test(start_paused = true)]
+    async fn a_resolved_location_is_re_resolved_on_the_periodic_timer() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let resolve = {
+            let calls = calls.clone();
+            move |_ov| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Some(a_fix())
+                }
+            }
+        };
+
+        // Just past one period: the boot resolve plus exactly one periodic wake.
+        let _ = tokio::time::timeout(
+            PERIODIC_RESOLVE_EVERY + Duration::from_mins(30),
+            run_resolve_loop(
+                Mutable::new(LocationState::default()),
+                Arc::new(Notify::new()),
+                Mutable::new(PlaceOverride::default()),
+                resolve,
+                FAST_RETRY,
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a successfully resolved location is never asked about again"
+        );
+    }
+
+    /// One resolve in flight at a time, and a burst of wakes during it is worth
+    /// exactly one more — `Notify::notify_one`'s single stored permit doing the
+    /// work, which is why `run_resolve_loop` needs no counter of its own.
+    ///
+    /// Three `refresh()`-equivalents land while the first resolve is still
+    /// awaiting; the loop must resolve once more, not three times.
+    #[tokio::test]
+    async fn a_burst_of_wakes_during_a_resolve_is_worth_one_more_resolve() {
+        let notify = Arc::new(Notify::new());
+        let calls = Arc::new(AtomicU32::new(0));
+        let resolve = {
+            let calls = calls.clone();
+            move |_ov| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // Slow enough that the wakes below land mid-resolve.
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    Some(a_fix())
+                }
+            }
+        };
+
+        let task = tokio::spawn(run_resolve_loop(
+            Mutable::new(LocationState::default()),
+            notify.clone(),
+            Mutable::new(PlaceOverride::default()),
+            resolve,
+            FAST_RETRY,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the boot resolve");
+        for _ in 0..3 {
+            notify.notify_one();
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a burst of wakes during one resolve queued more than one re-resolve"
+        );
+        task.abort();
     }
 }

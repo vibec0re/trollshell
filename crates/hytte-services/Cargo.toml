@@ -100,6 +100,8 @@ temp-env = { version = "0.3.6", features = ["async_closure"] }
 # `start_paused`: the retry budget walks a 500 ms → 30 s ramp, so spending it
 # for real would cost a minute. It resolves no new package (tokio's
 # `test-util = ["rt", "sync", "time"]`, all already on).
+# `geoclue`'s periodic re-resolve test leans on the same flag to cross
+# `PERIODIC_RESOLVE_EVERY`'s six hours in no wall clock at all.
 tokio = { workspace = true, features = [
   "macros",
   "rt",

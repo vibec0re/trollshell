@@ -69,7 +69,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock, mpsc};
-use std::thread;
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone, Utc};
@@ -79,7 +78,9 @@ use hytte_ecal::{CalClient, EventInstance, Registry, Source};
 use hytte_reactive::{Service, registry, spawn_supervised};
 use icalendar::{Calendar, CalendarComponent, Component, EventLike, EventStatus};
 
-use crate::eds_retry::{INIT_BACKOFF_START, SourceFailureStreak, next_backoff, wait_backoff};
+use crate::eds_retry::{
+    INIT_BACKOFF_START, SourceFailureStreak, next_backoff, spawn_eds_worker, wait_backoff,
+};
 
 // ── Public data types ────────────────────────────────────────────────────────
 
@@ -202,10 +203,22 @@ impl Service for CalendarService {
         // libecal isn't Sync and wants to be pinned to one thread (the same
         // constraint the tasks service handles); give the calendar its own
         // EDS worker thread owning a Registry + a per-source CalClient cache.
-        thread::Builder::new()
-            .name("hytte-eds-cal".into())
-            .spawn(move || run_worker(&rx, &writer))
-            .expect("spawn calendar EDS worker thread");
+        //
+        // Supervised since #1170 (the residual of #430): a panic under
+        // `run_worker` — libecal FFI, or `icalendar` parsing whatever a CalDAV
+        // server returned — used to kill the thread and freeze `events` for the
+        // session with no log line and nothing to restart it.
+        //
+        // **What a restart re-does:** a fresh `hytte_ecal::Registry` and an
+        // empty per-source `CalClient` cache, then the #432 init-with-backoff
+        // dance again — i.e. it reconnects to the daemon that holds the state,
+        // which is the supervisor's own restart-safety argument. `SENDER` is
+        // set once here, not per run, and the `Receiver` outlives every run
+        // inside `spawn_eds_worker`, so refresh pings queued while the worker
+        // was down are picked up by the run that follows — bar the one already
+        // `recv`'d when the panic hit, which costs this service a refresh the
+        // next ping repairs (`tasks`' loss is worse; see its call site).
+        spawn_eds_worker("calendar-eds", rx, move |rx| run_worker(rx, &writer));
 
         // Refresh ticker. The first send fires immediately (initial
         // populate); thereafter every POLL_INTERVAL.

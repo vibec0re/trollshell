@@ -7,11 +7,15 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, Once, PoisonError, RwLock};
 use std::thread;
+use std::time::Instant;
 
 use futures_signals::signal::Mutable;
+use hytte_reactive::spawn_supervised_blocking;
 use pipewire as pw;
+use pw::channel::Receiver;
 use pw::types::ObjectType;
 
 use super::super::pipewire::{
@@ -24,85 +28,306 @@ use super::types::{
     AudioRole, AudioState, Command, LinkEdge, MetadataProxy, NodeEntry, NodeProxy, SpectrumAction,
     SpectrumCapture, StateRef, clone_handles,
 };
+use crate::retry;
 
-/// Sender shared across all callers. Populated by [`spawn_mainloop`] before
-/// the loop runs; mutation fns read it with `.get()`. A `OnceLock` keeps
-/// this thread-safe without requiring a `Mutex`, and an inert clone after
-/// `spawn_mainloop` returns is enough to send commands from any thread.
-pub(super) static COMMAND_TX: OnceLock<pw::channel::Sender<Command>> = OnceLock::new();
+/// Sender shared across all callers. Published by [`spawn_mainloop`] before the
+/// loop runs; mutation fns read it through [`send_command`].
+///
+/// A re-settable slot rather than a `OnceLock` since #1170. The mainloop is
+/// supervised now, and a panicking run unwinds **with the `Receiver` it was
+/// holding**: without a way to republish a sender, the restarted run would find
+/// no receiver, and every `set_*` for the rest of the session would go nowhere.
+/// [`session_receiver`] is what re-establishes the pair; [`STARTED`] keeps the
+/// called-twice guard the `OnceLock` used to provide.
+pub(super) static COMMAND_TX: RwLock<Option<pw::channel::Sender<Command>>> = RwLock::new(None);
+
+/// Whether [`spawn_mainloop`] has already run. Its own flag now that
+/// [`COMMAND_TX`] is no longer set-once.
+static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Spawn the pipewire mainloop thread. Returns immediately; the thread
 /// runs for the lifetime of the process. Errors during init (e.g. no
-/// `/run/user/$UID/pipewire-0` socket) are logged and the thread retries
-/// after a short backoff so a daemon restart heals automatically.
+/// `/run/user/$UID/pipewire-0` socket) are logged and the thread reconnects
+/// on a capped ramp so a daemon restart heals automatically.
 ///
-/// Creates the command channel up front and installs the [`Sender`] into
-/// [`COMMAND_TX`] before the thread starts running the loop. That way any
+/// Creates the command channel up front and publishes the [`Sender`] into
+/// [`COMMAND_TX`] before the thread starts running the loop, **parking its
+/// [`Receiver`] in the slot the first session takes from**. That way any
 /// `set_*` call from the tokio side that lands before the loop has fully
 /// connected to pipewire goes through the channel and is buffered until
 /// the receiver attaches — never silently dropped.
 ///
+/// Seeding the slot is the load-bearing half, not a tidy-up. `publish_channel`
+/// hands its receiver back for a reason: dropping it here would leave the slot
+/// `None`, so the first [`session_receiver`] would publish a *second* channel
+/// and everything sent on the first would be stranded — and stranded
+/// **silently**, because `pw::channel::Sender::send` never checks for a live
+/// receiver (it writes the wakeup byte, pushes onto the queue and returns
+/// `Ok(())`), so not even `send_command`'s receiver-dropped warning could fire.
+///
+/// **Supervised** since #1170 (the residual of #430) — but read the scope
+/// carefully, because it is narrower than the obvious reading and the boundary
+/// is structural rather than a matter of degree.
+///
+/// **A panic inside a `PipeWire` callback is not covered, and cannot be.**
+/// pipewire-rs 0.10 dispatches every listener through an `unsafe extern "C"`
+/// trampoline — `registry_events_global` (the registry walk),
+/// `core_events_error` (the quit path's listener), `node_events_param` (the
+/// `Props` pods) and `loop_`'s `call_closure` (the `IoSource` behind
+/// `pw::channel`, i.e. [`handle_command`]). Since Rust 1.81 a panic that would
+/// unwind out of an `extern "C"` frame is a guaranteed **process abort**, not
+/// UB and not an unwind: it takes the whole shell down, `spawn_supervised_blocking`
+/// never sees a `JoinError::is_panic()`, and no `catch_unwind` is reachable
+/// from behind those trampolines. The only lever on that class is keeping every
+/// callback body total — which is why `decode_props`, `parse_default_name` and
+/// friends are written to return `Option`/defaults rather than index or unwrap.
+///
+/// **What supervision does cover is the Rust side of the thread**: the session
+/// prologue (`MainLoopRc::new`, `ContextRc::new`, `connect_rc`,
+/// `get_registry_rc`, `AudioState::new`), the reconnect loop in
+/// [`run_sessions`], and the channel bookkeeping around it. Those frames unwind
+/// normally, and a panic in one used to take sink/source/stream volume, the
+/// mute toggle and the spectrum tap out for the session with no log line and
+/// nothing to restart them. `a_panicking_mainloop_thread_restarts_with_a_live_command_channel`
+/// pins that half; the callback half has no test **by construction**, since the
+/// abort would take the test binary with it — that absence is the finding, not
+/// an oversight.
+///
+/// **What a restart re-does:** `pw::init()` (guarded by [`PW_INIT`], so the
+/// library is initialised exactly once per process however many times the
+/// closure re-runs), a fresh mainloop/context/core/registry, and a full
+/// registry walk that re-emits every snapshot. The state it republishes lives
+/// in the pipewire daemon, not here, which is the supervisor's own
+/// restart-safety argument.
+///
 /// [`Sender`]: pw::channel::Sender
 pub(super) fn spawn_mainloop(handles: PipewireHandles) {
-    let (tx, rx) = pw::channel::channel::<Command>();
-    if COMMAND_TX.set(tx).is_err() {
-        // Programmer error: start() called twice. Don't overwrite the live
+    if STARTED.swap(true, Ordering::SeqCst) {
+        // Programmer error: start() called twice. Don't disturb the live
         // sender — the second mainloop wouldn't share the first's proxy
         // map and writes would silently no-op.
         tracing::warn!("audio_native: spawn_mainloop called twice; ignoring second start");
         return;
     }
-    // The `pw::channel::Receiver` is not `Send`, so we hand it through a
-    // local `Cell<Option<_>>` style swap: the closure below moves it into
-    // the thread, where it gets `take()`n on first iteration of the retry
-    // loop and re-attached to each fresh mainloop. Concretely, since
-    // mainloop crashes (no daemon, dbus glitch) restart the whole loop,
-    // the receiver must outlive `run_once`. `pipewire::channel::Receiver`
-    // detaches cleanly when `AttachedReceiver` is dropped, so the next
-    // run_once just attaches again.
-    let mut rx = Some(rx);
-    thread::Builder::new()
-        .name("hytte-audio-pw".into())
-        .spawn(move || {
-            pw::init();
-            loop {
-                let handles = clone_handles(&handles);
-                let receiver = rx.take().expect("audio_native: receiver consumed twice");
-                let (returned_rx, res) = run_once(handles, receiver);
-                rx = Some(returned_rx);
-                if let Err(e) = res {
-                    tracing::warn!(error = ?e, "audio_native: mainloop exited, retrying in 1s");
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                }
-            }
-        })
-        .expect("spawn audio_native mainloop thread");
+    supervise_sessions("pipewire", initial_slot(), move |slot| {
+        run_sessions(slot, &handles);
+    });
 }
 
-/// One mainloop session. Returns the receiver (so `spawn_mainloop` can
-/// re-attach it on the next session) along with the run result.
+/// Run `body` on a supervised blocking thread, handing it the receiver slot on
+/// every run.
+///
+/// Split out of [`spawn_mainloop`] with the name and the body injected, for
+/// `idle_notify::supervise_observer`'s reason: it is the only way to supervise a
+/// body that panics without a live `PipeWire`, and it keeps `PW_INIT` — the
+/// one piece of per-process setup a restart must *not* repeat — on the path the
+/// test exercises rather than beside it.
+fn supervise_sessions<F>(
+    name: &'static str,
+    slot: Mutex<Option<pw::channel::Receiver<Command>>>,
+    body: F,
+) where
+    F: Fn(&Mutex<Option<pw::channel::Receiver<Command>>>) + Send + Sync + 'static,
+{
+    spawn_supervised_blocking(name, move || {
+        PW_INIT.call_once(pw::init);
+        body(&slot);
+    });
+}
+
+/// The receiver slot a fresh [`spawn_mainloop`] starts from: a published
+/// channel whose `Receiver` is already parked for the first session to take.
+///
+/// The `pw::channel::Receiver` is `!Sync`, and `spawn_supervised_blocking`
+/// wants an `Fn() + Send + Sync` it can re-run from a fresh blocking thread, so
+/// it rides in a mutex. It must outlive any one `run_once`: a mainloop that
+/// exits (no daemon, dbus glitch) restarts, and commands queued meanwhile have
+/// to survive. `pipewire::channel::Receiver` detaches cleanly when
+/// `AttachedReceiver` is dropped, so the next `run_once` just attaches again.
+///
+/// Its own function rather than an expression inside `spawn_mainloop` so the
+/// tests can start from the state production actually starts from — the
+/// `STARTED` latch makes `spawn_mainloop` itself a once-per-process call.
+fn initial_slot() -> Mutex<Option<pw::channel::Receiver<Command>>> {
+    Mutex::new(Some(publish_channel()))
+}
+
+/// `pw_init` is process-global and refcounted; the supervisor may re-enter the
+/// closure any number of times, and once is the honest number.
+static PW_INIT: Once = Once::new();
+
+/// Publish a fresh command channel and hand back its receiver.
+fn publish_channel() -> pw::channel::Receiver<Command> {
+    let (tx, rx) = pw::channel::channel::<Command>();
+    *COMMAND_TX.write().unwrap_or_else(PoisonError::into_inner) = Some(tx);
+    rx
+}
+
+/// The receiver for the next mainloop session.
+///
+/// Normally the previous session's, parked in `slot` — that is what makes a
+/// command issued while the daemon is down arrive once it is back. The first
+/// session's is parked there too, by [`initial_slot`], so the startup window is
+/// not a hole. It is `None` in exactly one case: after a session that
+/// **panicked**, which unwinds holding the receiver. Re-creating the channel
+/// there is what keeps a restart a real recovery rather than a mainloop whose
+/// command path is permanently dead; the commands queued on the lost channel
+/// are gone, which is acceptable for a surface that is fire-and-forget volume
+/// setting, and far better than the alternative of `.expect()`ing and turning
+/// one panic into an unbounded panic loop.
+fn session_receiver(slot: &Mutex<Option<pw::channel::Receiver<Command>>>) -> Receiver<Command> {
+    if let Some(rx) = slot.lock().unwrap_or_else(PoisonError::into_inner).take() {
+        return rx;
+    }
+    publish_channel()
+}
+
+/// Run mainloop sessions forever, reconnecting on a capped ramp.
+///
+/// Lives inside the supervised closure rather than being the closure, so the
+/// supervisor's "a clean return means the task finished" rule never fires: this
+/// never returns, and the only way out is a panic, which is what supervision is
+/// for.
+fn run_sessions(slot: &Mutex<Option<pw::channel::Receiver<Command>>>, handles: &PipewireHandles) {
+    run_sessions_with(
+        slot,
+        |rx| run_once(clone_handles(handles), rx),
+        thread::sleep,
+    );
+}
+
+/// [`run_sessions`]'s body, with the session and the **waiter** injected.
+///
+/// The waiter is a parameter because nothing else can pin it. `reconnect_after`
+/// is thoroughly tested and returns the right delay; the loop then has to
+/// actually wait it, and that one statement is the whole of #1170's items 3
+/// and 4 — deleting it reintroduces the hot respawn loop those items exist to
+/// kill. A test that only reads `reconnect_after`'s return value cannot see
+/// that, and clippy has nothing to say about a discarded `Duration` that is
+/// still passed to a `let`. With the waiter injected, a counting stub records
+/// what the loop waited and the assertion is on the wait itself.
+///
+/// `session` is injected for the ordinary reason: `run_once` needs a live
+/// `PipeWire`.
+fn run_sessions_with<R, S>(
+    slot: &Mutex<Option<pw::channel::Receiver<Command>>>,
+    session: R,
+    sleep: S,
+) where
+    R: Fn(pw::channel::Receiver<Command>) -> (pw::channel::Receiver<Command>, SessionEnd),
+    S: Fn(std::time::Duration),
+{
+    let mut reporter = retry::ReconnectReporter::new();
+    loop {
+        let receiver = session_receiver(slot);
+        let started = Instant::now();
+        let (returned_rx, end) = session(receiver);
+        *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(returned_rx);
+        let (_report, delay) = reconnect_after(&mut reporter, started.elapsed(), &end);
+        sleep(delay);
+    }
+}
+
+/// Record a finished mainloop session and say how long to wait before the next.
+///
+/// **Both arms come through here, and that is the point of #1170's item 3.**
+/// `run_once` ending in [`SessionEnd::Quit`] is a failure wearing a success's
+/// shape: the only thing that quits the mainloop is the core-error listener, so
+/// a daemon that dies mid-session leaves this way. That arm used to return
+/// straight to the top of the loop, skipping the 1s sleep the error arm took —
+/// so a dead `PipeWire` was a hot respawn loop, one `warn!` per turn, as fast as
+/// the daemon could fail. Now both are priced on `retry::RECONNECT_RETRY`
+/// (500ms → 30s) and both are latched, so a permanent outage costs one loud
+/// line and then silence until it heals.
+///
+/// Returns the report as well as the delay so the tests can read the cadence;
+/// the loop only needs the delay.
+fn reconnect_after(
+    reporter: &mut retry::ReconnectReporter,
+    ran_for: std::time::Duration,
+    end: &SessionEnd,
+) -> (retry::Report, std::time::Duration) {
+    let (report, delay) = reporter.record(ran_for);
+    let retry_in_secs = delay.as_secs_f64();
+    let cause = end.cause();
+    match report {
+        retry::Report::Opened => tracing::warn!(
+            cause,
+            retry_in_secs,
+            "audio_native: the PipeWire mainloop is not staying up; reconnecting with backoff. \
+             Volume, mute and the spectrum tap are stale until it does. This line will not \
+             repeat until it recovers"
+        ),
+        retry::Report::Repeating => tracing::debug!(
+            cause,
+            retry_in_secs,
+            "audio_native: PipeWire mainloop still not staying up"
+        ),
+        retry::Report::Recovered => tracing::info!(
+            "audio_native: the PipeWire mainloop is back; sinks, sources and streams are live again"
+        ),
+        // A session that stayed up and then ended: rare, and worth a line each
+        // time — the latch has nothing outstanding to retract.
+        retry::Report::Quiet => tracing::warn!(
+            cause,
+            retry_in_secs,
+            "audio_native: PipeWire mainloop session ended, reconnecting"
+        ),
+    }
+    (report, delay)
+}
+
+/// How one mainloop session ended.
+///
+/// A plain `Result<(), pw::Error>` cannot say this, which is how #1170's item 3
+/// got in: the quit path's `Ok(())` reads as success at every call site, and the
+/// reconnect loop treated it as one. Both variants are failures — the only
+/// difference is how far the session got — and naming them that way is what
+/// makes it hard to write a loop that backs off after one and not the other.
+pub(super) enum SessionEnd {
+    /// The session ran and the mainloop then quit. In practice that means the
+    /// core-error listener fired: `message` is what the daemon said.
+    Quit { message: Option<String> },
+    /// The session never started: mainloop / context / core / registry
+    /// construction failed (no `/run/user/$UID/pipewire-0` socket, say).
+    Failed(pw::Error),
+}
+
+impl SessionEnd {
+    /// One-line cause for a log field, whichever way the session ended.
+    fn cause(&self) -> String {
+        match self {
+            Self::Quit { message: Some(m) } => format!("core error: {m}"),
+            Self::Quit { message: None } => "mainloop quit".to_owned(),
+            Self::Failed(e) => format!("session could not start: {e:?}"),
+        }
+    }
+}
+
+/// One mainloop session. Returns the receiver (so `run_sessions` can
+/// re-attach it on the next session) along with how the session ended.
 // One cohesive PipeWire registry + listener wiring block; splitting it would
 // scatter shared closure state across helpers for no real readability gain.
 #[allow(clippy::too_many_lines)]
 pub(super) fn run_once(
     handles: PipewireHandles,
     rx: pw::channel::Receiver<Command>,
-) -> (pw::channel::Receiver<Command>, Result<(), pw::Error>) {
+) -> (pw::channel::Receiver<Command>, SessionEnd) {
     let mainloop = match pw::main_loop::MainLoopRc::new(None) {
         Ok(m) => m,
-        Err(e) => return (rx, Err(e)),
+        Err(e) => return (rx, SessionEnd::Failed(e)),
     };
     let context = match pw::context::ContextRc::new(&mainloop, None) {
         Ok(c) => c,
-        Err(e) => return (rx, Err(e)),
+        Err(e) => return (rx, SessionEnd::Failed(e)),
     };
     let core = match context.connect_rc(None) {
         Ok(c) => c,
-        Err(e) => return (rx, Err(e)),
+        Err(e) => return (rx, SessionEnd::Failed(e)),
     };
     let registry = match core.get_registry_rc() {
         Ok(r) => r,
-        Err(e) => return (rx, Err(e)),
+        Err(e) => return (rx, SessionEnd::Failed(e)),
     };
 
     let state = Rc::new(RefCell::new(AudioState::new(handles)));
@@ -124,15 +349,24 @@ pub(super) fn run_once(
         handle_command(cmd, &state_for_cmds, &core_for_cmds);
     });
 
-    // Core error → quit the mainloop so run_once returns cleanly and the
-    // outer loop reconnects. Without this, daemon crashes leave the
-    // mainloop blocked forever in the C-side poll.
+    // Core error → quit the mainloop so run_once returns and the outer loop
+    // reconnects. Without this, daemon crashes leave the mainloop blocked
+    // forever in the C-side poll.
+    //
+    // The message is *recorded* rather than logged here (#1170): this fires once
+    // per session, and with a daemon that is down sessions are back-to-back, so
+    // a `warn!` here was one line per reconnect attempt however hard the outer
+    // loop latched. `run_sessions` owns the narrative and carries this string on
+    // whichever line it decides to print.
+    let quit_cause: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let mainloop_weak = mainloop.downgrade();
+    let cause_for_listener = Rc::clone(&quit_cause);
     let _core_listener = core
         .add_listener_local()
         .error(move |id, _seq, _res, message| {
             if id == 0 {
-                tracing::warn!(message = %message, "audio_native: core error, quitting");
+                tracing::debug!(message = %message, "audio_native: core error, quitting");
+                *cause_for_listener.borrow_mut() = Some(message.to_owned());
                 if let Some(m) = mainloop_weak.upgrade() {
                     m.quit();
                 }
@@ -313,7 +547,8 @@ pub(super) fn run_once(
 
     mainloop.run();
     let rx = attached.deattach();
-    (rx, Ok(()))
+    let message = quit_cause.borrow_mut().take();
+    (rx, SessionEnd::Quit { message })
 }
 
 /// Bind a Node proxy and start receiving `Props` param events. The Node and
@@ -899,11 +1134,471 @@ fn build_enum_format_pod() -> Option<Vec<u8>> {
 /// Send a command on the loop's channel, or warn if the service hasn't
 /// started yet. Helper for the eight wrappers below.
 pub(super) fn send_command(cmd: Command) {
-    let Some(tx) = COMMAND_TX.get() else {
+    let published = COMMAND_TX.read().unwrap_or_else(PoisonError::into_inner);
+    let Some(tx) = published.as_ref() else {
         tracing::warn!("audio_native: command before service started");
         return;
     };
     if tx.send(cmd).is_err() {
         tracing::warn!("audio_native: send_command failed (receiver dropped)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        COMMAND_TX, Command, PW_INIT, SessionEnd, initial_slot, pw, reconnect_after,
+        run_sessions_with, send_command, session_receiver, supervise_sessions,
+    };
+    use crate::retry;
+    use hytte_reactive::test_lock::TEST_LOCK;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// #1170's item 3: a core error — the `Ok(())`-shaped exit — must be paced
+    /// exactly like a failed connect. Before this, the quit arm returned
+    /// straight to the top of the loop and skipped the sleep entirely, so a
+    /// dead `PipeWire` respawned as fast as it could fail.
+    ///
+    /// Falsify by giving `run_sessions` back its `if let Err(e) = …` shape (only
+    /// the `Failed` arm sleeping): the two ramps below stop agreeing, because
+    /// the quit arm would not be recorded at all.
+    #[test]
+    fn a_core_error_quit_is_paced_like_a_failed_connect() {
+        let instant = Duration::from_millis(1);
+        let quit = SessionEnd::Quit {
+            message: Some("connection error".to_owned()),
+        };
+
+        let mut after_quit = retry::ReconnectReporter::new();
+        let mut after_failure = retry::ReconnectReporter::new();
+        // `SessionEnd::Failed` needs a real `pw::Error`, which cannot be built
+        // without the library; `Quit { message: None }` stands in for "the
+        // session did not work" on the comparison side, and the arms are
+        // identical from `reconnect_after`'s point of view — which is exactly
+        // the property under test.
+        let plain = SessionEnd::Quit { message: None };
+
+        for turn in 0..5 {
+            let (_, quit_delay) = reconnect_after(&mut after_quit, instant, &quit);
+            let (_, other_delay) = reconnect_after(&mut after_failure, instant, &plain);
+            assert_eq!(
+                quit_delay, other_delay,
+                "turn {turn}: the quit path is on a different schedule from the error path"
+            );
+            assert!(
+                quit_delay > Duration::ZERO,
+                "turn {turn}: a core error respawns the mainloop with no delay at all"
+            );
+        }
+    }
+
+    /// …and the ramp actually climbs, rather than sitting at a flat delay: a
+    /// daemon that is gone for good must cost less and less.
+    #[test]
+    fn consecutive_short_sessions_climb_the_ramp() {
+        let mut reporter = retry::ReconnectReporter::new();
+        let instant = Duration::from_millis(1);
+        let end = SessionEnd::Quit { message: None };
+
+        let first = reconnect_after(&mut reporter, instant, &end).1;
+        let second = reconnect_after(&mut reporter, instant, &end).1;
+        assert!(
+            second > first,
+            "the reconnect delay is not climbing: {first:?} then {second:?}"
+        );
+    }
+
+    /// One loud line for a streak, not one per attempt — the other half of
+    /// item 3. The wording is the call site's; the cadence is asserted here.
+    #[test]
+    fn a_dead_daemon_costs_one_loud_line() {
+        let mut reporter = retry::ReconnectReporter::new();
+        let end = SessionEnd::Quit { message: None };
+        let reports: Vec<retry::Report> = (0..5)
+            .map(|_| reconnect_after(&mut reporter, Duration::from_millis(1), &end).0)
+            .collect();
+
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|r| **r == retry::Report::Opened)
+                .count(),
+            1,
+            "a permanently-dead PipeWire logs a warning per reconnect: {reports:?}"
+        );
+    }
+
+    /// The daemon's own message survives to the line that reports the outage —
+    /// the reason the core-error listener records it instead of logging it.
+    #[test]
+    fn the_cause_carries_the_daemons_message() {
+        let end = SessionEnd::Quit {
+            message: Some("no such device".to_owned()),
+        };
+        assert!(
+            end.cause().contains("no such device"),
+            "the core error's message is lost: {}",
+            end.cause()
+        );
+        assert!(
+            !SessionEnd::Quit { message: None }.cause().is_empty(),
+            "a quit with no recorded cause must still say something"
+        );
+    }
+
+    /// The first session gets a receiver, and the sender behind it is the one
+    /// `send_command` publishes to — otherwise every `set_*` before the daemon
+    /// answers goes nowhere, which is the guarantee `spawn_mainloop`'s doc
+    /// makes.
+    ///
+    /// Takes `TEST_LOCK` because it writes `COMMAND_TX`, a process-global, and
+    /// cargo runs this binary's tests in parallel — the same reason geoclue's
+    /// edge test takes it. It does not flake today only because every test here
+    /// keeps its receiver alive and `send` succeeds regardless (see
+    /// `a_command_sent_before_the_first_session_is_delivered` for why that
+    /// "regardless" is itself a hazard), which is one edit away from untrue.
+    #[test]
+    fn the_first_session_publishes_a_live_command_channel() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let slot = Mutex::new(None);
+        let rx = session_receiver(&slot);
+
+        let published = COMMAND_TX.read().unwrap_or_else(PoisonError::into_inner);
+        let tx = published
+            .as_ref()
+            .expect("session_receiver must publish a sender");
+        assert!(
+            tx.send(Command::SetSinkMute {
+                name: "probe".into(),
+                mute: true
+            })
+            .is_ok(),
+            "the published sender does not reach the session's receiver"
+        );
+        drop(rx);
+    }
+
+    /// A session that ended normally hands its receiver back, and the next one
+    /// picks *that* up rather than a fresh channel — which is what makes a
+    /// command issued while the daemon is down arrive once it comes back.
+    ///
+    /// `TEST_LOCK` again: its first `session_receiver` finds an empty slot and
+    /// publishes, so it writes `COMMAND_TX` too.
+    #[test]
+    fn a_returned_receiver_is_reused_rather_than_replaced() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let slot = Mutex::new(None);
+        let rx = session_receiver(&slot);
+        *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(rx);
+
+        // Whatever `COMMAND_TX` holds now must still reach the *same*
+        // receiver after the next take, so nothing was re-created behind it.
+        let again = session_receiver(&slot);
+        assert!(
+            slot.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "the parked receiver was not taken; the next session would build a second channel"
+        );
+        drop(again);
+    }
+
+    /// #1170's item 2, the audio-specific hazard: a **panicking** session
+    /// unwinds holding the receiver, so the restarted run finds the slot empty.
+    /// It must re-establish the channel rather than `expect()` — an `expect`
+    /// there turns one panic into an unbounded panic loop, which is strictly
+    /// worse than the dead thread supervision replaced.
+    ///
+    /// Falsify by making `session_receiver` `.expect()` the take: this panics.
+    ///
+    /// `TEST_LOCK` for the same reason as
+    /// `the_first_session_publishes_a_live_command_channel`: `COMMAND_TX` is a
+    /// process-global and these run in parallel.
+    #[test]
+    fn a_receiver_lost_to_a_panic_is_re_established() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        // An empty slot is exactly the state a panicked run leaves behind.
+        let slot: Mutex<Option<pw::channel::Receiver<Command>>> = Mutex::new(None);
+        let _first = session_receiver(&slot);
+
+        let rx = session_receiver(&slot);
+        let published = COMMAND_TX.read().unwrap_or_else(PoisonError::into_inner);
+        let tx = published
+            .as_ref()
+            .expect("the re-established channel must be published");
+        assert!(
+            tx.send(Command::SetSinkMute {
+                name: "probe".into(),
+                mute: true
+            })
+            .is_ok(),
+            "after a lost receiver the command path is dead for the session"
+        );
+        drop(rx);
+    }
+
+    /// The startup window: a command issued **before** the first session takes
+    /// its receiver must arrive on that session, not vanish into a channel
+    /// nobody holds. That is the guarantee `spawn_mainloop`'s doc makes, and it
+    /// is the one a bare `publish_channel();` there breaks — the slot would
+    /// start `None`, the first `session_receiver` would publish a *second*
+    /// channel, and everything sent in between would sit in the first one's
+    /// queue for the life of the process.
+    ///
+    /// It fails **silently** without this, which is why the assertion has to be
+    /// about delivery rather than about an error: `pw::channel::Sender::send`
+    /// never checks for a live receiver — it writes the wakeup byte, pushes onto
+    /// the queue and returns `Ok(())` — so `send_command`'s receiver-dropped
+    /// `warn!` cannot fire for this window, and a test that only asserted
+    /// `send(...).is_ok()` would stay green with the bug in place. (The two
+    /// tests above do exactly that, deliberately: they assert the channel is
+    /// *published*, which is a weaker property.)
+    ///
+    /// Attaching to a real `MainLoopRc` and iterating it once is the only way to
+    /// read a `pw::channel::Receiver`'s queue, and it needs no daemon: the
+    /// mainloop is an epoll loop and the channel is a pipe. Nothing here
+    /// connects to pipewire.
+    ///
+    /// Falsify by giving `initial_slot` the pre-fix shape — `publish_channel();`
+    /// then `Mutex::new(None)`: nothing is delivered.
+    #[test]
+    fn a_command_sent_before_the_first_session_is_delivered() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        PW_INIT.call_once(pw::init);
+
+        // Production's starting state, then the tokio side setting mute while
+        // the blocking thread is still on its way up.
+        let slot = initial_slot();
+        send_command(Command::SetSinkMute {
+            name: "probe".into(),
+            mute: true,
+        });
+
+        let rx = session_receiver(&slot);
+        let mainloop = pw::main_loop::MainLoopRc::new(None).expect("a mainloop needs no daemon");
+        let seen: Rc<RefCell<Vec<Command>>> = Rc::new(RefCell::new(Vec::new()));
+        let attached = rx.attach(mainloop.loop_(), {
+            let seen = Rc::clone(&seen);
+            move |cmd| seen.borrow_mut().push(cmd)
+        });
+        mainloop
+            .loop_()
+            .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(500)));
+
+        assert_eq!(
+            seen.borrow().len(),
+            1,
+            "a command issued before the first session was lost: {:?}",
+            seen.borrow()
+        );
+        drop(attached);
+    }
+
+    /// #1170's item 3, the **wiring** rather than the helper: the loop has to
+    /// actually wait the delay `reconnect_after` computed.
+    ///
+    /// Everything else about the ramp was already asserted against
+    /// `reconnect_after`'s return value, which is why `thread::sleep(delay);`
+    /// could be deleted from both reconnect loops in this crate with all 811
+    /// tests green and clippy silent — the hot respawn loop items 3 and 4 exist
+    /// to kill, reintroducible for free. This drives five turns with a counting
+    /// stub in the waiter's place and asserts the recorded waits, so deleting
+    /// the wait is a red test rather than a green one.
+    ///
+    /// Costs no wall clock: the stub records and returns, so the 15.5s the real
+    /// ramp would spend here never happens.
+    ///
+    /// Falsify by dropping `sleep(delay);` from `run_sessions_with` (bind
+    /// `_delay` so it still compiles): nothing is recorded and this fails.
+    #[test]
+    fn the_mainloop_waits_the_reconnect_delay_it_computed() {
+        /// Five turns is enough to see the ramp climb and still be far from the
+        /// 30s ceiling, so a clamp bug would show as a wrong value rather than
+        /// as a repeated one.
+        const TURNS: usize = 5;
+
+        let recorded: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+        let waits = Arc::clone(&recorded);
+        thread::spawn(move || {
+            // A session that ends instantly, the way a dead daemon's does.
+            // `COMMAND_TX` is never touched: the slot starts seeded and the
+            // fake session hands the same receiver straight back.
+            let (_tx, rx) = pw::channel::channel::<Command>();
+            let slot = Mutex::new(Some(rx));
+            run_sessions_with(
+                &slot,
+                |rx| (rx, SessionEnd::Quit { message: None }),
+                move |delay| {
+                    let mut v = waits.lock().unwrap_or_else(PoisonError::into_inner);
+                    v.push(delay);
+                    let done = v.len() >= TURNS;
+                    drop(v);
+                    if done {
+                        // `run_sessions_with` never returns by design, so park
+                        // the thread rather than spin it for the rest of the
+                        // binary. `park` may wake spuriously; the loop is the
+                        // documented way to hold it.
+                        loop {
+                            thread::park();
+                        }
+                    }
+                },
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && recorded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len()
+                < TURNS
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let waited = recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            waited,
+            vec![
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+            ],
+            "the mainloop did not wait `reconnect_after`'s ramp between sessions"
+        );
+    }
+
+    /// #1170's item 2 for the audio thread, scoped to **what supervision here
+    /// can actually catch**: a panic on the Rust side of the thread — the
+    /// session prologue and the loop around it — restarts, and the restarted
+    /// run's command path is live.
+    ///
+    /// The scope is the whole point, and it is `spawn_mainloop`'s doc restated
+    /// as an executable claim. A panic inside a `PipeWire` callback **aborts the
+    /// process** (pipewire-rs dispatches every listener through an
+    /// `unsafe extern "C"` trampoline, and Rust 1.81 made an unwind out of one a
+    /// guaranteed abort), so it has no test and can have none: writing one would
+    /// abort this binary rather than fail an assertion. What *is* testable is
+    /// the body `spawn_supervised_blocking` actually owns, which is what this
+    /// panics.
+    ///
+    /// The restart contract has a second half the `eds_retry` twin does not:
+    /// the panicking run unwinds **holding the receiver**, so the next one finds
+    /// the slot empty and has to re-establish the channel — asserted here at the
+    /// wire, by attaching the restarted run's receiver to a real mainloop and
+    /// checking a command sent afterwards arrives. `send(...).is_ok()` proves
+    /// nothing: it is `Ok(())` with no receiver at all.
+    ///
+    /// Two mechanisms hang on this, and deleting either reddens it:
+    ///
+    /// * `supervise_sessions`' `spawn_supervised_blocking` — a plain
+    ///   `std::thread::spawn` gives no second run at all;
+    /// * `session_receiver`'s re-publish — `.expect()`ing the empty slot instead
+    ///   turns the restart into an unbounded panic loop and no command arrives.
+    #[test]
+    fn a_panicking_mainloop_thread_restarts_with_a_live_command_channel() {
+        const NAME: &str = "test-pipewire-restart";
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let attached_runs = Arc::new(AtomicUsize::new(0));
+        let seen: Arc<Mutex<Vec<Command>>> = Arc::new(Mutex::new(Vec::new()));
+
+        supervise_sessions(NAME, initial_slot(), {
+            let runs = Arc::clone(&runs);
+            let attached_runs = Arc::clone(&attached_runs);
+            let seen = Arc::clone(&seen);
+            move |slot| {
+                let run = runs.fetch_add(1, Ordering::SeqCst);
+                // Taking the receiver first is what makes the panic lose it,
+                // which is the state `session_receiver` has to recover from.
+                let rx = session_receiver(slot);
+                assert!(run > 0, "{NAME}: the first run panics, deliberately");
+
+                let mainloop =
+                    pw::main_loop::MainLoopRc::new(None).expect("a mainloop needs no daemon");
+                let seen = Arc::clone(&seen);
+                let _attached = rx.attach(mainloop.loop_(), move |cmd| {
+                    seen.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(cmd);
+                });
+                attached_runs.fetch_add(1, Ordering::SeqCst);
+                // Block on the loop forever rather than return: a clean return
+                // would stop the supervisor and drop the health row this test
+                // reads. `Infinite` is an epoll wait, not a spin.
+                loop {
+                    mainloop.loop_().iterate(pw::loop_::Timeout::Infinite);
+                }
+            }
+        });
+
+        // Wait for the restarted run to be *attached* before sending: the
+        // command must go to the channel run 2 published, not the one run 1
+        // took to its grave.
+        assert!(
+            wait_until(Duration::from_secs(15), || attached_runs
+                .load(Ordering::SeqCst)
+                >= 1),
+            "no second run after the panic: runs={}, health={:?}",
+            runs.load(Ordering::SeqCst),
+            health_of(NAME)
+        );
+        send_command(Command::SetSinkMute {
+            name: "probe".into(),
+            mute: true,
+        });
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                seen.lock().unwrap_or_else(PoisonError::into_inner).len() == 1
+            }),
+            "the restarted run's command path is dead: {:?}",
+            seen.lock().unwrap_or_else(PoisonError::into_inner)
+        );
+
+        let health = health_of(NAME).expect("the supervisor publishes a live health row");
+        assert_eq!(health.panics, 1, "the restart is not on the health record");
+        assert!(
+            health.runs >= 2,
+            "health says {} run(s); the Stats drawer would not show the restart",
+            health.runs
+        );
+    }
+
+    /// Poll `cond` until it holds or `within` elapses; returns whether it held.
+    ///
+    /// The supervisor's first restart delay is a real 1s sleep with no seam to
+    /// shorten it from outside `hytte-reactive`, so the restart test waits for
+    /// wall clock. Polling rather than sleeping a fixed time keeps a fast
+    /// machine at ~1s and a loaded one passing. (`eds_retry`'s tests carry the
+    /// same helper for the same reason; it is four lines and crossing the module
+    /// boundary to share it would mean publishing a test helper.)
+    fn wait_until(within: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        cond()
+    }
+
+    /// The health row a supervisor keeps for `name`, if it is still live.
+    fn health_of(name: &str) -> Option<hytte_reactive::TaskHealth> {
+        hytte_reactive::health::snapshot()
+            .into_iter()
+            .find(|h| h.name == name)
     }
 }

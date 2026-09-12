@@ -47,7 +47,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
-use hytte_reactive::{Service, registry, runtime, spawn_supervised};
+use hytte_reactive::{Service, registry, runtime, spawn_supervised, spawn_supervised_blocking};
 use std::collections::BTreeSet;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -137,16 +137,26 @@ impl Service for IdleNotifyService {
         // relock arm instead of silently disabling before-sleep locking.
         spawn_supervised("idle_notify", run_prepare_for_sleep_relock);
 
-        // Wayland objects are `!Send`; the whole client lives on this dedicated
-        // thread and only writes back the `Send + Sync` `Mutable`. A `std::thread`
-        // (rather than a tokio task) keeps the blocking dispatch loop off the
-        // shared runtime's worker pool. The loop inside reconnects with capped
-        // backoff on any error exit — one dispatch error must not silently end
-        // dim/lock/suspend for the rest of the session (#431).
-        std::thread::Builder::new()
-            .name("hytte-idle-notify".into())
-            .spawn(move || run_observer_with_reconnect(&worker_state))
-            .expect("spawn hytte-idle-notify thread");
+        // Wayland objects are `!Send`; the whole client lives on its own
+        // blocking thread and only writes back the `Send + Sync` `Mutable`.
+        // The loop inside reconnects with capped backoff on any error exit —
+        // one dispatch error must not silently end dim/lock/suspend for the
+        // rest of the session (#431).
+        //
+        // Supervised since #1170: #431 covered the *error* exit, not a panic,
+        // and a panic under `run` — `wayland-client` dispatch over
+        // compositor-supplied events — killed the thread outright and with it
+        // the whole idle → dim → lock → suspend pipeline, silently, for the
+        // session.
+        //
+        // **What a restart re-does:** a fresh Wayland connection, a re-bound
+        // `ext_idle_notifier_v1`, and three fresh `ext_idle_notification_v1`
+        // objects (dim/lock/suspend). Dropping the old ones cancels them, so
+        // there is no double-arming, and the compositor — not this process —
+        // owns the idle timer being re-observed. It also re-runs
+        // `reset_after_observer_error`, which is why `dimmed` is created out
+        // here: see `spawn_observer`.
+        spawn_observer(worker_state);
 
         IdleNotifyHandles { state }
     }
@@ -579,23 +589,65 @@ fn reset_after_observer_error(state: &Mutable<IdleState>, dimmed: &Arc<AtomicBoo
     restore_dim_if_dimmed(dimmed);
 }
 
+/// Start the observer on a supervised blocking thread (#1170).
+///
+/// `dimmed` is created **here**, outside the supervised closure, so it survives
+/// a restart. That is the one piece of state a panic could otherwise corrupt in
+/// a way a restart would not repair: `run` unwinding between "backlight saved
+/// and lowered" and "resumed event restores it" would leave the screen at 10%
+/// with the next incarnation's fresh `false` flag having nothing to restore —
+/// exactly the stuck-backlight failure `reset_after_observer_error` was added
+/// for on the error path (#431). Every run therefore begins by calling it, so a
+/// panic-restart cleans up precisely as an error-reconnect does. On the first
+/// run it is a no-op (nothing published, nothing dimmed).
+///
+/// Split out from `Service::start` so the test below can supervise a body that
+/// panics without needing a compositor.
+fn spawn_observer(state: Mutable<IdleState>) {
+    let dimmed = Arc::new(AtomicBool::new(false));
+    supervise_observer("idle-notify-observer", state, dimmed, |state, dimmed| {
+        run_observer_with_reconnect(state, dimmed);
+    });
+}
+
+/// [`spawn_observer`] with the name and the loop body injected, so the restart
+/// contract — the same `dimmed` across runs, and the reset on every entry — can
+/// be asserted against a body the test controls.
+fn supervise_observer<F>(
+    name: &'static str,
+    state: Mutable<IdleState>,
+    dimmed: Arc<AtomicBool>,
+    body: F,
+) where
+    F: Fn(&Mutable<IdleState>, &Arc<AtomicBool>) + Send + Sync + 'static,
+{
+    spawn_supervised_blocking(name, move || {
+        reset_after_observer_error(&state, &dimmed);
+        body(&state, &dimmed);
+    });
+}
+
 /// Drive [`run`] forever on the dedicated observer thread, reconnecting with
 /// capped exponential backoff whenever it exits with an error (compositor
 /// restart, protocol/dispatch error, connect failure) instead of dying on the
 /// first one — this thread is the only thing standing between "idle" and
 /// "never dims/locks/suspends" (#431). Each error exit first runs
-/// [`reset_after_observer_error`]. A clean return means the compositor
-/// advertises no `ext_idle_notifier_v1` at all — retrying cannot change that,
-/// so the manager stays off (already logged inside [`run`]).
-fn run_observer_with_reconnect(state: &Mutable<IdleState>) {
-    let dimmed = Arc::new(AtomicBool::new(false));
+/// [`reset_after_observer_error`].
+///
+/// **A clean return is a real outcome here**, unlike the other three supervised
+/// bodies #1170 touched: it means the compositor advertises no
+/// `ext_idle_notifier_v1` at all, which retrying cannot change, so the manager
+/// stays off (already logged inside [`run`]). On such a host the supervisor
+/// stops the task and its health row goes away — a correct absence from the
+/// Stats drawer, not a missing subsystem.
+fn run_observer_with_reconnect(state: &Mutable<IdleState>, dimmed: &Arc<AtomicBool>) {
     let mut backoff = RetryBackoff::default();
     loop {
         let started = Instant::now();
         match run(state.clone(), dimmed.clone()) {
             Ok(()) => return,
             Err(err) => {
-                reset_after_observer_error(state, &dimmed);
+                reset_after_observer_error(state, dimmed);
                 let delay = backoff.next_delay(started.elapsed());
                 tracing::error!(
                     target: LOG_TARGET,
@@ -731,6 +783,92 @@ impl Dispatch<ExtIdleNotificationV1, u32> for IdleClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+
+    /// #1170's item 2 for the observer thread: panic a run and the next one
+    /// starts — *and* starts clean.
+    ///
+    /// The second assertion is the one worth having. #431 established that a
+    /// dead observer incarnation must have its side effects undone before the
+    /// next one runs (published state back to `Active`, a native dim restored),
+    /// because the seat may resume while nobody is listening and the fresh
+    /// notification objects will never deliver the `resumed` that would restore
+    /// the backlight. A panic is exactly that situation, so the restart has to
+    /// run the same cleanup the error path does.
+    ///
+    /// Falsify either half: drop `reset_after_observer_error` from
+    /// `supervise_observer` and the second run sees a dimmed, still-`Idle`
+    /// world (the screen stays at 10% with nothing left to restore it); swap
+    /// `spawn_supervised_blocking` back to `std::thread::spawn` and there is no
+    /// second run to look at.
+    #[test]
+    fn a_panicking_observer_restarts_with_the_dim_flag_reset() {
+        const NAME: &str = "test-idle-observer-restart";
+
+        let state = Mutable::new(IdleState::default());
+        let dimmed = Arc::new(AtomicBool::new(false));
+        let runs = Arc::new(AtomicUsize::new(0));
+        // What run 2 found on entry, so the assertions read a snapshot rather
+        // than racing the live handles.
+        let second: Arc<Mutex<Option<(bool, IdleState)>>> = Arc::new(Mutex::new(None));
+
+        supervise_observer(NAME, state.clone(), Arc::clone(&dimmed), {
+            let runs = Arc::clone(&runs);
+            let second = Arc::clone(&second);
+            move |state, dimmed| {
+                if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // Mid-dim, mid-idle — the exact moment #431 cares about.
+                    dimmed.store(true, Ordering::SeqCst);
+                    state.set(IdleState::Idle {
+                        deepest_secs: DIM_SECS,
+                        since: Local::now(),
+                    });
+                    panic!("{NAME}: first run panics, deliberately");
+                }
+                *second
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some((dimmed.load(Ordering::SeqCst), state.get_cloned()));
+                // Park so the supervisor stays live and keeps its health row.
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let observed = loop {
+            let seen = second
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if seen.is_some() {
+                break seen;
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        let (was_dimmed, seen_state) =
+            observed.expect("the observer never restarted after its panic");
+        assert!(
+            !was_dimmed,
+            "the restarted observer inherited a set dim flag, so the backlight stays at 10% \
+             with nothing left to restore it (#431)"
+        );
+        assert_eq!(
+            seen_state,
+            IdleState::Active,
+            "the restarted observer inherited a frozen Idle state"
+        );
+
+        let health = hytte_reactive::health::snapshot()
+            .into_iter()
+            .find(|h| h.name == NAME)
+            .expect("the supervisor publishes a live health row");
+        assert_eq!(health.panics, 1, "the restart is not on the health record");
+    }
 
     #[test]
     fn action_name_maps_known_thresholds() {

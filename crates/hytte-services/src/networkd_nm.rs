@@ -468,7 +468,10 @@ async fn pump_device_props(path: String, wake_tx: mpsc::Sender<()>) {
     let mut items = sub.items();
     while let Some(item) = items.next().await {
         if matches!(item, SignalItem::Resubscribed | SignalItem::Lagged { .. }) {
-            tracing::info!(path, "networkd_nm: per-device PropertiesChanged resubscribed; waking watcher");
+            tracing::info!(
+                path,
+                "networkd_nm: per-device PropertiesChanged resubscribed; waking watcher"
+            );
         }
         // A `Full` queue is not backpressure to wait on: a wakeup is already
         // pending and the refresh it triggers re-reads NM, so it will observe

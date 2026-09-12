@@ -1119,8 +1119,11 @@ async fn refresh_vpn_profiles(vpn: &Mutable<Vec<VpnProfile>>) {
 /// reason `FnMut`/`AsyncFnMut` would be the wrong choice for a closure like
 /// this) — injectable so a test can stand in for the real
 /// [`refresh_nm_state`] round trip with a counter.
-async fn handle_wifi_refresh_item<Refresh, Fut>(item: SignalItem, what: &'static str, refresh: Refresh)
-where
+async fn handle_wifi_refresh_item<Refresh, Fut>(
+    item: SignalItem,
+    what: &'static str,
+    refresh: Refresh,
+) where
     Refresh: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
@@ -2792,14 +2795,15 @@ mod tests {
         let checks = Arc::new(AtomicUsize::new(0));
         {
             let checks = checks.clone();
-            let reset = device_removed_should_reset(SignalItem::Resubscribed, "/dev/x", move || {
-                let checks = checks.clone();
-                async move {
-                    checks.fetch_add(1, Ordering::SeqCst);
-                    true // still present
-                }
-            })
-            .await;
+            let reset =
+                device_removed_should_reset(SignalItem::Resubscribed, "/dev/x", move || {
+                    let checks = checks.clone();
+                    async move {
+                        checks.fetch_add(1, Ordering::SeqCst);
+                        true // still present
+                    }
+                })
+                .await;
             assert!(!reset, "a still-present device must not reset");
         }
         assert_eq!(

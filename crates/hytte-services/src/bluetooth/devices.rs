@@ -213,14 +213,19 @@ async fn resync(
         .get(&zbus::zvariant::OwnedObjectPath::try_from(adapter_path)?)
         .and_then(|ifaces| ifaces.get("org.bluez.Adapter1"))
     else {
-        tracing::warn!(path = adapter_path, "bluetooth: adapter missing on resync — reconnecting");
+        tracing::warn!(
+            path = adapter_path,
+            "bluetooth: adapter missing on resync — reconnecting"
+        );
         state.adapter.set(None);
         state.devices_map.lock().await.clear();
         state.devices.set(Vec::new());
         device_subs.clear();
         return Err(anyhow::anyhow!("adapter removed"));
     };
-    state.adapter.set(Some(parse_adapter_props(adapter_path, adapter_props)));
+    state
+        .adapter
+        .set(Some(parse_adapter_props(adapter_path, adapter_props)));
 
     let mut new_map = HashMap::new();
     for (obj_path, ifaces) in &managed {
@@ -654,12 +659,13 @@ mod tests {
     async fn an_ordinary_event_is_forwarded_and_does_not_resync() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls2 = calls.clone();
-        let evt = bluetooth_marker_or_event(SignalItem::Event(signal_event()), "test", || async move {
-            calls2.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        })
-        .await
-        .expect("no error path here");
+        let evt =
+            bluetooth_marker_or_event(SignalItem::Event(signal_event()), "test", || async move {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .expect("no error path here");
         assert!(evt.is_some(), "an ordinary event must be forwarded");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }

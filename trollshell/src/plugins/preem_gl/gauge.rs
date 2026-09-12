@@ -33,20 +33,46 @@
 //! keeps the extent the kit gives it (its radius is scaled with everything
 //! else, so the halo covers the same area, just smoothly).
 //!
+//! The bloom is the one of those two that is **not** an identity at `scale > 1`,
+//! and it is worth stating rather than leaving to be discovered (#1148 review,
+//! LOW-2). The kit box-blurs the logical grid at radius `r` and then replicates,
+//! so a logical pixel's halo is the average of a `2r + 1` logical window
+//! stretched over `scale` native pixels; this blurs the native grid at radius
+//! `r * scale`, a `2·r·scale + 1` native window. Same extent to within one
+//! native pixel — the windows differ by `scale - 1` taps out of `2·r·scale + 1`,
+//! one of 13 at the default face's `r = 3`, `scale = 2` — and a different
+//! falloff inside it, which is the same "smoothly rather than in blocks"
+//! improvement the rest of the arm is for. The `scale = 2` harness cases measure
+//! it as part of the whole frame; it is inside the #893 ceiling and nowhere near
+//! it.
+//!
 //! At `scale == 1` all of that collapses to the identity and the two arms draw
-//! the same picture at the same resolution — which is exactly where the parity
-//! harness measures them, and why the gauge cases run at `scale = 1`.
+//! the same picture at the same resolution — which is where the parity harness
+//! takes its bit-exact measurement. It also renders the **shipping** `scale = 2`
+//! per skin and box-averages the native frame back down to the logical grid
+//! before comparing (#1148 review, HIGH-2), which is the one gate that sees
+//! every scale-dependent line below.
 //!
-//! # The dial geometry is mirrored, not shared
+//! # The dial geometry is the kit's, resolved by the kit
 //!
-//! `hytte-preem`'s `Gauge::dial` and every constant it reads are **private**,
-//! and the kit is the parity oracle — it must not move to accommodate a second
-//! renderer. So the resolution below is a hand mirror of `gauge.rs`'s, constant
-//! for constant, each one cited. That is a real duplication and it is worth
-//! naming: nothing in the type system holds the two together. What holds them
-//! together is the harness, which renders both arms from one state and compares
-//! the pixels — a drift in any constant here moves a measured delta, per skin,
-//! per needle position.
+//! This file used to carry a hand mirror of `Gauge::dial` and of the thirty-odd
+//! private constants it reads, held together by nothing but the harness. #1148's
+//! review drifted one of them (`TIP_FRAC`, by 0.02) and the entire unit suite
+//! stayed green. So the mirror is gone: `hytte-preem` made [`kit::Dial`],
+//! [`kit::Gauge::dial`], [`kit::on_dial`], [`kit::trail_fraction`],
+//! [`kit::bloom_radius`] and the shape constants **public** — a visibility
+//! change and nothing else, with every value and every caller in the kit
+//! untouched — and [`face`] now resolves a face by *calling* the oracle.
+//!
+//! What is left on this side is only what a second resolution needs and the kit
+//! has no concept of: [`scaled`], which carries a resolved face into native
+//! pixels, and [`tick_span`], which is a property of how the *shader* searches
+//! for ticks rather than of the dial.
+//!
+//! The shader is the one copy that remains, because a `.frag` cannot read a Rust
+//! `const`. `the_shader_declares_the_kits_own_constants` parses `gauge.frag` and
+//! compares every one of them against `hytte-preem`'s, so that copy is checked
+//! by a unit test rather than by a driver.
 //!
 //! # The pipeline
 //!
@@ -60,8 +86,8 @@
 //! 1. **lit** — the value arc, the motion-blur fan, the blade, the
 //!    counterweight and the hub, max-combined into an R8 aux texture;
 //! 2. **blur H** and 3. **blur V** — the kit's separable truncating box blur,
-//!    the *same* `blur.frag` the scope uses (that file stopped being
-//!    `scope_blur.frag` in this change for exactly that reason);
+//!    the *same* `blur.frag` the scope uses (which is why that file lost its
+//!    `scope_` prefix in this change);
 //! 4. **blit** — the flat face, the bloom max-combine, the CRT pass and the
 //!    composite, point-sampled into the letterboxed fit rect.
 //!
@@ -137,84 +163,41 @@ pub(crate) const GAUGE_PIPELINE: GlPipeline = GlPipeline {
     ],
 };
 
-// ── the kit's face constants, mirrored ───────────────────────────────────────
+// ── what the kit hands over ──────────────────────────────────────────────────
 //
-// Every one of these is `hytte-preem/src/gauge.rs`'s, private there. See the
-// module docs on why they are copied rather than shared, and on what actually
-// holds the two copies together.
+// Nothing is copied here any more. `hytte_preem::gauge`'s shape constants, its
+// resolved `Dial`, `Gauge::dial`, `on_dial`, `trail_fraction` and `bloom_radius`
+// are public (#1148 review, MEDIUM-2/MEDIUM-3) and this file calls them. See the
+// module docs for what that replaced and why.
 
-/// Clear logical pixels kept between the scale arc and the buffer edge.
-const EDGE: f32 = 3.5;
-/// Rows kept below the pivot for the counterweight, as a fraction of the height…
-const BASE_FRAC: f32 = 0.14;
-/// …with this floor in logical pixels.
-const MIN_BASE: f32 = 5.0;
-/// Smallest scale-arc radius, in logical pixels.
-const MIN_RADIUS: f32 = 1.0;
-/// Needle tip radius, as a fraction of the scale-arc radius.
-const TIP_FRAC: f32 = 0.80;
-/// Counterweight length behind the pivot, as a fraction of the arc radius.
-const TAIL_FRAC: f32 = 0.13;
-/// How much the counterweight flares as it goes back.
-const TAIL_FLARE: f32 = 1.25;
-/// Shortest counterweight worth drawing, in logical pixels (#931).
-const MIN_TAIL: f32 = 3.0;
-/// Hub radius, as a fraction of the arc radius…
-const HUB_FRAC: f32 = 0.065;
-/// …with this floor in logical pixels.
-const MIN_HUB: f32 = 1.2;
-/// Needle half-width at the pivot, as a fraction of the arc radius…
-const BLADE_FRAC: f32 = 0.032;
-/// …clamped into this range in logical pixels (the floor is [`BLADE_TIP`]).
-const BLADE_RANGE: (f32, f32) = (BLADE_TIP, 2.2);
-/// Needle half-width at the tip, in logical pixels.
-const BLADE_TIP: f32 = 0.5;
-/// Scale-arc band half-width, in logical pixels.
-const ARC_HW: f32 = 0.8;
-/// How much fatter the lit value arc is than the scale arc it fills.
-const VALUE_HW_BONUS: f32 = 0.35;
-/// Major/mid tick half-width, in logical pixels.
-const MAJOR_HW: f32 = 0.85;
-/// Major tick length inward from the scale arc, as a fraction of its radius.
-const MAJOR_LEN_FRAC: f32 = 0.15;
-/// Minor tick length inward from the scale arc, as a fraction of its radius.
-const MINOR_LEN_FRAC: f32 = 0.075;
-/// Shortest major (and mid) tick, in logical pixels (#931).
-const MIN_MAJOR_LEN: f32 = 3.0;
-/// Shortest minor tick, in logical pixels (#931).
-const MIN_MINOR_LEN: f32 = 2.0;
-/// How much longer the mid-scale tick is than a major one.
-const MID_LEN_BONUS: f32 = 1.35;
-/// Closest two adjacent ticks may sit on the scale arc, in logical pixels.
-const MIN_TICK_SPACING: f32 = 5.9;
-/// The widest bloom a face may spend, as a divisor of its arc radius (#931).
-const BLOOM_ARC_DIV: f32 = 16.0;
-/// The gauge wears **half** the halo its skin asks for (#930).
-const BLOOM_RADIUS_DIV: usize = 2;
-/// How far a lit edge ramps from full intensity to nothing.
+/// A **major** tick is at least as wide as a minor one, which [`tick_span`]
+/// depends on and neither file would otherwise state.
 ///
-/// The one length that is **not** scaled into native pixels — see the module
-/// docs. `gauge.frag` carries its own copy for the same arithmetic, and this
-/// one is only used where the *face resolution* consults it (the
-/// counterweight's clearance and the centring budget), which the kit does in
-/// logical units.
-const FEATHER: f32 = 1.15;
-/// Narrowest accepted sweep, in degrees (the kit's own clamp).
-const MIN_SWEEP_DEG: f32 = 10.0;
-/// Widest accepted sweep, in degrees (the kit's own clamp).
-const MAX_SWEEP_DEG: f32 = 180.0;
-/// Default sweep, for a non-finite `sweep_deg` — the kit's builder keeps the
-/// current value in that case, and the current value is only ever this.
-const DEFAULT_SWEEP_DEG: f32 = 150.0;
+/// `tick_span` bounds the search window with `MAJOR_HW` as the widest ink any
+/// tick lays down. That is an upper bound only while a major tick is the widest
+/// mark; inverted, the window would under-estimate and the shader would drop
+/// minor ticks out of the dial — silently, on every skin (#1148 review, LOW-1).
+/// A `const` assertion rather than a test because it is a statement about two
+/// literals and can be decided at compile time; the kit carries the matching
+/// runtime one (`the_major_tick_is_the_widest_mark_on_the_face`), on the side
+/// that owns the numbers.
+const _: () = assert!(
+    kit::MAJOR_HW >= kit::MINOR_HW,
+    "tick_span bounds the tick window with MAJOR_HW; a wider minor tick would be clipped",
+);
 
-/// How many motion-blur blades the fan carries — the length of the kit's
-/// `TRAIL_T`, which is also what subdivides [`kit::TRAIL_SPAN_SECS`].
+/// The motion-blur fan reaches the shader as a `vec4`, so the kit's blade count
+/// has to be four.
 ///
-/// The intensities themselves live in `gauge.frag`; this side only needs the
-/// count, because it decides how far back in time each blade samples.
-/// `the_shader_and_the_mapping_agree_about_the_trail_length` reads the array
-/// back out of the GLSL so the two cannot drift.
-const TRAIL_BLADES: usize = 4;
+/// [`gauge_surface`] fills one component per blade with the instant that blade
+/// samples, and subdivides [`kit::TRAIL_SPAN_SECS`] by `TRAIL_T.len()`. A fifth
+/// intensity added to the kit's array would leave the oldest blade reading a
+/// component a `vec4` does not have *and* move every other blade's instant, so
+/// it must not compile until the uniform grows with it.
+const _: () = assert!(
+    kit::TRAIL_T.len() == 4,
+    "u_theta_trail is a vec4: one component per kit trail blade",
+);
 
 /// Most ticks either side of the nearest one the blit shader will test.
 ///
@@ -225,181 +208,58 @@ const TRAIL_BLADES: usize = 4;
 /// per-fragment walk of the wire's 2048-tick cap.
 const MAX_TICK_SPAN: i32 = 16;
 
-/// The resolved pixel geometry of one dial face — the mirror of the kit's
-/// `Dial`, and in whichever units the caller resolved it in.
+/// Resolve a face's geometry in **logical** pixels, by asking the kit.
 ///
-/// [`face`] answers in **logical** pixels, exactly as `Gauge::dial` does;
-/// [`Dial::scaled`] converts one into the native pixels the shader draws in.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Dial {
-    /// The pivot, in buffer coordinates.
-    pub(crate) pivot: (f32, f32),
-    /// The scale arc's radius.
-    pub(crate) radius: f32,
-    /// Half the total sweep, in radians. An **angle**, so it never scales.
-    pub(crate) half: f32,
-    /// Needle tip radius.
-    pub(crate) tip: f32,
-    /// Counterweight radius behind the pivot; `0.0` when the face is too small.
-    pub(crate) tail: f32,
-    /// Hub radius.
-    pub(crate) hub: f32,
-    /// Blade half-width at the pivot.
-    pub(crate) blade: f32,
-    /// Major tick length, inward from the scale arc.
-    pub(crate) major_len: f32,
-    /// Minor tick length, inward from the scale arc.
-    pub(crate) minor_len: f32,
-    /// Minor ticks per major division **as the face can draw them** — the
-    /// configured count pulled down until adjacent ticks clear
-    /// [`MIN_TICK_SPACING`]. A count, so it never scales.
-    pub(crate) subdivisions: usize,
-}
-
-impl Dial {
-    /// The dial angle for a `0.0..=1.0` fraction of full scale.
-    fn angle(self, fraction: f32) -> f32 {
-        (fraction - 0.5) * 2.0 * self.half
-    }
-
-    /// This face in **native** pixels: every length times `scale`, and the
-    /// pivot moved to the centre of the logical pixel it sat on.
-    ///
-    /// `pivot * scale + (scale - 1) / 2` rather than `pivot * scale`, because
-    /// the kit's logical pixel `x` covers native columns `x*scale ..
-    /// x*scale+scale-1` after `Frame::upscale`, whose centre is half a block
-    /// further along. At the default face that is `71.5 * 2 + 0.5 = 143.5`,
-    /// which is `(288 - 1) / 2` — the native buffer's own centre, as it must
-    /// be — where a bare `* 2` would put the needle half a screen pixel left of
-    /// its dial.
-    fn scaled(self, scale: f32) -> Self {
-        let offset = (scale - 1.0) / 2.0;
-        Self {
-            pivot: (self.pivot.0 * scale + offset, self.pivot.1 * scale + offset),
-            radius: self.radius * scale,
-            half: self.half,
-            tip: self.tip * scale,
-            tail: self.tail * scale,
-            hub: self.hub * scale,
-            blade: self.blade * scale,
-            major_len: self.major_len * scale,
-            minor_len: self.minor_len * scale,
-            subdivisions: self.subdivisions,
-        }
-    }
-}
-
-/// Resolve a face's geometry in **logical** pixels — the mirror of
-/// `Gauge::dial`, statement for statement.
+/// The kit is the parity oracle and this is now literally it: the builders do
+/// the wire clamps they already did for the CPU arm (`with_size`'s 1×1 floor,
+/// `sweep_deg`'s clamp and its non-finite-keeps-the-default rule, `ticks`'
+/// floors) and [`kit::Gauge::dial`] resolves #931's radius, centring,
+/// counterweight and tick budget. Only the fields `dial` reads are set: the
+/// needle's physics and the upscale do not move a face.
 ///
-/// See that function for why a wide face is *seated* on the rows `BASE_FRAC`
-/// reserves while a square one is *centred* in the height it has, and why the
-/// centring budget counts the halo `render` lays over the ink (#931).
-pub(crate) fn face(config: vocab::GaugeConfig) -> Dial {
-    let cols = fx(config.cols.max(1));
-    let rows = fx(config.rows.max(1));
-    let half = (sweep_radians(config.sweep_deg) / 2.0).clamp(
-        MIN_SWEEP_DEG.to_radians() / 2.0,
-        MAX_SWEEP_DEG.to_radians() / 2.0,
-    );
-    let pivot_x = (cols - 1.0) / 2.0;
-    let base = (rows * BASE_FRAC).max(MIN_BASE);
-    let seated_y = (rows - 1.0 - base).max(0.0);
-    let by_height = seated_y - EDGE;
-    let by_width = (pivot_x - EDGE) / half.sin().max(f32::EPSILON);
-    let radius = by_height.min(by_width).max(MIN_RADIUS);
-    // Width binds ⇒ there is height to spare ⇒ the face *may* be centred in it.
-    let spare_height = by_width < by_height;
-
-    let blade = (radius * BLADE_FRAC).clamp(BLADE_RANGE.0, BLADE_RANGE.1);
-    let hub = (radius * HUB_FRAC).max(MIN_HUB);
-    let stub = if spare_height {
-        radius * TAIL_FRAC
-    } else {
-        (radius * TAIL_FRAC).min((base - FEATHER - 0.5).max(0.0))
-    };
-    let tail = if stub < MIN_TAIL { 0.0 } else { stub };
-    let glow = fx_usize(bloom_cap(radius));
-    let above = radius + ARC_HW + VALUE_HW_BONUS + FEATHER + glow;
-    let below = glow
-        + FEATHER
-        + if tail > 0.0 {
-            tail + blade * TAIL_FLARE
-        } else {
-            hub
-        };
-    let margin = (rows - 1.0 - above - below) / 2.0;
-    let centred = spare_height && margin >= 0.0;
-    let pivot_y = if centred {
-        (margin + above).clamp(0.0, (rows - 1.0).max(0.0))
-    } else {
-        seated_y
-    };
-    Dial {
-        pivot: (pivot_x, pivot_y),
-        radius,
-        half,
-        tip: radius * TIP_FRAC,
-        tail,
-        hub,
-        blade,
-        major_len: (radius * MAJOR_LEN_FRAC).clamp(MIN_MAJOR_LEN.min(radius), radius),
-        minor_len: (radius * MINOR_LEN_FRAC).clamp(MIN_MINOR_LEN.min(radius), radius),
-        subdivisions: usize_of(config.subdivisions.max(1)).min(tick_budget(
-            radius * 2.0 * half,
-            usize_of(config.divisions.max(1)),
-        )),
-    }
+/// **Falsified** by pointing it at a second `kit::Gauge` built with a different
+/// sweep: every gauge parity case moves at once.
+pub(crate) fn face(config: vocab::GaugeConfig) -> kit::Dial {
+    kit::Gauge::with_size(usize_of(config.cols), usize_of(config.rows))
+        .sweep_deg(config.sweep_deg)
+        .ticks(usize_of(config.divisions), usize_of(config.subdivisions))
+        .dial()
 }
 
-/// The sweep in radians the kit's `Gauge::sweep_deg` builder would have stored:
-/// clamped, and a non-finite value leaving the default in place.
-fn sweep_radians(degrees: f32) -> f32 {
-    if degrees.is_finite() {
-        degrees.clamp(MIN_SWEEP_DEG, MAX_SWEEP_DEG).to_radians()
-    } else {
-        DEFAULT_SWEEP_DEG.to_radians()
-    }
-}
-
-/// The most subdivisions per division a scale arc of `arc_len` logical pixels
-/// can carry with adjacent ticks still clearing [`MIN_TICK_SPACING`] (#931).
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn tick_budget(arc_len: f32, divisions: usize) -> usize {
-    let budget = arc_len / (MIN_TICK_SPACING * fx_usize(divisions.max(1)));
-    if !budget.is_finite() {
-        return 1;
-    }
-    budget.clamp(1.0, f32::from(u16::MAX)).floor() as usize
-}
-
-/// The widest bloom radius a face with this arc radius may spend, in logical
-/// pixels (#931).
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn bloom_cap(radius: f32) -> usize {
-    let cap = radius / BLOOM_ARC_DIV;
-    if !cap.is_finite() {
-        return 1;
-    }
-    cap.clamp(1.0, f32::from(u16::MAX)).floor() as usize
-}
-
-/// The bloom radius the gauge actually spends, in logical pixels: halved
-/// (#930), then ceilinged by what the face can afford (#931), in that order.
-fn bloom_radius(skin_radius: usize, arc_radius: f32) -> usize {
-    skin_radius
-        .div_ceil(BLOOM_RADIUS_DIV)
-        .min(bloom_cap(arc_radius))
-}
-
-/// The deflection the face actually draws: clamped to the dial's mechanical
-/// stops, and `0.0` for a non-finite reading. The *physics* is never clamped —
-/// only the drawn angle.
-fn on_dial(fraction: f32) -> f32 {
-    if fraction.is_finite() {
-        fraction.clamp(-kit::OVERTRAVEL, 1.0 + kit::OVERTRAVEL)
-    } else {
-        0.0
+/// A resolved face in **native** pixels: every length times `scale`, and the
+/// pivot moved to the centre of the logical pixel it sat on.
+///
+/// `pivot * scale + (scale - 1) / 2` rather than `pivot * scale`, because the
+/// kit's logical pixel `x` covers native columns `x*scale .. x*scale+scale-1`
+/// after `Frame::upscale`, whose centre is half a block further along. At the
+/// default face that is `71.5 * 2 + 0.5 = 143.5`, which is `(288 - 1) / 2` — the
+/// native buffer's own centre, as it must be — where a bare `* 2` would put the
+/// needle half a screen pixel left of its dial.
+///
+/// The kit has no counterpart: it replicates a logical raster rather than
+/// resampling, so "the same face at a second resolution" is not a concept it
+/// has. That is why this one function stayed on this side of the seam when the
+/// rest of the mirror went (#1148 review, MEDIUM-3).
+///
+/// A struct literal on purpose, and **not** a `mut` copy with the lengths
+/// multiplied in place: a field the kit grows is then a compile error here,
+/// where someone has to decide whether it is a length, an angle or a count,
+/// rather than a value that silently keeps its logical size.
+fn scaled(dial: kit::Dial, scale: f32) -> kit::Dial {
+    let offset = (scale - 1.0) / 2.0;
+    kit::Dial {
+        pivot: (dial.pivot.0 * scale + offset, dial.pivot.1 * scale + offset),
+        radius: dial.radius * scale,
+        // An angle, not a length.
+        half: dial.half,
+        tip: dial.tip * scale,
+        tail: dial.tail * scale,
+        hub: dial.hub * scale,
+        blade: dial.blade * scale,
+        major_len: dial.major_len * scale,
+        minor_len: dial.minor_len * scale,
+        // A count: the face keeps the tick budget #931 tuned.
+        subdivisions: dial.subdivisions,
     }
 }
 
@@ -413,21 +273,23 @@ fn on_dial(fraction: f32) -> f32 {
 /// widest ink a tick lays down is `MAJOR_HW * scale + FEATHER` either side of
 /// its centreline.
 ///
-/// At every face the kit tunes for, the answer is `1` — `MIN_TICK_SPACING`
-/// (5.9 logical px) is nearly three times the 2.0 px a major tick spreads. It
-/// grows only where `divisions` alone packs the arc, which `tick_budget` does
-/// not bound (it pulls down *subdivisions*): 64 divisions on the default face
-/// sit 2.06 px apart and want a window of 2.
-fn tick_span(dial: Dial, divisions: usize, scale: f32) -> i32 {
+/// At every face the kit tunes for, the answer is `1` — the kit's
+/// `MIN_TICK_SPACING` (5.9 logical px) is nearly three times the 2.0 px a major
+/// tick spreads. It grows only where `divisions` alone packs the arc, which the
+/// kit's tick budget does not bound (it pulls down *subdivisions*): 64 divisions
+/// on the default face sit 2.06 px apart and want a window of 2.
+fn tick_span(dial: kit::Dial, divisions: usize, scale: f32) -> i32 {
     let steps = divisions.max(1).saturating_mul(dial.subdivisions.max(1));
     let pitch = 2.0 * dial.half / fx_usize(steps.max(1));
     // The innermost radius any tick reaches — the mid tick is the longest.
-    let longest = (dial.major_len * MID_LEN_BONUS)
+    let longest = (dial.major_len * kit::MID_LEN_BONUS)
         .min(dial.radius)
         .max(dial.minor_len);
     let inner = (dial.radius - longest).max(1.0);
     let spacing = inner * pitch;
-    let pad = MAJOR_HW * scale + FEATHER;
+    // `MAJOR_HW` is the widest ink any tick lays down — see the `const`
+    // assertion above, which is what makes this an upper bound.
+    let pad = kit::MAJOR_HW * scale + kit::FEATHER;
     if !spacing.is_finite() || spacing <= 0.0 {
         return MAX_TICK_SPAN;
     }
@@ -463,7 +325,7 @@ pub(crate) fn gauge_surface(
     let upscale = fx(scale);
 
     let logical = face(config);
-    let dial = logical.scaled(upscale);
+    let dial = scaled(logical, upscale);
     let divisions = usize_of(config.divisions.max(1));
 
     // The halo this face spends, resolved against the **logical** arc radius
@@ -474,20 +336,21 @@ pub(crate) fn gauge_surface(
         strength: 0,
     });
     let bloom_radius_native =
-        bloom_radius(bloom.radius, logical.radius).saturating_mul(usize_of(scale));
+        kit::bloom_radius(bloom.radius, logical.radius).saturating_mul(usize_of(scale));
     let mask = palette.mask;
 
-    let reading = on_dial(fraction);
+    let reading = kit::on_dial(fraction);
     let filled = reading.clamp(0.0, 1.0);
     // Sampling the smear in *time* rather than in past frames is what keeps it
     // frame-rate independent along with the physics, and it is exact at rest:
     // with zero velocity every blade lands on the needle and the max-combine
-    // erases the fan entirely.
-    let step = kit::TRAIL_SPAN_SECS / fx_usize(TRAIL_BLADES);
-    let mut trail = [0.0f32; TRAIL_BLADES];
+    // erases the fan entirely. The extrapolation itself is the kit's
+    // (`trail_fraction`), so the two arms sample the same instants.
+    let step = kit::TRAIL_SPAN_SECS / fx_usize(kit::TRAIL_T.len());
+    let mut trail = [0.0f32; 4];
     for (index, slot) in trail.iter_mut().enumerate() {
         let back = fx_usize(index + 1) * step;
-        *slot = dial.angle(on_dial(fraction - velocity * back));
+        *slot = dial.angle(kit::on_dial(kit::trail_fraction(fraction, velocity, back)));
     }
 
     KitSurface {
@@ -576,8 +439,8 @@ fn int_of(value: usize) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLIT_FRAG, Dial, GAUGE_PIPELINE, GlUniforms, GlValue, LIT_FRAG, MAX_TICK_SPAN,
-        TRAIL_BLADES, face, gauge_surface, kit, tick_span, vocab,
+        BLIT_FRAG, GAUGE_PIPELINE, GlUniforms, GlValue, LIT_FRAG, MAX_TICK_SPAN, face,
+        gauge_surface, kit, scaled, tick_span, vocab,
     };
 
     /// A fixed palette so the golden table below is a function of the mapping
@@ -644,7 +507,7 @@ mod tests {
     /// own centre rather than half a pixel to the left of it.
     ///
     /// **Falsified** by dropping the `(scale - 1) / 2` term from
-    /// [`Dial::scaled`]: `pivot_x` comes back `143.0` on a 288-wide buffer
+    /// [`scaled`]: `pivot_x` comes back `143.0` on a 288-wide buffer
     /// whose centre is `143.5`, and every needle angle is then measured from a
     /// pivot that is not the one the ticks were drawn around.
     #[test]
@@ -655,7 +518,7 @@ mod tests {
             "the logical pivot is the kit's (cols - 1) / 2, got {}",
             logical.pivot.0,
         );
-        let native = logical.scaled(2.0);
+        let native = scaled(logical, 2.0);
         assert!(
             (native.pivot.0 - 143.5).abs() < 1e-4,
             "the native pivot is (288 - 1) / 2, got {}",
@@ -685,7 +548,7 @@ mod tests {
             scale: 1,
             ..config()
         });
-        assert_eq!(logical.scaled(1.0), logical);
+        assert_eq!(scaled(logical, 1.0), logical);
     }
 
     /// **The golden uniform table.** Every value the shaders read, in order,
@@ -875,7 +738,7 @@ mod tests {
     fn the_tick_window_covers_what_a_tick_can_reach() {
         let wide = face(config());
         assert_eq!(
-            tick_span(wide.scaled(2.0), 4, 2.0),
+            tick_span(scaled(wide, 2.0), 4, 2.0),
             1,
             "the default face's pitch is nearly four times a tick's own ink",
         );
@@ -890,7 +753,7 @@ mod tests {
         };
         let dense = face(packed);
         assert_eq!(dense.subdivisions, 1, "the budget drops to the boundaries");
-        let span = tick_span(dense.scaled(2.0), 64, 2.0);
+        let span = tick_span(scaled(dense, 2.0), 64, 2.0);
         assert!(
             span >= 2,
             "64 divisions on a 48x48 face pack the arc tighter than a tick's ink, got {span}",
@@ -906,7 +769,7 @@ mod tests {
             ..config()
         };
         let collapsed = face(tiny);
-        let span = tick_span(collapsed.scaled(1.0), 4, 1.0);
+        let span = tick_span(scaled(collapsed, 1.0), 4, 1.0);
         assert!((2..=MAX_TICK_SPAN).contains(&span), "got {span}");
     }
 
@@ -923,29 +786,116 @@ mod tests {
         assert!(BLIT_FRAG.starts_with("const int LAYER = 1;"));
     }
 
-    /// The shader's `TRAIL_T` and this module's [`TRAIL_BLADES`] are the same
-    /// number, read back out of the GLSL rather than restated.
+    /// One `const <type> <NAME> = <value>;` out of the shipped GLSL.
+    fn shader_const(name: &str) -> String {
+        let marker = format!(" {name} = ");
+        let at = LIT_FRAG
+            .find(&marker)
+            .unwrap_or_else(|| panic!("gauge.frag declares {name}"));
+        let rest = &LIT_FRAG[at + marker.len()..];
+        let (value, _) = rest
+            .split_once(';')
+            .unwrap_or_else(|| panic!("{name}'s declaration ends in a semicolon"));
+        value.trim().to_owned()
+    }
+
+    /// **Every constant `gauge.frag` shares with the kit is the kit's value**,
+    /// parsed back out of the shipped GLSL rather than restated beside it.
     ///
-    /// They are two halves of one decision: the shader owns the four
-    /// intensities, this side owns how far back in time each of them samples.
-    /// A fifth intensity added to the array without a matching bump here would
-    /// leave the oldest blade reading an out-of-range `u_theta_trail`
-    /// component — a `vec4` has four, so the fifth blade would draw at
-    /// whatever the compiler decided — with nothing else in the tree to notice.
+    /// This is the copy the #1148 review's HIGH-1 was about, and the only one
+    /// that has to exist: a `.frag` cannot read a Rust `const`, so the shader
+    /// re-declares the eight lengths and the eight intensities it draws with.
+    /// Before this they were tied to nothing — the review widened `MINOR_HW`
+    /// from 0.55 to 0.60, a 9 % fattening of every minor tick on every dial,
+    /// and the whole unit suite, the `glsl` lint and the parity harness all
+    /// stayed green. `MINOR_HW` was the worst one to pick because it appears
+    /// *only* in the shader; now every one of them appears in
+    /// `hytte-preem`'s `gauge.rs` too and this test is what says so.
+    ///
+    /// Declared as a list rather than derived, so a constant the shader grows
+    /// on its own (a purely GL quantity like `F32_EPSILON` or the CRT's
+    /// `MASK_ONE`) does not have to be given a Rust counterpart it has no
+    /// meaning for. What the list covers is every value that is *shared*.
+    ///
+    /// **Falsified** by changing any entry on either side of the seam.
     #[test]
-    fn the_shader_and_the_mapping_agree_about_the_trail_length() {
+    fn the_shader_declares_the_kits_own_constants() {
+        let lengths: [(&str, f32); 8] = [
+            ("ARC_HW", kit::ARC_HW),
+            ("VALUE_HW_BONUS", kit::VALUE_HW_BONUS),
+            ("MAJOR_HW", kit::MAJOR_HW),
+            ("MINOR_HW", kit::MINOR_HW),
+            ("BLADE_TIP", kit::BLADE_TIP),
+            ("TAIL_FLARE", kit::TAIL_FLARE),
+            ("MID_LEN_BONUS", kit::MID_LEN_BONUS),
+            ("FEATHER", kit::FEATHER),
+        ];
+        for (name, kit_value) in lengths {
+            let declared: f32 = shader_const(name)
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} is a float literal in gauge.frag"));
+            assert!(
+                (declared - kit_value).abs() < 1e-6,
+                "gauge.frag's {name} is {declared}, the kit's is {kit_value}",
+            );
+        }
+
+        let intensities: [(&str, u16); 7] = [
+            ("ARC_T", kit::ARC_T),
+            ("MINOR_T", kit::MINOR_T),
+            ("MAJOR_T", kit::MAJOR_T),
+            ("MID_T", kit::MID_T),
+            ("VALUE_T", kit::VALUE_T),
+            ("NEEDLE_T", kit::NEEDLE_T),
+            ("HUB_T", kit::HUB_T),
+        ];
+        for (name, kit_value) in intensities {
+            assert_eq!(
+                shader_const(name).parse::<u16>().ok(),
+                Some(kit_value),
+                "gauge.frag's {name} is not the kit's {kit_value}",
+            );
+        }
+    }
+
+    /// The shader's motion-blur intensities are the kit's `TRAIL_T`, **element
+    /// for element and length included**.
+    ///
+    /// Two halves of one decision: the shader owns the intensities the blades
+    /// are drawn at, this side owns how far back in time each of them samples
+    /// (`TRAIL_SPAN_SECS / TRAIL_T.len()`). A fifth intensity added to the kit
+    /// without the uniform growing with it would leave the oldest blade reading
+    /// a component a `vec4` does not have — the `const` assertion beside
+    /// [`MAX_TICK_SPAN`] refuses to compile then — and a *reordered* array
+    /// would draw the fan with its brightness running backwards, which is what
+    /// this reads the values for rather than only the count.
+    #[test]
+    fn the_shader_and_the_kit_agree_about_the_motion_blur_fan() {
         let marker = "const int TRAIL_T[";
         let at = LIT_FRAG
             .find(marker)
             .expect("gauge.frag declares the trail intensities");
         let rest = &LIT_FRAG[at + marker.len()..];
-        let (count, _) = rest.split_once(']').expect("a bracketed array length");
+        let (count, tail) = rest.split_once(']').expect("a bracketed array length");
         assert_eq!(
             count.trim().parse::<usize>().ok(),
-            Some(TRAIL_BLADES),
-            "gauge.frag's TRAIL_T length and TRAIL_BLADES are one number",
+            Some(kit::TRAIL_T.len()),
+            "gauge.frag's TRAIL_T length and the kit's are one number",
         );
-        assert_eq!(TRAIL_BLADES, 4, "and a vec4 is what carries the angles");
+        let body = tail
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(inside, _)| inside)
+            .expect("an int[N](…) initialiser");
+        let declared: Vec<u16> = body
+            .split(',')
+            .map(|value| value.trim().parse().expect("an integer intensity"))
+            .collect();
+        assert_eq!(
+            declared.as_slice(),
+            kit::TRAIL_T.as_slice(),
+            "gauge.frag's fan is not the kit's TRAIL_T",
+        );
     }
 
     /// The pipeline's shape, which a reader of the GLSL cannot see: **no step
@@ -1097,7 +1047,7 @@ mod tests {
             scale: 1,
             ..config()
         };
-        let dial: Dial = face(tiny);
+        let dial: kit::Dial = face(tiny);
         assert!(
             dial.radius >= 1.0,
             "the arc never collapses past MIN_RADIUS"

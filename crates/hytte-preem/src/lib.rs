@@ -153,7 +153,12 @@ mod textbox;
 pub use color_map::ColorMap;
 pub use dot_matrix::{DEFAULT_DOT_PX, DotMatrix, MAX_DOT_PX, MIN_DOT_PX, dot_matrix};
 pub use frame::{Frame, Rgba};
-pub use gauge::{DEFAULT_DAMPING, DEFAULT_FREQ_HZ, Gauge, Needle, OVERTRAVEL, TRAIL_SPAN_SECS};
+pub use gauge::{
+    ARC_HW, ARC_T, BLADE_TIP, DEFAULT_DAMPING, DEFAULT_FREQ_HZ, Dial, FEATHER, Gauge, HUB_T,
+    MAJOR_HW, MAJOR_T, MID_LEN_BONUS, MID_T, MINOR_HW, MINOR_T, NEEDLE_T, Needle, OVERTRAVEL,
+    TAIL_FLARE, TRAIL_SPAN_SECS, TRAIL_T, VALUE_HW_BONUS, VALUE_T, bloom_radius, on_dial,
+    trail_fraction,
+};
 pub use led_matrix::{Fill, LedMatrix};
 pub use led_strip::{DEFAULT_LEDS, DEFAULT_WIDTH, LedStrip, PeakHold, led_strip};
 pub use marquee::{Marquee, MarqueeStrip};

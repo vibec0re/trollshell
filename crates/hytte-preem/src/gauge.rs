@@ -414,7 +414,9 @@ const TAIL_FRAC: f32 = 0.13;
 /// How much the counterweight flares as it goes back: its far end is drawn this
 /// multiple of the blade's pivot half-width, which is what gives the stub its
 /// weight instead of reading as a second pointer.
-const TAIL_FLARE: f32 = 1.25;
+///
+/// Public for the reason the block below [`ARC_HW`] gives.
+pub const TAIL_FLARE: f32 = 1.25;
 /// Shortest counterweight worth drawing, in logical pixels (#931).
 ///
 /// Below this the stub sits entirely inside the hub's own feathered disc, so it
@@ -446,16 +448,40 @@ const BLADE_FRAC: f32 = 0.032;
 const BLADE_RANGE: (f32, f32) = (BLADE_TIP, 2.2);
 /// Needle half-width at the tip, in logical pixels — the blade tapers to a
 /// point, like a real pointer.
-const BLADE_TIP: f32 = 0.5;
+/// Public for the reason the block below gives.
+pub const BLADE_TIP: f32 = 0.5;
+
+// ── The shape constants a second renderer of this dial must share ────────────
+//
+// **Public since #1148's review, and `pub` is the whole of the change**: every
+// value, every expression and every caller below is untouched. The shell's GL
+// arm (`trollshell/src/plugins/preem_gl/gauge.rs` and its `gauge.frag`) draws
+// the same dial from the same numbers, and before this it carried a hand copy
+// of each one. A hand copy of a constant is held together by nothing the
+// compiler can see — #1148's review drifted `TIP_FRAC` by 0.02 and the whole
+// unit suite stayed green — so the kit hands them over instead. The kit stays
+// the parity oracle; what it gained is a way to *be* one.
+//
+// The same argument, on the same review, made [`Dial`], [`Gauge::dial`],
+// [`on_dial`], [`trail_fraction`] and [`bloom_radius`] public: the resolved
+// geometry and the three pure functions over it, so the second renderer
+// resolves a face by calling this one rather than by transcribing it.
 
 /// Scale-arc band half-width, in logical pixels.
-const ARC_HW: f32 = 0.8;
+pub const ARC_HW: f32 = 0.8;
 /// How much fatter the lit value arc is drawn than the scale arc it fills.
-const VALUE_HW_BONUS: f32 = 0.35;
+pub const VALUE_HW_BONUS: f32 = 0.35;
 /// Major/mid tick half-width, in logical pixels.
-const MAJOR_HW: f32 = 0.85;
+///
+/// Wider than [`MINOR_HW`], which is load-bearing rather than cosmetic: the
+/// widest ink any tick lays down is what bounds the window a renderer has to
+/// search for the ticks that can reach a fragment, and the GL arm computes that
+/// bound from this constant alone. `the_major_tick_is_the_widest_mark_on_the_face`
+/// pins the relation on this side; `preem_gl::gauge`'s `const` assertion pins it
+/// on the other.
+pub const MAJOR_HW: f32 = 0.85;
 /// Minor tick half-width, in logical pixels.
-const MINOR_HW: f32 = 0.55;
+pub const MINOR_HW: f32 = 0.55;
 /// Major tick length inward from the scale arc, as a fraction of its radius.
 const MAJOR_LEN_FRAC: f32 = 0.15;
 /// Minor tick length inward from the scale arc, as a fraction of its radius.
@@ -476,7 +502,9 @@ const MIN_MAJOR_LEN: f32 = 3.0;
 /// (2.2 px); it fires at 48×48, where the natural minor is 1.6 px.
 const MIN_MINOR_LEN: f32 = 2.0;
 /// How much longer the mid-scale tick is drawn than a major one.
-const MID_LEN_BONUS: f32 = 1.35;
+///
+/// Public for the reason the block above [`ARC_HW`] gives.
+pub const MID_LEN_BONUS: f32 = 1.35;
 /// Closest two adjacent ticks may sit on the scale arc, centre to centre, in
 /// logical pixels (#931). Below it the face drops a subdivision level rather
 /// than drawing a row of marks that merge into a band.
@@ -573,7 +601,11 @@ const BLOOM_RADIUS_DIV: usize = 2;
 /// Every shape on the face — arc, tick, blade, hub — gets its coverage from the
 /// same distance ramp, so nothing on the dial looks hand-drawn next to anything
 /// else.
-const FEATHER: f32 = 1.15;
+///
+/// Public for the reason the block above [`ARC_HW`] gives — though the GL arm
+/// deliberately reads it in *native* pixels where this one is logical, which is
+/// the one place the two renderers differ on purpose (#1090).
+pub const FEATHER: f32 = 1.15;
 
 /// The dial's mechanical stops: how far past each end of the scale the needle
 /// is allowed to travel. A real meter's pointer bangs its stop on a full-scale
@@ -584,24 +616,32 @@ pub const OVERTRAVEL: f32 = 0.06;
 // Intensities, of 255. The face's flat furniture is mixed from the field toward
 // the ink, exactly like the `Scope`'s graticule — it is a stable reference, so
 // it must not bloom, decay or flicker. Everything in the *lit* layer does bloom.
+// Public for the reason the block above [`ARC_HW`] gives.
 /// Scale arc, flat.
-const ARC_T: u16 = 30;
+pub const ARC_T: u16 = 30;
 /// Minor tick, flat.
-const MINOR_T: u16 = 52;
+pub const MINOR_T: u16 = 52;
 /// Major tick, flat.
-const MAJOR_T: u16 = 86;
+pub const MAJOR_T: u16 = 86;
 /// Mid-scale tick, flat — brighter than a major, the way the scope's center
 /// cross is brighter than its grid.
-const MID_T: u16 = 118;
+pub const MID_T: u16 = 118;
 /// The lit value arc filling the scale to the reading.
-const VALUE_T: u16 = 130;
+pub const VALUE_T: u16 = 130;
 /// The needle blade and counterweight — full brightness.
-const NEEDLE_T: u16 = 255;
+pub const NEEDLE_T: u16 = 255;
 /// The pivot hub, a hair under the blade so the blade still reads over it.
-const HUB_T: u16 = 235;
+pub const HUB_T: u16 = 235;
 /// The motion-blur blades, oldest last. Length sets [`TRAIL_SPAN_SECS`]'s
 /// subdivision.
-const TRAIL_T: [u16; 4] = [150, 104, 66, 34];
+///
+/// Public array **and** public length: the GL arm owns neither. It re-declares
+/// the intensities in its own GLSL (a shader cannot read a Rust `const`) and
+/// takes the subdivision count from `TRAIL_T.len()` here, and a test compares
+/// its declaration against this array element for element — so a fifth blade
+/// added here is a red test rather than a blade drawn at whatever the compiler
+/// left in the fourth component of a `vec4`.
+pub const TRAIL_T: [u16; 4] = [150, 104, 66, 34];
 
 /// How far back in time the needle's motion blur reaches, in seconds — a ~50 ms
 /// shutter. Sampling the smear in *time* rather than in past frames is what
@@ -621,28 +661,35 @@ enum Tick {
 
 /// The resolved pixel geometry of one dial face, derived from the buffer size
 /// and sweep. All lengths are in logical (pre-upscale) pixels.
-#[derive(Debug, Clone, Copy)]
-struct Dial {
+///
+/// Public since #1148's review, along with [`Gauge::dial`] that resolves it —
+/// see the block above [`ARC_HW`]. The fields are public rather than wrapped in
+/// accessors because a second renderer needs to *rebuild* one at its own
+/// resolution (the GL arm multiplies every length by the integer upscale and
+/// leaves the two that are not lengths alone), and a field it forgot to carry
+/// across should be a compile error at that struct literal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Dial {
     /// The pivot, in buffer coordinates.
-    pivot: (f32, f32),
+    pub pivot: (f32, f32),
     /// The scale arc's radius.
-    radius: f32,
+    pub radius: f32,
     /// Half the total sweep, in radians: the dial spans `-half..=half` measured
-    /// from 12 o'clock, growing clockwise.
-    half: f32,
+    /// from 12 o'clock, growing clockwise. An **angle**, so it never scales.
+    pub half: f32,
     /// Needle tip radius.
-    tip: f32,
+    pub tip: f32,
     /// Counterweight radius, behind the pivot — `0.0` when the face is too
     /// small to draw one (see [`MIN_TAIL`]).
-    tail: f32,
+    pub tail: f32,
     /// Hub radius.
-    hub: f32,
+    pub hub: f32,
     /// Blade half-width at the pivot (it tapers to [`BLADE_TIP`]).
-    blade: f32,
+    pub blade: f32,
     /// Major tick length, inward from the scale arc.
-    major_len: f32,
+    pub major_len: f32,
     /// Minor tick length, inward from the scale arc.
-    minor_len: f32,
+    pub minor_len: f32,
     /// Whether the face was **centred** in its buffer rather than seated on the
     /// rows [`BASE_FRAC`] reserves (#931). True exactly when the arc fits by
     /// width *and* the buffer can hold the halo at both ends — see
@@ -660,13 +707,16 @@ struct Dial {
     /// [`MIN_TICK_SPACING`]. Resolved here rather than in
     /// [`Gauge::ticks`](Gauge::ticks) because it is a function of the arc's
     /// radius, which only the resolved geometry knows.
-    subdivisions: usize,
+    ///
+    /// A **count**, so it never scales.
+    pub subdivisions: usize,
 }
 
 impl Dial {
     /// The dial angle for a `0.0..=1.0` fraction of full scale: the low end sits
     /// at `-half`, the high end at `+half`.
-    fn angle(self, fraction: f32) -> f32 {
+    #[must_use]
+    pub fn angle(self, fraction: f32) -> f32 {
         (fraction - 0.5) * 2.0 * self.half
     }
 }
@@ -1046,7 +1096,8 @@ impl Gauge {
     /// a hair — centring would buy nothing and cost a row of glow, so the face
     /// stays **seated**: precisely what it did before #931, which is the one
     /// placement guaranteed not to be a regression.
-    fn dial(&self) -> Dial {
+    #[must_use]
+    pub fn dial(&self) -> Dial {
         let cols = fx(self.cols);
         let rows = fx(self.rows);
         let half = (self.sweep / 2.0).clamp(
@@ -1341,7 +1392,8 @@ fn bloom_cap(radius: f32) -> usize {
 /// [`bloom_cap`] alone and not against this: the reservation only has to be an
 /// upper bound, and re-deriving the placement from a taste knob would move
 /// every centred face's geometry — #930 is a blur change, not a layout one.
-fn bloom_radius(skin_radius: usize, arc_radius: f32) -> usize {
+#[must_use]
+pub fn bloom_radius(skin_radius: usize, arc_radius: f32) -> usize {
     skin_radius
         .div_ceil(BLOOM_RADIUS_DIV)
         .min(bloom_cap(arc_radius))
@@ -1362,7 +1414,8 @@ fn span(low: f32, high: f32, dim: usize) -> std::ops::Range<usize> {
 /// [`OVERTRAVEL`] past either end of the scale — a real pointer bangs its stop
 /// on a full-scale slam — but never off the face. A non-finite deflection reads
 /// as the low end.
-fn on_dial(fraction: f32) -> f32 {
+#[must_use]
+pub fn on_dial(fraction: f32) -> f32 {
     if fraction.is_finite() {
         fraction.clamp(-OVERTRAVEL, 1.0 + OVERTRAVEL)
     } else {
@@ -1376,7 +1429,8 @@ fn on_dial(fraction: f32) -> f32 {
 /// First-order, which is plenty over the ~50 ms shutter, and **exact at rest**:
 /// with zero velocity every sample equals the current deflection, so the whole
 /// smear collapses onto the blade and the max-combine erases it.
-fn trail_fraction(fraction: f32, velocity: f32, back: f32) -> f32 {
+#[must_use]
+pub fn trail_fraction(fraction: f32, velocity: f32, back: f32) -> f32 {
     fraction - velocity * back
 }
 
@@ -2843,6 +2897,30 @@ mod tests {
     /// The **bloom** stays a fixed fraction of the dial instead of a fixed
     /// pixel count, so a small face's halo does not swallow its needle.
     ///
+    /// A **major** tick is the widest mark on the face, and a mid tick is drawn
+    /// at the same half-width — so `MAJOR_HW` alone bounds the ink any tick
+    /// lays down either side of its centreline.
+    ///
+    /// Nothing in this file depends on that (each mark is drawn at its own
+    /// half-width), so it looks like a tautology here. It is not one for the
+    /// shell's GL arm, which has to decide *in the shader* how many ticks can
+    /// reach a fragment and derives that window from `MAJOR_HW` as the upper
+    /// bound (`preem_gl::gauge`'s `tick_span`, which carries the matching
+    /// `const` assertion). If the two ever inverted, that window would
+    /// under-estimate and minor ticks would be clipped out of the dial — a
+    /// silent, skin-wide loss with nothing else in the tree to notice it
+    /// (#1148 review, LOW-1).
+    ///
+    /// **Falsified** by raising [`MINOR_HW`] past [`MAJOR_HW`].
+    #[test]
+    fn the_major_tick_is_the_widest_mark_on_the_face() {
+        assert!(
+            MAJOR_HW > super::MINOR_HW,
+            "a minor tick must stay narrower than a major one: {MAJOR_HW} vs {}",
+            super::MINOR_HW,
+        );
+    }
+
     /// Both halves matter: the cap arithmetic, and that `render` actually
     /// applies it. The second is measured the way #930 measured the blur — the
     /// lit cross-section straight through the settled blade — because that is

@@ -50,7 +50,7 @@ use futures_signals::map_ref;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
 use futures_util::StreamExt;
 use hytte_bus::{BusKind, BusProxy, ProxyState, call, proxy, signals};
-use hytte_reactive::{Service, registry, runtime, spawn_supervised};
+use hytte_reactive::{Service, registry, runtime, spawn_supervised, spawn_supervised_bounded};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -823,9 +823,13 @@ async fn listen(players: &Mutable<Vec<Player>>, active: &Mutable<bool>) -> Resul
             let state2 = state.clone();
             let bus_name = name.clone();
             // Supervised: `spawn_player_tasks` reads + parses this player's
-            // (untrusted) metadata, so it's the real panic surface. A clean
-            // completion (player closed / stream ended) does not restart.
-            spawn_supervised("mpris-player", move || {
+            // (untrusted) metadata, so it's the real panic surface. Bounded
+            // (#1174): a clean completion means the player closed, which is
+            // this task finishing its job — no restart, and none of the
+            // `warn!`-plus-kept-row that `spawn_supervised` gives an
+            // unexpected return. One per player over a session is a lot of
+            // both.
+            spawn_supervised_bounded("mpris-player", move || {
                 let state = state2.clone();
                 let bus_name = bus_name.clone();
                 async move {
@@ -861,8 +865,9 @@ async fn listen(players: &Mutable<Vec<Player>>, active: &Mutable<bool>) -> Resul
             tracing::debug!(name, "mpris player appeared");
             let state2 = state.clone();
             let bus_name = name.clone();
-            // Supervised — same rationale as the startup-discovery spawn above.
-            spawn_supervised("mpris-player", move || {
+            // Supervised (and bounded) — same rationale as the
+            // startup-discovery spawn above.
+            spawn_supervised_bounded("mpris-player", move || {
                 let state = state2.clone();
                 let bus_name = bus_name.clone();
                 async move {

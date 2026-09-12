@@ -187,6 +187,7 @@ pub(crate) struct PanicCounts {
 /// Start tracking a supervisor. Returns the id its later updates quote.
 ///
 /// Called by `supervise_runs` — the single loop `spawn_supervised`,
+/// `spawn_supervised_bounded`,
 /// `spawn_supervised_blocking` and `spawn_supervised_handle` all funnel
 /// through — so every supervision entry point is covered by construction,
 /// including ones that do not exist yet.

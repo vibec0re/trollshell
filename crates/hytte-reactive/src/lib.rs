@@ -18,7 +18,7 @@ pub use poll::gated_poll;
 pub use registry::{Registry, Service, ServiceErased};
 pub use supervisor::{
     SupervisorHandle, install_panic_hook, spawn_supervised, spawn_supervised_blocking,
-    spawn_supervised_handle,
+    spawn_supervised_bounded, spawn_supervised_handle,
 };
 
 // Re-export so consumers don't need their own dep on futures-signals.

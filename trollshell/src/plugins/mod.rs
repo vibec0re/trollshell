@@ -147,7 +147,7 @@ use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{glib, prelude::*};
 use hytte::prelude::*;
 use hytte::reactive::registry;
-use hytte::reactive::spawn_supervised;
+use hytte::reactive::spawn_supervised_bounded;
 use hytte::services::{calendar, clock, logind, mpris, pipewire};
 use hytte_plugin_proto::{
     AudioSpectrum, ClockState, Effect, HostMsg, Mount, NowPlaying, UpcomingEvent, wire,
@@ -586,7 +586,15 @@ impl Service for PluginsService {
             effects_tx,
             datasource,
         };
-        spawn_supervised("plugins", move || {
+        // Bounded (#1174): every way out of this closure is already reported
+        // where it happens, and three of them are designed stand-downs rather
+        // than a loop falling out from under itself — `XDG_RUNTIME_DIR` unset,
+        // another instance holding the host lock, another instance already
+        // listening on the socket (see `listener::listen`, which `warn!`s each
+        // with the detail a generic supervisor line could not carry). The
+        // remaining path is an `Err` this closure logs itself, right below. A
+        // second `warn!` from the supervisor would only restate it.
+        spawn_supervised_bounded("plugins", move || {
             let ctx = ctx.clone();
             async move {
                 if let Err(e) = listener::listen(&ctx).await {

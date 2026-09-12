@@ -17,6 +17,14 @@
 //! silently — see "Restart policy: why a return is not a panic" below for why
 //! this is *not* a panic-style retry.
 //!
+//! [`spawn_supervised_bounded`] is that same supervisor for the minority of
+//! bodies whose clean return is the **expected** end of their work — one task
+//! per discovered MPRIS player or tray item, a service standing down because
+//! there is nothing for it to do. There the return is reported at `debug!` and
+//! the health row is released, because a browser closing media tabs is not
+//! news. The difference is declared by the caller at the spawn site rather than
+//! inferred here; see [`Intent`].
+//!
 //! [`spawn_supervised_blocking`] is the same supervisor over a
 //! `spawn_blocking` closure, for the services whose client library is
 //! synchronous (niri's line-based IPC socket, for one). It shares the backoff
@@ -48,7 +56,7 @@
 //! current backoff — to [`crate::health`], which is where a diagnostics view
 //! reads "the niri connection has panicked four times in the last minute" from.
 //! The bookkeeping lives in [`supervise_runs`], the one loop every spawn
-//! function funnels through, so it covers all three variants and any future
+//! function funnels through, so it covers all four variants and any future
 //! entry point that reuses that loop (#238, #690, #691).
 //!
 //! # Restart policy: why a return is not a panic (#1174)
@@ -63,25 +71,29 @@
 //!   that could unwind) — panicking and being restarted from scratch is a
 //!   contract the factory signed up for.
 //! - **A return does not restart**, and this fix does not change that. There
-//!   is no equivalent "return-safety" contract anywhere in this API, and two
-//!   existing supervised bodies actively rely on a clean return meaning
-//!   *stop, permanently*: `mpris-player` and `tray-item`
-//!   (`hytte-services`) each supervise one task per discovered player/item and
-//!   return on purpose once it disappears, saying so in their own comments.
-//!   Auto-restarting on `Ok(())` would spin either of those back up forever.
+//!   is no equivalent "return-safety" contract anywhere in this API, and
+//!   several existing supervised bodies actively rely on a clean return meaning
+//!   *stop, permanently*: `mpris-player` and `tray-item` (`hytte-services`)
+//!   each supervise one task per discovered player/item and return on purpose
+//!   once it disappears, `networkd` returns when the host has no link backend
+//!   at all, and the plugin host returns when another shell instance already
+//!   owns its socket. Auto-restarting on `Ok(())` would spin every one of those
+//!   back up forever.
 //!
-//! What *does* change is visibility. Every factory in this tree today is
-//! written as an infinite loop — nothing actually intends to finish except
-//! those two per-instance cases — so a return is either one of those two
-//! deliberate exits, or a bug that fell out of the loop early, and the
-//! supervisor has no way to tell which. Previously both looked identical to a
-//! task that never existed: no log line, no health row. Now every return logs
-//! a `warn!` (not `error!` — a return, unlike a panic, is not necessarily a
-//! failure) naming the task, and its [`crate::health`] row is kept in
-//! [`crate::health::TaskState::Returned`] instead of being dropped — see that
-//! module's docs for the tradeoff this accepts (an unbounded, if slow, row
-//! backlog for the per-instance supervisors) in exchange for never again
-//! hiding a service loop that fell out from under itself.
+//! What *does* change is visibility, and **who decides how loud it is**. Almost
+//! every factory in this tree is written as an infinite loop, so a return from
+//! one of those is a bug that fell out of the loop early; previously it looked
+//! identical to a task that never existed — no log line, no health row. Now a
+//! return from [`spawn_supervised`] logs a `warn!` (not `error!` — a return,
+//! unlike a panic, is not necessarily a failure) naming the task, and keeps its
+//! [`crate::health`] row in [`crate::health::TaskState::Returned`].
+//!
+//! The handful of bodies listed above, whose return is the point rather than a
+//! symptom, say so by spawning through [`spawn_supervised_bounded`] instead:
+//! `debug!`, row released. The supervisor cannot tell the two apart by looking
+//! and does not try — the alternative, a `warn!` on every disconnected tray
+//! item at the shell's default `INFO` level, is how a `warn` level stops being
+//! read, which would defeat #1174 rather than serve it.
 //!
 //! # Extending this API
 //!
@@ -101,7 +113,7 @@
 //! points could one day hand back the same type without a single call site
 //! changing meaning. Do not add either property to it.
 //!
-//! All three funnel through [`supervise_runs`], which is how the cancellable
+//! All four funnel through [`supervise_runs`], which is how the cancellable
 //! variant inherits [`crate::health`] tracking for free — including releasing
 //! its row via [`crate::health::stopped`] when a cancelled supervisor unwinds,
 //! without which every backend switch would leak one.
@@ -148,6 +160,29 @@ impl Default for Backoff {
     }
 }
 
+/// What a clean `Ok(())` return *means* for this supervisor — declared by the
+/// caller at the spawn site, because the supervisor cannot see it from here.
+///
+/// The two shapes in this tree are genuinely different events that happen to
+/// look identical to [`supervise_runs`]: a service loop falling out from under
+/// itself is a bug worth a `warn!` and a visible row, while a per-instance
+/// watcher reaching the end of its instance is the expected end of a task that
+/// did its job. Guessing between them from the task's *name* was the shape
+/// rejected on review; the caller knows, so the caller says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Intent {
+    /// The body is written to run for the life of the process, so a return is
+    /// unexpected: `warn!` and keep a [`health::TaskState::Returned`] row.
+    /// [`spawn_supervised`], [`spawn_supervised_blocking`] and
+    /// [`spawn_supervised_handle`].
+    Perpetual,
+    /// The body is expected to finish — it watches one discovered instance and
+    /// that instance went away, or it stood down on purpose — so a return is
+    /// the end of a task that did its job: `debug!` and release the health row.
+    /// [`spawn_supervised_bounded`].
+    Bounded,
+}
+
 /// Spawn a supervised task on the shared hytte runtime.
 ///
 /// `factory` is called to produce the task future; it is called again — with
@@ -157,6 +192,12 @@ impl Default for Backoff {
 /// [`crate::health::TaskState::Returned`] row rather than vanishing (#1174;
 /// see "Restart policy" in this module's docs for why); a cancellation (the
 /// `JoinHandle` was aborted) likewise stops the supervisor, but drops its row.
+///
+/// That `warn!` says "this loop was not supposed to end". If the body you are
+/// spawning *is* supposed to end — one task per discovered instance, or a
+/// service that stands down when there is nothing to do — reach for
+/// [`spawn_supervised_bounded`] instead, which is the same supervisor with that
+/// one sentence declared.
 ///
 /// `factory: Fn() -> Fut` (not `FnOnce`) so each restart gets a fresh future;
 /// capture cheap `Mutable`/`Arc` clones inside it and clone them per call.
@@ -170,7 +211,72 @@ where
 {
     // No `Stop`: this entry point hands back nothing, so nothing can ever ask
     // the supervisor to stop. `spawn_supervised_handle` is the one that can.
-    runtime::handle().spawn(supervise(name, factory, Backoff::default(), None));
+    runtime::handle().spawn(supervise(
+        name,
+        factory,
+        Backoff::default(),
+        None,
+        Intent::Perpetual,
+    ));
+}
+
+/// [`spawn_supervised`] for a task whose clean return is the **expected** end
+/// of its work.
+///
+/// Identical in every other respect — same factory contract, same capped
+/// exponential backoff, same restart-on-panic, same [`crate::health`]
+/// publishing, because it is the same loop. What differs is only what a clean
+/// `Ok(())` *means*:
+///
+/// | | [`spawn_supervised`] | this |
+/// |---|---|---|
+/// | a run panics | restart with backoff | restart with backoff |
+/// | a run returns | `warn!` + a kept [`crate::health::TaskState::Returned`] row | `debug!` + the row released |
+/// | the task is cancelled | row released | row released |
+///
+/// # Why this exists rather than a smarter supervisor
+///
+/// #1174 made a clean return audible, because a service loop falling out from
+/// under itself used to look exactly like a task that never existed. But two
+/// shapes in this tree end by returning **on purpose**: the per-instance
+/// watchers (`mpris-player`, `tray-item` — one supervised task per discovered
+/// player/tray item, which returns when that player or item disappears) and the
+/// services that stand down when there is nothing to do (`networkd` on a host
+/// with no link backend, the plugin host when another shell instance already
+/// holds its socket). A browser closing media tabs walks through the first case
+/// dozens of times a day, and `warn!`-ing each one is how a `warn` level stops
+/// being read — which would defeat #1174 rather than serve it.
+///
+/// The supervisor cannot tell the two apart by looking, and guessing from the
+/// task's *name* would be a table of special cases maintained a long way from
+/// the code it describes. The caller knows, so the caller says it here, at the
+/// spawn site, in one word.
+///
+/// Reach for this **only** when the body's `Ok(())` is genuinely expected. On a
+/// loop that is supposed to run for the life of the process, the plain
+/// [`spawn_supervised`] is what turns a silent fall-out into a log line and a
+/// visible row.
+///
+/// # No blocking twin
+///
+/// There is no `spawn_supervised_bounded_blocking`, for the same reason
+/// [`spawn_supervised_handle`] has no blocking twin: nothing needs one. Every
+/// body that returns by design in this tree is async, and the sole
+/// [`spawn_supervised_blocking`] call site (niri's IPC socket) is an infinite
+/// reconnect loop. Adding the twin is a five-line copy of this function the day
+/// a blocking body earns it.
+pub fn spawn_supervised_bounded<F, Fut>(name: &'static str, factory: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    runtime::handle().spawn(supervise(
+        name,
+        factory,
+        Backoff::default(),
+        None,
+        Intent::Bounded,
+    ));
 }
 
 /// Spawn a supervised **blocking** task on the shared hytte runtime.
@@ -227,6 +333,8 @@ pub fn spawn_supervised_blocking<F>(name: &'static str, task: F)
 where
     F: Fn() + Send + Sync + 'static,
 {
+    // Always `Intent::Perpetual` (inside `supervise_blocking`) — see
+    // `spawn_supervised_bounded`'s "No blocking twin".
     runtime::handle().spawn(supervise_blocking(name, Arc::new(task), Backoff::default()));
 }
 
@@ -392,7 +500,10 @@ where
         cancel: cancel_rx,
         _stopped: stopped_tx,
     };
-    runtime::handle().spawn(supervise(name, factory, cfg, Some(stop)));
+    // `Intent::Perpetual`: a cancellable supervisor is the one whose teardown
+    // has a caller, so an *un*asked-for return is exactly as unexpected here as
+    // on `spawn_supervised`.
+    runtime::handle().spawn(supervise(name, factory, cfg, Some(stop), Intent::Perpetual));
     SupervisorHandle {
         cancel: Arc::new(cancel_tx),
         stopped: stopped_rx,
@@ -451,12 +562,24 @@ fn finish_cancelled(name: &'static str, id: health::TaskId) {
 /// The async supervision loop. Split out from [`spawn_supervised`] so the
 /// backoff schedule is injectable for hermetic tests (a zero-delay `Backoff`
 /// keeps the retry-path test fast and non-flaky).
-async fn supervise<F, Fut>(name: &'static str, factory: F, cfg: Backoff, stop: Option<Stop>)
-where
+async fn supervise<F, Fut>(
+    name: &'static str,
+    factory: F,
+    cfg: Backoff,
+    stop: Option<Stop>,
+    intent: Intent,
+) where
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    supervise_runs(name, move || runtime::handle().spawn(factory()), cfg, stop).await;
+    supervise_runs(
+        name,
+        move || runtime::handle().spawn(factory()),
+        cfg,
+        stop,
+        intent,
+    )
+    .await;
 }
 
 /// The blocking supervision loop — [`supervise`]'s twin, likewise split out so
@@ -476,11 +599,14 @@ where
         // thread has picked it up, so there is no cancellable blocking entry
         // point to pass a `Stop` in from. See [`spawn_supervised_handle`].
         None,
+        // Always perpetual: there is no bounded blocking entry point either.
+        // See [`spawn_supervised_bounded`]'s "No blocking twin".
+        Intent::Perpetual,
     )
     .await;
 }
 
-/// The one supervision loop all three entry points run.
+/// The one supervision loop all four entry points run.
 ///
 /// `spawn_run` starts a single run and hands back its `JoinHandle`; everything
 /// above it — restart policy, backoff schedule, log lines, [`crate::health`]
@@ -492,13 +618,24 @@ where
 /// starting a run, while awaiting one, and while sleeping out a backoff — so a
 /// cancel is never left waiting on a 30 s backoff or on a run that has no reason
 /// to end.
-async fn supervise_runs<S>(name: &'static str, spawn_run: S, cfg: Backoff, mut stop: Option<Stop>)
-where
+///
+/// `intent` is what the caller said a clean `Ok(())` means — see [`Intent`] and
+/// [`spawn_supervised_bounded`]. It is consulted at exactly one place, the
+/// `Ok(())` arm below.
+async fn supervise_runs<S>(
+    name: &'static str,
+    spawn_run: S,
+    cfg: Backoff,
+    mut stop: Option<Stop>,
+    intent: Intent,
+) where
     S: Fn() -> JoinHandle<()> + Send + 'static,
 {
-    // The health entry is this supervisor's, and lives exactly as long as this
-    // loop: every `return` below drops it. See `health`'s module docs on why
-    // nothing is retained for a supervisor that has stopped.
+    // The health entry is this supervisor's, and lives as long as this loop:
+    // every `return` below releases it, bar the one that marks it
+    // `TaskState::Returned` instead (an `Intent::Perpetual` task that returned;
+    // see `health`'s module docs on that bounded exception to
+    // entries-are-live).
     let id = health::register(name);
     let mut delay = cfg.initial;
     loop {
@@ -538,21 +675,38 @@ where
         };
 
         match outcome {
-            // The task returned on its own. Do not restart — see this
-            // module's "Restart policy" docs for why a return is not treated
-            // like a panic — but do not go silent about it either (#1174):
-            // every factory in this tree is written to run forever, so a
-            // return is either a deliberate per-instance exit
-            // (`mpris-player`/`tray-item`) or a bug, and the two are
-            // indistinguishable from here. `warn!` (not `error!`: this is not
-            // necessarily a failure) and keep the health row instead of
-            // dropping it, so it cannot be mistaken for a task that never ran.
+            // The task returned on its own. Do not restart either way — see
+            // this module's "Restart policy" docs for why a return is not
+            // treated like a panic. What differs is how loudly it is reported,
+            // and that is the caller's declaration (#1174 + its review), not a
+            // guess made from here.
             Ok(()) => {
-                tracing::warn!(
-                    service = name,
-                    "supervised task returned; ending supervision without a restart"
-                );
-                health::returned(id);
+                match intent {
+                    // Unexpected: this body was supposed to run forever, so it
+                    // either fell out of its loop or hit a `return` its author
+                    // did not mean as an ending. `warn!` (not `error!`: a
+                    // return is not necessarily a failure) and keep the health
+                    // row so it cannot be mistaken for a task that never ran,
+                    // which is the silence #1174 filed.
+                    Intent::Perpetual => {
+                        tracing::warn!(
+                            service = name,
+                            "supervised task returned; ending supervision without a restart"
+                        );
+                        health::returned(id);
+                    }
+                    // Expected: the caller reached for `spawn_supervised_bounded`
+                    // precisely because this is where the task's work ends. Say
+                    // so at `debug!` — a tray item disconnecting is not news —
+                    // and release the row, exactly as a cancellation would.
+                    Intent::Bounded => {
+                        tracing::debug!(
+                            service = name,
+                            "supervised task finished; ending supervision as declared at its spawn site"
+                        );
+                        health::stopped(id);
+                    }
+                }
                 return;
             }
 
@@ -779,6 +933,11 @@ mod tests {
         // The `service` name `a_returning_task_is_logged_and_keeps_a_visible_row`
         // supervises under.
         "test-return-visible",
+        // The `service` name `a_bounded_task_ends_quietly_and_releases_its_row`
+        // supervises under. Listed for the *absence* it asserts: an unlisted
+        // tag is never counted, so a `logged_warnings(…) == 0` on one would
+        // pass whatever the supervisor logged.
+        "test-bounded-quiet",
     ];
 
     /// Per-tag counts of `ERROR` events from this module.
@@ -904,6 +1063,7 @@ mod tests {
                 },
                 ZERO_BACKOFF,
                 None,
+                Intent::Perpetual,
             )
             .await;
         });
@@ -931,6 +1091,7 @@ mod tests {
                 },
                 Backoff::default(),
                 None,
+                Intent::Perpetual,
             )
             .await;
         });
@@ -1017,7 +1178,7 @@ mod tests {
         install_error_counter();
 
         runtime::handle().block_on(async move {
-            supervise(NAME, || async {}, ZERO_BACKOFF, None).await;
+            supervise(NAME, || async {}, ZERO_BACKOFF, None, Intent::Perpetual).await;
         });
 
         assert_eq!(
@@ -1033,6 +1194,69 @@ mod tests {
             row.state,
             crate::health::TaskState::Returned,
             "a returned task's row reads Returned rather than just disappearing"
+        );
+    }
+
+    /// The twin of the test above, for the entry point that *declares* a return
+    /// to be the expected end: no `warn!`, and no row left behind.
+    ///
+    /// This is the whole point of [`spawn_supervised_bounded`]. `mpris-player`
+    /// and `tray-item` supervise one task per discovered player/tray item and
+    /// return when it disappears, which a browser closing media tabs does
+    /// dozens of times a day; at the shell's default `INFO` level the generic
+    /// return `warn!` would reach the journal every time, for behaviour both
+    /// modules document as correct.
+    ///
+    /// It still restarts on a **panic** — the half that must not be traded
+    /// away for the quiet — which is why the body here panics once first.
+    #[test]
+    fn a_bounded_task_ends_quietly_and_releases_its_row() {
+        const NAME: &str = "test-bounded-quiet";
+
+        install_error_counter();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_factory = Arc::clone(&calls);
+
+        runtime::handle().block_on(async move {
+            supervise(
+                NAME,
+                move || {
+                    let calls = Arc::clone(&calls_factory);
+                    async move {
+                        let n = calls.fetch_add(1, Ordering::SeqCst);
+                        assert!(n >= 1, "panic on the first run only");
+                    }
+                },
+                ZERO_BACKOFF,
+                None,
+                Intent::Bounded,
+            )
+            .await;
+        });
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a bounded task is still restarted after a panic — only the meaning of a clean \
+             return changes"
+        );
+        assert_eq!(
+            logged_errors(NAME),
+            1,
+            "the panic is still reported at error level"
+        );
+        assert_eq!(
+            logged_warnings(NAME),
+            0,
+            "the declared-expected return must not warn; this is the log line that would \
+             otherwise fire on every closed media tab"
+        );
+        assert!(
+            !health::snapshot().iter().any(|task| task.name == NAME),
+            "a bounded task's row is released on its return, exactly as a cancellation \
+             releases one — which is also what keeps the per-instance supervisors from \
+             accumulating rows"
         );
     }
 
@@ -1075,6 +1299,7 @@ mod tests {
                 },
                 NEVER_RESET,
                 None,
+                Intent::Perpetual,
             )
             .await;
         });

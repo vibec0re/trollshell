@@ -40,7 +40,7 @@ use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
 use hytte_bus::{BusKind, call, signals};
-use hytte_reactive::{Service, registry, spawn_supervised};
+use hytte_reactive::{Service, registry, spawn_supervised_bounded};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
@@ -442,7 +442,16 @@ impl Service for NetworkdService {
         let primary_writer = handles.primary.clone();
         let source_writer = handles.source.clone();
 
-        spawn_supervised("networkd", move || {
+        // Bounded (#1174): this body returns by design on a host with no link
+        // backend at all — the `LinkBackend::None` arm below publishes
+        // `LinkSource::Unavailable`, says so at `info!`, and falls off the end,
+        // which is the documented steady state rather than a loop that fell
+        // out from under itself. Its two other arms never return: the
+        // NetworkManager watcher and the networkd reconnect loop are both
+        // infinite, and `seed_links`' `return` is unreachable under
+        // `STARTUP_REFRESH_RETRY` (`max_attempts: None`, so `Step::GiveUp` —
+        // the only verdict that makes it answer `false` — cannot be reached).
+        spawn_supervised_bounded("networkd", move || {
             let links_writer = links_writer.clone();
             let primary_writer = primary_writer.clone();
             let source_writer = source_writer.clone();

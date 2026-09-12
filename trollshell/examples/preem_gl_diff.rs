@@ -230,6 +230,9 @@ const GAUGE_SUPERSAMPLE: u32 = 2;
 const DOT_PX: u32 = 4;
 /// `MIN_DOT_PX` — see [`DisplayAt::Dense`].
 const DENSE_DOT_PX: u32 = 2;
+/// `MAX_DOT_PX` — see [`DisplayAt::Coarse`], which is there for the one
+/// arithmetic the other four pitches cannot reach.
+const COARSE_DOT_PX: u32 = 8;
 
 /// How much bigger than the kit's buffer the **stretched** dot-matrix case
 /// sizes its area — the one case that measures the improvement rather than the
@@ -258,6 +261,23 @@ const STRETCH: u32 = 2;
 /// thread and read after `run` returns on the same thread.
 static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How many cases actually reached a verdict, for [`main`]'s exit status
+/// (#1150 review, MEDIUM-1).
+///
+/// **A run that measured nothing must not exit 0.** Twice in six runs on
+/// #1144's branch this binary printed its header and exited **0** with no case
+/// lines, no `-- summary --` and no evidence file — a second, byte-identical
+/// invocation printed all of them. CI survives that on
+/// `nix/checks/system-tests.nix`'s `*.gl.ppm` count alone; a human following
+/// `docs/live-verify.md` reads a silent exit 0 as a pass, and this branch adds
+/// six live-verify items that lean on it. So the exit status now answers "did
+/// this run measure anything" as well as "did anything fail".
+///
+/// The underlying double-`activate` is **#1151**, not fixed here: this counter
+/// is the detector, deliberately independent of whatever is causing a session
+/// to end early, so it stays useful if the cause changes.
+static VERDICTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn main() -> glib::ExitCode {
     let skins = match parse_skins(&std::env::args().skip(1).collect::<Vec<_>>()) {
         Ok(skins) => skins,
@@ -281,19 +301,22 @@ fn main() -> glib::ExitCode {
     let exact = parity_exact();
     if exact {
         println!(
-            "TROLLSHELL_PARITY_EXACT=1: a **1:1** case of either kind with a \
+            "TROLLSHELL_PARITY_EXACT=1: a **1:1** case of any kind with a \
              non-zero delta on any channel fails as FAIL(exact), even inside \
              the ceiling above."
         );
     }
     println!(
-        "the .x{GAUGE_SUPERSAMPLE} gauge cases are box-averaged down from the shipping \
-         upscale and take neither the ceiling nor that pin: every pixel off a \
-         rasterisation edge must be bit-identical (FAIL(interior)) and the edge \
-         region has its own budget, mean {SUPERSAMPLED_EDGE_MEAN} / max {SUPERSAMPLED_EDGE_MAX} \
+        "the .x{GAUGE_SUPERSAMPLE} gauge cases and the .x{STRETCH} dot-matrix ones are \
+         box-averaged down from a denser render and take neither the ceiling nor that \
+         pin: every pixel off a rasterisation edge must be bit-identical \
+         (FAIL(interior)) and the edge region has a per-kind budget, gauge mean \
+         {gauge_mean} / max {gauge_max}, dot matrix mean {dots_mean} / max {dots_max} \
          (FAIL(edges)). See `preem_gl::parity`'s `case_verdict`.",
-        SUPERSAMPLED_EDGE_MEAN = parity::SUPERSAMPLED_EDGE_MEAN,
-        SUPERSAMPLED_EDGE_MAX = parity::SUPERSAMPLED_EDGE_MAX,
+        gauge_mean = parity::Kind::Gauge.edge_budget().mean,
+        gauge_max = parity::Kind::Gauge.edge_budget().max,
+        dots_mean = parity::Kind::DotMatrix.edge_budget().mean,
+        dots_max = parity::Kind::DotMatrix.edge_budget().max,
     );
 
     let app = gtk::Application::builder()
@@ -308,6 +331,16 @@ fn main() -> glib::ExitCode {
     // ceiling; a harness that always exits clean cannot be scripted, cannot be
     // trusted at a glance, and would let a red run be pasted as a green one.
     if FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return glib::ExitCode::FAILURE;
+    }
+    // …and a run that reached **no** verdict at all is a failure too, however
+    // it got there: an emptied case list, or the session ending before the
+    // first case (#1151). See [`VERDICTS`].
+    if VERDICTS.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        println!(
+            "FAIL(nothing-measured): the runner reported 0 case verdicts — \
+             this run measured nothing and is not a pass"
+        );
         return glib::ExitCode::FAILURE;
     }
     status
@@ -383,15 +416,29 @@ enum Case {
 
 /// What a dot-matrix case puts on the display.
 ///
-/// Four, chosen to cover what the shader has to get right: the degenerate
-/// buffer, the ordinary readout, the font's fallback path, and the pitch at
-/// which the CRT comb has to be **re-phased** or it stops being a raster
-/// (#1091). Each is the same lattice arithmetic at a different corner of it.
+/// Five, chosen to cover what the shader has to get right: the degenerate
+/// buffer, the ordinary readout, the font's fallback path, and each end of the
+/// pitch clamp — the one where the CRT comb has to be **re-phased** or it stops
+/// being a raster (#1091), and the one where the vignette's band is a different
+/// number of pixels than any other case makes it. Each is the same lattice
+/// arithmetic at a different corner of it.
 #[derive(Clone, Copy)]
 enum DisplayAt {
     /// The empty string: bezel only, no strip, no lit pixel — `2*pad` × `9*dot`.
     /// The one case where `u_data_len` is `0` and the shader must draw the
     /// field rather than sample an unbound texture.
+    ///
+    /// **On the OLED this case carries no information, and that is worth
+    /// knowing rather than hiding** (#1150 review, MEDIUM-3). The kit's frame
+    /// there is 8×72 of pure black (`style.rs`'s OLED `bg` is `0, 0, 0` with no
+    /// ghost), so both sides are flat *and* black: `verdict_for` excuses both
+    /// blank guards by design — a flat reference is not evidence of an undrawn
+    /// framebuffer — and every delta is 0 for any renderer that outputs black.
+    /// Measured: under an all-black blit it is the one dot-matrix case that
+    /// still says `PASS`. It is kept rather than special-cased because the
+    /// other three skins' blank cases *do* detect, and a case list that varies
+    /// by skin is a worse thing to reason about than one case that is
+    /// vacuously green on one skin.
     Blank,
     /// An ordinary readout at the default pitch: the ghost lattice, lit glyphs,
     /// the skin's halo, and the comb where the kit's own golden digests have it.
@@ -403,6 +450,24 @@ enum DisplayAt {
     /// falloff plateau (a solid block, no rim) **and** the CRT comb is re-phased
     /// onto a 2-row grid. A fixed 4-row comb here is interference, not a raster.
     Dense,
+    /// The same readout at `MAX_DOT_PX`, the other end of the clamp — and the
+    /// only case whose short side is **not** a multiple of both 8 and 9
+    /// (#1150 review, MEDIUM-2).
+    ///
+    /// It is here for the CRT vignette rather than for the dots. The mask's
+    /// edge ramp is `band = shortSide / BAND_DIV`, and `BAND_DIV` is one of the
+    /// five constants the shader declared with no Rust counterpart. The review
+    /// measured that `9 -> 8` shipped green across the whole tree, and the
+    /// reason was arithmetic rather than a loose detector: every case's short
+    /// side was `9 * dot` for `dot` in `{2, 4}`, and `36/9 == 36/8 == 4`,
+    /// `18/9 == 18/8 == 2`. At `dot = 8` the short side is 72, where
+    /// `72/9 == 8` and `72/8 == 9` — a one-pixel-wider ramp all the way round
+    /// the bezel, against the kit's own composite, on a case that is pinned
+    /// bit-exact. `3`, `5` and `7` do **not** work here and were checked:
+    /// `27/8`, `45/8` and `63/8` all floor back onto `k`.
+    ///
+    /// It also gets the upper clamp rendered at all, which nothing did before.
+    Coarse,
 }
 
 impl DisplayAt {
@@ -413,6 +478,7 @@ impl DisplayAt {
             Self::Readout => "readout",
             Self::Notdef => "notdef",
             Self::Dense => "dense",
+            Self::Coarse => "coarse",
         }
     }
 
@@ -423,6 +489,10 @@ impl DisplayAt {
             Self::Readout => ("PREEM 88:88", DOT_PX),
             Self::Notdef => ("\u{e5}\u{e4}\u{f6} \u{1f495}", DOT_PX),
             Self::Dense => ("PREEM 88:88", DENSE_DOT_PX),
+            // Shorter than the others on purpose: at `MAX_DOT_PX` the eleven
+            // characters the rest carry would make a 528 px strip, and the only
+            // thing this case is here to move is the bezel's own short side.
+            Self::Coarse => ("88:88", COARSE_DOT_PX),
         }
     }
 }
@@ -627,6 +697,7 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
                 DisplayAt::Readout,
                 DisplayAt::Notdef,
                 DisplayAt::Dense,
+                DisplayAt::Coarse,
             ]
             .into_iter()
             .map(move |display| Case::DotMatrix {
@@ -795,6 +866,7 @@ impl Runner {
 
     /// Record a case's verdict and move to the next one.
     fn done(&self, at: usize, passed: bool) {
+        VERDICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !passed {
             self.failures.set(self.failures.get() + 1);
         }
@@ -806,6 +878,20 @@ impl Runner {
     /// The closing verdict, and the process exit status behind it.
     fn summary(&self) {
         println!("-- summary --");
+        // **An empty case list is a failure, not a pass** (#1150 review,
+        // MEDIUM-1). Without this, a `--skins` regression that silently
+        // emptied the list would print `PASS all 0 case(s)` and exit 0 — the
+        // exact shape `nix/checks/system-tests.nix`'s evidence count exists to
+        // catch, and the one a reviewer running this by hand would miss.
+        if self.cases.is_empty() {
+            println!(
+                "FAIL(empty): no cases to measure — a harness that measured nothing \
+                 has not agreed with anything"
+            );
+            FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            println!("=== preem_gl_diff done — paste this into issue #893 ===");
+            return;
+        }
         if self.failures.get() == 0 {
             // The supersampled cases are counted here — they are cases that
             // can fail like any other — but they answer to a different

@@ -347,6 +347,26 @@ mod tests {
     const SEG2_BASE: usize = 955;
     const SEG2_SLOPE: usize = 760;
 
+    /// The plateau value of the falloff, and the four fixed-point constants of
+    /// the CRT pass — the five the shader declared and nothing on this side
+    /// stated (#1150 review, MEDIUM-2).
+    ///
+    /// `CORE` is `intensity`'s `s <= 1/2` return; the other four are
+    /// `hytte-preem/src/style.rs`'s own (private) `MASK_ONE`, `COORD_ONE`,
+    /// `BAND_DIV` and `CORNER_DIV`, verbatim. They are a **copy**, like the
+    /// knots above, for the same reason: those items are private to the kit and
+    /// this crate cannot read them. What the tests buy is that a change to one
+    /// side alone goes red — and, for the two divisors, that the *behaviour*
+    /// they decide is measured against the kit's at a pitch where the two
+    /// candidate values actually differ. See
+    /// [`tests::the_shader_and_the_mapping_agree_about_the_crt_mask_constants`]
+    /// and the `DisplayAt::Coarse` harness case.
+    const CORE: usize = 255;
+    const MASK_ONE: usize = 256;
+    const COORD_ONE: usize = 1024;
+    const BAND_DIV: usize = 9;
+    const CORNER_DIV: usize = 6;
+
     /// `round(num / denom)`, half away from zero — the kit's `round_div`.
     fn round_div(num: usize, denom: usize) -> u16 {
         u16::try_from((2 * num + denom) / (2 * denom)).unwrap_or(255)
@@ -506,6 +526,45 @@ mod tests {
             ("SEG2_SLOPE", SEG2_SLOPE),
         ] {
             let wanted = format!("const float {name} = {value}.0;");
+            assert!(
+                BODY.contains(&wanted),
+                "dot_matrix.frag must declare `{wanted}`",
+            );
+        }
+    }
+
+    /// **The other five shader constants** — the plateau and the CRT pass's
+    /// fixed point — carry a Rust counterpart too (#1150 review, MEDIUM-2).
+    ///
+    /// Until this existed, `CORE`, `MASK_ONE`, `COORD_ONE`, `BAND_DIV` and
+    /// `CORNER_DIV` were declared in the GLSL and nowhere else in the tree, so
+    /// nothing could disagree with them. The review measured what that costs:
+    /// `BAND_DIV` `9 -> 8` shipped **completely green** — 755 lib tests,
+    /// `nix/lint-glsl.py`, and all 44 harness cases at `max |Δ| 0` — because
+    /// `band = shortSide / BAND_DIV` and every case's short side was `9 * dot`
+    /// for `dot` in `{2, 4}`, where `36/9 == 36/8` and `18/9 == 18/8`.
+    ///
+    /// **Falsified** by changing any of the five on either side alone. Note
+    /// what this test does *not* do: it cannot see the shader and the kit
+    /// drifting together, because the kit's copies are private. The
+    /// `dot_matrix.*.coarse` harness case is the half that can — at
+    /// `MAX_DOT_PX` the short side is 72, where `72/9 == 8` and `72/8 == 9`,
+    /// so the CRT vignette's ramp is a different width and the comparison
+    /// against the kit's own composite fails.
+    #[test]
+    fn the_shader_and_the_mapping_agree_about_the_crt_mask_constants() {
+        let wanted = format!("const float CORE = {CORE}.0;");
+        assert!(
+            BODY.contains(&wanted),
+            "dot_matrix.frag must declare `{wanted}`",
+        );
+        for (name, value) in [
+            ("MASK_ONE", MASK_ONE),
+            ("COORD_ONE", COORD_ONE),
+            ("BAND_DIV", BAND_DIV),
+            ("CORNER_DIV", CORNER_DIV),
+        ] {
+            let wanted = format!("const int {name} = {value};");
             assert!(
                 BODY.contains(&wanted),
                 "dot_matrix.frag must declare `{wanted}`",

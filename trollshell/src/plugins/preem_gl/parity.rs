@@ -40,8 +40,8 @@ pub(crate) const CEILING_MAX: f64 = 32.0;
 /// Channel names, for the transcript.
 pub(crate) const CHANNELS: [&str; 3] = ["R", "G", "B"];
 
-/// Ceiling on the **mean** |Δ| over the edge region of a supersampled case
-/// (#1148 review, HIGH-2), in 255ths.
+/// What a supersampled case's **edge** region is allowed to drift by, in
+/// 255ths (#1148 review HIGH-2; per kind since #1150's review HIGH-2).
 ///
 /// A separate budget from #893's because it is a different measurement, and
 /// saying so out loud is the point. #893's ceiling bounds two renderers drawing
@@ -49,25 +49,24 @@ pub(crate) const CHANNELS: [&str; 3] = ["R", "G", "B"];
 /// supersampled case compares a box-average of a **twice-as-dense** render
 /// against a single-sample one: on every pixel the kit anti-aliased, the two
 /// have genuinely different coverage, and that difference *is* the improvement
-/// #1090 asked for. Holding it to mean 2 would be asking the fix not to happen —
-/// measured on llvmpipe, the four shipping-scale cases come out at an edge mean
-/// of 6.1 to 9.4 with the whole rest of the frame bit-identical.
+/// #1090 and #1144 asked for. Holding it to mean 2 would be asking the fix not
+/// to happen.
 ///
-/// So this bounds the drift rather than the difference: 16 is a little under
-/// twice the worst measured, which leaves a driver room to disagree about a
-/// ramp and leaves none for a face drawn in a different place. The assertion
-/// with the teeth is [`Regions::interior_max`] — see [`case_verdict`].
-pub(crate) const SUPERSAMPLED_EDGE_MEAN: f64 = 16.0;
-
-/// Ceiling on the **single worst** edge pixel of a supersampled case, in
-/// 255ths. Measured worst on llvmpipe: 76.
-///
-/// Half of full contrast. An anti-aliased edge pixel can legitimately be most
-/// of the way from field to ink in one render and most of the way back in the
-/// other — that is what a one-pixel ramp against a half-pixel ramp *is* — but a
-/// pixel that swings further than half the palette's range is not reporting a
-/// ramp any more.
-pub(crate) const SUPERSAMPLED_EDGE_MAX: u8 = 128;
+/// So this bounds the drift rather than the difference. It is **per kind**
+/// because the two kinds' edge populations are not the same shape — a dial is
+/// about a quarter edge pixels with long smooth arcs, a dot matrix is nearly
+/// all edge with thousands of tiny round rims — and a number calibrated off one
+/// is not calibrated for the other. Each kind's pair is stated with the
+/// llvmpipe measurement it was taken from in [`Kind::edge_budget`]. The
+/// assertion with the teeth is [`Regions::interior_max`], which is zero on
+/// every kind — see [`case_verdict`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EdgeBudget {
+    /// Ceiling on the mean |Δ| over the edge region.
+    pub(crate) mean: f64,
+    /// Ceiling on the single worst edge pixel.
+    pub(crate) max: u8,
+}
 
 /// How far a column's brightest row may move, in **grid** rows, before it counts
 /// as a structural difference rather than a rounding one.
@@ -171,7 +170,7 @@ pub(crate) enum Verdict {
     /// unscaled length, a doubled mask pitch or a mis-scaled bloom does.
     InteriorMoved,
     /// A supersampled case's edge region is outside
-    /// [`SUPERSAMPLED_EDGE_MEAN`]/[`SUPERSAMPLED_EDGE_MAX`].
+    /// its kind's [`EdgeBudget`] — see [`Kind::edge_budget`].
     EdgeOverBudget,
 }
 
@@ -281,6 +280,53 @@ impl Kind {
         matches!(self, Self::Scope)
     }
 
+    /// What this kind's **supersampled** cases may drift by in the edge region
+    /// — see [`EdgeBudget`] and [`case_verdict`].
+    ///
+    /// Exhaustive, for `pinned_exact`'s reason: these are numbers, and a kind
+    /// that inherits someone else's numbers off the end of a pattern is exactly
+    /// the failure this is meant to prevent. Each pair below is stated with the
+    /// llvmpipe measurement it was calibrated from, so the next reader can tell
+    /// a budget from a wish.
+    pub(crate) fn edge_budget(self) -> EdgeBudget {
+        match self {
+            // Four `scale = 2` cases, one per skin. Measured worst on llvmpipe
+            // (Mesa 26.2.2): edge mean 9.364, edge max 76. A dial is nearly a
+            // third edge pixels and its arcs are long shallow ramps, so a
+            // single pixel can legitimately swing far: `max` is half of full
+            // contrast, the point past which a pixel is not reporting a ramp
+            // any more, and `mean` a little under twice the worst measured.
+            Self::Gauge => EdgeBudget {
+                mean: 16.0,
+                max: 128,
+            },
+            // Four stretched cases, one per skin. Measured worst on llvmpipe:
+            // edge mean 10.641 (oled, the skin with the strongest bloom and no
+            // ghost lattice), edge max 39 (crt). Tighter on `max` than the
+            // gauge and deliberately so: a dot's rim is one or two pixels wide
+            // against a flat ground, so the largest *legitimate* disagreement
+            // here is one rim step, not a long ramp. 64 is ~1.6x the worst
+            // measured; 16 on the mean is ~1.5x. An all-black blit puts every
+            // one of the four at an edge mean of 51.7 to 65.0 and a max of 180
+            // to 255, so this catches the blank render on its own even where
+            // the field is black and the two blank guards cannot.
+            Self::DotMatrix => EdgeBudget {
+                mean: 16.0,
+                max: 64,
+            },
+            // No supersampled scope case exists: the scope's GL grid *is* the
+            // kit's upscaled buffer, so there is nothing to render denser. This
+            // arm is the compiler forcing a decision rather than a measurement,
+            // and it is deliberately the tighter of the two pairs — whoever
+            // adds a supersampled scope case should see it go red and come back
+            // here with their own numbers, not find it quietly accommodated.
+            Self::Scope => EdgeBudget {
+                mean: 16.0,
+                max: 64,
+            },
+        }
+    }
+
     /// The word the transcript prints.
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -381,9 +427,8 @@ pub(crate) fn case_verdict(
             if regions.interior_max() > 0 {
                 return Verdict::InteriorMoved;
             }
-            if regions.edge.mean > SUPERSAMPLED_EDGE_MEAN
-                || regions.edge.max > SUPERSAMPLED_EDGE_MAX
-            {
+            let budget = kind.edge_budget();
+            if regions.edge.mean > budget.mean || regions.edge.max > budget.max {
                 return Verdict::EdgeOverBudget;
             }
             Verdict::Pass
@@ -1003,7 +1048,7 @@ fn distribution(deltas: &mut [u8]) -> ChannelStats {
 mod tests {
     use super::{
         CEILING_MAX, CEILING_MEAN, CEILING_P99, ChannelStats, Flatness, Kind, Layout, RegionStats,
-        Regions, SUPERSAMPLED_EDGE_MEAN, Sampling, Stats, Verdict, box_downsample, case_verdict,
+        Regions, Sampling, Stats, Verdict, box_downsample, case_verdict,
         compare, distribution, peak_row_tolerance, regions,
     };
 
@@ -1158,7 +1203,7 @@ mod tests {
         );
 
         let mut wild_edges = clean_regions();
-        wild_edges.edge.mean = SUPERSAMPLED_EDGE_MEAN + 0.5;
+        wild_edges.edge.mean = Kind::Gauge.edge_budget().mean + 0.5;
         assert_eq!(
             case_verdict(
                 &edgy,
@@ -1185,6 +1230,48 @@ mod tests {
             Verdict::Pass,
             "…and the numbers llvmpipe actually measures pass, over #893's mean of 2 \
              on the worst-channel statistic and clean everywhere but the edges",
+        );
+
+        // The same three statements for #1144's kind, against **its** budget.
+        let mut dots = clean_regions();
+        dots.edge.mean = 10.641;
+        dots.edge.max = 39;
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &dots,
+                Kind::DotMatrix,
+                Sampling::Supersampled(2),
+                true,
+            ),
+            Verdict::Pass,
+            "the stretched dot matrix's own worst llvmpipe measurement passes",
+        );
+        let mut dots_over = dots;
+        dots_over.edge.max = Kind::DotMatrix.edge_budget().max + 1;
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &dots_over,
+                Kind::DotMatrix,
+                Sampling::Supersampled(2),
+                true,
+            ),
+            Verdict::EdgeOverBudget,
+            "…and one 255th past its max is over budget",
+        );
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &dots_over,
+                Kind::Gauge,
+                Sampling::Supersampled(2),
+                true,
+            ),
+            Verdict::Pass,
+            "**the budget is per kind, not shared**: the very same edge region is \
+             inside the gauge's wider max and outside the dot matrix's, which is the \
+             whole reason `Kind::edge_budget` exists rather than one constant",
         );
         assert_eq!(
             case_verdict(
@@ -1278,13 +1365,42 @@ mod tests {
             },
             ..inside_by(0.0)
         };
+        // **Both samplings, every kind** (#1150 review, HIGH-1). #1144's first
+        // cut returned early for a supersampled case and threw the whole
+        // verdict away with the two blank guards inside it, which let an
+        // all-black `dot_matrix.oled.readoutx2` pass a framebuffer nothing had
+        // drawn into — the OLED's field is `0, 0, 0`, so "the flat ground did
+        // not move" is black against black and cannot fail. The guards live
+        // above the `Sampling` match now, so the loop below is the assertion.
         for sampling in [Sampling::OneToOne, Sampling::Supersampled(2)] {
-            assert_eq!(
-                case_verdict(&blank, &clean_regions(), Kind::Gauge, sampling, true),
-                Verdict::RendersNothing,
-                "a gauge that drew nothing is bit-exactly nothing — the guard, not the \
-                 standard behind it",
-            );
+            for kind in Kind::ALL {
+                assert_eq!(
+                    case_verdict(&blank, &clean_regions(), kind, sampling, true),
+                    Verdict::RendersNothing,
+                    "a {} that drew nothing is bit-exactly nothing — the guard, not the \
+                     standard behind it, and a supersampled case is exempt from the \
+                     ceiling, not from having drawn something",
+                    kind.label(),
+                );
+            }
+        }
+        // The same for the weaker of the two: one flat non-black colour.
+        let one_colour = Stats {
+            gl: Flatness {
+                uniform: true,
+                all_zero: false,
+            },
+            ..inside_by(0.0)
+        };
+        for sampling in [Sampling::OneToOne, Sampling::Supersampled(2)] {
+            for kind in Kind::ALL {
+                assert_eq!(
+                    case_verdict(&one_colour, &clean_regions(), kind, sampling, true),
+                    Verdict::UndrawnFramebuffer,
+                    "{}: a flat GL frame against a structured reference, at any sampling",
+                    kind.label(),
+                );
+            }
         }
     }
 

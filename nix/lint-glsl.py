@@ -245,11 +245,11 @@ MIN_SHADERS = 8
 # splice, which is luck rather than a guard.
 #
 # Since #893 this counts all three groups (8 preem files → 11 compilations,
-# plus 1 widget stage and 1 widget body). Bumped 7 → 9 with them rather than
-# left with two compilations of slack: the whole point of a floor at the current
-# count is that it cannot tolerate a deletion, and the two per-group floors
-# below do not add up to this one on their own. 11 → 13 with #1144's
-# `dot_matrix.frag`, which is a third doubly-spliced body.
+# plus 1 widget stage and 1 widget body). It is kept at the current count rather
+# than left with slack: the whole point of a floor there is that it cannot
+# tolerate a deletion, and the two per-group floors below do not add up to this
+# one on their own. It moved 7 → 9 when #893 added the widget groups and
+# 11 → 13 with #1144's `dot_matrix.frag`, which is a third doubly-spliced body.
 MIN_COMPILATIONS = 13
 # Distinct bodies that must be spliced rather than compiled as written.
 MIN_SPLICED_BODIES = 3

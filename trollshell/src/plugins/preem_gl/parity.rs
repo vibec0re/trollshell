@@ -590,6 +590,26 @@ impl Verdict {
     }
 }
 
+/// "Is this frame one flat colour, and is that colour black?" — asked of the
+/// GL readback and of the kit's reference, because since #1144 the guards
+/// compare the two answers rather than reading the GL one alone.
+///
+/// A struct rather than two more `bool` fields on [`Stats`]: the pair is one
+/// observation made twice, and spelling it that way is what keeps the verdict's
+/// condition readable (`self.gl.uniform && !self.reference.uniform`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Flatness {
+    /// Every compared pixel of this frame carries the same colour.
+    pub(crate) uniform: bool,
+    /// Every compared pixel of this frame is `0, 0, 0`.
+    ///
+    /// A strict subset of [`Self::uniform`], carried separately because it is
+    /// the one failure shape a reader has to be told by name: "the GL arm drew
+    /// nothing" is a different bug report from "the GL arm drew a flat colour",
+    /// and #1070's M2 is specifically the first.
+    pub(crate) all_zero: bool,
+}
+
 /// One comparison's full result.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Stats {
@@ -615,23 +635,16 @@ pub(crate) struct Stats {
     ///
     /// On its own this is a statement about the GL side only. It becomes a
     /// *verdict* in [`verdict_for`](Self::verdict_for), and only against a
-    /// reference that is not itself flat — see [`Self::reference_uniform`].
-    pub(crate) uniform: bool,
-    /// Every compared GL pixel is `0, 0, 0` — see [`Verdict::RendersNothing`].
-    ///
-    /// A strict subset of [`Self::uniform`], reported separately because it is
-    /// the one failure shape a reader has to be told by name: "the GL arm drew
-    /// nothing" is a different bug report from "the GL arm drew a flat
-    /// colour", and #1070's M2 is specifically the first.
-    pub(crate) all_zero: bool,
+    /// reference that is not itself flat — see [`Self::reference`].
+    pub(crate) gl: Flatness,
     /// The same two questions, asked of the **kit's own frame** (#1144).
     ///
-    /// The two guards above were written when every case's reference was
-    /// guaranteed to have structure — a `Scope` always paints a graticule, a
-    /// `Gauge` always paints an arc. #1144's dot matrix broke that assumption
-    /// honestly: an **empty** display is a bezel and nothing else, so the kit's
-    /// own frame is one flat colour, and on the OLED (whose field is `0, 0, 0`)
-    /// it is flat *black*. Measured, all four blank cases reported
+    /// The two guards were written when every case's reference was guaranteed
+    /// to have structure — a `Scope` always paints a graticule, a `Gauge`
+    /// always paints an arc. #1144's dot matrix broke that assumption honestly:
+    /// an **empty** display is a bezel and nothing else, so the kit's own frame
+    /// is one flat colour, and on the OLED (whose field is `0, 0, 0`) it is
+    /// flat *black*. Measured, all four blank cases reported
     /// `FAIL(blank)`/`FAIL(nothing)` at max |Δ| **0** — the guards firing on a
     /// correct render.
     ///
@@ -642,9 +655,7 @@ pub(crate) struct Stats {
     /// loud, is a GL arm that drew nothing for a state whose reference is
     /// *also* flat black; there the two are indistinguishable by pixels, and
     /// the case's siblings are what carry the detection.
-    pub(crate) reference_uniform: bool,
-    /// …and the black half of it — see [`Self::reference_uniform`].
-    pub(crate) reference_all_zero: bool,
+    pub(crate) reference: Flatness,
     /// The single worst compared pixel, for the transcript: where it is, which
     /// channel, and what each arm put there.
     ///
@@ -706,10 +717,10 @@ impl Stats {
         // not", and a state whose kit frame is genuinely one colour — an empty
         // dot matrix is a bezel and nothing else — is not evidence of an
         // undrawn framebuffer. See `Stats::reference_uniform`.
-        if self.all_zero && !self.reference_all_zero {
+        if self.gl.all_zero && !self.reference.all_zero {
             return Verdict::RendersNothing;
         }
-        if self.uniform && !self.reference_uniform {
+        if self.gl.uniform && !self.reference.uniform {
             return Verdict::UndrawnFramebuffer;
         }
         if !self
@@ -859,22 +870,27 @@ pub(crate) fn compare(gl: &[u8], reference: &[u8], layout: Layout) -> Stats {
         channels: std::array::from_fn(|channel| distribution(&mut deltas[channel])),
         pixels: ref_w * ref_h,
         peak_row_mismatches,
-        // An empty comparison is not "uniform", it is nothing at all — but it
-        // is still not a frame, so it fails the same way.
-        uniform: uniform || empty,
-        // A readback that never arrived reads as zeros through `gl_pixel`,
-        // which is the same report as one that arrived full of them: in both
-        // the GL arm put no pixels in front of the comparison.
-        all_zero,
-        // The reference's own flatness, and `&& !empty` on both because these
-        // two only ever **excuse** the guards above. An empty comparison has no
-        // reference to be flat: left to the loop's initialisers it would come
-        // out `true` on both and excuse the `uniform || empty` right above it,
-        // turning "nothing at all was compared" into a `Pass`. That is the one
-        // way this change could have loosened a guard, so it is spelled out
-        // here and pinned by `an_empty_comparison_is_not_excused_by_a_flat_reference`.
-        reference_uniform: reference_uniform && !empty,
-        reference_all_zero: reference_all_zero && !empty,
+        gl: Flatness {
+            // An empty comparison is not "uniform", it is nothing at all — but
+            // it is still not a frame, so it fails the same way.
+            uniform: uniform || empty,
+            // A readback that never arrived reads as zeros through `gl_pixel`,
+            // which is the same report as one that arrived full of them: in
+            // both the GL arm put no pixels in front of the comparison.
+            all_zero,
+        },
+        // The reference's own flatness, and `&& !empty` on both because this
+        // half only ever **excuses** the guards above. An empty comparison has
+        // no reference to be flat: left to the loop's initialisers it would
+        // come out `true` on both and excuse the `uniform || empty` right above
+        // it, turning "nothing at all was compared" into a `Pass`. That is the
+        // one way #1144's change could have loosened a guard, so it is spelled
+        // out here and pinned by
+        // `an_empty_comparison_is_not_excused_by_a_flat_reference`.
+        reference: Flatness {
+            uniform: reference_uniform && !empty,
+            all_zero: reference_all_zero && !empty,
+        },
         worst,
     }
 }
@@ -968,9 +984,9 @@ fn distribution(deltas: &mut [u8]) -> ChannelStats {
 #[cfg(test)]
 mod tests {
     use super::{
-        CEILING_MAX, CEILING_MEAN, CEILING_P99, ChannelStats, Kind, Layout, RegionStats, Regions,
-        SUPERSAMPLED_EDGE_MEAN, Sampling, Stats, Verdict, box_downsample, case_verdict, compare,
-        distribution, peak_row_tolerance, regions,
+        CEILING_MAX, CEILING_MEAN, CEILING_P99, ChannelStats, Flatness, Kind, Layout, RegionStats,
+        Regions, SUPERSAMPLED_EDGE_MEAN, Sampling, Stats, Verdict, box_downsample, case_verdict,
+        compare, distribution, peak_row_tolerance, regions,
     };
 
     /// A `Stats` whose **worst pixel** is `delta` 255ths off on every channel,
@@ -990,13 +1006,11 @@ mod tests {
             channels: [channel, channel, channel],
             pixels: 1,
             peak_row_mismatches: 0,
-            uniform: false,
-            all_zero: false,
+            gl: Flatness::default(),
             // A reference with structure, which is what every kind but an empty
             // dot matrix has — so the two guards keep meaning what they meant
             // before #1144 in every test that builds on this.
-            reference_uniform: false,
-            reference_all_zero: false,
+            reference: Flatness::default(),
             worst: None,
         }
     }
@@ -1225,8 +1239,10 @@ mod tests {
             );
         }
         let blank = Stats {
-            uniform: true,
-            all_zero: true,
+            gl: Flatness {
+                uniform: true,
+                all_zero: true,
+            },
             ..inside_by(0.0)
         };
         for sampling in [Sampling::OneToOne, Sampling::Supersampled(2)] {
@@ -1254,35 +1270,42 @@ mod tests {
     /// arm that drew nothing against a reference with any structure at all
     /// still trips, exactly as it did before.
     ///
-    /// **Falsified** by dropping either `&& !self.reference_*` from
+    /// **Falsified** by dropping either `&& !self.reference.*` from
     /// [`Stats::verdict_for`] (the first and third go red), or by widening
     /// either to excuse a structured reference (the second and fourth).
     #[test]
     fn a_flat_gl_frame_is_excused_only_by_a_flat_reference() {
-        let flat = |gl_flat: bool, gl_black: bool, ref_flat: bool, ref_black: bool| Stats {
-            uniform: gl_flat,
-            all_zero: gl_black,
-            reference_uniform: ref_flat,
-            reference_all_zero: ref_black,
+        let flat = |gl: Flatness, reference: Flatness| Stats {
+            gl,
+            reference,
             ..inside_by(0.0)
         };
+        let structured = Flatness::default();
+        let one_colour = Flatness {
+            uniform: true,
+            all_zero: false,
+        };
+        let black = Flatness {
+            uniform: true,
+            all_zero: true,
+        };
         assert_eq!(
-            flat(true, false, true, false).verdict_for(Kind::DotMatrix),
+            flat(one_colour, one_colour).verdict_for(Kind::DotMatrix),
             Verdict::Pass,
             "an empty display: one flat colour on both sides, and they agree",
         );
         assert_eq!(
-            flat(true, false, false, false).verdict_for(Kind::DotMatrix),
+            flat(one_colour, structured).verdict_for(Kind::DotMatrix),
             Verdict::UndrawnFramebuffer,
             "…but a flat GL frame against a reference with structure still trips",
         );
         assert_eq!(
-            flat(true, true, true, true).verdict_for(Kind::DotMatrix),
+            flat(black, black).verdict_for(Kind::DotMatrix),
             Verdict::Pass,
             "an empty OLED display, whose field is literally black",
         );
         assert_eq!(
-            flat(true, true, false, false).verdict_for(Kind::DotMatrix),
+            flat(black, structured).verdict_for(Kind::DotMatrix),
             Verdict::RendersNothing,
             "…and a GL arm that drew nothing at all still trips, unchanged",
         );
@@ -1304,11 +1327,11 @@ mod tests {
     fn an_empty_comparison_is_not_excused_by_a_flat_reference() {
         let stats = compare(&[], &[], Layout::for_capture((0, 0), (0, 0), 1, 1));
         assert!(
-            stats.uniform && stats.all_zero,
+            stats.gl.uniform && stats.gl.all_zero,
             "the premise: an empty comparison reads flat and black",
         );
         assert!(
-            !stats.reference_uniform && !stats.reference_all_zero,
+            !stats.reference.uniform && !stats.reference.all_zero,
             "…and has no flat reference to be excused by",
         );
         assert_eq!(
@@ -1603,7 +1626,7 @@ mod tests {
         let stats = compare(&gl, &cpu, layout(w, h));
         assert_eq!(stats.verdict_for(Kind::Scope), Verdict::Pass);
         assert_eq!(stats.peak_row_mismatches, 0);
-        assert!(!stats.uniform);
+        assert!(!stats.gl.uniform);
         for (channel, name) in stats.channels.iter().zip(super::CHANNELS) {
             assert!(
                 (channel.mean, channel.p99, channel.max) == (0.0, 0.0, 0.0),
@@ -1628,8 +1651,8 @@ mod tests {
         // A *flat colour* that is not black: uniform, but something was drawn.
         let flat = flipped(w, h, |_, _| [0x20, 0x00, 0x40]);
         let stats = compare(&flat, &cpu, layout(w, h));
-        assert!(stats.uniform, "every pixel the same colour");
-        assert!(!stats.all_zero, "…but not zero");
+        assert!(stats.gl.uniform, "every pixel the same colour");
+        assert!(!stats.gl.all_zero, "…but not zero");
         assert_eq!(stats.verdict_for(Kind::Scope), Verdict::UndrawnFramebuffer);
     }
 
@@ -1662,7 +1685,7 @@ mod tests {
         let black = vec![0u8; w * h * 4];
 
         let bright = compare(&black, &frame(w, h, trace(4)), layout(w, h));
-        assert!(bright.all_zero, "every compared pixel is 0,0,0");
+        assert!(bright.gl.all_zero, "every compared pixel is 0,0,0");
         assert_eq!(bright.verdict_for(Kind::Scope), Verdict::RendersNothing);
 
         // The dangerous half: a nearly-black reference, where the *deltas*
@@ -1992,7 +2015,7 @@ mod tests {
             channels: [inside, inside, inside],
             pixels: 1,
             peak_row_mismatches: 0,
-            uniform: false,
+            gl: Flatness::default(),
             ..Stats::default()
         };
         assert_eq!(stats.verdict_for(Kind::Scope), Verdict::Pass);

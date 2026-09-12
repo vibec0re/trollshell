@@ -2022,6 +2022,81 @@ session.
      every other case stays green), so on glass this is a second pair of eyes
      rather than the only one.
 
+- [ ] **(#1144 / #865)** **`DotMatrix` renders on a `GtkGLArea`, with the dot
+      lattice drawn at the fragment's own resolution.** Third kind on the
+      `Scope` seam, same kill switch, same context-failure fallback — and the
+      last for now: Annika asked for the gauge and the dot matrix and then a
+      stop (#865, "but lets pause after those"), so the remaining kinds
+      (seven-seg, split flap, LED strip and matrix, marquee, textbox) still
+      draw on the kit.
+
+      **The improvement is not the gauge's, and that is the thing to look for.**
+      There is no `scale` on a dot matrix — the dot pitch *is* the size knob
+      (#1091) — so both arms always fill the same buffer and there is no #1090
+      smear to fix. What is resolution-dependent here is the **dot**: the kit
+      stamps each set font pixel as a `dot_px`×`dot_px` block read out of a
+      fixed integer table, so a chip that layout scales above its natural size
+      (`GlSurface::measure` requests a minimum of `0` on both axes on purpose —
+      "so CSS/layout can scale the surface above its grid size, which is the
+      whole LCD look") magnifies those blocks with nearest-neighbour scaling.
+      The GL arm evaluates the kit's own falloff law at the fragment's
+      continuous position on the lattice instead, so the dots stay round at
+      whatever size the chip is given.
+
+      What CI already holds: the mapping (the golden uniform table, the buffer
+      formula at every pitch and length, the pitch clamp, the CRT comb's
+      re-phase onto the dot grid, the glyph strip against the kit's own font
+      including its `NOTDEF` fallback, the skin's un-halved halo), the node
+      shape, the strip's sharing across mapping passes and its re-encode on a
+      new line, the kill switch, the context-failure rebuild, and — under
+      llvmpipe in `checks.system-tests` — sixteen dot-matrix parity cases (four
+      skins × blank / readout / notdef / dense). All sixteen came out
+      **byte-identical** on Mesa 26.2.2 (max |Δ| 0 of 255 on every channel), so
+      they are pinned there with the scope's; the ceiling (mean 2 / p99 8 /
+      max 32) is what a real driver answers to.
+
+      What only glass can answer is what the harness cannot see at 1:1.
+
+  1. **The readout is unchanged at its natural size.** Start the shell and open
+     a card with a dot-matrix readout (`hytte-plugin-preem-demo`, or any plugin
+     with one — the timer, the departures board). At its natural size this
+     should be **indistinguishable** from before, and that is the expected
+     result, not a disappointment: it is what the sixteen bit-exact cases say.
+     Anything visibly different at 1:1 is a bug.
+  2. **The dots are round when the chip is stretched.** The improvement shows
+     where CSS or layout gives the surface more room than its grid — widen the
+     card, or put a readout in a container that stretches it. The GL arm should
+     read as round dots with soft rims at the screen's resolution; the CPU arm
+     (restart with `TROLLSHELL_PREEM_RENDERER=cpu` in the **unit's**
+     environment — it is read once, at the first widget build) should read as
+     magnified square blocks. If they look the same, the surface was not
+     actually being stretched; check that the chip is not sized to exactly its
+     natural width.
+  3. **The halo behind a stretched display is still grid-resolution.** Known
+     and deliberate: the bloom is sampled out of the blurred offscreen texture,
+     which is grid-sized, so a stretched display has sharp dots over a blocky
+     halo. It is a diffuse low-contrast wash and should not read as blocky —
+     but if it does, say so on #1144, because the fix is one texture filter.
+  4. **The dense pitch.** A readout at `dot_px = 2` is the kit's documented
+     "bitmap font, not a dot matrix" floor (all four pixels of a cell sit on
+     the falloff plateau, so a dot is a solid block and two adjacent lit pixels
+     merge with no seam). The GL arm must reproduce that, not "improve" it into
+     visible dots at 1:1 — that would mean the pixel-centre snap is not
+     happening. Stretched, it _should_ round off.
+  5. **The CRT comb follows the pitch.** Walk the four skins with dot-matrix
+     readouts at two different pitches on screen at once. The CRT's scanline
+     comb is re-phased onto each surface's own dot grid (`Mask::with_pitch`,
+     #1091) — one dark line in the seam below each dot row — so the two
+     readouts should each show one comb line per dot row, at _different_ screen
+     pitches. A comb that is the same absolute pitch on both means the
+     re-phase was dropped.
+  6. **The fallback, if you can provoke it.** Force a context failure and
+     confirm the readout falls back to the CPU kit with one journal line rather
+     than a blank chip. This kind is the **strongest** case for the hook of the
+     three: a gauge at least animates while its needle swings and a scope while
+     its trail fades, but a dot matrix never animates at all, so no mapping
+     pass is ever coming on its own.
+
 - [ ] **(#893)** **The shader widget: a plugin's own GLSL on the GPU.** A
       plugin ships a fragment body plus a data buffer; the shell compiles the
       body once and per frame re-uploads only the buffer. Everything up to the

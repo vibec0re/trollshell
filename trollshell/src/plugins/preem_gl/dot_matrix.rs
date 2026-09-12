@@ -276,7 +276,10 @@ pub(crate) fn dot_matrix_surface(
             values: vec![
                 ("u_dot", GlValue::Int(int_of(dot))),
                 ("u_cells", GlValue::Int(int_of(glyphs.cells))),
-                ("u_ghost_on", GlValue::Int(i32::from(palette.ghost.is_some()))),
+                (
+                    "u_ghost_on",
+                    GlValue::Int(i32::from(palette.ghost.is_some())),
+                ),
                 (
                     "u_ghost",
                     channels(palette.ghost.unwrap_or([0, 0, 0, 0xff])),
@@ -466,12 +469,7 @@ mod tests {
                             palette.bg
                         };
                         let got = pixel(&frame, x, y);
-                        assert_eq!(
-                            got,
-                            want,
-                            "{}, pitch {dot}, pixel ({x},{y})",
-                            style.name(),
-                        );
+                        assert_eq!(got, want, "{}, pitch {dot}, pixel ({x},{y})", style.name());
                     }
                 }
             }
@@ -720,9 +718,9 @@ mod tests {
         ] {
             let palette = kit::palette_snapshot(style);
             let surface = dot_matrix_surface(config(name, 4), &glyphs("8"), &palette);
-            let (radius, strength) = palette
-                .bloom
-                .map_or((0, 0), |b| (i32::try_from(b.radius).unwrap_or(0), b.strength));
+            let (radius, strength) = palette.bloom.map_or((0, 0), |b| {
+                (i32::try_from(b.radius).unwrap_or(0), b.strength)
+            });
             assert_eq!(
                 uniform(&surface.uniforms, "u_bloom_radius"),
                 GlValue::Int(radius),
@@ -836,7 +834,11 @@ mod tests {
             DOT_MATRIX_PIPELINE.step.is_empty(),
             "a dot matrix carries no cross-frame GPU state at all",
         );
-        assert_eq!(DOT_MATRIX_PIPELINE.frame.len(), 4, "lit, blur H, blur V, blit");
+        assert_eq!(
+            DOT_MATRIX_PIPELINE.frame.len(),
+            4,
+            "lit, blur H, blur V, blit"
+        );
         assert_eq!(DOT_MATRIX_PIPELINE.frame[0].target, GlTarget::Aux(0));
         assert_eq!(DOT_MATRIX_PIPELINE.frame[0].inputs, &[GlInput::Data]);
         assert_eq!(DOT_MATRIX_PIPELINE.frame[1].inputs, &[GlInput::Aux(0)]);
@@ -864,7 +866,10 @@ mod tests {
             }
             for input in pass.inputs {
                 if let GlInput::Aux(index) = input {
-                    assert!(usize::from(*index) < declared, "aux {index} is not declared");
+                    assert!(
+                        usize::from(*index) < declared,
+                        "aux {index} is not declared"
+                    );
                 }
             }
         }

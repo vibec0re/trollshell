@@ -789,15 +789,12 @@ self:
                 - `pet` (hytte-plugin-pet): `PET_NAME` (display name),
                   `PET_LLM_URL` (opt into a local llama-server brain — the API
                   *key* is a `secrets` slot, not env).
-                - `usage` (hytte-plugin-usage): `TROLLSHELL_USAGE_DASHBOARD_URL`
-                  (the Grafana public-dashboard URL — the value that flips the
-                  card from empty-state to live).
                 - `weather` (hytte-plugin-weather): `TROLLSHELL_WEATHER_CITY`
                   (geocoded fallback when GeoClue is unavailable — usually set
                   session-wide via `programs.trollshell.weather.fallbackCity`
                   instead of per-plugin here).
 
-                The full inventory — swept from source, all 14 bundled
+                The full inventory — swept from source, all 13 bundled
                 plugins including the ones with zero knobs — is published at
                 <https://vibec0re.github.io/trollshell/plugin-env.html>
                 (source: `docs/plugin-env.md`). An absolute URL rather than a
@@ -805,9 +802,9 @@ self:
                 `nixos-option` and `man home-configuration.nix`, where a
                 relative `plugin-env.html` link would resolve to nothing.
 
-                Precedence for a plugin that also reads a config file (e.g.
-                usage's `~/.config/trollshell/usage.toml`): environment (this
-                option) wins over the file, which wins over the built-in default.
+                Precedence for a plugin that also reads a config file for the
+                same setting: environment (this option) wins over the file,
+                which wins over the built-in default.
               '';
             };
 
@@ -899,7 +896,7 @@ self:
 
         The bundled ids are: agents, audio-widget, bar-clock-demo, caw,
         clock-demo, departures, infobroker, niri-layouts, pet, preem-demo,
-        terminal, timer, usage, weather (each output named
+        terminal, timer, weather (each output named
         `hytte-plugin-<id>`). Their per-plugin runtime knobs go through
         `env` / `secrets` above.
 
@@ -1049,4 +1046,30 @@ self:
       '';
     };
   };
+
+  # hytte-plugin-usage was deleted in #1200 (#320's Claude usage-limits
+  # monitor — a Grafana public-dashboard poll that never had a real
+  # dashboard URL to point at, so it only ever rendered its own canned
+  # empty state). `plugins` is an `attrsOf` submodule keyed by an arbitrary
+  # id string, so "usage" was never a declared option path and
+  # `lib.mkRemovedOptionModule` (used above for the retired `claudeBridge`
+  # option) has nothing to attach to — a config that still writes
+  # `programs.trollshell.plugins.usage = { ... };` would otherwise just
+  # render a launch-state entry naming a `package` nobody built. Assert
+  # instead, unconditionally (not behind `lib.mkIf`) so both platform
+  # modules' `nix flake check` fixtures see it regardless of what else the
+  # fixture configures — see nix/nixos-module.nix's `nlConfigured` /
+  # flake.nix's `nixos-module-nightlight` for the same shape used for a
+  # different removed knob.
+  config.assertions = [
+    {
+      assertion = !(config.programs.trollshell.plugins ? usage);
+      message = ''
+        programs.trollshell.plugins.usage is set, but hytte-plugin-usage was
+        removed in #1200 — it never had a real Grafana dashboard URL to poll
+        (#320) and only ever rendered its own empty state. Drop
+        programs.trollshell.plugins.usage from your config.
+      '';
+    }
+  ];
 }

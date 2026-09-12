@@ -83,28 +83,51 @@ impl Service for NiriService {
         // restart-safe: every run reconnects from scratch and the compositor,
         // not this process, holds the state it republishes.
         spawn_supervised_blocking("niri", move || {
-            // Reconnect on `retry::RECONNECT_RETRY`'s ramp with the streak
-            // latched, rather than a flat 1s with a `warn!` per attempt (#1170
-            // item 4). The case that matters is a **missing** `NIRI_SOCKET`:
-            // `Socket::connect` fails instantly, so the old loop was 1 Hz of
-            // identical warnings, forever, on a condition nothing here can fix.
-            let mut reporter = retry::ReconnectReporter::new();
-            loop {
-                let started = Instant::now();
-                let outcome = listen_once(
-                    &ws_writer,
-                    &win_list_writer,
-                    &win_focus_writer,
-                    &casts_writer,
-                    &screenshot_writer,
-                );
-                let (_report, delay) =
-                    reconnect_after(&mut reporter, started.elapsed(), outcome.as_ref());
-                thread::sleep(delay);
-            }
+            listen_sessions(
+                || {
+                    listen_once(
+                        &ws_writer,
+                        &win_list_writer,
+                        &win_focus_writer,
+                        &casts_writer,
+                        &screenshot_writer,
+                    )
+                },
+                thread::sleep,
+            );
         });
 
         handles
+    }
+}
+
+/// Redial the event stream forever, reconnecting on a capped ramp.
+///
+/// Reconnect on `retry::RECONNECT_RETRY`'s ramp with the streak latched, rather
+/// than a flat 1s with a `warn!` per attempt (#1170 item 4). The case that
+/// matters is a **missing** `NIRI_SOCKET`: `Socket::connect` fails instantly, so
+/// the old loop was 1 Hz of identical warnings, forever, on a condition nothing
+/// here can fix.
+///
+/// Never returns: the only way out is a panic, which is what the supervisor
+/// above is for.
+///
+/// **Both parameters exist so the wait can be asserted.** `reconnect_after`
+/// returns the delay and this loop has to actually wait it — one statement that
+/// is the entire content of #1170 item 4, and that a test reading only
+/// `reconnect_after`'s return value is blind to. With the waiter injected, a
+/// counting stub records what the loop waited between attempts.
+fn listen_sessions<L, S>(listen: L, sleep: S)
+where
+    L: Fn() -> Result<()>,
+    S: Fn(Duration),
+{
+    let mut reporter = retry::ReconnectReporter::new();
+    loop {
+        let started = Instant::now();
+        let outcome = listen();
+        let (_report, delay) = reconnect_after(&mut reporter, started.elapsed(), outcome.as_ref());
+        sleep(delay);
     }
 }
 
@@ -1006,6 +1029,7 @@ pub fn reflow_workspace(workspace: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex, PoisonError};
 
     // ── The reconnect ramp and its latched warn (#1170 item 4) ───────────────
 
@@ -1060,6 +1084,73 @@ mod tests {
                 "the ramp is flat across a streak: {delays:?}"
             );
         }
+    }
+
+    /// #1170's item 4, the **wiring** rather than the helper: the loop has to
+    /// actually wait the delay `reconnect_after` computed.
+    ///
+    /// The two tests above assert what `reconnect_after` *returns*, which is why
+    /// `thread::sleep(delay);` could be deleted from this loop (and from
+    /// `audio_native`'s twin) with the whole crate's suite green and clippy
+    /// silent — the 1 Hz redial storm this item exists to kill, reintroducible
+    /// for free. Five turns through `listen_sessions` with a counting stub in
+    /// the waiter's place, asserting the waits themselves.
+    ///
+    /// Costs no wall clock: the stub records and returns, so the 15.5s the real
+    /// ramp would spend here never happens.
+    ///
+    /// Falsify by dropping `sleep(delay);` from `listen_sessions` (bind
+    /// `_delay` so it still compiles): nothing is recorded and this fails.
+    #[test]
+    fn the_listen_loop_waits_the_redial_delay_it_computed() {
+        /// Enough turns to watch the ramp climb, and well short of the 30s
+        /// ceiling so a clamp bug shows as a wrong value, not a repeated one.
+        const TURNS: usize = 5;
+
+        let recorded: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+        let waits = Arc::clone(&recorded);
+        thread::spawn(move || {
+            listen_sessions(
+                || Err(missing_socket()),
+                move |delay| {
+                    let mut v = waits.lock().unwrap_or_else(PoisonError::into_inner);
+                    v.push(delay);
+                    let done = v.len() >= TURNS;
+                    drop(v);
+                    if done {
+                        // `listen_sessions` never returns by design; park the
+                        // thread rather than spin it for the rest of the binary
+                        // (`park` may wake spuriously, hence the loop).
+                        loop {
+                            thread::park();
+                        }
+                    }
+                },
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && recorded.lock().unwrap_or_else(PoisonError::into_inner).len() < TURNS
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let waited = recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            waited,
+            vec![
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+            ],
+            "the listen loop did not wait `reconnect_after`'s ramp between redials"
+        );
     }
 
     /// The other half: the streak is *one* incident, so the ramp does not reset

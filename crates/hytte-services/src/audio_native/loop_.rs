@@ -147,14 +147,42 @@ fn session_receiver(slot: &Mutex<Option<pw::channel::Receiver<Command>>>) -> Rec
 /// never returns, and the only way out is a panic, which is what supervision is
 /// for.
 fn run_sessions(slot: &Mutex<Option<pw::channel::Receiver<Command>>>, handles: &PipewireHandles) {
+    run_sessions_with(
+        slot,
+        |rx| run_once(clone_handles(handles), rx),
+        thread::sleep,
+    );
+}
+
+/// [`run_sessions`]'s body, with the session and the **waiter** injected.
+///
+/// The waiter is a parameter because nothing else can pin it. `reconnect_after`
+/// is thoroughly tested and returns the right delay; the loop then has to
+/// actually wait it, and that one statement is the whole of #1170's items 3
+/// and 4 — deleting it reintroduces the hot respawn loop those items exist to
+/// kill. A test that only reads `reconnect_after`'s return value cannot see
+/// that, and clippy has nothing to say about a discarded `Duration` that is
+/// still passed to a `let`. With the waiter injected, a counting stub records
+/// what the loop waited and the assertion is on the wait itself.
+///
+/// `session` is injected for the ordinary reason: `run_once` needs a live
+/// `PipeWire`.
+fn run_sessions_with<R, S>(
+    slot: &Mutex<Option<pw::channel::Receiver<Command>>>,
+    session: R,
+    sleep: S,
+) where
+    R: Fn(pw::channel::Receiver<Command>) -> (pw::channel::Receiver<Command>, SessionEnd),
+    S: Fn(std::time::Duration),
+{
     let mut reporter = retry::ReconnectReporter::new();
     loop {
         let receiver = session_receiver(slot);
         let started = Instant::now();
-        let (returned_rx, end) = run_once(clone_handles(handles), receiver);
+        let (returned_rx, end) = session(receiver);
         *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(returned_rx);
         let (_report, delay) = reconnect_after(&mut reporter, started.elapsed(), &end);
-        thread::sleep(delay);
+        sleep(delay);
     }
 }
 
@@ -1078,14 +1106,15 @@ pub(super) fn send_command(cmd: Command) {
 mod tests {
     use super::{
         COMMAND_TX, Command, PW_INIT, SessionEnd, initial_slot, pw, reconnect_after,
-        send_command, session_receiver,
+        run_sessions_with, send_command, session_receiver,
     };
     use crate::retry;
     use hytte_reactive::test_lock::TEST_LOCK;
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::{Mutex, PoisonError};
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     /// #1170's item 3: a core error — the `Ok(())`-shaped exit — must be paced
     /// exactly like a failed connect. Before this, the quit arm returned
@@ -1308,5 +1337,81 @@ mod tests {
             seen.borrow()
         );
         drop(attached);
+    }
+
+    /// #1170's item 3, the **wiring** rather than the helper: the loop has to
+    /// actually wait the delay `reconnect_after` computed.
+    ///
+    /// Everything else about the ramp was already asserted against
+    /// `reconnect_after`'s return value, which is why `thread::sleep(delay);`
+    /// could be deleted from both reconnect loops in this crate with all 811
+    /// tests green and clippy silent — the hot respawn loop items 3 and 4 exist
+    /// to kill, reintroducible for free. This drives five turns with a counting
+    /// stub in the waiter's place and asserts the recorded waits, so deleting
+    /// the wait is a red test rather than a green one.
+    ///
+    /// Costs no wall clock: the stub records and returns, so the 15.5s the real
+    /// ramp would spend here never happens.
+    ///
+    /// Falsify by dropping `sleep(delay);` from `run_sessions_with` (bind
+    /// `_delay` so it still compiles): nothing is recorded and this fails.
+    #[test]
+    fn the_mainloop_waits_the_reconnect_delay_it_computed() {
+        /// Five turns is enough to see the ramp climb and still be far from the
+        /// 30s ceiling, so a clamp bug would show as a wrong value rather than
+        /// as a repeated one.
+        const TURNS: usize = 5;
+
+        let recorded: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+        let waits = Arc::clone(&recorded);
+        thread::spawn(move || {
+            // A session that ends instantly, the way a dead daemon's does.
+            // `COMMAND_TX` is never touched: the slot starts seeded and the
+            // fake session hands the same receiver straight back.
+            let (_tx, rx) = pw::channel::channel::<Command>();
+            let slot = Mutex::new(Some(rx));
+            run_sessions_with(
+                &slot,
+                |rx| (rx, SessionEnd::Quit { message: None }),
+                move |delay| {
+                    let mut v = waits.lock().unwrap_or_else(PoisonError::into_inner);
+                    v.push(delay);
+                    let done = v.len() >= TURNS;
+                    drop(v);
+                    if done {
+                        // `run_sessions_with` never returns by design, so park
+                        // the thread rather than spin it for the rest of the
+                        // binary. `park` may wake spuriously; the loop is the
+                        // documented way to hold it.
+                        loop {
+                            thread::park();
+                        }
+                    }
+                },
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && recorded.lock().unwrap_or_else(PoisonError::into_inner).len() < TURNS
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let waited = recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            waited,
+            vec![
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+            ],
+            "the mainloop did not wait `reconnect_after`'s ramp between sessions"
+        );
     }
 }

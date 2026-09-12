@@ -1,10 +1,15 @@
-//! The Edit sub-page — #1071 §5, phase 4.
+//! The Edit sub-page — #1071 §5, phase 4; laid out in two columns and given a
+//! per-row launch-command override toggle by #1134.
 //!
-//! Same drawer, content replaced: the name, the stack's apps as a list with an
-//! editable launch command and a drag handle each, **Add app** through the
-//! desktop-entry picker, the default layout, and the autostart switch. **No
-//! monitor field** — a card's screen is set by dragging it between the page's
-//! columns (Annika, on the epic thread), and phase 3 built that.
+//! Same drawer, content replaced, in **two columns** (#1134 change 1): a
+//! narrower left column for the name, the default layout and the autostart
+//! switch, and a right column — most of the form's width — for the stack's
+//! apps as a list, each with a drag handle and, behind a per-row "override the
+//! launch command" toggle, an editable command (#1134 change 2; see
+//! [`resolved_command`] for what the toggle pre-fills). **Add app** goes
+//! through the desktop-entry picker. **No monitor field** — a card's screen is
+//! set by dragging it between the page's columns (Annika, on the epic
+//! thread), and phase 3 built that.
 //!
 //! ## Why this is not a `Page` variant
 //!
@@ -54,7 +59,10 @@ use hytte::services::systemd;
 
 use crate::components::app_meta::{MetaCache, fallback_icon, resolve_app_meta};
 use crate::components::app_picker::add_app_button;
-use crate::components::layout::{DRAWER_MAX_WIDTH_WIDE, finish_page_clamped, page_box};
+use crate::components::desktop_entry::{self, Launchable};
+use crate::components::layout::{
+    DRAWER_MAX_WIDTH_WIDE, finish_page_clamped, page_box, page_grid_non_homogeneous,
+};
 use crate::config::workspaces::{Layout, Stack, StackApp};
 use crate::workspace_stacks::{self, StackState};
 
@@ -83,6 +91,21 @@ const NAME_ENTRY_CLASS: &str = "ts-ws-edit-name";
 /// CSS class on the page root, so a test can tell an edit page from the card
 /// page inside the same drawer stack.
 const EDIT_PAGE_CLASS: &str = "ts-ws-edit";
+
+/// CSS class on the two-column grid the form's fields sit in (#1134 change 1):
+/// name/layout/autostart in a narrower left column, the app list in a right
+/// column that claims most of the width.
+const FORM_GRID_CLASS: &str = "ts-ws-edit-grid";
+
+/// CSS class on a row's "override the launch command" toggle (#1134 change
+/// 2). Off, a row shows only its icon and name; on, it reveals
+/// [`EXEC_ENTRY_CLASS`] pre-filled with the resolved command.
+const OVERRIDE_TOGGLE_CLASS: &str = "ts-ws-edit-override";
+
+/// Design-baseline width, in CSS px before [`crate::scale::scale`], of the
+/// left column holding name/layout/autostart — narrow on purpose, since #1134
+/// change 1 gives the app list "most of the width".
+const FIELD_COLUMN_WIDTH: i32 = 240;
 
 /// The layouts the dropdown offers, in the order it offers them.
 const LAYOUTS: [Layout; 4] = [Layout::None, Layout::Equal, Layout::Golden, Layout::Split];
@@ -424,6 +447,36 @@ pub(crate) fn ephemeral_apps_for(windows: &[(String, Option<u32>)]) -> Vec<Stack
     ephemeral_apps(&resolved, &known)
 }
 
+/// What an app row's "override the launch command" toggle asks, given the
+/// app's id: the command to pre-fill the entry with (#1134 change 2).
+///
+/// Passed in rather than called from inside [`app_row`], so a `#[gtk::test]`
+/// can drive the toggle without touching the machine's real `$XDG_DATA_DIRS`
+/// — the same rule #1113's tests kept for every other `Exec` fact.
+type Resolver = Rc<dyn Fn(&str) -> String>;
+
+/// The command an override toggle reveals the **first** time it is switched
+/// on for a row with no saved override — the same resolution
+/// [`crate::workspace_stacks::app_start`] runs at Start time, so *"an override
+/// starts from the real command"* rather than a blank field.
+///
+/// `entry` is `None` when the id names no installed desktop entry: there is
+/// nothing to prefill, so the field opens empty and the user types their own
+/// command. Pure, so this is the half of the resolver a test drives directly;
+/// [`live_resolver`] is the impure half that actually reads a desktop file.
+#[must_use]
+pub(crate) fn resolved_command(entry: Option<&Launchable>) -> String {
+    entry.map_or_else(String::new, |entry| {
+        desktop_entry::strip_field_codes(&desktop_entry::exec_words(&entry.exec)).join(" ")
+    })
+}
+
+/// [`resolved_command`] wired to the real desktop-entry lookup — what every
+/// row outside a test resolves with.
+fn live_resolver() -> Resolver {
+    Rc::new(|id: &str| resolved_command(desktop_entry::launchable(id).as_ref()))
+}
+
 // ── The published selection ──────────────────────────────────────────────────
 
 thread_local! {
@@ -460,6 +513,16 @@ fn build_slot<S>(target: S) -> gtk::Widget
 where
     S: Signal<Item = Option<Draft>> + 'static,
 {
+    build_slot_with(target, live_resolver())
+}
+
+/// [`build_slot`] with the override toggle's resolver injected too, so a
+/// `#[gtk::test]` can drive it without touching the machine's real
+/// `$XDG_DATA_DIRS`.
+fn build_slot_with<S>(target: S, resolve: Resolver) -> gtk::Widget
+where
+    S: Signal<Item = Option<Draft>> + 'static,
+{
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class(EDIT_PAGE_CLASS);
     root.set_vexpand(true);
@@ -473,7 +536,7 @@ where
             root.remove(&child);
         }
         if let Some(draft) = draft {
-            root.append(&build_form(&draft));
+            root.append(&build_form(&draft, &resolve));
         } else {
             let hint = gtk::Label::new(Some(NOTHING_HINT));
             hint.add_css_class("ts-ws-empty");
@@ -485,7 +548,7 @@ where
 }
 
 /// The form for one card.
-fn build_form(seed: &Draft) -> gtk::Widget {
+fn build_form(seed: &Draft, resolve: &Resolver) -> gtk::Widget {
     // The form's own state. Every control writes into it; Save reads it once.
     // An `Rc<RefCell<…>>` rather than a `Mutable` because nothing subscribes —
     // the app list is the only part that redraws, and it redraws because an
@@ -497,39 +560,29 @@ fn build_form(seed: &Draft) -> gtk::Widget {
 
     column.append(&build_header(seed));
 
-    // ── Name ────────────────────────────────────────────────────────────────
+    // #1134 change 1: name/layout/autostart in a narrower left column, the app
+    // list in a right column with most of the width — a `gtk::Grid` (the same
+    // asymmetric-column primitive `panels::media` uses for its art vs. info
+    // split) rather than two plain `gtk::Box`es side by side, so a test can
+    // assert the split by construction (`grid.child_at`) instead of by guessing
+    // which sibling box is which.
+    let grid = page_grid_non_homogeneous();
+    grid.add_css_class(FORM_GRID_CLASS);
+
+    // ── Left: name, layout, autostart ──────────────────────────────────────
+    let fields = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    fields.set_size_request(crate::scale::scale(FIELD_COLUMN_WIDTH), -1);
+
     let name = build_name_field(seed, &draft);
-    column.append(&labelled("Name", &name));
+    fields.append(&labelled("Name", &name));
     if seed.active && seed.previous.is_some() {
         let note = gtk::Label::new(Some(RENAME_BLOCKED_HINT));
         note.add_css_class("ts-ws-empty");
         note.set_xalign(0.0);
         note.set_wrap(true);
-        column.append(&note);
+        fields.append(&note);
     }
 
-    // ── Apps ────────────────────────────────────────────────────────────────
-    let (apps, redraw) = build_app_list(&draft);
-    column.append(&section_label("Apps"));
-    column.append(&apps);
-
-    let add = add_app_button({
-        let draft = Rc::clone(&draft);
-        let redraw = Rc::clone(&redraw);
-        move |id| {
-            draft.borrow_mut().apps.push(StackApp {
-                id: id.to_owned(),
-                exec: None,
-            });
-            fire(&redraw);
-        }
-    });
-    let add_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    add_row.set_halign(gtk::Align::Start);
-    add_row.append(&add);
-    column.append(&add_row);
-
-    // ── Layout ──────────────────────────────────────────────────────────────
     let layouts = gtk::StringList::new(&LAYOUTS.map(Layout::name));
     let layout = gtk::DropDown::builder().model(&layouts).build();
     layout.add_css_class("ts-ws-edit-layout");
@@ -549,9 +602,8 @@ fn build_form(seed: &Draft) -> gtk::Widget {
             draft.borrow_mut().layout = LAYOUTS.get(chosen).copied().unwrap_or_default();
         });
     }
-    column.append(&labelled("Default layout", &layout));
+    fields.append(&labelled("Default layout", &layout));
 
-    // ── Autostart ───────────────────────────────────────────────────────────
     let autostart = gtk::Switch::new();
     autostart.add_css_class("ts-ws-edit-autostart");
     autostart.set_active(seed.autostart);
@@ -563,7 +615,37 @@ fn build_form(seed: &Draft) -> gtk::Widget {
             glib::Propagation::Proceed
         });
     }
-    column.append(&labelled("Start at login", &autostart));
+    fields.append(&labelled("Start at login", &autostart));
+
+    grid.attach(&fields, 0, 0, 1, 1);
+
+    // ── Right: the app list, hexpand so it claims most of the width ───────
+    let apps_column = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    apps_column.set_hexpand(true);
+
+    let (apps, redraw) = build_app_list(&draft, resolve);
+    apps_column.append(&section_label("Apps"));
+    apps_column.append(&apps);
+
+    let add = add_app_button({
+        let draft = Rc::clone(&draft);
+        let redraw = Rc::clone(&redraw);
+        move |id| {
+            draft.borrow_mut().apps.push(StackApp {
+                id: id.to_owned(),
+                exec: None,
+            });
+            fire(&redraw);
+        }
+    });
+    let add_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    add_row.set_halign(gtk::Align::Start);
+    add_row.append(&add);
+    apps_column.append(&add_row);
+
+    grid.attach(&apps_column, 1, 0, 1, 1);
+
+    column.append(&grid);
 
     // ── Save / Cancel ───────────────────────────────────────────────────────
     let (actions, refusal_label) = build_actions(&draft, &name);
@@ -786,7 +868,7 @@ fn build_name_field(seed: &Draft, draft: &Rc<RefCell<Draft>>) -> gtk::Entry {
 ///
 /// Returns both because the rows' own buttons need the handle and the caller
 /// needs the widget; see [`Redraw`] for why a rebuild rather than a patch.
-fn build_app_list(draft: &Rc<RefCell<Draft>>) -> (gtk::ListBox, Redraw) {
+fn build_app_list(draft: &Rc<RefCell<Draft>>, resolve: &Resolver) -> (gtk::ListBox, Redraw) {
     let apps = gtk::ListBox::new();
     apps.add_css_class("boxed-list");
     apps.add_css_class("ts-ws-edit-apps");
@@ -798,6 +880,7 @@ fn build_app_list(draft: &Rc<RefCell<Draft>>) -> (gtk::ListBox, Redraw) {
     let rebuild: Rc<dyn Fn()> = {
         let draft = Rc::clone(draft);
         let redraw = Rc::clone(&redraw);
+        let resolve = Rc::clone(resolve);
         // Weak, so the closure the list itself transitively holds does not pin
         // the list (#224's contract, stated by hand because this is not a
         // `bind`).
@@ -818,7 +901,7 @@ fn build_app_list(draft: &Rc<RefCell<Draft>>) -> (gtk::ListBox, Redraw) {
                 return;
             }
             for (index, app) in rows.iter().enumerate() {
-                apps.append(&app_row(index, app, &meta_cache, &draft, &redraw));
+                apps.append(&app_row(index, app, &meta_cache, &draft, &redraw, &resolve));
             }
         })
     };
@@ -893,13 +976,15 @@ fn commit(ticket: u64, plan: &SavePlan) {
     }
 }
 
-/// One app of the stack: icon, name, launch command, remove, drag handle.
+/// One app of the stack: icon, name, an optional launch-command override,
+/// remove, drag handle (#1134 change 2).
 fn app_row(
     index: usize,
     app: &StackApp,
     meta_cache: &MetaCache,
     draft: &Rc<RefCell<Draft>>,
     redraw: &Redraw,
+    resolve: &Resolver,
 ) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     row.add_css_class(APP_ROW_CLASS);
@@ -943,23 +1028,75 @@ fn app_row(
     title.set_ellipsize(pango::EllipsizeMode::End);
     labels.append(&title);
 
-    let exec = gtk::Entry::builder()
-        .text(app.exec.as_deref().unwrap_or_default())
-        .placeholder_text(EXEC_PLACEHOLDER)
-        .hexpand(true)
-        .build();
-    exec.add_css_class(EXEC_ENTRY_CLASS);
+    // #1134 change 2: the launch command is behind a per-row toggle now — a
+    // row shows only its icon and name until an override is on. Whether the
+    // entry exists at all (not merely whether it is visible) is what a test
+    // reads back, which is why this is an `if`, not a `set_visible`: the
+    // toggle's own handler rebuilds the row through [`fire`], so this branch
+    // re-evaluates every time the row's override state actually changes.
+    let has_override = app.exec.is_some();
+    if has_override {
+        let exec = gtk::Entry::builder()
+            .text(app.exec.as_deref().unwrap_or_default())
+            .placeholder_text(EXEC_PLACEHOLDER)
+            .hexpand(true)
+            .build();
+        exec.add_css_class(EXEC_ENTRY_CLASS);
+        {
+            let draft = Rc::clone(draft);
+            exec.connect_changed(move |entry| {
+                let typed = entry.text().to_string();
+                if let Some(app) = draft.borrow_mut().apps.get_mut(index) {
+                    app.exec = (!typed.trim().is_empty()).then_some(typed);
+                }
+            });
+        }
+        labels.append(&exec);
+    }
+    body.append(&labels);
+
+    // The override toggle. Its initial state is `has_override`, read directly
+    // off the app rather than tracked separately — the row is rebuilt (never
+    // patched) on every add/remove/drag/toggle, so there is nowhere for a
+    // second, disagreeing copy of this flag to live.
+    let toggle = gtk::ToggleButton::new();
+    toggle.set_icon_name("utilities-terminal-symbolic");
+    toggle.add_css_class("flat");
+    toggle.add_css_class(OVERRIDE_TOGGLE_CLASS);
+    toggle.set_valign(gtk::Align::Center);
+    toggle.set_tooltip_text(Some("Override the launch command"));
+    toggle.set_active(has_override);
     {
         let draft = Rc::clone(draft);
-        exec.connect_changed(move |entry| {
-            let typed = entry.text().to_string();
-            if let Some(app) = draft.borrow_mut().apps.get_mut(index) {
-                app.exec = (!typed.trim().is_empty()).then_some(typed);
+        let redraw = Rc::clone(redraw);
+        let resolve = Rc::clone(resolve);
+        let id = app.id.clone();
+        toggle.connect_toggled(move |button| {
+            {
+                let mut draft = draft.borrow_mut();
+                if let Some(app) = draft.apps.get_mut(index) {
+                    if button.is_active() {
+                        // Only when there was nothing saved yet: re-entering an
+                        // existing override must not clobber it with a fresh
+                        // resolve — this only fires for a row going from no
+                        // override to one.
+                        if app.exec.is_none() {
+                            app.exec = Some(resolve(&id));
+                        }
+                    } else {
+                        // Turning the toggle off clears the override outright
+                        // (rather than waiting for Save to drop it): the row's
+                        // rendered state is `app.exec.is_some()`, so leaving a
+                        // stale value here would spring the toggle back on at
+                        // the very next rebuild.
+                        app.exec = None;
+                    }
+                }
             }
+            fire(&redraw);
         });
     }
-    labels.append(&exec);
-    body.append(&labels);
+    body.append(&toggle);
 
     let remove = gtk::Button::from_icon_name("list-remove-symbolic");
     remove.add_css_class("flat");
@@ -1047,8 +1184,8 @@ fn section_label(text: &str) -> gtk::Label {
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
     use super::{
-        APP_ROW_CLASS, Draft, EXEC_ENTRY_CLASS, NAME_ENTRY_CLASS, NOTHING_HINT,
-        RENAME_BLOCKED_HINT, build_slot,
+        APP_ROW_CLASS, Draft, EXEC_ENTRY_CLASS, FORM_GRID_CLASS, NAME_ENTRY_CLASS, NOTHING_HINT,
+        OVERRIDE_TOGGLE_CLASS, RENAME_BLOCKED_HINT, Resolver, build_slot, build_slot_with,
     };
     use crate::config::workspaces::{Layout, StackApp};
     // One definition of the geometry discipline, shared with the card page's
@@ -1084,6 +1221,14 @@ mod tests {
         by_class(root, class)
             .into_iter()
             .filter_map(|w| w.downcast::<gtk::Entry>().ok())
+            .collect()
+    }
+
+    /// Every app row's override toggle, in row order.
+    fn override_toggles(root: &gtk::Widget) -> Vec<gtk::ToggleButton> {
+        by_class(root, OVERRIDE_TOGGLE_CLASS)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::ToggleButton>().ok())
             .collect()
     }
 
@@ -1167,6 +1312,15 @@ mod tests {
         page
     }
 
+    /// [`slot`] with the override toggle's resolver injected too, so a test can
+    /// drive it without touching the machine's real `$XDG_DATA_DIRS`.
+    fn slot_with_resolver(target: &Mutable<Option<Draft>>, resolve: Resolver) -> gtk::Widget {
+        adw::init().expect("libadwaita init");
+        let page = build_slot_with(target.signal_cloned(), resolve);
+        pump();
+        page
+    }
+
     /// §5: the sub-page opens **from a saved card**, showing every field of the
     /// stack — name, the apps with their launch commands, layout, autostart.
     #[gtk::test]
@@ -1183,10 +1337,24 @@ mod tests {
 
         assert_eq!(name_field(&page).text(), "chat");
         assert_eq!(app_rows(&page).len(), 2, "one row per app of the stack");
+
+        // #1134 change 2: the launch command is behind a per-row toggle now —
+        // a row with no saved override renders no entry at all, and one with a
+        // saved override opens with its toggle already on.
         assert_eq!(
             exec_texts(&page),
-            ["", "alacritty -e weechat"],
-            "each row shows its own launch command, and an app with none shows none"
+            ["alacritty -e weechat"],
+            "only the row with a saved override renders a launch-command entry"
+        );
+        let toggles = override_toggles(&page);
+        assert_eq!(toggles.len(), 2, "every app row carries an override toggle");
+        assert!(
+            !toggles[0].is_active(),
+            "firefox has no saved override, so its toggle opens off"
+        );
+        assert!(
+            toggles[1].is_active(),
+            "alacritty's saved override opens the toggle on"
         );
 
         let layout = by_class(&page, "ts-ws-edit-layout")
@@ -1215,6 +1383,150 @@ mod tests {
         assert!(
             label_texts(&page, "ts-ws-empty").contains(&RENAME_BLOCKED_HINT.to_owned()),
             "an Active stack must say why a rename is refused before it is tried"
+        );
+    }
+
+    /// #1134 change 1: name/layout/autostart sit in a narrower left column,
+    /// and the app list gets the right column with most of the width.
+    ///
+    /// **The mutation**: appending every control into one plain vertical box
+    /// again (no grid) reds this — the grid lookup itself fails.
+    #[gtk::test]
+    fn the_form_lays_out_in_two_columns_with_the_app_list_wide() {
+        let target: Mutable<Option<Draft>> = Mutable::new(None);
+        let page = slot(&target);
+        target.set(Some(saved_draft()));
+        pump();
+
+        let grid = by_class(&page, FORM_GRID_CLASS)
+            .into_iter()
+            .find_map(|w| w.downcast::<gtk::Grid>().ok())
+            .expect("the form lays its fields out in a two-column grid");
+
+        let left = grid.child_at(0, 0).expect("the left (fields) column");
+        let right = grid.child_at(1, 0).expect("the right (apps) column");
+
+        assert!(
+            right.hexpands(),
+            "the app-list column must claim the extra width, not the field column"
+        );
+        assert!(
+            name_field(&page).is_ancestor(&left),
+            "the name field belongs in the left column"
+        );
+        assert!(
+            !name_field(&page).is_ancestor(&right),
+            "the name field must not be in the app-list column"
+        );
+        assert!(
+            app_rows(&page)[0].is_ancestor(&right),
+            "the app list belongs in the right column"
+        );
+        assert!(
+            !app_rows(&page)[0].is_ancestor(&left),
+            "the app list must not be in the field column"
+        );
+    }
+
+    /// #1134 change 2: a row with no saved override renders no launch-command
+    /// entry at all — not merely a hidden one — until its toggle is switched
+    /// on.
+    #[gtk::test]
+    fn a_row_without_an_override_renders_no_entry() {
+        let target: Mutable<Option<Draft>> = Mutable::new(None);
+        let page = slot(&target);
+        target.set(Some(Draft {
+            apps: vec![app("org.mozilla.firefox", None)],
+            ..saved_draft()
+        }));
+        pump();
+
+        assert_eq!(app_rows(&page).len(), 1);
+        assert!(
+            entries(&page, EXEC_ENTRY_CLASS).is_empty(),
+            "a row with no saved override must render no launch-command entry"
+        );
+        let toggle = override_toggles(&page)
+            .into_iter()
+            .next()
+            .expect("the row's override toggle");
+        assert!(!toggle.is_active());
+    }
+
+    /// #1134 change 2: switching a row's override toggle on reveals an entry
+    /// pre-filled with the **resolved** command — the same resolution
+    /// `workspace_stacks::app_start` runs at Start time — not a blank field.
+    ///
+    /// Drives the toggle through an injected [`Resolver`] rather than the real
+    /// desktop-entry lookup, so this never touches the machine's real
+    /// `$XDG_DATA_DIRS` (the rule #1113's tests kept for every other `Exec`
+    /// fact).
+    ///
+    /// **The mutation**: prefilling with an empty string instead of the
+    /// resolver's answer reds this.
+    #[gtk::test]
+    fn toggling_an_override_on_prefills_the_resolved_command() {
+        let target: Mutable<Option<Draft>> = Mutable::new(None);
+        let resolve: Resolver = Rc::new(|id: &str| {
+            assert_eq!(
+                id, "org.mozilla.firefox",
+                "resolved the wrong app's command"
+            );
+            "firefox --new-window".to_owned()
+        });
+        let page = slot_with_resolver(&target, resolve);
+        target.set(Some(Draft {
+            apps: vec![app("org.mozilla.firefox", None)],
+            ..saved_draft()
+        }));
+        pump();
+
+        let toggle = override_toggles(&page)
+            .into_iter()
+            .next()
+            .expect("the row's override toggle");
+        assert!(!toggle.is_active());
+
+        toggle.set_active(true);
+        pump();
+
+        assert_eq!(
+            exec_texts(&page),
+            ["firefox --new-window"],
+            "the revealed entry must start from the resolved command, not empty"
+        );
+    }
+
+    /// #1134 change 2: turning a row's override toggle off clears it outright
+    /// — the row's state is `app.exec.is_some()`, so a stale value would
+    /// spring the toggle back on and the entry back up at the very next
+    /// rebuild.
+    ///
+    /// **The mutation**: not clearing `app.exec` when the toggle turns off
+    /// reds this — the toggle springs back on.
+    #[gtk::test]
+    fn toggling_an_override_off_clears_it() {
+        let target: Mutable<Option<Draft>> = Mutable::new(None);
+        let page = slot(&target);
+        target.set(Some(saved_draft()));
+        pump();
+
+        let before = override_toggles(&page);
+        assert!(
+            before[1].is_active(),
+            "alacritty opens with its saved override on"
+        );
+        before[1].set_active(false);
+        pump();
+
+        assert!(
+            entries(&page, EXEC_ENTRY_CLASS).is_empty(),
+            "turning the override off must clear it, not just hide the entry"
+        );
+        let after = override_toggles(&page);
+        assert!(
+            !after[1].is_active(),
+            "the toggle must not spring back on — the override is really gone"
         );
     }
 
@@ -1683,7 +1995,9 @@ mod tests {
 mod model_tests {
     use super::{
         Draft, SaveError, SavePlan, ephemeral_apps, move_app, plan_save, rename_is_blocked,
+        resolved_command,
     };
+    use crate::components::desktop_entry::Launchable;
     use crate::config::workspaces::{Layout, Stack, StackApp};
     use crate::workspace_stacks::StackState;
     use std::collections::BTreeSet;
@@ -2048,5 +2362,30 @@ mod model_tests {
             !hytte::services::systemd::is_valid_workspace_name("#7"),
             "'#' must not be a legal workspace name, or the two keyspaces collide"
         );
+    }
+
+    /// #1134 change 2: the override toggle's prefill is the same resolution
+    /// `workspace_stacks::app_start` runs at Start time — field codes stripped
+    /// — not the raw `Exec=` line verbatim.
+    ///
+    /// **The mutation**: returning `entry.exec` unstripped reds this.
+    #[test]
+    fn resolved_command_strips_field_codes_like_start_does() {
+        let entry = Launchable {
+            exec: "firefox %u --new-window".to_owned(),
+            dbus_activatable: false,
+            try_exec_missing: false,
+        };
+        assert_eq!(
+            resolved_command(Some(&entry)),
+            "firefox --new-window",
+            "the toggle must prefill what Start would actually run, not the raw Exec= line"
+        );
+    }
+
+    /// An id with no installed desktop entry has nothing to prefill.
+    #[test]
+    fn resolved_command_is_empty_with_no_entry() {
+        assert_eq!(resolved_command(None), String::new());
     }
 }

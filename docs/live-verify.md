@@ -3088,10 +3088,10 @@ trollshell`. Expect the cards to come back Active and **no notification at
     written — no activation, and no field-code stripping either (a `%` you type
     is yours).
   - **The Edit page opens from a saved card and replaces the drawer.** Click the
-    ✎ on a saved card. Same drawer, content replaced: the name, the app list
-    with an icon, a name and an editable launch command per row, **Add app**,
-    the layout dropdown, the autostart switch — and **no monitor field**. Change
-    every field, then press **Cancel**: `md5sum
+    ✎ on a saved card. Same drawer, content replaced, now in **two columns**
+    since #1134: name, the layout dropdown and the autostart switch on the
+    left; the app list, **Add app** and most of the width on the right — and
+    **no monitor field**. Change every field, then press **Cancel**: `md5sum
 ~/.config/trollshell/workspaces.toml` before and after must match byte for
     byte.
   - **…and Save with nothing changed is also byte-identical.** Open Edit, change
@@ -3100,6 +3100,19 @@ trollshell`. Expect the cards to come back Active and **no notification at
   - **Nothing is inline on a card (#1109).** There must be no text entry
     anywhere on any card — not on a saved one and not on an unnamed one. The
     only buttons are `[⏵/⏹] [✎]` on a saved card and `[✎]` on an unnamed one.
+  - **(#1134) The per-row override toggle, an ephemeral card's number, and the
+    card header.** Open Edit on a saved stack whose apps carry no override:
+    each row shows only its icon and name plus a small terminal-icon toggle,
+    off. Press it — the entry must appear pre-filled with the **resolved**
+    command, not empty; check it against
+    `systemctl --user show trollshell-ws-<name>-<n>.service -p ExecStart`
+    (field codes already stripped). Turn it back off and Save:
+    `workspaces.toml` must carry no `exec` for that app. Separately, open a
+    fresh (unnamed) workspace's card: its title must read `Workspace <n>` —
+    niri's own `idx`, cross-checked against `niri msg workspaces` — never
+    "Unsaved workspace". And on every card, saved or ephemeral, the header
+    (name plus its buttons) must not repeat the connector name the column
+    heading above it already shows.
   - **Saving an unnamed workspace makes it the Active card.** Open a fresh
     workspace, start two apps by hand, click its ✎. The form opens with the apps
     **in niri's column order**; any whose `app_id` has no desktop entry arrives

@@ -958,15 +958,19 @@
     border-radius: 0.462em;
 }
 
-/* The Edit sub-page (#1071 §5, phase 4) — same drawer, content replaced. The
-   form is a column of labelled controls; only the app list needs rules of its
-   own, because its rows carry a drag handle and an inline launch-command
-   field. */
+/* The Edit sub-page (#1071 §5, phase 4; two columns and a per-row override
+   toggle since #1134). Name/layout/autostart sit in a narrower left column
+   (`.ts-ws-edit-grid`'s first child); the app list gets the right column and
+   most of the width. Only the app list needs rules of its own, because its
+   rows carry a drag handle, an override toggle, and — only while a row's
+   override is switched on — a launch-command field. */
 .ts-ws-edit-apps {
     margin-top: 0.231em;
 }
 /* The launch-command override. Smaller than the app's own name above it: it is
-   the detail line of the row, not its title. */
+   the detail line of the row, not its title. Only present in the tree while
+   the row's override toggle is on (#1134) — there is nothing to style when
+   it is off, because there is nothing there. */
 .ts-ws-edit-exec {
     font-size: 0.85em;
 }
@@ -981,6 +985,14 @@
     opacity: 0.8;
 }
 .ts-ws-edit-remove {
+    min-width: 1.6em;
+    min-height: 1.6em;
+    padding: 0;
+}
+/* #1134: the per-row "override the launch command" toggle. Sized like
+   `.ts-ws-edit-remove` beside it so the row's small trailing controls read as
+   one group. */
+.ts-ws-edit-override {
     min-width: 1.6em;
     min-height: 1.6em;
     padding: 0;

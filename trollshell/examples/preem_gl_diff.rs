@@ -4,17 +4,24 @@
 //! per-channel delta, so the ceiling the spec proposes — mean ≤ 2/255,
 //! p99 ≤ 8/255, max ≤ 32/255 — is a measurement rather than a hope.
 //!
-//! Three kinds since #1144: the `Scope` (four skins × three fade depths), the
-//! `Gauge` (four skins × three needle positions, plus one at the **shipping**
-//! upscale) and the `DotMatrix` (four skins × five displays, plus one of them
-//! again stretched) — 52 cases. The three-per-skin gauge cases and the
-//! five-per-skin dot-matrix ones run 1:1, where the GL arm's native grid and
-//! the kit's logical one are the same number and the two can be compared pixel
-//! against pixel — that is where `TROLLSHELL_PARITY_EXACT=1` pins all three
-//! kinds at zero. The dot matrix has no `scale` on the widget at all — the dot
-//! pitch is its size knob (#1091) — so what its five 1:1 cases vary instead is
-//! the *line* and the *pitch*, which is where its own arithmetic lives; see
-//! `DisplayAt`.
+//! Five kinds since #1152, each four skins wide: the `Scope` (three fade
+//! depths), the `Gauge` (three needle positions, plus one at the **shipping**
+//! upscale), the `DotMatrix` (five displays, plus one stretched), the `Marquee`
+//! (five scroll phases, plus one stretched) and the `TextBox` (four
+//! configurations, plus one stretched) — **96** cases. Every case but the
+//! stretched and shipping-upscale ones runs 1:1, where the GL arm's native grid
+//! and the kit's logical one are the same number and the two can be compared
+//! pixel against pixel; that is where `TROLLSHELL_PARITY_EXACT=1` pins all five
+//! kinds at zero.
+//!
+//! What each kind's 1:1 cases *vary* is its own arithmetic. The dot matrix has
+//! no `scale` on the widget at all — the dot pitch is its size knob (#1091) —
+//! so its five vary the *line* and the *pitch* (see `DisplayAt`). The marquee's
+//! five vary the **scroll phase**, because the phase is the widget: the shader
+//! has no offset uniform (#839 made a sub-dot position inexpressible), so a
+//! step is a different set of lit columns rather than a shifted sample (see
+//! `TickerAt`). The text box's four vary the wrap, the upscale, the corner
+//! radius and the palette pins (see `BubbleAt`).
 //!
 //! # The supersampled cases, and the standard they answer to
 //!
@@ -23,29 +30,31 @@
 //! * The **fourth gauge case per skin** runs at `scale = 2`, which is
 //!   `GaugeConfig::default()` and therefore every dial on the glass (#1148
 //!   review, HIGH-2).
-//! * The **fifth dot-matrix case per skin** takes the same readout and gives
-//!   the *area* twice its natural size, which is what layout does to a chip in
-//!   a container wider than its grid (`GlSurface::measure` asks for a minimum
-//!   of `0` on purpose) — and what a `scale_factor >= 2` screen does to every
-//!   chip on it, since `GlSurface`'s allocation is in **device** pixels. See
-//!   [`STRETCH`].
+//! * **One case per skin on each of the other three kinds** takes an ordinary
+//!   state and gives the *area* twice its natural size, which is what layout
+//!   does to a chip in a container wider than its grid (`GlSurface::measure`
+//!   asks for a minimum of `0` on purpose) — and what a `scale_factor >= 2`
+//!   screen does to every chip on it, since `GlSurface`'s allocation is in
+//!   **device** pixels. See [`STRETCH`].
 //!
-//! Neither can be compared naively — the GL arm is rasterising at twice the
-//! density *on purpose*, which is the whole of #1090's and #1144's fix — so the
-//! harness box-averages the native readback back down to the kit's logical
-//! grid (`parity::box_downsample`) and then holds it to the split that
+//! None can be compared naively — the GL arm is rasterising at twice the
+//! density *on purpose*, which is the whole of #1090's, #1144's and #1152's fix
+//! — so the harness box-averages the native readback back down to the kit's
+//! logical grid (`parity::box_downsample`) and then holds it to the split that
 //! difference is supposed to have: **every pixel off a rasterisation edge is
 //! bit-identical to the kit's** (`FAIL(interior)`), and the edge region is
 //! inside a per-kind budget calibrated from measurement (`FAIL(edges)`).
-//! Measured on llvmpipe, all eight land exactly there — field and lit interiors
-//! at `max |Δ| 0`, an edge mean of 4.4 to 10.6 on the dot matrix and 6.1 to 9.4
-//! on the gauge — which is a sharper statement than #893's ceiling could make
+//! Measured on llvmpipe, all sixteen land exactly there — field and lit
+//! interiors at `max |Δ| 0`, an edge mean of 4.4 to 10.6 on the dot matrix, 4.7
+//! to 10.8 on the marquee, 6.1 to 9.4 on the gauge and 0.0 to 14.0 on the text
+//! box — which is a sharper statement than #893's ceiling could make
 //! about them, and one #893's ceiling itself would fail (a dial is nearly a
 //! third edge pixels, and on a dot matrix every lit pixel is one). A dropped
 //! half-pixel offset, an unscaled length, a doubled mask pitch, a mis-scaled
-//! bloom or a lattice that stopped being evaluated at the fragment's own
-//! position is what breaks it. See `preem_gl::gauge`, `preem_gl::dot_matrix`
-//! and `preem_gl::parity`'s `Kind`/`Sampling`/`case_verdict`.
+//! bloom, a corner arc half a pixel off its buffer's edge or a lattice that
+//! stopped being evaluated at the fragment's own position is what breaks it.
+//! See `preem_gl::gauge`, `preem_gl::dot_matrix`, `preem_gl::textbox` and
+//! `preem_gl::parity`'s `Kind`/`Sampling`/`case_verdict`.
 //!
 //! ```sh
 //! nix develop --command cargo run -p trollshell --example preem_gl_diff
@@ -121,10 +130,10 @@
 //! for all of them and their tests.
 //!
 //! Measured under llvmpipe on 2026-09-12 (Mesa 26.2.2, GLES 3.2), every one of
-//! the **44 1:1** cases came out **bit-exact**: max |Δ| 0 of 255 on R, G and B.
-//! Treat any non-zero number from this harness as real. The eight supersampled
-//! cases are not in that count and never could be — see above for what they
-//! answer to instead.
+//! the **80 1:1** cases came out **bit-exact**: max |Δ| 0 of 255 on R, G and B.
+//! Treat any non-zero number from this harness as real. The sixteen
+//! supersampled cases are not in that count and never could be — see above for
+//! what they answer to instead.
 //!
 //! # `TROLLSHELL_PARITY_EXACT` — the 0-pinned assertion (#1080)
 //!
@@ -139,7 +148,8 @@
 //! the only value that has ever been measured — it is **not** set when running
 //! this by hand against real glass, where the ceiling is the real contract.
 //!
-//! Since #1148's review it pins **both kinds**, not the scope alone. The
+//! Since #1148's review it pins every kind, not the scope alone — all five of
+//! them since #1152, each on its own llvmpipe measurement. The
 //! supersampled cases are unaffected either way: their verdict is the region
 //! split above, which is already exact where exactness is meaningful and does
 //! not depend on this variable at all.
@@ -276,10 +286,16 @@ const BUBBLE_COLS: u32 = 11;
 /// [`BubbleAt::Wrapped`] is measured against filling.
 const BUBBLE_LINES: u32 = 3;
 
-/// The field and ink [`BubbleAt::Pinned`] pins, and the `.notdef` it names — the
-/// pet's and caw's own configuration (#884/#885), which is the one that reaches
-/// all three of the `TextBox`'s colors at once.
-const PINNED_FIELD: [u8; 4] = [0x2a, 0x1e, 0x3c, 0xff];
+/// The ink [`BubbleAt::Pinned`] pins and the `.notdef` it names — the pet's and
+/// caw's own configuration (#884/#885) minus its field pin.
+///
+/// **The field is deliberately left to the skin.** Pinning all three makes the
+/// rendered box skin-*independent*, and four identical comparisons carry one
+/// case's worth of information — measured: with the field pinned too, all four
+/// `textbox.*.pinned` cases reported byte-for-byte the same statistics. What a
+/// pinned field reaches is `u_bg`, and that is covered hermetically by
+/// `preem_gl::textbox`'s `the_baked_palette_reaches_the_uniforms`, which drives
+/// all three pins at once.
 const PINNED_INK: [u8; 4] = [0xf0, 0xd0, 0xff, 0xff];
 const PINNED_NOTDEF: [u8; 4] = [0x80, 0x60, 0xa0, 0xff];
 
@@ -511,10 +527,11 @@ enum BubbleAt {
     /// lengths, so the block's blank padding cells are what keep every line
     /// after the first at the right strip offset.
     Wrapped,
-    /// A pinned field, a pinned ink, an explicit `.notdef` and an uncovered
-    /// char, over a corner cut wide enough to reach the glyph block —
-    /// #884/#885's configuration, and the one that renders all three colors and
-    /// the largest arc in one frame.
+    /// A pinned ink, an explicit `.notdef` and an uncovered char, over a corner
+    /// cut wide enough to reach the glyph block — #884/#885's configuration
+    /// (see [`PINNED_INK`] for the one pin it deliberately leaves out), and the
+    /// one that renders the ink, the notdef box and the largest arc in one
+    /// frame.
     Pinned,
 }
 
@@ -692,9 +709,21 @@ impl BubbleAt {
             // into the glyph block, which is the only way to render the kit's
             // "a glyph pixel is stamped *after* the field and does not consult
             // the corner" rule.
+            //
+            // `scale = 1` deliberately, because this is also the case the
+            // **stretched** comparison uses. The kit's `scale` replicates each
+            // logical pixel into a `scale²` block, and `parity::regions`
+            // classifies the reference's own structure with a 4-neighbour rule
+            // — so at `scale = 2` the middle of a replicated block has four
+            // equal neighbours and lands in an *interior* bin even though it
+            // sits on the arc. A one-pixel shape difference there would be
+            // reported as `FAIL(interior)` rather than measured against the
+            // edge budget, which would be the gate mis-classifying the very
+            // improvement it exists to bound. `OneLine` and `Wrapped` carry the
+            // `scale = 2` coverage, bit-exact, where the snap makes it exact.
             Self::Pinned => Bubble {
                 text: "hi \u{1f495} ok",
-                scale: 2,
+                scale: 1,
                 corner: 5,
                 pad: 2,
                 fixed_width: true,
@@ -716,7 +745,7 @@ fn bubble_box(style: kit::DisplayStyle, bubble: BubbleAt) -> kit::TextBox {
     let pins = if spec.pinned {
         kit::Pins {
             ink: kit::Ink::Fixed(PINNED_INK),
-            field: Some(PINNED_FIELD),
+            field: None,
         }
     } else {
         kit::Pins {

@@ -9718,3 +9718,462 @@ fn shader_state_of(scope: &Scope, tree: &wire::Node) -> std::sync::Arc<hytte::ui
         other => panic!("mapped to {other:?}"),
     }
 }
+
+// ── #1152: the two text kinds on the GL seam ─────────────────────────────────
+
+/// The marquee and the text box on the GPU (#1152) — the host-side half of the
+/// seam, against the kit as the oracle.
+///
+/// Appended as a module rather than woven in so the two kinds' assertions read
+/// together: they are the fourth and fifth arms on a seam whose first three
+/// each have a run of tests above, and what is *new* here is not a fourth copy
+/// of that run but the two things neither the gauge nor the dot matrix has — a
+/// ticker whose GPU state is re-uploaded on a clock, and a widget whose palette
+/// is baked at construction.
+mod text_kinds_gl {
+    use std::sync::Arc;
+
+    use hytte::ui::Node as UiNode;
+    use hytte_plugin_proto::preem as vocab;
+    use hytte_preem as kit;
+
+    use super::super::preem_render::{self, Scope};
+    use super::super::shader_map::Grants;
+    use super::super::wire_map::to_ui_node;
+    use super::{kit_pixels, mapped_gl_for, mapped_pixels, preem_ink_lock, preem_node};
+
+    /// The message every ticker case shows: long enough to overflow a 96 px
+    /// window at the default pitch, so it actually scrolls.
+    const LONG: &str = "PREEM RASTER KIT ~ SCROLLING TICKER ~ ";
+
+    /// A `Marquee` widget at a known geometry, scrolling at a rate that moves a
+    /// whole dot in well under a second.
+    fn marquee_widget(text: &str, speed: f32) -> vocab::PreemWidget {
+        vocab::PreemWidget::Marquee {
+            config: vocab::MarqueeConfig {
+                style: vocab::StyleRef::new(vocab::StyleName::Crt),
+                window_px: 96,
+                gap_dots: 6,
+                dot_px: 4,
+                speed_dots_per_sec: speed,
+            },
+            state: vocab::MarqueeState {
+                text: text.to_owned(),
+            },
+        }
+    }
+
+    /// The kit strip `marquee_widget` describes — the oracle for every byte
+    /// assertion below.
+    fn kit_strip(text: &str) -> kit::MarqueeStrip {
+        kit::Marquee::new(kit::DisplayStyle::Crt)
+            .window_px(96)
+            .gap_dots(6)
+            .dot_px(4)
+            .render(text)
+    }
+
+    /// A `TextBox` widget at a known geometry.
+    fn textbox_widget(text: &str) -> vocab::PreemWidget {
+        vocab::PreemWidget::TextBox {
+            config: vocab::TextBoxConfig {
+                style: vocab::StyleRef::new(vocab::StyleName::Crt),
+                width: vocab::TextBoxWidth::Cols(11),
+                max_lines: 3,
+                pad: 3,
+                corner: 2,
+                scale: 2,
+                fixed_width: true,
+                notdef: None,
+            },
+            state: vocab::TextBoxState {
+                text: text.to_owned(),
+            },
+        }
+    }
+
+    /// The kit box `textbox_widget` describes.
+    fn kit_box() -> kit::TextBox {
+        kit::TextBox::styled(kit::DisplayStyle::Crt)
+            .cols(11)
+            .max_lines(3)
+            .pad(3)
+            .corner(2)
+            .scale(2)
+            .fixed_width(true)
+    }
+
+    /// **Both new arms answer the two halves of the GL seam**, and both are on
+    /// the GPU under the GL arm.
+    ///
+    /// The sibling above (`every_gl_renderer_answers_both_halves_of_the_gl_seam`)
+    /// already loops every vocabulary widget and asserts
+    /// `is_gl() == gl_surface().is_some()`, so a new arm that answered one half
+    /// is caught there whether or not anyone edits it. What it does *not*
+    /// assert is that these two kinds specifically reached the GPU at all — its
+    /// premise names the first three — so that is what this adds.
+    ///
+    /// **Falsified** by dropping either kind's `build` arm, or by forgetting it
+    /// in `Renderer::is_gl`.
+    #[test]
+    fn the_two_text_kinds_draw_on_the_gpu_under_the_gl_arm() {
+        let _ink = preem_ink_lock();
+        let widgets = [marquee_widget(LONG, 12.0), textbox_widget("mrrp!")];
+        for widget in &widgets {
+            let (is_gl, has_surface) =
+                preem_render::gl_seam_for(widget).expect("every vocabulary widget builds");
+            assert!(
+                !is_gl && !has_surface,
+                "{}: the CPU arm draws on neither half",
+                widget.kind(),
+            );
+        }
+        super::super::preem_gl::with_gl_arm(|| {
+            for widget in &widgets {
+                let (is_gl, has_surface) =
+                    preem_render::gl_seam_for(widget).expect("every vocabulary widget builds");
+                assert!(
+                    is_gl && has_surface,
+                    "{}: #1152's arm answers both halves",
+                    widget.kind(),
+                );
+            }
+        });
+    }
+
+    /// **The kill switch restores the kit's own marquee bytes**, at the offset
+    /// the renderer is sitting at.
+    ///
+    /// The mirror of `the_cpu_arm_still_emits_the_kits_own_dot_matrix_bytes…`
+    /// for this kind. The whole preem suite runs on the CPU arm by default
+    /// (`preem_gl`'s `TEST_ARM`), so this also pins the *node kind*: a ticker
+    /// that silently took the GL arm under the switch would be caught here
+    /// rather than by a blank chip.
+    #[test]
+    fn the_cpu_arm_still_emits_the_kits_own_marquee_bytes_as_a_pixels_node() {
+        let _ink = preem_ink_lock();
+        let key = Scope::detached("marquee-kill-switch-cpu");
+        let node = preem_node(Some("mq"), marquee_widget(LONG, 12.0));
+
+        assert!(
+            matches!(
+                to_ui_node(&key, Grants::none(), &node),
+                UiNode::Pixels { .. }
+            ),
+            "with the kill switch on, a Marquee is a raster surface",
+        );
+        assert_eq!(
+            mapped_pixels(&key, &node),
+            kit_pixels(&kit_strip(LONG).window(0)),
+            "the CPU arm is the kit, byte for byte",
+        );
+    }
+
+    /// …and the same for the text box, whose builder bakes its palette.
+    #[test]
+    fn the_cpu_arm_still_emits_the_kits_own_textbox_bytes_as_a_pixels_node() {
+        let _ink = preem_ink_lock();
+        let key = Scope::detached("textbox-kill-switch-cpu");
+        let node = preem_node(Some("tb"), textbox_widget("mrrp mrrp"));
+
+        assert!(
+            matches!(
+                to_ui_node(&key, Grants::none(), &node),
+                UiNode::Pixels { .. }
+            ),
+            "with the kill switch on, a TextBox is a raster surface",
+        );
+        assert_eq!(
+            mapped_pixels(&key, &node),
+            kit_pixels(&kit_box().render("mrrp mrrp")),
+            "the CPU arm is the kit, byte for byte",
+        );
+    }
+
+    /// **The GL ticker emits its own pipeline at the kit's own window**, with
+    /// one texel per grid column.
+    ///
+    /// The size agreement is the layout argument every kind on this seam makes:
+    /// a kill-switch flip is a node-kind change, so it rebuilds the widget, and
+    /// a rebuild that also resized would reflow the whole card.
+    ///
+    /// The strip length is what separates this arm from the dot matrix's: a
+    /// ticker uploads the **visible grid**, `cols` texels, not `5 × chars` —
+    /// the message can be arbitrarily longer than the window and the upload
+    /// must not grow with it.
+    ///
+    /// **Falsified** by encoding the bitmap instead of the window (the strip
+    /// length), or by pointing the grid at anything but the kit's window.
+    #[test]
+    fn the_gl_marquee_emits_its_own_pipeline_with_the_window_grid() {
+        let _ink = preem_ink_lock();
+        let node = preem_node(Some("mq"), marquee_widget(LONG, 12.0));
+
+        let cpu = Scope::detached("marquee-gl-size-cpu");
+        let (cpu_w, cpu_h, _) = mapped_pixels(&cpu, &node);
+
+        super::super::preem_gl::with_gl_arm(|| {
+            let gl = Scope::detached("marquee-gl-size-gl");
+            let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::super::preem_gl::MARQUEE);
+            assert_eq!(
+                (gl_w, gl_h),
+                (cpu_w, cpu_h),
+                "same natural size on both arms",
+            );
+            // The window as asked for, by `9*dot`.
+            assert_eq!((gl_w, gl_h), (96, 36));
+            assert_eq!(uniforms.grid, (96, 36));
+            assert_eq!(
+                uniforms.step_seq, 0,
+                "the scroll is a texture upload, not GPU state",
+            );
+            let strip = kit_strip(LONG);
+            assert_eq!(
+                uniforms.data.as_ref().map(|grid| grid.len()),
+                Some(strip.cols()),
+                "one texel per grid column — not per character of the message",
+            );
+            assert!(
+                strip.cols() < LONG.chars().count() * kit::font::GLYPH_W,
+                "the premise: the message is much longer than the grid ({} \
+                 columns against {} texels for a per-character strip), so \
+                 encoding the bitmap instead would be visibly bigger",
+                strip.cols(),
+                LONG.chars().count() * kit::font::GLYPH_W,
+            );
+        });
+    }
+
+    /// **The GL box emits its own pipeline at the kit's own final buffer**,
+    /// with the block's glyph columns.
+    ///
+    /// `scale = 2` here on purpose: the kit bakes its upscale into the bytes,
+    /// so the grid the reconciler is handed is already `logical × 2` and the
+    /// shader divides back down. Handing it the pre-scale size would draw the
+    /// box at a quarter of its allocation.
+    ///
+    /// **Falsified** by passing `layout.width()` as the grid, or by encoding
+    /// only the characters each line actually has (the block is a rectangle).
+    #[test]
+    fn the_gl_textbox_emits_its_own_pipeline_with_the_glyph_block() {
+        let _ink = preem_ink_lock();
+        let node = preem_node(Some("tb"), textbox_widget("mrrp mrrp"));
+
+        let cpu = Scope::detached("textbox-gl-size-cpu");
+        let (cpu_w, cpu_h, _) = mapped_pixels(&cpu, &node);
+
+        super::super::preem_gl::with_gl_arm(|| {
+            let gl = Scope::detached("textbox-gl-size-gl");
+            let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::super::preem_gl::TEXTBOX);
+            assert_eq!(
+                (gl_w, gl_h),
+                (cpu_w, cpu_h),
+                "same natural size on both arms",
+            );
+            assert_eq!(uniforms.grid, (gl_w, gl_h));
+            let layout = kit_box().layout("mrrp mrrp");
+            assert_eq!(
+                (gl_w as usize, gl_h as usize),
+                layout.buffer(),
+                "the **final** buffer, upscale included",
+            );
+            assert_eq!(
+                uniforms.data.as_ref().map(|block| block.len()),
+                Some(layout.lines().len() * layout.content_cols() * kit::font::GLYPH_W),
+                "a rectangle of cells, five texels each",
+            );
+            assert_eq!(uniforms.step_seq, 0, "no cross-frame GPU state");
+        });
+    }
+
+    /// **A scroll step re-uploads the grid, and a mapping pass never does** —
+    /// the #911 rule for a widget whose GPU state moves on a clock.
+    ///
+    /// This is the property `Renderer::MarqueeGl`'s `window` field exists for
+    /// and the only one that can distinguish it from encoding inside
+    /// `gl_surface`: two mapping passes between two steps must hand out the
+    /// *same allocation*, and one `advance` past a whole dot must mint a new
+    /// one. `invalidate_cached_frames` in the middle is what makes the first
+    /// half non-vacuous — the uniform bag is genuinely rebuilt, so an `Arc`
+    /// that survives it was shared rather than re-encoded.
+    ///
+    /// **Falsified** by calling `preem_gl::encode_window` from
+    /// `Renderer::gl_surface` (the `ptr_eq` goes red), or by dropping the
+    /// re-encode from `advance`'s `MarqueeGl` arm (the `assert_ne` does).
+    #[test]
+    fn the_window_grid_is_shared_until_the_scroll_moves_a_whole_dot() {
+        let _ink = preem_ink_lock();
+        let node = preem_node(Some("mq"), marquee_widget(LONG, 12.0));
+        super::super::preem_gl::with_gl_arm(|| {
+            let key = Scope::detached("marquee-window-sharing");
+            let (_, _, first) = mapped_gl_for(&key, &node, super::super::preem_gl::MARQUEE);
+            preem_render::invalidate_cached_frames();
+            let (_, _, second) = mapped_gl_for(&key, &node, super::super::preem_gl::MARQUEE);
+            assert!(
+                !Arc::ptr_eq(&first, &second),
+                "the premise: the cache really was dropped, so this is a fresh bag",
+            );
+            let before = first.data.clone().expect("a grid");
+            let after = second.data.clone().expect("a grid");
+            assert!(
+                Arc::ptr_eq(&before, &after),
+                "a repeat mapping pass costs a refcount, not a re-encode",
+            );
+
+            // 12 dots/s for 0.2 s is 2.4 dots: past the first whole one.
+            assert!(
+                preem_render::advance_all(0.2).contains(&key),
+                "the premise: the ticker reported movement",
+            );
+            let (_, _, stepped) = mapped_gl_for(&key, &node, super::super::preem_gl::MARQUEE);
+            let moved = stepped.data.clone().expect("a grid");
+            assert!(
+                !Arc::ptr_eq(&before, &moved),
+                "a whole-dot step mints a new grid",
+            );
+            assert_ne!(&before[..], &moved[..], "…and it is a different picture");
+            let want: Vec<f32> = kit_strip(LONG)
+                .window_columns(2)
+                .into_iter()
+                .map(f32::from)
+                .collect();
+            assert_eq!(
+                &moved[..],
+                &want[..],
+                "…and it is the kit's own window at the phase the offset reached",
+            );
+        });
+    }
+
+    /// **A new message re-encodes the block**, and a re-tint reproduces the
+    /// same one — the text box's half of the rule above.
+    ///
+    /// **Falsified** by dropping the `TextBoxGl` arm from `update`, which
+    /// `update`'s catch-all would otherwise swallow, freezing the bubble's text
+    /// for ever.
+    #[test]
+    fn a_new_message_re_encodes_the_glyph_block() {
+        let _ink = preem_ink_lock();
+        super::super::preem_gl::with_gl_arm(|| {
+            let key = Scope::detached("textbox-block-sharing");
+            let first_node = preem_node(Some("tb"), textbox_widget("mrrp"));
+            let (_, _, first) = mapped_gl_for(&key, &first_node, super::super::preem_gl::TEXTBOX);
+            preem_render::invalidate_cached_frames();
+            let (_, _, again) = mapped_gl_for(&key, &first_node, super::super::preem_gl::TEXTBOX);
+            // `invalidate_cached_frames` **rebuilds** a TextBox renderer rather
+            // than only dropping its bytes — the builder bakes its palette — so
+            // the block is legitimately a fresh allocation here. What must hold
+            // is that it is the same *picture*.
+            assert_eq!(
+                first.data.as_deref(),
+                again.data.as_deref(),
+                "a re-tint reproduces the same block byte for byte",
+            );
+
+            let second_node = preem_node(Some("tb"), textbox_widget("purr purr"));
+            let (_, _, second) = mapped_gl_for(&key, &second_node, super::super::preem_gl::TEXTBOX);
+            assert_ne!(
+                first.data.as_deref(),
+                second.data.as_deref(),
+                "a new message is a new block",
+            );
+            let layout = kit_box().layout("purr purr");
+            assert_eq!(
+                second.data.as_ref().map(|b| b.len()),
+                Some(layout.lines().len() * layout.content_cols() * kit::font::GLYPH_W),
+                "…laid out on the new text's own wrap",
+            );
+        });
+    }
+
+    /// **A GL text box falls back without waiting for a frame that never
+    /// comes** — the context-failure hook, on the more exposed of the two.
+    ///
+    /// A ticker would recover on its next scroll step even without the hook; a
+    /// text box never animates at all, so no mapping pass is ever coming on its
+    /// own and the chip would stay blank until the plugin sent another message.
+    /// The premise assertion says so out loud rather than leaving it implied.
+    ///
+    /// **Falsified** by dropping `TextBoxGl` from `Renderer::is_gl`, which
+    /// leaves `rebuild_gl_renderers_on_cpu` walking past it.
+    #[test]
+    fn a_gl_textbox_falls_back_without_waiting_for_a_frame_that_never_comes() {
+        let _ink = preem_ink_lock();
+        super::super::preem_gl::install();
+        super::super::preem_gl::with_gl_arm(|| {
+            let key = Scope::detached("textbox-context-lost");
+            let node = preem_node(Some("tb"), textbox_widget("mrrp mrrp"));
+
+            assert!(
+                matches!(
+                    to_ui_node(&key, Grants::none(), &node),
+                    UiNode::GlSurface { .. }
+                ),
+                "the GL arm is chosen while a context is still possible",
+            );
+            assert!(
+                !preem_render::any_animating_in(std::slice::from_ref(&key)),
+                "a text box never animates, so nothing will ever re-map it",
+            );
+            let before = preem_render::probe(&key, Some("tb")).expect("the instance exists");
+
+            hytte::ui::gl_surface::abandon_gl("no GL in this test");
+
+            let after = preem_render::probe(&key, Some("tb")).expect("the instance survives");
+            assert_eq!(
+                after.0,
+                before.0 + 1,
+                "the failure hook rebuilt the renderer itself, not the next re-map",
+            );
+            assert_eq!(
+                after.1, before.1,
+                "…and did it without an apply, so no widget state was touched",
+            );
+            assert_eq!(
+                mapped_pixels(&key, &node),
+                kit_pixels(&kit_box().render("mrrp mrrp")),
+                "a lost context drops the bubble to the kit, byte for byte",
+            );
+        });
+    }
+
+    /// **Both marquee arms park the animation clock on the same predicate** —
+    /// the property #926's frame clock rests on.
+    ///
+    /// `animates()` is one shared expression for the two arms, so this cannot
+    /// drift by construction; what it *can* do is stop being shared, and then a
+    /// kill-switch flip would change when the shell parks. Driven through the
+    /// real renderers rather than by reading the source.
+    ///
+    /// **Falsified** by giving `MarqueeGl` its own `animates` arm.
+    #[test]
+    fn both_marquee_arms_park_the_clock_on_the_same_predicate() {
+        let _ink = preem_ink_lock();
+        // A message that fits the grid holds static; a parked or non-finite
+        // speed never moves. None must keep the clock awake, on either arm.
+        for (widget, animates) in [
+            (marquee_widget(LONG, 12.0), true),
+            (marquee_widget(LONG, 0.0), false),
+            (marquee_widget("HI", 12.0), false),
+            (marquee_widget(LONG, f32::NAN), false),
+        ] {
+            let node = preem_node(Some("mq"), widget);
+            let cpu = Scope::detached("marquee-clock-cpu");
+            let _ = to_ui_node(&cpu, Grants::none(), &node);
+            assert_eq!(
+                preem_render::any_animating_in(std::slice::from_ref(&cpu)),
+                animates,
+                "the CPU arm",
+            );
+            super::super::preem_gl::with_gl_arm(|| {
+                let gl = Scope::detached("marquee-clock-gl");
+                let _ = to_ui_node(&gl, Grants::none(), &node);
+                assert_eq!(
+                    preem_render::any_animating_in(std::slice::from_ref(&gl)),
+                    animates,
+                    "…and the GL arm, on the same predicate",
+                );
+            });
+        }
+    }
+}

@@ -356,15 +356,11 @@ mod tests {
     /// moves the corner by half a pixel — invisible at 1:1 in a screenshot and
     /// a full-byte disagreement in the harness.
     ///
-    /// **Falsified** by dropping either `0.5`, by using `n` instead of
-    /// `n - 0.5 - corner` on the far edge, or by comparing against `corner`
-    /// rather than `corner²`.
+    /// **Falsified** by dropping the `bias` from either term, by using `n`
+    /// instead of `n - bias - corner` on the far edge, or by comparing against
+    /// `corner` rather than `corner²`.
     #[test]
     fn the_corner_cut_is_the_kits_own_field() {
-        // `textbox.frag`'s `poke`, verbatim.
-        fn poke(v: f64, n: f64, corner: f64) -> f64 {
-            (corner + 0.5 - v).max(v - (n - 0.5 - corner)).max(0.0)
-        }
         for corner in [0_usize, 1, 2, 5, 9] {
             for pad in [0_usize, 1, 3] {
                 let boxed = kit::TextBox::new().cols(7).pad(pad).corner(corner);
@@ -378,7 +374,7 @@ mod tests {
                         for x in 0..layout.width() {
                             #[allow(clippy::cast_precision_loss)]
                             let (qx, qy) = (x as f64 + 0.5, y as f64 + 0.5);
-                            let (fx, fy) = (poke(qx, w, c), poke(qy, h, c));
+                            let (fx, fy) = (poke(qx, w, c, 0.5), poke(qy, h, c, 0.5));
                             assert_eq!(
                                 fx * fx + fy * fy <= c * c,
                                 layout.field_at(x, y),
@@ -389,6 +385,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **The unbiased arc leaves the straight edges alone**, which is the
+    /// entire reason `poke` takes a `bias` rather than carrying one constant.
+    ///
+    /// The kit's discrete disc (`bias = 0.5`) has its extreme points at pixel
+    /// *centres*, so sampling it densely finds the half-pixel strip
+    /// `v ∈ [0, 0.5)` outside along all four straight edges — and box-averaging
+    /// that back down cuts a border off a box the kit filled solid. #1152's
+    /// first cut shipped exactly that and the harness caught it: four
+    /// `FAIL(interior)` cases with the whole field bin moved. This asserts the
+    /// property that fix rests on, at the sub-pixel positions a `stretch = 2`
+    /// render actually samples.
+    ///
+    /// **Falsified** by giving the continuous branch `bias = 0.5` (the first
+    /// assertion), or by widening the arc's radius (the second).
+    #[test]
+    fn the_unbiased_arc_fills_the_buffers_own_edges() {
+        let c = 5.0_f64;
+        let (w, h) = (69.0, 11.0);
+        // Straight edges, at the sub-pixel offsets a `stretch = 2` render of a
+        // `scale = 1` box samples the outermost logical pixel at (0.25 and
+        // 0.75), and at the `stretch = 4` ones either side of them.
+        for v in [0.125, 0.25, 0.375, 0.75] {
+            assert!(
+                poke(v, w, c, 0.0) <= c,
+                "the arc keeps the left edge at v = {v}",
+            );
+            assert!(
+                poke(w - v, w, c, 0.0) <= c,
+                "…and the right edge at v = {v}",
+            );
+            // The kit's own disc reaches only to the pixel *centre*, so every
+            // sample in `[0, 0.5)` falls outside it — that is the bug, and it
+            // is deliberately not asserted at `0.75`, which is the half of the
+            // outermost pixel the disc does cover.
+            assert_eq!(
+                poke(v, w, c, 0.5) > c,
+                v < 0.5,
+                "the premise: the kit's own disc cuts the outer half-pixel",
+            );
+        }
+        // …and the two shapes still agree about the corner to within one
+        // logical pixel, which is what keeps every disagreement in the
+        // harness's `edge` bin.
+        for y in 0..11_usize {
+            for x in 0..69_usize {
+                #[allow(clippy::cast_precision_loss)]
+                let (qx, qy) = (x as f64 + 0.5, y as f64 + 0.5);
+                let kit_in = poke(qx, w, c, 0.5).powi(2) + poke(qy, h, c, 0.5).powi(2) <= c * c;
+                let arc_in = poke(qx, w, c, 0.0).powi(2) + poke(qy, h, c, 0.0).powi(2) <= c * c;
+                if kit_in != arc_in {
+                    assert!(
+                        arc_in,
+                        "({x},{y}): the arc only ever adds material, never removes it",
+                    );
+                    let corner_band = (x < 5 || x >= 64) && (y < 5 || y >= 6);
+                    assert!(corner_band, "({x},{y}) is not in a corner");
+                }
+            }
+        }
+    }
+
+    /// `textbox.frag`'s `poke`, verbatim, in `f64`.
+    fn poke(v: f64, n: f64, corner: f64, bias: f64) -> f64 {
+        (corner + bias - v).max(v - (n - bias - corner)).max(0.0)
     }
 
     /// **The block is a rectangle**, and an uncovered char is flagged rather

@@ -13,10 +13,12 @@
 // (`dx² + dy² ≤ corner²` over integer pokes into the margin) and then
 // replicates each logical pixel `scale` times, so a `scale = 2` bubble has a
 // corner built out of 2×2 blocks and a stretched one has it built out of
-// whatever GSK's nearest-neighbour scaling makes. Here the same expression is
+// whatever GSK's nearest-neighbour scaling makes. Here the same distance is
 // evaluated at the **fragment's own** position on the logical lattice, so the
 // arc is as round as the screen can draw it. That is #865's "could be even
-// better", on the one part of this widget that has a curve in it.
+// better", on the one part of this widget that has a curve in it. `poke`'s
+// `bias` is where the two branches part company and why — read it before
+// touching either.
 //
 // **The glyphs, deliberately not.** They are 5×7 bitmap pixels and the whole
 // look is that they are square: the fragment's logical position is *floored* to
@@ -83,14 +85,34 @@ out vec4 o_colour;
 
 // `textbox.rs`'s `corner_delta`, continuous: how far `v` pokes into the
 // `corner` margin at either end of a span that is `n` **pre-scale** pixels
-// wide, `0` in the middle.
+// wide, `0` in the middle. Squared against `corner²` this is the corner cut.
 //
-// The ±0.5 shifts are what make this the kit's own integer function at a pixel
-// centre. The kit asks `corner.saturating_sub(x)` and
-// `(x + corner).saturating_sub(n - 1)` of an integer `x`; substituting
-// `v = x + 0.5` here gives `corner - x` and `x + corner - (n - 1)` exactly.
-float poke(float v, float n, float corner) {
-    return max(max(corner + 0.5 - v, v - (n - 0.5 - corner)), 0.0);
+// # `bias` is the whole difference between the two branches, and it has to be
+//
+// `bias = 0.5` is **the kit's own discrete disc**. The kit asks
+// `corner.saturating_sub(x)` and `(x + corner).saturating_sub(n - 1)` of an
+// integer index `x`; substituting `v = x + 0.5` here gives `corner - x` and
+// `x + corner - (n - 1)` exactly, so at a logical pixel centre this returns the
+// integers `corner_delta` returns and the cut is bit-for-bit the kit's.
+//
+// `bias = 0.0` is **the rounded rectangle that disc approximates**: the same
+// arcs, pushed half a pixel out so the margin is measured from the buffer's own
+// edges. It is what a denser sampling should draw, and the reason it is a
+// second value rather than the same one is measured, not aesthetic. The
+// `bias = 0.5` shape's extreme points are pixel *centres* — its leftmost point
+// is `v = 0.5`, not `v = 0` — so sampling it densely finds the half-pixel strip
+// `v ∈ [0, 0.5)` **outside** along all four straight edges, and box-averaging
+// that back down cuts a visible border off a box the kit filled solid. (First
+// cut of #1152 did exactly that: four `FAIL(interior)` cases with the whole
+// field bin moved, `mean 6.189 / max 60`, before the bias was split.)
+//
+// The two shapes therefore differ, and only near the arcs — by at most one
+// logical pixel, every one of which is adjacent to the kit's own
+// transparent/field boundary and so lands in the harness's `edge` bin. That
+// difference *is* the improvement: at 1:1 the snap reproduces the kit's stair,
+// and given more room the arc is drawn as an arc.
+float poke(float v, float n, float corner, float bias) {
+    return max(max(corner + bias - v, v - (n - bias - corner)), 0.0);
 }
 
 // Is this glyph pixel set, and is its cell an uncovered char? `x` is the bit,
@@ -122,17 +144,20 @@ void main() {
         p = vec2(float(col), float(row)) + 0.5;
     }
     vec2 q = p / float(max(u_upscale, 1));
+    float bias = 0.0;
     if (u_viewport == u_grid) {
-        // The logical pixel *centre*, which is where the kit sampled.
+        // The logical pixel *centre*, which is where the kit sampled — and
+        // with it the kit's own discrete disc. See `poke`.
         q = floor(q) + 0.5;
+        bias = 0.5;
     }
 
     // The field, cut to transparent at the corners. `u_corner == 0` leaves
     // `poke` at `0` everywhere and `0 <= 0` holds, so a square box is the same
     // expression rather than a branch — exactly as the kit's is.
     float corner = float(u_corner);
-    float fx = poke(q.x, float(u_logical.x), corner);
-    float fy = poke(q.y, float(u_logical.y), corner);
+    float fx = poke(q.x, float(u_logical.x), corner, bias);
+    float fy = poke(q.y, float(u_logical.y), corner, bias);
     // Outside the cut the kit's buffer keeps `Frame::new`'s zeros, which are
     // transparent *black* and not a transparent field color — a host that
     // ignored alpha would see black rather than the bubble's ground, so the

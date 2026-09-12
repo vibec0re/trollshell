@@ -351,36 +351,49 @@ impl Kind {
                 mean: 16.0,
                 max: 64,
             },
-            // Four stretched cases, one per skin, at the scroll phase with the
-            // most lit rim on the grid. Measured worst on llvmpipe: edge mean
-            // 7.386 (oled), edge max 44 (crt). **The dot matrix's numbers, and
-            // not by inheritance**: it is the same shader over the same
-            // falloff, so the same population of tiny round rims against a flat
-            // ground is what the budget bounds — and measured, the two agree to
-            // within a few 255ths. It is stated separately because a ticker's
-            // grid is denser than a readout's (no spacing column, so ~20 % more
-            // dots per row) and a future divergence must be able to move one
-            // without the other.
+            // Four stretched cases, one per skin, at the mid-message scroll
+            // phase. Measured worst on llvmpipe: edge mean 10.781 (oled, the
+            // skin with the strongest bloom and no ghost lattice), edge max 40
+            // (crt). **The dot matrix's pair, and not by inheritance**: it is
+            // the same shader over the same falloff, so the same population of
+            // tiny round rims against a flat ground is what the budget bounds,
+            // and measured, the two kinds' worst numbers land within 0.2 and 1
+            // of each other. It is stated separately because a ticker's grid is
+            // denser than a readout's — no spacing column, so ~20 % more dots
+            // per row, and the edge bin is 2178–3070 px of 3456 against the
+            // readout's 5544–8463 of 9648 — and a future divergence must be
+            // able to move one without dragging the other.
             Self::Marquee => EdgeBudget {
                 mean: 16.0,
                 max: 64,
             },
             // Four stretched cases, one per skin. Measured worst on llvmpipe:
-            // edge mean 4.226, edge max 92 — a **different shape** from the two
-            // lattice kinds, and the one place this widget's numbers had to be
-            // taken on their own. Its edges are two things only: the rounded
-            // corner's arc and the 5×7 glyphs' own hard borders. The kit
-            // anti-aliases *neither* — it sets flat bytes — so a single edge
-            // pixel can legitimately swing by a large fraction of the
-            // field-to-ink contrast where the GL arm's box-averaged corner
-            // covers a fragment the kit left square, which is exactly the
-            // improvement. Hence a low mean (few edge pixels, most of them
-            // agreeing) against a high max: 128 would be half of full contrast
-            // and too loose to catch a mis-placed glyph, 92 is ~1.4x the worst
-            // measured single pixel and still under it.
+            // edge mean 14.016, edge max 180, both on the LCD. **A different
+            // shape from the other four kinds**, and the one place a budget had
+            // to be reasoned about rather than scaled off a measurement.
+            //
+            // This widget's edges are the rounded corner's arc and the 5×7
+            // glyphs' own borders, and the kit anti-aliases **neither** — it
+            // `set`s flat bytes. So every legitimate disagreement is a corner
+            // fragment that is field on one side and transparent black on the
+            // other, i.e. **exactly the field-to-transparent contrast**: 180 on
+            // the LCD (`169, 180, 126`), 14 on the VFD, 7 on the CRT and 0 on
+            // the OLED, whose field is black. 180 is therefore a *hard* bound
+            // rather than a sample — no renderer that draws either of the two
+            // legal colors can exceed it — and `max: 192` sits just above it so
+            // a corner drawn in some third color still shows.
+            //
+            // That makes `max` the weaker half here, and **the mean is what
+            // carries this kind**: it is a count in disguise, since each
+            // disagreement contributes the same full contrast. 14.016 over 244
+            // edge pixels is ~19 fragments the arc moved; `24` allows ~33, and
+            // a corner radius off by one moves 40+ (measured: `u_corner + 1`
+            // reports edge mean 33.7 and fails). The blank-render case is not
+            // this budget's job at all — an undrawn framebuffer moves the
+            // *field* bin and `interior_max()` catches it first.
             Self::TextBox => EdgeBudget {
-                mean: 16.0,
-                max: 128,
+                mean: 24.0,
+                max: 192,
             },
             // No supersampled scope case exists: the scope's GL grid *is* the
             // kit's upscaled buffer, so there is nothing to render denser. This
@@ -463,15 +476,31 @@ pub(crate) enum Sampling {
 ///   statement about the field *only*: every pixel of a falloff dot is an
 ///   `edge` by [`Regions`]' 4-neighbour rule, so they report `lit[n=0]`, and
 ///   the lattice, the falloff, the bloom and the comb are held by the edge
-///   budget alone. The residual hole, stated for both: a scale-only drift
-///   *inside* an expression that still carries `* s` moves only edge pixels
-///   and clears the budget — a tick or an arc 50 % wider on the gauge; a dot
-///   radius 5 % larger (caught on no skin; 10 % on one, oled) or a halo 25 %
-///   stronger (caught on none, edge mean ≤ 12.245 / max ≤ 48 against 16 / 64)
-///   on the dot matrix; neither the source scan nor the region split sees it.
-///   #893's ceiling is deliberately **not** applied here: it is a statement
-///   about rounding between two renders of one picture, and half the frame's
-///   pixels are edges on a dial.
+///   budget alone. **The four marquee cases are the same statement** (#1152),
+///   for the same reason — the same falloff over a denser grid, `lit[n=0]` on
+///   all four — so everything said about the dot matrix here applies to the
+///   ticker unchanged.
+///
+///   The four **text box** cases (#1152) are a third shape, and the narrowest:
+///   a text box has no emission at all, so its edge bin is the rounded
+///   corner's arc plus the glyph borders and nothing else — 194 to 244 pixels
+///   of 759, against an interior of 503–565 that is bit-identical. Its glyphs
+///   are `floor`ed to a logical pixel before the strip is read, so they
+///   box-average back to the kit's own bytes exactly and contribute *nothing*
+///   to the delta: what its budget bounds is the corner alone.
+///
+///   The residual hole, stated for all of them: a scale-only drift *inside* an
+///   expression that still carries `* s` moves only edge pixels and clears the
+///   budget — a tick or an arc 50 % wider on the gauge; a dot radius 5 %
+///   larger (caught on no skin; 10 % on one, oled) or a halo 25 % stronger
+///   (caught on none, edge mean ≤ 12.245 / max ≤ 48 against 16 / 64) on the
+///   dot matrix and, by construction, on the marquee; on the text box a corner
+///   radius **one logical pixel** wider is the smallest drift its budget does
+///   catch (measured: edge mean 33.7 against 24), so anything sub-pixel there
+///   is open too. Neither the source scan nor the region split sees any of
+///   them. #893's ceiling is deliberately **not** applied here: it is a
+///   statement about rounding between two renders of one picture, and half the
+///   frame's pixels are edges on a dial.
 pub(crate) fn case_verdict(
     stats: &Stats,
     regions: &Regions,
@@ -1371,6 +1400,72 @@ mod tests {
             "**the budget is per kind, not shared**: the very same edge region is \
              inside the gauge's wider max and outside the dot matrix's, which is the \
              whole reason `Kind::edge_budget` exists rather than one constant",
+        );
+    }
+
+    /// **The two text kinds' budgets are their own measurements** (#1152), and
+    /// the text box's is a different *shape* of number rather than a different
+    /// value of the same one.
+    ///
+    /// The marquee's worst llvmpipe measurement (edge mean 10.781 on the oled,
+    /// edge max 40 on the crt) lands inside the dot matrix's pair, which is
+    /// what one shader over one falloff should do — so this asserts it rather
+    /// than assuming it. The text box's (edge mean 14.016, edge max 180, both
+    /// on the lcd) does **not**: its edges are not anti-aliased by the kit at
+    /// all, so each legitimate disagreement is the full field-to-transparent
+    /// contrast and the numbers are a count in disguise. Under the two lattice
+    /// kinds' pair its own worst measurement fails outright, which is the
+    /// assertion with the teeth here.
+    ///
+    /// **Falsified** by collapsing [`Kind::edge_budget`]'s arms onto one pair —
+    /// the third assertion goes red — or by pointing either text kind at the
+    /// other's numbers.
+    #[test]
+    fn the_text_kinds_get_their_own_edge_budgets() {
+        let edgy = Stats {
+            channels: [ChannelStats {
+                mean: 5.0,
+                p99: 60.0,
+                max: 180.0,
+            }; 3],
+            ..inside_by(0.0)
+        };
+        let mut ticker = clean_regions();
+        ticker.edge.mean = 10.781;
+        ticker.edge.max = 40;
+        assert_eq!(
+            case_verdict(&edgy, &ticker, Kind::Marquee, Sampling::Supersampled(2), true),
+            Verdict::Pass,
+            "the stretched ticker's own worst llvmpipe measurement passes",
+        );
+        let mut bubble = clean_regions();
+        bubble.edge.mean = 14.016;
+        bubble.edge.max = 180;
+        assert_eq!(
+            case_verdict(&edgy, &bubble, Kind::TextBox, Sampling::Supersampled(2), true),
+            Verdict::Pass,
+            "…and so does the stretched bubble's",
+        );
+        assert_eq!(
+            case_verdict(&edgy, &bubble, Kind::Marquee, Sampling::Supersampled(2), true),
+            Verdict::EdgeOverBudget,
+            "**but not under the lattice kinds' pair**: a text box's corner \
+             fragment is field-or-transparent with nothing in between, so its \
+             worst pixel is a full 180 where a dot's rim step is 40",
+        );
+        let mut bubble_over = bubble;
+        bubble_over.edge.mean = Kind::TextBox.edge_budget().mean + 0.001;
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &bubble_over,
+                Kind::TextBox,
+                Sampling::Supersampled(2),
+                true,
+            ),
+            Verdict::EdgeOverBudget,
+            "…and the mean is the half that carries this kind — it is a count of \
+             moved corner fragments, since each one contributes the same contrast",
         );
     }
 

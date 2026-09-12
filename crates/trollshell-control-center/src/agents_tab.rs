@@ -3375,7 +3375,11 @@ mod gtk_tests {
         apply(&state, &["argus"]);
         apply(&state, &["argus"]);
         pump_until(|| asked() > 1, 1);
-        assert_eq!(asked(), 1, "a hive with no urls block is re-dialled forever");
+        assert_eq!(
+            asked(),
+            1,
+            "a hive with no urls block is re-dialled forever"
+        );
 
         assert!(
             !state.detail.config_repo.is_sensitive(),

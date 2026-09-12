@@ -882,7 +882,10 @@ mod tests {
                 line.strip_prefix("pub ")
                     .or_else(|| line.strip_prefix("pub(crate) "))
                     .or_else(|| line.strip_prefix("pub(super) "))
-                    .and_then(|r| r.strip_prefix("const ").or_else(|| r.strip_prefix("static ")))
+                    .and_then(|r| {
+                        r.strip_prefix("const ")
+                            .or_else(|| r.strip_prefix("static "))
+                    })
             })
         else {
             // Not column 0, or not a const/static: indented items are inside

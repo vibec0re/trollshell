@@ -1146,7 +1146,11 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline
-            && recorded.lock().unwrap_or_else(PoisonError::into_inner).len() < TURNS
+            && recorded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len()
+                < TURNS
         {
             thread::sleep(Duration::from_millis(10));
         }

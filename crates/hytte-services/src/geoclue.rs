@@ -996,7 +996,6 @@ mod tests {
     /// guard must not be held across an `await`.
     #[test]
     fn the_offline_to_online_edge_triggers_exactly_one_extra_resolve() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         // The `shared` map is process-global, so it must be cleared even when an
         // assertion below unwinds — otherwise this test's `Shared` stays
         // published for every later test in the binary. A drop guard rather than
@@ -1008,6 +1007,8 @@ mod tests {
                 hytte_reactive::shared::reset_for_tests();
             }
         }
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let _reset = ResetShared;
 
         hytte_reactive::runtime::handle().block_on(async {
@@ -1113,7 +1114,10 @@ mod tests {
         let primary: Mutable<Option<Link>> = Mutable::new(None);
         let waiter = wait_for_link_edge(&primary);
         tokio::pin!(waiter);
-        assert!(!fired_within(&mut waiter, SETTLE).await, "the replayed value");
+        assert!(
+            !fired_within(&mut waiter, SETTLE).await,
+            "the replayed value"
+        );
 
         // The interface shows up with carrier pending — `is_some` fired here.
         primary.set(Some(link_in(1, "wlan0", OperationalState::Dormant)));
@@ -1137,7 +1141,10 @@ mod tests {
         let primary = Mutable::new(Some(link_in(1, "wlan0", OperationalState::Carrier)));
         let waiter = wait_for_link_edge(&primary);
         tokio::pin!(waiter);
-        assert!(!fired_within(&mut waiter, SETTLE).await, "the replayed value");
+        assert!(
+            !fired_within(&mut waiter, SETTLE).await,
+            "the replayed value"
+        );
 
         primary.set(Some(link_in(1, "wlan0", OperationalState::Routable)));
         assert!(
@@ -1154,7 +1161,10 @@ mod tests {
         let primary = Mutable::new(Some(link_in(1, "wlan0", OperationalState::Routable)));
         let waiter = wait_for_link_edge(&primary);
         tokio::pin!(waiter);
-        assert!(!fired_within(&mut waiter, SETTLE).await, "the replayed value");
+        assert!(
+            !fired_within(&mut waiter, SETTLE).await,
+            "the replayed value"
+        );
 
         // Associating with the new AP: carrier held, route gone.
         primary.set(Some(link_in(1, "wlan0", OperationalState::Carrier)));
@@ -1179,7 +1189,10 @@ mod tests {
         let primary = Mutable::new(Some(link_in(1, "wlan0", OperationalState::Routable)));
         let waiter = wait_for_link_edge(&primary);
         tokio::pin!(waiter);
-        assert!(!fired_within(&mut waiter, SETTLE).await, "the replayed value");
+        assert!(
+            !fired_within(&mut waiter, SETTLE).await,
+            "the replayed value"
+        );
 
         primary.set(Some(link_in(2, "eth0", OperationalState::Routable)));
         assert!(
@@ -1214,7 +1227,7 @@ mod tests {
 
         // Just past one period: the boot resolve plus exactly one periodic wake.
         let _ = tokio::time::timeout(
-            PERIODIC_RESOLVE_EVERY + Duration::from_secs(1800),
+            PERIODIC_RESOLVE_EVERY + Duration::from_mins(30),
             run_resolve_loop(
                 Mutable::new(LocationState::default()),
                 Arc::new(Notify::new()),

@@ -1453,7 +1453,11 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline
-            && recorded.lock().unwrap_or_else(PoisonError::into_inner).len() < TURNS
+            && recorded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len()
+                < TURNS
         {
             thread::sleep(Duration::from_millis(10));
         }
@@ -1526,7 +1530,9 @@ mod tests {
                     pw::main_loop::MainLoopRc::new(None).expect("a mainloop needs no daemon");
                 let seen = Arc::clone(&seen);
                 let _attached = rx.attach(mainloop.loop_(), move |cmd| {
-                    seen.lock().unwrap_or_else(PoisonError::into_inner).push(cmd);
+                    seen.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(cmd);
                 });
                 attached_runs.fetch_add(1, Ordering::SeqCst);
                 // Block on the loop forever rather than return: a clean return

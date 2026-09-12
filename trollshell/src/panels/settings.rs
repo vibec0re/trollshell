@@ -31,6 +31,7 @@
 //! policy.
 
 use hytte::adw::{self, prelude::*};
+use hytte::futures_signals::signal::Signal;
 use hytte::gtk;
 use hytte::prelude::*;
 use hytte::services::dnd;
@@ -43,32 +44,37 @@ use crate::components::deep_link_row::deep_link_row;
 use crate::components::layout::{finish_page, page_box};
 use crate::components::power_profile::build_power_profile_expander;
 
-pub fn panel_settings() -> gtk::Widget {
-    let column = page_box();
-    column.add_css_class("ts-popup-column");
-
-    // ── Appearance ────────────────────────────────────────────────────────
-    let appearance = adw::PreferencesGroup::builder().title("Appearance").build();
-
-    let theme_row = adw::ActionRow::builder().title("Dark mode").build();
-
+/// The Dark-mode switch, bound to `current` (`theme::current_signal` in
+/// production).
+///
+/// `current` is a **factory**, not a signal: the switch needs two
+/// independent subscriptions (one for `sensitive`, one two-way for
+/// `active`) and a `Signal` is consumed by its first binding. That also
+/// makes the whole widget testable against a local `Mutable` without the
+/// process-global theme handle — see this module's gated `mod tests`.
+///
+/// - **`None` (seed in flight) → insensitive.** Unknown is rendered as
+///   unknown; a switch the user can flip while the answer is unknown would
+///   write a theme off a position nobody chose (#1192 review, HIGH-1).
+/// - **`Some(theme)` → sensitive, `active == is_dark`.**
+/// - `bind_two_way`, for the reason `keep_awake` / DND below are: the
+///   authoritative signal drives `active`, and the two-way bind blocks the
+///   handler while it does, so the programmatic `set_active` that lands
+///   when the seed arrives cannot re-enter `theme::set` and fan a whole
+///   `gsettings` write (plus a `theme-changed` hook) out at startup.
+fn build_theme_switch<S>(current: impl Fn() -> S) -> gtk::Switch
+where
+    S: Signal<Item = Option<Theme>> + 'static,
+{
     let theme_switch = gtk::Switch::new();
     theme_switch.set_valign(gtk::Align::Center);
-    // Insensitive until the service's seed read lands: `None` is "we don't
-    // know yet", and a switch the user can flip while the answer is unknown
-    // would write a theme off a position nobody chose.
     bind(
-        theme::current_signal().map(|t| t.is_some()),
+        current().map(|t| t.is_some()),
         &theme_switch,
         gtk::prelude::WidgetExt::set_sensitive,
     );
-    // Two-way, for the reason `keep_awake` / DND below are: the
-    // authoritative signal drives `active`, and `bind_two_way` blocks the
-    // handler while it does, so the programmatic `set_active` that lands
-    // when the seed arrives cannot re-enter `theme::set` and fan a whole
-    // `gsettings` write (plus a `theme-changed` hook) out at startup.
     bind_two_way(
-        theme::current_signal(),
+        current(),
         &theme_switch,
         |sw, theme| {
             if let Some(theme) = theme {
@@ -85,6 +91,19 @@ pub fn panel_settings() -> gtk::Widget {
             })
         },
     );
+    theme_switch
+}
+
+pub fn panel_settings() -> gtk::Widget {
+    let column = page_box();
+    column.add_css_class("ts-popup-column");
+
+    // ── Appearance ────────────────────────────────────────────────────────
+    let appearance = adw::PreferencesGroup::builder().title("Appearance").build();
+
+    let theme_row = adw::ActionRow::builder().title("Dark mode").build();
+
+    let theme_switch = build_theme_switch(theme::current_signal);
     theme_row.add_suffix(&theme_switch);
     theme_row.set_activatable_widget(Some(&theme_switch));
     appearance.add(&theme_row);
@@ -237,4 +256,63 @@ fn build_more_group() -> adw::PreferencesGroup {
     ));
 
     more
+}
+
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use super::build_theme_switch;
+    use hytte::adw::{self, prelude::*};
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk;
+    use hytte::services::theme::Theme;
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while gtk::glib::MainContext::default().iteration(false) {}
+    }
+
+    /// The UI half of #1192's HIGH-1. The service half
+    /// (`hytte_services::theme`'s `a_light_session_is_never_observed_as_dark`)
+    /// proves the value arrives correctly; this proves the switch renders it
+    /// correctly, including the state that used to be spelled as a confident
+    /// `Theme::Dark`: unknown.
+    ///
+    /// **Falsification:** drop the `sensitive` binding and the first
+    /// assertion fails; make the two-way apply run on `None` (e.g.
+    /// `sw.set_active(matches!(theme, Some(Theme::Dark)))`) and a light
+    /// session is indistinguishable from an unread one, which is the whole
+    /// bug.
+    #[gtk::test]
+    fn the_theme_switch_is_insensitive_until_the_seed_lands() {
+        adw::init().expect("libadwaita init");
+        let handle: Mutable<Option<Theme>> = Mutable::new(None);
+        let switch = build_theme_switch({
+            let handle = handle.clone();
+            move || handle.signal()
+        });
+        pump();
+
+        assert!(
+            !switch.is_sensitive(),
+            "while the theme is unknown the switch must not be flippable — a \
+             flip would write a theme off a position nobody chose",
+        );
+
+        handle.set(Some(Theme::Light));
+        pump();
+        assert!(
+            switch.is_sensitive(),
+            "the switch goes live once the seed lands",
+        );
+        assert!(
+            !switch.is_active(),
+            "a light session must show Dark mode OFF — this is the exact \
+             reading that was wrong, permanently, before #1192's review",
+        );
+
+        handle.set(Some(Theme::Dark));
+        pump();
+        assert!(switch.is_active(), "a dark session shows Dark mode ON");
+        assert!(switch.is_sensitive());
+    }
 }

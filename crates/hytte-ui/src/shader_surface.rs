@@ -1023,7 +1023,7 @@ mod imp {
                 data: hgl::Texture::new(gl, hgl::Format::R8, 1, 1)?,
                 data_shape: (1, 1, super::ShaderFormat::R8),
                 data_source: None,
-                vao: hgl::VertexArray::new(gl),
+                vao: hgl::VertexArray::new(gl)?,
             })
         }
     }

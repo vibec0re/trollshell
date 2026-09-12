@@ -1175,8 +1175,8 @@ mod imp {
                 data,
                 data_len: 0,
                 data_source: None,
-                framebuffer: hgl::Framebuffer::new(gl),
-                vao: hgl::VertexArray::new(gl),
+                framebuffer: hgl::Framebuffer::new(gl)?,
+                vao: hgl::VertexArray::new(gl)?,
                 grid: (cols, rows),
                 program,
             };

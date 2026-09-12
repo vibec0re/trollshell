@@ -2313,11 +2313,14 @@ session.
       the GLSL, the corner predicate against `TextBoxLayout::field_at` at every
       pixel of nine boxes, both node shapes, the shared `update`/`advance`
       helpers, the kill switch, the context-failure rebuild — and, under
-      llvmpipe in `checks.system-tests`, **twenty** marquee cases (four skins ×
-      empty / held / three scroll phases) plus **sixteen** text-box cases (four
-      skins × empty / one line / wrapped / pinned). All thirty-six came out
-      **byte-identical** on Mesa 26.2.2 (max |Δ| 0 of 255 on every channel), so
-      they are pinned there with the other three kinds'.
+      llvmpipe in `checks.system-tests`, **twenty-four** marquee cases (four
+      skins × empty / held / three scroll phases / one at a window width where
+      the centred origin and the bezel diverge — #1209 review, MEDIUM-1, so
+      the shader's `u_origin_x` uniform is actually read and not just set)
+      plus **sixteen** text-box cases (four skins × empty / one line / wrapped
+      / pinned). All forty came out **byte-identical** on Mesa 26.2.2 (max |Δ|
+      0 of 255 on every channel), so they are pinned there with the other
+      three kinds'.
 
       Eight more cases stretch an area to twice its natural size and box-average
       the readback back down, held to the supersampled standard rather than
@@ -2339,7 +2342,15 @@ session.
       edge mean actually *falls*, to 8.852, because a wider arc sits closer to
       the kit's stair); one a pixel **narrower** is caught, by the
       bit-identical-interior clause rather than by the budget. A corner drift
-      that reaches the 1:1 path too reds 12 of the 16 pinned cases.
+      that reaches the 1:1 path too reds 12 of the 16 pinned cases — but every
+      one of the four supersampled cases stays green under that same
+      unbranched drift, so the corner's own width has no supersampled
+      detector at all, in either direction. Two drifts the supersampled gate
+      *is* built to catch, for contrast: a glyph shifted one native pixel reds
+      all four on the edge budget (mean 37–57); the field colour alone shifted
+      +8/255 reds all four on the bit-identical-interior clause instead (mean
+      8.0–12.5). That leaves live item 2 below carrying the corner's width at
+      scale > 1 on its own — it is not a nice-to-check, it is the only check.
 
       What only glass can answer:
 
@@ -2353,12 +2364,17 @@ session.
      (`GtkGLArea:has-alpha` was removed in GTK 4.12 and the buffer always
      carries alpha now, which is why this is expected to just work — but it is
      expected, not measured.)
-  2. **The corner is rounder on a 2× screen or a stretched bubble.** Side by
-     side with `TROLLSHELL_PREEM_RENDERER=cpu` (in the **unit's** environment —
-     it is read once, at the first widget build): at the natural size on a 1×
-     screen the two must be indistinguishable, and on HiDPI or stretched the GL
-     arm's arc should be a smooth curve where the kit's is a stair. If the
-     stretched one looks identical, the surface was not actually stretched.
+  2. **The corner is rounder on a 2× screen or a stretched bubble — and this is
+     not a nice-to-check.** Measured above: the supersampled gate cannot see
+     the corner's own width move in either direction (an unbranched drift that
+     reds 12 of the 16 pinned 1:1 cases leaves all four supersampled ones
+     green), so this eyeball comparison is the _only_ thing standing behind
+     the arc at scale > 1. Side by side with `TROLLSHELL_PREEM_RENDERER=cpu`
+     (in the **unit's** environment — it is read once, at the first widget
+     build): at the natural size on a 1× screen the two must be
+     indistinguishable, and on HiDPI or stretched the GL arm's arc should be a
+     smooth curve where the kit's is a stair. If the stretched one looks
+     identical, the surface was not actually stretched.
   3. **The glyphs are still square.** The same comparison, on the text itself:
      the 5×7 pixels must stay hard-edged blocks at every size. Anything that
      reads as a smoothed or blurry font means the strip is being sampled with a

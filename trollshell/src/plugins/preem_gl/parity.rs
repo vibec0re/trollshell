@@ -396,12 +396,17 @@ impl Kind {
             // `Regions::interior_max` rather than by this pair: the narrower arc
             // eats pixels the kit filled solid, which are interior. A corner arc
             // one logical pixel **wider** on that branch alone is **not caught
-            // at all** — all 96 cases pass and the lcd's edge mean *falls* to
+            // at all** — all 100 cases pass and the lcd's edge mean *falls* to
             // 8.852, because a wider arc happens to sit closer to the kit's own
             // stair than the true one does. That is the residual hole, stated in
             // full at [`case_verdict`]. What does catch a corner drift loudly is
             // the 1:1 half: a drift that is not deliberately gated on the snap
-            // (plain `u_corner + 1`) reds 12 of the 16 pinned cases.
+            // (plain `u_corner + 1`) reds 12 of the 16 pinned cases — but every
+            // one of the four supersampled cases stays green under that same
+            // mutation, so this budget has no width-facing detector for the
+            // corner at all; [`case_verdict`] has the two mutations that *do*
+            // move it at scale > 1 (a shifted glyph, a shifted field colour),
+            // for contrast.
             Self::TextBox => EdgeBudget {
                 mean: 24.0,
                 max: 192,
@@ -509,7 +514,7 @@ pub(crate) enum Sampling {
 ///
 ///   **On the text box the hole has a direction, and it is worth knowing
 ///   which.** Measured: a corner arc one logical pixel **wider** on the
-///   continuous branch alone is not caught at all — all 96 cases pass and the
+///   continuous branch alone is not caught at all — all 100 cases pass and the
 ///   lcd's edge mean *falls* from 14.016 to 8.852, because a wider arc happens
 ///   to sit closer to the kit's own stair than the true one does. One a logical
 ///   pixel **narrower** is caught, but by [`Regions::interior_max`] rather than
@@ -519,7 +524,15 @@ pub(crate) enum Sampling {
 ///   (`textbox::tests::the_unbiased_arc_fills_the_buffers_own_edges` asserts
 ///   exactly that), so widening it moves pixels the kit had already classified
 ///   as edges. What does catch a corner drift loudly is the 1:1 half: a drift
-///   that is not deliberately gated on the snap reds 12 of the 16 pinned cases.
+///   that is not deliberately gated on the snap reds 12 of the 16 pinned
+///   cases — **and leaves all four supersampled cases green**, so the corner's
+///   own width has no supersampled detector at all, in either direction, at
+///   scale > 1. Two drifts the supersampled gate *is* built to catch, for
+///   contrast: a glyph shifted one native pixel (`u_viewport != u_grid`) reds
+///   all four on the edge budget, mean 37.180–57.216 against 24/192; the field
+///   colour alone shifted +8/255 reds all four on [`Regions::interior_max`]
+///   instead, mean 8.000–12.506. Both are caught outright — the corner's width
+///   is the one thing this gate cannot see moving.
 ///
 ///   Neither the source scan nor the region split sees any of these. #893's
 ///   ceiling is deliberately **not** applied here: it is a statement about

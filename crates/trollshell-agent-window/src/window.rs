@@ -96,14 +96,34 @@ impl Window {
         let cfg = hytte_plugin_agents::config::load();
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Unmapped until GTK says otherwise (#1149 L4) — a window is built
+        // and then explicitly presented (`main.rs`), so `false` is the
+        // correct starting snapshot for `feed::run` to read, not a guess.
+        let (visible_tx, visible_rx) = tokio::sync::watch::channel(false);
 
         let this = Self::assemble(app, name, cfg, cmd_tx);
+
+        // The poll's only visibility source — mirrors
+        // `hytte_plugin_agents::poll`'s `SlotVisible` gate, which this window
+        // has no host to push. Both closures hold their own clone of the
+        // sender, so it stays alive for exactly as long as `toplevel` does,
+        // and dropping the window is what ends `feed::run`'s parking loop
+        // (`visible_open` latches `false` once both are gone).
+        let tx = visible_tx.clone();
+        this.toplevel.connect_map(move |_| {
+            let _ = tx.send(true);
+        });
+        let tx = visible_tx.clone();
+        this.toplevel.connect_unmap(move |_| {
+            let _ = tx.send(false);
+        });
 
         runtime.spawn(feed::run(
             std::path::PathBuf::from(&this.cfg.socket),
             name.clone(),
             this.cfg.poll_interval(),
             cmd_rx,
+            visible_rx,
             out_tx,
         ));
 

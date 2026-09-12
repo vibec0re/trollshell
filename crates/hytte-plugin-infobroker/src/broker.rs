@@ -1224,6 +1224,7 @@ async fn socket_in_use(path: &Path) -> bool {
 }
 
 /// The outcome of trying to take the broker socket (#995).
+#[derive(Debug)]
 enum BindOutcome {
     /// This process owns the socket.
     Bound(UnixListener),
@@ -1231,9 +1232,46 @@ enum BindOutcome {
     StoodDown,
 }
 
+/// How the bind sequence sets a directory or socket's mode. A function
+/// pointer purely so the fail-closed chmod path is testable (#1169): a
+/// same-uid process's own `chmod(2)` on its own directory/socket does not
+/// naturally fail, so making it fail for a test needs an injected seam rather
+/// than a second uid — the same reason `hytte_claude_bridge::socket::Chmod`
+/// exists.
+type Chmod = fn(&Path, u32) -> std::io::Result<()>;
+
+/// The real one.
+fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+/// Ensure the socket's parent directory is `0700` (same-uid-only) before
+/// anything binds inside it — mirrors `hytte_claude_bridge::socket::prepare_dir`
+/// / `trollshell::plugins::listener`'s own tightening, and CLAUDE.md names that
+/// lock→probe→bind sequence as the pattern to follow. Normally a no-op:
+/// `$XDG_RUNTIME_DIR` (the socket's actual parent) is already `0700` by the XDG
+/// runtime-dir spec, but this makes that a *checked* invariant rather than an
+/// assumption, and tightens a looser directory (a previous run, a non-conformant
+/// launcher) rather than trusting it.
+///
+/// The chmod's error propagates — unlike the socket's own mode below before
+/// #1169, this one was never swallowed, but keeping the same fail-closed shape
+/// here is what makes "unreachable during the bind→chmod window" actually true:
+/// if nothing else can even traverse into the directory, the socket's own mode
+/// during that window stops mattering.
+fn prepare_dir(path: &Path, chmod: Chmod) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        chmod(parent, 0o700)?;
+    }
+    Ok(())
+}
+
 /// Take the broker socket: probe for a live incumbent, then unlink any *stale*
 /// socket, bind, and tighten to `0600` (same-user-only, exactly like the host's
-/// own plugin socket). The parent is `$XDG_RUNTIME_DIR`, already `0700`.
+/// own plugin socket). The parent is `$XDG_RUNTIME_DIR`, already `0700` — but
+/// [`prepare_dir`] checks and tightens it rather than assuming it (#1169).
 ///
 /// The probe is the whole point (#995). This runs from
 /// [`crate::plugin`]'s `sources()`, which the SDK calls **after** it writes
@@ -1244,7 +1282,19 @@ enum BindOutcome {
 /// kept a live listener on an unlinked inode, the path was left holding the
 /// duplicate's soon-dead socket, and every `hytte-infobroker` CLI dial got
 /// `ECONNREFUSED` while both processes logged success.
+///
+/// #1169: the socket's own `chmod` to `0600` used to be best-effort
+/// (`let _ = …`) — a failure there left the socket at whatever mode the
+/// inherited umask produced (`0755`/`0775` on a default login) with nobody
+/// told. That is now fatal: a failed chmod unbinds and unlinks the socket
+/// rather than serving it at an open mode.
 async fn bind_socket(path: &Path) -> std::io::Result<BindOutcome> {
+    bind_socket_with(path, chmod).await
+}
+
+/// [`bind_socket`] with the mode-setting call injected — see [`Chmod`].
+async fn bind_socket_with(path: &Path, chmod: Chmod) -> std::io::Result<BindOutcome> {
+    prepare_dir(path, chmod)?;
     if socket_in_use(path).await {
         return Ok(BindOutcome::StoodDown);
     }
@@ -1254,10 +1304,10 @@ async fn bind_socket(path: &Path) -> std::io::Result<BindOutcome> {
         Err(e) => return Err(e),
     }
     let listener = UnixListener::bind(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    if let Err(e) = chmod(path, 0o600) {
+        drop(listener);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
     }
     Ok(BindOutcome::Bound(listener))
 }
@@ -1793,6 +1843,108 @@ mod tests {
                 BindOutcome::Bound(_)
             ),
             "a stale socket is reclaimed",
+        );
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .expect("exists")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    /// **The boundary, measured** (#1169): the socket is `0600` inside a
+    /// `0700` directory, so no second uid can reach it at all, even during the
+    /// brief window between `bind` and the socket's own `chmod`.
+    ///
+    /// Mutation: drop the `chmod(parent, 0o700)?` inside `prepare_dir` (or the
+    /// socket's own `chmod(path, 0o600)` call) and this goes red — the
+    /// directory (or socket) is left at whatever the inherited umask produced.
+    #[tokio::test]
+    async fn the_socket_is_0600_inside_a_0700_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hytte-infobroker.sock");
+
+        let BindOutcome::Bound(listener) = bind_socket(&path).await.expect("binds") else {
+            panic!("an absent socket must be bound");
+        };
+
+        assert_eq!(mode_of(&path), 0o600, "the socket must be same-uid only");
+        assert_eq!(
+            mode_of(path.parent().expect("the socket has a parent")),
+            0o700,
+            "…inside a directory only this uid may even traverse",
+        );
+        drop(listener);
+    }
+
+    /// A [`Chmod`] that refuses the socket's `0600` and does the real thing
+    /// otherwise.
+    fn chmod_denied_on_socket(path: &Path, mode: u32) -> std::io::Result<()> {
+        if mode == 0o600 {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        chmod(path, mode)
+    }
+
+    /// **Fail closed on a socket that cannot be tightened** (#1169). Before
+    /// this, a failed `chmod` was swallowed (`let _ = …`) and the socket was
+    /// served at whatever mode the inherited umask left it — the whole defect.
+    /// Now the bind is undone and the file unlinked rather than served.
+    ///
+    /// Mutation: revert `bind_socket_with`'s `if let Err(e) = chmod(…)` arm to
+    /// `let _ = …` and this goes red — the bind reports success and a listener
+    /// is left on the path.
+    #[tokio::test]
+    async fn a_socket_that_cannot_be_tightened_is_unbound_rather_than_served() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hytte-infobroker.sock");
+
+        let err = bind_socket_with(&path, chmod_denied_on_socket)
+            .await
+            .expect_err("an untightenable socket is a refusal, not a swallowed error");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            !socket_in_use(&path).await,
+            "the endpoint must NOT be answering at the umask's mode",
+        );
+        assert!(
+            !path.exists(),
+            "…and the file is gone, so the next start's probe cannot mistake it \
+             for a stale socket worth reclaiming",
+        );
+    }
+
+    /// A [`Chmod`] that refuses the directory's `0700` and does the real thing
+    /// otherwise.
+    fn chmod_denied_on_dir(path: &Path, mode: u32) -> std::io::Result<()> {
+        if mode == 0o700 {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        chmod(path, mode)
+    }
+
+    /// **Fail closed on a directory this process cannot tighten** (#1169).
+    /// Driven through the injected [`Chmod`] since a same-uid process's own
+    /// `chmod(2)` on its own directory cannot naturally fail.
+    ///
+    /// Mutation: turn `prepare_dir`'s `chmod(parent, 0o700)?` back into
+    /// `let _ = …` and this goes red — the bind succeeds inside an untightened
+    /// directory.
+    #[tokio::test]
+    async fn a_directory_that_cannot_be_tightened_refuses_to_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hytte-infobroker.sock");
+
+        let err = bind_socket_with(&path, chmod_denied_on_dir)
+            .await
+            .expect_err("an untightenable directory is a refusal");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            !path.exists() && !socket_in_use(&path).await,
+            "…and nothing was bound on the way out",
         );
     }
 

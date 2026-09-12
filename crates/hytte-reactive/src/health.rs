@@ -534,14 +534,14 @@ mod tests {
     fn bounding_returned_rows_leaves_a_live_sibling_alone() {
         const NAME: &str = "test-health-returned-sibling";
 
+        fn state_of(rows: &[super::TaskHealth], id: super::TaskId) -> Option<TaskState> {
+            rows.iter().find(|t| t.id == id).map(|t| t.state)
+        }
+
         let live = register(NAME);
         run_started(live);
         let ended = register(NAME);
         returned(ended);
-
-        fn state_of(rows: &[super::TaskHealth], id: super::TaskId) -> Option<TaskState> {
-            rows.iter().find(|t| t.id == id).map(|t| t.state)
-        }
 
         let mine = tagged(NAME);
         assert_eq!(mine.len(), 2, "the running sibling keeps its row");

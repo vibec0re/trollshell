@@ -14,6 +14,16 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const HOOK_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Cap on captured stdout/stderr, per pipe (#1171). Without this, a chatty
+/// (or runaway) hook script had its output drained fully into memory before
+/// `HOOK_TIMEOUT` had a chance to matter — a script printing tens of
+/// megabytes ballooned this process's RSS well within the timeout window,
+/// not just at its edge. Sized generously relative to `effects.rs`'s
+/// `RUN_COMMAND_MAX_OUTPUT` (4 KiB): that cap bounds a wire reply to a
+/// plugin, this one bounds a diagnostic `tracing` field for the user's own
+/// script.
+const HOOK_OUTPUT_BUDGET: usize = 64 * 1024;
+
 /// Run the user's hook script for `event`, if one exists.
 ///
 /// Returns immediately. The actual spawn + wait happens on the
@@ -83,16 +93,22 @@ async fn run_inner(event: &str, env: &[(String, String)]) {
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let read_outputs = async { tokio::join!(drain(stdout), drain(stderr)) };
+    let read_outputs = async {
+        tokio::join!(
+            drain(stdout, HOOK_OUTPUT_BUDGET),
+            drain(stderr, HOOK_OUTPUT_BUDGET)
+        )
+    };
     let wait = async { tokio::join!(read_outputs, child.wait()) };
 
     match tokio::time::timeout(HOOK_TIMEOUT, wait).await {
-        Ok(((sout, serr), Ok(status))) if status.success() => {
+        Ok((((sout, sout_truncated), (serr, serr_truncated)), Ok(status))) if status.success() => {
             tracing::info!(event, "hooks: ran");
             if !sout.is_empty() {
                 tracing::info!(
                     event,
                     stdout = %String::from_utf8_lossy(&sout),
+                    truncated = sout_truncated,
                     "hooks: stdout",
                 );
             }
@@ -100,20 +116,23 @@ async fn run_inner(event: &str, env: &[(String, String)]) {
                 tracing::info!(
                     event,
                     stderr = %String::from_utf8_lossy(&serr),
+                    truncated = serr_truncated,
                     "hooks: stderr",
                 );
             }
         }
-        Ok(((sout, serr), Ok(status))) => {
+        Ok((((sout, sout_truncated), (serr, serr_truncated)), Ok(status))) => {
             tracing::warn!(
                 event,
                 status = ?status,
                 stdout = %String::from_utf8_lossy(&sout),
+                stdout_truncated = sout_truncated,
                 stderr = %String::from_utf8_lossy(&serr),
+                stderr_truncated = serr_truncated,
                 "hooks: script failed",
             );
         }
-        Ok(((_sout, _serr), Err(e))) => {
+        Ok((_outputs, Err(e))) => {
             tracing::warn!(event, error = %e, "hooks: wait failed");
         }
         Err(_) => {
@@ -134,16 +153,49 @@ fn resolve_path(event: &str) -> Option<PathBuf> {
     )
 }
 
-async fn drain<R>(stream: Option<R>) -> Vec<u8>
+/// Drain `stream` into a buffer capped at `budget` bytes, returning
+/// `(captured, truncated)`. Replaces the old `read_to_end`-with-no-cap
+/// shape (#1171): `.take(budget + 1)` reads at most one byte past the
+/// budget, which is enough to tell "exactly `budget` bytes, nothing more"
+/// apart from "there was more" without a separate EOF probe.
+///
+/// A truncated read then keeps draining (and discarding) the rest of the
+/// stream rather than stopping outright — stopping would leave the pipe's
+/// kernel buffer full and the writer blocked on its next `write()`, which
+/// would turn "printed more than the budget" into "hangs until
+/// `HOOK_TIMEOUT` kills it", discarding the very output the budget exists
+/// to preserve (see the `chatty_stdout_is_capped_at_budget` test).
+///
+/// That discard loop also stops on a read **error**, not only on EOF
+/// (#1192 review, NIT-3): `while matches!(…, Ok(n) if n > 0)` exits on
+/// `Err(_)` too, leaving the pipe unread. That is deliberate — retrying a
+/// broken pipe read would spin — and it is bounded from the other side by
+/// `kill_on_drop(true)` plus `HOOK_TIMEOUT`, so the writer cannot be left
+/// blocked indefinitely either way.
+async fn drain<R>(stream: Option<R>, budget: usize) -> (Vec<u8>, bool)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
+    let Some(mut s) = stream else {
+        return (Vec::new(), false);
+    };
     let mut buf = Vec::new();
-    if let Some(mut s) = stream {
-        let _ = s.read_to_end(&mut buf).await;
+    let extended_budget = u64::try_from(budget).unwrap_or(u64::MAX).saturating_add(1);
+    let _ = (&mut s).take(extended_budget).read_to_end(&mut buf).await;
+    let truncated = buf.len() > budget;
+    if truncated {
+        buf.truncate(budget);
+        // Heap-allocated, not a stack array: a stack buffer held across the
+        // `.await` below lives inside this fn's generated future, and two of
+        // those (stdout + stderr, `run_inner` joins them) pushed the whole
+        // call tree well past clippy::large_futures. A `Vec`'s backing bytes
+        // live on the heap regardless — the future only stores the 24-byte
+        // pointer/len/cap triple across the suspend point.
+        let mut sink = vec![0u8; 8192];
+        while matches!(s.read(&mut sink).await, Ok(n) if n > 0) {}
     }
-    buf
+    (buf, truncated)
 }
 
 #[cfg(test)]
@@ -444,6 +496,79 @@ mod tests {
             assert!(
                 elapsed < std::time::Duration::from_secs(5),
                 "timeout should fire well before 10s; took {elapsed:?}",
+            );
+        })
+        .await;
+    }
+
+    /// #1171: a script printing far more than [`super::HOOK_OUTPUT_BUDGET`]
+    /// is captured only up to the budget, marked `truncated`, and — because
+    /// `drain` keeps draining (and discarding) past the cap instead of
+    /// stopping — the script still finishes normally well inside
+    /// `HOOK_TIMEOUT`, rather than hanging on a full pipe until killed.
+    ///
+    /// **2 MB, not 50 MB** (#1192 review, LOW-3). The budget is 64 KiB, so
+    /// 2 MB is 32× over it — everything this test asserts (the cap, the
+    /// `truncated` flag, the "didn't hang on a full pipe" timing) holds
+    /// identically, while the work done under a **500 ms** `cfg(test)`
+    /// `HOOK_TIMEOUT` drops 25-fold. At 50 MB a slow enough run would have
+    /// the hook killed instead, the `ran` INFO would never fire, and the
+    /// test would hang in `wait_for` rather than failing cleanly — an
+    /// unnecessary flake to carry into `nix flake check`, which runs this
+    /// beside two nixosTest VMs and the workspace clippy.
+    #[tokio::test(flavor = "current_thread")]
+    async fn chatty_stdout_is_capped_at_budget() {
+        TestHome::with(|home| async move {
+            home.write_script(
+                "theme-changed",
+                "#!/bin/sh\nhead -c 2000000 /dev/zero\nexit 0\n",
+                0o755,
+            );
+            let (cap, _guard) = capture();
+
+            let started = std::time::Instant::now();
+            super::run("theme-changed", &[]);
+
+            let events = wait_for(&cap, "an INFO 'ran' event", |e| {
+                e.level == tracing::Level::INFO
+                    && e.message.contains("ran")
+                    && e.fields.get("event").is_some_and(|s| s == "theme-changed")
+            })
+            .await;
+
+            // Ran to completion, not killed by the timeout — proves the
+            // over-budget script wasn't left blocked on a full pipe.
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "a script draining past its own budget shouldn't hang until \
+                 killed; took {elapsed:?}",
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e.level == tracing::Level::WARN && e.message.contains("timed out")),
+                "expected no timeout WARN, got: {events:#?}",
+            );
+
+            let stdout_event = events
+                .iter()
+                .find(|e| e.fields.contains_key("stdout"))
+                .unwrap_or_else(|| panic!("no event carried stdout: {events:#?}"));
+            let captured = stdout_event
+                .fields
+                .get("stdout")
+                .expect("checked above via contains_key");
+            assert_eq!(
+                captured.len(),
+                super::HOOK_OUTPUT_BUDGET,
+                "captured stdout should be capped at the budget, not the full \
+                 2 MB the script printed",
+            );
+            assert_eq!(
+                stdout_event.fields.get("truncated").map(String::as_str),
+                Some("true"),
+                "a capped read must be flagged truncated: {stdout_event:#?}",
             );
         })
         .await;

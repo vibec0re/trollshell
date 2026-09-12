@@ -4,7 +4,14 @@
 //! Wraps `hytte::services::bluetooth` (`BlueZ` over D-Bus) plus
 //! `hytte::services::bluetooth_audio` for the auto-switch toggle. Pair
 //! prompts surface inline as a banner above the device list while
-//! `BlueZ`'s `Agent1` callback is awaiting user response.
+//! `BlueZ`'s `Agent1` callback is awaiting user response. A connect / pair /
+//! disconnect failure (#1171) surfaces as a toast via
+//! `notifications::post_local` — the row click itself stays fire-and-forget,
+//! exactly like the equivalent Wi-Fi row in `panels/network/wifi.rs`. (Wi-Fi
+//! calls `post_local` straight from the service; Bluetooth routes through a
+//! handle because the failure text is assembled where the shared state is,
+//! and the toast is then gated on being newer than the binding — see the
+//! `built_at` comment in `panel_bluetooth`.)
 
 use std::collections::HashSet;
 
@@ -15,6 +22,7 @@ use hytte::gtk::{self};
 use hytte::prelude::*;
 use hytte::services::bluetooth::{self, Device, PairPrompt, PromptKind};
 use hytte::services::bluetooth_audio;
+use hytte::services::notifications;
 
 use crate::components::layout::{finish_page, page_box};
 use crate::components::markup;
@@ -27,6 +35,33 @@ pub fn panel_bluetooth() -> gtk::Widget {
     column.append(&build_pair_prompt_banner());
     column.append(&build_bluetooth_controls());
     column.append(&build_bluetooth_device_groups());
+
+    // Connect/pair/disconnect failures (#1171) — the row's click handler
+    // (`build_device_row`, below) is fire-and-forget, so a failure has no
+    // other way to reach the user than this toast. Ignores the closure's own
+    // widget param: nothing here is rendered, only forwarded.
+    //
+    // `built_at` is the freshness gate (#1192 review, MEDIUM-2). The service
+    // handle is never cleared and `signal_cloned()` replays, so this
+    // binding's *first* poll yields whatever failure is recorded — including
+    // one from hours ago, on another monitor, already toasted at the time.
+    // A page built now can only be interested in failures that happen from
+    // now on; see `bluetooth::ActionError::at` for why this is a timestamp
+    // rather than a clear-after-post (which would race between the
+    // per-monitor binds).
+    let built_at = std::time::Instant::now();
+    bind(bluetooth::action_error(), &column, move |_column, err| {
+        let Some(err) = err else { return };
+        if !err.is_newer_than(built_at) {
+            return;
+        }
+        notifications::post_local(
+            "Bluetooth",
+            "Bluetooth",
+            &err.message,
+            notifications::Urgency::Critical,
+        );
+    });
 
     finish_page(&column)
 }

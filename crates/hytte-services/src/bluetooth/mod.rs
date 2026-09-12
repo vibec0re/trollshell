@@ -71,6 +71,57 @@ pub(super) struct BluetoothShared {
     pub(super) device_actions: Mutable<HashSet<String>>,
     pub(super) pair_prompt: Mutable<Option<PairPrompt>>,
     pub(super) pending_response: Arc<AsyncMutex<Option<oneshot::Sender<AgentReply>>>>,
+    /// Most recent connect/pair/disconnect failure (#1171), or `None` before
+    /// the first one. `Mutable::set` always notifies subscribers, even on an
+    /// unchanged value (see `mark_busy`'s doc below for the same invariant),
+    /// so a *second* identical failure is a fresh `set` rather than a
+    /// swallowed no-op — but a subscriber only observes what is there when it
+    /// next polls, so two failures inside one main-loop turn coalesce into one
+    /// toast (#1192 review, NIT-2). Harmless in practice: D-Bus action
+    /// failures are seconds apart.
+    ///
+    /// This handle is never cleared, and that is deliberate — see
+    /// [`ActionError::at`] for why staleness is handled by timestamp instead.
+    pub(super) action_error: Mutable<Option<ActionError>>,
+}
+
+/// A user-facing message describing why a connect/pair/disconnect action
+/// failed (#1171). The UI binds [`action_error`] and forwards each *fresh*
+/// emission to `notifications::post_local`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionError {
+    pub message: String,
+    /// When the failure happened.
+    ///
+    /// Load-bearing, not decoration (#1192 review, MEDIUM-2). `bind` drives
+    /// `signal_cloned()`, whose **first** poll yields the handle's current
+    /// value — so a panel built *after* a failure immediately forwards that
+    /// old error to a toast. Concretely: a connect fails on monitor A at
+    /// 10:00 and toasts; at 11:00 a second monitor is plugged in, its
+    /// Bluetooth page is built, and the same hour-old "Couldn't connect: …"
+    /// toasts again with nothing having failed. The 10 s `post_local` rate
+    /// limit does not span that gap (it does collapse the N-monitors-N-binds
+    /// duplicate while the failure is live, which is why that variant was
+    /// only cosmetic).
+    ///
+    /// So a binding records when it was created and forwards only errors
+    /// newer than itself — [`ActionError::is_newer_than`]. Clearing the
+    /// handle after posting would be the other option, but it races between
+    /// per-monitor binds: whichever one polls first would take the error and
+    /// blank it for the others, so which monitors toast would depend on
+    /// scheduling. A timestamp needs no coordination at all.
+    pub at: std::time::Instant,
+}
+
+impl ActionError {
+    /// Is this failure newer than `since` — i.e. did it happen after the
+    /// subscriber asking was created? The freshness gate described on
+    /// [`ActionError::at`]; a subscriber built after the failure gets
+    /// `false` and stays quiet.
+    #[must_use]
+    pub fn is_newer_than(&self, since: std::time::Instant) -> bool {
+        self.at > since
+    }
 }
 
 /// Cross-thread accessor for the shared handle bag published in
@@ -121,6 +172,11 @@ pub struct BluetoothHandles {
     /// an async mutex so `respond_to_prompt` / `submit_pin` / `submit_passkey`
     /// / `Cancel` can race-lessly take it. `None` when no prompt is in-flight.
     pub(crate) pending_response: Arc<AsyncMutex<Option<oneshot::Sender<AgentReply>>>>,
+    /// Most recent connect/pair/disconnect failure, or `None` before the
+    /// first one (#1171). The UI binds [`action_error`] and forwards each
+    /// emission **newer than the binding itself** to a toast — see
+    /// [`ActionError::at`].
+    pub(crate) action_error: Mutable<Option<ActionError>>,
     /// Keeps the `own_name` watcher task alive for the process lifetime so the
     /// system bus holds `AGENT_ANCHOR_NAME` and the `PairAgent` interface
     /// remains reachable at `AGENT_PATH`. Stored here for parity with other
@@ -151,6 +207,7 @@ impl Service for BluetoothService {
             device_actions: Mutable::new(HashSet::new()),
             pair_prompt: Mutable::new(None),
             pending_response: Arc::new(AsyncMutex::new(None)),
+            action_error: Mutable::new(None),
             _ownership: ownership.clone(),
         };
         hytte_reactive::shared::insert(BluetoothShared {
@@ -158,6 +215,7 @@ impl Service for BluetoothService {
             device_actions: handles.device_actions.clone(),
             pair_prompt: handles.pair_prompt.clone(),
             pending_response: handles.pending_response.clone(),
+            action_error: handles.action_error.clone(),
         });
 
         let adapter_mutable = handles.adapter.clone();
@@ -284,6 +342,53 @@ pub fn pair_prompts() -> impl Signal<Item = Option<PairPrompt>> {
             .pair_prompt
             .signal_cloned()
     })
+}
+
+/// Signal emitting the most recent connect/pair/disconnect failure, or
+/// `None` before the first one (#1171).
+///
+/// **A subscriber must gate on freshness, not just on `Some`.** This is a
+/// `signal_cloned()` over a handle that is never cleared, so the first poll
+/// of a *newly built* subscriber yields whatever failure is currently
+/// recorded, however old — which is a toast for a failure that already
+/// happened, possibly hours ago on another monitor. Record an
+/// `Instant::now()` where the binding is created and forward only errors
+/// satisfying [`ActionError::is_newer_than`]; `panels/bluetooth.rs` is the
+/// worked example.
+///
+/// Repeats are real: `Mutable::set` always notifies, even on an unchanged
+/// value (see `mark_busy`'s doc for the same invariant), so a second
+/// identical failure is a fresh emission — though two inside one main-loop
+/// turn coalesce, since a polling subscriber only ever sees the latest.
+pub fn action_error() -> impl Signal<Item = Option<ActionError>> {
+    registry::with(|r| {
+        r.get::<BluetoothHandles>()
+            .expect("bluetooth::service() not registered")
+            .action_error
+            .signal_cloned()
+    })
+}
+
+/// Record a connect/pair/disconnect failure for [`action_error`] to surface
+/// (#1171). Callable from any thread — goes through [`shared_state`], not
+/// the GTK-thread-only registry, since every call site here runs on the
+/// tokio runtime. No-op if the service isn't registered (test harness).
+fn report_action_error(message: impl Into<String>) {
+    let Some(shared) = shared_state() else {
+        return;
+    };
+    set_action_error(&shared.action_error, message.into());
+}
+
+/// The actual state transition (#1171), split out of [`report_action_error`]
+/// so it's testable without touching the process-global `shared` map: record
+/// `message` as the latest connect/pair/disconnect failure, stamped with the
+/// moment it happened (see [`ActionError::at`]).
+fn set_action_error(action_error: &Mutable<Option<ActionError>>, message: String) {
+    action_error.set(Some(ActionError {
+        message,
+        at: std::time::Instant::now(),
+    }));
 }
 
 /// Resolve the active yes/no pairing prompt. `accept = true` returns `Ok`
@@ -418,6 +523,7 @@ pub fn connect_device(device_path: &str) {
     runtime::handle().spawn(async move {
         if let Err(e) = do_device_call(&path, "Connect").await {
             tracing::warn!(error = %e, path, "bluetooth connect_device failed");
+            report_action_error(format!("Couldn't connect: {e}"));
         }
         mark_idle(&path);
     });
@@ -430,6 +536,7 @@ pub fn disconnect_device(device_path: &str) {
     runtime::handle().spawn(async move {
         if let Err(e) = do_device_call(&path, "Disconnect").await {
             tracing::warn!(error = %e, path, "bluetooth disconnect_device failed");
+            report_action_error(format!("Couldn't disconnect: {e}"));
         }
         mark_idle(&path);
     });
@@ -456,6 +563,7 @@ pub fn pair_device(device_path: &str) {
             }
             Err(e) => {
                 tracing::warn!(error = %e, path, "bluetooth pair_device failed");
+                report_action_error(format!("Couldn't pair: {e}"));
             }
         }
         mark_idle(&path);
@@ -574,4 +682,94 @@ async fn do_remove_device(
         .args((dev_op,))
         .send::<()>()
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ActionError, set_action_error};
+    use futures_signals::signal::{Mutable, Signal};
+    use std::time::Instant;
+
+    /// The message on the current `action_error`, or `None`.
+    fn message(action_error: &Mutable<Option<ActionError>>) -> Option<String> {
+        action_error.get_cloned().map(|e| e.message)
+    }
+
+    /// #1171: a connect/pair/disconnect failure moves `action_error` from
+    /// `None` to `Some`, and a later failure replaces it rather than
+    /// stacking — the UI shows one toast at a time, forwarding whatever the
+    /// latest emission carries.
+    #[test]
+    fn action_error_transitions_from_none_to_the_latest_failure() {
+        let action_error: Mutable<Option<ActionError>> = Mutable::new(None);
+        assert_eq!(action_error.get_cloned(), None, "starts with no failure");
+
+        set_action_error(&action_error, "Couldn't connect: timed out".to_string());
+        assert_eq!(
+            message(&action_error).as_deref(),
+            Some("Couldn't connect: timed out"),
+        );
+
+        set_action_error(&action_error, "Couldn't pair: rejected".to_string());
+        assert_eq!(
+            message(&action_error).as_deref(),
+            Some("Couldn't pair: rejected"),
+            "a later failure replaces the earlier one",
+        );
+    }
+
+    /// #1192 review, MEDIUM-2 — the stale-toast bug, driven through the same
+    /// signal a panel binds.
+    ///
+    /// `signal_cloned()` replays: a subscriber created *after* a failure gets
+    /// that failure on its first poll. That is a Bluetooth toast on a second
+    /// monitor plugged in an hour later, for a connect that failed once and
+    /// was already reported. The gate is `is_newer_than(built_at)`, where
+    /// `built_at` is stamped when the binding is created — so a late
+    /// subscriber sees the value and declines to toast it, while a failure
+    /// that happens afterwards still gets through.
+    ///
+    /// **Falsification:** make `is_newer_than` return `true`
+    /// unconditionally and the stale half of this test fails.
+    #[test]
+    fn a_late_subscriber_does_not_toast_a_failure_older_than_itself() {
+        let action_error: Mutable<Option<ActionError>> = Mutable::new(None);
+
+        // 10:00 — a connect fails on the monitor that already has a panel.
+        set_action_error(&action_error, "Couldn't connect: timed out".to_string());
+
+        // 11:00 — a second monitor is plugged in and its panel is built.
+        // ("created after the failure" is the whole predicate, so a
+        // millisecond of separation models an hour of it exactly; the sleep
+        // is only there so the two `Instant`s cannot land on one tick and
+        // make the comparison vacuous.)
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let built_at = Instant::now();
+
+        // Its binding's FIRST poll yields the hour-old failure…
+        let mut signal = std::pin::pin!(action_error.signal_cloned());
+        let replayed =
+            futures_executor::block_on(std::future::poll_fn(|cx| signal.as_mut().poll_change(cx)))
+                .expect("the signal must not end")
+                .expect("a fresh subscriber replays the current value");
+        assert_eq!(
+            replayed.message, "Couldn't connect: timed out",
+            "this replay is the bug's raw material — it is expected here",
+        );
+
+        // …and the freshness gate is what keeps it off the screen.
+        assert!(
+            !replayed.is_newer_than(built_at),
+            "a failure older than the binding must not be toasted",
+        );
+
+        // A genuinely new failure still gets through the same gate.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        set_action_error(&action_error, "Couldn't pair: rejected".to_string());
+        let fresh = action_error.get_cloned().expect("a failure was just set");
+        assert!(
+            fresh.is_newer_than(built_at),
+            "a failure after the binding was created must still toast",
+        );
+    }
 }

@@ -143,7 +143,7 @@ pub struct Agents {
     /// Agents named by an approval that the roster does not list, already
     /// warned about — so each one costs a single line rather than one per poll.
     /// Cleared per agent the moment it reappears; see [`Agents::on_roster`].
-    unknown_agents: BTreeSet<String>,
+    warned_unknown: BTreeSet<String>,
     /// The previous poll's alarm flags, per agent — the **edge** detector §8
     /// requires ("a hive with one wedged agent must not toast every 5 s").
     prev_alarms: BTreeMap<String, Alarms>,
@@ -179,7 +179,7 @@ impl Agents {
             pending: PendingApprovals::default(),
             prompted: BTreeSet::new(),
             prompt: None,
-            unknown_agents: BTreeSet::new(),
+            warned_unknown: BTreeSet::new(),
             now_unix: 0,
             last_poll_unix: None,
             prev_alarms: BTreeMap::new(),
@@ -405,9 +405,9 @@ impl Agents {
             let known = AgentName::parse(&approval.agent)
                 .is_some_and(|name| self.hive.agent(&name).is_some());
             if known {
-                self.unknown_agents.remove(&approval.agent);
+                self.warned_unknown.remove(&approval.agent);
                 kept.push(approval);
-            } else if self.unknown_agents.insert(approval.agent.clone()) {
+            } else if self.warned_unknown.insert(approval.agent.clone()) {
                 tracing::warn!(
                     agent = %approval.agent,
                     approval = approval.id,

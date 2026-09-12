@@ -663,7 +663,12 @@ fn spend_effect_tokens(
 /// Filter a render frame's effects through the plugin's rate limiter,
 /// dropping (with a warn) any that exceed the cap. All effects in one frame share
 /// a single `now`, so a burst frame depletes the bucket in order.
-fn throttle_effects(buckets: &EffectBuckets, plugin_id: &str, effects: Vec<Effect>) -> Vec<Effect> {
+fn throttle_effects(
+    buckets: &EffectBuckets,
+    plugin_id: &str,
+    effects: Vec<Effect>,
+    warned: &mut EffectWarnLatch,
+) -> Vec<Effect> {
     if effects.is_empty() {
         return effects;
     }
@@ -674,7 +679,26 @@ fn throttle_effects(buckets: &EffectBuckets, plugin_id: &str, effects: Vec<Effec
         if allowed {
             kept.push(effect);
         } else {
-            tracing::warn!(plugin = %plugin_id, ?effect, "plugin effect rate cap exceeded; dropped");
+            // #1165 item 5: latched per connection per effect *kind*, and
+            // naming the kind rather than `Debug`-formatting the whole effect.
+            // A plugin over the rate cap is over it on every frame, and the
+            // effect it is over with carries the very payloads the other caps
+            // in this file exist to bound — so the unlatched `?effect` line was
+            // a per-frame journal write of arbitrary plugin-supplied bytes,
+            // which is the flood it was reporting. The audit log below still
+            // records every dropped effect: that is the per-occurrence record,
+            // and it is rotated and bounded.
+            if warned.insert(std::mem::discriminant(&effect)) {
+                tracing::warn!(
+                    plugin = %plugin_id,
+                    effect = super::effects::effect_kind(&effect),
+                    burst = EFFECT_BURST,
+                    per_sec = EFFECT_REFILL_PER_SEC,
+                    "plugin effect rate cap exceeded; dropped (further drops of this effect \
+                     kind on this connection are silenced — the audit log still records each \
+                     one)",
+                );
+            }
             super::effects::record_audit(
                 plugin_id,
                 &effect,
@@ -809,6 +833,7 @@ pub(super) fn enforce_capabilities(
     granted: &[Capability],
     plugin_id: &str,
     effects: Vec<Effect>,
+    warned: &mut EffectWarnLatch,
 ) -> Vec<Effect> {
     effects
         .into_iter()
@@ -819,12 +844,23 @@ pub(super) fn enforce_capabilities(
             if granted.contains(&cap) {
                 true
             } else {
-                tracing::warn!(
-                    plugin = %plugin_id,
-                    ?effect,
-                    ?cap,
-                    "plugin effect requires a capability it didn't declare; dropped",
-                );
+                // #1165 item 5: one line per effect kind per connection, naming
+                // the kind rather than `Debug`-formatting the effect. A missing
+                // capability is a *manifest* mistake, so it is wrong on every
+                // frame for the life of the connection — the unlatched form
+                // wrote the plugin's whole (arbitrary-length, plugin-supplied)
+                // effect payload to the journal at the plugin's frame rate. The
+                // audit log keeps the per-occurrence record.
+                if warned.insert(std::mem::discriminant(effect)) {
+                    tracing::warn!(
+                        plugin = %plugin_id,
+                        effect = super::effects::effect_kind(effect),
+                        ?cap,
+                        "plugin effect requires a capability it didn't declare; dropped. Add it \
+                         to the manifest's capabilities (further drops of this effect kind on \
+                         this connection are silenced — the audit log still records each one)",
+                    );
+                }
                 super::effects::record_audit(
                     plugin_id,
                     effect,
@@ -1136,6 +1172,12 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // the same terms as `hidden_on_warned` above — one line per effect kind per
     // connection, not one per frame.
     let mut effect_text_warned = EffectWarnLatch::new();
+    // #1165 item 5: the two drop-warn latches. Kept apart rather than shared,
+    // because an effect kind can be dropped for *both* reasons over one
+    // connection's life and the two name different fixes — a manifest edit
+    // versus a slower emitter.
+    let mut ungranted_warned = EffectWarnLatch::new();
+    let mut rate_cap_warned = EffectWarnLatch::new();
     // #1165: the `PluginMsg::Log` length + rate gate, per connection like the
     // effect limiter beside it.
     let mut log_gate = LogGate::new_at(Instant::now());
@@ -1156,7 +1198,13 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                     let kept = throttle_effects(
                         &ctx.effect_buckets,
                         &plugin_id,
-                        enforce_capabilities(&capabilities, &plugin_id, effects),
+                        enforce_capabilities(
+                            &capabilities,
+                            &plugin_id,
+                            effects,
+                            &mut ungranted_warned,
+                        ),
+                        &mut rate_cap_warned,
                     );
                     // #1165: cap the human-facing strings LAST — after the two
                     // host policies have decided which effects run at all, so a

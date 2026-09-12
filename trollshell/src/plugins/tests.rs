@@ -40,7 +40,7 @@ use super::pump::{
 };
 use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
-    EFFECT_BURST, EffectBuckets, EffectRateLimiter, HiddenOnViolation, IdGuard,
+    EFFECT_BURST, EffectBuckets, EffectRateLimiter, EffectWarnLatch, HiddenOnViolation, IdGuard,
     MAX_HIDDEN_ON_ENTRIES, MAX_HIDDEN_ON_NAME_BYTES, OUTBOUND_CAPACITY, REGISTER_TIMEOUT,
     capped_hidden_on, enforce_capabilities, handle_conn, push_gate, state_key_capability,
 };
@@ -2002,12 +2002,18 @@ fn enforce_capabilities_drops_an_uncapped_open_uri() {
     let open = Effect::open_uri(3, "https://pr1ma.darkest.space/agents/argus");
 
     assert!(
-        enforce_capabilities(&[], "p", vec![open.clone()]).is_empty(),
+        enforce_capabilities(&[], "p", vec![open.clone()], &mut EffectWarnLatch::new()).is_empty(),
         "a plugin that declared no caps cannot open a link",
     );
     // Holding the highest-trust cap does not imply the narrow one…
     assert!(
-        enforce_capabilities(&[Capability::RunCommand], "p", vec![open.clone()]).is_empty(),
+        enforce_capabilities(
+            &[Capability::RunCommand],
+            "p",
+            vec![open.clone()],
+            &mut EffectWarnLatch::new(),
+        )
+        .is_empty(),
         "RunCommand does not stand in for OpenUri",
     );
     // …and holding the narrow one emphatically does not imply the other.
@@ -2016,12 +2022,18 @@ fn enforce_capabilities_drops_an_uncapped_open_uri() {
             &[Capability::OpenUri],
             "p",
             vec![Effect::run_command(4, vec!["true".into()])],
+            &mut EffectWarnLatch::new(),
         )
         .is_empty(),
         "OpenUri does not stand in for RunCommand",
     );
 
-    let kept = enforce_capabilities(&[Capability::Notify, Capability::OpenUri], "p", vec![open]);
+    let kept = enforce_capabilities(
+        &[Capability::Notify, Capability::OpenUri],
+        "p",
+        vec![open],
+        &mut EffectWarnLatch::new(),
+    );
     assert_eq!(kept.len(), 1, "the declared cap lets it through");
     assert!(matches!(kept[0], Effect::OpenUri { id: 3, .. }));
 }
@@ -2047,14 +2059,20 @@ fn enforce_capabilities_drops_ungranted_effects() {
         Effect::Niri(NiriAction::FocusWindow { id: 7 }), // NOT granted
     ];
 
-    let kept = enforce_capabilities(&granted, "p", effects);
+    let kept = enforce_capabilities(&granted, "p", effects, &mut EffectWarnLatch::new());
     assert_eq!(kept.len(), 2, "only the two granted effects survive");
     assert!(matches!(kept[0], Effect::OpenPage(Page::Media)));
     assert!(matches!(kept[1], Effect::Notify { .. }));
 
     // A plugin that declared no caps has every effect dropped.
     assert!(
-        enforce_capabilities(&[], "p", vec![Effect::OpenPage(Page::Power)]).is_empty(),
+        enforce_capabilities(
+            &[],
+            "p",
+            vec![Effect::OpenPage(Page::Power)],
+            &mut EffectWarnLatch::new(),
+        )
+        .is_empty(),
         "a plugin that declared no caps gets every effect dropped",
     );
 }
@@ -2687,7 +2705,13 @@ fn enforce_capabilities_gates_datasource_effects() {
     };
     // No caps → both dropped.
     assert!(
-        enforce_capabilities(&[], "p", vec![query.clone(), result.clone()]).is_empty(),
+        enforce_capabilities(
+            &[],
+            "p",
+            vec![query.clone(), result.clone()],
+            &mut EffectWarnLatch::new(),
+        )
+        .is_empty(),
         "ungranted datasource effects are dropped",
     );
     // The requester cap keeps only the query.
@@ -2695,11 +2719,17 @@ fn enforce_capabilities_gates_datasource_effects() {
         &[Capability::DatasourceQuery],
         "p",
         vec![query.clone(), result.clone()],
+        &mut EffectWarnLatch::new(),
     );
     assert_eq!(kept.len(), 1);
     assert!(matches!(kept[0], Effect::DatasourceQuery { .. }));
     // The provider cap keeps only the result.
-    let kept = enforce_capabilities(&[Capability::DatasourceProvider], "p", vec![query, result]);
+    let kept = enforce_capabilities(
+        &[Capability::DatasourceProvider],
+        "p",
+        vec![query, result],
+        &mut EffectWarnLatch::new(),
+    );
     assert_eq!(kept.len(), 1);
     assert!(matches!(kept[0], Effect::DatasourceResult { .. }));
 }

@@ -1912,7 +1912,11 @@ impl AuditDecision {
 /// is a program the shell handed to the user manager and will *not* clean up,
 /// so it is the one an after-the-fact review has to reconcile against
 /// `systemctl --user list-units 'trollshell-launch-*'`.
-fn effect_kind(effect: &Effect) -> &'static str {
+///
+/// `pub(super)` since #1165: the two drop-warn sites in `session` name the
+/// kind with it instead of `Debug`-formatting the whole effect, so one
+/// vocabulary of kind names serves the audit log and the journal.
+pub(super) fn effect_kind(effect: &Effect) -> &'static str {
     match effect {
         Effect::OpenPage(_) => "OpenPage",
         Effect::Niri(_) => "Niri",

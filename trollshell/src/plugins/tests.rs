@@ -10711,10 +10711,18 @@ mod containment_r2 {
     /// same-uid process could hold a task and an fd per dial and walk the shell
     /// into its fd limit.
     ///
-    /// **Falsified** by taking the permit after `accept(2)` instead of before,
-    /// or by dropping it at teardown instead of at registration: the middle
-    /// assertion (nothing mounted while the gate is full) reds in the first
-    /// case, and the last one (served after a slot frees) in the second.
+    /// **Falsified** by removing the gate — pass `serve_conn` a `None` permit
+    /// and drop the `acquire_owned`: all 65 dials are accepted, the plugin
+    /// mounts immediately, and the middle assertion reds.
+    ///
+    /// **What it does not distinguish**, stated because the falsification pass
+    /// measured it rather than assumed it: taking the permit immediately *after*
+    /// `accept(2)` instead of before leaves this green. The accept loop is
+    /// sequential, so that arrangement parks on the permit with exactly one
+    /// accepted connection in hand — a one-descriptor difference this test has
+    /// no way to see. The arrangement that would leak is acquiring inside the
+    /// spawned task, and distinguishing *that* needs an fd count, which is the
+    /// live-verify leg (`docs/live-verify.md`, #1165) rather than this.
     #[tokio::test]
     async fn an_unregistered_dial_flood_cannot_starve_a_registering_plugin() {
         let (_clock_tx, clock_rx) = watch::channel(None);
@@ -10993,16 +11001,24 @@ mod containment_r2 {
     /// A command that writes 50 MB must be captured at the host's budget and
     /// **killed**, not buffered for the whole `RUN_COMMAND_TIMEOUT`.
     ///
-    /// Two assertions carry it, and they are different failures: the reply size
-    /// (the old code truncated *after* buffering everything, so this passed
-    /// while the heap grew by 50 MB) and the wall clock (the old code waited for
-    /// the program, or for the timeout — this is what proves the child is
-    /// stopped rather than merely ignored).
+    /// Three assertions carry it, and each was **measured** to fail against a
+    /// different wrong implementation — which is the only reason to keep all
+    /// three:
     ///
-    /// **Falsified** by putting `cmd.output()` back: the elapsed assertion reds
-    /// (the whole 50 MB is read, or the pipe fills and the 10 s timeout fires),
-    /// while the output-length one stays green — which is exactly why the timing
-    /// assertion is here.
+    /// - `!outcome.ok` reds against the pre-#1165 `cmd.output()`: `head` exits
+    ///   cleanly, so the old code reports success in about a second and the
+    ///   *size* assertion below stays green while the heap grew by 50 MB. This
+    ///   is the proxy for "the host stopped reading", since a test cannot
+    ///   assert on the host's own RSS.
+    /// - The elapsed bound reds against the first #1165 attempt, which read
+    ///   both pipes under `join!`: the pipe that is not the runaway never EOFs
+    ///   while the child lives, so the capture parked for the whole
+    ///   `RUN_COMMAND_TIMEOUT` — measured at 10.001 s. It is what makes "the
+    ///   child is killed" mean something rather than "the child is ignored".
+    /// - The size bound reds if the reply cap is ever widened by accident.
+    ///
+    /// The memory claim itself is the live-verify leg (`docs/live-verify.md`),
+    /// because only a running shell has an RSS to watch.
     #[cfg(feature = "system-tests")]
     #[tokio::test]
     async fn run_command_capture_is_bounded_and_the_child_is_killed() {

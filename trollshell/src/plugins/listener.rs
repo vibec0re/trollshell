@@ -263,12 +263,19 @@ pub(super) const MAX_UNREGISTERED_CONNECTIONS: usize = 64;
 /// Accept plugin connections forever, at most [`MAX_UNREGISTERED_CONNECTIONS`]
 /// of them un-registered at a time.
 ///
-/// The permit is taken **before** `accept(2)`, not after, which is what makes
-/// this a bound on *file descriptors* rather than on tasks: past the cap the
-/// host simply stops accepting, and the kernel's listen backlog holds the
-/// waiting dials. Taking it after the accept would bound only how many tasks
-/// run, with the fds piling up regardless — the resource that actually runs
-/// out.
+/// The permit is taken **before** `accept(2)`: past the cap the host stops
+/// accepting at all, and the kernel's listen backlog — not this process — holds
+/// the waiting dials.
+///
+/// What the position buys, measured rather than asserted (#1165's own
+/// falsification pass): since this loop is sequential, acquiring immediately
+/// *after* `accept(2)` instead differs by exactly **one** descriptor, and the
+/// hermetic test below cannot tell the two apart. The arrangement that does
+/// leak is acquiring the permit **inside the spawned task**: the loop would then
+/// accept without limit and every parked task would hold its fd, which is the
+/// resource that actually runs out. So the rule is "the gate is upstream of the
+/// spawn", and taking it before the accept is the cheapest spelling of that
+/// rather than a difference in kind.
 ///
 /// The permit is handed to [`serve_conn`], which releases it the moment the
 /// connection registers (see there). A connection that never registers holds it

@@ -88,7 +88,7 @@ fn render_completions(shell: Shell) -> String {
 /// kinds) keep their 0.
 fn exit_for_parse_error(e: &clap::Error) -> ! {
     let _ = e.print();
-    std::process::exit(if e.exit_code() == 0 { 0 } else { 1 });
+    std::process::exit(i32::from(e.exit_code() != 0));
 }
 
 /// Default `tracing` level when `RUST_LOG` is unset (#746).

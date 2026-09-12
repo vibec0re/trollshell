@@ -7,8 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hytte_plugin::proto::{
-    Capability, ConsentChoices, ConsentDecision, Effect, EventKind, Manifest, Mount, Node, Page,
-    StateKey,
+    CONSENT_PROMPT_GRACE_SECS, CONSENT_PROMPT_TIMEOUT_SECS, Capability, ConsentChoices,
+    ConsentDecision, Effect, EventKind, Manifest, Mount, Node, Page, StateKey,
 };
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
@@ -40,6 +40,20 @@ pub const PLUGIN_ID: &str = "agents";
 /// bounds every free-text value it renders (#963's review).
 const DETAIL_CHARS: usize = 240;
 
+/// How much of the card's headline the agent label may take.
+///
+/// Hyperhive's own `Ident::MAX_LEN` (`hive-types/src/lib.rs:87`), so a
+/// legitimate agent is never shortened and only a wire value that could not
+/// have been an agent name is. #1140's review, MEDIUM-5.
+const AGENT_CHARS: usize = 63;
+
+/// How much of the card's detail line the request timestamp may take.
+///
+/// RFC 3339 UTC is ~20-30 characters; the mirror keeps this field an unparsed
+/// string on purpose (see `AgentStatusRow::status_set_at`), so the cap is what
+/// stops an unparseable one from being unbounded too.
+const REQUESTED_AT_CHARS: usize = 40;
+
 /// One consent prompt this plugin has raised and not yet heard back on
 /// (#947 P3).
 ///
@@ -62,6 +76,17 @@ struct RaisedPrompt {
     request_id: u64,
     /// The approval it is asking about.
     approval: i64,
+    /// The host clock's unix seconds when it was raised, or `0` before the
+    /// first [`Input::Snapshot`] carries a clock.
+    ///
+    /// The gate's **only** way out when nobody answers. The `Approval` card
+    /// sends nothing on a timeout, an `Esc` or a supersede
+    /// (`ConsentChoices::unanswered`), so [`Agents::decide`] never runs; and if
+    /// the approval stays queued — which is exactly what default 2 promises —
+    /// `fold_pending` never clears the prompt either. Without a stamp the gate
+    /// shuts for the rest of the session on the most ordinary user action
+    /// there is: ignoring one card (#1140's review, MEDIUM-1).
+    raised_unix: i64,
 }
 
 /// The two edge-triggered flags §8's `Effect::Notify` watches.
@@ -115,6 +140,10 @@ pub struct Agents {
     prompted: BTreeSet<i64>,
     /// The one consent prompt in flight — see [`RaisedPrompt`].
     prompt: Option<RaisedPrompt>,
+    /// Agents named by an approval that the roster does not list, already
+    /// warned about — so each one costs a single line rather than one per poll.
+    /// Cleared per agent the moment it reappears; see [`Agents::on_roster`].
+    unknown_agents: BTreeSet<String>,
     /// The previous poll's alarm flags, per agent — the **edge** detector §8
     /// requires ("a hive with one wedged agent must not toast every 5 s").
     prev_alarms: BTreeMap<String, Alarms>,
@@ -150,6 +179,7 @@ impl Agents {
             pending: PendingApprovals::default(),
             prompted: BTreeSet::new(),
             prompt: None,
+            unknown_agents: BTreeSet::new(),
             now_unix: 0,
             last_poll_unix: None,
             prev_alarms: BTreeMap::new(),
@@ -325,7 +355,7 @@ impl Agents {
     ///    also reopens the gate.
     /// 3. **Raise the next one**, if nothing is in flight.
     fn fold_pending(&mut self, queue: Vec<Approval>) -> Vec<Effect> {
-        let pending = PendingApprovals::new(queue);
+        let pending = PendingApprovals::new(self.on_roster(queue));
         self.prompted.retain(|id| pending.contains(*id));
         if let Some(raised) = self.prompt
             && !pending.contains(raised.approval)
@@ -340,9 +370,88 @@ impl Agents {
         self.raise_next()
     }
 
+    /// Keep only the approvals whose agent is on the rendered roster, warning
+    /// **once** per unknown agent (#1140's review, MEDIUM-2).
+    ///
+    /// Two filters in one pass, and each closes the same hole from a different
+    /// side:
+    ///
+    /// - [`AgentName::parse`], which is what [`crate::hive::wire::Approval`]'s
+    ///   own doc already claimed happened and did not. `approval.agent` reaches
+    ///   `cfg.label_for` and from there the consent card's headline, so it is a
+    ///   wire string on a modal.
+    /// - **membership of the roster**, because the badge — the *only* way back
+    ///   into a prompt that timed out — is drawn by walking `Hive::Up`'s
+    ///   agents. An approval for an agent that is not there would raise a card
+    ///   with nothing on screen corresponding to it, and (before the gate aged
+    ///   out) would mute the queue behind it forever.
+    ///
+    /// Dropping is the safe direction: an approval nobody can see is an
+    /// approval nobody can answer, and it stays untouched in the hive for the
+    /// dashboard. Nothing is dropped silently — the first sighting of each
+    /// unknown agent warns, and the set is cleared when it reappears on the
+    /// roster, so a flapping agent warns on each transition rather than on each
+    /// poll (twice a second, by default).
+    ///
+    /// When the hive is **not** `Up` there is no roster to judge against, so
+    /// the queue empties without a warning: "the hive is down" is not "this
+    /// agent does not exist", and the card renders its error row anyway.
+    fn on_roster(&mut self, queue: Vec<Approval>) -> Vec<Approval> {
+        if !matches!(self.hive, Hive::Up { .. }) {
+            return Vec::new();
+        }
+        let mut kept = Vec::with_capacity(queue.len());
+        for approval in queue {
+            let known = AgentName::parse(&approval.agent)
+                .is_some_and(|name| self.hive.agent(&name).is_some());
+            if known {
+                self.unknown_agents.remove(&approval.agent);
+                kept.push(approval);
+            } else if self.unknown_agents.insert(approval.agent.clone()) {
+                tracing::warn!(
+                    agent = %approval.agent,
+                    approval = approval.id,
+                    "an approval names an agent this hive's roster does not list; \
+                     no prompt and no badge — answer it on the dashboard"
+                );
+            }
+        }
+        kept
+    }
+
     /// Raise a prompt for the oldest approval nobody has been asked about yet,
     /// if the one-card gate is open.
+    ///
+    /// # Ageing the gate out (#1140's review, MEDIUM-1)
+    ///
+    /// The gate exists so a burst of approvals is answered one card at a time
+    /// rather than five cards superseding each other inside one 60 s window.
+    /// But the `Approval` card sends **nothing** when it is ignored, so without
+    /// a deadline of this plugin's own, one ignored card shuts the gate for the
+    /// rest of the session — for every agent — and default 3 ("the overlay is
+    /// the notification") means that failure is silent.
+    ///
+    /// So a prompt older than the host's own bound plus a race margin
+    /// ([`CONSENT_PROMPT_TIMEOUT_SECS`] + [`CONSENT_PROMPT_GRACE_SECS`], both
+    /// read from the proto so the two processes cannot drift) is treated as
+    /// abandoned and the gate reopens. What it does **not** do is re-raise the
+    /// ignored card: that approval keeps its `prompted` entry, so it stays
+    /// pending and badged and only a badge click brings it back — which is
+    /// default 2 exactly. What reopening buys is that the queue *behind* it
+    /// starts prompting again.
+    ///
+    /// A zero `raised_unix` (no clock yet) never ages: guessing at elapsed time
+    /// without a clock would abandon a card that is still on screen.
     fn raise_next(&mut self) -> Vec<Effect> {
+        if let Some(raised) = self.prompt
+            && self.prompt_is_abandoned(raised)
+        {
+            tracing::debug!(
+                approval = raised.approval,
+                "the consent card went unanswered past its bound; reopening the gate"
+            );
+            self.prompt = None;
+        }
         if self.prompt.is_some() {
             return Vec::new();
         }
@@ -350,6 +459,14 @@ impl Agents {
             return Vec::new();
         };
         self.raise(&next)
+    }
+
+    /// Whether `raised` has outlived the host's prompt bound — see
+    /// [`Agents::raise_next`].
+    fn prompt_is_abandoned(&self, raised: RaisedPrompt) -> bool {
+        let bound = i64::try_from(CONSENT_PROMPT_TIMEOUT_SECS + CONSENT_PROMPT_GRACE_SECS)
+            .unwrap_or(i64::MAX);
+        raised.raised_unix > 0 && self.now_unix.saturating_sub(raised.raised_unix) >= bound
     }
 
     /// Raise the consent prompt for one approval.
@@ -367,16 +484,22 @@ impl Agents {
     /// one: `Input::EffectResult`'s allocation contract makes `RunCommand`,
     /// `OpenUri` and `RequestConsent` one id space, and this plugin emits all
     /// three.
+    /// Every free-text value on the card is **bounded** here (#1140's review,
+    /// MEDIUM-5). `description` always was; `agent` and `requested_at` are wire
+    /// values this mirror deliberately keeps unparsed, and both are
+    /// interpolated into a 480 px wrapping label. A 5 000-char agent name
+    /// pushes the buttons off the only surface that can answer the approval.
     fn raise(&mut self, approval: &Approval) -> Vec<Effect> {
         let request_id = self.take_effect_id();
         self.prompted.insert(approval.id);
         self.prompt = Some(RaisedPrompt {
             request_id,
             approval: approval.id,
+            raised_unix: self.now_unix,
         });
         vec![Effect::RequestConsent {
             request_id,
-            agent: self.cfg.label_for(&approval.agent).to_owned(),
+            agent: clamp(self.cfg.label_for(&approval.agent), AGENT_CHARS),
             datasource: String::new(),
             scope: approval.kind.human(),
             detail: detail_line(approval),
@@ -388,18 +511,25 @@ impl Agents {
     /// is waiting on (spec §6.5 / #947's default 2).
     ///
     /// This is the recovery path for a prompt that timed out or was dismissed —
-    /// the operator's way back to a card that answered nothing — so it
-    /// **replaces** whatever is in flight rather than deferring to it: the host
-    /// has one consent window and a new `RequestConsent` supersedes what is in
-    /// it, so pretending otherwise would leave the model describing a card that
-    /// no longer exists.
+    /// the operator's way back to a card that answered nothing.
+    ///
+    /// It **bypasses the gate entirely**, and the mechanism is
+    /// [`Agents::raise`] itself: `raise` assigns `self.prompt` unconditionally,
+    /// so the click replaces whatever is in flight without consulting it. That
+    /// is correct because the host has exactly one consent window and a new
+    /// `RequestConsent` supersedes what is in it — deferring to the gate would
+    /// leave the model describing a card that no longer exists.
+    ///
+    /// It used to clear `self.prompt` first. That was dead code, and the test's
+    /// stated falsification for it was wrong (#1140's review, LOW-1): deleting
+    /// the clear changed nothing observable, because the unconditional assign
+    /// two lines later is what does the work.
     fn raise_for(&mut self, name: &AgentName) -> Vec<Effect> {
         let Some(next) = self.pending.oldest_for(name.as_str()).cloned() else {
             // The badge and the queue disagree — the click raced a poll. The
             // next render simply has no badge.
             return Vec::new();
         };
-        self.prompt = None;
         self.raise(&next)
     }
 
@@ -809,7 +939,15 @@ impl Plugin for Agents {
             Input::App(Msg::Status(result)) => self.fold_status(result),
             // #947 P3: the approval queue, folded on the same tick as the
             // roster it badges.
-            Input::App(Msg::Pending(queue)) => self.fold_pending(queue),
+            Input::App(Msg::Pending(Ok(queue))) => self.fold_pending(queue),
+            // …and a queue the hive refused (#1140's review, LOW-3). The badges
+            // go, because they are claims about a queue this build can no
+            // longer see; `prompted` and the in-flight prompt stay, so a
+            // one-tick blip cannot re-raise a card the operator already has.
+            Input::App(Msg::Pending(Err(_))) => {
+                self.pending = PendingApprovals::default();
+                Vec::new()
+            }
             // #947 P3: the human answered (or the two-button card would have
             // sent nothing at all, and this never arrives).
             Input::ConsentDecision {
@@ -887,7 +1025,13 @@ fn detail_line(approval: &Approval) -> String {
     let stamp = if approval.requested_at.is_empty() {
         format!("request #{}", approval.id)
     } else {
-        format!("request #{}, asked {}", approval.id, approval.requested_at)
+        // Bounded like the description: the mirror keeps `requested_at` an
+        // unparsed wire string on purpose, so nothing else caps it.
+        format!(
+            "request #{}, asked {}",
+            approval.id,
+            clamp(&approval.requested_at, REQUESTED_AT_CHARS)
+        )
     };
     match approval
         .description

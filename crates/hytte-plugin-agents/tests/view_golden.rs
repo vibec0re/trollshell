@@ -158,7 +158,7 @@ fn scenarios() -> Vec<(&'static str, Agents)> {
             m.update(Input::App(Msg::Status(Ok(roster(
                 "agent_status_grouped.json",
             )))));
-            m.update(Input::App(Msg::Pending(approval_queue())));
+            m.update(Input::App(Msg::Pending(Ok(approval_queue()))));
             m
         }),
         // The same roster with one agent selected — the §6.4 panel in full.

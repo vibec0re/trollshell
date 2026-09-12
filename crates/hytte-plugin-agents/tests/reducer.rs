@@ -20,6 +20,7 @@ use hytte_plugin_agents::hive::wire::{
     VersionMismatch,
 };
 use hytte_plugin_agents::model::{Hive, Status};
+use hytte_plugin_agents::plugin::card_of;
 use hytte_plugin_agents::poll::{Cmd, Msg};
 use hytte_plugin_agents::window::Probe;
 
@@ -1160,7 +1161,53 @@ fn approval(id: i64, agent: &str) -> Approval {
 }
 
 fn pending(queue: Vec<Approval>) -> Input<Msg> {
-    Input::App(Msg::Pending(queue))
+    Input::App(Msg::Pending(Ok(queue)))
+}
+
+/// A `Pending` round trip the hive refused — the lane that clears badges
+/// without disturbing the prompt bookkeeping (#1140's review, LOW-3).
+fn pending_refused() -> Input<Msg> {
+    Input::App(Msg::Pending(Err(HiveError::Refused {
+        reason: "permission denied".to_owned(),
+    })))
+}
+
+/// Every `Button` id in the rendered card, in render order.
+///
+/// The reducer suite usually asserts on effects and socket frames; this exists
+/// for the one #1140 finding whose symptom is a *missing* affordance — an
+/// approval that prompts with no badge behind it has no recovery path at all.
+fn button_ids(node: &hytte_plugin::proto::Node) -> Vec<String> {
+    use hytte_plugin::proto::Node;
+
+    fn walk(node: &Node, out: &mut Vec<String>) {
+        if let Node::Button { id, .. } = node {
+            out.push(id.clone());
+        }
+        match node {
+            Node::Box { children, .. }
+            | Node::Row { children, .. }
+            | Node::ListBox { children, .. } => {
+                for c in children {
+                    walk(c, out);
+                }
+            }
+            Node::Expander {
+                header, children, ..
+            } => {
+                walk(header, out);
+                for c in children {
+                    walk(c, out);
+                }
+            }
+            Node::Button { child, .. } | Node::Scrolled { child, .. } => walk(child, out),
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(node, &mut out);
+    out
 }
 
 /// Every `RequestConsent` in a batch of effects, as
@@ -1598,4 +1645,288 @@ fn a_long_description_is_clamped_on_a_char_boundary() {
     assert!(crabs <= 240, "clamped to the cap, got {crabs}");
     assert!(detail.contains('…'), "and says it was cut: {detail}");
     assert!(detail.contains("request #7"), "{detail}");
+}
+
+// ── #1140 review: the fix round ──────────────────────────────────────────────
+
+/// Advance the model's clock, the way the host's `StateKey::Clock` push does.
+fn clock(unix: i64) -> Input<Msg> {
+    Input::Snapshot(hytte_plugin::proto::StateSnapshot {
+        clock: Some(hytte_plugin::proto::ClockState {
+            unix,
+            iso: String::new(),
+        }),
+    })
+}
+
+/// **MEDIUM-1.** The review's probe, inverted: an ignored card must not mute
+/// the queue behind it for the rest of the session.
+///
+/// The `Approval` card sends nothing when it is ignored, so `decide` never
+/// runs; and the approval stays queued, which is default 2, so `fold_pending`
+/// never clears the prompt either. Before the `raised_unix` stamp, that shut
+/// the one-card gate permanently — for **every** agent — on the most ordinary
+/// user action there is, and default 3 ("the overlay is the notification")
+/// made the failure silent.
+///
+/// Falsification: delete the ageing branch at the head of `raise_next` (or
+/// stop stamping `raised_unix`) and the last assertion goes red — no approval,
+/// for any agent, ever prompts again.
+#[test]
+fn an_ignored_card_stops_muting_the_queue_once_it_ages_out() {
+    let (mut m, _rx) = model();
+    m.update(clock(1_000));
+    m.update(status(roster("agent_status_grouped.json")));
+
+    // #7 prompts, and nobody answers it.
+    let first = m.update(pending(vec![approval(7, "trollshell-choom")]));
+    assert_eq!(prompts(&first).len(), 1, "{first:?}");
+
+    // A second agent's approval queues up behind it. While the card could
+    // still be on screen, the gate correctly holds.
+    let queue = vec![approval(7, "trollshell-choom"), approval(8, "nixos-choom")];
+    for tick in 0..25 {
+        m.update(clock(1_000 + tick * 2));
+        let fx = m.update(pending(queue.clone()));
+        assert_eq!(prompts(&fx), Vec::new(), "tick {tick}: {fx:?}");
+    }
+
+    // Past the host's bound plus the race margin, the gate reopens and the
+    // approval *behind* the ignored one prompts.
+    m.update(clock(1_000 + 66));
+    let woken = m.update(pending(queue.clone()));
+    let raised = prompts(&woken);
+    assert_eq!(raised.len(), 1, "{woken:?}");
+    assert!(
+        raised[0].3.contains("request #8"),
+        "the queue behind the ignored card, not the card itself: {}",
+        raised[0].3
+    );
+
+    // …and the ignored one is still pending and still badged — default 2. It
+    // is *not* re-raised on its own; the badge click is its way back.
+    assert_eq!(m.pending.count_for("trollshell-choom"), 1);
+    let after = m.update(pending(queue));
+    assert_eq!(prompts(&after), Vec::new(), "{after:?}");
+}
+
+/// The ageing is bounded by the **host's** number, not a guess: a prompt that
+/// is merely old-ish still holds the gate, because the card may well still be
+/// on screen and a second `RequestConsent` would replace it.
+#[test]
+fn the_gate_ages_out_only_past_the_hosts_own_bound() {
+    let (mut m, _rx) = model();
+    m.update(clock(1_000));
+    m.update(status(roster("agent_status_grouped.json")));
+    let queue = vec![approval(7, "trollshell-choom"), approval(8, "nixos-choom")];
+    m.update(pending(vec![approval(7, "trollshell-choom")]));
+
+    // One second before the host would even have torn the card down.
+    m.update(clock(1_000 + 59));
+    assert_eq!(prompts(&m.update(pending(queue.clone()))), Vec::new());
+
+    // Exactly at the bound plus the grace.
+    m.update(clock(1_000 + 65));
+    assert_eq!(prompts(&m.update(pending(queue))).len(), 1);
+}
+
+/// With no clock yet, nothing ages: guessing at elapsed time without one would
+/// abandon a card that is still on screen.
+#[test]
+fn a_prompt_raised_before_the_first_clock_never_ages_out() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    m.update(pending(vec![approval(7, "trollshell-choom")]));
+
+    let queue = vec![approval(7, "trollshell-choom"), approval(8, "nixos-choom")];
+    // A clock arrives *after* the prompt was raised, reading far past the
+    // bound. `raised_unix` is 0, so the elapsed time is unknowable.
+    m.update(clock(9_999_999));
+    assert_eq!(prompts(&m.update(pending(queue))), Vec::new());
+}
+
+/// §6.5's "dropping it also reopens the gate" — the mechanism the review found
+/// unpinned (mutation 5).
+///
+/// Falsification: delete the `self.prompt = None` in `fold_pending` and #8
+/// never prompts, because the departed #7 holds the gate until the ageing
+/// branch eventually lets go.
+#[test]
+fn an_approval_leaving_the_queue_reopens_the_gate_in_that_same_fold() {
+    let (mut m, _rx) = model();
+    m.update(clock(1_000));
+    m.update(status(roster("agent_status_grouped.json")));
+    assert_eq!(
+        prompts(&m.update(pending(vec![approval(7, "trollshell-choom")]))).len(),
+        1
+    );
+
+    // #7 was answered on the dashboard; #8 arrived. Same fold, no clock
+    // movement at all — so only the departure can be what reopened the gate.
+    let fx = m.update(pending(vec![approval(8, "nixos-choom")]));
+    let raised = prompts(&fx);
+    assert_eq!(raised.len(), 1, "{fx:?}");
+    assert!(raised[0].3.contains("request #8"), "{}", raised[0].3);
+}
+
+/// **MEDIUM-2.** The review's probe, inverted: an approval naming an agent the
+/// roster does not list gets **no prompt and no badge**, and does not hold the
+/// gate against the agents that do exist.
+///
+/// A card with nothing on screen corresponding to it is unanswerable — the
+/// badge is the only way back into a prompt, and the badge is drawn by walking
+/// the roster.
+///
+/// Falsification: drop the roster filter in `fold_pending` and the first
+/// assertion finds a prompt for `ghost-agent`.
+#[test]
+fn an_approval_for_an_agent_the_roster_does_not_list_is_dropped() {
+    let (mut m, _rx) = model();
+    m.update(clock(1_000));
+    m.update(status(roster("agent_status_grouped.json")));
+
+    let fx = m.update(pending(vec![approval(7, "ghost-agent")]));
+    assert_eq!(prompts(&fx), Vec::new(), "no prompt: {fx:?}");
+    assert_eq!(m.pending.count_for("ghost-agent"), 0, "no badge");
+    assert!(
+        !button_ids(&card_of(&m))
+            .iter()
+            .any(|id| id.starts_with("approvals:")),
+        "no badge anywhere on the card"
+    );
+
+    // …and a real agent's approval behind it still prompts, in the same fold.
+    let fx = m.update(pending(vec![
+        approval(7, "ghost-agent"),
+        approval(8, "trollshell-choom"),
+    ]));
+    let raised = prompts(&fx);
+    assert_eq!(raised.len(), 1, "{fx:?}");
+    assert!(raised[0].3.contains("request #8"), "{}", raised[0].3);
+}
+
+/// A name hyperhive's own `Ident` would refuse never reaches the card's
+/// headline either — which is what `wire.rs`'s `Approval::agent` doc already
+/// claimed happened, and did not.
+#[test]
+fn an_approval_whose_agent_fails_the_whitelist_is_dropped() {
+    let (mut m, _rx) = model();
+    m.update(clock(1_000));
+    m.update(status(roster("agent_status_grouped.json")));
+    for bad in ["Agent_9", "SHOUTING", "../etc/passwd", ""] {
+        let fx = m.update(pending(vec![approval(7, bad)]));
+        assert_eq!(prompts(&fx), Vec::new(), "{bad:?}: {fx:?}");
+    }
+}
+
+/// With the hive not `Up` there is no roster to judge against, so the queue
+/// empties — "the hive is down" is not "this agent does not exist", and the
+/// card renders its error row rather than badges either way.
+#[test]
+fn a_queue_arriving_while_the_hive_is_down_badges_nothing() {
+    let (mut m, _rx) = model();
+    m.update(clock(1_000));
+    m.update(Input::App(Msg::Status(Err(HiveError::Unreachable {
+        reason: "no socket".to_owned(),
+    }))));
+    let fx = m.update(pending(vec![approval(7, "trollshell-choom")]));
+    assert_eq!(prompts(&fx), Vec::new(), "{fx:?}");
+    assert_eq!(m.pending.count_for("trollshell-choom"), 0);
+}
+
+/// **LOW-3.** A refused `Pending` clears the badges — they are claims about a
+/// queue this build can no longer see — without disturbing `prompted` or the
+/// in-flight prompt, so a one-tick blip cannot re-raise a card the operator
+/// already has on screen.
+///
+/// Falsification: make the `Err` arm a no-op and the badge survives a refusal;
+/// make it clear `prompted` too and the recovery fold re-prompts #7.
+#[test]
+fn a_refused_queue_clears_the_badges_but_never_re_prompts() {
+    let (mut m, _rx) = model();
+    m.update(clock(1_000));
+    m.update(status(roster("agent_status_grouped.json")));
+    assert_eq!(
+        prompts(&m.update(pending(vec![approval(7, "trollshell-choom")]))).len(),
+        1
+    );
+    assert_eq!(m.pending.count_for("trollshell-choom"), 1);
+
+    let refused = m.update(pending_refused());
+    assert_eq!(prompts(&refused), Vec::new(), "{refused:?}");
+    assert_eq!(
+        m.pending.count_for("trollshell-choom"),
+        0,
+        "a queue we cannot see must not be badged"
+    );
+
+    // The hive answers again with the same approval still queued: it is badged
+    // again, and it does **not** prompt again.
+    let back = m.update(pending(vec![approval(7, "trollshell-choom")]));
+    assert_eq!(prompts(&back), Vec::new(), "{back:?}");
+    assert_eq!(m.pending.count_for("trollshell-choom"), 1);
+}
+
+/// **MEDIUM-5.** All three of the card's free-text values are bounded, not one.
+///
+/// `agent` reaches the headline and `requested_at` the detail line, both raw
+/// off the wire and both deliberately unparsed by the mirror. On a 480 px
+/// wrapping label an unbounded one pushes the buttons off the only surface
+/// that can answer the approval.
+///
+/// Falsification: drop either `clamp` and the matching assertion goes red.
+#[test]
+fn every_free_text_value_on_the_card_is_bounded() {
+    let (mut m, _rx) = model();
+    m.update(clock(1_000));
+    // A roster row whose name is legal but long, so the *label* is what grows:
+    // `AgentName` already caps the name at 63 bytes, and the config's label
+    // for it is operator-supplied and uncapped.
+    m.update(status(roster("agent_status_grouped.json")));
+
+    let mut a = approval(7, "trollshell-choom");
+    a.description = Some("🦀".repeat(5_000));
+    a.requested_at = "9".repeat(5_000);
+
+    let fx = m.update(pending(vec![a]));
+    let (_, agent, _, detail) = prompts(&fx)[0].clone();
+    assert!(
+        agent.chars().count() <= 64,
+        "the headline is bounded, got {} chars",
+        agent.chars().count()
+    );
+    assert!(
+        detail.chars().count() <= 320,
+        "the detail line is bounded, got {} chars",
+        detail.chars().count()
+    );
+    assert!(detail.contains('…'), "and says it was cut: {detail}");
+}
+
+/// The same, with a 5 000-char **label** — the value an operator writes into
+/// `agents.toml`, which nothing else caps.
+#[test]
+fn a_runaway_display_label_cannot_grow_the_card() {
+    let (mut m, _rx) = model();
+    m.update(clock(1_000));
+    m.update(status(roster("agent_status_grouped.json")));
+    m.update(Input::App(Msg::Config(Box::new(
+        hytte_config::subsystem::assemble::<hytte_plugin_agents::config::AgentsConfig>(&[(
+            std::path::PathBuf::from("overlay.toml"),
+            format!(
+                "[display.trollshell-choom]\nlabel = \"{}\"\n",
+                "x".repeat(5_000)
+            ),
+        )])
+        .expect("the config assembles")
+        .config,
+    ))));
+
+    let fx = m.update(pending(vec![approval(7, "trollshell-choom")]));
+    let agent = prompts(&fx)[0].1.clone();
+    assert!(
+        agent.chars().count() <= 64,
+        "got {} chars",
+        agent.chars().count()
+    );
 }

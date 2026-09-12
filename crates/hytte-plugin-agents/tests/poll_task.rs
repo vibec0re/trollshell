@@ -414,3 +414,86 @@ async fn urls_is_fetched_once_per_session_not_once_per_poll() {
     assert_eq!(urls, 1, "Urls must be asked exactly once per session");
     task.abort();
 }
+
+/// **#1140's review, LOW-2.** A hive that is down costs **one** failed connect
+/// per tick, not three.
+///
+/// The ordering's stated reason — `AgentStatus` first, `Pending` and `Urls`
+/// skipped when it fails — was unpinned: replacing the `if !ok { return; }`
+/// with `if false` left the suite green, and a down hive would then burn three
+/// connect attempts every tick for as long as the sidebar is open.
+///
+/// Falsification: delete that early return and `seen()` grows past one, or —
+/// since the fake is not even bound here — a `Msg::Pending` arrives where none
+/// should.
+#[tokio::test(start_paused = true)]
+async fn a_failed_status_skips_the_rest_of_the_tick() {
+    // A path with no socket behind it: every connect fails.
+    let dir = tempfile::tempdir().expect("a tempdir");
+    let cfg = AgentsConfig {
+        socket: dir.path().join("absent.sock").display().to_string(),
+        poll_seconds: 1,
+        ..AgentsConfig::default()
+    };
+    let (_tx, rx) = cmd_channel();
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(poll_task_with(
+        rx,
+        msg_tx,
+        cfg,
+        ConfigSource::over(Vec::new()),
+    ));
+
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "the seed config").await,
+        Msg::Config(_)
+    ));
+    match recv_soon(&mut msg_rx, "the seed poll's failure").await {
+        Msg::Status(Err(_)) => {}
+        other => panic!("expected a failed status, got {other:?}"),
+    }
+
+    // Nothing else from that tick: no `Pending`, no `Urls`.
+    settle().await;
+    assert!(
+        msg_rx.try_recv().is_err(),
+        "a failed status must end the tick — no `Pending`, no `Urls`"
+    );
+    task.abort();
+}
+
+/// The refusal lane (#1140's review, LOW-3): `Pending` answering `ok: false`
+/// reaches the reducer as `Msg::Pending(Err(…))` rather than being swallowed,
+/// so the badges it can no longer vouch for are dropped.
+///
+/// Falsification: go back to logging the error and dropping it, and the
+/// `Msg::Pending(Err(_))` never arrives — this fails on `recv_soon`'s deadline.
+#[tokio::test(start_paused = true)]
+async fn a_refused_pending_reaches_the_reducer() {
+    let hive = FakeHive::serve(replies(&[
+        ("agent_status", &fixture("agent_status_grouped.json")),
+        ("pending", &fixture("error.json")),
+    ]));
+    let (_tx, rx) = cmd_channel();
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(poll_task_with(
+        rx,
+        msg_tx,
+        cfg_for(&hive),
+        ConfigSource::over(Vec::new()),
+    ));
+
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "the seed config").await,
+        Msg::Config(_)
+    ));
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "a poll answer").await,
+        Msg::Status(Ok(_))
+    ));
+    match recv_soon(&mut msg_rx, "the refused approval queue").await {
+        Msg::Pending(Err(e)) => assert!(e.to_string().contains("ghost"), "{e}"),
+        other => panic!("expected a refused queue, got {other:?}"),
+    }
+    task.abort();
+}

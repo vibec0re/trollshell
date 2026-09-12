@@ -3630,3 +3630,63 @@ fn the_capability_list_is_one_variant_from_an_array16_header() {
         "the 16th element crosses to array16, shifting every byte after it",
     );
 }
+
+/// The pre-#947 shape of the variant, as an older host's decoder sees it —
+/// five fields, no `choices`.
+///
+/// A hand-mirror rather than a version of the real type, because the point is
+/// to decode *today's* bytes with *yesterday's* struct, and cargo cannot link
+/// two versions of this crate.
+#[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+enum OldEffect {
+    RequestConsent {
+        request_id: u64,
+        agent: String,
+        datasource: String,
+        scope: String,
+        detail: String,
+    },
+}
+
+/// #1140's review, LOW-4. The **reverse** compat direction, which is the
+/// load-bearing safety argument for skipping the `VOCAB` bump and which
+/// `the_consent_choice_set_is_an_additive_skipped_field` only asserts forwards.
+///
+/// A newer plugin asking an older host for the approval card must degrade to
+/// "wrong label, right outcome" — the host skips the key it has never heard of
+/// and draws the four-button card, whose timeout denies. If it instead *failed*
+/// the body, the frame would die, the SDK would redial, and #437's near-silent
+/// crash-loop would be back for every approval prompt.
+///
+/// Falsification: put `#[serde(deny_unknown_fields)]` on `OldEffect`'s variant
+/// — which is what a future hardening of the real type would amount to — and
+/// the `expect` fails.
+#[test]
+fn an_old_host_skips_the_new_choices_key_instead_of_failing() {
+    let body = encode_body(&Effect::RequestConsent {
+        request_id: 7,
+        agent: "trollshell-choom".into(),
+        datasource: String::new(),
+        scope: "merge a reviewed config PR".into(),
+        detail: "request #7".into(),
+        choices: ConsentChoices::Approval,
+    });
+    assert!(
+        contains(&body, b"choices"),
+        "the two-button card does put the key on the wire"
+    );
+
+    let old: OldEffect = rmp_serde::from_slice(&body)
+        .expect("an older host must skip the unknown `choices` key, not fail the body");
+    assert_eq!(
+        old,
+        OldEffect::RequestConsent {
+            request_id: 7,
+            agent: "trollshell-choom".to_owned(),
+            datasource: String::new(),
+            scope: "merge a reviewed config PR".to_owned(),
+            detail: "request #7".to_owned(),
+        },
+        "and every field it does know decodes unchanged"
+    );
+}

@@ -725,6 +725,27 @@ pub enum ConsentChoices {
     Approval,
 }
 
+/// How long the host leaves a consent prompt up before tearing it down
+/// (#487's 60 s bound, named rather than described).
+///
+/// It is published here because **two processes have to agree on it**. The host
+/// owns the timer; a plugin using [`ConsentChoices::Approval`] receives nothing
+/// when it fires ([`ConsentChoices::unanswered`]), so it has to run a deadline
+/// of its own to know its prompt is gone — and a requester that guessed a
+/// smaller number than the host's would abandon a card the human is still
+/// looking at. Wait strictly longer than this (see
+/// [`CONSENT_PROMPT_GRACE_SECS`]).
+pub const CONSENT_PROMPT_TIMEOUT_SECS: u64 = 60;
+
+/// How much longer than [`CONSENT_PROMPT_TIMEOUT_SECS`] a requester should wait
+/// before treating its own prompt as abandoned.
+///
+/// The host's timer and the requester's are different clocks reached over a
+/// socket; without slack the requester can time out a prompt in the same second
+/// the human clicks it, and then ignore the answer as stale. Small on purpose —
+/// it is a race margin, not a second policy.
+pub const CONSENT_PROMPT_GRACE_SECS: u64 = 5;
+
 impl ConsentChoices {
     /// Whether this is the default card — the `skip_serializing_if` predicate,
     /// so the four-button frame stays byte-identical to a pre-#947 one.

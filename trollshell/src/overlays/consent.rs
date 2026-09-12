@@ -64,16 +64,19 @@ use crate::components::focused_output;
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::ui::{Layer, layer_window};
-use hytte_plugin_proto::{ConsentChoices, ConsentDecision, HostMsg};
+use hytte_plugin_proto::{CONSENT_PROMPT_TIMEOUT_SECS, ConsentChoices, ConsentDecision, HostMsg};
 use tokio::sync::mpsc;
 
 /// How long a prompt stays up unanswered before it tears itself down (#487).
-/// Matches the proto's documented 60 s bound — the broker holds its own,
-/// slightly longer, fallback so a live shell's decision always wins the race.
 ///
-/// What that teardown *sends* is [`ConsentChoices::unanswered`]'s call, not
-/// this constant's: `Deny` for a grant, nothing at all for an approval.
-const PROMPT_TIMEOUT: Duration = Duration::from_mins(1);
+/// Read from the **proto**, not spelled here, since #1140: a requester using
+/// [`ConsentChoices::Approval`] receives nothing when this fires and must run
+/// its own deadline, so the number is one both processes read rather than two
+/// that happen to agree today ([`CONSENT_PROMPT_TIMEOUT_SECS`]).
+///
+/// What the teardown *sends* is [`ConsentChoices::unanswered`]'s call, not this
+/// constant's: `Deny` for a grant, nothing at all for an approval.
+const PROMPT_TIMEOUT: Duration = Duration::from_secs(CONSENT_PROMPT_TIMEOUT_SECS);
 
 /// One button on a consent card: the label the human reads, the decision a
 /// click sends, and the style class that colours it.

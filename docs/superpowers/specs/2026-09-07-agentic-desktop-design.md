@@ -620,20 +620,45 @@ approval queue. An agent proposing a config change parks an approval, and today
 the only way to answer it is `hivectl` or the dashboard.
 
 The desktop already has the matching primitive — #487 phase 1b's interactive
-consent prompt. So the two are wired together with **no new vocabulary on either
-side**:
+consent prompt. So the two are wired together with **no new wire variant on
+either side** (one appended, defaulted `Effect::RequestConsent` field; see the
+amendment below):
 
 ```text
 poll  Pending                              (hive-host-sock/src/lib.rs:228-229)
   → for each new approval id, the plugin emits
-    Effect::RequestConsent { request_id, agent, datasource, scope, detail }
+    Effect::RequestConsent { request_id, agent, datasource, scope, detail, choices }
                                            (crates/hytte-plugin-proto/src/effect.rs:135-141)
-  → the shell raises the prompt on the focused output, four choices
+  → the shell raises the prompt on the focused output, TWO choices —
+    Approve / Deny (`ConsentChoices::Approval`)
   → HostMsg::ConsentDecision comes back keyed by the same request_id
                                            (crates/hytte-plugin-proto/src/msg.rs:122-124)
   → the plugin sends Approve { id }  or  Deny { id }
                                            (hive-host-sock/src/lib.rs:230-233)
 ```
+
+> **Amended 2026-09-12, and this paragraph is the normative one** (#947's
+> defaults 1–3, posted on the thread and unvetoed; built in #1140). The two
+> sentences below that say "four choices" and "60 s → deny is the right default
+> for an approval too" were this section's original call and are **retracted**;
+> they are kept struck through rather than deleted so a reader who followed a
+> citation here can see what moved.
+>
+> - **The approval card has two choices, Approve and Deny.** "This session" and
+>   "Always" name a standing grant over a one-shot config merge, which the
+>   requester cannot honour and which this section's own next paragraph already
+>   forbids persisting. The **datasource** card keeps its four — #487 is
+>   unchanged.
+> - **An unanswered approval prompt sends nothing at all.** Not a `Deny`: the
+>   plugin wires `Deny` to `Request::Deny { id }`, which durably refuses the
+>   reviewed PR on the far side, and "nobody was at the screen for 60 seconds"
+>   is not evidence for that. The approval stays pending — exactly as the
+>   original sentence's second half wanted — and the row keeps a badge counting
+>   what it waits on; clicking the badge re-raises the oldest. Deny is only ever
+>   a click. The rule lives in one place both processes read,
+>   `ConsentChoices::unanswered`.
+> - **The overlay is the notification.** No extra toast; the badge covers the
+>   silent case.
 
 The prompt's strings come from the `Approval` itself — `agent`, `kind`,
 `requested_at` and the free-text description
@@ -646,9 +671,11 @@ variants — `AllowOnce`, `AllowSession`, `AllowAlways`, `Deny`
 one-shot on a specific id. So **every `Allow*` maps to `Approve { id }` for that
 one id**, and the plugin persists **no standing grant**. "Approve every future
 config PR from this agent" is not something a consent prompt should be able to
-grant, and the `Deny` timeout (60 s → deny) is the right default for an approval
-too: an unanswered prompt leaves the approval pending, which is what it already
-was.
+grant, and ~~the `Deny` timeout (60 s → deny) is the right default for an
+approval too:~~ an unanswered prompt leaves the approval pending, which is what
+it already was. _(Struck 2026-09-12 — see the amendment above: a 60 s silence
+sends nothing, because a `Deny` here is not "leaves the approval pending", it
+resolves it.)_
 
 An approval that disappears from `Pending` between the prompt and the answer (the
 operator used `hivectl`, or another prompt won) is dropped with a debug line, not

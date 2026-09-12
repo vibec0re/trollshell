@@ -79,14 +79,17 @@ pub enum Msg {
     /// [`crate::model::PendingApprovals::new`], rather than trusting this
     /// task to have done it.
     ///
-    /// Sent **only** when the `Pending` round trip succeeded. A failed one is
-    /// logged and dropped rather than folded as an empty queue: the badge is
-    /// derived from this, and a transient refusal that cleared every badge —
-    /// then restored them on the next tick — would be a flicker that tells the
-    /// operator the opposite of the truth. The roster's own
-    /// [`Msg::Status`] failure already takes the card out of `Hive::Up`, which
-    /// is where the badges are drawn, so nothing stale is shown either.
-    Pending(Vec<Approval>),
+    /// **A refusal is carried, not swallowed** (#1140's review, LOW-3). It used
+    /// to be a `debug!` and nothing else, which left `self.pending` holding the
+    /// last good queue indefinitely: a hive that answers `agent_status` but
+    /// refuses `pending` — an older daemon, a permissions change — kept drawing
+    /// badges for approvals that may no longer exist, and clicking one raised a
+    /// card whose `Approve` the hive then refused. The reducer's `Err` arm
+    /// clears the badges without touching `prompted` or the in-flight prompt,
+    /// so a one-tick blip costs a badge rather than a duplicate prompt.
+    ///
+    /// Only sent when the *status* call succeeded — see [`poll_once`].
+    Pending(Result<Vec<Approval>, HiveError>),
     /// A [`Cmd::Send`] the hive did not accept.
     ///
     /// The row un-sticks on the next poll either way, but "the button flipped
@@ -190,11 +193,15 @@ pub async fn poll_task_with(
 
     let mut visible = false;
     let mut urls_done = false;
+    // Whether the `Pending` verb is currently refusing — the transition edge
+    // that decides `warn!` from `debug!`. Per task, so a plugin restart says it
+    // once more rather than staying quiet about a hive that never answered.
+    let mut pending_failing = false;
     let mut interval = tokio::time::interval(cfg.poll_interval());
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // The seed poll — see the module docs on why it ignores `visible`.
-    poll_once(&cfg, &msg_tx, &mut urls_done).await;
+    poll_once(&cfg, &msg_tx, &mut urls_done, &mut pending_failing).await;
 
     loop {
         tokio::select! {
@@ -216,7 +223,7 @@ pub async fn poll_task_with(
                             if reload(&mut cfg, &mut watch, &msg_tx) {
                                 interval = fresh_interval(&cfg);
                             }
-                            poll_once(&cfg, &msg_tx, &mut urls_done).await;
+                            poll_once(&cfg, &msg_tx, &mut urls_done, &mut pending_failing).await;
                         }
                     }
                     Cmd::Send(req) => {
@@ -236,7 +243,7 @@ pub async fn poll_task_with(
                         // truth, and a refused write must un-stick the row's
                         // optimistic flip just as fast as an accepted one.
                         interval.reset();
-                        poll_once(&cfg, &msg_tx, &mut urls_done).await;
+                        poll_once(&cfg, &msg_tx, &mut urls_done, &mut pending_failing).await;
                     }
                 }
             }
@@ -245,7 +252,7 @@ pub async fn poll_task_with(
                 if reload(&mut cfg, &mut watch, &msg_tx) {
                     interval = fresh_interval(&cfg);
                 }
-                poll_once(&cfg, &msg_tx, &mut urls_done).await;
+                poll_once(&cfg, &msg_tx, &mut urls_done, &mut pending_failing).await;
             }
         }
         if msg_tx.is_closed() {
@@ -300,7 +307,12 @@ fn reload(cfg: &mut AgentsConfig, watch: &mut ConfigSource, msg_tx: &UnboundedSe
 /// The order matters and is not alphabetical: `AgentStatus` goes first so a
 /// dead hive costs exactly one failed connect, and `Pending` is skipped
 /// entirely when it failed.
-async fn poll_once(cfg: &AgentsConfig, msg_tx: &UnboundedSender<Msg>, urls_done: &mut bool) {
+async fn poll_once(
+    cfg: &AgentsConfig,
+    msg_tx: &UnboundedSender<Msg>,
+    urls_done: &mut bool,
+    pending_failing: &mut bool,
+) {
     let socket = Path::new(&cfg.socket);
     let status = match client::request(socket, &Request::AgentStatus).await {
         // A daemon that answers `ok` but carries no roster is answering a
@@ -317,18 +329,27 @@ async fn poll_once(cfg: &AgentsConfig, msg_tx: &UnboundedSender<Msg>, urls_done:
         return;
     }
 
-    // #947 P3. A failure here is a debug line, not a `Msg` — see `Msg::Pending`
-    // for why an empty queue must not stand in for an unanswered one.
-    match client::request(socket, &Request::Pending).await {
-        Ok(resp) => {
-            if msg_tx
-                .send(Msg::Pending(resp.approvals.unwrap_or_default()))
-                .is_err()
-            {
-                return;
-            }
+    // #947 P3. A refusal rides the same `Msg`, so the reducer can drop badges
+    // it can no longer vouch for — and is announced **once per transition**
+    // (#1140's review, LOW-3): a hive that refuses this verb every tick would
+    // otherwise be invisible at the default log level, twice a second, forever.
+    let approvals = client::request(socket, &Request::Pending)
+        .await
+        .map(|resp| resp.approvals.unwrap_or_default());
+    match (&approvals, *pending_failing) {
+        (Err(e), false) => {
+            *pending_failing = true;
+            tracing::warn!(%e, "the hive refuses the approval queue; badges are cleared until it answers");
         }
-        Err(e) => tracing::debug!(%e, "the approval queue did not answer; keeping the last one"),
+        (Err(e), true) => tracing::debug!(%e, "the approval queue is still refusing"),
+        (Ok(_), true) => {
+            *pending_failing = false;
+            tracing::info!("the approval queue is answering again");
+        }
+        (Ok(_), false) => {}
+    }
+    if msg_tx.send(Msg::Pending(approvals)).is_err() {
+        return;
     }
 
     if !*urls_done

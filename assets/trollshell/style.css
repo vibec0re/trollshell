@@ -878,15 +878,14 @@
 .ts-ws-card {
     padding: 0.538em 0.692em;
 }
-/* "Not on a screen" (#1071 §3.3). The card keeps its place in the column —
-   Inactive cards are ordered with the Active ones — and says what it is
-   instead of vanishing.
+/* An Inactive card is greyed rather than removed (#1071 §3.3) — it keeps its
+   place in the column, since Inactive cards are ordered with the Active ones.
 
    Greyed with `filter`, NOT `opacity`: opacity composites, so an `opacity: .55`
-   card holding an `opacity: .35` idle icon renders that icon at **0.19** and
-   its note at 0.30 — past legible and not what either number says. `filter`
-   desaturates and dims the card as one layer, and the nested opacities below
-   then do their own job against it rather than multiplying with it. */
+   card holding an `opacity: .35` idle icon renders that icon at **0.19** —
+   past legible and not what either number says. `filter` desaturates and
+   dims the card as one layer, and the nested opacities below then do their
+   own job against it rather than multiplying with it. */
 .ts-ws-card-inactive {
     filter: grayscale(0.6) brightness(0.82);
 }

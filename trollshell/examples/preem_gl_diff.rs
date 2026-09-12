@@ -16,11 +16,16 @@
 //! review, HIGH-2). It cannot be compared naively — the GL arm is rasterising
 //! at twice the resolution *on purpose*, which is the whole of #1090's fix — so
 //! the harness box-averages the native readback back down to the kit's logical
-//! grid (`parity::box_downsample`) and holds the result to #893's ceiling. A
-//! supersampled render averaged down should land inside a single-sample render
-//! of the same picture; a dropped half-pixel offset, an unscaled length, a
-//! doubled mask pitch or a mis-scaled bloom is what breaks that. See
-//! `preem_gl::gauge` and `preem_gl::parity`'s `Kind`/`Sampling`.
+//! grid (`parity::box_downsample`) and then holds it to the split that
+//! difference is supposed to have: **every pixel off a rasterisation edge is
+//! bit-identical to the kit's**, and the edge region has its own budget.
+//! Measured on llvmpipe, all four land exactly there — field and lit interiors
+//! at `max |Δ| 0`, an edge mean of 6.1 to 9.4 — which is a sharper statement
+//! than #893's ceiling could make about them, and one #893's ceiling itself
+//! would fail (a dial is nearly a third edge pixels). A dropped half-pixel
+//! offset, an unscaled length, a doubled mask pitch or a mis-scaled bloom is
+//! what breaks it. See `preem_gl::gauge` and `preem_gl::parity`'s
+//! `Kind`/`Sampling`/`case_verdict`.
 //!
 //! ```sh
 //! nix develop --command cargo run -p trollshell --example preem_gl_diff
@@ -105,12 +110,17 @@
 //! it is deliberately loose enough to survive a different GPU's rounding. It
 //! does **not** protect the bit-exactness this file measured under llvmpipe
 //! (#1078's review, INFO-1): a 1–6/255 regression on every channel still
-//! reports `PASS`. With `TROLLSHELL_PARITY_EXACT=1` set, a case that is inside
-//! the ceiling but not bit-exact (`max |Δ| > 0` on any channel) fails anyway,
-//! named `FAIL(exact)`. This is meant for the sandboxed `system-tests` check
-//! (`flake.nix`), where the driver is pinned to Mesa llvmpipe and 0 is the
-//! only value that has ever been measured — it is **not** set when running
+//! reports `PASS`. With `TROLLSHELL_PARITY_EXACT=1` set, a **1:1** case that is
+//! inside the ceiling but not bit-exact (`max |Δ| > 0` on any channel) fails
+//! anyway, named `FAIL(exact)`. This is meant for the sandboxed `system-tests`
+//! check (`flake.nix`), where the driver is pinned to Mesa llvmpipe and 0 is
+//! the only value that has ever been measured — it is **not** set when running
 //! this by hand against real glass, where the ceiling is the real contract.
+//!
+//! Since #1148's review it pins **both kinds**, not the scope alone. The
+//! supersampled cases are unaffected either way: their verdict is the region
+//! split above, which is already exact where exactness is meaningful and does
+//! not depend on this variable at all.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -217,12 +227,18 @@ fn main() -> glib::ExitCode {
         println!(
             "TROLLSHELL_PARITY_EXACT=1: a **1:1** case of either kind with a \
              non-zero delta on any channel fails as FAIL(exact), even inside \
-             the ceiling above. The supersampled gauge cases (.x{GAUGE_SUPERSAMPLE}) \
-             are held to the ceiling only — a box-average of a render the kit \
-             never made cannot be bit-exact. See `preem_gl::parity`'s `Kind` \
-             and `Sampling`."
+             the ceiling above."
         );
     }
+    println!(
+        "the .x{GAUGE_SUPERSAMPLE} gauge cases are box-averaged down from the shipping \
+         upscale and take neither the ceiling nor that pin: every pixel off a \
+         rasterisation edge must be bit-identical (FAIL(interior)) and the edge \
+         region has its own budget, mean {SUPERSAMPLED_EDGE_MEAN} / max {SUPERSAMPLED_EDGE_MAX} \
+         (FAIL(edges)). See `preem_gl::parity`'s `case_verdict`.",
+        SUPERSAMPLED_EDGE_MEAN = parity::SUPERSAMPLED_EDGE_MEAN,
+        SUPERSAMPLED_EDGE_MAX = parity::SUPERSAMPLED_EDGE_MAX,
+    );
 
     let app = gtk::Application::builder()
         .application_id("mov.vibec0re.trollshell.preem-gl-diff")
@@ -621,7 +637,8 @@ impl Runner {
         println!("-- summary --");
         if self.failures.get() == 0 {
             println!(
-                "PASS all {} case(s) inside the proposed ceiling on every channel",
+                "PASS all {} case(s) — the 1:1 ones inside the proposed ceiling on every \
+                 channel, the box-averaged ones bit-identical off every edge",
                 self.cases.len()
             );
         } else {
@@ -891,11 +908,18 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
         upscale as usize,
     );
     let stats = parity::compare(&gl_raw, reference.data(), layout);
-    // **The per-case verdict**: the #893 ceiling and the blank-frame guards on
-    // every case, the per-column peak-row check on the scope alone (#1143), and
-    // the `TROLLSHELL_PARITY_EXACT=1` zero pin on both kinds where the
-    // comparison is 1:1 (#1148). See `parity::Kind` and `parity::Sampling`.
-    let verdict = parity::case_verdict(&stats, case.kind(), case.sampling(), exact);
+    let deltas = parity::delta_map(&gl_raw, reference.data(), layout);
+    let split = parity::regions(
+        reference.data(),
+        (reference.width(), reference.height()),
+        &deltas,
+    );
+    // **The per-case verdict**: the blank-frame guards on every case, then
+    // whichever standard this comparison is held to — #893's ceiling, the
+    // scope's peak-row check and the `TROLLSHELL_PARITY_EXACT=1` zero pin at
+    // 1:1 (#1143/#1148), the region split for a supersampled case. See
+    // `parity::case_verdict`.
+    let verdict = parity::case_verdict(&stats, &split, case.kind(), case.sampling(), exact);
     println!(
         "{} {label}: worst channel mean {:.3} p99 {:.0} max {:.0} of 255 \
          over {} px; peak-row mismatches {}/{}",
@@ -932,8 +956,7 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
         );
     }
 
-    let deltas = parity::delta_map(&gl_raw, reference.data(), layout);
-    print_regions(&deltas, &reference);
+    print_regions(&split);
     write_evidence(evidence, &label, &gl_raw, layout, &reference, &deltas);
 
     // #1080's 0-pinned assertion (#1078 review, INFO-1): the ceiling is loose
@@ -953,74 +976,25 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
     verdict.is_pass()
 }
 
-/// The classification aid, and the reason a transcript from this harness can be
-/// triaged without a driver in front of you (#1072's four buckets).
+/// Print the **edge / field / lit** split, the classification aid that lets a
+/// transcript from this harness be triaged without a driver in front of you
+/// (#1072's four buckets).
 ///
-/// Every compared pixel goes in exactly one of three bins, decided by the **CPU
-/// reference's own structure** rather than by the palette — so this needs no
-/// knowledge of which skin is running and cannot drift from one:
-///
-/// * **edge** — the reference disagrees with one of its four neighbours. A
-///   difference that lives only here is rasterisation edge coverage (bucket c):
-///   a boundary landing one pixel over.
-/// * **field** — not an edge, and the frame's *modal* colour, i.e. the flat
-///   unlit background. A difference that lives here is a tone-curve problem
-///   (bucket b): gamma/sRGB moves a flat fill uniformly, and nothing else does.
-/// * **lit** — not an edge, not the field: the interior of the trace, the
-///   graticule and the bloom. A difference concentrated here, with the field
-///   clean, is real shader math (bucket d) — or, where it tracks how *dim* the
-///   pixel is, blend/premultiply (bucket a).
-fn print_regions(deltas: &[u8], reference: &kit::Frame) {
-    let (w, h) = (reference.width(), reference.height());
-    let rgb = |x: usize, y: usize| -> [u8; 3] {
-        let i = (y * w + x) * 4;
-        reference.data()[i..i + 3].try_into().unwrap_or([0, 0, 0])
-    };
-    let mut counts: std::collections::HashMap<[u8; 3], usize> = std::collections::HashMap::new();
-    for y in 0..h {
-        for x in 0..w {
-            *counts.entry(rgb(x, y)).or_default() += 1;
-        }
-    }
-    let field = counts
-        .into_iter()
-        .max_by_key(|(colour, n)| (*n, *colour))
-        .map_or([0, 0, 0], |(colour, _)| colour);
-
-    // (count, sum, max) per bin.
-    let mut bins = [(0_usize, 0_u64, 0_u8); 3];
-    for y in 0..h {
-        for x in 0..w {
-            let here = rgb(x, y);
-            let edge = [(-1_isize, 0_isize), (1, 0), (0, -1), (0, 1)]
-                .into_iter()
-                .any(|(dx, dy)| {
-                    let (nx, ny) = (x.wrapping_add_signed(dx), y.wrapping_add_signed(dy));
-                    nx < w && ny < h && rgb(nx, ny) != here
-                });
-            let bin = if edge {
-                0
-            } else if here == field {
-                1
-            } else {
-                2
-            };
-            let delta = deltas[y * w + x];
-            bins[bin].0 += 1;
-            bins[bin].1 += u64::from(delta);
-            bins[bin].2 = bins[bin].2.max(delta);
-        }
-    }
-    let show = |(n, sum, max): (usize, u64, u8)| {
-        #[allow(clippy::cast_precision_loss)]
-        let mean = if n == 0 { 0.0 } else { sum as f64 / n as f64 };
-        format!("n={n} mean {mean:.3} max {max}")
+/// The binning itself moved into `parity::regions` in #1148's review, because
+/// the supersampled cases' verdict is a statement about it (everything off an
+/// edge must be bit-identical) and because down there it has tests. See that
+/// function for what each bin means and what a difference concentrated in one
+/// of them says.
+fn print_regions(split: &parity::Regions) {
+    let show = |bin: parity::RegionStats| {
+        format!("n={} mean {:.3} max {}", bin.pixels, bin.mean, bin.max)
     };
     println!(
-        "      regions: edge[{}]  field{field:?}[{}]  lit[{}]",
-        show(bins[0]),
-        show(bins[1]),
-        show(bins[2]),
+        "      regions: edge[{}]  field{:?}[{}]  lit[{}]",
+        show(split.edge),
+        split.field_colour,
+        show(split.field),
+        show(split.lit),
     );
 }
 

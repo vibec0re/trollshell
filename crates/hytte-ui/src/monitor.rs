@@ -19,11 +19,32 @@ impl Monitor {
         Self { inner }
     }
 
-    /// Connector name (e.g. `"DP-1"`, `"eDP-1"`). May be empty on some
-    /// drivers; callers should fall back to `model()` or `description()`.
+    /// Connector name (e.g. `"DP-1"`, `"eDP-1"`), or `None` for an output
+    /// this driver does not name — **including one it names with the empty
+    /// string**.
+    ///
+    /// That fold is the whole of #1180 item 6. GDK's own `connector()` can
+    /// answer `Some("")`, this doc used to say so ("may be empty on some
+    /// drivers; callers should fall back") and leave the handling to six call
+    /// sites, which grew three different policies: `fullscreen::install`,
+    /// `overlays::consent::install` and `plugins::region::named_connector`
+    /// each filtered the empty string out, while `components::monitor_key`
+    /// and the toast/OSD/frame overlay maps did not — so on a driver that
+    /// answers `Some("")` every unnamed output collided on one key `""`
+    /// instead of taking its own fallback, and two outputs shared one
+    /// drawer-open flag, one toast surface and one OSD.
+    ///
+    /// Folding it here rather than at the call sites is what makes that one
+    /// policy instead of six: an empty name is not a name, and no caller can
+    /// now be written that forgets to ask. The filters still at those call
+    /// sites are idempotent against this and harmless; they are simply no
+    /// longer load-bearing.
+    ///
+    /// A caller wanting something human-readable for an unnamed output still
+    /// falls back to [`description`](Self::description).
     #[must_use]
     pub fn connector(&self) -> Option<String> {
-        self.inner.connector().map(|s| s.to_string())
+        named_connector(self.inner.connector().map(|s| s.to_string()))
     }
 
     /// Free-form description (manufacturer + model).
@@ -80,6 +101,17 @@ impl Monitor {
     }
 }
 
+/// The empty-connector policy, once (#1180 item 6): a name that is empty (or
+/// only whitespace) is not a name.
+///
+/// A free function over the already-read `Option<String>` rather than a method
+/// on [`Monitor`], for `plugins::region::named_connector`'s reason — the
+/// helper this replaces: it keeps the decision pure, so it is testable with no
+/// display at all, which is the only environment CI's hermetic bucket has.
+fn named_connector(connector: Option<String>) -> Option<String> {
+    connector.filter(|name| !name.trim().is_empty())
+}
+
 /// Disconnects a `gdk::Monitor` `notify::geometry` handler when dropped. Owned
 /// by the [`Monitor::size_changed`] signal so the handler's lifetime is tied to
 /// the subscription — a persistent `gdk::Monitor` doesn't accumulate a live
@@ -94,5 +126,41 @@ impl Drop for GeometryNotifyGuard {
         if let Some(id) = self.handler.take() {
             self.monitor.disconnect(id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::named_connector;
+
+    /// **#1180 item 6.** One empty-connector policy, applied where the name
+    /// is read rather than at each of six call sites.
+    ///
+    /// `Some("")` is what GDK answers for an output some drivers do not name,
+    /// and it is the value that used to reach `components::monitor_key`
+    /// unfiltered — where it became the map key `""`, shared by *every*
+    /// unnamed output on the machine: one drawer-open flag, one toast surface
+    /// and one OSD between them, instead of a per-monitor fallback each.
+    ///
+    /// **Falsified** by dropping the filter from [`named_connector`]: the
+    /// empty and whitespace cases come back `Some`.
+    #[test]
+    fn an_empty_connector_name_is_not_a_name() {
+        assert_eq!(
+            named_connector(Some("DP-1".to_owned())),
+            Some("DP-1".to_owned()),
+            "a real connector passes through untouched",
+        );
+        assert_eq!(named_connector(None), None, "GDK's own None stays None");
+        assert_eq!(
+            named_connector(Some(String::new())),
+            None,
+            "an empty name must degrade exactly like no name at all",
+        );
+        assert_eq!(
+            named_connector(Some("   ".to_owned())),
+            None,
+            "…and so must one that is only whitespace: no compositor answers to it",
+        );
     }
 }

@@ -10869,6 +10869,7 @@ mod containment_r2 {
     #[test]
     fn an_over_cap_datasource_query_is_refused() {
         let mut warned = EffectWarnLatch::new();
+        let (out_tx, _out_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
         let query = |params: String| Effect::DatasourceQuery {
             request_id: 1,
             provider: "departures".into(),
@@ -10877,6 +10878,7 @@ mod containment_r2 {
         };
         let (effect, message) = capped_effect_payload(
             query("j".repeat(MAX_DATASOURCE_PAYLOAD_BYTES + 1)),
+            &out_tx,
             &mut warned,
         );
         assert!(
@@ -10886,14 +10888,18 @@ mod containment_r2 {
         assert!(message.is_some(), "and named once");
         let (effect, message) = capped_effect_payload(
             query("j".repeat(MAX_DATASOURCE_PAYLOAD_BYTES + 1)),
+            &out_tx,
             &mut warned,
         );
         assert!(effect.is_none(), "still refused");
         assert!(message.is_none(), "…silently, from the second one on");
         // An at-cap query is fine: the boundary is pinned on both sides so it
         // cannot drift by one silently.
-        let (effect, _) =
-            capped_effect_payload(query("j".repeat(MAX_DATASOURCE_PAYLOAD_BYTES)), &mut warned);
+        let (effect, _) = capped_effect_payload(
+            query("j".repeat(MAX_DATASOURCE_PAYLOAD_BYTES)),
+            &out_tx,
+            &mut warned,
+        );
         assert!(effect.is_some(), "exactly at the cap is forwarded");
     }
 
@@ -10906,11 +10912,13 @@ mod containment_r2 {
     #[test]
     fn an_over_cap_datasource_result_fails_instead_of_queueing() {
         let mut warned = EffectWarnLatch::new();
+        let (out_tx, _out_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
         let (effect, message) = capped_effect_payload(
             Effect::DatasourceResult {
                 request_id: 7,
                 outcome: DatasourceOutcome::Ready("j".repeat(MAX_DATASOURCE_PAYLOAD_BYTES + 1)),
             },
+            &out_tx,
             &mut warned,
         );
         assert!(message.is_some(), "the refusal is named");
@@ -11280,5 +11288,55 @@ mod containment_r2 {
             "reconciling {MAX_NODE_CLASSES} classes against {MAX_NODE_CLASSES} entirely \
              different ones took {elapsed:?}, over the 50 ms regression bound",
         );
+    }
+
+    // ── Adversarial review round 2, MEDIUM: an over-cap query gets a reply ──
+
+    /// An over-cap `DatasourceQuery` no longer vanishes: the requester's
+    /// pending correlation resolves with a `Failed` outcome naming the cap,
+    /// the same reply shape [`arm_query_timeout`](super::super::datasource)
+    /// sends on a real timeout — not a hang the plugin's own state machine has
+    /// no timer for.
+    ///
+    /// **Falsified** by reverting the refusal to `(None, message)` with no
+    /// outbound send: `out_rx` never yields anything and the `timeout(...)`
+    /// below reds.
+    #[tokio::test]
+    async fn an_over_cap_datasource_query_replies_with_failed_not_silence() {
+        let mut warned = EffectWarnLatch::new();
+        let (out_tx, mut out_rx) = mpsc::channel::<HostMsg>(OUTBOUND_CAPACITY);
+        let query = Effect::DatasourceQuery {
+            request_id: 42,
+            provider: "departures".into(),
+            scope: "next".into(),
+            params: "j".repeat(MAX_DATASOURCE_PAYLOAD_BYTES + 1),
+        };
+        let (effect, message) = capped_effect_payload(query, &out_tx, &mut warned);
+        assert!(
+            effect.is_none(),
+            "the query itself is still refused, not forwarded",
+        );
+        assert!(message.is_some(), "and named once, for the journal");
+
+        let sent = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("a reply must be sent within 5s, not left hanging")
+            .expect("the outbound channel is still open");
+        match sent {
+            HostMsg::DatasourceResult {
+                request_id,
+                outcome,
+            } => {
+                assert_eq!(
+                    request_id, 42,
+                    "on the requester's own correlation, not a fresh one",
+                );
+                assert!(
+                    matches!(outcome, DatasourceOutcome::Failed { .. }),
+                    "a Failed outcome, exactly what the timeout leg sends: {outcome:?}",
+                );
+            }
+            other => panic!("expected a DatasourceResult reply, got {other:?}"),
+        }
     }
 }

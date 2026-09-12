@@ -442,28 +442,40 @@ pub(super) fn capped_effect_strings(
 ///   the correlation it is waiting on, saying the provider's answer was
 ///   unusable — which is true, and is exactly what `DatasourceError::Provider`
 ///   is for.
-/// - **`DatasourceQuery`** is dropped, and the requester gets nothing. Stated
-///   plainly because it is the one asymmetry here: the refusal happens *before*
-///   the router parks anything, so there is no correlation to fail and no
-///   host-sourced "your request was too large" in the wire vocabulary to fail
-///   it with. Adding one is a wire change, which this is deliberately not. A
-///   plugin that hits it has a bug, and the journal line names it — the same
-///   terms on which an ungranted effect is dropped with no reply.
+/// - **`DatasourceQuery`** is refused with an immediate
+///   `HostMsg::DatasourceResult { outcome: Failed { error: Provider, … }, .. }`
+///   on `out_tx` — the requester's own connection, since the refusal happens
+///   *before* the router ever parks the query and so has no correlation to
+///   route a reply back through. This is the same reply shape
+///   `super::datasource`'s `fail` helper sends on a real query timeout (#1165
+///   review round 2 MEDIUM): the vocabulary already had a host-sourced
+///   "your request was too large" — `DatasourceOutcome::Failed` — so a
+///   plugin's pending query resolves instead of hanging forever with no
+///   timer of its own to notice.
 ///
 /// `provider` and `scope` are bounded too: they are identifiers, so an
 /// over-long one is refused rather than cut (a truncated name is a *different*
 /// datasource), and they are formatted into the failure messages the router
 /// sends back, which would otherwise be a second way onto the same queue.
 ///
-/// Pure and latched like [`capped_effect_strings`], and a separate function
-/// from it because the two answer different questions: that one bounds what a
-/// human will look at, this one bounds what a queue will hold.
+/// Latched like [`capped_effect_strings`], and a separate function from it
+/// because the two answer different questions: that one bounds what a human
+/// will look at, this one bounds what a queue will hold. No longer pure since
+/// the round-2 fix above — the `DatasourceQuery` refusal now has a side
+/// effect (`out_tx.try_send`), non-blocking like every other outbound push in
+/// this reader loop (`push_state`'s posture): the GTK broker thread must
+/// never block on a plugin that stopped reading its socket, and the liveness
+/// ping is what reaps that connection either way.
 pub(super) fn capped_effect_payload(
     mut effect: Effect,
+    out_tx: &mpsc::Sender<HostMsg>,
     warned: &mut EffectWarnLatch,
 ) -> (Option<Effect>, Option<String>) {
     let kind = std::mem::discriminant(&effect);
-    let refuse = |what: &str, bytes: usize, warned: &mut EffectWarnLatch| {
+    let refuse = |what: &str,
+                  bytes: usize,
+                  request_id: u64,
+                  warned: &mut EffectWarnLatch| {
         let message = warned.insert(kind).then(|| {
             format!(
                 "plugin {what} is {bytes} B, over the host's {MAX_DATASOURCE_PAYLOAD_BYTES} B \
@@ -472,23 +484,44 @@ pub(super) fn capped_effect_payload(
                  this effect kind are silenced for the rest of this connection)"
             )
         });
+        let _ = out_tx.try_send(HostMsg::DatasourceResult {
+            request_id,
+            outcome: DatasourceOutcome::Failed {
+                error: DatasourceError::Provider,
+                message: format!(
+                    "plugin {what} is {bytes} B, over the host's \
+                     {MAX_DATASOURCE_PAYLOAD_BYTES} B cap"
+                ),
+            },
+        });
         (None, message)
     };
     match &mut effect {
         Effect::DatasourceQuery {
+            request_id,
             provider,
             scope,
             params,
-            ..
         } => {
+            let request_id = *request_id;
             if params.len() > MAX_DATASOURCE_PAYLOAD_BYTES {
-                return refuse("DatasourceQuery params", params.len(), warned);
+                return refuse("DatasourceQuery params", params.len(), request_id, warned);
             }
             if provider.len() > MAX_DISPLAY_TEXT_BYTES {
-                return refuse("DatasourceQuery provider name", provider.len(), warned);
+                return refuse(
+                    "DatasourceQuery provider name",
+                    provider.len(),
+                    request_id,
+                    warned,
+                );
             }
             if scope.len() > MAX_DISPLAY_TEXT_BYTES {
-                return refuse("DatasourceQuery scope name", scope.len(), warned);
+                return refuse(
+                    "DatasourceQuery scope name",
+                    scope.len(),
+                    request_id,
+                    warned,
+                );
             }
         }
         Effect::DatasourceResult { outcome, .. } => {
@@ -1441,7 +1474,7 @@ pub(super) async fn serve_conn(
                                 tracing::warn!(plugin = %plugin_id, "{message}");
                             }
                             let (effect, message) =
-                                capped_effect_payload(effect, &mut effect_payload_warned);
+                                capped_effect_payload(effect, &out_tx, &mut effect_payload_warned);
                             if let Some(message) = message {
                                 tracing::warn!(plugin = %plugin_id, "{message}");
                             }

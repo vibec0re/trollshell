@@ -1052,19 +1052,24 @@ mod gtk_tests {
         );
     }
 
-    /// **A rebuild takes the old approval rows out of the group**, not just
-    /// out of the bookkeeping — the reviewer's test (#1146's review, M2),
-    /// taken as supplied.
+    /// **An id that leaves the queue takes its row out of the group**, not
+    /// just out of the bookkeeping — the reviewer's test (#1146's review,
+    /// M2), taken as supplied. Since #1149 N2, `ui::Approvals::apply`
+    /// retargets a *surviving* id's row rather than rebuilding it (the
+    /// sibling test below pins that half); this one is the case with no
+    /// surviving id at all, disjoint before and after, where retargeting and
+    /// a full rebuild produce the identical outcome this asserts: the old
+    /// widget leaves the container, and only the new one is in it.
     ///
-    /// `Settings::apply` rebuilds the approvals on every state change, so a
-    /// rebuild that only drained the `Vec` would leak every predecessor into
-    /// the group — with **live Approve/Deny buttons on approvals that already
-    /// left the queue** — and `approval_row_text` could not see it, because
-    /// it reads back from the same `Vec` the drain empties. #1130's M4,
-    /// reintroduced forty lines below the doc written about it.
+    /// Without the detach, a rebuild-or-retarget that only drained the `Vec`
+    /// would leak every predecessor into the group — with **live
+    /// Approve/Deny buttons on approvals that already left the queue** — and
+    /// `approval_row_text` could not see it, because it reads back from the
+    /// same `Vec` the drain empties. #1130's M4, reintroduced forty lines
+    /// below the doc written about it.
     ///
-    /// Mutation (verified red): delete the `self.root.remove(&w.row)` in
-    /// `ui::Approvals::apply`, keeping the drain.
+    /// Mutation (verified red): delete the `self.root.remove(&w.row)` loop in
+    /// `ui::Approvals::apply`, keeping the rest.
     #[gtk::test]
     fn approval_rows_are_rebuilt_not_appended() {
         let (w, _rx) = window();
@@ -1088,6 +1093,54 @@ mod gtk_tests {
                 .iter()
                 .all(|r| r.parent().is_some()),
             "…and the new one must be in it"
+        );
+    }
+
+    /// **A surviving approval id keeps its own widget across an apply**
+    /// (#1149 N2) — the fix's own pin, alongside the sibling test above that
+    /// covers the fully-disjoint case.
+    ///
+    /// `Settings::apply` used to rebuild every approval row on every call
+    /// regardless of whether the id set had changed at all, so a plain
+    /// status change elsewhere on the window (which repaints the whole
+    /// chrome, `Window::apply`) tore down and rebuilt buttons for a queue
+    /// that had not moved — cheap today, but H1's in-flight latch (#1146's
+    /// review) gives a row state to lose, and a click racing that rebuild
+    /// lands on a widget about to be replaced. `ui::Approvals::apply` now
+    /// retargets an id it has already seen instead of rebuilding it, proven
+    /// here by comparing the `AdwActionRow` `GObject` itself (`PartialEq` on
+    /// a `glib::Object` is pointer identity) before and after a second apply
+    /// that keeps id 1 and adds id 2.
+    ///
+    /// Mutation (verified red): revert `ui::Approvals::apply` to rebuild
+    /// every row unconditionally (drain everything, rebuild every id in
+    /// `approvals`) and the identity assertion reds — the row for `1` is a
+    /// fresh `GObject` on the second apply, even though nothing about it
+    /// changed.
+    #[gtk::test]
+    fn a_surviving_approval_id_keeps_its_own_widget_across_an_apply() {
+        let (w, _rx) = window();
+        w.update(Update::State(up(row())));
+        w.update(Update::Approvals(Ok(vec![approval(1, "stray")])));
+        let before = w.settings.tracked_approval_rows();
+        assert_eq!(before.len(), 1);
+        let survivor = before[0].clone();
+
+        // A second apply that keeps id 1 and adds id 2 — a plain queue
+        // growth, not a replacement.
+        w.update(Update::Approvals(Ok(vec![
+            approval(1, "stray"),
+            approval(2, "stray"),
+        ])));
+        let after = w.settings.tracked_approval_rows();
+        assert_eq!(after.len(), 2, "{after:?}");
+        assert_eq!(
+            after[0], survivor,
+            "id 1 survived the apply and must keep its own widget, not a rebuilt lookalike"
+        );
+        assert!(
+            survivor.parent().is_some(),
+            "the surviving row must still be mounted, not detached-and-forgotten"
         );
     }
 

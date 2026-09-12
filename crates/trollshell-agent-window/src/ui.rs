@@ -506,13 +506,9 @@ impl Decision {
 }
 
 /// One approval row's widgets — an `ActionRow` plus the two buttons in its
-/// suffix, tracked together so a test can find "the Approve button for id
-/// 42" without walking the widget tree.
-#[allow(
-    dead_code,
-    reason = "id, approve and deny are read back only by the system-tests press helpers below; \
-              a plain build never needs them once the buttons are wired and parented"
-)]
+/// suffix, tracked together so [`Approvals::apply`] can retarget "the row for
+/// id 42" by id (#1149 N2) and a test can find its Approve button the same
+/// way, without walking the widget tree.
 struct ApprovalRowWidgets {
     id: i64,
     row: adw::ActionRow,
@@ -573,12 +569,32 @@ impl Approvals {
         *self.on_decision.borrow_mut() = Some(Rc::new(on_decision));
     }
 
-    /// Replace the rows. Rebuilt rather than updated in place, exactly like
-    /// [`Settings::apply`]'s two groups: the row set is short, and a decided
-    /// approval must not linger as a stale row with live buttons on a queue
-    /// it has already left.
+    /// Retarget the rows by id rather than rebuilding them (#1149 N2).
+    ///
+    /// `Settings::apply` runs on **every** poll, whether or not the queue
+    /// changed, and it used to rebuild every approval row on every call —
+    /// cheap at today's queue sizes, but H1's in-flight latch (#1146's
+    /// review) means a row can now hold state (`in_flight`, a refusal
+    /// reason) across polls, so a plain status change elsewhere on the
+    /// window tore down and rebuilt buttons for a queue that had not moved,
+    /// and any click racing that rebuild would land on a widget about to be
+    /// replaced. An id present in both the last apply and this one keeps its
+    /// own `AdwActionRow` and its own two buttons — only the delta (an id
+    /// leaving, or a new one arriving) touches the container — the same
+    /// "retarget, not rebuild" the Agents tab's detail pane uses
+    /// (`trollshell-control-center/src/agents_tab.rs`).
+    ///
+    /// The refusal row is still a plain take-and-rebuild: it is one row with
+    /// no id and no buttons, so there is nothing to retarget it *by*.
     pub fn apply(&self, approvals: &[ApprovalRow], refused: Option<&str>) {
-        for w in self.rows.borrow_mut().drain(..) {
+        let mut existing = self.rows.borrow_mut();
+
+        // Detach every currently-mounted approval row up front — including
+        // ones about to be retargeted, which are re-added below in
+        // `approvals`' order. `remove` un-parents a widget without dropping
+        // it, so a retargeted row's `GObject` (and its buttons' click
+        // handlers) survive this untouched.
+        for w in existing.iter() {
             self.root.remove(&w.row);
         }
         if let Some(row) = self.refusal.borrow_mut().take() {
@@ -604,54 +620,80 @@ impl Approvals {
             *self.refusal.borrow_mut() = Some(row);
         }
 
-        let mut tracked = self.rows.borrow_mut();
+        let mut next = Vec::with_capacity(approvals.len());
         for a in approvals {
-            let approve = gtk::Button::builder().label("Approve").build();
-            approve.set_valign(gtk::Align::Center);
-            approve.add_css_class("suggested-action");
-            let deny = gtk::Button::builder().label("Deny").build();
-            deny.set_valign(gtk::Align::Center);
-            deny.add_css_class("destructive-action");
+            let widgets = if let Some(pos) = existing.iter().position(|w| w.id == a.id) {
+                let w = existing.remove(pos);
+                w.row.set_title(&a.title);
+                w.row.set_subtitle(&a.subtitle());
+                // **The latch** (#1146's review, H1), re-applied on the
+                // surviving widget rather than a fresh one: a decision
+                // already on the wire leaves the row exactly where it is
+                // until the next poll, so without this its two buttons stay
+                // live for a whole cadence — long enough for a double-click
+                // to send the same frame twice, or for an operator who saw
+                // no feedback to send `Deny` behind an `Approve` that
+                // already succeeded.
+                w.approve.set_sensitive(!a.in_flight);
+                w.deny.set_sensitive(!a.in_flight);
+                w
+            } else {
+                self.build_row(a)
+            };
+            self.root.add(&widgets.row);
+            next.push(widgets);
+        }
+        // Whatever is left in `existing` had no match in `approvals` — an
+        // id that left the queue. Already detached above; dropping the
+        // struct here is what tears its widgets down.
+        *existing = next;
+    }
 
-            if let Some(cb) = self.on_decision.borrow().clone() {
-                let id = a.id;
-                let f = Rc::clone(&cb);
-                approve.connect_clicked(move |_| f(Decision::Approve(id)));
-                let f = Rc::clone(&cb);
-                deny.connect_clicked(move |_| f(Decision::Deny(id)));
-            }
+    /// Build one approval row's widgets and wire its two buttons — the "new
+    /// id" half of [`Approvals::apply`]'s diff; an id it has already seen is
+    /// retargeted in place instead.
+    fn build_row(&self, a: &ApprovalRow) -> ApprovalRowWidgets {
+        let approve = gtk::Button::builder().label("Approve").build();
+        approve.set_valign(gtk::Align::Center);
+        approve.add_css_class("suggested-action");
+        let deny = gtk::Button::builder().label("Deny").build();
+        deny.set_valign(gtk::Align::Center);
+        deny.add_css_class("destructive-action");
 
-            // **The latch** (#1146's review, H1). A decision already on the
-            // wire leaves the row exactly where it is until the next poll, so
-            // without this its two buttons stay live for a whole cadence —
-            // long enough for a double-click to send the same frame twice, or
-            // for an operator who saw no feedback to send `Deny` behind an
-            // `Approve` that already succeeded.
-            approve.set_sensitive(!a.in_flight);
-            deny.set_sensitive(!a.in_flight);
+        if let Some(cb) = self.on_decision.borrow().clone() {
+            let id = a.id;
+            let f = Rc::clone(&cb);
+            approve.connect_clicked(move |_| f(Decision::Approve(id)));
+            let f = Rc::clone(&cb);
+            deny.connect_clicked(move |_| f(Decision::Deny(id)));
+        }
 
-            let suffix = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            suffix.set_valign(gtk::Align::Center);
-            suffix.append(&approve);
-            suffix.append(&deny);
+        // See the matching comment in `apply` — the same latch, for a row
+        // that has never been on screen before.
+        approve.set_sensitive(!a.in_flight);
+        deny.set_sensitive(!a.in_flight);
 
-            let row = adw::ActionRow::builder()
-                .title(&a.title)
-                .subtitle(a.subtitle())
-                .use_markup(false)
-                .subtitle_selectable(true)
-                .build();
-            // Room for the detail line, the stamp and (when a decision on
-            // this row was refused) the reason on its own line.
-            row.set_subtitle_lines(3);
-            row.add_suffix(&suffix);
-            self.root.add(&row);
-            tracked.push(ApprovalRowWidgets {
-                id: a.id,
-                row,
-                approve,
-                deny,
-            });
+        let suffix = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        suffix.set_valign(gtk::Align::Center);
+        suffix.append(&approve);
+        suffix.append(&deny);
+
+        let row = adw::ActionRow::builder()
+            .title(&a.title)
+            .subtitle(a.subtitle())
+            .use_markup(false)
+            .subtitle_selectable(true)
+            .build();
+        // Room for the detail line, the stamp and (when a decision on this
+        // row was refused) the reason on its own line.
+        row.set_subtitle_lines(3);
+        row.add_suffix(&suffix);
+
+        ApprovalRowWidgets {
+            id: a.id,
+            row,
+            approve,
+            deny,
         }
     }
 

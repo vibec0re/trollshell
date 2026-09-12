@@ -2475,7 +2475,7 @@ mod tests {
             latch.claim(program_key(GlProgram("preem.scope"))),
             "the first unregistered program is reported",
         );
-        assert!(!latch.claim(program_key(GlProgram("preem.scope"))), "…once",);
+        assert!(!latch.claim(program_key(GlProgram("preem.scope"))), "…once");
         assert!(
             latch.claim(program_key(GlProgram("preem.dot_matrix"))),
             "a different unregistered program must get its own line, not be silenced by the \

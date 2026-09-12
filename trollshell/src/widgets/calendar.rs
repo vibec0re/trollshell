@@ -69,6 +69,14 @@ struct State {
 /// keep a strong `State`: neither is reachable from `cells`, so neither
 /// closes a cycle, and between them they are what keeps the `Rc` alive for
 /// the day cells to upgrade through while the block is mounted.
+///
+/// A day-cell handler's handle on the **`group`** has to be weak for a
+/// second, longer reason that has nothing to do with ancestry — see the
+/// comment in [`wire_day_clicks`]. In short: the group is
+/// [`wire_events_bind`]'s bind target and that bind's closure owns a strong
+/// `State`, so a strong `group` here runs the chain
+/// `events-bind task → State → cells → button → handler → group` around the
+/// one widget the bind holds weakly, and the bind can then never end.
 #[derive(Clone)]
 struct WeakState {
     viewed: Rc<Cell<(i32, u32)>>,
@@ -304,17 +312,40 @@ fn wire_day_clicks(
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
 ) {
     for (idx, cell) in state.cells.iter().enumerate() {
-        // Weak, not `state.clone()` (#1176): this handler lives on a button
-        // the state's own `cells` vector holds, so a strong capture is a
-        // cycle GTK never breaks — see [`WeakState`]. `group` and the two
-        // tracks are *not* ancestors of this button (the group is the
-        // upcoming list, a sibling of the grid), so they stay strong.
+        // Both widget handles are weak (#1176); the two `Rc` tracks stay
+        // strong because they hold no widget that owns anything here.
+        //
+        // `state`, because this handler lives on a button the state's own
+        // `cells` vector holds, so a strong capture closes
+        // `cells → button → handler → State → cells` — see [`WeakState`].
+        //
+        // `group` is the subtler one, and a strong clone here is a leak even
+        // with `state` already weakened. The group is not an ancestor of this
+        // button — it is the upcoming list, a sibling of the grid — so it
+        // looks like the sibling capture that is always fine. But it is
+        // [`wire_events_bind`]'s **bind target**, and that bind's apply
+        // closure owns a strong `State`. So 42 strong clones here close
+        // `events-bind task → State → cells → button → handler → group`
+        // around the one widget that bind holds weakly: dropping the column
+        // frees the column and aborts the clock bind, and then stops — the
+        // group is still held by these handlers, so it is never destroyed, so
+        // `abort_on_destroy` never fires for the events bind, so the `State`
+        // is never released and all 42 cells stay on the heap. Measured on
+        // the tree that had `state` weak and `group` strong:
+        //
+        //     column destroyed=true  column alive=false  group alive=true
+        //     cells alive=42
+        //
+        // A bind whose closure transitively owns its own target can never
+        // end, which is #224's `WeakRef` contract defeated by a longer route
+        // than `nix/lint-bind-pins.py`'s rule (b) reads (it resolves a
+        // *field* relation, not a walk through the widget graph).
         let state = state.downgrade();
-        let group = group.clone();
+        let group = group.downgrade();
         let rows_track = rows_track.clone();
         let placeholder_track = placeholder_track.clone();
         cell.button.connect_clicked(move |_| {
-            let Some(state) = state.upgrade() else {
+            let (Some(state), Some(group)) = (state.upgrade(), group.upgrade()) else {
                 return;
             };
             let Some(d) = state.cells[idx].date.get() else {
@@ -1587,8 +1618,16 @@ mod lifetime_tests {
     use hytte::adw::{self, prelude::*};
     use hytte::gtk::{self, glib};
 
+    use chrono::{DateTime, NaiveDate, Timelike as _};
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::prelude::bind;
+    use hytte::services::calendar::CalendarEvent;
+
     use super::wire_day_clicks;
-    use super::{DayCell, State, build_day_cell, build_day_grid, flash_row_highlight_for};
+    use super::{
+        DayCell, State, build_day_cell, build_day_grid, build_day_names_row, build_grid_header,
+        flash_row_highlight_for, refresh_upcoming_list, render,
+    };
 
     /// Run the GTK main loop until it has nothing left to dispatch.
     fn pump() {
@@ -1608,11 +1647,185 @@ mod lifetime_tests {
         }
     }
 
+    /// Everything `build_block` wires, so the teardown this test measures is
+    /// the one the shell actually performs.
+    ///
+    /// The two service binds are **stand-ins**: `bind` reaches the thread-local
+    /// `Registry` through `calendar::events()` / `clock::now()`, which
+    /// `.expect()` a registered service, so the real wirings cannot be called
+    /// here. What matters for the cycle is what each apply closure *captures*,
+    /// and each stand-in captures exactly what its original does —
+    /// `wire_events_bind`: a `bind` on `group` owning a strong `State` and both
+    /// tracks; `wire_clock_bind`: a `bind` on `column` owning a strong `State`
+    /// **and** a strong `group`.
+    ///
+    /// The `Mutable`s are handed back to the caller rather than dropped here,
+    /// and that is load-bearing: dropping a `Mutable` ends its signal, which
+    /// ends `bind`'s apply-loop and releases the closure's captures on its own.
+    /// A test that let them fall out of scope would pass for a reason
+    /// production never enjoys — a service accessor's signal never ends.
+    ///
+    /// Returned: `column` (the only thing `build_block` itself returns), a weak
+    /// handle per day cell, a weak handle on the `group`, and the two signal
+    /// sources to keep alive. Every other local falls out of scope *inside*
+    /// this function, exactly as it does inside `build_block`.
+    #[expect(
+        clippy::type_complexity,
+        reason = "a test fixture's return tuple; naming a struct for it would not make the \
+                  three weak handles clearer"
+    )]
+    fn build_block_for_test() -> (
+        gtk::Box,
+        Vec<glib::WeakRef<gtk::Button>>,
+        glib::WeakRef<adw::PreferencesGroup>,
+        (Mutable<Vec<CalendarEvent>>, Mutable<DateTime<Local>>),
+    ) {
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let state = fresh_state();
+        let cells: Vec<glib::WeakRef<gtk::Button>> =
+            state.cells.iter().map(|c| c.button.downgrade()).collect();
+
+        column.append(&build_grid_header(&state));
+        column.append(&build_day_names_row());
+        column.append(&build_day_grid(&state.cells));
+
+        let group = adw::PreferencesGroup::new();
+        let weak_group = group.downgrade();
+        column.append(&group);
+
+        let rows_track: Rc<RefCell<Vec<(NaiveDate, gtk::Widget)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let placeholder_track: Rc<RefCell<Option<adw::ActionRow>>> = Rc::new(RefCell::new(None));
+
+        wire_day_clicks(&state, &group, &rows_track, &placeholder_track);
+
+        let events: Mutable<Vec<CalendarEvent>> = Mutable::new(Vec::new());
+        {
+            let state = state.clone();
+            let rows_track = Rc::clone(&rows_track);
+            let placeholder_track = Rc::clone(&placeholder_track);
+            bind(events.signal_cloned(), &group, move |group, evs| {
+                state.events.borrow_mut().clone_from(&evs);
+                refresh_upcoming_list(&state, group, &rows_track, &placeholder_track);
+                render(&state);
+            });
+        }
+
+        let now: Mutable<DateTime<Local>> = Mutable::new(Local::now());
+        {
+            let state = state.clone();
+            let group = group.clone();
+            let rows_track = Rc::clone(&rows_track);
+            let placeholder_track = Rc::clone(&placeholder_track);
+            let last_minute: Rc<Cell<Option<(NaiveDate, u32)>>> = Rc::new(Cell::new(None));
+            bind(now.signal(), &column, move |_, now| {
+                let minute_key = (now.date_naive(), now.hour() * 60 + now.minute());
+                if last_minute.replace(Some(minute_key)) == Some(minute_key) {
+                    return;
+                }
+                if minute_key.0 != state.today.get() {
+                    state.today.set(minute_key.0);
+                    render(&state);
+                }
+                refresh_upcoming_list(&state, &group, &rows_track, &placeholder_track);
+            });
+        }
+
+        render(&state);
+        (column, cells, weak_group, (events, now))
+    }
+
     /// Falsified by restoring `let state = state.clone();` in
-    /// `wire_day_clicks`: all 42 buttons then survive both the grid and the
-    /// state, and the count below reads 42 instead of 0.
+    /// `wire_day_clicks`: the count below reads **42** instead of 0 and the
+    /// group survives too.
+    ///
+    /// This wires all of `build_block`, not just `wire_day_clicks`, because the
+    /// rest of it is what makes the fix load-bearing rather than incidental.
+    /// Production installs two `bind`s whose apply closures own a strong
+    /// `State`, while every day-cell handler captures a strong `group` — a live
+    /// chain of bind-task → `State` → `cells` → button → handler → `group`, in
+    /// which `group` is the events bind's own weak target. Wiring only
+    /// `wire_day_clicks` (as this test did) measures none of it, and adding the
+    /// events-bind stand-in *without* a `column` parent reads 42 of 42 even
+    /// with the fix present: the grid is then held by a live bind task, not by
+    /// a cycle.
+    ///
+    /// What resolves it is the teardown, and the teardown is `build_block`'s:
+    /// dropping `column` emits `destroy`, each `bind`'s `abort_on_destroy`
+    /// fires, the apply closures are dropped and the last strong `State` goes
+    /// with them. So this test drops exactly one thing — and would notice if
+    /// someone later removed a bind's `abort_on_destroy`.
     #[gtk::test]
     fn day_cell_handlers_do_not_pin_the_grid() {
+        adw::init().expect("libadwaita init");
+        let (column, cells, weak_group, signals) = build_block_for_test();
+        pump();
+
+        assert_eq!(
+            cells.iter().filter(|c| c.upgrade().is_some()).count(),
+            42,
+            "all 42 cells must be alive while the block is mounted — a zero here would make the \
+             assertion below pass vacuously"
+        );
+
+        // The only thing the shell drops on a hot-plug: the block itself.
+        // Every builder local is already out of scope, as it is in `build_block`.
+        //
+        // `column`'s own `destroy` is witnessed rather than assumed. Both
+        // cycles this test can fail on free the column perfectly well and
+        // stall further up, so "the column died" is the fact that tells the
+        // next reader the teardown *started* and points them at the bind
+        // whose `abort_on_destroy` never fired.
+        let destroyed = Rc::new(Cell::new(false));
+        let witness = Rc::clone(&destroyed);
+        column.connect_destroy(move |_| witness.set(true));
+        let weak_column = column.downgrade();
+        drop(column);
+        pump();
+
+        let alive = cells.iter().filter(|c| c.upgrade().is_some()).count();
+        let diag = format!(
+            "column destroyed={} column alive={} group alive={} cells alive={alive}",
+            destroyed.get(),
+            weak_column.upgrade().is_some(),
+            weak_group.upgrade().is_some(),
+        );
+        assert_eq!(
+            alive, 0,
+            "all 42 day cells must be freed once the block is dropped, and two different strong \
+             captures in `wire_day_clicks` can keep them:\n  \
+             `state` — `cells → button → handler → State → cells`, a plain refcount cycle;\n  \
+             `group` — `events-bind task → State → cells → button → handler → group`, which \
+             wraps around the one widget that bind holds *weakly*, so the group is never \
+             destroyed, `abort_on_destroy` never fires and the `State` is never released.\n\
+             Either way the grid outlives its column once per monitor hot-plug and once per \
+             drawer-page rebuild (#1176).\n  measured: {diag}"
+        );
+        assert!(
+            weak_group.upgrade().is_none(),
+            "the upcoming-events group must go with the block too — it is the events bind's own \
+             target, and a group kept alive by the day-cell handlers is exactly what stops that \
+             bind from ever ending: {diag}"
+        );
+
+        // Held to here on purpose: an early drop would end both signals and
+        // release the bindings' captures without the teardown being tested.
+        drop(signals);
+    }
+
+    /// The live control for [`WeakState`](super::WeakState) (#1176): a day cell
+    /// must still select its day.
+    ///
+    /// `wire_day_clicks` upgrades and `return`s as its first statement, so a
+    /// handle that never upgraded would make every day in the grid silently
+    /// unclickable — and `day_cell_handlers_do_not_pin_the_grid` above would
+    /// stay green through it, because an inert grid frees at least as cleanly
+    /// as a working one.
+    ///
+    /// Falsified by making `WeakState::upgrade` return `None`: the click then
+    /// leaves `selected` untouched.
+    #[gtk::test]
+    fn a_day_click_still_selects_through_the_weak_state() {
         adw::init().expect("libadwaita init");
         let state = fresh_state();
         let group = adw::PreferencesGroup::new();
@@ -1620,24 +1833,39 @@ mod lifetime_tests {
         let placeholder_track = Rc::new(RefCell::new(None));
 
         let grid = build_day_grid(&state.cells);
-        let cells: Vec<glib::WeakRef<gtk::Button>> =
-            state.cells.iter().map(|c| c.button.downgrade()).collect();
         wire_day_clicks(&state, &group, &rows_track, &placeholder_track);
+        // Day cells carry no date until the first render assigns one.
+        render(&state);
         pump();
 
-        // Everything the shell would drop on a hot-plug: the grid (with the
-        // column above it) and the last strong `State`.
-        drop(grid);
-        drop(state);
-        pump();
-
-        let alive = cells.iter().filter(|c| c.upgrade().is_some()).count();
         assert_eq!(
-            alive, 0,
-            "all 42 day cells must be freed once the grid and the state are gone; {alive} \
-             survived, which is the `cells → button → handler → State → cells` cycle a strong \
-             `State` capture in `wire_day_clicks` closes (#1176)"
+            state.selected.get(),
+            None,
+            "nothing is selected before the click — otherwise the assertion below proves nothing"
         );
+        let cell = &state.cells[20];
+        let date = cell
+            .date
+            .get()
+            .expect("render assigns every one of the 42 cells a date");
+
+        cell.button.emit_clicked();
+        pump();
+
+        assert_eq!(
+            state.selected.get(),
+            Some(date),
+            "a day cell's click handler must still reach the state through its weak handle: it \
+             upgrades and returns as the first statement, so a stale handle turns every day in \
+             the grid into a no-op while every leak test stays green (#1176)"
+        );
+        assert!(
+            cell.button.has_css_class("ts-cal-day-selected"),
+            "`on_day_clicked` also re-renders, so the selected pill is a second, independent \
+             witness that the whole handler body ran"
+        );
+
+        drop(grid);
     }
 
     /// Falsified by restoring `let row_for_clear = row.clone();`: the timeout

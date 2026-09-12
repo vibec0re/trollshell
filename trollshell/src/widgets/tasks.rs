@@ -1223,6 +1223,53 @@ mod tests {
         );
     }
 
+    /// The live control for [`WeakDuePicker`] (#1176): the chips must still
+    /// drive the picker they hang off.
+    ///
+    /// `DuePicker::new` hands each chip's `connect_toggled` a weak view of the
+    /// picker, because a strong self-clone closes `container → chips →
+    /// chip_today → handler → picker → container`. The upgrade is all-or-nothing
+    /// across nine widget handles, so a single stale one turns the whole
+    /// picker into a visible, clickable, completely **inert** control — and
+    /// `a_due_picker_dies_with_its_last_reference` would stay green through
+    /// it, since an inert picker frees just as cleanly as a working one.
+    ///
+    /// Falsified by making `WeakDuePicker::upgrade` return `None`: the chip
+    /// then toggles visibly and the mode never moves.
+    #[gtk::test]
+    fn a_chip_still_drives_the_picker_through_the_weak_view() {
+        adw::init().expect("libadwaita init");
+        let picker = DuePicker::new();
+        assert_eq!(
+            picker.value(),
+            None,
+            "a fresh picker starts on \"No date\"; the move this test measures depends on it"
+        );
+
+        picker.chip_today.set_active(true);
+
+        assert_eq!(
+            *picker.mode.borrow(),
+            DueMode::Today,
+            "the chip's `connect_toggled` must still reach `set_mode` through the weak view — an \
+             upgrade that resolved to `None` would leave the chip looking pressed while the \
+             picker's mode never moved (#1176)"
+        );
+        let due = picker
+            .value()
+            .expect("Today mode yields a due date without touching `selected`");
+        assert_eq!(
+            due.date_naive(),
+            Local::now().date_naive(),
+            "the \"Today\" chip must mean today"
+        );
+        assert!(
+            picker.summary_label.is_visible(),
+            "`set_mode` also reveals the summary label, so this is a second, independent witness \
+             that the whole handler body ran rather than only the mode cell being written"
+        );
+    }
+
     /// The tripwire under both tests' choice of date: `day-selected` follows
     /// the **day-of-month**, not the date. A month-only or year-only move is
     /// silent, which is exactly how this coverage would rot into a false pass.
@@ -1873,5 +1920,120 @@ mod lifetime_tests {
              `a_due_picker_dies_with_its_last_reference` cannot make — it has no entry beside \
              the picker to pin it"
         );
+    }
+
+    /// The create popover's action row, by label.
+    fn action_button(popover: &gtk::Popover, label: &str) -> gtk::Button {
+        let mut child = popover
+            .child()
+            .expect("the create popover holds its column")
+            .last_child();
+        while let Some(c) = child {
+            if let Ok(btn) = c.clone().downcast::<gtk::Button>()
+                && btn.label().is_some_and(|l| l == label)
+            {
+                return btn;
+            }
+            if let Some(found) = c.first_child() {
+                let mut inner = Some(found);
+                while let Some(i) = inner {
+                    if let Ok(btn) = i.clone().downcast::<gtk::Button>()
+                        && btn.label().is_some_and(|l| l == label)
+                    {
+                        return btn;
+                    }
+                    inner = i.next_sibling();
+                }
+            }
+            child = c.prev_sibling();
+        }
+        panic!("the create popover has no {label:?} button");
+    }
+
+    /// The **live** half of the create popover's weak handles, and the reason
+    /// each is an `upgrade()` rather than a no-op: a handle that silently
+    /// resolved to `None` would satisfy every leak assertion above exactly as
+    /// well as a correct one does, while the popover stopped closing and the
+    /// Add button stopped adding. Both weak sites are exercised here:
+    ///
+    ///  * `popover_for_cancel` / `popover_for_create` — the popdown;
+    ///  * `entry_for_button` — the Add button's **weak** handle on the entry,
+    ///    which is weak because `entry.connect_changed` holds a strong
+    ///    `create` and a strong clone here would close `entry → create →
+    ///    entry` (see the comment at that site).
+    ///
+    /// Falsified by replacing either `upgrade()` arm with a no-op.
+    #[gtk::test]
+    fn the_create_popover_buttons_still_act_through_their_weak_handles() {
+        adw::init().expect("libadwaita init");
+        let monitor = test_monitor();
+        let lists: Rc<RefCell<Vec<TaskList>>> = Rc::new(RefCell::new(vec![TaskList {
+            uid: "list-uid".to_owned(),
+            display_name: "Inbox".to_owned(),
+        }]));
+
+        let anchor = gtk::MenuButton::new();
+        let popover = build_create_popover(&anchor, &lists, &monitor);
+        anchor.set_popover(Some(&popover));
+        let entry: gtk::Entry = find_descendant(popover.upcast_ref())
+            .expect("the create popover builds a gtk::Entry");
+        let cancel = action_button(&popover, "Cancel");
+        let add = action_button(&popover, "Add");
+
+        // A popover needs a real toplevel: popping one up with no surface
+        // realizes a popover with no window and segfaults rather than failing.
+        let window = gtk::Window::new();
+        window.set_child(Some(&anchor));
+        window.present();
+        pump();
+
+        // ── Cancel dismisses, and clears the row it left behind ──
+        popover.popup();
+        pump();
+        assert!(
+            popover.is_visible(),
+            "the popover must actually be up, or both halves below pass vacuously"
+        );
+        // After `popup()`, not before: `connect_show` resets the entry.
+        entry.set_text("Buy milk");
+        cancel.emit_clicked();
+        pump();
+        assert!(
+            !popover.is_visible(),
+            "Cancel must still dismiss the popover through its weak handle (#1176)"
+        );
+        assert_eq!(
+            entry.text().as_str(),
+            "",
+            "Cancel also clears the entry — a *sibling* strong clone, and the live control that \
+             says the handler body ran at all rather than the popdown happening some other way"
+        );
+
+        // ── Add acts through the weak entry, then dismisses ──
+        popover.popup();
+        pump();
+        entry.set_text("Buy milk");
+        assert!(
+            add.is_sensitive(),
+            "`entry.connect_changed` must have enabled Add — text plus one list. If this fails \
+             the click below would be on a dead button, not a live path"
+        );
+        add.emit_clicked();
+        pump();
+
+        assert_eq!(
+            entry.text().as_str(),
+            "",
+            "Add must still reach the entry through its weak handle: `do_create` clears the \
+             entry after handing the summary to `tasks::create_task`, so an empty entry here is \
+             the proof that the upgrade succeeded and the body ran. A weak handle that resolved \
+             to `None` would leave the typed text sitting there and add nothing"
+        );
+        assert!(
+            !popover.is_visible(),
+            "Add must still dismiss the popover through its own weak handle"
+        );
+
+        window.destroy();
     }
 }

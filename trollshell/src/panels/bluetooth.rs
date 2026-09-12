@@ -658,6 +658,80 @@ mod tests {
         );
     }
 
+    /// The **other direction** of the same weak handle, and the reason it is an
+    /// `upgrade()` rather than a no-op: a Trust button whose popover handle
+    /// silently resolved to `None` would satisfy
+    /// `a_device_menu_dies_with_its_button` above exactly as well as a correct
+    /// one does, while the menu simply stopped closing on click. Nothing else
+    /// in the tree would notice.
+    ///
+    /// This is the shape every popdown site in `panels/{clipboard,vpn}.rs` and
+    /// `panels/network/{wifi,wired}.rs` shares — same `popover.downgrade()`,
+    /// same `upgrade()` guard, same sole strong owner in the `set_popover` one
+    /// line down — so one live control covers the idiom. The `wifi`/`wired`/
+    /// `vpn` sites additionally cannot be driven in-process: their handlers
+    /// call a `wifi::`/`networkd::` command *before* the popdown, and
+    /// `get_backend()` aborts the whole test binary with a non-unwinding panic
+    /// when no service is registered. `bluetooth::set_trusted` is reachable
+    /// because `mark_busy` returns early on an absent `shared_state()`.
+    ///
+    /// Falsified by replacing the `upgrade()` arm with a no-op: the popover
+    /// stays visible after the click.
+    #[gtk::test]
+    fn the_trust_button_still_dismisses_the_menu() {
+        adw::init().expect("libadwaita init");
+        let dev = Device {
+            path: "/org/bluez/hci0/dev_AA".to_owned(),
+            alias: "Headphones".to_owned(),
+            paired: true,
+            trusted: false,
+            ..Device::default()
+        };
+
+        let menu_btn = build_device_menu(&dev, false);
+        let popover = menu_btn
+            .popover()
+            .expect("build_device_menu sets a popover on the menu button");
+        let pop_box = popover.child().expect("the popover holds its button box");
+        let trust_btn = pop_box
+            .first_child()
+            .expect("Trust leads the menu box")
+            .downcast::<gtk::Button>()
+            .expect("the first menu entry is a Button");
+        assert_eq!(
+            trust_btn.label().map(|s| s.to_string()).as_deref(),
+            Some("Trust"),
+            "an untrusted device's first menu entry is Trust — if this is the wrong button the \
+             assertions below would be measuring something else"
+        );
+
+        // A popover needs a real toplevel: popping one up with no surface
+        // realizes a popover with no window and segfaults rather than failing.
+        let window = gtk::Window::new();
+        window.set_child(Some(&menu_btn));
+        window.present();
+        pump();
+        popover.popup();
+        pump();
+        assert!(
+            popover.is_visible(),
+            "the menu must actually be up before the click, or the assertion below passes \
+             vacuously on a popover that was never open"
+        );
+
+        trust_btn.emit_clicked();
+        pump();
+
+        assert!(
+            !popover.is_visible(),
+            "the Trust button must still dismiss the menu it lives in: the handler holds the \
+             popover through a `glib::WeakRef` (#1176), and a weak handle that never upgraded \
+             would leave the menu open forever while every leak test stayed green"
+        );
+
+        window.destroy();
+    }
+
     /// The pair-prompt PIN/passkey row must die with its prompt (#1176 item
     /// 3): the entry cloned itself into its **own** `connect_activate`
     /// handler, so the entry's handler list held the entry.

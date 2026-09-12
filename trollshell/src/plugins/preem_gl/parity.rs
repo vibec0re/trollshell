@@ -358,11 +358,22 @@ pub(crate) fn case_verdict(
     exact: bool,
 ) -> Verdict {
     // "Drew nothing at all", then "drew one flat colour" — ahead of everything,
-    // on every comparison, for #1070's M2 reason.
-    if stats.all_zero {
+    // on every comparison, for #1070's M2 reason. Each is asked **against the
+    // reference** (#1144): the question is "is the GL side flat where the kit's
+    // is not", and a state whose kit frame is genuinely one colour (an empty
+    // dot matrix is a bezel and nothing else) is not evidence of an undrawn
+    // framebuffer.
+    //
+    // These bind on a supersampled case too, and that is the point of putting
+    // them above the `match`: #1144's first cut returned early for an ungated
+    // case and dropped them with the rest of the verdict, which let an
+    // all-black OLED readout at stretch 2 pass a framebuffer nothing had drawn
+    // into (#1150 review, HIGH-1). Box-averaging black is black, so the guard
+    // survives the downsample unchanged.
+    if stats.gl.all_zero && !stats.reference.all_zero {
         return Verdict::RendersNothing;
     }
-    if stats.uniform {
+    if stats.gl.uniform && !stats.reference.uniform {
         return Verdict::UndrawnFramebuffer;
     }
     match sampling {
@@ -1176,13 +1187,25 @@ mod tests {
              on the worst-channel statistic and clean everywhere but the edges",
         );
         assert_eq!(
-            case_verdict(&inside_by(1.0), Kind::DotMatrix, true),
+            case_verdict(
+                &inside_by(1.0),
+                &clean_regions(),
+                Kind::DotMatrix,
+                Sampling::OneToOne,
+                true,
+            ),
             Verdict::NotBitExact,
             "#1144's dot matrix measured zero under llvmpipe too, so CI pins it \
              the same way — the ceiling is still what a real driver answers to",
         );
         assert_eq!(
-            case_verdict(&inside_by(5.0), Kind::DotMatrix, false),
+            case_verdict(
+                &inside_by(5.0),
+                &clean_regions(),
+                Kind::DotMatrix,
+                Sampling::OneToOne,
+                false,
+            ),
             Verdict::Pass,
             "…and without the env, the ceiling alone, on every kind",
         );
@@ -1213,8 +1236,11 @@ mod tests {
                 // it — but not a beam: a dot's brightest row in a column is
                 // whichever dot row wins, and they tie constantly.
                 Kind::DotMatrix => (true, false),
-                // Not a beam either, and not yet measured at zero.
-                Kind::Gauge => (false, false),
+                // Measured at zero at 1:1 since #1148's review, which is what
+                // moved this arm off `false`. Not a beam: a dial's brightest
+                // row in a column is whichever of the arc, a tick, the needle
+                // and the hub happens to win there, and two of those tie.
+                Kind::Gauge => (true, false),
             };
             assert_eq!(
                 kind.pinned_exact(),

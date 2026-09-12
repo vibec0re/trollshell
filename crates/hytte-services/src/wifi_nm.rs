@@ -1143,7 +1143,10 @@ fn arm_refresh(item: &SignalItem, what: &'static str, wake: &mpsc::Sender<()>) {
         tracing::debug!(what, "wifi_nm: refreshing state");
     }
     if wake.try_send(()).is_err() {
-        tracing::debug!(what, "wifi_nm: a refresh is already pending; dropping this wake");
+        tracing::debug!(
+            what,
+            "wifi_nm: a refresh is already pending; dropping this wake"
+        );
     }
 }
 
@@ -1171,7 +1174,10 @@ where
 /// L8). Treating `Err` as "still present" costs nothing: the four refresh
 /// subscriptions re-read NM anyway, and a genuine NM restart takes the whole
 /// connection down, which is a reconnect rather than an `Err` here.
-fn still_present(reply: &Result<Vec<OwnedObjectPath>, hytte_bus::BusError>, device_path: &str) -> bool {
+fn still_present(
+    reply: &Result<Vec<OwnedObjectPath>, hytte_bus::BusError>,
+    device_path: &str,
+) -> bool {
     match reply {
         Ok(devices) => devices.iter().any(|p| p.as_str() == device_path),
         Err(e) => {

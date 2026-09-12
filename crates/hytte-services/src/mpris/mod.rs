@@ -1130,7 +1130,10 @@ fn spawn_player(state: &State, bus_name: String, cancel: CancelRx) {
 /// without a session bus — including through `run_owner_change_loop`, so the
 /// gate is exercised where the race actually happens.
 #[derive(Clone)]
-struct Spawner(Arc<dyn Fn(&State, String, CancelRx) + Send + Sync>);
+struct Spawner(SpawnFn);
+
+/// What a [`Spawner`] holds: "watch this player, and stop when this says so".
+type SpawnFn = Arc<dyn Fn(&State, String, CancelRx) + Send + Sync>;
 
 impl Spawner {
     /// The production spawner: one supervised, bounded [`spawn_player`] task

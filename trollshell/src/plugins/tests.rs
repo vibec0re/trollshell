@@ -40,9 +40,9 @@ use super::pump::{
 };
 use super::region::{clear_region_if_owned, upsert_region};
 use super::session::{
-    EFFECT_BURST, EffectRateLimiter, HiddenOnViolation, IdGuard, MAX_HIDDEN_ON_ENTRIES,
-    MAX_HIDDEN_ON_NAME_BYTES, OUTBOUND_CAPACITY, REGISTER_TIMEOUT, capped_hidden_on,
-    enforce_capabilities, handle_conn, push_gate, state_key_capability,
+    EFFECT_BURST, EffectBuckets, EffectRateLimiter, HiddenOnViolation, IdGuard,
+    MAX_HIDDEN_ON_ENTRIES, MAX_HIDDEN_ON_NAME_BYTES, OUTBOUND_CAPACITY, REGISTER_TIMEOUT,
+    capped_hidden_on, enforce_capabilities, handle_conn, push_gate, state_key_capability,
 };
 use super::shader_map::{self, Grants};
 use super::wire_map::{clamp_pixels_scale, pixels_len_ok, to_ui_node, to_wire_event};
@@ -1093,6 +1093,9 @@ fn ctx_with(
         now_playing_rx,
         locked_rx,
         live_ids: Arc::new(Mutex::new(HashSet::new())),
+        // #1165 item 4: the host-scoped effect bucket table, per-ctx like
+        // `live_ids` so the per-connection tests stay isolated.
+        effect_buckets: EffectBuckets::default(),
         // Host-scoped runtime mirror (#423); like `live_ids`, kept per-ctx so the
         // per-connection tests stay isolated and never publish `PLUGIN_RUNTIME`.
         runtime: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
@@ -3209,6 +3212,9 @@ fn ctx_now_playing_lane() -> (ListenerCtx, watch::Sender<bool>, watch::Sender<No
         now_playing_rx,
         locked_rx,
         live_ids: Arc::new(Mutex::new(HashSet::new())),
+        // #1165 item 4: the host-scoped effect bucket table, per-ctx like
+        // `live_ids` so the per-connection tests stay isolated.
+        effect_buckets: EffectBuckets::default(),
         runtime: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         effects_tx,
         datasource: DatasourceRouter::default(),

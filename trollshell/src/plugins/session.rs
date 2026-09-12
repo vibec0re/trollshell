@@ -185,8 +185,14 @@ const MAX_MISSED_PONGS: u32 = 2;
 /// above any real burst, so the happy path never fills it.
 pub(super) const OUTBOUND_CAPACITY: usize = 256;
 
-/// Max effect tokens a connection may hold — the burst of [`Effect`]s it can emit
+/// Max effect tokens a **plugin** may hold — the burst of [`Effect`]s it can emit
 /// back-to-back before the sustained cap ([`EFFECT_REFILL_PER_SEC`]) applies.
+///
+/// Per plugin id since #1165, not per connection: the bucket used to live in
+/// `handle_conn`'s stack frame, so a crash-looping plugin got a **fresh burst
+/// on every reconnect** — and the SDK backs off from 100 ms, which makes the
+/// sustained cap a ~10× multiple of its stated value for exactly the plugin the
+/// cap exists for. See [`EffectBuckets`].
 pub(super) const EFFECT_BURST: u32 = 8;
 
 /// Sustained effect budget refilled per second (a token-bucket rate). Together
@@ -449,6 +455,17 @@ impl TokenBucket {
             false
         }
     }
+
+    /// Whether this bucket has refilled to its full burst as of `now`, i.e.
+    /// whether it still remembers anything about what was spent.
+    ///
+    /// This is what makes a *keyed* bucket table sweepable (#1165 item 4): a
+    /// full bucket is indistinguishable from a fresh one, so forgetting it
+    /// changes no decision, while forgetting a partly-spent one would hand its
+    /// owner a free burst.
+    fn is_full(&self, now: Instant) -> bool {
+        self.refilled(now) >= self.burst
+    }
 }
 
 /// Per-plugin effect rate cap (#435): a token bucket over [`Effect`]
@@ -463,10 +480,6 @@ impl TokenBucket {
 pub(super) struct EffectRateLimiter(TokenBucket);
 
 impl EffectRateLimiter {
-    fn new() -> Self {
-        Self::new_at(Instant::now())
-    }
-
     pub(super) fn new_at(now: Instant) -> Self {
         Self(TokenBucket::new_at(
             now,
@@ -479,6 +492,13 @@ impl EffectRateLimiter {
     /// try to spend one token. `true` = allowed, `false` = over budget (drop).
     pub(super) fn allow(&mut self, now: Instant) -> bool {
         self.0.allow(now)
+    }
+
+    /// Whether this plugin's bucket has refilled completely — see
+    /// [`TokenBucket::is_full`]. The predicate [`sweep_effect_buckets`] retires
+    /// an entry on.
+    fn is_full(&self, now: Instant) -> bool {
+        self.0.is_full(now)
     }
 }
 
@@ -567,21 +587,91 @@ impl LogGate {
     }
 }
 
-/// Filter a render frame's effects through the connection's rate limiter,
+/// The host's effect rate buckets, keyed by **plugin id** and shared across its
+/// connections (#1165 item 4).
+///
+/// Before this the bucket was a local in `handle_conn`, so it died with the
+/// connection: a plugin that crash-loops — or one written to reconnect on
+/// purpose — got a fresh [`EFFECT_BURST`] every time it dialled back in, and
+/// the SDK's backoff starts at 100 ms. The cap that reads as "8 then 1/s" was
+/// therefore "8 per reconnect" for exactly the plugin it exists to bound.
+/// Keyed by id and held on the [`ListenerCtx`], it survives the reconnect.
+///
+/// Host-scoped (not process-global) for the reason `live_ids` is: the
+/// per-connection tests stay isolated from one another.
+pub(super) type EffectBuckets = Arc<Mutex<std::collections::HashMap<String, EffectRateLimiter>>>;
+
+/// How many plugin ids the host will keep a bucket for at once (#1165 item 4).
+///
+/// The table is swept at every registration ([`sweep_effect_buckets`]), and a
+/// *full* bucket is forgotten there because it is indistinguishable from a
+/// fresh one — so what the table actually holds is "ids that spent an effect
+/// token within the last refill window", a handful in any real session. This
+/// cap is the backstop against a synthetic flood of distinct ids registering
+/// faster than the sweep retires them: past it, an unknown id's effects are
+/// **refused** rather than tracked. Refusing is the safe direction — reaching
+/// this at all takes a thousand plugin ids actively spending effects, which is
+/// the abuse, not a deployment.
+pub(super) const MAX_TRACKED_EFFECT_BUCKETS: usize = 1024;
+
+/// Forget every bucket that has refilled to its full burst as of `now` (#1165
+/// item 4).
+///
+/// Called once per registration — the moment a new id may be about to add an
+/// entry — rather than on a timer, so the table has no background cost at all.
+/// Dropping a *full* bucket changes no decision (it is exactly a fresh one);
+/// dropping a partly-spent one would hand its owner the free burst this whole
+/// change exists to close, which is why the predicate is `is_full` and not an
+/// age.
+pub(super) fn sweep_effect_buckets(buckets: &EffectBuckets, now: Instant) {
+    buckets
+        .lock()
+        .expect("plugin effect buckets poisoned")
+        .retain(|_, bucket| !bucket.is_full(now));
+}
+
+/// Spend up to `count` tokens from `plugin_id`'s persistent bucket, returning
+/// one verdict per effect **in order** (#1165 item 4).
+///
+/// The lock is held for pure arithmetic only — the warn and the audit write for
+/// a refused effect happen after it is released, in [`throttle_effects`] — so a
+/// slow `tracing` subscriber can never stall another connection's reader.
+fn spend_effect_tokens(
+    buckets: &EffectBuckets,
+    plugin_id: &str,
+    count: usize,
+    now: Instant,
+) -> Vec<bool> {
+    let mut guard = buckets.lock().expect("plugin effect buckets poisoned");
+    if !guard.contains_key(plugin_id) {
+        // Borrow-first: the `to_owned()` is paid only on the insert that
+        // actually adds an id, not on every frame of every connection.
+        if guard.len() >= MAX_TRACKED_EFFECT_BUCKETS {
+            guard.retain(|_, bucket| !bucket.is_full(now));
+        }
+        if guard.len() >= MAX_TRACKED_EFFECT_BUCKETS {
+            return vec![false; count];
+        }
+        guard.insert(plugin_id.to_owned(), EffectRateLimiter::new_at(now));
+    }
+    let bucket = guard
+        .get_mut(plugin_id)
+        .expect("present, or inserted just above");
+    (0..count).map(|_| bucket.allow(now)).collect()
+}
+
+/// Filter a render frame's effects through the plugin's rate limiter,
 /// dropping (with a warn) any that exceed the cap. All effects in one frame share
 /// a single `now`, so a burst frame depletes the bucket in order.
-fn throttle_effects(
-    rl: &mut EffectRateLimiter,
-    plugin_id: &str,
-    effects: Vec<Effect>,
-) -> Vec<Effect> {
+fn throttle_effects(buckets: &EffectBuckets, plugin_id: &str, effects: Vec<Effect>) -> Vec<Effect> {
     if effects.is_empty() {
         return effects;
     }
     let now = Instant::now();
+    let verdicts = spend_effect_tokens(buckets, plugin_id, effects.len(), now);
     let mut kept = Vec::with_capacity(effects.len());
-    for effect in effects {
-        if rl.allow(now) {
+    for (effect, allowed) in effects.into_iter().zip(verdicts) {
+        if allowed {
             kept.push(effect);
         } else {
             tracing::warn!(plugin = %plugin_id, ?effect, "plugin effect rate cap exceeded; dropped");
@@ -830,6 +920,11 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         );
         return;
     };
+    // #1165 item 4: the one moment a new plugin id may be about to take a slot
+    // in the host's effect-bucket table, and therefore the moment to retire the
+    // entries that have refilled. This connection's own bucket is deliberately
+    // NOT reset here — surviving the reconnect is the whole point.
+    sweep_effect_buckets(&ctx.effect_buckets, Instant::now());
     let mount = manifest.mount;
     // Region sort key (advisory placement request); `None` sorts as `0` (#274).
     let order = manifest.order.unwrap_or(0);
@@ -1031,10 +1126,9 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // `select!` only ever *abandons* on teardown — it is never resumed after a
     // cancel, so no partial read is lost mid-stream.
     let pong_seen = AtomicBool::new(false);
-    let mut effect_rl = EffectRateLimiter::new();
     // #1058 review MEDIUM-2: per-connection latch for `capped_hidden_on`'s two
-    // violation kinds, mirroring `effect_rl`'s per-connection scope (and the
-    // SDK's own `capability_warned`) — reset on every reconnect, so a
+    // violation kinds, mirroring the SDK's own `capability_warned` — reset on
+    // every reconnect, so a
     // long-lived misconfiguration is named once per connection, not once per
     // frame.
     let mut hidden_on_warned = HashSet::new();
@@ -1060,7 +1154,7 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                     // plugin may request anything; the host decides what runs.
                     let requested = effects.len();
                     let kept = throttle_effects(
-                        &mut effect_rl,
+                        &ctx.effect_buckets,
                         &plugin_id,
                         enforce_capabilities(&capabilities, &plugin_id, effects),
                     );

@@ -502,6 +502,13 @@ struct ListenerCtx {
     /// across an await. Scoped to the host (not process-global) so the
     /// per-connection tests stay isolated from one another.
     live_ids: Arc<Mutex<HashSet<String>>>,
+    /// The host's effect rate buckets, keyed by plugin id (#1165). Host-scoped
+    /// like `live_ids` and for the same reason, but with the opposite lifetime:
+    /// `live_ids` releases an id at teardown, while a bucket deliberately
+    /// **outlives** the connection that spent from it, so a crash-looping
+    /// plugin can't earn a fresh burst by reconnecting. Swept at every
+    /// registration; see [`session::EffectBuckets`].
+    effect_buckets: session::EffectBuckets,
     /// Cross-thread mirror of connected plugins' runtime state (#423), written by
     /// the per-connection tasks and snapshotted by the `Control` endpoint via
     /// [`plugin_states`]. Host-scoped like `live_ids`; the production host also
@@ -582,6 +589,7 @@ impl Service for PluginsService {
             now_playing_rx,
             locked_rx,
             live_ids: Arc::new(Mutex::new(HashSet::new())),
+            effect_buckets: session::EffectBuckets::default(),
             runtime,
             effects_tx,
             datasource,

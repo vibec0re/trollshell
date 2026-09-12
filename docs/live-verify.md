@@ -3008,14 +3008,15 @@ trollshell`. Expect the cards to come back Active and **no notification at
     card header.** Open Edit on a saved stack whose apps carry no override:
     each row shows only its icon and name plus a small terminal-icon toggle,
     off. Press it — the entry must appear pre-filled with the **resolved**
-    command, not empty; check it against `systemctl --user show
-    trollshell-ws-<name>-<n>.service -p ExecStart` (field codes already
-    stripped). Turn it back off and Save: `workspaces.toml` must carry no
-    `exec` for that app. Separately, open a fresh (unnamed) workspace's card:
-    its title must read `Workspace <n>` — niri's own `idx`, cross-checked
-    against `niri msg workspaces` — never "Unsaved workspace". And on every
-    card, saved or ephemeral, the header (name plus its buttons) must not
-    repeat the connector name the column heading above it already shows.
+    command, not empty; check it against
+    `systemctl --user show trollshell-ws-<name>-<n>.service -p ExecStart`
+    (field codes already stripped). Turn it back off and Save:
+    `workspaces.toml` must carry no `exec` for that app. Separately, open a
+    fresh (unnamed) workspace's card: its title must read `Workspace <n>` —
+    niri's own `idx`, cross-checked against `niri msg workspaces` — never
+    "Unsaved workspace". And on every card, saved or ephemeral, the header
+    (name plus its buttons) must not repeat the connector name the column
+    heading above it already shows.
   - **Saving an unnamed workspace makes it the Active card.** Open a fresh
     workspace, start two apps by hand, click its ✎. The form opens with the apps
     **in niri's column order**; any whose `app_id` has no desktop entry arrives

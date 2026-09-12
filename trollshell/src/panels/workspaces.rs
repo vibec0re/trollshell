@@ -2923,16 +2923,18 @@ pub(in crate::panels) mod tests {
 
         let f = fixture();
         f.saved.set(saved(&[("chat", stack(Some(LEFT), &["a"]))]));
-        f.workspaces.set(vec![
-            ws(1, 1, LEFT, Some("chat")),
-            ws(2, 2, RIGHT, None),
-        ]);
+        f.workspaces
+            .set(vec![ws(1, 1, LEFT, Some("chat")), ws(2, 2, RIGHT, None)]);
         f.windows.set(vec![win(9, 2, "com.example.Term", 1)]);
         pump();
         let window = present(&f.page);
 
         let headers = by_class(&f.page, CARD_HEADER_CLASS);
-        assert_eq!(headers.len(), 2, "the saved card and the ephemeral one both carry a header");
+        assert_eq!(
+            headers.len(),
+            2,
+            "the saved card and the ephemeral one both carry a header"
+        );
         for header in &headers {
             let texts = all_label_texts(header);
             assert!(

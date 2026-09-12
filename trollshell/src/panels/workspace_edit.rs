@@ -1464,7 +1464,10 @@ mod tests {
     fn toggling_an_override_on_prefills_the_resolved_command() {
         let target: Mutable<Option<Draft>> = Mutable::new(None);
         let resolve: Resolver = Rc::new(|id: &str| {
-            assert_eq!(id, "org.mozilla.firefox", "resolved the wrong app's command");
+            assert_eq!(
+                id, "org.mozilla.firefox",
+                "resolved the wrong app's command"
+            );
             "firefox --new-window".to_owned()
         });
         let page = slot_with_resolver(&target, resolve);

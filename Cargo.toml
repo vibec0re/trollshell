@@ -28,6 +28,7 @@ members = [
   "crates/hytte-plugin-audio-widget",
   "crates/hytte-plugin-niri-layouts",
   "crates/hytte-plugin-agents",
+  "crates/trollshell-agent-window",
   "crates/trollshell-control-center",
   "trollshell",
 ]
@@ -51,7 +52,18 @@ repository = "https://git.hannig.cc/choom/trollshell"
 # hytte-plugin-weather). Per the issue's own escape hatch ("either add a
 # pinned-1.85 check or drop the claim"), this bumps the floor to the version
 # the code actually requires rather than rewriting call sites across 5 crates.
-rust-version = "1.91"
+#
+# **1.92 since #1130**, and this one is not a floor that drifted — it is
+# enforced. `webkit6` (the #950 companion window's engine) pulls `soup3` /
+# `soup3-sys` 0.9.0, both of which declare `rust-version = "1.92"`, and cargo
+# **hard-errors at build time** when the active toolchain is below a package's
+# declared floor ("package `soup3 v0.9.0` cannot be built because it requires
+# rustc 1.92 or newer"). `resolver.incompatible-rust-versions` is not what
+# matters here — that steers version *selection* while a lockfile is being
+# generated, and this lockfile is pinned. So a 1.91 toolchain cannot build this
+# workspace at all, and leaving the declaration at 1.91 would have made it
+# provably false rather than merely stale.
+rust-version = "1.92"
 
 # hytte-ecal and hytte-gl hand-mirror this table (crates/hytte-ecal/Cargo.toml,
 # crates/hytte-gl/Cargo.toml) instead of `[lints] workspace = true`, because
@@ -179,6 +191,20 @@ tracing = "0.1.44"
 # `default-features = true` locally for "fmt"/"env-filter".
 tracing-subscriber = { version = "0.3.23", default-features = false }
 ureq = { version = "3.3.0", default-features = false }
+# WebKitGTK 6.0 (the GTK4 API) — `trollshell-agent-window` ONLY, the #950
+# companion window. The engine spec #955 §7.1 decided for v1, kept at the
+# version that thread named (0.6.1, 2026-03); its `gtk4` 0.11 / `glib`+`gio`
+# 0.22 bounds are exactly what the rest of the workspace already locks, so the
+# resolver unifies to one build of each rather than a second GTK.
+#
+# Renamed to `webkit` so the call sites read as the engine rather than as its
+# API generation, matching how `adw`/`gtk` are spelled here.
+#
+# It adds native `buildInputs` (`webkitgtk_6_0` in nix/package.nix) and six
+# resolved packages — webkit6/-sys, javascriptcore6/-sys, soup3/-sys — and
+# lands in exactly one binary: the shell links no web engine, and neither does
+# any plugin.
+webkit = { version = "0.6.1", package = "webkit6" }
 zbus = { version = "5.14.0", default-features = false, features = ["tokio"] }
 
 [profile.release]

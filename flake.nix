@@ -105,6 +105,17 @@
             inherit workspace revision;
           };
 
+          # The per-agent companion window (#950, P2 of the agentic desktop):
+          # hyperhive's own agent page in a WebKitGTK view inside our chrome.
+          # Same slice-and-wrap shape as the control center — it is a windowed
+          # GTK app, and WebKit needs the GApplication env — but with no
+          # .desktop item, since it is meaningless without `--agent <name>`
+          # (nix/agent-window.nix says why). `programs.trollshell.agentWindow`
+          # installs it; the agents plugin launches it off `PATH`.
+          trollshell-agent-window = pkgs.callPackage ./nix/agent-window.nix {
+            inherit workspace revision;
+          };
+
           # Per-plugin flake packages (#558): `packages.hytte-plugin-<id>` for
           # each of the 14 bundled plugins. Generated from `bundledPluginNames`
           # (one attr each) rather than hand-written. Since #572 each is a `cp`
@@ -157,6 +168,7 @@
           inherit
             trollshell
             trollshell-control-center
+            trollshell-agent-window
             options-doc
             hytte-infobroker
             hytte-claude-bridge
@@ -195,6 +207,15 @@
           # The control-center companion app (#411), mirroring the `packages`
           # output above — a slice of `workspace`, no cargo of its own (#572).
           trollshell-control-center = pkgs.callPackage ./nix/control-center.nix {
+            inherit workspace revision;
+          };
+
+          # The #950 companion window, mirroring the `packages` output. Wired
+          # in here — the I1 gap the #1130 review measured — now that #1127 has
+          # landed and this region is stable: it is the one output whose
+          # **wrapper** derivation (nix/agent-window.nix) nothing else builds,
+          # and the wrapper is exactly where M1's closure bug lived.
+          trollshell-agent-window = pkgs.callPackage ./nix/agent-window.nix {
             inherit workspace revision;
           };
 
@@ -312,9 +333,19 @@
           inherit
             trollshell
             trollshell-control-center
+            trollshell-agent-window
             hytte-infobroker
             hytte-claude-bridge
             ;
+
+          # The shell's runtime closure must carry no WebKitGTK 6.0 (#1130 M1).
+          # A `runCommand` over `exportReferencesGraph` — no compile, so it is
+          # red in seconds, and it reads nix's own answer about the closure
+          # rather than re-deriving one. See nix/checks/ for the whole story,
+          # including why it names the ABI.
+          shell-has-no-web-engine = pkgs.callPackage ./nix/checks/shell-has-no-web-engine.nix {
+            inherit trollshell trollshell-control-center;
+          };
 
           # Lint the entire workspace with pedantic-clean Clippy. Reuses
           # cargoArtifacts from the package build so dependencies aren't

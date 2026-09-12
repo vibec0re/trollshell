@@ -323,6 +323,15 @@ in
         environment.systemPackages = [ cfg.controlCenter.package ];
       })
 
+      # The per-agent companion window (#950): the hyperhive agents card's two
+      # destinations. On by default exactly when `plugins.agents` is declared —
+      # the plugin resolves this binary on PATH and degrades to the browser
+      # without it (see the option). Its own mkMerge branch for the same reason
+      # the control center has one.
+      (lib.mkIf cfg.agentWindow.enable {
+        environment.systemPackages = [ cfg.agentWindow.package ];
+      })
+
       # The recommended-but-optional system daemons trollshell's chips lean
       # on, grouped behind the master switch. Each chip hides itself when its
       # daemon is missing, so dropping the lot still leaves a working bar.

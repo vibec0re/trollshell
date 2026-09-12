@@ -528,6 +528,102 @@ the reducer but cannot prove the hive agrees.
       them against the committed files. **A difference is a finding, not a
       formatting nit** — see that directory's `README.md`.
 
+### The companion window (#947 P2, #950)
+
+Needs the same hive, plus `programs.trollshell.agentWindow.enable` (on by
+default once a `plugins.agents` entry exists) so `trollshell-agent-window` is
+on the session's `PATH`. CI proves the argv both ends speak, the `?hide=`
+assembly, the verbs' bytes against a scripted socket and the TLS policy's
+scope; it cannot prove that hyperhive's page renders in WebKitGTK, which is the
+whole point of the window.
+
+- [ ] **(#950)** **The card's link opens the window, not the browser.** With
+      the window installed, click an agent's `agent page` link on the drawer
+      page and confirm a **new window** appears (title `<label> — agent`,
+      app-id `mov.vibec0re.trollshell.AgentWindow.<agent>`) rather than a
+      browser tab. Then `systemctl --user list-units 'trollshell-launch-*'` and
+      confirm it was started as a transient unit — it must be **outside** the
+      shell's cgroup, so `systemctl --user restart trollshell` leaves it alive.
+- [ ] **(#950)** **The pen opens the settings tab.** Click `[edit]` on a card
+      pill and confirm the same window opens **on Settings**, not on the agent
+      page, and that the drawer does **not** also open a plugin page behind it.
+- [ ] **(#950)** **A second launch focuses the first.** With the window open on
+      the agent page, click the pen: no second window appears, the existing one
+      is presented _and_ switches to Settings (that is the
+      `HANDLES_COMMAND_LINE` forward — if it merely raises without switching,
+      the remote command line is being dropped). Then open a **different**
+      agent's window and confirm the two coexist.
+- [ ] **(#950)** **The embedded page is the feed alone.** Confirm hyperhive's
+      own header and composer are **gone** inside the view — the URL carries
+      `?hide=header,input` — and that our header (icon, name, model word, live
+      status) and the start/stop/pause buttons are the only chrome. If the
+      hive's own header is still there, the parameter regressed on the hive's
+      side (it was shipped by @the-sword-above on #950) and the fix is one
+      constant in `crates/trollshell-agent-window/src/page.rs`.
+- [ ] **(#950)** **The header follows the hive, not the page.** Drive a status
+      change from outside (`hivectl`, or the agent's own `set_status`) and
+      confirm our header line changes within one `poll_seconds` **without**
+      reloading the embedded page — the page keeps its scroll position and any
+      half-typed message. Pause the agent from the hive side and confirm the
+      pause toggle moves on its own and does **not** bounce back (a bounce
+      means the echo guard in `ui::Header::apply` is gone and the window is
+      fighting the daemon).
+- [ ] **(#950)** **Start / stop / pause hit only this agent.** Use each button
+      and check `hivectl list-agents` before and after that nothing else moved
+      — the §11 rule-one footgun again, and this is a second writer on the same
+      socket.
+- [ ] **(#950)** **TLS — the inline error state names the way out.** A default
+      hyperhive gateway serves a self-signed leaf under a host-held CA and this
+      machine's trust store does not carry it, so **expect the window to open
+      on an error state** rather than the page. Confirm that state names the
+      failing host and all three routes (not WebKit's bare "load failed"), then
+      take the first one that applies:
+  1. **The hive is on this machine** — the `singleHostSwarm` case, i.e. yours.
+     Reference hyperhive's own option rather than typing the path (Mara's ask
+     on #948), so the two sides cannot drift if that directory moves:
+
+     ```nix
+     security.pki.certificateFiles = [
+       "${config.services.hyperhive.deploy.hive-controller.tls.stateDir}/trust-bundle.pem"
+     ];
+     ```
+
+  2. **A remote hive, or a host you do not configure.** Copy that file over and
+     name it literally — `/var/lib/hive-tls` is only that option's default, so
+     spelling it out is the fallback, not the example to copy.
+  3. **Last resort**, when neither is available: launch with
+     `TROLLSHELL_AGENT_WINDOW_CERT=<pem>`, which pins one certificate for the
+     agent's host only. ⚠️ It must be the certificate the gateway **presents**
+     — its leaf, **not** the bundle — because
+     `allow_tls_certificate_for_host` pins a certificate rather than adding an
+     anchor. `openssl s_client -connect <host>:443 -showcerts </dev/null |
+openssl x509` produces it. Pointing it at `trust-bundle.pem` gets you an
+     INFO line saying it worked and an error page anyway (#1130 M3).
+
+  Whichever you use, confirm the page then loads _and_ that an unrelated https
+  host with a bad certificate still fails in the same window — this window
+  never turns TLS checking off.
+
+- [ ] **(#950)** **The view stays on the hive.** With the page loaded, follow a
+      link in the agent's feed that points off the hive (or set
+      `window.location` from WebKit's inspector if the feed has none): the
+      **window must not move** — the link opens in your browser instead, and a
+      journal line says so. Same for a `target="_blank"` link: one browser tab,
+      no second WebKit window, and no silently-dead click. Then follow a link
+      _within_ the hive and confirm that one does load in place. This is the H1
+      guard from #1130's review: the embedded page is agent output, and this
+      window has no address bar to contradict a header that says "agent X".
+- [ ] **(#950)** **Without the window, nothing regresses.** Set
+      `programs.trollshell.agentWindow.enable = false;`, rebuild, restart the
+      plugin, and confirm the card's link opens the **browser** again and the
+      pen opens the plugin's own drawer page, with exactly one journal line
+      about the window not being on `PATH` (not one per click).
+- [ ] **(#950)** **niri rules.** The app-id carries the agent, so a rule for
+      all of these windows matches the prefix — e.g.
+      `match app-id="^mov\.vibec0re\.trollshell\.AgentWindow"`. Confirm a
+      size/placement rule written that way applies to two different agents'
+      windows.
+
 ## Plugins & launcher
 
 - [ ] **(#489)** Plugins now launch via `systemd-run --user` transient units

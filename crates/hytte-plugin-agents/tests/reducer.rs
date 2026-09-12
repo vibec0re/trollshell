@@ -18,6 +18,7 @@ use hytte_plugin_agents::hive::wire::{
 };
 use hytte_plugin_agents::model::{Hive, Status};
 use hytte_plugin_agents::poll::{Cmd, Msg};
+use hytte_plugin_agents::window::Probe;
 
 // ── harness ──────────────────────────────────────────────────────────────────
 
@@ -319,21 +320,62 @@ fn the_row_itself_is_not_a_click_target_until_the_webview_exists() {
     assert!(lines(&mut rx).is_empty(), "nor ask the hive anything");
 }
 
-/// The **edit** button — Annika's `[optionsedit]` — opens this plugin's page on
-/// that agent, and asks the hive nothing.
+/// The **edit** button — Annika's `[optionsedit]` — opens the agent's
+/// companion window **on its settings tab**, and asks the hive nothing.
 ///
-/// This pins a **placeholder**, deliberately. Its real destination is the
-/// agent's companion window on its settings tab (#950, her call on #947 at
-/// 2026-09-11 07:43Z), and opening a separate GTK window is not
-/// `OpenPage(PluginSelf)` — so this test is expected to change with that
-/// window, and the arm it covers with it. What must survive the swap is the
-/// other half: the button asks the hive nothing.
+/// Her call on #947, 2026-09-11 07:43Z: the pen opens that window's settings
+/// tab, so an agent has one surface. The launch is **detached** (#953), so the
+/// window outlives a `trollshell.service` restart instead of dying with it.
 ///
-/// Falsification: point the `ids::EDIT` arm at anything else and the `Effect`
-/// or the `selected` assertion reds.
+/// Falsification: swap the tab word, drop `--tab settings`, or reorder the
+/// flags, and the argv assertion reds; point the arm back at `open_detail` and
+/// the effect kind does.
 #[test]
-fn the_edit_button_opens_this_agents_page() {
+fn the_edit_button_opens_the_companion_window_on_its_settings_tab() {
     let (mut m, mut rx) = model();
+    m.set_window_probe(Probe::fixed(true));
+    m.update(status(roster("agent_status_grouped.json")));
+
+    let fx = m.update(click("edit:stray"));
+    assert_eq!(
+        fx,
+        vec![Effect::RunCommand {
+            id: 0,
+            argv: vec![
+                "trollshell-agent-window".to_owned(),
+                "--agent".to_owned(),
+                "stray".to_owned(),
+                "--tab".to_owned(),
+                "settings".to_owned(),
+            ],
+            detached: true,
+        }]
+    );
+    assert_eq!(
+        m.selected, None,
+        "the window IS the settings surface now — no drawer page opens behind it"
+    );
+    assert!(
+        lines(&mut rx).is_empty(),
+        "opening a window is not a hive request"
+    );
+}
+
+/// On a desktop with **no** companion window installed, the pen keeps P1's
+/// behaviour: this plugin's own drawer page, which was the placeholder for
+/// that window and is now its fallback.
+///
+/// Which of the two routes a click takes is a property of the *desktop*, not
+/// of the click, which is why every test in this section states which desktop
+/// it describes (`Agents::set_window_probe`) instead of inheriting the
+/// machine's `PATH`.
+///
+/// Falsification: drop the fallback (return `Vec::new()` when the window is
+/// absent) and this reds — such a desktop would have a dead pen.
+#[test]
+fn without_the_window_the_edit_button_still_opens_this_agents_page() {
+    let (mut m, mut rx) = model();
+    m.set_window_probe(Probe::fixed(false));
     m.update(status(roster("agent_status_grouped.json")));
 
     let fx = m.update(click("edit:stray"));
@@ -722,11 +764,15 @@ fn the_visibility_edge_reaches_the_poll_task() {
 }
 
 /// The manifest is the plugin's whole trust declaration, so it is pinned:
-/// `OpenPage` + `Notify` + `OpenUri` and nothing else. **`RunCommand` is P2 and
-/// `Consent` is P3** — a P1 that quietly declared either would be granted an
-/// authority the row has not earned yet (spec §11 rules two and three, §13).
+/// `OpenPage` + `Notify` + `OpenUri` + `RunCommand` and nothing else.
+/// `RunCommand` arrived with P2's companion window (#950) and is the
+/// highest-trust capability in the vocabulary, which is why the one argv this
+/// plugin can build is a constant binary plus a re-parsed `AgentName`
+/// (`window::argv`). **`Consent` is still P3** — a plugin that quietly declared
+/// it would be granted an authority the row has not earned yet (spec §11 rules
+/// two and three, §13).
 #[test]
-fn the_manifest_declares_exactly_three_capabilities_and_no_secrets() {
+fn the_manifest_declares_exactly_four_capabilities_and_no_secrets() {
     use hytte_plugin::proto::{Capability, Mount, StateKey};
     let m = Agents::manifest();
     assert_eq!(m.id, "agents");
@@ -736,10 +782,10 @@ fn the_manifest_declares_exactly_three_capabilities_and_no_secrets() {
         vec![
             Capability::OpenPage,
             Capability::Notify,
-            Capability::OpenUri
+            Capability::OpenUri,
+            Capability::RunCommand,
         ]
     );
-    assert!(!m.capabilities.contains(&Capability::RunCommand));
     assert!(!m.capabilities.contains(&Capability::Consent));
     assert_eq!(
         m.subscribes,
@@ -749,10 +795,13 @@ fn the_manifest_declares_exactly_three_capabilities_and_no_secrets() {
     assert!(m.provides.is_empty(), "this plugin serves no datasource");
 }
 
-// ── the link button (#1045) ─────────────────────────────────────────────────
+// ── the agent-page button: the companion window (#950), the browser behind it
+//    (#1045) ──────────────────────────────────────────────────────────────────
 
-/// The manifest grants the capability the link click's effect **requires** —
-/// asked of the one table that decides it, not restated as a list.
+/// The manifest grants the capability the agent-page click's effect
+/// **requires** — asked of the one table that decides it, not restated as a
+/// list, and asked on **both** desktops, because since #950 the click emits a
+/// different effect depending on whether the companion window is installed.
 ///
 /// `Effect::required_capability` (`hytte-plugin-proto/src/effect.rs`) is the
 /// single mapping both enforcement points consult: the host's
@@ -767,40 +816,91 @@ fn the_manifest_declares_exactly_three_capabilities_and_no_secrets() {
 /// current host, while on a host older than #1045 `Register` still decodes and
 /// the first frame carrying the effect does not — the #437 crash-loop.
 ///
-/// Mutation (verified red): delete `Capability::OpenUri` from `manifest()` and
-/// both the `granted` assertion and the manifest test above go red.
+/// Mutation (verified red): delete `Capability::OpenUri` **or**
+/// `Capability::RunCommand` from `manifest()` and one of the two rounds here
+/// goes red, along with the manifest test above.
 #[test]
-fn the_manifest_grants_what_the_link_click_emits() {
-    let (mut m, _rx) = model();
+fn the_manifest_grants_what_the_agent_page_click_emits() {
+    for installed in [true, false] {
+        let (mut m, _rx) = model();
+        m.set_window_probe(Probe::fixed(installed));
+        m.update(status(roster("agent_status_grouped.json")));
+
+        let fx = m.update(click("open:trollshell-choom"));
+        let [effect] = fx.as_slice() else {
+            panic!("a click emits exactly one effect, got {fx:?} (window installed: {installed})");
+        };
+        let required = effect
+            .required_capability()
+            .expect("both routes are gated effects");
+
+        let granted = Agents::manifest().capabilities;
+        assert!(
+            granted.contains(&required),
+            "the SDK drops an effect whose capability the manifest omits (#1058): \
+             {effect:?} needs {required:?}, manifest grants {granted:?}"
+        );
+    }
+}
+
+/// With the companion window installed, the agent-page click launches **it**,
+/// detached, for that agent — not the browser.
+///
+/// Annika on #947, 2026-09-11 07:16Z: the agent page opens in "a dedicated,
+/// shell-controlled webview, not the browser — the point is that we control it
+/// so it can be integrated". So the effect is a detached `RunCommand` (#953)
+/// naming the window binary and the agent, and **nothing else**: the URL is not
+/// carried, because the window reads `host.sock` itself and would be wrong to
+/// trust a string that made a round trip through the host.
+///
+/// Falsification: swap the argv order, emit `--tab agent` (the window's
+/// default, which #950 spells by omission), or drop `detached: true` — each
+/// reds on the exact effect.
+#[test]
+fn the_agent_page_click_launches_the_companion_window() {
+    let (mut m, mut rx) = model();
+    m.set_window_probe(Probe::fixed(true));
     m.update(status(roster("agent_status_grouped.json")));
 
     let fx = m.update(click("open:trollshell-choom"));
-    let [effect] = fx.as_slice() else {
-        panic!("a link click emits exactly one effect, got {fx:?}");
-    };
-    let required = effect
-        .required_capability()
-        .expect("OpenUri is a gated effect");
-
-    let granted = Agents::manifest().capabilities;
-    assert!(
-        granted.contains(&required),
-        "the SDK drops an effect whose capability the manifest omits (#1058): \
-         {effect:?} needs {required:?}, manifest grants {granted:?}"
+    assert_eq!(
+        fx,
+        vec![Effect::RunCommand {
+            id: 0,
+            argv: vec![
+                "trollshell-agent-window".to_owned(),
+                "--agent".to_owned(),
+                "trollshell-choom".to_owned(),
+            ],
+            detached: true,
+        }]
     );
+    assert!(
+        lines(&mut rx).is_empty(),
+        "opening a window is not a hive request"
+    );
+    assert_eq!(m.selected, None, "and it neither selects nor opens a page");
 }
 
-/// A click on the link emits **exactly one** `OpenUri`, carrying that row's own
-/// URL, and asks the hive nothing.
+/// Without the window, the click keeps P1's route: **exactly one** `OpenUri`,
+/// carrying that row's own URL, and asks the hive nothing.
+///
+/// This is the fallback #950 asks for by name — "so a plugin without the window
+/// still opens the browser" — and it is why the window is resolved on `PATH`
+/// *before* the effect is chosen rather than after the host answers: a detached
+/// launch reports only that the launch succeeded, and on the `systemd-run` path
+/// a binary that does not exist still produces `ok: true`
+/// (`trollshell/src/plugins/effects.rs`), so an `EffectResult`-driven fallback
+/// would never fire.
 ///
 /// The URL is the fixture's, read back out of the model — not a string the
 /// node id carried. Falsification: have `open_agent_page` parse a URL out of
 /// `node` instead of looking the agent up and the assertion still passes for
-/// this id but the `a_link_click_on_a_vanished_agent_opens_nothing` sibling
-/// below goes red.
+/// this id but the vanished-agent sibling below goes red.
 #[test]
-fn a_link_click_emits_one_open_uri_with_the_rows_own_url() {
+fn without_the_window_the_agent_page_click_opens_one_uri_with_the_rows_own_url() {
     let (mut m, mut rx) = model();
+    m.set_window_probe(Probe::fixed(false));
     m.update(status(roster("agent_status_grouped.json")));
 
     let fx = m.update(click("open:trollshell-choom"));
@@ -818,59 +918,109 @@ fn a_link_click_emits_one_open_uri_with_the_rows_own_url() {
     assert_eq!(m.selected, None, "and it neither selects nor opens a page");
 }
 
-/// Two link clicks take **distinct** correlation tokens.
+/// Two clicks take **distinct** correlation tokens — on either desktop, and
+/// out of the *same* counter when the two routes are mixed.
 ///
 /// `EffectResult`'s own docs call the reply-bearing effects one shared id space
 /// and say to allocate from a single counter (#1060): two effects in flight on
 /// the same id cannot be told apart by the host's audit or by the plugin's own
-/// result arm.
+/// result arm. Since #950 that is no longer hypothetical — `RunCommand` and
+/// `OpenUri` are both live in this plugin — so the mixed round is the one that
+/// would catch a per-kind counter.
 ///
-/// Falsification: make `take_effect_id` return a constant (or reset it per
-/// click) and this reds on the second id.
+/// Falsification: make `take_effect_id` return a constant, reset it per click,
+/// or give `open_window` a counter of its own, and one of the rounds reds.
 #[test]
-fn two_link_clicks_take_distinct_correlation_ids() {
-    let (mut m, _rx) = model();
-    m.update(status(roster("agent_status_grouped.json")));
+fn clicks_take_distinct_correlation_ids_across_both_routes() {
+    for installed in [true, false] {
+        let (mut m, _rx) = model();
+        m.set_window_probe(Probe::fixed(installed));
+        m.update(status(roster("agent_status_grouped.json")));
 
-    let ids: Vec<u64> = ["open:trollshell-choom", "open:nixos-choom"]
-        .into_iter()
-        .map(|node| match m.update(click(node)).as_slice() {
-            [Effect::OpenUri { id, .. }] => *id,
-            other => panic!("expected one OpenUri, got {other:?}"),
-        })
-        .collect();
-    assert_eq!(ids, vec![0, 1]);
+        let ids: Vec<u64> = ["open:trollshell-choom", "open:nixos-choom"]
+            .into_iter()
+            .map(|node| match m.update(click(node)).as_slice() {
+                [Effect::OpenUri { id, .. } | Effect::RunCommand { id, .. }] => *id,
+                other => panic!("expected one reply-bearing effect, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec![0, 1], "window installed: {installed}");
+    }
+
+    // The mixed case: a window launch and a browser open out of one model.
+    let (mut m, _rx) = model();
+    m.set_window_probe(Probe::fixed(true));
+    m.update(status(roster("agent_status_grouped.json")));
+    let launch = match m.update(click("open:trollshell-choom")).as_slice() {
+        [Effect::RunCommand { id, .. }] => *id,
+        other => panic!("expected a launch, got {other:?}"),
+    };
+    m.set_window_probe(Probe::fixed(false));
+    let opened = match m.update(click("open:nixos-choom")).as_slice() {
+        [Effect::OpenUri { id, .. }] => *id,
+        other => panic!("expected an open, got {other:?}"),
+    };
+    assert_ne!(
+        launch, opened,
+        "one id space, not one counter per effect kind (#1060)"
+    );
 }
 
-/// A link click whose agent the model no longer holds — or whose name is
-/// illegal — opens **nothing**.
+/// A click whose agent the model no longer holds — or whose name is illegal —
+/// opens **nothing**, on either desktop.
 ///
-/// This is what makes "the URL comes from the model, never from the id" a
-/// testable property rather than a comment: the id is well-formed and the
+/// This is what makes "the destination comes from the model, never from the id"
+/// a testable property rather than a comment: the id is well-formed and the
 /// prefix matches, and the only reason nothing is emitted is that there is no
-/// agent to read a URL off.
+/// agent behind it. The window route is held to the same rule even though it
+/// carries no URL — a window for an agent this roster does not have is a window
+/// with nothing to show.
 ///
 /// Falsification: carry the URL on the node id (`open:<url>`) and emit it
-/// verbatim, and this goes red.
+/// verbatim, or drop `open_window`'s `self.hive.agent(name).is_none()` guard,
+/// and this goes red.
 #[test]
-fn a_link_click_on_a_vanished_or_illegal_agent_opens_nothing() {
-    let (mut m, mut rx) = model();
-    m.update(status(roster("agent_status_grouped.json")));
+fn a_click_on_a_vanished_or_illegal_agent_opens_nothing() {
+    for installed in [true, false] {
+        let (mut m, mut rx) = model();
+        m.set_window_probe(Probe::fixed(installed));
+        m.update(status(roster("agent_status_grouped.json")));
 
-    assert_eq!(m.update(click("open:ghost")), vec![], "no such agent");
-    assert_eq!(
-        m.update(click("open:not a name")),
-        vec![],
-        "the name fails the §11 whitelist before anything else happens"
-    );
-    // …and an agent the hive reports with no `url` at all.
+        assert_eq!(m.update(click("open:ghost")), vec![], "no such agent");
+        assert_eq!(
+            m.update(click("open:not a name")),
+            vec![],
+            "the name fails the §11 whitelist before anything else happens"
+        );
+        assert!(lines(&mut rx).is_empty(), "window installed: {installed}");
+    }
+
+    // …and an agent the hive reports with no `url` at all: nothing to open in
+    // the browser. The window route does not need one, so it still launches.
+    let (mut m, _rx) = model();
+    m.set_window_probe(Probe::fixed(false));
     m.update(status(vec![AgentStatusRow {
         name: "trollshell-choom".to_owned(),
         running: true,
         ..AgentStatusRow::default()
     }]));
     assert_eq!(m.update(click("open:trollshell-choom")), vec![]);
-    assert!(lines(&mut rx).is_empty());
+
+    let (mut m, _rx) = model();
+    m.set_window_probe(Probe::fixed(true));
+    m.update(status(vec![AgentStatusRow {
+        name: "trollshell-choom".to_owned(),
+        running: true,
+        ..AgentStatusRow::default()
+    }]));
+    assert!(
+        matches!(
+            m.update(click("open:trollshell-choom")).as_slice(),
+            [Effect::RunCommand { .. }]
+        ),
+        "the window resolves the URL from host.sock itself, so a row without \
+         one is still openable there"
+    );
 }
 
 /// The panel's `dashboard` link opens the hive's own root, and only once the
@@ -903,18 +1053,20 @@ fn the_dashboard_link_opens_the_hives_root_once_urls_have_landed() {
     );
 }
 
-/// A refused open **says so**; a successful one says nothing.
+/// A refused open **says so**; a successful one says nothing — and the same
+/// arm covers a refused window launch, which is why its summary names neither
+/// a link nor a window.
 ///
 /// `EffectOutcome::output` exists for exactly this (`hytte-plugin`'s
 /// `Input::EffectResult` docs: "so a plugin can toast it instead of leaving a
-/// click that silently does nothing"). No correlation table is needed because
-/// `OpenUri` is the only reply-bearing effect P1 emits — P2's `choom` launch is
-/// what will need one.
+/// click that silently does nothing"). Two reply-bearing effects are live here
+/// since #950 and there is still no correlation table: both mean "the thing you
+/// clicked did not appear", and the host's own sentence is the useful half.
 ///
 /// Falsification: drop the `!outcome.ok` guard and the success half reds; drop
-/// the arm entirely and the refusal half does.
+/// the arm entirely and both refusal halves do.
 #[test]
-fn a_refused_open_toasts_its_reason_and_a_successful_one_is_silent() {
+fn a_refused_open_or_launch_toasts_its_reason_and_a_successful_one_is_silent() {
     let (mut m, _rx) = model();
 
     let refused = m.update(Input::EffectResult {
@@ -927,21 +1079,41 @@ fn a_refused_open_toasts_its_reason_and_a_successful_one_is_silent() {
     assert_eq!(
         refused,
         vec![Effect::Notify {
-            summary: "couldn't open the link".to_owned(),
+            summary: "couldn't open that".to_owned(),
             body: "refused scheme: ftp".to_owned(),
+        }]
+    );
+
+    // The same arm, a launch's own failure sentence (#953's `launch_outcome`).
+    let launch_failed = m.update(Input::EffectResult {
+        id: 1,
+        outcome: EffectOutcome {
+            ok: false,
+            output: Some(
+                "launch failed: spawning trollshell-agent-window: No such file or directory"
+                    .to_owned(),
+            ),
+        },
+    });
+    assert_eq!(
+        launch_failed,
+        vec![Effect::Notify {
+            summary: "couldn't open that".to_owned(),
+            body: "launch failed: spawning trollshell-agent-window: No such file or directory"
+                .to_owned(),
         }]
     );
 
     assert_eq!(
         m.update(Input::EffectResult {
-            id: 1,
+            id: 2,
             outcome: EffectOutcome {
                 ok: true,
                 output: None,
             },
         }),
         vec![],
-        "the browser appearing is the feedback; a toast on top of it is noise"
+        "the window (or the browser) appearing is the feedback; a toast on top of it is noise"
     );
 }
 

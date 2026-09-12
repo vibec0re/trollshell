@@ -90,6 +90,63 @@ self:
       };
     };
 
+    # The per-agent companion window (#950, phase P2 of the agentic desktop
+    # #947): hyperhive's own agent page in a WebKitGTK view inside trollshell's
+    # chrome, one window per agent. Like the control center it is a separate
+    # windowed binary that the shell never links — but unlike it, nothing
+    # launches it from a menu: the `agents` plugin's card does, by resolving
+    # `trollshell-agent-window` on the session's PATH and asking the host for a
+    # detached launch (#953). So installing it is what turns the card's two
+    # destinations from "the browser and a drawer page" into "the window", and
+    # the default follows the plugin rather than being an independent switch.
+    agentWindow = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = config.programs.trollshell.plugins ? agents;
+        defaultText = lib.literalExpression "config.programs.trollshell.plugins ? agents";
+        example = true;
+        description = ''
+          Install the trollshell-agent-window companion alongside the shell —
+          the per-agent window (#950) the hyperhive agents card opens, with
+          hyperhive's agent page embedded in a WebKitGTK view and start / stop /
+          pause / settings as its own chrome.
+
+          Defaults to on exactly when a `plugins.agents` entry is declared,
+          because that plugin is the only thing that launches it: without the
+          window on PATH its card falls back to opening the agent's page in the
+          browser and its own drawer page for the pen (one warning in the
+          journal, then silence). Set it true by hand if you want the binary
+          without the plugin — it is launchable as
+          `trollshell-agent-window --agent <name>`.
+
+          A hyperhive gateway is self-signed by default, so the window opens on
+          an error state until its anchor is in the machine's trust store. With
+          the hive on this machine, reference hyperhive's own option rather
+          than a literal path:
+
+              security.pki.certificateFiles = [
+                "''${config.services.hyperhive.deploy.hive-controller.tls.stateDir}/trust-bundle.pem"
+              ];
+
+          (`/var/lib/hive-tls` is only that option's default; spell it out only
+          for a remote hive.) The window's error state names that and the
+          `TROLLSHELL_AGENT_WINDOW_CERT` last resort, which pins one
+          certificate for one host and must be the **leaf** the gateway
+          presents, never the bundle.
+
+          It is the one package in this flake that links WebKitGTK; the shell
+          and every plugin stay free of a web engine.
+        '';
+      };
+
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = self.packages.${pkgs.stdenv.hostPlatform.system}.trollshell-agent-window;
+        defaultText = lib.literalExpression "trollshell.packages.\${system}.trollshell-agent-window";
+        description = "The trollshell-agent-window package to install.";
+      };
+    };
+
     weather.fallbackCity = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;

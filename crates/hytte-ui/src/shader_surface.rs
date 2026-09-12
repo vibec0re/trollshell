@@ -831,12 +831,25 @@ mod imp {
         /// compiled-program cache's own `failed` deque: both live *inside* the
         /// resources, so a context recreate clears them with the same line
         /// that drops the textures, rather than by anyone remembering to.
+        ///
+        /// **`warned_compile` has to be cleared alongside it** (PR #1199
+        /// review, NIT 2), and this is the one latch here that is not cleared
+        /// by construction. It sits on the widget while the `failed` deque it
+        /// shadows sits inside `Resources`, so they were on opposite sides of
+        /// the context boundary: after a re-realise a still-broken body was
+        /// recompiled once — correctly, it is a new context — and **not
+        /// reported**, which contradicts
+        /// [`FAILED_SOURCES`](super::FAILED_SOURCES)'s stated invariant that a
+        /// key which is retried is also re-reported. One line's worth of
+        /// silence, and the exact mirror of the `gl_surface` latch MEDIUM 1
+        /// is about.
         fn unrealize(&self) {
             let obj = self.obj();
             if obj.error().is_none() && obj.context().is_some() {
                 obj.make_current();
             }
             self.resources.replace(ResourceSlot::Unbuilt);
+            self.warned_compile.borrow_mut().said.clear();
             self.origin.set(None);
             self.parent_unrealize();
         }
@@ -1426,9 +1439,19 @@ mod imp {
         /// GLSL nobody validated, because there is no validator to have — and
         /// until now no test had ever handed a broken body to a driver.
         ///
+        /// The tail of this test is **PR #1199 review, NIT 2**: a re-realise
+        /// puts the body back in front of a new driver — a new context, so a
+        /// retry is right — and the journal must say so again.
+        /// `warned_compile` lives on the widget while the `failed` deque it
+        /// shadows lives inside `Resources`, so before NIT 2 they sat on
+        /// opposite sides of the context boundary and the second compile was
+        /// silent, contradicting [`FAILED_SOURCES`](super::FAILED_SOURCES)'s
+        /// "a key that is retried is also re-reported".
+        ///
         /// **Falsified** by making `ProgramCache::ensure` return the held
         /// program regardless: the compile failure is never latched and the
-        /// first assertion goes red.
+        /// first assertion goes red. The tail is falsified by deleting the
+        /// `warned_compile` clear from `unrealize`: the final count stays 1.
         #[gtk::test]
         fn a_realised_shader_surface_refuses_a_broken_body_once() {
             const BROKEN: &str = "void main() { fragColor = not_a_thing; }";
@@ -1459,6 +1482,38 @@ mod imp {
                 gl.take_error(),
                 None,
                 "a refused compile must leave no GL error queued for the next caller to trip on",
+            );
+
+            // **NIT 2.** Out of the window and back in: a new context, so the
+            // body is offered to it again — and the retry has to be reported,
+            // or the journal claims a compile happened once when it happened
+            // twice.
+            window.set_child(None::<&gtk::Widget>);
+            assert!(
+                surface.imp().warned_compile.borrow().said.is_empty(),
+                "unrealize must clear the compile-failure journal latch alongside the cache it \
+                 shadows (PR #1199 review, NIT 2)",
+            );
+            window.set_child(Some(&surface));
+            for _ in 0..1000 {
+                if surface.is_realized() && surface.width() > 0 {
+                    break;
+                }
+                if !gtk::glib::MainContext::default().iteration(false) {
+                    break;
+                }
+            }
+            assert!(
+                surface.is_realized() && surface.error().is_none(),
+                "the surface must come back with a context of its own",
+            );
+            surface.make_current();
+            surface.imp().draw();
+            assert_eq!(
+                surface.imp().warned_compile.borrow().said.len(),
+                1,
+                "a body recompiled against a fresh context is reported against it too — a key \
+                 that is retried is also re-reported (PR #1199 review, NIT 2)",
             );
 
             window.destroy();

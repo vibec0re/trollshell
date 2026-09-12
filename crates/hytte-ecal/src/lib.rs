@@ -790,7 +790,9 @@ unsafe fn skip_iterator_to_window(
     let interval = unsafe { sys::i_cal_recurrence_get_interval(rule) };
     let sub_day = matches!(
         freq,
-        sys::I_CAL_HOURLY_RECURRENCE | sys::I_CAL_MINUTELY_RECURRENCE | sys::I_CAL_SECONDLY_RECURRENCE
+        sys::I_CAL_HOURLY_RECURRENCE
+            | sys::I_CAL_MINUTELY_RECURRENCE
+            | sys::I_CAL_SECONDLY_RECURRENCE
     );
     if sub_day && interval != 1 {
         // libical recovers the post-skip phase for these three frequencies

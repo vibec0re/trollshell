@@ -296,13 +296,33 @@ thread_local! {
     static ABANDONED: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// Register `pipeline` under `program`, replacing any previous registration.
+/// Register `pipeline` under `program`.
 ///
-/// Call once per program at host startup, on the GTK main thread, before any
-/// [`Node::GlSurface`](crate::widget_tree::Node::GlSurface) naming it is
+/// Call **once per program at host startup**, on the GTK main thread, before
+/// any [`Node::GlSurface`](crate::widget_tree::Node::GlSurface) naming it is
 /// reconciled. A surface whose program is unregistered keeps whatever it last
 /// successfully drew and says so once (see [`PROGRAM_UNREGISTERED_REFUSED`]),
 /// rather than failing the render.
+///
+/// **A later call replaces the entry in this table, but it does not retract a
+/// refusal any surface has already latched against that name** (PR #1199
+/// review, LOW 6). A surface's [`BuildKey`] is `((cols, rows), GlProgram)` —
+/// the program *name*, not the pipeline behind it — so a pipeline that was
+/// refused, fixed, and re-registered under the same name is never handed back
+/// to the driver: the surface still believes that key will not build.
+///
+/// This is a documented limit, not a bug, because there is nothing here to
+/// fix it with: the latches live per surface, in widget state this
+/// module-level table cannot reach, and adding a registry generation to the
+/// key would invalidate every surface's latch on a call that in practice
+/// happens once, before any surface exists. The one call site in the tree
+/// (`trollshell/src/plugins/preem_gl/mod.rs`) registers a `'static` pipeline
+/// at startup and never replaces it. **If a host ever needs live
+/// re-registration, the honest fix is to key the latch on the pipeline
+/// identity rather than to hope; until then, treat this as
+/// register-once-never-replace.** (Unrealizing a surface does clear its
+/// latch — see `imp::GlSurface::unrealize` — so "re-register and re-map" is
+/// the workaround that exists today.)
 pub fn register(program: GlProgram, pipeline: GlPipeline) {
     PROGRAMS.with_borrow_mut(|programs| programs.insert(program, pipeline));
 }
@@ -461,6 +481,118 @@ fn resources_reusable(
     built_grid == grid && built_program == program
 }
 
+/// The identity of one pipeline build: what `Resources::build` was asked for.
+///
+/// The whole input to that call, so "this exact build was already refused" is
+/// a value comparison rather than a judgement call. Compared by value rather
+/// than hashed (unlike `shader_surface`'s source key, which stands in for a
+/// megabyte of GLSL) because it is two `u32`s and a `&'static str`: there is
+/// no collision question to close.
+///
+/// **The whole input to that call *as the surface can see it*.** The
+/// `GlProgram` is a name, and [`register`] resolves names against a
+/// process-wide table this key does not read, so a pipeline replaced under a
+/// name a surface has already latched is not retried — see `register`'s doc,
+/// which narrows the contract to register-once-never-replace rather than
+/// pretending otherwise (PR #1199 review, LOW 6).
+type BuildKey = ((u32, u32), GlProgram);
+
+/// How many distinct refused build keys a [`RefusedBuilds`] remembers.
+///
+/// Sized and argued exactly like [`WARNED_LENGTHS`] and
+/// `shader_surface::WARNED_SOURCES`, and for the same measured reason: a
+/// one-slot latch is not a bound at all when two keys alternate, since each
+/// evicts the other and every frame goes back to the driver. Eight covers
+/// alternation and any realistic set of grids one chip cycles through, in 128
+/// bytes.
+const REFUSED_BUILDS: usize = 8;
+
+/// The pipeline builds this surface has already asked the driver for and been
+/// refused (#1180 item 2).
+///
+/// **This latches the failure, not the warning.** Before it, a refused build
+/// set a one-shot `warned_build` bool: the journal went quiet, `resources`
+/// was left `None`, and `ensure_resources` therefore recompiled every pass of
+/// the pipeline — five shader pairs for the `Scope` — inside the render
+/// callback, on the GTK main thread, on every frame, for the life of the
+/// surface. Silenced, not stopped.
+///
+/// A key is retried only when it leaves the latch, which is what
+/// [`REFUSED_BUILDS`] eviction is for: a build refused, eight distinct other
+/// builds refused after it, and the first is worth asking about again (a
+/// driver that was out of memory may not be). A *successful* build does not
+/// clear it, deliberately — compiling the same GLSL for the same grid in the
+/// same context is deterministic, so retrying a remembered refusal can only
+/// fail the same way, and clearing on success is exactly what would make an
+/// alternating good/bad pair recompile per frame again.
+///
+/// **…and "in the same context" is a real condition, so the latch ends with
+/// the context** (PR #1199 review, MEDIUM 1). The determinism argued above is
+/// the whole justification for never retrying, and it holds only while the
+/// `GdkGLContext` that refused is the one being asked. A context lost and
+/// remade — a re-parent, a hot-plug, a driver reset — is a *different* driver
+/// state, and the one case where a retry could legitimately succeed. Shipped,
+/// this latch outlived every such recreate: `imp::GlSurface::unrealize`
+/// dropped `resources` and `last_drawn` (both per context) and left the keys
+/// standing, so a surface refused once under a degraded context stayed blank
+/// for the life of the process with `remember` returning `false` — not even a
+/// second journal line to say why. [`RefusedBuilds::clear`] is what
+/// `unrealize` now calls; the sibling widget got this right by construction,
+/// because `shader_surface`'s equivalent latch lives *inside* the resources
+/// that are dropped there.
+#[derive(Debug, Default)]
+struct RefusedBuilds {
+    /// The refused keys, oldest first. At most [`REFUSED_BUILDS`].
+    keys: std::collections::VecDeque<BuildKey>,
+}
+
+impl RefusedBuilds {
+    /// Whether `key` is a build this surface already knows will not build.
+    fn refused(&self, key: BuildKey) -> bool {
+        self.keys.contains(&key)
+    }
+
+    /// Forget every refusal: the context they were measured against is gone.
+    ///
+    /// Called from `unrealize` only — see the type's doc for why a context
+    /// boundary is the one thing that un-latches a key wholesale, while a
+    /// successful build deliberately does not.
+    fn clear(&mut self) {
+        self.keys.clear();
+    }
+
+    /// Remember `key` as refused, returning whether it is news — which is
+    /// also whether to write the journal line, so the log is bounded by the
+    /// same latch that bounds the compiles rather than by a second one that
+    /// could disagree with it.
+    fn remember(&mut self, key: BuildKey) -> bool {
+        if self.keys.contains(&key) {
+            return false;
+        }
+        // `>=` for the reason `WarnLatch::claim` spells out: `==` reads as
+        // "unbounded" the moment the bound is ever set to zero.
+        if self.keys.len() >= REFUSED_BUILDS {
+            self.keys.pop_front();
+        }
+        self.keys.push_back(key);
+        true
+    }
+}
+
+/// A [`WarnLatch`] key for a program *name* (PR #1199 review, NIT 1).
+///
+/// `WarnLatch` keys on a `u64` because its other two call sites key on a
+/// length and a framebuffer status; a `GlProgram` is a `&'static str`, so it
+/// is hashed to fit — the same `DefaultHasher` `shader_surface::source_key`
+/// uses, and with far less riding on it: a collision here costs one journal
+/// line about a program nobody registered, not a silently blank widget.
+fn program_key(program: GlProgram) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    program.0.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// How many distinct refused data-strip lengths a [`WarnLatch`] remembers.
 ///
 /// Mirrors `shader_surface::WARNED_SOURCES` and its rationale: a one-entry
@@ -608,6 +740,62 @@ const DATA_STRIP_REFUSED: &str = "a GL surface's data strip could not be (re)all
     frame's data upload is skipped and the strip reads as empty (u_data_len = 0) until a length \
     this driver will take arrives (further occurrences of this length are silenced)";
 
+/// Claim `latch` for `error`'s framebuffer status and log it once — the whole
+/// reporting half of a refused render target (#1180 item 3), in one function
+/// a test can drive with no GL context.
+///
+/// Sibling of [`warn_on_data_failure`], down to taking the latch as a
+/// parameter for the same reason: the only thing left at the call site is
+/// *which* latch is passed, and passing anything but the widget's own
+/// `warned_target` makes that field unread — `dead_code`, which is a
+/// `-D warnings` gate.
+fn warn_on_target_failure(latch: &RefCell<WarnLatch>, error: &hgl::Error) {
+    if latch.borrow_mut().claim(framebuffer_status_key(error)) {
+        tracing::warn!(%error, "{}", RENDER_TARGET_REFUSED);
+    }
+}
+
+/// The [`WarnLatch`] key for a refused render target: the raw
+/// `GL_FRAMEBUFFER_*` status.
+///
+/// `Framebuffer::draw_to` returns [`hgl::Error::Framebuffer`] and nothing
+/// else, so the fallback arm is unreachable today — it is `0` rather than a
+/// panic because widening that function's error type must cost a shared
+/// journal line, not a crashed shell.
+fn framebuffer_status_key(error: &hgl::Error) -> u64 {
+    match error {
+        hgl::Error::Framebuffer { status } => u64::from(*status),
+        _ => 0,
+    }
+}
+
+/// How far `last_drawn` may advance when a step replay stops early (#1180
+/// item 3).
+///
+/// `owed` is what [`steps_owed`] asked for and `done` is how many of those
+/// replays actually ran, so the surface lands on the step it really reached:
+/// all of them is `step_seq`, none of them leaves `last_drawn` where the
+/// clamp put it, and a partial replay keeps the remainder owed for the next
+/// render.
+///
+/// Pure, and separate from `draw`, for [`steps_owed`]'s reason: the arithmetic
+/// is the whole contract and CI cannot reach the arm that exercises it (a
+/// driver has to refuse a framebuffer first).
+fn last_drawn_after(step_seq: u64, owed: u64, done: u64) -> u64 {
+    step_seq.saturating_sub(owed.saturating_sub(done))
+}
+
+/// The line a refused render target writes to the journal.
+///
+/// Says what is **held**, not just what failed: the pass did not run, so the
+/// step it belongs to is not counted as drawn and the next render owes it
+/// again. Listed alongside the two early-return messages below in
+/// `neither_early_return_message_claims_the_surface_draws_nothing`, since it
+/// makes the same promise.
+const RENDER_TARGET_REFUSED: &str = "a GL pass's render target would not attach; that pass did \
+    not run, the step it belongs to is not counted as drawn, and the surface keeps whatever it \
+    last successfully drew (further occurrences of this framebuffer status are silenced)";
+
 /// The line an unregistered program name writes to the journal.
 ///
 /// Says the surface **keeps whatever it last successfully drew**, not that it
@@ -626,16 +814,22 @@ const PROGRAM_UNREGISTERED_REFUSED: &str = "no GL pipeline registered under that
 ///
 /// Same reasoning as [`PROGRAM_UNREGISTERED_REFUSED`]: `ensure_resources`
 /// returns `false`, `draw` gives up on that, and neither reaches a clear.
+///
+/// Says the build is **not retried**, not merely that further lines are
+/// silenced (#1180 item 2): silence was the whole bug. The old wording was
+/// accurate about the journal and wrong about the machine — the pipeline was
+/// recompiled on every frame behind it.
 const PIPELINE_BUILD_REFUSED: &str = "a GL pipeline could not be built; the surface keeps \
-    whatever it last successfully drew (nothing, before the first successful frame) (further \
-    occurrences are silenced)";
+    whatever it last successfully drew (nothing, before the first successful frame) and does \
+    not rebuild this pipeline again until its program or grid changes";
 
 mod imp {
     use super::{
-        DataFailure, GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline, GlProgram,
-        GlTarget, GlUniforms, GlValue, PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED,
-        PROGRAMS, SAMPLER_NAMES, WarnLatch, abandon_gl, fit_rect, fresh_last_drawn, gdk, glib,
-        refuse_data_strip, resources_reusable, steps_owed,
+        BuildKey, DataFailure, GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline,
+        GlProgram, GlTarget, GlUniforms, GlValue, PIPELINE_BUILD_REFUSED,
+        PROGRAM_UNREGISTERED_REFUSED, PROGRAMS, RefusedBuilds, SAMPLER_NAMES, WarnLatch,
+        abandon_gl, fit_rect, fresh_last_drawn, gdk, glib, last_drawn_after, program_key,
+        refuse_data_strip, resources_reusable, steps_owed, warn_on_target_failure,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
@@ -692,11 +886,42 @@ mod imp {
         resources: RefCell<Option<Resources>>,
         /// The last `step_seq` the accumulator has been advanced to.
         last_drawn: Cell<u64>,
-        /// One-shot latch for "this program is not registered".
-        warned_unregistered: Cell<bool>,
-        /// One-shot latch for "a pass would not compile", so a broken shader
-        /// costs one journal line and not one per frame.
-        warned_build: Cell<bool>,
+        /// Journal latch for "this program is not registered", **keyed by the
+        /// program name** via [`program_key`] (PR #1199 review, NIT 1).
+        ///
+        /// A bare `Cell<bool>` before, and the last one in this file: two
+        /// different unregistered names cost one line between them, so the
+        /// second — a genuinely different fact, with a different missing
+        /// `register` call behind it — was swallowed by the first for the
+        /// life of the surface. Log-only either way (this arm recompiles
+        /// nothing), which is why it is a nit rather than a defect, but it is
+        /// the shape the rest of this round converted and it costs one
+        /// [`WarnLatch`].
+        ///
+        /// **Not** cleared by `unrealize`, unlike `refused_builds`: a
+        /// program's absence from [`PROGRAMS`] is a fact about the process,
+        /// not about this surface's context, so a re-realise is not news
+        /// about it.
+        warned_unregistered: RefCell<WarnLatch>,
+        /// The builds this surface has been refused, keyed by `(grid,
+        /// program)` — so a broken shader costs **one compile** and one
+        /// journal line, not one of each per frame (#1180 item 2). This
+        /// replaced a bare `warned_build: Cell<bool>`, which silenced the
+        /// line and left the recompile running; see [`RefusedBuilds`].
+        ///
+        /// **Per context, and therefore cleared in [`Self::unrealize`]** (PR
+        /// #1199 review, MEDIUM 1) — it belongs with `resources` and
+        /// `last_drawn` above, not with the journal latches below.
+        refused_builds: RefCell<RefusedBuilds>,
+        /// Journal latch for "a pass's render target would not attach"
+        /// (#1180 item 3), keyed by the raw `GL_FRAMEBUFFER_*` status the
+        /// driver reported — for [`WarnLatch`]'s usual reason: an
+        /// `INCOMPLETE_ATTACHMENT` and an `UNSUPPORTED` are different triage,
+        /// and a bare bool would let the first one silence the second for the
+        /// life of the surface. This failure used to be dropped on the floor
+        /// entirely: no log, no latch, and the accumulator's step count
+        /// advanced over the pass that never ran.
+        warned_target: RefCell<WarnLatch>,
         /// Journal latch for "the data strip's texture could not be
         /// (re)allocated" (#1023 item 3), keyed **by the refused length** via
         /// [`WarnLatch`] — not a bare bool, so a second, differently sized
@@ -753,12 +978,32 @@ mod imp {
         }
 
         /// Drop every GL object **before** handing back to GTK, with the
-        /// context explicitly made current first.
+        /// context explicitly made current first, and forget everything this
+        /// surface only knows about *that* context.
         ///
         /// The handles' `Drop` calls `glDelete*`, which needs a current
         /// context. GTK makes one current inside its own `unrealize`, but that
         /// runs *after* this override's body, so the `make_current` here is
         /// what actually holds the crate's contract.
+        ///
+        /// **Three things are per context, and all three are reset here**
+        /// (PR #1199 review, MEDIUM 1): `resources` (GL objects), `last_drawn`
+        /// (a step count against an accumulator that no longer exists) and
+        /// `refused_builds` — the last of which shipped standing. Its whole
+        /// argument for never retrying is that the same GLSL at the same grid
+        /// compiles the same way *in the same context*; once the context is
+        /// gone that argument is gone with it, and a surface refused under a
+        /// context that came up degraded would otherwise never be offered to
+        /// the healthy one that replaced it.
+        ///
+        /// The two journal latches (`warned_target`, `warned_data`) are
+        /// deliberately **not** cleared. They gate only the log — neither
+        /// failure behind them is latched, both are retried on the very next
+        /// render regardless — so clearing them would buy a duplicate line per
+        /// re-realise and no retry that was not already happening.
+        /// `warned_unregistered` stays for a different reason: a program's
+        /// absence from [`PROGRAMS`] is a fact about the process, not about
+        /// this surface's context, so a re-realise is not news about it.
         fn unrealize(&self) {
             let obj = self.obj();
             if obj.error().is_none() && obj.context().is_some() {
@@ -766,6 +1011,7 @@ mod imp {
             }
             self.resources.replace(None);
             self.last_drawn.set(0);
+            self.refused_builds.borrow_mut().clear();
             self.parent_unrealize();
         }
     }
@@ -813,6 +1059,25 @@ mod imp {
             (true, resized)
         }
 
+        /// Whether the build this surface is *currently* asking for is one
+        /// the driver has already refused — see
+        /// [`GlSurface::build_refused`](super::GlSurface::build_refused).
+        ///
+        /// The key is rebuilt from the live program and the live state's
+        /// grid, deliberately, rather than answered from "the latch holds
+        /// anything at all": a surface repointed at a pipeline that builds
+        /// fine is not refused, even though the key that refused is still
+        /// remembered against the grid it failed at.
+        pub(super) fn build_refused(&self) -> bool {
+            let Some(program) = self.program.get() else {
+                return false;
+            };
+            let Some(grid) = self.state.borrow().as_ref().map(|state| state.grid) else {
+                return false;
+            };
+            self.refused_builds.borrow().refused((grid, program))
+        }
+
         /// The whole render: ensure resources, replay the outstanding steps,
         /// run the frame passes.
         fn draw(&self) {
@@ -823,7 +1088,11 @@ mod imp {
             let Some(state) = state else { return };
             let Some(pipeline) = PROGRAMS.with_borrow(|programs| programs.get(&program).copied())
             else {
-                if !self.warned_unregistered.replace(true) {
+                if self
+                    .warned_unregistered
+                    .borrow_mut()
+                    .claim(program_key(program))
+                {
                     tracing::warn!(program = program.0, "{}", PROGRAM_UNREGISTERED_REFUSED);
                 }
                 return;
@@ -857,24 +1126,57 @@ mod imp {
 
             // The idempotence rule, decided by `steps_owed` — see there.
             let (steps, reset) = steps_owed(self.last_drawn.get(), state.step_seq);
-            if reset {
-                resources.clear_accumulator(&gl);
+            if reset && let Err(error) = resources.clear_accumulator(&gl) {
+                // Nothing was wiped, so nothing may be replayed onto it:
+                // `last_drawn` stays ahead of `step_seq` and the next render
+                // tries the wipe again. See `RENDER_TARGET_REFUSED`.
+                warn_on_target_failure(&self.warned_target, &error);
+                return;
             }
             // The steps replayed are always the **newest** `steps` of them, so
             // a surface that fell far enough behind to hit the clamp catches up
             // on what is current rather than on ancient history.
-            for back in (0..steps).rev() {
+            //
+            // **A step that did not run is not counted as drawn** (#1180 item
+            // 3). `Framebuffer::draw_to` can refuse — an incomplete
+            // framebuffer is a real, if rare, driver answer — and its `Err`
+            // used to be dropped inside `run` with no log and no latch while
+            // the ping-pong pair flipped and `last_drawn` jumped to
+            // `step_seq` regardless. The accumulator then carried a hole the
+            // surface believed it had filled, permanently: `steps_owed` never
+            // asks for a step twice. Now the replay stops at the first
+            // refusal, the pair does not flip on the step that failed, and
+            // `last_drawn` lands on the last step that really ran
+            // (`last_drawn_after`), so the next render owes the rest.
+            let mut drawn = 0_u64;
+            'steps: for back in (0..steps).rev() {
                 for (slot, pass) in pipeline.step.iter().enumerate() {
                     let program = resources.step_programs.get(slot).copied();
-                    resources.run(&gl, pass, program, &state, self.obj().as_ref(), true, back);
+                    if let Err(error) =
+                        resources.run(&gl, pass, program, &state, self.obj().as_ref(), true, back)
+                    {
+                        warn_on_target_failure(&self.warned_target, &error);
+                        break 'steps;
+                    }
                 }
                 resources.front = 1 - resources.front;
+                drawn += 1;
             }
-            self.last_drawn.set(state.step_seq);
+            self.last_drawn
+                .set(last_drawn_after(state.step_seq, steps, drawn));
 
             for (slot, pass) in pipeline.frame.iter().enumerate() {
                 let program = resources.frame_programs.get(slot).copied();
-                resources.run(&gl, pass, program, &state, self.obj().as_ref(), false, 0);
+                // A frame pass advances nothing, so there is no state to hold
+                // — but the passes are ordered (a blur reads what the pass
+                // before it wrote), so the rest of the frame is abandoned
+                // rather than drawn over a target that was never written.
+                if let Err(error) =
+                    resources.run(&gl, pass, program, &state, self.obj().as_ref(), false, 0)
+                {
+                    warn_on_target_failure(&self.warned_target, &error);
+                    break;
+                }
             }
         }
 
@@ -893,6 +1195,17 @@ mod imp {
             {
                 return true;
             }
+            // **The failure is latched, not just its warning** (#1180 item
+            // 2): a build this surface has already been refused is not
+            // handed to the driver a second time. Without this the arm
+            // below silenced the journal line and nothing else — `resources`
+            // stayed `None`, so every frame recompiled every pass of the
+            // pipeline inside the render callback, forever. See
+            // [`RefusedBuilds`] for what un-latches a key.
+            let key: BuildKey = (grid, program);
+            if self.refused_builds.borrow().refused(key) {
+                return false;
+            }
             // A grid change **or** a program change means new textures /
             // freshly compiled shaders, which means a cleared accumulator —
             // so the step count restarts with it, at `fresh_last_drawn`
@@ -905,14 +1218,38 @@ mod imp {
                     true
                 }
                 Err(error) => {
-                    if !self.warned_build.replace(true) {
-                        tracing::warn!(%error, "{}", PIPELINE_BUILD_REFUSED);
+                    if self.refused_builds.borrow_mut().remember(key) {
+                        tracing::warn!(
+                            %error,
+                            program = program.0,
+                            grid = format!("{}x{}", grid.0, grid.1),
+                            "{}",
+                            PIPELINE_BUILD_REFUSED
+                        );
                     }
                     self.resources.replace(None);
                     false
                 }
             }
         }
+    }
+
+    #[cfg(all(test, feature = "system-tests"))]
+    thread_local! {
+        /// How many times [`Resources::build`] has asked the driver, on this
+        /// thread — the seam
+        /// `a_refused_pipeline_is_built_once_not_once_per_frame` reads
+        /// (#1180 item 2).
+        ///
+        /// A counter rather than a builder seam: "the compile did not
+        /// happen" has no observable trace otherwise (a refused compile
+        /// raises no `glGetError` and leaves no object), and unlike
+        /// `shader_surface`'s `ProgramCache` this call is not generic over
+        /// its builder — it allocates textures and an FBO against a live
+        /// context, so a counting stand-in would be a parallel probe
+        /// agreeing with itself. Compiled **only** into the gated test
+        /// build: nothing it touches exists in a shipped binary.
+        static BUILD_ATTEMPTS: Cell<u32> = const { Cell::new(0) };
     }
 
     impl Resources {
@@ -923,6 +1260,8 @@ mod imp {
             program: GlProgram,
             grid: (u32, u32),
         ) -> Result<Self, hgl::Error> {
+            #[cfg(all(test, feature = "system-tests"))]
+            BUILD_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
             let (cols, rows) = (grid.0.max(1), grid.1.max(1));
             let mut programs = Vec::new();
             let mut compile = |pass: &GlPass| -> Result<usize, hgl::Error> {
@@ -962,23 +1301,35 @@ mod imp {
                 data,
                 data_len: 0,
                 data_source: None,
-                framebuffer: hgl::Framebuffer::new(gl),
-                vao: hgl::VertexArray::new(gl),
+                framebuffer: hgl::Framebuffer::new(gl)?,
+                vao: hgl::VertexArray::new(gl)?,
                 grid: (cols, rows),
                 program,
             };
-            resources.clear_accumulator(gl);
+            resources.clear_accumulator(gl)?;
             Ok(resources)
         }
 
         /// Zero both halves of the ping-pong pair — a fresh screen.
-        fn clear_accumulator(&self, gl: &hgl::Gl) {
+        ///
+        /// # Errors
+        ///
+        /// The driver's, if either half cannot be attached as a render
+        /// target. **Propagated rather than skipped** (#1180 item 3): this
+        /// used to be `if draw_to(…).is_ok()`, so a refusal left whatever
+        /// `glTexStorage2D` had put in the texture — undefined contents, not
+        /// zeroes — and every caller carried on as though the screen were
+        /// fresh. `Resources::build`'s `?` turns that into a refused build
+        /// (which is latched, so it is asked once), and `draw`'s reset arm
+        /// holds `last_drawn` so the wipe is retried instead of being
+        /// replayed onto.
+        fn clear_accumulator(&self, gl: &hgl::Gl) -> Result<(), hgl::Error> {
             for texture in &self.accumulator {
-                if self.framebuffer.draw_to(gl, texture).is_ok() {
-                    hgl::set_blend(gl, hgl::Blend::Replace);
-                    hgl::clear(gl, [0.0, 0.0, 0.0, 0.0]);
-                }
+                self.framebuffer.draw_to(gl, texture)?;
+                hgl::set_blend(gl, hgl::Blend::Replace);
+                hgl::clear(gl, [0.0, 0.0, 0.0, 0.0]);
             }
+            Ok(())
         }
 
         /// Re-upload the data strip if it is not the allocation we already
@@ -1055,6 +1406,17 @@ mod imp {
         /// decayed, say) can tell them apart. Counted **backwards** so it never
         /// grows: an absolute step index would outrun the `int` a uniform
         /// carries after a few years of continuous animation.
+        ///
+        /// # Errors
+        ///
+        /// The driver's, when the pass's offscreen target cannot be attached
+        /// to the FBO (#1180 item 3). **Only** that: every other way this
+        /// returns early — a pass with no compiled program, an undeclared aux
+        /// slot, a zero-sized fit rect — is `Ok(())`, because each of those is
+        /// "there was nothing to draw", not "the draw was refused". The
+        /// caller's state machine turns on that distinction: an `Err` is what
+        /// stops the accumulator's step count from advancing over a step that
+        /// never ran.
         #[allow(clippy::too_many_arguments)]
         fn run(
             &self,
@@ -1065,15 +1427,15 @@ mod imp {
             area: &super::GlSurface,
             stepping: bool,
             step_back: u64,
-        ) {
+        ) -> Result<(), hgl::Error> {
             let Some(program) = program.and_then(|slot| self.programs.get(slot)) else {
-                return;
+                return Ok(());
             };
             let target = match pass.target {
                 GlTarget::Accumulator => {
                     debug_assert!(stepping, "a frame pass may not target the accumulator");
                     if !stepping {
-                        return;
+                        return Ok(());
                     }
                     Some(&self.accumulator[1 - self.front])
                 }
@@ -1088,9 +1450,10 @@ mod imp {
                 GlTarget::Screen => None,
             };
             let viewport = if let Some(texture) = target {
-                if self.framebuffer.draw_to(gl, texture).is_err() {
-                    return;
-                }
+                // The one refusal that is a refusal: propagated, so the caller
+                // can hold the state this pass was supposed to advance
+                // (#1180 item 3). It used to be `if …is_err() { return; }`.
+                self.framebuffer.draw_to(gl, texture)?;
                 texture.size()
             } else {
                 // GTK renders into its own FBO so GSK can import the result, so
@@ -1117,7 +1480,8 @@ mod imp {
                 hgl::clear(gl, [0.0, 0.0, 0.0, 0.0]);
                 let (x, y, w, h) = fit_rect(alloc_w, alloc_h, self.grid.0, self.grid.1);
                 if w == 0 || h == 0 {
-                    return;
+                    // Nothing to draw into, which is not a refusal.
+                    return Ok(());
                 }
                 hgl::viewport(gl, x, y, w, h);
                 (w, h)
@@ -1168,6 +1532,7 @@ mod imp {
                 GlDraw::PerColumn => hgl::draw_quads(gl, self.grid.0),
             }
             hgl::set_blend(gl, hgl::Blend::Replace);
+            Ok(())
         }
 
         /// Bind each declared input to its `u_texN` unit.
@@ -1204,10 +1569,12 @@ mod imp {
     #[cfg(all(test, feature = "system-tests"))]
     mod tests {
         use super::{
-            Arc, GlBlend, GlDraw, GlPass, GlPipeline, GlProgram, GlSurface, GlTarget, GlUniforms,
-            PROGRAMS, RefCell, Resources, WarnLatch, gdk, hgl,
+            Arc, BUILD_ATTEMPTS, GlBlend, GlDraw, GlInput, GlPass, GlPipeline, GlProgram,
+            GlSurface, GlTarget, GlUniforms, GlValue, PROGRAMS, RefCell, Resources, WarnLatch, gdk,
+            glib, hgl,
         };
         use gtk::prelude::*;
+        use gtk::subclass::prelude::ObjectSubclassIsExt;
 
         // This test never calls `run` — only `ensure_resources` /
         // `Resources::build` — so the two pipelines below only need to differ
@@ -1489,6 +1856,407 @@ mod imp {
                  warned_data latch",
             );
         }
+
+        /// **#1180 item 2.** A pipeline the driver will not build is asked
+        /// for **once**, not once per frame.
+        ///
+        /// The shipped code latched the *warning* (`warned_build:
+        /// Cell<bool>`) and nothing else: `resources` stayed `None`, so
+        /// `ensure_resources` handed the same broken GLSL back to the driver
+        /// on every single render — five shader pairs per frame for the
+        /// `Scope`, synchronously, on the GTK main thread — with the journal
+        /// silent about it after the first line. Silenced, not stopped.
+        ///
+        /// Counting the driver asks is the only way to see this: a refused
+        /// compile raises no `glGetError` and leaves no GL object behind, so
+        /// the *absence* of a second compile has no other trace. Hence
+        /// [`BUILD_ATTEMPTS`], which exists only in this gated test build.
+        ///
+        /// The eviction half of the bound is covered hermetically by
+        /// `RefusedBuilds`' own tests in the outer module; this is the one
+        /// place the decision is wired to a real driver refusal.
+        ///
+        /// **Falsified** by deleting the `refused_builds.borrow().refused(key)`
+        /// early return in `ensure_resources`: the count goes to 10.
+        #[gtk::test]
+        fn a_refused_pipeline_is_built_once_not_once_per_frame() {
+            // A fragment stage no driver will compile.
+            const BROKEN: GlPass = GlPass {
+                vertex: VERTEX,
+                fragment: "void main() { this is not GLSL }",
+                target: GlTarget::Screen,
+                inputs: &[],
+                blend: GlBlend::Replace,
+                draw: GlDraw::FullScreen,
+            };
+            const BROKEN_PASS: [GlPass; 1] = [BROKEN];
+
+            let Some((_window, _area, gl)) =
+                real_gl_or_skip("a_refused_pipeline_is_built_once_not_once_per_frame")
+            else {
+                return;
+            };
+
+            let pipeline = GlPipeline {
+                aux: 0,
+                step: &[],
+                frame: &BROKEN_PASS,
+            };
+            let program = GlProgram("gl_surface_test.will_not_build");
+
+            let surface = GlSurface::default();
+            BUILD_ATTEMPTS.set(0);
+            for frame in 0..10 {
+                assert!(
+                    !surface.ensure_resources(&gl, &pipeline, program, (4, 4), frame),
+                    "a pipeline that will not build can never report resources ready",
+                );
+            }
+
+            assert_eq!(
+                BUILD_ATTEMPTS.get(),
+                1,
+                "a refused pipeline must be handed to the driver once, not once per frame \
+                 (#1180 item 2)",
+            );
+            assert!(
+                surface.refused_builds.borrow().refused(((4, 4), program)),
+                "…because the refusal itself is latched, keyed by (grid, program)",
+            );
+
+            // The key really is the whole input: the same broken program at a
+            // *different* grid is a build this surface has not been refused
+            // yet, so it is asked once more and then latched too.
+            assert!(!surface.ensure_resources(&gl, &pipeline, program, (8, 4), 0));
+            assert_eq!(BUILD_ATTEMPTS.get(), 2, "a new grid is a new question");
+            assert!(!surface.ensure_resources(&gl, &pipeline, program, (8, 4), 1));
+            assert_eq!(
+                BUILD_ATTEMPTS.get(),
+                2,
+                "…asked exactly once, like the first"
+            );
+        }
+
+        /// **PR #1199 review, MEDIUM 1.** A refusal latched under one
+        /// `GdkGLContext` must not survive that context: after an unrealize /
+        /// re-realize the driver is asked again, and a second refusal writes a
+        /// second journal line.
+        ///
+        /// [`RefusedBuilds`]' own doc rests the never-retry rule on
+        /// determinism "*in the same context*". Shipped, `unrealize` dropped
+        /// `resources` and `last_drawn` and left the keys standing — so the
+        /// one condition the rule names was the one thing nothing checked. A
+        /// driver that refused a compile once (out of memory at login, a
+        /// context that came up degraded) refused it under every later
+        /// context too, with `remember` returning `false`, i.e. permanently
+        /// and silently blank.
+        ///
+        /// Taking the surface out of its window and putting it back is the
+        /// real trigger, not a stand-in: GTK unrealizes an unparented widget
+        /// synchronously and `GtkGLArea` creates a **fresh** context on the
+        /// way back in. (The other trigger — a context lost and remade by the
+        /// driver — cannot be arranged from a test at all.)
+        ///
+        /// Asserted on [`BUILD_ATTEMPTS`] rather than on the journal because
+        /// the two ride the same latch by construction: `remember` returns
+        /// whether to write the line, so a second ask *is* a second line. The
+        /// latch itself is checked directly on both sides of the recreate.
+        ///
+        /// **Falsified** by deleting `refused_builds.borrow_mut().clear()`
+        /// from `unrealize`: the count stays at 1, which is what the review
+        /// measured against the shipped code.
+        #[gtk::test]
+        fn a_refused_pipeline_is_asked_again_on_a_fresh_context() {
+            const BROKEN: GlPass = GlPass {
+                vertex: VERTEX,
+                fragment: "void main() { this is not GLSL }",
+                target: GlTarget::Screen,
+                inputs: &[],
+                blend: GlBlend::Replace,
+                draw: GlDraw::FullScreen,
+            };
+            const BROKEN_PASS: [GlPass; 1] = [BROKEN];
+
+            let Some((window, surface, _gl)) =
+                realised_surface_or_skip("a_refused_pipeline_is_asked_again_on_a_fresh_context")
+            else {
+                return;
+            };
+
+            let program = GlProgram("gl_surface_test.will_not_build_realised");
+            PROGRAMS.with_borrow_mut(|programs| {
+                programs.insert(
+                    program,
+                    GlPipeline {
+                        aux: 0,
+                        step: &[],
+                        frame: &BROKEN_PASS,
+                    },
+                );
+            });
+            let state = Arc::new(GlUniforms {
+                values: Vec::new(),
+                data: None,
+                grid: (4, 4),
+                step_seq: 0,
+            });
+            surface.set_state(program, 4, 4, &state);
+
+            BUILD_ATTEMPTS.set(0);
+            surface.imp().draw();
+            surface.imp().draw();
+            assert_eq!(
+                BUILD_ATTEMPTS.get(),
+                1,
+                "the refusal is latched within one context (#1180 item 2)",
+            );
+            assert!(
+                surface
+                    .imp()
+                    .refused_builds
+                    .borrow()
+                    .refused(((4, 4), program)),
+                "…keyed by (grid, program)",
+            );
+            assert!(
+                surface.build_refused(),
+                "…and the host can see it: `build_refused` answers for the program and grid \
+                 the surface is currently pointed at (PR #1199 review, LOW 5)",
+            );
+
+            // Out of the window: GTK unroots, which unrealizes, which is the
+            // only place the per-context state is dropped. The local `surface`
+            // is what keeps the widget alive across this.
+            window.set_child(None::<&gtk::Widget>);
+            assert!(
+                !surface.is_realized(),
+                "unparenting a realised widget must unrealize it — the premise of this test",
+            );
+            assert!(
+                surface.imp().refused_builds.borrow().keys.is_empty(),
+                "unrealize must forget refusals measured against a context that is gone \
+                 (PR #1199 review, MEDIUM 1)",
+            );
+            assert!(
+                !surface.build_refused(),
+                "…so a host that fell back to its CPU kit on the refusal may offer GL to the \
+                 context that replaces it",
+            );
+
+            // …and back in, onto a context GTK creates fresh.
+            window.set_child(Some(&surface));
+            for _ in 0..1000 {
+                if surface.is_realized() && surface.width() > 0 {
+                    break;
+                }
+                if !glib::MainContext::default().iteration(false) {
+                    break;
+                }
+            }
+            assert!(
+                surface.is_realized() && surface.error().is_none(),
+                "the surface must come back with a context of its own",
+            );
+            surface.make_current();
+            surface.imp().draw();
+
+            assert_eq!(
+                BUILD_ATTEMPTS.get(),
+                2,
+                "a fresh context is a fresh question: the pipeline must be offered to it, and \
+                 the refusal reported again (PR #1199 review, MEDIUM 1)",
+            );
+            assert!(
+                surface
+                    .imp()
+                    .refused_builds
+                    .borrow()
+                    .refused(((4, 4), program)),
+                "…and re-latched against the new context, so it is still asked only once",
+            );
+
+            window.destroy();
+        }
+
+        /// **#1180 item 9.** A **realised widget** draws a real pipeline end
+        /// to end: the `GlSurface` subclass, in a window, with the context
+        /// GTK made for it, through `draw` — every pass, both targets.
+        ///
+        /// Everything else in this module tests a piece: `ensure_resources`
+        /// against a bare `imp::GlSurface::default()` (which has no
+        /// `self.obj()`, so it can only be driven with an empty pipeline),
+        /// the pure decisions on their own, the uniform bag by value. Until
+        /// this, nothing had ever put the widget on a display and let it
+        /// render — so `realize`'s context check, the `GlTarget::Screen`
+        /// arm's `attach_buffers`/letterbox, `bind_inputs`, the accumulator
+        /// ping-pong and every `glUniform*` call ran for the first time on
+        /// Annika's laptop rather than in CI.
+        ///
+        /// The assertion is the driver's own verdict: after a complete
+        /// render, [`hgl::Gl::take_error`] must be empty. That covers a class
+        /// nothing else here can see — a viewport computed negative, a
+        /// sampler bound to a unit that was never set, an
+        /// incomplete-framebuffer attach — each of which draws *something*
+        /// (usually black) and would otherwise ship green.
+        ///
+        /// **Falsified, and measured rather than assumed** (llvmpipe, this
+        /// crate's own `system-tests` env): deleting `program.bind(gl)` from
+        /// `Resources::run` — so every `glUniform*` that follows is set with
+        /// no program of ours in use — turns `take_error` into
+        /// `Some(1282)`, `GL_INVALID_OPERATION`, and this test red.
+        ///
+        /// One mutation that does **not** fire, recorded so nobody re-adds
+        /// the assertion it would suggest: dropping `self.vao.bind(gl)` stays
+        /// green. A core *desktop* profile refuses to draw with vertex array
+        /// 0, but this surface pins GLES (`GlSurface::new`), where the
+        /// default vertex array is a legal object — so the VAO here is a
+        /// portability handle, not something the driver will complain about
+        /// losing.
+        #[gtk::test]
+        fn a_realised_surface_renders_every_pass_without_a_gl_error() {
+            const STEP_FRAGMENT: &str = "
+                out vec4 frag_color;
+                void main() {
+                    frag_color = vec4(1.0);
+                }";
+            // Reads the accumulator through the sampler the host binds, so
+            // the input plumbing is exercised rather than assumed.
+            const BLIT_FRAGMENT: &str = "
+                uniform sampler2D u_tex0;
+                uniform ivec2 u_grid;
+                out vec4 frag_color;
+                void main() {
+                    float v = texelFetch(u_tex0, ivec2(0, 0), 0).r;
+                    frag_color = vec4(v, v, v, 1.0) * float(u_grid.x > 0);
+                }";
+            const STEP: [GlPass; 1] = [GlPass {
+                vertex: VERTEX,
+                fragment: STEP_FRAGMENT,
+                target: GlTarget::Accumulator,
+                inputs: &[],
+                blend: GlBlend::Max,
+                draw: GlDraw::FullScreen,
+            }];
+            const FRAME: [GlPass; 1] = [GlPass {
+                vertex: VERTEX,
+                fragment: BLIT_FRAGMENT,
+                target: GlTarget::Screen,
+                inputs: &[GlInput::Accumulator],
+                blend: GlBlend::Replace,
+                draw: GlDraw::FullScreen,
+            }];
+
+            let Some((window, surface, gl)) = realised_surface_or_skip(
+                "a_realised_surface_renders_every_pass_without_a_gl_error",
+            ) else {
+                return;
+            };
+
+            let program = GlProgram("gl_surface_test.realised");
+            PROGRAMS.with_borrow_mut(|programs| {
+                programs.insert(
+                    program,
+                    GlPipeline {
+                        aux: 0,
+                        step: &STEP,
+                        frame: &FRAME,
+                    },
+                );
+            });
+
+            let state = Arc::new(GlUniforms {
+                values: vec![("u_unused_by_this_pipeline", GlValue::Float(0.5))],
+                data: Some(Arc::from(vec![0.25_f32, 0.5, 0.75])),
+                grid: (8, 4),
+                step_seq: 1,
+            });
+            surface.set_state(program, 8, 4, &state);
+
+            // Anything the fixture or GTK's own scene left queued belongs to
+            // them; the drain is what makes the check below an answer about
+            // this render.
+            let _ = gl.take_error();
+            surface.imp().draw();
+
+            assert!(
+                surface.imp().resources.borrow().is_some(),
+                "a realised surface must have built its GL objects",
+            );
+            assert_eq!(
+                surface.imp().last_drawn.get(),
+                1,
+                "…and replayed the one step the state owed",
+            );
+            assert_eq!(
+                gl.take_error(),
+                None,
+                "a complete render over a real driver must raise no GL error",
+            );
+
+            // A second render with the same state advances nothing (the
+            // idempotence rule) and must still be clean.
+            surface.imp().draw();
+            assert_eq!(surface.imp().last_drawn.get(), 1, "a repeat render is idle");
+            assert_eq!(gl.take_error(), None, "and just as clean");
+
+            window.destroy();
+        }
+
+        /// A realised [`super::super::GlSurface`] widget in a presented
+        /// window, its own context current, or a skip naming why.
+        ///
+        /// The widget's context, not a stand-in `gtk::GLArea`'s: `draw`
+        /// reaches `self.obj()` for `attach_buffers` and the allocation, so
+        /// the thing under test has to be the real widget in a real
+        /// allocation. Honours `TROLLSHELL_REQUIRE_GL` exactly as
+        /// [`real_gl_or_skip`] does.
+        fn realised_surface_or_skip(
+            test_name: &str,
+        ) -> Option<(gtk::Window, super::super::GlSurface, hgl::Gl)> {
+            let window = gtk::Window::new();
+            let surface = super::super::GlSurface::new();
+            window.set_default_size(64, 32);
+            window.set_child(Some(&surface));
+            window.present();
+            // A presented toplevel realises and allocates on this display;
+            // the bound keeps a display that will not do so from hanging the
+            // suite.
+            for _ in 0..1000 {
+                if surface.is_realized() && surface.width() > 0 {
+                    break;
+                }
+                if !glib::MainContext::default().iteration(false) {
+                    break;
+                }
+            }
+
+            let why = if let Some(error) = surface.error() {
+                format!("the GlSurface could not create a context: {error}")
+            } else if !surface.is_realized() || surface.width() <= 0 {
+                format!(
+                    "the surface never realised with an allocation (realized={}, width={})",
+                    surface.is_realized(),
+                    surface.width()
+                )
+            } else {
+                surface.make_current();
+                match hgl::Gl::current() {
+                    Ok(gl) => return Some((window, surface, gl)),
+                    Err(error) => format!("GDK made a context current, but {error}"),
+                }
+            };
+
+            window.destroy();
+            let required =
+                std::env::var_os("TROLLSHELL_REQUIRE_GL").is_some_and(|want| want == "1");
+            assert!(
+                !required,
+                "TROLLSHELL_REQUIRE_GL=1, but no realised GL surface is available for \
+                 {test_name}: {why}"
+            );
+            eprintln!("SKIPPED {test_name}: {why}");
+            None
+        }
     }
 }
 
@@ -1545,6 +2313,42 @@ impl GlSurface {
     pub fn has_error(&self) -> bool {
         self.error().is_some()
     }
+
+    /// Whether the driver has **refused to build** the pipeline this surface
+    /// is currently pointed at — the program and grid its last
+    /// [`set_state`](Self::set_state) named (PR #1199 review, LOW 5).
+    ///
+    /// This is a third failure, and until now the host had no way to see it.
+    /// [`abandon_gl`] covers a failed *context* and [`GlPipeline`]'s absence
+    /// covers "this kind has no GL arm" — the two cases #893 says the CPU kit
+    /// exists for — but a context that comes up fine and then will not
+    /// *compile* a particular pipeline is neither, so the chip simply stayed
+    /// blank. #1180 item 2 made that permanent rather than a per-frame
+    /// recompile, which is the right answer for the driver and the wrong one
+    /// for the widget: a refusal that is asked once is also a refusal nobody
+    /// is ever going to retract on its own.
+    ///
+    /// Reported per instance and polled rather than pushed, because the only
+    /// consumer is a host that already runs a pump: `trollshell`'s
+    /// `plugins::pump` ticks every render, and reading a `Cell`-shaped answer
+    /// there costs nothing, while a signal would need a `Mutable` in a crate
+    /// that deliberately has none.
+    ///
+    /// **The host half is #1180 part 2**, not this commit:
+    /// `trollshell/src/plugins/preem_render.rs` is where "GL refused this
+    /// instance" becomes a per-instance swap to the CPU kit with one `warn!`,
+    /// alongside the existing `preem_gl::arm() == Arm::Cpu` swap, and that
+    /// file is being rewritten by PR #1193 (dot matrix) at the same time.
+    /// Answering the question here is the half that can land without a
+    /// conflict; nothing in the tree reads it yet.
+    ///
+    /// Goes `false` again when the surface is unrealized — the latch is per
+    /// `GdkGLContext` (see `imp::GlSurface::unrealize`), so a host that
+    /// switched to the CPU kit on a refusal may offer GL to a fresh context.
+    #[must_use]
+    pub fn build_refused(&self) -> bool {
+        self.imp().build_refused()
+    }
 }
 
 impl Default for GlSurface {
@@ -1556,13 +2360,189 @@ impl Default for GlSurface {
 #[cfg(test)]
 mod tests {
     use super::{
-        DATA_STRIP_REFUSED, DataFailure, GlProgram, GlUniforms, GlValue, MAX_STEPS_PER_RENDER,
-        PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED, WARNED_LENGTHS, WarnLatch,
-        abandon_gl, fit_rect, fresh_last_drawn, gl_abandoned, hgl, refuse_data_strip,
-        resources_reusable, steps_owed, warn_on_data_failure,
+        BuildKey, DATA_STRIP_REFUSED, DataFailure, GlProgram, GlUniforms, GlValue,
+        MAX_STEPS_PER_RENDER, PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED, REFUSED_BUILDS,
+        RENDER_TARGET_REFUSED, RefusedBuilds, WARNED_LENGTHS, WarnLatch, abandon_gl, fit_rect,
+        framebuffer_status_key, fresh_last_drawn, gl_abandoned, hgl, last_drawn_after, program_key,
+        refuse_data_strip, resources_reusable, steps_owed, warn_on_data_failure,
+        warn_on_target_failure,
     };
     use std::cell::RefCell;
     use std::sync::Arc;
+
+    /// **#1180 item 3.** A replay that stops early leaves the steps it did
+    /// not run still owed.
+    ///
+    /// This is the arithmetic that makes "hold the state" true. `draw` used
+    /// to set `last_drawn` to `step_seq` unconditionally, right after a loop
+    /// whose passes could each have been refused and dropped in silence — so
+    /// a step that never ran was permanently counted as drawn, because
+    /// `steps_owed` never asks for a step twice.
+    ///
+    /// **Falsified** by returning `step_seq` unconditionally (the shipped
+    /// behaviour): every assertion but the first goes red.
+    #[test]
+    fn a_step_replay_that_stops_early_still_owes_the_rest() {
+        assert_eq!(
+            last_drawn_after(10, 3, 3),
+            10,
+            "a complete replay lands on the newest step"
+        );
+        assert_eq!(
+            last_drawn_after(10, 3, 0),
+            7,
+            "a replay that ran nothing advances nothing: the three are still owed"
+        );
+        assert_eq!(
+            last_drawn_after(10, 3, 2),
+            9,
+            "…and a partial one owes exactly the remainder"
+        );
+        assert_eq!(
+            last_drawn_after(0, 0, 0),
+            0,
+            "a surface at rest owes nothing and advances nothing"
+        );
+        // The clamp case: `steps_owed` caps a surface that fell far behind, so
+        // `owed` can be smaller than `step_seq - last_drawn`. Nothing here may
+        // underflow on it.
+        assert_eq!(
+            last_drawn_after(2, MAX_STEPS_PER_RENDER, 0),
+            0,
+            "saturating, so a clamped replay cannot wrap the step count",
+        );
+    }
+
+    /// **#1180 item 3.** The refused-target latch is keyed by the framebuffer
+    /// status, so a second, *different* refusal is not swallowed by the
+    /// first — the shape #1020's MEDIUM 1 and #1023 item 1 each settled for
+    /// the latch next door.
+    ///
+    /// **Falsified** by keying [`framebuffer_status_key`] on a constant: the
+    /// second claim returns `false` and the `UNSUPPORTED` refusal is never
+    /// reported.
+    #[test]
+    fn a_second_differently_refused_render_target_still_gets_its_own_line() {
+        let latch = RefCell::new(WarnLatch::default());
+        let incomplete = hgl::Error::Framebuffer { status: 0x8CD6 };
+        let unsupported = hgl::Error::Framebuffer { status: 0x8CDD };
+
+        assert_ne!(
+            framebuffer_status_key(&incomplete),
+            framebuffer_status_key(&unsupported),
+            "two different GL_FRAMEBUFFER_* statuses are two different facts",
+        );
+
+        warn_on_target_failure(&latch, &incomplete);
+        assert_eq!(
+            latch.borrow().said.len(),
+            1,
+            "the first refusal is reported"
+        );
+        warn_on_target_failure(&latch, &incomplete);
+        assert_eq!(latch.borrow().said.len(), 1, "…once");
+        warn_on_target_failure(&latch, &unsupported);
+        assert_eq!(
+            latch.borrow().said.len(),
+            2,
+            "a different framebuffer status must get its own line, not be silenced by the first",
+        );
+    }
+
+    /// **PR #1199 review, NIT 1.** The unregistered-program latch is keyed by
+    /// the program *name*, so a second, different missing registration gets
+    /// its own line.
+    ///
+    /// This field shipped as the file's last bare `Cell<bool>`: two
+    /// unregistered names cost one line between them, and the second — a
+    /// different missing `register` call, with a different fix — was
+    /// swallowed for the life of the surface. Log-only (the arm recompiles
+    /// nothing), which is the whole reason it is a nit.
+    ///
+    /// **Falsified** by keying [`program_key`] on a constant: the third
+    /// claim returns `false`.
+    #[test]
+    fn two_unregistered_program_names_each_get_their_own_line() {
+        let mut latch = WarnLatch::default();
+
+        assert_ne!(
+            program_key(GlProgram("preem.scope")),
+            program_key(GlProgram("preem.dot_matrix")),
+            "two program names are two different facts",
+        );
+
+        assert!(
+            latch.claim(program_key(GlProgram("preem.scope"))),
+            "the first unregistered program is reported",
+        );
+        assert!(!latch.claim(program_key(GlProgram("preem.scope"))), "…once");
+        assert!(
+            latch.claim(program_key(GlProgram("preem.dot_matrix"))),
+            "a different unregistered program must get its own line, not be silenced by the \
+             first (PR #1199 review, NIT 1)",
+        );
+    }
+
+    /// **#1180 item 2.** The refusal latch is keyed by the **whole** build
+    /// input, and bounded — the two properties `ensure_resources` rests on.
+    ///
+    /// A one-slot latch would be no bound at all: two refused keys
+    /// alternating (a chip flapping between two grids with a shader that
+    /// will not compile at either) would each evict the other, and every
+    /// frame would go back to the driver — the same measured shape as
+    /// `shader_surface`'s `WARNED_SOURCES` residual (#968 second review).
+    ///
+    /// **Falsified** by shrinking [`REFUSED_BUILDS`] to `1`: the alternating
+    /// pair below reports both keys as news on every round, so `asked` ends
+    /// at 10 instead of 2.
+    #[test]
+    fn a_refused_build_is_remembered_by_grid_and_program_and_the_latch_is_bounded() {
+        let scope = GlProgram("preem.scope");
+        let gauge = GlProgram("preem.gauge");
+        let mut refused = RefusedBuilds::default();
+
+        assert!(!refused.refused(((4, 4), scope)), "nothing is refused yet");
+        assert!(
+            refused.remember(((4, 4), scope)),
+            "the first refusal is news"
+        );
+        assert!(!refused.remember(((4, 4), scope)), "…and only once");
+        assert!(refused.refused(((4, 4), scope)));
+
+        // Both halves of the key matter: a different grid and a different
+        // program are each a build this latch has not seen.
+        assert!(!refused.refused(((8, 4), scope)), "a different grid");
+        assert!(!refused.refused(((4, 4), gauge)), "a different program");
+
+        // Two keys alternating cost two driver asks in total, not one per
+        // round — the thing a one-slot latch gets wrong.
+        let mut refused = RefusedBuilds::default();
+        let mut asked = 0_u32;
+        for round in 0..10 {
+            let key: BuildKey = if round % 2 == 0 {
+                ((4, 4), scope)
+            } else {
+                ((8, 4), scope)
+            };
+            if !refused.refused(key) {
+                asked += 1;
+                refused.remember(key);
+            }
+        }
+        assert_eq!(asked, 2, "two distinct refused builds, two driver asks");
+
+        // The bound holds, and the right way round: REFUSED_BUILDS further
+        // distinct refusals evict the first, so it is asked again rather
+        // than being refused forever on a driver that may have moved on.
+        for n in 0..REFUSED_BUILDS {
+            let grid = (u32::try_from(n).unwrap_or(0) + 16, 4);
+            refused.remember((grid, scope));
+        }
+        assert!(
+            !refused.refused(((4, 4), scope)),
+            "an evicted key is asked again — the cost of a bound, and the safe direction",
+        );
+    }
 
     /// **The idempotence rule** (#893's "the draw must be idempotent"), which
     /// is otherwise untestable: CI has no GL, and a repeat render draws exactly
@@ -1927,7 +2907,11 @@ mod tests {
     /// **Falsified** by reverting either const to #1020's wording.
     #[test]
     fn neither_early_return_message_claims_the_surface_draws_nothing() {
-        for msg in [PROGRAM_UNREGISTERED_REFUSED, PIPELINE_BUILD_REFUSED] {
+        for msg in [
+            PROGRAM_UNREGISTERED_REFUSED,
+            PIPELINE_BUILD_REFUSED,
+            RENDER_TARGET_REFUSED,
+        ] {
             assert!(
                 !msg.contains("draws nothing"),
                 "an early return out of draw() leaves the last frame up, so no such message may \
@@ -1968,8 +2952,8 @@ mod tests {
     /// makes eviction possible at all — with no clear-on-success anywhere in
     /// this module, eviction is the *only* path back to a second line for a
     /// length already reported. A port of
-    /// `shader_surface::two_broken_sources_alternating_cost_two_lines`, the
-    /// twin this bound shipped without a test for.
+    /// `shader_surface::two_broken_sources_alternating_cost_two_lines_and_two_compiles`,
+    /// the twin this bound shipped without a test for.
     ///
     /// `a_second_differently_sized_refused_data_strip_still_gets_its_own_line`
     /// looks like it would cover this and does not: it claims the same key

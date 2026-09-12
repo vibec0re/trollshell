@@ -110,3 +110,19 @@
     min-height: 0;
     padding: 0;
 }
+
+/* Sparkline default (#1180 item 7).
+   `Sparkline` reads its stroke colour straight off the widget
+   (`gtk_widget_get_color`), so the colour has to come from CSS — and the
+   widget is a bare GtkDrawingArea, whose minimum height is 0, so the height
+   has to as well. Both used to live only in trollshell's stylesheet under a
+   `ts-sparkline` class the library itself stamped: any other shell built on
+   `hytte` got an invisible sparkline drawn in the inherited text colour, and
+   the library could not have fixed it without writing into a namespace it
+   does not own. The class is `hytte-sparkline` now and the default is here;
+   a shell overrides it from its own user stylesheet, which is installed
+   above this one. */
+.hytte-sparkline {
+    color: @accent_color;
+    min-height: 1.846em;
+}

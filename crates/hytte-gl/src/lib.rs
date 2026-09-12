@@ -78,6 +78,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
+use std::num::NonZeroU32;
 
 use gl::types::{GLenum, GLint, GLsizei, GLuint};
 
@@ -129,6 +130,28 @@ pub enum Error {
         /// What the driver reported for `GL_MAX_TEXTURE_SIZE`.
         limit: u32,
     },
+    /// `glGen*` did not write a name: it left the reserved zero (#1180 item
+    /// 4).
+    ///
+    /// Zero is not "a name that happens to be small" — for a framebuffer it
+    /// **is** the window-system-provided framebuffer, so an FBO handle built
+    /// over a failed `glGenFramebuffers` would bind the default framebuffer
+    /// and every offscreen pass would draw straight into whatever GTK was
+    /// compositing, silently. (For a VAO, zero is the default vertex array,
+    /// which a core profile refuses to draw with — loud by comparison, but
+    /// equally not the object the caller asked for.) `glGen*` has no error
+    /// return, so this check is the only place that difference can be caught.
+    ///
+    /// [`Texture`] and [`Program`] need no such arm and deliberately do not
+    /// have one: `Texture::new`'s `glTexStorage2D` against the default
+    /// texture object raises `GL_INVALID_OPERATION`, which it already polls
+    /// for ([`Storage`](Error::Storage)), and a `glCreateProgram` that
+    /// returns zero fails the `LINK_STATUS` read that follows and comes back
+    /// as [`Link`](Error::Link).
+    Name {
+        /// Which object the driver would not name.
+        object: &'static str,
+    },
     /// `glTexStorage2D` raised a GL error, so the texture object exists with no
     /// storage behind it (#977).
     ///
@@ -164,6 +187,10 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "texture extent {w}x{h} is over this driver's GL_MAX_TEXTURE_SIZE of {limit}"
+            ),
+            Self::Name { object } => write!(
+                f,
+                "the driver did not name a new {object} (glGen* left the reserved name 0)"
             ),
             Self::Storage { size: (w, h), code } => write!(
                 f,
@@ -873,31 +900,47 @@ impl Drop for Texture {
 /// widget's teardown to one delete.
 #[derive(Debug)]
 pub struct Framebuffer {
-    id: GLuint,
+    /// **`NonZeroU32`, and that is load-bearing** (#1180 item 4): FBO name 0
+    /// is the window-system-provided framebuffer — the one `GtkGLArea` is
+    /// compositing — so a handle built over a `glGenFramebuffers` that wrote
+    /// nothing would point [`draw_to`](Framebuffer::draw_to) at the visible
+    /// surface instead of at a texture, with no error anywhere.
+    id: NonZeroU32,
     _not_send: PhantomData<*const ()>,
 }
 
 impl Framebuffer {
     /// Create an FBO with nothing attached.
-    #[must_use]
-    pub fn new(_gl: &Gl) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Name`] if `glGenFramebuffers` left the reserved name `0`.
+    /// `glGen*` reports failure no other way, and for this object in
+    /// particular the fallback is not "no framebuffer" but "the default
+    /// framebuffer" — see that variant.
+    pub fn new(_gl: &Gl) -> Result<Self, Error> {
         let mut id: GLuint = 0;
         // SAFETY: a context is current; the out-pointer is a live local.
+        // Whatever GL writes there is only *used* after the `NonZeroU32`
+        // conversion below refuses the reserved zero.
         unsafe { gl::GenFramebuffers(1, &raw mut id) };
-        Self {
-            id,
+        Ok(Self {
+            id: NonZeroU32::new(id).ok_or(Error::Name {
+                object: "framebuffer",
+            })?,
             _not_send: PhantomData,
-        }
+        })
     }
 
     /// Bind this FBO and point colour attachment 0 at `target`, leaving it
     /// bound for the draw that follows and setting the viewport to the
     /// texture's own extent.
     pub fn draw_to(&self, gl_ctx: &Gl, target: &Texture) -> Result<(), Error> {
-        // SAFETY: a context is current, `self.id` is a live FBO and `target.id`
-        // a live 2-D texture with level 0 allocated.
+        // SAFETY: a context is current, `self.id` is a live FBO — non-zero by
+        // construction, so this can never bind the default framebuffer — and
+        // `target.id` a live 2-D texture with level 0 allocated.
         let status = unsafe {
-            gl::BindFramebuffer(gl::FRAMEBUFFER, self.id);
+            gl::BindFramebuffer(gl::FRAMEBUFFER, self.id.get());
             gl::FramebufferTexture2D(
                 gl::FRAMEBUFFER,
                 gl::COLOR_ATTACHMENT0,
@@ -918,8 +961,11 @@ impl Framebuffer {
 
 impl Drop for Framebuffer {
     fn drop(&mut self) {
-        // SAFETY: `self.id` is this handle's own FBO; see the module contract.
-        unsafe { gl::DeleteFramebuffers(1, &raw const self.id) };
+        let id = self.id.get();
+        // SAFETY: `id` is this handle's own FBO, read out of the `NonZeroU32`
+        // into a live local for the out-pointer; see the module contract on
+        // when a handle may be dropped.
+        unsafe { gl::DeleteFramebuffers(1, &raw const id) };
     }
 }
 
@@ -944,34 +990,48 @@ impl Drop for Framebuffer {
 /// is kept for the life of the surface.
 #[derive(Debug)]
 pub struct VertexArray {
-    id: GLuint,
+    /// `NonZeroU32` for [`Framebuffer::id`]'s reason (#1180 item 4), one
+    /// notch less dangerous: VAO name 0 is the default vertex array, which a
+    /// core profile refuses to draw with, so a failed `glGenVertexArrays`
+    /// costs the draw rather than redirecting it.
+    id: NonZeroU32,
     _not_send: PhantomData<*const ()>,
 }
 
 impl VertexArray {
     /// Create an empty VAO.
-    #[must_use]
-    pub fn new(_gl: &Gl) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Name`] if `glGenVertexArrays` left the reserved name `0`.
+    pub fn new(_gl: &Gl) -> Result<Self, Error> {
         let mut id: GLuint = 0;
         // SAFETY: a context is current; the out-pointer is a live local.
+        // Whatever GL writes there is only *used* after the `NonZeroU32`
+        // conversion below refuses the reserved zero.
         unsafe { gl::GenVertexArrays(1, &raw mut id) };
-        Self {
-            id,
+        Ok(Self {
+            id: NonZeroU32::new(id).ok_or(Error::Name {
+                object: "vertex array",
+            })?,
             _not_send: PhantomData,
-        }
+        })
     }
 
     /// Bind it.
     pub fn bind(&self, _gl: &Gl) {
-        // SAFETY: a context is current and `self.id` is a live VAO.
-        unsafe { gl::BindVertexArray(self.id) };
+        // SAFETY: a context is current and `self.id` is a live VAO, non-zero
+        // by construction, so this never re-binds the default vertex array.
+        unsafe { gl::BindVertexArray(self.id.get()) };
     }
 }
 
 impl Drop for VertexArray {
     fn drop(&mut self) {
-        // SAFETY: `self.id` is this handle's own VAO; see the module contract.
-        unsafe { gl::DeleteVertexArrays(1, &raw const self.id) };
+        let id = self.id.get();
+        // SAFETY: `id` is this handle's own VAO, read out of the `NonZeroU32`
+        // into a live local for the out-pointer; see the module contract.
+        unsafe { gl::DeleteVertexArrays(1, &raw const id) };
     }
 }
 
@@ -1146,7 +1206,10 @@ pub fn read_rgba8(_gl: &Gl, width: u32, height: u32) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Blend, Error, Format, Stage, UNKNOWN_MAX_TEXTURE_SIZE, checked_extent};
+    use super::{
+        Blend, Error, Format, Framebuffer, NonZeroU32, PhantomData, Stage,
+        UNKNOWN_MAX_TEXTURE_SIZE, VertexArray, checked_extent,
+    };
 
     /// **#977.** The extent decision, which is the half of the driver check a
     /// hermetic test can reach — CI has no GL at all, so `Texture::new`'s
@@ -1290,6 +1353,57 @@ mod tests {
             .to_string()
             .contains("libepoxy")
         );
+        let unnamed = Error::Name {
+            object: "framebuffer",
+        }
+        .to_string();
+        assert!(unnamed.contains("framebuffer"), "{unnamed}");
+        assert!(
+            unnamed.contains('0'),
+            "the reserved name is the whole diagnosis: {unnamed}",
+        );
+    }
+
+    /// **#1180 item 4.** A failed `glGen*` cannot be mistaken for a live
+    /// object, because the reserved name `0` is unrepresentable in the
+    /// handle.
+    ///
+    /// `glGenFramebuffers`/`glGenVertexArrays` have no error return: on
+    /// failure they leave the out-parameter at `0`, and `0` is not "no
+    /// object" — for a framebuffer it is the **window-system-provided** one,
+    /// so an FBO handle over a zero would have pointed `draw_to` at the
+    /// surface `GtkGLArea` is compositing and every offscreen pass would have
+    /// been drawn into the visible window, with no error raised anywhere.
+    ///
+    /// There is no way to make a driver fail to name an object on demand, so
+    /// what is pinned here is the *type*: the field is a [`NonZeroU32`], so
+    /// the only way to build either handle is through the constructor that
+    /// refuses zero. **Falsified** by widening either `id` back to `GLuint`:
+    /// this test stops compiling (`NonZeroU32::new(…)` no longer type-checks
+    /// against the field), which is the point — the check cannot be dropped
+    /// while the type still holds.
+    #[test]
+    fn a_framebuffer_and_a_vao_can_only_hold_a_non_zero_name() {
+        let fbo = Framebuffer {
+            id: NonZeroU32::new(7).expect("7 is not zero"),
+            _not_send: PhantomData,
+        };
+        let vao = VertexArray {
+            id: NonZeroU32::new(9).expect("9 is not zero"),
+            _not_send: PhantomData,
+        };
+        assert_eq!(fbo.id.get(), 7);
+        assert_eq!(vao.id.get(), 9);
+        assert!(
+            NonZeroU32::new(0).is_none(),
+            "…and 0, the name glGen* leaves on failure, has no representation here",
+        );
+        // Both handles' `Drop` issues a `glDelete*` with no context current,
+        // which is a no-op through glvnd's dispatch on an unbound thread but
+        // is not what this test is about — forget them rather than letting
+        // the contract in the module docs be violated by a test.
+        std::mem::forget(fbo);
+        std::mem::forget(vao);
     }
 
     /// `Blend` is a two-state knob and both states are named, so a future third

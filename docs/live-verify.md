@@ -409,6 +409,24 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       generation gets rejected at `Register` with a "plugin … built against a
       newer wire vocabulary … update the shell" warn, instead of crash-looping
       silently.
+- [ ] **(#1180 item 2)** **A broken plugin shader costs one compile, not one
+      per frame.** Point a plugin at a `Node::Shader` fragment body that does
+      not compile (any undeclared identifier will do — e.g.
+      `void main() { fragColor = not_a_thing; }`) and leave the widget up.
+      With `RUST_LOG=hytte_ui=debug`, expect **exactly one**
+      `a plugin shader could not be compiled…` line and **no repeated**
+      `compiling a plugin shader` lines behind it, however long the widget
+      stays up. Before this, only the line was latched: the driver was handed
+      the same broken GLSL inside the render callback on every frame, on the
+      GTK main thread, in silence. The same check applies to the `GlSurface`
+      side (a refused `preem_gl` pipeline): one
+      `a GlSurface pipeline would not build…` line, no recompile loop behind
+      it. **PR #1199 review, MEDIUM 1 adds the other half:** both latches are
+      per `GdkGLContext`, so after a kanshi profile switch or any other event
+      that re-creates the context, a still-broken widget writes its line
+      **again** (once) and the driver is asked once more — a second line after
+      a hot-plug is correct, not a regression, and its _absence_ would be the
+      bug.
 
 ## Agents (hyperhive)
 
@@ -2612,6 +2630,36 @@ session.
       reproduces the pre-fix `SIGABRT` — nothing extra to click through for
       that one beyond the regular dismiss-catcher check already covered by
       #639 above.
+- [ ] **(#1180 item 1)** **A tray menu is no longer immortal.** Every popover
+      built with a dismiss catcher used to be pinned for the session: the
+      `show` handler captured a strong clone of the popover it was connected
+      to, which is a cycle through the popover itself. Open and close a tray
+      menu (or any catcher-backed popover — a task-edit popover does) **50
+      times** and watch the process RSS stay flat; before this, each open left
+      one immortal popover plus its whole child widget tree. `heaptrack`, or
+      just `grep VmRSS /proc/$(pgrep -f trollshell)/status` before and after,
+      is enough — the leak is per-open, so 50 opens make it obvious rather
+      than subtle.
+- [ ] **(#1180 item 1 / PR #1199 review, LOW 3)** **A catcher never outlives
+      its popover.** The same commit took the catcher's click and scroll
+      controllers weak, which is what makes "the popover is finalized while
+      its catchers are up" reachable at all — and the only thing between that
+      and an invisible full-output click-eater on every monitor is GTK's
+      `dispose → unrealize → unmap → close_catchers` chain. Open a tray menu
+      on the secondary output, then **hot-plug that output away** (a kanshi
+      profile switch, or unplug it) while the menu is still up. Input must
+      still reach the remaining output normally: clicks land on windows, the
+      bar responds, and no click is silently eaten. `gtk::Window::toplevels()`
+      (or `GTK_DEBUG=interactive`) must show no leftover
+      `hytte-popup-catcher` surface.
+- [ ] **(#1180 item 7)** **The sparklines are a no-op on screen.** The
+      library's `Sparkline` stamps `hytte-sparkline` instead of the shell's
+      `ts-sparkline`, and the shell's own stylesheet carries the same two
+      properties at higher priority — so the Stats drawer's history
+      sparklines must still draw in the accent colour at exactly their old
+      height. Any visible change here (a thinner line, a different colour, a
+      collapsed row) means the shell's override did not load, not that the
+      library default is wrong.
 
 ## Stats drawer
 

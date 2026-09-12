@@ -1,8 +1,9 @@
 //! Minimal time-series visualization. Owns a fixed-capacity ring
 //! buffer of `f64` samples and renders them as a single-stroke line
 //! plus 15%-alpha fill via cairo. Color resolves through the widget's
-//! GTK4 theme color (`.ts-sparkline { color: @accent_color; }` in
-//! the consumer's stylesheet drives this).
+//! GTK4 theme color: the library stylesheet's
+//! `.hytte-sparkline { color: @accent_color; }` is the default, and a shell
+//! overrides it from its own user stylesheet.
 //!
 //! Used by `trollshell`'s stats page History group; designed to be
 //! reusable for any future per-metric history surface.
@@ -42,7 +43,15 @@ impl Sparkline {
         assert!(capacity > 0, "Sparkline capacity must be > 0");
 
         let inner = gtk::DrawingArea::new();
-        inner.add_css_class("ts-sparkline");
+        // `hytte-`, not `ts-` (#1180 item 7). This class is the library's, so
+        // it is styled by the library's own stylesheet
+        // (`assets/hytte-ui/style.css`) and a second shell built on `hytte`
+        // gets a sparkline that paints. It used to be stamped `ts-sparkline`,
+        // a name only `trollshell`'s stylesheet defines — so anyone else's
+        // sparkline drew in the inherited text colour at the drawing area's
+        // zero minimum height, and the library could not fix it without
+        // reaching into a namespace it does not own.
+        inner.add_css_class("hytte-sparkline");
 
         let samples: Rc<RefCell<VecDeque<f64>>> =
             Rc::new(RefCell::new(VecDeque::with_capacity(capacity)));
@@ -144,7 +153,7 @@ fn draw_sparkline(
     let step_x = if count <= 1.0 { 0.0 } else { w / (count - 1.0) };
 
     // Resolve theme color via widget.color() — driven by
-    // `.ts-sparkline { color: @accent_color; }` in CSS.
+    // `.hytte-sparkline { color: @accent_color; }` in CSS.
     let color = area.color();
     let r = f64::from(color.red());
     let g = f64::from(color.green());
@@ -184,6 +193,34 @@ fn draw_sparkline(
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
     use super::*;
+
+    /// **#1180 item 7.** The widget wears the library's own namespace, so the
+    /// library's stylesheet is what styles it.
+    ///
+    /// A `ts-` class stamped by `hytte-ui` is a class `hytte-ui` cannot style:
+    /// `assets/hytte-ui/style.css` owns `hytte-*` and `ts-*` belongs to
+    /// whichever shell is on top — so every consumer that is not `trollshell`
+    /// got a sparkline with no colour and no height, and the library had no
+    /// way to give it one.
+    ///
+    /// The negative half is the load-bearing one: it is what fails if the old
+    /// class is re-added "for compatibility", which would put the library back
+    /// in a namespace it does not own.
+    ///
+    /// **Falsified** by restoring `add_css_class("ts-sparkline")`.
+    #[gtk::test]
+    fn the_sparkline_wears_the_library_class_not_the_shells() {
+        let s = Sparkline::new(8);
+        assert!(
+            s.widget().has_css_class("hytte-sparkline"),
+            "the library styles its own widget through its own namespace",
+        );
+        assert!(
+            !s.widget().has_css_class("ts-sparkline"),
+            "and not through a shell's: `ts-*` is trollshell's stylesheet, which a second \
+             shell built on hytte does not load",
+        );
+    }
 
     #[gtk::test]
     fn push_caps_at_capacity() {

@@ -2334,7 +2334,12 @@ session.
       matrix, so the bit-identical clause is about the flat field only; on the
       text box the glyphs contribute *nothing* to the delta (they box-average
       back to the kit's bytes exactly), so the budget is bounding the corner
-      alone, and a corner radius off by less than one logical pixel clears it.
+      alone — and there the hole has a direction. Measured: an arc one logical
+      pixel **wider** on the stretched path alone clears every gate (the lcd's
+      edge mean actually *falls*, to 8.852, because a wider arc sits closer to
+      the kit's stair); one a pixel **narrower** is caught, by the
+      bit-identical-interior clause rather than by the budget. A corner drift
+      that reaches the 1:1 path too reds 12 of the 16 pinned cases.
 
       What only glass can answer:
 

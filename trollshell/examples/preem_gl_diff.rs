@@ -516,9 +516,22 @@ enum TickerAt {
 #[derive(Clone, Copy)]
 enum BubbleAt {
     /// The empty string, hugging: the `max(1)`-wide degenerate buffer, no
-    /// cells at all (`u_cols == 0`, no strip), and the **only** case at the
+    /// cells at all (`u_cols == 0`, no strip), and one of the two cases at the
     /// kit's native `scale = 1` — so `u_upscale == 1` is rendered somewhere
     /// rather than only reasoned about.
+    ///
+    /// **On the OLED this case carries no information, and that is worth
+    /// knowing rather than hiding** — `DisplayAt::Blank`'s finding (#1150
+    /// review, MEDIUM-3) in this widget's shape. The OLED's field is
+    /// `0, 0, 0` and the corner cut is to transparent *black*, so an empty box
+    /// there is a frame of pure zeros: `verdict_for` excuses both blank guards
+    /// by design (a flat reference is not evidence of an undrawn framebuffer)
+    /// and every delta is 0 for any renderer that outputs black. Measured under
+    /// an all-black blit it is the one text-box case of twenty that still says
+    /// `PASS`. It is kept rather than special-cased because the other three
+    /// skins' empty cases *do* detect — `textbox.lcd.empty` reports mean 152.308
+    /// there — and a case list that varies by skin is a worse thing to reason
+    /// about than one case that is vacuously green on one skin.
     Empty,
     /// One short line at `scale = 2`, hugging — the pet's own bubble.
     OneLine,

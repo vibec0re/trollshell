@@ -10086,6 +10086,71 @@ mod text_kinds_gl {
         });
     }
 
+    /// **An accent change re-tints a GL text box** — the live-re-tint contract
+    /// (#396/#862), on the one kind whose colors are resolved at
+    /// **construction** rather than at mapping time.
+    ///
+    /// This is the mirror image of
+    /// `an_accent_change_re_tints_a_gl_scope_without_rebuilding_it`: a
+    /// `ScopeGl` resolves its palette per mapping pass and so must **not** be
+    /// rebuilt, while a `TextBoxGl` bakes bg/ink/notdef into its builder and its
+    /// `layout`, and so **must** be — exactly as the CPU `TextBox` is. Dropping
+    /// its bytes is not enough, because the uniforms are mapped from the layout
+    /// and the layout is where the old ink lives.
+    ///
+    /// **Falsified** by removing `Renderer::TextBoxGl` from
+    /// `invalidate_cached_frames`' rebuild branch, which was measured to ship
+    /// green against every other test in this module: the block's glyph bits do
+    /// not move on a re-tint, so a test that only compared those saw nothing.
+    /// A bubble stuck on the previous accent until its plugin next sent a
+    /// message is what that leaves on the glass.
+    #[test]
+    fn an_accent_change_re_tints_a_gl_textbox() {
+        let _ink = preem_ink_lock();
+        super::super::preem_gl::with_gl_arm(|| {
+            let key = Scope::detached("textbox-accent");
+            // A role-less style takes the session accent, which is what moves
+            // here — `kit_box`'s `Crt` skin tints its ink from it.
+            let node = preem_node(Some("tb"), textbox_widget("mrrp mrrp"));
+
+            super::tint_in_process_surfaces(Some([0x00, 0xff, 0x00, 0xff]));
+            let (_, _, green) = mapped_gl_for(&key, &node, super::super::preem_gl::TEXTBOX);
+            super::tint_in_process_surfaces(Some([0xff, 0x00, 0xff, 0xff]));
+            let (_, _, magenta) = mapped_gl_for(&key, &node, super::super::preem_gl::TEXTBOX);
+
+            assert_ne!(
+                green.values, magenta.values,
+                "the accent reaches the shader as a uniform",
+            );
+            assert_eq!(
+                green.data.as_deref(),
+                magenta.data.as_deref(),
+                "…and only the colors moved: the glyph block is the same bits",
+            );
+            // The bytes it re-tints *to* are the kit's own, which is the half a
+            // uniform comparison alone cannot say.
+            super::tint_in_process_surfaces(None);
+            let (_, _, plain) = mapped_gl_for(&key, &node, super::super::preem_gl::TEXTBOX);
+            let want = kit_box().layout("mrrp mrrp").colors();
+            let ink = plain
+                .values
+                .iter()
+                .find(|(name, _)| *name == "u_ink")
+                .expect("u_ink is mapped")
+                .1;
+            assert_eq!(
+                ink,
+                hytte::ui::gl_surface::GlValue::Vec4([
+                    f32::from(want.1[0]),
+                    f32::from(want.1[1]),
+                    f32::from(want.1[2]),
+                    f32::from(want.1[3]),
+                ]),
+                "the re-tinted ink is the one the kit's own builder baked",
+            );
+        });
+    }
+
     /// **A GL text box falls back without waiting for a frame that never
     /// comes** — the context-failure hook, on the more exposed of the two.
     ///

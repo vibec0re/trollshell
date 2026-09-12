@@ -383,14 +383,25 @@ impl Kind {
             // legal colors can exceed it — and `max: 192` sits just above it so
             // a corner drawn in some third color still shows.
             //
-            // That makes `max` the weaker half here, and **the mean is what
-            // carries this kind**: it is a count in disguise, since each
-            // disagreement contributes the same full contrast. 14.016 over 244
-            // edge pixels is ~19 fragments the arc moved; `24` allows ~33, and
-            // a corner radius off by one moves 40+ (measured: `u_corner + 1`
-            // reports edge mean 33.7 and fails). The blank-render case is not
-            // this budget's job at all — an undrawn framebuffer moves the
-            // *field* bin and `interior_max()` catches it first.
+            // That makes `max` the weaker half here, and the mean is a count in
+            // disguise: 14.016 over 244 edge pixels is ~19 fragments the arc
+            // moved, and `24` allows ~33.
+            //
+            // **What this budget does and does not catch, measured rather than
+            // assumed.** An undrawn framebuffer is not its job — an all-black
+            // blit moves the *field* bin and the two blank guards fire first
+            // (19 of the 20 text-box cases go red there, all four supersampled
+            // ones among them). A corner arc **one logical pixel narrower** on
+            // the continuous branch alone is caught, and again by
+            // `Regions::interior_max` rather than by this pair: the narrower arc
+            // eats pixels the kit filled solid, which are interior. A corner arc
+            // one logical pixel **wider** on that branch alone is **not caught
+            // at all** — all 96 cases pass and the lcd's edge mean *falls* to
+            // 8.852, because a wider arc happens to sit closer to the kit's own
+            // stair than the true one does. That is the residual hole, stated in
+            // full at [`case_verdict`]. What does catch a corner drift loudly is
+            // the 1:1 half: a drift that is not deliberately gated on the snap
+            // (plain `u_corner + 1`) reds 12 of the 16 pinned cases.
             Self::TextBox => EdgeBudget {
                 mean: 24.0,
                 max: 192,
@@ -494,13 +505,26 @@ pub(crate) enum Sampling {
 ///   budget — a tick or an arc 50 % wider on the gauge; a dot radius 5 %
 ///   larger (caught on no skin; 10 % on one, oled) or a halo 25 % stronger
 ///   (caught on none, edge mean ≤ 12.245 / max ≤ 48 against 16 / 64) on the
-///   dot matrix and, by construction, on the marquee; on the text box a corner
-///   radius **one logical pixel** wider is the smallest drift its budget does
-///   catch (measured: edge mean 33.7 against 24), so anything sub-pixel there
-///   is open too. Neither the source scan nor the region split sees any of
-///   them. #893's ceiling is deliberately **not** applied here: it is a
-///   statement about rounding between two renders of one picture, and half the
-///   frame's pixels are edges on a dial.
+///   dot matrix and, by construction, on the marquee.
+///
+///   **On the text box the hole has a direction, and it is worth knowing
+///   which.** Measured: a corner arc one logical pixel **wider** on the
+///   continuous branch alone is not caught at all — all 96 cases pass and the
+///   lcd's edge mean *falls* from 14.016 to 8.852, because a wider arc happens
+///   to sit closer to the kit's own stair than the true one does. One a logical
+///   pixel **narrower** is caught, but by [`Regions::interior_max`] rather than
+///   by the edge budget: a narrower arc eats pixels the kit filled solid, and
+///   those are interior. The asymmetry is the arc's own property — it only ever
+///   *adds* material relative to the kit's discrete disc
+///   (`textbox::tests::the_unbiased_arc_fills_the_buffers_own_edges` asserts
+///   exactly that), so widening it moves pixels the kit had already classified
+///   as edges. What does catch a corner drift loudly is the 1:1 half: a drift
+///   that is not deliberately gated on the snap reds 12 of the 16 pinned cases.
+///
+///   Neither the source scan nor the region split sees any of these. #893's
+///   ceiling is deliberately **not** applied here: it is a statement about
+///   rounding between two renders of one picture, and half the frame's pixels
+///   are edges on a dial.
 pub(crate) fn case_verdict(
     stats: &Stats,
     regions: &Regions,
@@ -1485,6 +1509,13 @@ mod tests {
             "…and the mean is the half that carries this kind — it is a count of \
              moved corner fragments, since each one contributes the same contrast",
         );
+        // What this pair does **not** catch is written down at
+        // `Kind::edge_budget` and `case_verdict` with the measurement behind
+        // it: a corner arc a logical pixel wider on the continuous branch alone
+        // clears it (the edge mean falls), and a narrower one is caught by
+        // `interior_max` instead. Neither is asserted here, because neither is
+        // a property of this function — they are properties of the shader, and
+        // the honest place for them is the doc a reader reaches first.
     }
 
     /// The `TROLLSHELL_PARITY_EXACT=1` pin binds the **dot matrix** too

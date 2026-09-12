@@ -321,6 +321,36 @@ mod tests {
         assert!(!p.warned);
     }
 
+    /// The `"-leading-hyphen"` fixture (`model.rs`'s `AgentName` test names it
+    /// "a P2 argv concern, not this type's") is safe **because of the shape
+    /// of the argv**, and this pins that shape byte for byte: the name travels
+    /// as its own element after `--agent`, never joined with `=` and never
+    /// preceded by anything that could read it as a flag.
+    ///
+    /// Why the shape matters: `trollshell-agent-window::cli::parse` is
+    /// hand-rolled, not `clap`. On the token `"--agent"` it takes the *next*
+    /// token as the value unconditionally, without re-examining it for a
+    /// leading `-`, so a name starting with one is never reinterpreted as a
+    /// flag — and `--agent=<name>` would in fact *break* it (no `=`-splitting
+    /// arm; the joined token falls to its `Unknown` arm, verified red while
+    /// this test was written). The parser side of the same contract is
+    /// `trollshell-agent-window`'s `the_plugins_own_argv_parses_on_both_tabs`,
+    /// which feeds this builder's output — this fixture included — through the
+    /// real parser; it lives there rather than here because a dev-dependency
+    /// from this crate back onto the window would link the web engine into
+    /// this crate's test build.
+    #[test]
+    fn a_leading_hyphen_name_is_its_own_argv_element() {
+        assert_eq!(
+            argv("-leading-hyphen", Tab::Agent),
+            [BINARY, ARG_AGENT, "-leading-hyphen"]
+        );
+        assert_eq!(
+            argv("-leading-hyphen", Tab::Settings),
+            [BINARY, ARG_AGENT, "-leading-hyphen", ARG_TAB, "settings"]
+        );
+    }
+
     /// The real probe resolves **once**: a second call does not re-scan.
     ///
     /// Falsification: drop the `cached` field (or re-run `lookup` every call)

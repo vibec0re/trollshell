@@ -30,8 +30,20 @@ use crate::hive::wire::{AgentStatusRow, Approval, ApprovalStatus, VersionMismatc
 /// so tightening it now is also the cheapest time to do it. Note for that
 /// phase: `[a-z0-9-]` still admits a **leading hyphen** (`--rm` is a legal
 /// `Ident`), which is an argv concern shared with upstream rather than
-/// something this type can fix — an argv builder must pass `--` or an
-/// explicit `--agent=<name>`, never bare interpolation.
+/// something this type can fix.
+///
+/// **Resolved for P2 (#1167):** `window::argv` passes the name as its own
+/// `Vec` element — `["--agent", name]`, two entries, never `format!("--agent
+/// {name}")` or any other joined string — and
+/// `trollshell-agent-window::cli::parse` is hand-rolled rather than `clap`: on
+/// seeing `"--agent"` it unconditionally consumes the *next* token as the
+/// value without re-examining it for a leading `-`. So a name starting with
+/// one is never reinterpreted as a flag, and no `--`/`--agent=<name>` spelling
+/// is needed — that spelling would in fact **break** this specific parser,
+/// which has no `=`-splitting arm (see
+/// `window::tests::a_leading_hyphen_name_round_trips_through_the_real_window_parser`,
+/// which round-trips the fixture below through the real parser and is
+/// falsified by switching to the joined form).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AgentName(String);
 
@@ -811,7 +823,7 @@ mod tests {
             "a",
             "agent-9",
             "9",
-            "-leading-hyphen", // legal Ident; a P2 argv concern, not this type's
+            "-leading-hyphen", // legal Ident; P2 argv round-trip covered in window.rs (#1167)
             &"a".repeat(AgentName::MAX_LEN),
         ] {
             assert!(AgentName::parse(ok).is_some(), "should accept {ok:?}");

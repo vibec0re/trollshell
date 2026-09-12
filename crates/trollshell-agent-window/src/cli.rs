@@ -221,18 +221,26 @@ mod tests {
     /// the window cannot read.
     ///
     /// Mutation (verified red, #1130 review M10): rename a flag on either side.
+    ///
+    /// `"-leading-hyphen"` is the fixture `hytte-plugin-agents`' `AgentName`
+    /// test marks as an argv concern (#1167): this parser takes the token after
+    /// `--agent` unconditionally, so a legal name that starts with `-` is a
+    /// name here and not a flag — asserted through the real builder so a
+    /// change to either side (an `=`-joined form, a re-examined value) reds.
     #[test]
     fn the_plugins_own_argv_parses_on_both_tabs() {
         use hytte_plugin_agents::window;
-        for (tab, expected) in [
-            (window::Tab::Agent, Tab::Agent),
-            (window::Tab::Settings, Tab::Settings),
-        ] {
-            let argv = window::argv("trollshell-choom", tab);
-            assert_eq!(argv[0], "trollshell-agent-window", "the binary name");
-            let parsed = parse(&argv[1..]).expect("the plugin's own argv parses");
-            assert_eq!(parsed.agent.as_str(), "trollshell-choom");
-            assert_eq!(parsed.tab, expected);
+        for name in ["trollshell-choom", "-leading-hyphen"] {
+            for (tab, expected) in [
+                (window::Tab::Agent, Tab::Agent),
+                (window::Tab::Settings, Tab::Settings),
+            ] {
+                let argv = window::argv(name, tab);
+                assert_eq!(argv[0], "trollshell-agent-window", "the binary name");
+                let parsed = parse(&argv[1..]).expect("the plugin's own argv parses");
+                assert_eq!(parsed.agent.as_str(), name);
+                assert_eq!(parsed.tab, expected);
+            }
         }
     }
 

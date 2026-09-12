@@ -890,8 +890,15 @@ mod tests {
     ///
     /// Falsify by swapping `supervise_observer`'s
     /// `spawn_supervised_blocking_bounded` back to `spawn_supervised_blocking`:
-    /// the row then survives forever in `Returned` and this test times out
-    /// waiting for it to disappear.
+    /// the row then survives forever in `Returned` and the second wait below
+    /// times out.
+    ///
+    /// Waits for the row to **appear** before waiting for it to disappear.
+    /// Without that first wait, a body that returns as fast as this one does
+    /// can race the tokio scheduler: checking only for absence would read "no
+    /// row" while supervision simply hadn't started yet, and pass even against
+    /// the plain `spawn_supervised_blocking` this test exists to catch —
+    /// measured, not hypothetical (it did, until this fix).
     #[test]
     fn a_returning_observer_releases_its_row_instead_of_sticking() {
         const NAME: &str = "test-idle-observer-bounded-return";
@@ -900,27 +907,42 @@ mod tests {
         let dimmed = Arc::new(AtomicBool::new(false));
 
         supervise_observer(NAME, state, dimmed, |_state, _dimmed| {
-            // Returns immediately — no `ext_idle_notifier_v1`, nothing to do.
+            // A brief pause before returning widens the window in which the
+            // row is observably present, so the first wait below is not
+            // itself a race against an instant return.
+            std::thread::sleep(Duration::from_millis(50));
         });
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let released = loop {
-            if !hytte_reactive::health::snapshot()
-                .iter()
-                .any(|h| h.name == NAME)
-            {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
         assert!(
-            released,
+            wait_for(Duration::from_secs(5), || health_row_exists(NAME)),
+            "the supervisor never published a health row for {NAME}"
+        );
+        assert!(
+            wait_for(Duration::from_secs(5), || !health_row_exists(NAME)),
             "a designed return from the observer must release its health row, not leave it \
              Returned forever"
         );
+    }
+
+    /// Whether `hytte_reactive::health` still carries a row for `name`.
+    fn health_row_exists(name: &str) -> bool {
+        hytte_reactive::health::snapshot()
+            .iter()
+            .any(|h| h.name == name)
+    }
+
+    /// Poll `cond` until it holds or `within` elapses; returns whether it held.
+    fn wait_for(within: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if cond() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

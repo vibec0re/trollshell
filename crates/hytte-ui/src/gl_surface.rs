@@ -579,6 +579,20 @@ impl RefusedBuilds {
     }
 }
 
+/// A [`WarnLatch`] key for a program *name* (PR #1199 review, NIT 1).
+///
+/// `WarnLatch` keys on a `u64` because its other two call sites key on a
+/// length and a framebuffer status; a `GlProgram` is a `&'static str`, so it
+/// is hashed to fit — the same `DefaultHasher` `shader_surface::source_key`
+/// uses, and with far less riding on it: a collision here costs one journal
+/// line about a program nobody registered, not a silently blank widget.
+fn program_key(program: GlProgram) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    program.0.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// How many distinct refused data-strip lengths a [`WarnLatch`] remembers.
 ///
 /// Mirrors `shader_surface::WARNED_SOURCES` and its rationale: a one-entry
@@ -814,8 +828,8 @@ mod imp {
         BuildKey, DataFailure, GLSL_HEADER, GlBlend, GlDraw, GlInput, GlPass, GlPipeline,
         GlProgram, GlTarget, GlUniforms, GlValue, PIPELINE_BUILD_REFUSED,
         PROGRAM_UNREGISTERED_REFUSED, PROGRAMS, RefusedBuilds, SAMPLER_NAMES, WarnLatch,
-        abandon_gl, fit_rect, fresh_last_drawn, gdk, glib, last_drawn_after, refuse_data_strip,
-        resources_reusable, steps_owed, warn_on_target_failure,
+        abandon_gl, fit_rect, fresh_last_drawn, gdk, glib, last_drawn_after, program_key,
+        refuse_data_strip, resources_reusable, steps_owed, warn_on_target_failure,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
@@ -872,8 +886,23 @@ mod imp {
         resources: RefCell<Option<Resources>>,
         /// The last `step_seq` the accumulator has been advanced to.
         last_drawn: Cell<u64>,
-        /// One-shot latch for "this program is not registered".
-        warned_unregistered: Cell<bool>,
+        /// Journal latch for "this program is not registered", **keyed by the
+        /// program name** via [`program_key`] (PR #1199 review, NIT 1).
+        ///
+        /// A bare `Cell<bool>` before, and the last one in this file: two
+        /// different unregistered names cost one line between them, so the
+        /// second — a genuinely different fact, with a different missing
+        /// `register` call behind it — was swallowed by the first for the
+        /// life of the surface. Log-only either way (this arm recompiles
+        /// nothing), which is why it is a nit rather than a defect, but it is
+        /// the shape the rest of this round converted and it costs one
+        /// [`WarnLatch`].
+        ///
+        /// **Not** cleared by `unrealize`, unlike `refused_builds`: a
+        /// program's absence from [`PROGRAMS`] is a fact about the process,
+        /// not about this surface's context, so a re-realise is not news
+        /// about it.
+        warned_unregistered: RefCell<WarnLatch>,
         /// The builds this surface has been refused, keyed by `(grid,
         /// program)` — so a broken shader costs **one compile** and one
         /// journal line, not one of each per frame (#1180 item 2). This
@@ -1059,7 +1088,11 @@ mod imp {
             let Some(state) = state else { return };
             let Some(pipeline) = PROGRAMS.with_borrow(|programs| programs.get(&program).copied())
             else {
-                if !self.warned_unregistered.replace(true) {
+                if self
+                    .warned_unregistered
+                    .borrow_mut()
+                    .claim(program_key(program))
+                {
                     tracing::warn!(program = program.0, "{}", PROGRAM_UNREGISTERED_REFUSED);
                 }
                 return;
@@ -2323,7 +2356,7 @@ mod tests {
         MAX_STEPS_PER_RENDER, PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED, REFUSED_BUILDS,
         RENDER_TARGET_REFUSED, RefusedBuilds, WARNED_LENGTHS, WarnLatch, abandon_gl, fit_rect,
         framebuffer_status_key, fresh_last_drawn, gl_abandoned, hgl, last_drawn_after,
-        refuse_data_strip, resources_reusable, steps_owed, warn_on_data_failure,
+        program_key, refuse_data_strip, resources_reusable, steps_owed, warn_on_data_failure,
         warn_on_target_failure,
     };
     use std::cell::RefCell;
@@ -2405,6 +2438,43 @@ mod tests {
             latch.borrow().said.len(),
             2,
             "a different framebuffer status must get its own line, not be silenced by the first",
+        );
+    }
+
+    /// **PR #1199 review, NIT 1.** The unregistered-program latch is keyed by
+    /// the program *name*, so a second, different missing registration gets
+    /// its own line.
+    ///
+    /// This field shipped as the file's last bare `Cell<bool>`: two
+    /// unregistered names cost one line between them, and the second — a
+    /// different missing `register` call, with a different fix — was
+    /// swallowed for the life of the surface. Log-only (the arm recompiles
+    /// nothing), which is the whole reason it is a nit.
+    ///
+    /// **Falsified** by keying [`program_key`] on a constant: the third
+    /// claim returns `false`.
+    #[test]
+    fn two_unregistered_program_names_each_get_their_own_line() {
+        let mut latch = WarnLatch::default();
+
+        assert_ne!(
+            program_key(GlProgram("preem.scope")),
+            program_key(GlProgram("preem.dot_matrix")),
+            "two program names are two different facts",
+        );
+
+        assert!(
+            latch.claim(program_key(GlProgram("preem.scope"))),
+            "the first unregistered program is reported",
+        );
+        assert!(
+            !latch.claim(program_key(GlProgram("preem.scope"))),
+            "…once",
+        );
+        assert!(
+            latch.claim(program_key(GlProgram("preem.dot_matrix"))),
+            "a different unregistered program must get its own line, not be silenced by the \
+             first (PR #1199 review, NIT 1)",
         );
     }
 

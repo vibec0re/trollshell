@@ -636,13 +636,33 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
 
 // ── NameOwnerChanged watcher ──────────────────────────────────────────────────
 
-/// Sweep every registered item whose owning bus name is no longer live,
-/// using a fresh `ListNames` as the source of truth — the repair for a
-/// `Resubscribed`/`Lagged` marker on the `NameOwnerChanged` subscription
-/// (#1201). Before that fix a missed release (the emission that would have
-/// called [`State::unregister_by_bus_name`]) left a dead tray icon forever,
-/// since nothing else in this fold ever re-checks a bus name once
+/// Sweep every registered item that is no longer there, using a fresh
+/// `ListNames` plus a re-read of each survivor as the source of truth — the
+/// repair for a `Resubscribed`/`Lagged` marker on the `NameOwnerChanged`
+/// subscription (#1201). Before that fix a missed release (the emission that
+/// would have called [`State::unregister_by_bus_name`]) left a dead tray icon
+/// forever, since nothing else in this fold ever re-checks a bus name once
 /// registered.
+///
+/// Two levels of "no longer there", because `ListNames` only answers the first
+/// one (#1201 review L7):
+///
+/// * the **bus name** is gone — the item's process exited, or released the
+///   name. `ListNames` says so.
+/// * the **object** is gone while the process lives on — an app that dropped
+///   its `StatusNotifierItem` during the gap. No `ListNames` answer covers
+///   that, `PeerGone` never fires (the peer is alive), and [`watch_item`]'s
+///   `still_alive` re-read only runs when one of its four signals fires — and
+///   for an object that is already gone there is no next signal. So the row
+///   was immortal. Re-reading each survivor's properties settles it: the read
+///   fails and [`State::refresh_item`] drops the row, exactly as it does on
+///   the `watch_item` path.
+///
+/// That re-read is not only a liveness probe: it also repairs whatever
+/// `NewIcon`/`NewTitle`/`NewStatus`/`NewToolTip` was lost while the
+/// subscription was down, which is the other half of the same hole.
+///
+/// `refresh` is injectable so a test can stand in for the per-item round trip.
 async fn prune_dead_bus_names(state: &State) {
     let live: Vec<String> = match call(BusKind::Session, "org.freedesktop.DBus")
         .at_path("/org/freedesktop/DBus")
@@ -659,15 +679,69 @@ async fn prune_dead_bus_names(state: &State) {
         }
     };
 
-    let mut map = state.registered.lock().await;
-    let before = map.len();
-    map.retain(|_, item| live.contains(&item.bus_name));
-    let removed = before - map.len();
-    drop(map);
+    resync_items(state, &live, |bus_name, object_path| async move {
+        state.refresh_item(&bus_name, &object_path).await
+    })
+    .await;
+}
 
-    if removed > 0 {
-        tracing::debug!(removed, "tray: pruned dead bus names on re-sync");
-        state.rebuild_published_list().await;
+/// The body of [`prune_dead_bus_names`] once `ListNames` has answered: drop
+/// every item whose bus name is absent from `live`, then re-read each survivor
+/// through `still_alive` and drop the ones that no longer answer.
+async fn resync_items<Alive, Fut>(state: &State, live: &[String], mut still_alive: Alive)
+where
+    Alive: FnMut(String, String) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    // Level one: the bus name is gone.
+    let mut gone: Vec<String> = Vec::new();
+    {
+        let mut map = state.registered.lock().await;
+        map.retain(|key, item| {
+            let keep = live.contains(&item.bus_name);
+            if !keep {
+                gone.push(key.clone());
+            }
+            keep
+        });
+    }
+
+    // Level two: the bus name is live but the object may not be. Re-read each
+    // survivor; `refresh_item` removes the ones whose read fails.
+    let survivors: Vec<(String, String, String)> = state
+        .registered
+        .lock()
+        .await
+        .values()
+        .map(|item| {
+            (
+                item.key.clone(),
+                item.bus_name.clone(),
+                item.object_path.clone(),
+            )
+        })
+        .collect();
+    for (key, bus_name, object_path) in survivors {
+        if !still_alive(bus_name, object_path).await {
+            // Remove it here rather than leaning on `refresh_item`'s own
+            // removal: `still_alive` is a predicate to this function, and a
+            // predicate whose answer only counts if it also mutated the map
+            // would be a trap for the next caller (and for the tests).
+            state.registered.lock().await.remove(&key);
+            gone.push(key);
+        }
+    }
+
+    if gone.is_empty() {
+        return;
+    }
+
+    tracing::debug!(removed = gone.len(), "tray: pruned dead items on re-sync");
+    state.rebuild_published_list().await;
+    // Tell the rest of the session what we just dropped: we are the watcher,
+    // and `watch_item`'s own removal paths emit this too.
+    for key in gone {
+        state.emit_unregistered(key).await;
     }
 }
 
@@ -1008,5 +1082,118 @@ mod tests {
             1,
             "Lagged must re-sync exactly once"
         );
+    }
+
+    // ── #1201 review L7: the prune covers object-level death too ────────────
+
+    use super::{ItemStatus, TrayItem, resync_items};
+
+    async fn register(state: &State, bus_name: &str, object_path: &str) -> String {
+        let key = format!("{bus_name}{object_path}");
+        state.registered.lock().await.insert(
+            key.clone(),
+            TrayItem {
+                key: key.clone(),
+                bus_name: bus_name.to_string(),
+                object_path: object_path.to_string(),
+                title: String::new(),
+                icon_name: String::new(),
+                status: ItemStatus::Active,
+                icon_pixmap: None,
+                tooltip_title: String::new(),
+                tooltip_description: String::new(),
+                menu_path: None,
+                item_is_menu: false,
+            },
+        );
+        state.rebuild_published_list().await;
+        key
+    }
+
+    /// An item whose process is still alive but whose `StatusNotifierItem`
+    /// object went away during the gap was immortal: `ListNames` still lists
+    /// the bus name, `PeerGone` never fires for a live peer, and `watch_item`'s
+    /// own `still_alive` re-read only runs when one of its four signals fires —
+    /// and a gone object sends no next signal. The re-sync must re-read each
+    /// survivor and drop the ones that no longer answer.
+    ///
+    /// Falsifiable: deleting the survivor loop from `resync_items` leaves the
+    /// dead object published.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resync_drops_an_item_whose_object_is_gone_but_bus_name_lives() {
+        let state = empty_state();
+        let alive_key = register(&state, ":1.7", "/StatusNotifierItem").await;
+        let dead_key = register(&state, ":1.9", "/StatusNotifierItem").await;
+        assert_eq!(state.items.get_cloned().len(), 2);
+
+        // Both bus names are still on the bus; only one object still answers.
+        let live = vec![":1.7".to_string(), ":1.9".to_string()];
+        resync_items(&state, &live, |bus_name, _path| async move {
+            bus_name == ":1.7"
+        })
+        .await;
+
+        let keys: Vec<String> = state
+            .items
+            .get_cloned()
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![alive_key],
+            "the item whose object stopped answering must be pruned"
+        );
+        assert!(!state.registered.lock().await.contains_key(&dead_key));
+    }
+
+    /// The bus-name level still works, and a dead bus name is not re-read —
+    /// asking a name that is gone is a round trip that can only time out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resync_drops_a_dead_bus_name_without_re_reading_it() {
+        let state = empty_state();
+        let alive_key = register(&state, ":1.7", "/StatusNotifierItem").await;
+        register(&state, ":1.9", "/StatusNotifierItem").await;
+
+        let asked = Arc::new(AtomicUsize::new(0));
+        let asked2 = asked.clone();
+        let live = vec![":1.7".to_string()];
+        resync_items(&state, &live, move |_bus, _path| {
+            let asked = asked2.clone();
+            async move {
+                asked.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+        })
+        .await;
+
+        let keys: Vec<String> = state
+            .items
+            .get_cloned()
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
+        assert_eq!(keys, vec![alive_key]);
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "only the survivor is re-read"
+        );
+    }
+
+    /// A re-sync that finds everything present must not churn the published
+    /// list (the widget layer's bind rebuilds on every `set`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn resync_with_nothing_gone_publishes_nothing() {
+        let state = empty_state();
+        register(&state, ":1.7", "/StatusNotifierItem").await;
+        let before = state.items.get_cloned();
+
+        let live = vec![":1.7".to_string()];
+        resync_items(&state, &live, |_bus, _path| async { true }).await;
+
+        let after = state.items.get_cloned();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(after[0].key, ":1.7/StatusNotifierItem");
     }
 }

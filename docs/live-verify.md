@@ -428,8 +428,8 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       a hot-plug is correct, not a regression, and its _absence_ would be the
       bug.
 - [ ] **(#1165)** **The crasher, on glass.** Everything below is bounded by a
-      hermetic test, but only a real GTK main loop can show that the *shell
-      stays usable*, which is the thing the caps are for. Point a scratch plugin
+      hermetic test, but only a real GTK main loop can show that the _shell
+      stays usable_, which is the thing the caps are for. Point a scratch plugin
       at the live socket and have it render a `Node::Label` whose text is ~8 MiB
       (`"a".repeat(8 << 20)`) — inside the 16 MiB frame cap, so the frame is
       legal. Expect: the chip renders a 4 KiB prefix, **the bar keeps
@@ -441,9 +441,9 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       `Effect::RaiseOsd { title: <8 MiB> }`: the OSD shows a prefix, the shell
       stays responsive, one warn.
 - [ ] **(#1165)** `RunCommand` memory. With a plugin holding
-      `Capability::RunCommand`, emit
-      `Effect::run_command(1, ["sh", "-c", "yes"])` (attached, i.e. `detached:
-      false`) and watch `systemctl --user status trollshell`'s `Memory:` line.
+      `Capability::RunCommand`, emit the **attached** (`detached: false`)
+      `Effect::run_command(1, ["sh", "-c", "yes"])`
+      and watch `systemctl --user status trollshell`'s `Memory:` line.
       It must stay flat, the reply must come back within a second or so with
       `ok: false`, and the journal must say _"wrote more than the host will
       read; killed"_. Before this the host buffered the child's whole stdout for

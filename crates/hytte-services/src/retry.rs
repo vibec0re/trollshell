@@ -385,8 +385,8 @@ const SHIPPED: &[(&str, Policy)] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureLatch, Policy, RECONNECT_RESET_AFTER, RECONNECT_RETRY, ReconnectBackoff,
-        Report, SHIPPED, Step,
+        FailureLatch, Policy, RECONNECT_RESET_AFTER, RECONNECT_RETRY, ReconnectBackoff, Report,
+        SHIPPED, Step,
     };
     use std::time::Duration;
 

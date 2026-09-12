@@ -7,11 +7,14 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, Once, PoisonError, RwLock};
 use std::thread;
 
 use futures_signals::signal::Mutable;
+use hytte_reactive::spawn_supervised_blocking;
 use pipewire as pw;
+use pw::channel::Receiver;
 use pw::types::ObjectType;
 
 use super::super::pipewire::{
@@ -25,58 +28,114 @@ use super::types::{
     SpectrumCapture, StateRef, clone_handles,
 };
 
-/// Sender shared across all callers. Populated by [`spawn_mainloop`] before
-/// the loop runs; mutation fns read it with `.get()`. A `OnceLock` keeps
-/// this thread-safe without requiring a `Mutex`, and an inert clone after
-/// `spawn_mainloop` returns is enough to send commands from any thread.
-pub(super) static COMMAND_TX: OnceLock<pw::channel::Sender<Command>> = OnceLock::new();
+/// Sender shared across all callers. Published by [`spawn_mainloop`] before the
+/// loop runs; mutation fns read it through [`send_command`].
+///
+/// A re-settable slot rather than a `OnceLock` since #1170. The mainloop is
+/// supervised now, and a panicking run unwinds **with the `Receiver` it was
+/// holding**: without a way to republish a sender, the restarted run would find
+/// no receiver, and every `set_*` for the rest of the session would go nowhere.
+/// [`session_receiver`] is what re-establishes the pair; [`STARTED`] keeps the
+/// called-twice guard the `OnceLock` used to provide.
+pub(super) static COMMAND_TX: RwLock<Option<pw::channel::Sender<Command>>> = RwLock::new(None);
+
+/// Whether [`spawn_mainloop`] has already run. Its own flag now that
+/// [`COMMAND_TX`] is no longer set-once.
+static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Spawn the pipewire mainloop thread. Returns immediately; the thread
 /// runs for the lifetime of the process. Errors during init (e.g. no
-/// `/run/user/$UID/pipewire-0` socket) are logged and the thread retries
-/// after a short backoff so a daemon restart heals automatically.
+/// `/run/user/$UID/pipewire-0` socket) are logged and the thread reconnects
+/// on a capped ramp so a daemon restart heals automatically.
 ///
-/// Creates the command channel up front and installs the [`Sender`] into
+/// Creates the command channel up front and publishes the [`Sender`] into
 /// [`COMMAND_TX`] before the thread starts running the loop. That way any
 /// `set_*` call from the tokio side that lands before the loop has fully
 /// connected to pipewire goes through the channel and is buffered until
 /// the receiver attaches — never silently dropped.
 ///
+/// **Supervised** since #1170 (the residual of #430): the reconnect loop below
+/// only ever covered `run_once` returning, and `run_once` is where every
+/// registry/param callback runs over daemon-supplied pods. A panic in one took
+/// the thread — and with it sink/source/stream volume, the mute toggle and the
+/// spectrum tap — out for the session, with no log line and nothing to restart
+/// it. **What a restart re-does:** `pw::init()` (guarded by [`PW_INIT`], so the
+/// library is initialised exactly once per process however many times the
+/// closure re-runs), a fresh mainloop/context/core/registry, and a full
+/// registry walk that re-emits every snapshot. The state it republishes lives
+/// in the pipewire daemon, not here, which is the supervisor's own
+/// restart-safety argument.
+///
 /// [`Sender`]: pw::channel::Sender
 pub(super) fn spawn_mainloop(handles: PipewireHandles) {
-    let (tx, rx) = pw::channel::channel::<Command>();
-    if COMMAND_TX.set(tx).is_err() {
-        // Programmer error: start() called twice. Don't overwrite the live
+    if STARTED.swap(true, Ordering::SeqCst) {
+        // Programmer error: start() called twice. Don't disturb the live
         // sender — the second mainloop wouldn't share the first's proxy
         // map and writes would silently no-op.
         tracing::warn!("audio_native: spawn_mainloop called twice; ignoring second start");
         return;
     }
-    // The `pw::channel::Receiver` is not `Send`, so we hand it through a
-    // local `Cell<Option<_>>` style swap: the closure below moves it into
-    // the thread, where it gets `take()`n on first iteration of the retry
-    // loop and re-attached to each fresh mainloop. Concretely, since
-    // mainloop crashes (no daemon, dbus glitch) restart the whole loop,
-    // the receiver must outlive `run_once`. `pipewire::channel::Receiver`
-    // detaches cleanly when `AttachedReceiver` is dropped, so the next
-    // run_once just attaches again.
-    let mut rx = Some(rx);
-    thread::Builder::new()
-        .name("hytte-audio-pw".into())
-        .spawn(move || {
-            pw::init();
-            loop {
-                let handles = clone_handles(&handles);
-                let receiver = rx.take().expect("audio_native: receiver consumed twice");
-                let (returned_rx, res) = run_once(handles, receiver);
-                rx = Some(returned_rx);
-                if let Err(e) = res {
-                    tracing::warn!(error = ?e, "audio_native: mainloop exited, retrying in 1s");
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                }
-            }
-        })
-        .expect("spawn audio_native mainloop thread");
+    publish_channel();
+
+    // The `pw::channel::Receiver` is `!Sync`, and `spawn_supervised_blocking`
+    // wants an `Fn() + Send + Sync` it can re-run from a fresh blocking thread,
+    // so it rides in a mutex. It must outlive any one `run_once`: a mainloop
+    // that exits (no daemon, dbus glitch) restarts, and commands queued
+    // meanwhile have to survive. `pipewire::channel::Receiver` detaches cleanly
+    // when `AttachedReceiver` is dropped, so the next `run_once` just attaches
+    // again.
+    let rx: Mutex<Option<pw::channel::Receiver<Command>>> = Mutex::new(None);
+    spawn_supervised_blocking("pipewire", move || {
+        PW_INIT.call_once(pw::init);
+        run_sessions(&rx, &handles);
+    });
+}
+
+/// `pw_init` is process-global and refcounted; the supervisor may re-enter the
+/// closure any number of times, and once is the honest number.
+static PW_INIT: Once = Once::new();
+
+/// Publish a fresh command channel and hand back its receiver.
+fn publish_channel() -> pw::channel::Receiver<Command> {
+    let (tx, rx) = pw::channel::channel::<Command>();
+    *COMMAND_TX.write().unwrap_or_else(PoisonError::into_inner) = Some(tx);
+    rx
+}
+
+/// The receiver for the next mainloop session.
+///
+/// Normally the previous session's, parked in `slot` — that is what makes a
+/// command issued while the daemon is down arrive once it is back. It is `None`
+/// in exactly two cases: the very first session, and after a session that
+/// **panicked**, which unwinds holding the receiver. Re-creating the channel
+/// there is what keeps a restart a real recovery rather than a mainloop whose
+/// command path is permanently dead; the commands queued on the lost channel
+/// are gone, which is acceptable for a surface that is fire-and-forget volume
+/// setting, and far better than the alternative of `.expect()`ing and turning
+/// one panic into an unbounded panic loop.
+fn session_receiver(slot: &Mutex<Option<pw::channel::Receiver<Command>>>) -> Receiver<Command> {
+    if let Some(rx) = slot.lock().unwrap_or_else(PoisonError::into_inner).take() {
+        return rx;
+    }
+    publish_channel()
+}
+
+/// Run mainloop sessions forever, reconnecting on a capped ramp.
+///
+/// Lives inside the supervised closure rather than being the closure, so the
+/// supervisor's "a clean return means the task finished" rule never fires: this
+/// never returns, and the only way out is a panic, which is what supervision is
+/// for.
+fn run_sessions(slot: &Mutex<Option<pw::channel::Receiver<Command>>>, handles: &PipewireHandles) {
+    loop {
+        let receiver = session_receiver(slot);
+        let (returned_rx, res) = run_once(clone_handles(handles), receiver);
+        *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(returned_rx);
+        if let Err(e) = res {
+            tracing::warn!(error = ?e, "audio_native: mainloop exited, retrying in 1s");
+            thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
 }
 
 /// One mainloop session. Returns the receiver (so `spawn_mainloop` can
@@ -899,11 +958,92 @@ fn build_enum_format_pod() -> Option<Vec<u8>> {
 /// Send a command on the loop's channel, or warn if the service hasn't
 /// started yet. Helper for the eight wrappers below.
 pub(super) fn send_command(cmd: Command) {
-    let Some(tx) = COMMAND_TX.get() else {
+    let published = COMMAND_TX.read().unwrap_or_else(PoisonError::into_inner);
+    let Some(tx) = published.as_ref() else {
         tracing::warn!("audio_native: command before service started");
         return;
     };
     if tx.send(cmd).is_err() {
         tracing::warn!("audio_native: send_command failed (receiver dropped)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{COMMAND_TX, Command, pw, session_receiver};
+    use std::sync::{Mutex, PoisonError};
+
+    /// The first session gets a receiver, and the sender behind it is the one
+    /// `send_command` publishes to — otherwise every `set_*` before the daemon
+    /// answers goes nowhere, which is the guarantee `spawn_mainloop`'s doc
+    /// makes.
+    #[test]
+    fn the_first_session_publishes_a_live_command_channel() {
+        let slot = Mutex::new(None);
+        let rx = session_receiver(&slot);
+
+        let published = COMMAND_TX.read().unwrap_or_else(PoisonError::into_inner);
+        let tx = published
+            .as_ref()
+            .expect("session_receiver must publish a sender");
+        assert!(
+            tx.send(Command::SetSinkMute {
+                name: "probe".into(),
+                mute: true
+            })
+            .is_ok(),
+            "the published sender does not reach the session's receiver"
+        );
+        drop(rx);
+    }
+
+    /// A session that ended normally hands its receiver back, and the next one
+    /// picks *that* up rather than a fresh channel — which is what makes a
+    /// command issued while the daemon is down arrive once it comes back.
+    #[test]
+    fn a_returned_receiver_is_reused_rather_than_replaced() {
+        let slot = Mutex::new(None);
+        let rx = session_receiver(&slot);
+        *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(rx);
+
+        // Whatever `COMMAND_TX` holds now must still reach the *same*
+        // receiver after the next take, so nothing was re-created behind it.
+        let again = session_receiver(&slot);
+        assert!(
+            slot.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "the parked receiver was not taken; the next session would build a second channel"
+        );
+        drop(again);
+    }
+
+    /// #1170's item 2, the audio-specific hazard: a **panicking** session
+    /// unwinds holding the receiver, so the restarted run finds the slot empty.
+    /// It must re-establish the channel rather than `expect()` — an `expect`
+    /// there turns one panic into an unbounded panic loop, which is strictly
+    /// worse than the dead thread supervision replaced.
+    ///
+    /// Falsify by making `session_receiver` `.expect()` the take: this panics.
+    #[test]
+    fn a_receiver_lost_to_a_panic_is_re_established() {
+        // An empty slot is exactly the state a panicked run leaves behind.
+        let slot: Mutex<Option<pw::channel::Receiver<Command>>> = Mutex::new(None);
+        let _first = session_receiver(&slot);
+
+        let rx = session_receiver(&slot);
+        let published = COMMAND_TX.read().unwrap_or_else(PoisonError::into_inner);
+        let tx = published
+            .as_ref()
+            .expect("the re-established channel must be published");
+        assert!(
+            tx.send(Command::SetSinkMute {
+                name: "probe".into(),
+                mute: true
+            })
+            .is_ok(),
+            "after a lost receiver the command path is dead for the session"
+        );
+        drop(rx);
     }
 }

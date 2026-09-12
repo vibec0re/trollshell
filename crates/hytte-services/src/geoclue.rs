@@ -868,74 +868,79 @@ mod tests {
     /// climbs to tens of GB of RSS within a minute (measured while writing
     /// this). That runaway *is* the falsification; run it under a memory cap,
     /// or kill it on sight.
-    #[tokio::test]
-    async fn the_offline_to_online_edge_triggers_exactly_one_extra_resolve() {
+    ///
+    /// Sync + `block_on` rather than `#[tokio::test]`: this one takes
+    /// `TEST_LOCK` (it writes the process-global `shared` map), and a `std`
+    /// guard must not be held across an `await`.
+    #[test]
+    fn the_offline_to_online_edge_triggers_exactly_one_extra_resolve() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        hytte_reactive::runtime::handle().block_on(async {
+            let location = Mutable::new(LocationState::default());
+            let notify = Arc::new(Notify::new());
+            shared::insert(Shared {
+                location: location.clone(),
+                notify: notify.clone(),
+                place_override: Mutable::new(PlaceOverride::default()),
+            });
 
-        let location = Mutable::new(LocationState::default());
-        let notify = Arc::new(Notify::new());
-        shared::insert(Shared {
-            location: location.clone(),
-            notify: notify.clone(),
-            place_override: Mutable::new(PlaceOverride::default()),
-        });
-
-        let calls = Arc::new(AtomicU32::new(0));
-        let resolve = {
-            let calls = calls.clone();
-            move |_ov| {
+            let calls = Arc::new(AtomicU32::new(0));
+            let resolve = {
                 let calls = calls.clone();
-                async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Some(a_fix())
+                move |_ov| {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Some(a_fix())
+                    }
                 }
-            }
-        };
+            };
 
-        // Offline at the start, so the edge is still ahead of us.
-        let primary: Mutable<Option<Link>> = Mutable::new(None);
-        let loop_task = tokio::spawn(run_resolve_loop(
-            location,
-            notify,
-            Mutable::new(PlaceOverride::default()),
-            resolve,
-            FAST_RETRY,
-        ));
-        let watcher = tokio::spawn({
-            let primary = primary.clone();
-            async move { link_up_watcher(|| wait_for_link_up(&primary)).await }
+            // Offline at the start, so the edge is still ahead of us.
+            let primary: Mutable<Option<Link>> = Mutable::new(None);
+            let loop_task = tokio::spawn(run_resolve_loop(
+                location,
+                notify,
+                Mutable::new(PlaceOverride::default()),
+                resolve,
+                FAST_RETRY,
+            ));
+            let watcher = tokio::spawn({
+                let primary = primary.clone();
+                async move { link_up_watcher(|| wait_for_link_up(&primary)).await }
+            });
+
+            // The boot resolve lands and the loop parks (a success arms no timer).
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "the boot resolve");
+
+            primary.set(Some(a_link()));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "the link came back and the location was not re-resolved"
+            );
+
+            // Still online: nothing further happens, however long we wait.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "the link-up edge re-fired while the link never went down"
+            );
+
+            // …and it re-arms: down then up is a second edge, not a second no-op.
+            primary.set(None);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            primary.set(Some(a_link()));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 3, "the edge did not re-arm");
+
+            loop_task.abort();
+            watcher.abort();
+            hytte_reactive::shared::reset_for_tests();
         });
-
-        // The boot resolve lands and the loop parks (a success arms no timer).
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "the boot resolve");
-
-        primary.set(Some(a_link()));
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "the link came back and the location was not re-resolved"
-        );
-
-        // Still online: nothing further happens, however long we wait.
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "the link-up edge re-fired while the link never went down"
-        );
-
-        // …and it re-arms: down then up is a second edge, not a second no-op.
-        primary.set(None);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        primary.set(Some(a_link()));
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 3, "the edge did not re-arm");
-
-        loop_task.abort();
-        watcher.abort();
-        hytte_reactive::shared::reset_for_tests();
     }
 
     /// A link that is already up when the watcher starts is not an edge.

@@ -45,9 +45,8 @@
 //! also enqueue an immediate refresh.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 use std::sync::mpsc;
-use std::thread;
+use std::sync::{OnceLock, PoisonError, RwLock};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, TimeZone};
@@ -59,7 +58,9 @@ use icalendar::{
     Calendar, CalendarComponent, CalendarDateTime, Component, DatePerhapsTime, Todo, TodoStatus,
 };
 
-use crate::eds_retry::{INIT_BACKOFF_START, SourceFailureStreak, next_backoff, wait_backoff};
+use crate::eds_retry::{
+    INIT_BACKOFF_START, SourceFailureStreak, next_backoff, spawn_eds_worker, wait_backoff,
+};
 
 // ── Public data types ────────────────────────────────────────────────────────
 
@@ -152,8 +153,15 @@ static SENDER: OnceLock<mpsc::Sender<Op>> = OnceLock::new();
 
 /// Wakes the worker out of its blocking [`MainContext`] iteration once an op
 /// has been queued, so commands are picked up promptly instead of waiting for
-/// the next EDS push or poll tick. Set once the worker's context exists.
-static WAKER: OnceLock<Waker> = OnceLock::new();
+/// the next EDS push or poll tick. Published once the worker's context exists.
+///
+/// A slot rather than a `OnceLock` since #1170: the worker is supervised, and a
+/// restarted run builds a *fresh* [`MainContext`]. A set-once cell would keep
+/// the dead incarnation's waker, so every later `send_op` would wake a context
+/// nobody iterates and the op would sit in the channel until the next EDS push
+/// or the 60s poll tick — a restart that half-works is worse to diagnose than
+/// one that does not happen.
+static WAKER: RwLock<Option<Waker>> = RwLock::new(None);
 
 fn send_op(op: Op) {
     let Some(tx) = SENDER.get() else {
@@ -167,7 +175,11 @@ fn send_op(op: Op) {
     // Break the worker out of `MainContext::iterate(block=true)` so it drains
     // the queue now rather than on the next push/poll. No-op until the worker
     // has published its waker.
-    if let Some(w) = WAKER.get() {
+    if let Some(w) = WAKER
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+    {
         w.wake();
     }
 }
@@ -205,14 +217,22 @@ impl Service for TasksService {
         let (tx, rx) = mpsc::channel::<Op>();
         let _ = SENDER.set(tx);
 
-        // Dedicated thread. EDS state lives here exclusively. We don't
-        // store a JoinHandle — shell processes that quit cleanly let
-        // the thread drop along with the OnceLock; ungraceful exits get
-        // the same OS cleanup either way.
-        thread::Builder::new()
-            .name("hytte-eds".into())
-            .spawn(move || run_worker(&rx, &tasks_writer, &lists_writer))
-            .expect("spawn EDS worker thread");
+        // Dedicated thread, supervised (#1170; the residual of #430). EDS state
+        // lives here exclusively and nothing else can rebuild it, so a panic
+        // anywhere under `run_worker` — libecal FFI, an iCal parse of
+        // server-supplied data — used to freeze `tasks` and `lists` for the
+        // rest of the session with no log line and nothing to restart it.
+        //
+        // **What a restart re-does:** a fresh `MainContext` (pushed
+        // thread-default on the new blocking thread, its waker republished —
+        // see `WAKER`), a fresh `hytte_ecal::Registry` and an empty per-source
+        // `CalClient` cache, then the whole #432 init-with-backoff dance again.
+        // `SENDER` is set once here, not per run, and the `Receiver` outlives
+        // every run in `spawn_eds_worker`'s mutex — so ops queued while the
+        // worker was down are delivered by the run that follows, not dropped.
+        spawn_eds_worker("tasks-eds", rx, move |rx| {
+            run_worker(rx, &tasks_writer, &lists_writer);
+        });
 
         // Refresh ticker on the tokio runtime.
         spawn_supervised("tasks", || async {
@@ -651,7 +671,7 @@ fn run_worker(
         for _ in rx {}
         return;
     };
-    let _ = WAKER.set(ctx.waker());
+    *WAKER.write().unwrap_or_else(PoisonError::into_inner) = Some(ctx.waker());
 
     // Init with retry + backoff instead of going permanently inert: at
     // session bring-up trollshell and evolution-data-server activate

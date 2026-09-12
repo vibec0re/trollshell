@@ -498,6 +498,21 @@ const REFUSED_BUILDS: usize = 8;
 /// same context is deterministic, so retrying a remembered refusal can only
 /// fail the same way, and clearing on success is exactly what would make an
 /// alternating good/bad pair recompile per frame again.
+///
+/// **…and "in the same context" is a real condition, so the latch ends with
+/// the context** (PR #1199 review, MEDIUM 1). The determinism argued above is
+/// the whole justification for never retrying, and it holds only while the
+/// `GdkGLContext` that refused is the one being asked. A context lost and
+/// remade — a re-parent, a hot-plug, a driver reset — is a *different* driver
+/// state, and the one case where a retry could legitimately succeed. Shipped,
+/// this latch outlived every such recreate: `imp::GlSurface::unrealize`
+/// dropped `resources` and `last_drawn` (both per context) and left the keys
+/// standing, so a surface refused once under a degraded context stayed blank
+/// for the life of the process with `remember` returning `false` — not even a
+/// second journal line to say why. [`RefusedBuilds::clear`] is what
+/// `unrealize` now calls; the sibling widget got this right by construction,
+/// because `shader_surface`'s equivalent latch lives *inside* the resources
+/// that are dropped there.
 #[derive(Debug, Default)]
 struct RefusedBuilds {
     /// The refused keys, oldest first. At most [`REFUSED_BUILDS`].
@@ -508,6 +523,15 @@ impl RefusedBuilds {
     /// Whether `key` is a build this surface already knows will not build.
     fn refused(&self, key: BuildKey) -> bool {
         self.keys.contains(&key)
+    }
+
+    /// Forget every refusal: the context they were measured against is gone.
+    ///
+    /// Called from `unrealize` only — see the type's doc for why a context
+    /// boundary is the one thing that un-latches a key wholesale, while a
+    /// successful build deliberately does not.
+    fn clear(&mut self) {
+        self.keys.clear();
     }
 
     /// Remember `key` as refused, returning whether it is news — which is
@@ -828,6 +852,10 @@ mod imp {
         /// journal line, not one of each per frame (#1180 item 2). This
         /// replaced a bare `warned_build: Cell<bool>`, which silenced the
         /// line and left the recompile running; see [`RefusedBuilds`].
+        ///
+        /// **Per context, and therefore cleared in [`Self::unrealize`]** (PR
+        /// #1199 review, MEDIUM 1) — it belongs with `resources` and
+        /// `last_drawn` above, not with the journal latches below.
         refused_builds: RefCell<RefusedBuilds>,
         /// Journal latch for "a pass's render target would not attach"
         /// (#1180 item 3), keyed by the raw `GL_FRAMEBUFFER_*` status the
@@ -894,12 +922,32 @@ mod imp {
         }
 
         /// Drop every GL object **before** handing back to GTK, with the
-        /// context explicitly made current first.
+        /// context explicitly made current first, and forget everything this
+        /// surface only knows about *that* context.
         ///
         /// The handles' `Drop` calls `glDelete*`, which needs a current
         /// context. GTK makes one current inside its own `unrealize`, but that
         /// runs *after* this override's body, so the `make_current` here is
         /// what actually holds the crate's contract.
+        ///
+        /// **Three things are per context, and all three are reset here**
+        /// (PR #1199 review, MEDIUM 1): `resources` (GL objects), `last_drawn`
+        /// (a step count against an accumulator that no longer exists) and
+        /// `refused_builds` — the last of which shipped standing. Its whole
+        /// argument for never retrying is that the same GLSL at the same grid
+        /// compiles the same way *in the same context*; once the context is
+        /// gone that argument is gone with it, and a surface refused under a
+        /// context that came up degraded would otherwise never be offered to
+        /// the healthy one that replaced it.
+        ///
+        /// The two journal latches (`warned_target`, `warned_data`) are
+        /// deliberately **not** cleared. They gate only the log — neither
+        /// failure behind them is latched, both are retried on the very next
+        /// render regardless — so clearing them would buy a duplicate line per
+        /// re-realise and no retry that was not already happening.
+        /// `warned_unregistered` stays for a different reason: a program's
+        /// absence from [`PROGRAMS`] is a fact about the process, not about
+        /// this surface's context, so a re-realise is not news about it.
         fn unrealize(&self) {
             let obj = self.obj();
             if obj.error().is_none() && obj.context().is_some() {
@@ -907,6 +955,7 @@ mod imp {
             }
             self.resources.replace(None);
             self.last_drawn.set(0);
+            self.refused_builds.borrow_mut().clear();
             self.parent_unrealize();
         }
     }
@@ -1807,6 +1856,129 @@ mod imp {
                 2,
                 "…asked exactly once, like the first"
             );
+        }
+
+        /// **PR #1199 review, MEDIUM 1.** A refusal latched under one
+        /// `GdkGLContext` must not survive that context: after an unrealize /
+        /// re-realize the driver is asked again, and a second refusal writes a
+        /// second journal line.
+        ///
+        /// [`RefusedBuilds`]' own doc rests the never-retry rule on
+        /// determinism "*in the same context*". Shipped, `unrealize` dropped
+        /// `resources` and `last_drawn` and left the keys standing — so the
+        /// one condition the rule names was the one thing nothing checked. A
+        /// driver that refused a compile once (out of memory at login, a
+        /// context that came up degraded) refused it under every later
+        /// context too, with `remember` returning `false`, i.e. permanently
+        /// and silently blank.
+        ///
+        /// Taking the surface out of its window and putting it back is the
+        /// real trigger, not a stand-in: GTK unrealizes an unparented widget
+        /// synchronously and `GtkGLArea` creates a **fresh** context on the
+        /// way back in. (The other trigger — a context lost and remade by the
+        /// driver — cannot be arranged from a test at all.)
+        ///
+        /// Asserted on [`BUILD_ATTEMPTS`] rather than on the journal because
+        /// the two ride the same latch by construction: `remember` returns
+        /// whether to write the line, so a second ask *is* a second line. The
+        /// latch itself is checked directly on both sides of the recreate.
+        ///
+        /// **Falsified** by deleting `refused_builds.borrow_mut().clear()`
+        /// from `unrealize`: the count stays at 1, which is what the review
+        /// measured against the shipped code.
+        #[gtk::test]
+        fn a_refused_pipeline_is_asked_again_on_a_fresh_context() {
+            const BROKEN: GlPass = GlPass {
+                vertex: VERTEX,
+                fragment: "void main() { this is not GLSL }",
+                target: GlTarget::Screen,
+                inputs: &[],
+                blend: GlBlend::Replace,
+                draw: GlDraw::FullScreen,
+            };
+            const BROKEN_PASS: [GlPass; 1] = [BROKEN];
+
+            let Some((window, surface, _gl)) =
+                realised_surface_or_skip("a_refused_pipeline_is_asked_again_on_a_fresh_context")
+            else {
+                return;
+            };
+
+            let program = GlProgram("gl_surface_test.will_not_build_realised");
+            PROGRAMS.with_borrow_mut(|programs| {
+                programs.insert(
+                    program,
+                    GlPipeline {
+                        aux: 0,
+                        step: &[],
+                        frame: &BROKEN_PASS,
+                    },
+                );
+            });
+            let state = Arc::new(GlUniforms {
+                values: Vec::new(),
+                data: None,
+                grid: (4, 4),
+                step_seq: 0,
+            });
+            surface.set_state(program, 4, 4, &state);
+
+            BUILD_ATTEMPTS.set(0);
+            surface.imp().draw();
+            surface.imp().draw();
+            assert_eq!(
+                BUILD_ATTEMPTS.get(),
+                1,
+                "the refusal is latched within one context (#1180 item 2)",
+            );
+            assert!(
+                surface.imp().refused_builds.borrow().refused(((4, 4), program)),
+                "…keyed by (grid, program)",
+            );
+
+            // Out of the window: GTK unroots, which unrealizes, which is the
+            // only place the per-context state is dropped. The local `surface`
+            // is what keeps the widget alive across this.
+            window.set_child(None::<&gtk::Widget>);
+            assert!(
+                !surface.is_realized(),
+                "unparenting a realised widget must unrealize it — the premise of this test",
+            );
+            assert!(
+                surface.imp().refused_builds.borrow().keys.is_empty(),
+                "unrealize must forget refusals measured against a context that is gone \
+                 (PR #1199 review, MEDIUM 1)",
+            );
+
+            // …and back in, onto a context GTK creates fresh.
+            window.set_child(Some(&surface));
+            for _ in 0..1000 {
+                if surface.is_realized() && surface.width() > 0 {
+                    break;
+                }
+                if !glib::MainContext::default().iteration(false) {
+                    break;
+                }
+            }
+            assert!(
+                surface.is_realized() && surface.error().is_none(),
+                "the surface must come back with a context of its own",
+            );
+            surface.make_current();
+            surface.imp().draw();
+
+            assert_eq!(
+                BUILD_ATTEMPTS.get(),
+                2,
+                "a fresh context is a fresh question: the pipeline must be offered to it, and \
+                 the refusal reported again (PR #1199 review, MEDIUM 1)",
+            );
+            assert!(
+                surface.imp().refused_builds.borrow().refused(((4, 4), program)),
+                "…and re-latched against the new context, so it is still asked only once",
+            );
+
+            window.destroy();
         }
 
         /// **#1180 item 9.** A **realised widget** draws a real pipeline end

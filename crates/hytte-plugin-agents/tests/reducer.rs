@@ -1061,6 +1061,7 @@ fn the_dashboard_link_opens_the_hives_root_once_urls_have_landed() {
     m.update(Input::App(Msg::Urls(Box::new(HiveUrls {
         domain: Some("hive.local".to_owned()),
         home: Some("  https://hive.local/  ".to_owned()),
+        forge: None,
     }))));
     assert_eq!(
         m.update(click("open-dashboard")),

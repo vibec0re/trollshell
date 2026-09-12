@@ -44,6 +44,20 @@ hytte-bus = { path = "../hytte-bus" }
 # this app can share it without linking `hytte-services` (and with it
 # libpipewire and evolution-data-server).
 hytte-config = { path = "../hytte-config" }
+# The Agents tab's whole data path (#947 P4, spec §10): the `host.sock` wire
+# mirror, the one-connection-per-request client, the `Status` precedence
+# collapse, the `group` ordering, `agents.toml` and the companion window's
+# argv + `PATH` probe. Linked as a **library**, exactly as
+# `trollshell-agent-window` links it and for the same reason — three readers
+# of one socket have to agree byte for byte about its verbs, and a third
+# mirror would be a third thing to update when hyperhive moves. It is the
+# #640 argument for `hytte-config`, applied to a wire.
+#
+# GTK-free, and it stays that way: it drags the plugin SDK's rlib (proto +
+# hytte-preem + tokio) and **no** GUI closure, no `hytte-services` (which
+# would pull libpipewire and evolution-data-server into a settings app) and no
+# web engine. `checks.shell-has-no-web-engine` still holds.
+hytte-plugin-agents = { path = "../hytte-plugin-agents" }
 hytte-reactive = { path = "../hytte-reactive" }
 # A oneshot to carry the Ping/Version reply from the tokio runtime back to the
 # GTK main thread. `sync` only — no runtime features (hytte-reactive owns it).
@@ -55,4 +69,19 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, default-features = true, features = [
   "fmt",
   "env-filter",
+] }
+
+[dev-dependencies]
+# The Agents tab's scripted `host.sock` (#947 P4): a real `UnixListener` in a
+# `TempDir` answering one recorded JSON line, the shape
+# `hytte-plugin-agents/tests/fake_socket.rs` uses. Dev-only — the app itself
+# reaches the socket through `hytte-plugin-agents`' client on the shared
+# `hytte-reactive` runtime and needs none of these features of its own.
+tempfile.workspace = true
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "time",
 ] }

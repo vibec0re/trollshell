@@ -422,9 +422,9 @@ pub enum ApprovalStatus {
 
 /// This hive's canonical domain plus the browser-facing dashboard root.
 ///
-/// Mirrors `HiveUrls` (`hive-host-sock/src/lib.rs:519-534`); `forge` and
-/// `matrix` are swarm surfaces the plugin never reads (spec §3), so they are
-/// not mirrored.
+/// Mirrors `HiveUrls` (`hive-host-sock/src/lib.rs:503-518`); `matrix` is a
+/// swarm surface nothing in this workspace reads (spec §3), so it is not
+/// mirrored.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct HiveUrls {
     /// Canonical hive domain (`services.hyperhive.domain`).
@@ -434,6 +434,27 @@ pub struct HiveUrls {
     /// dashboard is not reachable from a browser.
     #[serde(default)]
     pub home: Option<String>,
+    /// The forge's browser URL (`HIVE_FORGE_PUBLIC_URL`) — where an agent's
+    /// **config repo** lives. `None` on a direct-port forge deploy, and on
+    /// any hive whose gateway does not publish one.
+    ///
+    /// # Why a swarm URL is mirrored after all (#947 P4)
+    ///
+    /// Spec §3 keeps the *forge* out of this plugin's control loop, and that
+    /// still holds: nothing dials it, nothing authenticates to it, and no
+    /// verb here targets it. What #947 P4's control-center tab needs is one
+    /// **link destination** — spec §10's "links to the agent page and the
+    /// config repo", narrowed on the epic's P4 note to "the config repo
+    /// **where `HiveUrls` names one**". That clause is only satisfiable if
+    /// the mirror carries the key, and the alternative — deriving
+    /// `https://forge.<domain>/` from [`HiveUrls::domain`] — is precisely the
+    /// client-side guess [`crate::model::agent_url`] documents hyperhive#4073
+    /// as having retired.
+    ///
+    /// So it is read the way every other optional URL here is: rendered when
+    /// present, and the row simply absent when it is not.
+    #[serde(default)]
+    pub forge: Option<String>,
 }
 
 /// One agent's row in an `AgentStatus` result.

@@ -171,6 +171,7 @@ fn scenarios() -> Vec<(&'static str, Agents)> {
                 hytte_plugin_agents::hive::wire::HiveUrls {
                     domain: Some("hive.local".to_owned()),
                     home: Some("https://hive.local/".to_owned()),
+                    forge: None,
                 },
             ))));
             m.update(Input::event(
@@ -247,6 +248,7 @@ fn node_scenarios() -> Vec<(&'static str, hytte_plugin::proto::Node)> {
     let urls = hytte_plugin_agents::hive::wire::HiveUrls {
         domain: Some("hive.local".to_owned()),
         home: Some("https://hive.local/".to_owned()),
+        forge: None,
     };
     let ctx = |viewport_px| hytte_plugin_agents::view::PanelContext {
         now_unix: GOLDEN_NOW,

@@ -46,6 +46,7 @@ use adw::prelude::*;
 use gtk::glib;
 use hytte_bus::RetryPolicy;
 
+mod agents_tab;
 mod ai_keys_tab;
 mod places_tab;
 mod plugins_tab;
@@ -163,6 +164,18 @@ fn build_window(app: &adw::Application) {
         "AI Keys",
         "dialog-password-symbolic",
     );
+    // The Agents tab (#947 P4, spec §10): the hyperhive roster, read-only,
+    // polled straight off `host.sock` through the same client and model the
+    // sidebar plugin and the companion window share. Last in the switcher on
+    // purpose — it is the only tab that talks to something other than the
+    // shell, and it is the newest.
+    let (agents_page, agents_poll) = agents_tab::build_page();
+    stack.add_titled_with_icon(
+        &agents_page,
+        Some("agents"),
+        "Agents",
+        "system-run-symbolic",
+    );
 
     let switcher = adw::ViewSwitcher::builder()
         .stack(&stack)
@@ -220,7 +233,7 @@ fn build_window(app: &adw::Application) {
     // while another window is still resident can't leave the first window's
     // timers double-polling behind it (#542). Wrapped in a cell + `.take()` so
     // the one-shot removal is clean under the `Fn` close handler.
-    let polls = RefCell::new(vec![plugins_poll, places_poll, shell_poll]);
+    let polls = RefCell::new(vec![plugins_poll, places_poll, shell_poll, agents_poll]);
     window.connect_close_request(move |_| {
         for source in polls.take() {
             source.remove();

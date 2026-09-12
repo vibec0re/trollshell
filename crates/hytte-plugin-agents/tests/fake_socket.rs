@@ -97,6 +97,11 @@ async fn list_and_urls_decode_from_their_recorded_answers() {
         .expect("a urls block");
     assert_eq!(urls.domain.as_deref(), Some("hive.local"));
     assert_eq!(urls.home.as_deref(), Some("https://hive.local/"));
+    // #947 P4: the config-repo link's destination, read off the same recorded
+    // answer. The key has been in `urls.json` since the fixture was taken —
+    // the mirror simply did not carry it until the control-center tab needed
+    // somewhere to point "Config repo" at.
+    assert_eq!(urls.forge.as_deref(), Some("https://forge.hive.local/"));
 }
 
 /// Forward drift: a hive that grew fields — on the response, on the row, and

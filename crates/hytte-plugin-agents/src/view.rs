@@ -2106,6 +2106,7 @@ mod tests {
         let urls = crate::hive::wire::HiveUrls {
             domain: Some("hive.local".to_owned()),
             home: Some("https://hive.local/".to_owned()),
+            forge: None,
         };
         let hive = Hive::Up {
             agents: vec![running("argus", "idle")],

@@ -27,4 +27,4 @@ gtk4-layer-shell = "0.8.0"
 # `libloading`) were already in `Cargo.lock`.
 hytte-gl = { path = "../hytte-gl" }
 hytte-reactive = { path = "../hytte-reactive" }
-tracing = "0.1.44"
+tracing.workspace = true

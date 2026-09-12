@@ -4654,8 +4654,7 @@ fn the_gl_gauge_emits_its_own_pipeline_at_the_native_grid() {
 
     super::preem_gl::with_gl_arm(|| {
         let gl = Scope::detached("gauge-gl-size-gl");
-        let (gl_w, gl_h, uniforms) =
-            mapped_gl_for(&gl, &node, super::preem_gl::GAUGE);
+        let (gl_w, gl_h, uniforms) = mapped_gl_for(&gl, &node, super::preem_gl::GAUGE);
         assert_eq!(
             (gl_w, gl_h),
             (cpu_w, cpu_h),

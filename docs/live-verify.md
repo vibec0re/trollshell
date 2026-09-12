@@ -1923,9 +1923,9 @@ session.
 
   5. **CPU and GL side by side.** Two shells cannot share the session, so do it
      in sequence on the same preem-demo card and compare screenshots — or put a
-     GL scope next to a CPU-only kit widget (the gauge, which has no GL arm in
-     this PR) and check the skin reads as one device: same field, same ink,
-     same bloom character.
+     GL scope next to a CPU-only kit widget (a marquee or a seven-seg; the
+     gauge grew its own GL arm in #1143) and check the skin reads as one
+     device: same field, same ink, same bloom character.
   6. **Two monitors.** A scope on both outputs accumulates its phosphor twice,
      once per `GtkGLArea` — accepted and documented (#893, answer 3). Fed the
      same batches they stay visually equivalent; a monitor that was unmapped
@@ -1938,6 +1938,64 @@ session.
      confirm the scope falls back to the CPU kit with one journal line rather
      than showing a blank chip. The phosphor restarts from black, which is the
      honest outcome — the GL arm never drew a trail to inherit.
+
+- [ ] **(#1143 / #865 / #1090)** **`Gauge` renders on a `GtkGLArea`, at the
+      surface's native resolution — and that is what #1090 is waiting on.**
+      Second kind on the `Scope` seam, same kill switch, same context-failure
+      fallback. The difference that matters is the **grid**: a scope's
+      offscreen passes run at its pre-upscale `cols × rows`, a gauge's run at
+      `cols * scale × rows * scale`, so the arc, the ticks and the needle are
+      rasterised at the size they are shown at instead of at a logical 144 × 64
+      replicated ×2. Every length is the kit's own, resolved by the kit's own
+      rules (#931's tick budget, centring and counterweight decisions are
+      untouched); the one constant that is deliberately not scaled is the
+      anti-aliasing ramp, which stays **one native pixel** wide. That is the
+      whole of the fix.
+
+      What CI already holds: the mapping (the golden uniform table, the dial
+      geometry, the motion-blur fan collapsing exactly at rest, the overtravel
+      stop), the node shape, the kill switch, the lockstep park, the
+      context-failure rebuild, and — under llvmpipe in `checks.system-tests` —
+      twelve gauge parity cases (four skins × rest / mid-sweep / pegged) at
+      `scale = 1`, where the two arms rasterise at the same resolution. Those
+      came out **byte-identical** on Mesa 26.2.2 (max |Δ| 0 of 255 on every
+      channel), the same as the scope's twelve, though the gauge is held only
+      to #893's on-glass ceiling and not to that zero — Annika's word on #865
+      was that it does not have to be pixel-perfect identical.
+
+      What only glass can answer is the thing the harness cannot see at 1:1:
+      whether the sharper dial is the one you want.
+
+  1. **The needle is crisp.** Start the shell and open
+     `hytte-plugin-preem-demo`'s card (or any plugin with a gauge — the timer,
+     the usage tiles). The needle should read as a thin, hard pointer with a
+     tight glow, and the tick marks as separate marks rather than a soft band.
+     Compare against #1090's screenshot: that is the "before".
+  2. **Side by side with the kit.** Restart with
+     `TROLLSHELL_PREEM_RENDERER=cpu` in the **unit's** environment (it is read
+     once, at the first widget build, so your shell's environment is not
+     enough) and screenshot the same dial. The GL one should differ **only**
+     in edge softness — the field, the flat tick/arc interiors and the lit
+     core are byte-identical, which is measured: at `scale = 2` the harness
+     reports the whole delta in the `edge` region (`field` mean 0.000, `lit`
+     mean ≤ 0.005) and the GL arm lights ~19 % fewer partial-coverage pixels
+     (4530 against the kit's 5648 on `gauge.vfd.sweep`). If anything but the
+     edges moved — a different colour, a moved tick, a needle at another angle
+     — that is a bug, not the improvement.
+  3. **The verdict is Annika's.** #1090 is the open report; this entry is what
+     closes it, and only she can say the dial now looks right. Both looks are
+     one restart apart (item 2), which is the point of keeping the kill switch.
+  4. **The fallback, if you can provoke it.** Same as the scope's item 7: force
+     a context failure and confirm the dial falls back to the CPU kit with one
+     journal line rather than a blank chip. A gauge is the case that needs the
+     hook rather than the next mapping pass — a needle sitting on its target
+     never animates, so no pass is coming.
+  5. **A skin rotation.** Walk the four skins with a gauge on screen (the
+     preem-demo card rotates them). The CRT's scanline comb must keep the
+     **same pitch on glass** as the scope's beside it: the mask is the skin's
+     screen-space furniture and is deliberately evaluated at the logical
+     coordinate, so only the geometry gains resolution. A dial whose comb is
+     twice as fine as its neighbour's means that division was dropped.
 
 - [ ] **(#893)** **The shader widget: a plugin's own GLSL on the GPU.** A
       plugin ships a fragment body plus a data buffer; the shell compiles the

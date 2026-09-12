@@ -275,10 +275,7 @@ impl Dial {
     fn scaled(self, scale: f32) -> Self {
         let offset = (scale - 1.0) / 2.0;
         Self {
-            pivot: (
-                self.pivot.0 * scale + offset,
-                self.pivot.1 * scale + offset,
-            ),
+            pivot: (self.pivot.0 * scale + offset, self.pivot.1 * scale + offset),
             radius: self.radius * scale,
             half: self.half,
             tip: self.tip * scale,
@@ -348,8 +345,10 @@ pub(crate) fn face(config: vocab::GaugeConfig) -> Dial {
         blade,
         major_len: (radius * MAJOR_LEN_FRAC).clamp(MIN_MAJOR_LEN.min(radius), radius),
         minor_len: (radius * MINOR_LEN_FRAC).clamp(MIN_MINOR_LEN.min(radius), radius),
-        subdivisions: usize_of(config.subdivisions.max(1))
-            .min(tick_budget(radius * 2.0 * half, usize_of(config.divisions.max(1)))),
+        subdivisions: usize_of(config.subdivisions.max(1)).min(tick_budget(
+            radius * 2.0 * half,
+            usize_of(config.divisions.max(1)),
+        )),
     }
 }
 
@@ -474,7 +473,8 @@ pub(crate) fn gauge_surface(
         radius: 0,
         strength: 0,
     });
-    let bloom_radius_native = bloom_radius(bloom.radius, logical.radius).saturating_mul(usize_of(scale));
+    let bloom_radius_native =
+        bloom_radius(bloom.radius, logical.radius).saturating_mul(usize_of(scale));
     let mask = palette.mask;
 
     let reading = on_dial(fraction);
@@ -509,7 +509,10 @@ pub(crate) fn gauge_surface(
                 ("u_minor_len", GlValue::Float(dial.minor_len)),
                 ("u_divisions", GlValue::Int(int_of(divisions))),
                 ("u_subdivisions", GlValue::Int(int_of(dial.subdivisions))),
-                ("u_tick_span", GlValue::Int(tick_span(dial, divisions, upscale))),
+                (
+                    "u_tick_span",
+                    GlValue::Int(tick_span(dial, divisions, upscale)),
+                ),
                 ("u_theta_needle", GlValue::Float(dial.angle(reading))),
                 ("u_theta_trail", GlValue::Vec4(trail)),
                 ("u_value_end", GlValue::Float(dial.angle(filled))),
@@ -747,7 +750,10 @@ mod tests {
         assert_eq!(value(&surface.uniforms, "u_mask_on"), GlValue::Int(1));
         assert_eq!(value(&surface.uniforms, "u_mask_pitch"), GlValue::Int(4));
         assert_eq!(value(&surface.uniforms, "u_mask_phase"), GlValue::Int(3));
-        assert_eq!(value(&surface.uniforms, "u_scanline_keep"), GlValue::Int(150));
+        assert_eq!(
+            value(&surface.uniforms, "u_scanline_keep"),
+            GlValue::Int(150)
+        );
         assert_eq!(value(&surface.uniforms, "u_corner_keep"), GlValue::Int(115));
         // The CRT asks for radius 3; the gauge halves it (#930) to 2, the
         // default face's cap (⌊50.54 / 16⌋ = 3) does not bind, and the native
@@ -771,7 +777,10 @@ mod tests {
         assert!(lcd.bloom.is_none() && lcd.mask.is_none(), "the LCD premise");
         let surface = gauge_surface(config(), 0.25, 0.0, &lcd);
         assert_eq!(value(&surface.uniforms, "u_bloom_radius"), GlValue::Int(0));
-        assert_eq!(value(&surface.uniforms, "u_bloom_strength"), GlValue::Int(0));
+        assert_eq!(
+            value(&surface.uniforms, "u_bloom_strength"),
+            GlValue::Int(0)
+        );
         assert_eq!(value(&surface.uniforms, "u_mask_on"), GlValue::Int(0));
         assert_eq!(value(&surface.uniforms, "u_mask_pitch"), GlValue::Int(0));
         assert_eq!(value(&surface.uniforms, "u_scanline_keep"), GlValue::Int(0));
@@ -1089,8 +1098,14 @@ mod tests {
             ..config()
         };
         let dial: Dial = face(tiny);
-        assert!(dial.radius >= 1.0, "the arc never collapses past MIN_RADIUS");
-        assert!(dial.subdivisions >= 1, "a scale with no marks is not a scale");
+        assert!(
+            dial.radius >= 1.0,
+            "the arc never collapses past MIN_RADIUS"
+        );
+        assert!(
+            dial.subdivisions >= 1,
+            "a scale with no marks is not a scale"
+        );
         assert!(dial.half > 0.0, "and the sweep is clamped open");
         let surface = gauge_surface(tiny, 0.5, 0.0, &crt_like());
         assert_eq!(surface.uniforms.grid, (1, 1));

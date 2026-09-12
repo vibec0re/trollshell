@@ -1395,8 +1395,8 @@ fn apply(instance: &mut Instance, widget: &vocab::PreemWidget) {
     //
     // The phosphor restarts from black. That is the honest outcome: the GL arm
     // never drew a trail to inherit.
-    let gl_lost = instance.renderer.as_ref().is_some_and(Renderer::is_gl)
-        && preem_gl::arm() == Arm::Cpu;
+    let gl_lost =
+        instance.renderer.as_ref().is_some_and(Renderer::is_gl) && preem_gl::arm() == Arm::Cpu;
     // `same_widget`, not `==`: derived `PartialEq` is not reflexive over a
     // non-finite float, and a short-circuit that never fires is a permanent
     // 20 Hz loop rather than a missed optimisation. See `sanitize_in_place`.

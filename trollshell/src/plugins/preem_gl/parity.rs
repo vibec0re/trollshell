@@ -565,8 +565,8 @@ fn distribution(deltas: &mut [u8]) -> ChannelStats {
 #[cfg(test)]
 mod tests {
     use super::{
-        CEILING_MAX, CEILING_MEAN, CEILING_P99, ChannelStats, Kind, Layout, Stats, Verdict, case_verdict,
-        compare, distribution, peak_row_tolerance,
+        CEILING_MAX, CEILING_MEAN, CEILING_P99, ChannelStats, Kind, Layout, Stats, Verdict,
+        case_verdict, compare, distribution, peak_row_tolerance,
     };
 
     /// A `Stats` whose **worst pixel** is `delta` 255ths off on every channel,

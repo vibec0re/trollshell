@@ -384,10 +384,12 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
     let cases: Vec<Case> = skins
         .iter()
         .flat_map(|style| {
-            let scopes = [0_u32, 1, 5].into_iter().map(move |idle_steps| Case::Scope {
-                style: *style,
-                idle_steps,
-            });
+            let scopes = [0_u32, 1, 5]
+                .into_iter()
+                .map(move |idle_steps| Case::Scope {
+                    style: *style,
+                    idle_steps,
+                });
             let gauges = [NeedleAt::Rest, NeedleAt::Sweeping, NeedleAt::Pegged]
                 .into_iter()
                 .map(move |needle| Case::Gauge {
@@ -756,9 +758,7 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
             }
             oracle.render(*style)
         }
-        Case::Gauge { style, needle } => {
-            gauge_state(gauge_config(*style), *needle).render(*style)
-        }
+        Case::Gauge { style, needle } => gauge_state(gauge_config(*style), *needle).render(*style),
     };
 
     let natural = case.natural();

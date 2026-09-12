@@ -1,5 +1,5 @@
 //! `hytte-plugin-agents` — hyperhive agents as trollshell sidebar rows
-//! (issue #947, phase P1; spec
+//! (issue #947, phases P1 and P3; spec
 //! `docs/superpowers/specs/2026-09-07-agentic-desktop-design.md`).
 //!
 //! One **pill** per hyperhive agent, two lines and nothing else —
@@ -76,11 +76,39 @@
 //!   ([#1045](https://github.com/vibec0re/trollshell/issues/1045)), which is
 //!   the fallback once the `WebView` is there and the only way to follow it
 //!   until then.
-//! - **approvals** (spec §6.5) — phase P3, and deliberately so: the row must
-//!   be trustworthy before it is allowed to raise a modal that approves a
-//!   config change. The plugin therefore declares no
-//!   [`Capability::Consent`](hytte_plugin::proto::Capability::Consent).
 //! - **triggers** (§6.6) and the **control-center Agents tab** (§10).
+//!
+//! # Approvals (spec §6.5) — phase P3, and the one thing here that writes
+//!
+//! The hive's approval queue is polled on the same tick as the roster
+//! ([`poll`]), and a newly-queued approval raises the shell's **consent
+//! prompt** through
+//! [`Effect::RequestConsent`](hytte_plugin::proto::Effect::RequestConsent) with
+//! the two-button card
+//! ([`ConsentChoices::Approval`](hytte_plugin::proto::ConsentChoices::Approval)):
+//! Approve / Deny, because "This session" and "Always" are not answers to a
+//! one-shot config merge. The human's answer goes back as exactly one
+//! `Approve { id }` or `Deny { id }` — §6.5's deliberately lossy rule, where
+//! **every** affirmative is a single approve and **no standing grant is ever
+//! persisted**, which this plugin achieves by having nowhere to persist one.
+//!
+//! Three rules are worth stating here because they are what make a modal that
+//! merges a config change acceptable at all:
+//!
+//! 1. **It prompts once.** An approval raises one card and then waits, until
+//!    it leaves the queue or the operator asks again. A hive with one
+//!    unanswered approval does not raise a modal every two seconds.
+//! 2. **Silence decides nothing.** A card nobody answers — the 60 s timeout,
+//!    `Esc`, no output to draw on — sends the hive *nothing*. The approval
+//!    stays exactly as it was, the row keeps a badge counting what it is
+//!    waiting on, and clicking the badge re-raises the oldest. Deny is only
+//!    ever a click.
+//! 3. **The queue is the truth.** A decision for an approval that left
+//!    `Pending` in the meantime is dropped with a debug line, never re-applied.
+//!
+//! This is why [`Capability::Consent`](hytte_plugin::proto::Capability::Consent)
+//! was withheld through P1 and P2: the row had to be trustworthy first
+//! (spec §13).
 //!
 //! # Testing without a hive
 //!

@@ -6,15 +6,41 @@
 //! motivating consumer is the `infobroker` data broker asking a human to approve
 //! a local AI agent's data request). [`request`] shows a centered, focus-grabbing
 //! card on niri's focused output — *"⟨agent⟩ wants: ⟨scope⟩ from ⟨datasource⟩"* —
-//! with **Allow once / This session / Always / Deny**, and routes the choice back
-//! to the requesting plugin as `HostMsg::ConsentDecision` over its outbound
-//! channel.
+//! and routes the choice back to the requesting plugin as
+//! `HostMsg::ConsentDecision` over its outbound channel.
 //!
-//! **Bounded (60 s).** An unanswered prompt resolves to
-//! [`ConsentDecision::Deny`] after [`PROMPT_TIMEOUT`], so a wedged UI can never
-//! leave the requesting agent hanging (the broker independently applies its own
-//! longer fallback). Every prompt resolves **exactly once** — the first of a
-//! button click, `Esc`, or the timeout wins and tears down the rest.
+//! # Two cards, and the difference is what silence means (#947 P3)
+//!
+//! The effect carries a [`ConsentChoices`], and this module is the only place
+//! that turns it into widgets:
+//!
+//! | [`ConsentChoices`] | buttons | 60 s / `Esc` | keyboard default |
+//! | --- | --- | --- | --- |
+//! | `Grant` (default) | Allow once / This session / Always / Deny | [`ConsentDecision::Deny`] | `Always` |
+//! | `Approval` | **Approve / Deny** | **nothing is sent** | none |
+//!
+//! `Grant` is #487 unchanged, down to the byte: `GRANT_CARD` is the same four
+//! labels in the same order with the same style classes, and `golden_card_*`
+//! pins that.
+//!
+//! `Approval` (spec §6.5) is for a one-shot decision on a queued item — a
+//! hyperhive approval — where "This session" and "Always" would name a standing
+//! grant the requester cannot honour. Its silence rule is the load-bearing half:
+//! an unanswered prompt sends **no** decision, because a `Deny` there resolves
+//! the item durably on the far side and "nobody was at the screen" is not
+//! evidence for that. The requester keeps the item pending and re-raises on
+//! demand. See [`ConsentChoices::unanswered`], which is where that rule lives so
+//! both ends read it from one place.
+//!
+//! For the same reason the `Approval` card focuses **no** button: the surface
+//! takes the keyboard exclusively, so a stray `Return` must not be able to
+//! answer it either way. `Esc` still dismisses (sending nothing), which is the
+//! deliberate no-op the card wants a key for.
+//!
+//! **Bounded (60 s).** Every prompt tears down after [`PROMPT_TIMEOUT`], so a
+//! wedged UI never leaves a card on screen; whether that teardown *sends* a
+//! decision is the table above. Every prompt resolves **exactly once** — the
+//! first of a button click, `Esc`, or the timeout wins and cancels the rest.
 //!
 //! **Focused output.** [`install`] registers each monitor by connector;
 //! [`request`] picks the monitor for niri's focused output via the shared
@@ -38,14 +64,171 @@ use crate::components::focused_output;
 use hytte::gtk::{self, gdk, glib, prelude::*};
 use hytte::prelude::*;
 use hytte::ui::{Layer, layer_window};
-use hytte_plugin_proto::{ConsentDecision, HostMsg};
+use hytte_plugin_proto::{CONSENT_PROMPT_TIMEOUT_SECS, ConsentChoices, ConsentDecision, HostMsg};
 use tokio::sync::mpsc;
 
-/// How long a prompt stays up unanswered before it resolves to
-/// [`ConsentDecision::Deny`] (#487). Matches the proto's documented 60 s bound —
-/// the broker holds its own, slightly longer, fallback so a live shell's decision
-/// always wins the race.
-const PROMPT_TIMEOUT: Duration = Duration::from_mins(1);
+/// How long a prompt stays up unanswered before it tears itself down (#487).
+///
+/// Read from the **proto**, not spelled here, since #1140: a requester using
+/// [`ConsentChoices::Approval`] receives nothing when this fires and must run
+/// its own deadline, so the number is one both processes read rather than two
+/// that happen to agree today ([`CONSENT_PROMPT_TIMEOUT_SECS`]).
+///
+/// What the teardown *sends* is [`ConsentChoices::unanswered`]'s call, not this
+/// constant's: `Deny` for a grant, nothing at all for an approval.
+const PROMPT_TIMEOUT: Duration = Duration::from_secs(CONSENT_PROMPT_TIMEOUT_SECS);
+
+/// One button on a consent card: the label the human reads, the decision a
+/// click sends, and the style class that colours it.
+///
+/// A table rather than four hand-built widgets, because the *card* is the thing
+/// two choice sets disagree about and a table is the thing a test can compare.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Choice {
+    /// The button's label.
+    pub(crate) label: &'static str,
+    /// What a click on it routes back to the requesting plugin.
+    pub(crate) decision: ConsentDecision,
+    /// A libadwaita style class, or `""` for a plain button.
+    pub(crate) class: &'static str,
+}
+
+/// #487's four-button grant card, in its original order and styling.
+///
+/// Order is left-to-right as appended, and `Deny` leads deliberately: it sits
+/// furthest from the pointer's resting place on the affirmative end.
+const GRANT_CARD: &[Choice] = &[
+    Choice {
+        label: "Deny",
+        decision: ConsentDecision::Deny,
+        class: "destructive-action",
+    },
+    Choice {
+        label: "Allow once",
+        decision: ConsentDecision::AllowOnce,
+        class: "",
+    },
+    Choice {
+        label: "This session",
+        decision: ConsentDecision::AllowSession,
+        class: "",
+    },
+    Choice {
+        label: "Always",
+        decision: ConsentDecision::AllowAlways,
+        class: "suggested-action",
+    },
+];
+
+/// The #947 P3 two-button card: **Approve / Deny**, same rhythm as the grant
+/// card (destructive first, affirmative last, one suggested action).
+///
+/// `Approve` sends [`ConsentDecision::AllowOnce`] — the one variant that means
+/// "this request and no future one", which is exactly what spec §6.5 wants and
+/// the only affirmative that does not imply a standing grant the requester
+/// would have to invent a policy for. A requester that maps *every* `Allow*` to
+/// its one-shot action (as the agents plugin does) therefore reads the same
+/// answer from either card.
+const APPROVAL_CARD: &[Choice] = &[
+    Choice {
+        label: "Deny",
+        decision: ConsentDecision::Deny,
+        class: "destructive-action",
+    },
+    Choice {
+        label: "Approve",
+        decision: ConsentDecision::AllowOnce,
+        class: "suggested-action",
+    },
+];
+
+/// The buttons a choice set draws, left to right.
+pub(crate) const fn card(choices: ConsentChoices) -> &'static [Choice] {
+    match choices {
+        ConsentChoices::Grant => GRANT_CARD,
+        ConsentChoices::Approval => APPROVAL_CARD,
+    }
+}
+
+/// Everything [`request`] needs to know about *which* card it is drawing,
+/// resolved once, up front.
+///
+/// This type exists to make one class of regression unrepresentable rather than
+/// merely tested. Before it, three separate call sites inside `request` — the
+/// no-monitor fallback, `Esc`, and the 60 s timer — each decided for themselves
+/// what an unanswered prompt sends, and each could be independently changed to
+/// `ConsentDecision::Deny` with the whole suite green (#1140's review, HIGH-1).
+/// That is the §6.5 regression in one line, three times over: a durable deny of
+/// a queued hive config-merge that nobody looked at.
+///
+/// Now `on_silence` is computed **once** from [`ConsentChoices::unanswered`] and
+/// the three sites read this field. `request`'s body consequently names no
+/// [`ConsentDecision`] variant at all, which
+/// [`request_never_names_a_decision_of_its_own`] asserts over this file's own
+/// source — crude, on the `nix/lint-bind-pins.py` precedent, and the only thing
+/// that reaches the two sites living inside the widget half.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CardPlan {
+    /// The buttons, left to right.
+    pub(crate) buttons: &'static [Choice],
+    /// Which of them takes the keyboard focus, if any.
+    pub(crate) focus: Option<usize>,
+    /// The card's bold first line.
+    pub(crate) title: &'static str,
+    /// What a prompt nobody answered sends — `None` means *nothing at all*.
+    pub(crate) on_silence: Option<ConsentDecision>,
+}
+
+/// Resolve the whole card from the requester's choice set.
+pub(crate) fn plan(choices: ConsentChoices) -> CardPlan {
+    CardPlan {
+        buttons: card(choices),
+        focus: keyboard_default(choices),
+        title: title_for(choices),
+        on_silence: choices.unanswered(),
+    }
+}
+
+/// Which button (as an index into [`card`]) takes the keyboard focus when the
+/// prompt appears, if any.
+///
+/// `Grant` focuses the **least-destructive** choice — #487's rule, so a
+/// keyboard user cannot fall onto `Deny`. `Approval` focuses **nothing**: both
+/// of its buttons are consequential (one merges a config change, the other
+/// resolves the request negatively), and the surface holds the keyboard
+/// exclusively, so any default would let a stray `Return` from another window
+/// answer it. `Esc` remains the keyboard's only reach into that card, and it
+/// sends nothing.
+pub(crate) const fn keyboard_default(choices: ConsentChoices) -> Option<usize> {
+    match choices {
+        // The last entry, `Always` — see `GRANT_CARD`.
+        ConsentChoices::Grant => Some(GRANT_CARD.len() - 1),
+        ConsentChoices::Approval => None,
+    }
+}
+
+/// The card's bold first line.
+pub(crate) const fn title_for(choices: ConsentChoices) -> &'static str {
+    match choices {
+        ConsentChoices::Grant => "Consent request",
+        ConsentChoices::Approval => "Approval request",
+    }
+}
+
+/// The primary ask, computed by the plugin and assembled here.
+///
+/// `"⟨agent⟩ wants: ⟨scope⟩ from ⟨datasource⟩"` is #487's sentence and stays
+/// exactly that whenever a datasource is named. A requester with no datasource
+/// to name — an approval is about an item, not a data source — leaves the field
+/// empty and gets the sentence without its trailing clause, rather than a
+/// dangling `from `.
+pub(crate) fn ask_line(agent: &str, datasource: &str, scope: &str) -> String {
+    if datasource.is_empty() {
+        format!("{agent} wants: {scope}")
+    } else {
+        format!("{agent} wants: {scope} from {datasource}")
+    }
+}
 
 thread_local! {
     /// The single live consent window, if any. A fresh [`request`] replaces it
@@ -99,9 +282,14 @@ pub fn close_all() {
 /// to the requesting plugin over `outbound` as
 /// [`HostMsg::ConsentDecision`](hytte_plugin_proto::HostMsg::ConsentDecision),
 /// keyed by `request_id` (#487 phase 1b). GTK-main-thread only (the effect broker
-/// runs there). If no output is mounted, the request is denied immediately so the
-/// agent is never left hanging.
-// One cohesive overlay-construction function (card + four buttons + Esc + the
+/// runs there).
+///
+/// `choices` picks the card — see the module docs' table. If no output is
+/// mounted there is nowhere to ask, and the fallback follows the same rule the
+/// timeout does ([`ConsentChoices::unanswered`]): a grant is denied immediately
+/// so the agent is never left hanging, an approval sends nothing and stays
+/// pending on the requester's side.
+// One cohesive overlay-construction function (card + buttons + Esc + the
 // bounded-resolve wiring); the length is the widget count, not branching — like
 // `osd::build_osd_view`, splitting it would scatter the paired setup for no gain.
 #[allow(clippy::too_many_lines)]
@@ -111,6 +299,7 @@ pub fn request(
     datasource: &str,
     scope: &str,
     detail: &str,
+    choices: ConsentChoices,
     outbound: mpsc::Sender<HostMsg>,
 ) {
     // Supersede any prompt already up (rare — one knock is typically in
@@ -122,13 +311,33 @@ pub fn request(
         window.close();
     }
 
+    // The one place this function decides anything about the card. Every site
+    // below reads `plan`; none names a decision of its own.
+    let plan = plan(choices);
+
     let Some(monitor) = focused_monitor() else {
-        // No output to prompt on: deny straight away rather than strand the agent.
-        tracing::warn!(request_id, %agent, "consent prompt: no monitor to show on; denying");
-        let _ = outbound.try_send(HostMsg::ConsentDecision {
-            request_id,
-            decision: ConsentDecision::Deny,
-        });
+        // No output to prompt on — which is silence of the most literal kind,
+        // so it follows the same rule the timeout does. A grant is denied
+        // straight away rather than stranding the agent; an approval sends
+        // nothing, because the whole point of `ConsentChoices::Approval` is
+        // that a decision nobody made is not a decision (spec §6.5) — the
+        // requester's own badge is what surfaces it instead.
+        match plan.on_silence {
+            Some(decision) => {
+                tracing::warn!(request_id, %agent, "consent prompt: no monitor to show on; denying");
+                let _ = outbound.try_send(HostMsg::ConsentDecision {
+                    request_id,
+                    decision,
+                });
+            }
+            None => {
+                tracing::warn!(
+                    request_id,
+                    %agent,
+                    "consent prompt: no monitor to show on; leaving the request unanswered"
+                );
+            }
+        }
         return;
     };
 
@@ -149,13 +358,13 @@ pub fn request(
     root.set_margin_top(18);
     root.set_margin_bottom(18);
 
-    let title = gtk::Label::new(Some("Consent request"));
+    let title = gtk::Label::new(Some(plan.title));
     title.add_css_class("ts-consent-title");
     title.set_xalign(0.0);
     root.append(&title);
 
     // The primary ask, computed by the plugin: "⟨agent⟩ wants: ⟨scope⟩ from ⟨datasource⟩".
-    let ask = gtk::Label::new(Some(&format!("{agent} wants: {scope} from {datasource}")));
+    let ask = gtk::Label::new(Some(&ask_line(agent, datasource, scope)));
     ask.add_css_class("ts-consent-subtitle");
     ask.set_xalign(0.0);
     ask.set_wrap(true);
@@ -171,8 +380,14 @@ pub fn request(
 
     // ── Resolve-exactly-once machinery ────────────────────────────────────────
     //
-    // A click, Esc, or the timeout all race to resolve; the first wins, sends the
-    // decision, closes the window, and cancels the timer. `done` is the guard.
+    // A click, Esc, or the timeout all race to resolve; the first wins, closes
+    // the window, and cancels the timer. `done` is the guard.
+    //
+    // `resolve` takes an `Option`: `Some(d)` sends `d` back to the plugin,
+    // `None` tears the card down **silently**. Only the second exists because of
+    // `ConsentChoices::Approval` — see the module docs — and routing both
+    // through one closure is what keeps "exactly once" a single guard rather
+    // than two that could both fire.
     let done: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let timeout: Rc<Cell<Option<glib::SourceId>>> = Rc::new(Cell::new(None));
 
@@ -180,7 +395,10 @@ pub fn request(
         let done = done.clone();
         let timeout = timeout.clone();
         let window = window.clone();
-        move |decision: ConsentDecision| {
+        // Owned: the closure outlives this call (it is held by three GTK
+        // handlers), so the borrowed `agent` cannot ride into it.
+        let agent = agent.to_owned();
+        move |decision: Option<ConsentDecision>| {
             if done.replace(true) {
                 return; // already resolved by an earlier click / Esc / timeout
             }
@@ -189,47 +407,53 @@ pub fn request(
             }
             // Route the answer back to the requesting plugin. A full/closed queue
             // (the plugin is being reaped) just drops it — the broker times out.
-            let _ = outbound.try_send(HostMsg::ConsentDecision {
-                request_id,
-                decision,
-            });
+            if let Some(decision) = decision {
+                let _ = outbound.try_send(HostMsg::ConsentDecision {
+                    request_id,
+                    decision,
+                });
+            } else {
+                tracing::debug!(
+                    request_id,
+                    %agent,
+                    "consent prompt dismissed unanswered; the requester keeps the request"
+                );
+            }
             window.close();
         }
     };
 
-    // ── Buttons: Allow once / This session / Always / Deny ────────────────────
+    // ── Buttons: whichever card `choices` named ───────────────────────────────
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
     buttons.set_margin_top(6);
 
-    let deny_btn = gtk::Button::with_label("Deny");
-    deny_btn.add_css_class("destructive-action");
-    let once_btn = gtk::Button::with_label("Allow once");
-    let session_btn = gtk::Button::with_label("This session");
-    let always_btn = gtk::Button::with_label("Always");
-    always_btn.add_css_class("suggested-action");
-
-    for (btn, decision) in [
-        (&deny_btn, ConsentDecision::Deny),
-        (&once_btn, ConsentDecision::AllowOnce),
-        (&session_btn, ConsentDecision::AllowSession),
-        (&always_btn, ConsentDecision::AllowAlways),
-    ] {
-        let resolve = resolve.clone();
-        btn.connect_clicked(move |_| resolve(decision));
-        buttons.append(btn);
-    }
+    let widgets: Vec<gtk::Button> = plan
+        .buttons
+        .iter()
+        .map(|choice| {
+            let btn = gtk::Button::with_label(choice.label);
+            if !choice.class.is_empty() {
+                btn.add_css_class(choice.class);
+            }
+            let resolve = resolve.clone();
+            let decision = choice.decision;
+            btn.connect_clicked(move |_| resolve(Some(decision)));
+            buttons.append(&btn);
+            btn
+        })
+        .collect();
     root.append(&buttons);
 
     window.set_child(Some(&root));
 
-    // ── Esc → Deny ────────────────────────────────────────────────────────────
+    // ── Esc → whatever "unanswered" means for this card ───────────────────────
     let key_ctrl = gtk::EventControllerKey::new();
     {
         let resolve = resolve.clone();
         key_ctrl.connect_key_pressed(move |_, key, _, _| {
             if key == gdk::Key::Escape {
-                resolve(ConsentDecision::Deny);
+                resolve(plan.on_silence);
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -237,20 +461,30 @@ pub fn request(
     }
     window.add_controller(key_ctrl);
 
-    // ── Bounded: unanswered → Deny after 60 s ─────────────────────────────────
+    // ── Bounded: 60 s of silence tears the card down ──────────────────────────
     {
         let resolve = resolve.clone();
         let id = glib::timeout_add_local_once(PROMPT_TIMEOUT, move || {
-            resolve(ConsentDecision::Deny);
+            resolve(plan.on_silence);
         });
         timeout.set(Some(id));
     }
 
     window.set_visible(true);
     window.present();
-    // Focus the least-destructive default so keyboard users don't accidentally
-    // Deny; Esc is the explicit cancel.
-    always_btn.grab_focus();
+    // Focus the card's keyboard default, or explicitly nothing — see
+    // `keyboard_default`. The `set_focus(None)` is not redundant: GTK focuses
+    // the first focusable child of a freshly-presented window on its own, which
+    // on the approval card would be `Deny`.
+    match plan.focus.and_then(|i| widgets.get(i)) {
+        Some(btn) => {
+            btn.grab_focus();
+        }
+        // Disambiguated: `GtkWindowExt` and `RootExt` both carry `set_focus`
+        // and both are in the prelude. `GtkWindowExt`'s is the one that also
+        // updates the window's own focus bookkeeping.
+        None => gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>),
+    }
 
     CONSENT_WINDOW.with(|w| *w.borrow_mut() = Some(window));
 }
@@ -267,4 +501,244 @@ fn focused_monitor() -> Option<Monitor> {
             .or_else(|| m.values().next())
             .cloned()
     })
+}
+/// A card as one line per button, `label|decision|class`, plus the keyboard
+/// default and the silence rule — the artifact the goldens compare.
+///
+/// A rendering of the *table* rather than of the widgets: [`request`] builds
+/// the buttons by a straight `map` over [`card`] with no per-variant branch
+/// left in it, so the table is the whole of what "which card" means. (The
+/// widget half wants a display server, a layer-shell compositor and a mounted
+/// `Monitor` to exist at all, which is exactly the wall
+/// `tests/overlay_reentrancy.rs` documents.)
+#[cfg(test)]
+fn render_card(choices: ConsentChoices) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    for choice in card(choices) {
+        let _ = writeln!(
+            out,
+            "{}|{:?}|{}",
+            choice.label, choice.decision, choice.class
+        );
+    }
+    let _ = writeln!(
+        out,
+        "keyboard_default={}",
+        keyboard_default(choices).map_or_else(|| "none".to_owned(), |i| i.to_string())
+    );
+    let _ = writeln!(out, "unanswered={:?}", choices.unanswered());
+    out
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ConsentChoices, ConsentDecision, HostMsg, ask_line, card, keyboard_default, plan,
+        render_card, request,
+    };
+    use tokio::sync::mpsc;
+
+    /// #1140 review, HIGH-1 — the reviewer's test, verbatim in substance.
+    ///
+    /// The no-monitor arm is the one branch of [`request`] that returns before a
+    /// single GTK call, so it is reachable from a plain `#[test]` with no
+    /// display, no compositor and no mounted `Monitor` — which makes it the one
+    /// place the *runtime* silence rule can be pinned hermetically. With
+    /// `MONITORS` empty (its state in any test thread) every call takes it.
+    ///
+    /// Falsification: make that arm deny unconditionally — the exact mutation
+    /// the review shipped green — and the second half fails, because an
+    /// approval nobody could be shown would answer `Deny { id }` to the hive.
+    #[test]
+    fn the_no_monitor_arm_follows_the_silence_rule() {
+        let (tx, mut rx) = mpsc::channel::<HostMsg>(4);
+        request(1, "a", "", "s", "d", ConsentChoices::Grant, tx.clone());
+        match rx.try_recv() {
+            Ok(HostMsg::ConsentDecision {
+                request_id,
+                decision,
+            }) => {
+                assert_eq!(request_id, 1);
+                assert_eq!(decision, ConsentDecision::Deny);
+            }
+            other => panic!("a grant with no output must deny (#487), got {other:?}"),
+        }
+
+        request(2, "a", "", "s", "d", ConsentChoices::Approval, tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "an approval with no output must answer nothing (§6.5)"
+        );
+    }
+
+    /// The structural half of HIGH-1, on the `nix/lint-bind-pins.py` precedent:
+    /// a source scan, because the `Esc` and 60 s-timeout call sites live inside
+    /// the widget half and no hermetic test can reach them.
+    ///
+    /// After the [`CardPlan`](super::CardPlan) refactor, `request` decides
+    /// nothing for itself — every silence path reads `plan.on_silence`. So the
+    /// invariant that is actually checkable is *`request` names no
+    /// `ConsentDecision` variant at all*, and each of the three mutations the
+    /// review shipped green (`consent.rs:278`, `:408`, `:420`, all of the form
+    /// "resolve `Some(ConsentDecision::Deny)` here instead") reintroduces one.
+    ///
+    /// `HostMsg::ConsentDecision { … }` is a *struct variant of another enum*
+    /// and contains no `ConsentDecision::`, so the needle is unambiguous.
+    ///
+    /// Its limit, stated rather than papered over: a mutation that reaches the
+    /// same wrong outcome without naming a variant (say, hardcoding
+    /// `ConsentChoices::Grant` into the `plan(…)` call) is invisible here —
+    /// that one is caught by `the_no_monitor_arm_follows_the_silence_rule`
+    /// instead, which is why both exist.
+    #[test]
+    fn request_never_names_a_decision_of_its_own() {
+        let body = request_fn_body();
+        assert!(
+            !body.contains("ConsentDecision::"),
+            "`request` must route every decision through `plan`, but its body names one directly:\n{body}"
+        );
+        // …and the scan is only worth anything if it is actually looking at the
+        // function. Mutation-test the scanner itself: the body must contain the
+        // three reads it is asserting *about*.
+        assert_eq!(
+            body.matches("plan.on_silence").count(),
+            3,
+            "the no-monitor arm, `Esc` and the timeout each read the plan; found:\n{body}"
+        );
+    }
+
+    /// `request`'s body, brace-matched out of this file's own source.
+    ///
+    /// Brace matching rather than a regex, for `lint-bind-pins.py`'s reason:
+    /// the body contains closures, nested blocks and `match` arms, none of
+    /// which a line-oriented pattern survives.
+    fn request_fn_body() -> String {
+        let src = include_str!("consent.rs");
+        let start = src
+            .find("pub fn request(")
+            .expect("this file defines `pub fn request`");
+        let open = start + src[start..].find('{').expect("`request` has a body") + 1;
+        let mut depth = 1usize;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[open..open + i].to_owned();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("`request`'s body is unbalanced");
+    }
+
+    /// The plan is the single resolution point, so it must agree with the four
+    /// accessors it is built from — otherwise the golden pins a table the
+    /// widgets no longer read.
+    #[test]
+    fn the_plan_is_exactly_the_tables_it_resolves() {
+        for choices in [ConsentChoices::Grant, ConsentChoices::Approval] {
+            let p = plan(choices);
+            assert_eq!(p.buttons, card(choices), "{choices:?}");
+            assert_eq!(p.focus, keyboard_default(choices), "{choices:?}");
+            assert_eq!(p.on_silence, choices.unanswered(), "{choices:?}");
+        }
+    }
+
+    /// #487's card, pinned literally. #947 P3 made the buttons table-driven and
+    /// added a second card; this is the assertion that the first one did not
+    /// move by so much as a label, an order, a style class or a decision.
+    ///
+    /// Falsification: swap two labels, drop `destructive-action`, or re-order
+    /// the table, and this goes red with a diff naming the row.
+    #[test]
+    fn golden_card_grant_is_487_unchanged() {
+        assert_eq!(
+            render_card(ConsentChoices::Grant),
+            "\
+Deny|Deny|destructive-action
+Allow once|AllowOnce|
+This session|AllowSession|
+Always|AllowAlways|suggested-action
+keyboard_default=3
+unanswered=Some(Deny)
+"
+        );
+    }
+
+    /// The #947 P3 card. Two buttons, `Approve` last and suggested, no keyboard
+    /// default, and — the load-bearing line — **no** decision on silence.
+    ///
+    /// Falsification: give `ConsentChoices::Approval` a
+    /// `Some(ConsentDecision::Deny)` silence rule (the "just deny it like the
+    /// other card" regression) and the last line goes red; label it "Allow"
+    /// and the second row does.
+    #[test]
+    fn golden_card_approval_is_two_buttons_and_answers_nothing_on_silence() {
+        assert_eq!(
+            render_card(ConsentChoices::Approval),
+            "\
+Deny|Deny|destructive-action
+Approve|AllowOnce|suggested-action
+keyboard_default=none
+unanswered=None
+"
+        );
+    }
+
+    /// Every affirmative on either card is an `Allow*`, and every card offers
+    /// exactly one `Deny` — the property a requester's decision mapping rests
+    /// on (spec §6.5 maps *any* `Allow*` to one approve).
+    #[test]
+    fn every_card_has_exactly_one_deny_and_the_rest_are_allows() {
+        for choices in [ConsentChoices::Grant, ConsentChoices::Approval] {
+            let denies = card(choices)
+                .iter()
+                .filter(|c| c.decision == ConsentDecision::Deny)
+                .count();
+            assert_eq!(denies, 1, "{choices:?}");
+            assert!(
+                card(choices).len() >= 2,
+                "{choices:?} must offer a yes and a no"
+            );
+        }
+    }
+
+    /// The approval card's silence rule is the one the keyboard must not be
+    /// able to route around, so no button may hold the default focus.
+    #[test]
+    fn the_approval_card_focuses_no_button() {
+        assert_eq!(keyboard_default(ConsentChoices::Approval), None);
+        // …and the grant card's default is an `Allow*`, never `Deny` (#487).
+        let idx = keyboard_default(ConsentChoices::Grant).expect("a default");
+        assert_ne!(
+            card(ConsentChoices::Grant)[idx].decision,
+            ConsentDecision::Deny
+        );
+    }
+
+    /// #487's sentence, unchanged whenever a datasource is named.
+    #[test]
+    fn the_ask_line_keeps_487s_sentence() {
+        assert_eq!(
+            ask_line("claude", "departures", "next"),
+            "claude wants: next from departures"
+        );
+    }
+
+    /// A requester with no datasource to name gets the sentence without a
+    /// dangling `from ` — the approval case, where the ask is about an item.
+    #[test]
+    fn an_empty_datasource_drops_the_trailing_clause() {
+        assert_eq!(
+            ask_line("trollshell-choom", "", "merge a reviewed config PR"),
+            "trollshell-choom wants: merge a reviewed config PR"
+        );
+    }
 }

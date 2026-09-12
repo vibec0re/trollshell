@@ -3,13 +3,13 @@
 //! sockets, no display — pure encode/decode.
 
 use hytte_plugin_proto::{
-    AudioAction, Capability, ClockState, ConsentDecision, DEFAULT_SLIDER_MAX, DEFAULT_SLIDER_MIN,
-    DEFAULT_SLIDER_STEP_FRACTION, DatasourceError, DatasourceOutcome, Dir, Effect, EffectOutcome,
-    EventKind, HostMsg, LedStripConfig, LedStripState, LogLevel, MAX_FRAME_LEN,
-    MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Manifest, MediaAction, Mount, NiriAction, Node,
-    NodeId, OPEN_URI_VOCAB, PROTO_VERSION, Page, PluginMsg, PreemWidget, ProtoError,
-    ProvidedDatasource, SCROLLED_VOCAB, SHADER_VOCAB, ShaderData, SliderFloats, StateKey,
-    StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body,
+    AudioAction, Capability, ClockState, ConsentChoices, ConsentDecision, DEFAULT_SLIDER_MAX,
+    DEFAULT_SLIDER_MIN, DEFAULT_SLIDER_STEP_FRACTION, DatasourceError, DatasourceOutcome, Dir,
+    Effect, EffectOutcome, EventKind, HostMsg, LedStripConfig, LedStripState, LogLevel,
+    MAX_FRAME_LEN, MAX_SHADER_DATA_BYTES, MAX_SHADER_SOURCE_BYTES, Manifest, MediaAction, Mount,
+    NiriAction, Node, NodeId, OPEN_URI_VOCAB, PROTO_VERSION, Page, PluginMsg, PreemWidget,
+    ProtoError, ProvidedDatasource, SCROLLED_VOCAB, SHADER_VOCAB, ShaderData, SliderFloats,
+    StateKey, StateSnapshot, VOCAB, VOCAB_UNCONDITIONAL, decode, decode_body, encode, encode_body,
     sane_fraction, sane_slider_floats,
 };
 
@@ -1139,6 +1139,7 @@ fn request_consent_effect_is_name_tagged_and_additive() {
         datasource: "departures".into(),
         scope: "*".into(),
         detail: "next S-Bahn departures".into(),
+        choices: ConsentChoices::Grant,
     };
     let body = encode_body(&effect);
     assert!(
@@ -1147,6 +1148,64 @@ fn request_consent_effect_is_name_tagged_and_additive() {
     );
     let back: Effect = decode(&encode(&effect)).expect("decode RequestConsent");
     assert_eq!(effect, back);
+}
+
+/// #947 P3's appended field, on the [`Effect::RunCommand`] `detached`
+/// precedent: `#[serde(default, skip_serializing_if = …)]`, so the four-button
+/// frame is **byte-identical** to the one a pre-#947 plugin emitted and the
+/// two-button one is the only frame that carries the key at all.
+///
+/// This is what makes the addition additive without a
+/// [`VOCAB`](hytte_plugin_proto::VOCAB) bump (the crate root: "a defaulted
+/// *field* is not a variant"): an older host skips an unknown **key** in a
+/// named map, where it would fail the whole body on an unknown **variant tag**.
+///
+/// Falsification: drop the `skip_serializing_if` and the first assertion goes
+/// red — and so does `golden.rs`'s committed `effect_*` fixture, which is the
+/// same claim pinned in bytes.
+#[test]
+fn the_consent_choice_set_is_an_additive_skipped_field() {
+    let grant = Effect::RequestConsent {
+        request_id: 42,
+        agent: "claude".into(),
+        datasource: "departures".into(),
+        scope: "*".into(),
+        detail: "next S-Bahn departures".into(),
+        choices: ConsentChoices::Grant,
+    };
+    let grant_body = encode_body(&grant);
+    assert!(
+        !contains(&grant_body, b"choices"),
+        "the default choice set must not reach the wire at all"
+    );
+
+    let approval = Effect::RequestConsent {
+        request_id: 42,
+        agent: "trollshell-choom".into(),
+        datasource: String::new(),
+        scope: "merge a reviewed config PR".into(),
+        detail: "PR 12: bump the meta flake".into(),
+        choices: ConsentChoices::Approval,
+    };
+    let approval_body = encode_body(&approval);
+    assert!(
+        contains(&approval_body, b"choices") && contains(&approval_body, b"Approval"),
+        "the two-button card names itself on the wire"
+    );
+    let back: Effect = decode(&encode(&approval)).expect("decode the approval card");
+    assert_eq!(approval, back);
+
+    // And the direction that matters for an older *plugin* meeting a newer
+    // host's echo, or a newer host meeting an older plugin's frame: a body with
+    // no `choices` key decodes to the four-button card, never to a failure.
+    assert_eq!(
+        decode::<Effect>(&encode(&grant)).expect("a keyless body decodes"),
+        grant,
+    );
+    assert_eq!(
+        PROTO_VERSION, 1,
+        "appending a defaulted field must not bump the proto"
+    );
 }
 
 #[test]
@@ -3569,5 +3628,65 @@ fn the_capability_list_is_one_variant_from_an_array16_header() {
         &wider[..3],
         &[0xdc, 0x00, 0x10],
         "the 16th element crosses to array16, shifting every byte after it",
+    );
+}
+
+/// The pre-#947 shape of the variant, as an older host's decoder sees it —
+/// five fields, no `choices`.
+///
+/// A hand-mirror rather than a version of the real type, because the point is
+/// to decode *today's* bytes with *yesterday's* struct, and cargo cannot link
+/// two versions of this crate.
+#[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+enum OldEffect {
+    RequestConsent {
+        request_id: u64,
+        agent: String,
+        datasource: String,
+        scope: String,
+        detail: String,
+    },
+}
+
+/// #1140's review, LOW-4. The **reverse** compat direction, which is the
+/// load-bearing safety argument for skipping the `VOCAB` bump and which
+/// `the_consent_choice_set_is_an_additive_skipped_field` only asserts forwards.
+///
+/// A newer plugin asking an older host for the approval card must degrade to
+/// "wrong label, right outcome" — the host skips the key it has never heard of
+/// and draws the four-button card, whose timeout denies. If it instead *failed*
+/// the body, the frame would die, the SDK would redial, and #437's near-silent
+/// crash-loop would be back for every approval prompt.
+///
+/// Falsification: put `#[serde(deny_unknown_fields)]` on `OldEffect`'s variant
+/// — which is what a future hardening of the real type would amount to — and
+/// the `expect` fails.
+#[test]
+fn an_old_host_skips_the_new_choices_key_instead_of_failing() {
+    let body = encode_body(&Effect::RequestConsent {
+        request_id: 7,
+        agent: "trollshell-choom".into(),
+        datasource: String::new(),
+        scope: "merge a reviewed config PR".into(),
+        detail: "request #7".into(),
+        choices: ConsentChoices::Approval,
+    });
+    assert!(
+        contains(&body, b"choices"),
+        "the two-button card does put the key on the wire"
+    );
+
+    let old: OldEffect = rmp_serde::from_slice(&body)
+        .expect("an older host must skip the unknown `choices` key, not fail the body");
+    assert_eq!(
+        old,
+        OldEffect::RequestConsent {
+            request_id: 7,
+            agent: "trollshell-choom".to_owned(),
+            datasource: String::new(),
+            scope: "merge a reviewed config PR".to_owned(),
+            detail: "request #7".to_owned(),
+        },
+        "and every field it does know decodes unchanged"
     );
 }

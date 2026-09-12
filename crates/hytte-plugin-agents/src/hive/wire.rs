@@ -12,6 +12,9 @@
 //! | [`Response`]      | `HostResponse`, `hive-host-sock/src/lib.rs:546-604`                 |
 //! | [`AgentStatusRow`]| `hive_sh4re::container::AgentStatusRow`, `hive-sh4re/src/container.rs:34-96` |
 //! | [`HiveUrls`]      | `HiveUrls`, `hive-host-sock/src/lib.rs:519-534`                     |
+//! | [`Approval`]      | `hive_sh4re::approvals::Approval`, `hive-sh4re/src/approvals.rs:14-38` |
+//! | [`ApprovalKind`]  | `ApprovalKind`, `hive-sh4re/src/approvals.rs:45-69`                 |
+//! | [`ApprovalStatus`]| `ApprovalStatus`, `hive-sh4re/src/approvals.rs:90-100`              |
 //!
 //! # The three rules the mirror follows
 //!
@@ -28,12 +31,30 @@
 //! 3. **Drift refuses, it does not guess.** [`HOST_SOCK_VERSION`] is compiled
 //!    in and every response is checked against it — see [`check_version`].
 //!
-//! P1 mirrors eight of #948's ten verbs — the seven request/response ones plus
+//! P1 mirrored eight of #948's ten verbs — the seven request/response ones plus
 //! `SubscribeAgentStatus` (hyperhive#4064, landed), which is mirrored but
-//! deliberately unused: see [`Request::SubscribeAgentStatus`]. `Pending` /
-//! `Approve` / `Deny` — the approval prompt, spec §6.5 — are phase P3 and are
-//! deliberately absent: the row must be trustworthy before it is allowed to
-//! raise a modal that approves a config change.
+//! deliberately unused: see [`Request::SubscribeAgentStatus`]. **#947 P3 adds
+//! the remaining three** — [`Request::Pending`], [`Request::Approve`] and
+//! [`Request::Deny`], spec §6.5's approval prompt — which P1 left out on
+//! purpose, so the row was trustworthy before it was allowed to raise a modal
+//! that approves a config change.
+//!
+//! # Rule 1, the enum half
+//!
+//! The approval row is the first mirrored struct with **enum-typed** fields
+//! ([`ApprovalKind`], [`ApprovalStatus`]), and rule 1's forward-drift promise
+//! has to survive that. serde's default for an unknown enum value is to fail
+//! the whole `Approval`, which would fail the whole `Vec<Approval>`, which
+//! would fail the poll — so one new `ApprovalKind` variant hive-side would
+//! blank every badge on the card, including the approvals this build
+//! understands perfectly well.
+//!
+//! Both therefore carry a `#[serde(untagged)] Unknown(String)` catch-all, and
+//! the value survives as the string the hive sent, so the prompt can still say
+//! *something* truthful about it. Nothing here matches on a kind in a way that
+//! changes what the plugin *does* — a kind is human wording, a status is
+//! "pending or not" — so an unknown value costs a nicer sentence, never a
+//! decision.
 
 use serde::{Deserialize, Serialize};
 
@@ -157,6 +178,37 @@ pub enum Request {
     /// This hive's domain plus its browser-facing URLs
     /// (`hive-host-sock/src/lib.rs:232`).
     Urls,
+    /// List the approval queue (`hive-host-sock/src/lib.rs:228-229`) — the
+    /// answer is [`Response::approvals`]. **#947 P3's data path.**
+    ///
+    /// Despite its name the answer is not filtered to pending rows: the
+    /// daemon's own store hands back what it hands back, so a reader that
+    /// cares about "still waiting for a human" filters on
+    /// [`ApprovalStatus::Pending`] itself rather than trusting the verb's
+    /// name. [`crate::model::PendingApprovals::new`] is that filter, in one
+    /// place — a model policy, not a wire shape, which is why it does not live
+    /// on [`Response`].
+    Pending,
+    /// Approve one queued request by id; **the action runs immediately**
+    /// (`hive-host-sock/src/lib.rs:230-231`).
+    ///
+    /// Not idempotent the way [`Request::SetPaused`] is — the far side runs a
+    /// config merge, a spawn or a flake update off this one frame — which is
+    /// why the plugin sends exactly one per human decision and drops its
+    /// correlation entry before the frame goes out, rather than after.
+    Approve {
+        /// The approval's id, echoed from the hive's own [`Approval::id`].
+        id: i64,
+    },
+    /// Deny one queued request by id (`hive-host-sock/src/lib.rs:232-233`).
+    ///
+    /// Only ever sent for a **click**: spec §6.5's rule that an unanswered
+    /// prompt leaves the approval exactly as it was is enforced one layer up,
+    /// in `hytte_plugin_proto::ConsentChoices::unanswered`.
+    Deny {
+        /// The approval's id, echoed from the hive's own [`Approval::id`].
+        id: i64,
+    },
 }
 
 /// Which containers a lifecycle verb targets — **always exactly one agent**.
@@ -230,6 +282,142 @@ pub struct Response {
     /// `AgentStatus` result — the roster.
     #[serde(default)]
     pub agent_statuses: Option<Vec<AgentStatusRow>>,
+    /// `Pending` result — the approval queue (#947 P3), **verbatim**.
+    ///
+    /// Not filtered here, deliberately: despite the verb's name the daemon
+    /// hands back whatever its store returns, and "which statuses are still
+    /// actionable" is model policy rather than wire shape. That rule lives in
+    /// exactly one place, [`crate::model::PendingApprovals::new`].
+    ///
+    /// `None` means *this response did not answer `Pending`* — distinct from
+    /// `Some(vec![])`, an empty queue, which is what clears a badge.
+    #[serde(default)]
+    pub approvals: Option<Vec<Approval>>,
+}
+
+/// One row in the hive's approval queue.
+///
+/// Mirrors `hive_sh4re::approvals::Approval`
+/// (`hive-sh4re/src/approvals.rs:14-38`). Mirror rule 2 applies: `commit_ref`,
+/// `fetched_sha`, `resolved_at` and `note` are **not** carried. They are the
+/// payload and the audit trail of a decision the desktop does not make — the
+/// prompt says who asked, for what kind of action, and the manager's own
+/// free-text description, and everything past that belongs on the dashboard.
+/// Carrying `commit_ref` in particular would mean rendering a field whose
+/// meaning is per-kind (a sha, a PR number, an inputs array, or empty — that
+/// struct's own doc), i.e. four render paths for a string nobody acts on.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct Approval {
+    /// The queue id — what [`Request::Approve`] / [`Request::Deny`] name, and
+    /// the plugin's dedup key.
+    #[serde(default)]
+    pub id: i64,
+    /// The agent that asked. An `Ident` hive-side, a plain string on the wire
+    /// (`hive-types/src/lib.rs:143-147`), and re-validated here through
+    /// [`crate::model::AgentName`] before it reaches a node id, exactly as an
+    /// [`AgentStatusRow::name`] is.
+    #[serde(default)]
+    pub agent: String,
+    /// What granting it will do.
+    ///
+    /// `#[serde(default)]` mirrors the hive's own attribute on this field, so
+    /// a row that omits the key reads as `MergeConfigPr` on both sides.
+    #[serde(default)]
+    pub kind: ApprovalKind,
+    /// When it was submitted — RFC 3339 UTC on the wire.
+    ///
+    /// Kept as the **raw string** for [`AgentStatusRow::status_set_at`]'s
+    /// reason: a timestamp this build cannot parse should cost one label, not
+    /// the whole queue.
+    #[serde(default)]
+    pub requested_at: String,
+    /// Where in its lifecycle the request is.
+    #[serde(default)]
+    pub status: ApprovalStatus,
+    /// The manager's free-text description, attached at submission time
+    /// (`hive-sh4re/src/approvals.rs:34-37`). The prompt's detail line.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// What an approval, once granted, will trigger.
+///
+/// Mirrors `ApprovalKind` (`hive-sh4re/src/approvals.rs:45-69`), including its
+/// `snake_case` rename — plus the [`Unknown`](ApprovalKind::Unknown) arm, which
+/// hyperhive's own enum does not have and this one needs (see the module docs'
+/// "rule 1, the enum half").
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalKind {
+    /// Create and start a new sub-agent container.
+    Spawn,
+    /// Create an agent's config repo and seed it from the template.
+    InitConfig,
+    /// `nix flake update` the meta flake and commit the lock changes.
+    UpdateMetaInputs,
+    /// Add a scheduled prompt to the broker queue.
+    SchedulePrompt,
+    /// Merge an operator-reviewed config PR — the hive's sole config-change
+    /// flow, and its `#[default]` on both sides.
+    #[default]
+    MergeConfigPr,
+    /// A kind this build has never heard of, kept verbatim.
+    #[serde(untagged)]
+    Unknown(String),
+}
+
+impl ApprovalKind {
+    /// The kind as a sentence fragment, for the prompt's *"⟨agent⟩ wants:
+    /// ⟨this⟩"* line.
+    ///
+    /// The plugin computes every human string the host renders (that is what
+    /// keeps `RequestConsent` domain-free), so this is where the hive's
+    /// vocabulary becomes English. An [`Unknown`](ApprovalKind::Unknown) reads
+    /// as the hive's own token rather than as "unknown": the operator can act
+    /// on `spawn_replica`, and cannot act on a shrug.
+    #[must_use]
+    pub fn human(&self) -> String {
+        match self {
+            Self::Spawn => "create and start a new agent".to_owned(),
+            Self::InitConfig => "create this agent's config repo".to_owned(),
+            Self::UpdateMetaInputs => "update the hive's flake inputs".to_owned(),
+            Self::SchedulePrompt => "schedule a prompt".to_owned(),
+            Self::MergeConfigPr => "merge a reviewed config PR".to_owned(),
+            Self::Unknown(raw) => format!("perform `{raw}`"),
+        }
+    }
+}
+
+/// Where an approval is in its lifecycle.
+///
+/// Mirrors `ApprovalStatus` (`hive-sh4re/src/approvals.rs:90-100`), plus the
+/// same [`Unknown`](ApprovalStatus::Unknown) arm [`ApprovalKind`] carries.
+///
+/// The default is [`Pending`](ApprovalStatus::Pending) only because
+/// `#[serde(default)]` on [`Approval::status`] needs one and the hive's own
+/// field has no default — a row that somehow omits the key is *unresolved* by
+/// construction, and defaulting the other way would silently hide it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStatus {
+    /// Waiting on the operator. The only status that raises a prompt.
+    #[default]
+    Pending,
+    /// The operator approved it.
+    Approved,
+    /// The operator denied it.
+    Denied,
+    /// It failed after approval.
+    Failed,
+    /// The manager withdrew it before the operator acted.
+    Cancelled,
+    /// A status this build has never heard of, kept verbatim.
+    ///
+    /// Deliberately **not** treated as pending: an unknown status is a state
+    /// the hive grew, and a build that cannot name it must not raise a modal
+    /// offering to resolve it.
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 /// This hive's canonical domain plus the browser-facing dashboard root.
@@ -327,7 +515,8 @@ pub struct AgentStatusRow {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentStatusRow, HOST_SOCK_VERSION, Request, Response, Scope, VersionMismatch, check_version,
+        AgentStatusRow, Approval, ApprovalKind, ApprovalStatus, HOST_SOCK_VERSION, Request,
+        Response, Scope, VersionMismatch, check_version,
     };
 
     fn line(req: &Request) -> String {
@@ -373,6 +562,26 @@ mod tests {
             }),
             r#"{"cmd":"stop","scope":{"agent_names":["trollshell-choom"]},"graceful":true}"#
         );
+        // #947 P3's three, cited from `hive-host-sock/src/lib.rs:228-233`.
+        assert_eq!(line(&Request::Pending), r#"{"cmd":"pending"}"#);
+        assert_eq!(
+            line(&Request::Approve { id: 42 }),
+            r#"{"cmd":"approve","id":42}"#
+        );
+        assert_eq!(line(&Request::Deny { id: 42 }), r#"{"cmd":"deny","id":42}"#);
+    }
+
+    /// The id is `i64` on both sides, so a queue that has run past `u32` — or a
+    /// hive that ever hands back a negative sentinel — still addresses the row
+    /// it means. Pinned because a `u32` here would compile, pass every
+    /// small-number test, and silently refuse the 4-billionth approval.
+    #[test]
+    fn an_approval_id_is_a_full_width_signed_integer_on_the_wire() {
+        assert_eq!(
+            line(&Request::Approve { id: i64::MAX }),
+            r#"{"cmd":"approve","id":9223372036854775807}"#
+        );
+        assert_eq!(line(&Request::Deny { id: -1 }), r#"{"cmd":"deny","id":-1}"#);
     }
 
     /// Spec §11 rule one. `Scope` has no `Default` and no all-false
@@ -489,5 +698,98 @@ mod tests {
         )
         .expect("decodes");
         assert_eq!(with.url.as_deref(), Some("https://hive.local/agent/a/"));
+    }
+
+    // ── #947 P3: the approval queue ──────────────────────────────────────────
+
+    /// A `Pending` answer carrying every field the mirror reads, in the shape
+    /// `HostResponse::pending` builds (`hive-host-sock/src/lib.rs:599-604`)
+    /// around `hive_sh4re::approvals::Approval`.
+    #[test]
+    fn a_pending_answer_decodes_the_whole_row() {
+        let raw = r#"{"version":1,"ok":true,"approvals":[{"id":7,"agent":"trollshell-choom","kind":"merge_config_pr","commit_ref":"12","fetched_sha":"deadbeefcafe","requested_at":"2026-09-12T09:15:00Z","status":"pending","description":"bump the meta flake"}]}"#;
+        let resp: Response = serde_json::from_str(raw).expect("decodes");
+        let queue = resp.approvals.clone().expect("a queue");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].id, 7);
+        assert_eq!(queue[0].agent, "trollshell-choom");
+        assert_eq!(queue[0].kind, ApprovalKind::MergeConfigPr);
+        assert_eq!(queue[0].status, ApprovalStatus::Pending);
+        assert_eq!(queue[0].requested_at, "2026-09-12T09:15:00Z");
+        assert_eq!(queue[0].description.as_deref(), Some("bump the meta flake"));
+        // `commit_ref`/`fetched_sha` are deliberately unmirrored (rule 2) and
+        // their presence must not fail the decode.
+    }
+
+    /// Rule 1, the enum half. A hive that grows an `ApprovalKind` or an
+    /// `ApprovalStatus` must cost that row its *wording*, never the queue.
+    ///
+    /// Falsification: delete either `#[serde(untagged)] Unknown(String)` arm —
+    /// the strict-enum version this mirror could have been — and `from_str`
+    /// fails the whole `Vec<Approval>`, so both of the first two assertions go
+    /// red at the `expect`.
+    #[test]
+    fn an_unknown_kind_or_status_costs_its_own_row_and_nothing_else() {
+        let raw = r#"{"version":1,"ok":true,"approvals":[
+            {"id":1,"agent":"a","kind":"teleport_agent","requested_at":"2026-09-12T09:00:00Z","status":"pending"},
+            {"id":2,"agent":"a","kind":"merge_config_pr","requested_at":"2026-09-12T09:01:00Z","status":"awaiting_quorum"},
+            {"id":3,"agent":"a","kind":"spawn","requested_at":"2026-09-12T09:02:00Z","status":"pending"}
+        ]}"#;
+        let resp: Response = serde_json::from_str(raw).expect("an unknown enum value is not fatal");
+        let queue = resp.approvals.clone().expect("a queue");
+        assert_eq!(queue.len(), 3, "no row is dropped");
+        assert_eq!(
+            queue[0].kind,
+            ApprovalKind::Unknown("teleport_agent".to_owned())
+        );
+        assert_eq!(
+            queue[1].status,
+            ApprovalStatus::Unknown("awaiting_quorum".to_owned())
+        );
+
+        // The unknown kind still says something an operator can act on.
+        assert_eq!(queue[0].kind.human(), "perform `teleport_agent`");
+    }
+
+    /// The `kind` key is `#[serde(default)]` on the hive's own struct
+    /// (`hive-sh4re/src/approvals.rs:17-18`), so a row that omits it must read
+    /// as `MergeConfigPr` here too — the mirror agreeing with the source of
+    /// truth about a default, not inventing its own.
+    #[test]
+    fn an_omitted_kind_defaults_the_way_the_hives_own_struct_does() {
+        let row: Approval = serde_json::from_str(
+            r#"{"id":1,"agent":"a","requested_at":"2026-09-12T09:00:00Z","status":"pending"}"#,
+        )
+        .expect("decodes");
+        assert_eq!(row.kind, ApprovalKind::MergeConfigPr);
+    }
+
+    /// A response to a verb that carries no queue leaves `approvals` absent,
+    /// which must read as "not an answer to `Pending`" rather than as an empty
+    /// queue that clears every badge.
+    #[test]
+    fn a_response_without_approvals_is_not_an_empty_queue() {
+        let resp: Response = serde_json::from_str(r#"{"version":1,"ok":true}"#).expect("decodes");
+        assert_eq!(resp.approvals, None);
+    }
+
+    /// Every kind renders a distinct, non-empty sentence fragment — the
+    /// prompt's *"⟨agent⟩ wants: ⟨this⟩"* line, so two kinds reading alike
+    /// would make two different asks indistinguishable on screen.
+    #[test]
+    fn every_kind_has_its_own_human_wording() {
+        let kinds = [
+            ApprovalKind::Spawn,
+            ApprovalKind::InitConfig,
+            ApprovalKind::UpdateMetaInputs,
+            ApprovalKind::SchedulePrompt,
+            ApprovalKind::MergeConfigPr,
+        ];
+        let mut seen: Vec<String> = kinds.iter().map(ApprovalKind::human).collect();
+        assert!(seen.iter().all(|s| !s.is_empty()));
+        seen.sort();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), before, "two kinds read alike");
     }
 }

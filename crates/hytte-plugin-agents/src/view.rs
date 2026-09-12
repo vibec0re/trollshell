@@ -90,8 +90,9 @@ use hytte_plugin::proto::{Dir, Node};
 
 use crate::config::AgentsConfig;
 use crate::model::{
-    Agent, AgentName, ExpandedGroups, Group, Hive, Status, UPDATE_BADGE_CLASS, UPDATE_BADGE_ICON,
-    agent_url, group, headers_wanted, model_family,
+    APPROVAL_BADGE_CLASS, APPROVAL_BADGE_ICON, Agent, AgentName, ExpandedGroups, Group, Hive,
+    PendingApprovals, Status, UPDATE_BADGE_CLASS, UPDATE_BADGE_ICON, agent_url, group,
+    headers_wanted, model_family,
 };
 
 /// The card's root node id.
@@ -162,6 +163,18 @@ pub mod ids {
     /// agent, so it is a whole id rather than a prefix. Not `OPEN`-prefixed:
     /// `strip_prefix("open:")` must never match it by accident.
     pub const OPEN_DASHBOARD: &str = "open-dashboard";
+    /// The pending-approval badge (#947 P3), carrying the **agent name**.
+    ///
+    /// Not the approval id, for [`OPEN`]'s reason and one more: the id the row
+    /// was rendered with may have been resolved on the dashboard in the seconds
+    /// since, and "raise the oldest approval this agent is *now* waiting on" is
+    /// both what the operator means by clicking a badge and the only phrasing
+    /// that cannot address a resolved request.
+    ///
+    /// Its prefix is deliberately not a prefix of any other id here: nothing
+    /// else starts with `approvals`, and `strip_prefix` is how every arm
+    /// routes.
+    pub const APPROVALS: &str = "approvals:";
 }
 
 /// The most agent rows the card will draw.
@@ -667,17 +680,65 @@ fn model_chip(agent: &Agent) -> Option<Node> {
     ))
 }
 
+/// The pending-approval badge (#947 P3), or `None` when this agent is waiting
+/// on nothing.
+///
+/// A **button**, unlike the row's other two badges: those report a state the
+/// operator can only fix elsewhere, this one is the way back into a prompt that
+/// timed out or was dismissed — spec §6.5's "clicking it re-raises". That is
+/// also why it carries a count: the badge has to distinguish "one thing is
+/// waiting" from "four are", since answering only raises the oldest and the
+/// operator needs to know more is queued behind it.
+///
+/// One approval draws the glyph alone; more draw the glyph plus the number,
+/// rather than always drawing a `1` that would read as a version or an index.
+fn approval_badge(name: &str, count: usize) -> Option<Node> {
+    if count == 0 {
+        return None;
+    }
+    let hover = if count == 1 {
+        "1 approval waiting — click to answer it".to_owned()
+    } else {
+        format!("{count} approvals waiting — click to answer the oldest")
+    };
+    let id = format!("{}{name}", ids::APPROVALS);
+    let glyph = icon_titled(APPROVAL_BADGE_ICON, hover.clone(), &[]);
+    Some(if count == 1 {
+        button(id, &["flat", "ts-agent-btn", APPROVAL_BADGE_CLASS], glyph)
+    } else {
+        button(
+            id,
+            &["flat", "ts-agent-btn", APPROVAL_BADGE_CLASS],
+            hrow(
+                2,
+                &[],
+                vec![
+                    glyph,
+                    clipped_titled(
+                        count.to_string(),
+                        // Two digits plus the ellipsis budget: a queue past 99
+                        // is a hive problem, not a layout problem.
+                        3,
+                        hover,
+                        &["caption", "numeric"],
+                    ),
+                ],
+            ),
+        )
+    })
+}
+
 /// One agent as a **pill**: two lines, nothing else (Annika, 2026-09-11 —
 /// see the module doc for her mock and for what each removed thing became).
 ///
-/// Line 1: `[runtime icon] [Name] [Model] … [start|stop] [edit]`.
+/// Line 1: `[runtime icon] [Name] [Model] … [approvals?] [start|stop] [edit]`.
 /// Line 2: the state glyph, the update badge if it is set, and the harness's
 /// own status text in full.
 ///
 /// The name is a `Text`, not a `Button`: the row's click belongs to #950's
 /// `WebView` and does not exist yet, and a button that opened the drawer instead
 /// would train the wrong surface.
-fn agent_row(agent: &Agent, cfg: &AgentsConfig) -> Node {
+fn agent_row(agent: &Agent, cfg: &AgentsConfig, approvals: usize) -> Node {
     let name = agent.name.as_str();
     let status = agent.status();
     let (lifecycle_id, lifecycle_glyph, lifecycle_hover) = lifecycle_affordance(agent);
@@ -696,6 +757,10 @@ fn agent_row(agent: &Agent, cfg: &AgentsConfig) -> Node {
     ];
     head.extend(model_chip(agent));
     head.push(Node::Spacer);
+    // First of the right-hand group: an approval is the one thing on this row
+    // that is waiting on *the operator*, so it sits where the eye lands before
+    // the lifecycle controls rather than after them.
+    head.extend(approval_badge(name, approvals));
     head.push(icon_button(
         format!("{lifecycle_id}{name}"),
         lifecycle_glyph,
@@ -759,7 +824,12 @@ pub fn hive_summary(hive: &Hive) -> String {
 /// (`.ts-plugin-card`, #319) and deliberately no padding, so the root carries
 /// `ts-agents-card` for its own inset.
 #[must_use]
-pub fn card(hive: &Hive, cfg: &AgentsConfig, expanded: &ExpandedGroups) -> Node {
+pub fn card(
+    hive: &Hive,
+    cfg: &AgentsConfig,
+    expanded: &ExpandedGroups,
+    approvals: &PendingApprovals,
+) -> Node {
     let title = hrow(
         6,
         &["ts-agents-title"],
@@ -800,7 +870,7 @@ pub fn card(hive: &Hive, cfg: &AgentsConfig, expanded: &ExpandedGroups) -> Node 
         Hive::Up { agents } if agents.is_empty() => {
             vec![notice("system-run-symbolic", "no agents", "dim-label")]
         }
-        Hive::Up { agents } => roster(agents, cfg, expanded),
+        Hive::Up { agents } => roster(agents, cfg, expanded, approvals),
     };
 
     Node::Box {
@@ -822,7 +892,12 @@ pub fn card(hive: &Hive, cfg: &AgentsConfig, expanded: &ExpandedGroups) -> Node 
 /// earlier ask (spec §6.3). A header is one collapsible line above a run of
 /// pills and adds nothing per row; with one project it is suppressed entirely
 /// ([`headers_wanted`]), which is the single-hive case.
-fn roster(agents: &[Agent], cfg: &AgentsConfig, expanded: &ExpandedGroups) -> Vec<Node> {
+fn roster(
+    agents: &[Agent],
+    cfg: &AgentsConfig,
+    expanded: &ExpandedGroups,
+    approvals: &PendingApprovals,
+) -> Vec<Node> {
     let groups = group(agents, cfg);
     let headers = headers_wanted(&groups);
     let mut out = Vec::new();
@@ -844,7 +919,11 @@ fn roster(agents: &[Agent], cfg: &AgentsConfig, expanded: &ExpandedGroups) -> Ve
                 skipped += 1;
                 continue;
             }
-            rows.push(agent_row(agent, cfg));
+            rows.push(agent_row(
+                agent,
+                cfg,
+                approvals.count_for(agent.name.as_str()),
+            ));
             drawn += 1;
         }
         if headers {
@@ -1289,7 +1368,8 @@ mod tests {
     use super::{MAX_ROWS, PANEL_MAX_ROWS, PANEL_VIEWPORT_PX, age, ids, parse_set_at};
     use crate::config::AgentsConfig;
     use crate::hive::wire::AgentStatusRow;
-    use crate::model::{Agent, AgentName, ExpandedGroups, Hive};
+    use crate::hive::wire::{Approval, ApprovalKind, ApprovalStatus};
+    use crate::model::{Agent, AgentName, ExpandedGroups, Hive, PendingApprovals};
     use hytte_plugin::proto::Node;
 
     fn agent(name: &str, row: AgentStatusRow) -> Agent {
@@ -1312,11 +1392,18 @@ mod tests {
         )
     }
 
+    /// An empty approval queue — what every pre-#947-P3 assertion here
+    /// describes, named so a badge appearing in one of them is a visible diff.
+    fn no_approvals() -> PendingApprovals {
+        PendingApprovals::default()
+    }
+
     fn card_of(agents: Vec<Agent>) -> Node {
         super::card(
             &Hive::Up { agents },
             &AgentsConfig::default(),
             &ExpandedGroups::new(),
+            &no_approvals(),
         )
     }
 
@@ -1698,7 +1785,7 @@ mod tests {
         };
 
         for tree in [
-            super::card(&hive, &cfg, &ExpandedGroups::new()),
+            super::card(&hive, &cfg, &ExpandedGroups::new(), &no_approvals()),
             super::panel(&hive, &cfg, None, ctx()),
         ] {
             let name = find_text(&tree, "choom").expect("the label renders");
@@ -1716,6 +1803,7 @@ mod tests {
             },
             &AgentsConfig::default(),
             &ExpandedGroups::new(),
+            &no_approvals(),
         );
         assert_eq!(
             find_text(&plain, "argus")
@@ -1879,7 +1967,10 @@ mod tests {
         let selected = AgentName::parse(&long_name).expect("63 bytes is legal");
 
         let surfaces = [
-            ("card", super::card(&hive, &cfg, &ExpandedGroups::new())),
+            (
+                "card",
+                super::card(&hive, &cfg, &ExpandedGroups::new(), &no_approvals()),
+            ),
             (
                 "panel/agent",
                 super::panel(&hive, &cfg, Some(&selected), ctx()),
@@ -1973,6 +2064,7 @@ mod tests {
             },
             &cfg,
             &ExpandedGroups::new(),
+            &no_approvals(),
         );
 
         let mut expanders = 0usize;
@@ -2137,6 +2229,103 @@ mod tests {
         max_width_chars: Option<i32>,
         tooltip: Option<String>,
         classes: Vec<String>,
+    }
+
+    // ── #947 P3: the approval badge ──────────────────────────────────────────
+
+    fn approval(id: i64, agent: &str) -> Approval {
+        Approval {
+            id,
+            agent: agent.to_owned(),
+            kind: ApprovalKind::MergeConfigPr,
+            requested_at: "2026-09-12T09:00:00Z".to_owned(),
+            status: ApprovalStatus::Pending,
+            description: None,
+        }
+    }
+
+    fn card_with(agents: Vec<Agent>, queue: Vec<Approval>) -> Node {
+        super::card(
+            &Hive::Up { agents },
+            &AgentsConfig::default(),
+            &ExpandedGroups::new(),
+            &PendingApprovals::new(queue),
+        )
+    }
+
+    /// An agent waiting on nothing wears no badge — the property that keeps the
+    /// quiet card exactly what P1 shipped.
+    ///
+    /// Falsification: render the badge unconditionally (drop
+    /// `approval_badge`'s `count == 0` guard) and the id appears here.
+    #[test]
+    fn an_agent_with_no_approvals_has_no_badge() {
+        let tree = card_with(vec![running("argus", "idle")], Vec::new());
+        assert!(
+            !button_ids(&tree)
+                .iter()
+                .any(|id| id.starts_with(ids::APPROVALS)),
+            "{:?}",
+            button_ids(&tree)
+        );
+    }
+
+    /// The badge names its **agent**, sits before the lifecycle button, and
+    /// says how many are waiting — one in the hover, more in the hover *and* a
+    /// visible count.
+    #[test]
+    fn the_badge_counts_and_precedes_the_lifecycle_button() {
+        let one = card_with(vec![running("argus", "idle")], vec![approval(1, "argus")]);
+        let ids = button_ids(&one);
+        let badge = ids
+            .iter()
+            .position(|id| id == "approvals:argus")
+            .expect("a badge");
+        let stop = ids
+            .iter()
+            .position(|id| id == "stop:argus")
+            .expect("the lifecycle button");
+        assert!(badge < stop, "{ids:?}");
+        // One approval draws no number — just the glyph and its hover.
+        assert!(find_text(&one, "1").is_none());
+
+        let many = card_with(
+            vec![running("argus", "idle")],
+            vec![
+                approval(1, "argus"),
+                approval(2, "argus"),
+                approval(3, "argus"),
+            ],
+        );
+        let count = find_text(&many, "3").expect("the count renders");
+        assert_eq!(
+            count.tooltip.as_deref(),
+            Some("3 approvals waiting — click to answer the oldest")
+        );
+    }
+
+    /// A badge counts only its **own** agent's approvals — the bug a
+    /// `queue.len()` would have shipped on a hive where one agent is noisy.
+    ///
+    /// Falsification: make `count_for` ignore the name and the second
+    /// assertion goes red.
+    #[test]
+    fn a_badge_counts_only_its_own_agents_approvals() {
+        let tree = card_with(
+            vec![running("argus", "idle"), running("bosun", "idle")],
+            vec![
+                approval(1, "argus"),
+                approval(2, "argus"),
+                approval(3, "bosun"),
+            ],
+        );
+        let ids = button_ids(&tree);
+        assert!(ids.contains(&"approvals:argus".to_owned()), "{ids:?}");
+        assert!(ids.contains(&"approvals:bosun".to_owned()), "{ids:?}");
+        // argus wears a "2"; bosun wears no number at all (its single approval
+        // draws the glyph alone), so a stray "3" would mean the count leaked.
+        assert!(find_text(&tree, "2").is_some());
+        assert!(find_text(&tree, "3").is_none());
     }
 
     /// Walk every node in `node`, applying `f` to each.

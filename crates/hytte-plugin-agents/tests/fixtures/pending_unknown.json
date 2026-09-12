@@ -1,0 +1,1 @@
+{"version":1,"ok":true,"approvals":[{"id":11,"agent":"trollshell-choom","kind":"teleport_agent","commit_ref":"","requested_at":"2026-09-12T10:00:00Z","status":"pending","description":"a kind this build has never heard of"},{"id":12,"agent":"trollshell-choom","kind":"merge_config_pr","commit_ref":"13","requested_at":"2026-09-12T10:01:00Z","status":"awaiting_quorum"}]}

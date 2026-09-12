@@ -28,7 +28,9 @@ use hytte_plugin::{Input, Plugin, cmd_channel};
 use hytte_plugin_agents::Agents;
 use hytte_plugin_agents::config::AgentsConfig;
 use hytte_plugin_agents::hive::client::HiveError;
-use hytte_plugin_agents::hive::wire::{AgentStatusRow, Response, VersionMismatch};
+use hytte_plugin_agents::hive::wire::{
+    AgentStatusRow, Approval, ApprovalKind, ApprovalStatus, Response, VersionMismatch,
+};
 use hytte_plugin_agents::poll::Msg;
 use std::path::{Path, PathBuf};
 
@@ -144,6 +146,21 @@ fn scenarios() -> Vec<(&'static str, Agents)> {
             m.update(Input::App(Msg::Status(Ok(many_agents(12)))));
             m
         }),
+        // #947 P3's badge, on the card that carries it: one agent waiting on a
+        // single approval (glyph only), one waiting on three (glyph plus the
+        // count), and one waiting on nothing at all — so the golden shows both
+        // badge shapes *and* the row that must stay exactly as P1 drew it.
+        //
+        // The prompt the fold raises is not in the tree (an `Effect` is not a
+        // node), which is the point: what a reviewer reads here is the row.
+        ("approvals", {
+            let mut m = seed(GOLDEN_NOW);
+            m.update(Input::App(Msg::Status(Ok(roster(
+                "agent_status_grouped.json",
+            )))));
+            m.update(Input::App(Msg::Pending(Ok(approval_queue()))));
+            m
+        }),
         // The same roster with one agent selected — the §6.4 panel in full.
         ("panel_selected", {
             let mut m = seed(GOLDEN_NOW);
@@ -163,6 +180,33 @@ fn scenarios() -> Vec<(&'static str, Agents)> {
             m
         }),
     ]
+}
+
+/// The `approvals` golden's queue: three waiting on `trollshell-choom`, one on
+/// `nixos-choom`, none on `stray`, plus one already-approved row that must not
+/// reach a badge.
+fn approval_queue() -> Vec<Approval> {
+    let mut queue: Vec<Approval> = [
+        (1_i64, "trollshell-choom", ApprovalStatus::Pending),
+        (2, "trollshell-choom", ApprovalStatus::Pending),
+        (3, "trollshell-choom", ApprovalStatus::Pending),
+        (4, "nixos-choom", ApprovalStatus::Pending),
+        (5, "stray", ApprovalStatus::Approved),
+    ]
+    .into_iter()
+    .map(|(id, agent, status)| Approval {
+        id,
+        agent: agent.to_owned(),
+        kind: ApprovalKind::MergeConfigPr,
+        requested_at: "2026-09-07T12:40:00Z".to_owned(),
+        status,
+        description: Some("bump the meta flake inputs".to_owned()),
+    })
+    .collect();
+    // The hive's order is not the queue's order; the model sorts. Handing it
+    // something out of order here is what makes that visible in the golden.
+    queue.reverse();
+    queue
 }
 
 /// `n` running agents named `agent-0…`, in one ungrouped hive.

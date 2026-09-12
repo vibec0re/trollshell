@@ -768,13 +768,52 @@ pub enum Input<M> {
     /// plugin with several prompts in flight can correlate the answer. Delivered
     /// only to a plugin that declared
     /// [`Capability::Consent`](proto::Capability::Consent) and actually requested
-    /// a prompt; an unanswered prompt resolves to
-    /// [`ConsentDecision::Deny`](proto::ConsentDecision::Deny) after the host's
-    /// 60 s timeout, so this always eventually arrives.
+    /// a prompt.
+    ///
+    /// # This does **not** always arrive — the guarantee is the card's, not the timeout's
+    ///
+    /// It used to say it did, which was true of the only card that existed then
+    /// and is false since #947 P3 added a second one. What an unanswered prompt
+    /// sends is
+    /// [`ConsentChoices::unanswered`](proto::ConsentChoices::unanswered), read
+    /// off the `choices` the *requester* put on its own `RequestConsent`:
+    ///
+    /// ```
+    /// use hytte_plugin::proto::{ConsentChoices, ConsentDecision};
+    ///
+    /// // #487's four-button grant card: a 60 s silence denies, and this input
+    /// // arrives.
+    /// assert_eq!(
+    ///     ConsentChoices::Grant.unanswered(),
+    ///     Some(ConsentDecision::Deny),
+    /// );
+    ///
+    /// // The two-button approval card: a 60 s silence, an `Esc`, a supersede
+    /// // or no output to draw on all send NOTHING. This input never arrives.
+    /// assert_eq!(ConsentChoices::Approval.unanswered(), None);
+    /// ```
+    ///
+    /// The asymmetry is deliberate — a `Deny` on a one-shot queued item is a
+    /// durable answer on the requester's far side, and "nobody was at the
+    /// screen for 60 seconds" is not evidence for it.
+    ///
+    /// **So a plugin using [`ConsentChoices::Approval`](proto::ConsentChoices::Approval)
+    /// must run a deadline of its own.** Anything keyed on `request_id` — a
+    /// correlation table, a one-card gate — leaks an entry per ignored prompt
+    /// otherwise, and a gate leaks the whole feature: the next prompt never
+    /// opens. Time out strictly later than the host does
+    /// ([`CONSENT_PROMPT_TIMEOUT_SECS`](proto::CONSENT_PROMPT_TIMEOUT_SECS) plus
+    /// [`CONSENT_PROMPT_GRACE_SECS`](proto::CONSENT_PROMPT_GRACE_SECS), both
+    /// published for exactly this), and on expiry treat the item as *still
+    /// unanswered* rather than as denied — that is what the card promised the
+    /// human. `hytte-plugin-agents`' `RaisedPrompt` is the worked example.
     ConsentDecision {
         /// The `request_id` the plugin chose on the originating `RequestConsent`.
         request_id: u64,
-        /// The human's choice (or `Deny` on the 60 s timeout).
+        /// The human's choice, or whatever the card's
+        /// [`ConsentChoices::unanswered`](proto::ConsentChoices::unanswered)
+        /// names — which for an approval card means this variant is simply
+        /// never sent.
         decision: ConsentDecision,
     },
     /// The next few upcoming calendar events (#484): the host

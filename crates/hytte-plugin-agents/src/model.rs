@@ -4,10 +4,10 @@
 //! and [`crate::view`] projects it. That is what makes the status precedence
 //! and the grouping testable without a socket, a host, or a wall clock.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::AgentsConfig;
-use crate::hive::wire::{AgentStatusRow, VersionMismatch};
+use crate::hive::wire::{AgentStatusRow, Approval, ApprovalStatus, VersionMismatch};
 
 /// A hive-reported agent name that has passed the whitelist.
 ///
@@ -213,8 +213,101 @@ impl Agent {
     }
 }
 
+/// The hive's approval queue, filtered to what is still waiting on a human and
+/// ordered oldest first (#947 P3, spec §6.5).
+///
+/// A type rather than a bare `Vec<Approval>` because four call sites ask it
+/// four different questions — "how many badges does this row wear", "which one
+/// does a badge click raise", "which one has never been prompted", "is this
+/// decision still answerable" — and each of those answers has to agree about
+/// *ordering* and about *what counts as waiting*, or the badge and the prompt
+/// would disagree about which approval is the oldest.
+///
+/// So both rules are established once, in [`PendingApprovals::new`], and every
+/// method below reads them as an invariant rather than re-deriving them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PendingApprovals {
+    /// Status-[`Pending`](ApprovalStatus::Pending) rows, ascending by id.
+    queue: Vec<Approval>,
+}
+
+impl PendingApprovals {
+    /// Take a raw `Pending` answer and keep what is still waiting on a human,
+    /// oldest first.
+    ///
+    /// Two decisions, both here rather than at the call sites:
+    ///
+    /// - **Filter on the status, not on the verb.** `Pending`'s answer is
+    ///   whatever the daemon's store returns, so an `Approved` row arriving in
+    ///   it must not raise a prompt for a decision somebody already made. An
+    ///   [`Unknown`](ApprovalStatus::Unknown) status is *not* waiting either: a
+    ///   build that cannot name a state must not offer to resolve it.
+    /// - **Order by id.** The hive's ids are monotonic per queue insert, so
+    ///   ascending id *is* oldest-first — and it is a total order over `i64`,
+    ///   where `requested_at` is a free-text timestamp the mirror deliberately
+    ///   keeps unparsed (the [`AgentStatusRow::status_set_at`] rule).
+    #[must_use]
+    pub fn new(queue: Vec<Approval>) -> Self {
+        let mut queue: Vec<Approval> = queue
+            .into_iter()
+            .filter(|a| a.status == ApprovalStatus::Pending)
+            .collect();
+        queue.sort_by_key(|a| a.id);
+        Self { queue }
+    }
+
+    /// The whole queue, oldest first.
+    #[must_use]
+    pub fn all(&self) -> &[Approval] {
+        &self.queue
+    }
+
+    /// Whether `id` is still waiting on a human.
+    ///
+    /// The question every decision path asks before acting: an approval that
+    /// left the queue between the prompt and the answer (the operator used the
+    /// dashboard, or `hivectl`) must be dropped, not re-decided — spec §6.5's
+    /// "dropped with a debug line, not an error".
+    #[must_use]
+    pub fn contains(&self, id: i64) -> bool {
+        self.queue.iter().any(|a| a.id == id)
+    }
+
+    /// How many approvals `agent` is waiting on — the badge's count.
+    #[must_use]
+    pub fn count_for(&self, agent: &str) -> usize {
+        self.queue.iter().filter(|a| a.agent == agent).count()
+    }
+
+    /// The oldest approval `agent` is waiting on — what its badge click raises.
+    #[must_use]
+    pub fn oldest_for(&self, agent: &str) -> Option<&Approval> {
+        self.queue.iter().find(|a| a.agent == agent)
+    }
+
+    /// The oldest approval no prompt has been raised for yet.
+    ///
+    /// `prompted` is the dedup set: an approval prompts **once** and then waits
+    /// for a decision or a badge click, so a hive with one unanswered approval
+    /// does not raise a modal every poll.
+    #[must_use]
+    pub fn oldest_unprompted<'a>(&'a self, prompted: &BTreeSet<i64>) -> Option<&'a Approval> {
+        self.queue.iter().find(|a| !prompted.contains(&a.id))
+    }
+}
+
 /// The badge icon for `needs_update` (spec §6.2's badge row).
 pub const UPDATE_BADGE_ICON: &str = "software-update-available-symbolic";
+
+/// The badge icon for a pending approval (#947 P3).
+///
+/// A **question**, not a warning: an approval is the hive asking, and the row's
+/// warning vocabulary (`failed`, `needs_login`) is already spoken for by
+/// [`Status`], which this badge must not be mistaken for.
+pub const APPROVAL_BADGE_ICON: &str = "dialog-question-symbolic";
+
+/// The approval badge's style class.
+pub const APPROVAL_BADGE_CLASS: &str = "ts-agent-approvals";
 
 /// The badge's style class.
 pub const UPDATE_BADGE_CLASS: &str = "ts-agent-upd";
@@ -455,10 +548,89 @@ pub fn model_family(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Agent, AgentName, Group, Hive, Status, agent_url, group, headers_wanted, model_family,
+        Agent, AgentName, Group, Hive, PendingApprovals, Status, agent_url, group, headers_wanted,
+        model_family,
     };
     use crate::config::AgentsConfig;
-    use crate::hive::wire::AgentStatusRow;
+    use crate::hive::wire::{AgentStatusRow, Approval, ApprovalKind, ApprovalStatus};
+    use std::collections::BTreeSet;
+
+    // ── #947 P3: the approval queue's two invariants ─────────────────────────
+
+    fn queued(id: i64, agent: &str, status: ApprovalStatus) -> Approval {
+        Approval {
+            id,
+            agent: agent.to_owned(),
+            kind: ApprovalKind::MergeConfigPr,
+            requested_at: String::new(),
+            status,
+            description: None,
+        }
+    }
+
+    /// [`PendingApprovals::new`] is the one place "still waiting, oldest
+    /// first" is decided, so both halves are pinned here.
+    ///
+    /// Falsification: drop the `sort_by_key` and the order assertion goes red;
+    /// drop the status filter and the resolved rows appear — which is the bug
+    /// that would raise a modal offering to approve something already approved.
+    #[test]
+    fn the_queue_keeps_only_what_is_waiting_and_orders_it_oldest_first() {
+        let q = PendingApprovals::new(vec![
+            queued(9, "argus", ApprovalStatus::Pending),
+            queued(4, "argus", ApprovalStatus::Approved),
+            queued(6, "argus", ApprovalStatus::Pending),
+            queued(2, "argus", ApprovalStatus::Denied),
+            queued(1, "argus", ApprovalStatus::Cancelled),
+            queued(3, "argus", ApprovalStatus::Failed),
+        ]);
+        assert_eq!(
+            q.all().iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![6, 9],
+            "only `pending`, ascending by id"
+        );
+    }
+
+    /// An [`ApprovalStatus::Unknown`] is **not** waiting: a build that cannot
+    /// name a state must not offer the operator a card that resolves it.
+    #[test]
+    fn an_unknown_status_is_not_treated_as_waiting() {
+        let q = PendingApprovals::new(vec![
+            queued(
+                1,
+                "argus",
+                ApprovalStatus::Unknown("awaiting_quorum".to_owned()),
+            ),
+            queued(2, "argus", ApprovalStatus::Pending),
+        ]);
+        assert_eq!(q.all().iter().map(|a| a.id).collect::<Vec<_>>(), vec![2]);
+    }
+
+    /// The three questions the badge and the prompt ask, and they must agree:
+    /// the count is per agent, the badge click's target is that agent's oldest,
+    /// and the prompt's target is the oldest nobody has been asked about.
+    #[test]
+    fn the_queue_answers_per_agent_and_agrees_about_oldest() {
+        let q = PendingApprovals::new(vec![
+            queued(5, "argus", ApprovalStatus::Pending),
+            queued(7, "bosun", ApprovalStatus::Pending),
+            queued(9, "argus", ApprovalStatus::Pending),
+        ]);
+        assert_eq!(q.count_for("argus"), 2);
+        assert_eq!(q.count_for("bosun"), 1);
+        assert_eq!(q.count_for("nobody"), 0);
+        assert_eq!(q.oldest_for("argus").map(|a| a.id), Some(5));
+        assert_eq!(q.oldest_for("nobody"), None);
+        assert!(q.contains(7) && !q.contains(8));
+
+        let mut prompted = BTreeSet::new();
+        assert_eq!(q.oldest_unprompted(&prompted).map(|a| a.id), Some(5));
+        prompted.insert(5);
+        assert_eq!(q.oldest_unprompted(&prompted).map(|a| a.id), Some(7));
+        prompted.insert(7);
+        prompted.insert(9);
+        assert_eq!(q.oldest_unprompted(&prompted), None);
+    }
 
     fn agent(name: &str, row: AgentStatusRow) -> Agent {
         Agent {

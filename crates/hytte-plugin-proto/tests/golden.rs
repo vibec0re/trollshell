@@ -51,15 +51,15 @@
 //! `the_capability_list_is_one_variant_from_an_array16_header` in `proto.rs`.
 
 use hytte_plugin_proto::{
-    AccentRole, AudioAction, AudioSpectrum, Capability, ClockState, ConsentDecision,
-    DEFAULT_DOT_PX, DatasourceError, DatasourceOutcome, Dir, DotMatrixConfig, DotMatrixState,
-    Effect, EffectOutcome, EventKind, FlipBoardConfig, FlipBoardState, GaugeConfig, GaugeRange,
-    GaugeState, HostMsg, LedStripConfig, LedStripState, LogLevel, Manifest, MarqueeConfig,
-    MarqueeState, Mechanism, MediaAction, Mount, NiriAction, Node, NowPlaying, PROTO_VERSION, Page,
-    PeakHoldConfig, PluginMsg, PreemWidget, ProvidedDatasource, SPECTRUM_BINS, ScopeConfig,
-    ScopeState, SevenSegConfig, SevenSegState, ShaderData, StateKey, StateSnapshot, StyleName,
-    StyleRef, TextBoxConfig, TextBoxState, TextBoxWidth, UpcomingEvent, VOCAB, VOCAB_UNCONDITIONAL,
-    decode, encode, preem, preem_id, preem_styled,
+    AccentRole, AudioAction, AudioSpectrum, Capability, ClockState, ConsentChoices,
+    ConsentDecision, DEFAULT_DOT_PX, DatasourceError, DatasourceOutcome, Dir, DotMatrixConfig,
+    DotMatrixState, Effect, EffectOutcome, EventKind, FlipBoardConfig, FlipBoardState, GaugeConfig,
+    GaugeRange, GaugeState, HostMsg, LedStripConfig, LedStripState, LogLevel, Manifest,
+    MarqueeConfig, MarqueeState, Mechanism, MediaAction, Mount, NiriAction, Node, NowPlaying,
+    PROTO_VERSION, Page, PeakHoldConfig, PluginMsg, PreemWidget, ProvidedDatasource, SPECTRUM_BINS,
+    ScopeConfig, ScopeState, SevenSegConfig, SevenSegState, ShaderData, StateKey, StateSnapshot,
+    StyleName, StyleRef, TextBoxConfig, TextBoxState, TextBoxWidth, UpcomingEvent, VOCAB,
+    VOCAB_UNCONDITIONAL, decode, encode, preem, preem_id, preem_styled,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -359,12 +359,19 @@ fn effect_table() -> Vec<Effect> {
             summary: "Timer done".into(),
             body: "25:00 timer finished".into(),
         },
+        // #947 P3 appended `choices` to this variant. It stays out of the table
+        // deliberately: `ConsentChoices::Grant` is `skip_serializing_if`-skipped,
+        // so naming it here must leave every byte of the committed fixture
+        // untouched — and a fixture that did not move is the compat evidence.
+        // The two-button card's own bytes are pinned in `proto.rs` instead, so
+        // this table keeps meaning "what a pre-#947 plugin could emit".
         Effect::RequestConsent {
             request_id: 7,
             agent: "claude".into(),
             datasource: "departures".into(),
             scope: "*".into(),
             detail: "next S-Bahn departures".into(),
+            choices: ConsentChoices::Grant,
         },
         Effect::DatasourceQuery {
             request_id: 11,

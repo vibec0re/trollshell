@@ -1,4 +1,5 @@
-//! The plugin's own I/O: the `AgentStatus` poll loop and the command lane.
+//! The plugin's own I/O: the poll loop — `AgentStatus`, and since #947 P3 the
+//! `Pending` approval queue on the same tick — plus the command lane.
 //!
 //! Spec §5.1 picks the shape deliberately. `hytte-claude-bridge` binds its
 //! listener *before* handing the main thread to the SDK, because its clients
@@ -48,7 +49,7 @@ use hytte_plugin::CmdReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::{self, AgentsConfig};
-use crate::hive::wire::{AgentStatusRow, HiveUrls, Request};
+use crate::hive::wire::{AgentStatusRow, Approval, HiveUrls, Request};
 use crate::hive::{HiveError, client};
 
 /// A command from the reducer to this task — the sanctioned outbound lane
@@ -73,6 +74,22 @@ pub enum Msg {
     /// The hive's `Urls`, fetched once per session after the first successful
     /// poll — it backs the panel's agent-page link and changes about never.
     Urls(Box<HiveUrls>),
+    /// The approval queue as the hive returned it (#947 P3), unfiltered — the
+    /// reducer establishes "still waiting, oldest first" in one place,
+    /// [`crate::model::PendingApprovals::new`], rather than trusting this
+    /// task to have done it.
+    ///
+    /// **A refusal is carried, not swallowed** (#1140's review, LOW-3). It used
+    /// to be a `debug!` and nothing else, which left `self.pending` holding the
+    /// last good queue indefinitely: a hive that answers `agent_status` but
+    /// refuses `pending` — an older daemon, a permissions change — kept drawing
+    /// badges for approvals that may no longer exist, and clicking one raised a
+    /// card whose `Approve` the hive then refused. The reducer's `Err` arm
+    /// clears the badges without touching `prompted` or the in-flight prompt,
+    /// so a one-tick blip costs a badge rather than a duplicate prompt.
+    ///
+    /// Only sent when the *status* call succeeded — see [`poll_once`].
+    Pending(Result<Vec<Approval>, HiveError>),
     /// A [`Cmd::Send`] the hive did not accept.
     ///
     /// The row un-sticks on the next poll either way, but "the button flipped
@@ -176,11 +193,15 @@ pub async fn poll_task_with(
 
     let mut visible = false;
     let mut urls_done = false;
+    // Whether the `Pending` verb is currently refusing — the transition edge
+    // that decides `warn!` from `debug!`. Per task, so a plugin restart says it
+    // once more rather than staying quiet about a hive that never answered.
+    let mut pending_failing = false;
     let mut interval = tokio::time::interval(cfg.poll_interval());
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // The seed poll — see the module docs on why it ignores `visible`.
-    poll_once(&cfg, &msg_tx, &mut urls_done).await;
+    poll_once(&cfg, &msg_tx, &mut urls_done, &mut pending_failing).await;
 
     loop {
         tokio::select! {
@@ -202,7 +223,7 @@ pub async fn poll_task_with(
                             if reload(&mut cfg, &mut watch, &msg_tx) {
                                 interval = fresh_interval(&cfg);
                             }
-                            poll_once(&cfg, &msg_tx, &mut urls_done).await;
+                            poll_once(&cfg, &msg_tx, &mut urls_done, &mut pending_failing).await;
                         }
                     }
                     Cmd::Send(req) => {
@@ -222,7 +243,7 @@ pub async fn poll_task_with(
                         // truth, and a refused write must un-stick the row's
                         // optimistic flip just as fast as an accepted one.
                         interval.reset();
-                        poll_once(&cfg, &msg_tx, &mut urls_done).await;
+                        poll_once(&cfg, &msg_tx, &mut urls_done, &mut pending_failing).await;
                     }
                 }
             }
@@ -231,7 +252,7 @@ pub async fn poll_task_with(
                 if reload(&mut cfg, &mut watch, &msg_tx) {
                     interval = fresh_interval(&cfg);
                 }
-                poll_once(&cfg, &msg_tx, &mut urls_done).await;
+                poll_once(&cfg, &msg_tx, &mut urls_done, &mut pending_failing).await;
             }
         }
         if msg_tx.is_closed() {
@@ -263,8 +284,35 @@ fn reload(cfg: &mut AgentsConfig, watch: &mut ConfigSource, msg_tx: &UnboundedSe
     true
 }
 
-/// One `AgentStatus` round trip, plus a one-shot `Urls` once the hive answers.
-async fn poll_once(cfg: &AgentsConfig, msg_tx: &UnboundedSender<Msg>, urls_done: &mut bool) {
+/// One `AgentStatus` round trip, then the `Pending` queue, plus a one-shot
+/// `Urls` once the hive answers.
+///
+/// # Why `Pending` rides this tick rather than a task of its own (#947 P3)
+///
+/// Spec §5.4 gives the status poll one cadence, one parking rule and one
+/// config key, and the approval queue wants all three to be *the same* ones —
+/// so this is the existing poll extended, not a second task:
+///
+/// - **The badge is on the row.** A badge count folded from a different tick
+///   than the roster it decorates can describe an agent the card is no longer
+///   drawing. One round of I/O per tick keeps them a single observation.
+/// - **Parking is the whole energy argument.** A second task would need its own
+///   copy of the `SlotVisible` gate, the `agents.toml` reload and the seed
+///   poll, and any divergence between the two copies would be an approval
+///   prompt firing at a closed sidebar.
+/// - **It costs one round trip on a unix socket**, on a cadence measured in
+///   seconds, and only after the status call already proved the socket is
+///   answering.
+///
+/// The order matters and is not alphabetical: `AgentStatus` goes first so a
+/// dead hive costs exactly one failed connect, and `Pending` is skipped
+/// entirely when it failed.
+async fn poll_once(
+    cfg: &AgentsConfig,
+    msg_tx: &UnboundedSender<Msg>,
+    urls_done: &mut bool,
+    pending_failing: &mut bool,
+) {
     let socket = Path::new(&cfg.socket);
     let status = match client::request(socket, &Request::AgentStatus).await {
         // A daemon that answers `ok` but carries no roster is answering a
@@ -277,9 +325,34 @@ async fn poll_once(cfg: &AgentsConfig, msg_tx: &UnboundedSender<Msg>, urls_done:
     if msg_tx.send(Msg::Status(status)).is_err() {
         return;
     }
+    if !ok {
+        return;
+    }
 
-    if ok
-        && !*urls_done
+    // #947 P3. A refusal rides the same `Msg`, so the reducer can drop badges
+    // it can no longer vouch for — and is announced **once per transition**
+    // (#1140's review, LOW-3): a hive that refuses this verb every tick would
+    // otherwise be invisible at the default log level, twice a second, forever.
+    let approvals = client::request(socket, &Request::Pending)
+        .await
+        .map(|resp| resp.approvals.unwrap_or_default());
+    match (&approvals, *pending_failing) {
+        (Err(e), false) => {
+            *pending_failing = true;
+            tracing::warn!(%e, "the hive refuses the approval queue; badges are cleared until it answers");
+        }
+        (Err(e), true) => tracing::debug!(%e, "the approval queue is still refusing"),
+        (Ok(_), true) => {
+            *pending_failing = false;
+            tracing::info!("the approval queue is answering again");
+        }
+        (Ok(_), false) => {}
+    }
+    if msg_tx.send(Msg::Pending(approvals)).is_err() {
+        return;
+    }
+
+    if !*urls_done
         && let Ok(resp) = client::request(socket, &Request::Urls).await
         && let Some(urls) = resp.urls
     {

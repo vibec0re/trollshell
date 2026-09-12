@@ -732,6 +732,19 @@
 .ts-agents-panel .ts-agent-upd {
     color: @warning_color;
 }
+/* The pending-approval badge (#947 P3). Tinted `@accent_color`, not
+ * `@warning_color`: an approval is the hive *asking*, and the row's warning
+ * ink is already spoken for by `failed` / `needs_login`, which are states the
+ * operator has to go fix elsewhere.
+ *
+ * It is tinted at all — where the lifecycle buttons beside it are not —
+ * because since #1140 this badge is the only way back into a prompt that timed
+ * out or was dismissed. A badge that reads as one more flat icon button is a
+ * recovery path nobody finds (#1140 review, LOW-5). */
+.ts-agents-card .ts-agent-approvals,
+.ts-agents-panel .ts-agent-approvals {
+    color: @accent_color;
+}
 /* The in-place unfold sits under its row, indented past the runtime icon so it
  * reads as belonging to the row above rather than as a new one. */
 .ts-agents-card .ts-agent-details {

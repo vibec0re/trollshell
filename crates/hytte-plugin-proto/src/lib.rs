@@ -270,8 +270,9 @@ pub const VOCAB_UNCONDITIONAL: u16 = 1;
 
 pub use codec::{MAX_FRAME_LEN, ProtoError, decode, decode_body, encode, encode_body};
 pub use effect::{
-    AudioAction, ConsentDecision, DatasourceError, DatasourceOutcome, Effect, EffectOutcome,
-    MediaAction, NiriAction, OPEN_URI_VOCAB, Page,
+    AudioAction, CONSENT_PROMPT_GRACE_SECS, CONSENT_PROMPT_TIMEOUT_SECS, ConsentChoices,
+    ConsentDecision, DatasourceError, DatasourceOutcome, Effect, EffectOutcome, MediaAction,
+    NiriAction, OPEN_URI_VOCAB, Page,
 };
 pub use manifest::{Capability, Manifest, Mount, ProvidedDatasource, StateKey};
 pub use msg::{HostMsg, LogLevel, PluginMsg};

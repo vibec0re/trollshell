@@ -624,6 +624,75 @@ openssl x509` produces it. Pointing it at `trust-bundle.pem` gets you an
       size/placement rule written that way applies to two different agents'
       windows.
 
+### Approvals (#947 P3, spec §6.5)
+
+Needs the same hive, plus something in its **approval queue** — a manager
+agent opening a config PR is the natural source, and `hivectl` can submit one
+by hand (`hivectl agent <name> request-create` queues a `spawn`). CI proves the
+three verbs' bytes against a scripted socket, the dedup, the decision mapping
+and both consent cards' button tables; it cannot prove that a card appears on
+the right output, that hyperhive actually acts on an `approve`, or that the
+badge count is legible at the sidebar's width.
+
+A note on what CI is asserting, so a live difference reads as a finding: the
+`pending_*.json` fixtures were derived from hyperhive's structs by hand, like
+the P1 ones, and against a **2026-09-03 checkout** — so `Pending`'s answer is
+the first thing to diff.
+
+- [ ] **(#947 P3)** **A queued approval raises the card.** With the sidebar
+      open, queue an approval and confirm a prompt appears on the **focused**
+      output within one poll interval, reading
+      _"⟨agent label⟩ wants: ⟨kind⟩"_ — not _"… from "_ with a dangling
+      clause — with the manager's description on the detail line.
+- [ ] **(#947 P3)** **Two buttons, Approve and Deny.** Confirm the card offers
+      exactly those, not Allow once / This session / Always, and that
+      **no button has the keyboard focus** — press `Return` with the card up
+      and confirm nothing happens.
+- [ ] **(#947 P3)** **Approve reaches the hive.** Click Approve and confirm
+      with `hivectl` (or the dashboard) that the request moved to `approved`
+      and its action ran — and that the badge disappears from the row within
+      one poll, without restarting the plugin.
+- [ ] **(#947 P3)** **Deny reaches the hive**, same check, landing on `denied`.
+- [ ] **(#947 P3)** **The prompt fires once.** Queue an approval, leave the
+      card up, and watch `journalctl --user -u trollshell -f`: exactly one
+      `plugin effect: RequestConsent` line, not one per poll. (At the 2 s
+      default that is the difference between one card and thirty.)
+- [ ] **(#947 P3)** **A timeout answers nothing.** Queue an approval, leave the
+      card untouched for 60 s, and confirm three things: the card closes; the
+      approval is **still pending** hive-side; and the row keeps its badge. Do
+      the same with `Esc` — same outcome, because `Esc` is a dismiss on this
+      card, not a deny.
+- [ ] **(#947 P3)** **The badge re-raises it.** Click the badge on that row and
+      confirm the card comes back for the **same** approval. With two or more
+      queued for one agent, confirm the badge shows the count and that the
+      click raises the **oldest**.
+- [ ] **(#947 P3)** **Answered elsewhere clears the badge.** With a card up,
+      approve the same request on the hive dashboard instead. Confirm the badge
+      clears on the next poll and that clicking the still-open card's Approve
+      writes nothing (`journalctl` shows the "resolved elsewhere" debug line,
+      with `RUST_LOG=hytte_plugin_agents=debug`).
+- [ ] **(#947 P3)** **A refusal is loud.** Make the write fail (approve the
+      request on the dashboard first, then answer the stale card; or drop the
+      user from `hive-admin`) and confirm exactly one toast naming the action
+      and the request — _"hive refused: approve "merge a reviewed config PR"
+      for ⟨label⟩ (#⟨id⟩)"_ — and that the badge is still there afterwards.
+- [ ] **(#947 P3)** **A burst is answered one at a time.** Queue three
+      approvals at once and confirm one card at a time: answering the first
+      brings up the second on the next poll, rather than three cards
+      superseding each other inside one 60 s window.
+- [ ] **(#947 P3)** **The datasource prompt is unchanged.** Trigger the
+      infobroker's own consent prompt (an agent asking for data it has no
+      standing grant for) and confirm it still draws **four** buttons with
+      `Always` focused, and that its 60 s timeout still denies. The
+      `RequestConsent` bytes for that path are unchanged by this PR and CI pins
+      that, but this is the one path a human should look at once.
+- [ ] **(#947 P3)** **Re-record the approval fixtures.** Capture a real
+      `Pending` answer and diff it against
+      `crates/hytte-plugin-agents/tests/fixtures/pending.json`. Watch
+      `commit_ref` in particular — it is overloaded per kind and the mirror
+      deliberately does not read it, so a surprise there is a spec question,
+      not a decode bug.
+
 ## Plugins & launcher
 
 - [ ] **(#489)** Plugins now launch via `systemd-run --user` transient units

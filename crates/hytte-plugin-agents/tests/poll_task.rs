@@ -66,6 +66,28 @@ async fn recv_soon(rx: &mut mpsc::UnboundedReceiver<Msg>, what: &str) -> Msg {
         .unwrap_or_else(|| panic!("the poll task dropped its sender before {what}"))
 }
 
+/// The next message that is **not** a tick's incidental traffic.
+///
+/// A tick has emitted more than one message since #947 P3 put `Pending` on it,
+/// and the one-shot `Urls` was always there — so "the next message is the one I
+/// am asserting on" stopped being true, and a wait written that way now reads
+/// whichever of a tick's messages happened to be at the head of the queue.
+/// These tests are about *when the poller talks to the socket* and *what it
+/// says about a write*, not about the order within a tick, so they skip the two
+/// carriers and assert on the rest.
+///
+/// Deliberately **not** a blanket drain: `Status`, `Config` and `WriteRefused`
+/// all come back, so a test still fails loudly when the wrong one arrives
+/// rather than waiting out its deadline.
+async fn recv_status_lane(rx: &mut mpsc::UnboundedReceiver<Msg>, what: &str) -> Msg {
+    loop {
+        match recv_soon(rx, what).await {
+            Msg::Pending(_) | Msg::Urls(_) => {}
+            other => return other,
+        }
+    }
+}
+
 /// **§5.4's parking.** While the sidebar is hidden the loop makes no round
 /// trips at all; opening it polls immediately and resumes the cadence.
 ///
@@ -96,7 +118,7 @@ async fn the_poll_parks_while_the_sidebar_is_closed_and_wakes_on_open() {
         Msg::Config(_)
     ));
     assert!(matches!(
-        recv_soon(&mut msg_rx, "a poll answer").await,
+        recv_status_lane(&mut msg_rx, "a poll answer").await,
         Msg::Status(Ok(_))
     ));
     // Settle before the baseline: a successful poll is followed by the
@@ -120,7 +142,7 @@ async fn the_poll_parks_while_the_sidebar_is_closed_and_wakes_on_open() {
     // Open: an immediate poll…
     tx.send(Cmd::SetVisible(true)).expect("the lane is open");
     assert!(matches!(
-        recv_soon(&mut msg_rx, "a poll answer").await,
+        recv_status_lane(&mut msg_rx, "a poll answer").await,
         Msg::Status(Ok(_))
     ));
     settle().await;
@@ -188,7 +210,21 @@ async fn the_seed_poll_runs_before_any_visibility_edge() {
         Msg::Status(Ok(rows)) => assert_eq!(rows.len(), 3),
         other => panic!("expected a seeded roster, got {other:?}"),
     }
-    assert_eq!(hive.seen(), vec![r#"{"cmd":"agent_status"}"#.to_owned()]);
+    // Settle so the rest of the seed tick lands: the status answer is sent
+    // before the tick's remaining round trips finish, so reading `seen()` here
+    // without settling would be a race that happens to pass.
+    settle().await;
+    assert_eq!(
+        hive.seen(),
+        vec![
+            r#"{"cmd":"agent_status"}"#.to_owned(),
+            // #947 P3 rides the same tick, in this order — the roster first, so
+            // a dead hive costs one failed connect and not two.
+            r#"{"cmd":"pending"}"#.to_owned(),
+            r#"{"cmd":"urls"}"#.to_owned(),
+        ],
+        "the seed tick is one round of each read verb, and nothing else"
+    );
     task.abort();
 }
 
@@ -222,14 +258,14 @@ async fn an_agents_toml_edit_is_picked_up_on_the_next_poll() {
         other => panic!("expected the seed config, got {other:?}"),
     }
     assert!(matches!(
-        recv_soon(&mut msg_rx, "a poll answer").await,
+        recv_status_lane(&mut msg_rx, "a poll answer").await,
         Msg::Status(Ok(_))
     ));
 
     // The operator edits the file while the sidebar is open.
     tx.send(Cmd::SetVisible(true)).expect("the lane is open");
     assert!(matches!(
-        recv_soon(&mut msg_rx, "a poll answer").await,
+        recv_status_lane(&mut msg_rx, "a poll answer").await,
         Msg::Status(Ok(_))
     ));
     std::fs::write(
@@ -243,10 +279,16 @@ async fn an_agents_toml_edit_is_picked_up_on_the_next_poll() {
         loop {
             tokio::time::advance(Duration::from_secs(1)).await;
             settle().await;
-            if let Ok(Msg::Config(cfg)) = msg_rx.try_recv() {
-                return cfg;
+            // Drain the whole tick looking for the reload, rather than
+            // inspecting only its first message: a tick emits a status and
+            // (since #947 P3) an approval queue, and a leftover one of those
+            // would otherwise be the message that got looked at while the
+            // `Msg::Config` behind it was thrown away by the drain.
+            while let Ok(msg) = msg_rx.try_recv() {
+                if let Msg::Config(cfg) = msg {
+                    return cfg;
+                }
             }
-            while msg_rx.try_recv().is_ok() {}
         }
     })
     .await
@@ -287,7 +329,7 @@ async fn a_refused_write_reaches_the_reducer_and_still_re_polls() {
         Msg::Config(_)
     ));
     assert!(matches!(
-        recv_soon(&mut msg_rx, "a poll answer").await,
+        recv_status_lane(&mut msg_rx, "a poll answer").await,
         Msg::Status(Ok(_))
     ));
     settle().await;
@@ -298,7 +340,7 @@ async fn a_refused_write_reaches_the_reducer_and_still_re_polls() {
     }))
     .expect("the lane is open");
 
-    match recv_soon(&mut msg_rx, "the refusal").await {
+    match recv_status_lane(&mut msg_rx, "the refusal").await {
         Msg::WriteRefused { request, reason } => {
             assert_eq!(
                 request,
@@ -319,7 +361,7 @@ async fn a_refused_write_reaches_the_reducer_and_still_re_polls() {
     // …and the roster is re-read regardless, which is what un-sticks the row's
     // optimistic flip.
     assert!(matches!(
-        recv_soon(&mut msg_rx, "the reconciling poll").await,
+        recv_status_lane(&mut msg_rx, "the reconciling poll").await,
         Msg::Status(Ok(_))
     ));
     task.abort();
@@ -370,5 +412,88 @@ async fn urls_is_fetched_once_per_session_not_once_per_poll() {
         .count();
     assert!(statuses > 2, "several polls happened: {statuses}");
     assert_eq!(urls, 1, "Urls must be asked exactly once per session");
+    task.abort();
+}
+
+/// **#1140's review, LOW-2.** A hive that is down costs **one** failed connect
+/// per tick, not three.
+///
+/// The ordering's stated reason — `AgentStatus` first, `Pending` and `Urls`
+/// skipped when it fails — was unpinned: replacing the `if !ok { return; }`
+/// with `if false` left the suite green, and a down hive would then burn three
+/// connect attempts every tick for as long as the sidebar is open.
+///
+/// Falsification: delete that early return and `seen()` grows past one, or —
+/// since the fake is not even bound here — a `Msg::Pending` arrives where none
+/// should.
+#[tokio::test(start_paused = true)]
+async fn a_failed_status_skips_the_rest_of_the_tick() {
+    // A path with no socket behind it: every connect fails.
+    let dir = tempfile::tempdir().expect("a tempdir");
+    let cfg = AgentsConfig {
+        socket: dir.path().join("absent.sock").display().to_string(),
+        poll_seconds: 1,
+        ..AgentsConfig::default()
+    };
+    let (_tx, rx) = cmd_channel();
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(poll_task_with(
+        rx,
+        msg_tx,
+        cfg,
+        ConfigSource::over(Vec::new()),
+    ));
+
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "the seed config").await,
+        Msg::Config(_)
+    ));
+    match recv_soon(&mut msg_rx, "the seed poll's failure").await {
+        Msg::Status(Err(_)) => {}
+        other => panic!("expected a failed status, got {other:?}"),
+    }
+
+    // Nothing else from that tick: no `Pending`, no `Urls`.
+    settle().await;
+    assert!(
+        msg_rx.try_recv().is_err(),
+        "a failed status must end the tick — no `Pending`, no `Urls`"
+    );
+    task.abort();
+}
+
+/// The refusal lane (#1140's review, LOW-3): `Pending` answering `ok: false`
+/// reaches the reducer as `Msg::Pending(Err(…))` rather than being swallowed,
+/// so the badges it can no longer vouch for are dropped.
+///
+/// Falsification: go back to logging the error and dropping it, and the
+/// `Msg::Pending(Err(_))` never arrives — this fails on `recv_soon`'s deadline.
+#[tokio::test(start_paused = true)]
+async fn a_refused_pending_reaches_the_reducer() {
+    let hive = FakeHive::serve(replies(&[
+        ("agent_status", &fixture("agent_status_grouped.json")),
+        ("pending", &fixture("error.json")),
+    ]));
+    let (_tx, rx) = cmd_channel();
+    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(poll_task_with(
+        rx,
+        msg_tx,
+        cfg_for(&hive),
+        ConfigSource::over(Vec::new()),
+    ));
+
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "the seed config").await,
+        Msg::Config(_)
+    ));
+    assert!(matches!(
+        recv_soon(&mut msg_rx, "a poll answer").await,
+        Msg::Status(Ok(_))
+    ));
+    match recv_soon(&mut msg_rx, "the refused approval queue").await {
+        Msg::Pending(Err(e)) => assert!(e.to_string().contains("ghost"), "{e}"),
+        other => panic!("expected a refused queue, got {other:?}"),
+    }
     task.abort();
 }

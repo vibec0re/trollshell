@@ -30,7 +30,7 @@
         "x86_64-linux"
         "aarch64-linux"
       ];
-      # The 14 bundled widget plugins (#558), by crate = binary = flake-output
+      # The 13 bundled widget plugins (#558), by crate = binary = flake-output
       # name. Each is packaged by nix/plugin.nix, which since #572 is a plain
       # `cp` of one already-compiled binary out of the single whole-workspace
       # compile (`trollshell.passthru.workspace`) — no cargo, no crane. Shared
@@ -116,7 +116,7 @@
           };
 
           # Per-plugin flake packages (#558): `packages.hytte-plugin-<id>` for
-          # each of the 14 bundled plugins. Generated from `bundledPluginNames`
+          # each of the 13 bundled plugins. Generated from `bundledPluginNames`
           # (one attr each) rather than hand-written. Since #572 each is a `cp`
           # of one already-compiled binary out of `workspace` — no cargo, no
           # crane, no recompile.
@@ -233,7 +233,7 @@
             inherit workspace revision;
           };
 
-          # The 14 per-plugin packages (#558), mirroring the `packages` output.
+          # The 13 per-plugin packages (#558), mirroring the `packages` output.
           # Merged into `checks` below so `nix flake check` actually *builds*
           # each one — the same reason #449 wired the two existing packages into
           # checks: flake check only builds what's listed here, so without this a
@@ -1143,6 +1143,59 @@
                 builtins.deepSeq { inherit falsePredicates; } "ok";
             in
             pkgs.runCommand "trollshell-nixos-module-nightlight-check" { inherit probe; } ''
+              echo "$probe" >/dev/null
+              touch $out
+            '';
+
+          # #1200: hytte-plugin-usage was deleted (#320's Claude usage-limits
+          # monitor — a Grafana public-dashboard poll that never had a real
+          # dashboard URL, so it only ever rendered its own empty state). The
+          # `plugins` option is an `attrsOf` submodule keyed by an arbitrary
+          # id string, so "usage" was never a declared option path and
+          # `lib.mkRemovedOptionModule` has nothing to attach to —
+          # `nix/module-common.nix` asserts on the merged `plugins` set
+          # instead (unconditionally, so both platforms' default-config
+          # fixtures above see it too, staying part of the "every predicate
+          # true" guarantee those checks make). This fixture is the same
+          # shape as `nixos-module-nightlight` above: set the one thing that
+          # should trip exactly one predicate, and check it's the right one
+          # by message content, not by count.
+          nixos-module-plugin-removed-1200 =
+            let
+              nixos = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.default
+                  {
+                    programs.trollshell = {
+                      enable = true;
+                      package = stubPackage;
+                      weather.fallbackCity = "Berlin";
+                      # The one thing this fixture exists to set: a config
+                      # that still names the removed `usage` plugin id must
+                      # trip nix/module-common.nix's assertion rather than
+                      # silently rendering a launch-state entry for a
+                      # `package` nobody built.
+                      plugins.usage.package = stubPlugin;
+                    };
+                    boot.loader.grub.enable = false;
+                    fileSystems."/" = {
+                      device = "/dev/sda1";
+                      fsType = "ext4";
+                    };
+                    system.stateVersion = "24.11";
+                  }
+                ];
+              };
+              cfg = nixos.config;
+              falsePredicates = builtins.filter (a: !a.assertion) cfg.assertions;
+              probe =
+                assert builtins.length falsePredicates == 1;
+                assert pkgs.lib.hasInfix "plugins.usage" (builtins.head falsePredicates).message;
+                assert pkgs.lib.hasInfix "1200" (builtins.head falsePredicates).message;
+                builtins.deepSeq { inherit falsePredicates; } "ok";
+            in
+            pkgs.runCommand "trollshell-nixos-module-plugin-removed-1200-check" { inherit probe; } ''
               echo "$probe" >/dev/null
               touch $out
             '';

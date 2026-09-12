@@ -28,14 +28,23 @@ pub trait Service: Sized + 'static {
 
 /// Type-erased shim used internally by `App` to store heterogeneous
 /// services in a single `Vec`.
+///
+/// Split into two steps — run `start`, *then* hand back a thunk that inserts
+/// its result — rather than one method that takes `&mut Registry` and does
+/// both: that used to let [`install`] hold the registry's mutable borrow for
+/// the whole span of `start`, which panics the moment `start` calls
+/// [`with`] itself (a service reading a sibling's already-installed
+/// handles). Splitting it means `start` runs with *no* registry borrow held
+/// at all, and the returned thunk only ever does the trivial insert — no
+/// user code — so it can never re-enter [`with`] or [`install`] either.
 pub trait ServiceErased: 'static {
-    fn start_erased(self: Box<Self>, rt: &tokio::runtime::Handle, registry: &mut Registry);
+    fn start_erased(self: Box<Self>, rt: &tokio::runtime::Handle) -> Box<dyn FnOnce(&mut Registry)>;
 }
 
 impl<S: Service> ServiceErased for S {
-    fn start_erased(self: Box<Self>, rt: &tokio::runtime::Handle, registry: &mut Registry) {
+    fn start_erased(self: Box<Self>, rt: &tokio::runtime::Handle) -> Box<dyn FnOnce(&mut Registry)> {
         let handles = self.start(rt);
-        registry.insert::<S::Handles>(handles);
+        Box::new(move |registry: &mut Registry| registry.insert::<S::Handles>(handles))
     }
 }
 
@@ -90,21 +99,28 @@ thread_local! {
 /// Run a closure with shared read access to the thread-local registry.
 ///
 /// # Panics
-/// Panics if a mutable borrow is already active on this thread's registry
-/// (a `RefCell` borrow conflict). In practice this never happens because
-/// the registry is only mutated during `install`, which runs before any
-/// subscriptions.
+/// Panics if a mutable borrow is already active on this thread's registry (a
+/// `RefCell` borrow conflict). That cannot happen from inside a `Service::start`
+/// call: [`install`] runs `start` to completion *before* it ever borrows the
+/// registry, taking a (mutable) borrow only afterwards, to perform the
+/// resulting insert — a step that runs no service code and so cannot recurse
+/// into `with` or `install`. So a service's `start` calling this to read an
+/// already-installed sibling's handles is a supported pattern, not a hazard.
 pub fn with<R>(f: impl FnOnce(&Registry) -> R) -> R {
     REGISTRY.with(|cell| f(&cell.borrow()))
 }
 
 /// Install a single service. Called by `App::run` once per registered
 /// service before invoking the consumer's body closure.
+///
+/// `start_erased` runs the service's `start` here, with no registry borrow
+/// held — see [`ServiceErased`] — so `start` may itself call [`with`] to read
+/// a sibling service that was installed earlier in the same list. Only the
+/// trivial insert that follows touches `REGISTRY`, and only for the instant
+/// it takes to run.
 pub fn install(service: Box<dyn ServiceErased>, rt: &tokio::runtime::Handle) {
-    REGISTRY.with(|cell| {
-        let mut reg = cell.borrow_mut();
-        service.start_erased(rt, &mut reg);
-    });
+    let insert = service.start_erased(rt);
+    REGISTRY.with(|cell| insert(&mut cell.borrow_mut()));
 }
 
 /// Wipe both registries — exposed for tests only.
@@ -120,7 +136,7 @@ pub fn reset_for_tests() {
 
 #[cfg(test)]
 mod tests {
-    use super::{REGISTRY, Registry, reset_for_tests, with};
+    use super::{REGISTRY, Registry, Service, install, reset_for_tests, with};
     use crate::test_lock::TEST_LOCK;
     use std::sync::PoisonError;
 
@@ -174,5 +190,61 @@ mod tests {
             None,
             "reset_for_tests must clear the thread-local registry"
         );
+    }
+
+    /// A sibling service's handles, read by [`ReaderService::start`] below.
+    struct SiblingHandles(u32);
+
+    struct SiblingService;
+
+    impl Service for SiblingService {
+        type Handles = SiblingHandles;
+
+        fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
+            SiblingHandles(7)
+        }
+    }
+
+    struct ReaderHandles(u32);
+
+    /// A service whose `start` reads another service's already-installed
+    /// handles via [`with`] — an accessor function in `hytte-services`
+    /// (`upower::state()`, say) doing exactly this from a sibling's `start`
+    /// is the real-world shape this regression-tests.
+    struct ReaderService;
+
+    impl Service for ReaderService {
+        type Handles = ReaderHandles;
+
+        fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
+            let sibling = with(|r| r.get::<SiblingHandles>().map(|h| h.0))
+                .expect("SiblingService must already be installed");
+            ReaderHandles(sibling)
+        }
+    }
+
+    /// Before the fix, `install` held `REGISTRY`'s mutable borrow for the
+    /// whole span of `Service::start`, so `ReaderService::start`'s call to
+    /// [`with`] (an immutable borrow, on the *same* thread, while that
+    /// mutable borrow was still live) panicked with "already mutably
+    /// borrowed" — exactly the case `with`'s own Panics doc claimed could
+    /// not happen. Reverting the `install`/`ServiceErased` restructure
+    /// reproduces that panic here; see the fix in `install` and
+    /// `ServiceErased::start_erased`.
+    #[test]
+    fn install_lets_a_services_start_read_an_already_installed_sibling() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        reset_for_tests();
+
+        install(Box::new(SiblingService), crate::runtime::handle());
+        install(Box::new(ReaderService), crate::runtime::handle());
+
+        assert_eq!(
+            with(|r| r.get::<ReaderHandles>().map(|h| h.0)),
+            Some(7),
+            "ReaderService::start must have seen SiblingHandles"
+        );
+
+        reset_for_tests();
     }
 }

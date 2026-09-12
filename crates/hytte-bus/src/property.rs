@@ -225,6 +225,11 @@ async fn run_property<T>(
 {
     let mut last: Option<T> = None;
     let mut task_done_tx = Some(task_done_tx);
+    // `true` while the pre-Get state for the current (re)connect cycle has
+    // still to be published; cleared the moment it is, and set again by the
+    // `Loaded` that ends the cycle. See the comment on the marking block below
+    // for why a flag rather than an unconditional `set` (#1173).
+    let mut needs_mark = true;
     // The crate's retry ramp, owned across the outer loop's iterations so a bus
     // that will not answer actually backs off instead of resetting to 250 ms
     // every time round. Cleared by a successful subscribe.
@@ -245,13 +250,26 @@ async fn run_property<T>(
             return;
         }
 
-        // Mark the pre-Get state exactly once per (re)connect cycle. The retry
-        // loop below must not re-emit it on every failed attempt — a permanently
-        // failing property (absent daemon, AccessDenied) would otherwise re-wake
-        // every bound GTK loop at the retry cadence.
-        match &last {
-            Some(v) => writer.set(PropState::Stale(v.clone())),
-            None => writer.set(PropState::Loading),
+        // Mark the pre-Get state exactly once per (re)connect cycle — on the
+        // edge, not on every attempt.
+        //
+        // The comment here has said "exactly once per (re)connect cycle" since
+        // the block was written, but until #1173 nothing implemented it: the
+        // `continue` below re-enters the outer loop on every failed subscribe,
+        // so a property whose re-subscribe keeps failing (dead daemon, dead
+        // connection) re-ran this `set` at the retry cadence forever.
+        // `Mutable::set` notifies unconditionally — only `set_if_changed`
+        // compares, and it needs `T: PartialEq`, which this type parameter does
+        // not carry — so each of those was a real wakeup for every `bind`ing on
+        // the signal, i.e. a GTK apply-loop running several times a second for
+        // as long as the outage lasted, to re-apply a value that never changed.
+        // The flag is what makes the sentence true.
+        if needs_mark {
+            match &last {
+                Some(v) => writer.set(PropState::Stale(v.clone())),
+                None => writer.set(PropState::Loading),
+            }
+            needs_mark = false;
         }
 
         // Subscribe to PropertiesChanged BEFORE the initial Get (#429). A change
@@ -331,6 +349,8 @@ async fn run_property<T>(
         };
         last = Some(initial.clone());
         writer.set(PropState::Loaded(initial));
+        // The cycle closed with a value; the next disruption gets to mark once.
+        needs_mark = true;
 
         let exited = drain_changes::<T>(
             &ctx,

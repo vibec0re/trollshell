@@ -14,6 +14,8 @@ use futures_signals::signal::SignalExt;
 use futures_util::StreamExt;
 use hytte_bus::test_support::SharedConnection;
 use hytte_bus::{PropState, property_with};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 // ── An ephemeral broker that can be restarted on the same socket path ────────
@@ -289,5 +291,77 @@ async fn a_lone_property_subscription_detects_a_dead_daemon_and_recovers() {
         shared.epoch() > 1,
         "the supervisor never installed the armed connection, so nothing \
          detected the dead one"
+    );
+}
+
+// ── Item 2: Stale is an edge, not a heartbeat ────────────────────────────────
+
+/// A property whose re-subscribe keeps failing must publish `Stale` **once**,
+/// not once per retry.
+///
+/// `Mutable::set` notifies unconditionally — `set_if_changed` needs
+/// `T: PartialEq`, which `PropState<T>`'s parameter does not carry — so each
+/// re-mark was a real wakeup for every `bind`ing on the signal: a GTK
+/// apply-loop running several times a second for the whole length of an
+/// outage, re-applying a value that never changed. Before #1173 the outer loop
+/// re-ran the marking block on every failed attempt; the comment above it had
+/// claimed "exactly once per (re)connect cycle" since the day it was written.
+///
+/// The daemon is killed and never restarted, so the re-subscribe fails for the
+/// rest of the test. Counting through the signal is sound here because the
+/// pre-fix cadence (one `set` per retry) is far slower than a dedicated tokio
+/// task polling the stream, so no emission is lost to
+/// `MutableSignalCloned`'s latest-value coalescing; and coalescing can only
+/// ever *reduce* a count, never inflate it past 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_resubscribe_marks_stale_exactly_once() {
+    /// Long enough that the retired flat 250 ms spin would publish ~20 `Stale`s
+    /// inside it, and that the ramp has gone round several times.
+    const WINDOW: Duration = Duration::from_secs(5);
+
+    let (conn, guard) = daemon::ephemeral_bus().await;
+    let address = guard.address.clone();
+    let _server = serve_counter(&address, 42).await;
+
+    // No supervisor and no armed replacement: once the daemon is gone, every
+    // re-subscribe fails for the rest of the test.
+    let shared = SharedConnection::for_test_session(conn);
+
+    let prop = counter_property(&shared);
+    let mut warmup = prop.signal().to_stream();
+    wait_for(
+        &mut warmup,
+        Duration::from_secs(20),
+        "the initial Loaded(42)",
+        |s| matches!(s, PropState::Loaded(42)),
+    )
+    .await;
+    drop(warmup);
+
+    // Count from a fresh subscriber: its first item is the current value
+    // (`Loaded(42)`), and everything after it is a real transition.
+    let stales = Arc::new(AtomicUsize::new(0));
+    let counter = stales.clone();
+    let mut counting = prop.signal().to_stream();
+    let counting_task = tokio::spawn(async move {
+        while let Some(state) = counting.next().await {
+            if matches!(state, PropState::Stale(_)) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+
+    // Kill the daemon for good.
+    drop(guard);
+
+    tokio::time::sleep(WINDOW).await;
+    counting_task.abort();
+
+    assert_eq!(
+        stales.load(Ordering::Relaxed),
+        1,
+        "a failing re-subscribe must publish Stale on the edge only; \
+         {:?} of retries produced this many emissions",
+        WINDOW
     );
 }

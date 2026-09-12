@@ -295,7 +295,16 @@ mod tests {
     ///
     /// Falsify by swapping `spawn_eds_worker`'s
     /// `spawn_supervised_blocking_bounded` back to `spawn_supervised_blocking`:
-    /// the row then survives forever in `Returned` and this test times out.
+    /// the row then survives forever in `Returned` and the second wait below
+    /// times out.
+    ///
+    /// Waits for the row to **appear** before waiting for it to disappear.
+    /// Without that first wait, a body that returns as fast as this one does
+    /// (the receiver is already disconnected before the worker even starts)
+    /// can race the tokio scheduler: checking only for absence would read "no
+    /// row" while supervision simply hadn't started yet, and pass even against
+    /// the plain `spawn_supervised_blocking` this test exists to catch —
+    /// measured, not hypothetical (it did, until this fix).
     #[test]
     fn a_returning_eds_worker_releases_its_row_instead_of_sticking() {
         const NAME: &str = "test-eds-worker-bounded-return";
@@ -304,11 +313,19 @@ mod tests {
         drop(tx); // every sender gone before the worker even starts
 
         spawn_eds_worker(NAME, rx, |rx| {
+            // A brief pause before draining widens the window in which the
+            // row is observably present, so the first wait below is not
+            // itself a race against an instant return.
+            std::thread::sleep(Duration::from_millis(50));
             // Mirror the shutdown shape both real workers use: drain until
             // disconnected, then return.
             for _ in rx {}
         });
 
+        assert!(
+            wait_until(Duration::from_secs(5), || health_of(NAME).is_some()),
+            "the supervisor never published a health row for {NAME}"
+        );
         assert!(
             wait_until(Duration::from_secs(5), || health_of(NAME).is_none()),
             "a designed return from an EDS worker must release its health row, not leave it \

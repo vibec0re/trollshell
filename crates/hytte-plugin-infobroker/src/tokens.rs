@@ -212,32 +212,50 @@ fn tokens_match(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// Fill `bytes` from `read`, with no second branch that synthesizes a value
+/// on failure (#1162 lens 7 item 3).
+///
+/// Before this, a failed `/dev/urandom` read fell back to the wall clock plus
+/// a per-call counter — not just weaker than OS randomness but a value an
+/// attacker with a rough idea of process start time could guess outright,
+/// which defeats the entire property a bearer token exists for: this value
+/// authenticates an agent to the broker, so "unguessable" is not negotiable
+/// just because the read that produces it is expected to always succeed on
+/// Linux. Split out from [`random_value`] as its own function — taking the
+/// read as a parameter rather than hardcoding `/dev/urandom` — purely so a
+/// test can inject a failing reader and observe the refusal without needing
+/// root or a broken VM to make the real device unreadable.
+fn read_random_bytes(
+    read: impl FnOnce(&mut [u8; 16]) -> std::io::Result<()>,
+) -> std::io::Result<[u8; 16]> {
+    let mut bytes = [0u8; 16];
+    read(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// 16 bytes of OS randomness, hex-encoded to a 32-char token. Reads exactly 16
 /// bytes from `/dev/urandom` (no extra crate; `read_exact`, never a full-file
-/// read — `/dev/urandom` has no EOF). The fallback path — used only if that read
-/// ever fails — mixes the wall clock with a per-call counter so a token is still
-/// unique, just not cryptographically strong (never hit in practice on Linux,
-/// where `/dev/urandom` always reads).
+/// read — `/dev/urandom` has no EOF).
+///
+/// **Refuses rather than falls back** (#1162 lens 7 item 3): a failed read
+/// panics naming `/dev/urandom` instead of minting a guessable value. This is
+/// reachable only from [`TokenStore::mint_scoped`], whose signature — and
+/// every call site in `broker.rs` — returns a bare [`Token`], not a
+/// `Result`; threading a `Result` up through that public API for a read that
+/// is, in practice, never observed to fail on Linux would push a fallible
+/// path onto every caller for a "recoverable" condition that in fact means
+/// the box's randomness source is broken in a way nothing downstream can
+/// paper over. A broken `/dev/urandom` is exactly the kind of failure a loud
+/// crash is right for.
 fn random_value() -> String {
     use std::io::Read as _;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let mut bytes = [0u8; 16];
-    let read_ok = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .is_ok();
-    if !read_ok {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|d| u64::try_from(d.as_nanos()).ok())
-            .unwrap_or(0);
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        bytes[..8].copy_from_slice(&nanos.to_le_bytes());
-        bytes[8..].copy_from_slice(&seq.to_le_bytes());
-    }
+    let bytes = read_random_bytes(|buf| {
+        std::fs::File::open("/dev/urandom")?.read_exact(buf)
+    })
+    .unwrap_or_else(|e| {
+        panic!("hytte-infobroker: refusing to mint a session token: /dev/urandom: {e}")
+    });
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         // Infallible: writing to a String never errors.
@@ -267,6 +285,58 @@ mod tests {
         assert!(!tokens_match("abcdef0123456789", "abcdef012345678"));
         assert!(!tokens_match("short", "muchlonger"));
         assert!(tokens_match("", ""));
+    }
+
+    /// #1162 lens 7 item 3: a failed read must come back as `Err`, never as a
+    /// synthesized value. This is the whole fallback branch the fix removes —
+    /// pinned directly, not just by way of `random_value`'s panic, since that
+    /// panic is the only other place this shape shows up.
+    #[test]
+    fn read_random_bytes_refuses_rather_than_falls_back_on_a_failed_read() {
+        let err = read_random_bytes(|_buf| Err(std::io::Error::other("simulated /dev/urandom failure")))
+            .expect_err("a failed read must not synthesize bytes");
+        assert_eq!(err.to_string(), "simulated /dev/urandom failure");
+    }
+
+    /// A successful read is the only `Ok` path, and produces real bytes
+    /// (not a fixed/zeroed buffer left untouched by a reader that lied about
+    /// succeeding without writing anything meaningful).
+    #[test]
+    fn read_random_bytes_returns_what_the_reader_wrote() {
+        let bytes = read_random_bytes(|buf| {
+            buf.copy_from_slice(&[0xAB; 16]);
+            Ok(())
+        })
+        .expect("a succeeding reader must produce Ok");
+        assert_eq!(bytes, [0xAB; 16]);
+    }
+
+    /// [`random_value`] hardcodes `/dev/urandom` rather than taking an
+    /// injected reader, so this cannot drive that function's own panic
+    /// directly — but its panic path is textually
+    /// `read_random_bytes(..).unwrap_or_else(|e| panic!(...))`, so exercising
+    /// that exact combinator against a failing reader pins the same shape:
+    /// refuse loudly, naming the device, rather than mint a fallback value.
+    ///
+    /// Falsification: restoring the old wall-clock+counter fallback branch
+    /// makes this panic never fire for a real caller (the read failure would
+    /// be swallowed into a still-`Ok`-shaped mint) even though this test
+    /// itself keeps passing — which is why item 1's mechanism-falsification
+    /// discipline also asks for a manual revert-and-rerun of `random_value`
+    /// itself, not just this pinned combinator.
+    #[test]
+    fn the_panic_combinator_refuses_naming_dev_urandom_on_a_failed_read() {
+        let result = std::panic::catch_unwind(|| {
+            read_random_bytes(|_buf| Err(std::io::Error::other("boom"))).unwrap_or_else(|e| {
+                panic!("hytte-infobroker: refusing to mint a session token: /dev/urandom: {e}")
+            })
+        });
+        let payload = result.expect_err("must panic rather than return a fallback value");
+        let msg = payload
+            .downcast_ref::<String>()
+            .expect("panic payload is a String");
+        assert!(msg.contains("/dev/urandom"), "{msg}");
+        assert!(msg.contains("boom"), "{msg}");
     }
 
     #[test]

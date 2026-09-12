@@ -52,7 +52,6 @@
         "hytte-plugin-preem-demo"
         "hytte-plugin-terminal"
         "hytte-plugin-timer"
-        "hytte-plugin-usage"
         "hytte-plugin-weather"
       ];
       # The source revision this build came from (#601), threaded into the

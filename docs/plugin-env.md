@@ -48,10 +48,10 @@ plugin's own `/proc/<pid>/environ`. All three are same-user and in scope per
 channel that crossed it. The non-secret `env` above stays inline on the argv on
 purpose: it is already public in the state file.
 
-**Precedence**, for a plugin that also reads a config file (e.g. usage's
-`~/.config/trollshell/usage.toml`): environment wins over the file, which wins
-over the plugin's built-in default. Not every plugin has all three layers —
-each section below says which it actually reads.
+**Precedence**, for a plugin that also reads a config file for the same
+setting: environment wins over the file, which wins over the plugin's
+built-in default. Not every plugin has all three layers — each section below
+says which it actually reads.
 
 **Infrastructure vars, not knobs.** Every plugin (via `hytte-plugin-proto`'s
 `topology::socket_path`) dials the host at
@@ -251,20 +251,6 @@ No runtime knobs — configuration is entirely via the shell/wire protocol.
 ### timer (`hytte-plugin-timer`)
 
 No runtime knobs — configuration is entirely via the shell/wire protocol.
-
-### usage (`hytte-plugin-usage`)
-
-Precedence is env → `~/.config/trollshell/usage.toml` → built-in default,
-resolved once per field (`config.rs::resolve`). With no dashboard URL from
-either source the plugin renders a calm empty-state card and makes no network
-calls at all.
-
-| Variable                         | Default                                     | Effect                                                                                                                           |
-| -------------------------------- | ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `TROLLSHELL_USAGE_DASHBOARD_URL` | unset (empty-state, no polling)             | The Grafana `…/public-dashboards/<token>` URL (browser or API form). The one value that flips the card from empty-state to live. |
-| `TROLLSHELL_USAGE_BUDGET`        | unset (spend-only, no gauge)                | The budget denominator for the "burned ÷ budget" gauge. Must parse as a finite `f64`; an unparseable value is ignored.           |
-| `TROLLSHELL_USAGE_PANEL`         | unset (auto-discover the first value panel) | Pins the dashboard panel to query by its numeric id, skipping panel discovery.                                                   |
-| `TROLLSHELL_USAGE_WINDOW`        | `now-5h`                                    | The Grafana time-range `from` for the query window (e.g. `now-24h`, `now/d`); `to` is always `now`.                              |
 
 ### weather (`hytte-plugin-weather`)
 

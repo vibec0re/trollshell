@@ -31,13 +31,29 @@
 //! matches [`crate::runtime::handle`], the other process-global the supervisor
 //! leans on.
 //!
-//! **Entries are live, not historical.** A task is added when supervision
-//! starts and *removed* when the supervisor stops — a clean completion, or a
-//! cancellation. Retaining terminated entries would be a slow leak rather than a
-//! feature: `mpris-player` and `tray-item` supervise one task per discovered
-//! player/item, so a long session churns through an unbounded number of them.
-//! What this answers is "what is being supervised right now, and is it healthy",
-//! which is the question a diagnostics view asks.
+//! **Entries are live, not historical — with one deliberate exception.** A
+//! task is added when supervision starts and *removed* when the supervisor
+//! stops via cancellation. Retaining every terminated entry would be a slow
+//! leak rather than a feature: `mpris-player` and `tray-item` supervise one
+//! task per discovered player/item, so a long session churns through an
+//! unbounded number of them. What most of this answers is "what is being
+//! supervised right now, and is it healthy", which is the question a
+//! diagnostics view asks.
+//!
+//! The exception is [`TaskState::Returned`] (#1174): a task that ends by
+//! *returning* — as opposed to being cancelled — keeps its row instead of
+//! being dropped, because every `spawn_supervised`/`spawn_supervised_blocking`
+//! factory in this tree is written as a loop meant to run for the life of the
+//! process, so a plain return is either a deliberate bounded task (a
+//! `mpris-player` whose stream ended) or a bug that fell out of the loop
+//! early — and the supervisor cannot tell those apart. Silently dropping the
+//! row either way is exactly the "looks like it never existed" failure #1174
+//! filed; keeping it visible costs an unbounded (if slow-growing) `Returned`
+//! backlog for the per-instance supervisors, which is judged the smaller
+//! problem — a diagnostics view that never lies beats one that stays small by
+//! forgetting.
+
+
 //!
 //! ```ignore
 //! use hytte::prelude::*;
@@ -55,7 +71,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Identity of one supervised task, valid from the moment supervision starts
-/// until the supervisor stops.
+/// until the supervisor stops — except a task whose last run *returned*
+/// (rather than being cancelled), whose id and row are kept indefinitely as a
+/// visible record; see [`TaskState::Returned`].
 ///
 /// Distinct per *supervisor*, not per name: several services supervise more
 /// than one task under the same label (`sensors` runs four, `upower` three,
@@ -65,10 +83,12 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TaskId(u64);
 
-/// Whether a supervised task is running, or waiting out a restart backoff.
+/// Whether a supervised task is running, waiting out a restart backoff, or has
+/// returned and is no longer supervised at all.
 ///
-/// There is no terminal variant: a supervisor that has stopped has no entry at
-/// all (see the module docs on live-not-historical).
+/// [`Returned`](TaskState::Returned) is the one terminal variant: every other
+/// way a supervisor stops (cancellation) drops the row entirely rather than
+/// leaving it in a terminal state (see the module docs on live-not-historical).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskState {
     /// A run is in flight.
@@ -76,6 +96,13 @@ pub enum TaskState {
     /// The last run panicked; the supervisor is sleeping out
     /// [`TaskHealth::backoff`] before it starts the next one.
     Restarting,
+    /// The last run *returned* rather than panicking or being cancelled.
+    /// Supervision has ended — there is no run in flight and none will be
+    /// started — but unlike a cancelled supervisor, the row is kept rather
+    /// than dropped (see the module docs on the live-not-historical
+    /// exception, and [`crate::supervisor`]'s module docs on why this is not
+    /// treated as an error worth restarting from).
+    Returned,
 }
 
 /// What the supervisor knows about one task it is supervising.
@@ -89,7 +116,7 @@ pub struct TaskHealth {
     /// The label the task was supervised under — the same string that appears
     /// as `service` in the supervisor's log lines. **Not unique.**
     pub name: &'static str,
-    /// Running, or backing off before a restart.
+    /// Running, backing off before a restart, or (terminally) returned.
     pub state: TaskState,
     /// Runs started so far, including the one in flight. `1` for a task that
     /// has never panicked.
@@ -205,10 +232,21 @@ pub(crate) fn panicked(id: TaskId, backoff: Duration, after_healthy_run: bool) -
     counts
 }
 
-/// The supervisor stopped — drop its entry. See the module docs on why nothing
-/// is retained.
+/// The supervisor was cancelled — drop its entry. See the module docs on why
+/// nothing is retained for this path (contrast [`returned`], which is).
 pub(crate) fn stopped(id: TaskId) {
     TASKS.lock_mut().retain(|task| task.id != id);
+}
+
+/// The supervisor's task *returned* rather than being cancelled or panicking:
+/// mark it [`TaskState::Returned`] and leave the row in place, rather than
+/// dropping it the way [`stopped`] does. See the module docs on why this one
+/// path is the deliberate exception to "entries are live, not historical".
+pub(crate) fn returned(id: TaskId) {
+    with_task(id, |task| {
+        task.state = TaskState::Returned;
+        task.backoff = Duration::ZERO;
+    });
 }
 
 /// Every live supervisor's record, in the order supervision started.

@@ -1949,6 +1949,11 @@ fn flapping_subtitle(
         }
         TaskState::Restarting => "Restarting".to_owned(),
         TaskState::Running => "Running".to_owned(),
+        // Terminal (#1174): the task returned and nothing is supervising it
+        // any more. Reachable here if it had a nonzero panic streak (see
+        // `is_flapping`) at the moment it returned — `flapping_tasks` filters
+        // on that streak, not on `state`.
+        TaskState::Returned => "Returned".to_owned(),
     });
     let panic_word = if consecutive_panics == 1 {
         "panic"
@@ -2267,6 +2272,18 @@ mod tests {
         assert_eq!(
             flapping_subtitle(TaskState::Running, 4, 3, 3, Duration::ZERO),
             "Running \u{00b7} 3 panics in a row \u{00b7} 4 runs"
+        );
+    }
+
+    /// A task that flapped and then returned (#1174) can still reach this
+    /// group — `flapping_tasks` filters on the panic streak, not on `state` —
+    /// so `Returned` needs its own row text rather than falling out of the
+    /// match.
+    #[test]
+    fn flapping_subtitle_says_returned_for_a_terminated_task() {
+        assert_eq!(
+            flapping_subtitle(TaskState::Returned, 4, 3, 3, Duration::ZERO),
+            "Returned \u{00b7} 3 panics in a row \u{00b7} 4 runs"
         );
     }
 

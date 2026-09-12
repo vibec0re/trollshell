@@ -202,3 +202,133 @@ fn map_edge(a: Anchor) -> LsEdge {
         Anchor::Right => LsEdge::Right,
     }
 }
+
+// The #212/#192/#193 fix — this module's whole reason for having
+// `on_surface_ready` at all — shipped with nothing testing it: deleting the
+// already-mapped branch left every `hytte-ui` test green (#1180 item 8).
+//
+// What is exercised here is the *timing contract*, which is plain-GTK
+// toplevel mechanics and needs no compositor: a persistent layer surface maps
+// once and never again, so surface wiring either rides that one map or it
+// never happens. A bare `gtk::Window` stands in — the same substitution
+// `bar`'s own gated test makes — because the distinction under test
+// (is the surface there yet, and did the callback run for this map) is not a
+// layer-shell one. What genuinely needs niri, and stays in
+// `docs/live-verify.md`, is that the region a caller sets inside `apply` is
+// the one the compositor frosts.
+//
+// Needs a display → `system-tests`, run under `xvfb-run`.
+#[cfg(all(test, feature = "system-tests"))]
+mod tests {
+    use super::on_surface_ready;
+    use gtk::prelude::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Spin the main loop until `done` or the bound runs out, so a test never
+    /// hangs on a display that will not map.
+    fn settle(done: impl Fn() -> bool) {
+        for _ in 0..1000 {
+            if done() {
+                return;
+            }
+            if !gtk::glib::MainContext::default().iteration(false) {
+                // Nothing left to dispatch; one more check and give up.
+                break;
+            }
+        }
+    }
+
+    /// **#1180 item 8, the #212 half.** Surface wiring runs *within the first
+    /// map*, ahead of anything connected after it — not on some later turn of
+    /// the loop.
+    ///
+    /// The order is recorded through a probe: a second `map` handler is
+    /// connected **after** `on_surface_ready`, so GTK runs it second, and the
+    /// trace has to read `["apply", "map"]`. That is what makes this an
+    /// ordering test rather than a "did it run eventually" one — a callback
+    /// deferred to an idle handler (a plausible-looking fix for the
+    /// not-yet-mapped case) would still run, and would still be too late for
+    /// a caller that needs the surface configured before the compositor sees
+    /// it mapped.
+    ///
+    /// **Falsified** by deferring the `apply` inside `on_surface_ready`'s map
+    /// handler (`glib::idle_add_local_once`): the trace reads `["map",
+    /// "apply"]`.
+    #[gtk::test]
+    fn surface_wiring_runs_inside_the_first_map() {
+        let window = gtk::Window::new();
+        let trace: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let for_apply = Rc::clone(&trace);
+        on_surface_ready(&window, move |_| for_apply.borrow_mut().push("apply"));
+
+        let for_map = Rc::clone(&trace);
+        window.connect_map(move |_| for_map.borrow_mut().push("map"));
+
+        assert!(
+            trace.borrow().is_empty(),
+            "nothing runs before the window is shown — there is no surface yet",
+        );
+
+        window.present();
+        settle(|| !trace.borrow().is_empty());
+
+        assert_eq!(
+            *trace.borrow(),
+            vec!["apply", "map"],
+            "the surface callback must run inside the first map emission, before handlers \
+             connected after it — not deferred to a later loop turn (#212/#192/#193)",
+        );
+
+        window.destroy();
+    }
+
+    /// **#1180 item 8, the #193 half** — the five lines whose deletion left
+    /// every test in this crate green.
+    ///
+    /// A persistent layer surface maps synchronously inside the first
+    /// `set_visible(true)` and then never remaps, so a caller that wires
+    /// *after* that one map has no second map to hook: without the
+    /// already-mapped branch its `apply` is never called at all, silently.
+    /// That is the exact shape of the #192/#193 frost regressions, where the
+    /// blur region was attached after the sole map and did nothing — and the
+    /// tell was zero blur log lines, because nothing failed.
+    ///
+    /// The assertion is deliberately made **before** the loop is spun: the
+    /// branch has to apply synchronously, since a caller wiring after the map
+    /// gets no other callback to wait for.
+    ///
+    /// **Falsified** by deleting the `if window.is_mapped() && …` branch from
+    /// `on_surface_ready`: `applied` stays 0.
+    #[gtk::test]
+    fn wiring_an_already_mapped_window_applies_at_once() {
+        let window = gtk::Window::new();
+        window.present();
+        settle(|| window.is_mapped() && window.surface().is_some());
+        assert!(
+            window.is_mapped() && window.surface().is_some(),
+            "the fixture needs a mapped window with a live surface",
+        );
+
+        let applied = Rc::new(std::cell::Cell::new(0_u32));
+        let for_apply = Rc::clone(&applied);
+        on_surface_ready(&window, move |surface| {
+            assert!(surface.is_mapped(), "the callback is handed a live surface");
+            for_apply.set(for_apply.get() + 1);
+        });
+
+        assert_eq!(
+            applied.get(),
+            1,
+            "wiring after the one-and-only map must apply immediately — there is no second \
+             map to hook, and a missed apply is silent (#192/#193)",
+        );
+
+        // …and exactly once: the immediate call must not also queue one.
+        settle(|| false);
+        assert_eq!(applied.get(), 1, "and not a second time on the same map");
+
+        window.destroy();
+    }
+}

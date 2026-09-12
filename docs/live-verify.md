@@ -472,6 +472,37 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       `systemctl --user list-units 'trollshell-launch-*'` shows exactly the
       launches that were allowed, and that after a minute a further click works
       again — this is a rate cap, not a lockout.
+- [ ] **(#1165 review round 2, HIGH-1)** **The id crasher, on glass.** Round 1
+      capped every display string the vocabulary carries, but not the plugin
+      `id` itself. Register a scratch plugin with `id: "a".repeat(65)` (one
+      byte over `MAX_PLUGIN_ID_BYTES`, 64): the connection must be dropped at
+      the handshake with no card mounted, and the journal carries one
+      _"plugin Register carried an id over the host's cap; dropping the
+      connection"_ line. Before this fix, an id up to ~16 MiB was a legal
+      `Register`, and one that then sent a single `Effect::Notify` rode the id
+      into `gtk::Label::new` as the notification's app name, unbounded — this
+      was the #1165 headline freeze reached through the very effect round 1
+      capped two of three arguments of.
+- [ ] **(#1165 review round 2, HIGH-2)** **`classes` freeze, on glass.** Point
+      a scratch plugin at the live socket and have it render a `Node::Label`
+      with 20 000 CSS classes on one frame, then a second frame with 20 000
+      *different* class names (a full replace, the reconciler's worst case).
+      Expect: the mapped node carries at most `MAX_NODE_CLASSES` (32) of them,
+      the bar keeps ticking across both frames, and the journal carries one
+      _"plugin render tree carries a node with more CSS classes than the
+      host's count cap…"_ line. Before this fix, `classes` was unbounded and
+      `reconcile_classes`'s `Vec::contains` diff was quadratic — the review
+      measured 5.70 s for this exact case, over three times the 8 MiB label
+      the round-1 crasher fix exists to stop.
+- [ ] **(#1165 review round 2, MEDIUM)** An over-cap `DatasourceQuery` resolves
+      instead of hanging. From a plugin with `Capability::DatasourceQuery`,
+      emit one with `params` over `MAX_DATASOURCE_PAYLOAD_BYTES`. Before this
+      fix the request vanished with no reply and a card watching for
+      `Input::DatasourceResult` waited forever with nothing in its own
+      journal to explain why; now the plugin's pending query resolves with a
+      `Failed` outcome naming the cap, on the same correlation, within the
+      same frame — no different from a routing failure (unknown provider,
+      denied scope) the plugin already has to handle.
 
 ## Agents (hyperhive)
 

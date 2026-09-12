@@ -813,6 +813,24 @@ pub(super) type EffectBuckets = Arc<Mutex<std::collections::HashMap<String, Effe
 /// `MAX_TRACKED_EFFECT_BUCKETS × MAX_PLUGIN_ID_BYTES` bytes of keys — 64 KiB —
 /// plus one fixed-size [`EffectRateLimiter`] per entry, not the unbounded
 /// figure a round-1 id cap would have left this at.
+///
+/// **What this table does and does not defend against** (#1165 review round
+/// 2, judge item 3, answered explicitly rather than left for the next
+/// reviewer to re-derive). A peer that re-registers under a fresh id every
+/// time gets a fresh [`EFFECT_BURST`] (and a fresh `LAUNCH_BURST` in
+/// `super::effects`'s sibling table) each time, and — worse — 1024 non-full
+/// buckets from a cycling peer can deny a *new* legitimate plugin its own
+/// bucket. This is moot rather than a gap: the plugin socket is `0600` in a
+/// `0700` directory (`listener.rs`'s `take_socket`/`listen`), so route 0 is
+/// same-uid by construction. A peer that can cycle plugin ids fast enough to
+/// matter can already fork processes, read the keyring and replace the
+/// binaries under this uid — it is strictly above what the plugin API is
+/// meant to contain, not something these buckets are positioned to stop. What
+/// this table genuinely fixes is the case #1165 item 4 names: a
+/// **crash-looping plugin that keeps its id**, which is the ordinary
+/// reconnect this eviction policy (evict full buckets first, never touch a
+/// partly-spent one, refuse rather than evict a victim once the table is
+/// full) protects correctly.
 pub(super) const MAX_TRACKED_EFFECT_BUCKETS: usize = 1024;
 
 /// Forget every bucket that has refilled to its full burst as of `now` (#1165

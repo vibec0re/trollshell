@@ -707,7 +707,11 @@ pub(super) async fn execute_command(plugin_id: &str, id: u64, argv: &[String]) -
                         cap = RUN_COMMAND_MAX_CAPTURE,
                         "plugin RunCommand wrote more than the host will read; killed. The \
                          captured prefix is returned and the outcome is a failure — the program \
-                         did not finish, so there is no exit status to report",
+                         did not finish, so there is no exit status to report. If the cap was \
+                         hit on stdout, the reply's stderr may read empty even though the \
+                         program wrote some: `capture_bounded` discards whichever pipe was NOT \
+                         the one that tripped the cap, on the same 'an honest empty one beats a \
+                         torn one' posture as the returned stdout/stderr split",
                     );
                 }
             }
@@ -1291,6 +1295,14 @@ thread_local! {
     /// inside the last budget window. No separate size cap is needed the way
     /// the effect table needs one: a launch *is* an effect, so reaching this at
     /// all is already inside the effect rate cap.
+    ///
+    /// The **key**, though, is bounded the same way `EffectBuckets`' is (#1165
+    /// review round 2): `serve_conn` refuses a `Register` whose id is over
+    /// [`MAX_PLUGIN_ID_BYTES`](hytte_plugin_proto::MAX_PLUGIN_ID_BYTES) before
+    /// a connection's id can reach either table, so this map's worst case is
+    /// as many entries as the effect rate cap allows, each keyed by at most
+    /// that many bytes — not the unbounded-key shape a round-1 id cap would
+    /// have left it in.
     static LAUNCH_BUDGETS: std::cell::RefCell<std::collections::HashMap<String, TokenBucket>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
@@ -1334,6 +1346,17 @@ fn launch_budget_allows(plugin_id: &str, now: std::time::Instant) -> bool {
 /// Pulled out of [`broker_effect`] only to keep that function under clippy's
 /// line cap, the same reason [`dispatch_detached_run_command`] is a separate
 /// function; the reasoning lives with the constants above.
+///
+/// **Spends the token before anything else can reject the launch.** This runs
+/// first in `broker_effect`, ahead of `detached_launch_unit_for_audit`'s
+/// rejected-id check and `execute_command`'s empty-argv guard, so a plugin
+/// that sends four malformed detached launches (an empty argv, say) burns its
+/// whole [`LAUNCH_BURST`] on requests that were never going to launch anything.
+/// Harmless — a plugin doing that is already misbehaving, and the cost lands
+/// only on itself — but worth knowing before "fix the ordering" looks like a
+/// free improvement: checking argv/unit-id validity first would need those
+/// checks pulled out of `execute_command` and `detached_launch_unit_for_audit`
+/// and duplicated here, for a plugin that is malfunctioning either way.
 fn over_launch_budget(plugin_id: &str, effect: &Effect, outbound: &mpsc::Sender<HostMsg>) -> bool {
     let Some(id) = detached_launch_id(effect) else {
         return false;

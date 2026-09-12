@@ -4076,6 +4076,70 @@ trollshell`. Expect the cards to come back Active and **no notification at
       description now links out to the styled `plugin-env.html` page rather
       than raw Markdown on GitHub.
 
+## Widget lifetimes (#1176)
+
+Four refcount cycles that `nix/lint-bind-pins.py` was structurally blind to
+before #1176, because none of them is a `bind*` call site. Nothing here
+changes what anything looks like or does — every item is "the same UI, minus a
+leak" — so the checks below are all **memory** checks plus one confirmation
+that the widgets still work at all. `RES` here means the shell's own RSS:
+`ps -o rss= -C trollshell` (or
+`systemctl --user show -p MainPID trollshell.service` then
+`grep VmRSS /proc/<pid>/status`).
+
+- [ ] **(#1176 item 1, the leak with no click)** Open the Bluetooth drawer
+      page and leave a **scan** running for a full minute with a handful of
+      discoverable devices in radio range. `bind_device_groups` rebuilds every
+      row on every `bluetooth::devices()` emission, several times a second,
+      and each paired row carries a ⋮ menu whose Trust/Forget handlers used to
+      hold their own popover strongly — so the leak was one four-widget
+      popover subtree _per device per emission_, with nobody touching
+      anything. Sample RSS before and after: it should be flat (a few hundred
+      KiB of churn, not the tens of MiB a minute of scanning used to cost).
+      Then actually use the menus once each — Trust, Untrust, Forget — and
+      confirm each still dismisses the popover as it acts.
+- [ ] **(#1176 item 1, same shape elsewhere)** The identical popover-menu
+      cycle existed in the Wi-Fi network list (Disconnect / Forget / Connect),
+      the wired-profile list (Activate / Deactivate / Forget) and the VPN list
+      (Activate / Deactivate) — found by the extended lint, not by the sweep
+      that filed the issue. Trigger a Wi-Fi **rescan** with the Network page
+      open and watch RSS the same way, then exercise one item from each of the
+      three menus and confirm the action fires _and_ the popover closes.
+- [ ] **(#1176 item 2, the dead page that keeps fetching)** Open the Media
+      drawer page on an external monitor with a player running, then
+      **unplug** that monitor while the page is open. Play through two or
+      three track changes on the player. Before this fix the hot-unplugged
+      page's apply-loop stayed alive forever and re-ran `render_player` — and
+      therefore `spawn_art_fetch`, an HTTP fetch plus a texture decode — on
+      every one of them. With `RUST_LOG=hytte_services=debug` there must be
+      **no** art-fetch activity attributable to the dead page after the
+      unplug, and RSS must not step up per track change. Re-plug the monitor
+      and confirm the fresh Media page still shows art, metadata and a
+      working seek bar.
+- [ ] **(#1176 item 3)** Hot-plug a monitor a few times with the sidebar
+      showing (calendar + tasks). Each cycle used to leak the whole 6×7 day
+      grid — 42 buttons with their labels and dot rows — because every day
+      cell's click handler held the `State` that owns all 42 cells. RSS
+      should return to roughly its pre-hotplug value after each cycle.
+      Functionally: click a day (the month view moves, the upcoming list
+      re-anchors, the matching row flashes), page the month back and forth,
+      and open a task's due picker to confirm the No date / Today / Tomorrow /
+      Pick… chips and the calendar underneath all still drive the summary
+      line.
+- [ ] **(#1176 item 3, per row tap)** Tap several task rows in a row to open
+      and dismiss their edit popovers, and use the ⊕ Add popover a few times.
+      Each popover builds a `DuePicker`, which used to hand strong self-clones
+      to its own chips' handlers and so could never be freed. RSS flat across
+      a dozen open/dismiss cycles. Confirm Save, Cancel and Delete each still
+      apply and close the popover, and that Add still creates a task and
+      returns focus to the ⊕ button (that last one is the `anchor` handle
+      that went weak).
+- [ ] **(#1176 item 4)** Click a day in the sidebar calendar that has an
+      event, and confirm the matching row in the upcoming list still flashes
+      its highlight and that the highlight **clears** after ~1.5 s. The timer
+      now holds the row weakly, so the failure mode to watch for is a
+      highlight that sticks rather than one that never appears.
+
 ## Not carrying a live-verify list, noted for context
 
 - **(#488)** Dependency-hygiene / MSRV PR — bumped the workspace MSRV

@@ -478,6 +478,92 @@ impl<P> Default for ProgramCache<P> {
 /// per frame by construction, which no source-keyed cache can help.
 const FAILED_SOURCES: usize = WARNED_SOURCES;
 
+/// One surface's GL objects: not built yet, built, or **refused by this
+/// context and not to be asked again under it** (PR #1199 review, MEDIUM 2).
+///
+/// Shipped, `draw` held `Option<Resources>` and latched only the *warning*:
+/// on `Err` the slot stayed `None` behind a one-shot `warned_resources` bool,
+/// so every subsequent frame called `Resources::build` again — the exact
+/// shape #1180 item 2 removed one field over, still live here. Cheaper per
+/// frame than a five-pair recompile (two 1×1 textures and a VAO), but the
+/// round's rule is *latch the failure, not the warning*, and #1180 item 4
+/// widened the way in: before it, `Resources::build` could only fail through
+/// `Texture::new`; now `VertexArray::new(gl)?` can fail too.
+///
+/// **The refusal is cleared by construction, not by remembering to clear
+/// it.** `unrealize` replaces the whole slot — it already had to, for the GL
+/// objects — so a context recreate un-latches the refusal with the same line
+/// that drops the textures. That is the property `gl_surface`'s
+/// [`RefusedBuilds`](crate::gl_surface) had to be *taught* in this same
+/// round: its latch sat beside the resources rather than inside them, and so
+/// outlived every context that ever refused.
+///
+/// There is no key, unlike [`ProgramCache`]'s `failed`: a plugin controls the
+/// *source*, and two broken sources alternating is a real shape. Nothing a
+/// plugin sends changes what `Resources::build` asks for — two 1×1 textures
+/// and a VAO, always — so "this context refused the allocation" is one bit
+/// with nothing to distinguish.
+///
+/// Generic over the resource type for [`ProgramCache`]'s reason: the reuse
+/// and refusal rules are then testable against a counting builder with no GL
+/// context at all, which is the only environment CI's hermetic bucket has.
+#[derive(Debug)]
+enum ResourceSlot<R> {
+    /// Nothing built yet under the current context — the state a fresh
+    /// surface and a freshly re-realised one are both in.
+    Unbuilt,
+    /// Built, and reused by every frame until the context goes.
+    Built(R),
+    /// The driver refused the allocation under this context. Asked once, then
+    /// never again until `unrealize` replaces the slot.
+    Refused,
+}
+
+impl<R> Default for ResourceSlot<R> {
+    /// Hand-written rather than derived: `#[derive(Default)]` would demand
+    /// `R: Default`, which no GL object can be.
+    fn default() -> Self {
+        Self::Unbuilt
+    }
+}
+
+impl<R> ResourceSlot<R> {
+    /// The resources for this context, building them with `build` if this is
+    /// the first ask since the slot was (re)created.
+    ///
+    /// - `Ok(Some(resources))` — reused, or freshly built.
+    /// - `Ok(None)` — **this context already refused**; nothing to draw and
+    ///   nothing to say (the caller said it the first time).
+    /// - `Err(error)` — it failed now. The caller writes one line; the slot is
+    ///   already latched, so the next frame takes the `Ok(None)` arm.
+    ///
+    /// Taking the builder rather than exposing the variants is what removes
+    /// the shipped bug's spelling: a caller cannot re-enter the allocation
+    /// without first replacing the slot, and replacing the slot is what
+    /// `unrealize` does. The same discipline `upload_data`'s
+    /// return-the-texture signature encodes for its own skip.
+    fn ensure<E>(&mut self, build: impl FnOnce() -> Result<R, E>) -> Result<Option<&mut R>, E> {
+        if matches!(self, Self::Unbuilt) {
+            match build() {
+                Ok(resources) => *self = Self::Built(resources),
+                Err(error) => {
+                    // Latched **before** the caller is told, so a handler that
+                    // re-enters `draw` finds the refusal already standing.
+                    *self = Self::Refused;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(match self {
+            Self::Built(resources) => Some(resources),
+            // `Unbuilt` is unreachable here — the block above either built or
+            // returned — and spelling it out beside `Refused` costs nothing
+            // and tells no lie, which `unreachable!()` would have to.
+            Self::Unbuilt | Self::Refused => None,
+        })
+    }
+}
+
 impl<P> ProgramCache<P> {
     /// The program for `fragment`, building it with `build` if this is a source
     /// the cache has not linked.
@@ -629,9 +715,9 @@ fn first_line(log: &str) -> &str {
 mod imp {
     use super::{
         Arc, COMPILE_FAILURE_REFUSED, Cell, Failure, Instant, ProgramCache,
-        RESOURCES_ALLOCATION_REFUSED, RefCell, SHADER_PREAMBLE, SHADER_VERT, ShaderState,
-        WarnLatch, abandon_gl, first_line, fit_rect, gdk, glib, refuse_data_grid, source_key,
-        would_upload, wrapped_seconds,
+        RESOURCES_ALLOCATION_REFUSED, RefCell, ResourceSlot, SHADER_PREAMBLE, SHADER_VERT,
+        ShaderState, WarnLatch, abandon_gl, first_line, fit_rect, gdk, glib, refuse_data_grid,
+        source_key, would_upload, wrapped_seconds,
     };
     use crate::gl_surface::{GLSL_HEADER, GlValue};
     use gtk::prelude::*;
@@ -658,8 +744,12 @@ mod imp {
         /// Natural (logical) size in pixels, honored by `measure`.
         nat_width: Cell<i32>,
         nat_height: Cell<i32>,
-        /// GL objects, built on the first render that has a context.
-        resources: RefCell<Option<Resources>>,
+        /// GL objects, built on the first render that has a context — and the
+        /// **latch** for a context that refused to allocate them, which is
+        /// why this is a [`ResourceSlot`] rather than an `Option` (PR #1199
+        /// review, MEDIUM 2). `unrealize` replaces the whole slot, so the
+        /// refusal ends with the context that made it, by construction.
+        resources: RefCell<ResourceSlot<Resources>>,
         /// When this surface first drew, for `u_time`. Set on the first render
         /// rather than at construction: a widget built during a bar rebuild and
         /// mapped a second later would otherwise open mid-animation.
@@ -670,10 +760,6 @@ mod imp {
         /// swallowed. (`ProgramCache` stops the *compile* repeating; this stops
         /// the *log*.) See [`WarnLatch`].
         warned_compile: RefCell<WarnLatch>,
-        /// One-shot latch for "the GL objects could not be allocated at all",
-        /// which is not keyed by anything a plugin controls — its own bool, so
-        /// it cannot mask a compile failure or be masked by one.
-        warned_resources: Cell<bool>,
         /// Journal latch for "the **data texture** could not be allocated"
         /// (#977) — a driver refusing the grid the plugin asked for. **Keyed
         /// by `(width, height, format)`** via [`data_key`] (#1023 item 1),
@@ -739,12 +825,18 @@ mod imp {
         /// Drop every GL object **before** handing back to GTK, with the context
         /// explicitly made current first — the handles' `Drop` calls
         /// `glDelete*`, and GTK's own `unrealize` runs after this body.
+        ///
+        /// Replacing the whole [`ResourceSlot`] is also what un-latches a
+        /// refused allocation (PR #1199 review, MEDIUM 2) and, with it, the
+        /// compiled-program cache's own `failed` deque: both live *inside* the
+        /// resources, so a context recreate clears them with the same line
+        /// that drops the textures, rather than by anyone remembering to.
         fn unrealize(&self) {
             let obj = self.obj();
             if obj.error().is_none() && obj.context().is_some() {
                 obj.make_current();
             }
-            self.resources.replace(None);
+            self.resources.replace(ResourceSlot::Unbuilt);
             self.origin.set(None);
             self.parent_unrealize();
         }
@@ -800,28 +892,38 @@ mod imp {
             hgl::reset_fixed_function_state(&gl);
 
             let mut held = self.resources.borrow_mut();
-            if held.is_none() {
-                match Resources::build(&gl) {
-                    Ok(resources) => *held = Some(resources),
-                    Err(error) => {
-                        if !self.warned_resources.replace(true) {
-                            tracing::warn!(%error, "{}", RESOURCES_ALLOCATION_REFUSED);
-                        }
-                        return;
-                    }
-                }
-            }
+            // **The refusal is latched, not its warning** (PR #1199 review,
+            // MEDIUM 2). This used to be an `Option` plus a one-shot
+            // `warned_resources` bool: the bool silenced the line and nothing
+            // else, so a context that would not allocate two 1×1 textures and
+            // a VAO was asked for them again on every single frame, for the
+            // life of the surface. [`ResourceSlot::ensure`] is what makes
+            // re-entering the allocation unspellable without first replacing
+            // the slot — which is exactly what `unrealize` does, and the only
+            // thing that should.
+            //
+            // The journal line rides the `Err` arm rather than a separate
+            // latch, so the two cannot disagree about how often a refusal is
+            // reported: once per refusal, which is once per realisation.
+            //
             // Disjoint field borrows: `ensure` needs the cache mutably while the
             // program it returns is still live, and the draw below needs the
             // texture and the VAO at the same time. Destructuring is what makes
             // those three borrows provably separate.
+            let built = match held.ensure(|| Resources::build(&gl)) {
+                Ok(built) => built,
+                Err(error) => {
+                    tracing::warn!(%error, "{}", RESOURCES_ALLOCATION_REFUSED);
+                    return;
+                }
+            };
             let Some(Resources {
                 programs,
                 data,
                 data_shape,
                 data_source,
                 vao,
-            }) = held.as_mut()
+            }) = built
             else {
                 return;
             };
@@ -1016,8 +1118,42 @@ mod imp {
         value as f32
     }
 
+    #[cfg(all(test, feature = "system-tests"))]
+    thread_local! {
+        /// How many times [`Resources::build`] has asked the driver, on this
+        /// thread — the seam
+        /// `a_refused_resource_build_is_asked_once_per_realisation` reads
+        /// (PR #1199 review, MEDIUM 2), mirroring `gl_surface`'s
+        /// `BUILD_ATTEMPTS` and existing for the same reason: an allocation
+        /// that did not happen leaves no GL object and raises no
+        /// `glGetError`, so its absence has no other trace.
+        static BUILD_ATTEMPTS: Cell<u32> = const { Cell::new(0) };
+
+        /// Makes the next [`Resources::build`] report the refusal that cannot
+        /// be arranged against a working driver.
+        ///
+        /// `Resources::build` asks for two 1×1 textures and a vertex array;
+        /// no driver refuses that, which is precisely why the shipped
+        /// per-frame retry never showed up anywhere. The injected error is
+        /// the one #1180 item 4 newly made reachable —
+        /// [`hgl::Error::Name`], what `VertexArray::new` returns when
+        /// `glGenVertexArrays` leaves the reserved name `0` — so the arm
+        /// under test is entered exactly as a real refusal would enter it.
+        /// Compiled **only** into the gated test build.
+        static REFUSE_BUILD: Cell<bool> = const { Cell::new(false) };
+    }
+
     impl Resources {
         fn build(gl: &hgl::Gl) -> Result<Self, hgl::Error> {
+            #[cfg(all(test, feature = "system-tests"))]
+            {
+                BUILD_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+                if REFUSE_BUILD.get() {
+                    return Err(hgl::Error::Name {
+                        object: "vertex array",
+                    });
+                }
+            }
             Ok(Self {
                 programs: ProgramCache::default(),
                 data: hgl::Texture::new(gl, hgl::Format::R8, 1, 1)?,
@@ -1138,7 +1274,7 @@ mod imp {
     // anywhere but on Annika's laptop.
     #[cfg(all(test, feature = "system-tests"))]
     mod tests {
-        use super::{Arc, ShaderState, hgl};
+        use super::{Arc, BUILD_ATTEMPTS, REFUSE_BUILD, ResourceSlot, ShaderState, hgl};
         use crate::gl_surface::GlValue;
         use crate::shader_surface::{ShaderFormat, ShaderSurface};
         use gtk::prelude::*;
@@ -1256,7 +1392,7 @@ mod imp {
             surface.imp().draw();
 
             assert!(
-                surface.imp().resources.borrow().is_some(),
+                matches!(*surface.imp().resources.borrow(), ResourceSlot::Built(_)),
                 "a realised surface must have built its GL objects",
             );
             assert!(
@@ -1323,6 +1459,103 @@ mod imp {
                 gl.take_error(),
                 None,
                 "a refused compile must leave no GL error queued for the next caller to trip on",
+            );
+
+            window.destroy();
+        }
+
+        /// **PR #1199 review, MEDIUM 2.** A context that refuses to allocate
+        /// the surface's GL objects is asked **once per realisation**, not
+        /// once per frame — and the refusal ends with the context.
+        ///
+        /// This is `draw`'s own call site, not the mechanism: the mechanism
+        /// (`ResourceSlot::ensure`) has a hermetic test against a counting
+        /// builder in this file's outer `mod tests`, and the bug this pins
+        /// lived *here* — an `Option` slot plus a one-shot `warned_resources`
+        /// bool, which silenced the line and left `Resources::build` running
+        /// on every frame for the life of the surface.
+        ///
+        /// The refusal is injected ([`REFUSE_BUILD`]) because it cannot be
+        /// provoked: no driver refuses two 1×1 textures and a vertex array,
+        /// which is exactly why the shipped retry loop was invisible. The
+        /// error injected is the one #1180 item 4 newly made reachable
+        /// (`VertexArray::new`'s [`hgl::Error::Name`]), so the arm under test
+        /// is the arm a real refusal takes.
+        ///
+        /// [`REFUSE_BUILD`] is cleared **before** the first assertion, not
+        /// after: `#[gtk::test]` bodies share a thread, so a panic while the
+        /// flag is set would refuse every sibling's allocation too.
+        ///
+        /// **Falsified** by reverting the slot to an `Option` plus a one-shot
+        /// bool (the shipped shape): the first count reads 3, one per `draw`.
+        /// Deleting the `ResourceSlot::Unbuilt` reset from `unrealize` reds
+        /// the second count instead, at 1.
+        #[gtk::test]
+        fn a_refused_resource_build_is_asked_once_per_realisation() {
+            const BODY: &str = "
+                void main() {
+                    fragColor = mix(u_bg, u_fg, texture(u_data, v_uv).r);
+                }";
+
+            let Some((window, surface, _gl)) = realised_surface_or_skip(
+                "a_refused_resource_build_is_asked_once_per_realisation",
+            ) else {
+                return;
+            };
+
+            surface.set_state(8, 4, &state_with(BODY));
+
+            BUILD_ATTEMPTS.set(0);
+            REFUSE_BUILD.set(true);
+            surface.imp().draw();
+            surface.imp().draw();
+            surface.imp().draw();
+            let refused_asks = BUILD_ATTEMPTS.get();
+            let latched = matches!(*surface.imp().resources.borrow(), ResourceSlot::Refused);
+            REFUSE_BUILD.set(false);
+
+            assert_eq!(
+                refused_asks, 1,
+                "a context that refused the allocation must be asked once, not once per frame \
+                 (PR #1199 review, MEDIUM 2)",
+            );
+            assert!(
+                latched,
+                "…because the refusal itself is latched in the slot, not just its warning",
+            );
+
+            // Out of the window and back in: `unrealize` replaces the slot, so
+            // the refusal ends with the context that made it — by
+            // construction, which is the whole reason the latch lives here.
+            window.set_child(None::<&gtk::Widget>);
+            assert!(
+                matches!(*surface.imp().resources.borrow(), ResourceSlot::Unbuilt),
+                "unrealize must leave a slot with nothing latched in it",
+            );
+            window.set_child(Some(&surface));
+            for _ in 0..1000 {
+                if surface.is_realized() && surface.width() > 0 {
+                    break;
+                }
+                if !gtk::glib::MainContext::default().iteration(false) {
+                    break;
+                }
+            }
+            assert!(
+                surface.is_realized() && surface.error().is_none(),
+                "the surface must come back with a context of its own",
+            );
+            surface.make_current();
+            surface.imp().draw();
+
+            assert_eq!(
+                BUILD_ATTEMPTS.get(),
+                2,
+                "a fresh context is a fresh question: the allocation must be offered to it",
+            );
+            assert!(
+                matches!(*surface.imp().resources.borrow(), ResourceSlot::Built(_)),
+                "…and this one has no reason to refuse it",
             );
 
             window.destroy();
@@ -1450,10 +1683,72 @@ impl Default for ShaderSurface {
 mod tests {
     use super::{
         Arc, COMPILE_FAILURE_REFUSED, DATA_UPLOAD_REFUSED, ProgramCache,
-        RESOURCES_ALLOCATION_REFUSED, RefCell, SHADER_PREAMBLE, SHADER_VERT, ShaderFormat,
-        ShaderState, TIME_WRAP_SECS, WARNED_SOURCES, WarnLatch, data_key, first_line, hgl,
-        refuse_data_grid, source_key, warn_on_data_upload_failure, would_upload, wrapped_seconds,
+        RESOURCES_ALLOCATION_REFUSED, RefCell, ResourceSlot, SHADER_PREAMBLE, SHADER_VERT,
+        ShaderFormat, ShaderState, TIME_WRAP_SECS, WARNED_SOURCES, WarnLatch, data_key, first_line,
+        hgl, refuse_data_grid, source_key, warn_on_data_upload_failure, would_upload,
+        wrapped_seconds,
     };
+
+    /// **PR #1199 review, MEDIUM 2.** A refused allocation is asked for
+    /// **once**, and the refusal is cleared by replacing the slot — which is
+    /// the one thing `unrealize` does.
+    ///
+    /// The mechanism half of `a_refused_resource_build_is_asked_once_per_
+    /// realisation` (which drives the real `draw` against a real context).
+    /// [`ResourceSlot`] is generic for [`ProgramCache`]'s reason, so this
+    /// drives **the shipped `ensure`** with no GL at all rather than a probe
+    /// that agrees with itself.
+    ///
+    /// **Falsified** by making the `Err` arm leave the slot `Unbuilt` (the
+    /// shipped shape, where only a `warned_resources` bool moved): the first
+    /// count reads 10.
+    #[test]
+    fn a_refused_resource_slot_is_built_once_and_cleared_by_replacement() {
+        let asks = std::cell::Cell::new(0_u32);
+        let refuse = || {
+            asks.set(asks.get() + 1);
+            Err::<u32, &'static str>("the driver did not name a new vertex array")
+        };
+
+        let mut slot: ResourceSlot<u32> = ResourceSlot::default();
+        assert!(
+            slot.ensure(refuse).is_err(),
+            "the first ask reports the refusal, so the caller can write its one line",
+        );
+        for _ in 0..9 {
+            assert!(
+                matches!(slot.ensure(refuse), Ok(None)),
+                "…and every later frame is told there is nothing to draw, silently",
+            );
+        }
+        assert_eq!(
+            asks.get(),
+            1,
+            "a refused allocation must be asked for once, not once per frame \
+             (PR #1199 review, MEDIUM 2)",
+        );
+
+        // What `unrealize` does: the whole slot goes, so the refusal goes with
+        // the context that made it. No `clear` to forget to call.
+        slot = ResourceSlot::default();
+        let built = slot
+            .ensure(|| {
+                asks.set(asks.get() + 1);
+                Ok::<u32, &'static str>(7)
+            })
+            .expect("a context with no reason to refuse builds");
+        assert_eq!(built.copied(), Some(7), "a fresh slot builds");
+        assert_eq!(asks.get(), 2, "…having asked exactly once more");
+
+        // And a built slot is never rebuilt: the builder below would panic.
+        let reused = slot
+            .ensure(|| -> Result<u32, &'static str> {
+                panic!("a built slot must never call its builder again")
+            })
+            .expect("nothing was asked");
+        assert_eq!(reused.copied(), Some(7), "the same resources, every frame");
+        assert_eq!(asks.get(), 2, "…and no further asks");
+    }
 
     /// A counting builder, standing in for `hgl::Program::compile`. The cache is
     /// generic precisely so this drives **the shipped `ensure`**, not a

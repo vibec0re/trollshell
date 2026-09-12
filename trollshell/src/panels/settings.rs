@@ -2,11 +2,17 @@
 //!
 //! - Dark mode — delegated to `hytte::services::theme`, which fans out across
 //!   GTK4/libadwaita, legacy GTK (gsettings + settings.ini), and Qt
-//!   (qt[56]ct.conf). The switch reads the current theme once at page mount
-//!   and writes back on toggle; we do NOT live-track external changes.
-//!   Trollshell *is* the compositor session, so "follow system" is
-//!   meaningless — if gsettings reads back `default` (externally set), the
-//!   service surfaces Dark and the next user pick makes it canonical.
+//!   (qt[56]ct.conf). The switch **binds** `theme::current_signal()` rather
+//!   than reading a snapshot at page mount: the service's value is seeded by
+//!   an async `gsettings get`, so a one-shot read taken while building the
+//!   page is `None` by construction, and `modal::ensure_page` caches this
+//!   page for the life of the shell — which is how a light session ended up
+//!   with a permanently wrong "Dark mode: on" switch (#1192 review, HIGH-1).
+//!   While the seed is in flight the switch is insensitive (unknown, not
+//!   wrong); it becomes live when the answer lands, and follows an external
+//!   change too. Trollshell *is* the compositor session, so "follow system"
+//!   is meaningless — if gsettings reads back `default` (externally set),
+//!   the service surfaces Dark and the next user pick makes it canonical.
 //! - Keep awake (#513) — the on-demand "stop idle-locking" caffeine toggle.
 //!   Duplicates the switch in `panel_power`'s "Keep awake" section (both drive
 //!   `screensaver::set_keep_awake` / observe `screensaver::keep_awake()`, so
@@ -31,6 +37,7 @@ use hytte::services::dnd;
 use hytte::services::power_profiles;
 use hytte::services::recorder;
 use hytte::services::screensaver;
+use hytte::services::theme::{self, Theme};
 
 use crate::components::deep_link_row::deep_link_row;
 use crate::components::layout::{finish_page, page_box};
@@ -47,17 +54,37 @@ pub fn panel_settings() -> gtk::Widget {
 
     let theme_switch = gtk::Switch::new();
     theme_switch.set_valign(gtk::Align::Center);
-    theme_switch.set_active(matches!(
-        hytte::services::theme::current(),
-        hytte::services::theme::Theme::Dark
-    ));
-    theme_switch.connect_active_notify(|sw| {
-        hytte::services::theme::set(if sw.is_active() {
-            hytte::services::theme::Theme::Dark
-        } else {
-            hytte::services::theme::Theme::Light
-        });
-    });
+    // Insensitive until the service's seed read lands: `None` is "we don't
+    // know yet", and a switch the user can flip while the answer is unknown
+    // would write a theme off a position nobody chose.
+    bind(
+        theme::current_signal().map(|t| t.is_some()),
+        &theme_switch,
+        gtk::prelude::WidgetExt::set_sensitive,
+    );
+    // Two-way, for the reason `keep_awake` / DND below are: the
+    // authoritative signal drives `active`, and `bind_two_way` blocks the
+    // handler while it does, so the programmatic `set_active` that lands
+    // when the seed arrives cannot re-enter `theme::set` and fan a whole
+    // `gsettings` write (plus a `theme-changed` hook) out at startup.
+    bind_two_way(
+        theme::current_signal(),
+        &theme_switch,
+        |sw, theme| {
+            if let Some(theme) = theme {
+                sw.set_active(matches!(theme, Theme::Dark));
+            }
+        },
+        |w| {
+            w.connect_active_notify(|sw| {
+                theme::set(if sw.is_active() {
+                    Theme::Dark
+                } else {
+                    Theme::Light
+                });
+            })
+        },
+    );
     theme_row.add_suffix(&theme_switch);
     theme_row.set_activatable_widget(Some(&theme_switch));
     appearance.add(&theme_row);

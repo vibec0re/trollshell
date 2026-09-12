@@ -494,6 +494,16 @@ unsafe extern "C" {
         destroy_data: GClosureNotify,
         connect_flags: c_uint,
     ) -> GULong;
+
+    /// `g_signal_handler_disconnect` — drop the handler `handler_id` names on
+    /// `instance`, so it can never be invoked again. This is what makes the
+    /// Rust callback behind a handler's `user_data` safe to free (#1179):
+    /// `g_object_unref` alone only disconnects handlers if *our* ref was the
+    /// last one, which we cannot prove — libecal or an in-flight emission may
+    /// hold another. GLib emits a critical warning (it does not abort) if
+    /// `handler_id` is not a live handler of `instance`, so only ever pass an
+    /// id [`g_signal_connect_data`] returned non-zero for, exactly once.
+    pub fn g_signal_handler_disconnect(instance: *mut c_void, handler_id: GULong);
 }
 
 #[link(name = "glib-2.0")]

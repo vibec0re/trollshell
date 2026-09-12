@@ -1106,19 +1106,33 @@ impl CalClient {
         // The callback lives in a double-box so we can hand GLib a *thin*
         // `*mut c_void` (the inner `Box<dyn Fn()>`) as each handler's
         // user_data. We own this box on the Rust side and free it in Drop —
-        // strictly after the view is stopped + unref'd, so no in-flight
-        // trampoline can read a freed pointer. Hence the connections use a
-        // no-op destroy-notify; ownership is ours, not the closures'.
+        // strictly after every handler that could reach it is disconnected
+        // (see `CalClientView::drop`), so no trampoline can read a freed
+        // pointer. Hence the connections use a no-op destroy-notify;
+        // ownership is ours, not the closures'.
         let boxed: Box<Box<dyn Fn()>> = Box::new(Box::new(on_change));
         let user_data = (&raw const *boxed).cast::<c_void>().cast_mut();
 
-        // Connect all three change signals to one trampoline. We don't track
-        // the returned handler ids: teardown is `g_object_unref(view)` in
-        // `CalClientView::drop`, which disconnects every handler on the object
-        // automatically. A `0` id means a connect failed — log but continue,
+        // Connect all three change signals to one trampoline, **keeping every
+        // handler id**: teardown disconnects each one explicitly before the
+        // unref (#1179). Relying on `g_object_unref(view)` to disconnect them
+        // — what this did before — is only sound if our ref is the last one,
+        // and nothing here can prove that: libecal, or a signal emission in
+        // flight, may hold another, in which case the handlers outlive the
+        // `Box<dyn Fn()>` they point at and the trampoline dereferences freed
+        // memory. A `0` id means that connect failed — log but continue,
         // since a partial subscription still beats none (and the safety-net
-        // poll backstops anything missed).
+        // poll backstops anything missed); it is never passed to
+        // `g_signal_handler_disconnect`.
+        let mut handler_ids: Vec<sys::GULong> = Vec::with_capacity(3);
         for sig in [c"objects-added", c"objects-modified", c"objects-removed"] {
+            // SAFETY: `view` is the non-null `ECalClientView*` `get_view_sync`
+            // just handed us, `sig` is a `'static` NUL-terminated literal, and
+            // `user_data` points at the boxed callback this function owns for
+            // longer than every handler (Drop disconnects them all first). The
+            // transmute retypes a concrete `extern "C"` fn to the
+            // signature-erased `GCallback` GLib stores; GLib calls it back with
+            // the `objects-*` signature the trampoline is written for.
             let id = unsafe {
                 sys::g_signal_connect_data(
                     view,
@@ -1136,16 +1150,32 @@ impl CalClient {
                 )
             };
             debug_assert!(id != 0, "g_signal_connect_data returned 0 for {sig:?}");
+            if id != 0 {
+                handler_ids.push(id);
+            }
         }
 
         // Begin notifications. `view-start` also replays the current contents
         // via `objects-added`, so the first refresh fires promptly without an
         // extra manual poll.
         let mut start_err: *mut sys::GError = ptr::null_mut();
+        // SAFETY: `view` is live and owned here; `start_err` is a live local
+        // initialised to null, which is what the `GError**` out-param wants.
         unsafe { sys::e_cal_client_view_start(view, &mut start_err) }
         if let Some(e) = take_error(start_err) {
-            // Couldn't start — disconnect/free everything we just set up and
-            // surface the error rather than returning a dead view.
+            // Couldn't start — disconnect every handler *before* dropping the
+            // box they point at, then release the view and surface the error
+            // rather than returning a dead view. Same ordering as Drop, and
+            // for the same reason.
+            for id in handler_ids {
+                // SAFETY: `id` is non-zero and came from a
+                // `g_signal_connect_data` on this same live `view`, and is
+                // disconnected exactly once (this path returns immediately
+                // after, so Drop never runs for these ids).
+                unsafe { sys::g_signal_handler_disconnect(view, id) }
+            }
+            // SAFETY: `view` is the ref `get_view_sync` transferred to us and
+            // is released exactly once here.
             unsafe { sys::g_object_unref(view) }
             drop(boxed);
             return Err(e);
@@ -1153,6 +1183,7 @@ impl CalClient {
 
         Ok(CalClientView {
             raw: view,
+            handler_ids,
             _callback: boxed,
         })
     }
@@ -1174,6 +1205,10 @@ impl Drop for CalClient {
 /// the callback.
 pub struct CalClientView {
     raw: *mut sys::ECalClientView,
+    /// The `objects-{added,modified,removed}` handler ids, each disconnected
+    /// in [`Drop`] **before** the view is unref'd and before `_callback` is
+    /// freed (#1179). Only non-zero ids (successful connects) are in here.
+    handler_ids: Vec<sys::GULong>,
     // Kept alive (and dropped last, after the view is torn down) so the raw
     // user_data pointer the handlers hold stays valid for their whole life.
     _callback: Box<Box<dyn Fn()>>,
@@ -1181,15 +1216,41 @@ pub struct CalClientView {
 
 impl Drop for CalClientView {
     fn drop(&mut self) {
-        // Stop first so EDS quits emitting, then unref. Both run on the view's
-        // owning thread (the only place a `CalClientView` lives), so no
-        // trampoline can be mid-flight against the callback we're about to
-        // free when `_callback` drops right after this.
+        // Teardown order is the whole safety argument for the raw `user_data`
+        // the three handlers carry, and it is exactly this (#1179):
+        //
+        //   1. stop the view, so EDS quits emitting;
+        //   2. **disconnect every handler**, so none of them can be invoked
+        //      again by anyone — this is the step that makes freeing
+        //      `_callback` sound. `g_object_unref` alone would only achieve
+        //      it if our ref were the last one, which nothing here can prove:
+        //      libecal (or an emission in flight) may hold another, and then
+        //      the handlers outlive the box they point at;
+        //   3. release our ref on the view;
+        //   4. `_callback` drops, freeing the `Box<dyn Fn()>` — after (2),
+        //      unreachable by construction rather than by refcount luck.
+        //
+        // Steps 1-3 run on the view's owning thread (the only place a
+        // `CalClientView` lives), so no trampoline can be mid-flight either.
         let mut err: *mut sys::GError = ptr::null_mut();
+        // SAFETY: `self.raw` is the live view this value owns (non-null since
+        // `watch` rejected a null one), and `err` is a live local initialised
+        // to null for the `GError**` out-param.
         unsafe { sys::e_cal_client_view_stop(self.raw, &mut err) }
         if !err.is_null() {
+            // SAFETY: non-null here, and set by the call above, so it is a
+            // `GError` we own; freed exactly once and never read after.
             unsafe { sys::g_error_free(err) }
         }
+        for &id in &self.handler_ids {
+            // SAFETY: every id in this vector is a non-zero id
+            // `g_signal_connect_data` returned for this same `self.raw`, and
+            // Drop runs once, so each is disconnected exactly once.
+            unsafe { sys::g_signal_handler_disconnect(self.raw, id) }
+        }
+        // SAFETY: the single ref `e_cal_client_get_view_sync` transferred to
+        // this value, released exactly once (Drop runs once) and never used
+        // after.
         unsafe { sys::g_object_unref(self.raw) }
     }
 }
@@ -1202,10 +1263,12 @@ impl Drop for CalClientView {
 /// # Safety
 ///
 /// GLib calls this with `user_data` equal to the pointer we passed to
-/// `g_signal_connect_data` — a live `*const Box<dyn Fn()>` owned by the
-/// [`CalClientView`] that is, by construction, still alive (it's torn down
-/// strictly before that box is freed). `_view`/`_objects` are borrowed and not
-/// touched.
+/// `g_signal_connect_data` — a `*const Box<dyn Fn()>` owned by the
+/// [`CalClientView`]. It is live at every reachable call: the three handlers
+/// that can reach this function are **disconnected** in `CalClientView::drop`
+/// before that box is freed (#1179), so an invocation after the free is
+/// unreachable by construction rather than by the view's refcount happening
+/// to be one. `_view`/`_objects` are borrowed and not touched.
 unsafe extern "C" fn view_changed_trampoline(
     _view: *mut c_void,
     _objects: *mut sys::GSList,

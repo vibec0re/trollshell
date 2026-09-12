@@ -486,7 +486,7 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
 - [ ] **(#1165 review round 2, HIGH-2)** **`classes` freeze, on glass.** Point
       a scratch plugin at the live socket and have it render a `Node::Label`
       with 20 000 CSS classes on one frame, then a second frame with 20 000
-      *different* class names (a full replace, the reconciler's worst case).
+      _different_ class names (a full replace, the reconciler's worst case).
       Expect: the mapped node carries at most `MAX_NODE_CLASSES` (32) of them,
       the bar keeps ticking across both frames, and the journal carries one
       _"plugin render tree carries a node with more CSS classes than the

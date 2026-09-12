@@ -11111,12 +11111,10 @@ mod containment_r2 {
         .await
         .expect("Register with an over-cap id");
 
-        let dropped = tokio::time::timeout(
-            Duration::from_secs(5),
-            read_frame::<HostMsg, _>(&mut prd),
-        )
-        .await
-        .expect("the over-cap-id connection is dropped within 5s");
+        let dropped =
+            tokio::time::timeout(Duration::from_secs(5), read_frame::<HostMsg, _>(&mut prd))
+                .await
+                .expect("the over-cap-id connection is dropped within 5s");
         assert!(
             dropped.is_err(),
             "an over-cap id Register is rejected (EOF)",

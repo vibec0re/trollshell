@@ -472,10 +472,7 @@ pub(super) fn capped_effect_payload(
     warned: &mut EffectWarnLatch,
 ) -> (Option<Effect>, Option<String>) {
     let kind = std::mem::discriminant(&effect);
-    let refuse = |what: &str,
-                  bytes: usize,
-                  request_id: u64,
-                  warned: &mut EffectWarnLatch| {
+    let refuse = |what: &str, bytes: usize, request_id: u64, warned: &mut EffectWarnLatch| {
         let message = warned.insert(kind).then(|| {
             format!(
                 "plugin {what} is {bytes} B, over the host's {MAX_DATASOURCE_PAYLOAD_BYTES} B \

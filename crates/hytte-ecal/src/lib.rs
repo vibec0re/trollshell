@@ -736,26 +736,40 @@ enum Truncation {
 /// Fast-forward a freshly-created recurrence iterator to the query window, so
 /// the expansion loop's steps are in-window steps (#1195).
 ///
-/// Returns `true` when the iterator was moved. `false` means "iterate from
-/// `DTSTART` as before" and is not an error; it happens for four reasons: the
-/// series starts inside (or just before) the window already, so there is
-/// nothing to skip; the skip time could not be built; the rule is one of the
-/// three sub-day frequencies (HOURLY/MINUTELY/SECONDLY) with `INTERVAL > 1`,
-/// where libical recovers the post-skip phase from a single calendar field
-/// rather than the elapsed interval count and would re-anchor the series onto
-/// the wrong grid (#1206 HIGH-1); or libical itself **refused**, which it
-/// does for an RRULE carrying `COUNT`, where starting late would change which
-/// occurrences the count selects.
+/// `*iter` in and out is always the iterator the caller should keep driving —
+/// almost always unchanged, but rebuilt fresh from `rule`/`dtstart` in the one
+/// case libical answers a refusal by mutating the iterator's internal state
+/// first before this function can hand it back (#1206 MEDIUM-2; see
+/// `sys::i_cal_recur_iterator_set_start`'s doc for which refusals do that).
+///
+/// Returns `true` when the skip actually re-anchored `*iter`. `false` means
+/// "iterate from `DTSTART` as before" and is not an error; it happens for
+/// four reasons: the series already starts inside (or just before) the
+/// window, so there is nothing to skip; the skip time could not be built; the
+/// rule is one of the three sub-day frequencies (HOURLY/MINUTELY/SECONDLY)
+/// with `INTERVAL > 1`, where libical recovers the post-skip phase from a
+/// single calendar field rather than the elapsed interval count and would
+/// re-anchor the series onto the wrong grid (#1206 HIGH-1); or libical itself
+/// **refused** — for an RRULE carrying `COUNT` (starting late would change
+/// which occurrences the count selects), a `FREQ=YEARLY` rule whose
+/// day-of-year expansion errors, or a first re-anchored instance past
+/// libical's `MAX_TIME_T_YEAR`.
 ///
 /// # Safety
 ///
-/// `iter` must be a live `ICalRecurIterator*` that has not been stepped yet —
-/// libical re-anchors the rule's state, so a partially-consumed iterator would
-/// silently restart. `rule` must be the same live, borrowed `ICalRecurrence`
-/// `iter` was built from. Both are borrowed: freed by the caller, never here.
+/// `*iter` must be a live `ICalRecurIterator*` that has not been stepped yet
+/// — libical re-anchors the rule's state, so a partially-consumed iterator
+/// would silently restart. `rule` and `dtstart` must be the same live,
+/// borrowed values `*iter` was built from ([`sys::i_cal_recur_iterator_new`]),
+/// and must stay alive for as long as the caller keeps using the iterator
+/// this function hands back — a rebuild borrows them again. This function
+/// frees at most the iterator it was given (never `rule`/`dtstart`) and, on a
+/// rebuild, hands back a new owned iterator in `*iter`; the caller frees
+/// whatever `*iter` holds when done, exactly once.
 unsafe fn skip_iterator_to_window(
-    iter: *mut sys::ICalRecurIterator,
+    iter: &mut *mut sys::ICalRecurIterator,
     rule: *mut sys::ICalRecurrence,
+    dtstart: *mut sys::ICalTime,
     dtstart_unix: i64,
     window_start: i64,
 ) -> bool {
@@ -769,7 +783,7 @@ unsafe fn skip_iterator_to_window(
         return false;
     }
     // SAFETY: `rule` is the live, borrowed `ICalRecurrence` this function's
-    // contract guarantees (the same one `iter` was built from); both getters
+    // contract guarantees (the same one `*iter` was built from); both getters
     // are plain field reads with no ownership transfer.
     let freq = unsafe { sys::i_cal_recurrence_get_freq(rule) };
     // SAFETY: as the `freq` read above.
@@ -801,14 +815,33 @@ unsafe fn skip_iterator_to_window(
     if start.is_null() {
         return false;
     }
-    // SAFETY: `iter` is the live, unstepped iterator this function's contract
+    // SAFETY: `*iter` is the live, unstepped iterator this function's contract
     // guarantees, and `start` the live time just built — borrowed for the call
     // only (the iterator copies the value out; its `sys` declaration says so).
-    let moved = unsafe { sys::i_cal_recur_iterator_set_start(iter, start) };
-    // SAFETY: the new ref taken above, released exactly once on this (the only
-    // remaining) exit path and never read after.
+    let moved = unsafe { sys::i_cal_recur_iterator_set_start(*iter, start) };
+    // SAFETY: the new ref taken above, released exactly once and never read
+    // after, on every path below.
     unsafe { sys::g_object_unref(start) }
-    moved != 0
+    if moved != 0 {
+        return true;
+    }
+    // libical refused, and for two of its three refusal reasons it has
+    // already mutated `*iter`'s internal state before answering zero (#1206
+    // MEDIUM-2 — see `sys::i_cal_recur_iterator_set_start`'s doc), so the only
+    // iterator that genuinely behaves like a fresh DTSTART-anchored one is an
+    // actual fresh one; rebuilding costs nothing this path wasn't already
+    // going to spend on the fallback loop.
+    //
+    // SAFETY: `*iter` is the live iterator this function's contract
+    // guarantees and has not been freed yet; freeing it here (and replacing
+    // it below) is what makes "false ⇒ iterate from DTSTART as before" true
+    // unconditionally rather than only for the `COUNT` refusal.
+    unsafe { sys::i_cal_recur_iterator_free(*iter) }
+    // SAFETY: `rule` and `dtstart` are the same live, borrowed values `*iter`
+    // was originally built from (this function's contract); building a new
+    // iterator from them is exactly `i_cal_recur_iterator_new`'s contract.
+    *iter = unsafe { sys::i_cal_recur_iterator_new(rule, dtstart) };
+    false
 }
 
 /// Expand one master `comp` over `[start_unix, end_unix)` (POSIX UTC
@@ -980,72 +1013,86 @@ unsafe fn expand_component(
             // `i_cal_recur_iterator_free` below, which is what libical's
             // iterator requires of the rule and the start time it is built
             // from.
-            let iter = unsafe { sys::i_cal_recur_iterator_new(rule, dtstart) };
+            let mut iter = unsafe { sys::i_cal_recur_iterator_new(rule, dtstart) };
             if !iter.is_null() {
                 // Skip straight to the window before stepping (#1195). Without
                 // this the loop below walks every occurrence since DTSTART:
                 // for an hourly series begun in 2014 that is ~105 000 steps
                 // before the first one the window wants, which trips
                 // MAX_RECUR_ITERATIONS and hands back an *empty* series. The
-                // call declines (leaving `iter` untouched) when there is
+                // call declines (leaving `iter` as built) when there is
                 // nothing to skip, when the rule is a sub-day frequency
                 // (HOURLY/MINUTELY/SECONDLY) with INTERVAL > 1 — libical's
                 // post-skip phase recovery only accounts for one calendar
                 // field there and would land the series on the wrong grid
                 // (#1206 HIGH-1) — or when libical itself refuses (e.g. a
                 // COUNT rule), in which case the guard below is doing its
-                // original job.
+                // original job. On a refusal it may also rebuild `iter` from
+                // scratch (#1206 MEDIUM-2, since two of libical's three
+                // refusal paths mutate the iterator before answering
+                // failure) — either way, `iter` below is the one to keep
+                // using.
                 //
                 // SAFETY: `iter` is the non-null iterator created directly
-                // above and not yet stepped; `rule` is the same live,
-                // borrowed value it was built from — exactly what this
-                // callee requires. It borrows both and frees neither.
-                unsafe { skip_iterator_to_window(iter, rule, dtstart_unix, start_unix) };
-                // A defensive cap: even with the time-window stop condition, a
-                // pathological rule shouldn't loop forever. After a successful
-                // skip it counts in-window steps, so the occurrence budget
-                // binds long before it does.
-                let mut guard = 0u32;
-                loop {
-                    guard += 1;
-                    if guard > MAX_RECUR_ITERATIONS {
-                        truncated = truncated.or(Some(Truncation::IterationGuard));
-                        break;
-                    }
-                    // SAFETY: `iter` is the non-null iterator we own and have
-                    // not yet freed; each step returns a **new** `ICalTime`
-                    // ref (or a null-time sentinel), released on both paths
-                    // below before the next step.
-                    let occ = unsafe { sys::i_cal_recur_iterator_next(iter) };
-                    // SAFETY: null or a live borrow of the ref just taken.
-                    let Some(occ_unix) = (unsafe { ical_time_to_unix(occ) }) else {
-                        // null-time ⇒ series exhausted.
+                // above and not yet stepped; `rule` and `dtstart` are the
+                // same live, borrowed values it was built from, kept alive
+                // by this scope across the iterator's whole life — whether
+                // that ends up being the one above or a replacement the
+                // callee builds from them. The callee frees nothing it did
+                // not itself create and hands back the iterator this scope
+                // now owns.
+                unsafe {
+                    skip_iterator_to_window(&mut iter, rule, dtstart, dtstart_unix, start_unix);
+                }
+                if !iter.is_null() {
+                    // A defensive cap: even with the time-window stop condition, a
+                    // pathological rule shouldn't loop forever. After a successful
+                    // skip it counts in-window steps, so the occurrence budget
+                    // binds long before it does.
+                    let mut guard = 0u32;
+                    loop {
+                        guard += 1;
+                        if guard > MAX_RECUR_ITERATIONS {
+                            truncated = truncated.or(Some(Truncation::IterationGuard));
+                            break;
+                        }
+                        // SAFETY: `iter` is the non-null iterator we own and have
+                        // not yet freed; each step returns a **new** `ICalTime`
+                        // ref (or a null-time sentinel), released on both paths
+                        // below before the next step.
+                        let occ = unsafe { sys::i_cal_recur_iterator_next(iter) };
+                        // SAFETY: null or a live borrow of the ref just taken.
+                        let Some(occ_unix) = (unsafe { ical_time_to_unix(occ) }) else {
+                            // null-time ⇒ series exhausted.
+                            if !occ.is_null() {
+                                // SAFETY: the new ref from this step, released
+                                // exactly once (this path breaks the loop).
+                                unsafe { sys::g_object_unref(occ) }
+                            }
+                            break;
+                        };
                         if !occ.is_null() {
-                            // SAFETY: the new ref from this step, released
-                            // exactly once (this path breaks the loop).
+                            // SAFETY: the new ref from this step, released exactly
+                            // once — `occ` is not read again this iteration (only
+                            // the `i64` extracted from it is).
                             unsafe { sys::g_object_unref(occ) }
                         }
-                        break;
-                    };
-                    if !occ.is_null() {
-                        // SAFETY: the new ref from this step, released exactly
-                        // once — `occ` is not read again this iteration (only
-                        // the `i64` extracted from it is).
-                        unsafe { sys::g_object_unref(occ) }
+                        if occ_unix >= end_unix {
+                            break; // past the window ⇒ done
+                        }
+                        if !emit.emit(out, occ_unix) {
+                            // Budget spent: stop stepping the iterator instead of
+                            // running it to the end of the window for nothing.
+                            truncated = truncated.or(Some(Truncation::Budget));
+                            break;
+                        }
                     }
-                    if occ_unix >= end_unix {
-                        break; // past the window ⇒ done
-                    }
-                    if !emit.emit(out, occ_unix) {
-                        // Budget spent: stop stepping the iterator instead of
-                        // running it to the end of the window for nothing.
-                        truncated = truncated.or(Some(Truncation::Budget));
-                        break;
-                    }
+                    // SAFETY: `iter` is the non-null iterator this scope now
+                    // owns — whether the one created above or the
+                    // replacement `skip_iterator_to_window` built — freed
+                    // exactly once here and never stepped after.
+                    unsafe { sys::i_cal_recur_iterator_free(iter) }
                 }
-                // SAFETY: `iter` is the non-null iterator this scope created
-                // and owns, freed exactly once here and never stepped after.
-                unsafe { sys::i_cal_recur_iterator_free(iter) }
             }
             // SAFETY: the new `ICalRecurrence` ref taken above, released
             // exactly once and only after the iterator built from it is freed.
@@ -3021,6 +3068,33 @@ mod tests {
         }
     }
 
+    /// A `FREQ=YEARLY` rule that also trips the `COUNT` refusal — exercising
+    /// the frequency whose `__iterator_set_start` branch does the most work
+    /// (day-of-year expansion), not just `DAILY`'s single `increment_monthday`
+    /// — must still expand correctly once `skip_iterator_to_window` rebuilds
+    /// the iterator on refusal (#1206 MEDIUM-2). A 10-year count begun in
+    /// 2020 contributes exactly its one in-window year.
+    #[test]
+    fn a_yearly_count_rule_that_trips_the_refusal_still_yields_its_in_window_instance() {
+        let ical = "BEGIN:VEVENT\r\nUID:yearly-count\r\nDTSTAMP:20200605T090000Z\r\n\
+                     DTSTART:20200605T090000Z\r\nDTEND:20200605T093000Z\r\n\
+                     SUMMARY:Anniversary\r\nRRULE:FREQ=YEARLY;COUNT=10\r\nEND:VEVENT\r\n";
+        let inst = super::expand_ical_for_test(ical, JUN_START, WINDOW_43D_END).unwrap();
+
+        // DTSTART 2020-06-05; the count runs 2020..=2029, so 2026-06-05 is
+        // occurrence #6 of 10 and the only one inside the 43-day window.
+        assert_eq!(
+            inst.len(),
+            1,
+            "exactly the 2026 anniversary should fall in the window",
+        );
+        assert_eq!(
+            inst[0].start_unix,
+            ANCHOR_0900 + 4 * 86_400,
+            "2026-06-05T09:00:00Z",
+        );
+    }
+
     /// A series that ended before the window contributes nothing: the skip
     /// must not resurrect it by re-anchoring past its `UNTIL`.
     #[test]
@@ -3093,8 +3167,8 @@ mod tests {
     fn libical_refuses_to_skip_a_count_rule_and_accepts_one_without() {
         /// Build the iterator `expand_component` builds for a given RRULE and
         /// report what `skip_iterator_to_window` says about skipping it to
-        /// June 2026.
-        fn iterator_skips(recurrence_rule: &str) -> bool {
+        /// June 2026, plus whether it rebuilt the iterator (#1206 MEDIUM-2).
+        fn iterator_skips(recurrence_rule: &str) -> (bool, bool) {
             let ical = format!(
                 "BEGIN:VEVENT\r\nUID:probe\r\nDTSTAMP:20140101T090000Z\r\n\
                  DTSTART:20140101T090000Z\r\nDTEND:20140101T093000Z\r\n\
@@ -3119,16 +3193,20 @@ mod tests {
             // SAFETY: both arguments are live and stay borrowed until after
             // the iterator is freed below, which is what libical requires of
             // the rule and start time an iterator is built from.
-            let iter = unsafe { sys::i_cal_recur_iterator_new(rule, dtstart) };
+            let mut iter = unsafe { sys::i_cal_recur_iterator_new(rule, dtstart) };
             assert!(!iter.is_null(), "iterator constructs");
+            let original = iter;
 
             // SAFETY: `iter` is the live iterator just built and not yet
-            // stepped, and `rule` is the same live value it was built from —
-            // exactly this callee's contract.
-            let skipped = unsafe { super::skip_iterator_to_window(iter, rule, 0, JUN_START) };
+            // stepped, and `rule`/`dtstart` are the same live values it was
+            // built from — exactly this callee's contract.
+            let skipped =
+                unsafe { super::skip_iterator_to_window(&mut iter, rule, dtstart, 0, JUN_START) };
+            let rebuilt = iter != original;
 
-            // SAFETY: the iterator this scope owns, freed exactly once and
-            // never stepped after.
+            // SAFETY: `iter` is the iterator this scope now owns (whether
+            // the original or a replacement), freed exactly once and never
+            // stepped after.
             unsafe { sys::i_cal_recur_iterator_free(iter) }
             // SAFETY: the new `ICalRecurrence` ref above, released exactly
             // once and only after the iterator built from it is freed.
@@ -3139,20 +3217,31 @@ mod tests {
             // only after the iterator that borrowed it is freed.
             unsafe { sys::g_object_unref(dtstart) }
             drop(comp);
-            skipped
+            (skipped, rebuilt)
         }
 
+        let (skipped, rebuilt) = iterator_skips("FREQ=HOURLY");
         assert!(
-            iterator_skips("FREQ=HOURLY"),
+            skipped,
             "libical must accept the skip for a plain rule — without it the \
              whole of #1195 is a no-op that happens to still pass its \
              expansion tests only if nothing else changed",
         );
+        assert!(!rebuilt, "a successful skip must reuse the same iterator");
+
+        let (skipped, rebuilt) = iterator_skips("FREQ=HOURLY;COUNT=200000");
         assert!(
-            !iterator_skips("FREQ=HOURLY;COUNT=200000"),
+            !skipped,
             "libical accepted a skip on a COUNT rule; the fallback path, its \
              warn! and MAX_RECUR_ITERATIONS's doc are all written around the \
              refusal",
+        );
+        assert!(
+            rebuilt,
+            "a refused skip must rebuild the iterator (#1206 MEDIUM-2) — \
+             \"false ⇒ iterate from DTSTART as before\" is a promise about \
+             the iterator returned, not a description of the one the \
+             caller happened to be holding",
         );
     }
 }

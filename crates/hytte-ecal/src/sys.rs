@@ -497,14 +497,22 @@ unsafe extern "C" {
     /// ~100 000.
     ///
     /// Borrows both arguments (the iterator keeps no reference to `start`, so
-    /// the caller may release it straight after). **Returns zero on
-    /// failure.** libical's own doc string is deliberately open-ended here
-    /// ("1 if succeeded, 0 if failed, like when the recurrence type is
-    /// unsupported"); the only case it explicitly names is an RRULE carrying
-    /// `COUNT`, where skipping would change which occurrences the count
-    /// selects. Callers must treat a zero return as "iterate from `DTSTART`
-    /// after all" rather than assume the iterator moved — see
-    /// `lib.rs`'s `skip_iterator_to_window`.
+    /// the caller may release it straight after). **Returns zero on failure.**
+    /// libical's own doc string names one case ("1 if succeeded, 0 if failed,
+    /// like when the recurrence type is unsupported") but leaves the rest
+    /// open-ended; reading `icalrecur.c` directly, three things return zero:
+    /// an RRULE carrying `COUNT` (skipping would change which occurrences the
+    /// count selects — the only one of the three that returns *before*
+    /// touching the iterator's internal state); a `FREQ=YEARLY` rule whose
+    /// day-of-year expansion errors (an unsupported `BY*` combination); and a
+    /// first re-anchored instance whose year exceeds libical's compiled
+    /// `MAX_TIME_T_YEAR`. The latter two mutate the iterator's internal state
+    /// (`istart`, `occurrence_no`, the Gregorian fields `set_datetime`
+    /// writes) before answering zero, so "zero ⇒ iterate from `DTSTART` as
+    /// before" is not literally true of the iterator libical hands back for
+    /// them (#1206 MEDIUM-2) — `lib.rs`'s `skip_iterator_to_window` rebuilds a
+    /// fresh iterator on any zero return rather than trust the one it was
+    /// given.
     ///
     /// Separately: for the three sub-day frequencies (HOURLY/MINUTELY/
     /// SECONDLY), a **non-zero** return is not safe to trust either once

@@ -1191,11 +1191,25 @@ fn one_prompt(fx: &[Effect]) -> u64 {
 /// **same** approval raises none — spec §6.5's dedup, and the difference
 /// between a modal and a modal every two seconds.
 ///
-/// Falsification: delete the `prompted` insert in `Agents::raise` (or the
-/// `oldest_unprompted` filter) and the second fold raises a second prompt.
+/// # Two mechanisms, and the second half is what separates them
+///
+/// Two things could produce "no second prompt", and a test that only polls
+/// twice cannot tell which one did it: the **gate** (one card at a time, so
+/// nothing else is raised while the first is open) and the **`prompted` set**
+/// (this approval has already been asked about). Measured: deleting the
+/// `prompted` insert leaves a poll-twice test green, because the gate alone
+/// covers it.
+///
+/// So the second half answers the card first — which opens the gate — and then
+/// polls again with the approval **still queued**, which is the real sequence
+/// (the write has not landed yet, or the hive refused it). Only `prompted`
+/// stops a second card there.
+///
+/// Falsification: delete the `prompted` insert in `Agents::raise`, or the
+/// `oldest_unprompted` filter, and the last assertion goes red.
 #[test]
 fn a_pending_approval_prompts_once_and_not_again_on_the_next_poll() {
-    let (mut m, _rx) = model();
+    let (mut m, mut rx) = model();
     m.update(status(roster("agent_status_grouped.json")));
 
     let first = m.update(pending(vec![approval(7, "trollshell-choom")]));
@@ -1211,9 +1225,29 @@ fn a_pending_approval_prompts_once_and_not_again_on_the_next_poll() {
         "the detail names the request: {}",
         raised[0].3
     );
+    let id = raised[0].0;
 
+    // While the card is open: nothing new — that is the gate.
     let second = m.update(pending(vec![approval(7, "trollshell-choom")]));
     assert_eq!(prompts(&second), Vec::new(), "{second:?}");
+
+    // Answered, so the gate is open — and the approval is still queued,
+    // because the hive has not processed the write yet.
+    m.update(Input::ConsentDecision {
+        request_id: id,
+        decision: ConsentDecision::AllowOnce,
+    });
+    assert_eq!(
+        lines(&mut rx),
+        vec![r#"{"cmd":"approve","id":7}"#.to_owned()]
+    );
+
+    let third = m.update(pending(vec![approval(7, "trollshell-choom")]));
+    assert_eq!(
+        prompts(&third),
+        Vec::new(),
+        "an approval already asked about must not be asked again: {third:?}"
+    );
 }
 
 /// The card asks with the **two-button** choice set, because "This session" and

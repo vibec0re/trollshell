@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "The consent-gated data broker for local AI agents (issue #487, phase 1a): a hytte plugin whose own panel manages grants + audit, plus a boring JSON-lines socket the `hytte-infobroker` CLI dials to auth + fetch scoped data"
 
 [lints]
@@ -33,24 +34,23 @@ hytte-plugin = { path = "../hytte-plugin" }
 # (`plugin.rs`), which never parses arguments.
 clap = { workspace = true, features = ["derive"] }
 clap_complete.workspace = true
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde.workspace = true
+serde_json.workspace = true
 # The durable grant store (grants.toml) + the ported places.toml station config.
-toml = "1"
+toml.workspace = true
 # The departures datasource: the same blocking `ureq` + `spawn_blocking` idiom as
 # `hytte-plugin-departures` (accepted code dup — dedup is phase 2, once the proto
 # grows a Datasource capability). `rustls` for HTTPS.
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 # RFC 3339 departure timestamps → unix seconds + `HH:MM`, and `Utc::now()` for
 # token TTLs / audit timestamps.
-chrono = { version = "0.4.44", default-features = false, features = [
-  "clock",
-  "std",
-] }
+chrono.workspace = true
 # The broker socket server (UnixListener + line I/O) and the blocking-fetch
 # offload. `net` for the listener, `io-util` for the buffered line read/write,
-# `rt` for `spawn`/`spawn_blocking`, `macros` for `select!`.
-tokio = { version = "1.40", default-features = false, features = [
+# `rt` for `spawn`/`spawn_blocking`, `macros` for `select!`. The workspace
+# baseline carries no features (each consumer lists its own, #453); this
+# crate's set stays here.
+tokio = { workspace = true, features = [
   "rt",
   "macros",
   "net",

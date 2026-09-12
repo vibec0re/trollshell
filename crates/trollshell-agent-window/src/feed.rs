@@ -31,6 +31,7 @@ use hytte_plugin_agents::hive::client::{self, HiveError};
 use hytte_plugin_agents::hive::wire::{Approval, HiveUrls, Request, Response, Scope};
 use hytte_plugin_agents::model::{Agent, AgentName};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 
 /// What the chrome knows about this window's agent right now.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,11 +177,64 @@ pub fn deny(id: i64) -> Request {
 /// The command lane is **biased** over the tick, and every accepted command is
 /// followed by an immediate re-poll, so a button's effect shows up at once
 /// instead of up to `interval` later.
+///
+/// # Parking (#1149 L4)
+///
+/// `visible` is this window's only visibility source — **the compositor's own
+/// `GdkToplevelState::SUSPENDED`**, plus the map/unmap edges, wired in
+/// [`crate::window::watch_presentation`] — the mirror of
+/// `hytte_plugin_agents::poll`'s `SlotVisible` gate for a surface that has no
+/// host to push one to it. Each tick this poll makes since #1146 is two round
+/// trips (`AgentStatus` then `Pending`), so a window nobody is being shown
+/// should spend none.
+///
+/// The signal is `SUSPENDED` and not map/unmap because **map/unmap parks
+/// nothing on the target compositor** (this round's review): no Wayland
+/// compositor can unmap a client's toplevel, only the client can, so those two
+/// signals report the window's own `present()`/teardown. niri has no minimise
+/// at all, and a window on an inactive workspace stays mapped — it merely
+/// stops receiving frame callbacks and gets the `SUSPENDED` bit, which is
+/// exactly the "not being presented" xdg-shell v6 publishes. `presenting`
+/// carries the rest of that argument, including why focus is the wrong signal.
+///
+/// While `visible` says no the ticker is disabled outright — not backed off,
+/// parked, the same as the plugin's own poller ("no ticks, no sockets"). The
+/// edge back gets at most **one** immediate poll, with the ticker reset first
+/// so the next *scheduled* tick lands a clean interval after it rather than
+/// doubling up — `Cmd::SetVisible`'s own reasoning in
+/// `hytte_plugin_agents::poll::poll_task_with`. Tokio's `Interval` already
+/// refuses to queue up missed ticks (`MissedTickBehavior::Delay`), so a
+/// `.tick()` never polled while parked costs nothing and fires no burst on its
+/// own — the reset only prevents the *reconciling* poll below from being
+/// immediately followed by a stale scheduled one.
+///
+/// **At most one**, because a `SUSPENDED` signal flaps where map/unmap never
+/// did: every workspace switch across this window is an edge, so ten flicks
+/// across a workspace would otherwise be twenty round trips and ten interval
+/// resets. `last_immediate` is the guard — a resume less than one `interval`
+/// after the last immediate poll skips both the poll and the reset, because
+/// the already-scheduled tick is then at most one interval away and carries
+/// data at most one interval old. Skipping the *reset* too is deliberate and
+/// is where this differs from the review's sketch: resetting on every edge
+/// would let a fast enough flap push the scheduled tick out indefinitely,
+/// which is the one way a guard against extra polls could turn into no polls
+/// at all.
+// One cohesive poll lifecycle (seed → the select loop over visibility,
+// commands and the tick) — the same shape and the same allow
+// `hytte_plugin::runtime::session` carries; the length is the loop's three
+// event sources plus their shared reconciling-poll call, not branching
+// complexity, so splitting it would scatter one state machine across
+// several functions for no gain.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one poll lifecycle, not nested branching — see the comment above"
+)]
 pub async fn run(
     socket: PathBuf,
     name: AgentName,
     interval: Duration,
     mut cmds: UnboundedReceiver<Request>,
+    mut visible: watch::Receiver<bool>,
     out: UnboundedSender<Update>,
 ) {
     let mut last: Option<AgentState> = None;
@@ -204,26 +258,99 @@ pub async fn run(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // the first tick is immediate; the seed below is it.
 
-    if urls.attempt(&socket, &out).await.is_err() {
-        return;
-    }
-    if poll_once(
-        &socket,
-        &name,
-        &out,
-        &mut last,
-        &mut last_approvals,
-        &mut pending_failing,
-    )
-    .await
-    .is_err()
-    {
-        return;
+    // The seed is conditional on the window already being presented — reading
+    // the snapshot rather than waiting on `changed()`, which by tokio's own
+    // contract only fires on a *change* after this receiver was created, so
+    // it would never see the value the sender was constructed with. A window
+    // is built and then explicitly presented (`main.rs`), so this is very
+    // likely `false` at this instant; the `opened` edge below picks the seed
+    // up the moment GTK maps it.
+    let mut mapped = *visible.borrow_and_update();
+    // Latched `false` once the sender side is gone, so a torn-down window
+    // cannot turn this into a busy loop of instantly-erroring `changed()`
+    // calls — see the `select!` arm below.
+    let mut visible_open = true;
+    // When the last *edge-driven* immediate poll happened — the flap guard's
+    // only state (see the "Parking" section above). Tokio's clock, so a
+    // `start_paused` test drives it exactly. Commands and scheduled ticks
+    // deliberately do not stamp it: a command is an operator's own action and
+    // owes them a reconciling answer whatever the poll did a moment ago.
+    let mut last_immediate: Option<tokio::time::Instant> = None;
+    if mapped {
+        last_immediate = Some(tokio::time::Instant::now());
+        if urls.attempt(&socket, &out).await.is_err() {
+            return;
+        }
+        if poll_once(
+            &socket,
+            &name,
+            &out,
+            &mut last,
+            &mut last_approvals,
+            &mut pending_failing,
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
     }
 
     loop {
         tokio::select! {
+            // Prefer a visibility edge and a command over a tick, so a
+            // suspend parks promptly rather than firing one more round trip
+            // first — `hytte_plugin_agents::poll::poll_task_with`'s own bias.
             biased;
+            changed = visible.changed(), if visible_open => {
+                let Ok(()) = changed else {
+                    // The sender side is gone (the window was torn down).
+                    // Latched so this branch is never selected again —
+                    // otherwise a closed `watch` channel resolves instantly
+                    // forever, spinning this loop with no ticker or command
+                    // ever getting a turn.
+                    visible_open = false;
+                    continue;
+                };
+                let now = *visible.borrow_and_update();
+                let opened = now && !mapped;
+                mapped = now;
+                // The flap guard: a resume inside one interval of the last
+                // immediate poll rides the already-scheduled tick instead of
+                // buying a second pair of round trips (and a reset that would
+                // push that tick further out). See the "Parking" section.
+                let recent = last_immediate.is_some_and(|t| t.elapsed() < interval);
+                if opened && recent {
+                    tracing::debug!(
+                        "presented again inside one poll interval — the scheduled tick reconciles \
+                         this one"
+                    );
+                }
+                if opened && !recent {
+                    // Reset first so the next scheduled tick lands a clean
+                    // interval after this immediate refresh —
+                    // `Cmd::SetVisible`'s own reasoning in
+                    // `hytte_plugin_agents::poll`.
+                    ticker.reset();
+                    last_immediate = Some(tokio::time::Instant::now());
+                    if urls.attempt(&socket, &out).await.is_err() {
+                        return;
+                    }
+                    if poll_once(
+                        &socket,
+                        &name,
+                        &out,
+                        &mut last,
+                        &mut last_approvals,
+                        &mut pending_failing,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
             cmd = cmds.recv() => {
                 let Some(req) = cmd else { return };
                 if let Err(reason) = write(&socket, &req).await {
@@ -256,7 +383,10 @@ pub async fn run(
                     return;
                 }
             }
-            _ = ticker.tick() => {
+            // Disabled while the compositor is not presenting this window —
+            // the poller parks (no ticks, no sockets), the same gate
+            // `hytte_plugin_agents::poll` applies on `SlotVisible` (#1149 L4).
+            _ = ticker.tick(), if mapped => {
                 if urls.attempt(&socket, &out).await.is_err() {
                     return;
                 }

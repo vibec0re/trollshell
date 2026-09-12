@@ -779,6 +779,60 @@ about the same queue.
       Settings entry grows a badge with the count and the attention dot —
       this is the only signal an operator watching the turn stream gets.
 
+### Parking the `host.sock` polls (#1149 L4 + its review)
+
+The one thing on this page that **only niri can answer**: whether the
+compositor actually sends `GdkToplevelState::SUSPENDED`, and when. Everything
+else about the park is pinned in CI — the pure policy (`window::presenting`
+over a `ToplevelState`), the wiring up to the `GdkToplevel` (a display test
+that realizes a window, resolves the toplevel and watches the map/unmap
+edges), and the poll's whole reaction to the bool (`tests/feed.rs`, driving
+the `watch::Receiver` directly). What CI cannot do is set the bit: `gdk`
+exposes no setter — the state comes from the compositor's xdg-shell configure
+— and the test environment is a bare X server with no window manager, let
+alone a Wayland compositor.
+
+Note what is **not** worth verifying here: GTK's `map`/`unmap` on this
+window. No Wayland compositor can unmap a client's toplevel, niri has no
+minimise, and a window on an inactive workspace stays mapped — so those two
+signals only ever fire for the window's own open and teardown. That is why
+the park moved onto `SUSPENDED` in the first place.
+
+- [ ] **(#1149 L4 review)** **niri sends `SUSPENDED` at all.** Open a
+      companion window (`trollshell-agent-window --agent <name>`) from a
+      terminal with `WAYLAND_DEBUG=1`, switch to another workspace, and look
+      for an `xdg_toplevel.configure` carrying the suspended state (niri
+      26.04 ships xdg-shell v6). If it never arrives, the park is inert —
+      harmless, but then the right follow-up is the stalled frame clock (a
+      `add_tick_callback` that stops being called) as the proxy, not
+      `is-active`, which would wrongly park a visible-but-unfocused window.
+- [ ] **(#1149 L4 review)** **The poll actually parks and resumes.** Same
+      window, run with `RUST_LOG=trollshell_agent_window=debug`, and watch
+      `host.sock` traffic across a workspace switch away and back — e.g.
+      `sudo ss -xp | grep host.sock` or the hive's own request log. Expect:
+      no `agent_status`/`pending` pair while the window is on another
+      workspace, exactly **one** immediately on the way back, then the
+      ordinary two-second cadence. Flicking across the workspace several
+      times inside one cadence must buy **one** poll, not one per flick (the
+      flap guard logs `presented again inside one poll interval` for the ones
+      it skips).
+- [ ] **(#1149 L4 review)** **The header is still live while unfocused.**
+      With the companion window visible but _not_ focused (work in another
+      window on the same workspace), confirm the status line still follows
+      the agent. This is the case that rules out focus as the park signal, so
+      a regression here is the thing to watch for if anyone swaps the state
+      bit.
+- [ ] **(#1149 N2 review)** **A click on a repainting row still lands.** With
+      a queued approval showing on the Settings tab, click **Approve** at the
+      moment a poll lands (the cadence is two seconds; a few tries). The
+      press and release now reach the same `GtkButton` because the row is
+      retargeted rather than rebuilt, so no click should be silently dropped.
+      Focus behaviour across a repaint is the other half of this and is
+      deliberately unverified in CI — a display test for it had zero
+      detection power (it passed with a forced full rebuild too), so if you
+      have a keyboard-driven habit here, this is the pass that establishes
+      it.
+
 ### The control-center Agents tab (#947 P4, spec §10)
 
 Open with `trollshell-control-center` and pick the **Agents** tab (fourth,
@@ -865,6 +919,28 @@ opens what it claims.
       `poll_seconds = 30` and confirm this tab slows down with the sidebar card
       (both read the same file; a restart of the control-center is expected —
       the tab reads the config once at window build).
+- [ ] **(#1149 N1)** **Unassigned approvals show, and stay reachable.** Queue
+      an approval the hive cannot match to any agent on this roster — an
+      agent renamed or removed from `agents.toml` orphans its whole queue at
+      once, which is the realistic way to get several — and confirm the
+      "Unassigned approvals" group appears **below the roster**, carrying one
+      row per orphan. Past two or three rows it must **scroll inside its own
+      box** (capped at 220 px) rather than growing: no row may be drawn
+      outside the window, and the agent list above it must keep the majority
+      of the sidebar. Each row's first line says where to answer it — check
+      the wording against the case: no agent named → the dashboard; a name
+      with capitals or spaces (which this build will not render anywhere) →
+      the dashboard; a plain absent name → that agent's own card if it comes
+      back. Nothing on these rows is clickable: this tab writes nothing.
+- [ ] **(#1149 N1 review)** **The tab's poll parks when it is not showing.**
+      With the control-center open on **Plugins**, watch `host.sock` (the
+      hive's request log, or `sudo ss -xp | grep host.sock`) for a minute and
+      confirm the Agents tab asks for nothing at all — no `agent_status`, no
+      `pending`. Switch to **Agents** and confirm it refreshes immediately
+      rather than after a cadence, then resumes the ordinary rhythm. Minimise
+      or hide the whole window with the Agents tab showing and confirm the
+      same park (this is the `SUSPENDED` half; on niri, see the
+      companion-window entries above for whether that state arrives at all).
 
 ## Plugins & launcher
 

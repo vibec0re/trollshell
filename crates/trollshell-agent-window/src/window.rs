@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gdk, glib};
 
 use hytte_plugin_agents::config::AgentsConfig;
 use hytte_plugin_agents::hive::wire::{Approval, HiveUrls, Request};
@@ -29,6 +29,94 @@ use crate::{cli, page, tls, ui, webview};
 /// What the window shows before the hive has a page URL for this agent.
 pub const NO_PAGE: &str = "This hive publishes no page for this agent yet — its domain is unconfigured, or the agent is \
      not on its roster. The header above still follows the agent's live status.";
+
+/// Whether the compositor is **presenting** this window's content — the poll's
+/// visibility signal (#1149 L4, reworked after this round's review).
+///
+/// The first cut read GTK's `map`/`unmap` on the toplevel, and on the target
+/// compositor that parks nothing. No Wayland compositor can unmap a client's
+/// toplevel — only the client can — so `map`/`unmap` report this binary's own
+/// `present()`/teardown and nothing about whether anyone is looking; niri has
+/// no minimise at all, and a window on an inactive workspace stays mapped, it
+/// just stops being handed frame callbacks.
+///
+/// `GdkToplevelState::SUSPENDED` is the state that *does* move there:
+/// xdg-shell v6's "the compositor is not presenting this content", which is
+/// exactly the question the poll wants answered. It landed in GTK 4.12 and the
+/// devShell is 4.22, so reading it costs nothing beyond the `v4_14` feature
+/// this crate already takes.
+///
+/// Deliberately **not** `is-active` (focus): a visible-but-unfocused window
+/// must keep polling, since a live status header while you work in another
+/// window is the entire point of this chrome.
+#[must_use]
+pub(crate) fn presenting(state: gdk::ToplevelState) -> bool {
+    !state.contains(gdk::ToplevelState::SUSPENDED)
+}
+
+/// The poll's visibility source: `true` while `window` is mapped **and** the
+/// compositor says it is presenting it.
+///
+/// Three signals feed one `watch`, because no single one of them covers every
+/// case:
+///
+/// - `realize` is where the `GdkSurface` first exists, so it is the only place
+///   the `GdkToplevel` can be reached and its `state` subscribed to. A window
+///   can be unrealized and realized again (each time on a *new* surface),
+///   which is why the subscription is made here rather than once at build.
+/// - `notify::state` on that toplevel is the live signal — the suspend and
+///   un-suspend edges [`presenting`] exists for.
+/// - `map`/`unmap` stay, for the two edges the toplevel state cannot give: the
+///   window's own first presentation, and its teardown. On niri the unmap edge
+///   is only ever the latter (see [`presenting`]), at which point the poll
+///   ends anyway; on a compositor that *can* hide a client's toplevel it is a
+///   real park.
+///
+/// The state handler holds the window **weakly**: the surface is owned by the
+/// widget, so a strong clone captured in a handler attached to that surface
+/// would be a cycle outliving the window.
+pub(crate) fn watch_presentation(
+    window: &adw::ApplicationWindow,
+) -> tokio::sync::watch::Receiver<bool> {
+    // Not presenting until GTK says otherwise — a window is built and then
+    // explicitly presented (`main.rs`), so `false` is the correct starting
+    // snapshot for `feed::run` to read, not a guess.
+    let (tx, rx) = tokio::sync::watch::channel(false);
+
+    let sender = tx.clone();
+    window.connect_realize(move |w| {
+        let Some(toplevel) = w.surface().and_downcast::<gdk::Toplevel>() else {
+            // Not a toplevel surface. No backend that ships here does this,
+            // but the cast is fallible: the map/unmap edges below still drive
+            // the poll, it simply stops parking on suspension.
+            tracing::debug!("this window has no GdkToplevel — the poll cannot park on suspension");
+            return;
+        };
+        let state_tx = sender.clone();
+        let weak = w.downgrade();
+        toplevel.connect_state_notify(move |t| {
+            let mapped = weak
+                .upgrade()
+                .is_some_and(|w: adw::ApplicationWindow| w.is_mapped());
+            let _ = state_tx.send(mapped && presenting(t.state()));
+        });
+        let _ = sender.send(w.is_mapped() && presenting(toplevel.state()));
+    });
+
+    let sender = tx.clone();
+    window.connect_map(move |w| {
+        let _ = sender.send(
+            w.surface()
+                .and_downcast::<gdk::Toplevel>()
+                .is_none_or(|t| presenting(t.state())),
+        );
+    });
+    window.connect_unmap(move |_| {
+        let _ = tx.send(false);
+    });
+
+    rx
+}
 
 /// One agent's window.
 pub struct Window {
@@ -99,11 +187,20 @@ impl Window {
 
         let this = Self::assemble(app, name, cfg, cmd_tx);
 
+        // The poll's only visibility source — mirrors
+        // `hytte_plugin_agents::poll`'s `SlotVisible` gate, which this window
+        // has no host to push. Every closure it installs holds its own clone
+        // of the sender, so it stays alive for exactly as long as `toplevel`
+        // does, and dropping the window is what ends `feed::run`'s parking
+        // loop (`visible_open` latches `false` once they are all gone).
+        let visible_rx = watch_presentation(&this.toplevel);
+
         runtime.spawn(feed::run(
             std::path::PathBuf::from(&this.cfg.socket),
             name.clone(),
             this.cfg.poll_interval(),
             cmd_rx,
+            visible_rx,
             out_tx,
         ));
 
@@ -463,6 +560,47 @@ impl Window {
     #[cfg(all(test, feature = "system-tests"))]
     fn header(&self) -> &ui::Header {
         &self.header
+    }
+
+    /// The window itself, for the test that drives the presentation watch.
+    #[cfg(all(test, feature = "system-tests"))]
+    fn toplevel(&self) -> &adw::ApplicationWindow {
+        &self.toplevel
+    }
+}
+
+/// [`presenting`]'s policy, with no display and no compositor: a `ToplevelState`
+/// is a bitflags value, so the decision it drives can be pinned hermetically
+/// even though nothing in CI can make a real compositor set the bit (see
+/// [`gtk_tests::the_presentation_watch_follows_map_and_unmap`] for how far the
+/// wiring itself is pinned, and `docs/live-verify.md` for the rest).
+#[cfg(test)]
+mod tests {
+    use super::presenting;
+    use gtk::gdk::ToplevelState;
+
+    /// **Suspended is the only state that parks the poll.** Focus in
+    /// particular must not: a visible-but-unfocused window keeps its header
+    /// live while you work elsewhere, which is the whole point of this chrome.
+    ///
+    /// Mutation (verified red): swap `SUSPENDED` for `FOCUSED` in
+    /// [`presenting`] and the unfocused cases below red.
+    #[test]
+    fn only_a_suspended_toplevel_parks_the_poll() {
+        assert!(presenting(ToplevelState::empty()), "a plain window polls");
+        assert!(
+            presenting(ToplevelState::TILED | ToplevelState::MAXIMIZED),
+            "geometry states are not presentation states — neither parks the poll"
+        );
+        assert!(presenting(ToplevelState::FOCUSED), "a focused window polls");
+        assert!(
+            !presenting(ToplevelState::SUSPENDED),
+            "a suspended window parks"
+        );
+        assert!(
+            !presenting(ToplevelState::SUSPENDED | ToplevelState::FOCUSED),
+            "suspended wins over every other bit that may ride along"
+        );
     }
 }
 
@@ -1032,19 +1170,24 @@ mod gtk_tests {
         );
     }
 
-    /// **A rebuild takes the old approval rows out of the group**, not just
-    /// out of the bookkeeping — the reviewer's test (#1146's review, M2),
-    /// taken as supplied.
+    /// **An id that leaves the queue takes its row out of the group**, not
+    /// just out of the bookkeeping — the reviewer's test (#1146's review,
+    /// M2), taken as supplied. Since #1149 N2, `ui::Approvals::apply`
+    /// retargets a *surviving* id's row rather than rebuilding it (the
+    /// sibling test below pins that half); this one is the case with no
+    /// surviving id at all, disjoint before and after, where retargeting and
+    /// a full rebuild produce the identical outcome this asserts: the old
+    /// widget leaves the container, and only the new one is in it.
     ///
-    /// `Settings::apply` rebuilds the approvals on every state change, so a
-    /// rebuild that only drained the `Vec` would leak every predecessor into
-    /// the group — with **live Approve/Deny buttons on approvals that already
-    /// left the queue** — and `approval_row_text` could not see it, because
-    /// it reads back from the same `Vec` the drain empties. #1130's M4,
-    /// reintroduced forty lines below the doc written about it.
+    /// Without the detach, a rebuild-or-retarget that only drained the `Vec`
+    /// would leak every predecessor into the group — with **live
+    /// Approve/Deny buttons on approvals that already left the queue** — and
+    /// `approval_row_text` could not see it, because it reads back from the
+    /// same `Vec` the drain empties. #1130's M4, reintroduced forty lines
+    /// below the doc written about it.
     ///
-    /// Mutation (verified red): delete the `self.root.remove(&w.row)` in
-    /// `ui::Approvals::apply`, keeping the drain.
+    /// Mutation (verified red): delete the `self.root.remove(&w.row)` loop in
+    /// `ui::Approvals::apply`, keeping the rest.
     #[gtk::test]
     fn approval_rows_are_rebuilt_not_appended() {
         let (w, _rx) = window();
@@ -1068,6 +1211,149 @@ mod gtk_tests {
                 .iter()
                 .all(|r| r.parent().is_some()),
             "…and the new one must be in it"
+        );
+    }
+
+    /// **A surviving approval id keeps its own widget across an apply**
+    /// (#1149 N2) — the fix's own pin, alongside the sibling test above that
+    /// covers the fully-disjoint case.
+    ///
+    /// `Settings::apply` used to rebuild every approval row on every call
+    /// regardless of whether the id set had changed at all, so a plain
+    /// status change elsewhere on the window (which repaints the whole
+    /// chrome, `Window::apply`) tore down and rebuilt buttons for a queue
+    /// that had not moved — cheap today, but H1's in-flight latch (#1146's
+    /// review) gives a row state to lose, and a click racing that rebuild
+    /// lands on a widget about to be replaced. `ui::Approvals::apply` now
+    /// retargets an id it has already seen instead of rebuilding it, proven
+    /// here by comparing the `AdwActionRow` `GObject` itself (`PartialEq` on
+    /// a `glib::Object` is pointer identity) before and after a second apply
+    /// that keeps id 1 and adds id 2.
+    ///
+    /// Mutation (verified red): revert `ui::Approvals::apply` to rebuild
+    /// every row unconditionally (drain everything, rebuild every id in
+    /// `approvals`) and the identity assertion reds — the row for `1` is a
+    /// fresh `GObject` on the second apply, even though nothing about it
+    /// changed.
+    #[gtk::test]
+    fn a_surviving_approval_id_keeps_its_own_widget_across_an_apply() {
+        let (w, _rx) = window();
+        w.update(Update::State(up(row())));
+        w.update(Update::Approvals(Ok(vec![approval(1, "stray")])));
+        let before = w.settings.tracked_approval_rows();
+        assert_eq!(before.len(), 1);
+        let survivor = before[0].clone();
+
+        // A second apply that keeps id 1 and adds id 2 — a plain queue
+        // growth, not a replacement.
+        w.update(Update::Approvals(Ok(vec![
+            approval(1, "stray"),
+            approval(2, "stray"),
+        ])));
+        let after = w.settings.tracked_approval_rows();
+        assert_eq!(after.len(), 2, "{after:?}");
+        assert_eq!(
+            after[0], survivor,
+            "id 1 survived the apply and must keep its own widget, not a rebuilt lookalike"
+        );
+        assert!(
+            survivor.parent().is_some(),
+            "the surviving row must still be mounted, not detached-and-forgotten"
+        );
+    }
+
+    /// **Only the delta touches the container** (#1149 N2, this round's
+    /// review LOW 2) — a surviving row is not unparented and re-added.
+    ///
+    /// The first cut of the retarget preserved the `GObject` but still
+    /// detached *every* row up front and re-added the survivors in order, so
+    /// the container churn N2 set out to remove was unchanged and the doc
+    /// claiming "only the delta … touches the container" was false. `parent`
+    /// is a widget property, so the churn is directly observable: a
+    /// detach-and-re-add fires `notify::parent` twice, in place fires it not
+    /// at all.
+    ///
+    /// This drives the **production** shape end to end: the queue only ever
+    /// reaches the group id-sorted (`PendingApprovals::new` sorts by id, and
+    /// the hive's ids only grow), so a departure comes out of the middle and
+    /// an arrival goes on the end — never a reorder. The reorder *fallback*
+    /// cannot be produced through `Window::update` at all and is exercised
+    /// one level down, in `ui`'s own
+    /// `a_reordered_queue_re_adds_the_same_rows_in_the_new_order`.
+    ///
+    /// Mutation (verified red): restore the up-front
+    /// `for w in existing.iter() { self.root.remove(&w.row) }` in
+    /// `ui::Approvals::apply` and this reds at four (two applies × detach and
+    /// re-add).
+    #[gtk::test]
+    fn only_the_delta_touches_the_container_when_the_queue_grows_or_shrinks() {
+        let (w, _rx) = window();
+        w.update(Update::State(up(row())));
+        w.update(Update::Approvals(Ok(vec![
+            approval(1, "stray"),
+            approval(2, "stray"),
+        ])));
+        let survivor = w.settings.tracked_approval_rows()[0].clone();
+        let churn = Rc::new(std::cell::Cell::new(0u32));
+        let counter = Rc::clone(&churn);
+        survivor.connect_parent_notify(move |_| counter.set(counter.get() + 1));
+
+        // An arrival on the end and a departure from the middle: neither
+        // moves the row for id 1.
+        w.update(Update::Approvals(Ok(vec![
+            approval(1, "stray"),
+            approval(2, "stray"),
+            approval(3, "stray"),
+        ])));
+        w.update(Update::Approvals(Ok(vec![
+            approval(1, "stray"),
+            approval(3, "stray"),
+        ])));
+        assert_eq!(
+            churn.get(),
+            0,
+            "a surviving row was unparented and re-added — only the delta may touch the container"
+        );
+        let rows = w.settings.tracked_approval_rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0], survivor, "id 1 kept its own widget and its place");
+        assert!(
+            rows.iter().all(|r| r.parent().is_some()),
+            "every row must still be mounted"
+        );
+    }
+
+    /// **A surviving row's buttons still send its own id after the queue
+    /// moved around it** — the reviewer's added test (this round, "what I
+    /// added"), in the shape the window can actually produce.
+    ///
+    /// Sound by construction, since the match key `w.id == a.id` is the same
+    /// id the closure captured when the row was built — but the shipped
+    /// identity test proves only that the widget survives, and never presses
+    /// it. Approving the wrong request is the worst thing a retarget could
+    /// do; this measures the frame on the wire after the row above it left
+    /// the queue and every surviving row shifted up. (The reviewer's literal
+    /// version swaps two ids, which `PendingApprovals`' id sort makes
+    /// unreachable here; that path is pressed in `ui`'s own
+    /// `a_reordered_queue_re_adds_the_same_rows_in_the_new_order`.)
+    #[gtk::test]
+    fn a_shifted_queue_still_sends_the_pressed_rows_own_id() {
+        let (w, mut rx) = window();
+        w.update(Update::State(up(row())));
+        w.update(Update::Approvals(Ok(vec![
+            approval(1, "stray"),
+            approval(2, "stray"),
+            approval(3, "stray"),
+        ])));
+        w.update(Update::Approvals(Ok(vec![
+            approval(2, "stray"),
+            approval(3, "stray"),
+        ])));
+
+        assert!(w.settings.try_press_approve_for_test(3));
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Approve { id: 3 })),
+            "the button on id 3's row must still approve id 3 after the row above it left"
         );
     }
 
@@ -1191,5 +1477,59 @@ mod gtk_tests {
         w.update(Update::Approvals(Ok(Vec::new())));
         assert_eq!(page.badge_number(), 0);
         assert!(!page.needs_attention());
+    }
+
+    /// **The presentation watch is wired, and its map/unmap half works** —
+    /// the window realizes, resolves a `GdkToplevel`, seeds the watch from
+    /// its state, and drops to `false` when the window goes away.
+    ///
+    /// What this cannot reach is the **SUSPENDED flip itself**: only a
+    /// compositor sets that bit, `gdk` exposes no setter (the property is
+    /// read-only, fed from the xdg-shell configure), and CI has no compositor
+    /// — xvfb is a bare X server with not even a window manager. So the flip
+    /// is a live-verify line (`docs/live-verify.md`, the #1149 entries), and
+    /// what CI pins instead is split in two: the *policy* hermetically
+    /// ([`super::tests::only_a_suspended_toplevel_parks_the_poll`]), and the
+    /// *wiring up to the toplevel* here. The poll's own reaction to the bool
+    /// is `tests/feed.rs`'s, driven through the same `watch::Receiver` this
+    /// returns.
+    ///
+    /// Mutation (verified red): drop the `connect_unmap` arm in
+    /// [`super::watch_presentation`] and the last assertion reds; drop the
+    /// `connect_realize`/`connect_map` pair and the first two do.
+    #[gtk::test]
+    fn the_presentation_watch_follows_map_and_unmap() {
+        let (w, _rx) = window();
+        let rx = super::watch_presentation(w.toplevel());
+        assert!(
+            !*rx.borrow(),
+            "an unmapped window must not be reported as presenting"
+        );
+
+        w.toplevel().present();
+        while gtk::glib::MainContext::default().iteration(false) {}
+        assert!(
+            w.toplevel().is_mapped(),
+            "the test window never mapped — nothing below would mean anything"
+        );
+        assert!(
+            w.toplevel()
+                .surface()
+                .and_downcast::<gtk::gdk::Toplevel>()
+                .is_some(),
+            "a realized window must resolve a GdkToplevel — without one the poll \
+             cannot park on suspension at all"
+        );
+        assert!(
+            *rx.borrow(),
+            "a mapped, unsuspended window must be reported as presenting"
+        );
+
+        w.toplevel().set_visible(false);
+        while gtk::glib::MainContext::default().iteration(false) {}
+        assert!(
+            !*rx.borrow(),
+            "the unmap edge (teardown, and a hide on a compositor that allows one) must park"
+        );
     }
 }

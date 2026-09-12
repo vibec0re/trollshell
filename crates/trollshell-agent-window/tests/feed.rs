@@ -137,6 +137,7 @@ async fn a_status_change_on_the_socket_becomes_a_new_header() {
         name("stray"),
         CADENCE,
         cmd_rx,
+        tokio::sync::watch::channel(true).1,
         out_tx,
     ));
 
@@ -176,6 +177,7 @@ async fn an_unchanged_hive_sends_one_state_not_one_per_poll() {
         name("stray"),
         CADENCE,
         cmd_rx,
+        tokio::sync::watch::channel(true).1,
         out_tx,
     ));
 
@@ -211,6 +213,7 @@ async fn each_button_sends_its_verb_once_and_repolls() {
         // An hour, so nothing here can be a tick that happened to land.
         Duration::from_hours(1),
         cmd_rx,
+        tokio::sync::watch::channel(true).1,
         out_tx,
     ));
     let _seed = next_state(&mut out_rx, "the seed poll").await;
@@ -278,6 +281,7 @@ async fn a_refused_pause_puts_the_toggle_back_where_the_hive_has_it() {
         // An hour: nothing here may be a scheduled tick that happened to land.
         Duration::from_hours(1),
         cmd_rx,
+        tokio::sync::watch::channel(true).1,
         out_tx,
     ));
 
@@ -325,6 +329,7 @@ async fn every_refused_verb_is_followed_by_a_reconciling_state() {
             name("stray"),
             Duration::from_hours(1),
             cmd_rx,
+            tokio::sync::watch::channel(true).1,
             out_tx,
         ));
         let _seed = seed_state(&mut out_rx).await;
@@ -353,6 +358,7 @@ async fn an_accepted_verb_does_not_force_a_repaint() {
         name("stray"),
         Duration::from_hours(1),
         cmd_rx,
+        tokio::sync::watch::channel(true).1,
         out_tx,
     ));
     let _seed = seed_state(&mut out_rx).await;
@@ -384,6 +390,7 @@ async fn an_absent_socket_parks_and_keeps_trying() {
         name("stray"),
         CADENCE,
         cmd_rx,
+        tokio::sync::watch::channel(true).1,
         out_tx,
     ));
 
@@ -416,6 +423,7 @@ async fn the_hives_urls_are_fetched_once() {
         name("stray"),
         CADENCE,
         cmd_rx,
+        tokio::sync::watch::channel(true).1,
         out_tx,
     ));
 
@@ -464,6 +472,7 @@ async fn urls_are_retried_with_backoff_until_the_hive_answers() {
         name("stray"),
         CADENCE,
         cmd_rx,
+        tokio::sync::watch::channel(true).1,
         out_tx,
     ));
     let _seed = next_state(&mut out_rx, "the seed poll").await;
@@ -505,6 +514,7 @@ async fn a_refused_status_poll_does_not_also_ask_for_the_queue() {
         name("stray"),
         CADENCE,
         cmd_rx,
+        tokio::sync::watch::channel(true).1,
         out_tx,
     ));
 
@@ -547,6 +557,7 @@ async fn a_refused_pending_clears_the_rows_and_names_the_reason() {
         name("stray"),
         CADENCE,
         cmd_rx,
+        tokio::sync::watch::channel(true).1,
         out_tx,
     ));
 
@@ -594,6 +605,7 @@ async fn the_polls_two_answers_arrive_with_no_await_between_them() {
         name("stray"),
         CADENCE,
         cmd_rx,
+        tokio::sync::watch::channel(true).1,
         out_tx,
     ));
 
@@ -605,4 +617,303 @@ async fn the_polls_two_answers_arrive_with_no_await_between_them() {
              awaiting between the two sends splits one observation across two paints: {other:?}"
         ),
     }
+}
+
+/// **A window that was never mapped never polls, and mapping it costs exactly
+/// one poll — not the cadences it missed while parked** (#1149 L4).
+///
+/// `feed::run`'s `visible` parameter is driven directly here rather than
+/// through a real GTK map signal, the same way `each_button_sends_its_verb_once_and_repolls`
+/// drives `cmd_tx` directly rather than a real button: `Window::build` is
+/// what wires the receiver to `connect_map`/`connect_unmap`, and that wiring
+/// has no logic of its own left to test once this pins what it delivers.
+///
+/// Mutation (verified red): drop the `if mapped` guard on the ticker arm and
+/// the first assertion reds — the hive is polled while nothing could
+/// possibly be looking at the window.
+#[tokio::test(start_paused = true)]
+async fn a_window_that_was_never_mapped_never_polls_and_maps_to_exactly_one() {
+    let hive = FakeHive::script(&[&roster(r#"{"name":"stray","running":true}"#)]);
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    // The updates are never read — the assertions below are all on
+    // `polls(&hive)`, and the channel only has to stay open (a dropped
+    // receiver would end `feed::run` on its first send).
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let (visible_tx, visible_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(feed::run(
+        hive.path().to_path_buf(),
+        name("stray"),
+        CADENCE,
+        cmd_rx,
+        visible_rx,
+        out_tx,
+    ));
+
+    // Several cadences pass with the window never mapped.
+    for _ in 0..5 {
+        tokio::time::advance(CADENCE).await;
+    }
+
+    // A probe, forced through the loop regardless of visibility
+    // (`cmds.recv()` carries no `if mapped` guard): `until`, not a bare
+    // assertion straight after the blind `advance` loop above, is what
+    // makes "zero polls" a property this test actually exercised rather
+    // than ticks the runtime simply never got around to delivering —
+    // `unmapping_again_re_parks_the_poll_and_remapping_resumes_it`'s doc
+    // has the longer version of why a raw `advance` loop alone cannot be
+    // trusted here. The extra yields after `until` returns give a would-be
+    // stray tick — one whose deadline the `advance` loop already passed —
+    // room to fire on its own before the assertion below locks in the
+    // count.
+    cmd_tx
+        .send(feed::set_paused(&name("stray"), false))
+        .expect("the loop is listening");
+    until("the probe's reconciling poll", || polls(&hive) > 0).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        polls(&hive),
+        1,
+        "only the probe's own reconciling poll — a window that was never mapped must never \
+         poll on its own, however many cadences pass: {:?}",
+        hive.seen()
+    );
+    let after_probe = polls(&hive);
+
+    // Map it: exactly one more poll, immediately — not a burst of the five
+    // cadences missed while parked.
+    visible_tx.send(true).expect("the loop is listening");
+    until("the map-edge poll", || polls(&hive) > after_probe).await;
+    assert_eq!(
+        polls(&hive),
+        after_probe + 1,
+        "one poll on the map edge, not a burst of the missed cadences: {:?}",
+        hive.seen()
+    );
+
+    // The cadence resumes normally from here — a single ordinary tick, not
+    // zero and not several.
+    one_cadence(&hive, CADENCE).await;
+    assert_eq!(polls(&hive), after_probe + 2);
+}
+
+/// **A burst of presentation edges inside one cadence costs one poll, not
+/// N** — the flap guard (#1149 L4, this round's review, LOW 1).
+///
+/// This is the cost of moving the park signal onto the compositor's
+/// `SUSPENDED` state: unlike map/unmap, which a Wayland client toggles once at
+/// open and once at teardown, that bit flips on every workspace switch across
+/// the window. Without the guard, flicking across a workspace ten times is
+/// twenty round trips and ten interval resets.
+///
+/// `visible` is driven directly here, as the sibling park tests do: the source
+/// of the bool changed (`window::watch_presentation` now reads the toplevel's
+/// state, not just `map`), the driver reading it did not.
+///
+/// The absence is measured against a **probe command**, not against a bare
+/// pile of yields, for the reason
+/// `unmapping_again_re_parks_the_poll_and_remapping_resumes_it` spells out:
+/// `cmds.recv()` carries no visibility guard, so a command always forces the
+/// loop through, and a stray edge-driven poll would have to land before that
+/// probe's own.
+///
+/// Mutation (verified red): delete the `recent` guard in `feed::run`'s
+/// visibility arm and this reds at six polls instead of two.
+#[tokio::test(start_paused = true)]
+async fn a_burst_of_presentation_edges_inside_one_cadence_costs_one_poll() {
+    let hive = FakeHive::script(&[&roster(r#"{"name":"stray","running":true}"#)]);
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let (visible_tx, visible_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(feed::run(
+        hive.path().to_path_buf(),
+        name("stray"),
+        CADENCE,
+        cmd_rx,
+        visible_rx,
+        out_tx,
+    ));
+
+    // The window is presented once: one immediate poll, as its own test pins.
+    visible_tx.send(true).expect("the loop is listening");
+    until("the first presentation's poll", || polls(&hive) > 0).await;
+    let after_first = polls(&hive);
+
+    // Five suspend/resume pairs, all inside the same cadence — the clock is
+    // never advanced here, so every one of them is provably within one
+    // interval of the poll above. Each send is settled before the next,
+    // because `watch` coalesces: a `false` and a `true` the task never got to
+    // observe in between is not an edge at all, and the burst would be
+    // measuring nothing.
+    for _ in 0..5 {
+        visible_tx.send(false).expect("the loop is listening");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        visible_tx.send(true).expect("the loop is listening");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    cmd_tx
+        .send(feed::set_paused(&name("stray"), false))
+        .expect("the loop is listening");
+    until("the probe's reconciling poll", || {
+        polls(&hive) > after_first
+    })
+    .await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        polls(&hive),
+        after_first + 1,
+        "only the probe's own poll — five resumes inside one cadence must buy no extra round \
+         trips: {:?}",
+        hive.seen()
+    );
+
+    // And the guard expires: once a whole interval has passed, a resume is a
+    // genuine refresh again rather than a flap.
+    tokio::time::advance(CADENCE).await;
+    until("the cadence's own poll", || polls(&hive) > after_first + 1).await;
+    let settled = polls(&hive);
+    visible_tx.send(false).expect("the loop is listening");
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(CADENCE).await;
+    visible_tx.send(true).expect("the loop is listening");
+    until("the resume poll a full interval later", || {
+        polls(&hive) > settled
+    })
+    .await;
+}
+
+/// **Parking again re-parks the poll**, and resuming works cleanly — not just
+/// the first edge the test above covers.
+///
+/// The park is confirmed with a **probe command** before any cadence is
+/// advanced, rather than a bare `advance` after a few `yield_now`s: under
+/// `start_paused`, `tokio::time::advance` does not guarantee that a task
+/// parked on a plain (non-timer) wakeup — here, the just-sent `false` — has
+/// actually been polled before the clock jumps, so asserting an absence right
+/// after a blind advance can pass for the wrong reason (it did, once, in this
+/// exact test). `cmds.recv()` carries no `if mapped` guard, so sending a
+/// harmless command always reaches the loop and forces a reconciling poll;
+/// biased selection checks the visibility branch ahead of it every iteration,
+/// so by the time that poll lands, `mapped` is provably `false`.
+///
+/// **A second probe closes the absence**, and this is the review's own fix
+/// (MEDIUM 1): the first shape asserted "no polls" straight after a bare
+/// `for … advance(CADENCE)` loop with nothing after it, which is five yields —
+/// nowhere near enough for a stray tick's connect/write/read round trip to
+/// reach `FakeHive::seen()`. That assertion measured scheduling latency, not
+/// parking, and it stayed **green** with the `if mapped` guard deleted from
+/// the ticker arm. The second probe forces the loop through again, so a
+/// would-be stray tick has somewhere to land before the count is read. The
+/// 50-yield settle before `after_probe` matters for the same family of
+/// reasons: the urls retry's backoff sleep auto-advances the paused clock, so
+/// an extra scheduled poll can otherwise land between the `until` and the
+/// read.
+///
+/// Mutation (verified red, this round): delete the `if mapped` guard on the
+/// ticker arm and the "parked" assertion reds with the stray
+/// `agent_status`/`pending` pairs in the message. Making the park arm a no-op
+/// (dropping `mapped = now`) reds it too.
+#[tokio::test(start_paused = true)]
+async fn unmapping_again_re_parks_the_poll_and_remapping_resumes_it() {
+    let hive = FakeHive::script(&[&roster(r#"{"name":"stray","running":true}"#)]);
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (visible_tx, visible_rx) = tokio::sync::watch::channel(true);
+    tokio::spawn(feed::run(
+        hive.path().to_path_buf(),
+        name("stray"),
+        CADENCE,
+        cmd_rx,
+        visible_rx,
+        out_tx,
+    ));
+    let _seed = seed_state(&mut out_rx).await;
+    let after_seed = polls(&hive);
+
+    visible_tx.send(false).expect("the loop is listening");
+    cmd_tx
+        .send(feed::set_paused(&name("stray"), false))
+        .expect("the loop is listening");
+    until("the probe's reconciling poll", || polls(&hive) > after_seed).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await; // let the first probe's poll settle
+    }
+    let after_probe = polls(&hive);
+
+    for _ in 0..5 {
+        tokio::time::advance(CADENCE).await;
+    }
+    cmd_tx
+        .send(feed::set_paused(&name("stray"), false))
+        .expect("the loop is listening");
+    until("the second probe's poll", || polls(&hive) > after_probe).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        polls(&hive),
+        after_probe + 1,
+        "parked: no polls of its own while suspended, however many cadences pass — only the \
+         second probe's: {:?}",
+        hive.seen()
+    );
+    let after_probe = after_probe + 1;
+
+    visible_tx.send(true).expect("the loop is listening");
+    until("the resume poll after remapping", || {
+        polls(&hive) > after_probe
+    })
+    .await;
+    assert_eq!(
+        polls(&hive),
+        after_probe + 1,
+        "exactly one resume poll, not a burst: {:?}",
+        hive.seen()
+    );
+}
+
+/// A dropped visibility sender (the window torn down mid-poll) must not spin
+/// this task: `changed()` errors instantly and forever once the sender side
+/// is gone, so without latching `visible_open` to `false` this becomes a
+/// tight loop that never yields to the ticker or the command lane again.
+///
+/// Asserted by the command lane still working *after* the sender drops —
+/// a spun loop would starve `cmds.recv()` and this would time out instead of
+/// failing an assertion, which is why `until` bounds it rather than awaiting
+/// forever.
+#[tokio::test(start_paused = true)]
+async fn a_dropped_visibility_sender_does_not_spin_the_poller() {
+    let hive = FakeHive::script(&[&roster(r#"{"name":"stray","running":true}"#)]);
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (visible_tx, visible_rx) = tokio::sync::watch::channel(true);
+    tokio::spawn(feed::run(
+        hive.path().to_path_buf(),
+        name("stray"),
+        Duration::from_hours(1),
+        cmd_rx,
+        visible_rx,
+        out_tx,
+    ));
+    let _seed = seed_state(&mut out_rx).await;
+    drop(visible_tx);
+
+    cmd_tx
+        .send(feed::set_paused(&name("stray"), true))
+        .expect("the loop is listening");
+    until(
+        "the command lane still drains after the sender drops",
+        || !hive.writes().is_empty(),
+    )
+    .await;
 }

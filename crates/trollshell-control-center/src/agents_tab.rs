@@ -124,12 +124,15 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gdk, glib};
 
 use hytte_plugin_agents::config::AgentsConfig;
 use hytte_plugin_agents::hive::client::{self, HiveError};
-use hytte_plugin_agents::hive::wire::{HiveUrls, Request, Response};
-use hytte_plugin_agents::model::{Agent, AgentName, Hive, Status, agent_url, group};
+use hytte_plugin_agents::hive::wire::{Approval, HiveUrls, Request, Response};
+use hytte_plugin_agents::model::{
+    Agent, AgentName, Hive, PendingApprovals, Status, agent_url, group,
+};
+use hytte_plugin_agents::plugin::detail_line;
 use hytte_plugin_agents::view::{age, parse_set_at};
 use hytte_plugin_agents::window as agent_window;
 
@@ -174,6 +177,17 @@ const BIN_MIN_WIDTH_PX: i32 = 360;
 
 /// The bin's own minimum height — the other half of the same contract.
 const BIN_MIN_HEIGHT_PX: i32 = 200;
+
+/// How tall the "Unassigned approvals" group may grow before it scrolls
+/// (#1149 N1, this round's review HIGH).
+///
+/// Measured against the row it holds: an unassigned row is ~84 px (three
+/// subtitle lines), so this is about two and a half rows — enough that the
+/// common case (one or two orphans) never scrolls at all, and small enough
+/// that at the window's own 560 px the roster keeps the clear majority of the
+/// sidebar. Everything past it is reachable by scrolling instead of being
+/// allocated off the bottom of the window, which is what it did before.
+const UNASSIGNED_MAX_HEIGHT_PX: i32 = 220;
 
 // ── The pure layer: one wire snapshot → what the widgets show ────────────────
 
@@ -465,6 +479,85 @@ pub(crate) fn same_agent_set(known: &[String], listed: &[String]) -> bool {
     known.len() == listed.len() && listed.iter().all(|name| known.contains(name))
 }
 
+// ── Unassigned approvals (#1149 N1) ──────────────────────────────────────────
+//
+// The sidebar card and the companion window both filter `Pending` by agent —
+// `hytte_plugin_agents::model::PendingApprovals::count_for`/`oldest_for` for
+// the card, `trollshell-agent-window::chrome::pending_for`'s identical
+// `a.agent == name` narrowing for the window — so a hive-side approval whose
+// `agent` is absent (an empty string, the wire's decode for a missing key,
+// `hive/wire.rs`) or names an agent not on this hive's roster matches neither
+// and is never shown, never denied, anywhere on the desktop. This tab is the
+// natural catch-all (#1149's own framing): it already links `hytte-plugin-
+// agents` for the roster, and #1147 already established it as read-only, so
+// an orphan approval fits the same contract every other row on this tab does
+// — show what the wire says, write nothing.
+
+/// The `Pending` answer, narrowed to the rows neither per-agent surface can
+/// ever show: still-waiting (`PendingApprovals::new`, the one place "which
+/// statuses count" is decided) and naming an agent outside `known`.
+///
+/// `known` is this tab's own roster at the moment the queue was polled — the
+/// same one `Hive::agents()` already carries from the paired `AgentStatus`
+/// answer, so this is never asked to guess about an agent it cannot see.
+#[must_use]
+pub(crate) fn unassigned_approvals(queue: Vec<Approval>, known: &[String]) -> Vec<Approval> {
+    PendingApprovals::new(queue)
+        .all()
+        .iter()
+        .filter(|a| a.agent.trim().is_empty() || !known.iter().any(|k| k == &a.agent))
+        .cloned()
+        .collect()
+}
+
+/// Where to answer one unassigned approval — the **first** line of its row.
+///
+/// This tab writes nothing (#1147's contract), so the row's only job once it
+/// has named the request is to say which *other* surface might still be able
+/// to decide it. Three answers, not two (this round's review, LOW 5):
+///
+/// - No name at all: nothing but the hive's own dashboard can reach it.
+/// - A name this build will not render: [`hive_of`] drops any roster row whose
+///   name fails [`AgentName::parse`], so such an agent has no sidebar card and
+///   never will — telling the operator to wait for one is telling them to wait
+///   forever.
+/// - A legal name that is merely absent (renamed, or removed from
+///   `agents.toml`): its own card is the place, if it comes back.
+#[must_use]
+fn unassigned_destination(agent: &str) -> String {
+    let agent = agent.trim();
+    if agent.is_empty() {
+        "no agent named on this request — answer from the hive's dashboard".to_owned()
+    } else if AgentName::parse(agent).is_none() {
+        format!(
+            "for \"{agent}\", a name this build will not show anywhere — answer from the hive's \
+             dashboard"
+        )
+    } else {
+        format!(
+            "for \"{agent}\", not on this hive's roster — answer from that agent's own sidebar \
+             card if it returns, or the hive's dashboard"
+        )
+    }
+}
+
+/// One unassigned row's subtitle: where to answer it, then the plugin's own
+/// detail line (kind, description, stamp —
+/// `hytte_plugin_agents::plugin::detail_line`, not a copy of it, for the
+/// reason `chrome::ApprovalRow::of`'s doc gives: two renderers of one queue's
+/// free text have to agree).
+///
+/// **The destination comes first** (this round's review, LOW 4). The row is
+/// clamped to three lines and `detail_line` carries up to `DETAIL_CHARS` of
+/// the manager's own prose, which wraps to three lines on its own at this
+/// sidebar's width — so with the order the other way round, the one sentence
+/// this row exists to say was ellipsized away exactly when the description was
+/// long enough to need it.
+#[must_use]
+fn unassigned_subtitle(a: &Approval) -> String {
+    format!("{}\n{}", unassigned_destination(&a.agent), detail_line(a))
+}
+
 // ── The widget tree ──────────────────────────────────────────────────────────
 
 /// Which of the sidebar's two shapes is on screen, gating rebuild vs. in-place
@@ -559,6 +652,50 @@ struct AgentsState {
     /// `WeakAgentsState` cloned at connect time, so a test that swaps the
     /// actions after `build_tab` has to swap them through shared ownership.
     actions: Rc<RefCell<Actions>>,
+    /// The "Unassigned approvals" group (#1149 N1) — read-only, mounted below
+    /// the roster so it is visible regardless of which agent (if any) is
+    /// selected. Hidden whenever there is nothing to show.
+    unassigned_group: adw::PreferencesGroup,
+    /// The group's current rows. Rebuilt on every apply
+    /// ([`render_unassigned`]) rather than retargeted by id: unlike the
+    /// companion window's approvals (#1149 N2), these rows carry no buttons
+    /// and no in-flight latch, so there is no widget state a rebuild could
+    /// lose and no click that could land on one mid-replacement.
+    unassigned_rows: Rc<RefCell<Vec<adw::ActionRow>>>,
+    /// Whether this tab is on screen, and when it last asked because of that
+    /// — the poll's park gate. See [`Presentation`].
+    presentation: Rc<Presentation>,
+}
+
+/// The Agents tab's park gate (#1149 L4's argument, applied here on this
+/// round's review, MEDIUM 3).
+///
+/// [`start_poll`] used to be an unconditional `glib::timeout_add_local`, so the
+/// tab dialled `host.sock` every `poll_seconds` for the whole life of the
+/// control-center — whichever tab was showing, mapped or not — and #1149 N1
+/// then added a second round trip (`Pending`) to every one of those ticks, in
+/// the same change whose headline is "spend fewer round trips on a surface
+/// nobody is looking at".
+///
+/// The signal is the one the companion window parks on
+/// (`trollshell_agent_window::window::watch_presentation`): the compositor's
+/// `GdkToplevelState::SUSPENDED`, plus map/unmap. Here map/unmap is doing real
+/// work rather than standing in for teardown, and it is the stronger half:
+/// this tab is one child of an `AdwViewStack`, and GTK maps only the visible
+/// child — so "another tab is showing" unmaps this one, which is exactly the
+/// state the review wanted gated and needs no `visible-child-name` watching of
+/// its own.
+///
+/// The flap guard is the window's, for the same reason (a workspace switch is
+/// an edge): a resume less than one poll interval after the last gated refresh
+/// rides the next scheduled tick instead of dialling again.
+#[derive(Default)]
+struct Presentation {
+    /// Whether the tab is being presented — mapped, on an unsuspended window.
+    on: Cell<bool>,
+    /// When the gate last let a tick through, or forced one on a resume.
+    /// Wall-clock, because the timer this guards is a `glib` one.
+    last: Cell<Option<std::time::Instant>>,
 }
 
 /// The single in-flight slot's guard: releases it on drop, wherever that
@@ -610,6 +747,9 @@ struct WeakAgentsState {
     probe: Rc<RefCell<agent_window::Probe>>,
     in_flight: Rc<Cell<bool>>,
     actions: Rc<RefCell<Actions>>,
+    unassigned_group: glib::WeakRef<adw::PreferencesGroup>,
+    unassigned_rows: Rc<RefCell<Vec<adw::ActionRow>>>,
+    presentation: Rc<Presentation>,
 }
 
 /// [`FlagRow`], weakly — see [`WeakAgentsState`].
@@ -683,6 +823,9 @@ impl AgentsState {
             probe: self.probe.clone(),
             in_flight: self.in_flight.clone(),
             actions: self.actions.clone(),
+            unassigned_group: self.unassigned_group.downgrade(),
+            presentation: self.presentation.clone(),
+            unassigned_rows: self.unassigned_rows.clone(),
         }
     }
 }
@@ -733,6 +876,9 @@ impl WeakAgentsState {
             probe: self.probe.clone(),
             in_flight: self.in_flight.clone(),
             actions: self.actions.clone(),
+            unassigned_group: self.unassigned_group.upgrade()?,
+            presentation: self.presentation.clone(),
+            unassigned_rows: self.unassigned_rows.clone(),
         })
     }
 }
@@ -760,12 +906,104 @@ pub(crate) fn build_page() -> (adw::BreakpointBin, glib::SourceId) {
 /// testable at all. Before #1147's review, turning it into
 /// [`glib::ControlFlow::Break`] — a tab that polls exactly once and then never
 /// again — passed the whole suite (its MEDIUM 4).
+///
+/// The tick is **gated on [`Presentation`]**: the timer keeps running (a
+/// `SourceId` the window still owns and still drops on close), but a tick that
+/// fires while the tab is not on screen asks the hive for nothing. The resume
+/// itself is what reconciles — [`on_presented`] — so switching back does not
+/// wait out an interval.
 fn start_poll(state: &AgentsState, interval: std::time::Duration) -> glib::SourceId {
     let state = state.clone();
     glib::timeout_add_local(interval, move || {
-        refresh(&state);
+        if state.presentation.on.get() {
+            state.presentation.last.set(Some(std::time::Instant::now()));
+            refresh(&state);
+        } else {
+            tracing::trace!("the Agents tab is not on screen — this tick asks the hive nothing");
+        }
         glib::ControlFlow::Continue
     })
+}
+
+/// Track whether the tab is on screen, so [`start_poll`] can park.
+///
+/// Wired on the tab's own root rather than on the window, which the tab never
+/// sees (`main.rs` builds every page before the window exists): a widget's
+/// `map`/`unmap` already carry both halves — the window being hidden, and
+/// `AdwViewStack` unmapping every child but the visible one — and `realize` is
+/// where the `GdkSurface` behind it first exists, which is the only place the
+/// `GdkToplevel` whose `state` carries `SUSPENDED` can be reached. See
+/// [`Presentation`].
+fn connect_presentation(state: &AgentsState, bin: &adw::BreakpointBin) {
+    let weak = state.downgrade();
+    bin.connect_map(move |w| {
+        if let Some(state) = weak.upgrade() {
+            on_presented(&state, presenting(w));
+        }
+    });
+    let weak = state.downgrade();
+    bin.connect_unmap(move |_| {
+        if let Some(state) = weak.upgrade() {
+            on_presented(&state, false);
+        }
+    });
+    let weak = state.downgrade();
+    bin.connect_realize(move |w| {
+        let Some(toplevel) = w
+            .native()
+            .and_then(|n| n.surface())
+            .and_downcast::<gdk::Toplevel>()
+        else {
+            tracing::debug!("no GdkToplevel over this tab — the poll cannot park on suspension");
+            return;
+        };
+        let weak = weak.clone();
+        let widget = w.downgrade();
+        toplevel.connect_state_notify(move |t| {
+            let Some(state) = weak.upgrade() else { return };
+            let on = widget
+                .upgrade()
+                .is_some_and(|w: adw::BreakpointBin| w.is_mapped())
+                && !t.state().contains(gdk::ToplevelState::SUSPENDED);
+            on_presented(&state, on);
+        });
+    });
+}
+
+/// Whether `widget` is being presented: mapped, on a toplevel the compositor
+/// has not suspended. A widget with no toplevel (nothing realized yet) is
+/// judged on its map state alone.
+fn presenting(widget: &impl IsA<gtk::Widget>) -> bool {
+    let widget = widget.as_ref();
+    widget.is_mapped()
+        && widget
+            .native()
+            .and_then(|n| n.surface())
+            .and_downcast::<gdk::Toplevel>()
+            .is_none_or(|t| !t.state().contains(gdk::ToplevelState::SUSPENDED))
+}
+
+/// Take one presentation edge: park, or resume with a reconciling poll.
+///
+/// The resume's poll is skipped when the gate let one through less than a poll
+/// interval ago — the flap guard `feed::run` carries for the same signal, so
+/// flicking between tabs (or across a workspace) costs the hive nothing beyond
+/// its ordinary cadence.
+fn on_presented(state: &AgentsState, on: bool) {
+    if state.presentation.on.replace(on) || !on {
+        return;
+    }
+    if state
+        .presentation
+        .last
+        .get()
+        .is_some_and(|t| t.elapsed() < state.cfg.poll_interval())
+    {
+        tracing::debug!("the Agents tab came back inside one poll interval — the tick reconciles");
+        return;
+    }
+    state.presentation.last.set(Some(std::time::Instant::now()));
+    refresh(state);
 }
 
 /// The widget tree and its state, with no socket traffic and no timer.
@@ -791,9 +1029,57 @@ fn build_tab(cfg: AgentsConfig) -> (adw::BreakpointBin, AgentsState) {
         .child(&list)
         .build();
 
+    // "Unassigned approvals" (#1149 N1) — mounted below the roster rather
+    // than inside the detail pane, because it is not about any one agent
+    // and has to stay visible whichever (if any) is selected. Hidden by
+    // default; `render_unassigned` reveals it once there is something to
+    // show.
+    let unassigned_group = adw::PreferencesGroup::builder()
+        .title("Unassigned approvals")
+        .description(
+            "Queued decisions the hive could not match to an agent on this roster. Read-only \
+             here, like every other row on this tab — see each row for where to answer it.",
+        )
+        .build();
+    unassigned_group.set_visible(false);
+
+    // **In a scroller of its own, capped** (this round's review, HIGH). In a
+    // plain `Box` the group had no scroller and no cap, so every row cost the
+    // roster ~84 px until the roster hit its own floor, and past four rows the
+    // group's own rows were allocated *below the window* with no scrollbar to
+    // reach them. That defeats exactly what N1 is for: one agent renamed out
+    // of `agents.toml` orphans its whole queue at once, not one row, so the
+    // feature stops working at the size that triggers it.
+    //
+    // `propagate_natural_height` + `max_content_height` is "as tall as the
+    // rows need, up to the cap"; a `ScrolledWindow`'s minimum height is its
+    // own, not its child's, so under pressure it shrinks rather than pushing
+    // anything off-screen. `Automatic` horizontally for `list_scroller`'s
+    // reason above.
+    let unassigned_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(UNASSIGNED_MAX_HEIGHT_PX)
+        .vexpand(false)
+        .child(&unassigned_group)
+        .build();
+    unassigned_scroller.set_visible(false);
+    // One visibility, two widgets: `render_unassigned` still toggles the
+    // group, and an empty scroller must not sit on the roster's height
+    // budget. A property binding rather than a second `set_visible` call so
+    // there is no way to hide one and leave the other showing.
+    unassigned_group
+        .bind_property("visible", &unassigned_scroller, "visible")
+        .sync_create()
+        .build();
+
+    let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    sidebar_box.append(&list_scroller);
+    sidebar_box.append(&unassigned_scroller);
+
     let sidebar_toolbar = adw::ToolbarView::new();
     sidebar_toolbar.add_top_bar(&crate::plugins_tab::tab_header_bar());
-    sidebar_toolbar.set_content(Some(&list_scroller));
+    sidebar_toolbar.set_content(Some(&sidebar_box));
     let sidebar_page = adw::NavigationPage::new(&sidebar_toolbar, "Agents");
 
     let detail = build_detail();
@@ -841,10 +1127,14 @@ fn build_tab(cfg: AgentsConfig) -> (adw::BreakpointBin, AgentsState) {
         probe: Rc::new(RefCell::new(agent_window::Probe::path())),
         in_flight: Rc::new(Cell::new(false)),
         actions: Rc::new(RefCell::new(Actions::default())),
+        unassigned_group,
+        unassigned_rows: Rc::new(RefCell::new(Vec::new())),
+        presentation: Rc::new(Presentation::default()),
     };
 
     connect_selection(&state);
     connect_links(&state);
+    connect_presentation(&state, &bin);
     // Seed the sidebar and the pane from the `Connecting` snapshot, so the tab
     // mounts with a state rather than as a blank pane beside a blank list.
     apply(&state);
@@ -1468,11 +1758,30 @@ fn refresh(state: &AgentsState) {
     let socket = PathBuf::from(&state.cfg.socket);
     let weak = state.downgrade();
     spawn_on_runtime(
-        async move { client::request(&socket, &Request::AgentStatus).await },
-        move |answer| {
+        async move {
+            let status = client::request(&socket, &Request::AgentStatus).await;
+            // `Pending` rides the same round trip, and only once `AgentStatus`
+            // itself answered — `hytte_plugin_agents::poll::poll_once`'s own
+            // order and reason (#1149 N1): a dead hive costs one failed
+            // connect, not two, and the roster this tick's queue is scoped
+            // against has to be the one that arrived with it.
+            let approvals = if status.is_ok() {
+                Some(
+                    client::request(&socket, &Request::Pending)
+                        .await
+                        .map(|resp| resp.approvals.unwrap_or_default())
+                        .map_err(|e| e.to_string()),
+                )
+            } else {
+                None
+            };
+            (status, approvals)
+        },
+        move |(answer, approvals)| {
             drop(slot);
             if let Some(state) = weak.upgrade() {
                 on_status(&state, &answer);
+                apply_unassigned(&state, approvals);
             }
         },
     );
@@ -1541,6 +1850,75 @@ fn on_status(state: &AgentsState, answer: &Result<Response, HiveError>) {
     apply(state);
     if up {
         refresh_urls(state);
+    }
+}
+
+/// Render the "Unassigned approvals" group off this tick's `Pending` answer
+/// (#1149 N1), scoped to the roster [`on_status`] just folded into
+/// `state.snapshot` — call this **after** `on_status`, not before, so the two
+/// are always one observation.
+///
+/// `None` (`refresh`'s own doc: `AgentStatus` itself failed, so `Pending` was
+/// never asked) and `Some(Err(reason))` (the hive answered `AgentStatus` but
+/// refused `Pending` — an older daemon, a permissions change) both clear the
+/// group rather than leaving it on its last good answer: this tab cannot
+/// vouch for rows it no longer has a fresh roster or a fresh queue for,
+/// mirroring the rule `hytte_plugin_agents::poll` and
+/// `trollshell-agent-window::feed` both follow for their own approval
+/// surfaces. Only `Some(Ok(queue))` renders real rows.
+fn apply_unassigned(state: &AgentsState, approvals: Option<Result<Vec<Approval>, String>>) {
+    let rows = match approvals {
+        Some(Ok(queue)) => {
+            let known: Vec<String> = state
+                .snapshot
+                .borrow()
+                .agents()
+                .iter()
+                .map(|a| a.name.as_str().to_owned())
+                .collect();
+            unassigned_approvals(queue, &known)
+        }
+        Some(Err(reason)) => {
+            tracing::debug!(
+                %reason,
+                "the hive refused the approval queue; the Unassigned group is cleared until it \
+                 answers"
+            );
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+    render_unassigned(state, &rows);
+}
+
+/// Replace the "Unassigned approvals" group's rows.
+///
+/// Rebuilt on every call rather than retargeted by id, unlike the companion
+/// window's approvals (#1149 N2): these rows are read-only (#1147's
+/// contract) — no buttons, no in-flight latch — so there is no widget state
+/// a rebuild could lose and no click that could land on one mid-replacement,
+/// which is the whole argument for retargeting there and does not apply
+/// here.
+fn render_unassigned(state: &AgentsState, rows: &[Approval]) {
+    for row in state.unassigned_rows.borrow_mut().drain(..) {
+        state.unassigned_group.remove(&row);
+    }
+    state.unassigned_group.set_visible(!rows.is_empty());
+
+    let mut tracked = state.unassigned_rows.borrow_mut();
+    for a in rows {
+        let row = adw::ActionRow::builder()
+            .title(a.kind.human())
+            .subtitle(unassigned_subtitle(a))
+            // The subtitle carries the manager's own free text
+            // (`detail_line`) plus this tab's own sentence — never markup,
+            // the module doc's rule for every hive-sourced string.
+            .use_markup(false)
+            .subtitle_selectable(true)
+            .build();
+        row.set_subtitle_lines(3);
+        state.unassigned_group.add(&row);
+        tracked.push(row);
     }
 }
 
@@ -1966,14 +2344,16 @@ mod tests {
     use super::{
         ABSENT, DetailModel, FACT_LABELS, Route, RowModel, agent_page_is_live, detail_of, flags_of,
         flags_of_labels, hive_of, ordered, placeholder, route_for, rows_of, same_agent_set,
-        status_set, systemd_run_argv, user_manager_unreachable,
+        status_set, systemd_run_argv, unassigned_approvals, unassigned_destination,
+        unassigned_subtitle, user_manager_unreachable,
     };
     use hytte_plugin_agents::config::{AgentsConfig, Display};
     use hytte_plugin_agents::hive::client::HiveError;
     use hytte_plugin_agents::hive::wire::{
-        AgentStatusRow, HOST_SOCK_VERSION, HiveUrls, Response, VersionMismatch,
+        AgentStatusRow, Approval, ApprovalStatus, HOST_SOCK_VERSION, HiveUrls, Response,
+        VersionMismatch,
     };
-    use hytte_plugin_agents::model::{Agent, AgentName, Hive, Status};
+    use hytte_plugin_agents::model::{Agent, AgentName, Hive, PendingApprovals, Status};
 
     /// The `status_set_at` the plugin's own fixtures carry.
     const SET_AT: &str = "2026-09-07T12:34:56Z";
@@ -2641,6 +3021,139 @@ mod tests {
             other => panic!("expected Unreachable, got {other:?}"),
         }
     }
+
+    fn approval(id: i64, agent: &str, status: ApprovalStatus) -> Approval {
+        Approval {
+            id,
+            agent: agent.to_owned(),
+            status,
+            ..Approval::default()
+        }
+    }
+
+    /// **The current behaviour, stated as intended** (#1149 N1): an approval
+    /// with no `agent` (the wire's decode for an absent key, `hive/wire.rs`)
+    /// or one naming an agent not on this hive's roster is invisible to
+    /// *both* per-agent surfaces — the sidebar plugin's own
+    /// [`PendingApprovals::count_for`]/`oldest_for` selectors, and the
+    /// companion window's `chrome::pending_for`, which narrows the identical
+    /// [`PendingApprovals::new`] answer by the same `a.agent == name`
+    /// predicate restated here (a cross-crate call would need a dependency
+    /// this tab has no other reason to take) — but this tab's
+    /// [`unassigned_approvals`] is exactly the complement of that predicate,
+    /// so the two rows neither surface can show land here and nowhere else.
+    ///
+    /// Mutation (verified red): drop the `!known.iter().any(…)` arm of the
+    /// filter and the "unknown agent" row (id 2) vanishes from this tab too
+    /// — landing on no desktop surface at all. Drop the `agent.trim().is_empty()`
+    /// arm instead and the "no agent" row (id 1) vanishes the same way.
+    #[test]
+    fn an_agentless_or_unknown_agent_approval_is_invisible_to_the_per_agent_filters() {
+        let queue = vec![
+            approval(1, "", ApprovalStatus::Pending), // absent agent
+            approval(2, "ghost", ApprovalStatus::Pending), // unknown agent
+            approval(3, "stray", ApprovalStatus::Pending), // on the roster
+            approval(4, "stray", ApprovalStatus::Approved), // already decided
+        ];
+        let known = vec!["stray".to_owned()];
+
+        // The sidebar's own per-agent selectors, over the roster's one known
+        // name — real production functions, not a restatement of them. The
+        // sidebar only ever calls these with a name off its own roster
+        // (`agents.toml`/the wire's own agent rows), never with `""` or
+        // `"ghost"` — there is no row to raise a badge on for either — so
+        // the true claim to pin is that summing every *reachable* query
+        // never turns up ids 1 or 2, not that querying an unreachable one
+        // would happen to answer `None` (`oldest_for` has no idea "" is not
+        // a real name; it would cheerfully return the row if asked).
+        let pending = PendingApprovals::new(queue.clone());
+        let reachable_count: usize = known.iter().map(|a| pending.count_for(a)).sum();
+        assert_eq!(
+            reachable_count, 1,
+            "only the roster's own approval is reachable through any agent's badge"
+        );
+        assert_eq!(
+            pending.oldest_for("stray").map(|a| a.id),
+            Some(3),
+            "the one badge the roster can raise names the roster's own approval"
+        );
+
+        // The companion window's `chrome::pending_for` filter, restated:
+        // `PendingApprovals` narrowed to one agent's name — the identical
+        // expression that function applies after the identical `new`.
+        let window_sees: Vec<i64> = pending
+            .all()
+            .iter()
+            .filter(|a| a.agent == "stray")
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(window_sees, vec![3], "the window sees only its own agent");
+
+        // This tab is the complement: exactly the two rows neither surface
+        // shows, still-pending only (id 4 is excluded on status, not agent).
+        let here = unassigned_approvals(queue, &known);
+        assert_eq!(
+            here.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "{here:?}"
+        );
+    }
+
+    /// A roster agent's queue does not leak into "unassigned" — the filter's
+    /// other arm, pinned on its own so a mutation that always returns `true`
+    /// (or drops the roster check entirely) cannot pass by accident.
+    #[test]
+    fn a_roster_agents_approval_is_not_unassigned() {
+        let queue = vec![approval(1, "stray", ApprovalStatus::Pending)];
+        let here = unassigned_approvals(queue, &["stray".to_owned()]);
+        assert!(here.is_empty(), "{here:?}");
+    }
+
+    /// **Each row is sent somewhere that can actually exist** (this round's
+    /// review, LOW 5), and the destination is the row's **first** line (LOW
+    /// 4) so a long description cannot ellipsize away the one sentence the
+    /// row is for.
+    ///
+    /// The middle case is the one the review caught: `hive_of` drops any
+    /// roster row whose name fails `AgentName::parse`, so an approval naming
+    /// `Bad Name` lands here *and* the sidebar will never grow a card for it —
+    /// "answer from that agent's own sidebar card if it returns" was advice
+    /// that could not be taken.
+    ///
+    /// Mutation (verified red): drop the `AgentName::parse` arm and the
+    /// illegal name is told to wait for a card again; put `detail_line` back
+    /// in front and the ordering assertion reds.
+    #[test]
+    fn an_unrenderable_agent_name_is_sent_to_the_dashboard_not_to_a_card() {
+        assert_eq!(
+            unassigned_destination(""),
+            "no agent named on this request — answer from the hive's dashboard"
+        );
+        let illegal = unassigned_destination("Bad Name");
+        assert!(
+            illegal.contains("dashboard") && !illegal.contains("card"),
+            "a name this build will not render has no card to wait for: {illegal}"
+        );
+        let stale = unassigned_destination("ghost");
+        assert!(
+            stale.contains("card") && stale.contains("dashboard"),
+            "a legal name that is merely absent keeps both routes: {stale}"
+        );
+
+        let row = Approval {
+            description: Some("a very long description the manager wrote".to_owned()),
+            ..approval(1, "ghost", ApprovalStatus::Pending)
+        };
+        let subtitle = unassigned_subtitle(&row);
+        let (first, rest) = subtitle
+            .split_once('\n')
+            .expect("the subtitle is two lines");
+        assert_eq!(first, stale, "the destination is the first line");
+        assert!(
+            rest.contains("a very long description the manager wrote"),
+            "the manager's own detail line follows it: {rest}"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "system-tests"))]
@@ -2654,12 +3167,14 @@ mod gtk_tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ABSENT, Actions, AgentsState, AgentsView, FACT_LABELS, build_tab, flags_of_labels,
-        launch_detached, on_status, refresh, start_poll,
+        ABSENT, Actions, AgentsState, AgentsView, FACT_LABELS, apply_unassigned, build_tab,
+        flags_of_labels, launch_detached, on_status, refresh, start_poll,
     };
     use hytte_plugin_agents::config::{AgentsConfig, Display};
     use hytte_plugin_agents::hive::client::HiveError;
-    use hytte_plugin_agents::hive::wire::{AgentStatusRow, HOST_SOCK_VERSION, Response};
+    use hytte_plugin_agents::hive::wire::{
+        AgentStatusRow, Approval, ApprovalStatus, HOST_SOCK_VERSION, Response,
+    };
     use hytte_plugin_agents::window as agent_window;
 
     /// Run the GTK main loop until it has nothing left to dispatch, so a
@@ -2856,6 +3371,120 @@ mod gtk_tests {
             }),
         );
         pump();
+    }
+
+    /// One `Pending` fixture row.
+    fn approval(id: i64, agent: &str, status: ApprovalStatus) -> Approval {
+        Approval {
+            id,
+            agent: agent.to_owned(),
+            status,
+            ..Approval::default()
+        }
+    }
+
+    /// Every "Unassigned approvals" row's `title: subtitle`.
+    fn unassigned_row_text(state: &AgentsState) -> Vec<String> {
+        state
+            .unassigned_rows
+            .borrow()
+            .iter()
+            .map(|r| format!("{}: {}", r.title(), r.subtitle().unwrap_or_default()))
+            .collect()
+    }
+
+    /// **An orphan approval surfaces here, and nowhere else** (#1149 N1): the
+    /// group is hidden with nothing queued, shows exactly the rows neither
+    /// per-agent surface can (an absent agent, an agent this roster does not
+    /// carry) and none of the roster's own, and clears itself the moment the
+    /// hive refuses the queue — the "cannot vouch for it" rule
+    /// `apply_unassigned`'s doc states, mirroring what both per-agent
+    /// approval surfaces already do on the same refusal.
+    ///
+    /// Mutation (verified red): drop the `!known.iter().any(…)` arm in
+    /// `unassigned_approvals` and the row count assertion reds (the "ghost"
+    /// row stops appearing, or if the `agent.trim().is_empty()` arm is
+    /// dropped instead, the "no agent" row does); replace the `Err` arm's
+    /// `Vec::new()` in `apply_unassigned` with keeping the old rows and the
+    /// group stays visible after the refusal.
+    #[gtk::test]
+    fn an_orphan_approval_populates_the_group_and_clears_on_refusal() {
+        let (bin, state) = build_tab(cfg());
+        let window = present(&bin, 900);
+
+        apply(&state, &["stray"]);
+        assert!(
+            !state.unassigned_group.is_visible(),
+            "nothing queued yet — the group must not show empty"
+        );
+
+        apply_unassigned(
+            &state,
+            Some(Ok(vec![
+                approval(1, "", ApprovalStatus::Pending),
+                approval(2, "ghost", ApprovalStatus::Pending),
+                approval(3, "stray", ApprovalStatus::Pending),
+            ])),
+        );
+        pump();
+
+        assert!(
+            state.unassigned_group.is_visible(),
+            "two rows are unassigned; the group must show"
+        );
+        let text = unassigned_row_text(&state);
+        assert_eq!(
+            text.len(),
+            2,
+            "the roster's own row (id 3) must not leak in: {text:?}"
+        );
+
+        apply_unassigned(&state, Some(Err("permission denied".to_owned())));
+        pump();
+        assert!(
+            !state.unassigned_group.is_visible(),
+            "a hive that refuses the queue must not leave stale rows showing"
+        );
+        assert!(unassigned_row_text(&state).is_empty());
+
+        dismiss(&window);
+    }
+
+    /// **A status poll that never answered asks for nothing** (`refresh`'s
+    /// own doc): `apply_unassigned(state, None)` is what a failed
+    /// `AgentStatus` feeds it, and it must clear the group rather than leave
+    /// whatever the last successful tick drew.
+    #[gtk::test]
+    fn a_never_asked_tick_clears_the_group_rather_than_freezing_it() {
+        let (bin, state) = build_tab(cfg());
+        let window = present(&bin, 900);
+
+        apply(&state, &["stray"]);
+        apply_unassigned(
+            &state,
+            Some(Ok(vec![approval(1, "ghost", ApprovalStatus::Pending)])),
+        );
+        pump();
+        assert!(state.unassigned_group.is_visible());
+
+        apply_unassigned(&state, None);
+        pump();
+        assert!(
+            !state.unassigned_group.is_visible(),
+            "a tick that never asked must not leave the last answer's rows on screen"
+        );
+
+        dismiss(&window);
+    }
+
+    /// Put the tab in a window `width` × `height` px and let GTK allocate it.
+    fn present_sized(bin: &adw::BreakpointBin, width: i32, height: i32) -> gtk::Window {
+        let window = gtk::Window::new();
+        window.set_child(Some(bin));
+        window.set_default_size(width, height);
+        window.present();
+        pump();
+        window
     }
 
     /// Put the tab in a window `width` px wide and let GTK allocate it. The
@@ -3713,6 +4342,93 @@ mod gtk_tests {
         dismiss(&window);
     }
 
+    /// **A tab nobody is looking at asks the hive nothing**, and coming back
+    /// reconciles at once (this round's review, MEDIUM 3).
+    ///
+    /// `start_poll` used to dial every `poll_seconds` for the whole life of
+    /// the control-center whatever was on screen, and #1149 N1 doubled what
+    /// each of those ticks costs by adding `Pending` to it. The gate is the
+    /// companion window's — `GdkToplevelState::SUSPENDED` plus map/unmap — and
+    /// on a tab the map half is the load-bearing one: `AdwViewStack` maps only
+    /// its visible child, so "another tab is showing" is an unmap. That is the
+    /// state driven here, with a plain `GtkStack` standing in for the view
+    /// stack, because it is the case the review is actually about and it needs
+    /// no compositor. (The `SUSPENDED` half has no setter and no compositor in
+    /// CI — `docs/live-verify.md` carries it.)
+    ///
+    /// The absence is measured **after** letting anything already in flight
+    /// land, then over 25 intervals' worth of main loop, so it is a parked
+    /// timer rather than a slow one.
+    ///
+    /// Mutation (run, verified red): drop the `presentation.on` check in
+    /// [`start_poll`] and the parked assertion reds with a double-digit
+    /// request count.
+    #[gtk::test]
+    fn the_poll_parks_while_another_tab_is_showing() {
+        let hive = scripted(|_, _| Some((Duration::ZERO, roster_line(&["argus"]))));
+        let (bin, state) = build_tab(hive.cfg());
+
+        let stack = gtk::Stack::new();
+        stack.add_named(&bin, Some("agents"));
+        stack.add_named(&gtk::Label::new(Some("another tab")), Some("other"));
+        let window = gtk::Window::new();
+        window.set_child(Some(&stack));
+        window.set_default_size(900, 400);
+        window.present();
+        pump();
+
+        let poll = start_poll(&state, Duration::from_millis(20));
+        pump_until(|| rosters_asked(&hive) >= 2, 10);
+        assert!(
+            state.presentation.on.get(),
+            "the visible child of the stack must read as presented"
+        );
+
+        stack.set_visible_child_name("other");
+        pump();
+        assert!(
+            !state.presentation.on.get(),
+            "another tab showing must park the poll"
+        );
+        // Let a round trip issued just before the switch land, so the count
+        // below is a baseline and not a race.
+        pump_for(Duration::from_millis(100));
+        let parked_at = rosters_asked(&hive);
+        pump_for(Duration::from_millis(500));
+        assert_eq!(
+            rosters_asked(&hive),
+            parked_at,
+            "a parked tab must ask the hive nothing over 25 intervals: {:?}",
+            hive.seen()
+        );
+
+        // …and coming back reconciles immediately rather than waiting out an
+        // interval — the tab's data must not be one cadence stale the moment
+        // it is looked at.
+        stack.set_visible_child_name("agents");
+        pump_until(|| rosters_asked(&hive) > parked_at, 10);
+        assert!(
+            rosters_asked(&hive) > parked_at,
+            "the tab came back and never re-asked: {:?}",
+            hive.seen()
+        );
+        poll.remove();
+        dismiss(&window);
+    }
+
+    /// Drive the main loop for `how_long`, dispatching whatever comes up.
+    ///
+    /// For the absence assertions: `pump_until` stops at its predicate, and
+    /// "nothing happened" needs the opposite — a bounded stretch of real main
+    /// loop with real timer ticks in it.
+    fn pump_for(how_long: Duration) {
+        let deadline = Instant::now() + how_long;
+        while Instant::now() < deadline {
+            pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// A round trip that **fails** still releases the in-flight slot — the
     /// production code drops it unconditionally, but a one-slot guard whose
     /// release is conditional is a permanent freeze, and nothing else in the
@@ -3791,6 +4507,116 @@ mod gtk_tests {
                 "{name}'s row is drawn outside its scroller: {bounds:?} in {w}×{h}"
             );
         }
+        dismiss(&window);
+    }
+
+    /// **A full Unassigned queue scrolls; it does not push rows past the
+    /// window, and it does not crush the roster** (#1149 N1, this round's
+    /// review HIGH).
+    ///
+    /// The group used to sit in a plain `Box` under the roster scroller with
+    /// no scroller and no cap of its own, so each ~84 px row came out of the
+    /// roster's height until the roster hit its floor, after which the group's
+    /// own rows were allocated **below the window** with no scrollbar to reach
+    /// them — at the control-center's own default size, from about five rows.
+    /// That is N1's own trigger: one agent renamed out of `agents.toml`
+    /// orphans its whole queue at once.
+    ///
+    /// The existing behaviour test cannot see any of this — it asserts
+    /// `unassigned_group.is_visible()` and reads text back out of
+    /// `state.unassigned_rows`, i.e. its own bookkeeping. #851 is the standing
+    /// lesson: `is_visible()` is orthogonal to being on screen, so this
+    /// asserts the **allocation**, against the window.
+    ///
+    /// Three claims, because "inside the window" alone would pass for a group
+    /// squeezed to nothing or one whose rows are simply unreachable:
+    /// the scrolled container is inside the window, the rows past the cap are
+    /// reachable (`upper > page_size`, i.e. there is something to scroll to
+    /// rather than content quietly lost), and the roster still has room for
+    /// more than one agent row.
+    ///
+    /// Mutation (run, verified red): mount `unassigned_group` straight into
+    /// `sidebar_box` again, with no `ScrolledWindow` — the containment
+    /// assertion reds, and in the sharpest possible way: twelve rows' natural
+    /// height cannot be fitted into the sidebar at all, so GTK leaves the
+    /// group **without a usable allocation in the window**, which is why that
+    /// assertion has to fail loudly on a missing bounds rather than treat it
+    /// as "nothing to check".
+    #[gtk::test]
+    fn a_full_unassigned_queue_scrolls_instead_of_leaving_the_window() {
+        let (bin, state) = build_tab(cfg());
+        // The control-center's own default is 760 × 560; 480 is a window an
+        // operator can genuinely have, and the review's measurements were
+        // taken at it.
+        let window = present_sized(&bin, 760, 480);
+        apply(&state, &["argus", "beta", "gamma"]);
+
+        let queue: Vec<Approval> = (1..=12)
+            .map(|id| approval(id, "", ApprovalStatus::Pending))
+            .collect();
+        apply_unassigned(&state, Some(Ok(queue)));
+        pump_until(
+            || {
+                state
+                    .unassigned_rows
+                    .borrow()
+                    .first()
+                    .is_some_and(|r| r.height() > 0)
+            },
+            5,
+        );
+        assert_eq!(state.unassigned_rows.borrow().len(), 12);
+
+        // The container whose extent is what an operator can actually see.
+        // Falling back to the group itself (rather than unwrapping) is what
+        // makes the mutation above red on the geometry rather than on a
+        // missing widget.
+        let container: gtk::Widget = state
+            .unassigned_group
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .unwrap_or_else(|| state.unassigned_group.clone().upcast());
+        let bounds = container.compute_bounds(&window).unwrap_or_else(|| {
+            panic!(
+                "the Unassigned group has no bounds in the window at all — twelve rows could not \
+                 be allocated inside it (the group measures {} px tall)",
+                container.height()
+            )
+        });
+        // The allocation is in pixels and fits an f32 exactly at any size a
+        // window has; the cast is the only way to compare it with a
+        // `graphene::Rect`.
+        #[allow(clippy::cast_precision_loss)]
+        let window_height = window.height() as f32;
+        assert!(
+            bounds.y() >= -0.5 && bounds.y() + bounds.height() <= window_height + 0.5,
+            "the Unassigned group is allocated past the window: {bounds:?} in a window \
+             {window_height} px tall"
+        );
+
+        let scroller: gtk::ScrolledWindow = container
+            .downcast()
+            .expect("the group must live in a scroller of its own");
+        let adjustment = scroller.vadjustment();
+        assert!(
+            adjustment.upper() > adjustment.page_size() + 0.5,
+            "twelve rows must overflow the cap and be reachable by scrolling, not silently \
+             clipped: upper {} page {}",
+            adjustment.upper(),
+            adjustment.page_size()
+        );
+
+        let row_height = state.by_name.borrow()["argus"].row.height();
+        assert!(row_height > 0, "the roster was never allocated");
+        let roster = state
+            .list
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .expect("the sidebar list lives in a scroller");
+        assert!(
+            roster.height() > row_height * 2,
+            "the Unassigned group crushed the roster: {} px left for {} px rows",
+            roster.height(),
+            row_height
+        );
         dismiss(&window);
     }
 

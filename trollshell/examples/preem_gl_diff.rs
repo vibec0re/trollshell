@@ -7,11 +7,13 @@
 //! Five kinds since #1152, each four skins wide: the `Scope` (three fade
 //! depths), the `Gauge` (three needle positions, plus one at the **shipping**
 //! upscale), the `DotMatrix` (five displays, plus one stretched), the `Marquee`
-//! (five scroll phases, plus one stretched) and the `TextBox` (four
-//! configurations, plus one stretched) — **96** cases. Every case but the
-//! stretched and shipping-upscale ones runs 1:1, where the GL arm's native grid
-//! and the kit's logical one are the same number and the two can be compared
-//! pixel against pixel; that is where `TROLLSHELL_PARITY_EXACT=1` pins all five
+//! (five scroll phases, plus one stretched, plus one per skin at a window
+//! width where the centred origin and the bezel diverge — #1209 review,
+//! MEDIUM-1) and the `TextBox` (four configurations, plus one stretched) —
+//! **100** cases. Every case but the stretched and shipping-upscale ones runs
+//! 1:1, where the GL arm's native grid and the kit's logical one are the same
+//! number and the two can be compared pixel against pixel; that is where
+//! `TROLLSHELL_PARITY_EXACT=1` pins all five
 //! kinds at zero.
 //!
 //! What each kind's 1:1 cases *vary* is its own arithmetic. The dot matrix has
@@ -20,8 +22,10 @@
 //! five vary the **scroll phase**, because the phase is the widget: the shader
 //! has no offset uniform (#839 made a sub-dot position inexpressible), so a
 //! step is a different set of lit columns rather than a shifted sample (see
-//! `TickerAt`). The text box's four vary the wrap, the upscale, the corner
-//! radius and the palette pins (see `BubbleAt`).
+//! `TickerAt`). Its sixth 1:1 case holds the phase and varies the **window**
+//! instead, so the centred origin no longer coincides with the bezel — see
+//! `TICKER_ORIGIN_WINDOW_PX`. The text box's four vary the wrap, the upscale,
+//! the corner radius and the palette pins (see `BubbleAt`).
 //!
 //! # The supersampled cases, and the standard they answer to
 //!
@@ -130,7 +134,7 @@
 //! for all of them and their tests.
 //!
 //! Measured under llvmpipe on 2026-09-12 (Mesa 26.2.2, GLES 3.2), every one of
-//! the **80 1:1** cases came out **bit-exact**: max |Δ| 0 of 255 on R, G and B.
+//! the **84 1:1** cases came out **bit-exact**: max |Δ| 0 of 255 on R, G and B.
 //! Treat any non-zero number from this harness as real. The sixteen
 //! supersampled cases are not in that count and never could be — see above for
 //! what they answer to instead.
@@ -276,6 +280,24 @@ const STRETCH: u32 = 2;
 /// hold and a long one must scroll) and narrow enough to keep the whole
 /// comparison on screen beside the other kinds.
 const TICKER_WINDOW_PX: u32 = 96;
+
+/// The window **one marquee case per skin** runs at instead of
+/// [`TICKER_WINDOW_PX`] — closing #1209's review MEDIUM-1.
+///
+/// `origin_x = pad + floor(r/2)` where `r = (window_px - 2*pad) mod dot`
+/// (`kit::MarqueeStrip::window_px`'s own arithmetic), and at 96 px with the
+/// default pitch that remainder is 0 — `origin_x` collides with `pad`, the
+/// bezel, for **every** marquee case in this file otherwise. That let the
+/// shader's `u_origin_x` uniform be quietly swapped back for the pre-#1152
+/// `p.x - pad` (or dropped outright) and leave every gate green: nothing here
+/// could tell the centred grid from the bezel apart. 98 keeps the same
+/// 22-cell grid (`(98 - 2*4) / 4` still floors to 22, the same premise
+/// `preem_gl::marquee`'s own `the_marquee_drives_the_lattice_as_a_continuous_grid`
+/// test uses 99 to establish) and moves `origin_x` to `5`, one
+/// pixel off the bezel — enough to red the mutation above while the case
+/// stays exact-pinned: the GL and CPU arms still rasterise at the same
+/// resolution, just at a width where the two candidate origins disagree.
+const TICKER_ORIGIN_WINDOW_PX: u32 = 98;
 
 /// The wrap width the **textbox** cases run at, in glyph cells — wide enough
 /// that a sentence wraps to three lines and narrow enough that the hugging
@@ -466,6 +488,10 @@ enum Case {
         ticker: TickerAt,
         /// As [`Case::DotMatrix`]'s — `1` for every case but the stretched one.
         stretch: u32,
+        /// The window this case renders at, in final buffer pixels —
+        /// [`TICKER_WINDOW_PX`] for every case but one per skin, which runs at
+        /// [`TICKER_ORIGIN_WINDOW_PX`] instead (#1209 review, MEDIUM-1).
+        window_px: u32,
     },
     /// A `TextBox` in one configuration (#1152).
     TextBox {
@@ -783,11 +809,12 @@ fn bubble_box(style: kit::DisplayStyle, bubble: BubbleAt) -> kit::TextBox {
 }
 
 /// The kit `MarqueeStrip` a ticker case renders. One builder for both arms, for
-/// [`bubble_box`]'s reason.
-fn ticker_strip(style: kit::DisplayStyle, ticker: TickerAt) -> kit::MarqueeStrip {
+/// [`bubble_box`]'s reason. `window_px` is [`Case::Marquee`]'s own field, not
+/// always [`TICKER_WINDOW_PX`] — see [`TICKER_ORIGIN_WINDOW_PX`].
+fn ticker_strip(style: kit::DisplayStyle, ticker: TickerAt, window_px: u32) -> kit::MarqueeStrip {
     let (text, _) = ticker.line();
     kit::Marquee::new(style)
-        .window_px(TICKER_WINDOW_PX as usize)
+        .window_px(window_px as usize)
         .dot_px(DOT_PX as usize)
         .render(text)
 }
@@ -901,8 +928,9 @@ impl Case {
                 style,
                 ticker,
                 stretch,
+                window_px,
             } => {
-                let strip = ticker_strip(*style, *ticker);
+                let strip = ticker_strip(*style, *ticker, *window_px);
                 let surface = marquee::marquee_surface(
                     &strip,
                     &marquee::window(&strip, ticker.line().1),
@@ -1121,6 +1149,7 @@ fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                 style: *style,
                 ticker,
                 stretch: 1,
+                window_px: TICKER_WINDOW_PX,
             });
             // …and the same mid-message phase given more room than its natural
             // size, which is where this arm's improvement lives — the dot
@@ -1129,6 +1158,18 @@ fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                 style: *style,
                 ticker: TickerAt::Scrolled(7),
                 stretch: STRETCH,
+                window_px: TICKER_WINDOW_PX,
+            });
+            // …and the same mid-message phase again, but through a window
+            // where the centred grid's origin does not coincide with the
+            // bezel (#1209 review, MEDIUM-1) — still 1:1 and exact-pinned,
+            // since the point is the uniform's *value*, not a new sampling
+            // standard. See [`TICKER_ORIGIN_WINDOW_PX`].
+            let ticker_origin = std::iter::once(Case::Marquee {
+                style: *style,
+                ticker: TickerAt::Scrolled(7),
+                stretch: 1,
+                window_px: TICKER_ORIGIN_WINDOW_PX,
             });
             // The bubble (#1152): the degenerate box, one line, a message
             // wrapped to the last row, and the pinned-palette configuration.
@@ -1160,6 +1201,7 @@ fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
                 .chain(stretched)
                 .chain(tickers)
                 .chain(stretched_ticker)
+                .chain(ticker_origin)
                 .chain(bubbles)
                 .chain(stretched_bubble)
         })
@@ -1412,7 +1454,20 @@ fn label(case: &Case) -> String {
             style,
             ticker,
             stretch,
+            ..
         } if *stretch > 1 => format!("marquee.{}.{}x{stretch}", style.name(), ticker.name()),
+        // The odd-origin case (#1209 review, MEDIUM-1) — named for the window
+        // it runs at, the same way the stretch above names itself for its
+        // factor, so its evidence files don't collide with the same skin's
+        // default-window case.
+        Case::Marquee {
+            style,
+            ticker,
+            window_px,
+            ..
+        } if *window_px != TICKER_WINDOW_PX => {
+            format!("marquee.{}.{}w{window_px}", style.name(), ticker.name())
+        }
         Case::Marquee { style, ticker, .. } => {
             format!("marquee.{}.{}", style.name(), ticker.name())
         }
@@ -1483,8 +1538,13 @@ fn drive(area: &GlSurface, case: &Case) {
                 surface.uniforms,
             )
         }
-        Case::Marquee { style, ticker, .. } => {
-            let strip = ticker_strip(*style, *ticker);
+        Case::Marquee {
+            style,
+            ticker,
+            window_px,
+            ..
+        } => {
+            let strip = ticker_strip(*style, *ticker, *window_px);
             let surface = marquee::marquee_surface(
                 &strip,
                 &marquee::window(&strip, ticker.line().1),
@@ -1605,9 +1665,12 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
         // The kit's own window at this phase — the *same* strip the mapping
         // read its geometry off, so a disagreement here is a disagreement
         // between renderers and not between two tickers.
-        Case::Marquee { style, ticker, .. } => {
-            ticker_strip(*style, *ticker).window(ticker.line().1)
-        }
+        Case::Marquee {
+            style,
+            ticker,
+            window_px,
+            ..
+        } => ticker_strip(*style, *ticker, *window_px).window(ticker.line().1),
         // The box's `scale` is already in these bytes (the kit upscales at the
         // end of `render`), which is why `reference_scale` has nothing to do
         // for this kind either — see `Case::geometry`.

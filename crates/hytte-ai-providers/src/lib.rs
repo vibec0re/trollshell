@@ -931,7 +931,8 @@ mod tests {
     /// guessing which file or what to `chmod`.
     #[test]
     fn check_key_file_permissions_refuses_group_or_other_access() {
-        let dir = std::env::temp_dir().join(format!("hytte-ai-providers-perm-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hytte-ai-providers-perm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let path = dir.join("openrouter.key");
         std::fs::write(&path, "sk-x").expect("write key");
@@ -969,7 +970,8 @@ mod tests {
     /// `load_key_from` and this test goes red — `sk-loose` loads clean.
     #[test]
     fn load_key_from_refuses_a_world_readable_file() {
-        let dir = std::env::temp_dir().join(format!("hytte-ai-providers-loose-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hytte-ai-providers-loose-{}", std::process::id()));
         let ts = dir.join("trollshell");
         std::fs::create_dir_all(&ts).expect("mkdir");
         let path = ts.join("openrouter.key");

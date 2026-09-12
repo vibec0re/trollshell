@@ -276,6 +276,15 @@ pub(crate) fn dot_matrix_surface(
             values: vec![
                 ("u_dot", GlValue::Int(int_of(dot))),
                 ("u_cells", GlValue::Int(int_of(glyphs.cells))),
+                // The grid's shape, as three numbers rather than three literals
+                // in the shader (#1152): the bezel **is** one dot cell on a
+                // static display, a cell is `GLYPH_W` dot columns, and the
+                // spacing column between two cells carries no dots. The
+                // `Marquee` passes `(origin_x, 1, 0)` through the same
+                // `site_at` — see `dot_matrix.frag`'s header.
+                ("u_origin_x", GlValue::Int(int_of(dot))),
+                ("u_cell_cols", GlValue::Int(int_of(kit::font::GLYPH_W))),
+                ("u_cell_gap", GlValue::Int(int_of(kit::font::SPACING))),
                 (
                     "u_ghost_on",
                     GlValue::Int(i32::from(palette.ghost.is_some())),
@@ -815,6 +824,9 @@ mod tests {
             vec![
                 "u_dot",
                 "u_cells",
+                "u_origin_x",
+                "u_cell_cols",
+                "u_cell_gap",
                 "u_ghost_on",
                 "u_ghost",
                 "u_bloom_radius",
@@ -830,6 +842,13 @@ mod tests {
         );
         assert_eq!(uniform(&surface.uniforms, "u_dot"), GlValue::Int(3));
         assert_eq!(uniform(&surface.uniforms, "u_cells"), GlValue::Int(2));
+        // The static display's grid shape: the bezel is one dot cell, a cell is
+        // `GLYPH_W` columns and one spacing column follows it. The `Marquee`
+        // drives the same three with `(origin_x, 1, 0)` — see
+        // `marquee::tests::the_marquee_drives_the_lattice_as_a_continuous_grid`.
+        assert_eq!(uniform(&surface.uniforms, "u_origin_x"), GlValue::Int(3));
+        assert_eq!(uniform(&surface.uniforms, "u_cell_cols"), GlValue::Int(5));
+        assert_eq!(uniform(&surface.uniforms, "u_cell_gap"), GlValue::Int(1));
         assert_eq!(
             uniform(&surface.uniforms, "u_ghost_on"),
             GlValue::Int(i32::from(palette.ghost.is_some())),

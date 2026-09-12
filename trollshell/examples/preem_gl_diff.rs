@@ -173,6 +173,13 @@ mod gauge;
 // the same reason.
 #[path = "../src/plugins/preem_gl/dot_matrix.rs"]
 mod dot_matrix;
+// The two text kinds (#1152). The marquee reaches `dot_matrix` through
+// `super::dot_matrix::…` — it registers that very pipeline — which resolves
+// here for the same reason `gauge`'s `super::program::…` does.
+#[path = "../src/plugins/preem_gl/marquee.rs"]
+mod marquee;
+#[path = "../src/plugins/preem_gl/textbox.rs"]
+mod textbox;
 
 /// Logical grid the **scope** cases run at. Small enough to keep the whole
 /// comparison on screen at 1× and wide enough that the graticule's 12-column
@@ -253,6 +260,28 @@ const COARSE_DOT_PX: u32 = 8;
 /// bit-identical interior plus an edge budget — see
 /// [`Case::sampling`] and `parity::case_verdict`.
 const STRETCH: u32 = 2;
+
+/// The window the **marquee** cases run at, in final buffer pixels — wide
+/// enough that a 22-cell grid fits at the default pitch (so a short message can
+/// hold and a long one must scroll) and narrow enough to keep the whole
+/// comparison on screen beside the other kinds.
+const TICKER_WINDOW_PX: u32 = 96;
+
+/// The wrap width the **textbox** cases run at, in glyph cells — wide enough
+/// that a sentence wraps to three lines and narrow enough that the hugging
+/// cases are visibly narrower than the fixed ones.
+const BUBBLE_COLS: u32 = 11;
+
+/// Wrapped-line cap for every textbox case — the kit's own default, and what
+/// [`BubbleAt::Wrapped`] is measured against filling.
+const BUBBLE_LINES: u32 = 3;
+
+/// The field and ink [`BubbleAt::Pinned`] pins, and the `.notdef` it names — the
+/// pet's and caw's own configuration (#884/#885), which is the one that reaches
+/// all three of the `TextBox`'s colors at once.
+const PINNED_FIELD: [u8; 4] = [0x2a, 0x1e, 0x3c, 0xff];
+const PINNED_INK: [u8; 4] = [0xf0, 0xd0, 0xff, 0xff];
+const PINNED_NOTDEF: [u8; 4] = [0x80, 0x60, 0xa0, 0xff];
 
 /// Whether any case failed, for [`main`]'s exit status.
 ///
@@ -415,6 +444,94 @@ enum Case {
         /// see [`STRETCH`]. `1` for every case but the stretched one.
         stretch: u32,
     },
+    /// A `Marquee` at one scroll phase (#1152).
+    Marquee {
+        style: kit::DisplayStyle,
+        ticker: TickerAt,
+        /// As [`Case::DotMatrix`]'s — `1` for every case but the stretched one.
+        stretch: u32,
+    },
+    /// A `TextBox` in one configuration (#1152).
+    TextBox {
+        style: kit::DisplayStyle,
+        bubble: BubbleAt,
+        /// As [`Case::DotMatrix`]'s — `1` for every case but the stretched one.
+        stretch: u32,
+    },
+}
+
+/// What a marquee case is showing, and where the message has scrolled to.
+///
+/// Five, and the choice is the issue's: the degenerate display, the
+/// [hold rule](kit::MarqueeStrip::scrolls), and a scrolling message at **three**
+/// phases. Three rather than one because the whole widget is the phase — the
+/// shader has no offset uniform at all (#839 made a sub-dot position
+/// inexpressible, so a step is a different set of lit columns) — and because
+/// the three chosen below are the three shapes the wrap can take.
+#[derive(Clone, Copy)]
+enum TickerAt {
+    /// The empty string: the bezel and the **fixed** ghost grid, with nothing
+    /// lit. `u_data_len` is the grid's width and every texel is `0`, which is
+    /// the one case that separates "no strip" from "a blank strip" — the kit
+    /// paints the ghost lattice either way, so a shader that refused to draw on
+    /// an all-zero grid would go dark here and nowhere else.
+    Empty,
+    /// A message that fits the grid, so the kit **holds** it static and ignores
+    /// the offset entirely. Left-aligned on the grid, and the phase below can
+    /// never move it.
+    Held,
+    /// A message wider than the grid, at scroll phase `offset` **in dots**.
+    ///
+    /// The three the case list uses are `0` (the message's head at the grid's
+    /// first column), `7` (mid-message, so every visible column is a glyph
+    /// column of a *different* character than at `0`) and one that lands inside
+    /// the **loop seam** — the blank gap the kit appends after the message —
+    /// where the grid is part message and part nothing, which is the one phase
+    /// where `window_columns`' `bitmap.get` returns `None` for some columns and
+    /// not others.
+    Scrolled(usize),
+}
+
+/// What a textbox case is showing.
+///
+/// Four, the issue's list: the degenerate box, one line, a message wrapped to
+/// the last row it is allowed, and the pinned-palette configuration the pet's
+/// and caw's bubbles actually ship in.
+#[derive(Clone, Copy)]
+enum BubbleAt {
+    /// The empty string, hugging: the `max(1)`-wide degenerate buffer, no
+    /// cells at all (`u_cols == 0`, no strip), and the **only** case at the
+    /// kit's native `scale = 1` — so `u_upscale == 1` is rendered somewhere
+    /// rather than only reasoned about.
+    Empty,
+    /// One short line at `scale = 2`, hugging — the pet's own bubble.
+    OneLine,
+    /// A sentence wrapped to exactly [`BUBBLE_LINES`] rows with the kit's
+    /// trailing `…`, in a **fixed-width** slot: three lines of different
+    /// lengths, so the block's blank padding cells are what keep every line
+    /// after the first at the right strip offset.
+    Wrapped,
+    /// A pinned field, a pinned ink, an explicit `.notdef` and an uncovered
+    /// char, over a corner cut wide enough to reach the glyph block —
+    /// #884/#885's configuration, and the one that renders all three colors and
+    /// the largest arc in one frame.
+    Pinned,
+}
+
+/// One textbox case's box, spelled out: the knobs each [`BubbleAt`] turns, and
+/// the text it shows.
+///
+/// A struct rather than a tuple because five of the seven fields differ between
+/// cases and a positional `(…)` of that width is unreadable at the call site.
+#[derive(Clone, Copy)]
+struct Bubble {
+    text: &'static str,
+    scale: u32,
+    corner: u32,
+    pad: u32,
+    fixed_width: bool,
+    /// Whether the field/ink pins and the explicit `.notdef` are in play.
+    pinned: bool,
 }
 
 /// What a dot-matrix case puts on the display.
@@ -500,6 +617,139 @@ impl DisplayAt {
     }
 }
 
+/// The message that overflows a [`TICKER_WINDOW_PX`] window at the default
+/// pitch, so it scrolls — and whose period is long enough that all three
+/// [`TickerAt::Scrolled`] phases land in different parts of it.
+const TICKER_LONG: &str = "PREEM RASTER KIT ~ SCROLLING TICKER ~ ";
+
+/// The phase that lands inside the loop seam. `TICKER_LONG` rasterises to 223
+/// bitmap columns and the kit appends a `GLYPH_W + SPACING` gap, so a 22-cell
+/// grid starting here straddles the message's tail and the blank seam.
+const TICKER_SEAM_PHASE: usize = 215;
+
+impl TickerAt {
+    /// The word in the case label and on its evidence files.
+    fn name(self) -> String {
+        match self {
+            Self::Empty => "empty".to_owned(),
+            Self::Held => "held".to_owned(),
+            Self::Scrolled(offset) => format!("phase{offset}"),
+        }
+    }
+
+    /// `(message, scroll offset in dots)`.
+    fn line(self) -> (&'static str, usize) {
+        match self {
+            Self::Empty => ("", 0),
+            // Four characters is 4 columns against a 22-cell grid, so the kit
+            // holds it; the offset is deliberately non-zero to prove the hold
+            // ignores it.
+            Self::Held => ("HI 8", 9),
+            Self::Scrolled(offset) => (TICKER_LONG, offset),
+        }
+    }
+}
+
+impl BubbleAt {
+    /// The word in the case label and on its evidence files.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::OneLine => "line",
+            Self::Wrapped => "wrapped",
+            Self::Pinned => "pinned",
+        }
+    }
+
+    /// The box this case renders, knob by knob.
+    fn spec(self) -> Bubble {
+        match self {
+            Self::Empty => Bubble {
+                text: "",
+                scale: 1,
+                corner: 2,
+                pad: 3,
+                fixed_width: false,
+                pinned: false,
+            },
+            Self::OneLine => Bubble {
+                text: "mrrp!",
+                scale: 2,
+                corner: 2,
+                pad: 3,
+                fixed_width: false,
+                pinned: false,
+            },
+            Self::Wrapped => Bubble {
+                text: "the quick brown fox jumps over the lazy dog",
+                scale: 2,
+                corner: 2,
+                pad: 3,
+                fixed_width: true,
+                pinned: false,
+            },
+            // `pad` below the corner radius on purpose: the cut then reaches
+            // into the glyph block, which is the only way to render the kit's
+            // "a glyph pixel is stamped *after* the field and does not consult
+            // the corner" rule.
+            Self::Pinned => Bubble {
+                text: "hi \u{1f495} ok",
+                scale: 2,
+                corner: 5,
+                pad: 2,
+                fixed_width: true,
+                pinned: true,
+            },
+        }
+    }
+}
+
+/// The kit `TextBox` a bubble case renders, with its palette already baked —
+/// which for this widget means **built inside the pin scope**, exactly as
+/// `preem_render::build` does it.
+///
+/// One builder for both arms, for [`gauge_state`]'s reason: the CPU reference
+/// and the GL mapping each call this, so the comparison is of two renderers
+/// rather than of two boxes that happen to be configured alike.
+fn bubble_box(style: kit::DisplayStyle, bubble: BubbleAt) -> kit::TextBox {
+    let spec = bubble.spec();
+    let pins = if spec.pinned {
+        kit::Pins {
+            ink: kit::Ink::Fixed(PINNED_INK),
+            field: Some(PINNED_FIELD),
+        }
+    } else {
+        kit::Pins {
+            ink: kit::Ink::Default,
+            field: None,
+        }
+    };
+    kit::with_pins(pins, || {
+        let boxed = kit::TextBox::styled(style)
+            .cols(BUBBLE_COLS as usize)
+            .max_lines(BUBBLE_LINES as usize)
+            .pad(spec.pad as usize)
+            .corner(spec.corner as usize)
+            .scale(spec.scale as usize)
+            .fixed_width(spec.fixed_width);
+        if spec.pinned {
+            boxed.notdef(PINNED_NOTDEF)
+        } else {
+            boxed
+        }
+    })
+}
+
+/// The kit `MarqueeStrip` a ticker case renders. One builder for both arms, for
+/// [`bubble_box`]'s reason.
+fn ticker_strip(style: kit::DisplayStyle, ticker: TickerAt) -> kit::MarqueeStrip {
+    let (text, _) = ticker.line();
+    kit::Marquee::new(style)
+        .window_px(TICKER_WINDOW_PX as usize)
+        .dot_px(DOT_PX as usize)
+        .render(text)
+}
+
 /// Where a gauge case's needle is when the frame is taken.
 ///
 /// Three positions, chosen to cover what the shader has to get right: the
@@ -550,6 +800,8 @@ impl Case {
             Self::Scope { .. } => parity::Kind::Scope,
             Self::Gauge { .. } => parity::Kind::Gauge,
             Self::DotMatrix { .. } => parity::Kind::DotMatrix,
+            Self::Marquee { .. } => parity::Kind::Marquee,
+            Self::TextBox { .. } => parity::Kind::TextBox,
         }
     }
 
@@ -562,7 +814,11 @@ impl Case {
     fn sampling(&self) -> parity::Sampling {
         match self {
             Self::Gauge { scale, .. } if *scale > 1 => parity::Sampling::Supersampled(*scale),
-            Self::DotMatrix { stretch, .. } if *stretch > 1 => {
+            Self::DotMatrix { stretch, .. }
+            | Self::Marquee { stretch, .. }
+            | Self::TextBox { stretch, .. }
+                if *stretch > 1 =>
+            {
                 parity::Sampling::Supersampled(*stretch)
             }
             _ => parity::Sampling::OneToOne,
@@ -591,6 +847,35 @@ impl Case {
                     &dot_matrix::glyphs(line),
                     &kit::palette_snapshot(*style),
                 );
+                (surface.width, surface.height, (*stretch).max(1))
+            }
+            // Both text kinds resolve their grid the dot matrix's way: through
+            // the very mapping the shell calls, so it cannot drift from what
+            // the area is driven with. Neither has an upscale to report here —
+            // the ticker's pitch *is* its size knob and the box's `scale` is
+            // already baked into the buffer the kit ships — so the third
+            // element is the stretch, exactly as the dot matrix's is.
+            Self::Marquee {
+                style,
+                ticker,
+                stretch,
+            } => {
+                let strip = ticker_strip(*style, *ticker);
+                let surface = marquee::marquee_surface(
+                    &strip,
+                    &marquee::window(&strip, ticker.line().1),
+                    &kit::palette_snapshot(*style),
+                );
+                (surface.width, surface.height, (*stretch).max(1))
+            }
+            Self::TextBox {
+                style,
+                bubble,
+                stretch,
+            } => {
+                let boxed = bubble_box(*style, *bubble);
+                let layout = boxed.layout(bubble.spec().text);
+                let surface = textbox::textbox_surface(&layout, &textbox::block(&layout));
                 (surface.width, surface.height, (*stretch).max(1))
             }
         }
@@ -668,6 +953,8 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
     hytte::ui::gl_surface::register(program::SCOPE, program::SCOPE_PIPELINE);
     hytte::ui::gl_surface::register(gauge::GAUGE, gauge::GAUGE_PIPELINE);
     hytte::ui::gl_surface::register(dot_matrix::DOT_MATRIX, dot_matrix::DOT_MATRIX_PIPELINE);
+    hytte::ui::gl_surface::register(marquee::MARQUEE, marquee::MARQUEE_PIPELINE);
+    hytte::ui::gl_surface::register(textbox::TEXTBOX, textbox::TEXTBOX_PIPELINE);
 
     let cases: Vec<Case> = skins
         .iter()
@@ -715,11 +1002,62 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
                 display: DisplayAt::Readout,
                 stretch: STRETCH,
             });
+            // The ticker (#1152): the degenerate display, the hold rule, and a
+            // scrolling message at three phases — the head, mid-message, and
+            // one straddling the loop seam. See [`TickerAt`].
+            let tickers = [
+                TickerAt::Empty,
+                TickerAt::Held,
+                TickerAt::Scrolled(0),
+                TickerAt::Scrolled(7),
+                TickerAt::Scrolled(TICKER_SEAM_PHASE),
+            ]
+            .into_iter()
+            .map(move |ticker| Case::Marquee {
+                style: *style,
+                ticker,
+                stretch: 1,
+            });
+            // …and the same mid-message phase given more room than its natural
+            // size, which is where this arm's improvement lives — the dot
+            // lattice at the screen's resolution rather than a magnified table.
+            let stretched_ticker = std::iter::once(Case::Marquee {
+                style: *style,
+                ticker: TickerAt::Scrolled(7),
+                stretch: STRETCH,
+            });
+            // The bubble (#1152): the degenerate box, one line, a message
+            // wrapped to the last row, and the pinned-palette configuration.
+            let bubbles = [
+                BubbleAt::Empty,
+                BubbleAt::OneLine,
+                BubbleAt::Wrapped,
+                BubbleAt::Pinned,
+            ]
+            .into_iter()
+            .map(move |bubble| Case::TextBox {
+                style: *style,
+                bubble,
+                stretch: 1,
+            });
+            // …and the widest corner given more room than its natural size,
+            // which is where *this* arm's improvement lives: the cut is an arc
+            // at the screen's resolution rather than a replicated logical-pixel
+            // mask, and `Pinned`'s radius-5 corner is the one that shows it.
+            let stretched_bubble = std::iter::once(Case::TextBox {
+                style: *style,
+                bubble: BubbleAt::Pinned,
+                stretch: STRETCH,
+            });
             scopes
                 .chain(gauges)
                 .chain(shipping)
                 .chain(displays)
                 .chain(stretched)
+                .chain(tickers)
+                .chain(stretched_ticker)
+                .chain(bubbles)
+                .chain(stretched_bubble)
         })
         .collect();
 
@@ -1016,6 +1354,22 @@ fn label(case: &Case) -> String {
         Case::DotMatrix { style, display, .. } => {
             format!("dot_matrix.{}.{}", style.name(), display.name())
         }
+        Case::Marquee {
+            style,
+            ticker,
+            stretch,
+        } if *stretch > 1 => format!("marquee.{}.{}x{stretch}", style.name(), ticker.name()),
+        Case::Marquee { style, ticker, .. } => {
+            format!("marquee.{}.{}", style.name(), ticker.name())
+        }
+        Case::TextBox {
+            style,
+            bubble,
+            stretch,
+        } if *stretch > 1 => format!("textbox.{}.{}x{stretch}", style.name(), bubble.name()),
+        Case::TextBox { style, bubble, .. } => {
+            format!("textbox.{}.{}", style.name(), bubble.name())
+        }
     }
 }
 
@@ -1070,6 +1424,31 @@ fn drive(area: &GlSurface, case: &Case) {
             );
             (
                 dot_matrix::DOT_MATRIX,
+                surface.width,
+                surface.height,
+                surface.uniforms,
+            )
+        }
+        Case::Marquee { style, ticker, .. } => {
+            let strip = ticker_strip(*style, *ticker);
+            let surface = marquee::marquee_surface(
+                &strip,
+                &marquee::window(&strip, ticker.line().1),
+                &kit::palette_snapshot(*style),
+            );
+            (
+                marquee::MARQUEE,
+                surface.width,
+                surface.height,
+                surface.uniforms,
+            )
+        }
+        Case::TextBox { style, bubble, .. } => {
+            let boxed = bubble_box(*style, *bubble);
+            let layout = boxed.layout(bubble.spec().text);
+            let surface = textbox::textbox_surface(&layout, &textbox::block(&layout));
+            (
+                textbox::TEXTBOX,
                 surface.width,
                 surface.height,
                 surface.uniforms,
@@ -1168,6 +1547,18 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
             kit::DotMatrix::new(*style)
                 .dot_px(dot_px as usize)
                 .render(line)
+        }
+        // The kit's own window at this phase — the *same* strip the mapping
+        // read its geometry off, so a disagreement here is a disagreement
+        // between renderers and not between two tickers.
+        Case::Marquee { style, ticker, .. } => {
+            ticker_strip(*style, *ticker).window(ticker.line().1)
+        }
+        // The box's `scale` is already in these bytes (the kit upscales at the
+        // end of `render`), which is why `reference_scale` has nothing to do
+        // for this kind either — see `Case::geometry`.
+        Case::TextBox { style, bubble, .. } => {
+            bubble_box(*style, *bubble).render(bubble.spec().text)
         }
     };
 

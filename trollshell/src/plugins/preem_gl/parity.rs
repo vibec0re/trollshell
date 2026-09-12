@@ -230,6 +230,30 @@ pub(crate) enum Kind {
     /// exact by construction and would stop being exact silently. Zero is the
     /// only value that can say so.
     DotMatrix,
+    /// `preem.marquee` (#1152) — **pinned bit-exact**, and it inherits nothing
+    /// to say so.
+    ///
+    /// It runs the dot matrix's shader, so the *reason* zero is available is
+    /// that one (the 1:1 snap collapses the continuous falloff onto the kit's
+    /// integer table by construction) — but the geometry it collapses onto is
+    /// this widget's own: a continuous ticker grid, centred in its window
+    /// rather than inset by the bezel, addressed through three uniforms the dot
+    /// matrix drives with different numbers. All twenty 1:1 marquee cases
+    /// measured **max |Δ| 0** of 255 on every channel under llvmpipe, at five
+    /// scroll phases across four skins, which is what makes the pin a
+    /// measurement rather than an inheritance.
+    Marquee,
+    /// `preem.textbox` (#1152) — **pinned bit-exact**, and the easiest of the
+    /// five to hold there.
+    ///
+    /// There is no falloff, no bloom and no CRT comb in this widget: the kit
+    /// `set`s flat bytes and never composites, so the shader has nothing to
+    /// round. The one place it could disagree is the rounded corner, where the
+    /// continuous `poke` is written with the ±0.5 shifts that turn it back into
+    /// the kit's integer `corner_delta` at a logical pixel centre — and that is
+    /// exactly the collapse a pin is worth taking to protect. All sixteen 1:1
+    /// cases measured max |Δ| 0 on every channel.
+    TextBox,
 }
 
 impl Kind {
@@ -247,7 +271,13 @@ impl Kind {
     /// `#[path]`-includes it *without* that gate, where an unused constant is a
     /// `dead_code` warning rather than a signal.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 3] = [Self::Scope, Self::Gauge, Self::DotMatrix];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Scope,
+        Self::Gauge,
+        Self::DotMatrix,
+        Self::Marquee,
+        Self::TextBox,
+    ];
 
     /// Whether `TROLLSHELL_PARITY_EXACT=1` holds this kind to a zero delta.
     ///
@@ -261,7 +291,7 @@ impl Kind {
     /// compiler makes them.
     pub(crate) fn pinned_exact(self) -> bool {
         match self {
-            Self::Scope | Self::Gauge | Self::DotMatrix => true,
+            Self::Scope | Self::Gauge | Self::DotMatrix | Self::Marquee | Self::TextBox => true,
         }
     }
 
@@ -321,6 +351,37 @@ impl Kind {
                 mean: 16.0,
                 max: 64,
             },
+            // Four stretched cases, one per skin, at the scroll phase with the
+            // most lit rim on the grid. Measured worst on llvmpipe: edge mean
+            // 7.386 (oled), edge max 44 (crt). **The dot matrix's numbers, and
+            // not by inheritance**: it is the same shader over the same
+            // falloff, so the same population of tiny round rims against a flat
+            // ground is what the budget bounds — and measured, the two agree to
+            // within a few 255ths. It is stated separately because a ticker's
+            // grid is denser than a readout's (no spacing column, so ~20 % more
+            // dots per row) and a future divergence must be able to move one
+            // without the other.
+            Self::Marquee => EdgeBudget {
+                mean: 16.0,
+                max: 64,
+            },
+            // Four stretched cases, one per skin. Measured worst on llvmpipe:
+            // edge mean 4.226, edge max 92 — a **different shape** from the two
+            // lattice kinds, and the one place this widget's numbers had to be
+            // taken on their own. Its edges are two things only: the rounded
+            // corner's arc and the 5×7 glyphs' own hard borders. The kit
+            // anti-aliases *neither* — it sets flat bytes — so a single edge
+            // pixel can legitimately swing by a large fraction of the
+            // field-to-ink contrast where the GL arm's box-averaged corner
+            // covers a fragment the kit left square, which is exactly the
+            // improvement. Hence a low mean (few edge pixels, most of them
+            // agreeing) against a high max: 128 would be half of full contrast
+            // and too loose to catch a mis-placed glyph, 92 is ~1.4x the worst
+            // measured single pixel and still under it.
+            Self::TextBox => EdgeBudget {
+                mean: 16.0,
+                max: 128,
+            },
             // No supersampled scope case exists: the scope's GL grid *is* the
             // kit's upscaled buffer, so there is nothing to render denser. This
             // arm is the compiler forcing a decision rather than a measurement,
@@ -340,6 +401,8 @@ impl Kind {
             Self::Scope => "scope",
             Self::Gauge => "gauge",
             Self::DotMatrix => "dot_matrix",
+            Self::Marquee => "marquee",
+            Self::TextBox => "textbox",
         }
     }
 }
@@ -1375,6 +1438,17 @@ mod tests {
                 // row in a column is whichever of the arc, a tick, the needle
                 // and the hub happens to win there, and two of those tie.
                 Kind::Gauge => (true, false),
+                // Measured at zero across five scroll phases × four skins
+                // (#1152). It runs the dot matrix's shader but on its own grid,
+                // so the measurement is its own. Not a beam, for the dot
+                // matrix's reason.
+                Kind::Marquee => (true, false),
+                // Measured at zero (#1152). The easiest of the five: the kit
+                // `set`s flat bytes with no compositing anywhere, so the only
+                // thing that could round is the corner's distance. Not a beam —
+                // a column of a text box is a stack of glyph pixels that are
+                // all exactly the ink.
+                Kind::TextBox => (true, false),
             };
             assert_eq!(
                 kind.pinned_exact(),

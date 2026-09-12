@@ -182,7 +182,10 @@ mod tests {
         }
         // …and a page that *does* have an origin still refuses a hostless
         // candidate, so the conjunct is not doing this one's work for it.
-        assert!(!navigable_in_place("https://hive.local/agent/stray/", "https://"));
+        assert!(!navigable_in_place(
+            "https://hive.local/agent/stray/",
+            "https://"
+        ));
     }
 
     /// The ordinary case: the hive's `https://<domain>/agent/<name>/`.

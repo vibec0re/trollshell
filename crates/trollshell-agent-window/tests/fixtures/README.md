@@ -20,8 +20,8 @@ something rather than against a plausible-sounding guess.
 
 `trust-bundle.pem` is a **byte-for-byte copy of `hive-ca.pem`** here (the
 generator does `cp`), because this fixture CA is self-signed and so is its own
-whole chain. A real hyperhive bundle carries the hive CA *plus the swarm root
-it is issued under*. That is why the file keeps its own name — and why only the
+whole chain. A real hyperhive bundle carries the hive CA _plus the swarm root
+it is issued under_. That is why the file keeps its own name — and why only the
 **first** assertion in `a_bundle_is_not_the_certificate_the_gateway_presents`
 is load-bearing: what `CERT_ENV` hands WebKit is the first PEM block either
 way, and that block is the CA in both shapes.

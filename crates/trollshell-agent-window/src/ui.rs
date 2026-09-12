@@ -276,7 +276,10 @@ impl Default for Header {
 /// own flag is what this layer controls and what a test should hold it to.
 #[cfg(all(test, feature = "system-tests"))]
 fn own_flags(w: &impl gtk::glib::object::ObjectExt) -> (bool, bool) {
-    (w.property::<bool>("visible"), w.property::<bool>("sensitive"))
+    (
+        w.property::<bool>("visible"),
+        w.property::<bool>("sensitive"),
+    )
 }
 
 fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
@@ -646,19 +649,25 @@ mod gtk_tests {
 
         // Failed and NeedsLogin are not running, but they are not `Stopped`
         // either — P1's rule, and the two rows #1130's M15 slipped through.
-        show(&header, &row(|r| {
-            r.running = false;
-            r.failed = true;
-        }));
+        show(
+            &header,
+            &row(|r| {
+                r.running = false;
+                r.failed = true;
+            }),
+        );
         assert_eq!(
             header.button_states(),
             [(false, false), (true, true), (true, true)],
             "failed: offered Stop, matching the card"
         );
-        show(&header, &row(|r| {
-            r.running = false;
-            r.needs_login = true;
-        }));
+        show(
+            &header,
+            &row(|r| {
+                r.running = false;
+                r.needs_login = true;
+            }),
+        );
         assert_eq!(
             header.button_states(),
             [(false, false), (true, true), (true, true)],

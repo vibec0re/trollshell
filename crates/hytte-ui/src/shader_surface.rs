@@ -1552,9 +1552,9 @@ mod imp {
                     fragColor = mix(u_bg, u_fg, texture(u_data, v_uv).r);
                 }";
 
-            let Some((window, surface, _gl)) = realised_surface_or_skip(
-                "a_refused_resource_build_is_asked_once_per_realisation",
-            ) else {
+            let Some((window, surface, _gl)) =
+                realised_surface_or_skip("a_refused_resource_build_is_asked_once_per_realisation")
+            else {
                 return;
             };
 

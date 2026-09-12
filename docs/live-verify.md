@@ -405,7 +405,7 @@ unit=<the unit above> slice=trollshell-launch.slice` — distinct from the
       per `GdkGLContext`, so after a kanshi profile switch or any other event
       that re-creates the context, a still-broken widget writes its line
       **again** (once) and the driver is asked once more — a second line after
-      a hot-plug is correct, not a regression, and its *absence* would be the
+      a hot-plug is correct, not a regression, and its _absence_ would be the
       bug.
 
 ## Agents (hyperhive)

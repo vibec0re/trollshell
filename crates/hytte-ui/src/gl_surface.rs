@@ -2011,7 +2011,11 @@ mod imp {
                 "the refusal is latched within one context (#1180 item 2)",
             );
             assert!(
-                surface.imp().refused_builds.borrow().refused(((4, 4), program)),
+                surface
+                    .imp()
+                    .refused_builds
+                    .borrow()
+                    .refused(((4, 4), program)),
                 "…keyed by (grid, program)",
             );
             assert!(
@@ -2063,7 +2067,11 @@ mod imp {
                  the refusal reported again (PR #1199 review, MEDIUM 1)",
             );
             assert!(
-                surface.imp().refused_builds.borrow().refused(((4, 4), program)),
+                surface
+                    .imp()
+                    .refused_builds
+                    .borrow()
+                    .refused(((4, 4), program)),
                 "…and re-latched against the new context, so it is still asked only once",
             );
 
@@ -2355,8 +2363,8 @@ mod tests {
         BuildKey, DATA_STRIP_REFUSED, DataFailure, GlProgram, GlUniforms, GlValue,
         MAX_STEPS_PER_RENDER, PIPELINE_BUILD_REFUSED, PROGRAM_UNREGISTERED_REFUSED, REFUSED_BUILDS,
         RENDER_TARGET_REFUSED, RefusedBuilds, WARNED_LENGTHS, WarnLatch, abandon_gl, fit_rect,
-        framebuffer_status_key, fresh_last_drawn, gl_abandoned, hgl, last_drawn_after,
-        program_key, refuse_data_strip, resources_reusable, steps_owed, warn_on_data_failure,
+        framebuffer_status_key, fresh_last_drawn, gl_abandoned, hgl, last_drawn_after, program_key,
+        refuse_data_strip, resources_reusable, steps_owed, warn_on_data_failure,
         warn_on_target_failure,
     };
     use std::cell::RefCell;
@@ -2467,10 +2475,7 @@ mod tests {
             latch.claim(program_key(GlProgram("preem.scope"))),
             "the first unregistered program is reported",
         );
-        assert!(
-            !latch.claim(program_key(GlProgram("preem.scope"))),
-            "…once",
-        );
+        assert!(!latch.claim(program_key(GlProgram("preem.scope"))), "…once",);
         assert!(
             latch.claim(program_key(GlProgram("preem.dot_matrix"))),
             "a different unregistered program must get its own line, not be silenced by the \

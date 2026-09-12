@@ -134,7 +134,9 @@ impl FakeHive {
         self.seen()
             .into_iter()
             .filter(|l| {
-                !l.contains("\"agent_status\"") && !l.contains("\"urls\"") && !l.contains("\"pending\"")
+                !l.contains("\"agent_status\"")
+                    && !l.contains("\"urls\"")
+                    && !l.contains("\"pending\"")
             })
             .collect()
     }

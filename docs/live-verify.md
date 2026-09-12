@@ -693,6 +693,52 @@ the first thing to diff.
       deliberately does not read it, so a surprise there is a spec question,
       not a decode bug.
 
+### The companion window's approvals (#947 P3 follow-up, #1141)
+
+Same hive and the same need for something in its **approval queue** as the
+section above — the difference is which surface answers it. CI proves the
+window's own `pending_for` filter (still-waiting, this agent, oldest first),
+the `Approve`/`Deny` bytes over a scripted socket, the stale-id guard, and
+that a refused write's row stays put with the reason folded into its own
+subtitle; none of that needs a display. What only a real window can show is
+whether the Settings page actually reads that way to a person looking at it,
+and whether the two surfaces (sidebar card, companion window) ever disagree
+about the same queue.
+
+- [ ] **(#1141)** **The Settings tab, not a new surface.** Open an agent's
+      companion window (row click or the sidebar's edit pen), switch to the
+      Settings tab, and with an empty queue confirm there is **no** Approvals
+      group at all — not an empty one with just a description line.
+- [ ] **(#1141)** **A queued approval shows a row there**, within one poll
+      interval of queuing it (`hivectl agent <name> request-create`, as in
+      the section above): the kind in English, the manager's description,
+      and the request stamp — same wording the sidebar's card would have
+      used, since both read `ApprovalKind::human` and the same `Approval`.
+- [ ] **(#1141)** **Approve/Deny act immediately**, from the row's own
+      buttons. Click Approve and confirm with `hivectl` (or the dashboard)
+      that the request moved to `approved` — and that the row itself
+      disappears from the Settings page within one poll, with no restart.
+      Repeat for Deny, landing on `denied`.
+- [ ] **(#1141)** **A refusal stays on the row.** Make the write fail (deny
+      the request on the dashboard first, then click Approve on the still-open
+      row in the window; or drop the user from `hive-admin`) and confirm the
+      row does **not** disappear and its subtitle grows a second line reading
+      `couldn't answer: <the hive's reason>` — no separate banner for this
+      one, unlike a refused Start/Stop/Pause on the same window.
+- [ ] **(#1141)** **Answered elsewhere drops it silently.** With the row
+      showing in the window, approve the same request from the sidebar's
+      card (or the dashboard) instead. Confirm the window's row clears on its
+      next poll, and that clicking the window's own now-stale button first
+      (if the click and the poll race) writes nothing — run the window from
+      a terminal with `RUST_LOG=trollshell_agent_window=debug` and confirm
+      the "left the queue before this window could send a decision" debug
+      line instead of a second write reaching the hive.
+- [ ] **(#1141)** **Two windows agree.** With both the sidebar card's badge
+      and the companion window open for the same agent and the same pending
+      approval, confirm neither one's decision leaves the other showing a
+      stale row past its next poll — there is no shared cache between them,
+      only the same hive answered twice.
+
 ## Plugins & launcher
 
 - [ ] **(#489)** Plugins now launch via `systemd-run --user` transient units

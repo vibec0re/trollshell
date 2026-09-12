@@ -53,7 +53,10 @@ async fn next_state(rx: &mut mpsc::UnboundedReceiver<Update>, what: &str) -> Age
 async fn seed_state(rx: &mut mpsc::UnboundedReceiver<Update>) -> AgentState {
     let state = next_state(rx, "the seed poll").await;
     assert!(
-        matches!(next(rx, "the seed's paired approvals").await, Update::Approvals(_)),
+        matches!(
+            next(rx, "the seed's paired approvals").await,
+            Update::Approvals(_)
+        ),
         "the seed poll must pair exactly one Approvals answer with its State"
     );
     state

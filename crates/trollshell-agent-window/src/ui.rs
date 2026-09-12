@@ -587,7 +587,13 @@ impl Approvals {
         self.rows
             .borrow()
             .iter()
-            .map(|w| format!("{}: {}", w.row.title(), w.row.subtitle().unwrap_or_default()))
+            .map(|w| {
+                format!(
+                    "{}: {}",
+                    w.row.title(),
+                    w.row.subtitle().unwrap_or_default()
+                )
+            })
             .collect()
     }
 

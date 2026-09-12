@@ -170,7 +170,8 @@ impl Window {
         let press = Rc::clone(&this);
         this.header.connect(move |p| press.on_press(p));
         let decide = Rc::clone(&this);
-        this.settings.connect_decision(move |d| decide.on_decision(d));
+        this.settings
+            .connect_decision(move |d| decide.on_decision(d));
         this.apply();
         this
     }
@@ -682,7 +683,11 @@ mod gtk_tests {
             reason: "agent busy".to_owned(),
         });
 
-        assert_eq!(w.banner_text(), None, "an approval refusal is inline, not a banner");
+        assert_eq!(
+            w.banner_text(),
+            None,
+            "an approval refusal is inline, not a banner"
+        );
         assert!(
             w.settings
                 .approval_row_text()

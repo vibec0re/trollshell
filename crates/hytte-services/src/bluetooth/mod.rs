@@ -748,11 +748,10 @@ mod tests {
 
         // Its binding's FIRST poll yields the hour-old failure…
         let mut signal = std::pin::pin!(action_error.signal_cloned());
-        let replayed = futures_executor::block_on(std::future::poll_fn(|cx| {
-            signal.as_mut().poll_change(cx)
-        }))
-        .expect("the signal must not end")
-        .expect("a fresh subscriber replays the current value");
+        let replayed =
+            futures_executor::block_on(std::future::poll_fn(|cx| signal.as_mut().poll_change(cx)))
+                .expect("the signal must not end")
+                .expect("a fresh subscriber replays the current value");
         assert_eq!(
             replayed.message, "Couldn't connect: timed out",
             "this replay is the bug's raw material — it is expected here",

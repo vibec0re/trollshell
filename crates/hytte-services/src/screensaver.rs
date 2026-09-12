@@ -622,7 +622,7 @@ async fn watch_owner_changes(
 /// windows this covers; a minute is far below the "until the shell restarts"
 /// the bug it closes actually lasted, and the sweep is a single `ListNames`
 /// round trip that does nothing at all when no cookie is registered.
-const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Every name currently owned on the session bus, or `None` if the broker
 /// couldn't be asked. `None` is **not** an empty list: a failed probe must
@@ -732,7 +732,11 @@ async fn reconcile_owners<P, Fut>(
     P: Fn() -> Fut,
     Fut: std::future::Future<Output = Option<Vec<String>>>,
 {
-    if owners.lock().expect("screensaver owners poisoned").is_empty() {
+    if owners
+        .lock()
+        .expect("screensaver owners poisoned")
+        .is_empty()
+    {
         return; // nothing recorded — don't even ask the broker
     }
     let Some(names) = live_names().await else {
@@ -1009,8 +1013,9 @@ mod tests {
             (3, ":1.10".to_string()),
             (4, ":1.30".to_string()),
         ]));
-        let live: HashSet<&str> =
-            [":1.20", ":1.30", "org.freedesktop.DBus"].into_iter().collect();
+        let live: HashSet<&str> = [":1.20", ":1.30", "org.freedesktop.DBus"]
+            .into_iter()
+            .collect();
 
         let mut dead = drop_cookies_with_absent_owners(&owners, &live);
         dead.sort_unstable();
@@ -1434,9 +1439,7 @@ mod system_tests {
         let polled = tokio::time::timeout(DBUS_REPLY_BUDGET, async {
             loop {
                 let owned = proxy
-                    .name_has_owner(
-                        name.try_into().expect("the client's unique name is valid"),
-                    )
+                    .name_has_owner(name.try_into().expect("the client's unique name is valid"))
                     .await
                     .unwrap_or(false);
                 if !owned {
@@ -1635,8 +1638,10 @@ mod system_tests {
         let method = xml
             .split_once(r#"<method name="Inhibit">"#)
             .and_then(|(_, rest)| rest.split_once("</method>"))
-            .map(|(body, _)| body.to_string())
-            .unwrap_or_else(|| panic!("no Inhibit method in introspection XML:\n{xml}"));
+            .map_or_else(
+                || panic!("no Inhibit method in introspection XML:\n{xml}"),
+                |(body, _)| body.to_string(),
+            );
 
         let in_args = method.matches(r#"direction="in""#).count();
         let string_in_args = method.matches(r#"type="s" direction="in""#).count();

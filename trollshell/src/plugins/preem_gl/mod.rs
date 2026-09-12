@@ -4,13 +4,19 @@
 //!
 //! The pipelines themselves and their pure `state → GlUniforms` mappings live
 //! one module per kind — [`program`] for the `Scope`, [`gauge`] for the
-//! `Gauge` (#1143), [`dot_matrix`] for the `DotMatrix` (#1144) — each
-//! referencing nothing above it, so the parity harness can `#[path]`-include
-//! the same code the shell runs. Everything that needs the *shell* — the kill
-//! switch, the fallback latch — is here, and it is deliberately kind-agnostic.
-//! #1143 predicted "a third kind is a module, a `register` line and a
-//! `preem_render` arm, with nothing in this file to change"; #1144 was exactly
-//! that, so the prediction now reads as a measurement.
+//! `Gauge` (#1143), [`dot_matrix`] for the `DotMatrix` (#1144), [`marquee`]
+//! and [`textbox`] for the two text kinds (#1152) — each referencing nothing
+//! above it, so the parity harness can `#[path]`-include the same code the
+//! shell runs. Everything that needs the *shell* — the kill switch, the
+//! fallback latch — is here, and it is deliberately kind-agnostic. #1143
+//! predicted "a third kind is a module, a `register` line and a `preem_render`
+//! arm, with nothing in this file to change"; #1144 was exactly that and #1152
+//! was exactly that twice, so the prediction now reads as a measurement.
+//!
+//! The [`marquee`] is the one module here with no shader of its own: a ticker
+//! is the **same dot hardware** as a static display on a different grid, so it
+//! registers `dot_matrix`'s pipeline under its own name and drives `site_at`'s
+//! three grid uniforms with a continuous matrix's numbers. See its module docs.
 //!
 //! # The switch: GL is the default, `TROLLSHELL_PREEM_RENDERER=cpu` is the kill switch
 //!
@@ -50,9 +56,10 @@
 //! The CPU arm is used in three cases, and only these:
 //!
 //! 1. the switch names `cpu`;
-//! 2. the widget kind has no GL arm — everything but `Scope`, `Gauge` and
-//!    `DotMatrix` today (#1143 added the second, #1144 the third, and #865's
-//!    "lets pause after those" is where the list stops until Annika says);
+//! 2. the widget kind has no GL arm — everything but `Scope`, `Gauge`,
+//!    `DotMatrix`, `Marquee` and `TextBox` today (#1143 added the second,
+//!    #1144 the third, and #1152 the two text kinds on Annika's word for the
+//!    rest of #865);
 //! 3. **a GL context could not be created**, which `hytte-ui` latches and
 //!    reports through the hook installed in [`install`]. Falling back is free
 //!    here in a way it is not for #893's shader widget: a kit widget *has* a
@@ -81,7 +88,9 @@
 
 mod dot_matrix;
 mod gauge;
+mod marquee;
 mod program;
+mod textbox;
 
 /// The parity harness's arithmetic — see the module docs there.
 ///
@@ -98,7 +107,13 @@ pub(super) use dot_matrix::{
     DOT_MATRIX, DOT_MATRIX_PIPELINE, Glyphs, dot_matrix_surface, glyphs as encode_glyphs,
 };
 pub(super) use gauge::{GAUGE, GAUGE_PIPELINE, gauge_surface};
+pub(super) use marquee::{
+    MARQUEE, MARQUEE_PIPELINE, Window, marquee_surface, window as encode_window,
+};
 pub(super) use program::{KitSurface, SCOPE, SCOPE_PIPELINE, scope_surface};
+pub(super) use textbox::{
+    Block, TEXTBOX, TEXTBOX_PIPELINE, block as encode_block, textbox_surface,
+};
 
 /// The renderer switch. `cpu` forces the kit; unset, `gl`, or anything else
 /// takes the GL arm — see the module docs for the parity numbers behind that
@@ -109,8 +124,9 @@ pub(super) const RENDERER_ENV: &str = "TROLLSHELL_PREEM_RENDERER";
 ///
 /// **Per kind, not per widget** — one answer for the whole preem renderer, and
 /// `preem_render::build` consults it in each arm that *has* a GL pipeline.
-/// Since #1144 that is the `Scope`, the `Gauge` and the `DotMatrix`; every
-/// other kind takes [`Arm::Cpu`] because there is nothing else to take.
+/// Since #1152 that is the `Scope`, the `Gauge`, the `DotMatrix`, the
+/// `Marquee` and the `TextBox`; every other kind takes [`Arm::Cpu`] because
+/// there is nothing else to take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Arm {
     /// A `GtkGLArea` running one of the pipelines [`install`] registers — the
@@ -278,6 +294,12 @@ pub(super) fn install() {
     hytte::ui::gl_surface::register(SCOPE, SCOPE_PIPELINE);
     hytte::ui::gl_surface::register(GAUGE, GAUGE_PIPELINE);
     hytte::ui::gl_surface::register(DOT_MATRIX, DOT_MATRIX_PIPELINE);
+    // The ticker's pipeline **is** the dot matrix's, under its own name so a
+    // journal line says which widget is on screen — see `marquee`'s module
+    // docs. `hytte-ui` compiles programs per surface, so the second name costs
+    // one map entry and no extra compilation.
+    hytte::ui::gl_surface::register(MARQUEE, MARQUEE_PIPELINE);
+    hytte::ui::gl_surface::register(TEXTBOX, TEXTBOX_PIPELINE);
     hytte::ui::gl_surface::set_context_failure_handler(|_reason| {
         // `hytte-ui` has already logged the reason once. What is left for the
         // host is to make the fallback actually reach the screen, and that is

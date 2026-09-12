@@ -1,6 +1,20 @@
 // `DotMatrix::render` — the unlit matrix, the lit glyph dots and the
 // composite, as **one body compiled twice**.
 //
+// **Since #1152 it draws the `Marquee` too**, and that is one uniform triple
+// rather than a second shader. A marquee is the *same dot hardware* — same
+// pitch, same bezel, same falloff painters, all carried in one shared `Dots`
+// value in `hytte-preem` — on a **continuous** grid instead of a row of
+// character cells: `marquee.rs`'s module docs say why the kit drops the cell
+// structure there ("cell structure that *travels* is exactly the artefact a
+// fixed grid removes"). So the only thing the two geometries disagree about is
+// where the grid starts and how a group of dot columns is spaced, and
+// `site_at` takes all three as uniforms: `u_origin_x`, `u_cell_cols` and
+// `u_cell_gap`. The dot matrix passes `(dot, GLYPH_W, SPACING)` — the literals
+// the body carried before — and the marquee passes `(origin_x, 1, 0)`, where
+// every "cell" is one dot column and there is no gap to skip. Nothing else in
+// this file knows which widget it is drawing.
+//
 // **The layer is a `const int LAYER` prepended by the Rust side**
 // (`dot_matrix.rs` `concat!`s it ahead of this body), exactly the way
 // `blur.frag`'s `BLUR_DIR` and `gauge.frag`'s own `LAYER` are: `GlUniforms` is
@@ -85,7 +99,15 @@ uniform int u_data_len;     // texels in the strip (0 = an empty display)
 uniform ivec2 u_grid;       // the buffer, which for this widget *is* native
 uniform ivec2 u_viewport;   // the pass's viewport — equal to the grid at 1:1
 uniform int u_dot;          // the dot pitch in buffer px (the kit's clamp)
-uniform int u_cells;        // characters on the display
+uniform int u_cells;        // cell groups across the grid: characters on a
+                            // dot matrix, dot columns on a marquee (#1152)
+uniform int u_origin_x;     // buffer x of the grid's first dot cell — `Dots::pad`
+                            // on a dot matrix, `MarqueeStrip::origin_x` (the
+                            // *centred* grid, which is wider than the pad when
+                            // the window is not a whole number of dots) on a
+                            // marquee
+uniform int u_cell_cols;    // dot columns per group: GLYPH_W, or 1 on a marquee
+uniform int u_cell_gap;     // blank dot columns after each group: SPACING, or 0
 uniform int u_ghost_on;     // 0 on a skin with no unlit matrix (the OLED)
 uniform vec4 u_ghost;       // the unlit dot colour, channels as 0..255
 uniform int u_bloom_strength;   // halo strength in 256ths; 0 = no bloom
@@ -153,9 +175,21 @@ struct Site {
     float qy;
 };
 
-// `DotMatrix::render`'s geometry, inverted: the bezel is one dot cell on every
-// side, a character advances `(GLYPH_W + SPACING) * dot`, and the spacing
-// column between two cells carries no dots because the hardware has none there.
+// The kit's grid geometry, inverted: the bezel is one dot cell top and bottom,
+// the grid starts at `u_origin_x` across, a group advances
+// `(u_cell_cols + u_cell_gap) * dot`, and the gap columns between two groups
+// carry no dots because the hardware has none there.
+//
+// On a dot matrix the group is a character cell — `u_origin_x` is `Dots::pad`,
+// `u_cell_cols` is `GLYPH_W` and `u_cell_gap` is `SPACING`, i.e. exactly the
+// literals this function carried before #1152. On a marquee the group is one
+// dot column of a continuous ticker matrix: `(origin_x, 1, 0)`, so `advance`
+// is one pitch, no `within` can reach the gap test, and `col` is always `0`.
+//
+// **The vertical axis is not parameterised**, and that is a statement rather
+// than an omission: `Dots::pad` *is* the pitch by definition and both surfaces
+// are built on one `Dots`, so `9*dot` tall with a one-cell bezel is the dot
+// hardware's own height, not the widget's.
 //
 // `p` is a **continuous** buffer coordinate. At 1:1 the caller hands it a pixel
 // centre and every value below is exact: `fx`, `within` and `u` are differences
@@ -165,7 +199,7 @@ Site site_at(vec2 p) {
     Site s = Site(false, 0, 0, 0, 0.0, 0.0);
     float pitch = float(u_dot);
     float pad = pitch;                                  // `Dots::pad`
-    float advance = float(GLYPH_W + SPACING) * pitch;   // `Dots::advance`
+    float advance = float(u_cell_cols + u_cell_gap) * pitch;
 
     float fy = p.y - pad;
     if (fy < 0.0 || fy >= float(GLYPH_H) * pitch) {
@@ -174,7 +208,7 @@ Site site_at(vec2 p) {
     float rowf = floor(fy / pitch);
     float v = fy - rowf * pitch;
 
-    float fx = p.x - pad;
+    float fx = p.x - float(u_origin_x);
     if (fx < 0.0) {
         return s;
     }
@@ -183,8 +217,8 @@ Site site_at(vec2 p) {
         return s;
     }
     float within = fx - cellf * advance;
-    if (within >= float(GLYPH_W) * pitch) {
-        return s;   // the spacing column between two cells
+    if (within >= float(u_cell_cols) * pitch) {
+        return s;   // the gap column between two cell groups
     }
     float colf = floor(within / pitch);
     float u = within - colf * pitch;
@@ -207,12 +241,16 @@ int ghost_intensity(Site s) {
     return int(falloff(s.qx, s.qy, float(u_dot * u_dot)));
 }
 
-// Is this font pixel set? The strip carries one texel per glyph column, holding
-// that column's GLYPH_H row bits with bit `row` set for a lit pixel — see
-// `dot_matrix.rs`'s `glyphs`, which builds it from `hytte_preem::font::glyph`
-// (an uncovered char already resolved to the hollow `NOTDEF` box there).
+// Is this font pixel set? The strip carries one texel per **grid column**,
+// holding that column's GLYPH_H row bits with bit `row` set for a lit pixel —
+// see `dot_matrix.rs`'s `glyphs`, which builds it from
+// `hytte_preem::font::glyph` (an uncovered char already resolved to the hollow
+// `NOTDEF` box there), and `marquee.rs`'s `window`, which takes the kit's own
+// `MarqueeStrip::window_columns` for the offset being drawn. The stride is
+// `u_cell_cols` for the same reason `site_at`'s advance is: one texel per glyph
+// column of a character cell, or one per dot column of a ticker matrix.
 bool glyph_bit(int cell, int col, int row) {
-    int index = cell * GLYPH_W + col;
+    int index = cell * u_cell_cols + col;
     if (index < 0 || index >= u_data_len) {
         return false;
     }

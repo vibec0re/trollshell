@@ -172,7 +172,7 @@ pub use split_flap::{
     FlipBoard, Mechanism,
 };
 pub use style::DisplayStyle;
-pub use textbox::TextBox;
+pub use textbox::{TextBox, TextBoxLayout};
 
 /// Install the host-resolved desktop accent as the kit's default widget tint
 /// (#376). Host-facing, not author-facing: the SDK transport runtime calls it

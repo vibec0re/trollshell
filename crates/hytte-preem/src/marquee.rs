@@ -298,6 +298,69 @@ impl MarqueeStrip {
         self.period != 0
     }
 
+    /// Dot cells across the window's **fixed** grid — the same number at every
+    /// offset, because the grid is what the message slides *through*.
+    #[must_use]
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    /// Buffer-pixel x of the grid's first dot cell. The bezel is one dot cell
+    /// or wider — a window width that is not a whole number of dots widens it
+    /// rather than clipping a dot — so this is `(window_px - cols*dot) / 2`
+    /// and not simply the pad.
+    #[must_use]
+    pub fn origin_x(&self) -> usize {
+        self.origin_x
+    }
+
+    /// The dot pitch this strip was rasterised on, in buffer pixels — the
+    /// already-clamped value [`Marquee::dot_px`] resolved.
+    #[must_use]
+    pub fn dot_px(&self) -> usize {
+        self.dots.dot()
+    }
+
+    /// The buffer width in pixels: the window, constant across offsets.
+    #[must_use]
+    pub fn width(&self) -> usize {
+        self.base.width()
+    }
+
+    /// The grid's columns at `offset`: one entry per dot cell of the window's
+    /// fixed grid, with bit `row` set exactly where [`window`](Self::window)
+    /// lights that cell's dot (top row = bit 0, [`font::GLYPH_H`] rows).
+    ///
+    /// **Published for a second renderer** (#1152: the shell's GL arm uploads
+    /// these as its per-frame glyph grid), on the [`dot_cell`] precedent — plain
+    /// data, additive, and the *same code* rather than a copy: `window` is
+    /// written in terms of this, so the two cannot drift and a test can assert
+    /// the published columns against the rendered pixels. The offset wrap, the
+    /// loop gap and the [hold rule](self#short-text-holds) are all resolved
+    /// here, so a caller never re-implements `(offset + col) % period`.
+    ///
+    /// [`dot_cell`]: super::dot_cell
+    #[must_use]
+    pub fn window_columns(&self, offset: usize) -> Vec<u8> {
+        let start = if self.period == 0 {
+            0
+        } else {
+            offset % self.period
+        };
+        (0..self.cols)
+            .map(|col| {
+                let src = if self.period == 0 {
+                    col
+                } else {
+                    (start + col) % self.period
+                };
+                // Past the bitmap is the loop gap (or the blank tail of a held
+                // message): a grid position with nothing lit on it.
+                self.bitmap.get(src).copied().unwrap_or(0)
+            })
+            .collect()
+    }
+
     /// The buffer height in pixels (constant across offsets).
     #[must_use]
     pub fn height(&self) -> usize {
@@ -320,22 +383,10 @@ impl MarqueeStrip {
         let palette = self.style.palette();
         let mut out = self.base.clone();
         let mut lit = Emission::new(out.width(), out.height());
-        let start = if self.period == 0 {
-            0
-        } else {
-            offset % self.period
-        };
-        for col in 0..self.cols {
-            let src = if self.period == 0 {
-                col
-            } else {
-                (start + col) % self.period
-            };
-            // Past the bitmap is the loop gap (or the blank tail of a held
-            // message): grid position with nothing lit on it.
-            let Some(&column) = self.bitmap.get(src) else {
-                continue;
-            };
+        // Which grid cells this offset lights — [`Self::window_columns`], so
+        // the published columns are the ones this loop reads rather than a
+        // second copy of the wrap arithmetic.
+        for (col, column) in self.window_columns(offset).into_iter().enumerate() {
             for row in 0..font::GLYPH_H {
                 if (column >> row) & 1 == 1 {
                     let (dot, pad) = (self.dots.dot(), self.dots.pad());
@@ -898,6 +949,78 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// **The published columns are the dots [`MarqueeStrip::window`] lights**
+    /// (#1152) — the additive accessor the shell's GL arm uploads as its
+    /// per-frame glyph grid, measured against the kit's own rendered pixels.
+    ///
+    /// The `dot_cell` precedent: `window_columns` is not a mirror of the wrap
+    /// arithmetic, it *is* the arithmetic (`window` iterates it), so what this
+    /// test buys is the other half — that a bit in the published column means a
+    /// lit dot **at that grid cell** in the rendered frame, at every offset a
+    /// caller can reach, including the hold rule's ignored offset and the loop
+    /// gap's blank columns.
+    ///
+    /// LCD, because it has no bloom: a lit dot is then the only thing that can
+    /// move a pixel away from the unlit reference, so `lit_cells` reads the
+    /// lattice rather than a halo.
+    ///
+    /// **Falsified** by dropping the `% self.period` from `window_columns`, by
+    /// starting its range at `1`, or by making the `None` arm light a dot.
+    #[test]
+    fn the_published_columns_are_the_dots_the_window_lights() {
+        let style = DisplayStyle::Lcd;
+        let want = reference(style, 96);
+        for text in ["", "HI", LONG, "åäö 💕 0123"] {
+            let strip = Marquee::new(style).window_px(96).render(text);
+            assert_eq!(strip.cols(), 22, "the premise: a 96 px window at pitch 4");
+            assert_eq!(strip.dot_px(), DOT, "…on the default hardware");
+            assert_eq!(strip.width(), 96, "…and the window is the buffer width");
+            for offset in [0, 1, 2, 7, strip.period().max(1) + 3, 9_999] {
+                let frame = strip.window(offset);
+                let lit = lit_cells(&strip, &frame, &want);
+                let published = strip.window_columns(offset);
+                assert_eq!(published.len(), strip.cols(), "one entry per grid cell");
+                for (col, (cell, column)) in lit.iter().zip(&published).enumerate() {
+                    for (row, on) in cell.iter().enumerate() {
+                        assert_eq!(
+                            *on,
+                            (column >> row) & 1 == 1,
+                            "{text:?} @ {offset}: cell ({col},{row})",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The grid's origin is the **centred** one, not the bezel — a window width
+    /// that is not a whole number of dots widens the margin on both sides, and
+    /// a GL arm that assumed `pad` would draw the whole lattice one or two
+    /// pixels left of the kit's.
+    ///
+    /// **Falsified** by returning `dots.pad()` from
+    /// [`MarqueeStrip::origin_x`].
+    #[test]
+    fn the_published_origin_is_the_centred_grid() {
+        for window_px in [96, 97, 98, 99, 100, 192] {
+            for px in MIN_DOT_PX..=MAX_DOT_PX {
+                let strip = Marquee::new(DisplayStyle::Lcd)
+                    .window_px(window_px)
+                    .dot_px(px)
+                    .render("HI");
+                let cols = window_px.saturating_sub(2 * px) / px;
+                assert_eq!(strip.cols(), cols, "{window_px} px at pitch {px}");
+                assert_eq!(
+                    strip.origin_x(),
+                    (window_px - cols * px) / 2,
+                    "{window_px} px at pitch {px}",
+                );
+                assert_eq!(strip.width(), window_px);
+                assert_eq!(strip.dot_px(), px);
             }
         }
     }

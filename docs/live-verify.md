@@ -2402,6 +2402,128 @@ session.
      its trail fades, but a dot matrix never animates at all, so no mapping
      pass is ever coming on its own.
 
+- [ ] **(#1152 / #865)** **The two text kinds on the GPU: the ticker and the
+      speech bubble.** Fourth and fifth kinds on the `Scope` seam, same kill
+      switch, same context-failure fallback. Annika's word for the rest of #865
+      after the pause she asked for; the kinds still on the kit are seven-seg,
+      split flap, LED strip, LED matrix and the flip board.
+
+      **The `Marquee` has no shader of its own, and that is the claim to check
+      first.** A ticker is the *same dot hardware* as a static dot matrix — the
+      kit says so itself ("same pitch, same bezel, same falloff painters … so a
+      scrolled dot is pixel-for-pixel a static one") — on a continuous grid
+      rather than a row of character cells, so it registers `dot_matrix`'s
+      pipeline under its own name (`preem.marquee`) and differs in three grid
+      uniforms. Its improvement is therefore the dot matrix's, verbatim: the
+      falloff law evaluated at the fragment's own position, so a stretched
+      ticker draws round dots at the screen's resolution. Its scroll is a
+      **texture upload**, not a uniform — #839 made a sub-dot position
+      inexpressible, so a step is a different set of lit columns, taken from the
+      kit's own `window_columns`.
+
+      **The `TextBox`'s improvement is one shape: the rounded corner.** The kit
+      decides its cut on the pre-scale buffer and replicates each logical pixel
+      `scale` times, so a `scale = 2` bubble's corner is built out of 2×2 blocks.
+      The GL arm evaluates the same distance at the fragment's own position, so
+      the arc is as round as the screen can draw it. The 5×7 glyphs are
+      deliberately **not** smoothed — the fragment is floored to a logical pixel
+      before the strip is read, so a stretched bubble gets bigger hard-edged
+      pixels and the 8-bit look survives.
+
+      What CI already holds: both golden uniform tables, the kit's published
+      `MarqueeStrip::window_columns` against its own rendered dots at every
+      offset, the kit's published `TextBox::layout` against its own rendered
+      bytes, the shader's four font metrics and its notdef bit read back out of
+      the GLSL, the corner predicate against `TextBoxLayout::field_at` at every
+      pixel of nine boxes, both node shapes, the shared `update`/`advance`
+      helpers, the kill switch, the context-failure rebuild — and, under
+      llvmpipe in `checks.system-tests`, **twenty-four** marquee cases (four
+      skins × empty / held / three scroll phases / one at a window width where
+      the centred origin and the bezel diverge — #1209 review, MEDIUM-1, so
+      the shader's `u_origin_x` uniform is actually read and not just set)
+      plus **sixteen** text-box cases (four skins × empty / one line / wrapped
+      / pinned). All forty came out **byte-identical** on Mesa 26.2.2 (max |Δ|
+      0 of 255 on every channel), so they are pinned there with the other
+      three kinds'.
+
+      Eight more cases stretch an area to twice its natural size and box-average
+      the readback back down, held to the supersampled standard rather than
+      #893's ceiling: every pixel off a rasterisation edge bit-identical
+      (`FAIL(interior)`) plus a per-kind edge budget (`FAIL(edges)`). The
+      marquee's is the dot matrix's pair, mean 16 / max 64, against a measured
+      worst of 10.781 / 40. The text box's is its own and a different *shape* of
+      number — mean 24 / max 192 against a measured worst of 14.016 / 180 —
+      because the kit anti-aliases none of this widget's edges, so every
+      legitimate disagreement is the full field-to-transparent contrast (180 on
+      the LCD, 0 on the OLED, whose field is black) and the mean is really a
+      count of moved corner fragments. What that gate cannot see, stated: on the
+      marquee every falloff-dot pixel is an `edge`, exactly as on the dot
+      matrix, so the bit-identical clause is about the flat field only; on the
+      text box the glyphs contribute *nothing* to the delta (they box-average
+      back to the kit's bytes exactly), so the budget is bounding the corner
+      alone — and there the hole has a direction. Measured: an arc one logical
+      pixel **wider** on the stretched path alone clears every gate (the lcd's
+      edge mean actually *falls*, to 8.852, because a wider arc sits closer to
+      the kit's stair); one a pixel **narrower** is caught, by the
+      bit-identical-interior clause rather than by the budget. A corner drift
+      that reaches the 1:1 path too reds 12 of the 16 pinned cases — but every
+      one of the four supersampled cases stays green under that same
+      unbranched drift, so the corner's own width has no supersampled
+      detector at all, in either direction. Two drifts the supersampled gate
+      *is* built to catch, for contrast: a glyph shifted one native pixel reds
+      all four on the edge budget (mean 37–57); the field colour alone shifted
+      +8/255 reds all four on the bit-identical-interior clause instead (mean
+      8.0–12.5). That leaves live item 2 below carrying the corner's width at
+      scale > 1 on its own — it is not a nice-to-check, it is the only check.
+
+      What only glass can answer:
+
+  1. **The bubble's corners are transparent, not black.** The most important
+     item, and the one nothing in CI can see: the harness compares **R, G and
+     B** only, and the kit's corner cut is to _transparent_ (`Frame::new`'s
+     zeros). The GL arm writes `vec4(0,0,0,0)` there, which matches the kit
+     byte for byte on the three compared channels whatever the alpha does — so
+     open the pet's or caw's bubble over a **light** background and confirm the
+     corners show the panel through rather than four black notches.
+     (`GtkGLArea:has-alpha` was removed in GTK 4.12 and the buffer always
+     carries alpha now, which is why this is expected to just work — but it is
+     expected, not measured.)
+  2. **The corner is rounder on a 2× screen or a stretched bubble — and this is
+     not a nice-to-check.** Measured above: the supersampled gate cannot see
+     the corner's own width move in either direction (an unbranched drift that
+     reds 12 of the 16 pinned 1:1 cases leaves all four supersampled ones
+     green), so this eyeball comparison is the _only_ thing standing behind
+     the arc at scale > 1. Side by side with `TROLLSHELL_PREEM_RENDERER=cpu`
+     (in the **unit's** environment — it is read once, at the first widget
+     build): at the natural size on a 1× screen the two must be
+     indistinguishable, and on HiDPI or stretched the GL arm's arc should be a
+     smooth curve where the kit's is a stair. If the stretched one looks
+     identical, the surface was not actually stretched.
+  3. **The glyphs are still square.** The same comparison, on the text itself:
+     the 5×7 pixels must stay hard-edged blocks at every size. Anything that
+     reads as a smoothed or blurry font means the strip is being sampled with a
+     filter instead of floored.
+  4. **The ticker steps dot-on-grid and the grid never moves.** Open a card with
+     a marquee (`hytte-plugin-audio-widget`'s track title, the departures
+     board). The message must step one whole dot at a time with no smearing,
+     and the **ghost lattice behind it must not move at all** — that is #839's
+     fix, and a GL arm that had encoded the bitmap instead of the window would
+     slide the whole grid.
+  5. **A short message holds.** A title that fits the grid must sit still,
+     left-aligned, however long you watch it. That is the kit's hold rule
+     reaching the GPU through `window_columns` rather than being re-implemented;
+     a ticker that creeps means the offset is being wrapped against the column
+     count somewhere.
+  6. **The ticker's dots are round when stretched**, and its halo is still
+     grid-resolution — both inherited from #1144 verbatim, since it is the same
+     blit. #1186 is the halo's follow-up and covers this kind too.
+  7. **The fallback.** Force a context failure and confirm both kinds fall back
+     to the kit with one journal line rather than a blank chip. The text box is
+     the #1144-shaped case here — it never animates, so no mapping pass is
+     coming on its own — while a scrolling ticker would recover on its next
+     step even without the hook, which is exactly why the text box is the one to
+     test.
+
 - [ ] **(#893)** **The shader widget: a plugin's own GLSL on the GPU.** A
       plugin ships a fragment body plus a data buffer; the shell compiles the
       body once and per frame re-uploads only the buffer. Everything up to the

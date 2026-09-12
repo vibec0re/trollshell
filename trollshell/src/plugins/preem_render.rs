@@ -61,11 +61,37 @@
 //! position instead, and snaps to the pixel centre at 1:1 so the two arms draw
 //! the same picture where the harness measures them.
 //!
+//! # …and the two text kinds (#1152)
+//!
+//! A [`Marquee`](vocab::PreemWidget::Marquee) takes
+//! [`Renderer::MarqueeGl`] and a [`TextBox`](vocab::PreemWidget::TextBox)
+//! takes [`Renderer::TextBoxGl`], on Annika's word for the rest of #865.
+//!
+//! The ticker needs **no shader of its own**: it is the same dot hardware as
+//! the static display on a continuous grid rather than a row of character
+//! cells, so it registers `dot_matrix`'s pipeline under its own name and
+//! drives three grid uniforms differently. Its animation is the one thing new
+//! here, and it is not a uniform: #839 made a sub-dot position inexpressible,
+//! so a scroll step is a *different set of lit columns* and the arm re-uploads
+//! the grid exactly when the whole-dot phase moves. Both arms integrate that
+//! phase through one [`marquee_step`], so `animates()` is the same expression
+//! on both and #926's clock parks identically.
+//!
+//! The text box is the *smallest* GL arm in the tree — one pass, no aux
+//! textures, no step passes, because the widget has no emission at all — and
+//! its improvement is one shape: the rounded corner, evaluated as a distance at
+//! the fragment's own resolution instead of replicated out of a logical-pixel
+//! mask. Its glyphs stay deliberately square. It is also the one arm whose
+//! mapping takes **no palette**: a `TextBox` bakes its colors at construction,
+//! so [`invalidate_cached_frames`] rebuilds this renderer exactly as it rebuilds
+//! the CPU one.
+//!
 //! The CPU arm is still the reference and is still gated byte-exactly. It is
 //! taken when `TROLLSHELL_PREEM_RENDERER=cpu` is set (the kill switch — read
 //! once at the first build), when the widget kind has no GL arm (everything but
-//! `Scope`, `Gauge` and `DotMatrix` today), or when a GL context could not be
-//! created. See [`preem_gl`](super::preem_gl) for all three.
+//! `Scope`, `Gauge`, `DotMatrix`, `Marquee` and `TextBox` today), or when a GL
+//! context could not be created. See [`preem_gl`](super::preem_gl) for all
+//! three.
 //!
 //! # What this module owns
 //!
@@ -644,6 +670,30 @@ enum Renderer {
         boxed: kit::TextBox,
         text: String,
     },
+    /// The **GPU** arm of [`TextBox`](Self::TextBox) (#1152).
+    ///
+    /// Pure, like the CPU arm, and it keeps the same `kit::TextBox` builder for
+    /// the same reason — it *is* the config, with the palette baked in, so
+    /// [`invalidate_cached_frames`] rebuilds this arm exactly as it rebuilds
+    /// that one.
+    ///
+    /// What it adds is the **resolved layout** and the **encoded block**, and
+    /// both are here rather than in the mapping for #911's reason: the wrap,
+    /// the width rule and the glyph bits are a function of the text alone, so
+    /// re-deriving them per mapping pass would wrap the message once per
+    /// monitor and again on every re-tint. [`update`](Self::update) rebuilds
+    /// them — the only time they can move, since [`apply`] short-circuits an
+    /// unchanged widget before `update` is reached — and every pass after that
+    /// clones an `Arc`.
+    TextBoxGl {
+        /// The builder, with its palette baked — see [`TextBox`](Self::TextBox).
+        boxed: kit::TextBox,
+        text: String,
+        /// The wrap, the buffer and the baked colors this text resolved to.
+        layout: kit::TextBoxLayout,
+        /// The glyph block as the shader consumes it — see `preem_gl::textbox`.
+        block: preem_gl::Block,
+    },
     LedStrip {
         strip: kit::LedStrip,
         level: f32,
@@ -665,6 +715,36 @@ enum Renderer {
         /// Scroll position in **dots**, fractional so a slow speed still moves.
         offset: f32,
         speed_dots_per_sec: f32,
+    },
+    /// The **GPU** arm of [`Marquee`](Self::Marquee) (#1152), on the
+    /// [`ScopeGl`](Self::ScopeGl) seam.
+    ///
+    /// It holds the **same `kit::MarqueeStrip`** the CPU arm holds, the way
+    /// [`GaugeGl`](Self::GaugeGl) holds the same `kit::Gauge` — and for a
+    /// sharper reason than the gauge's. The strip is not just state: it is the
+    /// *geometry oracle*. Its `cols`, `origin_x` and `dot_px` are what the
+    /// uniforms are mapped from, and its `window_columns` is what the shader's
+    /// glyph grid is encoded from, so the two arms cannot end up drawing on
+    /// different lattices. The cost is the strip's baked backdrop frame — one
+    /// window of RGBA the GL arm never reads, ~27 KiB at the kit's defaults —
+    /// paid once per message rather than per frame, which is the right side of
+    /// that trade.
+    ///
+    /// The scroll is a **texture upload**, not a uniform: #839 made a sub-dot
+    /// position inexpressible, so a step is a different set of lit columns and
+    /// [`window`](preem_gl::Window) is re-encoded exactly when the whole-dot
+    /// offset moves — in [`advance`](Self::advance), the only place it can.
+    MarqueeGl {
+        /// The rasterised message, shared with nothing — see above.
+        strip: kit::MarqueeStrip,
+        text: String,
+        /// Scroll position in **dots**, fractional so a slow speed still moves
+        /// — identical to the CPU arm's, and advanced by the same
+        /// [`marquee_step`].
+        offset: f32,
+        speed_dots_per_sec: f32,
+        /// The grid at the current whole-dot phase, as the shader consumes it.
+        window: preem_gl::Window,
     },
     Scope {
         scope: kit::Scope,
@@ -1001,13 +1081,10 @@ thread_local! {
     /// quiet end of the trade, and stated as such in the wire docs so a plugin
     /// author knows to check the journal from the top of the shell's run.
     ///
-    /// Growth is one entry per `(plugin id, tree, diagnostic)` that ever
-    /// tripped: a short `String` and two discriminants, bounded in practice by
-    /// the plugin roster. A plugin reconnecting under a *fresh* id each time
-    /// would accumulate entries, but a process that can do that already runs
-    /// code as this user.
     /// Growth is one entry per plugin tree that ever tripped anything: a short
-    /// `String` and a `u8`.
+    /// `String` and a `u8`, bounded in practice by the plugin roster. A plugin
+    /// reconnecting under a *fresh* id each time would accumulate entries, but
+    /// a process that can do that already runs code as this user.
     ///
     /// A `HashMap<Scope, u8>` bitmask rather than a `HashSet<(Scope, Warned)>`
     /// so the hot path can probe with a **borrow**. A set of pairs can only be
@@ -1763,7 +1840,14 @@ pub(super) fn invalidate_cached_frames() {
         for state in store.values_mut() {
             for instance in state.instances.values_mut() {
                 instance.cached = None;
-                if matches!(instance.renderer, Some(Renderer::TextBox { .. })) {
+                if matches!(
+                    instance.renderer,
+                    // Both arms: the GL one holds the same baked builder, and
+                    // its uniforms are mapped from the layout that builder
+                    // resolved, so dropping bytes it does not have would leave
+                    // the old palette on screen (#1152).
+                    Some(Renderer::TextBox { .. } | Renderer::TextBoxGl { .. })
+                ) {
                     instance.renderer = build(&instance.applied);
                 }
             }
@@ -2210,7 +2294,15 @@ fn dim(value: u32) -> usize {
 // about the contract: the `Option` *is* the placeholder seam, and collapsing it
 // would delete the unknown-widget path #883 is required to keep (and that
 // `an_unrenderable_preem_widget_degrades_to_an_empty_surface` covers).
-#[allow(clippy::unnecessary_wraps)]
+//
+// `too_many_lines` is [`Renderer::advance`]'s allow, for its reason and with
+// its history: this is one flat arm per widget kind with no nesting between
+// them, and it crossed the ceiling when #1152 gave two more kinds a second arm
+// each. Splitting it would put half the **construction** table somewhere else,
+// which is worse to read and worse to review than a long match — and this
+// function is also the one place a reader can see which kinds consult
+// [`preem_gl::arm`] at all.
+#[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
 fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
     use vocab::PreemWidget as W;
     #[cfg(test)]
@@ -2245,10 +2337,25 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
         W::SevenSeg { state, .. } => Renderer::SevenSeg {
             text: state.text.clone(),
         },
-        W::TextBox { config, state } => Renderer::TextBox {
-            boxed: text_box(*config, style),
-            text: state.text.clone(),
-        },
+        W::TextBox { config, state } => {
+            // GL by default (#1152), the CPU kit under the kill switch or once
+            // a context has failed — the same `preem_gl::arm` decision every
+            // other arm on this seam takes.
+            let boxed = text_box(*config, style);
+            if preem_gl::arm() == Arm::Gl {
+                let layout = boxed.layout(&state.text);
+                return Renderer::TextBoxGl {
+                    block: preem_gl::encode_block(&layout),
+                    layout,
+                    boxed,
+                    text: state.text.clone(),
+                };
+            }
+            Renderer::TextBox {
+                boxed,
+                text: state.text.clone(),
+            }
+        }
         W::LedStrip { config, state } => {
             let mut hold = config.peak_hold.map(|p| kit::PeakHold::new(p.rate));
             if let Some(hold) = hold.as_mut() {
@@ -2263,12 +2370,27 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
                 steps: Steps::default(),
             }
         }
-        W::Marquee { config, state } => Renderer::Marquee {
-            strip: marquee_strip(*config, style, &state.text),
-            text: state.text.clone(),
-            offset: 0.0,
-            speed_dots_per_sec: config.speed_dots_per_sec,
-        },
+        W::Marquee { config, state } => {
+            // GL by default (#1152). Both arms rasterise the *same* strip: on
+            // the GPU it is the geometry oracle rather than a picture — see
+            // `Renderer::MarqueeGl`.
+            let strip = marquee_strip(*config, style, &state.text);
+            if preem_gl::arm() == Arm::Gl {
+                return Renderer::MarqueeGl {
+                    window: preem_gl::encode_window(&strip, 0),
+                    strip,
+                    text: state.text.clone(),
+                    offset: 0.0,
+                    speed_dots_per_sec: config.speed_dots_per_sec,
+                };
+            }
+            Renderer::Marquee {
+                strip,
+                text: state.text.clone(),
+                offset: 0.0,
+                speed_dots_per_sec: config.speed_dots_per_sec,
+            }
+        }
         W::Scope { config, state } => {
             // GL by default, the CPU kit under the kill switch or once a
             // context has failed — `preem_gl::arm` is the whole decision, and
@@ -2391,6 +2513,93 @@ fn marquee_strip(
         .render(text)
 }
 
+/// Point a marquee renderer at a new message, returning whether it actually
+/// re-rasterised.
+///
+/// **Shared by both `Marquee` arms** (#1152), which is what keeps the palette
+/// scope below from existing on one of them only — a divergence a test that
+/// only drove the CPU arm would never see.
+///
+/// A new message re-rasterises the strip; the offset is deliberately *not*
+/// reset, so a ticker whose text changes mid-scroll keeps moving instead of
+/// snapping left (`window` wraps modulo the new period).
+///
+/// Scoped like [`build`]'s: the strip bakes the skin's field and ghost, and
+/// while today it re-resolves the *ink* per `window()` call, that is the kit's
+/// business and not a contract this call site should depend on. Since #885's
+/// palette widening the field is a pin too, and the strip does bake *that* — so
+/// the scope has to be the widened one here, not just an ink.
+///
+/// This is the **second** palette scope, and the only one a *state* change
+/// reaches: a new message leaves [`same_config`] agreeing, so [`build`] never
+/// runs and cannot cover it. `a_pinned_field_survives_a_marquee_text_change` is
+/// what measures it — before that test, narrowing this one line back to
+/// `with_ink` left the whole shell suite green.
+/// `a_pinned_field_survives_a_state_change_on_every_widget` is the enumeration
+/// behind "and no other arm bakes".
+fn remarquee(
+    strip: &mut kit::MarqueeStrip,
+    text: &mut String,
+    config: vocab::MarqueeConfig,
+    message: &str,
+) -> bool {
+    if text == message {
+        return false;
+    }
+    *strip = kit::with_pins(pins_for(config.style), || {
+        marquee_strip(config, display_style(config.style), message)
+    });
+    text.clear();
+    text.push_str(message);
+    true
+}
+
+/// Integrate a marquee's scroll offset by `dt`, returning whether the
+/// **whole-dot** position moved.
+///
+/// **Shared by both `Marquee` arms** (#1152) for [`scope_steps`]'s reason: what
+/// the two arms disagree about is what a step *does* (the CPU one re-windows a
+/// frame, the GL one re-uploads a grid), never *when* one happens — and
+/// [`Renderer::animates`] reads the same predicate, so #926's frame-clock park
+/// must not change across a kill-switch flip.
+///
+/// **The sign convention, which is a two-ended contract.** The kit takes an
+/// unsigned `window(offset)` and has no signed API to inherit from, so the
+/// direction lives entirely in whoever integrates the offset — here, and in the
+/// SDK's raster path (#884/#898). `window` reads source column
+/// `(offset + col) % period`, so a *rising* offset walks the message leftwards
+/// past the grid: the kit's documented "any monotonically increasing frame
+/// counter loops seamlessly", and the conventional ticker direction. A
+/// **positive** speed therefore raises the offset and scrolls left; a
+/// **negative** speed lowers it and scrolls right. The wire permits a negative
+/// speed (the cap is on magnitude) and the proto does not spell the direction
+/// out, so `marquee_scroll_direction_follows_the_speeds_sign` pins it against
+/// the kit — if the two ends disagree, a plugin's ticker reverses the day the
+/// host flips from raster to state.
+fn marquee_step(
+    strip: &kit::MarqueeStrip,
+    offset: &mut f32,
+    speed_dots_per_sec: f32,
+    dt: f32,
+) -> bool {
+    let period = strip.period();
+    // A message short enough to sit still, or a parked speed — the
+    // vocabulary's documented "`0.0` or non-finite parks".
+    if period == 0 || !speed_dots_per_sec.is_finite() || speed_dots_per_sec == 0.0 {
+        return false;
+    }
+    if !dt.is_finite() || dt <= 0.0 {
+        return false;
+    }
+    let before = dots(*offset, period);
+    #[allow(clippy::cast_precision_loss)]
+    let modulus = period as f32;
+    // `rem_euclid` rather than `%` so the negative case wraps into
+    // `0.0..period` instead of saturating an unsigned offset at zero.
+    *offset = (*offset + speed_dots_per_sec * dt).rem_euclid(modulus);
+    before != dots(*offset, period)
+}
+
 /// The kit `FlipBoard` a [`vocab::FlipBoardConfig`] describes, blank.
 fn flip_board(config: vocab::FlipBoardConfig, style: kit::DisplayStyle) -> kit::FlipBoard {
     let _ = style; // the board takes its skin at render time, not construction
@@ -2425,8 +2634,12 @@ impl Renderer {
                 | (Self::DotMatrixGl { .. }, W::DotMatrix { .. })
                 | (Self::SevenSeg { .. }, W::SevenSeg { .. })
                 | (Self::TextBox { .. }, W::TextBox { .. })
+                // …and the same for the two `TextBox` and `Marquee` arms
+                // (#1152).
+                | (Self::TextBoxGl { .. }, W::TextBox { .. })
                 | (Self::LedStrip { .. }, W::LedStrip { .. })
                 | (Self::Marquee { .. }, W::Marquee { .. })
+                | (Self::MarqueeGl { .. }, W::Marquee { .. })
                 | (Self::Scope { .. }, W::Scope { .. })
                 // Both `Scope` arms answer for the same wire kind: which one an
                 // instance holds is the host's choice (`preem_gl::arm`), not
@@ -2458,7 +2671,11 @@ impl Renderer {
     fn is_gl(&self) -> bool {
         matches!(
             self,
-            Self::ScopeGl { .. } | Self::GaugeGl { .. } | Self::DotMatrixGl { .. }
+            Self::ScopeGl { .. }
+                | Self::GaugeGl { .. }
+                | Self::DotMatrixGl { .. }
+                | Self::MarqueeGl { .. }
+                | Self::TextBoxGl { .. }
         )
     }
 
@@ -2483,6 +2700,28 @@ impl Renderer {
             }
             (Self::SevenSeg { text }, W::SevenSeg { state, .. }) => text.clone_from(&state.text),
             (Self::TextBox { text, .. }, W::TextBox { state, .. }) => text.clone_from(&state.text),
+            // The GL arm re-wraps and re-encodes instead of keeping the
+            // `String` alone. Reached **only** on a real state change — `apply`
+            // returns early on an unchanged widget — so it is the one place a
+            // new block can be minted, and every mapping pass between two of
+            // them clones the `Arc` rather than wrapping the message again
+            // (#911's rule). No palette scope is needed: the builder baked its
+            // colors at construction and `layout` hands those back, which is
+            // exactly why `invalidate_cached_frames` rebuilds this renderer
+            // rather than only dropping its bytes.
+            (
+                Self::TextBoxGl {
+                    boxed,
+                    text,
+                    layout,
+                    block,
+                },
+                W::TextBox { state, .. },
+            ) => {
+                text.clone_from(&state.text);
+                *layout = boxed.layout(text);
+                *block = preem_gl::encode_block(layout);
+            }
             (
                 Self::LedStrip {
                     level,
@@ -2502,31 +2741,26 @@ impl Renderer {
                 }
             }
             (Self::Marquee { strip, text, .. }, W::Marquee { config, state }) => {
-                if *text != state.text {
-                    // A new message re-rasterises the strip; the offset is
-                    // deliberately *not* reset, so a ticker whose text changes
-                    // mid-scroll keeps moving instead of snapping left.
-                    // `window` wraps modulo the new period.
-                    // Scoped like `build`'s: the strip bakes the skin's field and
-                    // ghost, and while today it re-resolves the *ink* per
-                    // `window()` call, that is the kit's business and not a
-                    // contract this call site should depend on. Since #885's
-                    // palette widening the field is a pin too, and the strip
-                    // does bake *that* — so the scope has to be the widened one
-                    // here, not just an ink.
-                    //
-                    // This is the **second** palette scope, and the only one a
-                    // *state* change reaches: a new message leaves `same_config`
-                    // agreeing, so `build` never runs and cannot cover it.
-                    // `a_pinned_field_survives_a_marquee_text_change` is what
-                    // measures it — before that test, narrowing this one line
-                    // back to `with_ink` left the whole shell suite green.
-                    // `a_pinned_field_survives_a_state_change_on_every_widget`
-                    // is the enumeration behind "and no other arm bakes".
-                    *strip = kit::with_pins(pins_for(config.style), || {
-                        marquee_strip(*config, display_style(config.style), &state.text)
-                    });
-                    text.clone_from(&state.text);
+                remarquee(strip, text, *config, &state.text);
+            }
+            // **One helper for both arms**, so the palette scope below cannot
+            // exist on one of them only. What the GL arm adds is the grid: the
+            // offset is deliberately not reset, and `window_columns` wraps it
+            // modulo the *new* period, so the shader's columns have to be
+            // re-encoded against the new strip even though the phase did not
+            // move.
+            (
+                Self::MarqueeGl {
+                    strip,
+                    text,
+                    offset,
+                    window,
+                    ..
+                },
+                W::Marquee { config, state },
+            ) => {
+                if remarquee(strip, text, *config, &state.text) {
+                    *window = preem_gl::encode_window(strip, dots(*offset, strip.period()));
                 }
             }
             (Self::Scope { pending, idle, .. }, W::Scope { state, .. })
@@ -2578,7 +2812,8 @@ impl Renderer {
             Self::DotMatrix { .. }
             | Self::DotMatrixGl { .. }
             | Self::SevenSeg { .. }
-            | Self::TextBox { .. } => false,
+            | Self::TextBox { .. }
+            | Self::TextBoxGl { .. } => false,
             Self::LedStrip {
                 hold,
                 steps,
@@ -2606,44 +2841,31 @@ impl Renderer {
                 }
                 changed(before, hold.value())
             }
+            // Both `Marquee` arms integrate through [`marquee_step`] — see
+            // there for the sign convention and why it is shared.
             Self::Marquee {
                 strip,
                 offset,
                 speed_dots_per_sec,
                 ..
+            } => marquee_step(strip, offset, *speed_dots_per_sec, dt),
+            // …and the GL arm re-uploads the grid exactly when the whole-dot
+            // phase moved, which is the entire animation of this widget on the
+            // GPU: #839 made a sub-dot position inexpressible, so there is no
+            // phase uniform to interpolate and a step *is* a different set of
+            // lit columns.
+            Self::MarqueeGl {
+                strip,
+                offset,
+                speed_dots_per_sec,
+                window,
+                ..
             } => {
-                let period = strip.period();
-                // A message short enough to sit still, or a parked speed — the
-                // vocabulary's documented "`0.0` or non-finite parks".
-                if period == 0 || !speed_dots_per_sec.is_finite() || *speed_dots_per_sec == 0.0 {
+                if !marquee_step(strip, offset, *speed_dots_per_sec, dt) {
                     return false;
                 }
-                if !dt.is_finite() || dt <= 0.0 {
-                    return false;
-                }
-                let before = dots(*offset, period);
-                #[allow(clippy::cast_precision_loss)]
-                let modulus = period as f32;
-                // **The sign convention, which is a two-ended contract.** The
-                // kit takes an unsigned `window(offset)` and has no signed API
-                // to inherit from, so the direction lives entirely in whoever
-                // integrates the offset — here, and in the SDK's raster path
-                // (#884/#898). `window` reads source column `(offset + col) %
-                // period`, so a *rising* offset walks the message leftwards past
-                // the grid: the kit's documented "any monotonically increasing
-                // frame counter loops seamlessly", and the conventional ticker
-                // direction. A **positive** speed therefore raises the offset
-                // and scrolls left; a **negative** speed lowers it and scrolls
-                // right. The wire permits a negative speed (the cap is on
-                // magnitude) and the proto does not spell the direction out, so
-                // `marquee_scroll_direction_follows_the_speeds_sign` pins it
-                // against the kit — if the two ends disagree, a plugin's ticker
-                // reverses the day the host flips from raster to state.
-                //
-                // `rem_euclid` rather than `%` so the negative case wraps into
-                // `0.0..period` instead of saturating an unsigned offset at zero.
-                *offset = (*offset + *speed_dots_per_sec * dt).rem_euclid(modulus);
-                before != dots(*offset, period)
+                *window = preem_gl::encode_window(strip, dots(*offset, strip.period()));
+                true
             }
             Self::Scope {
                 scope,
@@ -2743,7 +2965,8 @@ impl Renderer {
             Self::DotMatrix { .. }
             | Self::DotMatrixGl { .. }
             | Self::SevenSeg { .. }
-            | Self::TextBox { .. } => false,
+            | Self::TextBox { .. }
+            | Self::TextBoxGl { .. } => false,
             // A peak dot only moves while it is above the floor, has a fall
             // rate, and is actually the value being drawn: the kit clamps a
             // negative or non-finite rate to `0.0` ("never falls"), and an
@@ -2760,7 +2983,16 @@ impl Renderer {
                     && *hold_rate > 0.0
                     && hold.as_ref().is_some_and(|hold| hold.value() > 0.0)
             }
+            // **The same expression on both arms**, and for #926's reason:
+            // whether a ticker keeps its mount's tick callback armed must not
+            // depend on which renderer drew it, or a kill-switch flip would
+            // change when the shell parks.
             Self::Marquee {
+                strip,
+                speed_dots_per_sec,
+                ..
+            }
+            | Self::MarqueeGl {
                 strip,
                 speed_dots_per_sec,
                 ..
@@ -2817,7 +3049,11 @@ impl Renderer {
             } => strip.render(*level, peak_for(*explicit_peak, hold.as_ref())),
             Self::Marquee { strip, offset, .. } => strip.window(dots(*offset, strip.period())),
             Self::Scope { scope, .. } => scope.render(style),
-            Self::ScopeGl { .. } | Self::GaugeGl { .. } | Self::DotMatrixGl { .. } => return None,
+            Self::ScopeGl { .. }
+            | Self::GaugeGl { .. }
+            | Self::DotMatrixGl { .. }
+            | Self::MarqueeGl { .. }
+            | Self::TextBoxGl { .. } => return None,
             Self::Gauge { gauge } => gauge.render(style),
             Self::FlipBoard { board } => board.render(style),
         })
@@ -2878,6 +3114,24 @@ impl Renderer {
                 preem_gl::DOT_MATRIX,
                 preem_gl::dot_matrix_surface(*config, glyphs, &kit::palette_snapshot(style)),
             )),
+            // The strip is the **geometry oracle** as well as the message: the
+            // window width, the dot pitch, the grid's column count and its
+            // centred origin all come off it, which is what keeps the two arms
+            // drawing on one lattice. The grid at this phase was encoded when
+            // the phase moved, not here.
+            Self::MarqueeGl { strip, window, .. } => Some((
+                preem_gl::MARQUEE,
+                preem_gl::marquee_surface(strip, window, &kit::palette_snapshot(style)),
+            )),
+            // The **one** arm that takes no palette snapshot, and the `style`
+            // argument goes unread for it: a `TextBox` bakes its colors at
+            // construction, so `layout` already carries the ones the CPU arm
+            // would paint with — a pinned field, a pinned ink and the plugin's
+            // own `.notdef` included. Re-resolving here would silently drop all
+            // three.
+            Self::TextBoxGl { layout, block, .. } => {
+                Some((preem_gl::TEXTBOX, preem_gl::textbox_surface(layout, block)))
+            }
             _ => None,
         }
     }

@@ -230,6 +230,30 @@ pub(crate) enum Kind {
     /// exact by construction and would stop being exact silently. Zero is the
     /// only value that can say so.
     DotMatrix,
+    /// `preem.marquee` (#1152) — **pinned bit-exact**, and it inherits nothing
+    /// to say so.
+    ///
+    /// It runs the dot matrix's shader, so the *reason* zero is available is
+    /// that one (the 1:1 snap collapses the continuous falloff onto the kit's
+    /// integer table by construction) — but the geometry it collapses onto is
+    /// this widget's own: a continuous ticker grid, centred in its window
+    /// rather than inset by the bezel, addressed through three uniforms the dot
+    /// matrix drives with different numbers. All twenty 1:1 marquee cases
+    /// measured **max |Δ| 0** of 255 on every channel under llvmpipe, at five
+    /// scroll phases across four skins, which is what makes the pin a
+    /// measurement rather than an inheritance.
+    Marquee,
+    /// `preem.textbox` (#1152) — **pinned bit-exact**, and the easiest of the
+    /// five to hold there.
+    ///
+    /// There is no falloff, no bloom and no CRT comb in this widget: the kit
+    /// `set`s flat bytes and never composites, so the shader has nothing to
+    /// round. The one place it could disagree is the rounded corner, where the
+    /// continuous `poke` is written with the ±0.5 shifts that turn it back into
+    /// the kit's integer `corner_delta` at a logical pixel centre — and that is
+    /// exactly the collapse a pin is worth taking to protect. All sixteen 1:1
+    /// cases measured max |Δ| 0 on every channel.
+    TextBox,
 }
 
 impl Kind {
@@ -247,7 +271,13 @@ impl Kind {
     /// `#[path]`-includes it *without* that gate, where an unused constant is a
     /// `dead_code` warning rather than a signal.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 3] = [Self::Scope, Self::Gauge, Self::DotMatrix];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Scope,
+        Self::Gauge,
+        Self::DotMatrix,
+        Self::Marquee,
+        Self::TextBox,
+    ];
 
     /// Whether `TROLLSHELL_PARITY_EXACT=1` holds this kind to a zero delta.
     ///
@@ -261,7 +291,7 @@ impl Kind {
     /// compiler makes them.
     pub(crate) fn pinned_exact(self) -> bool {
         match self {
-            Self::Scope | Self::Gauge | Self::DotMatrix => true,
+            Self::Scope | Self::Gauge | Self::DotMatrix | Self::Marquee | Self::TextBox => true,
         }
     }
 
@@ -321,6 +351,66 @@ impl Kind {
                 mean: 16.0,
                 max: 64,
             },
+            // Four stretched cases, one per skin, at the mid-message scroll
+            // phase. Measured worst on llvmpipe: edge mean 10.781 (oled, the
+            // skin with the strongest bloom and no ghost lattice), edge max 40
+            // (crt). **The dot matrix's pair, and not by inheritance**: it is
+            // the same shader over the same falloff, so the same population of
+            // tiny round rims against a flat ground is what the budget bounds,
+            // and measured, the two kinds' worst numbers land within 0.2 and 1
+            // of each other. It is stated separately because a ticker's grid is
+            // denser than a readout's — no spacing column, so ~20 % more dots
+            // per row, and the edge bin is 2178–3070 px of 3456 against the
+            // readout's 5544–8463 of 9648 — and a future divergence must be
+            // able to move one without dragging the other.
+            Self::Marquee => EdgeBudget {
+                mean: 16.0,
+                max: 64,
+            },
+            // Four stretched cases, one per skin. Measured worst on llvmpipe:
+            // edge mean 14.016, edge max 180, both on the LCD. **A different
+            // shape from the other four kinds**, and the one place a budget had
+            // to be reasoned about rather than scaled off a measurement.
+            //
+            // This widget's edges are the rounded corner's arc and the 5×7
+            // glyphs' own borders, and the kit anti-aliases **neither** — it
+            // `set`s flat bytes. So every legitimate disagreement is a corner
+            // fragment that is field on one side and transparent black on the
+            // other, i.e. **exactly the field-to-transparent contrast**: 180 on
+            // the LCD (`169, 180, 126`), 14 on the VFD, 7 on the CRT and 0 on
+            // the OLED, whose field is black. 180 is therefore a *hard* bound
+            // rather than a sample — no renderer that draws either of the two
+            // legal colors can exceed it — and `max: 192` sits just above it so
+            // a corner drawn in some third color still shows.
+            //
+            // That makes `max` the weaker half here, and the mean is a count in
+            // disguise: 14.016 over 244 edge pixels is ~19 fragments the arc
+            // moved, and `24` allows ~33.
+            //
+            // **What this budget does and does not catch, measured rather than
+            // assumed.** An undrawn framebuffer is not its job — an all-black
+            // blit moves the *field* bin and the two blank guards fire first
+            // (19 of the 20 text-box cases go red there, all four supersampled
+            // ones among them). A corner arc **one logical pixel narrower** on
+            // the continuous branch alone is caught, and again by
+            // `Regions::interior_max` rather than by this pair: the narrower arc
+            // eats pixels the kit filled solid, which are interior. A corner arc
+            // one logical pixel **wider** on that branch alone is **not caught
+            // at all** — all 100 cases pass and the lcd's edge mean *falls* to
+            // 8.852, because a wider arc happens to sit closer to the kit's own
+            // stair than the true one does. That is the residual hole, stated in
+            // full at [`case_verdict`]. What does catch a corner drift loudly is
+            // the 1:1 half: a drift that is not deliberately gated on the snap
+            // (plain `u_corner + 1`) reds 12 of the 16 pinned cases — but every
+            // one of the four supersampled cases stays green under that same
+            // mutation, so this budget has no width-facing detector for the
+            // corner at all; [`case_verdict`] has the two mutations that *do*
+            // move it at scale > 1 (a shifted glyph, a shifted field colour),
+            // for contrast.
+            Self::TextBox => EdgeBudget {
+                mean: 24.0,
+                max: 192,
+            },
             // No supersampled scope case exists: the scope's GL grid *is* the
             // kit's upscaled buffer, so there is nothing to render denser. This
             // arm is the compiler forcing a decision rather than a measurement,
@@ -340,6 +430,8 @@ impl Kind {
             Self::Scope => "scope",
             Self::Gauge => "gauge",
             Self::DotMatrix => "dot_matrix",
+            Self::Marquee => "marquee",
+            Self::TextBox => "textbox",
         }
     }
 }
@@ -400,15 +492,52 @@ pub(crate) enum Sampling {
 ///   statement about the field *only*: every pixel of a falloff dot is an
 ///   `edge` by [`Regions`]' 4-neighbour rule, so they report `lit[n=0]`, and
 ///   the lattice, the falloff, the bloom and the comb are held by the edge
-///   budget alone. The residual hole, stated for both: a scale-only drift
-///   *inside* an expression that still carries `* s` moves only edge pixels
-///   and clears the budget — a tick or an arc 50 % wider on the gauge; a dot
-///   radius 5 % larger (caught on no skin; 10 % on one, oled) or a halo 25 %
-///   stronger (caught on none, edge mean ≤ 12.245 / max ≤ 48 against 16 / 64)
-///   on the dot matrix; neither the source scan nor the region split sees it.
-///   #893's ceiling is deliberately **not** applied here: it is a statement
-///   about rounding between two renders of one picture, and half the frame's
-///   pixels are edges on a dial.
+///   budget alone. **The four marquee cases are the same statement** (#1152),
+///   for the same reason — the same falloff over a denser grid, `lit[n=0]` on
+///   all four — so everything said about the dot matrix here applies to the
+///   ticker unchanged.
+///
+///   The four **text box** cases (#1152) are a third shape, and the narrowest:
+///   a text box has no emission at all, so its edge bin is the rounded
+///   corner's arc plus the glyph borders and nothing else — 194 to 244 pixels
+///   of 759, against an interior of 503–565 that is bit-identical. Its glyphs
+///   are `floor`ed to a logical pixel before the strip is read, so they
+///   box-average back to the kit's own bytes exactly and contribute *nothing*
+///   to the delta: what its budget bounds is the corner alone.
+///
+///   The residual hole, stated for all of them: a scale-only drift *inside* an
+///   expression that still carries `* s` moves only edge pixels and clears the
+///   budget — a tick or an arc 50 % wider on the gauge; a dot radius 5 %
+///   larger (caught on no skin; 10 % on one, oled) or a halo 25 % stronger
+///   (caught on none, edge mean ≤ 12.245 / max ≤ 48 against 16 / 64) on the
+///   dot matrix and, by construction, on the marquee.
+///
+///   **On the text box the hole has a direction, and it is worth knowing
+///   which.** Measured: a corner arc one logical pixel **wider** on the
+///   continuous branch alone is not caught at all — all 100 cases pass and the
+///   lcd's edge mean *falls* from 14.016 to 8.852, because a wider arc happens
+///   to sit closer to the kit's own stair than the true one does. One a logical
+///   pixel **narrower** is caught, but by [`Regions::interior_max`] rather than
+///   by the edge budget: a narrower arc eats pixels the kit filled solid, and
+///   those are interior. The asymmetry is the arc's own property — it only ever
+///   *adds* material relative to the kit's discrete disc
+///   (`textbox::tests::the_unbiased_arc_fills_the_buffers_own_edges` asserts
+///   exactly that), so widening it moves pixels the kit had already classified
+///   as edges. What does catch a corner drift loudly is the 1:1 half: a drift
+///   that is not deliberately gated on the snap reds 12 of the 16 pinned
+///   cases — **and leaves all four supersampled cases green**, so the corner's
+///   own width has no supersampled detector at all, in either direction, at
+///   scale > 1. Two drifts the supersampled gate *is* built to catch, for
+///   contrast: a glyph shifted one native pixel (`u_viewport != u_grid`) reds
+///   all four on the edge budget, mean 37.180–57.216 against 24/192; the field
+///   colour alone shifted +8/255 reds all four on [`Regions::interior_max`]
+///   instead, mean 8.000–12.506. Both are caught outright — the corner's width
+///   is the one thing this gate cannot see moving.
+///
+///   Neither the source scan nor the region split sees any of these. #893's
+///   ceiling is deliberately **not** applied here: it is a statement about
+///   rounding between two renders of one picture, and half the frame's pixels
+///   are edges on a dial.
 pub(crate) fn case_verdict(
     stats: &Stats,
     regions: &Regions,
@@ -1311,6 +1440,97 @@ mod tests {
         );
     }
 
+    /// **The two text kinds' budgets are their own measurements** (#1152), and
+    /// the text box's is a different *shape* of number rather than a different
+    /// value of the same one.
+    ///
+    /// The marquee's worst llvmpipe measurement (edge mean 10.781 on the oled,
+    /// edge max 40 on the crt) lands inside the dot matrix's pair, which is
+    /// what one shader over one falloff should do — so this asserts it rather
+    /// than assuming it. The text box's (edge mean 14.016, edge max 180, both
+    /// on the lcd) does **not**: its edges are not anti-aliased by the kit at
+    /// all, so each legitimate disagreement is the full field-to-transparent
+    /// contrast and the numbers are a count in disguise. Under the two lattice
+    /// kinds' pair its own worst measurement fails outright, which is the
+    /// assertion with the teeth here.
+    ///
+    /// **Falsified** by collapsing [`Kind::edge_budget`]'s arms onto one pair —
+    /// the third assertion goes red — or by pointing either text kind at the
+    /// other's numbers.
+    #[test]
+    fn the_text_kinds_get_their_own_edge_budgets() {
+        let edgy = Stats {
+            channels: [ChannelStats {
+                mean: 5.0,
+                p99: 60.0,
+                max: 180.0,
+            }; 3],
+            ..inside_by(0.0)
+        };
+        let mut ticker = clean_regions();
+        ticker.edge.mean = 10.781;
+        ticker.edge.max = 40;
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &ticker,
+                Kind::Marquee,
+                Sampling::Supersampled(2),
+                true
+            ),
+            Verdict::Pass,
+            "the stretched ticker's own worst llvmpipe measurement passes",
+        );
+        let mut bubble = clean_regions();
+        bubble.edge.mean = 14.016;
+        bubble.edge.max = 180;
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &bubble,
+                Kind::TextBox,
+                Sampling::Supersampled(2),
+                true
+            ),
+            Verdict::Pass,
+            "…and so does the stretched bubble's",
+        );
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &bubble,
+                Kind::Marquee,
+                Sampling::Supersampled(2),
+                true
+            ),
+            Verdict::EdgeOverBudget,
+            "**but not under the lattice kinds' pair**: a text box's corner \
+             fragment is field-or-transparent with nothing in between, so its \
+             worst pixel is a full 180 where a dot's rim step is 40",
+        );
+        let mut bubble_over = bubble;
+        bubble_over.edge.mean = Kind::TextBox.edge_budget().mean + 0.001;
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &bubble_over,
+                Kind::TextBox,
+                Sampling::Supersampled(2),
+                true,
+            ),
+            Verdict::EdgeOverBudget,
+            "…and the mean is the half that carries this kind — it is a count of \
+             moved corner fragments, since each one contributes the same contrast",
+        );
+        // What this pair does **not** catch is written down at
+        // `Kind::edge_budget` and `case_verdict` with the measurement behind
+        // it: a corner arc a logical pixel wider on the continuous branch alone
+        // clears it (the edge mean falls), and a narrower one is caught by
+        // `interior_max` instead. Neither is asserted here, because neither is
+        // a property of this function — they are properties of the shader, and
+        // the honest place for them is the doc a reader reaches first.
+    }
+
     /// The `TROLLSHELL_PARITY_EXACT=1` pin binds the **dot matrix** too
     /// (#1144): llvmpipe measured `max |Δ| 0` on all twenty of its 1:1 cases.
     ///
@@ -1375,6 +1595,17 @@ mod tests {
                 // row in a column is whichever of the arc, a tick, the needle
                 // and the hub happens to win there, and two of those tie.
                 Kind::Gauge => (true, false),
+                // Measured at zero across five scroll phases × four skins
+                // (#1152). It runs the dot matrix's shader but on its own grid,
+                // so the measurement is its own. Not a beam, for the dot
+                // matrix's reason.
+                Kind::Marquee => (true, false),
+                // Measured at zero (#1152). The easiest of the five: the kit
+                // `set`s flat bytes with no compositing anywhere, so the only
+                // thing that could round is the corner's distance. Not a beam —
+                // a column of a text box is a stack of glyph pixels that are
+                // all exactly the ink.
+                Kind::TextBox => (true, false),
             };
             assert_eq!(
                 kind.pinned_exact(),

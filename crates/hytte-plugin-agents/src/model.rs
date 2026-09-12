@@ -4,10 +4,10 @@
 //! and [`crate::view`] projects it. That is what makes the status precedence
 //! and the grouping testable without a socket, a host, or a wall clock.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::AgentsConfig;
-use crate::hive::wire::{AgentStatusRow, VersionMismatch};
+use crate::hive::wire::{AgentStatusRow, Approval, VersionMismatch};
 
 /// A hive-reported agent name that has passed the whitelist.
 ///
@@ -213,8 +213,82 @@ impl Agent {
     }
 }
 
+/// The hive's approval queue, filtered to what is still waiting on a human and
+/// ordered oldest first (#947 P3, spec §6.5).
+///
+/// A type rather than a bare `Vec<Approval>` because three call sites ask it
+/// three different questions — "how many badges does this row wear", "which one
+/// does a badge click raise", "which one has never been prompted" — and each of
+/// those answers has to agree about *ordering* or the badge and the prompt
+/// would disagree about which approval is the oldest. Construct it through
+/// [`crate::hive::wire::Response::pending_approvals`], which is the one place
+/// the filter and the sort live.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PendingApprovals {
+    /// Status-`Pending` rows, ascending by id — the invariant every method
+    /// below reads.
+    queue: Vec<Approval>,
+}
+
+impl PendingApprovals {
+    /// Wrap an already-filtered, already-ordered queue.
+    #[must_use]
+    pub fn new(queue: Vec<Approval>) -> Self {
+        Self { queue }
+    }
+
+    /// The whole queue, oldest first.
+    #[must_use]
+    pub fn all(&self) -> &[Approval] {
+        &self.queue
+    }
+
+    /// Whether `id` is still waiting on a human.
+    ///
+    /// The question every decision path asks before acting: an approval that
+    /// left the queue between the prompt and the answer (the operator used the
+    /// dashboard, or `hivectl`) must be dropped, not re-decided — spec §6.5's
+    /// "dropped with a debug line, not an error".
+    #[must_use]
+    pub fn contains(&self, id: i64) -> bool {
+        self.queue.iter().any(|a| a.id == id)
+    }
+
+    /// How many approvals `agent` is waiting on — the badge's count.
+    #[must_use]
+    pub fn count_for(&self, agent: &str) -> usize {
+        self.queue.iter().filter(|a| a.agent == agent).count()
+    }
+
+    /// The oldest approval `agent` is waiting on — what its badge click raises.
+    #[must_use]
+    pub fn oldest_for(&self, agent: &str) -> Option<&Approval> {
+        self.queue.iter().find(|a| a.agent == agent)
+    }
+
+    /// The oldest approval no prompt has been raised for yet.
+    ///
+    /// `prompted` is the dedup set: an approval prompts **once** and then waits
+    /// for a decision or a badge click, so a hive with one unanswered approval
+    /// does not raise a modal every poll.
+    #[must_use]
+    pub fn oldest_unprompted<'a>(&'a self, prompted: &BTreeSet<i64>) -> Option<&'a Approval> {
+        self.queue.iter().find(|a| !prompted.contains(&a.id))
+    }
+}
+
 /// The badge icon for `needs_update` (spec §6.2's badge row).
 pub const UPDATE_BADGE_ICON: &str = "software-update-available-symbolic";
+
+/// The badge icon for a pending approval (#947 P3).
+///
+/// A **question**, not a warning: an approval is the hive asking, and the row's
+/// warning vocabulary (`failed`, `needs_login`) is already spoken for by
+/// [`Status`], which this badge must not be mistaken for.
+pub const APPROVAL_BADGE_ICON: &str = "dialog-question-symbolic";
+
+/// The approval badge's style class.
+pub const APPROVAL_BADGE_CLASS: &str = "ts-agent-approvals";
 
 /// The badge's style class.
 pub const UPDATE_BADGE_CLASS: &str = "ts-agent-upd";

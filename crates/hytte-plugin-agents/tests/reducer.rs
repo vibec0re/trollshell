@@ -764,15 +764,20 @@ fn the_visibility_edge_reaches_the_poll_task() {
 }
 
 /// The manifest is the plugin's whole trust declaration, so it is pinned:
-/// `OpenPage` + `Notify` + `OpenUri` + `RunCommand` and nothing else.
-/// `RunCommand` arrived with P2's companion window (#950) and is the
+/// `OpenPage` + `Notify` + `OpenUri` + `RunCommand` + `Consent` and nothing
+/// else. `RunCommand` arrived with P2's companion window (#950) and is the
 /// highest-trust capability in the vocabulary, which is why the one argv this
 /// plugin can build is a constant binary plus a re-parsed `AgentName`
-/// (`window::argv`). **`Consent` is still P3** — a plugin that quietly declared
-/// it would be granted an authority the row has not earned yet (spec §11 rules
-/// two and three, §13).
+/// (`window::argv`). **`Consent` arrived with #947 P3** — withheld through P1
+/// and P2 on purpose (spec §11 rules two and three, §13), so the row was
+/// trustworthy before it could raise a modal that approves a config change.
+///
+/// Declaring it is load-bearing twice: without it the SDK drops every
+/// `RequestConsent` this plugin emits (#1058), *and* the host never pushes the
+/// `ConsentDecision` back (the #305 opt-in), so the prompt would neither appear
+/// nor be answerable.
 #[test]
-fn the_manifest_declares_exactly_four_capabilities_and_no_secrets() {
+fn the_manifest_declares_exactly_five_capabilities_and_no_secrets() {
     use hytte_plugin::proto::{Capability, Mount, StateKey};
     let m = Agents::manifest();
     assert_eq!(m.id, "agents");
@@ -784,9 +789,19 @@ fn the_manifest_declares_exactly_four_capabilities_and_no_secrets() {
             Capability::Notify,
             Capability::OpenUri,
             Capability::RunCommand,
+            Capability::Consent,
         ]
     );
-    assert!(!m.capabilities.contains(&Capability::Consent));
+    // Still nothing that reads the operator's own data: an approval prompt is
+    // the hive asking about itself.
+    for denied in [
+        Capability::Calendar,
+        Capability::SessionState,
+        Capability::NowPlaying,
+        Capability::DatasourceProvider,
+    ] {
+        assert!(!m.capabilities.contains(&denied), "{denied:?}");
+    }
     assert_eq!(
         m.subscribes,
         vec![StateKey::Clock, StateKey::SlotVisible],

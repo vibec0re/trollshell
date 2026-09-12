@@ -571,31 +571,52 @@ impl Approvals {
 
     /// Retarget the rows by id rather than rebuilding them (#1149 N2).
     ///
-    /// `Settings::apply` runs on **every** poll, whether or not the queue
-    /// changed, and it used to rebuild every approval row on every call —
-    /// cheap at today's queue sizes, but H1's in-flight latch (#1146's
-    /// review) means a row can now hold state (`in_flight`, a refusal
-    /// reason) across polls, so a plain status change elsewhere on the
-    /// window tore down and rebuilt buttons for a queue that had not moved,
-    /// and any click racing that rebuild would land on a widget about to be
-    /// replaced. An id present in both the last apply and this one keeps its
-    /// own `AdwActionRow` and its own two buttons — only the delta (an id
-    /// leaving, or a new one arriving) touches the container — the same
-    /// "retarget, not rebuild" the Agents tab's detail pane uses
-    /// (`trollshell-control-center/src/agents_tab.rs`).
+    /// `Settings::apply` runs on every **changed** poll — `poll_once` dedups
+    /// both `State` and `Approvals`, so an unchanged hive repaints nothing
+    /// (this round's review, NIT) — and it used to rebuild every approval row
+    /// on every one of those. Cheap at today's queue sizes, but H1's
+    /// in-flight latch (#1146's review) means a row can now hold state
+    /// (`in_flight`, a refusal reason) across polls, so a plain status change
+    /// elsewhere on the window tore down and rebuilt buttons for a queue that
+    /// had not moved. What that costs in practice is a **press/release
+    /// straddling a repaint**: GTK delivers a click to the widget that got
+    /// the press, and on a two-second cadence a rebuilt button silently drops
+    /// it. (Focus is the other half of that argument and is deliberately
+    /// *not* claimed here: a `#[gtk::test]` for it had zero detection power —
+    /// it passed with a forced full rebuild too, because `GtkWindowExt::focus`
+    /// is bookkeeping on a window xvfb never really realises. Live-verify,
+    /// not shipped.)
     ///
-    /// The refusal row is still a plain take-and-rebuild: it is one row with
-    /// no id and no buttons, so there is nothing to retarget it *by*.
+    /// An id present in both the last apply and this one keeps its own
+    /// `AdwActionRow` and its own two buttons, **and its own place in the
+    /// container**: only the delta is added or removed. `AdwPreferencesGroup`
+    /// can only `add` (append) and `remove`, so "in place" holds exactly when
+    /// the surviving ids keep their relative order and every arrival sorts
+    /// after the last of them — which is the ordinary case, since
+    /// `chrome::pending_for` hands the queue over oldest-first, so departures
+    /// come out of the middle and arrivals go on the end. Anything else (a
+    /// genuine reorder, a backdated arrival, a refusal row that has to sit
+    /// first) falls back to detaching the survivors and re-adding them in the
+    /// new order — still the same `GObject`s, just re-parented.
+    ///
+    /// The refusal row is a plain take-and-rebuild: it is one row with no id
+    /// and no buttons, so there is nothing to retarget it *by*. Its presence
+    /// forces the fallback path, because it has to be added before the rows
+    /// and only an append is available — in practice it never competes with
+    /// any, since a refused queue clears `pending` first (`Window::update`).
     pub fn apply(&self, approvals: &[ApprovalRow], refused: Option<&str>) {
         let mut existing = self.rows.borrow_mut();
 
-        // Detach every currently-mounted approval row up front — including
-        // ones about to be retargeted, which are re-added below in
-        // `approvals`' order. `remove` un-parents a widget without dropping
-        // it, so a retargeted row's `GObject` (and its buttons' click
-        // handlers) survive this untouched.
-        for w in existing.iter() {
-            self.root.remove(&w.row);
+        // Detach only the rows whose id left the queue. `remove` un-parents a
+        // widget without dropping it; dropping the struct at the end of this
+        // function is what tears a leaver's widgets down.
+        let mut kept: Vec<ApprovalRowWidgets> = Vec::new();
+        for w in existing.drain(..) {
+            if approvals.iter().any(|a| a.id == w.id) {
+                kept.push(w);
+            } else {
+                self.root.remove(&w.row);
+            }
         }
         if let Some(row) = self.refusal.borrow_mut().take() {
             self.root.remove(&row);
@@ -620,10 +641,19 @@ impl Approvals {
             *self.refusal.borrow_mut() = Some(row);
         }
 
+        let in_place = refused.is_none() && Self::appendable(&kept, approvals);
+        if !in_place {
+            // A reorder: the survivors have to come back in the new order,
+            // and appending is the only placement this container offers.
+            for w in &kept {
+                self.root.remove(&w.row);
+            }
+        }
+
         let mut next = Vec::with_capacity(approvals.len());
         for a in approvals {
-            let widgets = if let Some(pos) = existing.iter().position(|w| w.id == a.id) {
-                let w = existing.remove(pos);
+            let widgets = if let Some(pos) = kept.iter().position(|w| w.id == a.id) {
+                let w = kept.remove(pos);
                 w.row.set_title(&a.title);
                 w.row.set_subtitle(&a.subtitle());
                 // **The latch** (#1146's review, H1), re-applied on the
@@ -636,17 +666,39 @@ impl Approvals {
                 // already succeeded.
                 w.approve.set_sensitive(!a.in_flight);
                 w.deny.set_sensitive(!a.in_flight);
+                if !in_place {
+                    self.root.add(&w.row);
+                }
                 w
             } else {
-                self.build_row(a)
+                let w = self.build_row(a);
+                self.root.add(&w.row);
+                w
             };
-            self.root.add(&widgets.row);
             next.push(widgets);
         }
-        // Whatever is left in `existing` had no match in `approvals` — an
-        // id that left the queue. Already detached above; dropping the
-        // struct here is what tears its widgets down.
         *existing = next;
+    }
+
+    /// Whether `approvals` can be rendered by **appending** its new ids to the
+    /// rows already mounted: every survivor keeps its relative order, and no
+    /// survivor comes after an arrival.
+    ///
+    /// `kept` is in container order (it was drained from the tracked `Vec`,
+    /// which is that order), so this is a single walk down `approvals`.
+    fn appendable(kept: &[ApprovalRowWidgets], approvals: &[ApprovalRow]) -> bool {
+        let mut survivors = kept.iter();
+        let mut seen_arrival = false;
+        for a in approvals {
+            if kept.iter().any(|w| w.id == a.id) {
+                if seen_arrival || survivors.next().map(|w| w.id) != Some(a.id) {
+                    return false;
+                }
+            } else {
+                seen_arrival = true;
+            }
+        }
+        survivors.next().is_none()
     }
 
     /// Build one approval row's widgets and wire its two buttons — the "new
@@ -1175,6 +1227,71 @@ mod gtk_tests {
                 .any(|r| r == "Model: claude-opus-5-20262981"),
             "{:?}",
             settings.row_text()
+        );
+    }
+
+    /// One approval row model, with everything but the id fixed.
+    fn approval_row(id: i64) -> crate::chrome::ApprovalRow {
+        crate::chrome::ApprovalRow {
+            id,
+            title: format!("Approve #{id}"),
+            detail: format!("test approval #{id}"),
+            refused: None,
+            in_flight: false,
+        }
+    }
+
+    /// **A reorder re-adds the same rows in the new order** — the fallback
+    /// half of [`super::Approvals::apply`]'s retarget (#1149 N2, this round's
+    /// review LOW 2).
+    ///
+    /// Driven against [`super::Approvals`] directly rather than through the
+    /// window, because the window cannot produce this input:
+    /// `PendingApprovals::new` sorts the queue by id and the hive's ids only
+    /// grow, so a survivor never moves relative to another survivor. That is
+    /// exactly why the fallback needs its own test — nothing upstream of here
+    /// can reach it, and `AdwPreferencesGroup` has no insert, so an
+    /// out-of-order apply that only appended would silently render the queue
+    /// in the wrong order.
+    ///
+    /// Both halves are asserted: the rows come back in the new order, and
+    /// they are the **same** `GObject`s (so a press still carries the id its
+    /// closure captured — the second assertion presses one to prove it).
+    ///
+    /// Mutation (verified red): drop the `if !in_place` detach in
+    /// `Approvals::apply` and the order assertion reds — the rows stay in
+    /// their old order while the model says otherwise.
+    #[gtk::test]
+    fn a_reordered_queue_re_adds_the_same_rows_in_the_new_order() {
+        let approvals = super::Approvals::new();
+        let pressed: Rc<RefCell<Vec<super::Decision>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&pressed);
+        approvals.connect(move |d| sink.borrow_mut().push(d));
+
+        approvals.apply(&[approval_row(1), approval_row(2)], None);
+        let (first, second) = {
+            let rows = approvals.tracked_rows();
+            (rows[0].clone(), rows[1].clone())
+        };
+
+        approvals.apply(&[approval_row(2), approval_row(1)], None);
+        let rows = approvals.tracked_rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0], second, "id 2 must now be the first row");
+        assert_eq!(rows[1], first, "id 1 must now be the second row");
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.next_sibling().is_some())
+                .collect::<Vec<_>>(),
+            [true, false],
+            "the container order must follow the model's, not the old one"
+        );
+
+        assert!(approvals.try_press_for_test(1, super::Decision::Approve(1)));
+        assert_eq!(
+            *pressed.borrow(),
+            [super::Decision::Approve(1)],
+            "the moved row's button must still name its own id"
         );
     }
 }

@@ -1260,6 +1260,101 @@ mod gtk_tests {
         );
     }
 
+    /// **Only the delta touches the container** (#1149 N2, this round's
+    /// review LOW 2) — a surviving row is not unparented and re-added.
+    ///
+    /// The first cut of the retarget preserved the `GObject` but still
+    /// detached *every* row up front and re-added the survivors in order, so
+    /// the container churn N2 set out to remove was unchanged and the doc
+    /// claiming "only the delta … touches the container" was false. `parent`
+    /// is a widget property, so the churn is directly observable: a
+    /// detach-and-re-add fires `notify::parent` twice, in place fires it not
+    /// at all.
+    ///
+    /// This drives the **production** shape end to end: the queue only ever
+    /// reaches the group id-sorted (`PendingApprovals::new` sorts by id, and
+    /// the hive's ids only grow), so a departure comes out of the middle and
+    /// an arrival goes on the end — never a reorder. The reorder *fallback*
+    /// cannot be produced through `Window::update` at all and is exercised
+    /// one level down, in `ui`'s own
+    /// `a_reordered_queue_re_adds_the_same_rows_in_the_new_order`.
+    ///
+    /// Mutation (verified red): restore the up-front
+    /// `for w in existing.iter() { self.root.remove(&w.row) }` in
+    /// `ui::Approvals::apply` and this reds at four (two applies × detach and
+    /// re-add).
+    #[gtk::test]
+    fn only_the_delta_touches_the_container_when_the_queue_grows_or_shrinks() {
+        let (w, _rx) = window();
+        w.update(Update::State(up(row())));
+        w.update(Update::Approvals(Ok(vec![
+            approval(1, "stray"),
+            approval(2, "stray"),
+        ])));
+        let survivor = w.settings.tracked_approval_rows()[0].clone();
+        let churn = Rc::new(std::cell::Cell::new(0u32));
+        let counter = Rc::clone(&churn);
+        survivor.connect_parent_notify(move |_| counter.set(counter.get() + 1));
+
+        // An arrival on the end and a departure from the middle: neither
+        // moves the row for id 1.
+        w.update(Update::Approvals(Ok(vec![
+            approval(1, "stray"),
+            approval(2, "stray"),
+            approval(3, "stray"),
+        ])));
+        w.update(Update::Approvals(Ok(vec![
+            approval(1, "stray"),
+            approval(3, "stray"),
+        ])));
+        assert_eq!(
+            churn.get(),
+            0,
+            "a surviving row was unparented and re-added — only the delta may touch the container"
+        );
+        let rows = w.settings.tracked_approval_rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0], survivor, "id 1 kept its own widget and its place");
+        assert!(
+            rows.iter().all(|r| r.parent().is_some()),
+            "every row must still be mounted"
+        );
+    }
+
+    /// **A surviving row's buttons still send its own id after the queue
+    /// moved around it** — the reviewer's added test (this round, "what I
+    /// added"), in the shape the window can actually produce.
+    ///
+    /// Sound by construction, since the match key `w.id == a.id` is the same
+    /// id the closure captured when the row was built — but the shipped
+    /// identity test proves only that the widget survives, and never presses
+    /// it. Approving the wrong request is the worst thing a retarget could
+    /// do; this measures the frame on the wire after the row above it left
+    /// the queue and every surviving row shifted up. (The reviewer's literal
+    /// version swaps two ids, which `PendingApprovals`' id sort makes
+    /// unreachable here; that path is pressed in `ui`'s own
+    /// `a_reordered_queue_re_adds_the_same_rows_in_the_new_order`.)
+    #[gtk::test]
+    fn a_shifted_queue_still_sends_the_pressed_rows_own_id() {
+        let (w, mut rx) = window();
+        w.update(Update::State(up(row())));
+        w.update(Update::Approvals(Ok(vec![
+            approval(1, "stray"),
+            approval(2, "stray"),
+            approval(3, "stray"),
+        ])));
+        w.update(Update::Approvals(Ok(vec![
+            approval(2, "stray"),
+            approval(3, "stray"),
+        ])));
+
+        assert!(w.settings.try_press_approve_for_test(3));
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Approve { id: 3 })),
+            "the button on id 3's row must still approve id 3 after the row above it left"
+        );
+    }
+
     /// **A refused queue says so, rather than looking like an empty one**
     /// (#1146's review, M1).
     ///

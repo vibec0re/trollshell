@@ -69,8 +69,14 @@ serde.workspace = true
 serde_json.workspace = true
 # `fs` reads plugins.json; `process` spawns `systemd-run --user` (#419); `time`
 # bounds the relaunch-after-key-rotation wait-until-stopped poll (#392).
+# `io-util` is `AsyncReadExt::take`, which bounds what the host reads off a
+# plugin-spawned command's pipes (#1165). It was already on transitively via
+# `hytte-plugin-proto`'s `tokio` feature, so this adds no resolved package and
+# nothing to the build — it is declared because this crate now uses it directly,
+# and a feature another crate happens to enable is not a dependency.
 tokio = { workspace = true, features = [
   "fs",
+  "io-util",
   "net",
   "process",
   "rt",

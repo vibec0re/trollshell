@@ -495,6 +495,33 @@ const RUN_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// host truncate [`EffectOutcome::output`]; keep a single reply frame small.
 const RUN_COMMAND_MAX_OUTPUT: usize = 4096;
 
+/// Cap on what the host **reads** off each of a plugin-spawned command's pipes
+/// before it stops the program (bytes, #1165).
+///
+/// [`RUN_COMMAND_MAX_OUTPUT`] is the *reply* cap and was, until #1165, the only
+/// one: `cmd.output()` buffered the child's entire stdout **and** stderr in
+/// memory and the 4 KiB truncation happened afterwards, on the way into the
+/// reply frame. So `sh -c 'yes'` — an ordinary shell one-liner, inside a
+/// 10-second timeout — grew the shell's heap by whatever a `yes` can write in
+/// ten seconds. The plugin was fine; the shell was OOM-killed.
+///
+/// The two caps bound different things and so are two numbers. The reply cap is
+/// what the plugin *sees*; this is what the host is willing to *read* before it
+/// concludes nobody will ever use the rest. **64 KiB**, 16× the reply cap, so
+/// every command whose output a plugin could plausibly act on still runs to
+/// completion and reports a real exit status — only a program streaming past
+/// sixteen times what can be returned to it is treated as runaway.
+///
+/// Past it the child is **killed** rather than drained: the host has stopped
+/// reading that pipe, so the program is about to block on a full pipe nobody
+/// will empty, and waiting out [`RUN_COMMAND_TIMEOUT`] for that would burn ten
+/// seconds of CPU to reach the same answer. The outcome is then
+/// `ok: false` with the truncated capture — honest, because the program did not
+/// finish and the host never learns an exit status — plus a `warn` naming the
+/// budget. Memory is bounded at `2 × (this + 1)` per in-flight `RunCommand`,
+/// and the effect rate cap bounds how many of those there can be.
+const RUN_COMMAND_MAX_CAPTURE: usize = 64 * 1024;
+
 /// Spawn a plugin-requested `argv` on the tokio runtime and route the
 /// [`EffectOutcome`] back to the originating plugin as [`HostMsg::EffectResult`]
 /// keyed by `id` (#510). Capability-gated upstream
@@ -522,8 +549,77 @@ fn run_command(plugin_id: &str, id: u64, argv: Vec<String>, outbound: mpsc::Send
     });
 }
 
-/// Run one `argv` to completion (bounded by [`RUN_COMMAND_TIMEOUT`]) and map it
-/// onto an [`EffectOutcome`]. stdin is `/dev/null`; stdout/stderr are captured.
+/// What [`capture_bounded`] got out of one plugin-spawned command (#1165).
+struct Captured {
+    /// The program's exit status, or `None` when it blew
+    /// [`RUN_COMMAND_MAX_CAPTURE`] and was killed — the host never learns a
+    /// status in that case, and saying so is the point of the `Option`.
+    status: Option<std::process::ExitStatus>,
+    /// stdout, at most `RUN_COMMAND_MAX_CAPTURE + 1` bytes.
+    stdout: Vec<u8>,
+    /// stderr, same bound. Captured (rather than left to fill its pipe) because
+    /// a program that blocks writing stderr never exits, which is the deadlock
+    /// `Command::output` exists to avoid.
+    stderr: Vec<u8>,
+}
+
+/// Spawn `cmd` and read **at most** [`RUN_COMMAND_MAX_CAPTURE`] bytes off each
+/// of its pipes, killing it if it produces more (#1165).
+///
+/// Three things make this not a re-spelling of `Command::output`:
+///
+/// - each pipe is read through `take(budget + 1)`, so the host's heap is
+///   bounded by the budget and not by what the child decides to write (the
+///   extra byte is what makes "at the budget" distinguishable from "over it");
+/// - both pipes are drained **concurrently**, because a program that fills
+///   stderr while the host reads stdout blocks forever on a pipe nobody empties
+///   — the deadlock `output()` was avoiding for us;
+/// - past the budget the child is **killed** instead of waited on. The host has
+///   stopped reading, so the program is about to block on a full pipe; waiting
+///   out [`RUN_COMMAND_TIMEOUT`] would spend ten seconds to reach the same
+///   answer.
+async fn capture_bounded(cmd: &mut tokio::process::Command) -> std::io::Result<Captured> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut child = cmd.spawn()?;
+    // Both are `Stdio::piped()` at every call site (the caller sets them one
+    // statement above), so `take()` always yields the handle.
+    let out_pipe = child.stdout.take().expect("RunCommand stdout is piped");
+    let err_pipe = child.stderr.take().expect("RunCommand stderr is piped");
+    let budget = RUN_COMMAND_MAX_CAPTURE as u64 + 1;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    // The two `Take`s are bound (rather than built inline in the `join!`)
+    // because a `join!` arm's temporaries die at the end of the statement while
+    // the futures still borrow them.
+    let mut out_capped = out_pipe.take(budget);
+    let mut err_capped = err_pipe.take(budget);
+    let (read_out, read_err) = tokio::join!(
+        out_capped.read_to_end(&mut stdout),
+        err_capped.read_to_end(&mut stderr),
+    );
+    read_out?;
+    read_err?;
+    // Drop the read ends before the kill/wait below, so a still-running child's
+    // next write gets EPIPE on top of it.
+    drop((out_capped, err_capped));
+    let status = if stdout.len() > RUN_COMMAND_MAX_CAPTURE || stderr.len() > RUN_COMMAND_MAX_CAPTURE
+    {
+        child.kill().await?;
+        None
+    } else {
+        Some(child.wait().await?)
+    };
+    Ok(Captured {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Run one `argv` to completion (bounded by [`RUN_COMMAND_TIMEOUT`], and by
+/// [`RUN_COMMAND_MAX_CAPTURE`] per pipe) and map it onto an [`EffectOutcome`].
+/// stdin is `/dev/null`; stdout/stderr are captured.
 pub(super) async fn execute_command(plugin_id: &str, id: u64, argv: &[String]) -> EffectOutcome {
     let Some((program, tail)) = argv.split_first() else {
         tracing::warn!(plugin = %plugin_id, id, "RunCommand with empty argv; nothing to spawn");
@@ -538,18 +634,37 @@ pub(super) async fn execute_command(plugin_id: &str, id: u64, argv: &[String]) -
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    match tokio::time::timeout(RUN_COMMAND_TIMEOUT, cmd.output()).await {
-        Ok(Ok(output)) => {
-            if output.status.success() {
-                tracing::info!(plugin = %plugin_id, id, program = %program, "plugin RunCommand finished");
-            } else {
-                tracing::warn!(
-                    plugin = %plugin_id, id, status = ?output.status,
-                    stderr = %String::from_utf8_lossy(&output.stderr),
-                    "plugin RunCommand exited non-zero",
-                );
+    match tokio::time::timeout(RUN_COMMAND_TIMEOUT, capture_bounded(&mut cmd)).await {
+        Ok(Ok(captured)) => {
+            let success = captured.status.is_some_and(|status| status.success());
+            match captured.status {
+                Some(status) if status.success() => {
+                    tracing::info!(plugin = %plugin_id, id, program = %program, "plugin RunCommand finished");
+                }
+                Some(status) => {
+                    tracing::warn!(
+                        plugin = %plugin_id, id, status = ?status,
+                        // Bounded twice over: `capture_bounded` stopped at the
+                        // capture cap, and the journal gets only the reply cap
+                        // of it — a 64 KiB `tracing` line is its own problem.
+                        stderr = %truncate_on_char_boundary(
+                            &String::from_utf8_lossy(&captured.stderr),
+                            RUN_COMMAND_MAX_OUTPUT,
+                        ),
+                        "plugin RunCommand exited non-zero",
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        plugin = %plugin_id, id, program = %program,
+                        cap = RUN_COMMAND_MAX_CAPTURE,
+                        "plugin RunCommand wrote more than the host will read; killed. The \
+                         captured prefix is returned and the outcome is a failure — the program \
+                         did not finish, so there is no exit status to report",
+                    );
+                }
             }
-            command_outcome(output.status.success(), &output.stdout)
+            command_outcome(success, &captured.stdout)
         }
         Ok(Err(e)) => {
             tracing::warn!(plugin = %plugin_id, id, program = %program, error = %e, "plugin RunCommand failed to spawn");

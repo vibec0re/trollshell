@@ -210,7 +210,8 @@ async fn killed_and_restarted_daemon_is_detected_by_with_conn_itself() {
     let mut detected = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline && !detected {
-        if let Ok(Some(state)) = tokio::time::timeout(Duration::from_millis(20), stream.next()).await
+        if let Ok(Some(state)) =
+            tokio::time::timeout(Duration::from_millis(20), stream.next()).await
             && matches!(state, PropState::Stale(42))
         {
             saw_stale = true;

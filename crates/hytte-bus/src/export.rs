@@ -89,7 +89,7 @@ impl ExportBuilder {
             // The crate's retry ramp, owned across the loop's iterations so a
             // bus that will not answer actually backs off instead of resetting
             // to 250 ms every time round. Cleared by a successful mount.
-            let mut streak = crate::backoff::FailureStreak::default();
+            let mut failures = crate::backoff::FailureStreak::default();
             loop {
                 // Stop once the caller has dropped every ExportHandle clone,
                 // unmounting the interface so a daemon that recorded our unique
@@ -120,11 +120,11 @@ impl ExportBuilder {
                         Ok(()) => {
                             tracing::debug!(path = %path, epoch = current, "exported object mounted");
                             last_epoch = current;
-                            streak.reset();
+                            failures.reset();
                         }
                         Err(e) => {
                             crate::backoff::back_off_resubscribe(
-                                &mut streak,
+                                &mut failures,
                                 "export: object-server mount",
                                 &path,
                                 &e,

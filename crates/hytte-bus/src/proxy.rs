@@ -335,7 +335,7 @@ async fn run_proxy_watcher(
     // The crate's retry ramp, owned across the loop's iterations so a bus that
     // will not answer actually backs off instead of resetting to 250 ms every
     // time round. Cleared once the subscribe and the rebuild have both worked.
-    let mut streak = crate::backoff::FailureStreak::default();
+    let mut failures = crate::backoff::FailureStreak::default();
 
     loop {
         if tracker.all_dropped() {
@@ -346,14 +346,14 @@ async fn run_proxy_watcher(
             return;
         }
 
-        let Some(mut stream) = subscribe_noc(&inner, &dest, &mut streak).await else {
+        let Some(mut stream) = subscribe_noc(&inner, &dest, &mut failures).await else {
             continue;
         };
 
         if !first_iteration && let Err(e) = do_rebuild_proxy_cache(&inner).await {
             inner.liveness.set(ProxyState::Reconnecting);
             crate::backoff::back_off_resubscribe(
-                &mut streak,
+                &mut failures,
                 "proxy: cached-proxy rebuild",
                 &dest,
                 &e,
@@ -362,7 +362,7 @@ async fn run_proxy_watcher(
             continue;
         }
         first_iteration = false;
-        streak.reset();
+        failures.reset();
 
         let current_epoch = inner.shared.epoch();
         inner.liveness.set(ProxyState::Live);
@@ -391,7 +391,7 @@ async fn run_proxy_watcher(
 async fn subscribe_noc(
     inner: &Arc<ProxyInner>,
     dest: &str,
-    streak: &mut crate::backoff::FailureStreak,
+    failures: &mut crate::backoff::FailureStreak,
 ) -> Option<zbus::MessageStream> {
     let subscribe_result = inner
         .shared
@@ -409,7 +409,7 @@ async fn subscribe_noc(
         Err(e) => {
             inner.liveness.set(ProxyState::Reconnecting);
             crate::backoff::back_off_resubscribe(
-                streak,
+                failures,
                 "proxy: NameOwnerChanged subscribe",
                 dest,
                 &e,

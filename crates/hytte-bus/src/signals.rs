@@ -351,7 +351,7 @@ async fn run_subscription(ctx: RunCtx) {
     // The crate's retry ramp, owned across the outer loop's iterations so a bus
     // that will not answer actually backs off instead of resetting to 250 ms
     // every time round. Cleared by a successful subscribe.
-    let mut streak = FailureStreak::default();
+    let mut failures = FailureStreak::default();
     // Whether a subscription has ever been established, so the `Resubscribed`
     // marker is emitted for the re-subscriptions only.
     let mut subscribed_before = false;
@@ -412,7 +412,7 @@ async fn run_subscription(ctx: RunCtx) {
 
         let stream = match stream_result {
             Ok(s) => {
-                streak.reset();
+                failures.reset();
                 // Tell consumers the subscription behind them is a new one, so
                 // a fold over emissions can re-read the state it was tracking
                 // (#1173). Deliberately *after* the subscribe succeeded and
@@ -429,7 +429,7 @@ async fn run_subscription(ctx: RunCtx) {
             }
             Err(e) => {
                 crate::backoff::back_off_resubscribe(
-                    &mut streak,
+                    &mut failures,
                     "signals: receive_signal",
                     &dest,
                     &e,

@@ -281,7 +281,7 @@ async fn a_lone_property_subscription_detects_a_dead_daemon_and_recovers() {
 
     wait_for(
         &mut stream,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         "Loaded(7) after a real detect-and-reconnect",
         |s| matches!(s, PropState::Loaded(7)),
     )
@@ -361,8 +361,7 @@ async fn a_failing_resubscribe_marks_stale_exactly_once() {
         stales.load(Ordering::Relaxed),
         1,
         "a failing re-subscribe must publish Stale on the edge only; \
-         {:?} of retries produced this many emissions",
-        WINDOW
+         {WINDOW:?} of retries produced this many emissions"
     );
 }
 
@@ -508,7 +507,7 @@ async fn a_resubscribe_reaches_the_consumer_as_a_marker() {
 
     wait_for(
         &mut items,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         "a Resubscribed marker after the broker restarted",
         |i| matches!(i, SignalItem::Resubscribed),
     )

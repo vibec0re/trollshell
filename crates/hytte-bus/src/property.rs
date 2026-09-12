@@ -233,7 +233,7 @@ async fn run_property<T>(
     // The crate's retry ramp, owned across the outer loop's iterations so a bus
     // that will not answer actually backs off instead of resetting to 250 ms
     // every time round. Cleared by a successful subscribe.
-    let mut streak = FailureStreak::default();
+    let mut failures = FailureStreak::default();
 
     loop {
         if ctx.tracker.all_dropped() {
@@ -284,12 +284,12 @@ async fn run_property<T>(
         // Live).
         let (mut changes, current_epoch) = match subscribe_properties_changed(&ctx).await {
             Ok(pair) => {
-                streak.reset();
+                failures.reset();
                 pair
             }
             Err(e) => {
                 crate::backoff::back_off_resubscribe(
-                    &mut streak,
+                    &mut failures,
                     "property: PropertiesChanged subscribe",
                     &ctx.dest,
                     &e,
@@ -299,53 +299,11 @@ async fn run_property<T>(
             }
         };
 
-        // Retry the cold Get until it succeeds (or all handles drop), backing
-        // off differently for transient (bus mid-reconnect — retry promptly)
-        // versus permanent (`ServiceUnknown`/`AccessDenied` — retry rarely so a
-        // doomed call doesn't hammer the bus at 2 Hz forever). The subscription
-        // above stays live across every retry, so a change landing mid-Get is
-        // buffered in `changes` and still replayed by `drain_changes` below.
-        let mut perm_backoff = Duration::from_millis(500);
-        let mut warned_permanent = false;
-        let initial = loop {
-            if ctx.tracker.all_dropped() {
-                tracing::debug!(
-                    dest = ctx.dest,
-                    path = ctx.path,
-                    iface = ctx.iface,
-                    name = ctx.name,
-                    "all property handles dropped (Get retry); exiting task"
-                );
-                if let Some(tx) = task_done_tx.take() {
-                    let _ = tx.send(());
-                }
-                return;
-            }
-
-            match cold_get::<T>(&ctx).await {
-                Ok(v) => break v,
-                Err(e) if e.is_transient() => {
-                    tracing::debug!(error = %e, dest = ctx.dest, path = ctx.path,
-                        iface = ctx.iface, name = ctx.name,
-                        "property Get failed (transient); will retry");
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-                Err(e) => {
-                    if warned_permanent {
-                        tracing::debug!(error = %e, dest = ctx.dest, path = ctx.path,
-                            iface = ctx.iface, name = ctx.name,
-                            retry_in_ms = perm_backoff.as_millis(),
-                            "property Get still permanently failing");
-                    } else {
-                        warned_permanent = true;
-                        tracing::warn!(error = %e, dest = ctx.dest, path = ctx.path,
-                            iface = ctx.iface, name = ctx.name,
-                            "property Get permanently failing; backing off retries");
-                    }
-                    tokio::time::sleep(perm_backoff).await;
-                    perm_backoff = (perm_backoff * 2).min(Duration::from_mins(1));
-                }
-            }
+        // Retry the cold Get until it succeeds. `None` means every handle was
+        // dropped mid-retry and the task must exit; `retry_cold_get` has
+        // already fired `task_done_tx`.
+        let Some(initial) = retry_cold_get::<T>(&ctx, &mut task_done_tx).await else {
+            return;
         };
         last = Some(initial.clone());
         writer.set(PropState::Loaded(initial));
@@ -368,6 +326,74 @@ async fn run_property<T>(
         // Brief pause before re-subscribing to avoid a tight loop on bus
         // disconnect / invalidation.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Retry the cold `Get` until it succeeds, backing off differently for
+/// transient (bus mid-reconnect — retry promptly) versus permanent
+/// (`ServiceUnknown`/`AccessDenied` — retry rarely, so a doomed call doesn't
+/// hammer the bus at 2 Hz forever).
+///
+/// The caller's `PropertiesChanged` subscription stays live across every retry,
+/// so a change landing mid-Get is buffered and still replayed by
+/// `drain_changes` afterwards.
+///
+/// Returns `None` when every [`PropertySignal`] handle was dropped while
+/// retrying — the caller must return, and `task_done_tx` has already been
+/// fired here.
+async fn retry_cold_get<T>(
+    ctx: &PropCtx,
+    task_done_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+) -> Option<T>
+where
+    T: Clone
+        + Send
+        + Sync
+        + 'static
+        + TryFrom<OwnedValue, Error = zbus::zvariant::Error>
+        + for<'v> TryFrom<Value<'v>, Error = zbus::zvariant::Error>,
+{
+    let mut perm_backoff = Duration::from_millis(500);
+    let mut warned_permanent = false;
+    loop {
+        if ctx.tracker.all_dropped() {
+            tracing::debug!(
+                dest = ctx.dest,
+                path = ctx.path,
+                iface = ctx.iface,
+                name = ctx.name,
+                "all property handles dropped (Get retry); exiting task"
+            );
+            if let Some(tx) = task_done_tx.take() {
+                let _ = tx.send(());
+            }
+            return None;
+        }
+
+        match cold_get::<T>(ctx).await {
+            Ok(v) => return Some(v),
+            Err(e) if e.is_transient() => {
+                tracing::debug!(error = %e, dest = ctx.dest, path = ctx.path,
+                    iface = ctx.iface, name = ctx.name,
+                    "property Get failed (transient); will retry");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => {
+                if warned_permanent {
+                    tracing::debug!(error = %e, dest = ctx.dest, path = ctx.path,
+                        iface = ctx.iface, name = ctx.name,
+                        retry_in_ms = perm_backoff.as_millis(),
+                        "property Get still permanently failing");
+                } else {
+                    warned_permanent = true;
+                    tracing::warn!(error = %e, dest = ctx.dest, path = ctx.path,
+                        iface = ctx.iface, name = ctx.name,
+                        "property Get permanently failing; backing off retries");
+                }
+                tokio::time::sleep(perm_backoff).await;
+                perm_backoff = (perm_backoff * 2).min(Duration::from_mins(1));
+            }
+        }
     }
 }
 

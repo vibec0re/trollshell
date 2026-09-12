@@ -32,7 +32,7 @@ use anyhow::{Context, Result};
 use futures_signals::signal::SignalExt;
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
-use hytte_bus::{BusKind, OwnNameSignal, OwnState, ProxyState, call, proxy, signals};
+use hytte_bus::{BusKind, OwnNameSignal, OwnState, ProxyState, SignalItem, call, proxy, signals};
 use hytte_reactive::{Service, registry, runtime, spawn_supervised, spawn_supervised_bounded};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -636,6 +636,80 @@ async fn watch_item(state: State, bus_name: String, object_path: String) {
 
 // ── NameOwnerChanged watcher ──────────────────────────────────────────────────
 
+/// Sweep every registered item whose owning bus name is no longer live,
+/// using a fresh `ListNames` as the source of truth — the repair for a
+/// `Resubscribed`/`Lagged` marker on the `NameOwnerChanged` subscription
+/// (#1201). Before that fix a missed release (the emission that would have
+/// called [`State::unregister_by_bus_name`]) left a dead tray icon forever,
+/// since nothing else in this fold ever re-checks a bus name once
+/// registered.
+async fn prune_dead_bus_names(state: &State) {
+    let live: Vec<String> = match call(BusKind::Session, "org.freedesktop.DBus")
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .method("ListNames")
+        .args(())
+        .send()
+        .await
+    {
+        Ok(names) => names,
+        Err(e) => {
+            tracing::warn!(error = %e, "tray: ListNames failed during re-sync; skipping this pass");
+            return;
+        }
+    };
+
+    let mut map = state.registered.lock().await;
+    let before = map.len();
+    map.retain(|_, item| live.contains(&item.bus_name));
+    let removed = before - map.len();
+    drop(map);
+
+    if removed > 0 {
+        tracing::debug!(removed, "tray: pruned dead bus names on re-sync");
+        state.rebuild_published_list().await;
+    }
+}
+
+/// Drive the `NameOwnerChanged` items stream: prune a released bus name for
+/// each ordinary emission (byte-identical to before #1201), and call
+/// `resync` once per [`SignalItem::Resubscribed`]/[`SignalItem::Lagged`]
+/// marker instead of dropping it — before #1201 this subscription was read
+/// via `events()`, which cannot represent either marker, so a missed release
+/// during a bus blip left a dead tray icon for the rest of the session (the
+/// one repair, [`prune_dead_bus_names`], relies entirely on this loop
+/// calling it). `resync` is injectable so a test can stand in for the real
+/// `ListNames` round trip with a counter.
+async fn run_owner_change_loop<S, Resync, Fut>(state: &State, mut items: S, mut resync: Resync)
+where
+    S: futures_util::Stream<Item = SignalItem> + Unpin,
+    Resync: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    while let Some(item) = items.next().await {
+        match item {
+            SignalItem::Resubscribed | SignalItem::Lagged { .. } => {
+                tracing::info!("tray NameOwnerChanged resubscribed; re-syncing owned bus names");
+                resync().await;
+            }
+            SignalItem::Event(event) => {
+                let Ok((name, _old_owner, new_owner)) =
+                    event.body.body().deserialize::<(String, String, String)>()
+                else {
+                    tracing::debug!("NameOwnerChanged parse error");
+                    continue;
+                };
+
+                // `new_owner` is empty → the bus name was released.
+                if new_owner.is_empty() {
+                    tracing::debug!(name, "bus name released, pruning tray items");
+                    state.unregister_by_bus_name(&name).await;
+                }
+            }
+        }
+    }
+}
+
 /// Subscribe to `NameOwnerChanged` on the session bus and prune items when
 /// their bus name is released.
 async fn watch_name_owner_changes(state: &State) -> Result<()> {
@@ -645,21 +719,7 @@ async fn watch_name_owner_changes(state: &State) -> Result<()> {
         .signal("NameOwnerChanged")
         .start();
 
-    let mut events = owner_changes.events();
-    while let Some(event) = events.next().await {
-        let Ok((name, _old_owner, new_owner)) =
-            event.body.body().deserialize::<(String, String, String)>()
-        else {
-            tracing::debug!("NameOwnerChanged parse error");
-            continue;
-        };
-
-        // `new_owner` is empty → the bus name was released.
-        if new_owner.is_empty() {
-            tracing::debug!(name, "bus name released, pruning tray items");
-            state.unregister_by_bus_name(&name).await;
-        }
-    }
+    run_owner_change_loop(state, owner_changes.items(), || prune_dead_bus_names(state)).await;
 
     Ok(())
 }
@@ -882,5 +942,71 @@ mod tests {
         // Bogus giant dimensions must be rejected by the bound, never overflow.
         assert!(!icon_pixmap_consistent(i32::MAX, i32::MAX, 4));
         assert!(!icon_pixmap_consistent(1 << 20, 1 << 20, 16));
+    }
+
+    // ── #1201: NameOwnerChanged re-syncs on Resubscribed/Lagged ─────────────
+
+    use super::{Mutable, SignalItem, State, run_owner_change_loop};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
+    use tokio::sync::Mutex as AsyncMutex;
+
+    fn empty_state() -> State {
+        State {
+            items: Mutable::new(Vec::new()),
+            registered: Arc::new(AsyncMutex::new(HashMap::new())),
+            ownership: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Before #1201 this loop was driven by `events()`, which cannot
+    /// represent either marker, so a missed release during a bus blip left a
+    /// dead tray icon for the rest of the session (nothing else in this fold
+    /// ever re-checks a registered bus name). Pushing exactly one marker
+    /// through `run_owner_change_loop` must call `resync` exactly once — for
+    /// both `Resubscribed` and a broadcast `Lagged`.
+    ///
+    /// Falsifiable: deleting the `Resubscribed | Lagged { .. }` arm (or
+    /// making it a no-op) drops both counts to 0.
+    #[tokio::test(flavor = "current_thread")]
+    async fn owner_change_loop_resyncs_exactly_once_per_marker() {
+        let state = empty_state();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = calls.clone();
+            let items = futures_util::stream::iter(vec![SignalItem::Resubscribed]);
+            run_owner_change_loop(&state, items, move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Resubscribed must re-sync exactly once"
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = calls.clone();
+            let items = futures_util::stream::iter(vec![SignalItem::Lagged { skipped: 5 }]);
+            run_owner_change_loop(&state, items, move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Lagged must re-sync exactly once"
+        );
     }
 }

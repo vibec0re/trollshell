@@ -237,21 +237,22 @@ MIN_WIDGET_BODIES = 1  # the preem demo's spectrum.frag
 # `scope_decay.frag` carries the whole `(v * retained) >> 8` phosphor
 # recurrence, and with a floor of five against six files its deletion was
 # green.
-MIN_SHADERS = 7
+MIN_SHADERS = 8
 # Compilations, not files: `blur.frag` is one body compiled twice. A
 # splice that stops being found (a moved `include_str!` path, a `concat!` this
 # script's parser stops recognising) drops this — today that shows up as a
 # compile failure only because the body happens not to build without its
 # splice, which is luck rather than a guard.
 #
-# Since #893 this counts all three groups (6 preem files → 7 compilations, plus
-# 1 widget stage and 1 widget body). Bumped 7 → 9 with them rather than left
-# with two compilations of slack: the whole point of a floor at the current
-# count is that it cannot tolerate a deletion, and the two per-group floors
-# below do not add up to this one on their own.
-MIN_COMPILATIONS = 11
+# Since #893 this counts all three groups (8 preem files → 11 compilations,
+# plus 1 widget stage and 1 widget body). It is kept at the current count rather
+# than left with slack: the whole point of a floor there is that it cannot
+# tolerate a deletion, and the two per-group floors below do not add up to this
+# one on their own. It moved 7 → 9 when #893 added the widget groups and
+# 11 → 13 with #1144's `dot_matrix.frag`, which is a third doubly-spliced body.
+MIN_COMPILATIONS = 13
 # Distinct bodies that must be spliced rather than compiled as written.
-MIN_SPLICED_BODIES = 2
+MIN_SPLICED_BODIES = 3
 
 # `glslangValidator` names the stage by extension. `.glsl` is deliberately
 # **absent**: it names no stage, so this script could not compile one, and

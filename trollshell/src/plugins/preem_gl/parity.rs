@@ -40,8 +40,8 @@ pub(crate) const CEILING_MAX: f64 = 32.0;
 /// Channel names, for the transcript.
 pub(crate) const CHANNELS: [&str; 3] = ["R", "G", "B"];
 
-/// Ceiling on the **mean** |Δ| over the edge region of a supersampled case
-/// (#1148 review, HIGH-2), in 255ths.
+/// What a supersampled case's **edge** region is allowed to drift by, in
+/// 255ths (#1148 review HIGH-2; per kind since #1150's review HIGH-2).
 ///
 /// A separate budget from #893's because it is a different measurement, and
 /// saying so out loud is the point. #893's ceiling bounds two renderers drawing
@@ -49,25 +49,24 @@ pub(crate) const CHANNELS: [&str; 3] = ["R", "G", "B"];
 /// supersampled case compares a box-average of a **twice-as-dense** render
 /// against a single-sample one: on every pixel the kit anti-aliased, the two
 /// have genuinely different coverage, and that difference *is* the improvement
-/// #1090 asked for. Holding it to mean 2 would be asking the fix not to happen —
-/// measured on llvmpipe, the four shipping-scale cases come out at an edge mean
-/// of 6.1 to 9.4 with the whole rest of the frame bit-identical.
+/// #1090 and #1144 asked for. Holding it to mean 2 would be asking the fix not
+/// to happen.
 ///
-/// So this bounds the drift rather than the difference: 16 is a little under
-/// twice the worst measured, which leaves a driver room to disagree about a
-/// ramp and leaves none for a face drawn in a different place. The assertion
-/// with the teeth is [`Regions::interior_max`] — see [`case_verdict`].
-pub(crate) const SUPERSAMPLED_EDGE_MEAN: f64 = 16.0;
-
-/// Ceiling on the **single worst** edge pixel of a supersampled case, in
-/// 255ths. Measured worst on llvmpipe: 76.
-///
-/// Half of full contrast. An anti-aliased edge pixel can legitimately be most
-/// of the way from field to ink in one render and most of the way back in the
-/// other — that is what a one-pixel ramp against a half-pixel ramp *is* — but a
-/// pixel that swings further than half the palette's range is not reporting a
-/// ramp any more.
-pub(crate) const SUPERSAMPLED_EDGE_MAX: u8 = 128;
+/// So this bounds the drift rather than the difference. It is **per kind**
+/// because the two kinds' edge populations are not the same shape — a dial is
+/// about a quarter edge pixels with long smooth arcs, a dot matrix is nearly
+/// all edge with thousands of tiny round rims — and a number calibrated off one
+/// is not calibrated for the other. Each kind's pair is stated with the
+/// llvmpipe measurement it was taken from in [`Kind::edge_budget`]. The
+/// assertion with the teeth is [`Regions::interior_max`], which is zero on
+/// every kind — see [`case_verdict`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EdgeBudget {
+    /// Ceiling on the mean |Δ| over the edge region.
+    pub(crate) mean: f64,
+    /// Ceiling on the single worst edge pixel.
+    pub(crate) max: u8,
+}
 
 /// How far a column's brightest row may move, in **grid** rows, before it counts
 /// as a structural difference rather than a rounding one.
@@ -171,7 +170,7 @@ pub(crate) enum Verdict {
     /// unscaled length, a doubled mask pitch or a mis-scaled bloom does.
     InteriorMoved,
     /// A supersampled case's edge region is outside
-    /// [`SUPERSAMPLED_EDGE_MEAN`]/[`SUPERSAMPLED_EDGE_MAX`].
+    /// its kind's [`EdgeBudget`] — see [`Kind::edge_budget`].
     EdgeOverBudget,
 }
 
@@ -213,21 +212,56 @@ pub(crate) enum Kind {
     /// `preem.gauge` (#1143) — pinned bit-exact too, since #1148's review; no
     /// peak-row check, which is a beam statistic.
     Gauge,
+    /// `preem.dot_matrix` (#1144) — **pinned bit-exact**, like the scope, and
+    /// for the scope's reason rather than in spite of Annika's.
+    ///
+    /// Her word on #865 is about **glass**, and the ceiling is what carries it:
+    /// a real driver only ever has to clear mean 2 / p99 8 / max 32, and
+    /// nothing here tightens that. `TROLLSHELL_PARITY_EXACT=1` is exported in
+    /// exactly one place — `nix/checks/system-tests.nix`, inside a sandbox with
+    /// Mesa llvmpipe — so what it pins is a *CI regression detector* against
+    /// one known driver, not a design target.
+    ///
+    /// All sixteen dot-matrix cases measured **max |Δ| 0** of 255 on every
+    /// channel there, which makes the pin available; and it is worth taking
+    /// precisely because this arm's improvement is a coordinate change. At 1:1
+    /// the shader snaps its sample to the pixel centre so the continuous
+    /// falloff collapses onto the kit's integer table — a collapse that is
+    /// exact by construction and would stop being exact silently. Zero is the
+    /// only value that can say so.
+    DotMatrix,
 }
 
 impl Kind {
+    /// Every kind, for the tests that have to reason about all of them at once.
+    ///
+    /// It has to be extended by hand when a kind lands — but forgetting to is a
+    /// **compile** error rather than a silent gap, because
+    /// `every_kind_states_its_pin_and_its_beam_check` pairs this list with an
+    /// exhaustive `match` over the enum: a variant missing from here still has
+    /// to be named there, and a variant named there still has to be here for
+    /// the loop to reach it.
+    ///
+    /// `cfg(test)` because the tests are its only consumer: the shell mounts
+    /// this whole module under `cfg(test)` anyway, and the parity harness
+    /// `#[path]`-includes it *without* that gate, where an unused constant is a
+    /// `dead_code` warning rather than a signal.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 3] = [Self::Scope, Self::Gauge, Self::DotMatrix];
+
     /// Whether `TROLLSHELL_PARITY_EXACT=1` holds this kind to a zero delta.
     ///
-    /// **Only what has been measured at zero** — which, since #1148's review,
-    /// is both of them. See the type docs.
+    /// **Only what has been measured at zero** — which, since #1148's review
+    /// and #1144, is all three. See the type docs.
     ///
-    /// An exhaustive `match` rather than a `matches!`, deliberately: a third
-    /// kind (#1144) must not inherit an answer by falling off the end of a
-    /// pattern. Whoever adds it has to look at their own llvmpipe numbers and
-    /// say which of the two this is, and the compiler makes them.
+    /// An exhaustive `match` rather than a `matches!`, deliberately: a fourth
+    /// kind must not inherit an answer by falling off the end of a pattern.
+    /// Whoever adds it has to look at their own llvmpipe numbers and say
+    /// whether zero is a value their arm has actually measured, and the
+    /// compiler makes them.
     pub(crate) fn pinned_exact(self) -> bool {
         match self {
-            Self::Scope | Self::Gauge => true,
+            Self::Scope | Self::Gauge | Self::DotMatrix => true,
         }
     }
 
@@ -246,11 +280,66 @@ impl Kind {
         matches!(self, Self::Scope)
     }
 
+    /// What this kind's **supersampled** cases may drift by in the edge region
+    /// — see [`EdgeBudget`] and [`case_verdict`].
+    ///
+    /// Exhaustive, for `pinned_exact`'s reason: these are numbers, and a kind
+    /// that inherits someone else's numbers off the end of a pattern is exactly
+    /// the failure this is meant to prevent. Each pair below is stated with the
+    /// llvmpipe measurement it was calibrated from, so the next reader can tell
+    /// a budget from a wish.
+    ///
+    /// `match_same_arms` is allowed **deliberately**: two of these three
+    /// currently hold the same pair, and collapsing them would delete exactly
+    /// the property this function exists for — that each kind's budget is its
+    /// own measurement, arrived at separately, and moves without dragging
+    /// another kind's with it.
+    #[allow(clippy::match_same_arms)]
+    pub(crate) fn edge_budget(self) -> EdgeBudget {
+        match self {
+            // Four `scale = 2` cases, one per skin. Measured worst on llvmpipe
+            // (Mesa 26.2.2): edge mean 9.364, edge max 76. A dial is nearly a
+            // third edge pixels and its arcs are long shallow ramps, so a
+            // single pixel can legitimately swing far: `max` is half of full
+            // contrast, the point past which a pixel is not reporting a ramp
+            // any more, and `mean` a little under twice the worst measured.
+            Self::Gauge => EdgeBudget {
+                mean: 16.0,
+                max: 128,
+            },
+            // Four stretched cases, one per skin. Measured worst on llvmpipe:
+            // edge mean 10.641 (oled, the skin with the strongest bloom and no
+            // ghost lattice), edge max 39 (crt). Tighter on `max` than the
+            // gauge and deliberately so: a dot's rim is one or two pixels wide
+            // against a flat ground, so the largest *legitimate* disagreement
+            // here is one rim step, not a long ramp. 64 is ~1.6x the worst
+            // measured; 16 on the mean is ~1.5x. An all-black blit puts every
+            // one of the four at an edge mean of 51.7 to 65.0 and a max of 180
+            // to 255, so this catches the blank render on its own even where
+            // the field is black and the two blank guards cannot.
+            Self::DotMatrix => EdgeBudget {
+                mean: 16.0,
+                max: 64,
+            },
+            // No supersampled scope case exists: the scope's GL grid *is* the
+            // kit's upscaled buffer, so there is nothing to render denser. This
+            // arm is the compiler forcing a decision rather than a measurement,
+            // and it is deliberately the tighter of the two pairs — whoever
+            // adds a supersampled scope case should see it go red and come back
+            // here with their own numbers, not find it quietly accommodated.
+            Self::Scope => EdgeBudget {
+                mean: 16.0,
+                max: 64,
+            },
+        }
+    }
+
     /// The word the transcript prints.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Scope => "scope",
             Self::Gauge => "gauge",
+            Self::DotMatrix => "dot_matrix",
         }
     }
 }
@@ -303,14 +392,20 @@ pub(crate) enum Sampling {
 ///   bit-identical**, and the edge region is inside its own budget. The GL arm
 ///   drew at twice the density and the harness averaged it back down, so the
 ///   edges are *supposed* to differ — that is #1090's fix — while nothing else
-///   is. Measured on llvmpipe, all four shipping-scale cases come out with the
-///   flat field and the small lit-interior bin at `max |Δ| 0` and everything
-///   else in the edge bin — "small" meaning 46, 47, 46 and 3 pixels of 9216:
-///   a 1.7-logical-px tick has no interior to speak of, so this is mostly a
-///   statement about the field. The residual hole, stated: a scale-only drift
-///   *inside* an expression that still carries `* s` (a tick or an arc 50 %
-///   wider at the shipping scale) moves only edge pixels and clears the
-///   budget; neither the source scan nor the region split sees it.
+///   is. Measured on llvmpipe, the four gauge shipping-scale cases come out
+///   with the flat field and the small lit-interior bin at `max |Δ| 0` and
+///   everything else in the edge bin — "small" meaning 46, 47, 46 and 3 pixels
+///   of 9216: a 1.7-logical-px tick has no interior to speak of, so this is
+///   mostly a statement about the field. On the four dot-matrix cases it is a
+///   statement about the field *only*: every pixel of a falloff dot is an
+///   `edge` by [`Regions`]' 4-neighbour rule, so they report `lit[n=0]`, and
+///   the lattice, the falloff, the bloom and the comb are held by the edge
+///   budget alone. The residual hole, stated for both: a scale-only drift
+///   *inside* an expression that still carries `* s` moves only edge pixels
+///   and clears the budget — a tick or an arc 50 % wider on the gauge; a dot
+///   radius 5 % larger (caught on no skin; 10 % on one, oled) or a halo 25 %
+///   stronger (caught on none, edge mean ≤ 12.245 / max ≤ 48 against 16 / 64)
+///   on the dot matrix; neither the source scan nor the region split sees it.
 ///   #893's ceiling is deliberately **not** applied here: it is a statement
 ///   about rounding between two renders of one picture, and half the frame's
 ///   pixels are edges on a dial.
@@ -322,11 +417,22 @@ pub(crate) fn case_verdict(
     exact: bool,
 ) -> Verdict {
     // "Drew nothing at all", then "drew one flat colour" — ahead of everything,
-    // on every comparison, for #1070's M2 reason.
-    if stats.all_zero {
+    // on every comparison, for #1070's M2 reason. Each is asked **against the
+    // reference** (#1144): the question is "is the GL side flat where the kit's
+    // is not", and a state whose kit frame is genuinely one colour (an empty
+    // dot matrix is a bezel and nothing else) is not evidence of an undrawn
+    // framebuffer.
+    //
+    // These bind on a supersampled case too, and that is the point of putting
+    // them above the `match`: #1144's first cut returned early for an ungated
+    // case and dropped them with the rest of the verdict, which let an
+    // all-black OLED readout at stretch 2 pass a framebuffer nothing had drawn
+    // into (#1150 review, HIGH-1). Box-averaging black is black, so the guard
+    // survives the downsample unchanged.
+    if stats.gl.all_zero && !stats.reference.all_zero {
         return Verdict::RendersNothing;
     }
-    if stats.uniform {
+    if stats.gl.uniform && !stats.reference.uniform {
         return Verdict::UndrawnFramebuffer;
     }
     match sampling {
@@ -334,9 +440,8 @@ pub(crate) fn case_verdict(
             if regions.interior_max() > 0 {
                 return Verdict::InteriorMoved;
             }
-            if regions.edge.mean > SUPERSAMPLED_EDGE_MEAN
-                || regions.edge.max > SUPERSAMPLED_EDGE_MAX
-            {
+            let budget = kind.edge_budget();
+            if regions.edge.mean > budget.mean || regions.edge.max > budget.max {
                 return Verdict::EdgeOverBudget;
             }
             Verdict::Pass
@@ -554,6 +659,26 @@ impl Verdict {
     }
 }
 
+/// "Is this frame one flat colour, and is that colour black?" — asked of the
+/// GL readback and of the kit's reference, because since #1144 the guards
+/// compare the two answers rather than reading the GL one alone.
+///
+/// A struct rather than two more `bool` fields on [`Stats`]: the pair is one
+/// observation made twice, and spelling it that way is what keeps the verdict's
+/// condition readable (`self.gl.uniform && !self.reference.uniform`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Flatness {
+    /// Every compared pixel of this frame carries the same colour.
+    pub(crate) uniform: bool,
+    /// Every compared pixel of this frame is `0, 0, 0`.
+    ///
+    /// A strict subset of [`Self::uniform`], carried separately because it is
+    /// the one failure shape a reader has to be told by name: "the GL arm drew
+    /// nothing" is a different bug report from "the GL arm drew a flat colour",
+    /// and #1070's M2 is specifically the first.
+    pub(crate) all_zero: bool,
+}
+
 /// One comparison's full result.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Stats {
@@ -576,14 +701,30 @@ pub(crate) struct Stats {
     /// all three `GLArea::error()` is `None`, `context()` is `Some` and
     /// `glGetError` is clean. A `Scope` always paints a graticule, so a real
     /// frame is never uniform.
-    pub(crate) uniform: bool,
-    /// Every compared GL pixel is `0, 0, 0` — see [`Verdict::RendersNothing`].
     ///
-    /// A strict subset of [`Self::uniform`], reported separately because it is
-    /// the one failure shape a reader has to be told by name: "the GL arm drew
-    /// nothing" is a different bug report from "the GL arm drew a flat
-    /// colour", and #1070's M2 is specifically the first.
-    pub(crate) all_zero: bool,
+    /// On its own this is a statement about the GL side only. It becomes a
+    /// *verdict* in [`verdict_for`](Self::verdict_for), and only against a
+    /// reference that is not itself flat — see [`Self::reference`].
+    pub(crate) gl: Flatness,
+    /// The same two questions, asked of the **kit's own frame** (#1144).
+    ///
+    /// The two guards were written when every case's reference was guaranteed
+    /// to have structure — a `Scope` always paints a graticule, a `Gauge`
+    /// always paints an arc. #1144's dot matrix broke that assumption honestly:
+    /// an **empty** display is a bezel and nothing else, so the kit's own frame
+    /// is one flat colour, and on the OLED (whose field is `0, 0, 0`) it is
+    /// flat *black*. Measured, all four blank cases reported
+    /// `FAIL(blank)`/`FAIL(nothing)` at max |Δ| **0** — the guards firing on a
+    /// correct render.
+    ///
+    /// So the question the verdict asks is the one it always meant: *is the GL
+    /// side flat where the kit's is not*. That can only remove false positives
+    /// — a GL arm that drew nothing against a reference with any structure at
+    /// all still trips, unchanged. What it cannot detect, and now says so out
+    /// loud, is a GL arm that drew nothing for a state whose reference is
+    /// *also* flat black; there the two are indistinguishable by pixels, and
+    /// the case's siblings are what carry the detection.
+    pub(crate) reference: Flatness,
     /// The single worst compared pixel, for the transcript: where it is, which
     /// channel, and what each arm put there.
     ///
@@ -639,10 +780,16 @@ impl Stats {
         // "Drew nothing at all" first, then "drew one flat colour": the second
         // is the general case of the first, and the first is the one #1070's
         // M2 says must never be reported as anything else.
-        if self.all_zero {
+        //
+        // Each is asked **against the reference** (#1144): the question these
+        // guards exist to answer is "is the GL side flat where the kit's is
+        // not", and a state whose kit frame is genuinely one colour — an empty
+        // dot matrix is a bezel and nothing else — is not evidence of an
+        // undrawn framebuffer. See `Stats::reference_uniform`.
+        if self.gl.all_zero && !self.reference.all_zero {
             return Verdict::RendersNothing;
         }
-        if self.uniform {
+        if self.gl.uniform && !self.reference.uniform {
             return Verdict::UndrawnFramebuffer;
         }
         if !self
@@ -687,6 +834,13 @@ impl Layout {
     /// monitor) while two comments described a different number again. The
     /// tests below drive this function, not a literal, which is what would have
     /// caught that.
+    ///
+    /// There is deliberately **no** supersample factor here: a supersampled
+    /// case is box-averaged onto the reference grid by [`box_downsample`]
+    /// *before* a `Layout` is built for it, so everything below this point
+    /// compares one pair of buffers of one shape, whatever the case (#1148
+    /// review, HIGH-2). #1144's first cut averaged inside [`gl_pixel`] instead
+    /// and carried its own factor here; one seam is the whole point.
     pub(crate) fn for_capture(
         alloc: (u32, u32),
         reference: (usize, usize),
@@ -718,6 +872,9 @@ pub(crate) fn compare(gl: &[u8], reference: &[u8], layout: Layout) -> Stats {
     let mut first_gl: Option<[u8; 3]> = None;
     let mut uniform = true;
     let mut all_zero = true;
+    let mut first_ref: Option<[u8; 3]> = None;
+    let mut reference_uniform = true;
+    let mut reference_all_zero = true;
     let mut worst: Option<WorstPixel> = None;
 
     let luma = |px: [u8; 3]| u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2]);
@@ -736,6 +893,14 @@ pub(crate) fn compare(gl: &[u8], reference: &[u8], layout: Layout) -> Stats {
                 Some(_) => {}
             }
             all_zero &= g == [0, 0, 0];
+            // The same two questions of the kit's own frame — see
+            // `Stats::reference_uniform`.
+            match first_ref {
+                None => first_ref = Some(c),
+                Some(seen) if seen != c => reference_uniform = false,
+                Some(_) => {}
+            }
+            reference_all_zero &= c == [0, 0, 0];
             for (channel, bucket) in deltas.iter_mut().enumerate() {
                 let delta = g[channel].abs_diff(c[channel]);
                 bucket.push(delta);
@@ -781,13 +946,27 @@ pub(crate) fn compare(gl: &[u8], reference: &[u8], layout: Layout) -> Stats {
         channels: std::array::from_fn(|channel| distribution(&mut deltas[channel])),
         pixels: ref_w * ref_h,
         peak_row_mismatches,
-        // An empty comparison is not "uniform", it is nothing at all — but it
-        // is still not a frame, so it fails the same way.
-        uniform: uniform || empty,
-        // A readback that never arrived reads as zeros through `gl_pixel`,
-        // which is the same report as one that arrived full of them: in both
-        // the GL arm put no pixels in front of the comparison.
-        all_zero,
+        gl: Flatness {
+            // An empty comparison is not "uniform", it is nothing at all — but
+            // it is still not a frame, so it fails the same way.
+            uniform: uniform || empty,
+            // A readback that never arrived reads as zeros through `gl_pixel`,
+            // which is the same report as one that arrived full of them: in
+            // both the GL arm put no pixels in front of the comparison.
+            all_zero,
+        },
+        // The reference's own flatness, and `&& !empty` on both because this
+        // half only ever **excuses** the guards above. An empty comparison has
+        // no reference to be flat: left to the loop's initialisers it would
+        // come out `true` on both and excuse the `uniform || empty` right above
+        // it, turning "nothing at all was compared" into a `Pass`. That is the
+        // one way #1144's change could have loosened a guard, so it is spelled
+        // out here and pinned by
+        // `an_empty_comparison_is_not_excused_by_a_flat_reference`.
+        reference: Flatness {
+            uniform: reference_uniform && !empty,
+            all_zero: reference_all_zero && !empty,
+        },
         worst,
     }
 }
@@ -881,9 +1060,9 @@ fn distribution(deltas: &mut [u8]) -> ChannelStats {
 #[cfg(test)]
 mod tests {
     use super::{
-        CEILING_MAX, CEILING_MEAN, CEILING_P99, ChannelStats, Kind, Layout, RegionStats, Regions,
-        SUPERSAMPLED_EDGE_MEAN, Sampling, Stats, Verdict, box_downsample, case_verdict, compare,
-        distribution, peak_row_tolerance, regions,
+        CEILING_MAX, CEILING_MEAN, CEILING_P99, ChannelStats, Flatness, Kind, Layout, RegionStats,
+        Regions, Sampling, Stats, Verdict, box_downsample, case_verdict, compare, distribution,
+        peak_row_tolerance, regions,
     };
 
     /// A `Stats` whose **worst pixel** is `delta` 255ths off on every channel,
@@ -903,8 +1082,11 @@ mod tests {
             channels: [channel, channel, channel],
             pixels: 1,
             peak_row_mismatches: 0,
-            uniform: false,
-            all_zero: false,
+            gl: Flatness::default(),
+            // A reference with structure, which is what every kind but an empty
+            // dot matrix has — so the two guards keep meaning what they meant
+            // before #1144 in every test that builds on this.
+            reference: Flatness::default(),
             worst: None,
         }
     }
@@ -1034,7 +1216,7 @@ mod tests {
         );
 
         let mut wild_edges = clean_regions();
-        wild_edges.edge.mean = SUPERSAMPLED_EDGE_MEAN + 0.5;
+        wild_edges.edge.mean = Kind::Gauge.edge_budget().mean + 0.5;
         assert_eq!(
             case_verdict(
                 &edgy,
@@ -1064,13 +1246,158 @@ mod tests {
         );
     }
 
+    /// **The edge budget is per kind, and the dot matrix's is its own**
+    /// (#1150 review, HIGH-2).
+    ///
+    /// The sibling above states the supersampled standard on the gauge, where
+    /// #1148's review set it. This one repeats it for #1144's kind against
+    /// #1144's numbers — worst measured on llvmpipe, edge mean 10.641 (oled)
+    /// and edge max 39 (crt) — and then shows the two budgets are not the same
+    /// number by handing one edge region to both kinds and getting two
+    /// verdicts.
+    ///
+    /// **Falsified** by collapsing [`Kind::edge_budget`]'s arms onto one pair
+    /// (the last assertion goes red), or by widening the dot matrix's `max`
+    /// past the region the second one builds.
+    #[test]
+    fn the_dot_matrix_gets_its_own_edge_budget() {
+        let edgy = Stats {
+            channels: [ChannelStats {
+                mean: 8.0,
+                p99: 40.0,
+                max: 76.0,
+            }; 3],
+            ..inside_by(0.0)
+        };
+        let mut dots = clean_regions();
+        dots.edge.mean = 10.641;
+        dots.edge.max = 39;
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &dots,
+                Kind::DotMatrix,
+                Sampling::Supersampled(2),
+                true,
+            ),
+            Verdict::Pass,
+            "the stretched dot matrix's own worst llvmpipe measurement passes",
+        );
+        let mut dots_over = dots;
+        dots_over.edge.max = Kind::DotMatrix.edge_budget().max + 1;
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &dots_over,
+                Kind::DotMatrix,
+                Sampling::Supersampled(2),
+                true,
+            ),
+            Verdict::EdgeOverBudget,
+            "…and one 255th past its max is over budget",
+        );
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &dots_over,
+                Kind::Gauge,
+                Sampling::Supersampled(2),
+                true,
+            ),
+            Verdict::Pass,
+            "**the budget is per kind, not shared**: the very same edge region is \
+             inside the gauge's wider max and outside the dot matrix's, which is the \
+             whole reason `Kind::edge_budget` exists rather than one constant",
+        );
+    }
+
+    /// The `TROLLSHELL_PARITY_EXACT=1` pin binds the **dot matrix** too
+    /// (#1144): llvmpipe measured `max |Δ| 0` on all twenty of its 1:1 cases.
+    ///
+    /// **Falsified** by flipping `Kind::pinned_exact`'s answer for this kind.
+    #[test]
+    fn the_dot_matrix_is_pinned_bit_exact_at_one_to_one() {
+        assert_eq!(
+            case_verdict(
+                &inside_by(1.0),
+                &clean_regions(),
+                Kind::DotMatrix,
+                Sampling::OneToOne,
+                true,
+            ),
+            Verdict::NotBitExact,
+            "#1144's dot matrix measured zero under llvmpipe too, so CI pins it \
+             the same way — the ceiling is still what a real driver answers to",
+        );
+        assert_eq!(
+            case_verdict(
+                &inside_by(5.0),
+                &clean_regions(),
+                Kind::DotMatrix,
+                Sampling::OneToOne,
+                false,
+            ),
+            Verdict::Pass,
+            "…and without the env, the ceiling alone, on every kind",
+        );
+    }
+
+    /// **Every kind states its pin and its beam check, and the compiler makes
+    /// sure a new one has to** (#1144).
+    ///
+    /// The two per-kind decisions are one-line `matches!`es, which is the
+    /// cheapest possible thing to get wrong by omission: a fourth kind added to
+    /// the enum inherits "not pinned, not a beam" silently, and if that is the
+    /// wrong answer for it nothing says so. The exhaustive `match` below is
+    /// what turns that omission into a build failure — it cannot compile
+    /// against a variant it does not name, and [`Kind::ALL`] cannot loop over a
+    /// variant it does not carry.
+    ///
+    /// **Falsified** by flipping either arm of either `matches!`, and — the
+    /// point of it — by adding a variant to [`Kind`], which stops this file
+    /// compiling until the new kind's two answers are written down.
+    #[test]
+    #[allow(clippy::match_same_arms)]
+    fn every_kind_states_its_pin_and_its_beam_check() {
+        for kind in Kind::ALL {
+            // One arm per kind even where two currently answer alike: the
+            // point is that each is written down on its own evidence.
+            let (pinned, beam) = match kind {
+                // Measured at zero under llvmpipe since #1078, and a trace with
+                // exactly one bright row per column.
+                Kind::Scope => (true, true),
+                // Measured at zero too (#1144, all sixteen cases), so CI pins
+                // it — but not a beam: a dot's brightest row in a column is
+                // whichever dot row wins, and they tie constantly.
+                Kind::DotMatrix => (true, false),
+                // Measured at zero at 1:1 since #1148's review, which is what
+                // moved this arm off `false`. Not a beam: a dial's brightest
+                // row in a column is whichever of the arc, a tick, the needle
+                // and the hub happens to win there, and two of those tie.
+                Kind::Gauge => (true, false),
+            };
+            assert_eq!(
+                kind.pinned_exact(),
+                pinned,
+                "{}: the exact pin",
+                kind.label(),
+            );
+            assert_eq!(
+                kind.checks_peak_rows(),
+                beam,
+                "{}: the peak-row check",
+                kind.label(),
+            );
+        }
+    }
+
     /// Every guard fires **ahead** of both standards: a breach is reported as a
     /// breach, not as "not bit-exact" or as an edge budget, whichever
     /// comparison it came from.
     #[test]
     fn the_ceiling_and_the_blank_guards_come_before_the_pin() {
         let over = inside_by(CEILING_MAX + 1.0);
-        for kind in [Kind::Scope, Kind::Gauge] {
+        for kind in Kind::ALL {
             assert_eq!(
                 case_verdict(&over, &clean_regions(), kind, Sampling::OneToOne, true),
                 Verdict::OverCeiling,
@@ -1079,18 +1406,135 @@ mod tests {
             );
         }
         let blank = Stats {
-            uniform: true,
-            all_zero: true,
+            gl: Flatness {
+                uniform: true,
+                all_zero: true,
+            },
+            ..inside_by(0.0)
+        };
+        // **Both samplings, every kind** (#1150 review, HIGH-1). #1144's first
+        // cut returned early for a supersampled case and threw the whole
+        // verdict away with the two blank guards inside it, which let an
+        // all-black `dot_matrix.oled.readoutx2` pass a framebuffer nothing had
+        // drawn into — the OLED's field is `0, 0, 0`, so "the flat ground did
+        // not move" is black against black and cannot fail. The guards live
+        // above the `Sampling` match now, so the loop below is the assertion.
+        for sampling in [Sampling::OneToOne, Sampling::Supersampled(2)] {
+            for kind in Kind::ALL {
+                assert_eq!(
+                    case_verdict(&blank, &clean_regions(), kind, sampling, true),
+                    Verdict::RendersNothing,
+                    "a {} that drew nothing is bit-exactly nothing — the guard, not the \
+                     standard behind it, and a supersampled case is exempt from the \
+                     ceiling, not from having drawn something",
+                    kind.label(),
+                );
+            }
+        }
+        // The same for the weaker of the two: one flat non-black colour.
+        let one_colour = Stats {
+            gl: Flatness {
+                uniform: true,
+                all_zero: false,
+            },
             ..inside_by(0.0)
         };
         for sampling in [Sampling::OneToOne, Sampling::Supersampled(2)] {
-            assert_eq!(
-                case_verdict(&blank, &clean_regions(), Kind::Gauge, sampling, true),
-                Verdict::RendersNothing,
-                "a gauge that drew nothing is bit-exactly nothing — the guard, not the \
-                 standard behind it",
-            );
+            for kind in Kind::ALL {
+                assert_eq!(
+                    case_verdict(&one_colour, &clean_regions(), kind, sampling, true),
+                    Verdict::UndrawnFramebuffer,
+                    "{}: a flat GL frame against a structured reference, at any sampling",
+                    kind.label(),
+                );
+            }
         }
+    }
+
+    /// **A flat GL frame is only suspicious where the kit's frame is not**
+    /// (#1144).
+    ///
+    /// Both guards were written against kinds whose reference always has
+    /// structure. An empty dot matrix is a bezel and nothing else, so its
+    /// reference *is* one flat colour — and on the OLED, whose field is
+    /// `0, 0, 0`, flat black. Measured, all four blank cases reported
+    /// `FAIL(blank)`/`FAIL(nothing)` at max |Δ| 0: the guards firing on a
+    /// correct render.
+    ///
+    /// The four assertions below are the whole truth table, and the second and
+    /// fourth are the ones that say the change did not loosen anything: a GL
+    /// arm that drew nothing against a reference with any structure at all
+    /// still trips, exactly as it did before.
+    ///
+    /// **Falsified** by dropping either `&& !self.reference.*` from
+    /// [`Stats::verdict_for`] (the first and third go red), or by widening
+    /// either to excuse a structured reference (the second and fourth).
+    #[test]
+    fn a_flat_gl_frame_is_excused_only_by_a_flat_reference() {
+        let flat = |gl: Flatness, reference: Flatness| Stats {
+            gl,
+            reference,
+            ..inside_by(0.0)
+        };
+        let structured = Flatness::default();
+        let one_colour = Flatness {
+            uniform: true,
+            all_zero: false,
+        };
+        let black = Flatness {
+            uniform: true,
+            all_zero: true,
+        };
+        assert_eq!(
+            flat(one_colour, one_colour).verdict_for(Kind::DotMatrix),
+            Verdict::Pass,
+            "an empty display: one flat colour on both sides, and they agree",
+        );
+        assert_eq!(
+            flat(one_colour, structured).verdict_for(Kind::DotMatrix),
+            Verdict::UndrawnFramebuffer,
+            "…but a flat GL frame against a reference with structure still trips",
+        );
+        assert_eq!(
+            flat(black, black).verdict_for(Kind::DotMatrix),
+            Verdict::Pass,
+            "an empty OLED display, whose field is literally black",
+        );
+        assert_eq!(
+            flat(black, structured).verdict_for(Kind::DotMatrix),
+            Verdict::RendersNothing,
+            "…and a GL arm that drew nothing at all still trips, unchanged",
+        );
+    }
+
+    /// An **empty** comparison is not excused by the flat-reference rule
+    /// (#1144).
+    ///
+    /// A comparison with no pixels in it reads flat *and* black on the GL side
+    /// (`uniform || empty`, and an `all_zero` no loop ever falsified), and it
+    /// has always failed as `RendersNothing`. The reference's own flatness is
+    /// initialised the same way, so left alone it would have excused both
+    /// guards and turned "nothing was compared" into a `Pass` — which is the
+    /// one way #1144's change could have loosened something.
+    ///
+    /// **Falsified** by dropping either `&& !empty` in `compare`: the verdict
+    /// becomes `Pass`.
+    #[test]
+    fn an_empty_comparison_is_not_excused_by_a_flat_reference() {
+        let stats = compare(&[], &[], Layout::for_capture((0, 0), (0, 0), 1, 1));
+        assert!(
+            stats.gl.uniform && stats.gl.all_zero,
+            "the premise: an empty comparison reads flat and black",
+        );
+        assert!(
+            !stats.reference.uniform && !stats.reference.all_zero,
+            "…and has no flat reference to be excused by",
+        );
+        assert_eq!(
+            stats.verdict_for(Kind::DotMatrix),
+            Verdict::RendersNothing,
+            "nothing compared is still a failure, and the same one as before",
+        );
     }
 
     /// The **peak-row** check is the scope's alone (#1143): it is a statement
@@ -1378,7 +1822,7 @@ mod tests {
         let stats = compare(&gl, &cpu, layout(w, h));
         assert_eq!(stats.verdict_for(Kind::Scope), Verdict::Pass);
         assert_eq!(stats.peak_row_mismatches, 0);
-        assert!(!stats.uniform);
+        assert!(!stats.gl.uniform);
         for (channel, name) in stats.channels.iter().zip(super::CHANNELS) {
             assert!(
                 (channel.mean, channel.p99, channel.max) == (0.0, 0.0, 0.0),
@@ -1403,8 +1847,8 @@ mod tests {
         // A *flat colour* that is not black: uniform, but something was drawn.
         let flat = flipped(w, h, |_, _| [0x20, 0x00, 0x40]);
         let stats = compare(&flat, &cpu, layout(w, h));
-        assert!(stats.uniform, "every pixel the same colour");
-        assert!(!stats.all_zero, "…but not zero");
+        assert!(stats.gl.uniform, "every pixel the same colour");
+        assert!(!stats.gl.all_zero, "…but not zero");
         assert_eq!(stats.verdict_for(Kind::Scope), Verdict::UndrawnFramebuffer);
     }
 
@@ -1437,7 +1881,7 @@ mod tests {
         let black = vec![0u8; w * h * 4];
 
         let bright = compare(&black, &frame(w, h, trace(4)), layout(w, h));
-        assert!(bright.all_zero, "every compared pixel is 0,0,0");
+        assert!(bright.gl.all_zero, "every compared pixel is 0,0,0");
         assert_eq!(bright.verdict_for(Kind::Scope), Verdict::RendersNothing);
 
         // The dangerous half: a nearly-black reference, where the *deltas*
@@ -1767,7 +2211,7 @@ mod tests {
             channels: [inside, inside, inside],
             pixels: 1,
             peak_row_mismatches: 0,
-            uniform: false,
+            gl: Flatness::default(),
             ..Stats::default()
         };
         assert_eq!(stats.verdict_for(Kind::Scope), Verdict::Pass);

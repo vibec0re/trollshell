@@ -34,7 +34,7 @@
 //! `Scope`-shaped: the arm decision, the context-failure rebuild
 //! ([`Renderer::is_gl`]) and the `Option` payload type
 //! ([`preem_gl::KitSurface`]) all stopped naming one widget, so #1144's dot
-//! matrix is one `build` arm and one pipeline.
+//! matrix **was** one `build` arm and one pipeline — the prediction held.
 //!
 //! Where it differs from `ScopeGl` is instructive: a gauge has **no**
 //! cross-frame GPU state, so `GaugeGl` holds the very `kit::Gauge` the CPU arm
@@ -43,11 +43,29 @@
 //! because doing it at the surface's native resolution instead of at a logical
 //! 144 × 64 replicated ×2 is what fixes #1090's smeared needle.
 //!
+//! # …and a third, which pays for itself differently (#1144)
+//!
+//! A [`DotMatrix`](vocab::PreemWidget::DotMatrix) takes
+//! [`Renderer::DotMatrixGl`] — the last kind on this seam until Annika says
+//! otherwise (#865: "lets pause after those"). It is the *simplest* of the
+//! three: no animation at all, so it shares its `advance`/`animates` arm with
+//! the other text widgets, and its only per-instance GPU state is the line
+//! encoded as a glyph strip.
+//!
+//! Its improvement is not the gauge's. There is no `scale` on a dot matrix —
+//! the dot pitch is the size knob (#1091) — so the kit already rasterises at
+//! the buffer it ships. What is resolution-*dependent* is the **dot**: the kit
+//! replicates each font pixel into a `dot_px`×`dot_px` block out of a fixed
+//! table, so a chip that layout scales above its natural size magnifies those
+//! blocks. The GL arm evaluates the kit's falloff law at the fragment's own
+//! position instead, and snaps to the pixel centre at 1:1 so the two arms draw
+//! the same picture where the harness measures them.
+//!
 //! The CPU arm is still the reference and is still gated byte-exactly. It is
 //! taken when `TROLLSHELL_PREEM_RENDERER=cpu` is set (the kill switch — read
 //! once at the first build), when the widget kind has no GL arm (everything but
-//! `Scope` and `Gauge` today), or when a GL context could not be created. See
-//! [`preem_gl`](super::preem_gl) for all three.
+//! `Scope`, `Gauge` and `DotMatrix` today), or when a GL context could not be
+//! created. See [`preem_gl`](super::preem_gl) for all three.
 //!
 //! # What this module owns
 //!
@@ -588,6 +606,32 @@ enum Renderer {
     DotMatrix {
         text: String,
         dot_px: usize,
+    },
+    /// The **GPU** arm of [`DotMatrix`](Self::DotMatrix) (#1144), the third and
+    /// (for now) last kind on the [`ScopeGl`](Self::ScopeGl) seam — #865's
+    /// "start with the dotmatrix and gauge … but lets pause after those".
+    ///
+    /// Pure, like the CPU arm: the whole state is the line of text, so there is
+    /// no animation here and [`advance`](Self::advance) /
+    /// [`animates`](Self::animates) share their arm with every other text
+    /// widget.
+    ///
+    /// It keeps the line **encoded** rather than as a `String`, which is the
+    /// one thing it has that the CPU arm does not. The shader reads the glyph
+    /// grid out of a data strip, and a mapping pass that re-encoded the display
+    /// would do it once per monitor and again on every re-tint; here
+    /// [`update`](Self::update) rebuilds it (that is the *only* time it can
+    /// move — [`apply`] short-circuits an unchanged widget before `update` is
+    /// reached) and every mapping pass after that clones an `Arc`. #911's rule,
+    /// the same one `ScopeGl`'s shared batch follows.
+    ///
+    /// The config rides along because the pitch and the skin are both config
+    /// and the mapping needs them every pass.
+    DotMatrixGl {
+        /// The already-clamped config the uniforms are rebuilt from.
+        config: vocab::DotMatrixConfig,
+        /// The line as the shader consumes it — see `preem_gl::dot_matrix`.
+        glyphs: preem_gl::Glyphs,
     },
     /// Pure.
     SevenSeg {
@@ -2181,10 +2225,23 @@ fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
     // costs nothing and cannot miss a future widget that bakes.
     let pins = pins_for(widget.style());
     Some(kit::with_pins(pins, || match widget {
-        W::DotMatrix { config, state } => Renderer::DotMatrix {
-            text: state.text.clone(),
-            dot_px: dim(config.dot_px),
-        },
+        W::DotMatrix { config, state } => {
+            // GL by default (#1144), the CPU kit under the kill switch or once
+            // a context has failed — the same `preem_gl::arm` decision the
+            // `Scope` and the `Gauge` below take, consulted per *build* so an
+            // instance rebuilt after a context failure lands on the CPU arm
+            // (see `apply`).
+            if preem_gl::arm() == Arm::Gl {
+                return Renderer::DotMatrixGl {
+                    config: *config,
+                    glyphs: preem_gl::encode_glyphs(&state.text),
+                };
+            }
+            Renderer::DotMatrix {
+                text: state.text.clone(),
+                dot_px: dim(config.dot_px),
+            }
+        }
         W::SevenSeg { state, .. } => Renderer::SevenSeg {
             text: state.text.clone(),
         },
@@ -2364,6 +2421,8 @@ impl Renderer {
         matches!(
             (self, widget),
             (Self::DotMatrix { .. }, W::DotMatrix { .. })
+                // …and the same for the two `DotMatrix` arms (#1144).
+                | (Self::DotMatrixGl { .. }, W::DotMatrix { .. })
                 | (Self::SevenSeg { .. }, W::SevenSeg { .. })
                 | (Self::TextBox { .. }, W::TextBox { .. })
                 | (Self::LedStrip { .. }, W::LedStrip { .. })
@@ -2397,7 +2456,10 @@ impl Renderer {
     /// rasterise nothing and never be rebuilt onto the kit — a permanently
     /// blank chip.
     fn is_gl(&self) -> bool {
-        matches!(self, Self::ScopeGl { .. } | Self::GaugeGl { .. })
+        matches!(
+            self,
+            Self::ScopeGl { .. } | Self::GaugeGl { .. } | Self::DotMatrixGl { .. }
+        )
     }
 
     /// Point the renderer at `widget`'s new **state**, keeping the animation it
@@ -2410,6 +2472,14 @@ impl Renderer {
                 // The pitch is config, so `same_config` already agreed it is
                 // unchanged — only the text can move here.
                 text.clone_from(&state.text);
+            }
+            // The GL arm re-encodes the glyph strip instead of keeping the
+            // `String`. This is reached **only** on a real state change —
+            // `apply` returns early on an unchanged widget — so it is the one
+            // place a new strip can be minted, and every mapping pass between
+            // two of them clones the `Arc` rather than walking the line again.
+            (Self::DotMatrixGl { glyphs, .. }, W::DotMatrix { state, .. }) => {
+                *glyphs = preem_gl::encode_glyphs(&state.text);
             }
             (Self::SevenSeg { text }, W::SevenSeg { state, .. }) => text.clone_from(&state.text),
             (Self::TextBox { text, .. }, W::TextBox { state, .. }) => text.clone_from(&state.text),
@@ -2495,9 +2565,20 @@ impl Renderer {
     /// The rest take `dt` straight: the needle's spring and the flip board's
     /// clock are closed-form and frame-rate independent by construction, and the
     /// marquee's speed is stated in dots *per second*.
+    ///
+    /// The `too_many_lines` allow is the vocabulary's, not this function's: it
+    /// is one flat arm per widget kind with no nesting between them, and it
+    /// crossed the ceiling by three lines when #1144 added a second arm for a
+    /// kind that already had one. Splitting it would put half the animation
+    /// table somewhere else, which is worse to read and worse to review than a
+    /// long match.
+    #[allow(clippy::too_many_lines)]
     fn advance(&mut self, dt: f32) -> bool {
         match self {
-            Self::DotMatrix { .. } | Self::SevenSeg { .. } | Self::TextBox { .. } => false,
+            Self::DotMatrix { .. }
+            | Self::DotMatrixGl { .. }
+            | Self::SevenSeg { .. }
+            | Self::TextBox { .. } => false,
             Self::LedStrip {
                 hold,
                 steps,
@@ -2659,7 +2740,10 @@ impl Renderer {
     /// all.
     fn animates(&self) -> bool {
         match self {
-            Self::DotMatrix { .. } | Self::SevenSeg { .. } | Self::TextBox { .. } => false,
+            Self::DotMatrix { .. }
+            | Self::DotMatrixGl { .. }
+            | Self::SevenSeg { .. }
+            | Self::TextBox { .. } => false,
             // A peak dot only moves while it is above the floor, has a fall
             // rate, and is actually the value being drawn: the kit clamps a
             // negative or non-finite rate to `0.0` ("never falls"), and an
@@ -2733,7 +2817,7 @@ impl Renderer {
             } => strip.render(*level, peak_for(*explicit_peak, hold.as_ref())),
             Self::Marquee { strip, offset, .. } => strip.window(dots(*offset, strip.period())),
             Self::Scope { scope, .. } => scope.render(style),
-            Self::ScopeGl { .. } | Self::GaugeGl { .. } => return None,
+            Self::ScopeGl { .. } | Self::GaugeGl { .. } | Self::DotMatrixGl { .. } => return None,
             Self::Gauge { gauge } => gauge.render(style),
             Self::FlipBoard { board } => board.render(style),
         })
@@ -2785,6 +2869,14 @@ impl Renderer {
                     gauge.needle().velocity(),
                     &kit::palette_snapshot(style),
                 ),
+            )),
+            // The line is handed over **already encoded** — the strip is built
+            // on a text change, not on a mapping pass, so a second monitor's
+            // pass costs a refcount rather than a re-encode of the display
+            // (#911's rule, and the same reason `ScopeGl` shares its batch).
+            Self::DotMatrixGl { config, glyphs, .. } => Some((
+                preem_gl::DOT_MATRIX,
+                preem_gl::dot_matrix_surface(*config, glyphs, &kit::palette_snapshot(style)),
             )),
             _ => None,
         }

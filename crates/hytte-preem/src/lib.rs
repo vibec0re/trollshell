@@ -151,7 +151,9 @@ mod style;
 mod textbox;
 
 pub use color_map::ColorMap;
-pub use dot_matrix::{DEFAULT_DOT_PX, DotMatrix, MAX_DOT_PX, MIN_DOT_PX, dot_matrix};
+pub use dot_matrix::{
+    DEFAULT_DOT_PX, DotCell, DotMatrix, MAX_DOT_PX, MIN_DOT_PX, dot_cell, dot_matrix,
+};
 pub use frame::{Frame, Rgba};
 pub use gauge::{
     ARC_HW, ARC_T, BLADE_TIP, DEFAULT_DAMPING, DEFAULT_FREQ_HZ, Dial, FEATHER, Gauge, HUB_T,

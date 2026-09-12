@@ -191,13 +191,14 @@ craneLib.mkCargoDerivation (
       # perfect identical" (#865) as excusing the gauge from it and
       # #1148's review corrected that — her word was about the glass,
       # which only ever faces the ceiling, while this variable is
-      # exported nowhere but the three lines above. Both kinds are
-      # pinned at the 1:1 grid, where both have measured `max |Δ| 0`.
-      # The box-averaged `scale = 2` gauge comparison is a render the
+      # exported nowhere but the three lines above. All three kinds are
+      # pinned at the 1:1 grid, where all three have measured
+      # `max |Δ| 0` (the dot matrix on every channel, all twenty
+      # cases). A box-averaged supersampled comparison is a render the
       # kit never made and so cannot be bit-exact by construction; it
       # is held to its own standard instead (every pixel off an edge
-      # bit-identical plus an edge budget, `parity::case_verdict`), not
-      # to #893's ceiling.
+      # bit-identical plus a per-kind edge budget,
+      # `parity::case_verdict`), not to #893's ceiling.
       export TROLLSHELL_PARITY_EXACT=1
     '';
     checkPhaseCargoCommand = ''
@@ -277,25 +278,28 @@ craneLib.mkCargoDerivation (
       # empties the list would ship green through the exit code
       # alone. Assert the evidence instead of trusting the exit
       # code: the case list is 4 skins × (3 scope fade depths + 3
-      # gauge needle positions + 1 gauge at the shipping upscale), so
-      # exactly 28 cases means exactly 28 `.gl.ppm` files. It was 12
-      # until #1143 added the gauge arm and 24 until #1148's review
-      # added the `scale = 2` case; bump it with the case list, in
-      # the same commit, for the reason the number is asserted at all.
+      # gauge needle positions + 1 gauge at the shipping upscale + 5
+      # dot-matrix displays + 1 stretched dot matrix), so exactly 52
+      # cases means exactly 52 `.gl.ppm` files. It was 12 until #1143
+      # added the gauge arm, 24 until #1148's review added the
+      # `scale = 2` gauge case and 28 until #1144 added the dot
+      # matrix; bump it with the case list, in the same commit, for
+      # the reason the number is asserted at all.
       #
       # Nothing here needs a per-kind knob: `TROLLSHELL_PARITY_EXACT=1`
       # still means "pin what has been measured at zero", and *which*
       # cases those are is the harness's own decision
       # (`preem_gl::parity`'s `Kind` and `Sampling`) rather than this
-      # file's. Both kinds are pinned bit-exact where the two arms
-      # rasterise at the same resolution; the box-averaged `scale = 2`
-      # gauge cases are held to the supersampled standard instead —
-      # every pixel off an edge bit-identical plus an edge budget —
-      # which is the only kind of statement a supersampled comparison
-      # can meet.
+      # file's. All three kinds are pinned bit-exact where the two arms
+      # rasterise at the same resolution; a box-averaged supersampled
+      # case — four gauge, four dot matrix — is held to the
+      # supersampled standard instead: every pixel off an edge
+      # bit-identical plus a per-kind edge budget, which is the only
+      # kind of statement such a comparison can meet. The blank-frame
+      # guards bind on every case either way.
       gl_ppm_count="$(find "$out/parity" -maxdepth 1 -name '*.gl.ppm' -type f | wc -l)"
-      if [ "$gl_ppm_count" -ne 28 ]; then
-        echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected 28 — a case-count regression, not a parity failure." >&2
+      if [ "$gl_ppm_count" -ne 52 ]; then
+        echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected 52 — a case-count regression, not a parity failure." >&2
         exit 1
       fi
     '';

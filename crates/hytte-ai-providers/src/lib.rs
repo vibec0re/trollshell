@@ -45,7 +45,7 @@ pub use unix::{
     bridge_socket_path_in,
 };
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The one route this crate speaks, appended to every provider's base URL.
@@ -338,9 +338,34 @@ fn config_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
 }
 
+/// Refuse a key file that grants any access to group or other — the way
+/// `ssh` refuses a loose private key (#1169). `mode & 0o077 != 0` covers
+/// group/other read, write, *or* execute in one test, which is the same bit
+/// group `ssh-keygen`/`sshd` check. Pure and path-injected so it's testable
+/// against a real tempfile without touching the loader's I/O.
+fn check_key_file_permissions(path: &Path, mode: u32) -> Result<(), String> {
+    let mode = mode & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "key file {} has mode {mode:03o}, readable/writable by group or other — \
+             refusing to load it (chmod 600 it)",
+            path.display(),
+        ));
+    }
+    Ok(())
+}
+
 /// Core of [`load_key`] with the env override and config dir injected, so it's
 /// unit-testable without mutating the process environment (which is `unsafe`
 /// under edition 2024, and this crate forbids `unsafe`).
+///
+/// The happy path — a `0600`-or-tighter file, or no file at all (the ordinary
+/// "no key configured" case) — is byte-identical to before #1169. What's new
+/// is the middle case: a key file that *exists* but is readable by group or
+/// other is refused rather than read, with [`check_key_file_permissions`]'s
+/// message printed to stderr — this crate carries no logging dependency (and
+/// #1169 adds none), so a plain `eprintln!` is the loudest warning available
+/// without moving `Cargo.lock`.
 fn load_key_from(
     name: &str,
     env_override: Option<String>,
@@ -353,6 +378,13 @@ fn load_key_from(
         }
     }
     let path = config_dir?.join("trollshell").join(format!("{name}.key"));
+    if let Ok(meta) = std::fs::metadata(&path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) = check_key_file_permissions(&path, meta.permissions().mode()) {
+            eprintln!("hytte-ai-providers: {e}");
+            return None;
+        }
+    }
     let contents = std::fs::read_to_string(path).ok()?;
     let trimmed = contents.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
@@ -849,6 +881,10 @@ mod tests {
         let ts = dir.join("trollshell");
         std::fs::create_dir_all(&ts).expect("mkdir");
         std::fs::write(ts.join("openrouter.key"), "  sk-file-abc\n").expect("write key");
+        // #1169: the happy path needs an explicit 0600, not whatever the
+        // ambient umask left it at — this test's whole claim is "a properly
+        // permissioned file loads", so it must not depend on the environment.
+        chmod(&ts.join("openrouter.key"), 0o600);
 
         // File read + trimmed.
         assert_eq!(
@@ -872,9 +908,78 @@ mod tests {
         );
         // Missing file, no override → None.
         assert!(load_key_from("absent", None, Some(dir.clone())).is_none());
-        // Empty file → None.
+        // Empty file → None (0600 so it's the blank content being refused,
+        // not the permission check landing first).
         std::fs::write(ts.join("blank.key"), "  \n").expect("write blank");
+        chmod(&ts.join("blank.key"), 0o600);
         assert!(load_key_from("blank", None, Some(dir.clone())).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tiny `chmod` wrapper so the tests read as intent, not
+    /// `PermissionsExt` boilerplate at every call site.
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    /// **The check itself** (#1169): `0600`/`0400`/`0000` are fine (no
+    /// group/other bit set); anything that sets a group or other bit —
+    /// world-readable `0644` included — is refused, with the file's path and
+    /// its mode named in the message so a human can act on it without
+    /// guessing which file or what to `chmod`.
+    #[test]
+    fn check_key_file_permissions_refuses_group_or_other_access() {
+        let dir = std::env::temp_dir().join(format!("hytte-ai-providers-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("openrouter.key");
+        std::fs::write(&path, "sk-x").expect("write key");
+
+        for ok_mode in [0o600, 0o400, 0o000] {
+            chmod(&path, ok_mode);
+            assert!(
+                check_key_file_permissions(&path, ok_mode).is_ok(),
+                "mode {ok_mode:03o} grants nothing to group/other and must be accepted",
+            );
+        }
+        for bad_mode in [0o644, 0o640, 0o604, 0o755, 0o666] {
+            chmod(&path, bad_mode);
+            let err = check_key_file_permissions(&path, bad_mode)
+                .expect_err("group/other access must be refused");
+            assert!(
+                err.contains(&path.display().to_string()),
+                "the error must name the file: {err}",
+            );
+            assert!(
+                err.contains(&format!("{bad_mode:03o}")),
+                "the error must name the mode: {err}",
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **End to end through the loader**: a world-readable `0644` key file is
+    /// refused by [`load_key_from`] itself, not just the pure checker — the
+    /// live-verify claim in the PR ("a world-readable key silently loaded
+    /// before, now it doesn't") is exactly this behaviour.
+    ///
+    /// Falsification: delete the `check_key_file_permissions` call out of
+    /// `load_key_from` and this test goes red — `sk-loose` loads clean.
+    #[test]
+    fn load_key_from_refuses_a_world_readable_file() {
+        let dir = std::env::temp_dir().join(format!("hytte-ai-providers-loose-{}", std::process::id()));
+        let ts = dir.join("trollshell");
+        std::fs::create_dir_all(&ts).expect("mkdir");
+        let path = ts.join("openrouter.key");
+        std::fs::write(&path, "sk-loose").expect("write key");
+        chmod(&path, 0o644);
+
+        assert!(
+            load_key_from("openrouter", None, Some(dir.clone())).is_none(),
+            "a world-readable key file must be refused, not loaded",
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

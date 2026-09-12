@@ -42,6 +42,23 @@ async fn next_state(rx: &mut mpsc::UnboundedReceiver<Update>, what: &str) -> Age
     }
 }
 
+/// The seed poll's `Update::State`, **plus** the `Update::Approvals` it is
+/// always paired with (#1141): the first successful poll has no prior
+/// answer to compare against on either `last` or `last_approvals`, so it
+/// emits both, in that order, with no await between the two sends
+/// (`poll_once`'s own doc). A test that goes on to assert "no more messages"
+/// or "the very next message is X" has to drain this pair first, or it sees
+/// the seed's own approvals answer instead of what it is actually waiting
+/// for — this is that drain, named so a reader sees why it is there.
+async fn seed_state(rx: &mut mpsc::UnboundedReceiver<Update>) -> AgentState {
+    let state = next_state(rx, "the seed poll").await;
+    assert!(
+        matches!(next(rx, "the seed's paired approvals").await, Update::Approvals(_)),
+        "the seed poll must pair exactly one Approvals answer with its State"
+    );
+    state
+}
+
 /// Yield until `pred` holds, without advancing the (paused) clock.
 ///
 /// `tokio::time::sleep` is the wrong tool for waiting on **socket** progress
@@ -154,7 +171,7 @@ async fn an_unchanged_hive_sends_one_state_not_one_per_poll() {
         out_tx,
     ));
 
-    let _seed = next_state(&mut out_rx, "the seed poll").await;
+    let _seed = seed_state(&mut out_rx).await;
     for _ in 0..5 {
         one_cadence(&hive, CADENCE).await;
     }
@@ -256,7 +273,7 @@ async fn a_refused_pause_puts_the_toggle_back_where_the_hive_has_it() {
         out_tx,
     ));
 
-    let seed = next_state(&mut out_rx, "the seed poll").await;
+    let seed = seed_state(&mut out_rx).await;
     assert!(!seed.agent().expect("on the roster").paused());
 
     cmd_tx
@@ -302,7 +319,7 @@ async fn every_refused_verb_is_followed_by_a_reconciling_state() {
             cmd_rx,
             out_tx,
         ));
-        let _seed = next_state(&mut out_rx, "the seed poll").await;
+        let _seed = seed_state(&mut out_rx).await;
 
         cmd_tx.send(req).expect("the loop is listening");
         assert!(
@@ -330,7 +347,7 @@ async fn an_accepted_verb_does_not_force_a_repaint() {
         cmd_rx,
         out_tx,
     ));
-    let _seed = next_state(&mut out_rx, "the seed poll").await;
+    let _seed = seed_state(&mut out_rx).await;
     let before = polls(&hive);
 
     cmd_tx

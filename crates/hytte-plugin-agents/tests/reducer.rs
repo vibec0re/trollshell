@@ -1512,9 +1512,7 @@ fn a_prompt_nobody_answers_writes_nothing_and_keeps_its_badge() {
 /// is waiting on — the recovery path for a timed-out card.
 ///
 /// Falsification: make `raise_for` pick `last()` instead of the oldest and the
-/// "request #6" assertion goes red; delete the `self.prompt = None` and the
-/// click raises nothing at all, because the gate is still held by the card that
-/// timed out.
+/// "request #6" assertion goes red.
 #[test]
 fn the_badge_click_re_raises_the_oldest_approval() {
     let (mut m, _rx) = model();

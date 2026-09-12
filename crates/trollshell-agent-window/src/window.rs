@@ -11,17 +11,19 @@
 //! and asserts what it did.
 
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
 
 use hytte_plugin_agents::config::AgentsConfig;
-use hytte_plugin_agents::hive::wire::{HiveUrls, Request};
+use hytte_plugin_agents::hive::wire::{Approval, HiveUrls, Request};
 use hytte_plugin_agents::model::{AgentName, agent_url};
 
-use crate::chrome::{Controls, Facts, HeaderModel};
+use crate::chrome::{self, Controls, Facts, HeaderModel};
 use crate::feed::{self, AgentState, Update};
+use crate::ui::Decision;
 use crate::{cli, page, tls, ui, webview};
 
 /// What the window shows before the hive has a page URL for this agent.
@@ -43,6 +45,16 @@ pub struct Window {
     name: AgentName,
     urls: RefCell<Option<HiveUrls>>,
     last: RefCell<AgentState>,
+    /// The agent's `Pending` queue, already narrowed to this agent and
+    /// sorted oldest-first (`chrome::pending_for`) — #1141. What
+    /// `Window::on_decision` checks a click's id against before it becomes a
+    /// frame, and what `Window::apply` renders.
+    pending: RefCell<Vec<Approval>>,
+    /// The hive's own reason the **last** decision for an approval was
+    /// refused, keyed by id. Pruned to the ids `pending` still carries on
+    /// every `Update::Approvals` — an approval that left the queue has
+    /// nothing left to keep showing a reason for.
+    approval_refusals: RefCell<BTreeMap<i64, String>>,
     cmds: tokio::sync::mpsc::UnboundedSender<Request>,
 }
 
@@ -150,11 +162,15 @@ impl Window {
             name: name.clone(),
             urls: RefCell::new(None),
             last: RefCell::new(AgentState::Connecting),
+            pending: RefCell::new(Vec::new()),
+            approval_refusals: RefCell::new(BTreeMap::new()),
             cmds,
         });
 
         let press = Rc::clone(&this);
         this.header.connect(move |p| press.on_press(p));
+        let decide = Rc::clone(&this);
+        this.settings.connect_decision(move |d| decide.on_decision(d));
         this.apply();
         this
     }
@@ -188,6 +204,35 @@ impl Window {
         }
     }
 
+    /// Route one Approve/Deny press (#1141, spec §6.5).
+    ///
+    /// Two guards, both from the spec's own rule for the sidebar's identical
+    /// decision path (`hytte_plugin_agents::plugin::Agents::decide`): the id
+    /// must still be in the last-polled queue
+    /// ([`chrome::should_send`] — an approval that left `Pending` between the
+    /// render and the click raced a poll, and is dropped with a debug line,
+    /// not sent); and unlike a lifecycle press, there is nothing to flip
+    /// optimistically here — `Approve`/`Deny` run immediately on the far
+    /// side, so the row simply waits for the next poll to reflect it (or,
+    /// since #1141, for a refusal to annotate it in place).
+    fn on_decision(&self, decision: Decision) {
+        let id = decision.id();
+        if !chrome::should_send(&self.pending.borrow(), id) {
+            tracing::debug!(
+                approval = id,
+                "the approval left the queue before this window could send a decision; dropping it"
+            );
+            return;
+        }
+        let req = match decision {
+            Decision::Approve(id) => feed::approve(id),
+            Decision::Deny(id) => feed::deny(id),
+        };
+        if self.cmds.send(req).is_err() {
+            tracing::warn!("the hive client is gone; this window is no longer live");
+        }
+    }
+
     /// Fold one update from the `host.sock` client into the chrome.
     pub fn update(&self, update: Update) {
         match update {
@@ -199,10 +244,32 @@ impl Window {
                 *self.urls.borrow_mut() = Some(*urls);
                 self.apply();
             }
-            Update::Refused { request, reason } => {
-                self.banner.set_title(&ui::refusal(&request, &reason));
-                self.banner.set_revealed(true);
+            Update::Approvals(queue) => {
+                let pending = chrome::pending_for(&self.name, queue);
+                // Prune refusal reasons to ids the fresh queue still carries
+                // — a row that left the queue has nothing left to explain.
+                let live: BTreeSet<i64> = pending.iter().map(|a| a.id).collect();
+                self.approval_refusals
+                    .borrow_mut()
+                    .retain(|id, _| live.contains(id));
+                *self.pending.borrow_mut() = pending;
+                self.apply();
             }
+            Update::Refused { request, reason } => match &request {
+                // #1141: an Approve/Deny refusal is shown **inline**, on the
+                // row it names — a global banner would say "the hive refused
+                // that" beside a row that still shows live buttons, which
+                // does not say *which* decision failed once more than one is
+                // queued.
+                Request::Approve { id } | Request::Deny { id } => {
+                    self.approval_refusals.borrow_mut().insert(*id, reason);
+                    self.apply();
+                }
+                _ => {
+                    self.banner.set_title(&ui::refusal(&request, &reason));
+                    self.banner.set_revealed(true);
+                }
+            },
         }
     }
 
@@ -213,9 +280,18 @@ impl Window {
             &HeaderModel::of(&self.name, &self.cfg, &state),
             &Controls::of(&state),
         );
+        let refusals = self.approval_refusals.borrow();
+        let rows: Vec<chrome::ApprovalRow> = self
+            .pending
+            .borrow()
+            .iter()
+            .map(|a| chrome::ApprovalRow::of(a, refusals.get(&a.id).cloned()))
+            .collect();
+        drop(refusals);
         self.settings.apply(
             &Facts::agent(&self.name, &state),
             &Facts::hive(&self.cfg, self.urls.borrow().as_ref()),
+            &rows,
         );
         self.load_page(&state);
     }
@@ -289,15 +365,31 @@ mod gtk_tests {
     use super::{NO_PAGE, Window};
     use crate::cli::Tab;
     use crate::feed::{AgentState, Update};
+    use crate::ui::Decision;
     use gtk::prelude::*;
     use hytte_plugin_agents::config::AgentsConfig;
-    use hytte_plugin_agents::hive::wire::{AgentStatusRow, HiveUrls, Request, Scope};
+    use hytte_plugin_agents::hive::wire::{
+        AgentStatusRow, Approval, ApprovalStatus, HiveUrls, Request, Scope,
+    };
     use hytte_plugin_agents::model::{Agent, AgentName};
     use std::rc::Rc;
     use tokio::sync::mpsc;
 
     fn name(s: &str) -> AgentName {
         AgentName::parse(s).expect("a legal test name")
+    }
+
+    /// One `Pending` row for `agent`, with a description a test can look for
+    /// in the rendered row.
+    fn approval(id: i64, agent: &str) -> Approval {
+        Approval {
+            id,
+            agent: agent.to_owned(),
+            status: ApprovalStatus::Pending,
+            description: Some(format!("test approval #{id}")),
+            requested_at: "2026-09-12T00:00:00Z".to_owned(),
+            ..Approval::default()
+        }
     }
 
     /// An application object, never run — `adw::ApplicationWindow` wants one,
@@ -486,5 +578,120 @@ mod gtk_tests {
         assert_eq!(w.visible_tab().as_deref(), Some("settings"));
         w.show_tab(Tab::Agent);
         assert_eq!(w.visible_tab().as_deref(), Some("agent"));
+    }
+
+    /// **Rows render from `Pending`, and the group hides itself when the
+    /// queue is empty.** The widget half of the pin `chrome`'s own tests
+    /// already have for the pure filter — this is what proves the filtered
+    /// rows actually reach the Settings page (#1141).
+    #[gtk::test]
+    fn approvals_render_from_pending_and_the_group_hides_when_empty() {
+        let (w, _rx) = window();
+        w.update(Update::State(up(row())));
+        assert!(
+            !w.settings.approvals_visible(),
+            "no approval, no group — nothing to decide yet"
+        );
+
+        w.update(Update::Approvals(vec![
+            approval(1, "stray"),
+            approval(2, "other-agent"),
+        ]));
+        assert!(w.settings.approvals_visible());
+        assert_eq!(
+            w.settings.approval_row_text().len(),
+            1,
+            "the other agent's row must not leak into this window: {:?}",
+            w.settings.approval_row_text()
+        );
+
+        w.update(Update::Approvals(Vec::new()));
+        assert!(
+            !w.settings.approvals_visible(),
+            "an emptied queue hides the group again"
+        );
+    }
+
+    /// **Approving a pending row sends the pinned bytes**, and the row's
+    /// membership check is the guard [`Window::on_decision`] applies before
+    /// anything reaches the command lane.
+    ///
+    /// Mutation (verified red): make `on_decision` build `Request::Deny`
+    /// for `Decision::Approve` and the byte assertion reds.
+    #[gtk::test]
+    fn approving_a_pending_row_sends_the_pinned_approve_bytes() {
+        let (w, mut rx) = window();
+        w.update(Update::State(up(row())));
+        w.update(Update::Approvals(vec![approval(42, "stray")]));
+
+        w.settings.press_approve_for_test(42);
+        match rx.try_recv() {
+            Ok(Request::Approve { id }) => assert_eq!(id, 42),
+            other => panic!("expected Approve {{ id: 42 }}, got {other:?}"),
+        }
+    }
+
+    /// Denying does the same, on the other button.
+    #[gtk::test]
+    fn denying_a_pending_row_sends_the_pinned_deny_bytes() {
+        let (w, mut rx) = window();
+        w.update(Update::State(up(row())));
+        w.update(Update::Approvals(vec![approval(7, "stray")]));
+
+        w.settings.press_deny_for_test(7);
+        match rx.try_recv() {
+            Ok(Request::Deny { id }) => assert_eq!(id, 7),
+            other => panic!("expected Deny {{ id: 7 }}, got {other:?}"),
+        }
+    }
+
+    /// **A decision for an id no longer pending is dropped, not sent** —
+    /// spec §6.5's rule for the race between a poll and a click, exercised
+    /// directly against [`Window::on_decision`] rather than through a stale
+    /// button (nothing renders a row for an id the window no longer has, so
+    /// the only way to construct the race in a test is to ask for the
+    /// decision the way a queued click would arrive).
+    ///
+    /// Mutation (verified red): delete the `chrome::should_send` guard in
+    /// `on_decision` and this reds.
+    #[gtk::test]
+    fn a_decision_for_an_id_no_longer_pending_is_dropped_not_sent() {
+        let (w, mut rx) = window();
+        w.update(Update::State(up(row())));
+        w.update(Update::Approvals(vec![approval(5, "stray")]));
+        w.update(Update::Approvals(Vec::new())); // resolved elsewhere
+
+        w.on_decision(Decision::Approve(5));
+        assert!(
+            rx.try_recv().is_err(),
+            "an id the last poll no longer carries must not reach the hive"
+        );
+    }
+
+    /// **A refused write keeps the row and shows why inline.** The row is
+    /// still there, still bearing live buttons, and its subtitle now carries
+    /// the hive's own reason — no global banner for this one (#1141).
+    #[gtk::test]
+    fn a_refused_approval_keeps_the_row_and_shows_the_reason_inline() {
+        let (w, _rx) = window();
+        w.update(Update::State(up(row())));
+        w.update(Update::Approvals(vec![approval(9, "stray")]));
+
+        w.update(Update::Refused {
+            request: Request::Approve { id: 9 },
+            reason: "agent busy".to_owned(),
+        });
+
+        assert_eq!(w.banner_text(), None, "an approval refusal is inline, not a banner");
+        assert!(
+            w.settings
+                .approval_row_text()
+                .iter()
+                .any(|r| r.contains("agent busy")),
+            "{:?}",
+            w.settings.approval_row_text()
+        );
+        // Still pressable — the operator can retry.
+        w.settings.press_approve_for_test(9);
     }
 }

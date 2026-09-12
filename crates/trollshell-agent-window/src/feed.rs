@@ -1,5 +1,5 @@
-//! The window's own `host.sock` client: one agent's live state, and the three
-//! lifecycle verbs its buttons send.
+//! The window's own `host.sock` client: one agent's live state, its pending
+//! approval queue (#1141), and the five verbs its buttons send.
 //!
 //! # Why the window reads the socket itself
 //!
@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use hytte_plugin_agents::hive::client::{self, HiveError};
-use hytte_plugin_agents::hive::wire::{HiveUrls, Request, Response, Scope};
+use hytte_plugin_agents::hive::wire::{Approval, HiveUrls, Request, Response, Scope};
 use hytte_plugin_agents::model::{Agent, AgentName};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -95,6 +95,15 @@ pub enum Update {
     State(AgentState),
     /// The hive's own URLs, fetched once per session.
     Urls(Box<HiveUrls>),
+    /// The approval queue as the hive returned it (#1141), **unfiltered** —
+    /// same contract as `hytte_plugin_agents::poll::Msg::Pending`: "which
+    /// statuses are still actionable" and "which agent is this window's" are
+    /// both model policy (`crate::chrome::pending_for`), not something the
+    /// I/O task decides. A `Pending` refusal (an older daemon, a permissions
+    /// change) also arrives here as an empty `Vec` — the window can no longer
+    /// vouch for the rows, so it clears them rather than freezing on the last
+    /// good answer.
+    Approvals(Vec<Approval>),
     /// A verb this window sent was refused, with the hive's own words.
     Refused {
         /// The verb, for the sentence the window shows.
@@ -137,6 +146,22 @@ pub fn set_paused(name: &AgentName, paused: bool) -> Request {
     }
 }
 
+/// `Approve` one queued approval by id (#1141, spec §6.5) — the action runs
+/// **immediately** on the far side, so this is sent for a click and nothing
+/// else; [`crate::chrome::should_send`] is the guard the window applies
+/// before it ever reaches [`run`]'s command lane.
+#[must_use]
+pub fn approve(id: i64) -> Request {
+    Request::Approve { id }
+}
+
+/// `Deny` one queued approval by id. Only ever sent for a click — an
+/// unanswered prompt is not a `Deny` (spec §6.5).
+#[must_use]
+pub fn deny(id: i64) -> Request {
+    Request::Deny { id }
+}
+
 /// Poll one agent forever, and send what the buttons ask for.
 ///
 /// Ends when either channel is closed — which is how the window's own exit
@@ -153,11 +178,15 @@ pub async fn run(
     out: UnboundedSender<Update>,
 ) {
     let mut last: Option<AgentState> = None;
+    let mut last_approvals: Option<Vec<Approval>> = None;
     let mut urls = UrlsFetch::default();
     if urls.attempt(&socket, &out).await.is_err() {
         return;
     }
-    if poll_once(&socket, &name, &out, &mut last).await.is_err() {
+    if poll_once(&socket, &name, &out, &mut last, &mut last_approvals)
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -186,7 +215,10 @@ pub async fn run(
                 if urls.attempt(&socket, &out).await.is_err() {
                     return;
                 }
-                if poll_once(&socket, &name, &out, &mut last).await.is_err() {
+                if poll_once(&socket, &name, &out, &mut last, &mut last_approvals)
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -194,7 +226,10 @@ pub async fn run(
                 if urls.attempt(&socket, &out).await.is_err() {
                     return;
                 }
-                if poll_once(&socket, &name, &out, &mut last).await.is_err() {
+                if poll_once(&socket, &name, &out, &mut last, &mut last_approvals)
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -263,11 +298,18 @@ async fn write(socket: &std::path::Path, req: &Request) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// One poll, sent only when it **changed**.
+/// One poll: `AgentStatus`, sent only when it **changed**, then `Pending`
+/// (#1141) — only once the status call already proved the socket answering,
+/// same order [`hytte_plugin_agents::poll::poll_once`] uses and for the same
+/// reason: a dead hive should cost one failed connect, not two.
 ///
-/// Dedup is not an optimisation: `Update::State` drives a label rewrite and a
-/// button-sensitivity pass on the GTK thread, and at the default two-second
-/// cadence an idle hive would otherwise repaint the header forever.
+/// Dedup on `Update::State` is not an optimisation: it drives a label rewrite
+/// and a button-sensitivity pass on the GTK thread, and at the default
+/// two-second cadence an idle hive would otherwise repaint the header
+/// forever. `Update::Approvals` is deduped too, on the **raw** answer — the
+/// per-agent filter runs downstream, in [`crate::chrome::pending_for`], so two
+/// polls that changed only another agent's queue still cost this window
+/// nothing.
 ///
 /// `Err(())` means the GTK side is gone.
 async fn poll_once(
@@ -275,19 +317,58 @@ async fn poll_once(
     name: &AgentName,
     out: &UnboundedSender<Update>,
     last: &mut Option<AgentState>,
+    last_approvals: &mut Option<Vec<Approval>>,
 ) -> Result<(), ()> {
     let answer = client::request(socket, &Request::AgentStatus).await;
+    let status_ok = answer.is_ok();
     let state = AgentState::of(&answer, name);
-    if last.as_ref() == Some(&state) {
-        return Ok(());
+
+    // `Pending` rides the same tick, right after `AgentStatus` and only once
+    // it answered — same order and reason `hytte_plugin_agents::poll`'s
+    // `poll_once` uses: a dead hive should cost one failed connect, not two.
+    // A refusal (an older daemon, a permissions change) clears this window's
+    // rows rather than freezing on the last good answer — the same rule
+    // `hytte_plugin_agents::plugin::Agents`'s `Input::App(Msg::Pending(Err))`
+    // arm follows for the sidebar's badges.
+    let approvals = if status_ok {
+        Some(match client::request(socket, &Request::Pending).await {
+            Ok(resp) => resp.approvals.unwrap_or_default(),
+            Err(e) => {
+                tracing::debug!(
+                    %e,
+                    "the hive refused the approval queue; clearing this window's rows until it answers"
+                );
+                Vec::new()
+            }
+        })
+    } else {
+        None
+    };
+
+    // Every send below is **synchronous** (an unbounded channel never
+    // blocks) — deliberately no `.await` between here and `return`. The seed
+    // call relies on that: a test observes `Update::State` the moment it is
+    // sent and then assumes this task has already reached its ticker
+    // (`run`'s next few lines, none of which await either), which held only
+    // because nothing here used to await *after* the send. Fetching the two
+    // answers above **first**, and sending only once both are in hand,
+    // keeps that property true with a second round trip in the mix.
+    if last.as_ref() != Some(&state) {
+        *last = Some(state.clone());
+        out.send(Update::State(state)).map_err(|_| ())?;
     }
-    *last = Some(state.clone());
-    out.send(Update::State(state)).map_err(|_| ())
+    if let Some(approvals) = approvals
+        && last_approvals.as_ref() != Some(&approvals)
+    {
+        *last_approvals = Some(approvals.clone());
+        out.send(Update::Approvals(approvals)).map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentState, set_paused, start, stop};
+    use super::{AgentState, approve, deny, set_paused, start, stop};
     use hytte_plugin_agents::hive::client::HiveError;
     use hytte_plugin_agents::hive::wire::{AgentStatusRow, Response};
     use hytte_plugin_agents::model::{AgentName, Status};
@@ -332,6 +413,23 @@ mod tests {
             line(set_paused(&n, false)),
             r#"{"cmd":"set_paused","name":"trollshell-choom","paused":false}"#
         );
+    }
+
+    /// `Approve` and `Deny` put the **exact** bytes hyperhive's own host
+    /// documents on the socket — cited from `hive-host-sock/src/lib.rs:230-233`
+    /// via `hive::wire::Request`'s own committed test
+    /// (`crates/hytte-plugin-agents/src/hive/wire.rs`), not derived from this
+    /// crate's `Request` variants: a serializer bug that renamed the `cmd` tag
+    /// or dropped the `id` field would still round-trip through `Request`
+    /// itself and stay invisible to an assertion built the same way.
+    ///
+    /// Mutation (verified red): swap the two bodies (`approve` builds `Deny`,
+    /// `deny` builds `Approve`) and both assertions red.
+    #[test]
+    fn approve_and_deny_put_their_pinned_bytes_on_the_socket() {
+        let line = |r| serde_json::to_string(&r).expect("a Request serializes");
+        assert_eq!(line(approve(42)), r#"{"cmd":"approve","id":42}"#);
+        assert_eq!(line(deny(42)), r#"{"cmd":"deny","id":42}"#);
     }
 
     /// Every verb names **exactly one** agent — spec §11 rule one, which

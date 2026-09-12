@@ -125,11 +125,17 @@ impl FakeHive {
     }
 
     /// Only the lines that are not the status poll — i.e. what a button did.
+    ///
+    /// `pending` rides the same poll as `agent_status` since #1141 and is
+    /// filtered out here for the same reason: it is the window asking, not
+    /// the operator clicking.
     #[must_use]
     pub fn writes(&self) -> Vec<String> {
         self.seen()
             .into_iter()
-            .filter(|l| !l.contains("\"agent_status\"") && !l.contains("\"urls\""))
+            .filter(|l| {
+                !l.contains("\"agent_status\"") && !l.contains("\"urls\"") && !l.contains("\"pending\"")
+            })
             .collect()
     }
 }

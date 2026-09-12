@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-use crate::chrome::{Controls, Fact, HeaderModel};
+use crate::chrome::{ApprovalRow, Controls, Fact, HeaderModel};
 
 /// The lifecycle verb a button press asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,10 +291,13 @@ fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
     b
 }
 
-/// The settings tab: what the hive says about this agent, read-only.
+/// The settings tab: what the hive says about this agent (read-only), and
+/// since #1141 the one thing on this page that writes — the agent's queued
+/// approvals.
 pub struct Settings {
     /// The widget to mount in the `ViewStack`.
     pub root: adw::PreferencesPage,
+    approvals: Approvals,
     agent: adw::PreferencesGroup,
     hive: adw::PreferencesGroup,
     agent_rows: RefCell<Vec<adw::ActionRow>>,
@@ -305,6 +308,7 @@ impl Settings {
     /// Build the empty page.
     #[must_use]
     pub fn new() -> Self {
+        let approvals = Approvals::new();
         let agent = adw::PreferencesGroup::builder()
             .title("Agent")
             .description(
@@ -317,10 +321,14 @@ impl Settings {
             .description("Where this window reads that from.")
             .build();
         let root = adw::PreferencesPage::new();
+        // Approvals first — it is the one group asking for a decision, ahead
+        // of the two that only report.
+        root.add(&approvals.root);
         root.add(&agent);
         root.add(&hive);
         Self {
             root,
+            approvals,
             agent,
             hive,
             agent_rows: RefCell::new(Vec::new()),
@@ -328,7 +336,13 @@ impl Settings {
         }
     }
 
-    /// Replace both groups' rows.
+    /// Route every Approve/Deny press to `on_decision` (#1141).
+    pub fn connect_decision(&self, on_decision: impl Fn(Decision) + 'static) {
+        self.approvals.connect(on_decision);
+    }
+
+    /// Replace every group's rows: the two read-only ones plus the
+    /// approvals group.
     ///
     /// Rebuilt rather than updated in place: the row set is short and fixed,
     /// and a rebuild cannot leave a stale row behind when a field goes from
@@ -337,7 +351,8 @@ impl Settings {
     /// Rows are `adw::ActionRow`s — `GtkListBoxRow`s — because a
     /// `PreferencesGroup` renders anything else *below* its list rather than
     /// among the rows, which type-checks and looks wrong.
-    pub fn apply(&self, agent: &[Fact], hive: &[Fact]) {
+    pub fn apply(&self, agent: &[Fact], hive: &[Fact], approvals: &[ApprovalRow]) {
+        self.approvals.apply(approvals);
         for (group, tracked, facts) in [
             (&self.agent, &self.agent_rows, agent),
             (&self.hive, &self.hive_rows, hive),
@@ -398,9 +413,220 @@ impl Settings {
             .map(|r| format!("{}: {}", r.title(), r.subtitle().unwrap_or_default()))
             .collect()
     }
+
+    /// The approvals group's own rows, `title: subtitle` — kept separate from
+    /// [`Settings::row_text`] because a subtitle here can legitimately
+    /// contain the same text twice in two different tests' expectations
+    /// (a refusal reason), and mixing the two groups would make a length
+    /// assertion ambiguous about which group grew.
+    #[cfg(all(test, feature = "system-tests"))]
+    pub fn approval_row_text(&self) -> Vec<String> {
+        self.approvals.row_text()
+    }
+
+    /// Whether the Approvals group is showing at all — hidden when the queue
+    /// is empty.
+    #[cfg(all(test, feature = "system-tests"))]
+    pub fn approvals_visible(&self) -> bool {
+        self.approvals.root.property::<bool>("visible")
+    }
+
+    /// Press Approve for `id` in the approvals group. See
+    /// `Header::press_start_for_test`.
+    #[cfg(all(test, feature = "system-tests"))]
+    pub fn press_approve_for_test(&self, id: i64) {
+        self.approvals.press_approve_for_test(id);
+    }
+
+    /// Press Deny for `id`. See [`Settings::press_approve_for_test`].
+    #[cfg(all(test, feature = "system-tests"))]
+    pub fn press_deny_for_test(&self, id: i64) {
+        self.approvals.press_deny_for_test(id);
+    }
 }
 
 impl Default for Settings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One decision a row's Approve/Deny button asks for (#1141, spec §6.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// Approve the approval with this id.
+    Approve(i64),
+    /// Deny it.
+    Deny(i64),
+}
+
+impl Decision {
+    /// The id it names, regardless of which button raised it — what the
+    /// window's staleness guard checks before either becomes a frame.
+    #[must_use]
+    pub fn id(self) -> i64 {
+        match self {
+            Self::Approve(id) | Self::Deny(id) => id,
+        }
+    }
+}
+
+/// One approval row's widgets — an `ActionRow` plus the two buttons in its
+/// suffix, tracked together so a test can find "the Approve button for id
+/// 42" without walking the widget tree.
+#[allow(
+    dead_code,
+    reason = "id, approve and deny are read back only by the system-tests press helpers below; \
+              a plain build never needs them once the buttons are wired and parented"
+)]
+struct ApprovalRowWidgets {
+    id: i64,
+    row: adw::ActionRow,
+    approve: gtk::Button,
+    deny: gtk::Button,
+}
+
+/// The callback slot a row's Approve/Deny buttons close over — named so
+/// `Approvals`'s field escapes `clippy::type_complexity`.
+type DecisionHandler = Rc<dyn Fn(Decision)>;
+
+/// The Settings page's "Approvals" group: the agent's queued decisions,
+/// Approve/Deny per row (#1141, spec §6.5).
+///
+/// Hidden whenever the queue is empty, which is most of the time: an operator
+/// who has nothing to approve should not carry a permanently-empty group on
+/// a page that otherwise only reports facts.
+pub struct Approvals {
+    /// The widget to mount in the settings page.
+    pub root: adw::PreferencesGroup,
+    rows: RefCell<Vec<ApprovalRowWidgets>>,
+    on_decision: RefCell<Option<DecisionHandler>>,
+}
+
+impl Approvals {
+    /// Build the empty group.
+    #[must_use]
+    pub fn new() -> Self {
+        let root = adw::PreferencesGroup::builder()
+            .title("Approvals")
+            .description(
+                "Queued decisions this agent is waiting on. Approve and Deny act \
+                 immediately; an unanswered row stays exactly as it is — silence never \
+                 decides it.",
+            )
+            .build();
+        root.set_visible(false);
+        Self {
+            root,
+            rows: RefCell::new(Vec::new()),
+            on_decision: RefCell::new(None),
+        }
+    }
+
+    /// Route every Approve/Deny press to `on_decision`.
+    pub fn connect(&self, on_decision: impl Fn(Decision) + 'static) {
+        *self.on_decision.borrow_mut() = Some(Rc::new(on_decision));
+    }
+
+    /// Replace the rows. Rebuilt rather than updated in place, exactly like
+    /// [`Settings::apply`]'s two groups: the row set is short, and a decided
+    /// approval must not linger as a stale row with live buttons on a queue
+    /// it has already left.
+    pub fn apply(&self, approvals: &[ApprovalRow]) {
+        for w in self.rows.borrow_mut().drain(..) {
+            self.root.remove(&w.row);
+        }
+        self.root.set_visible(!approvals.is_empty());
+
+        let mut tracked = self.rows.borrow_mut();
+        for a in approvals {
+            let approve = gtk::Button::builder().label("Approve").build();
+            approve.set_valign(gtk::Align::Center);
+            approve.add_css_class("suggested-action");
+            let deny = gtk::Button::builder().label("Deny").build();
+            deny.set_valign(gtk::Align::Center);
+            deny.add_css_class("destructive-action");
+
+            if let Some(cb) = self.on_decision.borrow().clone() {
+                let id = a.id;
+                let f = Rc::clone(&cb);
+                approve.connect_clicked(move |_| f(Decision::Approve(id)));
+                let f = Rc::clone(&cb);
+                deny.connect_clicked(move |_| f(Decision::Deny(id)));
+            }
+
+            let suffix = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            suffix.set_valign(gtk::Align::Center);
+            suffix.append(&approve);
+            suffix.append(&deny);
+
+            let row = adw::ActionRow::builder()
+                .title(&a.title)
+                .subtitle(a.subtitle())
+                .use_markup(false)
+                .subtitle_selectable(true)
+                .build();
+            // Room for the detail line, the stamp and (when a decision on
+            // this row was refused) the reason on its own line.
+            row.set_subtitle_lines(3);
+            row.add_suffix(&suffix);
+            self.root.add(&row);
+            tracked.push(ApprovalRowWidgets {
+                id: a.id,
+                row,
+                approve,
+                deny,
+            });
+        }
+    }
+
+    /// Every row's `title: subtitle` — see [`Settings::row_text`]'s doc for
+    /// why this group's rows are read back separately.
+    #[cfg(all(test, feature = "system-tests"))]
+    fn row_text(&self) -> Vec<String> {
+        self.rows
+            .borrow()
+            .iter()
+            .map(|w| format!("{}: {}", w.row.title(), w.row.subtitle().unwrap_or_default()))
+            .collect()
+    }
+
+    /// Press Approve for `id`, refusing an insensitive or absent button —
+    /// what an operator could actually do. See
+    /// `Header::press_start_for_test`.
+    #[cfg(all(test, feature = "system-tests"))]
+    fn press_approve_for_test(&self, id: i64) {
+        let rows = self.rows.borrow();
+        let w = rows
+            .iter()
+            .find(|w| w.id == id)
+            .unwrap_or_else(|| panic!("no approval row for id {id}"));
+        let (visible, sensitive) = own_flags(&w.approve);
+        assert!(
+            visible && sensitive,
+            "Approve for {id} is not pressable (visible: {visible}, sensitive: {sensitive})"
+        );
+        w.approve.emit_clicked();
+    }
+
+    /// Press Deny for `id`. See [`Approvals::press_approve_for_test`].
+    #[cfg(all(test, feature = "system-tests"))]
+    fn press_deny_for_test(&self, id: i64) {
+        let rows = self.rows.borrow();
+        let w = rows
+            .iter()
+            .find(|w| w.id == id)
+            .unwrap_or_else(|| panic!("no approval row for id {id}"));
+        let (visible, sensitive) = own_flags(&w.deny);
+        assert!(
+            visible && sensitive,
+            "Deny for {id} is not pressable (visible: {visible}, sensitive: {sensitive})"
+        );
+        w.deny.emit_clicked();
+    }
+}
+
+impl Default for Approvals {
     fn default() -> Self {
         Self::new()
     }
@@ -730,6 +956,7 @@ mod gtk_tests {
         settings.apply(
             &Facts::agent(&name("stray"), &AgentState::Connecting),
             &Facts::hive(&cfg, None),
+            &[],
         );
         let first = settings.tracked_rows();
         assert!(
@@ -745,6 +972,7 @@ mod gtk_tests {
         settings.apply(
             &Facts::agent(&name("stray"), &state),
             &Facts::hive(&cfg, None),
+            &[],
         );
         assert!(
             first.iter().all(|r| r.parent().is_none()),
@@ -768,7 +996,7 @@ mod gtk_tests {
 
         let (a, h) = facts(&AgentState::Connecting);
         let expected = a.len() + h.len();
-        settings.apply(&a, &h);
+        settings.apply(&a, &h, &[]);
         assert_eq!(settings.row_text().len(), expected);
 
         let state = up(AgentStatusRow {
@@ -778,7 +1006,7 @@ mod gtk_tests {
             ..AgentStatusRow::default()
         });
         let (a, h) = facts(&state);
-        settings.apply(&a, &h);
+        settings.apply(&a, &h, &[]);
         assert_eq!(settings.row_text().len(), expected, "rebuilt, not appended");
         assert!(
             settings

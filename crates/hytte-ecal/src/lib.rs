@@ -20,15 +20,25 @@
 //! `GError**` (if any) and wraps it in an `anyhow::Error`. The GError
 //! itself is freed; the resulting string copy lives in the `Error`.
 //!
-//! ## `unsafe` and its SAFETY comments (#1179)
+//! ## `unsafe` and its SAFETY comments (#1179, #1195)
 //!
 //! This is one of the workspace's two `unsafe` islands (the other is
 //! `hytte-gl`); everything else is compiled under `unsafe_code = "forbid"`.
 //! Every `unsafe` block here carries a `// SAFETY:` line saying what that
-//! block relies on. Three premises recur on nearly every call, so they are
-//! stated once here and referred to by name (**P1**/**P2**/**P3**) rather
-//! than retyped a hundred times; a block whose soundness needs anything
-//! beyond them spells that out in full.
+//! block relies on — **one line per block**, because
+//! `clippy::undocumented_unsafe_blocks` is `deny` for this crate (#1195, from
+//! the root lints table its `Cargo.toml` mirrors), and that lint reads the
+//! comment directly above each block and nothing else. A grouped comment
+//! covering three blocks at once therefore does not compile, which is the
+//! point: a future block arriving without a justification fails `cargo check`
+//! rather than a reviewer's sampling.
+//!
+//! Three premises recur on nearly every call, so they are stated once here
+//! and referred to by name (**P1**/**P2**/**P3**) rather than retyped a
+//! hundred times; a block whose soundness needs anything beyond them spells
+//! that out in full. Where several adjacent blocks genuinely share one
+//! argument, the argument is written once as ordinary prose above them and
+//! each block's own `SAFETY:` line cites it.
 //!
 //! - **P1 — owned handle.** A wrapper's `self.raw` (or a local that a
 //!   null-check just guarded) is a live GObject pointer this crate owns
@@ -418,11 +428,13 @@ impl CalClient {
             // runtime via `e_cal_client_error_quark()` (stable for the
             // process lifetime); `GError.domain` is itself a GQuark.
             if !err.is_null() {
-                // SAFETY (both reads): `err` is non-null (checked) and was set
-                // by the call above, so it points at a `GError` we own whose
-                // layout `sys::GError` mirrors `#[repr(C)]`; both fields are
-                // plain integers, read before the free below.
+                // SAFETY: `err` is non-null (checked) and was set by the
+                // call above, so it points at a `GError` we own whose layout
+                // `sys::GError` mirrors `#[repr(C)]`; `domain` is a plain
+                // integer field, read before the free below.
                 let domain = unsafe { (*err).domain };
+                // SAFETY: as the `domain` read above — the same live, owned
+                // `GError`, another plain integer field, still before the free.
                 let code = unsafe { (*err).code };
                 // SAFETY: a nullary `G_GNUC_CONST` function that only interns
                 // and returns a quark — no arguments to get wrong.
@@ -770,15 +782,19 @@ unsafe fn expand_component(
     // the emitted-set scan was); RDATE a list of extra starts, kept ordered
     // because emission order is part of this function's output contract.
     //
-    // SAFETY (both calls): `collect_property_times` wants a live, borrowed
-    // `ICalComponent*` — `comp` — plus a property-kind discriminant; the two
-    // constants are the `ICalPropertyKind` values libical defines (pinned at
-    // their `sys` declarations), and the `is_rdate` flag matches the kind, so
-    // each value is read through the accessor for the type it actually has.
+    // SAFETY: `collect_property_times` wants a live, borrowed
+    // `ICalComponent*` — `comp` is exactly that (P1, this function's own
+    // contract) — plus a property-kind discriminant; `I_CAL_EXDATE_PROPERTY`
+    // is the `ICalPropertyKind` value libical defines (pinned at its `sys`
+    // declaration), and `is_rdate = false` matches it, so the value is read
+    // through the accessor for the type it actually has.
     let exdates: HashSet<i64> =
         unsafe { collect_property_times(comp, sys::I_CAL_EXDATE_PROPERTY, false) }
             .into_iter()
             .collect();
+    // SAFETY: as the EXDATE call above, with the other half of the pairing —
+    // `I_CAL_RDATE_PROPERTY` is libical's RDATE discriminant and `is_rdate =
+    // true` selects the `ICalDatetimeperiod` accessor an RDATE value needs.
     let rdates = unsafe { collect_property_times(comp, sys::I_CAL_RDATE_PROPERTY, true) };
 
     let mut emit = Emitter::new(ical, exdates, duration, all_day, start_unix, end_unix);
@@ -1176,17 +1192,22 @@ unsafe fn ical_time_to_unix(tt: *mut sys::ICalTime) -> Option<i64> {
         return None;
     }
     let tt_const = tt.cast_const();
-    // SAFETY (this and the three reads below): `tt` is non-null (checked) and
-    // a live borrowed `ICalTime*` by this function's contract; all four are
-    // read-only accessors that take no ownership and free nothing. `own_zone`
-    // is the zone the time itself holds — **borrowed**, owned by libical, and
-    // never unref'd here.
+    // The four reads below share one premise, cited by each `SAFETY:` line:
+    // `tt` is non-null (checked) and a live borrowed `ICalTime*` by this
+    // function's contract, and every accessor here is read-only — none takes
+    // ownership or frees anything.
+    //
+    // SAFETY: the premise above; the null-time predicate only reads `tt`.
     if unsafe { sys::i_cal_time_is_null_time(tt_const) } != 0 {
         return None;
     }
 
+    // SAFETY: the premise above; a read-only predicate on the same borrow.
     let is_date = unsafe { sys::i_cal_time_is_date(tt_const) } != 0;
+    // SAFETY: as `is_date`.
     let is_utc = unsafe { sys::i_cal_time_is_utc(tt_const) } != 0;
+    // SAFETY: as `is_date`, and the zone it returns is the one the time itself
+    // holds — **borrowed**, owned by libical, and never unref'd here.
     let own_zone = unsafe { sys::i_cal_time_get_timezone(tt_const) };
     let has_own_zone = !own_zone.is_null();
 
@@ -1197,11 +1218,13 @@ unsafe fn ical_time_to_unix(tt: *mut sys::ICalTime) -> Option<i64> {
         // midnight-UTC or the day would drift. The zone argument is irrelevant
         // for a DATE (no time-of-day to shift) — pass the UTC singleton.
         //
-        // SAFETY (both): `i_cal_timezone_get_utc_timezone` is nullary and
-        // returns libical's process-wide singleton — borrowed, never unref'd
-        // (its `sys` declaration says so); `tt_const` is the live borrow from
-        // above, and the conversion only reads both.
+        // SAFETY: `i_cal_timezone_get_utc_timezone` is nullary and returns
+        // libical's process-wide singleton — borrowed, never unref'd (its
+        // `sys` declaration says so).
         let utc = unsafe { sys::i_cal_timezone_get_utc_timezone() };
+        // SAFETY: `tt_const` is the live borrow checked at the top of this
+        // function and `utc` the singleton just taken; the conversion only
+        // reads both and allocates nothing.
         return Some(unsafe { sys::i_cal_time_as_timet_with_zone(tt_const, utc.cast_const()) });
     }
 
@@ -1234,9 +1257,11 @@ unsafe fn ical_time_to_unix(tt: *mut sys::ICalTime) -> Option<i64> {
         // libical values carry the `is_utc` bit without a zone object). It is
         // already absolute — the UTC singleton is the correct source zone.
         //
-        // SAFETY (both): as the DATE branch above — the nullary singleton
-        // getter, and a read-only conversion of the live borrow.
+        // SAFETY: as the DATE branch above — a nullary getter for libical's
+        // borrowed, never-unref'd process-wide singleton.
         let utc = unsafe { sys::i_cal_timezone_get_utc_timezone() };
+        // SAFETY: as the DATE branch above — a read-only conversion of the
+        // live borrow, with the singleton as the source zone.
         return Some(unsafe { sys::i_cal_time_as_timet_with_zone(tt_const, utc.cast_const()) });
     }
 
@@ -1272,18 +1297,31 @@ impl WallClock {
     /// `tt` must be a valid, non-null `ICalTime*` borrowed from libical.
     unsafe fn from_ical(tt: *mut sys::ICalTime) -> Self {
         let c = tt.cast_const();
-        // SAFETY (all six reads): `tt` is non-null and a live borrowed
-        // `ICalTime*` by this function's contract, and each accessor is a
-        // read-only field getter returning a `gint` — none takes ownership,
-        // frees anything, or can observe a partially-built value (P3: the
-        // time belongs to this thread).
+        // The six reads below share one premise, cited by each `SAFETY:` line:
+        // `tt` is non-null and a live borrowed `ICalTime*` by this function's
+        // contract, and each accessor is a read-only field getter returning a
+        // `gint` — none takes ownership, frees anything, or can observe a
+        // partially-built value (P3: the time belongs to this thread).
+        //
+        // SAFETY: the premise above.
+        let year = unsafe { sys::i_cal_time_get_year(c) };
+        // SAFETY: as `year`.
+        let month = unsafe { sys::i_cal_time_get_month(c) };
+        // SAFETY: as `year`.
+        let day = unsafe { sys::i_cal_time_get_day(c) };
+        // SAFETY: as `year`.
+        let hour = unsafe { sys::i_cal_time_get_hour(c) };
+        // SAFETY: as `year`.
+        let minute = unsafe { sys::i_cal_time_get_minute(c) };
+        // SAFETY: as `year`.
+        let second = unsafe { sys::i_cal_time_get_second(c) };
         Self {
-            year: unsafe { sys::i_cal_time_get_year(c) },
-            month: unsafe { sys::i_cal_time_get_month(c) },
-            day: unsafe { sys::i_cal_time_get_day(c) },
-            hour: unsafe { sys::i_cal_time_get_hour(c) },
-            minute: unsafe { sys::i_cal_time_get_minute(c) },
-            second: unsafe { sys::i_cal_time_get_second(c) },
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
         }
     }
 
@@ -1785,9 +1823,10 @@ fn take_error(err: *mut sys::GError) -> Option<anyhow::Error> {
             CStr::from_ptr(ptr).to_string_lossy().into_owned()
         }
     };
-    // SAFETY (both): as above — plain integer fields of the same live error,
-    // read before it is freed.
+    // SAFETY: as the `message` read above — a plain integer field of the same
+    // live, owned error, read before it is freed.
     let domain = unsafe { (*err).domain };
+    // SAFETY: as the `domain` read above.
     let code = unsafe { (*err).code };
     // SAFETY: the error we own, freed exactly once (this function consumes the
     // pointer and every caller drops it afterwards) and never read after.

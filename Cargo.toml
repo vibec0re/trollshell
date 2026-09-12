@@ -69,7 +69,8 @@ rust-version = "1.92"
 # crates/hytte-gl/Cargo.toml) instead of `[lints] workspace = true`, because
 # they need `unsafe_code = "allow"` and Cargo's workspace-lints inheritance is
 # all-or-nothing (no per-lint override). Keep all three in sync when editing
-# this table.
+# this table — `checks.lints-tables` (`nix/lint-lints-tables.py`, #1179) fails
+# if they drift.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
@@ -82,6 +83,18 @@ unsafe_code = "forbid"
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 disallowed_methods = "deny"
+# Every `unsafe` block carries a `// SAFETY:` line saying what it relies on
+# (#1179 wrote 129 of them by hand; #1195 made them enforceable instead of
+# reviewer-sampled). A no-op in every crate but the two islands — `unsafe_code
+# = "forbid"` above means there is no `unsafe` block left here to document —
+# and it lives HERE rather than as a per-island extra on purpose: this is a
+# workspace rule that happens to bind only where `unsafe` is legal, and
+# `nix/lint-lints-tables.py`'s rule 4 (every root key present, with an equal
+# value, in each island's mirrored table) is what then makes *deleting* it from
+# an island red. Its `EXTRA_ALLOWS` slot could not: that is a permission list,
+# checked against the keys an island *has*, so an island that dropped the line
+# would sail through. A third island would inherit the rule by existing.
+undocumented_unsafe_blocks = "deny"
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"

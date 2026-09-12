@@ -40,9 +40,11 @@ gdk4-sys = "0.11.2"
 # inheritance is all-or-nothing (no per-lint override), so the umbrella below is
 # hand-mirrored from the root `[workspace.lints]` (see the tripwire comment
 # there) with `unsafe_code` flipped. Keep the `rust`/`clippy` tables' shared
-# entries (`all`, `pedantic`, `disallowed_methods`, `module_name_repetitions`,
+# entries (`all`, `pedantic`, `disallowed_methods`,
+# `undocumented_unsafe_blocks`, `module_name_repetitions`,
 # `missing_errors_doc`, `missing_panics_doc`) in sync with root when either
-# changes.
+# changes — `checks.lints-tables` (#1179, `nix/lint-lints-tables.py`) fails if
+# they drift.
 [lints.rust]
 # Every OpenGL entry point the `gl` crate exposes is an `unsafe fn`; issuing a
 # draw call is therefore impossible under the workspace's global `forbid`. This
@@ -57,6 +59,10 @@ unsafe_code = "allow"
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 disallowed_methods = "deny"
+# Mirrored from root (#1195). This crate already satisfied it — every `unsafe`
+# block here had its `// SAFETY:` line when the lint was measured — so it costs
+# nothing today and catches the first block that arrives without one.
+undocumented_unsafe_blocks = "deny"
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"

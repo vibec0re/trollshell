@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, PoisonError, RwLock};
 use std::thread;
+use std::time::Instant;
 
 use futures_signals::signal::Mutable;
 use hytte_reactive::spawn_supervised_blocking;
@@ -27,6 +28,7 @@ use super::types::{
     AudioRole, AudioState, Command, LinkEdge, MetadataProxy, NodeEntry, NodeProxy, SpectrumAction,
     SpectrumCapture, StateRef, clone_handles,
 };
+use crate::retry;
 
 /// Sender shared across all callers. Published by [`spawn_mainloop`] before the
 /// loop runs; mutation fns read it through [`send_command`].
@@ -127,41 +129,117 @@ fn session_receiver(slot: &Mutex<Option<pw::channel::Receiver<Command>>>) -> Rec
 /// never returns, and the only way out is a panic, which is what supervision is
 /// for.
 fn run_sessions(slot: &Mutex<Option<pw::channel::Receiver<Command>>>, handles: &PipewireHandles) {
+    let mut reporter = retry::ReconnectReporter::new();
     loop {
         let receiver = session_receiver(slot);
-        let (returned_rx, res) = run_once(clone_handles(handles), receiver);
+        let started = Instant::now();
+        let (returned_rx, end) = run_once(clone_handles(handles), receiver);
         *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(returned_rx);
-        if let Err(e) = res {
-            tracing::warn!(error = ?e, "audio_native: mainloop exited, retrying in 1s");
-            thread::sleep(std::time::Duration::from_secs(1));
+        let (_report, delay) = reconnect_after(&mut reporter, started.elapsed(), &end);
+        thread::sleep(delay);
+    }
+}
+
+/// Record a finished mainloop session and say how long to wait before the next.
+///
+/// **Both arms come through here, and that is the point of #1170's item 3.**
+/// `run_once` ending in [`SessionEnd::Quit`] is a failure wearing a success's
+/// shape: the only thing that quits the mainloop is the core-error listener, so
+/// a daemon that dies mid-session leaves this way. That arm used to return
+/// straight to the top of the loop, skipping the 1s sleep the error arm took —
+/// so a dead `PipeWire` was a hot respawn loop, one `warn!` per turn, as fast as
+/// the daemon could fail. Now both are priced on `retry::RECONNECT_RETRY`
+/// (500ms → 30s) and both are latched, so a permanent outage costs one loud
+/// line and then silence until it heals.
+///
+/// Returns the report as well as the delay so the tests can read the cadence;
+/// the loop only needs the delay.
+fn reconnect_after(
+    reporter: &mut retry::ReconnectReporter,
+    ran_for: std::time::Duration,
+    end: &SessionEnd,
+) -> (retry::Report, std::time::Duration) {
+    let (report, delay) = reporter.record(ran_for);
+    let retry_in_secs = delay.as_secs_f64();
+    let cause = end.cause();
+    match report {
+        retry::Report::Opened => tracing::warn!(
+            cause,
+            retry_in_secs,
+            "audio_native: the PipeWire mainloop is not staying up; reconnecting with backoff. \
+             Volume, mute and the spectrum tap are stale until it does. This line will not \
+             repeat until it recovers"
+        ),
+        retry::Report::Repeating => tracing::debug!(
+            cause,
+            retry_in_secs,
+            "audio_native: PipeWire mainloop still not staying up"
+        ),
+        retry::Report::Recovered => tracing::info!(
+            "audio_native: the PipeWire mainloop is back; sinks, sources and streams are live again"
+        ),
+        // A session that stayed up and then ended: rare, and worth a line each
+        // time — the latch has nothing outstanding to retract.
+        retry::Report::Quiet => tracing::warn!(
+            cause,
+            retry_in_secs,
+            "audio_native: PipeWire mainloop session ended, reconnecting"
+        ),
+    }
+    (report, delay)
+}
+
+/// How one mainloop session ended.
+///
+/// A plain `Result<(), pw::Error>` cannot say this, which is how #1170's item 3
+/// got in: the quit path's `Ok(())` reads as success at every call site, and the
+/// reconnect loop treated it as one. Both variants are failures — the only
+/// difference is how far the session got — and naming them that way is what
+/// makes it hard to write a loop that backs off after one and not the other.
+pub(super) enum SessionEnd {
+    /// The session ran and the mainloop then quit. In practice that means the
+    /// core-error listener fired: `message` is what the daemon said.
+    Quit { message: Option<String> },
+    /// The session never started: mainloop / context / core / registry
+    /// construction failed (no `/run/user/$UID/pipewire-0` socket, say).
+    Failed(pw::Error),
+}
+
+impl SessionEnd {
+    /// One-line cause for a log field, whichever way the session ended.
+    fn cause(&self) -> String {
+        match self {
+            Self::Quit { message: Some(m) } => format!("core error: {m}"),
+            Self::Quit { message: None } => "mainloop quit".to_owned(),
+            Self::Failed(e) => format!("session could not start: {e:?}"),
         }
     }
 }
 
-/// One mainloop session. Returns the receiver (so `spawn_mainloop` can
-/// re-attach it on the next session) along with the run result.
+/// One mainloop session. Returns the receiver (so `run_sessions` can
+/// re-attach it on the next session) along with how the session ended.
 // One cohesive PipeWire registry + listener wiring block; splitting it would
 // scatter shared closure state across helpers for no real readability gain.
 #[allow(clippy::too_many_lines)]
 pub(super) fn run_once(
     handles: PipewireHandles,
     rx: pw::channel::Receiver<Command>,
-) -> (pw::channel::Receiver<Command>, Result<(), pw::Error>) {
+) -> (pw::channel::Receiver<Command>, SessionEnd) {
     let mainloop = match pw::main_loop::MainLoopRc::new(None) {
         Ok(m) => m,
-        Err(e) => return (rx, Err(e)),
+        Err(e) => return (rx, SessionEnd::Failed(e)),
     };
     let context = match pw::context::ContextRc::new(&mainloop, None) {
         Ok(c) => c,
-        Err(e) => return (rx, Err(e)),
+        Err(e) => return (rx, SessionEnd::Failed(e)),
     };
     let core = match context.connect_rc(None) {
         Ok(c) => c,
-        Err(e) => return (rx, Err(e)),
+        Err(e) => return (rx, SessionEnd::Failed(e)),
     };
     let registry = match core.get_registry_rc() {
         Ok(r) => r,
-        Err(e) => return (rx, Err(e)),
+        Err(e) => return (rx, SessionEnd::Failed(e)),
     };
 
     let state = Rc::new(RefCell::new(AudioState::new(handles)));
@@ -183,15 +261,24 @@ pub(super) fn run_once(
         handle_command(cmd, &state_for_cmds, &core_for_cmds);
     });
 
-    // Core error → quit the mainloop so run_once returns cleanly and the
-    // outer loop reconnects. Without this, daemon crashes leave the
-    // mainloop blocked forever in the C-side poll.
+    // Core error → quit the mainloop so run_once returns and the outer loop
+    // reconnects. Without this, daemon crashes leave the mainloop blocked
+    // forever in the C-side poll.
+    //
+    // The message is *recorded* rather than logged here (#1170): this fires once
+    // per session, and with a daemon that is down sessions are back-to-back, so
+    // a `warn!` here was one line per reconnect attempt however hard the outer
+    // loop latched. `run_sessions` owns the narrative and carries this string on
+    // whichever line it decides to print.
+    let quit_cause: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let mainloop_weak = mainloop.downgrade();
+    let cause_for_listener = Rc::clone(&quit_cause);
     let _core_listener = core
         .add_listener_local()
         .error(move |id, _seq, _res, message| {
             if id == 0 {
-                tracing::warn!(message = %message, "audio_native: core error, quitting");
+                tracing::debug!(message = %message, "audio_native: core error, quitting");
+                *cause_for_listener.borrow_mut() = Some(message.to_owned());
                 if let Some(m) = mainloop_weak.upgrade() {
                     m.quit();
                 }
@@ -372,7 +459,8 @@ pub(super) fn run_once(
 
     mainloop.run();
     let rx = attached.deattach();
-    (rx, Ok(()))
+    let message = quit_cause.borrow_mut().take();
+    (rx, SessionEnd::Quit { message })
 }
 
 /// Bind a Node proxy and start receiving `Props` param events. The Node and
@@ -970,8 +1058,102 @@ pub(super) fn send_command(cmd: Command) {
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMAND_TX, Command, pw, session_receiver};
+    use super::{COMMAND_TX, Command, SessionEnd, pw, reconnect_after, session_receiver};
+    use crate::retry;
     use std::sync::{Mutex, PoisonError};
+    use std::time::Duration;
+
+    /// #1170's item 3: a core error — the `Ok(())`-shaped exit — must be paced
+    /// exactly like a failed connect. Before this, the quit arm returned
+    /// straight to the top of the loop and skipped the sleep entirely, so a
+    /// dead `PipeWire` respawned as fast as it could fail.
+    ///
+    /// Falsify by giving `run_sessions` back its `if let Err(e) = …` shape (only
+    /// the `Failed` arm sleeping): the two ramps below stop agreeing, because
+    /// the quit arm would not be recorded at all.
+    #[test]
+    fn a_core_error_quit_is_paced_like_a_failed_connect() {
+        let instant = Duration::from_millis(1);
+        let quit = SessionEnd::Quit {
+            message: Some("connection error".to_owned()),
+        };
+
+        let mut after_quit = retry::ReconnectReporter::new();
+        let mut after_failure = retry::ReconnectReporter::new();
+        // `SessionEnd::Failed` needs a real `pw::Error`, which cannot be built
+        // without the library; `Quit { message: None }` stands in for "the
+        // session did not work" on the comparison side, and the arms are
+        // identical from `reconnect_after`'s point of view — which is exactly
+        // the property under test.
+        let plain = SessionEnd::Quit { message: None };
+
+        for turn in 0..5 {
+            let (_, quit_delay) = reconnect_after(&mut after_quit, instant, &quit);
+            let (_, other_delay) = reconnect_after(&mut after_failure, instant, &plain);
+            assert_eq!(
+                quit_delay, other_delay,
+                "turn {turn}: the quit path is on a different schedule from the error path"
+            );
+            assert!(
+                quit_delay > Duration::ZERO,
+                "turn {turn}: a core error respawns the mainloop with no delay at all"
+            );
+        }
+    }
+
+    /// …and the ramp actually climbs, rather than sitting at a flat delay: a
+    /// daemon that is gone for good must cost less and less.
+    #[test]
+    fn consecutive_short_sessions_climb_the_ramp() {
+        let mut reporter = retry::ReconnectReporter::new();
+        let instant = Duration::from_millis(1);
+        let end = SessionEnd::Quit { message: None };
+
+        let first = reconnect_after(&mut reporter, instant, &end).1;
+        let second = reconnect_after(&mut reporter, instant, &end).1;
+        assert!(
+            second > first,
+            "the reconnect delay is not climbing: {first:?} then {second:?}"
+        );
+    }
+
+    /// One loud line for a streak, not one per attempt — the other half of
+    /// item 3. The wording is the call site's; the cadence is asserted here.
+    #[test]
+    fn a_dead_daemon_costs_one_loud_line() {
+        let mut reporter = retry::ReconnectReporter::new();
+        let end = SessionEnd::Quit { message: None };
+        let reports: Vec<retry::Report> = (0..5)
+            .map(|_| reconnect_after(&mut reporter, Duration::from_millis(1), &end).0)
+            .collect();
+
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|r| **r == retry::Report::Opened)
+                .count(),
+            1,
+            "a permanently-dead PipeWire logs a warning per reconnect: {reports:?}"
+        );
+    }
+
+    /// The daemon's own message survives to the line that reports the outage —
+    /// the reason the core-error listener records it instead of logging it.
+    #[test]
+    fn the_cause_carries_the_daemons_message() {
+        let end = SessionEnd::Quit {
+            message: Some("no such device".to_owned()),
+        };
+        assert!(
+            end.cause().contains("no such device"),
+            "the core error's message is lost: {}",
+            end.cause()
+        );
+        assert!(
+            !SessionEnd::Quit { message: None }.cause().is_empty(),
+            "a quit with no recorded cause must still say something"
+        );
+    }
 
     /// The first session gets a receiver, and the sender behind it is the one
     /// `send_command` publishes to — otherwise every `set_*` before the daemon

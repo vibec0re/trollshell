@@ -362,6 +362,54 @@ impl FailureLatch {
     }
 }
 
+/// [`ReconnectBackoff`] with [`FailureLatch`] bolted on: the two things every
+/// `reconnect-forever` loop has to decide after a run ends — how long to wait,
+/// and whether to say anything — answered together from the one fact both
+/// depend on, how long the run stayed up.
+///
+/// Deriving "healthy" from that single input is what keeps the two answers
+/// consistent: a run the ramp treats as healthy is exactly the run that
+/// retracts the warning, so a loop cannot reset its delay while still claiming
+/// the peer is down (or the reverse). The threshold is
+/// [`RECONNECT_RESET_AFTER`], the same one the ramp already applies.
+///
+/// **Note what "recovered" costs.** A run's health is only known when it
+/// *ends*, so [`Report::Recovered`] lands at the end of the first healthy run
+/// rather than at its start. For a reconnect loop that is the honest place for
+/// it — the alternative is claiming recovery from a connection that has not yet
+/// proved it will last — but it does mean a peer that comes back and then stays
+/// up for hours has its retraction logged hours later, alongside that run's own
+/// end-of-session line.
+pub(crate) struct ReconnectReporter {
+    latch: FailureLatch,
+    backoff: ReconnectBackoff,
+    reset_after: Duration,
+}
+
+impl ReconnectReporter {
+    /// A reporter on the shipped reconnect ramp and threshold.
+    pub(crate) const fn new() -> Self {
+        Self::with(ReconnectBackoff::new(), RECONNECT_RESET_AFTER)
+    }
+
+    /// The same over an arbitrary ramp/threshold, so the tests can assert the
+    /// mechanism without wall-clock sleeps or the shipped numbers.
+    const fn with(backoff: ReconnectBackoff, reset_after: Duration) -> Self {
+        Self {
+            latch: FailureLatch::new(),
+            backoff,
+            reset_after,
+        }
+    }
+
+    /// Record a finished run: how long it stayed up decides both the delay
+    /// before the next one and what this one is worth saying.
+    pub(crate) fn record(&mut self, ran_for: Duration) -> (Report, Duration) {
+        let report = self.latch.record(ran_for >= self.reset_after);
+        (report, self.backoff.delay_after_run(ran_for))
+    }
+}
+
 /// Every retry policy this crate **ships**, so the `every_shipped_policy_*`
 /// tests below see all of them.
 ///
@@ -385,8 +433,8 @@ const SHIPPED: &[(&str, Policy)] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureLatch, Policy, RECONNECT_RESET_AFTER, RECONNECT_RETRY, ReconnectBackoff, Report,
-        SHIPPED, Step,
+        FailureLatch, Policy, RECONNECT_RESET_AFTER, RECONNECT_RETRY, ReconnectBackoff,
+        ReconnectReporter, Report, SHIPPED, Step,
     };
     use std::time::Duration;
 
@@ -627,6 +675,36 @@ mod tests {
         let mut latch = FailureLatch::new();
         assert_eq!(latch.record(true), Report::Quiet);
         assert_eq!(latch.record(true), Report::Quiet);
+    }
+
+    /// The reporter reads "healthy" off the *same* elapsed time the ramp resets
+    /// on, so a loop can never reset its delay while still claiming the peer is
+    /// down. `bounded()` stands in for the shipped ramp, with a 100ms stand-in
+    /// threshold.
+    #[test]
+    fn the_reporter_ties_the_retraction_to_the_ramp_reset() {
+        let threshold = Duration::from_millis(100);
+        let mut reporter =
+            ReconnectReporter::with(ReconnectBackoff::with(bounded(), threshold), threshold);
+        let fast = Duration::from_millis(1);
+
+        assert_eq!(reporter.record(fast), (Report::Opened, bounded().initial));
+        assert_eq!(
+            reporter.record(fast),
+            (Report::Repeating, Duration::from_millis(20)),
+            "the streak must climb the ramp while staying quiet"
+        );
+        // A run that reaches the threshold both retracts the warning and
+        // re-prices its own reconnect at the bottom of the ramp (#806).
+        assert_eq!(
+            reporter.record(threshold),
+            (Report::Recovered, bounded().initial),
+            "the retraction and the ramp reset disagreed about the same run"
+        );
+        assert_eq!(
+            reporter.record(threshold),
+            (Report::Quiet, bounded().initial)
+        );
     }
 
     // ── The shipped constants (#665) ─────────────────────────────────────────

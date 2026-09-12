@@ -38,7 +38,10 @@ pub const PLUGIN_ID: &str = "agents";
 /// show: the consent card is a 480 px surface with a wrapping label, and an
 /// unbounded description would push the buttons off it. Same reason the drawer
 /// bounds every free-text value it renders (#963's review).
-const DETAIL_CHARS: usize = 240;
+///
+/// `pub` since #1141's review (M4): the companion window renders the same
+/// free text on the same class of surface and had copied the constant.
+pub const DETAIL_CHARS: usize = 240;
 
 /// How much of the card's headline the agent label may take.
 ///
@@ -52,7 +55,9 @@ const AGENT_CHARS: usize = 63;
 /// RFC 3339 UTC is ~20-30 characters; the mirror keeps this field an unparsed
 /// string on purpose (see `AgentStatusRow::status_set_at`), so the cap is what
 /// stops an unparseable one from being unbounded too.
-const REQUESTED_AT_CHARS: usize = 40;
+///
+/// `pub` for the same reason as [`DETAIL_CHARS`].
+pub const REQUESTED_AT_CHARS: usize = 40;
 
 /// One consent prompt this plugin has raised and not yet heard back on
 /// (#947 P3).
@@ -1021,7 +1026,14 @@ pub fn card_of(model: &Agents) -> Node {
 /// card. An approval with none still gets a line, because "when was this asked"
 /// is the next thing an operator wants and a blank detail would hide the
 /// overlay's whole second row.
-fn detail_line(approval: &Approval) -> String {
+///
+/// `pub` since #1141's review (M4). `trollshell-agent-window` renders the same
+/// approval on its Settings page and had a byte-for-byte copy of this body;
+/// two renderers of one queue's free text have to agree the way
+/// [`crate::hive::wire`] argues for the bytes, and a shared function makes
+/// that a compile-time fact rather than a reviewer's eyeball.
+#[must_use]
+pub fn detail_line(approval: &Approval) -> String {
     let stamp = if approval.requested_at.is_empty() {
         format!("request #{}", approval.id)
     } else {
@@ -1049,7 +1061,10 @@ fn detail_line(approval: &Approval) -> String {
 /// `&s[..n]` would panic mid-codepoint, and a description is arbitrary UTF-8
 /// somebody else wrote — a plugin that panicked on an emoji in a PR title would
 /// take its whole session down.
-fn clamp(s: &str, chars: usize) -> String {
+///
+/// `pub` since #1141's review (M4), with [`detail_line`].
+#[must_use]
+pub fn clamp(s: &str, chars: usize) -> String {
     if s.chars().count() <= chars {
         return s.to_owned();
     }

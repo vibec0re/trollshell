@@ -42,6 +42,31 @@ async fn next_state(rx: &mut mpsc::UnboundedReceiver<Update>, what: &str) -> Age
     }
 }
 
+/// The seed poll's `Update::State`, **plus** the `Update::Approvals` it is
+/// always paired with (#1141): the first successful poll has no prior
+/// answer to compare against on either `last` or `last_approvals`, so it
+/// emits both, in that order, with no await between the two sends
+/// (`poll_once`'s own doc). A test that goes on to assert "no more messages"
+/// or "the very next message is X" has to drain this pair first, or it sees
+/// the seed's own approvals answer instead of what it is actually waiting
+/// for — this is that drain, named so a reader sees why it is there.
+async fn seed_state(rx: &mut mpsc::UnboundedReceiver<Update>) -> AgentState {
+    let state = next_state(rx, "the seed poll").await;
+    assert!(
+        matches!(
+            next(rx, "the seed's paired approvals").await,
+            Update::Approvals(_)
+        ),
+        "the seed poll must pair exactly one Approvals answer with its State"
+    );
+    state
+}
+
+/// Whether the hive was ever asked for the approval queue.
+fn asked_for_the_queue(hive: &FakeHive) -> bool {
+    hive.seen().iter().any(|l| l.contains("\"pending\""))
+}
+
 /// Yield until `pred` holds, without advancing the (paused) clock.
 ///
 /// `tokio::time::sleep` is the wrong tool for waiting on **socket** progress
@@ -154,7 +179,7 @@ async fn an_unchanged_hive_sends_one_state_not_one_per_poll() {
         out_tx,
     ));
 
-    let _seed = next_state(&mut out_rx, "the seed poll").await;
+    let _seed = seed_state(&mut out_rx).await;
     for _ in 0..5 {
         one_cadence(&hive, CADENCE).await;
     }
@@ -256,7 +281,7 @@ async fn a_refused_pause_puts_the_toggle_back_where_the_hive_has_it() {
         out_tx,
     ));
 
-    let seed = next_state(&mut out_rx, "the seed poll").await;
+    let seed = seed_state(&mut out_rx).await;
     assert!(!seed.agent().expect("on the roster").paused());
 
     cmd_tx
@@ -302,7 +327,7 @@ async fn every_refused_verb_is_followed_by_a_reconciling_state() {
             cmd_rx,
             out_tx,
         ));
-        let _seed = next_state(&mut out_rx, "the seed poll").await;
+        let _seed = seed_state(&mut out_rx).await;
 
         cmd_tx.send(req).expect("the loop is listening");
         assert!(
@@ -330,7 +355,7 @@ async fn an_accepted_verb_does_not_force_a_repaint() {
         cmd_rx,
         out_tx,
     ));
-    let _seed = next_state(&mut out_rx, "the seed poll").await;
+    let _seed = seed_state(&mut out_rx).await;
     let before = polls(&hive);
 
     cmd_tx
@@ -458,4 +483,126 @@ async fn urls_are_retried_with_backoff_until_the_hive_answers() {
         "…but not on every poll: that is a request per cadence for a value that never \
          changes ({asks} asks over {POLLS} polls)"
     );
+}
+
+/// **A hive that refuses the status poll is not also asked for the queue**
+/// (#1146's review, M3).
+///
+/// `poll_once`'s own doc claims this — "a dead hive should cost one failed
+/// connect, not two", the order `hytte_plugin_agents::poll::poll_once` uses —
+/// and nothing pinned it: replacing the `if status_ok` gate with `if true`
+/// left all 69 tests green.
+///
+/// Mutation (verified red): `if status_ok` → `if true`.
+#[tokio::test(start_paused = true)]
+async fn a_refused_status_poll_does_not_also_ask_for_the_queue() {
+    let hive = FakeHive::script(&[&roster(r#"{"name":"stray","running":true}"#)])
+        .refusing("agent_status", "the hive said no");
+    let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    tokio::spawn(feed::run(
+        hive.path().to_path_buf(),
+        name("stray"),
+        CADENCE,
+        cmd_rx,
+        out_tx,
+    ));
+
+    // Not `seed_state`: a refused status has no paired approvals answer,
+    // which is exactly what this test is about.
+    let state = next_state(&mut out_rx, "the seed poll").await;
+    assert!(
+        matches!(state, AgentState::Unreachable { .. }),
+        "a refused status poll is an unreachable hive, not a roster: {state:?}"
+    );
+    // A few more cadences, so this cannot pass merely by looking too early.
+    for _ in 0..3 {
+        one_cadence(&hive, CADENCE).await;
+    }
+    assert!(
+        !asked_for_the_queue(&hive),
+        "a hive that refuses the status poll must not also be asked for the queue: {:?}",
+        hive.seen()
+    );
+}
+
+/// **A refused `Pending` clears this window's rows** rather than freezing on
+/// the last good answer, and says which it is (#1146's review, M3/M1).
+///
+/// `FakeHive::refusing("pending", …)` existed since #1130's review and no
+/// test used it, so the documented behaviour change was unpinned. The
+/// refusal rides the update as an `Err` carrying the hive's own sentence —
+/// an empty `Vec` would be indistinguishable from a healthy empty queue.
+///
+/// Mutation (verified red): map the `Pending` error to `Ok(Vec::new())` in
+/// `poll_once` and the `Err` assertion reds.
+#[tokio::test(start_paused = true)]
+async fn a_refused_pending_clears_the_rows_and_names_the_reason() {
+    let hive = FakeHive::script(&[&roster(r#"{"name":"stray","running":true}"#)])
+        .refusing("pending", "the approval queue is not available");
+    let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    tokio::spawn(feed::run(
+        hive.path().to_path_buf(),
+        name("stray"),
+        CADENCE,
+        cmd_rx,
+        out_tx,
+    ));
+
+    let _state = next_state(&mut out_rx, "the seed poll").await;
+    let approvals = loop {
+        if let Update::Approvals(a) = next(&mut out_rx, "the seed's paired approvals").await {
+            break a;
+        }
+    };
+    let reason = approvals.expect_err("a refused queue must not arrive as an answered one");
+    assert!(
+        reason.contains("the approval queue is not available"),
+        "the hive's own sentence has to survive to the group that shows it: {reason}"
+    );
+    assert!(
+        asked_for_the_queue(&hive),
+        "…and the window did ask, since the status poll answered: {:?}",
+        hive.seen()
+    );
+}
+
+/// **One poll's two answers reach the window as one batch** (#1146's review,
+/// L3).
+///
+/// `poll_once` sends `Update::State` and `Update::Approvals` back to back
+/// with no `.await` between them, so the header and the rows a window paints
+/// come from the same observation. That invariant used to be a comment whose
+/// only teeth were an accident of where `run` built its ticker: adding an
+/// await between the sends reddened the two *urls* tests, with a message
+/// naming nothing about the cause.
+///
+/// This is the direct pin — the `Approvals` has to be sitting in the channel
+/// the moment the `State` comes off it, which is exactly false if anything
+/// awaits in between.
+///
+/// Mutation (verified red): await the `Pending` request after sending
+/// `Update::State` instead of before it.
+#[tokio::test(start_paused = true)]
+async fn the_polls_two_answers_arrive_with_no_await_between_them() {
+    let hive = FakeHive::script(&[&roster(r#"{"name":"stray","running":true}"#)]);
+    let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    tokio::spawn(feed::run(
+        hive.path().to_path_buf(),
+        name("stray"),
+        CADENCE,
+        cmd_rx,
+        out_tx,
+    ));
+
+    let _state = next_state(&mut out_rx, "the seed poll").await;
+    match out_rx.try_recv() {
+        Ok(Update::Approvals(_)) => {}
+        other => panic!(
+            "the queue must already be in the channel when the state comes off it — anything \
+             awaiting between the two sends splits one observation across two paints: {other:?}"
+        ),
+    }
 }

@@ -1,5 +1,5 @@
-//! The window's own `host.sock` client: one agent's live state, and the three
-//! lifecycle verbs its buttons send.
+//! The window's own `host.sock` client: one agent's live state, its pending
+//! approval queue (#1141), and the five verbs its buttons send.
 //!
 //! # Why the window reads the socket itself
 //!
@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use hytte_plugin_agents::hive::client::{self, HiveError};
-use hytte_plugin_agents::hive::wire::{HiveUrls, Request, Response, Scope};
+use hytte_plugin_agents::hive::wire::{Approval, HiveUrls, Request, Response, Scope};
 use hytte_plugin_agents::model::{Agent, AgentName};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -95,6 +95,21 @@ pub enum Update {
     State(AgentState),
     /// The hive's own URLs, fetched once per session.
     Urls(Box<HiveUrls>),
+    /// The approval queue as the hive returned it (#1141), **unfiltered** —
+    /// same contract as `hytte_plugin_agents::poll::Msg::Pending`: "which
+    /// statuses are still actionable" and "which agent is this window's" are
+    /// both model policy (`crate::chrome::pending_for`), not something the
+    /// I/O task decides.
+    ///
+    /// A **refusal rides the same update** rather than arriving as an empty
+    /// `Vec` (#1146's review, M1). Both clear the rows — the window can no
+    /// longer vouch for them, so it does not freeze on the last good answer —
+    /// but only one of the two is a hive saying no, and an operator looking
+    /// at a group that hid itself cannot tell "nothing to decide" from "this
+    /// hive will not tell me". The `Err` arm carries the hive's own sentence
+    /// so the group can say which it is. Same shape as the sidebar's
+    /// `Msg::Pending(Result<…>)`, for the same reason.
+    Approvals(Result<Vec<Approval>, String>),
     /// A verb this window sent was refused, with the hive's own words.
     Refused {
         /// The verb, for the sentence the window shows.
@@ -137,6 +152,22 @@ pub fn set_paused(name: &AgentName, paused: bool) -> Request {
     }
 }
 
+/// `Approve` one queued approval by id (#1141, spec §6.5) — the action runs
+/// **immediately** on the far side, so this is sent for a click and nothing
+/// else; [`crate::chrome::should_send`] is the guard the window applies
+/// before it ever reaches [`run`]'s command lane.
+#[must_use]
+pub fn approve(id: i64) -> Request {
+    Request::Approve { id }
+}
+
+/// `Deny` one queued approval by id. Only ever sent for a click — an
+/// unanswered prompt is not a `Deny` (spec §6.5).
+#[must_use]
+pub fn deny(id: i64) -> Request {
+    Request::Deny { id }
+}
+
 /// Poll one agent forever, and send what the buttons ask for.
 ///
 /// Ends when either channel is closed — which is how the window's own exit
@@ -153,17 +184,42 @@ pub async fn run(
     out: UnboundedSender<Update>,
 ) {
     let mut last: Option<AgentState> = None;
+    let mut last_approvals: Option<Result<Vec<Approval>, String>> = None;
+    // Whether the `Pending` verb is currently refusing — the transition edge
+    // that decides `warn!` from `debug!` in `poll_once`. Per task, exactly as
+    // `hytte_plugin_agents::poll::poll_task_with` keeps it.
+    let mut pending_failing = false;
     let mut urls = UrlsFetch::default();
+
+    // **The ticker is created before the seed poll, not after it** (#1146's
+    // review, L3). It used to be built afterwards, which coupled the seed to
+    // an invariant nothing enforced: a seed that yields would let a
+    // `start_paused` test's `tokio::time::advance` land before the interval
+    // existed, so the next tick never came — and the two tests that reddened
+    // when someone added an await to the seed were the *urls* ones, naming
+    // nothing about the cause. Built first, the interval's deadline exists
+    // before anything can await, and the seed may yield as freely as any
+    // later poll.
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // the first tick is immediate; the seed below is it.
+
     if urls.attempt(&socket, &out).await.is_err() {
         return;
     }
-    if poll_once(&socket, &name, &out, &mut last).await.is_err() {
+    if poll_once(
+        &socket,
+        &name,
+        &out,
+        &mut last,
+        &mut last_approvals,
+        &mut pending_failing,
+    )
+    .await
+    .is_err()
+    {
         return;
     }
-
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await; // the first tick is immediate; the seed above was it.
 
     loop {
         tokio::select! {
@@ -186,7 +242,17 @@ pub async fn run(
                 if urls.attempt(&socket, &out).await.is_err() {
                     return;
                 }
-                if poll_once(&socket, &name, &out, &mut last).await.is_err() {
+                if poll_once(
+                    &socket,
+                    &name,
+                    &out,
+                    &mut last,
+                    &mut last_approvals,
+                    &mut pending_failing,
+                )
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -194,7 +260,17 @@ pub async fn run(
                 if urls.attempt(&socket, &out).await.is_err() {
                     return;
                 }
-                if poll_once(&socket, &name, &out, &mut last).await.is_err() {
+                if poll_once(
+                    &socket,
+                    &name,
+                    &out,
+                    &mut last,
+                    &mut last_approvals,
+                    &mut pending_failing,
+                )
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -263,11 +339,18 @@ async fn write(socket: &std::path::Path, req: &Request) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// One poll, sent only when it **changed**.
+/// One poll: `AgentStatus`, sent only when it **changed**, then `Pending`
+/// (#1141) — only once the status call already proved the socket answering,
+/// same order [`hytte_plugin_agents::poll::poll_once`] uses and for the same
+/// reason: a dead hive should cost one failed connect, not two.
 ///
-/// Dedup is not an optimisation: `Update::State` drives a label rewrite and a
-/// button-sensitivity pass on the GTK thread, and at the default two-second
-/// cadence an idle hive would otherwise repaint the header forever.
+/// Dedup on `Update::State` is not an optimisation: it drives a label rewrite
+/// and a button-sensitivity pass on the GTK thread, and at the default
+/// two-second cadence an idle hive would otherwise repaint the header
+/// forever. `Update::Approvals` is deduped too, on the **raw** answer — the
+/// per-agent filter runs downstream, in [`crate::chrome::pending_for`], so two
+/// polls that changed only another agent's queue still cost this window
+/// nothing.
 ///
 /// `Err(())` means the GTK side is gone.
 async fn poll_once(
@@ -275,19 +358,83 @@ async fn poll_once(
     name: &AgentName,
     out: &UnboundedSender<Update>,
     last: &mut Option<AgentState>,
+    last_approvals: &mut Option<Result<Vec<Approval>, String>>,
+    pending_failing: &mut bool,
 ) -> Result<(), ()> {
     let answer = client::request(socket, &Request::AgentStatus).await;
+    let status_ok = answer.is_ok();
     let state = AgentState::of(&answer, name);
-    if last.as_ref() == Some(&state) {
-        return Ok(());
+
+    // `Pending` rides the same tick, right after `AgentStatus` and only once
+    // it answered — same order and reason `hytte_plugin_agents::poll`'s
+    // `poll_once` uses: a dead hive should cost one failed connect, not two.
+    // A refusal (an older daemon, a permissions change) clears this window's
+    // rows rather than freezing on the last good answer — the same rule
+    // `hytte_plugin_agents::plugin::Agents`'s `Input::App(Msg::Pending(Err))`
+    // arm follows for the sidebar's badges.
+    let approvals = if status_ok {
+        let answer = client::request(socket, &Request::Pending)
+            .await
+            .map(|resp| resp.approvals.unwrap_or_default())
+            .map_err(|e| e.to_string());
+        // **Once per transition**, not once per tick (#1146's review, M1) —
+        // the three-arm match `hytte_plugin_agents::poll::poll_once` uses,
+        // ported rather than paraphrased. This used to be a bare `debug!`,
+        // i.e. invisible at the default level *always*, which #1140's LOW-3
+        // is the argument against: a hive refusing this verb every tick would
+        // say nothing, twice a second, forever — and with the group hiding
+        // itself when empty, it rendered identically to a healthy hive with
+        // nothing queued.
+        match (&answer, *pending_failing) {
+            (Err(e), false) => {
+                *pending_failing = true;
+                tracing::warn!(
+                    %e,
+                    "the hive refuses the approval queue; this window's rows are cleared until it answers"
+                );
+            }
+            (Err(e), true) => tracing::debug!(%e, "the approval queue is still refusing"),
+            (Ok(_), true) => {
+                *pending_failing = false;
+                tracing::info!("the approval queue is answering again");
+            }
+            (Ok(_), false) => {}
+        }
+        Some(answer)
+    } else {
+        None
+    };
+
+    // Every send below is **synchronous** (an unbounded channel never
+    // blocks) — deliberately no `.await` between here and `return`, so one
+    // poll's answers reach the window as one batch: the state and the queue
+    // it was observed with land together, and the window never paints a
+    // header from this tick beside rows from the last one.
+    //
+    // Enforced rather than asserted since #1146's review (L3): the invariant
+    // used to be a comment whose only teeth were an accident of where `run`
+    // built its ticker, so breaking it reddened two *urls* tests with a
+    // message naming nothing about the cause. `tests/feed.rs`'s
+    // `the_polls_two_answers_arrive_with_no_await_between_them` now takes the
+    // `State` off the channel and requires the `Approvals` to be sitting
+    // there already, which is exactly false the moment anything awaits
+    // between these two sends.
+    if last.as_ref() != Some(&state) {
+        *last = Some(state.clone());
+        out.send(Update::State(state)).map_err(|_| ())?;
     }
-    *last = Some(state.clone());
-    out.send(Update::State(state)).map_err(|_| ())
+    if let Some(approvals) = approvals
+        && last_approvals.as_ref() != Some(&approvals)
+    {
+        *last_approvals = Some(approvals.clone());
+        out.send(Update::Approvals(approvals)).map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentState, set_paused, start, stop};
+    use super::{AgentState, approve, deny, set_paused, start, stop};
     use hytte_plugin_agents::hive::client::HiveError;
     use hytte_plugin_agents::hive::wire::{AgentStatusRow, Response};
     use hytte_plugin_agents::model::{AgentName, Status};
@@ -332,6 +479,23 @@ mod tests {
             line(set_paused(&n, false)),
             r#"{"cmd":"set_paused","name":"trollshell-choom","paused":false}"#
         );
+    }
+
+    /// `Approve` and `Deny` put the **exact** bytes hyperhive's own host
+    /// documents on the socket — cited from `hive-host-sock/src/lib.rs:230-233`
+    /// via `hive::wire::Request`'s own committed test
+    /// (`crates/hytte-plugin-agents/src/hive/wire.rs`), not derived from this
+    /// crate's `Request` variants: a serializer bug that renamed the `cmd` tag
+    /// or dropped the `id` field would still round-trip through `Request`
+    /// itself and stay invisible to an assertion built the same way.
+    ///
+    /// Mutation (verified red): swap the two bodies (`approve` builds `Deny`,
+    /// `deny` builds `Approve`) and both assertions red.
+    #[test]
+    fn approve_and_deny_put_their_pinned_bytes_on_the_socket() {
+        let line = |r| serde_json::to_string(&r).expect("a Request serializes");
+        assert_eq!(line(approve(42)), r#"{"cmd":"approve","id":42}"#);
+        assert_eq!(line(deny(42)), r#"{"cmd":"deny","id":42}"#);
     }
 
     /// Every verb names **exactly one** agent — spec §11 rule one, which

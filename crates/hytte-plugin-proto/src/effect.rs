@@ -746,6 +746,13 @@ pub const CONSENT_PROMPT_TIMEOUT_SECS: u64 = 60;
 /// it is a race margin, not a second policy.
 pub const CONSENT_PROMPT_GRACE_SECS: u64 = 5;
 
+// #1141 (from #1140's re-verification): a grace of `0` leaves the suite
+// green, and at grace 0 the requester reopens its gate in the same second the
+// host's own timer fires — a click landing right then hits the stale-token
+// guard in `decide` and is dropped. The margin only does its job if it is
+// strictly positive.
+const _: () = assert!(CONSENT_PROMPT_GRACE_SECS > 0);
+
 impl ConsentChoices {
     /// Whether this is the default card — the `skip_serializing_if` predicate,
     /// so the four-button frame stays byte-identical to a pre-#947 one.

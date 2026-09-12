@@ -7,8 +7,8 @@
 //! `set_label` calls a single display test can pin.
 
 use hytte_plugin_agents::config::AgentsConfig;
-use hytte_plugin_agents::hive::wire::HiveUrls;
-use hytte_plugin_agents::model::{AgentName, Status, agent_url, model_family};
+use hytte_plugin_agents::hive::wire::{Approval, HiveUrls};
+use hytte_plugin_agents::model::{AgentName, PendingApprovals, Status, agent_url, model_family};
 
 use crate::feed::AgentState;
 
@@ -228,6 +228,202 @@ impl Facts {
                 value: cfg.socket.clone(),
             },
         ]
+    }
+}
+
+/// One row in this window's approval list — spec §6.5's queue, narrowed to
+/// the one agent this window is for.
+///
+/// **v1 is not read-only.** Unlike [`Fact`], a row here carries the two verbs
+/// that answer it; see [`crate::ui::Approvals`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalRow {
+    /// The queue id — what a click's `Approve { id }` / `Deny { id }` names.
+    pub id: i64,
+    /// What granting it will do, in English (`ApprovalKind::human`).
+    pub title: String,
+    /// The manager's description plus the request stamp, bounded.
+    pub detail: String,
+    /// The hive's own reason the **last** decision for this row was refused,
+    /// if it was. Cleared the moment the row itself leaves the queue —
+    /// `Window::update`'s job, not this type's: a row that no longer exists
+    /// has nothing to keep showing a reason for.
+    pub refused: Option<String>,
+    /// Whether a decision for this row is **in flight** — sent and not yet
+    /// answered, either by a poll that takes the approval out of `Pending` or
+    /// by a refusal (#1146's review, H1).
+    ///
+    /// Renders as two insensitive buttons. `Approve`/`Deny` act immediately on
+    /// the far side and nothing is flipped optimistically here, so without
+    /// this the row sits for a whole cadence with two live buttons: a
+    /// double-click sends the same decision twice, and an impatient operator
+    /// can send `Deny` behind an `Approve` that already succeeded — which
+    /// spec §6.5 spends its whole "silence decides nothing" argument
+    /// preventing.
+    pub in_flight: bool,
+}
+
+impl ApprovalRow {
+    /// Derive one row from the hive's `Approval` plus whatever this window
+    /// last heard back about a decision on it.
+    #[must_use]
+    pub fn of(approval: &Approval, refused: Option<String>, in_flight: bool) -> Self {
+        Self {
+            id: approval.id,
+            title: approval.kind.human(),
+            // The plugin's own renderer, not a copy of it (#1146's review,
+            // M4): the sidebar's consent card and this row show the same
+            // manager-written free text under the same bounds, and a shared
+            // function makes that a compile-time fact.
+            detail: hytte_plugin_agents::plugin::detail_line(approval),
+            refused,
+            in_flight,
+        }
+    }
+
+    /// The subtitle text: the detail line, plus the refusal reason on its own
+    /// line when the last write for this row came back refused (#1141's "a
+    /// refused write keeps the row and shows why inline" — this is the
+    /// "inline": the row's own text, not a separate banner).
+    #[must_use]
+    pub fn subtitle(&self) -> String {
+        match &self.refused {
+            Some(reason) => format!("{}\ncouldn't answer: {reason}", self.detail),
+            None => self.detail.clone(),
+        }
+    }
+}
+
+/// The `Pending` answer, filtered to this window's one agent.
+///
+/// Spec §6.5's policy — still-waiting only, oldest first — is
+/// [`PendingApprovals::new`], reused rather than re-derived: two readers of
+/// one queue's rules have to agree, exactly as `hive::wire` argues for the
+/// bytes. What this adds on top is the one thing the sidebar's model does not
+/// need: **one hive answer carries every agent's queue**, and this window
+/// renders exactly one agent's rows.
+#[must_use]
+pub fn pending_for(name: &AgentName, queue: Vec<Approval>) -> Vec<Approval> {
+    PendingApprovals::new(queue)
+        .all()
+        .iter()
+        .filter(|a| a.agent == name.as_str())
+        .cloned()
+        .collect()
+}
+
+/// Whether `id` is still worth sending a decision for.
+///
+/// Spec §6.5: "an approval that disappears from `Pending` between the prompt
+/// and the answer … is dropped with a debug line, not an error." `pending` is
+/// this window's last-polled, already-filtered queue; a click for an id no
+/// longer in it raced a poll, and the guard is a pure predicate so the race
+/// itself needs no display server to test.
+#[must_use]
+pub fn should_send(pending: &[Approval], id: i64) -> bool {
+    pending.iter().any(|a| a.id == id)
+}
+
+#[cfg(test)]
+mod approvals_tests {
+    use super::{ApprovalRow, pending_for, should_send};
+    use hytte_plugin_agents::hive::wire::{Approval, ApprovalStatus};
+    use hytte_plugin_agents::model::AgentName;
+
+    fn name(s: &str) -> AgentName {
+        AgentName::parse(s).expect("a legal test name")
+    }
+
+    fn approval(id: i64, agent: &str, status: ApprovalStatus) -> Approval {
+        Approval {
+            id,
+            agent: agent.to_owned(),
+            status,
+            ..Approval::default()
+        }
+    }
+
+    /// **Rows render from `Pending`.** Only this agent's still-waiting
+    /// approvals survive, oldest id first — another agent's row and a
+    /// resolved row are both dropped, which is the two filters
+    /// `PendingApprovals::new` plus the per-agent narrowing are for.
+    ///
+    /// Mutation (verified red): drop the `filter(|a| a.agent == …)` line and
+    /// the length assertion reds (the other agent's row leaks in); pass the
+    /// raw `queue` straight through instead of via `PendingApprovals::new`
+    /// and the length assertion reds the other way (the `Approved` row
+    /// leaks in).
+    #[test]
+    fn rows_render_from_pending_scoped_to_this_agent_oldest_first() {
+        let queue = vec![
+            approval(9, "stray", ApprovalStatus::Pending),
+            approval(3, "stray", ApprovalStatus::Pending),
+            approval(5, "other-agent", ApprovalStatus::Pending),
+            approval(1, "stray", ApprovalStatus::Approved),
+        ];
+        let rows = pending_for(&name("stray"), queue);
+        assert_eq!(
+            rows.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![3, 9],
+            "oldest first, this agent only, still pending only"
+        );
+    }
+
+    /// **A stale id is not sent.** `should_send` is the guard
+    /// [`crate::window::Window::on_decision`] applies before a click ever
+    /// reaches the command lane — an id the last poll no longer carries has
+    /// left the queue between the render and the click.
+    ///
+    /// Mutation (verified red): return `true` unconditionally and the second
+    /// assertion reds.
+    #[test]
+    fn a_stale_id_is_not_worth_sending() {
+        let pending = vec![approval(7, "stray", ApprovalStatus::Pending)];
+        assert!(should_send(&pending, 7));
+        assert!(!should_send(&pending, 99));
+        assert!(!should_send(&[], 7), "an emptied queue carries nothing");
+    }
+
+    /// **A refused write keeps the row** — the row is [`ApprovalRow`], built
+    /// the same way whether or not a decision on it was ever refused, and the
+    /// refusal reaches the screen through the row's own subtitle rather than
+    /// removing the row or routing through a separate banner.
+    ///
+    /// Mutation (verified red): make `subtitle` ignore `refused` and the
+    /// second assertion reds.
+    #[test]
+    fn a_refused_write_keeps_the_row_and_shows_why_inline() {
+        let approval = approval(11, "stray", ApprovalStatus::Pending);
+        let clean = ApprovalRow::of(&approval, None, false);
+        assert_eq!(clean.subtitle(), clean.detail);
+
+        let refused = ApprovalRow::of(&approval, Some("agent busy".to_owned()), false);
+        assert_eq!(refused.id, 11, "the row is still the same approval");
+        assert!(refused.subtitle().contains(&refused.detail));
+        assert!(refused.subtitle().contains("agent busy"));
+    }
+
+    /// **The row's detail line is the plugin's, not a copy of it** (#1146's
+    /// review, M4). The sidebar's consent card and this window's row render
+    /// the same manager-written free text under the same bounds; the two used
+    /// to be byte-identical bodies in two crates, so a change to one was a
+    /// silent divergence.
+    ///
+    /// Mutation: re-introduce a local `detail_line` with any different bound
+    /// or wording and this reds.
+    #[test]
+    fn the_detail_line_is_the_plugins_own_renderer() {
+        let long = "x".repeat(hytte_plugin_agents::plugin::DETAIL_CHARS + 50);
+        let a = Approval {
+            description: Some(long.clone()),
+            requested_at: "2026-09-12T00:00:00Z".to_owned(),
+            ..approval(11, "stray", ApprovalStatus::Pending)
+        };
+        assert_eq!(
+            ApprovalRow::of(&a, None, false).detail,
+            hytte_plugin_agents::plugin::detail_line(&a),
+            "the window must render the queue's free text through the plugin's own function"
+        );
     }
 }
 

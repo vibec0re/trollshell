@@ -46,7 +46,7 @@ const DBUS_DAEMON_STARTUP_BUDGET: Duration = Duration::from_secs(30);
 
 pub struct BusGuard {
     child: Option<Child>,
-    _tmp: TempDir,
+    tmp: TempDir,
     // Used by connection_reconnect.rs to open a replacement connection against
     // the same ephemeral bus; not all test binaries need it.
     #[allow(dead_code)]
@@ -156,7 +156,7 @@ pub async fn ephemeral_bus() -> (Connection, BusGuard) {
         conn,
         BusGuard {
             child: Some(child),
-            _tmp: tmp,
+            tmp,
             address,
         },
     )
@@ -186,7 +186,7 @@ pub async fn restart_on_same_address(mut guard: BusGuard) -> (Connection, BusGua
         let _ = std::fs::remove_file(socket_path);
     }
 
-    let config = guard._tmp.path().join("session.conf");
+    let config = guard.tmp.path().join("session.conf");
     let child = spawn_daemon(&config).await;
     let conn = connect(&guard.address).await;
 

@@ -166,26 +166,16 @@ pub const PLUGIN_ID: &str = "caw";
 /// local/self-hosted backend (keyless OK); no URL defaults to `OpenRouter`
 /// **only when a key exists** (a keyless cloud call would just 401, so it
 /// short-circuits to the plain path instead of a doomed round-trip).
+///
+/// Hoisted to [`hytte_ai_providers::provider::resolve`] (#1168) — this was a
+/// byte-for-byte copy of the pet's version under the same name; this is now a
+/// thin wrapper supplying caw's own [`PLUGIN_ID`].
 fn resolve_provider(
     url_env: Option<&str>,
     key: Option<String>,
     model: Option<String>,
 ) -> Option<Provider> {
-    match url_env {
-        Some("") => None,
-        Some(url) => Some(Provider {
-            base_url: url.to_owned(),
-            api_key: key,
-            model,
-            user: Some(PLUGIN_ID.to_owned()),
-        }),
-        None => key.map(|key| Provider {
-            base_url: "https://openrouter.ai/api".to_owned(),
-            api_key: Some(key),
-            model,
-            user: Some(PLUGIN_ID.to_owned()),
-        }),
-    }
+    hytte_ai_providers::provider::resolve(url_env, key, model, PLUGIN_ID)
 }
 
 // ── The trigger ──────────────────────────────────────────────────────────────

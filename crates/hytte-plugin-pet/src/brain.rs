@@ -223,31 +223,16 @@ pub const PLUGIN_ID: &str = "pet";
 /// explicit `$PET_LLM_URL` selects a local/self-hosted backend (e.g. a
 /// `llama-server`, which needs no key) as the base, with any `key`/`model`
 /// layered on.
+///
+/// Hoisted to [`hytte_ai_providers::provider::resolve`] (#1168) — caw had the
+/// exact same logic under the same name; this is a thin wrapper supplying the
+/// pet's own [`PLUGIN_ID`].
 fn resolve_provider(
     url_env: Option<&str>,
     key: Option<String>,
     model: Option<String>,
 ) -> Option<Provider> {
-    match url_env {
-        // Explicitly empty `$PET_LLM_URL` → model disabled (canned-only pet).
-        Some("") => None,
-        // An explicit URL is a local/self-hosted backend that needs no key —
-        // keep it even keyless.
-        Some(url) => Some(Provider {
-            base_url: url.to_owned(),
-            api_key: key,
-            model,
-            user: Some(PLUGIN_ID.to_owned()),
-        }),
-        // No URL → the OpenRouter cloud default, but ONLY with a key. Keyless →
-        // `None` (canned-only): the call would just 401, so skip it (#438).
-        None => key.map(|key| Provider {
-            base_url: "https://openrouter.ai/api".to_owned(),
-            api_key: Some(key),
-            model,
-            user: Some(PLUGIN_ID.to_owned()),
-        }),
-    }
+    hytte_ai_providers::provider::resolve(url_env, key, model, PLUGIN_ID)
 }
 
 /// The brain task. Every request gets exactly one [`PetMsg::Thought`] reply;

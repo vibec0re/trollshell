@@ -16,12 +16,13 @@
 //! - Commands open a fresh short-lived socket (cheap unix-socket connect)
 //!   so they don't have to share the long-lived event-stream socket.
 
+use crate::retry;
 use anyhow::{Context, Result, anyhow};
 use futures_signals::signal::{Mutable, Signal};
 use hytte_reactive::{Service, registry, runtime, spawn_supervised_blocking};
 use niri_ipc::{Action, Event, Reply, Request, Response, WorkspaceReferenceArg, socket::Socket};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Re-export the niri-ipc data types consumers need so trollshell etc.
 // don't have to depend on niri-ipc directly.
@@ -82,23 +83,83 @@ impl Service for NiriService {
         // restart-safe: every run reconnects from scratch and the compositor,
         // not this process, holds the state it republishes.
         spawn_supervised_blocking("niri", move || {
+            // Reconnect on `retry::RECONNECT_RETRY`'s ramp with the streak
+            // latched, rather than a flat 1s with a `warn!` per attempt (#1170
+            // item 4). The case that matters is a **missing** `NIRI_SOCKET`:
+            // `Socket::connect` fails instantly, so the old loop was 1 Hz of
+            // identical warnings, forever, on a condition nothing here can fix.
+            let mut reporter = retry::ReconnectReporter::new();
             loop {
-                match listen_once(
+                let started = Instant::now();
+                let outcome = listen_once(
                     &ws_writer,
                     &win_list_writer,
                     &win_focus_writer,
                     &casts_writer,
                     &screenshot_writer,
-                ) {
-                    Ok(()) => tracing::warn!("niri event stream closed, reconnecting in 1s"),
-                    Err(e) => tracing::warn!(error = ?e, "niri ipc error, reconnecting in 1s"),
-                }
-                thread::sleep(Duration::from_secs(1));
+                );
+                let (_report, delay) =
+                    reconnect_after(&mut reporter, started.elapsed(), outcome.as_ref());
+                thread::sleep(delay);
             }
         });
 
         handles
     }
+}
+
+/// Record a finished `listen_once` and say how long to wait before redialling.
+///
+/// The cadence is [`retry::ReconnectReporter`]'s — a run that stayed up at least
+/// its reset threshold is healthy, anything shorter is a failure streak — and
+/// the wording is this call site's, per `retry`'s mechanism/judgement split.
+/// The shape is #668/#669's: warn once on the edge into failure, `debug!` while
+/// nothing changes, `info!` to retract it.
+///
+/// **A run's health, not its `Result`, decides.** A `NIRI_SOCKET` that is not
+/// there fails instantly with an `Err`; a niri that restarts mid-session gives
+/// an `Err` too but only after hours; and an event stream that closes cleanly
+/// after hours is an `Ok`. Only the elapsed time separates "we are stuck" from
+/// "that was one hiccup", which is also exactly what the ramp resets on — so
+/// the two can never disagree.
+///
+/// Returns the report alongside the delay so the tests can read the cadence
+/// without a subscriber; the loop only needs the delay.
+fn reconnect_after(
+    reporter: &mut retry::ReconnectReporter,
+    ran_for: Duration,
+    outcome: Result<&(), &anyhow::Error>,
+) -> (retry::Report, Duration) {
+    let (report, delay) = reporter.record(ran_for);
+    let retry_in_secs = delay.as_secs_f64();
+    let cause = match outcome {
+        Ok(()) => "the event stream closed".to_owned(),
+        Err(e) => format!("{e:#}"),
+    };
+    match report {
+        retry::Report::Opened => tracing::warn!(
+            cause,
+            retry_in_secs,
+            "niri: cannot hold an IPC event stream (is NIRI_SOCKET set and is niri running?). \
+             Workspaces, windows, casts and the frame overlay are stale until it comes back. \
+             Redialling with backoff; this line will not repeat until it does"
+        ),
+        retry::Report::Repeating => {
+            tracing::debug!(cause, retry_in_secs, "niri: still no IPC event stream");
+        }
+        retry::Report::Recovered => {
+            tracing::info!("niri: IPC event stream held again; workspaces and windows are live");
+        }
+        // A stream that ran healthily and then ended — a niri restart, say.
+        // Worth a line each time: nothing is outstanding for the latch to
+        // retract, and these are rare by construction.
+        retry::Report::Quiet => tracing::warn!(
+            cause,
+            retry_in_secs,
+            "niri: IPC event stream ended, reconnecting"
+        ),
+    }
+    (report, delay)
 }
 
 fn listen_once(
@@ -945,6 +1006,90 @@ pub fn reflow_workspace(workspace: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The reconnect ramp and its latched warn (#1170 item 4) ───────────────
+
+    /// A failed dial, the shape `Socket::connect` gives when `NIRI_SOCKET` is
+    /// unset or nothing is listening on it.
+    fn missing_socket() -> anyhow::Error {
+        anyhow!("connect to NIRI_SOCKET: No such file or directory (os error 2)")
+    }
+
+    /// #1170's item 4, stated exactly: five consecutive missing-socket attempts
+    /// are worth one loud line.
+    ///
+    /// The ramp is asserted alongside it, because the two are the same decision
+    /// in `ReconnectReporter`: a cadence that spoke on every attempt would have
+    /// to treat every attempt as a fresh incident, and reset the delay too.
+    ///
+    /// Falsify by dropping the reporter and going back to
+    /// `warn!(…); thread::sleep(Duration::from_secs(1))`: five `Opened`s and
+    /// five identical 1s delays (measured).
+    #[test]
+    fn five_missing_socket_attempts_log_one_warn_and_climb_one_ramp() {
+        let mut reporter = retry::ReconnectReporter::new();
+        let err = missing_socket();
+        let instant = Duration::from_millis(1);
+
+        let turns: Vec<(retry::Report, Duration)> = (0..5)
+            .map(|_| reconnect_after(&mut reporter, instant, Err(&err)))
+            .collect();
+
+        let loud = turns
+            .iter()
+            .filter(|(r, _)| *r == retry::Report::Opened)
+            .count();
+        assert_eq!(
+            loud, 1,
+            "a missing NIRI_SOCKET warns per attempt, forever: {turns:?}"
+        );
+        assert_eq!(
+            turns[0].0,
+            retry::Report::Opened,
+            "the outage is not reported at all until later; the first attempt must be the loud one"
+        );
+
+        let delays: Vec<Duration> = turns.iter().map(|(_, d)| *d).collect();
+        assert!(
+            delays[0] > Duration::ZERO,
+            "the first redial is immediate, i.e. a hot loop"
+        );
+        for pair in delays.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "the ramp is flat across a streak: {delays:?}"
+            );
+        }
+    }
+
+    /// The other half: the streak is *one* incident, so the ramp does not reset
+    /// mid-outage — which is the same fact as the warn not repeating, since
+    /// both read `ReconnectReporter`'s one notion of a healthy run.
+    #[test]
+    fn a_held_stream_resets_the_ramp_and_a_short_one_does_not() {
+        let mut reporter = retry::ReconnectReporter::new();
+        let err = missing_socket();
+        let instant = Duration::from_millis(1);
+
+        let (_, first) = reconnect_after(&mut reporter, instant, Err(&err));
+        for _ in 0..4 {
+            reconnect_after(&mut reporter, instant, Err(&err));
+        }
+        // A stream that held for the reset threshold prices its own redial at
+        // the bottom of the ramp again (#806's ordering) *and* retracts the
+        // warning — one fact, two consequences.
+        let (report, after_healthy) =
+            reconnect_after(&mut reporter, Duration::from_mins(1), Ok(&()));
+        assert_eq!(
+            after_healthy, first,
+            "a long-lived stream's own reconnect still paid the streak's ratcheted delay"
+        );
+        assert_eq!(
+            report,
+            retry::Report::Recovered,
+            "the outage was never retracted, so a journal shows every death and no recovery"
+        );
+    }
 
     const MON_W: f64 = 1920.0;
     const MON_H: f64 = 1080.0;

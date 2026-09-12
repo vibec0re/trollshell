@@ -420,7 +420,13 @@ fn event(name: &str, owner: &str, req: ThinkReq) -> String {
 /// non-empty line, quotes stripped, the model's "{name}:" self-naming tic
 /// removed, emoji dropped (tiny models ignore "no emoji"), clamped to
 /// [`MAX_LINE`] chars.
+///
+/// The codepoint tables (combining marks, dropped noise) are
+/// [`hytte_plugin::preem::text`] (#1168) — caw's paragraph-shaped `sanitize`
+/// used the exact same tables under a "kept in sync by hand" comment.
 fn sanitize(raw: &str, name: &str) -> String {
+    use hytte_plugin::preem::text::{is_bubble_noise, is_combining_mark};
+
     let line = raw
         .lines()
         .map(str::trim)
@@ -433,41 +439,17 @@ fn sanitize(raw: &str, name: &str) -> String {
         Some((head, tail)) if head.trim().to_lowercase() == name.to_lowercase() => tail.trim(),
         _ => line,
     };
-    let cleaned: String = line.chars().filter(|&c| !is_dropped(c)).collect();
+    let cleaned: String = line.chars().filter(|&c| !is_bubble_noise(c)).collect();
     let cleaned = cleaned.trim();
     let mut out: String = cleaned.chars().take(MAX_LINE).collect();
     if cleaned.chars().count() > MAX_LINE {
         // Don't strand combining marks on the cut edge.
-        while out.chars().last().is_some_and(is_combining) {
+        while out.chars().last().is_some_and(is_combining_mark) {
             out.pop();
         }
         out.push('…');
     }
     out
-}
-
-/// Common combining-mark ranges (a full grapheme segmenter would be a dep;
-/// this covers what a chat model realistically emits).
-fn is_combining(c: char) -> bool {
-    matches!(c, '\u{0300}'..='\u{036F}' | '\u{1AB0}'..='\u{1AFF}' | '\u{20D0}'..='\u{20FF}')
-}
-
-/// Codepoints to drop from bubbles: emoji blocks (kaomoji glyphs sit far
-/// below them and survive) plus every double-quote lookalike — a tiny model
-/// loves opening a quote it never closes, which end-trimming can't catch.
-fn is_dropped(c: char) -> bool {
-    matches!(
-        c,
-        '\u{1F000}'..='\u{1FAFF}'
-            | '\u{2600}'..='\u{27BF}'
-            | '\u{FE0F}'
-            | '\u{200D}'
-            | '"'
-            | '\u{201c}'
-            | '\u{201d}'
-            | '\u{201e}'
-            | '\u{ff02}'
-    )
 }
 
 // ── The canned path ──────────────────────────────────────────────────────────

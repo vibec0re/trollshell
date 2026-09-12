@@ -365,7 +365,13 @@ pub(crate) fn compose_llm(provider: &Provider, facts: &str) -> Result<String, St
 /// wrapping quotes stripped, emoji and double-quote lookalikes dropped (the
 /// pixel font boxes them anyway), whitespace collapsed, clamped to
 /// [`MAX_BRIEF`] chars.
+///
+/// The codepoint tables (combining marks, dropped noise) are
+/// [`hytte_plugin::preem::text`] (#1168) — the pet's one-line `sanitize` used
+/// the exact same tables under a "kept in sync by hand" comment.
 pub(crate) fn sanitize(raw: &str) -> String {
+    use hytte_plugin::preem::text::{is_bubble_noise, is_combining_mark};
+
     let joined = raw
         .lines()
         .map(str::trim)
@@ -375,39 +381,16 @@ pub(crate) fn sanitize(raw: &str) -> String {
     let joined = joined
         .trim_matches(|c| c == '"' || c == '\'' || c == '“' || c == '”')
         .trim();
-    let cleaned: String = joined.chars().filter(|&c| !is_dropped(c)).collect();
+    let cleaned: String = joined.chars().filter(|&c| !is_bubble_noise(c)).collect();
     let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut out: String = cleaned.chars().take(MAX_BRIEF).collect();
     if cleaned.chars().count() > MAX_BRIEF {
-        while out.chars().last().is_some_and(is_combining) {
+        while out.chars().last().is_some_and(is_combining_mark) {
             out.pop();
         }
         out.push('…');
     }
     out
-}
-
-/// Common combining-mark ranges (kept in sync with the pet's bubble rule; a
-/// full grapheme segmenter would be a dep for nothing).
-fn is_combining(c: char) -> bool {
-    matches!(c, '\u{0300}'..='\u{036F}' | '\u{1AB0}'..='\u{1AFF}' | '\u{20D0}'..='\u{20FF}')
-}
-
-/// Codepoints to drop: emoji blocks plus every double-quote lookalike — the
-/// same policy as the pet's bubble (tiny models ignore "no emoji").
-fn is_dropped(c: char) -> bool {
-    matches!(
-        c,
-        '\u{1F000}'..='\u{1FAFF}'
-            | '\u{2600}'..='\u{27BF}'
-            | '\u{FE0F}'
-            | '\u{200D}'
-            | '"'
-            | '\u{201c}'
-            | '\u{201d}'
-            | '\u{201e}'
-            | '\u{ff02}'
-    )
 }
 
 // ── The pipeline ─────────────────────────────────────────────────────────────

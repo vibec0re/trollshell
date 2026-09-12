@@ -57,11 +57,13 @@
 
 use crate::config_file;
 use futures_signals::signal::{Mutable, Signal, SignalExt};
+use futures_util::StreamExt;
 use hytte_bus::FdLease;
-use hytte_reactive::{Service, registry, runtime, shared};
+use hytte_reactive::{Service, registry, runtime, shared, spawn_supervised};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use zbus::message::Header;
 
 // ── Keep-awake persistence (#534) ─────────────────────────────────────────────
 //
@@ -141,6 +143,22 @@ struct ScreenSaverShared {
     /// reverse, so the two can't deadlock.
     manual: Arc<Mutex<ManualCaffeine>>,
 }
+
+// Cookie → caller's unique D-Bus name (#1171), for cookies registered through
+// the `Inhibit` D-Bus method (not the internal [`inhibit`] used by the manual
+// caffeine toggle, which has no remote caller to track). A client that dies
+// without calling `UnInhibit` used to keep its cookie — and the screen awake
+// — until this process restarted; the `NameOwnerChanged` watcher spawned in
+// `Service::start` drops a cookie the moment its owner's entry names a bus
+// name that just vanished (`drop_cookies_for_vanished_owner`).
+//
+// Not part of `ScreenSaverShared`: unlike `state`/`inhibitors`/`manual`, no
+// free function needs to reach this through `shared_state()` — only
+// `ScreenSaverIface` (in-process D-Bus method handlers) and
+// `watch_owner_changes` touch it, and `Service::start` hands each its own
+// `Arc` clone directly. Locked independently of `state`/`manual` — never
+// nested under either.
+type OwnersMap = Arc<Mutex<HashMap<u32, String>>>;
 
 // ── Manual "Keep awake" (caffeine) ─────────────────────────────────────────────
 //
@@ -237,11 +255,13 @@ impl Service for ScreenSaverService {
         let inhibitors = Mutable::new(Vec::new());
         // Start at 1 so a leaked default-zero cookie never matches.
         let next_cookie = Arc::new(AtomicU32::new(1));
+        let owners: OwnersMap = Arc::new(Mutex::new(HashMap::new()));
 
         let iface = ScreenSaverIface {
             state: state.clone(),
             inhibitors: inhibitors.clone(),
             next_cookie: next_cookie.clone(),
+            owners: owners.clone(),
         };
 
         // Own the well-known name on session bus, mount at both paths.
@@ -270,6 +290,25 @@ impl Service for ScreenSaverService {
         {
             acquire_manual(shared);
         }
+
+        // Drop a D-Bus-registered Inhibit cookie the moment its caller's
+        // unique bus name vanishes without an `UnInhibit` (#1171) — reuses
+        // `hytte_bus::signals`, the same `NameOwnerChanged` subscription
+        // primitive `mpris`/`tray` already watch their own peers with,
+        // rather than adding a bespoke second watcher. Cloned here (rather
+        // than moving `state`/`inhibitors`/`owners` themselves) so those
+        // bindings are still available below for `ScreenSaverHandles`.
+        let watch_state = state.clone();
+        let watch_inhibitors = inhibitors.clone();
+        let watch_owners = owners.clone();
+        spawn_supervised("screensaver-owner-watch", move || {
+            let state = watch_state.clone();
+            let inhibitors = watch_inhibitors.clone();
+            let owners = watch_owners.clone();
+            async move {
+                watch_owner_changes(&state, &inhibitors, &owners).await;
+            }
+        });
 
         ScreenSaverHandles {
             _state: state,
@@ -504,6 +543,78 @@ fn publish_inhibitors(state: &Mutex<HashMap<u32, Inhibitor>>, view: &Mutable<Vec
     view.set(snapshot);
 }
 
+// ── Internal: dead-caller cleanup (#1171) ──────────────────────────────────────
+
+/// Remove every cookie owned by `vanished_sender` from `owners`, returning
+/// the removed cookies. Pulled out of [`watch_owner_changes`] so the
+/// bookkeeping is testable without a real bus connection: the async loop is
+/// just "deserialize the signal, call this, remove the returned cookies
+/// from the inhibitor map too, republish".
+///
+/// Locks only `owners`, and never while `state` or `manual` is held — see
+/// `ScreenSaverShared::owners`'s doc for the lock-ordering note.
+fn drop_cookies_for_vanished_owner(
+    owners: &Mutex<HashMap<u32, String>>,
+    vanished_sender: &str,
+) -> Vec<u32> {
+    let mut map = owners.lock().expect("screensaver owners poisoned");
+    let dead: Vec<u32> = map
+        .iter()
+        .filter(|(_, sender)| sender.as_str() == vanished_sender)
+        .map(|(cookie, _)| *cookie)
+        .collect();
+    for cookie in &dead {
+        map.remove(cookie);
+    }
+    dead
+}
+
+/// Watch session-bus `NameOwnerChanged` and drop any Inhibit cookie whose
+/// registering caller just vanished (#1171) — a client that dies without
+/// calling `UnInhibit` would otherwise keep the screen awake until this
+/// process restarts. Reuses `hytte_bus::signals`, the same subscription
+/// primitive `mpris`/`tray` already use to watch their own peers, rather
+/// than a bespoke second watcher; runs for the process lifetime under
+/// `spawn_supervised`.
+async fn watch_owner_changes(
+    state: &Mutex<HashMap<u32, Inhibitor>>,
+    inhibitors: &Mutable<Vec<Inhibitor>>,
+    owners: &Mutex<HashMap<u32, String>>,
+) {
+    let subscription = hytte_bus::signals(hytte_bus::BusKind::Session, "org.freedesktop.DBus")
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .signal("NameOwnerChanged")
+        .start();
+    let mut events = subscription.events();
+    while let Some(event) = events.next().await {
+        let Ok((name, _old_owner, new_owner)) =
+            event.body.body().deserialize::<(String, String, String)>()
+        else {
+            continue;
+        };
+        if !new_owner.is_empty() {
+            continue; // a name gaining an owner is not a departure
+        }
+        // For a direct connection dropping, `name` here IS the vanished
+        // unique bus name (":1.NN") — the same value `header.sender()`
+        // captured in `ScreenSaverIface::inhibit`.
+        let dead = drop_cookies_for_vanished_owner(owners, &name);
+        if dead.is_empty() {
+            continue;
+        }
+        for cookie in &dead {
+            tracing::debug!(
+                cookie,
+                sender = %name,
+                "screensaver: caller vanished, dropping Inhibit cookie",
+            );
+            remove_inhibitor(state, *cookie);
+        }
+        publish_inhibitors(state, inhibitors);
+    }
+}
+
 // ── D-Bus interface ───────────────────────────────────────────────────────────
 
 const PATH_CANONICAL: &str = "/org/freedesktop/ScreenSaver";
@@ -519,6 +630,7 @@ struct ScreenSaverIface {
     state: Arc<Mutex<HashMap<u32, Inhibitor>>>,
     inhibitors: Mutable<Vec<Inhibitor>>,
     next_cookie: Arc<AtomicU32>,
+    owners: Arc<Mutex<HashMap<u32, String>>>,
 }
 
 // zbus's `#[interface]` macro requires every method to be `async fn` even
@@ -539,15 +651,35 @@ impl ScreenSaverIface {
     /// back to `UnInhibit`. The inhibitor is tracked and surfaced via
     /// [`inhibitors`] (the idle manager enforces on logind inhibitors, not this
     /// list — see the module docs).
-    async fn inhibit(&self, application_name: String, reason_for_inhibit: String) -> u32 {
+    ///
+    /// Also remembers the caller's unique bus name against the cookie
+    /// (#1171): if that name's connection drops without a matching
+    /// `UnInhibit`, the `NameOwnerChanged` watcher spawned in
+    /// `Service::start` drops the cookie for us — see
+    /// `drop_cookies_for_vanished_owner`.
+    async fn inhibit(
+        &self,
+        application_name: String,
+        reason_for_inhibit: String,
+        #[zbus(header)] header: Header<'_>,
+    ) -> u32 {
         let cookie = self.next_cookie.fetch_add(1, Ordering::Relaxed);
         let inh = Inhibitor {
             cookie,
             application: application_name,
             reason: reason_for_inhibit,
         };
-        tracing::debug!(cookie, app = %inh.application, reason = %inh.reason, "Inhibit");
+        let sender = header
+            .sender()
+            .map(|s| zbus::names::UniqueName::as_str(s).to_string());
+        tracing::debug!(cookie, app = %inh.application, reason = %inh.reason, sender = ?sender, "Inhibit");
         insert_inhibitor(&self.state, inh);
+        if let Some(sender) = sender {
+            self.owners
+                .lock()
+                .expect("screensaver owners poisoned")
+                .insert(cookie, sender);
+        }
         publish_inhibitors(&self.state, &self.inhibitors);
         cookie
     }
@@ -557,6 +689,10 @@ impl ScreenSaverIface {
     async fn un_inhibit(&self, cookie: u32) {
         tracing::debug!(cookie, "UnInhibit");
         remove_inhibitor(&self.state, cookie);
+        self.owners
+            .lock()
+            .expect("screensaver owners poisoned")
+            .remove(&cookie);
         publish_inhibitors(&self.state, &self.inhibitors);
     }
 
@@ -639,5 +775,68 @@ mod tests {
             application: CAFFEINE_APP.to_string(),
             reason: "Screen sharing".to_string(),
         }));
+    }
+
+    #[test]
+    fn owner_vanished_drops_only_that_owners_cookies() {
+        // #1171: three cookies, two owned by the same (about-to-vanish)
+        // sender, one owned by a still-live sender.
+        let owners = Mutex::new(HashMap::from([
+            (1, ":1.10".to_string()),
+            (2, ":1.20".to_string()),
+            (3, ":1.10".to_string()),
+        ]));
+
+        let mut dead = drop_cookies_for_vanished_owner(&owners, ":1.10");
+        dead.sort_unstable();
+        assert_eq!(dead, vec![1, 3]);
+
+        let remaining = owners.lock().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.get(&2).map(String::as_str), Some(":1.20"));
+    }
+
+    #[test]
+    fn owner_with_no_cookies_drops_nothing() {
+        let owners = Mutex::new(HashMap::from([(1, ":1.10".to_string())]));
+        let dead = drop_cookies_for_vanished_owner(&owners, ":1.99");
+        assert!(dead.is_empty());
+        assert_eq!(owners.lock().unwrap().len(), 1);
+    }
+
+    /// End-to-end bookkeeping (#1171), still fully hermetic: register a
+    /// cookie the way `Inhibit` does (insert into `state` + remember its
+    /// caller in `owners`), then simulate its caller vanishing the way
+    /// `watch_owner_changes` does on a `NameOwnerChanged` event, and assert
+    /// the cookie — and its `inhibitors()` entry — are gone.
+    #[test]
+    fn inhibit_cookie_is_dropped_when_its_owner_vanishes() {
+        let state: Mutex<HashMap<u32, Inhibitor>> = Mutex::new(HashMap::new());
+        let owners = Mutex::new(HashMap::new());
+        let inhibitors = Mutable::new(Vec::new());
+
+        insert_inhibitor(
+            &state,
+            Inhibitor {
+                cookie: 1,
+                application: "Firefox".to_string(),
+                reason: "Playing video".to_string(),
+            },
+        );
+        owners.lock().unwrap().insert(1, ":1.42".to_string());
+        publish_inhibitors(&state, &inhibitors);
+        assert_eq!(inhibitors.get_cloned().len(), 1, "cookie should be live");
+
+        let dead = drop_cookies_for_vanished_owner(&owners, ":1.42");
+        for cookie in &dead {
+            remove_inhibitor(&state, *cookie);
+        }
+        publish_inhibitors(&state, &inhibitors);
+
+        assert!(
+            inhibitors.get_cloned().is_empty(),
+            "the cookie should be gone after its owner vanished",
+        );
+        assert!(owners.lock().unwrap().is_empty());
     }
 }

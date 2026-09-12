@@ -1443,10 +1443,12 @@ mod imp {
     #[cfg(all(test, feature = "system-tests"))]
     mod tests {
         use super::{
-            Arc, BUILD_ATTEMPTS, GlBlend, GlDraw, GlPass, GlPipeline, GlProgram, GlSurface,
-            GlTarget, GlUniforms, PROGRAMS, RefCell, Resources, WarnLatch, gdk, hgl,
+            Arc, BUILD_ATTEMPTS, GlBlend, GlDraw, GlInput, GlPass, GlPipeline, GlProgram,
+            GlSurface, GlTarget, GlUniforms, GlValue, PROGRAMS, RefCell, Resources, WarnLatch,
+            gdk, glib, hgl,
         };
         use gtk::prelude::*;
+        use gtk::subclass::prelude::ObjectSubclassIsExt;
 
         // This test never calls `run` — only `ensure_resources` /
         // `Resources::build` — so the two pipelines below only need to differ
@@ -1803,6 +1805,185 @@ mod imp {
             assert_eq!(BUILD_ATTEMPTS.get(), 2, "a new grid is a new question");
             assert!(!surface.ensure_resources(&gl, &pipeline, program, (8, 4), 1));
             assert_eq!(BUILD_ATTEMPTS.get(), 2, "…asked exactly once, like the first");
+        }
+
+        /// **#1180 item 9.** A **realised widget** draws a real pipeline end
+        /// to end: the `GlSurface` subclass, in a window, with the context
+        /// GTK made for it, through `draw` — every pass, both targets.
+        ///
+        /// Everything else in this module tests a piece: `ensure_resources`
+        /// against a bare `imp::GlSurface::default()` (which has no
+        /// `self.obj()`, so it can only be driven with an empty pipeline),
+        /// the pure decisions on their own, the uniform bag by value. Until
+        /// this, nothing had ever put the widget on a display and let it
+        /// render — so `realize`'s context check, the `GlTarget::Screen`
+        /// arm's `attach_buffers`/letterbox, `bind_inputs`, the accumulator
+        /// ping-pong and every `glUniform*` call ran for the first time on
+        /// Annika's laptop rather than in CI.
+        ///
+        /// The assertion is the driver's own verdict: after a complete
+        /// render, [`hgl::Gl::take_error`] must be empty. That covers a class
+        /// nothing else here can see — a viewport computed negative, a
+        /// sampler bound to a unit that was never set, an
+        /// incomplete-framebuffer attach — each of which draws *something*
+        /// (usually black) and would otherwise ship green.
+        ///
+        /// **Falsified, and measured rather than assumed** (llvmpipe, this
+        /// crate's own `system-tests` env): deleting `program.bind(gl)` from
+        /// `Resources::run` — so every `glUniform*` that follows is set with
+        /// no program of ours in use — turns `take_error` into
+        /// `Some(1282)`, `GL_INVALID_OPERATION`, and this test red.
+        ///
+        /// One mutation that does **not** fire, recorded so nobody re-adds
+        /// the assertion it would suggest: dropping `self.vao.bind(gl)` stays
+        /// green. A core *desktop* profile refuses to draw with vertex array
+        /// 0, but this surface pins GLES (`GlSurface::new`), where the
+        /// default vertex array is a legal object — so the VAO here is a
+        /// portability handle, not something the driver will complain about
+        /// losing.
+        #[gtk::test]
+        fn a_realised_surface_renders_every_pass_without_a_gl_error() {
+            const STEP_FRAGMENT: &str = "
+                out vec4 frag_color;
+                void main() {
+                    frag_color = vec4(1.0);
+                }";
+            // Reads the accumulator through the sampler the host binds, so
+            // the input plumbing is exercised rather than assumed.
+            const BLIT_FRAGMENT: &str = "
+                uniform sampler2D u_tex0;
+                uniform ivec2 u_grid;
+                out vec4 frag_color;
+                void main() {
+                    float v = texelFetch(u_tex0, ivec2(0, 0), 0).r;
+                    frag_color = vec4(v, v, v, 1.0) * float(u_grid.x > 0);
+                }";
+            const STEP: [GlPass; 1] = [GlPass {
+                vertex: VERTEX,
+                fragment: STEP_FRAGMENT,
+                target: GlTarget::Accumulator,
+                inputs: &[],
+                blend: GlBlend::Max,
+                draw: GlDraw::FullScreen,
+            }];
+            const FRAME: [GlPass; 1] = [GlPass {
+                vertex: VERTEX,
+                fragment: BLIT_FRAGMENT,
+                target: GlTarget::Screen,
+                inputs: &[GlInput::Accumulator],
+                blend: GlBlend::Replace,
+                draw: GlDraw::FullScreen,
+            }];
+
+            let Some((window, surface, gl)) =
+                realised_surface_or_skip("a_realised_surface_renders_every_pass_without_a_gl_error")
+            else {
+                return;
+            };
+
+            let program = GlProgram("gl_surface_test.realised");
+            PROGRAMS.with_borrow_mut(|programs| {
+                programs.insert(
+                    program,
+                    GlPipeline {
+                        aux: 0,
+                        step: &STEP,
+                        frame: &FRAME,
+                    },
+                );
+            });
+
+            let state = Arc::new(GlUniforms {
+                values: vec![("u_unused_by_this_pipeline", GlValue::Float(0.5))],
+                data: Some(Arc::from(vec![0.25_f32, 0.5, 0.75])),
+                grid: (8, 4),
+                step_seq: 1,
+            });
+            surface.set_state(program, 8, 4, &state);
+
+            // Anything the fixture or GTK's own scene left queued belongs to
+            // them; the drain is what makes the check below an answer about
+            // this render.
+            let _ = gl.take_error();
+            surface.imp().draw();
+
+            assert!(
+                surface.imp().resources.borrow().is_some(),
+                "a realised surface must have built its GL objects",
+            );
+            assert_eq!(
+                surface.imp().last_drawn.get(),
+                1,
+                "…and replayed the one step the state owed",
+            );
+            assert_eq!(
+                gl.take_error(),
+                None,
+                "a complete render over a real driver must raise no GL error",
+            );
+
+            // A second render with the same state advances nothing (the
+            // idempotence rule) and must still be clean.
+            surface.imp().draw();
+            assert_eq!(surface.imp().last_drawn.get(), 1, "a repeat render is idle");
+            assert_eq!(gl.take_error(), None, "and just as clean");
+
+            window.destroy();
+        }
+
+        /// A realised [`super::super::GlSurface`] widget in a presented
+        /// window, its own context current, or a skip naming why.
+        ///
+        /// The widget's context, not a stand-in `gtk::GLArea`'s: `draw`
+        /// reaches `self.obj()` for `attach_buffers` and the allocation, so
+        /// the thing under test has to be the real widget in a real
+        /// allocation. Honours `TROLLSHELL_REQUIRE_GL` exactly as
+        /// [`real_gl_or_skip`] does.
+        fn realised_surface_or_skip(
+            test_name: &str,
+        ) -> Option<(gtk::Window, super::super::GlSurface, hgl::Gl)> {
+            let window = gtk::Window::new();
+            let surface = super::super::GlSurface::new();
+            window.set_default_size(64, 32);
+            window.set_child(Some(&surface));
+            window.present();
+            // A presented toplevel realises and allocates on this display;
+            // the bound keeps a display that will not do so from hanging the
+            // suite.
+            for _ in 0..1000 {
+                if surface.is_realized() && surface.width() > 0 {
+                    break;
+                }
+                if !glib::MainContext::default().iteration(false) {
+                    break;
+                }
+            }
+
+            let why = if let Some(error) = surface.error() {
+                format!("the GlSurface could not create a context: {error}")
+            } else if !surface.is_realized() || surface.width() <= 0 {
+                format!(
+                    "the surface never realised with an allocation (realized={}, width={})",
+                    surface.is_realized(),
+                    surface.width()
+                )
+            } else {
+                surface.make_current();
+                match hgl::Gl::current() {
+                    Ok(gl) => return Some((window, surface, gl)),
+                    Err(error) => format!("GDK made a context current, but {error}"),
+                }
+            };
+
+            window.destroy();
+            let required = std::env::var_os("TROLLSHELL_REQUIRE_GL").is_some_and(|want| want == "1");
+            assert!(
+                !required,
+                "TROLLSHELL_REQUIRE_GL=1, but no realised GL surface is available for \
+                 {test_name}: {why}"
+            );
+            eprintln!("SKIPPED {test_name}: {why}");
+            None
         }
     }
 }

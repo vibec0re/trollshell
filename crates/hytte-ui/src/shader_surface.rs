@@ -1126,6 +1126,207 @@ mod imp {
         *data_source = Some(Arc::clone(&state.data));
         Some(data)
     }
+
+    // ── #1180 item 9: a realised widget, so `draw` actually runs ────────────
+    //
+    // Nested inside `mod imp` (like `gl_surface`'s own GL tests) so it can
+    // call the private `draw` and read `resources`/`warned_compile` directly.
+    // Everything else in this file drives the pieces — `ProgramCache` against
+    // a counting builder, the latches, the pure folds — and *nothing* had ever
+    // executed `draw` at all: the widget that runs plugin-supplied GLSL had
+    // never compiled a shader, uploaded a buffer or issued a draw call
+    // anywhere but on Annika's laptop.
+    #[cfg(all(test, feature = "system-tests"))]
+    mod tests {
+        use super::{Arc, ShaderState, hgl};
+        use crate::gl_surface::GlValue;
+        use crate::shader_surface::{ShaderFormat, ShaderSurface};
+        use gtk::prelude::*;
+        use gtk::subclass::prelude::ObjectSubclassIsExt;
+
+        /// A realised [`ShaderSurface`] in a presented window, its own
+        /// context current, or a skip naming why — the twin of
+        /// `gl_surface::imp::tests::realised_surface_or_skip`, and honouring
+        /// `TROLLSHELL_REQUIRE_GL` the same way.
+        fn realised_surface_or_skip(
+            test_name: &str,
+        ) -> Option<(gtk::Window, ShaderSurface, hgl::Gl)> {
+            let window = gtk::Window::new();
+            let surface = ShaderSurface::new();
+            window.set_default_size(64, 32);
+            window.set_child(Some(&surface));
+            window.present();
+            for _ in 0..1000 {
+                if surface.is_realized() && surface.width() > 0 {
+                    break;
+                }
+                if !gtk::glib::MainContext::default().iteration(false) {
+                    break;
+                }
+            }
+
+            let why = if let Some(error) = surface.error() {
+                format!("the ShaderSurface could not create a context: {error}")
+            } else if !surface.is_realized() || surface.width() <= 0 {
+                format!(
+                    "the surface never realised with an allocation (realized={}, width={})",
+                    surface.is_realized(),
+                    surface.width()
+                )
+            } else {
+                surface.make_current();
+                match hgl::Gl::current() {
+                    Ok(gl) => return Some((window, surface, gl)),
+                    Err(error) => format!("GDK made a context current, but {error}"),
+                }
+            };
+
+            window.destroy();
+            let required = std::env::var_os("TROLLSHELL_REQUIRE_GL").is_some_and(|want| want == "1");
+            assert!(
+                !required,
+                "TROLLSHELL_REQUIRE_GL=1, but no realised shader surface is available for \
+                 {test_name}: {why}"
+            );
+            eprintln!("SKIPPED {test_name}: {why}");
+            None
+        }
+
+        /// A state carrying `body` over a 2×2 `R8` buffer.
+        fn state_with(body: &str) -> Arc<ShaderState> {
+            Arc::new(ShaderState {
+                fragment: Arc::from(body),
+                data: Arc::from(&[0u8, 64, 128, 255][..]),
+                format: ShaderFormat::R8,
+                data_size: (2, 2),
+                scale: 1,
+                values: vec![
+                    ("u_fg", GlValue::Vec4([1.0, 1.0, 1.0, 1.0])),
+                    ("u_bg", GlValue::Vec4([0.0, 0.0, 0.0, 1.0])),
+                ],
+            })
+        }
+
+        /// **#1180 item 9.** The widget that runs untrusted GLSL compiles it,
+        /// uploads the plugin's buffer and draws — on a real driver, through
+        /// the real `draw`.
+        ///
+        /// The assertion is the driver's own verdict: after a complete render
+        /// [`hgl::Gl::take_error`] must be empty. That is what covers the
+        /// interface contract this module publishes — every uniform in
+        /// `SHADER_PREAMBLE` set on a program that declares only some of
+        /// them, the data texture bound to unit 0, the letterboxed viewport —
+        /// none of which any other test in this file can reach, and each of
+        /// which fails by drawing black rather than by failing.
+        ///
+        /// It also pins the compile-once rule *against a driver* rather than
+        /// against a counting stand-in: the second render of an unchanged
+        /// source must not raise a new line or rebuild anything.
+        ///
+        /// **Falsified, and measured rather than assumed** (llvmpipe, this
+        /// crate's own `system-tests` env): deleting `program.bind(&gl)` from
+        /// `draw` — so the preamble's uniforms are set with no program of
+        /// ours in use — turns `take_error` into `Some(1282)`,
+        /// `GL_INVALID_OPERATION`, and this test red.
+        ///
+        /// What `take_error` deliberately does **not** catch is a uniform
+        /// this module simply stops setting: GL ignores a write to a location
+        /// the program does not declare, and a name that never arrives is
+        /// silently zero. That is why the compile and the `u_time` origin
+        /// are asserted separately rather than folded into "no error" — and
+        /// why `SHADER_PREAMBLE`'s own contract test (`the_preamble_declares_
+        /// every_contract_name`) exists next door.
+        #[gtk::test]
+        fn a_realised_shader_surface_compiles_uploads_and_draws() {
+            const BODY: &str = "
+                void main() {
+                    float v = texture(u_data, v_uv).r;
+                    fragColor = mix(u_bg, u_fg, v) * (u_time >= 0.0 ? 1.0 : 0.0);
+                }";
+
+            let Some((window, surface, gl)) =
+                realised_surface_or_skip("a_realised_shader_surface_compiles_uploads_and_draws")
+            else {
+                return;
+            };
+
+            surface.set_state(8, 4, &state_with(BODY));
+            let _ = gl.take_error();
+            surface.imp().draw();
+
+            assert!(
+                surface.imp().resources.borrow().is_some(),
+                "a realised surface must have built its GL objects",
+            );
+            assert!(
+                surface.imp().warned_compile.borrow().said.is_empty(),
+                "a body that compiles must write no compile-failure line",
+            );
+            assert!(
+                surface.imp().origin.get().is_some(),
+                "…and must have stamped its u_time origin, which only a real draw does",
+            );
+            assert_eq!(
+                gl.take_error(),
+                None,
+                "a complete render over a real driver must raise no GL error",
+            );
+
+            // The same source again: no recompile, no new line, still clean.
+            surface.imp().draw();
+            assert!(surface.imp().warned_compile.borrow().said.is_empty());
+            assert_eq!(gl.take_error(), None, "a repeat render is just as clean");
+
+            window.destroy();
+        }
+
+        /// **#1180 item 9, the other half.** A body the driver refuses is
+        /// refused *here*, not on the laptop: one journal line, one compile,
+        /// and the widget keeps drawing nothing rather than taking the shell
+        /// down.
+        ///
+        /// This is the path #893's whole trust story rests on — a plugin ships
+        /// GLSL nobody validated, because there is no validator to have — and
+        /// until now no test had ever handed a broken body to a driver.
+        ///
+        /// **Falsified** by making `ProgramCache::ensure` return the held
+        /// program regardless: the compile failure is never latched and the
+        /// first assertion goes red.
+        #[gtk::test]
+        fn a_realised_shader_surface_refuses_a_broken_body_once() {
+            const BROKEN: &str = "void main() { fragColor = not_a_thing; }";
+
+            let Some((window, surface, gl)) =
+                realised_surface_or_skip("a_realised_shader_surface_refuses_a_broken_body_once")
+            else {
+                return;
+            };
+
+            surface.set_state(8, 4, &state_with(BROKEN));
+            let _ = gl.take_error();
+            surface.imp().draw();
+
+            assert_eq!(
+                surface.imp().warned_compile.borrow().said.len(),
+                1,
+                "a body the driver will not compile is reported once",
+            );
+            surface.imp().draw();
+            surface.imp().draw();
+            assert_eq!(
+                surface.imp().warned_compile.borrow().said.len(),
+                1,
+                "…and only once, however many frames carry it",
+            );
+            assert_eq!(
+                gl.take_error(),
+                None,
+                "a refused compile must leave no GL error queued for the next caller to trip on",
+            );
+
+            window.destroy();
+        }
+    }
 }
 
 /// Whether the data texture must be re-uploaded for `incoming`.

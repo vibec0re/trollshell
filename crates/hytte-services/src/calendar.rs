@@ -215,7 +215,9 @@ impl Service for CalendarService {
         // which is the supervisor's own restart-safety argument. `SENDER` is
         // set once here, not per run, and the `Receiver` outlives every run
         // inside `spawn_eds_worker`, so refresh pings queued while the worker
-        // was down are picked up by the run that follows.
+        // was down are picked up by the run that follows — bar the one already
+        // `recv`'d when the panic hit, which costs this service a refresh the
+        // next ping repairs (`tasks`' loss is worse; see its call site).
         spawn_eds_worker("calendar-eds", rx, move |rx| run_worker(rx, &writer));
 
         // Refresh ticker. The first send fires immediately (initial

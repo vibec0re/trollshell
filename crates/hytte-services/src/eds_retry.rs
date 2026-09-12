@@ -53,9 +53,33 @@ use std::time::{Duration, Instant};
 ///
 /// **The poison tolerance is load-bearing, not boilerplate.** A panicking run
 /// unwinds while this guard is held, which poisons the mutex; a plain
-/// `.unwrap()` would panic the restarted run too, turning one dead worker into
-/// an unbounded panic loop at the supervisor's 30s ceiling — strictly worse
-/// than what it replaced.
+/// `.unwrap()` would panic the restarted run too, so *every* run after the
+/// first would die on the lock rather than on the bug — measured:
+/// `panics: 4, consecutive_panics: 4, backoff: 8s` where the tolerant version
+/// picks the queued op up on run 2.
+///
+/// Two things that reading "poison-tolerant lock" as a hazard being accepted
+/// would get wrong:
+///
+/// * **There is no state to expose.** The lock wraps a `mpsc::Receiver` and
+///   nothing else. A `Receiver` carries no invariant across messages, so a
+///   panic mid-`recv` cannot leave it half-updated; the poison flag here is
+///   pure collateral from unwinding through the guard, not a signal about the
+///   data. Poison tolerance is dangerous where the guarded value has a
+///   multi-field invariant — this is the other case.
+/// * **The panic loop it avoids is slow, not hot.** The supervisor's ramp is
+///   1 → 2 → 4 → 8 → … → 30 s, so the `.unwrap()` variant costs one panic and
+///   one `error!` per 30 s in the steady state. Unbounded, and the service
+///   never comes back — but not a burning core, and worth knowing before
+///   triaging one.
+///
+/// **One op is still lost per panic**: the one already `recv`'d when the panic
+/// hit is gone with the run that took it. Ops still queued survive, which is
+/// what the shared `Arc<Mutex<Receiver>>` buys. For `calendar` that costs a
+/// refresh, which the next one repairs; for `tasks` it can be an `Op::Create`
+/// or `Op::Delete`, i.e. a user write that silently does not happen. Recovering
+/// that would mean acknowledging ops rather than consuming them, which is a
+/// different design and not one #1170 bought.
 pub(crate) fn spawn_eds_worker<T, F>(name: &'static str, rx: mpsc::Receiver<T>, body: F)
 where
     T: Send + 'static,

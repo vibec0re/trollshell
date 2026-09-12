@@ -230,6 +230,10 @@ impl Service for TasksService {
         // `SENDER` is set once here, not per run, and the `Receiver` outlives
         // every run in `spawn_eds_worker`'s mutex — so ops queued while the
         // worker was down are delivered by the run that follows, not dropped.
+        // **Except the one already `recv`'d when the panic hit**, which goes
+        // with the run that took it: for `tasks` that can be an `Op::Create` or
+        // `Op::Delete`, i.e. a user write that silently does not happen. See
+        // `eds_retry::spawn_eds_worker`.
         spawn_eds_worker("tasks-eds", rx, move |rx| {
             run_worker(rx, &tasks_writer, &lists_writer);
         });

@@ -1753,4 +1753,62 @@ mod tests {
             "iteration returned in {elapsed:?} — it didn't actually block on the waker"
         );
     }
+
+    // ── Expansion output fixture (#1179) ──────────────────────────────────
+    //
+    // Pinned *before* #1179 rewrote `expand_component`'s dedup and its
+    // per-occurrence iCal cloning, so that rewrite is provably
+    // output-preserving rather than merely believed to be. One rule
+    // exercising RRULE + EXDATE + RDATE at once, with every field of every
+    // occurrence asserted in order — including the iCal serialisation
+    // libical hands back, which is what the pre-#1179 code cloned per
+    // occurrence and the post-#1179 code shares.
+
+    /// The fixture component: a 3-occurrence daily series with one cancelled
+    /// occurrence (EXDATE, Jun 2) and one extra one-off (RDATE, Jun 10).
+    const FIXTURE_DAILY: &str = "BEGIN:VEVENT\r\nUID:fixture-daily\r\n\
+         DTSTAMP:20260601T090000Z\r\nDTSTART:20260601T090000Z\r\n\
+         DTEND:20260601T093000Z\r\nSUMMARY:Standup\r\nLOCATION:Kitchen\r\n\
+         RRULE:FREQ=DAILY;COUNT=3\r\nEXDATE:20260602T090000Z\r\n\
+         RDATE:20260610T090000Z\r\nEND:VEVENT\r\n";
+
+    /// What `i_cal_component_as_ical_string` hands back for [`FIXTURE_DAILY`]
+    /// — the string every occurrence of the series carries. Recorded from the
+    /// pre-#1179 tree; property order is libical's, not ours.
+    const FIXTURE_DAILY_SERIALISED: &str = "BEGIN:VEVENT\r\nUID:fixture-daily\r\n\
+         DTSTAMP:20260601T090000Z\r\nDTSTART:20260601T090000Z\r\n\
+         DTEND:20260601T093000Z\r\nSUMMARY:Standup\r\nLOCATION:Kitchen\r\n\
+         RRULE:FREQ=DAILY;COUNT=3\r\nEXDATE:20260602T090000Z\r\n\
+         RDATE:20260610T090000Z\r\nEND:VEVENT\r\n";
+
+    #[test]
+    fn small_daily_rule_expansion_is_pinned_field_by_field() {
+        let inst = super::expand_ical_for_test(FIXTURE_DAILY, JUN_START, JUL_START).unwrap();
+
+        // Jun 1 (RRULE), Jun 3 (RRULE — Jun 2 is EXDATE'd), Jun 10 (RDATE),
+        // in that emission order: RRULE occurrences first, RDATEs appended.
+        let expected: [(i64, i64, bool); 3] = [
+            (ANCHOR_0900, ANCHOR_0900 + 1_800, false),
+            (
+                ANCHOR_0900 + 2 * 86_400,
+                ANCHOR_0900 + 2 * 86_400 + 1_800,
+                false,
+            ),
+            (
+                ANCHOR_0900 + 9 * 86_400,
+                ANCHOR_0900 + 9 * 86_400 + 1_800,
+                false,
+            ),
+        ];
+        assert_eq!(inst.len(), expected.len(), "occurrence count");
+        for (i, (e, (start, end, all_day))) in inst.iter().zip(expected).enumerate() {
+            assert_eq!(e.start_unix, start, "occurrence {i} start");
+            assert_eq!(e.end_unix, end, "occurrence {i} end");
+            assert_eq!(e.all_day, all_day, "occurrence {i} all_day");
+            assert_eq!(
+                &*e.ical, FIXTURE_DAILY_SERIALISED,
+                "occurrence {i} carries the component's serialisation verbatim",
+            );
+        }
+    }
 }

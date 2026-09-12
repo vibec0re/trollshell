@@ -557,7 +557,8 @@ fn load_key_from(env_override: Option<String>, config_dir: Option<PathBuf>) -> O
     let path = config_dir?.join("trollshell").join("anthropic.key");
     if let Ok(meta) = std::fs::metadata(&path) {
         use std::os::unix::fs::PermissionsExt as _;
-        if let Err(e) = hytte_ai_providers::check_key_file_permissions(&path, meta.permissions().mode())
+        if let Err(e) =
+            hytte_ai_providers::check_key_file_permissions(&path, meta.permissions().mode())
         {
             eprintln!("hytte-claude-bridge: {e}");
             return None;

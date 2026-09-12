@@ -1141,7 +1141,11 @@ mod tests {
         let mut reference = Vec::new();
         for _ in 0..h {
             for x in 0..w {
-                let px: [u8; 4] = if x < 2 { [10, 10, 10, 255] } else { [90, 90, 90, 255] };
+                let px: [u8; 4] = if x < 2 {
+                    [10, 10, 10, 255]
+                } else {
+                    [90, 90, 90, 255]
+                };
                 reference.extend_from_slice(&px);
             }
         }
@@ -1159,7 +1163,10 @@ mod tests {
             split.edge.pixels, 6,
             "the two columns either side of the colour change, and only those",
         );
-        assert_eq!(split.edge.max, 7, "the boundary delta lands in the edge bin");
+        assert_eq!(
+            split.edge.max, 7,
+            "the boundary delta lands in the edge bin"
+        );
         assert_eq!(split.interior_max(), 0, "and nothing off an edge disagrees");
 
         // Widen the frame so there are interior pixels — and make one colour
@@ -1168,15 +1175,26 @@ mod tests {
         let mut reference = Vec::new();
         for _ in 0..h {
             for x in 0..w {
-                let px: [u8; 4] = if x < 6 { [10, 10, 10, 255] } else { [90, 90, 90, 255] };
+                let px: [u8; 4] = if x < 6 {
+                    [10, 10, 10, 255]
+                } else {
+                    [90, 90, 90, 255]
+                };
                 reference.extend_from_slice(&px);
             }
         }
         let mut deltas = vec![0_u8; w * h];
         deltas[w + 1] = 5; // (1, 1) — two columns from the boundary: field
         let split = regions(&reference, (w, h), &deltas);
-        assert_eq!(split.field.max, 5, "a flat fill that moved is a field finding");
-        assert_eq!(split.interior_max(), 5, "…and that is what the verdict reads");
+        assert_eq!(
+            split.field.max, 5,
+            "a flat fill that moved is a field finding"
+        );
+        assert_eq!(
+            split.interior_max(),
+            5,
+            "…and that is what the verdict reads"
+        );
         assert_eq!(split.edge.max, 0, "the edges are clean here");
     }
 
@@ -1209,15 +1227,23 @@ mod tests {
         assert_eq!(out.len(), 2 * 2 * 4, "…and so does the buffer");
         // Rows 0 and 1 average to 5 on R; rows 2 and 3 to 25. Bottom-up order
         // means the first output row is still the first input block.
-        assert_eq!(out[0], 5, "the first block is the average of input rows 0-1");
         assert_eq!(
-            out[2 * 4], 25,
+            out[0], 5,
+            "the first block is the average of input rows 0-1"
+        );
+        assert_eq!(
+            out[2 * 4],
+            25,
             "and the second output row is input rows 2-3, not 0-1 mirrored",
         );
         assert_eq!(out[3], 255, "alpha rides through the same average");
 
         let (same, alloc) = box_downsample(&buf, (4, 4), 1);
-        assert_eq!((same.len(), alloc), (buf.len(), (4, 4)), "factor 1 is a copy");
+        assert_eq!(
+            (same.len(), alloc),
+            (buf.len(), (4, 4)),
+            "factor 1 is a copy"
+        );
         let (odd, alloc) = box_downsample(&buf, (4, 4), 3);
         assert_eq!(
             (odd.len(), alloc),
@@ -1251,7 +1277,10 @@ mod tests {
         }
         let (back, alloc) = box_downsample(&native, (6, 4), 2);
         assert_eq!(alloc, (3, 2));
-        assert_eq!(back, logical, "a 2× replication box-averages back to itself");
+        assert_eq!(
+            back, logical,
+            "a 2× replication box-averages back to itself"
+        );
     }
 
     /// A `w`×`h` top-down RGBA8 frame from a per-pixel colour function.

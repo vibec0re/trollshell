@@ -986,9 +986,8 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
 /// function for what each bin means and what a difference concentrated in one
 /// of them says.
 fn print_regions(split: &parity::Regions) {
-    let show = |bin: parity::RegionStats| {
-        format!("n={} mean {:.3} max {}", bin.pixels, bin.mean, bin.max)
-    };
+    let show =
+        |bin: parity::RegionStats| format!("n={} mean {:.3} max {}", bin.pixels, bin.mean, bin.max);
     println!(
         "      regions: edge[{}]  field{:?}[{}]  lit[{}]",
         show(split.edge),

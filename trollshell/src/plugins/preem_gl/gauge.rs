@@ -835,7 +835,13 @@ mod tests {
         let body = LIT_FRAG
             .split_once("const float F32_EPSILON")
             .map_or(LIT_FRAG, |(_, rest)| rest);
-        for name in ["ARC_HW", "VALUE_HW_BONUS", "MAJOR_HW", "MINOR_HW", "BLADE_TIP"] {
+        for name in [
+            "ARC_HW",
+            "VALUE_HW_BONUS",
+            "MAJOR_HW",
+            "MINOR_HW",
+            "BLADE_TIP",
+        ] {
             for line in body.lines().filter(|line| line.contains(name)) {
                 assert!(
                     line.contains("* s") || line.contains("* u_upscale"),

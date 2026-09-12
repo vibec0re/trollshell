@@ -1,7 +1,7 @@
 //! The crate's one retry ramp: 250 ms doubling to a 30 s ceiling, indexed by
 //! **attempt number** rather than by the last delay.
 //!
-//! Two loops in this crate drive their own retry rate because nothing else
+//! Several loops in this crate drive their own retry rate because nothing else
 //! will wake them — a bus that is down publishes no events to wait on:
 //!
 //! - [`connection`](crate::connection)'s supervisor, reconnecting a
@@ -10,6 +10,13 @@
 //! - [`own`](crate::own)'s acquisition-error streak, retrying everything on
 //!   the way to a `RequestName` *reply* — connect, subscribe, build the
 //!   `DBusProxy`, and `RequestName` itself.
+//! - Since #1173, the four **subscription-rebuild** loops, through
+//!   [`back_off_resubscribe`]: `property`'s `PropertiesChanged`, `signals`'
+//!   `receive_signal`, and `proxy`'s `NameOwnerChanged` subscribe and its
+//!   cached-proxy rebuild. Those four each carried a hand-written
+//!   `sleep(250 ms)` — the very spin this module was written to retire, still
+//!   running at 4 Hz for the whole length of an outage, in the one crate that
+//!   owns the ramp.
 //!
 //! They shipped as two implementations of the same 250 ms → 30 s ladder, in
 //! two different shapes: the supervisor's was a duration cursor (`next_ms`,
@@ -195,6 +202,52 @@ impl FailureStreak {
     pub(crate) fn reset(&mut self) {
         self.attempts = 0;
     }
+}
+
+/// Back off from one failed attempt to (re)establish a subscription.
+///
+/// The four loops that rebuild a subscription after the bus or the peer went
+/// away — [`property`](crate::property)'s `PropertiesChanged`,
+/// [`signals`](crate::signals)' `receive_signal`, and
+/// [`proxy`](crate::proxy)'s `NameOwnerChanged` subscribe and its cached-proxy
+/// rebuild — each shipped its own `sleep(Duration::from_millis(250))`. That is
+/// the 4 Hz spin this module exists to retire, kept alive in four places
+/// because every one of them wrote the sleep out by hand rather than reaching
+/// for the ramp (#1173). This is the one way in, so there is nothing left to
+/// drift: record the failure on the caller's streak, say what happened at
+/// [`logs_at`]'s cadence rather than once per attempt, and sleep
+/// [`delay_for`]'s delay for it.
+///
+/// The streak belongs to the loop, not to this call, and must outlive the
+/// loop's iterations — otherwise a bus that will not answer resets to 250 ms
+/// every time round and the ramp buys nothing. Callers clear it with
+/// [`FailureStreak::reset`] the moment a subscribe succeeds, so a blip costs at
+/// most one extra step rather than the 30 s ceiling.
+///
+/// `what` names the step that failed and is `&'static str` on purpose: it is a
+/// constant per call site, never a formatted string built at the retry
+/// cadence.
+pub(crate) async fn back_off_resubscribe(
+    streak: &mut FailureStreak,
+    what: &'static str,
+    dest: &str,
+    // `+ Sync` so the reference survives the `sleep` below without making the
+    // caller's whole subscription task `!Send` — every one of them is spawned
+    // onto the multi-thread runtime.
+    error: &(dyn std::fmt::Display + Sync),
+) {
+    let step = streak.record();
+    if step.log {
+        tracing::debug!(
+            what,
+            dest,
+            error = %error,
+            attempt = step.attempt,
+            retry_in_ms = step.delay.as_millis(),
+            "bus subscription could not be established; retrying"
+        );
+    }
+    tokio::time::sleep(step.delay).await;
 }
 
 #[cfg(test)]

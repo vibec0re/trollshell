@@ -3,6 +3,7 @@
 //! See spec section 3.4.
 
 use crate::BusError;
+use crate::backoff::FailureStreak;
 use crate::connection::SharedConnection;
 use crate::handle::HandleTracker;
 use futures_signals::signal::{Mutable, Signal, SignalExt as _};
@@ -224,6 +225,10 @@ async fn run_property<T>(
 {
     let mut last: Option<T> = None;
     let mut task_done_tx = Some(task_done_tx);
+    // The crate's retry ramp, owned across the outer loop's iterations so a bus
+    // that will not answer actually backs off instead of resetting to 250 ms
+    // every time round. Cleared by a successful subscribe.
+    let mut streak = FailureStreak::default();
 
     loop {
         if ctx.tracker.all_dropped() {
@@ -259,9 +264,21 @@ async fn run_property<T>(
         // wins over the slightly-later Get — latest-wins, no clobber. This mirrors
         // own.rs (NameOwnerChanged before RequestName) and proxy.rs (NOC before
         // Live).
-        let Some((mut changes, current_epoch)) = subscribe_properties_changed(&ctx).await else {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            continue;
+        let (mut changes, current_epoch) = match subscribe_properties_changed(&ctx).await {
+            Ok(pair) => {
+                streak.reset();
+                pair
+            }
+            Err(e) => {
+                crate::backoff::back_off_resubscribe(
+                    &mut streak,
+                    "property: PropertiesChanged subscribe",
+                    &ctx.dest,
+                    &e,
+                )
+                .await;
+                continue;
+            }
         };
 
         // Retry the cold Get until it succeeds (or all handles drop), backing
@@ -369,43 +386,47 @@ where
 }
 
 /// Returns the `PropertiesChanged` stream and the epoch under which it was
-/// built. Epoch is captured *after* `with_conn` returns so a mid-build
-/// reconnect doesn't leave us watching the wrong connection — same lesson
-/// as signals.rs's cold-start fix.
+/// built.
+///
+/// The `AddMatch` runs **inside** `with_conn` (#1173), not on a connection
+/// fetched out of it. `Connection::add_match` answers
+/// `InputOutput(BrokenPipe)` as soon as its socket reader task has died, and
+/// that error is exactly what `with_conn`'s tail is watching for: it clears
+/// the cached connection and wakes the supervisor. Until #1173 the subscribe
+/// happened *outside* the closure — the `with_conn` above it only fetched the
+/// connection through an infallible `Ok(conn)` — so a dead connection made
+/// this retry forever while nothing invalidated the cache. Recovery was
+/// parasitic on some *other* primitive on the same bus happening to issue a
+/// fallible call; a process whose only use of a bus is `property()` never
+/// reconnected at all. `own.rs` and `proxy.rs` always subscribed inside the
+/// closure; this is now the same shape.
+///
+/// Epoch is captured *after* `with_conn` returns so a mid-build reconnect
+/// doesn't leave us watching the wrong connection — same lesson as
+/// signals.rs's cold-start fix, and the same ordering `proxy.rs`'s watcher
+/// uses around `subscribe_noc`.
 async fn subscribe_properties_changed(
     ctx: &PropCtx,
-) -> Option<(zbus::fdo::PropertiesChangedStream, u64)> {
-    let conn_result = ctx.shared.with_conn(|conn| async move { Ok(conn) }).await;
+) -> Result<(zbus::fdo::PropertiesChangedStream, u64), BusError> {
+    let subscribe_result = ctx
+        .shared
+        .with_conn(|conn| {
+            let dest = ctx.dest.clone();
+            let path = ctx.path.clone();
+            async move {
+                let props = zbus::fdo::PropertiesProxy::builder(&conn)
+                    .destination(dest.as_str())?
+                    .path(path.as_str())?
+                    .build()
+                    .await?;
+                props.receive_properties_changed().await
+            }
+        })
+        .await;
 
     let current_epoch = ctx.shared.epoch();
 
-    let conn = match conn_result {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::debug!(error = %e, dest = ctx.dest,
-                "property: failed to get connection for PropertiesChanged; will retry");
-            return None;
-        }
-    };
-
-    let subscribe_result = async {
-        let props = zbus::fdo::PropertiesProxy::builder(&conn)
-            .destination(ctx.dest.as_str())?
-            .path(ctx.path.as_str())?
-            .build()
-            .await?;
-        props.receive_properties_changed().await
-    }
-    .await;
-
-    match subscribe_result {
-        Ok(s) => Some((s, current_epoch)),
-        Err(e) => {
-            tracing::debug!(error = %e, dest = ctx.dest,
-                "property: PropertiesChanged subscribe failed; will retry");
-            None
-        }
-    }
+    subscribe_result.map(|s| (s, current_epoch))
 }
 
 /// Pump the `PropertiesChanged` stream until reconnect / invalidation / handle

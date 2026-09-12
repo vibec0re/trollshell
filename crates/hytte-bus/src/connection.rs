@@ -359,19 +359,53 @@ pub mod test_support {
         /// supervisor. This lets tests exercise the full supervisor reconnect
         /// path without needing to mutate `DBUS_SESSION_BUS_ADDRESS` (which
         /// is not allowed under `unsafe_code = "forbid"`).
+        ///
+        /// **Not usable for testing *detection*.** Clearing the cache and
+        /// waking the supervisor is exactly the work `with_conn`'s own tail is
+        /// supposed to do when an operation comes back transient; a test that
+        /// calls this has performed the step it means to verify. Use
+        /// [`Self::arm_reconnect_for_test`] instead, which arms only the
+        /// recovery half — see `tests/resubscribe.rs` (#1173).
         #[doc(hidden)]
         pub async fn simulate_disconnect_for_test(&self, replacement: Connection) {
-            INJECTED_CONN.inject(self, replacement);
-            {
-                let mut guard = self.inner.lock().await;
-                guard.conn = None;
-                // Release the lock before notifying so the supervisor can
-                // immediately acquire it.
-                drop(guard);
-            }
+            self.arm_reconnect_for_test(replacement);
+            self.drop_connection_for_test().await;
             if let Some(notify) = SUPERVISOR_NOTIFY.lookup(self) {
                 notify.notify_one();
             }
+        }
+
+        /// Test-only: pre-arm the connection the supervisor will install on its
+        /// next reconnect — and nothing else. The cached connection is left
+        /// alone and the supervisor is not woken.
+        ///
+        /// This is [`Self::simulate_disconnect_for_test`] minus the two steps
+        /// that make it useless for testing detection. A test that kills a real
+        /// `dbus-daemon` and then arms a replacement requires the *primitive*
+        /// to notice the dead connection, clear it through `with_conn`, and
+        /// wake the supervisor on its own; the supervisor then finds this
+        /// injection where it would otherwise call
+        /// `Connection::session`/`system` (which reads
+        /// `$DBUS_SESSION_BUS_ADDRESS`, a variable no test in this crate can
+        /// safely repoint — mutating it needs `unsafe`, forbidden
+        /// workspace-wide).
+        #[doc(hidden)]
+        pub fn arm_reconnect_for_test(&self, replacement: Connection) {
+            INJECTED_CONN.inject(self, replacement);
+        }
+
+        /// Test-only: drop the cached connection without arming a replacement
+        /// and without waking the supervisor — the "bus is mid-reconnect" state,
+        /// held open for as long as the test needs it. Every subsequent
+        /// `with_conn` returns its `Transient` sentinel without running the
+        /// caller's closure.
+        #[doc(hidden)]
+        pub async fn drop_connection_for_test(&self) {
+            let mut guard = self.inner.lock().await;
+            guard.conn = None;
+            // Release the lock explicitly so a waiting supervisor (if the
+            // caller goes on to wake one) can acquire it immediately.
+            drop(guard);
         }
     }
 }

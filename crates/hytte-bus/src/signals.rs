@@ -2,6 +2,7 @@
 //!
 //! See spec section 3.2.
 
+use crate::backoff::FailureStreak;
 use crate::connection::SharedConnection;
 use crate::handle::HandleTracker;
 use futures_util::StreamExt;
@@ -226,7 +227,7 @@ struct DrainCtx<'a> {
 /// Consume one connected signal stream until it ends, the epoch advances,
 /// or all subscription handles are dropped.
 async fn drain_signal_stream(
-    mut stream: zbus::proxy::SignalStream<'_>,
+    mut stream: zbus::proxy::SignalStream<'static>,
     dc: DrainCtx<'_>,
 ) -> DrainOutcome {
     use futures_signals::signal::SignalExt;
@@ -285,6 +286,11 @@ async fn run_subscription(ctx: RunCtx) {
         task_done_tx,
     } = ctx;
 
+    // The crate's retry ramp, owned across the outer loop's iterations so a bus
+    // that will not answer actually backs off instead of resetting to 250 ms
+    // every time round. Cleared by a successful subscribe.
+    let mut streak = FailureStreak::default();
+
     loop {
         // Exit cleanly if all handles have been dropped (checked at each reconnect boundary).
         if tracker.all_dropped() {
@@ -299,36 +305,59 @@ async fn run_subscription(ctx: RunCtx) {
             return;
         }
 
-        let conn_result = shared.with_conn(|conn| async move { Ok(conn) }).await;
+        // Build the proxy and issue the `AddMatch` **inside** `with_conn`
+        // (#1173), rather than pulling the connection out through an
+        // infallible `Ok(conn)` and subscribing on it afterwards.
+        //
+        // `Connection::add_match` answers `InputOutput(BrokenPipe)` the moment
+        // its socket reader task has died, and that is precisely the error
+        // `with_conn`'s tail is watching for: it clears the cached connection
+        // and wakes the supervisor. Subscribing outside the closure — as this
+        // did until #1173 — turned a dead connection into a silent retry
+        // forever, because nothing ever invalidated the cache. `own.rs` and
+        // `proxy.rs` always subscribed inside the closure; this is the same
+        // shape.
+        //
+        // `new_owned` (not `new`) because the resulting stream outlives the
+        // closure: it takes the `Connection` by value and owned name strings,
+        // so the `Proxy` is `'static` and nothing borrows a local. The
+        // `signal_name` goes in as an owned `String` for the same reason —
+        // `receive_signal`'s lifetime parameter comes from the member name, not
+        // from `&self`.
+        //
         // Capture epoch AFTER with_conn returns so that current_epoch reflects
         // the epoch under which the subscription was actually built. Capturing
         // it before with_conn would race against the supervisor's first connect
         // (which bumps epoch 0 → 1), causing drain_signal_stream to see an
         // immediate epoch advance and needlessly tear down and rebuild the
         // subscription on cold start before any genuine reconnect has occurred.
+        let stream_result: Result<zbus::proxy::SignalStream<'static>, crate::BusError> = shared
+            .with_conn(|conn| {
+                let dest = dest.clone();
+                let path = path.clone();
+                let iface = iface.clone();
+                let signal_name = signal_name.clone();
+                async move {
+                    let proxy = zbus::Proxy::new_owned(conn, dest, path, iface).await?;
+                    proxy.receive_signal(signal_name).await
+                }
+            })
+            .await;
         let current_epoch = shared.epoch();
-        let conn = match conn_result {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(error = %e, "signal subscription: no connection, will retry");
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                continue;
-            }
-        };
-
-        let stream_result = async {
-            let proxy =
-                zbus::Proxy::new(&conn, dest.as_str(), path.as_str(), iface.as_str()).await?;
-            proxy.receive_signal(signal_name.as_str()).await
-        }
-        .await;
 
         let stream = match stream_result {
-            Ok(s) => s,
+            Ok(s) => {
+                streak.reset();
+                s
+            }
             Err(e) => {
-                tracing::debug!(error = %e, dest, path, iface, signal_name,
-                    "signal subscription: receive_signal failed, will retry");
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                crate::backoff::back_off_resubscribe(
+                    &mut streak,
+                    "signals: receive_signal",
+                    &dest,
+                    &e,
+                )
+                .await;
                 continue;
             }
         };

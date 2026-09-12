@@ -136,6 +136,24 @@ inline in `flake.nix` as one-liners.
   script's header documents the deliberate carve-out (capturing a _different_
   widget is correct) and why it paren/brace-matches instead of using a regex —
   read it before changing it.
+- `lints-tables` (#1179): the same shape for the three hand-mirrored `[lints]`
+  tables — `nix/lint-lints-tables.py` parses the root `[workspace.lints]` and
+  both `unsafe` islands' copies (`crates/hytte-ecal/Cargo.toml`,
+  `crates/hytte-gl/Cargo.toml`) and fails unless they agree on every entry
+  except the one `unsafe_code` line, which must read `"allow"` on an island
+  and `"forbid"` at root. Nothing enforced the "keep the three tables in sync"
+  comment before: deleting `pedantic` from an island leaves the clippy check
+  above and the whole of `nix flake check` green, so one of the two crates
+  where `unsafe` is legal silently stops being pedantic-checked. It asserts the other direction too — every non-island
+  member inherits with `[lints] workspace = true` — so a **third** island
+  cannot appear unnoticed. `hytte-ecal`'s five documented FFI-only `allow`s
+  (`missing_safety_doc`, `doc_markdown`, `must_use_candidate`, `ref_as_ptr`,
+  `borrow_as_ptr`) are declared in the script's `EXTRA_ALLOWS` rather than
+  waved through, so adding a sixth means editing the script in the same commit
+  — which is the review moment an "anything extra is fine" rule would skip.
+  Run it by hand with
+  `nix shell nixpkgs#python3 --command python3 nix/lint-lints-tables.py` — the
+  `nix shell` is not optional, for the `bind-pins` reason above.
 - `glsl` (#893 stage B): the same shape for the preem GL renderer's shaders —
   `nix/lint-glsl.py` assembles each `trollshell/src/plugins/preem_gl/*.{vert,frag}`
   the way `Program::compile` does (the `GLSL_HEADER` const is read out of
@@ -188,7 +206,7 @@ inline in `flake.nix` as one-liners.
 
 The workspace lint config (`Cargo.toml`) is deliberately severe; a violation fails `cargo check`, not just clippy:
 
-- `unsafe_code = "forbid"` workspace-wide. **Only `hytte-ecal` and `hytte-gl`** override this — the two islands (FFI to libecal; OpenGL entry points), each confining its unsafety to safe wrappers and each hand-mirroring the root lints table because workspace-lints inheritance is all-or-nothing. Keep the three tables in sync.
+- `unsafe_code = "forbid"` workspace-wide. **Only `hytte-ecal` and `hytte-gl`** override this — the two islands (FFI to libecal; OpenGL entry points), each confining its unsafety to safe wrappers and each hand-mirroring the root lints table because workspace-lints inheritance is all-or-nothing. Keep the three tables in sync — `checks.lints-tables` (#1179) fails if you don't.
 - clippy `all` **and** `pedantic` at `deny`. Code must be pedantic-clean.
 - `disallowed_methods`: `zbus::Connection::session`/`::system` are **banned** (see `clippy.toml`). All D-Bus access goes through the `hytte-bus` primitives, never a raw zbus connection.
 

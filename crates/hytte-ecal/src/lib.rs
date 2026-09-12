@@ -19,13 +19,47 @@
 //! Every fallible call extracts the GLib message from the out-param
 //! `GError**` (if any) and wraps it in an `anyhow::Error`. The GError
 //! itself is freed; the resulting string copy lives in the `Error`.
+//!
+//! ## `unsafe` and its SAFETY comments (#1179)
+//!
+//! This is one of the workspace's two `unsafe` islands (the other is
+//! `hytte-gl`); everything else is compiled under `unsafe_code = "forbid"`.
+//! Every `unsafe` block here carries a `// SAFETY:` line saying what that
+//! block relies on. Three premises recur on nearly every call, so they are
+//! stated once here and referred to by name (**P1**/**P2**/**P3**) rather
+//! than retyped a hundred times; a block whose soundness needs anything
+//! beyond them spells that out in full.
+//!
+//! - **P1 — owned handle.** A wrapper's `self.raw` (or a local that a
+//!   null-check just guarded) is a live GObject pointer this crate owns
+//!   exactly one ref to: non-null because the constructor rejected null, and
+//!   released exactly once in `Drop`. It is therefore valid for the whole
+//!   `&self` borrow, and handing it to a libecal/libical/GLib accessor is
+//!   sound. Sub-objects those accessors return are null-checked before use,
+//!   and the "new ref vs borrow" convention of each is documented at its
+//!   `sys` declaration.
+//! - **P2 — `GError**` out-param.** `&mut err` points at a live local
+//!   initialised to `ptr::null_mut()`, which is exactly what a `GError**`
+//!   out-param wants. The callee either leaves it null or stores a `GError`
+//!   it transfers to us; [`take_error`] reads and frees it at most once.
+//! - **P3 — thread affinity.** `Registry`, `CalClient`, `CalClientView` and
+//!   `MainContext` are `!Send`/`!Sync` (raw pointers), so this crate never
+//!   lets two threads touch one object; no call here races another on the
+//!   same handle. [`Waker`] is the deliberate exception and carries its own
+//!   argument at its `unsafe impl`.
+//!
+//! Where a block's real invariant cannot be stated honestly, its comment says
+//! `SAFETY: UNVERIFIED` and names what would have to be true — a finding to
+//! chase, not a claim to trust.
 
 #![doc(test(no_crate_inject))]
 
 pub mod sys;
 
+use std::collections::HashSet;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 
@@ -42,7 +76,17 @@ use anyhow::{Context as _, Result, anyhow, bail};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventInstance {
     /// iCalendar serialisation of the component this occurrence belongs to.
-    pub ical: String,
+    ///
+    /// **Shared, not cloned** (#1179): every occurrence of one series points
+    /// at the same allocation, because the string is identical across them by
+    /// construction — it is the *master* component's serialisation, the same
+    /// bytes for occurrence 1 and occurrence 60 000. It is an [`Arc`] rather
+    /// than an `Rc` because expansion runs on the EDS worker thread and the
+    /// instances are handed to the UI thread.
+    ///
+    /// Read it as a `&str` (`&inst.ical` coerces); construct one from a
+    /// `String`/`&str` with `.into()`.
+    pub ical: Arc<str>,
     /// Occurrence start, POSIX seconds since the Unix epoch (UTC).
     pub start_unix: i64,
     /// Occurrence end, POSIX seconds since the Unix epoch (UTC).
@@ -65,6 +109,9 @@ impl Registry {
     /// Synchronously open the source registry. Blocks until EDS responds.
     pub fn new() -> Result<Self> {
         let mut err: *mut sys::GError = ptr::null_mut();
+        // SAFETY: P2. A null `GCancellable*` is the documented "uncancellable"
+        // argument; the returned ref is checked for null and then owned by the
+        // `Registry` this returns.
         let raw = unsafe { sys::e_source_registry_new_sync(ptr::null_mut(), &mut err) };
         if raw.is_null() {
             return Err(
@@ -96,6 +143,9 @@ impl Registry {
     /// know about that UID. The returned [`Source`] holds its own ref.
     pub fn ref_source(&self, uid: &str) -> Result<Option<Source>> {
         let c = CString::new(uid).context("uid contained an interior NUL")?;
+        // SAFETY: P1/P3. `c` is a live `CString` (NUL-terminated, no interior
+        // NUL — `CString::new` just proved it) that outlives the call, and the
+        // returned ref is null-checked before a `Source` adopts it.
         let raw = unsafe { sys::e_source_registry_ref_source(self.raw, c.as_ptr()) };
         if raw.is_null() {
             return Ok(None);
@@ -112,6 +162,9 @@ impl Registry {
     }
 
     fn sources_by_extension(&self, extension: &CStr) -> Vec<Source> {
+        // SAFETY: P1/P3. `extension` is a live `&CStr` (NUL-terminated by
+        // construction) that outlives the call. The returned `GList*` is owned
+        // by us — spine freed below, elements adopted into `Source`s.
         let list = unsafe { sys::e_source_registry_list_sources(self.raw, extension.as_ptr()) };
         if list.is_null() {
             return Vec::new();
@@ -122,6 +175,10 @@ impl Registry {
         // re-walks from the head, making the whole thing O(n²).
         let mut node = list;
         while !node.is_null() {
+            // SAFETY: `node` is non-null (loop condition) and points at a
+            // `GList` node GLib allocated, whose layout `sys::GList` mirrors
+            // `#[repr(C)]`; the list is alive until the free below, and
+            // nothing mutates it meanwhile (P3).
             let data = unsafe { (*node).data };
             if !data.is_null() {
                 // `list_sources` returns refs we own — but `g_list_free_full`
@@ -132,12 +189,18 @@ impl Registry {
                     raw: data.cast::<sys::ESource>(),
                 });
             }
+            // SAFETY: as the `data` read above — `node` is non-null and the
+            // node it names is still allocated.
             node = unsafe { (*node).next };
         }
         // Free the spine only — calling `g_list_free` here is the standard
         // pattern when ownership of the elements is transferred elsewhere.
         // We don't have a binding for `g_list_free` directly, so reach into
         // sys via the destroy-notify-free path with a no-op destroyer.
+        //
+        // SAFETY: `list` is the non-null list we own, freed exactly once here
+        // and never read after; `no_op_destroy` matches `GDestroyNotify` and
+        // touches nothing, so the element refs adopted above survive.
         unsafe { sys::g_list_free_full(list, no_op_destroy) }
         out
     }
@@ -145,6 +208,9 @@ impl Registry {
 
 impl Drop for Registry {
     fn drop(&mut self) {
+        // SAFETY: P1 — the single ref `e_source_registry_new_sync` transferred
+        // to this value, released exactly once (Drop runs once) and never used
+        // after.
         unsafe { sys::g_object_unref(self.raw) }
     }
 }
@@ -170,12 +236,17 @@ impl Source {
     /// Stable EDS UID — the same string that names the `.source` file
     /// in `~/.config/evolution/sources/`.
     pub fn uid(&self) -> String {
+        // SAFETY: P1/P3. `e_source_get_uid` returns a `const char*` the
+        // `ESource` owns; `borrowed_cstr` copies it before this borrow of
+        // `self` ends and never frees it.
         unsafe { borrowed_cstr(sys::e_source_get_uid(self.raw)) }.unwrap_or_default()
     }
 
     /// Human-readable name from the `DisplayName=` key. Localised
     /// variants are ignored; only the untagged value is returned.
     pub fn display_name(&self) -> String {
+        // SAFETY: as `uid` above — a borrowed `const char*` owned by the
+        // `ESource`, copied out within this borrow.
         unsafe { borrowed_cstr(sys::e_source_get_display_name(self.raw)) }.unwrap_or_default()
     }
 
@@ -186,6 +257,7 @@ impl Source {
         let Ok(c) = CString::new(extension_name) else {
             return false;
         };
+        // SAFETY: P1/P3, and `c` is a live `CString` outliving the call.
         let r = unsafe { sys::e_source_has_extension(self.raw, c.as_ptr()) };
         r != 0
     }
@@ -197,6 +269,8 @@ impl Source {
 
 impl Drop for Source {
     fn drop(&mut self) {
+        // SAFETY: P1 — the one ref this `Source` adopted (from
+        // `list_sources`/`ref_source`), released exactly once.
         unsafe { sys::g_object_unref(self.raw) }
     }
 }
@@ -222,6 +296,9 @@ impl CalClient {
         wait_seconds: u32,
     ) -> Result<Self> {
         let mut err: *mut sys::GError = ptr::null_mut();
+        // SAFETY: P2, and `source.raw()` is borrowed from a live `Source`
+        // (P1) for the duration of this blocking call — libecal takes its own
+        // ref if it keeps the source. Null `GCancellable*` = uncancellable.
         let raw = unsafe {
             sys::e_cal_client_connect_sync(
                 source.raw(),
@@ -247,6 +324,10 @@ impl CalClient {
         let comp = parse_component(ical)?;
         let mut out_uid: *mut c_char = ptr::null_mut();
         let mut err: *mut sys::GError = ptr::null_mut();
+        // SAFETY: P1/P2/P3. `comp.raw` is the live component `parse_component`
+        // just built and this scope still owns (dropped only after the call);
+        // `out_uid` is a live local initialised to null, the out-param
+        // contract, and the string it receives is freed below.
         let ok = unsafe {
             sys::e_cal_client_create_object_sync(
                 self.raw,
@@ -265,9 +346,14 @@ impl CalClient {
         if out_uid.is_null() {
             return Ok(String::new());
         }
+        // SAFETY: `out_uid` is non-null here (checked above) and points at the
+        // NUL-terminated string libecal allocated for us; the copy is taken
+        // before it is freed.
         let s = unsafe { CStr::from_ptr(out_uid) }
             .to_string_lossy()
             .into_owned();
+        // SAFETY: `out_uid` is the GLib-allocated string transferred to us,
+        // freed exactly once and never read after.
         unsafe { sys::g_free(out_uid.cast::<c_void>()) }
         Ok(s)
     }
@@ -278,6 +364,8 @@ impl CalClient {
     pub fn modify_from_ical(&self, ical: &str) -> Result<()> {
         let comp = parse_component(ical)?;
         let mut err: *mut sys::GError = ptr::null_mut();
+        // SAFETY: P1/P2/P3, and `comp.raw` is the live component this scope
+        // owns until the `drop(comp)` below.
         let ok = unsafe {
             sys::e_cal_client_modify_object_sync(
                 self.raw,
@@ -308,6 +396,10 @@ impl CalClient {
         let rid_ptr = rid_c.as_ref().map_or(ptr::null(), |c| c.as_ptr());
         let mut out: *mut sys::ICalComponent = ptr::null_mut();
         let mut err: *mut sys::GError = ptr::null_mut();
+        // SAFETY: P1/P2/P3. `uid_c`/`rid_c` are live `CString`s that outlive
+        // the call (`rid_ptr` is null when there is no rid, which is the
+        // documented "no recurrence-id" argument), and `out` is a live local
+        // initialised to null for the out-param.
         let ok = unsafe {
             sys::e_cal_client_get_object_sync(
                 self.raw,
@@ -326,10 +418,19 @@ impl CalClient {
             // runtime via `e_cal_client_error_quark()` (stable for the
             // process lifetime); `GError.domain` is itself a GQuark.
             if !err.is_null() {
+                // SAFETY (both reads): `err` is non-null (checked) and was set
+                // by the call above, so it points at a `GError` we own whose
+                // layout `sys::GError` mirrors `#[repr(C)]`; both fields are
+                // plain integers, read before the free below.
                 let domain = unsafe { (*err).domain };
                 let code = unsafe { (*err).code };
+                // SAFETY: a nullary `G_GNUC_CONST` function that only interns
+                // and returns a quark — no arguments to get wrong.
                 let not_found_domain = unsafe { sys::e_cal_client_error_quark() };
                 if domain == not_found_domain && code == sys::E_CAL_CLIENT_ERROR_OBJECT_NOT_FOUND {
+                    // SAFETY: `err` is the `GError` transferred to us, freed
+                    // exactly once on this path (we return immediately, so
+                    // `take_error` below never sees it).
                     unsafe { sys::g_error_free(err) }
                     return Ok(None);
                 }
@@ -339,16 +440,25 @@ impl CalClient {
         if out.is_null() {
             return Ok(None);
         }
+        // SAFETY: `out` is the non-null component (checked above) whose single
+        // ref `get_object_sync` transferred to us; the serialisation it
+        // returns is a GLib-allocated string we own.
         let s_ptr = unsafe { sys::i_cal_component_as_ical_string(out) };
         let s = if s_ptr.is_null() {
             String::new()
         } else {
+            // SAFETY: non-null (this arm) and NUL-terminated, as libical's
+            // `as_ical_string` returns; copied before the free below.
             let s = unsafe { CStr::from_ptr(s_ptr) }
                 .to_string_lossy()
                 .into_owned();
+            // SAFETY: the GLib-allocated string above, freed exactly once and
+            // never read after.
             unsafe { sys::g_free(s_ptr.cast::<c_void>()) }
             s
         };
+        // SAFETY: the component ref transferred to us, released exactly once
+        // on every path that reaches here.
         unsafe { sys::g_object_unref(out) }
         Ok(Some(s))
     }
@@ -363,6 +473,8 @@ impl CalClient {
             .transpose()?;
         let rid_ptr = rid_c.as_ref().map_or(ptr::null(), |c| c.as_ptr());
         let mut err: *mut sys::GError = ptr::null_mut();
+        // SAFETY: P1/P2/P3, with `uid_c`/`rid_c` live `CString`s outliving the
+        // call and a null `rid_ptr` meaning "no recurrence-id".
         let ok = unsafe {
             sys::e_cal_client_remove_object_sync(
                 self.raw,
@@ -395,6 +507,8 @@ impl CalClient {
         let s = CString::new(sexp).context("sexp contained an interior NUL")?;
         let mut out_list: *mut sys::GSList = ptr::null_mut();
         let mut err: *mut sys::GError = ptr::null_mut();
+        // SAFETY: P1/P2/P3, `s` is a live `CString` outliving the call, and
+        // `out_list` is a live local initialised to null for the out-param.
         let ok = unsafe {
             sys::e_cal_client_get_object_list_sync(
                 self.raw,
@@ -416,21 +530,35 @@ impl CalClient {
         // from the head).
         let mut node = out_list;
         while !node.is_null() {
+            // SAFETY: `node` is non-null (loop condition) and names a node of
+            // the list we own until the free below; `sys::GSList` mirrors
+            // glib's layout `#[repr(C)]` and nothing mutates the list (P3).
             let data = unsafe { (*node).data }.cast::<sys::ICalComponent>();
             if !data.is_null() {
+                // SAFETY: `data` is a non-null element of that list — a live
+                // `ICalComponent*` we own a ref to — and this only reads it.
                 let s_ptr = unsafe { sys::i_cal_component_as_ical_string(data) };
                 if !s_ptr.is_null() {
+                    // SAFETY: non-null (this arm), NUL-terminated, copied
+                    // before the free below.
                     let s = unsafe { CStr::from_ptr(s_ptr) }
                         .to_string_lossy()
                         .into_owned();
+                    // SAFETY: the GLib-allocated string above, freed once.
                     unsafe { sys::g_free(s_ptr.cast::<c_void>()) }
                     out.push(s);
                 }
             }
+            // SAFETY: as the `data` read above.
             node = unsafe { (*node).next };
         }
         // Free the list AND each ICalComponent — list_sync passes
         // ownership of every element to the caller.
+        //
+        // SAFETY: `out_list` is the non-null list we own, freed exactly once
+        // and never read after; `g_object_unref_destroy_notify` has the
+        // `GDestroyNotify` signature and every element is a GObject whose ref
+        // we own (so releasing them here is right, not a double-free).
         unsafe { sys::g_slist_free_full(out_list, sys::g_object_unref_destroy_notify) }
         Ok(out)
     }
@@ -443,9 +571,13 @@ impl CalClient {
     /// meeting over a 30-day window returns ~30 instances). Non-recurring
     /// events in the window come back as a single instance.
     ///
-    /// The window is the only bound on expansion: a `FREQ=DAILY` series with
-    /// no `UNTIL`/`COUNT` is naturally capped by the range you pass, never
-    /// expanded unboundedly.
+    /// The window bounds expansion: a `FREQ=DAILY` series with no
+    /// `UNTIL`/`COUNT` is naturally capped by the range you pass, never
+    /// expanded unboundedly. It is **not** the only bound — a sub-hourly rule
+    /// fills any window with more occurrences than a UI can use, so each
+    /// component is additionally capped by
+    /// [`MAX_OCCURRENCES_PER_COMPONENT`]/[`EXPANSION_BYTES_BUDGET`] and
+    /// truncated with one `warn!` (#1179).
     ///
     /// Implementation: we fetch every master component (`#t`) and expand
     /// each one with libical's **core recurrence iterator**
@@ -463,6 +595,8 @@ impl CalClient {
         let s = CString::new("#t").expect("static sexp has no interior NUL");
         let mut out_list: *mut sys::GSList = ptr::null_mut();
         let mut err: *mut sys::GError = ptr::null_mut();
+        // SAFETY: P1/P2/P3, `s` is the live static-sexp `CString` above, and
+        // `out_list` is a live local initialised to null for the out-param.
         let ok = unsafe {
             sys::e_cal_client_get_object_list_sync(
                 self.raw,
@@ -479,21 +613,56 @@ impl CalClient {
         let mut out: Vec<EventInstance> = Vec::new();
         let mut node = out_list;
         while !node.is_null() {
+            // SAFETY: `node` is non-null (loop condition) and names a node of
+            // the list we own until the free below (`sys::GSList` mirrors
+            // glib's layout `#[repr(C)]`; nothing mutates it, P3).
             let comp = unsafe { (*node).data }.cast::<sys::ICalComponent>();
             if !comp.is_null() {
+                // SAFETY: `expand_component`'s contract is a live, borrowed
+                // `ICalComponent*` — `comp` is a non-null element of this
+                // list, alive until the free below, and the callee frees
+                // nothing it does not itself create.
                 unsafe { expand_component(comp, start_unix, end_unix, &mut out) }
             }
+            // SAFETY: as the `data` read above.
             node = unsafe { (*node).next };
         }
 
         // Free the list AND each ICalComponent — list_sync transferred
         // ownership of every element to us.
         if !out_list.is_null() {
+            // SAFETY: non-null (checked), ours, freed exactly once and never
+            // read after; every element is a GObject whose ref we own, which
+            // is what `g_object_unref_destroy_notify` releases.
             unsafe { sys::g_slist_free_full(out_list, sys::g_object_unref_destroy_notify) }
         }
         Ok(out)
     }
 }
+
+/// Hard ceiling on how many occurrences a single component may contribute to
+/// one expansion (#1179). A `FREQ=MINUTELY` invite over the calendar's 43-day
+/// window is 61 380 occurrences and every one of them costs the *consumer*
+/// work too (`hytte-services` re-parses `EventInstance::ical` per instance),
+/// so this is a budget on the whole pipeline, not just on this function. No
+/// UI in this tree can show 10 000 rows; a series that hits this cap is
+/// truncated, with one `warn!` naming its UID.
+pub const MAX_OCCURRENCES_PER_COMPONENT: usize = 10_000;
+
+/// The other half of the #1179 work budget: the number of *bytes* of iCal
+/// metadata one component's occurrences may commit downstream, counted as
+/// `occurrences × ical.len()`. The string itself is shared (one [`Arc<str>`]
+/// per component), so this does not bound *this* crate's allocation — it
+/// bounds the parsing every consumer does per instance, which a component
+/// with a large VEVENT body would otherwise blow past long before
+/// [`MAX_OCCURRENCES_PER_COMPONENT`] binds. Whichever cap binds first wins.
+pub const EXPANSION_BYTES_BUDGET: usize = 4 * 1024 * 1024;
+
+/// Hard ceiling on recurrence-iterator steps for one component — the
+/// original #29 guard, kept: it bounds a *pathological rule* (one whose
+/// occurrences never reach `end_unix`), which the occurrence budget above
+/// cannot, since such a rule emits nothing while still looping.
+const MAX_RECUR_ITERATIONS: u32 = 100_000;
 
 /// Expand one master `comp` over `[start_unix, end_unix)` (POSIX UTC
 /// seconds), pushing each occurrence into `out`.
@@ -524,6 +693,24 @@ impl CalClient {
 ///   with an `EXDATE` (per RFC, EXDATE wins). RDATE can stand alone (no
 ///   RRULE), adding occurrences alongside DTSTART.
 ///
+/// ## Bounded work (#1179)
+///
+/// The window is not by itself a bound on *work*: `FREQ=MINUTELY` over the
+/// 43-day window the calendar service asks for is 61 380 occurrences, and
+/// before #1179 each of those was checked against the emitted ones with a
+/// linear `Vec::contains` and carried its own clone of the component's iCal
+/// string — 1.9 × 10⁹ comparisons and ~9 MB of duplicated string, measured at
+/// **13.6 s** for one such invite, on every refresh, per source. Three things
+/// bound it now:
+///
+/// - the emitted set is a [`HashSet`] keyed by the occurrence's
+///   `(start, end)`, so dedup is O(1) per occurrence rather than O(n);
+/// - the iCal string is one [`Arc<str>`] shared by every occurrence of the
+///   component, so the per-occurrence cost is a refcount bump;
+/// - [`MAX_OCCURRENCES_PER_COMPONENT`] and [`EXPANSION_BYTES_BUDGET`] cap what
+///   one component may contribute, whichever binds first, and truncation logs
+///   exactly one `warn!` naming the component's UID.
+///
 /// # Safety
 ///
 /// `comp` must be a live `ICalComponent*` (a VEVENT). Borrowed — never freed
@@ -535,71 +722,95 @@ unsafe fn expand_component(
     out: &mut Vec<EventInstance>,
 ) {
     // DTSTART (owned). No DTSTART ⇒ undatable ⇒ skip.
+    //
+    // SAFETY: `comp` is a live component by this function's own contract; the
+    // accessor returns a **new** `ICalTime` ref (libical-glib's "get_dtstart"
+    // convention, `sys`) that this function releases on every exit path.
     let dtstart = unsafe { sys::i_cal_component_get_dtstart(comp) };
+    // SAFETY: `ical_time_to_unix` accepts null or a live borrowed `ICalTime*`
+    // — `dtstart` is exactly that, and is not freed until below.
     let Some(dtstart_unix) = (unsafe { ical_time_to_unix(dtstart) }) else {
         if !dtstart.is_null() {
+            // SAFETY: the new ref taken above, released exactly once on this
+            // early-return path.
             unsafe { sys::g_object_unref(dtstart) }
         }
         return;
     };
+    // SAFETY: as the `ical_time_to_unix` call above — null or live borrow, and
+    // `dtstart` is live here (the `else` arm returned).
     let all_day = unsafe { ical_time_is_date(dtstart) };
 
     // Duration = DTEND − DTSTART when DTEND is present; else 0.
+    // SAFETY: `comp` is live; this returns a new `ICalTime` ref (or null),
+    // released a few lines below.
     let dtend = unsafe { sys::i_cal_component_get_dtend(comp) };
+    // SAFETY: null or a live borrow, as above.
     let duration = match unsafe { ical_time_to_unix(dtend) } {
         Some(e) if e >= dtstart_unix => e - dtstart_unix,
         _ => 0,
     };
     if !dtend.is_null() {
+        // SAFETY: the new ref taken above, released exactly once; `dtend` is
+        // not used again.
         unsafe { sys::g_object_unref(dtend) }
     }
 
     // The component's iCal serialisation (metadata: UID/SUMMARY/LOCATION/…),
-    // identical across a series' occurrences.
-    let ical = unsafe { component_ical_string(comp) };
+    // identical across a series' occurrences — so it is materialised **once**
+    // and every occurrence shares this one allocation (#1179).
+    // SAFETY: `component_ical_string` wants a live `ICalComponent*`, which
+    // `comp` is by this function's contract; it borrows and frees nothing.
+    let ical: Arc<str> = Arc::from(unsafe { component_ical_string(comp) });
 
     // Recurrence-set modifiers, normalised to UTC seconds the same way every
     // occurrence is, so comparisons are apples-to-apples regardless of DATE
-    // vs DATE-TIME / TZID. EXDATE is a membership set; RDATE a list of extra
-    // starts.
-    let exdates = unsafe { collect_property_times(comp, sys::I_CAL_EXDATE_PROPERTY, false) };
+    // vs DATE-TIME / TZID. EXDATE is a membership set (hashed: it is probed
+    // once per occurrence, so a linear scan here is quadratic in the same way
+    // the emitted-set scan was); RDATE a list of extra starts, kept ordered
+    // because emission order is part of this function's output contract.
+    //
+    // SAFETY (both calls): `collect_property_times` wants a live, borrowed
+    // `ICalComponent*` — `comp` — plus a property-kind discriminant; the two
+    // constants are the `ICalPropertyKind` values libical defines (pinned at
+    // their `sys` declarations), and the `is_rdate` flag matches the kind, so
+    // each value is read through the accessor for the type it actually has.
+    let exdates: HashSet<i64> =
+        unsafe { collect_property_times(comp, sys::I_CAL_EXDATE_PROPERTY, false) }
+            .into_iter()
+            .collect();
     let rdates = unsafe { collect_property_times(comp, sys::I_CAL_RDATE_PROPERTY, true) };
 
-    // `emitted` tracks occurrence starts we've already pushed, so RDATE
-    // doesn't double up one the RRULE (or DTSTART) already produced.
-    let mut emitted: Vec<i64> = Vec::new();
-    let mut emit = |out: &mut Vec<EventInstance>, occ_unix: i64| {
-        // EXDATE excludes; the window bounds the rest. An occurrence is kept
-        // when it starts before the window end and its end is at/after the
-        // window start (so it overlaps the window).
-        if exdates.contains(&occ_unix) {
-            return;
-        }
-        if occ_unix >= end_unix || occ_unix + duration < start_unix {
-            return;
-        }
-        if emitted.contains(&occ_unix) {
-            return;
-        }
-        emitted.push(occ_unix);
-        out.push(EventInstance {
-            ical: ical.clone(),
-            start_unix: occ_unix,
-            end_unix: occ_unix + duration,
-            all_day,
-        });
-    };
+    let mut emit = Emitter::new(ical, exdates, duration, all_day, start_unix, end_unix);
+
+    // Set once the work budget (or the iteration guard) cut the expansion
+    // short, so the `warn!` below fires exactly once per component however
+    // many occurrences were dropped.
+    let mut truncated = false;
 
     // RRULE present?
+    //
+    // SAFETY: `comp` is live (this function's contract) and
+    // `I_CAL_RRULE_PROPERTY` is libical's `ICalPropertyKind` discriminant for
+    // an RRULE; the "first property" accessor returns a **new** ref (or null),
+    // released at the end of this branch.
     let rrule_prop =
         unsafe { sys::i_cal_component_get_first_property(comp, sys::I_CAL_RRULE_PROPERTY) };
     if rrule_prop.is_null() {
         // No RRULE: DTSTART is the (sole) base occurrence; RDATE may add more.
-        emit(out, dtstart_unix);
+        truncated |= !emit.emit(out, dtstart_unix);
     } else {
         // Recurring: iterate occurrences from DTSTART.
+        // SAFETY: `rrule_prop` is the non-null property ref we hold; reading
+        // its value yields a new `ICalRecurrence` ref (or null), released
+        // below.
         let rule = unsafe { sys::i_cal_property_get_rrule(rrule_prop) };
         if !rule.is_null() {
+            // SAFETY: both arguments are live and borrowed for the iterator's
+            // whole life — `rule` and `dtstart` are released only after
+            // `i_cal_recur_iterator_free` below, which is what libical's
+            // iterator requires of the rule and the start time it is built
+            // from.
             let iter = unsafe { sys::i_cal_recur_iterator_new(rule, dtstart) };
             if !iter.is_null() {
                 // A defensive cap: even with the time-window stop condition, a
@@ -607,39 +818,178 @@ unsafe fn expand_component(
                 let mut guard = 0u32;
                 loop {
                     guard += 1;
-                    if guard > 100_000 {
+                    if guard > MAX_RECUR_ITERATIONS {
+                        truncated = true;
                         break;
                     }
+                    // SAFETY: `iter` is the non-null iterator we own and have
+                    // not yet freed; each step returns a **new** `ICalTime`
+                    // ref (or a null-time sentinel), released on both paths
+                    // below before the next step.
                     let occ = unsafe { sys::i_cal_recur_iterator_next(iter) };
+                    // SAFETY: null or a live borrow of the ref just taken.
                     let Some(occ_unix) = (unsafe { ical_time_to_unix(occ) }) else {
                         // null-time ⇒ series exhausted.
                         if !occ.is_null() {
+                            // SAFETY: the new ref from this step, released
+                            // exactly once (this path breaks the loop).
                             unsafe { sys::g_object_unref(occ) }
                         }
                         break;
                     };
                     if !occ.is_null() {
+                        // SAFETY: the new ref from this step, released exactly
+                        // once — `occ` is not read again this iteration (only
+                        // the `i64` extracted from it is).
                         unsafe { sys::g_object_unref(occ) }
                     }
                     if occ_unix >= end_unix {
                         break; // past the window ⇒ done
                     }
-                    emit(out, occ_unix);
+                    if !emit.emit(out, occ_unix) {
+                        // Budget spent: stop stepping the iterator instead of
+                        // running it to the end of the window for nothing.
+                        truncated = true;
+                        break;
+                    }
                 }
+                // SAFETY: `iter` is the non-null iterator this scope created
+                // and owns, freed exactly once here and never stepped after.
                 unsafe { sys::i_cal_recur_iterator_free(iter) }
             }
+            // SAFETY: the new `ICalRecurrence` ref taken above, released
+            // exactly once and only after the iterator built from it is freed.
             unsafe { sys::g_object_unref(rule) }
         }
+        // SAFETY: the new property ref taken above, released exactly once on
+        // this branch (the `if` arm never took one).
         unsafe { sys::g_object_unref(rrule_prop) }
     }
 
     // RDATE: extra one-off occurrences within the window, deduped against the
     // RRULE-expanded set and subject to the same EXDATE exclusion.
     for rd in rdates {
-        emit(out, rd);
+        if !emit.emit(out, rd) {
+            truncated = true;
+            break;
+        }
     }
 
+    if truncated {
+        tracing::warn!(
+            uid = uid_from_ical(&emit.ical).unwrap_or("(no UID)"),
+            emitted = emit.emitted.len(),
+            max_occurrences = emit.max_occurrences,
+            "hytte-ecal: recurrence expansion truncated — this component alone \
+             would fill the window with occurrences; showing the first ones only",
+        );
+    }
+
+    // SAFETY: the new `dtstart` ref taken at the top, released exactly once on
+    // this (the only remaining) exit path — strictly after the recurrence
+    // iterator that borrowed it was freed.
     unsafe { sys::g_object_unref(dtstart) }
+}
+
+/// Accumulates one component's occurrences into the caller's output vector,
+/// applying — in this order — EXDATE exclusion, the query window, dedup, and
+/// the #1179 work budget. Split out of [`expand_component`] so the budget
+/// lives in one readable place (and so that function stays under clippy's
+/// `too_many_lines`); it holds no raw pointer and needs no `unsafe`.
+struct Emitter {
+    /// The component's serialisation, shared by every occurrence it emits.
+    ical: Arc<str>,
+    /// Cancelled starts (EXDATE), hashed because this is probed once per
+    /// occurrence — a linear scan here is quadratic in the same way the
+    /// emitted-set scan was before #1179.
+    exdates: HashSet<i64>,
+    /// `(start, end)` of every occurrence already pushed, so an RDATE doesn't
+    /// double up one the RRULE (or DTSTART) already produced.
+    emitted: HashSet<(i64, i64)>,
+    /// `DTEND − DTSTART`, applied to every occurrence of the series.
+    duration: i64,
+    all_day: bool,
+    window_start: i64,
+    window_end: i64,
+    /// Whichever of [`MAX_OCCURRENCES_PER_COMPONENT`] and
+    /// [`EXPANSION_BYTES_BUDGET`] binds first for this component's body size.
+    max_occurrences: usize,
+}
+
+impl Emitter {
+    fn new(
+        ical: Arc<str>,
+        exdates: HashSet<i64>,
+        duration: i64,
+        all_day: bool,
+        window_start: i64,
+        window_end: i64,
+    ) -> Self {
+        // At least one occurrence, so a component with an absurdly large body
+        // still yields its first instance rather than vanishing.
+        let max_occurrences = MAX_OCCURRENCES_PER_COMPONENT
+            .min(EXPANSION_BYTES_BUDGET / ical.len().max(1))
+            .max(1);
+        Self {
+            ical,
+            exdates,
+            emitted: HashSet::new(),
+            duration,
+            all_day,
+            window_start,
+            window_end,
+            max_occurrences,
+        }
+    }
+
+    /// Push the occurrence starting at `occ_unix`, if it survives the filters.
+    ///
+    /// Returns `false` **only** once the work budget is spent, so a caller
+    /// stops iterating instead of spinning the recurrence iterator for
+    /// occurrences it would discard. A merely filtered-out occurrence (EXDATE,
+    /// outside the window, duplicate) returns `true`: it consumed no budget.
+    fn emit(&mut self, out: &mut Vec<EventInstance>, occ_unix: i64) -> bool {
+        // EXDATE excludes; the window bounds the rest. An occurrence is kept
+        // when it starts before the window end and its end is at/after the
+        // window start (so it overlaps the window).
+        if self.exdates.contains(&occ_unix) {
+            return true;
+        }
+        let end_unix = occ_unix + self.duration;
+        if occ_unix >= self.window_end || end_unix < self.window_start {
+            return true;
+        }
+        if self.emitted.contains(&(occ_unix, end_unix)) {
+            return true;
+        }
+        if self.emitted.len() >= self.max_occurrences {
+            return false;
+        }
+        self.emitted.insert((occ_unix, end_unix));
+        out.push(EventInstance {
+            ical: Arc::clone(&self.ical),
+            start_unix: occ_unix,
+            end_unix,
+            all_day: self.all_day,
+        });
+        true
+    }
+}
+
+/// The value of the first `UID:` property line in an iCal serialisation, for
+/// log lines only (the expansion budget's `warn!` has to name *which*
+/// component it truncated, and the component pointer is long gone by the time
+/// a human reads the log).
+///
+/// Deliberately a string scan over the serialisation we already hold rather
+/// than another libical accessor: it costs no FFI surface, and the worst case
+/// for a wrong answer is a mislabelled warning. A folded (continued) UID is
+/// reported as its first line.
+fn uid_from_ical(ical: &str) -> Option<&str> {
+    ical.lines()
+        .find_map(|line| line.strip_prefix("UID:"))
+        .map(str::trim_end)
+        .filter(|uid| !uid.is_empty())
 }
 
 /// Collect every value of the repeated date-valued property `kind` on `comp`
@@ -660,14 +1010,25 @@ unsafe fn collect_property_times(
     is_rdate: bool,
 ) -> Vec<i64> {
     let mut times = Vec::new();
+    // SAFETY: `comp` is live (this function's contract) and `kind` is an
+    // `ICalPropertyKind` discriminant; the accessor returns a **new** property
+    // ref (or null), released at the end of each iteration.
     let mut prop = unsafe { sys::i_cal_component_get_first_property(comp, kind) };
     while !prop.is_null() {
         let unix = if is_rdate {
+            // SAFETY: `prop` is the non-null property ref we hold, and the
+            // caller passed `is_rdate` for an RDATE `kind` — so it really is
+            // an RDATE property, which is what this callee requires.
             unsafe { rdate_property_to_unix(prop) }
         } else {
+            // SAFETY: `prop` is a live EXDATE property (the `is_rdate = false`
+            // arm); reading its value yields a new `ICalTime` ref or null.
             let tt = unsafe { sys::i_cal_property_get_exdate(prop) };
+            // SAFETY: null or a live borrow of the ref just taken.
             let u = unsafe { ical_time_to_unix(tt) };
             if !tt.is_null() {
+                // SAFETY: that new ref, released exactly once; only the `i64`
+                // read out of it is used afterwards.
                 unsafe { sys::g_object_unref(tt) }
             }
             u
@@ -675,7 +1036,12 @@ unsafe fn collect_property_times(
         if let Some(u) = unix {
             times.push(u);
         }
+        // SAFETY: the property ref from this iteration, released exactly once
+        // — `get_next_property` walks the component's own cursor and does not
+        // need the previous property to still be held.
         unsafe { sys::g_object_unref(prop) }
+        // SAFETY: as the `get_first_property` call above; the cursor was
+        // established by it, on this same live `comp` and `kind`.
         prop = unsafe { sys::i_cal_component_get_next_property(comp, kind) };
     }
     times
@@ -690,28 +1056,45 @@ unsafe fn collect_property_times(
 ///
 /// `prop` must be a live RDATE `ICalProperty*`. Borrowed — never freed here.
 unsafe fn rdate_property_to_unix(prop: *mut sys::ICalProperty) -> Option<i64> {
+    // SAFETY: `prop` is a live RDATE property by this function's contract;
+    // reading its value yields a **new** `ICalDatetimeperiod` ref (or null),
+    // released at the end.
     let dtp = unsafe { sys::i_cal_property_get_rdate(prop) };
     if dtp.is_null() {
         return None;
     }
     // Date-time form first.
+    // SAFETY: `dtp` is the non-null value we own; this returns a new
+    // `ICalTime` ref (or null) released two lines down.
     let tt = unsafe { sys::i_cal_datetimeperiod_get_time(dtp) };
+    // SAFETY: null or a live borrow of the ref just taken.
     let mut result = unsafe { ical_time_to_unix(tt) };
     if !tt.is_null() {
+        // SAFETY: that new ref, released exactly once.
         unsafe { sys::g_object_unref(tt) }
     }
     // Period form: take its start.
     if result.is_none() {
+        // SAFETY: `dtp` is still the live value we own; this returns a new
+        // `ICalPeriod` ref (or null), released below.
         let period = unsafe { sys::i_cal_datetimeperiod_get_period(dtp) };
         if !period.is_null() {
+            // SAFETY: `period` is non-null and live; its start comes back as a
+            // new `ICalTime` ref (or null), released below.
             let start = unsafe { sys::i_cal_period_get_start(period) };
+            // SAFETY: null or a live borrow of the ref just taken.
             result = unsafe { ical_time_to_unix(start) };
             if !start.is_null() {
+                // SAFETY: that new ref, released exactly once.
                 unsafe { sys::g_object_unref(start) }
             }
+            // SAFETY: the period ref above, released exactly once and only
+            // after the start time read out of it.
             unsafe { sys::g_object_unref(period) }
         }
     }
+    // SAFETY: the datetimeperiod ref taken at the top, released exactly once
+    // on every path that reaches here, after everything read out of it.
     unsafe { sys::g_object_unref(dtp) }
     result
 }
@@ -727,6 +1110,9 @@ pub fn expand_ical_for_test(
 ) -> Result<Vec<EventInstance>> {
     let comp = parse_vevent(ical)?;
     let mut out = Vec::new();
+    // SAFETY: `comp.raw` is the live VEVENT `parse_vevent` just produced and
+    // this scope owns until the `drop` below — exactly the borrowed, live
+    // `ICalComponent*` `expand_component` requires.
     unsafe { expand_component(comp.raw, start_unix, end_unix, &mut out) }
     drop(comp);
     Ok(out)
@@ -738,13 +1124,17 @@ pub fn expand_ical_for_test(
 ///
 /// `comp` must be a live `ICalComponent*`.
 unsafe fn component_ical_string(comp: *mut sys::ICalComponent) -> String {
+    // SAFETY: `comp` is live by this function's contract; the serialisation
+    // comes back as a GLib-allocated string we own.
     let s_ptr = unsafe { sys::i_cal_component_as_ical_string(comp) };
     if s_ptr.is_null() {
         return String::new();
     }
+    // SAFETY: non-null (checked) and NUL-terminated, copied before the free.
     let s = unsafe { CStr::from_ptr(s_ptr) }
         .to_string_lossy()
         .into_owned();
+    // SAFETY: that GLib-allocated string, freed exactly once, never read after.
     unsafe { sys::g_free(s_ptr.cast::<c_void>()) }
     s
 }
@@ -786,6 +1176,11 @@ unsafe fn ical_time_to_unix(tt: *mut sys::ICalTime) -> Option<i64> {
         return None;
     }
     let tt_const = tt.cast_const();
+    // SAFETY (this and the three reads below): `tt` is non-null (checked) and
+    // a live borrowed `ICalTime*` by this function's contract; all four are
+    // read-only accessors that take no ownership and free nothing. `own_zone`
+    // is the zone the time itself holds — **borrowed**, owned by libical, and
+    // never unref'd here.
     if unsafe { sys::i_cal_time_is_null_time(tt_const) } != 0 {
         return None;
     }
@@ -801,6 +1196,11 @@ unsafe fn ical_time_to_unix(tt: *mut sys::ICalTime) -> Option<i64> {
         // midnight-UTC `time_t` as a *local* calendar date, so this must stay
         // midnight-UTC or the day would drift. The zone argument is irrelevant
         // for a DATE (no time-of-day to shift) — pass the UTC singleton.
+        //
+        // SAFETY (both): `i_cal_timezone_get_utc_timezone` is nullary and
+        // returns libical's process-wide singleton — borrowed, never unref'd
+        // (its `sys` declaration says so); `tt_const` is the live borrow from
+        // above, and the conversion only reads both.
         let utc = unsafe { sys::i_cal_timezone_get_utc_timezone() };
         return Some(unsafe { sys::i_cal_time_as_timet_with_zone(tt_const, utc.cast_const()) });
     }
@@ -820,6 +1220,10 @@ unsafe fn ical_time_to_unix(tt: *mut sys::ICalTime) -> Option<i64> {
         // CEST — the +2h double-shift. A UTC (`…Z`) time carries the UTC
         // singleton as its own zone, so this yields the correct instant for it
         // unchanged.
+        //
+        // SAFETY: `tt_const` is the live borrow from above and `own_zone` is
+        // non-null (this branch) — a zone libical owns and keeps for the
+        // process lifetime, borrowed here and never unref'd. Read-only.
         return Some(unsafe {
             sys::i_cal_time_as_timet_with_zone(tt_const, own_zone.cast_const())
         });
@@ -829,6 +1233,9 @@ unsafe fn ical_time_to_unix(tt: *mut sys::ICalTime) -> Option<i64> {
         // A UTC-flagged time with no attached zone pointer (defensive: some
         // libical values carry the `is_utc` bit without a zone object). It is
         // already absolute — the UTC singleton is the correct source zone.
+        //
+        // SAFETY (both): as the DATE branch above — the nullary singleton
+        // getter, and a read-only conversion of the live borrow.
         let utc = unsafe { sys::i_cal_timezone_get_utc_timezone() };
         return Some(unsafe { sys::i_cal_time_as_timet_with_zone(tt_const, utc.cast_const()) });
     }
@@ -838,6 +1245,8 @@ unsafe fn ical_time_to_unix(tt: *mut sys::ICalTime) -> Option<i64> {
     // covers a `TZID`'d time whose `VTIMEZONE` libical could not resolve (it
     // then reports the time as floating) — the local zone is the right
     // fallback for the viewer.
+    // SAFETY: `WallClock::from_ical` requires a non-null live `ICalTime*`;
+    // `tt` is non-null (checked at the top) and live for this borrow.
     unsafe { WallClock::from_ical(tt) }.to_local_unix()
 }
 
@@ -863,6 +1272,11 @@ impl WallClock {
     /// `tt` must be a valid, non-null `ICalTime*` borrowed from libical.
     unsafe fn from_ical(tt: *mut sys::ICalTime) -> Self {
         let c = tt.cast_const();
+        // SAFETY (all six reads): `tt` is non-null and a live borrowed
+        // `ICalTime*` by this function's contract, and each accessor is a
+        // read-only field getter returning a `gint` — none takes ownership,
+        // frees anything, or can observe a partially-built value (P3: the
+        // time belongs to this thread).
         Self {
             year: unsafe { sys::i_cal_time_get_year(c) },
             month: unsafe { sys::i_cal_time_get_month(c) },
@@ -902,6 +1316,9 @@ impl WallClock {
 ///
 /// `tt` must be null or a valid `ICalTime*` borrowed from libical.
 unsafe fn ical_time_is_date(tt: *mut sys::ICalTime) -> bool {
+    // SAFETY: short-circuit — the accessor is reached only when `tt` is
+    // non-null, and it is then a live borrowed `ICalTime*` (this function's
+    // contract) read without taking ownership.
     !tt.is_null() && unsafe { sys::i_cal_time_is_date(tt.cast_const()) } != 0
 }
 
@@ -928,6 +1345,8 @@ impl CalClient {
         let sexp_c = CString::new(sexp).context("sexp contained an interior NUL")?;
         let mut view: *mut sys::ECalClientView = ptr::null_mut();
         let mut err: *mut sys::GError = ptr::null_mut();
+        // SAFETY: P1/P2/P3, `sexp_c` is a live `CString` outliving the call,
+        // and `view` is a live local initialised to null for the out-param.
         let ok = unsafe {
             sys::e_cal_client_get_view_sync(
                 self.raw,
@@ -944,19 +1363,33 @@ impl CalClient {
         // The callback lives in a double-box so we can hand GLib a *thin*
         // `*mut c_void` (the inner `Box<dyn Fn()>`) as each handler's
         // user_data. We own this box on the Rust side and free it in Drop —
-        // strictly after the view is stopped + unref'd, so no in-flight
-        // trampoline can read a freed pointer. Hence the connections use a
-        // no-op destroy-notify; ownership is ours, not the closures'.
+        // strictly after every handler that could reach it is disconnected
+        // (see `CalClientView::drop`), so no trampoline can read a freed
+        // pointer. Hence the connections use a no-op destroy-notify;
+        // ownership is ours, not the closures'.
         let boxed: Box<Box<dyn Fn()>> = Box::new(Box::new(on_change));
         let user_data = (&raw const *boxed).cast::<c_void>().cast_mut();
 
-        // Connect all three change signals to one trampoline. We don't track
-        // the returned handler ids: teardown is `g_object_unref(view)` in
-        // `CalClientView::drop`, which disconnects every handler on the object
-        // automatically. A `0` id means a connect failed — log but continue,
+        // Connect all three change signals to one trampoline, **keeping every
+        // handler id**: teardown disconnects each one explicitly before the
+        // unref (#1179). Relying on `g_object_unref(view)` to disconnect them
+        // — what this did before — is only sound if our ref is the last one,
+        // and nothing here can prove that: libecal, or a signal emission in
+        // flight, may hold another, in which case the handlers outlive the
+        // `Box<dyn Fn()>` they point at and the trampoline dereferences freed
+        // memory. A `0` id means that connect failed — log but continue,
         // since a partial subscription still beats none (and the safety-net
-        // poll backstops anything missed).
+        // poll backstops anything missed); it is never passed to
+        // `g_signal_handler_disconnect`.
+        let mut handler_ids: Vec<sys::GULong> = Vec::with_capacity(3);
         for sig in [c"objects-added", c"objects-modified", c"objects-removed"] {
+            // SAFETY: `view` is the non-null `ECalClientView*` `get_view_sync`
+            // just handed us, `sig` is a `'static` NUL-terminated literal, and
+            // `user_data` points at the boxed callback this function owns for
+            // longer than every handler (Drop disconnects them all first). The
+            // transmute retypes a concrete `extern "C"` fn to the
+            // signature-erased `GCallback` GLib stores; GLib calls it back with
+            // the `objects-*` signature the trampoline is written for.
             let id = unsafe {
                 sys::g_signal_connect_data(
                     view,
@@ -974,16 +1407,32 @@ impl CalClient {
                 )
             };
             debug_assert!(id != 0, "g_signal_connect_data returned 0 for {sig:?}");
+            if id != 0 {
+                handler_ids.push(id);
+            }
         }
 
         // Begin notifications. `view-start` also replays the current contents
         // via `objects-added`, so the first refresh fires promptly without an
         // extra manual poll.
         let mut start_err: *mut sys::GError = ptr::null_mut();
+        // SAFETY: `view` is live and owned here; `start_err` is a live local
+        // initialised to null, which is what the `GError**` out-param wants.
         unsafe { sys::e_cal_client_view_start(view, &mut start_err) }
         if let Some(e) = take_error(start_err) {
-            // Couldn't start — disconnect/free everything we just set up and
-            // surface the error rather than returning a dead view.
+            // Couldn't start — disconnect every handler *before* dropping the
+            // box they point at, then release the view and surface the error
+            // rather than returning a dead view. Same ordering as Drop, and
+            // for the same reason.
+            for id in handler_ids {
+                // SAFETY: `id` is non-zero and came from a
+                // `g_signal_connect_data` on this same live `view`, and is
+                // disconnected exactly once (this path returns immediately
+                // after, so Drop never runs for these ids).
+                unsafe { sys::g_signal_handler_disconnect(view, id) }
+            }
+            // SAFETY: `view` is the ref `get_view_sync` transferred to us and
+            // is released exactly once here.
             unsafe { sys::g_object_unref(view) }
             drop(boxed);
             return Err(e);
@@ -991,6 +1440,7 @@ impl CalClient {
 
         Ok(CalClientView {
             raw: view,
+            handler_ids,
             _callback: boxed,
         })
     }
@@ -998,6 +1448,8 @@ impl CalClient {
 
 impl Drop for CalClient {
     fn drop(&mut self) {
+        // SAFETY: P1 — the single ref `e_cal_client_connect_sync` transferred
+        // to this value, released exactly once and never used after.
         unsafe { sys::g_object_unref(self.raw) }
     }
 }
@@ -1008,10 +1460,14 @@ impl Drop for CalClient {
 /// [`CalClient::watch`]). Holds the EDS view plus the boxed Rust callback the
 /// signal handlers fire into. Notifications flow only while this is alive **and**
 /// the owning thread keeps pumping the [`MainContext`] the view was created
-/// under; dropping it stops the view, releases EDS's proxy, and finally frees
-/// the callback.
+/// under; dropping it stops the view, **disconnects each handler**, releases
+/// EDS's proxy, and only then frees the callback (in that order — see `Drop`).
 pub struct CalClientView {
     raw: *mut sys::ECalClientView,
+    /// The `objects-{added,modified,removed}` handler ids, each disconnected
+    /// in [`Drop`] **before** the view is unref'd and before `_callback` is
+    /// freed (#1179). Only non-zero ids (successful connects) are in here.
+    handler_ids: Vec<sys::GULong>,
     // Kept alive (and dropped last, after the view is torn down) so the raw
     // user_data pointer the handlers hold stays valid for their whole life.
     _callback: Box<Box<dyn Fn()>>,
@@ -1019,15 +1475,41 @@ pub struct CalClientView {
 
 impl Drop for CalClientView {
     fn drop(&mut self) {
-        // Stop first so EDS quits emitting, then unref. Both run on the view's
-        // owning thread (the only place a `CalClientView` lives), so no
-        // trampoline can be mid-flight against the callback we're about to
-        // free when `_callback` drops right after this.
+        // Teardown order is the whole safety argument for the raw `user_data`
+        // the three handlers carry, and it is exactly this (#1179):
+        //
+        //   1. stop the view, so EDS quits emitting;
+        //   2. **disconnect every handler**, so none of them can be invoked
+        //      again by anyone — this is the step that makes freeing
+        //      `_callback` sound. `g_object_unref` alone would only achieve
+        //      it if our ref were the last one, which nothing here can prove:
+        //      libecal (or an emission in flight) may hold another, and then
+        //      the handlers outlive the box they point at;
+        //   3. release our ref on the view;
+        //   4. `_callback` drops, freeing the `Box<dyn Fn()>` — after (2),
+        //      unreachable by construction rather than by refcount luck.
+        //
+        // Steps 1-3 run on the view's owning thread (the only place a
+        // `CalClientView` lives), so no trampoline can be mid-flight either.
         let mut err: *mut sys::GError = ptr::null_mut();
+        // SAFETY: `self.raw` is the live view this value owns (non-null since
+        // `watch` rejected a null one), and `err` is a live local initialised
+        // to null for the `GError**` out-param.
         unsafe { sys::e_cal_client_view_stop(self.raw, &mut err) }
         if !err.is_null() {
+            // SAFETY: non-null here, and set by the call above, so it is a
+            // `GError` we own; freed exactly once and never read after.
             unsafe { sys::g_error_free(err) }
         }
+        for &id in &self.handler_ids {
+            // SAFETY: every id in this vector is a non-zero id
+            // `g_signal_connect_data` returned for this same `self.raw`, and
+            // Drop runs once, so each is disconnected exactly once.
+            unsafe { sys::g_signal_handler_disconnect(self.raw, id) }
+        }
+        // SAFETY: the single ref `e_cal_client_get_view_sync` transferred to
+        // this value, released exactly once (Drop runs once) and never used
+        // after.
         unsafe { sys::g_object_unref(self.raw) }
     }
 }
@@ -1040,10 +1522,12 @@ impl Drop for CalClientView {
 /// # Safety
 ///
 /// GLib calls this with `user_data` equal to the pointer we passed to
-/// `g_signal_connect_data` — a live `*const Box<dyn Fn()>` owned by the
-/// [`CalClientView`] that is, by construction, still alive (it's torn down
-/// strictly before that box is freed). `_view`/`_objects` are borrowed and not
-/// touched.
+/// `g_signal_connect_data` — a `*const Box<dyn Fn()>` owned by the
+/// [`CalClientView`]. It is live at every reachable call: the three handlers
+/// that can reach this function are **disconnected** in `CalClientView::drop`
+/// before that box is freed (#1179), so an invocation after the free is
+/// unreachable by construction rather than by the view's refcount happening
+/// to be one. `_view`/`_objects` are borrowed and not touched.
 unsafe extern "C" fn view_changed_trampoline(
     _view: *mut c_void,
     _objects: *mut sys::GSList,
@@ -1052,6 +1536,12 @@ unsafe extern "C" fn view_changed_trampoline(
     if user_data.is_null() {
         return;
     }
+    // SAFETY: `user_data` is non-null (checked) and is the pointer `watch`
+    // passed to `g_signal_connect_data` — the address of the inner
+    // `Box<dyn Fn()>` its `CalClientView` owns. That box outlives every
+    // handler that can reach this function (Drop disconnects them first), and
+    // the reference taken here lives only for this call, so it cannot alias a
+    // `&mut` (nothing ever takes one) and cannot dangle.
     let cb = unsafe { &*user_data.cast::<Box<dyn Fn()>>() };
     cb();
 }
@@ -1084,10 +1574,16 @@ impl MainContext {
     /// calling thread. Returns `None` if GLib couldn't allocate one.
     #[must_use]
     pub fn new() -> Option<Self> {
+        // SAFETY: nullary GLib allocator; the ref it returns is owned by the
+        // `MainContext` this builds and released exactly once in its Drop.
         let raw = unsafe { sys::g_main_context_new() };
         if raw.is_null() {
             return None;
         }
+        // SAFETY: `raw` is the non-null context just created. The push is
+        // paired with exactly one pop in Drop, on this same thread — the type
+        // is `!Send`, so the pop cannot happen on another thread and unbalance
+        // GLib's per-thread stack.
         unsafe { sys::g_main_context_push_thread_default(raw) }
         Some(Self { raw })
     }
@@ -1096,6 +1592,9 @@ impl MainContext {
     /// (a view signal arrived) or a [`Waker::wake`] fires — fully event-driven,
     /// no busy spin. Returns true if a source was dispatched.
     pub fn iterate(&self, block: bool) -> bool {
+        // SAFETY: P1/P3 — `self.raw` is the live context this value owns, and
+        // `MainContext` is `!Send`, so this iterates on the thread that pushed
+        // it thread-default (GLib's requirement for iteration).
         unsafe { sys::g_main_context_iteration(self.raw, sys::GBoolean::from(block)) != 0 }
     }
 
@@ -1105,6 +1604,10 @@ impl MainContext {
     /// the `MainContext` is dropped first.
     #[must_use]
     pub fn waker(&self) -> Waker {
+        // SAFETY: P1, and `g_main_context_ref` is one of GLib's thread-safe
+        // `GMainContext` calls. The extra ref it returns is owned by the
+        // `Waker` and released exactly once in its Drop, so the context
+        // outlives the waker even if this `MainContext` is dropped first.
         let raw = unsafe { sys::g_main_context_ref(self.raw) };
         Waker { raw }
     }
@@ -1112,7 +1615,13 @@ impl MainContext {
 
 impl Drop for MainContext {
     fn drop(&mut self) {
+        // SAFETY: P1/P3 — pops the push from `new` on the same thread (the
+        // type is `!Send`), exactly once, so GLib's thread-default stack stays
+        // balanced; `self.raw` is still live because we hold the ref released
+        // on the next line.
         unsafe { sys::g_main_context_pop_thread_default(self.raw) }
+        // SAFETY: that ref, released exactly once and never used after. Any
+        // `Waker` holds its own ref, so the context survives them.
         unsafe { sys::g_main_context_unref(self.raw) }
     }
 }
@@ -1136,12 +1645,18 @@ impl Waker {
     /// Break a [`MainContext::iterate(true)`] out of its block so the owning
     /// thread loops promptly (e.g. to pick up a newly-queued command).
     pub fn wake(&self) {
+        // SAFETY: `self.raw` is the context this `Waker` holds its own ref to,
+        // so it is live for `&self`; `g_main_context_wakeup` is explicitly
+        // thread-safe, which is what makes the `Send`/`Sync` impls above sound.
         unsafe { sys::g_main_context_wakeup(self.raw) }
     }
 }
 
 impl Drop for Waker {
     fn drop(&mut self) {
+        // SAFETY: the ref `MainContext::waker` took for this value, released
+        // exactly once; `_unref` is thread-safe, so dropping on any thread is
+        // fine.
         unsafe { sys::g_main_context_unref(self.raw) }
     }
 }
@@ -1160,6 +1675,10 @@ impl Drop for Component {
         // libical-glib's GObject-style components are released via
         // `g_object_unref`. The legacy `i_cal_component_free` exists for
         // the C struct, not the GObject wrapper.
+        //
+        // SAFETY: P1 — `self.raw` is the one component ref this value adopted
+        // (from the parser or from a `get_first_component`), released exactly
+        // once and never used after.
         unsafe { sys::g_object_unref(self.raw) }
     }
 }
@@ -1175,6 +1694,9 @@ impl Drop for Component {
 /// this crate's primary use case.
 fn parse_component(ical: &str) -> Result<Component> {
     let c = CString::new(ical).context("ical body contained an interior NUL")?;
+    // SAFETY: `c` is a live `CString` (NUL-terminated, no interior NUL) that
+    // outlives the call; libical copies what it needs and hands back a new
+    // component ref, adopted by the `Component` below.
     let raw = unsafe { sys::i_cal_parser_parse_string(c.as_ptr()) };
     if raw.is_null() {
         bail!("libical: failed to parse iCalendar body");
@@ -1184,6 +1706,9 @@ fn parse_component(ical: &str) -> Result<Component> {
     // constants rather than transmuting into the 8-variant Rust enum
     // (libical may return any of ~28 kinds — an unlisted value read as a
     // `#[repr(C)]` enum would be UB).
+    //
+    // SAFETY: `parsed.raw` is that live component; `isa` only reads it, and
+    // the `c_int` it returns is matched against constants, never transmuted.
     let kind = unsafe { sys::i_cal_component_isa(parsed.raw) };
     if matches!(
         kind,
@@ -1196,6 +1721,10 @@ fn parse_component(ical: &str) -> Result<Component> {
         sys::ICalComponentKind::Vtodo,
         sys::ICalComponentKind::Vevent,
     ] {
+        // SAFETY: `parsed.raw` is the live parsed component this scope owns,
+        // and `k` is a real `ICalComponentKind` variant (a Rust enum with the
+        // libical discriminants, passed out — never received — so no invalid
+        // value can be constructed). Returns a new ref or null.
         let inner = unsafe { sys::i_cal_component_get_first_component(parsed.raw, k) };
         if !inner.is_null() {
             // `get_first_component` returns a NEW ref (libical-glib
@@ -1212,14 +1741,20 @@ fn parse_component(ical: &str) -> Result<Component> {
 /// to materialise a recurring event from a string for hermetic expansion.
 fn parse_vevent(ical: &str) -> Result<Component> {
     let c = CString::new(ical).context("ical body contained an interior NUL")?;
+    // SAFETY: as `parse_component` — a live `CString` outliving the call, and
+    // a new component ref (or null) adopted below.
     let raw = unsafe { sys::i_cal_parser_parse_string(c.as_ptr()) };
     if raw.is_null() {
         bail!("libical: failed to parse iCalendar body");
     }
     let parsed = Component { raw };
+    // SAFETY: `parsed.raw` is that live component; `isa` only reads it and its
+    // `c_int` result is compared, never transmuted.
     if unsafe { sys::i_cal_component_isa(parsed.raw) } == sys::I_CAL_VEVENT_COMPONENT {
         return Ok(parsed);
     }
+    // SAFETY: as the loop in `parse_component` — live component, a real
+    // `ICalComponentKind` variant, new ref or null.
     let inner = unsafe {
         sys::i_cal_component_get_first_component(parsed.raw, sys::ICalComponentKind::Vevent)
     };
@@ -1238,6 +1773,10 @@ fn take_error(err: *mut sys::GError) -> Option<anyhow::Error> {
     if err.is_null() {
         return None;
     }
+    // SAFETY: `err` is non-null (checked) and, by every caller's construction,
+    // a `GError` GLib allocated and transferred to us — `sys::GError` mirrors
+    // its layout `#[repr(C)]`. `message` is either null or a NUL-terminated
+    // string owned by the error, copied here before the free below.
     let msg = unsafe {
         let ptr = (*err).message;
         if ptr.is_null() {
@@ -1246,8 +1785,12 @@ fn take_error(err: *mut sys::GError) -> Option<anyhow::Error> {
             CStr::from_ptr(ptr).to_string_lossy().into_owned()
         }
     };
+    // SAFETY (both): as above — plain integer fields of the same live error,
+    // read before it is freed.
     let domain = unsafe { (*err).domain };
     let code = unsafe { (*err).code };
+    // SAFETY: the error we own, freed exactly once (this function consumes the
+    // pointer and every caller drops it afterwards) and never read after.
     unsafe { sys::g_error_free(err) }
     Some(anyhow!("EDS error [domain={domain} code={code}]: {msg}"))
 }
@@ -1258,6 +1801,9 @@ unsafe fn borrowed_cstr(p: *const c_char) -> Option<String> {
     if p.is_null() {
         return None;
     }
+    // SAFETY: `p` is non-null (checked) and, by this function's contract, a
+    // NUL-terminated string owned by the GObject it came from and live for
+    // that borrow; the copy is taken here and the original is never freed.
     Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
 }
 
@@ -1751,6 +2297,188 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(100),
             "iteration returned in {elapsed:?} — it didn't actually block on the waker"
+        );
+    }
+
+    // ── Expansion output fixture (#1179) ──────────────────────────────────
+    //
+    // Pinned *before* #1179 rewrote `expand_component`'s dedup and its
+    // per-occurrence iCal cloning, so that rewrite is provably
+    // output-preserving rather than merely believed to be. One rule
+    // exercising RRULE + EXDATE + RDATE at once, with every field of every
+    // occurrence asserted in order — including the iCal serialisation
+    // libical hands back, which is what the pre-#1179 code cloned per
+    // occurrence and the post-#1179 code shares.
+
+    /// The fixture component: a 3-occurrence daily series with one cancelled
+    /// occurrence (EXDATE, Jun 2) and one extra one-off (RDATE, Jun 10).
+    const FIXTURE_DAILY: &str = "BEGIN:VEVENT\r\nUID:fixture-daily\r\n\
+         DTSTAMP:20260601T090000Z\r\nDTSTART:20260601T090000Z\r\n\
+         DTEND:20260601T093000Z\r\nSUMMARY:Standup\r\nLOCATION:Kitchen\r\n\
+         RRULE:FREQ=DAILY;COUNT=3\r\nEXDATE:20260602T090000Z\r\n\
+         RDATE:20260610T090000Z\r\nEND:VEVENT\r\n";
+
+    /// What `i_cal_component_as_ical_string` hands back for [`FIXTURE_DAILY`]
+    /// — the string every occurrence of the series carries. Recorded from the
+    /// pre-#1179 tree; property order is libical's, not ours.
+    const FIXTURE_DAILY_SERIALISED: &str = "BEGIN:VEVENT\r\nUID:fixture-daily\r\n\
+         DTSTAMP:20260601T090000Z\r\nDTSTART:20260601T090000Z\r\n\
+         DTEND:20260601T093000Z\r\nSUMMARY:Standup\r\nLOCATION:Kitchen\r\n\
+         RRULE:FREQ=DAILY;COUNT=3\r\nEXDATE:20260602T090000Z\r\n\
+         RDATE:20260610T090000Z\r\nEND:VEVENT\r\n";
+
+    #[test]
+    fn small_daily_rule_expansion_is_pinned_field_by_field() {
+        let inst = super::expand_ical_for_test(FIXTURE_DAILY, JUN_START, JUL_START).unwrap();
+
+        // Jun 1 (RRULE), Jun 3 (RRULE — Jun 2 is EXDATE'd), Jun 10 (RDATE),
+        // in that emission order: RRULE occurrences first, RDATEs appended.
+        let expected: [(i64, i64, bool); 3] = [
+            (ANCHOR_0900, ANCHOR_0900 + 1_800, false),
+            (
+                ANCHOR_0900 + 2 * 86_400,
+                ANCHOR_0900 + 2 * 86_400 + 1_800,
+                false,
+            ),
+            (
+                ANCHOR_0900 + 9 * 86_400,
+                ANCHOR_0900 + 9 * 86_400 + 1_800,
+                false,
+            ),
+        ];
+        assert_eq!(inst.len(), expected.len(), "occurrence count");
+        for (i, (e, (start, end, all_day))) in inst.iter().zip(expected).enumerate() {
+            assert_eq!(e.start_unix, start, "occurrence {i} start");
+            assert_eq!(e.end_unix, end, "occurrence {i} end");
+            assert_eq!(e.all_day, all_day, "occurrence {i} all_day");
+            assert_eq!(
+                &*e.ical, FIXTURE_DAILY_SERIALISED,
+                "occurrence {i} carries the component's serialisation verbatim",
+            );
+        }
+    }
+
+    /// Every occurrence of one series must share **one** `Arc<str>`, not carry
+    /// its own copy of the same bytes. Equality alone cannot see the
+    /// difference — this asserts pointer identity, so re-introducing a
+    /// per-occurrence copy (`Arc::from(ical.to_string())` inside the loop)
+    /// fails here even though every field still compares equal (#1179).
+    #[test]
+    fn occurrences_of_one_series_share_a_single_ical_allocation() {
+        let inst = super::expand_ical_for_test(FIXTURE_DAILY, JUN_START, JUL_START).unwrap();
+        assert!(inst.len() >= 2, "need at least two occurrences to compare");
+        for (i, e) in inst.iter().enumerate().skip(1) {
+            assert!(
+                std::sync::Arc::ptr_eq(&inst[0].ical, &e.ical),
+                "occurrence {i} allocated its own copy of the series' iCal string",
+            );
+        }
+    }
+
+    // ── Bounded expansion work (#1179) ────────────────────────────────────
+
+    #[test]
+    fn uid_is_read_out_of_an_ical_serialisation_for_the_truncation_warning() {
+        assert_eq!(super::uid_from_ical(FIXTURE_DAILY), Some("fixture-daily"));
+        // No UID property at all, and an empty one, both decline rather than
+        // naming something wrong in a log line.
+        assert_eq!(
+            super::uid_from_ical("BEGIN:VEVENT\r\nSUMMARY:x\r\nEND:VEVENT\r\n"),
+            None
+        );
+        assert_eq!(super::uid_from_ical("UID:\r\n"), None);
+        // Not confused by a property whose *name* ends in UID.
+        assert_eq!(
+            super::uid_from_ical("X-MY-UID:nope\r\nUID:real\r\n"),
+            Some("real")
+        );
+    }
+
+    /// The #1179 crasher, as a test. `FREQ=MINUTELY` over the 43-day window
+    /// the calendar service actually asks for (`WINDOW_DAYS` unioned with the
+    /// 6-week grid, `hytte-services`' `calendar.rs`) is 61 380 occurrences.
+    /// Before the fix each one was checked against every already-emitted one
+    /// with a linear `Vec::contains` and carried its own clone of the
+    /// component's iCal string: 1.9 × 10⁹ comparisons and ~9 MB of duplicated
+    /// string, **measured at 13.6 s** on this tree — per source, on every
+    /// refresh, with the calendar `Mutable` the panel binds to waiting on it.
+    ///
+    /// The elapsed bound here is deliberately loose (CI is slow and shares a
+    /// box); it is three orders of magnitude under the pre-fix number, which
+    /// is the only resolution this needs to have.
+    #[test]
+    fn minutely_rule_over_the_calendar_window_expands_in_bounded_work() {
+        use std::time::{Duration, Instant};
+
+        // 43 days from Jun 1 — the widest window `calendar.rs` composes.
+        let window_end = JUN_START + 43 * 86_400;
+        let ical = "BEGIN:VEVENT\r\nUID:minutely-1\r\nDTSTAMP:20260601T090000Z\r\n\
+                     DTSTART:20260601T090000Z\r\nDTEND:20260601T090500Z\r\n\
+                     SUMMARY:Tick\r\nRRULE:FREQ=MINUTELY\r\nEND:VEVENT\r\n";
+
+        let started = Instant::now();
+        let inst = super::expand_ical_for_test(ical, JUN_START, window_end).unwrap();
+        let elapsed = started.elapsed();
+
+        // Capped, not merely finished: the naive expansion is 61 380.
+        assert!(
+            inst.len() <= super::MAX_OCCURRENCES_PER_COMPONENT,
+            "expansion returned {} occurrences, over the {} cap",
+            inst.len(),
+            super::MAX_OCCURRENCES_PER_COMPONENT,
+        );
+        assert!(
+            inst.len() < 61_380,
+            "the minutely series was not truncated at all ({} occurrences)",
+            inst.len(),
+        );
+        assert!(!inst.is_empty(), "truncation must not swallow the series");
+
+        // Truncation keeps a *prefix* — the first occurrences in order, one
+        // per minute from DTSTART — not an arbitrary subset.
+        for (i, e) in inst.iter().enumerate() {
+            let minute = i64::try_from(i).unwrap();
+            assert_eq!(
+                e.start_unix,
+                ANCHOR_0900 + minute * 60,
+                "occurrence {i} is not the {i}th minute of the series",
+            );
+        }
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "expansion took {elapsed:?} — the O(n²) dedup or the per-occurrence \
+             clone is back (#1179 measured 13.6 s before the fix)",
+        );
+    }
+
+    /// The bytes budget, not the count cap, is what binds for a component with
+    /// a large body: `EXPANSION_BYTES_BUDGET / ical.len()` occurrences. Pinned
+    /// with a VEVENT padded past 419 bytes (4 MiB / 10 000), so a change that
+    /// drops the bytes half of the budget shows up here rather than only on a
+    /// calendar full of fat invites.
+    #[test]
+    fn a_large_component_is_capped_by_the_bytes_budget_not_the_count() {
+        let padding = "X".repeat(8_000);
+        let ical = format!(
+            "BEGIN:VEVENT\r\nUID:fat-1\r\nDTSTAMP:20260601T090000Z\r\n\
+             DTSTART:20260601T090000Z\r\nDTEND:20260601T090500Z\r\n\
+             SUMMARY:Fat\r\nDESCRIPTION:{padding}\r\nRRULE:FREQ=MINUTELY\r\nEND:VEVENT\r\n"
+        );
+        let window_end = JUN_START + 43 * 86_400;
+        let inst = super::expand_ical_for_test(&ical, JUN_START, window_end).unwrap();
+
+        let len = inst[0].ical.len();
+        assert!(len > 8_000, "the fixture's body did not survive parsing");
+        let expected = super::EXPANSION_BYTES_BUDGET / len;
+        assert!(
+            expected < super::MAX_OCCURRENCES_PER_COMPONENT,
+            "fixture too small to make the bytes budget the binding cap",
+        );
+        assert_eq!(
+            inst.len(),
+            expected,
+            "a {len}-byte component must cap at EXPANSION_BYTES_BUDGET / {len}",
         );
     }
 }

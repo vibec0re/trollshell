@@ -439,6 +439,31 @@
             touch $out
           '';
 
+          # The root `[workspace.lints]` table and the two `unsafe` islands'
+          # hand-mirrored copies (`crates/hytte-ecal/Cargo.toml`,
+          # `crates/hytte-gl/Cargo.toml`) must agree on every lint except the
+          # one `unsafe_code` line — Cargo's workspace-lints inheritance is
+          # all-or-nothing, which is why the copies exist at all. Nothing
+          # enforced that: deleting `pedantic` from an island leaves `cargo
+          # clippy --workspace --all-targets -- -D warnings` and the whole of
+          # `nix flake check` green, and one of the two crates where `unsafe`
+          # is legal quietly stops being pedantic-checked (#1179, from the
+          # #1162 sweep). Same posture as `bind-pins` above: a source-level
+          # defect no compile in this flake can see, so a script rather than a
+          # test, with no cargoArtifacts so it goes red in seconds. It also
+          # asserts the other direction — every *non*-island member inherits
+          # with `[lints] workspace = true` — so a third island cannot appear
+          # unnoticed. `nix/lint-lints-tables.py`'s own header has the full
+          # story, including why the five documented FFI-only `allow`s in
+          # `hytte-ecal` are declared in the script rather than waved through.
+          lints-tables =
+            pkgs.runCommand "trollshell-lints-tables-check" { nativeBuildInputs = [ pkgs.python3 ]; }
+              ''
+                cd ${self}
+                python3 nix/lint-lints-tables.py
+                touch $out
+              '';
+
           # `programs.trollshell.config.core-leds`'s nix-side vocabulary
           # (`style`/`fill` enums, `rows`'s cap) hand-mirrors Rust's
           # `DisplayStyle`/`parse_core_leds_fill`/`MAX_ROWS` (#1041, #1081

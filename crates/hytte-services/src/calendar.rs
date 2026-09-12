@@ -775,7 +775,7 @@ mod tests {
             start.naive_utc().format("%Y%m%dT%H%M%SZ"),
         );
         EventInstance {
-            ical,
+            ical: ical.into(),
             start_unix: start.timestamp(),
             end_unix: end.timestamp(),
             all_day: false,
@@ -796,7 +796,7 @@ mod tests {
             series_origin.naive_utc().format("%Y%m%dT%H%M%SZ"),
         );
         let instance = EventInstance {
-            ical,
+            ical: ical.into(),
             start_unix: occurrence.timestamp(),
             end_unix: (occurrence + Duration::hours(1)).timestamp(),
             all_day: false,
@@ -844,7 +844,7 @@ mod tests {
             start.naive_utc().format("%Y%m%dT%H%M%SZ"),
         );
         let instance = EventInstance {
-            ical,
+            ical: ical.into(),
             start_unix: start.timestamp(),
             end_unix: (start + Duration::hours(1)).timestamp(),
             all_day: false,
@@ -922,7 +922,8 @@ mod tests {
             ical: format!(
                 "BEGIN:VEVENT\r\nUID:ad\r\nSUMMARY:Holiday\r\nDTSTART;VALUE=DATE:{}\r\nEND:VEVENT\r\n",
                 date.format("%Y%m%d"),
-            ),
+            )
+            .into(),
             start_unix: midnight_utc.timestamp(),
             end_unix: midnight_utc.timestamp(),
             all_day: true,
@@ -957,7 +958,7 @@ mod tests {
         let now = Local::now();
         let start = now + Duration::days(1);
         let instance = EventInstance {
-            ical: "BEGIN:VEVENT\r\nUID:nt\r\nEND:VEVENT\r\n".to_string(),
+            ical: "BEGIN:VEVENT\r\nUID:nt\r\nEND:VEVENT\r\n".into(),
             start_unix: start.timestamp(),
             end_unix: (start + Duration::hours(1)).timestamp(),
             all_day: false,

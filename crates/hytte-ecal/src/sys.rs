@@ -62,11 +62,16 @@ pub type ICalComponent = c_void;
 /// return new refs).
 pub type ICalTime = c_void;
 
-/// `ICalTimezone *` — a libical timezone. We use the process-wide UTC singleton
-/// ([`i_cal_timezone_get_utc_timezone`]) as the conversion zone, and read the
-/// borrowed zone an [`ICalTime`] carries ([`i_cal_time_get_timezone`]) purely to
-/// detect whether a time is absolute. Both are owned by libical and must never
-/// be unref'd.
+/// `ICalTimezone *` — a libical timezone. Two of these reach us, and **both**
+/// are used as the *source zone* argument to
+/// [`i_cal_time_as_timet_with_zone`], not merely as a flag: the process-wide
+/// UTC singleton ([`i_cal_timezone_get_utc_timezone`]) for a DATE or a
+/// zone-less UTC value, and the zone an [`ICalTime`] itself carries
+/// ([`i_cal_time_get_timezone`]) for a resolved `TZID` — which is exactly what
+/// #522 fixed, and what the previous wording here ("purely to detect whether a
+/// time is absolute") described the pre-#522 behaviour of. See
+/// `lib.rs`'s `ical_time_to_unix` for the full three-way split. Both zones are
+/// owned by libical and must never be unref'd.
 pub type ICalTimezone = c_void;
 
 /// `ICalProperty *` — one property of a component (e.g. an RRULE). Returned
@@ -494,6 +499,16 @@ unsafe extern "C" {
         destroy_data: GClosureNotify,
         connect_flags: c_uint,
     ) -> GULong;
+
+    /// `g_signal_handler_disconnect` — drop the handler `handler_id` names on
+    /// `instance`, so it can never be invoked again. This is what makes the
+    /// Rust callback behind a handler's `user_data` safe to free (#1179):
+    /// `g_object_unref` alone only disconnects handlers if *our* ref was the
+    /// last one, which we cannot prove — libecal or an in-flight emission may
+    /// hold another. GLib emits a critical warning (it does not abort) if
+    /// `handler_id` is not a live handler of `instance`, so only ever pass an
+    /// id [`g_signal_connect_data`] returned non-zero for, exactly once.
+    pub fn g_signal_handler_disconnect(instance: *mut c_void, handler_id: GULong);
 }
 
 #[link(name = "glib-2.0")]
@@ -566,5 +581,9 @@ pub unsafe extern "C" fn g_object_unref_destroy_notify(obj: *mut c_void) {
     if obj.is_null() {
         return;
     }
+    // SAFETY: `obj` is non-null (checked) and, by this function's own contract
+    // above, a GObject pointer whose ref the caller (GLib, walking a list we
+    // own) is handing over — so releasing it here is the transfer completing,
+    // not a double-free.
     unsafe { g_object_unref(obj) }
 }

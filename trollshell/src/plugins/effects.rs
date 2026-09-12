@@ -1270,7 +1270,7 @@ thread_local! {
 /// anything else — including the attached mode, which is bounded by
 /// [`RUN_COMMAND_TIMEOUT`] and dies with the shell and so needs no budget of its
 /// own.
-fn detached_launch_id(effect: &Effect) -> Option<u64> {
+pub(super) fn detached_launch_id(effect: &Effect) -> Option<u64> {
     match effect {
         Effect::RunCommand {
             id,

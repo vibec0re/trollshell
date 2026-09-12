@@ -458,14 +458,32 @@ async fn pump_device_props(path: String, wake_tx: mpsc::Sender<()>) {
         .signal("PropertiesChanged")
         .start();
 
-    // Both an ordinary emission and a Resubscribed/Lagged marker (#1201) wake
-    // the watcher loop the same way: the wakeup just asks for a fresh
-    // GetDevices-driven refresh, and re-reading everything is exactly the
-    // repair a missed PropertiesChanged needs too. Before #1201 this was
-    // `events()`, which cannot represent either marker, so a subscription
-    // that quietly rebuilt mid-gap left this device's state stale until the
-    // 5 s poll happened to catch up.
-    let mut items = sub.items();
+    drive_device_pump(&path, sub.items(), &wake_tx).await;
+
+    tracing::debug!(path, "networkd_nm: per-device signal stream ended");
+}
+
+/// The body of [`pump_device_props`], over an injected item stream.
+///
+/// Both an ordinary emission and a `Resubscribed`/`Lagged` marker (#1201) wake
+/// the watcher loop the same way: the wakeup just asks for a fresh
+/// `GetDevices`-driven refresh, and re-reading everything is exactly the repair
+/// a missed `PropertiesChanged` needs too. Before #1201 this was `events()`,
+/// which cannot represent either marker, so a subscription that quietly
+/// rebuilt mid-gap left this device's state stale until the 5 s poll happened
+/// to catch up.
+///
+/// Split out so that choice is actually guarded (#1201 review L5). Measured:
+/// reverting the loop to `sub.events()` compiled clean and left the whole
+/// suite green, because nothing else in this file looks at the item type.
+/// With the stream injected it is guarded twice — by this signature (an
+/// `events()` stream yields `SignalEvent`, which does not fit) and by a test
+/// that pushes a marker through and expects a wake, which cannot even be
+/// written against `events()`.
+async fn drive_device_pump<S>(path: &str, mut items: S, wake_tx: &mpsc::Sender<()>)
+where
+    S: futures_util::Stream<Item = SignalItem> + Unpin,
+{
     while let Some(item) = items.next().await {
         if matches!(item, SignalItem::Resubscribed | SignalItem::Lagged { .. }) {
             tracing::info!(
@@ -479,11 +497,9 @@ async fn pump_device_props(path: String, wake_tx: mpsc::Sender<()>) {
         // blocking behind a slow multi-round-trip refresh. Only `Closed` — the
         // watcher loop is gone — ends the pump.
         if let Err(mpsc::error::TrySendError::Closed(())) = wake_tx.try_send(()) {
-            break;
+            return;
         }
     }
-
-    tracing::debug!(path, "networkd_nm: per-device signal stream ended");
 }
 
 // ── Main watcher task ──────────────────────────────────────────────────────────
@@ -982,5 +998,41 @@ mod tests {
             1,
             "Lagged must refresh exactly once"
         );
+    }
+
+    /// The per-device pump's own guard (#1201 review L5). The three arms above
+    /// are type-enforced — `handle_nm_item` takes a `SignalItem` — but the pump
+    /// consumed its stream inline, so reverting it to `sub.events()` compiled
+    /// clean and left the suite green at 815/815. A marker must wake the
+    /// watcher exactly like an emission does.
+    ///
+    /// Falsifiable two ways: the `events()` revert no longer type-checks
+    /// against `drive_device_pump`, and deleting the `try_send` leaves the
+    /// queue empty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_device_pump_wakes_the_watcher_for_a_marker() {
+        for item in [SignalItem::Resubscribed, SignalItem::Lagged { skipped: 4 }] {
+            let (tx, mut rx) = mpsc::channel::<()>(DEVICE_WAKE_QUEUE);
+            drive_device_pump(WIFI, futures_util::stream::iter(vec![item]), &tx).await;
+            assert!(rx.try_recv().is_ok(), "a marker must wake the watcher");
+            assert!(rx.try_recv().is_err(), "exactly one wake, not two");
+        }
+    }
+
+    /// And the pump gives up when the watcher loop is gone, rather than
+    /// spinning on a dead channel for the rest of the session.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_device_pump_stops_when_the_watcher_is_gone() {
+        let (tx, rx) = mpsc::channel::<()>(DEVICE_WAKE_QUEUE);
+        drop(rx);
+        // An endless stream: only the closed channel can end this.
+        let pump = drive_device_pump(
+            WIFI,
+            futures_util::stream::repeat(SignalItem::Resubscribed),
+            &tx,
+        );
+        tokio::time::timeout(Duration::from_secs(1), pump)
+            .await
+            .expect("a pump nobody listens to must stop");
     }
 }

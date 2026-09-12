@@ -319,6 +319,17 @@ mod tests {
     /// ("the first certificate, with the rest as its issuer chain") and
     /// precisely what `WebKit` then fails to match against the server's own.
     ///
+    /// # Only the first assertion is load-bearing
+    ///
+    /// `trust-bundle.pem` is a **byte-for-byte copy** of `hive-ca.pem` in
+    /// these fixtures — the generator does `cp` — so the second assertion is
+    /// true by construction and proves nothing on its own (#1130's
+    /// re-verification said so, correctly). It is kept as a statement of what
+    /// the bundle *is*: a real hyperhive bundle is the hive CA plus whatever
+    /// it is rooted at, and the property that matters for `CERT_ENV` is only
+    /// ever about the **first** block, which is the CA in both shapes. The
+    /// first assertion is the one a change can break.
+    ///
     /// Mutation (re-run this round, red): compare `gateway-leaf.pem` with
     /// itself — i.e. assert the thing the old docs implied — and it reds.
     #[test]

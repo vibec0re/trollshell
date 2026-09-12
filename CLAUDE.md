@@ -60,6 +60,16 @@ xvfb-run cargo test --features system-tests -p hytte-ui   # display tests headle
 - `hytte-bus`'s system tests **spawn a real `dbus-daemon`** (one ephemeral
   broker per test; must be on `PATH`). They don't touch the host session bus.
 - The GTK-dependent system tests need a display server (`xvfb-run` works).
+- `trollshell-agent-window`'s display tests construct a `webkit::WebView`, and
+  WebKitGTK sandboxes its subprocesses with `bwrap`, which needs nested user
+  namespaces. Without them, constructing the view **aborts the test binary**
+  (`bwrap: Can't mount proc…`, SIGABRT) rather than failing a test — so both
+  `nix/devshell.nix` and `nix/checks/system-tests.nix` export
+  `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1`, each with the comment saying
+  why. Nothing that ships sets it. It buys a constructible widget, not a
+  working web process (one still crashes in both), which is why the
+  navigation-policy assertion is a live-verify item and not a test — see
+  `crates/trollshell-agent-window/src/webview.rs`'s `gtk_tests` module doc.
 - `hytte-services`'s gated test round-trips the NetworkManager secret agent
   (`wifi::nm_agent`'s `GetSecrets`) against a real `dbus-daemon` too.
 - The Nix package (`nix/package.nix`) sets `doCheck = true`: every

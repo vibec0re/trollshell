@@ -156,17 +156,33 @@ mod tests {
     }
 
     /// A page URL with no host of its own admits **nothing** — the window
-    /// would otherwise have no origin to compare against and a naive
-    /// `None == None` would let every hostless URI through.
+    /// would otherwise have no origin to compare against, and a naive
+    /// `None == None` would let a hostless candidate through.
     ///
-    /// Mutation (re-run this round, red): drop the
-    /// `host_of(embedded).is_some()` conjunct and the `file:` pair passes.
+    /// The last pair is the one that makes the `host_of(embedded).is_some()`
+    /// conjunct load-bearing, and it is here because #1130's re-verification
+    /// measured the claim without it: every other candidate in this file is
+    /// already excluded by the `starts_with("https://")` guard, so dropping
+    /// the conjunct left the suite **green**. `https://` is the shape that
+    /// slips past the guard and has no host — `None == None` — so it is the
+    /// case the conjunct exists for.
+    ///
+    /// Mutation (re-run this round, red): drop
+    /// `crate::tls::host_of(embedded).is_some()` and the `https://` pair
+    /// passes.
     #[test]
     fn a_page_with_no_origin_admits_nothing() {
         for page in ["", "not a url", "file:///tmp/x"] {
             assert!(!navigable_in_place(page, "https://hive.local/"));
             assert!(!navigable_in_place(page, "file:///tmp/x"));
+            assert!(
+                !navigable_in_place(page, "https://"),
+                "{page:?} has no host and neither does the candidate — two Nones are not a match"
+            );
         }
+        // …and a page that *does* have an origin still refuses a hostless
+        // candidate, so the conjunct is not doing this one's work for it.
+        assert!(!navigable_in_place("https://hive.local/agent/stray/", "https://"));
     }
 
     /// The ordinary case: the hive's `https://<domain>/agent/<name>/`.

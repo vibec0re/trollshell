@@ -18,6 +18,14 @@ something rather than against a plausible-sounding guess.
 | `gateway-leaf.pem` | a leaf for `hive.local` issued by it — what a gateway actually presents                                                       |
 | `trust-bundle.pem` | the anchor bundle a _trust store_ wants: **CA first**, never the leaf                                                         |
 
+`trust-bundle.pem` is a **byte-for-byte copy of `hive-ca.pem`** here (the
+generator does `cp`), because this fixture CA is self-signed and so is its own
+whole chain. A real hyperhive bundle carries the hive CA *plus the swarm root
+it is issued under*. That is why the file keeps its own name — and why only the
+**first** assertion in `a_bundle_is_not_the_certificate_the_gateway_presents`
+is load-bearing: what `CERT_ENV` hands WebKit is the first PEM block either
+way, and that block is the CA in both shapes.
+
 **No private keys are here.** They were deleted by the generator; nothing in
 this directory can sign anything, and none of these certificates is trusted by
 anything anywhere. `hive.local` is not a resolvable name.

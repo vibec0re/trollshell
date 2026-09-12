@@ -203,13 +203,18 @@ fn failure_state() -> adw::StatusPage {
 ///
 /// # Why `on_refuse` is a parameter
 ///
-/// [`page`] passes [`elsewhere`], and that is the only production value. It is
-/// injectable because **an ignored policy decision is silent**: `WebKit` aborts
-/// the load and emits no `load-failed`, no `load-changed`, nothing — and
-/// `WebViewExt::uri` is set by `load_uri` *before* any decision, so it reads
-/// back the refused URI either way (measured, both). With no observable in the
-/// view, the only way to test the real handler through `WebKit`'s real dispatch
-/// is to watch what it hands out, which is what the display tests below do.
+/// [`page`] passes [`elsewhere`], and that is the **only** call site — nothing
+/// in the tree passes anything else today (#1130 N5, which caught this doc
+/// claiming otherwise).
+///
+/// It is a seam rather than a hard-coded call because **an ignored policy
+/// decision is silent**: `WebKit` aborts the load and emits no `load-failed`,
+/// no `load-changed`, nothing — and `WebViewExt::uri` is set by `load_uri`
+/// *before* any decision, so it reads back the refused URI either way
+/// (measured, both). So the day a web process can start where these tests run,
+/// watching what this hands out is the only way to observe the real handler
+/// through `WebKit`'s real dispatch; until then it costs one parameter and
+/// nothing else. See [`gtk_tests`]' module doc for why that day is not today.
 fn install_policy(view: &webkit::WebView, embedded: &str, on_refuse: std::rc::Rc<dyn Fn(&str)>) {
     let origin = embedded.to_owned();
     let refuse = std::rc::Rc::clone(&on_refuse);
@@ -383,11 +388,20 @@ mod gtk_tests {
         );
     }
 
-    /// …and the view is built **with** those settings, not with `WebKit`'s
-    /// defaults — the wiring the test above cannot see.
+    /// …and the view reads back those values too.
     ///
-    /// Mutation (re-run this round, red): drop `.settings(&settings())` from
-    /// the builder in `page` and this reds.
+    /// **This does not pin the wiring, and saying so is the point** (#1130
+    /// N3): dropping `.settings(&settings())` from the builder in `page`
+    /// leaves it **green** — measured by the re-verification — for the same
+    /// reason the sibling above cannot be falsified, which is that all six
+    /// properties already default to `false`, so a view built with no
+    /// `Settings` at all reads back identically.
+    ///
+    /// It is kept as the other half of the same pin: if an upstream default
+    /// flips, this reds whether the cause is the constructor or the builder.
+    /// The wiring itself is genuinely unpinned here, and there is no honest
+    /// way to pin it until a `Settings` value diverges from `WebKit`'s
+    /// defaults.
     #[gtk::test]
     fn the_view_carries_those_settings() {
         use gtk::glib::object::ObjectExt as _;

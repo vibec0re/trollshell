@@ -82,6 +82,31 @@ pkgs.mkShell {
     # the raw schema dirs ourselves so org.gnome.desktop.interface (and
     # therefore the active GTK icon theme name) reads cleanly.
     GSETTINGS_SCHEMA_DIR = "${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}/glib-2.0/schemas:${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}/glib-2.0/schemas";
+
+    # #1130 N1 — **the local `system-tests` bucket aborts without this.**
+    #
+    # `trollshell-agent-window`'s display tests construct a `webkit::WebView`,
+    # and WebKitGTK sandboxes its own subprocesses with `bwrap`, which needs
+    # nested user namespaces. Where there are none — a nix build sandbox, and
+    # the container this is developed in — constructing the view does not fail,
+    # it **aborts the whole test binary**: `bwrap: Can't mount proc on
+    # /newroot/proc: Operation not permitted`, then `Failed to fully launch
+    # dbus-proxy`, SIGABRT, exit 101, with no hint about the cause.
+    #
+    # `nix/checks/system-tests.nix` exports the same variable, with the longer
+    # version of this comment, so CI is green — and before this line the two
+    # disagreed: `xvfb-run cargo test --workspace --features system-tests`, the
+    # command CLAUDE.md's Tests section documents, passed in CI and aborted
+    # here. Keeping the local and CI buckets agreeing is the whole point of
+    # that block.
+    #
+    # devShell-only, like `RUSTFLAGS` above, and it reaches nothing that ships:
+    # the packaged window (nix/agent-window.nix) sets no such variable and runs
+    # a fully sandboxed engine on a real desktop. It does not buy a *working*
+    # web process either — one still crashes here — only a process that can
+    # construct the widget; see `webview.rs`'s `gtk_tests` module doc for what
+    # that does and does not make testable.
+    WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS = "1";
   };
 
   shellHook = ''

@@ -350,6 +350,15 @@ mod gtk_tests {
 
         w.update(Update::State(up(with_url.clone())));
         let first = w.page_child().expect("the page went into the slot");
+        // **Not vacuously** (#1130 N6): `assemble`'s first `apply` puts the
+        // `NO_PAGE` label in the slot, so without this the test would compare
+        // that label with itself and stay green with `Window::update` mutated
+        // to a no-op — measured by the re-verification.
+        assert!(
+            first.downcast_ref::<gtk::Label>().is_none(),
+            "the update must have replaced the no-page hint with the view, or what follows \
+             compares the hint with itself"
+        );
 
         // A second poll, and a third that changes something else entirely.
         w.update(Update::State(up(with_url.clone())));

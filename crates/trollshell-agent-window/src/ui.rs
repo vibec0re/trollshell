@@ -181,21 +181,58 @@ impl Header {
         }
     }
 
-    /// Press Start as a human would — through the widget, so the `clicked`
-    /// handler [`Header::connect`] installed is what runs.
+    /// Press Start, **refusing an insensitive button** — what a user can
+    /// actually do.
     ///
     /// The two `press_*_for_test` helpers exist so `window.rs`'s display tests
     /// can drive the wiring between a button and the command lane, which
     /// nothing covered before #1130's review (L2).
+    ///
+    /// They **panic** rather than press a dead button, because `emit_clicked`
+    /// does not care: it fires the `clicked` handler regardless of
+    /// `sensitive`, so a helper that used it alone would let
+    /// `a_button_press_reaches_the_command_lane` pass with every
+    /// `set_sensitive` line in [`Header::apply`] deleted — measured on the
+    /// #1130 re-verification (N2). GTK will not deliver a click to an
+    /// insensitive widget, so neither will this.
     #[cfg(all(test, feature = "system-tests"))]
     pub fn press_start_for_test(&self) {
+        let (visible, sensitive) = own_flags(&self.start);
+        assert!(
+            visible && sensitive,
+            "Start is not pressable (visible: {visible}, sensitive: {sensitive}); a user could \
+             not have done this"
+        );
         self.start.emit_clicked();
     }
 
     /// Press Stop. See [`Header::press_start_for_test`].
     #[cfg(all(test, feature = "system-tests"))]
     pub fn press_stop_for_test(&self) {
+        let (visible, sensitive) = own_flags(&self.stop);
+        assert!(
+            visible && sensitive,
+            "Stop is not pressable (visible: {visible}, sensitive: {sensitive}); a user could \
+             not have done this"
+        );
         self.stop.emit_clicked();
+    }
+
+    /// `(visible, sensitive)` for Start, Stop and the pause toggle — the
+    /// display tests' read-back for [`Header::apply`]'s effect on the buttons.
+    #[cfg(all(test, feature = "system-tests"))]
+    pub fn button_states(&self) -> [(bool, bool); 3] {
+        [
+            own_flags(&self.start),
+            own_flags(&self.stop),
+            own_flags(&self.pause),
+        ]
+    }
+
+    /// Whether the pause toggle is down.
+    #[cfg(all(test, feature = "system-tests"))]
+    pub fn pause_is_active(&self) -> bool {
+        self.pause.is_active()
     }
 
     /// The status line as shown.
@@ -226,6 +263,20 @@ impl Default for Header {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A widget's **own** `visible`/`sensitive` flags — the two [`Header::apply`]
+/// sets, read straight back off the properties.
+///
+/// Not `WidgetExt::is_visible`/`is_sensitive`: those are the *effective*
+/// values, which fold in every ancestor. A window that is never presented is
+/// not visible, so every button inside it reports `is_visible() == false`
+/// however `apply` left it — which made the first version of the press
+/// helpers refuse a perfectly live Start (measured, #1130 N2's own fix). The
+/// own flag is what this layer controls and what a test should hold it to.
+#[cfg(all(test, feature = "system-tests"))]
+fn own_flags(w: &impl gtk::glib::object::ObjectExt) -> (bool, bool) {
+    (w.property::<bool>("visible"), w.property::<bool>("sensitive"))
 }
 
 fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
@@ -528,6 +579,91 @@ mod gtk_tests {
             }),
         );
         assert_eq!(header.status_text(), "failed");
+    }
+
+    /// **`Controls` reaches the buttons.** For every `Status`, what
+    /// `Header::apply` leaves on screen is what `Controls::of` decided.
+    ///
+    /// `chrome::tests` pins the decision; this pins its *application*, which
+    /// nothing covered — all five `set_visible`/`set_sensitive` lines in
+    /// `apply` could be deleted with the suite green (#1130 N2). The gap was
+    /// widened by `press_*_for_test` using `emit_clicked`, which fires
+    /// regardless of sensitivity; those helpers now refuse an insensitive
+    /// button, so the two halves cannot drift apart again.
+    ///
+    /// Mutation (re-run this round, red): delete any of the five lines and
+    /// this reds on the row it governs — measured for all five.
+    #[gtk::test]
+    fn the_controls_reach_the_buttons() {
+        let header = Header::new();
+
+        // Before the hive answers: nothing is pressable, and Start is the one
+        // that shows (a dead Stop beside a dead Start reads as two broken
+        // buttons rather than one unknown state).
+        show(&header, &AgentState::Connecting);
+        assert_eq!(
+            header.button_states(),
+            [(true, false), (false, false), (true, false)],
+            "connecting: Start visible-but-dead, Stop hidden, pause dead"
+        );
+
+        let row = |f: fn(&mut AgentStatusRow)| {
+            let mut r = AgentStatusRow {
+                name: "stray".to_owned(),
+                running: true,
+                ..AgentStatusRow::default()
+            };
+            f(&mut r);
+            up(r)
+        };
+
+        // Running: Stop is offered, Start is not, pause is live and up.
+        show(&header, &row(|_| {}));
+        assert_eq!(
+            header.button_states(),
+            [(false, false), (true, true), (true, true)],
+            "running: Stop is the offer"
+        );
+        assert!(!header.pause_is_active());
+
+        // Paused: still running, so still Stop — and the toggle is down.
+        show(&header, &row(|r| r.paused = true));
+        assert_eq!(
+            header.button_states(),
+            [(false, false), (true, true), (true, true)],
+            "paused is a running agent: it is offered Stop, not Start"
+        );
+        assert!(header.pause_is_active());
+
+        // Stopped: the offer swaps.
+        show(&header, &row(|r| r.running = false));
+        assert_eq!(
+            header.button_states(),
+            [(true, true), (false, false), (true, true)],
+            "stopped: Start is the offer"
+        );
+        assert!(!header.pause_is_active());
+
+        // Failed and NeedsLogin are not running, but they are not `Stopped`
+        // either — P1's rule, and the two rows #1130's M15 slipped through.
+        show(&header, &row(|r| {
+            r.running = false;
+            r.failed = true;
+        }));
+        assert_eq!(
+            header.button_states(),
+            [(false, false), (true, true), (true, true)],
+            "failed: offered Stop, matching the card"
+        );
+        show(&header, &row(|r| {
+            r.running = false;
+            r.needs_login = true;
+        }));
+        assert_eq!(
+            header.button_states(),
+            [(false, false), (true, true), (true, true)],
+            "needs_login: offered Stop, matching the card"
+        );
     }
 
     /// A **programmatic** pause flip does not read back as a click.

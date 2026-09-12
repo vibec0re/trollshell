@@ -2208,7 +2208,16 @@ session.
       they are pinned there with the scope's; the ceiling (mean 2 / p99 8 /
       max 32) is what a real driver answers to.
 
-      What only glass can answer is what the harness cannot see at 1:1.
+      A seventeenth-through-twentieth case renders the same readout into an
+      area **twice** its natural size and box-averages the readback back down,
+      which is the only thing in CI that exercises the improvement at all.
+      Those four are **measured, not gated**: mean 3.3–6.1 / max 19–39 of 255,
+      entirely in the `edge` region, with the **field byte-identical** on every
+      skin. Over the ceiling, and correctly so — supersampling a convex falloff
+      adds light at the rim, which is the point. The field is what they are
+      gated on.
+
+      What only glass can answer is what neither of those can see.
 
   1. **The readout is unchanged at its natural size.** Start the shell and open
      a card with a dot-matrix readout (`hytte-plugin-preem-demo`, or any plugin

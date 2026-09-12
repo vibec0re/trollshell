@@ -6,32 +6,46 @@
 //!
 //! Three kinds since #1144: the `Scope` (four skins × three fade depths), the
 //! `Gauge` (four skins × three needle positions, plus one at the **shipping**
-//! upscale) and the `DotMatrix` (four skins × four displays). The
-//! three-per-skin gauge cases run at `scale = 1`, where the GL arm's native
-//! grid and the kit's logical one are the same number and the two can be
-//! compared pixel against pixel — that is where `TROLLSHELL_PARITY_EXACT=1`
-//! pins them at zero.
+//! upscale) and the `DotMatrix` (four skins × four displays, plus one of them
+//! again stretched). The three-per-skin gauge cases and the four-per-skin
+//! dot-matrix ones run 1:1, where the GL arm's native grid and the kit's
+//! logical one are the same number and the two can be compared pixel against
+//! pixel — that is where `TROLLSHELL_PARITY_EXACT=1` pins all three kinds at
+//! zero. The dot matrix has no `scale` on the widget at all — the dot pitch is
+//! its size knob (#1091) — so what its four 1:1 cases vary instead is the
+//! *line* and the *pitch*, which is where its own arithmetic lives; see
+//! `DisplayAt`.
 //!
-//! The fourth gauge case per skin runs at `scale = 2`, which is
-//! `GaugeConfig::default()` and therefore every dial on the glass (#1148
-//! review, HIGH-2). It cannot be compared naively — the GL arm is rasterising
-//! at twice the resolution *on purpose*, which is the whole of #1090's fix — so
-//! the harness box-averages the native readback back down to the kit's logical
+//! # The supersampled cases, and the standard they answer to
+//!
+//! Two case shapes render the GL arm at a higher resolution than the kit can:
+//!
+//! * The **fourth gauge case per skin** runs at `scale = 2`, which is
+//!   `GaugeConfig::default()` and therefore every dial on the glass (#1148
+//!   review, HIGH-2).
+//! * The **fifth dot-matrix case per skin** takes the same readout and gives
+//!   the *area* twice its natural size, which is what layout does to a chip in
+//!   a container wider than its grid (`GlSurface::measure` asks for a minimum
+//!   of `0` on purpose) — and what a `scale_factor >= 2` screen does to every
+//!   chip on it, since `GlSurface`'s allocation is in **device** pixels. See
+//!   [`STRETCH`].
+//!
+//! Neither can be compared naively — the GL arm is rasterising at twice the
+//! density *on purpose*, which is the whole of #1090's and #1144's fix — so the
+//! harness box-averages the native readback back down to the kit's logical
 //! grid (`parity::box_downsample`) and then holds it to the split that
 //! difference is supposed to have: **every pixel off a rasterisation edge is
-//! bit-identical to the kit's**, and the edge region has its own budget.
-//! Measured on llvmpipe, all four land exactly there — field and lit interiors
-//! at `max |Δ| 0`, an edge mean of 6.1 to 9.4 — which is a sharper statement
-//! than #893's ceiling could make about them, and one #893's ceiling itself
-//! would fail (a dial is nearly a third edge pixels). A dropped half-pixel
-//! offset, an unscaled length, a doubled mask pitch or a mis-scaled bloom is
-//! what breaks it. See `preem_gl::gauge` and `preem_gl::parity`'s
-//! `Kind`/`Sampling`/`case_verdict`.
-//!
-//! The dot matrix has no `scale` at all — the dot pitch is its size knob
-//! (#1091), so at the natural size both arms fill the same buffer and the
-//! question does not arise. What its four cases vary instead is the *line* and
-//! the *pitch*, which is where its own arithmetic lives; see `DisplayAt`.
+//! bit-identical to the kit's** (`FAIL(interior)`), and the edge region is
+//! inside a per-kind budget calibrated from measurement (`FAIL(edges)`).
+//! Measured on llvmpipe, all eight land exactly there — field and lit interiors
+//! at `max |Δ| 0`, an edge mean of 4.4 to 10.6 on the dot matrix and 6.1 to 9.4
+//! on the gauge — which is a sharper statement than #893's ceiling could make
+//! about them, and one #893's ceiling itself would fail (a dial is nearly a
+//! third edge pixels, and on a dot matrix every lit pixel is one). A dropped
+//! half-pixel offset, an unscaled length, a doubled mask pitch, a mis-scaled
+//! bloom or a lattice that stopped being evaluated at the fragment's own
+//! position is what breaks it. See `preem_gl::gauge`, `preem_gl::dot_matrix`
+//! and `preem_gl::parity`'s `Kind`/`Sampling`/`case_verdict`.
 //!
 //! ```sh
 //! nix develop --command cargo run -p trollshell --example preem_gl_diff
@@ -217,6 +231,24 @@ const DOT_PX: u32 = 4;
 /// `MIN_DOT_PX` — see [`DisplayAt::Dense`].
 const DENSE_DOT_PX: u32 = 2;
 
+/// How much bigger than the kit's buffer the **stretched** dot-matrix case
+/// sizes its area — the one case that measures the improvement rather than the
+/// agreement.
+///
+/// `GlSurface::measure` requests a minimum of `0` on both axes on purpose ("so
+/// CSS/layout can scale the surface above its grid size, which is the whole LCD
+/// look"), so this is a real configuration and not a contrived one: it is what
+/// a readout in a container wider than its natural size gets. At `2` the GL arm
+/// rasterises the dot lattice into four screen pixels per kit pixel; the
+/// readback is box-averaged back down to the kit's grid before the comparison,
+/// so what is measured is "the same picture, drawn with more samples".
+///
+/// It is deliberately **not** held to the bit-exact pin, nor to #893's
+/// ceiling: it is box-averaged onto the kit's grid and then held to a
+/// bit-identical interior plus an edge budget — see
+/// [`Case::sampling`] and `parity::case_verdict`.
+const STRETCH: u32 = 2;
+
 /// Whether any case failed, for [`main`]'s exit status.
 ///
 /// A process-global rather than a value threaded out of `activate`, because
@@ -343,6 +375,9 @@ enum Case {
     DotMatrix {
         style: kit::DisplayStyle,
         display: DisplayAt,
+        /// How many times the area's size request exceeds the kit's buffer —
+        /// see [`STRETCH`]. `1` for every case but the stretched one.
+        stretch: u32,
     },
 }
 
@@ -454,6 +489,9 @@ impl Case {
     fn sampling(&self) -> parity::Sampling {
         match self {
             Self::Gauge { scale, .. } if *scale > 1 => parity::Sampling::Supersampled(*scale),
+            Self::DotMatrix { stretch, .. } if *stretch > 1 => {
+                parity::Sampling::Supersampled(*stretch)
+            }
             _ => parity::Sampling::OneToOne,
         }
     }
@@ -469,19 +507,29 @@ impl Case {
         match self {
             Self::Scope { .. } => (SCOPE_COLS, SCOPE_ROWS, SCOPE_SCALE),
             Self::Gauge { scale, .. } => (GAUGE_COLS, GAUGE_ROWS, *scale),
-            Self::DotMatrix { style, display } => {
+            Self::DotMatrix {
+                style,
+                display,
+                stretch,
+            } => {
                 let (line, dot_px) = display.line();
                 let surface = dot_matrix::dot_matrix_surface(
                     dot_matrix_config(*style, dot_px),
                     &dot_matrix::glyphs(line),
                     &kit::palette_snapshot(*style),
                 );
-                (surface.width, surface.height, 1)
+                (surface.width, surface.height, (*stretch).max(1))
             }
         }
     }
 
     /// The natural size in logical pixels — what the area is sized to.
+    ///
+    /// For a supersampled case that is the *GL* arm's size, above the CPU
+    /// reference's: the gauge renders `scale ×` larger internally and the
+    /// stretched dot matrix is simply handed a bigger allocation. Either way
+    /// the readback is box-averaged back onto the reference grid before
+    /// anything is compared — see [`Case::sampling`].
     fn natural(&self) -> (u32, u32) {
         let (cols, rows, scale) = self.geometry();
         (cols * scale, rows * scale)
@@ -584,8 +632,20 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
             .map(move |display| Case::DotMatrix {
                 style: *style,
                 display,
+                stretch: 1,
             });
-            scopes.chain(gauges).chain(shipping).chain(displays)
+            // …and the same readout given more room than its natural size,
+            // which is where the improvement actually lives (#1144).
+            let stretched = std::iter::once(Case::DotMatrix {
+                style: *style,
+                display: DisplayAt::Readout,
+                stretch: STRETCH,
+            });
+            scopes
+                .chain(gauges)
+                .chain(shipping)
+                .chain(displays)
+                .chain(stretched)
         })
         .collect();
 
@@ -596,8 +656,16 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
     // moves per case (the two kinds run at different grids) and an area GTK
     // could not give its requested size would be compared against a reference
     // of a different shape. `measure` says so out loud if that ever happens.
-    let widest = cases.iter().map(|case| case.natural().0).max().unwrap_or(1);
-    let tallest = cases.iter().map(|case| case.natural().1).max().unwrap_or(1);
+    let widest = cases
+        .iter()
+        .map(|case| case.natural().0)
+        .max()
+        .unwrap_or(1);
+    let tallest = cases
+        .iter()
+        .map(|case| case.natural().1)
+        .max()
+        .unwrap_or(1);
     let width = i32::try_from(widest).unwrap_or(i32::MAX);
     let height = i32::try_from(tallest).unwrap_or(i32::MAX);
 
@@ -739,10 +807,21 @@ impl Runner {
     fn summary(&self) {
         println!("-- summary --");
         if self.failures.get() == 0 {
+            // The supersampled cases are counted here — they are cases that
+            // can fail like any other — but they answer to a different
+            // standard, so the sentence says which of the two things it is
+            // claiming about how many. See `parity::case_verdict`.
+            let supersampled = self
+                .cases
+                .iter()
+                .filter(|case| case.sampling() != parity::Sampling::OneToOne)
+                .count();
             println!(
-                "PASS all {} case(s) — the 1:1 ones inside the proposed ceiling on every \
-                 channel, the box-averaged ones bit-identical off every edge",
-                self.cases.len()
+                "PASS all {} case(s) — {} 1:1 ones inside the proposed ceiling on every \
+                 channel, {supersampled} box-averaged ones bit-identical off every edge \
+                 and inside their edge budget",
+                self.cases.len(),
+                self.cases.len() - supersampled,
             );
         } else {
             println!(
@@ -836,7 +915,8 @@ fn label(case: &Case) -> String {
     match case {
         Case::Scope { style, idle_steps } => format!("scope.{}.idle{idle_steps}", style.name()),
         // The upscale is in the name only where it is not the 1:1 comparison,
-        // so the twelve pinned cases keep the labels #1143's transcripts carry.
+        // so the pinned cases keep the labels #1143's and #1144's transcripts
+        // carry.
         Case::Gauge {
             style,
             needle,
@@ -847,7 +927,12 @@ fn label(case: &Case) -> String {
             needle,
             scale,
         } => format!("gauge.{}.{}.x{scale}", style.name(), needle.name()),
-        Case::DotMatrix { style, display } => {
+        Case::DotMatrix {
+            style,
+            display,
+            stretch,
+        } if *stretch > 1 => format!("dot_matrix.{}.{}x{stretch}", style.name(), display.name()),
+        Case::DotMatrix { style, display, .. } => {
             format!("dot_matrix.{}.{}", style.name(), display.name())
         }
     }
@@ -895,7 +980,7 @@ fn drive(area: &GlSurface, case: &Case) {
                 surface.uniforms,
             )
         }
-        Case::DotMatrix { style, display } => {
+        Case::DotMatrix { style, display, .. } => {
             let (line, dot_px) = display.line();
             let surface = dot_matrix::dot_matrix_surface(
                 dot_matrix_config(*style, dot_px),
@@ -910,10 +995,15 @@ fn drive(area: &GlSurface, case: &Case) {
             )
         }
     };
-    // Per case, because the two kinds run at different grids — see `activate`.
+    // Per case, because the kinds run at different grids — see `activate`. The
+    // **requested** size, not the grid: a stretched case (#1144) deliberately
+    // asks for more room than the surface's natural size so the blit rasterises
+    // the lattice at a higher resolution, which is what `Case::stretch`
+    // exists to arrange and what `measure` box-averages back down.
+    let (request_w, request_h) = case.natural();
     area.set_size_request(
-        i32::try_from(width).unwrap_or(i32::MAX),
-        i32::try_from(height).unwrap_or(i32::MAX),
+        i32::try_from(request_w).unwrap_or(i32::MAX),
+        i32::try_from(request_h).unwrap_or(i32::MAX),
     );
     area.set_state(program, width, height, &std::sync::Arc::new(uniforms));
 }
@@ -992,7 +1082,7 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
         Case::Gauge { style, needle, .. } => {
             gauge_state(gauge_config(*style, upscale), *needle).render(*style)
         }
-        Case::DotMatrix { style, display } => {
+        Case::DotMatrix { style, display, .. } => {
             let (line, dot_px) = display.line();
             kit::DotMatrix::new(*style)
                 .dot_px(dot_px as usize)
@@ -1000,11 +1090,11 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
         }
     };
 
-    let natural = case.natural();
-    let expected = (natural.0 * shot.scale, natural.1 * shot.scale);
+    let requested = case.natural();
+    let expected = (requested.0 * shot.scale, requested.1 * shot.scale);
     if shot.alloc != expected {
         println!(
-            "INFO {label}: allocation {}x{} is not the natural size {}x{} — \
+            "INFO {label}: allocation {}x{} is not the requested size {}x{} — \
              the window manager overrode the size request, so point sampling \
              differs and the numbers below are not a fair comparison",
             shot.alloc.0, shot.alloc.1, expected.0, expected.1
@@ -1070,7 +1160,7 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
             channel.mean,
             channel.p99,
             channel.max,
-            if channel.inside_ceiling() {
+            if channel.inside_ceiling() || !gated {
                 ""
             } else {
                 "   <-- outside the ceiling"

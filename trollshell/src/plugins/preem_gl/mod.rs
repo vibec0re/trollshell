@@ -4,11 +4,13 @@
 //!
 //! The pipelines themselves and their pure `state → GlUniforms` mappings live
 //! one module per kind — [`program`] for the `Scope`, [`gauge`] for the
-//! `Gauge` (#1143) — each referencing nothing above it, so the parity harness
-//! can `#[path]`-include the same code the shell runs. Everything that needs
-//! the *shell* — the kill switch, the fallback latch — is here, and it is
-//! deliberately kind-agnostic: a third kind is a module, a `register` line and
-//! a `preem_render` arm, with nothing in this file to change.
+//! `Gauge` (#1143), [`dot_matrix`] for the `DotMatrix` (#1144) — each
+//! referencing nothing above it, so the parity harness can `#[path]`-include
+//! the same code the shell runs. Everything that needs the *shell* — the kill
+//! switch, the fallback latch — is here, and it is deliberately kind-agnostic.
+//! #1143 predicted "a third kind is a module, a `register` line and a
+//! `preem_render` arm, with nothing in this file to change"; #1144 was exactly
+//! that, so the prediction now reads as a measurement.
 //!
 //! # The switch: GL is the default, `TROLLSHELL_PREEM_RENDERER=cpu` is the kill switch
 //!
@@ -48,8 +50,9 @@
 //! The CPU arm is used in three cases, and only these:
 //!
 //! 1. the switch names `cpu`;
-//! 2. the widget kind has no GL arm — everything but `Scope` and `Gauge`
-//!    today (#1143 added the second; #1144 is the third);
+//! 2. the widget kind has no GL arm — everything but `Scope`, `Gauge` and
+//!    `DotMatrix` today (#1143 added the second, #1144 the third, and #865's
+//!    "lets pause after those" is where the list stops until Annika says);
 //! 3. **a GL context could not be created**, which `hytte-ui` latches and
 //!    reports through the hook installed in [`install`]. Falling back is free
 //!    here in a way it is not for #893's shader widget: a kit widget *has* a
@@ -76,6 +79,7 @@
 //! `advance` and `animates` arms outright and differ only in what they hand
 //! the reconciler.
 
+mod dot_matrix;
 mod gauge;
 mod program;
 
@@ -90,6 +94,9 @@ mod program;
 #[cfg(test)]
 mod parity;
 
+pub(super) use dot_matrix::{
+    DOT_MATRIX, DOT_MATRIX_PIPELINE, Glyphs, dot_matrix_surface, glyphs as encode_glyphs,
+};
 pub(super) use gauge::{GAUGE, GAUGE_PIPELINE, gauge_surface};
 pub(super) use program::{KitSurface, SCOPE, SCOPE_PIPELINE, scope_surface};
 
@@ -102,8 +109,8 @@ pub(super) const RENDERER_ENV: &str = "TROLLSHELL_PREEM_RENDERER";
 ///
 /// **Per kind, not per widget** — one answer for the whole preem renderer, and
 /// `preem_render::build` consults it in each arm that *has* a GL pipeline.
-/// Since #1143 that is the `Scope` and the `Gauge`; every other kind takes
-/// [`Arm::Cpu`] because there is nothing else to take.
+/// Since #1144 that is the `Scope`, the `Gauge` and the `DotMatrix`; every
+/// other kind takes [`Arm::Cpu`] because there is nothing else to take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Arm {
     /// A `GtkGLArea` running one of the pipelines [`install`] registers — the
@@ -270,6 +277,7 @@ fn configured_arm() -> Arm {
 pub(super) fn install() {
     hytte::ui::gl_surface::register(SCOPE, SCOPE_PIPELINE);
     hytte::ui::gl_surface::register(GAUGE, GAUGE_PIPELINE);
+    hytte::ui::gl_surface::register(DOT_MATRIX, DOT_MATRIX_PIPELINE);
     hytte::ui::gl_surface::set_context_failure_handler(|_reason| {
         // `hytte-ui` has already logged the reason once. What is left for the
         // host is to make the fallback actually reach the screen, and that is

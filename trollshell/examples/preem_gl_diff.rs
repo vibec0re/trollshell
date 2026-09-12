@@ -4,12 +4,13 @@
 //! per-channel delta, so the ceiling the spec proposes — mean ≤ 2/255,
 //! p99 ≤ 8/255, max ≤ 32/255 — is a measurement rather than a hope.
 //!
-//! Two kinds since #1143: the `Scope` (four skins × three fade depths) and the
+//! Three kinds since #1144: the `Scope` (four skins × three fade depths), the
 //! `Gauge` (four skins × three needle positions, plus one at the **shipping**
-//! upscale). The three-per-skin gauge cases run at `scale = 1`, where the GL
-//! arm's native grid and the kit's logical one are the same number and the two
-//! can be compared pixel against pixel — that is where
-//! `TROLLSHELL_PARITY_EXACT=1` pins both kinds at zero.
+//! upscale) and the `DotMatrix` (four skins × four displays). The
+//! three-per-skin gauge cases run at `scale = 1`, where the GL arm's native
+//! grid and the kit's logical one are the same number and the two can be
+//! compared pixel against pixel — that is where `TROLLSHELL_PARITY_EXACT=1`
+//! pins them at zero.
 //!
 //! The fourth gauge case per skin runs at `scale = 2`, which is
 //! `GaugeConfig::default()` and therefore every dial on the glass (#1148
@@ -26,6 +27,11 @@
 //! offset, an unscaled length, a doubled mask pitch or a mis-scaled bloom is
 //! what breaks it. See `preem_gl::gauge` and `preem_gl::parity`'s
 //! `Kind`/`Sampling`/`case_verdict`.
+//!
+//! The dot matrix has no `scale` at all — the dot pitch is its size knob
+//! (#1091), so at the natural size both arms fill the same buffer and the
+//! question does not arise. What its four cases vary instead is the *line* and
+//! the *pitch*, which is where its own arithmetic lives; see `DisplayAt`.
 //!
 //! ```sh
 //! nix develop --command cargo run -p trollshell --example preem_gl_diff
@@ -147,6 +153,10 @@ mod parity;
 // one module down from a crate root.
 #[path = "../src/plugins/preem_gl/gauge.rs"]
 mod gauge;
+// The dot matrix's pipeline and mapping (#1144), included the same way and for
+// the same reason.
+#[path = "../src/plugins/preem_gl/dot_matrix.rs"]
+mod dot_matrix;
 
 /// Logical grid the **scope** cases run at. Small enough to keep the whole
 /// comparison on screen at 1× and wide enough that the graticule's 12-column
@@ -195,6 +205,18 @@ const GAUGE_SCALE: u32 = 1;
 /// move the field, not only the edges.
 const GAUGE_SUPERSAMPLE: u32 = 2;
 
+/// The dot pitch the **dot matrix** cases run at — the kit's `DEFAULT_DOT_PX`,
+/// which is what every caller written before #1091 renders at and what the
+/// kit's own golden digests were recorded against.
+///
+/// There is no `scale` on this widget: the pitch *is* the size knob, so the
+/// kit's buffer is already the one both arms fill and the gauge's "which
+/// resolution are we comparing at" question does not arise. What varies instead
+/// is the pitch, and [`DisplayAt::Dense`] is the other end of it.
+const DOT_PX: u32 = 4;
+/// `MIN_DOT_PX` — see [`DisplayAt::Dense`].
+const DENSE_DOT_PX: u32 = 2;
+
 /// Whether any case failed, for [`main`]'s exit status.
 ///
 /// A process-global rather than a value threaded out of `activate`, because
@@ -218,6 +240,7 @@ fn main() -> glib::ExitCode {
         "scope {SCOPE_COLS}x{SCOPE_ROWS} scale {SCOPE_SCALE} persistence {PERSISTENCE}; \
          gauge {GAUGE_COLS}x{GAUGE_ROWS} scale {GAUGE_SCALE} and {GAUGE_SUPERSAMPLE} \
          (box-averaged down); \
+         dot matrix pitch {DOT_PX} (and {DENSE_DOT_PX}); \
          ceiling mean {} / p99 {} / max {} per channel",
         parity::CEILING_MEAN,
         parity::CEILING_P99,
@@ -316,6 +339,57 @@ enum Case {
         /// native frame against the kit's logical one.
         scale: u32,
     },
+    /// A `DotMatrix` showing one line at one pitch (#1144).
+    DotMatrix {
+        style: kit::DisplayStyle,
+        display: DisplayAt,
+    },
+}
+
+/// What a dot-matrix case puts on the display.
+///
+/// Four, chosen to cover what the shader has to get right: the degenerate
+/// buffer, the ordinary readout, the font's fallback path, and the pitch at
+/// which the CRT comb has to be **re-phased** or it stops being a raster
+/// (#1091). Each is the same lattice arithmetic at a different corner of it.
+#[derive(Clone, Copy)]
+enum DisplayAt {
+    /// The empty string: bezel only, no strip, no lit pixel — `2*pad` × `9*dot`.
+    /// The one case where `u_data_len` is `0` and the shader must draw the
+    /// field rather than sample an unbound texture.
+    Blank,
+    /// An ordinary readout at the default pitch: the ghost lattice, lit glyphs,
+    /// the skin's halo, and the comb where the kit's own golden digests have it.
+    Readout,
+    /// Accented glyphs, a space and an uncovered char — so the hollow `NOTDEF`
+    /// box reaches the strip encoder and the shader end to end.
+    Notdef,
+    /// The same readout at `MIN_DOT_PX`, where every pixel of a dot sits on the
+    /// falloff plateau (a solid block, no rim) **and** the CRT comb is re-phased
+    /// onto a 2-row grid. A fixed 4-row comb here is interference, not a raster.
+    Dense,
+}
+
+impl DisplayAt {
+    /// The word in the case label and on its evidence files.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Blank => "blank",
+            Self::Readout => "readout",
+            Self::Notdef => "notdef",
+            Self::Dense => "dense",
+        }
+    }
+
+    /// `(line, dot pitch)`.
+    fn line(self) -> (&'static str, u32) {
+        match self {
+            Self::Blank => ("", DOT_PX),
+            Self::Readout => ("PREEM 88:88", DOT_PX),
+            Self::Notdef => ("\u{e5}\u{e4}\u{f6} \u{1f495}", DOT_PX),
+            Self::Dense => ("PREEM 88:88", DENSE_DOT_PX),
+        }
+    }
 }
 
 /// Where a gauge case's needle is when the frame is taken.
@@ -367,14 +441,16 @@ impl Case {
         match self {
             Self::Scope { .. } => parity::Kind::Scope,
             Self::Gauge { .. } => parity::Kind::Gauge,
+            Self::DotMatrix { .. } => parity::Kind::DotMatrix,
         }
     }
 
     /// How the two buffers are brought to one grid — see `parity::Sampling`.
     ///
-    /// Every scope case and the `scale = 1` gauge cases compare pixel against
-    /// pixel. The gauge's shipping-scale cases render `factor`× larger and are
-    /// box-averaged down, which is a comparison the exact pin cannot apply to.
+    /// Every scope case, every dot-matrix case and the `scale = 1` gauge cases
+    /// compare pixel against pixel. The gauge's shipping-scale cases render
+    /// `factor`× larger and are box-averaged down, which is a comparison the
+    /// exact pin cannot apply to.
     fn sampling(&self) -> parity::Sampling {
         match self {
             Self::Gauge { scale, .. } if *scale > 1 => parity::Sampling::Supersampled(*scale),
@@ -384,10 +460,24 @@ impl Case {
 
     /// `(logical cols, logical rows, integer upscale)` — the upscale the **GL**
     /// arm renders at.
+    ///
+    /// A dot matrix has no upscale at all, so its `1` is a statement rather
+    /// than a setting, and its grid is whatever the line and the pitch make —
+    /// resolved through the same `dot_matrix_surface` the shell calls, so this
+    /// cannot drift from what the area is actually driven with.
     fn geometry(&self) -> (u32, u32, u32) {
         match self {
             Self::Scope { .. } => (SCOPE_COLS, SCOPE_ROWS, SCOPE_SCALE),
             Self::Gauge { scale, .. } => (GAUGE_COLS, GAUGE_ROWS, *scale),
+            Self::DotMatrix { style, display } => {
+                let (line, dot_px) = display.line();
+                let surface = dot_matrix::dot_matrix_surface(
+                    dot_matrix_config(*style, dot_px),
+                    &dot_matrix::glyphs(line),
+                    &kit::palette_snapshot(*style),
+                );
+                (surface.width, surface.height, 1)
+            }
         }
     }
 
@@ -456,6 +546,7 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
     // pipeline constant — the harness drives the shipping pipeline, not a copy.
     hytte::ui::gl_surface::register(program::SCOPE, program::SCOPE_PIPELINE);
     hytte::ui::gl_surface::register(gauge::GAUGE, gauge::GAUGE_PIPELINE);
+    hytte::ui::gl_surface::register(dot_matrix::DOT_MATRIX, dot_matrix::DOT_MATRIX_PIPELINE);
 
     let cases: Vec<Case> = skins
         .iter()
@@ -483,7 +574,18 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
                 needle: NeedleAt::Sweeping,
                 scale: GAUGE_SUPERSAMPLE,
             });
-            scopes.chain(gauges).chain(shipping)
+            let displays = [
+                DisplayAt::Blank,
+                DisplayAt::Readout,
+                DisplayAt::Notdef,
+                DisplayAt::Dense,
+            ]
+            .into_iter()
+            .map(move |display| Case::DotMatrix {
+                style: *style,
+                display,
+            });
+            scopes.chain(gauges).chain(shipping).chain(displays)
         })
         .collect();
 
@@ -722,6 +824,13 @@ fn gauge_config(style: kit::DisplayStyle, scale: u32) -> vocab::GaugeConfig {
     }
 }
 
+fn dot_matrix_config(style: kit::DisplayStyle, dot_px: u32) -> vocab::DotMatrixConfig {
+    vocab::DotMatrixConfig {
+        style: style_ref(style),
+        dot_px,
+    }
+}
+
 /// One case's name in the transcript and on its evidence files.
 fn label(case: &Case) -> String {
     match case {
@@ -738,6 +847,9 @@ fn label(case: &Case) -> String {
             needle,
             scale,
         } => format!("gauge.{}.{}.x{scale}", style.name(), needle.name()),
+        Case::DotMatrix { style, display } => {
+            format!("dot_matrix.{}.{}", style.name(), display.name())
+        }
     }
 }
 
@@ -778,6 +890,20 @@ fn drive(area: &GlSurface, case: &Case) {
             );
             (
                 gauge::GAUGE,
+                surface.width,
+                surface.height,
+                surface.uniforms,
+            )
+        }
+        Case::DotMatrix { style, display } => {
+            let (line, dot_px) = display.line();
+            let surface = dot_matrix::dot_matrix_surface(
+                dot_matrix_config(*style, dot_px),
+                &dot_matrix::glyphs(line),
+                &kit::palette_snapshot(*style),
+            );
+            (
+                dot_matrix::DOT_MATRIX,
                 surface.width,
                 surface.height,
                 surface.uniforms,
@@ -865,6 +991,12 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
         }
         Case::Gauge { style, needle, .. } => {
             gauge_state(gauge_config(*style, upscale), *needle).render(*style)
+        }
+        Case::DotMatrix { style, display } => {
+            let (line, dot_px) = display.line();
+            kit::DotMatrix::new(*style)
+                .dot_px(dot_px as usize)
+                .render(line)
         }
     };
 

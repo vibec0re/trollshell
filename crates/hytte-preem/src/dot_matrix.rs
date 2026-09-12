@@ -361,6 +361,82 @@ impl DotMatrix {
     }
 }
 
+// ── the dot hardware as plain data (#1144) ──────────────────────────────────
+
+/// One dot cell's **radial falloff**, as plain, public data — what a renderer
+/// outside this crate needs to draw the same dot somewhere else.
+///
+/// [`Dots`] itself is `pub(super)` and stays that way: it is the kit's own
+/// internal currency, shared with [`Marquee`](super::Marquee), and widening it
+/// would make every field a compatibility promise. What #1144's GPU renderer
+/// needs is narrower and honest as a snapshot — the clamped pitch and the
+/// intensity at each pixel of the cell — so it gets a copy through
+/// [`dot_cell`], exactly the way [`palette_snapshot`](super::palette_snapshot)
+/// hands out a [`Palette`](super::PaletteSnapshot).
+///
+/// **Additive only.** Nothing in the kit reads this type; no render path
+/// changed to produce it. It is a projection of [`Dots`], and
+/// `the_published_cell_is_the_falloff_the_kit_stamps` asserts that projection
+/// is exact, so the two cannot drift without going red.
+///
+/// The cell is square and `pitch`×`pitch`; the array behind it is a fixed
+/// [`MAX_DOT_PX`]² so the whole thing stays `Copy`, which is why the intensity
+/// is read through [`at`](Self::at) rather than exposed as a field a caller
+/// could index past the live corner of.
+///
+/// ```
+/// use hytte_preem::dot_cell;
+///
+/// // The 4×4 table the kit has stamped since #356.
+/// let cell = dot_cell(4);
+/// assert_eq!(cell.pitch(), 4);
+/// assert_eq!(cell.at(0, 0), 25);
+/// assert_eq!(cell.at(1, 1), 255);
+/// // …and nothing outside it: the kit paints no pixel there.
+/// assert_eq!(cell.at(4, 0), 0);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DotCell {
+    pitch: usize,
+    intensity: [[u16; MAX_DOT_PX]; MAX_DOT_PX],
+}
+
+impl DotCell {
+    /// The cell's edge length in buffer pixels — the requested pitch after
+    /// [`MIN_DOT_PX`]`..=`[`MAX_DOT_PX`] clamping, i.e. what
+    /// [`DotMatrix::dot_px`] would have rendered at.
+    #[must_use]
+    pub const fn pitch(self) -> usize {
+        self.pitch
+    }
+
+    /// The intensity (`0..=255`) the kit stamps at pixel (`i`, `j`) of the
+    /// cell, and `0` for a pixel outside it — the kit paints none there, so
+    /// that is the honest answer rather than a panic.
+    #[must_use]
+    pub fn at(self, i: usize, j: usize) -> u16 {
+        if i >= self.pitch || j >= self.pitch {
+            return 0;
+        }
+        self.intensity[j][i]
+    }
+}
+
+/// The dot falloff [`DotMatrix`] (and [`Marquee`](super::Marquee)) stamps at
+/// `dot_px`, as plain data.
+///
+/// Clamped exactly as [`DotMatrix::dot_px`] clamps it, so a caller that hands
+/// the wire's value straight in gets the cell the kit would actually have
+/// drawn. See [`DotCell`] for why this exists and what holds it to the kit.
+#[must_use]
+pub fn dot_cell(dot_px: usize) -> DotCell {
+    let dots = Dots::new(dot_px);
+    DotCell {
+        pitch: dots.dot(),
+        intensity: dots.falloff,
+    }
+}
+
 /// Render one line of `text` as a dot-matrix display in `style`, at the
 /// [`DEFAULT_DOT_PX`] pitch.
 ///
@@ -404,6 +480,36 @@ mod tests {
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
         hash
+    }
+
+    /// #1144's: [`dot_cell`](super::dot_cell) is a **projection** of what the
+    /// kit stamps, not a second table.
+    ///
+    /// The published cell has to be the one `ghost_dot`/`lit_dot` read, at
+    /// every pitch and every pixel — including the clamped pitches, where the
+    /// caller's number and the kit's differ — and it has to read `0` outside
+    /// the live corner rather than whatever the fixed `MAX_DOT_PX²` array
+    /// happens to hold there.
+    ///
+    /// **Falsified** by returning `Dots::default()`'s cell regardless of
+    /// `dot_px`, by dropping the clamp, or by letting `at` index past `pitch`.
+    #[test]
+    fn the_published_cell_is_the_falloff_the_kit_stamps() {
+        for requested in 0..=12 {
+            let dots = Dots::new(requested);
+            let cell = super::dot_cell(requested);
+            assert_eq!(cell.pitch(), dots.dot(), "pitch {requested} is clamped");
+            for j in 0..MAX_DOT_PX {
+                for i in 0..MAX_DOT_PX {
+                    let want = if i < dots.dot() && j < dots.dot() {
+                        dots.falloff[j][i]
+                    } else {
+                        0
+                    };
+                    assert_eq!(cell.at(i, j), want, "pitch {requested}, cell ({i},{j})");
+                }
+            }
+        }
     }
 
     /// #1091's load-bearing test: the **computed** falloff at the default pitch

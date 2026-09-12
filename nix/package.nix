@@ -77,16 +77,62 @@ let
   # crane src filter means editing an icon or any other stylesheet doesn't
   # invalidate the expensive Rust build — only the trivial `assets`
   # derivation + the wrapper rebuild (#133).
+
+  # Per-entry predicate, ignoring directory ancestry: does THIS path, on its
+  # own, belong in the filtered source. `craneLib.filterCargoSources` ends
+  # with `type == "directory" || …`, i.e. every directory unconditionally
+  # passes — that's fine here because `keepEntry` is only ever asked about
+  # non-directory entries below (`hasKeptDescendant`'s `else` branch); asking
+  # it about a directory would just get the unconditional `true` back and
+  # defeat the pruning this file exists to do.
+  keepEntry =
+    path: type:
+    (craneLib.filterCargoSources path type)
+    || (lib.hasInfix "/tests/fixtures/" path)
+    || (lib.hasSuffix "assets/hytte-ui/style.css" path)
+    || (lib.hasSuffix ".vert" path)
+    || (lib.hasSuffix ".frag" path);
+
+  # #1128: a directory belongs in the filtered source only if something
+  # beneath it does. Without this, `lib.cleanSourceWith`/`builtins.path` keep
+  # every directory `keepEntry` waves through (which, per the crane behaviour
+  # above, is ALL of them) even when none of its descendants match — so an
+  # empty `nix/checks/`, a `docs/` folder, or a new fixtures dir survives as a
+  # bare entry in `trollshell-source`, changes that directory's own NAR hash,
+  # and rehashes `workspace` (and everything sliced from it) for a folder that
+  # holds no compiled input.
+  #
+  # This walks the REAL tree with `builtins.readDir` (not the filtered one —
+  # there is no such thing yet while this predicate is still deciding it), one
+  # `readDir` per directory, recursing into subdirectories and asking
+  # `keepEntry` of everything else. That is chosen over excluding known-empty
+  # trees by name (`nix/`, `docs/`, `etc/`, …) — the other acceptable shape
+  # per #1128 — because a name list has to be complete by inspection and
+  # re-audited every time a tree gains its first kept file (`assets/` already
+  # needs two carve-outs above); this is exact by construction; it can only
+  # ever prune a directory that is genuinely empty of kept files. It costs one
+  # extra subtree walk per directory beyond the walk `cleanSourceWith` already
+  # does, bounded by this repo's size (a few hundred files, a few dozen
+  # directories) — measured at a fraction of a second in the PR body — not
+  # memoized because at this size it doesn't need to be.
+  hasKeptDescendant =
+    path:
+    let
+      entries = builtins.readDir path;
+    in
+    lib.any (
+      name:
+      let
+        childPath = path + "/${name}";
+        childType = entries.${name};
+      in
+      if childType == "directory" then hasKeptDescendant childPath else keepEntry childPath childType
+    ) (builtins.attrNames entries);
+
   src = lib.cleanSourceWith {
     src = ../.;
     name = "trollshell-source";
-    filter =
-      path: type:
-      (craneLib.filterCargoSources path type)
-      || (lib.hasInfix "/tests/fixtures/" path)
-      || (lib.hasSuffix "assets/hytte-ui/style.css" path)
-      || (lib.hasSuffix ".vert" path)
-      || (lib.hasSuffix ".frag" path);
+    filter = path: type: if type == "directory" then hasKeptDescendant path else keepEntry path type;
   };
 
   # Standalone assets derivation: depends ONLY on the asset files, so editing a

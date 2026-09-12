@@ -441,7 +441,7 @@ mod tests {
                         arc_in,
                         "({x},{y}): the arc only ever adds material, never removes it",
                     );
-                    let corner_band = (x < 5 || x >= 64) && (y < 5 || y >= 6);
+                    let corner_band = !(5..64).contains(&x) && !(5..6).contains(&y);
                     assert!(corner_band, "({x},{y}) is not in a corner");
                 }
             }
@@ -478,7 +478,8 @@ mod tests {
         );
 
         let bits = |cell: usize, col: usize| texel(&strip, cell, col);
-        let notdef = |cell: usize| (0..kit::font::GLYPH_W).all(|c| bits(cell, c) >> NOTDEF_BIT == 1);
+        let notdef =
+            |cell: usize| (0..kit::font::GLYPH_W).all(|c| bits(cell, c) >> NOTDEF_BIT == 1);
         // "hi 💕" wraps to one line of four cells plus two blank ones.
         assert!(!notdef(0), "'h' is covered");
         assert!(!notdef(1), "'i' is covered");
@@ -587,7 +588,13 @@ mod tests {
         let layout = boxed.layout("hi");
         let surface = textbox_surface(&layout, &block(&layout));
         let set: Vec<&str> = surface.uniforms.values.iter().map(|(n, _)| *n).collect();
-        let host = ["u_grid", "u_viewport", "u_data_len", "u_step_back", "u_tex0"];
+        let host = [
+            "u_grid",
+            "u_viewport",
+            "u_data_len",
+            "u_step_back",
+            "u_tex0",
+        ];
         for line in BODY.lines() {
             let Some(rest) = line.trim().strip_prefix("uniform ") else {
                 continue;

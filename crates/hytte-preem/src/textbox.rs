@@ -560,7 +560,10 @@ mod tests {
                 // The colors are the ones the render can actually produce: a
                 // covered char draws `ink`, an uncovered one `notdef`.
                 let has = |c: [u8; 4]| frame.data().chunks_exact(4).any(|px| px == c);
-                if text.chars().any(|c| super::font::glyph(c).is_some() && c != ' ') {
+                if text
+                    .chars()
+                    .any(|c| super::font::glyph(c).is_some() && c != ' ')
+                {
                     assert!(has(ink), "{text:?} draws the published ink");
                 }
                 if text.contains('\u{1f495}') {

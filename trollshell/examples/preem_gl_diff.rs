@@ -985,7 +985,69 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
     hytte::ui::gl_surface::register(marquee::MARQUEE, marquee::MARQUEE_PIPELINE);
     hytte::ui::gl_surface::register(textbox::TEXTBOX, textbox::TEXTBOX_PIPELINE);
 
-    let cases: Vec<Case> = skins
+    let cases = cases_for(skins);
+
+    let area = GlSurface::new();
+    area.set_halign(gtk::Align::Center);
+    area.set_valign(gtk::Align::Center);
+    // The window has to hold the **largest** case, because the size request
+    // moves per case (the kinds run at different grids) and an area GTK
+    // could not give its requested size would be compared against a reference
+    // of a different shape. `measure` says so out loud if that ever happens.
+    let widest = cases.iter().map(|case| case.natural().0).max().unwrap_or(1);
+    let tallest = cases.iter().map(|case| case.natural().1).max().unwrap_or(1);
+    let width = i32::try_from(widest).unwrap_or(i32::MAX);
+    let height = i32::try_from(tallest).unwrap_or(i32::MAX);
+
+    let window = gtk::ApplicationWindow::builder()
+        .application(app)
+        .title("preem_gl_diff")
+        .default_width(width + 64)
+        .default_height(height + 64)
+        .child(&area)
+        .build();
+    window.present();
+
+    let evidence = out_dir();
+    if let Err(why) = std::fs::create_dir_all(&evidence) {
+        println!(
+            "INFO: no evidence images — {} is not writable ({why})",
+            evidence.display()
+        );
+    }
+    println!(
+        "evidence images -> {}/<case>.{{gl,cpu,delta}}.p[pg]m",
+        evidence.display()
+    );
+
+    // One case per *several* ticks — see [`Runner::step`].
+    let runner = Rc::new(Runner {
+        cases,
+        evidence,
+        exact,
+        index: std::cell::Cell::new(0),
+        phase: std::cell::Cell::new(0),
+        failures: std::cell::Cell::new(0),
+        first: RefCell::new(None),
+    });
+
+    glib::timeout_add_local(std::time::Duration::from_millis(60), {
+        let area = area.clone();
+        let app = app.clone();
+        move || runner.step(&area, &app)
+    });
+}
+
+/// Every case this run measures, in transcript order — four skins' worth of
+/// each kind's own state list.
+///
+/// Split out of [`activate`] so the **case list** is one findable thing rather
+/// than a third of a long function that also builds a window and arms a
+/// timeout. `nix/checks/system-tests.nix` asserts this list's length by
+/// counting evidence files; if you change it, change the number there in the
+/// same commit.
+fn cases_for(skins: &[kit::DisplayStyle]) -> Vec<Case> {
+    skins
         .iter()
         .flat_map(|style| {
             let scopes = [0_u32, 1, 5]
@@ -1088,57 +1150,7 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
                 .chain(bubbles)
                 .chain(stretched_bubble)
         })
-        .collect();
-
-    let area = GlSurface::new();
-    area.set_halign(gtk::Align::Center);
-    area.set_valign(gtk::Align::Center);
-    // The window has to hold the **largest** case, because the size request
-    // moves per case (the two kinds run at different grids) and an area GTK
-    // could not give its requested size would be compared against a reference
-    // of a different shape. `measure` says so out loud if that ever happens.
-    let widest = cases.iter().map(|case| case.natural().0).max().unwrap_or(1);
-    let tallest = cases.iter().map(|case| case.natural().1).max().unwrap_or(1);
-    let width = i32::try_from(widest).unwrap_or(i32::MAX);
-    let height = i32::try_from(tallest).unwrap_or(i32::MAX);
-
-    let window = gtk::ApplicationWindow::builder()
-        .application(app)
-        .title("preem_gl_diff")
-        .default_width(width + 64)
-        .default_height(height + 64)
-        .child(&area)
-        .build();
-    window.present();
-
-    let evidence = out_dir();
-    if let Err(why) = std::fs::create_dir_all(&evidence) {
-        println!(
-            "INFO: no evidence images — {} is not writable ({why})",
-            evidence.display()
-        );
-    }
-    println!(
-        "evidence images -> {}/<case>.{{gl,cpu,delta}}.p[pg]m",
-        evidence.display()
-    );
-
-    // One case per *several* ticks — see [`Runner::step`].
-    let runner = Rc::new(Runner {
-        cases,
-        evidence,
-        exact,
-        index: std::cell::Cell::new(0),
-        phase: std::cell::Cell::new(0),
-        failures: std::cell::Cell::new(0),
-        first: RefCell::new(None),
-    });
-
-    glib::timeout_add_local(std::time::Duration::from_millis(60), {
-        let area = area.clone();
-        let app = app.clone();
-        move || runner.step(&area, &app)
-    });
+        .collect()
 }
 
 /// The tick machine that walks the cases.

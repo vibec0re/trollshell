@@ -1434,7 +1434,13 @@ mod tests {
         ticker.edge.mean = 10.781;
         ticker.edge.max = 40;
         assert_eq!(
-            case_verdict(&edgy, &ticker, Kind::Marquee, Sampling::Supersampled(2), true),
+            case_verdict(
+                &edgy,
+                &ticker,
+                Kind::Marquee,
+                Sampling::Supersampled(2),
+                true
+            ),
             Verdict::Pass,
             "the stretched ticker's own worst llvmpipe measurement passes",
         );
@@ -1442,12 +1448,24 @@ mod tests {
         bubble.edge.mean = 14.016;
         bubble.edge.max = 180;
         assert_eq!(
-            case_verdict(&edgy, &bubble, Kind::TextBox, Sampling::Supersampled(2), true),
+            case_verdict(
+                &edgy,
+                &bubble,
+                Kind::TextBox,
+                Sampling::Supersampled(2),
+                true
+            ),
             Verdict::Pass,
             "…and so does the stretched bubble's",
         );
         assert_eq!(
-            case_verdict(&edgy, &bubble, Kind::Marquee, Sampling::Supersampled(2), true),
+            case_verdict(
+                &edgy,
+                &bubble,
+                Kind::Marquee,
+                Sampling::Supersampled(2),
+                true
+            ),
             Verdict::EdgeOverBudget,
             "**but not under the lattice kinds' pair**: a text box's corner \
              fragment is field-or-transparent with nothing in between, so its \

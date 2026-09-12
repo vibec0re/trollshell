@@ -2294,7 +2294,15 @@ fn dim(value: u32) -> usize {
 // about the contract: the `Option` *is* the placeholder seam, and collapsing it
 // would delete the unknown-widget path #883 is required to keep (and that
 // `an_unrenderable_preem_widget_degrades_to_an_empty_surface` covers).
-#[allow(clippy::unnecessary_wraps)]
+//
+// `too_many_lines` is [`Renderer::advance`]'s allow, for its reason and with
+// its history: this is one flat arm per widget kind with no nesting between
+// them, and it crossed the ceiling when #1152 gave two more kinds a second arm
+// each. Splitting it would put half the **construction** table somewhere else,
+// which is worse to read and worse to review than a long match — and this
+// function is also the one place a reader can see which kinds consult
+// [`preem_gl::arm`] at all.
+#[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
 fn build(widget: &vocab::PreemWidget) -> Option<Renderer> {
     use vocab::PreemWidget as W;
     #[cfg(test)]

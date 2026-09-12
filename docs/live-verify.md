@@ -2340,7 +2340,7 @@ session.
 
   1. **The bubble's corners are transparent, not black.** The most important
      item, and the one nothing in CI can see: the harness compares **R, G and
-     B** only, and the kit's corner cut is to *transparent* (`Frame::new`'s
+     B** only, and the kit's corner cut is to _transparent_ (`Frame::new`'s
      zeros). The GL arm writes `vec4(0,0,0,0)` there, which matches the kit
      byte for byte on the three compared channels whatever the alpha does — so
      open the pet's or caw's bubble over a **light** background and confirm the

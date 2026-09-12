@@ -10,13 +10,15 @@
 //! - [`own`](crate::own)'s acquisition-error streak, retrying everything on
 //!   the way to a `RequestName` *reply* — connect, subscribe, build the
 //!   `DBusProxy`, and `RequestName` itself.
-//! - Since #1173, the four **subscription-rebuild** loops, through
+//! - Since #1173, the **subscription-rebuild** loops, through
 //!   [`back_off_resubscribe`]: `property`'s `PropertiesChanged`, `signals`'
-//!   `receive_signal`, and `proxy`'s `NameOwnerChanged` subscribe and its
-//!   cached-proxy rebuild. Those four each carried a hand-written
-//!   `sleep(250 ms)` — the very spin this module was written to retire, still
-//!   running at 4 Hz for the whole length of an outage, in the one crate that
-//!   owns the ramp.
+//!   `receive_signal`, `proxy`'s `NameOwnerChanged` subscribe and its
+//!   cached-proxy rebuild, and `export`'s mount rebuild. Each carried its own
+//!   hand-written `sleep(250 ms)` — the very spin this module was written to
+//!   retire, still running at 4 Hz for the whole length of an outage, in the
+//!   one crate that owns the ramp. (Deliberately not counted here: naming a
+//!   number invites it to drift out of sync with the call sites the way an
+//!   earlier revision of this doc did.)
 //!
 //! They shipped as two implementations of the same 250 ms → 30 s ladder, in
 //! two different shapes: the supervisor's was a duration cursor (`next_ms`,
@@ -206,17 +208,17 @@ impl FailureStreak {
 
 /// Back off from one failed attempt to (re)establish a subscription.
 ///
-/// The four loops that rebuild a subscription after the bus or the peer went
+/// The loops that rebuild a subscription after the bus or the peer went
 /// away — [`property`](crate::property)'s `PropertiesChanged`,
-/// [`signals`](crate::signals)' `receive_signal`, and
-/// [`proxy`](crate::proxy)'s `NameOwnerChanged` subscribe and its cached-proxy
-/// rebuild — each shipped its own `sleep(Duration::from_millis(250))`. That is
-/// the 4 Hz spin this module exists to retire, kept alive in four places
-/// because every one of them wrote the sleep out by hand rather than reaching
-/// for the ramp (#1173). This is the one way in, so there is nothing left to
-/// drift: record the failure on the caller's streak, say what happened at
-/// [`logs_at`]'s cadence rather than once per attempt, and sleep
-/// [`delay_for`]'s delay for it.
+/// [`signals`](crate::signals)' `receive_signal`, [`proxy`](crate::proxy)'s
+/// `NameOwnerChanged` subscribe and its cached-proxy rebuild, and
+/// [`export`](crate::export)'s mount rebuild — each shipped its own
+/// `sleep(Duration::from_millis(250))`. That is the 4 Hz spin this module
+/// exists to retire, kept alive in as many places because every one of them
+/// wrote the sleep out by hand rather than reaching for the ramp (#1173).
+/// This is the one way in, so there is nothing left to drift: record the
+/// failure on the caller's streak, say what happened at [`logs_at`]'s cadence
+/// rather than once per attempt, and sleep [`delay_for`]'s delay for it.
 ///
 /// The streak belongs to the loop, not to this call, and must outlive the
 /// loop's iterations — otherwise a bus that will not answer resets to 250 ms

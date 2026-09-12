@@ -1255,8 +1255,16 @@ mod tests {
     /// `send_command` publishes to — otherwise every `set_*` before the daemon
     /// answers goes nowhere, which is the guarantee `spawn_mainloop`'s doc
     /// makes.
+    ///
+    /// Takes `TEST_LOCK` because it writes `COMMAND_TX`, a process-global, and
+    /// cargo runs this binary's tests in parallel — the same reason geoclue's
+    /// edge test takes it. It does not flake today only because every test here
+    /// keeps its receiver alive and `send` succeeds regardless (see
+    /// `a_command_sent_before_the_first_session_is_delivered` for why that
+    /// "regardless" is itself a hazard), which is one edit away from untrue.
     #[test]
     fn the_first_session_publishes_a_live_command_channel() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let slot = Mutex::new(None);
         let rx = session_receiver(&slot);
 
@@ -1278,8 +1286,12 @@ mod tests {
     /// A session that ended normally hands its receiver back, and the next one
     /// picks *that* up rather than a fresh channel — which is what makes a
     /// command issued while the daemon is down arrive once it comes back.
+    ///
+    /// `TEST_LOCK` again: its first `session_receiver` finds an empty slot and
+    /// publishes, so it writes `COMMAND_TX` too.
     #[test]
     fn a_returned_receiver_is_reused_rather_than_replaced() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let slot = Mutex::new(None);
         let rx = session_receiver(&slot);
         *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(rx);
@@ -1303,8 +1315,13 @@ mod tests {
     /// worse than the dead thread supervision replaced.
     ///
     /// Falsify by making `session_receiver` `.expect()` the take: this panics.
+    ///
+    /// `TEST_LOCK` for the same reason as
+    /// `the_first_session_publishes_a_live_command_channel`: `COMMAND_TX` is a
+    /// process-global and these run in parallel.
     #[test]
     fn a_receiver_lost_to_a_panic_is_re_established() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         // An empty slot is exactly the state a panicked run leaves behind.
         let slot: Mutex<Option<pw::channel::Receiver<Command>>> = Mutex::new(None);
         let _first = session_receiver(&slot);

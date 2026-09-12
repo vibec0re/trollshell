@@ -4704,8 +4704,10 @@ fn every_gl_renderer_answers_both_halves_of_the_gl_seam() {
     });
 
     assert!(
-        on_the_gpu.contains(&"scope") && on_the_gpu.contains(&"gauge"),
-        "the premise: under the GL arm the two kinds that have one draw on the GPU, got \
+        on_the_gpu.contains(&"scope")
+            && on_the_gpu.contains(&"gauge")
+            && on_the_gpu.contains(&"dot-matrix"),
+        "the premise: under the GL arm the three kinds that have one draw on the GPU, got \
          {on_the_gpu:?}",
     );
 }

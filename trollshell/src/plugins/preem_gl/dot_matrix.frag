@@ -103,9 +103,16 @@ out vec4 o_colour;
 
 // `round_div`: `round(num / denom)`, half away from zero, for non-negative
 // values. The kit does this in `usize`; every value reaching it here is a small
-// integer exactly representable in `f32` (`denom ≤ 64`, `num ≤ 138240`), and
-// the quotient is never within `1e-4` of a half-integer boundary at any pitch,
-// so the float form returns the kit's own answer.
+// integer exactly representable in `f32`, and the quotient is never within
+// `1e-4` of a half-integer boundary at any pitch, so the float form returns the
+// kit's own answer.
+//
+// The bounds, stated for the quantities this function actually takes (#1150
+// review, NIT-2): `denom` is `dot²` or `4·dot²`, so at `MAX_DOT_PX = 8` it is
+// at most 256; `num` is `qx² + qy²` over doubled offsets bounded by `dot`, so
+// at most `2·(2·MAX_DOT_PX - 1)² = 450`, and at the `SEG*` call sites it is
+// `SEG*_BASE·denom - SEG*_SLOPE·num`, bounded by `955 · 256 = 244480`. All of
+// them are well inside `f32`'s exact integer range of `2²⁴`.
 float round_div(float num, float denom) {
     return floor((2.0 * num + denom) / (2.0 * denom));
 }
@@ -319,6 +326,31 @@ void main() {
     // centre, and it is taken from `col`/`row` rather than from the `v_uv`
     // product so no float round trip can move it off the centre the kit
     // samples at.
+    //
+    // **Which branch a real screen takes.** `u_viewport` is the allocation in
+    // *device* pixels (`GlSurface`'s `alloc` multiplies by `scale_factor`), so
+    // `u_viewport == u_grid` holds only on a scale-1 display showing the chip
+    // at its natural size. On a `scale_factor >= 2` monitor the snap does
+    // **not** fire even for an unstretched chip, and the continuous branch
+    // below is the shipping path — which is the whole point of #1144 (the
+    // lattice is drawn at the screen's resolution, not replicated out of the
+    // kit's table), but it does mean the pinned 1:1 harness cases only ever
+    // exercise the snap. The path a HiDPI screen takes is covered by the
+    // `dot_matrix.*.readoutx2` cases instead, which are box-averaged back down
+    // and held to a bit-identical interior plus an edge budget — see
+    // `preem_gl::parity`'s `Sampling` and `Kind::edge_budget`. Neither branch
+    // is untested; they are tested by different cases.
+    //
+    // **And nobody should believe the harness is protecting the snap itself**
+    // (#1150 review, LOW-2). Deleting this `if` does not move a single pixel
+    // under llvmpipe, and that is arithmetic rather than luck: `round_div`'s
+    // numerator is bounded by `2*955*64 + 256 = 122496 < 2^24` over a divisor
+    // `<= 512`, and the true quotient is never nearer an integer than
+    // `1/512 ~ 2e-3` against an ulp of `~6e-5`, so the continuous form returns
+    // the kit's integer answer anyway. The snap is insurance against a driver
+    // whose `v_uv` interpolation is *not* exact at a pixel centre — a real
+    // risk on hardware this has never run on, and one no gate here can see.
+    // Keep it; do not read a green harness as evidence for it.
     vec2 p = vec2(v_uv.x * float(cols), (1.0 - v_uv.y) * float(rows));
     if (u_viewport == u_grid) {
         p = vec2(float(col), float(row)) + 0.5;

@@ -278,9 +278,9 @@ craneLib.mkCargoDerivation (
       # empties the list would ship green through the exit code
       # alone. Assert the evidence instead of trusting the exit
       # code: the case list is 4 skins × (3 scope fade depths + 3
-      # gauge needle positions + 1 gauge at the shipping upscale + 4
-      # dot-matrix displays + 1 stretched dot matrix), so exactly 48
-      # cases means exactly 48 `.gl.ppm` files. It was 12 until #1143
+      # gauge needle positions + 1 gauge at the shipping upscale + 5
+      # dot-matrix displays + 1 stretched dot matrix), so exactly 52
+      # cases means exactly 52 `.gl.ppm` files. It was 12 until #1143
       # added the gauge arm, 24 until #1148's review added the
       # `scale = 2` gauge case and 28 until #1144 added the dot
       # matrix; bump it with the case list, in the same commit, for
@@ -298,8 +298,8 @@ craneLib.mkCargoDerivation (
       # kind of statement such a comparison can meet. The blank-frame
       # guards bind on every case either way.
       gl_ppm_count="$(find "$out/parity" -maxdepth 1 -name '*.gl.ppm' -type f | wc -l)"
-      if [ "$gl_ppm_count" -ne 48 ]; then
-        echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected 48 — a case-count regression, not a parity failure." >&2
+      if [ "$gl_ppm_count" -ne 52 ]; then
+        echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected 52 — a case-count regression, not a parity failure." >&2
         exit 1
       fi
     '';

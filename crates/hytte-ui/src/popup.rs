@@ -235,8 +235,47 @@ pub fn attach_dismiss_catcher(popover: &gtk::Popover, monitor: &Monitor) {
     // path; autohide is the belt-and-suspenders one where the grab routes.
     popover.set_autohide(true);
 
-    let catchers: Rc<RefCell<Vec<gtk::Window>>> = Rc::new(RefCell::new(Vec::new()));
     let monitor = monitor.clone();
+    wire_dismiss_catchers(popover, move |shown| {
+        all_monitors(&monitor)
+            .iter()
+            .map(|m| {
+                let win = build_popover_catcher(m, shown);
+                win.present();
+                win
+            })
+            .collect()
+    });
+}
+
+/// The catcher **lifecycle**, split from the catcher **construction**
+/// (PR #1199 review, LOW 3).
+///
+/// `build` is called on every show and hands back the windows to tear down;
+/// everything else — the shared cell, the stale-catcher drain, and the two
+/// teardown hooks — lives here. The split exists because the construction is
+/// the only compositor-dependent half: [`build_popover_catcher`] needs a live
+/// `gtk4-layer-shell`, so the whole function was unreachable from a headless
+/// test, while the lifecycle it wires is exactly what #1180 item 1's weak
+/// controllers now depend on.
+///
+/// **The invariant those weak references rest on is
+/// `dispose → unrealize → unmap → close_catchers`.** Before item 1, a
+/// catcher's click controller held a strong clone of the popover, which made
+/// "the popover is finalized while its catchers are up" unreachable by
+/// construction. With the controllers weak that ordering is no longer
+/// guaranteed by a refcount — it is guaranteed by GTK, because
+/// `gtk_widget_dispose` unrealizes, unrealizing unmaps, and the `unmap`
+/// handler below `destroy()`s every catcher. If that chain ever broke, each
+/// catcher would survive in GTK's toplevel list as an invisible full-output
+/// click-eater whose weak popover no longer upgrades: an input black hole
+/// that can no longer dismiss itself, on every monitor. That is what
+/// `a_disposed_popover_takes_its_catchers_with_it` pins.
+fn wire_dismiss_catchers(
+    popover: &gtk::Popover,
+    build: impl Fn(&gtk::Popover) -> Vec<gtk::Window> + 'static,
+) {
+    let catchers: Rc<RefCell<Vec<gtk::Window>>> = Rc::new(RefCell::new(Vec::new()));
 
     // On show, build + present the catchers *before* the popover's surface
     // finishes mapping so the popover stacks above the home-output one.
@@ -255,14 +294,12 @@ pub fn attach_dismiss_catcher(popover: &gtk::Popover, monitor: &Monitor) {
     popover.connect_show(move |shown| {
         // Tear down any stale catchers from a previous show first.
         close_catchers(&catchers_for_show);
-        let wins: Vec<gtk::Window> = all_monitors(&monitor)
-            .iter()
-            .map(|m| {
-                let win = build_popover_catcher(m, shown);
-                win.present();
-                win
-            })
-            .collect();
+        // Built into a local **before** the cell is borrowed: `*cell
+        // .borrow_mut() = build(…)` evaluates the place first, so the
+        // builder — arbitrary GTK work, which for the real one presents a
+        // layer surface — would run with the cell mutably borrowed. Same
+        // discipline as `close_catchers`' `take()`.
+        let wins = build(shown);
         *catchers_for_show.borrow_mut() = wins;
     });
 
@@ -482,6 +519,97 @@ mod tests {
             witness_weak.strong_count(),
             0,
             "the popover's handlers — and everything they captured — must be dropped with it",
+        );
+    }
+
+    /// **PR #1199 review, LOW 3.** A popover disposed **while its catchers
+    /// are up** takes them with it: `dispose → unrealize → unmap →
+    /// close_catchers`.
+    ///
+    /// #1180 item 1 made this chain load-bearing. Before it,
+    /// `build_popover_catcher`'s click and scroll controllers held a *strong*
+    /// clone of the popover, so "the popover is finalized while a catcher
+    /// exists" could not happen — the catcher kept it alive. With the
+    /// controllers weak (which is the fix: the strong clone was half of the
+    /// cycle `popover → catchers → window → controller → popover`) that case
+    /// is reachable for the first time, and the only thing standing between
+    /// it and an invisible full-output click-eater whose weak popover no
+    /// longer upgrades is GTK's own unmap-on-dispose. Nothing in the tree
+    /// pinned it: `attach_dismiss_catcher_does_not_pin_its_popover` proves
+    /// the popover *dies*, which is the opposite end of the same question,
+    /// and the two `close_catchers` tests drive the drain directly rather
+    /// than through a popover at all.
+    ///
+    /// Goes through [`wire_dismiss_catchers`] with plain toplevels standing
+    /// in for the catchers, so the whole real lifecycle runs — the shared
+    /// cell, the stale drain, both teardown hooks — with only the one
+    /// compositor-dependent line (`build_popover_catcher`, which needs a live
+    /// `gtk4-layer-shell`) replaced. What is stood in for is the thing that
+    /// cannot run here; what is under test is not.
+    ///
+    /// The popover is disposed by destroying the window it is parented into,
+    /// which is the real trigger named in `attach_dismiss_catcher`'s own doc:
+    /// a bar chip's menu up when `monitors_changed` tears the bar down.
+    ///
+    /// **Falsified** by deleting the `connect_unmap` teardown hook (leaving
+    /// only `closed`, which is not guaranteed on dispose-while-mapped): both
+    /// stand-in windows survive and the last assertion goes red.
+    #[gtk::test]
+    fn a_disposed_popover_takes_its_catchers_with_it() {
+        let window = gtk::Window::new();
+        let anchor = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        window.set_child(Some(&anchor));
+        window.present();
+
+        let popover = gtk::Popover::new();
+        popover.set_autohide(true);
+        popover.set_parent(&anchor);
+
+        // Two plain toplevels per show, standing in for the per-monitor
+        // layer-shell catchers. GTK tracks each in its global toplevel list
+        // exactly as it tracks a real catcher, which is the property
+        // `close_catchers` exists to undo.
+        let built: Rc<RefCell<Vec<glib::WeakRef<gtk::Window>>>> = Rc::new(RefCell::new(Vec::new()));
+        let built_for_show = built.clone();
+        wire_dismiss_catchers(&popover, move |_shown| {
+            let wins: Vec<gtk::Window> = (0..2).map(|_| gtk::Window::new()).collect();
+            for win in &wins {
+                win.present();
+            }
+            *built_for_show.borrow_mut() = wins.iter().map(ObjectExt::downgrade).collect();
+            wins
+        });
+
+        popover.popup();
+        while glib::MainContext::default().iteration(false) {}
+        assert_eq!(
+            built.borrow().len(),
+            2,
+            "the show handler must have built the catchers — the premise of this test",
+        );
+        assert!(
+            built.borrow().iter().all(|w| w.upgrade().is_some()),
+            "…and they are up while the popover is",
+        );
+
+        // Dispose the popover out from under a live show, the hot-plug shape.
+        // `closed` is not guaranteed here; `unmap` is.
+        //
+        // GTK writes one `Gtk-CRITICAL: gtk_widget_is_ancestor` line while it
+        // does this. It is GTK's own, not this wiring's — measured with a
+        // bare `gtk::Popover` popped up on a destroyed window and no catchers
+        // anywhere — and it is the same sequence the shell performs on
+        // hot-plug, so it is recorded here rather than worked around.
+        window.destroy();
+        while glib::MainContext::default().iteration(false) {}
+        drop(popover);
+        while glib::MainContext::default().iteration(false) {}
+
+        assert!(
+            built.borrow().iter().all(|w| w.upgrade().is_none()),
+            "a popover disposed while its catchers are up must destroy them: with #1180 item \
+             1's weak controllers, a surviving catcher is an invisible full-output click-eater \
+             that can no longer pop anything down (PR #1199 review, LOW 3)",
         );
     }
 

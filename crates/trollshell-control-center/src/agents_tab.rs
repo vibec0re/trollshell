@@ -3367,6 +3367,9 @@ mod gtk_tests {
         let asked = || hive.seen().iter().filter(|l| l.contains("urls")).count();
         apply(&state, &["argus"]);
         pump_until(|| asked() >= 1, 10);
+        // …and settle, so the *answer* has been folded in before the next
+        // polls run: a want put back by the answer has to be able to show up.
+        pump_until(|| false, 1);
         assert_eq!(asked(), 1, "the first good poll asks once");
 
         apply(&state, &["argus"]);

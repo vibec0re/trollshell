@@ -993,7 +993,8 @@ mod gtk_tests {
     /// nothing queued. It carries the hive's own sentence, and recovers.
     ///
     /// Mutation (verified red): drop the `refused` arm in
-    /// `ui::Approvals::apply` and the visibility assertion reds.
+    /// `ui::Approvals::apply` and the row-count assertion reds with an empty
+    /// group — which is precisely the indistinguishable state.
     #[gtk::test]
     fn a_refused_queue_renders_its_own_state_not_an_empty_group() {
         let (w, _rx) = window();

@@ -6,6 +6,11 @@
   rustPlatform,
   pkg-config,
   wrapGAppsHook4,
+  # The `trollshell` slice's shell-completion install (#1116) —
+  # `installShellCompletion --cmd trollshell --bash <(…) --zsh <(…) --fish <(…)`
+  # in its own `installPhase` below, well past the source-filter/compile
+  # region above.
+  installShellFiles,
   glib,
   gtk4,
   libadwaita,
@@ -430,12 +435,27 @@ stdenv.mkDerivation {
   dontConfigure = true;
   dontBuild = true;
 
-  nativeBuildInputs = [ wrapGAppsHook4 ];
+  nativeBuildInputs = [
+    wrapGAppsHook4
+    installShellFiles
+  ];
   inherit buildInputs;
 
   installPhase = ''
     runHook preInstall
     install -Dm755 ${workspace}/bin/trollshell "$out/bin/trollshell"
+
+    # Shell completions (#1116): generated from `trollshell`'s own hidden
+    # `completions <shell>` subcommand (`Cli` in `main.rs`). Run against the
+    # UNWRAPPED binary straight out of `workspace` — completion generation
+    # (`clap_complete::generate`) needs no GApplication/GSettings/icon-theme
+    # env, and `$out/bin/trollshell` isn't wrapped until `wrapGAppsHook4`'s
+    # fixup phase runs, after this one.
+    installShellCompletion --cmd trollshell \
+      --bash <(${workspace}/bin/trollshell completions bash) \
+      --zsh <(${workspace}/bin/trollshell completions zsh) \
+      --fish <(${workspace}/bin/trollshell completions fish)
+
     runHook postInstall
   '';
 

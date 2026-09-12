@@ -1,12 +1,18 @@
 //! Argument parsing for the standalone hat.
 //!
-//! Hand-rolled, following `hytte-infobroker`'s CLI: the workspace carries no
-//! argument-parsing dependency at all (there is no `clap` in
-//! `[workspace.dependencies]`, and none in any member's manifest), and two
-//! tokens do not justify introducing one.
+//! `clap` (#1116, following @kaesaecracker's recommendation on the thread),
+//! not hand-rolled any more: nix generates shell completions from the same
+//! `Command` tree at build time — see the hidden `completions <shell>`
+//! subcommand below, which `nix/plugin.nix`'s `installShellCompletion` call
+//! invokes.
 //!
-//! The grammar is deliberately tiny, and **no arguments means the plugin
-//! session** — that is the hinge the two hats turn on.
+//! The grammar is still deliberately tiny, and **no arguments means the
+//! plugin session** — that is the hinge the two hats turn on, preserved here
+//! as `Cli::command` being an `Option`: a `None` is the plugin hat, never a
+//! parse failure.
+
+use clap::{CommandFactory as _, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell, generate};
 
 use crate::layout::Layout;
 
@@ -14,6 +20,11 @@ use crate::layout::Layout;
 /// path).
 pub(crate) const BIN: &str = "hytte-plugin-niri-layouts";
 
+/// Named the breakpoint/proportions as literal text for the humans reading
+/// `--help` or a niri bind file, same as before clap: `hardcoded_breakpoint_
+/// strings_track_the_constant` (`layout.rs`) reads this constant back to
+/// check it still names [`crate::layout::GOLDEN_BREAKPOINT`] correctly, so
+/// keep the "2560" spelling if this text changes.
 pub(crate) const USAGE: &str = "\
 hytte-plugin-niri-layouts — column layouts for the focused niri workspace (issue #1019)
 
@@ -36,98 +47,124 @@ column of three windows is one column.
 As a niri bind (etc/niri/binds.kdl):
     Mod+Alt+E { spawn \"hytte-plugin-niri-layouts\" \"apply\" \"equal\"; }";
 
-/// What the command line asked for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Invocation {
-    /// No arguments: be an ordinary out-of-process widget plugin.
-    Plugin,
-    /// `apply <layout>`: talk to niri directly and exit.
-    Apply(Layout),
-    /// `--help` / `-h` / `help`.
-    Help,
+/// Three one-click column layouts for the focused niri workspace.
+///
+/// With no subcommand, runs as an ordinary out-of-process trollshell widget
+/// plugin (dials the shell's plugin socket). `apply <layout>` applies one
+/// layout and exits instead, which is what a niri `spawn` bind invokes — see
+/// `etc/niri/binds.kdl` for the wiring.
+#[derive(Parser, Debug)]
+#[command(name = "hytte-plugin-niri-layouts", version, long_about = USAGE)]
+pub(crate) struct Cli {
+    #[command(subcommand)]
+    pub(crate) command: Option<Command>,
 }
 
-/// Parse `argv[1..]`.
-pub(crate) fn parse(args: &[String]) -> Result<Invocation, String> {
-    match args.first().map(String::as_str) {
-        None => Ok(Invocation::Plugin),
-        Some("--help" | "-h" | "help") => Ok(Invocation::Help),
-        Some("apply") => match args.len() {
-            1 => Err(format!(
-                "apply: missing <layout> (one of {})",
-                known_layouts()
-            )),
-            2 => Layout::from_id(&args[1])
-                .map(Invocation::Apply)
-                .ok_or_else(|| {
-                    format!(
-                        "apply: unknown layout '{}' (known: {})",
-                        args[1],
-                        known_layouts()
-                    )
-                }),
-            _ => Err(format!("apply: unexpected extra argument '{}'", args[2])),
-        },
-        Some(other) => Err(format!("unknown command '{other}'")),
+#[derive(Subcommand, Debug)]
+pub(crate) enum Command {
+    /// Apply one layout to the focused workspace's columns and exit
+    Apply {
+        /// equal (1/n each) | golden (75/25, or 61.8/38.2 under 2560 logical
+        /// px, #1052) | split (50/50)
+        layout: LayoutArg,
+    },
+    /// Print a shell completion script (invoked by nix's
+    /// `installShellCompletion`, not meant for a human to type)
+    #[command(hide = true)]
+    Completions {
+        /// Which shell's script to print
+        shell: Shell,
+    },
+}
+
+/// A `clap`-facing mirror of [`Layout`]. Kept as its own type rather than
+/// deriving `ValueEnum` on `Layout` itself — `layout.rs` is pure planning
+/// logic with no argument-parsing concern, so this is where that concern
+/// lives instead. Variant names map 1:1 via `From`, and clap's default
+/// kebab-case rendering (`Equal` → `"equal"`, etc.) matches
+/// [`Layout::id`](crate::layout::Layout::id)'s own strings, which the tests
+/// below pin.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum LayoutArg {
+    Equal,
+    Golden,
+    Split,
+}
+
+impl From<LayoutArg> for Layout {
+    fn from(arg: LayoutArg) -> Self {
+        match arg {
+            LayoutArg::Equal => Self::Equal,
+            LayoutArg::Golden => Self::Golden,
+            LayoutArg::Split => Self::Split,
+        }
     }
 }
 
-fn known_layouts() -> String {
-    Layout::ALL
-        .iter()
-        .map(|l| l.id())
-        .collect::<Vec<_>>()
-        .join(", ")
+/// Render one shell's completion script for this binary's `Command` tree.
+/// Split from printing so a test can inspect the bytes without capturing
+/// stdout.
+pub(crate) fn render_completions(shell: Shell) -> String {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_owned();
+    let mut buf: Vec<u8> = Vec::new();
+    generate(shell, &mut cmd, name, &mut buf);
+    String::from_utf8(buf).expect("clap_complete's generated script is always valid UTF-8")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Invocation, USAGE, parse};
+    use clap::{CommandFactory as _, Parser as _};
+    use clap_complete::Shell;
+
+    use super::{Cli, Command, USAGE, render_completions};
     use crate::layout::Layout;
 
-    fn args(argv: &[&str]) -> Vec<String> {
-        argv.iter().map(|s| (*s).to_owned()).collect()
+    fn parse(argv: &[&str]) -> Result<Cli, clap::Error> {
+        let mut full = vec!["hytte-plugin-niri-layouts"];
+        full.extend_from_slice(argv);
+        Cli::try_parse_from(full)
     }
 
     #[test]
     fn no_arguments_is_the_plugin_session() {
-        assert_eq!(parse(&[]), Ok(Invocation::Plugin));
+        let cli = parse(&[]).expect("bare invocation parses");
+        assert!(cli.command.is_none());
     }
 
     #[test]
     fn apply_takes_each_of_the_three_layouts() {
         for layout in Layout::ALL {
-            assert_eq!(
-                parse(&args(&["apply", layout.id()])),
-                Ok(Invocation::Apply(layout)),
-                "apply {}",
-                layout.id()
-            );
+            let cli = parse(&["apply", layout.id()])
+                .unwrap_or_else(|e| panic!("apply {}: {e}", layout.id()));
+            let Some(Command::Apply { layout: arg }) = cli.command else {
+                panic!("apply {} did not parse as Apply", layout.id());
+            };
+            assert_eq!(Layout::from(arg), layout, "apply {}", layout.id());
         }
     }
 
     #[test]
     fn help_is_recognised_three_ways() {
         for flag in ["--help", "-h", "help"] {
-            assert_eq!(parse(&args(&[flag])), Ok(Invocation::Help), "{flag}");
+            let err = parse(&[flag]).expect_err("help exits through the Err/DisplayHelp path");
+            assert_eq!(err.exit_code(), 0, "{flag} should be a zero-exit help display");
         }
     }
 
     #[test]
-    fn apply_without_a_layout_names_the_three() {
-        let err = parse(&args(&["apply"])).expect_err("a layout is required");
-        assert!(err.contains("equal"), "got {err:?}");
-        assert!(err.contains("golden"), "got {err:?}");
-        assert!(err.contains("split"), "got {err:?}");
+    fn apply_without_a_layout_is_refused() {
+        assert!(parse(&["apply"]).is_err());
     }
 
     #[test]
     fn an_unknown_layout_is_refused_and_echoed() {
-        let err = parse(&args(&["apply", "fibonacci"])).expect_err("not a layout");
-        assert!(err.contains("fibonacci"), "got {err:?}");
+        let err = parse(&["apply", "fibonacci"]).expect_err("not a layout");
+        let msg = err.to_string();
+        assert!(msg.contains("fibonacci"), "got {msg:?}");
         assert!(
-            err.contains("golden"),
-            "and lists the ones that are: {err:?}"
+            msg.contains("golden"),
+            "and lists the ones that are: {msg:?}"
         );
     }
 
@@ -135,14 +172,14 @@ mod tests {
     fn a_trailing_argument_is_refused_rather_than_ignored() {
         // Silently ignoring it would make `apply equal golden` look like it did
         // both.
-        let err = parse(&args(&["apply", "equal", "golden"])).expect_err("one layout only");
-        assert!(err.contains("golden"), "got {err:?}");
+        let err = parse(&["apply", "equal", "golden"]).expect_err("one layout only");
+        assert!(err.to_string().contains("golden"), "got {err}");
     }
 
     #[test]
     fn an_unknown_subcommand_is_refused_rather_than_starting_a_session() {
-        let err = parse(&args(&["aply", "equal"])).expect_err("typo, not a plugin start");
-        assert!(err.contains("aply"), "got {err:?}");
+        let err = parse(&["aply", "equal"]).expect_err("typo, not a plugin start");
+        assert!(err.to_string().contains("aply"), "got {err}");
     }
 
     #[test]
@@ -154,7 +191,7 @@ mod tests {
         assert!(USAGE.contains("widget plugin"), "the plugin hat");
     }
 
-    /// `--help` never dials niri (see `Invocation::Help` in `main`), so it
+    /// `--help` never dials niri (see the `None` arm in `main`), so it
     /// can't report which pair actually applies on the screen it's run on —
     /// it documents the rule instead, both pairs and the breakpoint between
     /// them (#1052).
@@ -169,5 +206,42 @@ mod tests {
             "the golden cut"
         );
         assert!(USAGE.contains("2560"), "the breakpoint between them");
+    }
+
+    #[test]
+    fn completions_parses_every_shell_but_stays_hidden() {
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let cli = parse(&["completions", &shell.to_string()])
+                .unwrap_or_else(|e| panic!("completions {shell}: {e}"));
+            assert!(matches!(cli.command, Some(Command::Completions { .. })));
+        }
+        // Checked against the `Command` tree's own hidden flag, not against
+        // rendered `--help` text: `USAGE` (this file's `long_about`) is free
+        // to *mention* the word "completions" without that meaning the
+        // subcommand itself is listed.
+        let cmd = Cli::command();
+        let completions = cmd
+            .get_subcommands()
+            .find(|s| s.get_name() == "completions")
+            .expect("a completions subcommand exists");
+        assert!(
+            completions.is_hide_set(),
+            "completions subcommand must be hidden from --help"
+        );
+    }
+
+    /// Falsifies a dropped subcommand: removing `apply` from [`Command`]
+    /// would no longer print its name here.
+    #[test]
+    fn bash_completions_name_the_binary_and_every_subcommand() {
+        let script = render_completions(Shell::Bash);
+        assert!(script.contains("hytte-plugin-niri-layouts"), "{script}");
+        assert!(script.contains("apply"), "bash completions missing 'apply':\n{script}");
     }
 }

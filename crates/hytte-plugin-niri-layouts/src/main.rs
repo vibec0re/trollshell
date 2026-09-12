@@ -106,34 +106,51 @@ mod niri;
 mod plugin;
 mod watch;
 
-use cli::{BIN, Invocation, USAGE};
+use clap::Parser as _;
+use cli::{BIN, Cli, Command};
 use plugin::{NiriLayouts, apply_from_cli};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match cli::parse(&args) {
-        // The plugin hat. `run` never returns: it owns the process from here,
-        // dialing the host socket and reconnecting forever.
-        Ok(Invocation::Plugin) => hytte_plugin::run::<NiriLayouts>(),
-        Ok(Invocation::Help) => {
-            println!("{USAGE}");
-            ExitCode::SUCCESS
-        }
+    let args: Vec<String> = std::env::args().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(e) => return exit_for_parse_error(&e),
+    };
+    match cli.command {
+        // The plugin hat: no subcommand. `run` never returns: it owns the
+        // process from here, dialing the host socket and reconnecting
+        // forever.
+        None => hytte_plugin::run::<NiriLayouts>(),
         // The standalone hat. Same `apply` the chip's click worker runs (via
         // `apply_from_cli`, which is where the "a keybind names no screen"
         // decision lives and is tested), so a keybind and a click cannot drift.
-        Ok(Invocation::Apply(layout)) => match apply_from_cli(&mut niri::SocketTransport, layout) {
-            // niri's own text, verbatim — the CLI has no toast to put it in.
-            Some(error) => {
-                eprintln!("{BIN}: {error}");
-                ExitCode::FAILURE
+        Some(Command::Apply { layout }) => {
+            match apply_from_cli(&mut niri::SocketTransport, layout.into()) {
+                // niri's own text, verbatim — the CLI has no toast to put it in.
+                Some(error) => {
+                    eprintln!("{BIN}: {error}");
+                    ExitCode::FAILURE
+                }
+                None => ExitCode::SUCCESS,
             }
-            None => ExitCode::SUCCESS,
-        },
-        Err(error) => {
-            eprintln!("{BIN}: {error}\n\n{USAGE}");
-            ExitCode::FAILURE
         }
+        Some(Command::Completions { shell }) => {
+            print!("{}", cli::render_completions(shell));
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// clap's own exit code for a usage error is 2; this CLI's contract predates
+/// clap and treats any misuse as a plain failure — exit 1 — so map it down
+/// rather than let switching parsers move the number a script might check.
+/// `--help`/`--version`/`help` (clap's "display" error kinds) keep their 0.
+fn exit_for_parse_error(e: &clap::Error) -> ExitCode {
+    let _ = e.print();
+    if e.exit_code() == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }

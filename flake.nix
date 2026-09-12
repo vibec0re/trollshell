@@ -122,7 +122,18 @@
           # of one already-compiled binary out of `workspace` — no cargo, no
           # crane, no recompile.
           bundledPlugins = pkgs.lib.genAttrs bundledPluginNames (
-            name: pkgs.callPackage ./nix/plugin.nix { inherit workspace name; }
+            name:
+            pkgs.callPackage ./nix/plugin.nix (
+              { inherit workspace name; }
+              # `hytte-plugin-niri-layouts` is the one bundled plugin with a
+              # standalone-CLI hat (`apply <layout>`, #1019) and so the one
+              # with a `completions <shell>` subcommand to build (#1116); every
+              # other bundled plugin is driven entirely by the wire protocol
+              # and has no argv to complete.
+              // pkgs.lib.optionalAttrs (name == "hytte-plugin-niri-layouts") {
+                hasCompletions = true;
+              }
+            )
           );
 
           # The `hytte-infobroker` CLI (#562): the #487 consent-gated broker's
@@ -136,6 +147,8 @@
             inherit workspace;
             name = "hytte-infobroker";
             description = "trollshell consent-gated agent-bridge broker CLI (#487)";
+            # The CLI's own `completions <shell>` subcommand (#1116).
+            hasCompletions = true;
           };
 
           # The `hytte-claude-bridge` daemon (#584): a keyless same-uid-socket shim
@@ -227,7 +240,18 @@
           # .#hytte-plugin-<id>`. Genuinely near-free since #572: each is a `cp`
           # out of the one `workspace` output every other check already forces.
           bundledPlugins = pkgs.lib.genAttrs bundledPluginNames (
-            name: pkgs.callPackage ./nix/plugin.nix { inherit workspace name; }
+            name:
+            pkgs.callPackage ./nix/plugin.nix (
+              { inherit workspace name; }
+              # `hytte-plugin-niri-layouts` is the one bundled plugin with a
+              # standalone-CLI hat (`apply <layout>`, #1019) and so the one
+              # with a `completions <shell>` subcommand to build (#1116); every
+              # other bundled plugin is driven entirely by the wire protocol
+              # and has no argv to complete.
+              // pkgs.lib.optionalAttrs (name == "hytte-plugin-niri-layouts") {
+                hasCompletions = true;
+              }
+            )
           );
 
           # The `hytte-infobroker` CLI package (#562), mirroring the `packages`
@@ -238,6 +262,8 @@
             inherit workspace;
             name = "hytte-infobroker";
             description = "trollshell consent-gated agent-bridge broker CLI (#487)";
+            # The CLI's own `completions <shell>` subcommand (#1116).
+            hasCompletions = true;
           };
 
           # The `hytte-claude-bridge` daemon package (#584), mirroring the

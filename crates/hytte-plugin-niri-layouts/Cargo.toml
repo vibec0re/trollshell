@@ -22,6 +22,12 @@ path = "src/main.rs"
 # the SDK already enables) — so there is deliberately no direct `tokio`
 # dependency here. No gtk / adw / hytte-ui: a plugin never links the shell.
 hytte-plugin = { path = "../hytte-plugin" }
+# The standalone hat's argv parsing (#1116, following @kaesaecracker's
+# recommendation on that thread), so nix can generate shell completions from
+# the same `Command` tree at build time (`nix/plugin.nix`'s hidden
+# `completions <shell>` invocation) — see `cli.rs`.
+clap = { workspace = true, features = ["derive"] }
+clap_complete.workspace = true
 # niri's own IPC types plus its blocking `socket::Socket`. This plugin dials
 # `$NIRI_SOCKET` **itself** rather than routing widths through the shell:
 # `Effect::Niri` only knows FocusWorkspace / FocusWindow, so the shell route

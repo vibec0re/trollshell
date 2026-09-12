@@ -1366,6 +1366,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "hytte-config",
  "hytte-plugin",
  "serde",
  "serde_json",

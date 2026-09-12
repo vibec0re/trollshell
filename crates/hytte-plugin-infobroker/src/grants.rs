@@ -20,10 +20,8 @@
 //! decision = "always"
 //! ```
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -266,29 +264,33 @@ impl GrantStore {
     /// part of this that touches `self`. The rendered bytes are then queued on
     /// the store's **single writer lane** (below), whose task does the actual
     /// I/O off this thread: `mkdir -p` the state dir (tightened to `0700`),
-    /// write to a sibling `.<file>.<pid>.<ticket>.tmp` **at the target's own
-    /// mode**, `fsync` it, then `rename(2)` over the target — the same
-    /// write-then-rename shape `hytte_config::file::write_atomic` uses for
-    /// `places.toml`/the `~/.config/trollshell/*` writer. This crate doesn't
-    /// otherwise depend on `hytte-config` (and doesn't gain that dependency
-    /// here), so [`write_atomic`] is the sequence copied rather than the
-    /// function imported. It diverges from that helper in exactly three
-    /// stated places, and no others:
+    /// then [`write_atomic`] — this crate's own thin wrapper around
+    /// [`hytte_config::file::write_atomic`], the workspace's one copy of
+    /// tmp+`fsync`+`rename(2)` (#1162 lens 7 item 4: `grants.rs` used to hand-copy
+    /// that whole sequence rather than link the crate, a divergence stated and
+    /// re-checked here rather than left to rot; the crate now links
+    /// `hytte-config` — see its `Cargo.toml` comment). It diverges from a bare
+    /// call to that helper in exactly two stated places, and no others:
     ///
-    /// 1. **no symlink-following** — `grants.toml` is state, not a
-    ///    hand-edited dotfile that a user might symlink into a dotfile repo;
-    /// 2. **no parent-directory `fsync`** — which is precisely that helper's
-    ///    `Durability::FileOnly`. The file's *own* `fsync` is kept, because
-    ///    without it the rename can be durable while the data is not,
-    ///    resurrecting a zero-length `grants.toml` — which *parses*, as zero
-    ///    grants (`empty_body_is_an_empty_store`), i.e. every grant silently
-    ///    forgotten;
-    /// 3. **a `0600` first-run default** where that helper takes the umask.
-    ///    Mode *preservation* is mirrored, not skipped (#1074 review M6): a
-    ///    `rename(2)` carries the temp's mode onto the target, so a temp born
-    ///    at the umask would silently undo a `chmod 600` on every save. Only
-    ///    the mode of a file that doesn't exist yet differs, and it differs
-    ///    tighter — see [`target_mode`].
+    /// 1. **no parent-directory `fsync`** — [`Durability::FileOnly`](hytte_config::file::Durability::FileOnly).
+    ///    The file's *own* `fsync` is unconditional in the shared helper too,
+    ///    which is what matters: without it the rename can be durable while
+    ///    the data is not, resurrecting a zero-length `grants.toml` — which
+    ///    *parses*, as zero grants (`empty_body_is_an_empty_store`), i.e.
+    ///    every grant silently forgotten;
+    /// 2. **a `0600` first-run default** where the helper takes the umask —
+    ///    [`ensure_default_mode`] pre-creates an empty target at `0600`
+    ///    before handing off, so the helper's own mode-preservation (it reads
+    ///    the target's mode before opening the temp file) sees a file to
+    ///    preserve rather than reaching for the platform default.
+    ///
+    /// Symlink-following is no longer a stated divergence: the shared helper
+    /// writes *through* a symlinked target rather than replacing the link
+    /// with a regular file, and unifying on it means `grants.toml` now gets
+    /// that safety too, the same as `places.toml` always has — there was no
+    /// test pinning the old "replace the link" behaviour, only a doc comment
+    /// asserting it was deliberate, and #1162 reads it as the residue of not
+    /// having the helper available rather than a requirement.
     ///
     /// Atomicity closes PR #1064's review finding F2: since #1059 moved the
     /// session-start grant *load* to `spawn_blocking`, it is genuinely
@@ -512,38 +514,25 @@ fn log(msg: &str) {
     eprintln!("[infobroker] {msg}");
 }
 
-/// Distinguishes the temp files of two [`GrantStore::save`] calls that
-/// overlap in time (e.g. an Allow immediately followed by a Revoke, each
-/// spawning its own detached write) — mirrors `hytte_config::file`'s
-/// `TMP_TICKET`. Without a distinct name per write, two in-flight writers to
-/// the same target would share one temp file and interleave into it: two
-/// open file descriptors to one inode isn't a "last write wins" race, it's
-/// byte-level corruption of the tmp file itself, before `rename` even runs.
-static TMP_TICKET: AtomicU64 = AtomicU64::new(0);
-
 /// Atomically replace `path`'s contents with `text`: create its parent
 /// directory (tightened to `0700`, same as [`GrantStore::load`]'s caller
-/// expects), write **and `fsync`** a sibling temp file **at the target's own
-/// mode**, then `rename(2)` over the target.
+/// expects), then hand off to [`hytte_config::file::write_atomic`] — the
+/// workspace's one copy of tmp+`fsync`+`rename(2)`, at the target's own mode
+/// (#1162 lens 7 item 4: this used to hand-copy that whole sequence rather
+/// than link the crate; see [`GrantStore::save`]'s doc for the two stated
+/// divergences that remain and the one — symlink-following — that
+/// unification deliberately dropped).
 ///
-/// Copies `hytte_config::file::write_atomic`'s core sequence — a temp file in
-/// the target's own directory, so the rename stays on one filesystem and is
-/// genuinely atomic, opened at the mode the target already carries so the
-/// rename cannot change it — without linking that crate. The full list of
-/// what it deliberately does *not* copy is on [`GrantStore::save`]'s doc, and
-/// it is three items: no symlink-following (`grants.toml` is state, not a
-/// hand-edited dotfile), no optional parent-directory `fsync` (i.e. precisely
-/// that helper's `Durability::FileOnly`), and a `0600` rather than umask
-/// default for a file that does not exist yet ([`target_mode`]).
-///
-/// The **file's own `fsync` is not optional** and is why this writes through
-/// `OpenOptions` instead of `std::fs::write` (#1074 review M2): without it the
-/// `rename` can be durable across a power cut while the *data* is not, leaving
-/// a zero-length `grants.toml` — which parses, as zero grants
-/// (`empty_body_is_an_empty_store`), silently forgetting every grant. That is
-/// the same outcome
-/// `write_atomic_never_exposes_a_torn_file_to_a_concurrent_reader` exists to
-/// prevent, reached by a crash instead of by a concurrent read.
+/// [`ensure_default_mode`] runs first because the shared helper preserves an
+/// *existing* target's mode but takes the platform default (the umask) for a
+/// brand-new one, and `grants.toml` is the broker's policy file rather than a
+/// hand-edited dotfile — a first save should not leave it at the umask
+/// (#1074 review M6). [`Durability::FileOnly`](hytte_config::file::Durability::FileOnly)
+/// is the other stated divergence: the file's own `fsync` inside the shared
+/// helper is unconditional regardless of that choice, which is what matters —
+/// without it the rename can be durable across a power cut while the *data*
+/// is not, leaving a zero-length `grants.toml` — which parses, as zero grants
+/// (`empty_body_is_an_empty_store`), silently forgetting every grant.
 ///
 /// Synchronous by design: every caller runs it from
 /// [`tokio::task::spawn_blocking`], never inline on the runtime thread —
@@ -558,74 +547,39 @@ fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
         .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", dir.display())))?;
     tighten_dir(dir);
-    let ticket = TMP_TICKET.fetch_add(1, Ordering::Relaxed);
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("grants.toml");
-    let tmp = dir.join(format!(".{name}.{}.{ticket}.tmp", std::process::id()));
-    if let Err(e) = fill_tmp(&tmp, text, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    ensure_default_mode(path);
+    hytte_config::file::write_atomic(path, text, hytte_config::file::Durability::FileOnly)
 }
 
-/// The mode `grants.toml` should carry after the rename: the one it already
-/// has, or `0600` when there is no file yet (#1074 review M6).
+/// Pre-create `path` at `0600` if — and only if — nothing is there yet, so
+/// [`hytte_config::file::write_atomic`]'s mode-preservation (it reads the
+/// target's mode before opening its own temp file) has a `0600` file to
+/// preserve instead of reaching for the platform default. See
+/// [`write_atomic`]'s doc for why the default matters here specifically.
 ///
-/// A `rename(2)` carries the *temp* file's mode onto the target, so a temp
-/// born at the process umask (0644 under the usual 0022) silently undoes a
-/// `chmod 600` on every save — a regression against `main`, whose
-/// `std::fs::write` was a `create+truncate` open that left an existing file's
-/// mode alone. `hytte_config::file::write_atomic` preserves the target's mode
-/// for exactly this reason; the only place this differs from that helper is
-/// the **first-run** default, which is `0600` rather than the umask, because
-/// `grants.toml` is the broker's policy file rather than a hand-edited
-/// dotfile. The 0700 state dir (see [`tighten_dir`]) is defence in depth on
-/// top, not a substitute: a mode leaks past the directory through backups,
-/// `rsync -a`, tarballs, and an `$XDG_STATE_HOME` pointed somewhere shared.
+/// Best-effort and deliberately racy: if another writer creates `path`
+/// between the existence check and `create_new`, the open simply fails
+/// (`AlreadyExists`) and is ignored — whichever mode won, the file now
+/// exists, and the save this guards still proceeds. The window is a
+/// first-run event that can happen at most once per file's lifetime, and
+/// losing the race costs nothing worse than the umask default this function
+/// exists to avoid on the *common* first run.
 #[cfg(unix)]
-fn target_mode(path: &Path) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o7777)
+fn ensure_default_mode(path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    if path.exists() {
+        return;
+    }
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path);
 }
 
-/// Write `text` into a freshly-created temp file for `target` and `fsync` it —
-/// the durability half of [`write_atomic`], mirroring `hytte_config::file`'s
-/// `fill`. See that function's doc for why the `sync_all` is load-bearing.
-///
-/// `target`'s mode ([`target_mode`]) is applied at `open` **and** re-asserted
-/// on the fd, the same belt-and-braces `fill` uses: `OpenOptions::mode` only
-/// takes effect when `open` actually creates the file, so it is silently
-/// ignored if a temp file from a crashed earlier run happens to be sitting at
-/// this name — which is reachable here precisely because a crash mid-write is
-/// what [`sweep_stale_tmp`] exists to clean up after.
-fn fill_tmp(tmp: &Path, text: &str, target: &Path) -> std::io::Result<()> {
-    #[cfg(not(unix))]
-    let _ = target;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    let mode = target_mode(target);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(mode);
-    }
-    let mut file = opts.open(tmp)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-    }
-    file.write_all(text.as_bytes())?;
-    file.sync_all()
-}
+#[cfg(not(unix))]
+fn ensure_default_mode(_path: &Path) {}
 
 /// How long a sibling temp file must have sat untouched before
 /// [`sweep_stale_tmp`] treats it as crash litter rather than a live write.
@@ -936,8 +890,8 @@ mod tests {
 
     #[test]
     fn write_atomic_uses_distinct_tmp_names_across_calls() {
-        // Two overlapping writers must never share one tmp path (see
-        // `TMP_TICKET`'s doc) — same pid, so only the ticket can tell them
+        // Two overlapping writers must never share one tmp path — same pid,
+        // so only `hytte_config::file`'s own ticket counter can tell them
         // apart. Exercised indirectly: two `write_atomic` calls on the same
         // target must not error out from a tmp-path collision.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -947,6 +901,49 @@ mod tests {
                 .unwrap_or_else(|e| panic!("write {i}: {e}"));
         }
         assert_eq!(std::fs::read_to_string(&path).expect("reads"), "body 4\n");
+    }
+
+    /// #1162 lens 7 item 4: since unifying on [`hytte_config::file::write_atomic`],
+    /// a `grants.toml` symlinked elsewhere (an `$XDG_STATE_HOME` a dotfiles
+    /// setup points at a shared location, say) is written *through* — the
+    /// real target's content and mode change, and the link itself survives
+    /// rather than being replaced by a plain file. This is new behaviour
+    /// relative to the hand-copied writer this replaces (which `rename(2)`d
+    /// straight over `path`, breaking a symlink there); there was never a
+    /// test pinning the old behaviour, only a doc comment calling it
+    /// deliberate — this test is what makes the new behaviour real rather
+    /// than assumed.
+    ///
+    /// Falsification: reverting `write_atomic` to `rename(2)` over `path`
+    /// directly turns this red — `link` stops being a symlink afterward.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_writes_through_a_symlink_and_preserves_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real-grants.toml");
+        let link = dir.path().join("grants.toml");
+        std::fs::write(&real, "old\n").expect("seed real file");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640))
+            .expect("chmod 640");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        write_atomic(&link, "new\n").expect("writes through the symlink");
+
+        assert_eq!(
+            std::fs::read_to_string(&real).expect("reads real file"),
+            "new\n",
+            "the real target must receive the new content"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat the link")
+                .is_symlink(),
+            "the symlink must survive the write, not be replaced by a regular file"
+        );
+        let mode = std::fs::metadata(&real).expect("stat real file").permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640, "the real target's mode must be preserved");
     }
 
     /// `save` (reached only through `grant_always`/`grant_deny`/`revoke`) is

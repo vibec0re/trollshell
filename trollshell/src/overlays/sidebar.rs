@@ -110,8 +110,24 @@
 //! State is per-connector, mirroring `modal::DRAWER_OPEN`. Subscribers (the
 //! sidebar surface, the frame draw, future bar-CSS bindings) read
 //! `open_signal`; the chip writes via `toggle`.
+//!
+//! ## Post-close niri reflow (#1129)
+//!
+//! Committing `exclusive_zone = 0` makes niri stop *reserving* the strip, but
+//! niri only *reflows* a workspace's columns on a change **about** them, not
+//! on a change to the space around them — so a column that sat flush against
+//! the old reserved edge is left exactly where it was, now partly off screen
+//! with nothing pushing it back. `drive_exclusive_zone_on_settle`'s settle
+//! re-assert nudges niri to reflow the monitor's active workspace right after
+//! it commits the closed (`0`) zone — never on open, where niri already
+//! reflows its own reserve, and never on a redundant closed→closed re-assert;
+//! see [`should_reflow_after_close`] for the exact edge and
+//! `hytte_services::niri::reflow_workspace` for the nudge itself (the same
+//! move-to-first/move-to-last/move-to-first chain
+//! `hytte-plugin-niri-layouts`'s `apply` sends after resizing columns, for
+//! the same reason).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
@@ -120,6 +136,7 @@ use hytte::adw::{self, prelude::*};
 use hytte::futures_signals::signal::{Mutable, Signal};
 use hytte::gtk::{self, cairo, gdk, glib};
 use hytte::prelude::*;
+use hytte::services::niri;
 use hytte::ui::{Anchor, Layer, LayerShell, layer_window};
 
 use super::frame;
@@ -346,7 +363,22 @@ pub fn install(monitor: &Monitor) {
     // before tearing the surface down (see field docs on SidebarPanel).
     let zone_tick: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
 
-    let subscription = wire_open_subscription(&window, &revealer, &card, &open_state, &zone_tick);
+    // The last exclusive zone actually committed on this surface, seeded at 0
+    // to match what `build_sidebar_window` committed above (#1129) — read by
+    // [`should_reflow_after_close`] so the post-close niri reflow nudge fires
+    // on a genuine open→closed transition and not on a redundant
+    // closed→closed re-assert.
+    let last_zone: Rc<Cell<i32>> = Rc::new(Cell::new(0));
+
+    let subscription = wire_open_subscription(
+        &window,
+        &revealer,
+        &card,
+        &open_state,
+        &zone_tick,
+        &last_zone,
+        &key,
+    );
     wire_escape(&window, monitor.clone());
 
     // Forward this monitor's sidebar open/close edge to the plugin host so
@@ -601,6 +633,17 @@ fn build_card(monitor: &Monitor) -> gtk::Box {
     card
 }
 
+/// The three widgets [`drive_exclusive_zone_on_settle`]/`reassert_if_settled`
+/// act on together, bundled into one clonable value so those two functions
+/// stay under clippy's `too_many_arguments` now that #1129 added the reflow
+/// tracking (`last_zone`, `key`) alongside them.
+#[derive(Clone)]
+struct ZoneSurface {
+    window: gtk::Window,
+    revealer: gtk::Revealer,
+    card: gtk::Box,
+}
+
 /// Drive open/close transitions from the shared mutable. The surface stays
 /// alive across toggles (see module note on z-order); we flip the revealer,
 /// the exclusive zone, AND the surface's input region in lockstep. Niri
@@ -616,11 +659,15 @@ fn wire_open_subscription(
     card: &gtk::Box,
     open_state: &Mutable<bool>,
     zone_tick: &Rc<RefCell<Option<glib::SourceId>>>,
+    last_zone: &Rc<Cell<i32>>,
+    key: &str,
 ) -> glib::JoinHandle<()> {
     let window = window.clone();
     let revealer = revealer.clone();
     let card = card.clone();
     let zone_tick = zone_tick.clone();
+    let last_zone = last_zone.clone();
+    let key = key.to_owned();
     let open_state_for_zone = open_state.clone();
     glib::MainContext::default().spawn_local(open_state.signal().for_each(move |open| {
         // Restore the card's full-width floor the moment we start opening, so the
@@ -659,11 +706,15 @@ fn wire_open_subscription(
         // (queue_draw) so the FINAL committed surface state carries the right
         // zone. NEEDS LIVE NIRI RE-TEST.
         drive_exclusive_zone_on_settle(
-            &window,
-            &revealer,
-            &card,
+            &ZoneSurface {
+                window: window.clone(),
+                revealer: revealer.clone(),
+                card: card.clone(),
+            },
             &open_state_for_zone,
             &zone_tick,
+            &last_zone,
+            &key,
             open,
         );
         async {}
@@ -745,23 +796,32 @@ where
 /// A mid-animation re-toggle is detected via `open_state` and the stale timer
 /// bails so two timers don't fight; the timer id is parked in `tick_slot` so
 /// [`close_all`] can cancel it on teardown.
+///
+/// Since #1129, the settle re-assert is also where niri gets nudged to
+/// reflow this monitor's active workspace: see [`should_reflow_after_close`]
+/// for the exact condition and `last_zone`'s role in it.
 fn drive_exclusive_zone_on_settle(
-    window: &gtk::Window,
-    revealer: &gtk::Revealer,
-    card: &gtk::Box,
+    surface: &ZoneSurface,
     open_state: &Mutable<bool>,
     tick_slot: &Rc<RefCell<Option<glib::SourceId>>>,
+    last_zone: &Rc<Cell<i32>>,
+    key: &str,
     open: bool,
 ) {
     // Helper: when the revealer has reached the target, deflate/restore the card
     // floor, lock in the zone, and force a commit. Returns whether it settled
     // (i.e. the caller can stop).
     fn reassert_if_settled(
-        window: &gtk::Window,
-        revealer: &gtk::Revealer,
-        card: &gtk::Box,
+        surface: &ZoneSurface,
+        last_zone: &Cell<i32>,
+        key: &str,
         open: bool,
     ) -> bool {
+        let ZoneSurface {
+            window,
+            revealer,
+            card,
+        } = surface;
         if revealer.is_child_revealed() != open {
             return false;
         }
@@ -804,27 +864,64 @@ fn drive_exclusive_zone_on_settle(
         window.queue_resize();
         window.queue_draw();
         WidgetExt::display(window).flush();
+
+        // #1129: niri stops *reserving* the strip the moment this commit
+        // lands, but it only *reflows* the columns on a change about the
+        // columns themselves — so a tile that was flush against the old
+        // reserved edge is left exactly where it was, partly off screen.
+        // Nudge it only on the genuine open→closed edge (never on open,
+        // where niri already reflows its own reserve as part of opening —
+        // and never on a redundant closed→closed re-assert, which a spurious
+        // `open_state.set(false)` or a second immediate-settle emission for
+        // an unchanged signal could otherwise re-fire).
+        let previous_zone = last_zone.get();
+        last_zone.set(zone);
+        if should_reflow_after_close(open, previous_zone, zone)
+            && let Some(workspace) = niri::active_workspace_id(key)
+        {
+            niri::reflow_workspace(workspace);
+        }
         true
     }
 
-    if reassert_if_settled(window, revealer, card, open) {
+    if reassert_if_settled(surface, last_zone, key, open) {
         return;
     }
-    let window = window.clone();
-    let revealer = revealer.clone();
-    let card = card.clone();
+    let surface = surface.clone();
     let open_state = open_state.clone();
+    let last_zone = last_zone.clone();
+    let key = key.to_owned();
     rearm_slide_tick(tick_slot, move || {
         // A re-toggle started a fresh tick for the new target; bail out.
         if open_state.get() != open {
             return glib::ControlFlow::Break;
         }
-        if reassert_if_settled(&window, &revealer, &card, open) {
+        if reassert_if_settled(&surface, &last_zone, &key, open) {
             glib::ControlFlow::Break
         } else {
             glib::ControlFlow::Continue
         }
     });
+}
+
+/// Whether an exclusive-zone settle should trigger the post-close niri
+/// reflow nudge (#1129).
+///
+/// Split out purely so it's unit-testable without a live widget tree or a
+/// registered niri service — the same reason [`open_width_from_natural`] is
+/// split out of [`open_width`].
+///
+/// `true` only on a genuine open→closed transition: `!open` (never on open —
+/// niri already reflows its own reserve as part of opening, so the nudge
+/// would be redundant there even if it were harmless) **and** the zone
+/// actually flipped from something reserved (`previous_zone != 0`) to
+/// nothing (`new_zone == 0`). A closed→closed re-assert — `previous_zone`
+/// already `0` — must not re-fire: `close_all` unconditionally
+/// `open_state.set(false)`s on teardown, and a second immediate-settle
+/// emission for a value that didn't change is otherwise indistinguishable
+/// from a real close at this call site.
+fn should_reflow_after_close(open: bool, previous_zone: i32, new_zone: i32) -> bool {
+    !open && new_zone == 0 && previous_zone != 0
 }
 
 /// Toggle the surface's input region so the closed sidebar's persistent
@@ -976,6 +1073,35 @@ mod tests {
     fn is_settled_defaults_to_true_when_no_panel() {
         // Same situation: no panel installed → nothing animating → settled.
         assert!(is_settled_for_key("nonexistent"));
+    }
+
+    // ── Post-close niri reflow (#1129) ───────────────────────────────────────
+
+    /// The one case the nudge exists for: a settle that just committed the
+    /// closed (`0`) zone, coming from a previously-reserved one.
+    #[test]
+    fn reflows_on_a_genuine_open_to_closed_transition() {
+        assert!(should_reflow_after_close(false, 320, 0));
+    }
+
+    /// Mutation guard ("fire twice"): a closed→closed re-assert — the
+    /// previous commit was *already* `0` — must not re-fire. This is what
+    /// keeps a spurious `close_all` `open_state.set(false)`, or a second
+    /// immediate-settle emission for a value that didn't change, from
+    /// nudging niri a second time for the same close.
+    #[test]
+    fn does_not_reflow_when_already_closed() {
+        assert!(!should_reflow_after_close(false, 0, 0));
+    }
+
+    /// Mutation guard ("fire on open"): opening must never nudge, even in the
+    /// contrived case where the computed zone happens to land on `0` — this
+    /// is what falsifies a mutation that drops the `!open` term and keeps
+    /// only the zone comparison.
+    #[test]
+    fn does_not_reflow_on_open() {
+        assert!(!should_reflow_after_close(true, 0, 320));
+        assert!(!should_reflow_after_close(true, 320, 0));
     }
 }
 

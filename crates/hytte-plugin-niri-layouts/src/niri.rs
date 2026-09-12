@@ -6,8 +6,12 @@
 //! snapshots [`plan`](crate::layout::plan) and [`Layout::Golden`]'s pair
 //! resolution need — windows, workspaces, outputs, and (only when the caller
 //! did not name a screen itself, #1050) the focused output — then sends one
-//! `SetWindowWidth` per column. All the deciding lives in
-//! [`layout`](crate::layout); this module only moves bytes (plus one debug
+//! `SetWindowWidth` per column, followed by a niri reflow nudge (#1129,
+//! `move_column_to_first_then_last_then_first`): `SetWindowWidth` changes a
+//! column's *width*, not anything niri reflows the workspace layout for, so a
+//! column sitting flush against the old edge is left exactly where it was —
+//! partly off screen once the widths around it change. All the deciding lives
+//! in [`layout`](crate::layout); this module only moves bytes (plus one debug
 //! line, #1052, for when the width resolution comes back empty).
 //!
 //! The [`Transport`] indirection is what makes the whole path testable: the
@@ -92,10 +96,12 @@ fn ask(transport: &mut impl Transport, request: Request) -> Result<Response, Str
 /// usual debug line, never a layout applied to the wrong screen.
 ///
 /// Returns how many columns were resized — `Ok(0)` means the target workspace
-/// held no tiled columns, which is a no-op and not an error. `Err` carries
-/// niri's own text for the first request that failed; nothing is retried and no
-/// widths are rolled back, because a partially applied layout is still a
-/// coherent one and the next click fixes it.
+/// held no tiled columns, which is a no-op and not an error (and, since
+/// #1129, sends no reflow nudge either — there is no column to nudge). `Err`
+/// carries niri's own text for the first request that failed, resize or
+/// reflow; nothing is retried and no widths are rolled back, because a
+/// partially applied layout — even one whose reflow nudge itself failed
+/// partway — is still a coherent one and the next click fixes it.
 ///
 /// Always fetches `Outputs` (#1052), even for `equal`/`split`, which never
 /// look at it: `apply` doesn't special-case the layout when asking niri, only
@@ -133,6 +139,38 @@ pub(crate) fn apply(
             }),
         )?;
     }
+
+    // #1129: the resize loop above changes column *widths*, which is not a
+    // change niri reflows the workspace layout for — nudge it with the same
+    // move-to-first/move-to-last/move-to-first chain
+    // `hytte_services::niri::reflow_workspace` sends after the shell's
+    // sidebar settles closed (that module's the twin of this one: same
+    // chain, same reason, over its own `send_actions` rather than this
+    // plugin's `Transport` — the plugin can't link `hytte-services`, #35).
+    //
+    // `plan`'s first entry is already the leftmost column's representative
+    // window (`layout::plan`'s `BTreeMap` is keyed by column index), so no
+    // second windows-in-column-order pass is needed. No columns → no nudge:
+    // there is nothing to reflow, and no `FocusWindow` to steal focus for no
+    // reason. `windows` was fetched once, at the top of `apply`, before
+    // anything above changed niri's state — so "whatever had focus" here
+    // really does mean "before this apply ran".
+    if let Some(&(first_id, _)) = plan.first() {
+        ask(
+            transport,
+            Request::Action(Action::FocusWindow { id: first_id }),
+        )?;
+        ask(transport, Request::Action(Action::MoveColumnToFirst {}))?;
+        ask(transport, Request::Action(Action::MoveColumnToLast {}))?;
+        ask(transport, Request::Action(Action::MoveColumnToFirst {}))?;
+        if let Some(focused) = windows.iter().find(|w| w.is_focused) {
+            ask(
+                transport,
+                Request::Action(Action::FocusWindow { id: focused.id }),
+            )?;
+        }
+    }
+
     Ok(plan.len())
 }
 
@@ -451,7 +489,7 @@ mod tests {
     use super::fake::{self, Fake, tile};
     use super::{Transport, apply, missing_width_diagnostic};
     use crate::layout::Layout;
-    use niri_ipc::{Reply, Request, Response};
+    use niri_ipc::{Action, Reply, Request, Response};
     use std::collections::HashMap;
 
     // ── The wire unit ────────────────────────────────────────────────────────
@@ -509,8 +547,23 @@ mod tests {
         );
     }
 
-    /// The serialised actions of one `apply`, in send order.
+    /// The serialised `SetWindowWidth` resize actions of one `apply`, in send
+    /// order — scoped to just the resize half (not [`all_action_wire_bytes`]'
+    /// full action log) so the percentage-literal tests below keep pinning
+    /// only that, unaffected by the #1129 reflow tail `apply` now sends after
+    /// it.
     fn wire_bytes(niri: &Fake) -> Vec<String> {
+        niri.seen
+            .iter()
+            .filter(|r| matches!(r, Request::Action(Action::SetWindowWidth { .. })))
+            .map(|r| serde_json::to_string(r).expect("a Request serialises"))
+            .collect()
+    }
+
+    /// Every action's wire bytes, in send order — the #1129 reflow-chain
+    /// tests below need the whole action log, not just the resize half
+    /// [`wire_bytes`] scopes itself to.
+    fn all_action_wire_bytes(niri: &Fake) -> Vec<String> {
         niri.seen
             .iter()
             .filter(|r| matches!(r, Request::Action(_)))
@@ -911,6 +964,71 @@ mod tests {
 
         assert_eq!(applied, 0, "reported as a no-op, not an error");
         assert!(niri.widths().is_empty(), "and nothing was sent");
+        // #1129: "no action at all" now also has to cover the reflow chain —
+        // a workspace with no tiled column has no first column to nudge, so
+        // no `FocusWindow`/`MoveColumnToFirst`/`MoveColumnToLast` either.
+        assert!(
+            all_action_wire_bytes(&niri).is_empty(),
+            "an empty workspace must send no Action request whatsoever, resize \
+             or reflow: {:?}",
+            all_action_wire_bytes(&niri)
+        );
+    }
+
+    // ── Post-resize niri reflow nudge (#1129) ───────────────────────────────
+
+    /// The chain `apply` sends after resizing columns, mirroring
+    /// `hytte_services::niri::reflow_batch`'s verified sequence: focus the
+    /// leftmost column, move it to the end and back to the start twice, then
+    /// restore whatever window was actually focused before `apply` ran — not
+    /// the window the nudge itself focused.
+    #[test]
+    fn apply_ends_with_the_reflow_chain_and_restores_the_original_focus() {
+        let mut focused = tile(20, 2);
+        focused.is_focused = true;
+        let mut niri = Fake::with(vec![tile(10, 1), focused, tile(30, 3)]);
+
+        apply(&mut niri, Layout::Equal, None).expect("the fake answers everything");
+
+        let actions = all_action_wire_bytes(&niri);
+        assert_eq!(
+            actions[actions.len() - 5..],
+            [
+                r#"{"Action":{"FocusWindow":{"id":10}}}"#.to_owned(),
+                r#"{"Action":{"MoveColumnToFirst":{}}}"#.to_owned(),
+                r#"{"Action":{"MoveColumnToLast":{}}}"#.to_owned(),
+                r#"{"Action":{"MoveColumnToFirst":{}}}"#.to_owned(),
+                r#"{"Action":{"FocusWindow":{"id":20}}}"#.to_owned(),
+            ],
+            "must end on the verified chain, restoring focus to window 20 (the \
+             one actually focused), not window 10 (the one the nudge itself \
+             focused): {actions:?}"
+        );
+    }
+
+    /// Mutation guard: dropping the reflow tail (or the restore step alone)
+    /// must redden. `apply` must not stop at the resize half.
+    #[test]
+    fn apply_reflow_chain_has_no_restore_step_when_nothing_is_focused() {
+        let mut niri = Fake::two_columns(); // both windows unfocused
+
+        apply(&mut niri, Layout::Split, None).expect("the fake answers everything");
+
+        assert_eq!(
+            all_action_wire_bytes(&niri),
+            vec![
+                r#"{"Action":{"SetWindowWidth":{"id":10,"change":{"SetProportion":50.0}}}}"#
+                    .to_owned(),
+                r#"{"Action":{"SetWindowWidth":{"id":20,"change":{"SetProportion":50.0}}}}"#
+                    .to_owned(),
+                r#"{"Action":{"FocusWindow":{"id":10}}}"#.to_owned(),
+                r#"{"Action":{"MoveColumnToFirst":{}}}"#.to_owned(),
+                r#"{"Action":{"MoveColumnToLast":{}}}"#.to_owned(),
+                r#"{"Action":{"MoveColumnToFirst":{}}}"#.to_owned(),
+            ],
+            "no window is focused, so the chain must end on the move back to \
+             first — no trailing FocusWindow restore step"
+        );
     }
 
     #[test]

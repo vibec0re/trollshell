@@ -553,29 +553,31 @@ impl State {
         }
     }
 
-    /// Re-read one player's properties and update the map. Returns `false`
-    /// when the player should be dropped (property read failed).
-    async fn refresh_player(&self, bus_name: &str) -> bool {
-        match read_player_props(bus_name).await {
-            Ok(mut player) => {
-                let mut map = self.map.lock().await;
-                // `Position` is intentionally not part of `PropertiesChanged`
-                // per MPRIS spec, so `read_player_props` always returns 0 for
-                // it. Preserve whatever the position poller last published so
-                // a property change (e.g. CanGoNext flipping) doesn't snap
-                // the seek bar back to 0.
-                if let Some(prev) = map.get(bus_name) {
-                    player.position_us = prev.position_us;
-                }
-                map.insert(bus_name.to_string(), player);
-                true
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, bus_name, "player property read failed, removing");
-                self.map.lock().await.remove(bus_name);
-                false
-            }
+    /// Re-read one player's properties and update the map.
+    ///
+    /// `read_player_props` is infallible by construction — every property it
+    /// reads defaults independently rather than failing the whole read (see
+    /// its doc) — so there is no failure case here to report, and this used
+    /// to return `bool` for one that could never actually happen: the
+    /// `Err` arm was dead code, and the `state.unregister(&bus_name).await;
+    /// return;` its callers held for it was unreachable. Removed rather than
+    /// kept "in case a future error path returns" — the honest way to add
+    /// one back is to let a property genuinely propagate a transient error
+    /// (see the doc on [`spawn_player_tasks`]'s initial read for why that
+    /// window is real and what closing it would take), not to leave an arm
+    /// standing that nothing can currently reach.
+    async fn refresh_player(&self, bus_name: &str) {
+        let mut player = read_player_props(bus_name).await;
+        let mut map = self.map.lock().await;
+        // `Position` is intentionally not part of `PropertiesChanged`
+        // per MPRIS spec, so `read_player_props` always returns 0 for
+        // it. Preserve whatever the position poller last published so
+        // a property change (e.g. CanGoNext flipping) doesn't snap
+        // the seek bar back to 0.
+        if let Some(prev) = map.get(bus_name) {
+            player.position_us = prev.position_us;
         }
+        map.insert(bus_name.to_string(), player);
     }
 
     /// Rebuild and publish the player list. The active player is derived
@@ -696,11 +698,18 @@ async fn spawn_player_tasks(state: State, bus_name: String) {
         return;
     };
 
-    // Initial property read.
-    if !state.refresh_player(&bus_name).await {
-        state.unregister(&bus_name).await;
-        return;
-    }
+    // Initial property read. `build()` succeeding just above proves the bus
+    // was up a moment ago, but a blip in the window between that and this
+    // `Get` still surfaces as a blank player published for one cycle (no
+    // identity, `Stopped`, every `Can*` false) rather than a failure this
+    // task could react to — see the doc above and `read_player_props`'s.
+    // Accepted by design here: the window is one `Get` round trip, it
+    // self-heals on the very next `PropertiesChanged` this task subscribes to
+    // below (or on `watch_liveness`'s `PeerGone` if the player is actually
+    // gone), and closing it for real would mean letting a property like
+    // `Identity` propagate a transient error through `setup_step` too —
+    // a bigger change than this dead-arm cleanup (#1197 review).
+    state.refresh_player(&bus_name).await;
     state.publish().await;
 
     // Subscribe to PropertiesChanged for this player.
@@ -796,12 +805,8 @@ async fn watch_properties(state: State, bus_name: String, sub: hytte_bus::Signal
             }
         }
 
-        let still_alive = state.refresh_player(&bus_name).await;
+        state.refresh_player(&bus_name).await;
         state.publish().await;
-        if !still_alive {
-            tracing::debug!(bus_name, "player disappeared mid-watch");
-            return;
-        }
     }
 
     tracing::debug!(bus_name, "PropertiesChanged stream ended for player");
@@ -1007,7 +1012,12 @@ where
     })
 }
 
-async fn read_player_props(bus_name: &str) -> Result<Player> {
+/// Read every player property, defaulting each one independently on failure
+/// (see the call sites below) rather than failing the whole read — so this is
+/// infallible by construction and returns `Player` directly rather than a
+/// `Result` nothing can actually put an `Err` into. See [`State::refresh_player`]
+/// for what that means for the caller.
+async fn read_player_props(bus_name: &str) -> Player {
     let identity: String = get_property(bus_name, MPRIS_IFACE, "Identity")
         .await
         .unwrap_or_default();
@@ -1029,7 +1039,7 @@ async fn read_player_props(bus_name: &str) -> Result<Player> {
 
     let (title, artists, album, art_url, length_us, track_id) = read_metadata(bus_name).await;
 
-    Ok(Player {
+    Player {
         bus_name: bus_name.to_string(),
         identity,
         status,
@@ -1043,7 +1053,7 @@ async fn read_player_props(bus_name: &str) -> Result<Player> {
         position_us: 0,
         length_us,
         track_id,
-    })
+    }
 }
 
 /// Extract track metadata from the `Metadata` property. Returns

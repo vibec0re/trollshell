@@ -2989,6 +2989,8 @@ mod tests {
     /// grid, not just a spot-checked few.
     #[test]
     fn a_minutely_rule_with_interval_7_stays_on_the_dtstart_grid() {
+        use chrono::{TimeZone as _, Utc};
+
         let ical = "BEGIN:VEVENT\r\nUID:minutely-i7\r\nDTSTAMP:20260101T090300Z\r\n\
                      DTSTART:20260101T090300Z\r\nDTEND:20260101T090800Z\r\n\
                      SUMMARY:Every 7 minutes\r\nRRULE:FREQ=MINUTELY;INTERVAL=7\r\n\
@@ -2999,7 +3001,6 @@ mod tests {
             !inst.is_empty(),
             "fixture must contribute occurrences to the window",
         );
-        use chrono::{TimeZone as _, Utc};
         let dtstart_unix = Utc
             .with_ymd_and_hms(2026, 1, 1, 9, 3, 0)
             .unwrap()

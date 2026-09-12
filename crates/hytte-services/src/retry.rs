@@ -300,6 +300,68 @@ impl ReconnectBackoff {
     }
 }
 
+// ── Log cadence over a failure streak (#1170) ────────────────────────────────
+
+/// What a finished attempt should *say*, given what the attempts before it
+/// already said.
+///
+/// Mechanism, on this module's split: the latch decides **whether** a given
+/// attempt is worth a line and at what standing, never **what** the line says —
+/// the wording, the fields and the level stay at the call site, exactly as
+/// [`Policy::step`] leaves the "which outcomes are retryable" judgement there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Report {
+    /// The first failure of a streak. Say it loudly, once — and say that it
+    /// will not repeat, because it will not.
+    Opened,
+    /// The streak continues. `debug!`; the condition is already on the record
+    /// and the ramp is already slowing the retries down.
+    Repeating,
+    /// It worked again after a streak. Retract the warning, at the level that
+    /// opened it (see `hytte_bus::own`'s `log_recovered`: a filter that shows
+    /// an incident opening must show it closing).
+    Recovered,
+    /// It worked, and nothing was outstanding. The call site may still have
+    /// something of its own to say about the run that just ended — this only
+    /// says the *streak* narrative has nothing to add.
+    Quiet,
+}
+
+/// A latch over a run of consecutive failures, so a permanent condition costs
+/// one line rather than one line per attempt.
+///
+/// The shape is `hytte_bus::own`'s (#668/#669): open loudly on the edge into
+/// failure, stay quiet while nothing changes, and speak again only to retract.
+/// #1170 needed it at three call sites at once — `geoclue`'s resolve loop,
+/// `niri`'s reconnect and the `PipeWire` mainloop's — which is why it is a type
+/// here and not a `bool` in each of them.
+pub(crate) struct FailureLatch {
+    /// `true` once a failure has been reported and no success has retracted it.
+    open: bool,
+}
+
+impl FailureLatch {
+    pub(crate) const fn new() -> Self {
+        Self { open: false }
+    }
+
+    /// Record one attempt's verdict and get back what to say about it.
+    pub(crate) const fn record(&mut self, healthy: bool) -> Report {
+        match (healthy, self.open) {
+            (true, true) => {
+                self.open = false;
+                Report::Recovered
+            }
+            (true, false) => Report::Quiet,
+            (false, false) => {
+                self.open = true;
+                Report::Opened
+            }
+            (false, true) => Report::Repeating,
+        }
+    }
+}
+
 /// Every retry policy this crate **ships**, so the `every_shipped_policy_*`
 /// tests below see all of them.
 ///
@@ -317,11 +379,15 @@ const SHIPPED: &[(&str, Policy)] = &[
         "networkd::STARTUP_REFRESH_RETRY",
         crate::networkd::STARTUP_REFRESH_RETRY,
     ),
+    ("geoclue::RESOLVE_RETRY", crate::geoclue::RESOLVE_RETRY),
 ];
 
 #[cfg(test)]
 mod tests {
-    use super::{Policy, RECONNECT_RESET_AFTER, RECONNECT_RETRY, ReconnectBackoff, SHIPPED, Step};
+    use super::{
+        FailureLatch, Policy, RECONNECT_RESET_AFTER, RECONNECT_RETRY, ReconnectBackoff,
+        Report, SHIPPED, Step,
+    };
     use std::time::Duration;
 
     /// A *bounded* policy with tiny delays, so the give-up path stays reachable
@@ -508,6 +574,59 @@ mod tests {
             "a daemon restart after a long healthy run left the panel dead for the full ceiling \
              (#806)"
         );
+    }
+
+    // ── The failure latch (#1170) ────────────────────────────────────────────
+
+    /// #1170's item 4, stated as the mechanism: five consecutive missing-socket
+    /// attempts are worth exactly one loud line.
+    #[test]
+    fn a_streak_of_failures_opens_once_and_then_stays_quiet() {
+        let mut latch = FailureLatch::new();
+        let reports: Vec<Report> = (0..5).map(|_| latch.record(false)).collect();
+        assert_eq!(
+            reports.iter().filter(|r| **r == Report::Opened).count(),
+            1,
+            "a permanent condition must cost one loud line, not one per attempt (#1170)"
+        );
+        assert_eq!(
+            reports,
+            vec![
+                Report::Opened,
+                Report::Repeating,
+                Report::Repeating,
+                Report::Repeating,
+                Report::Repeating
+            ]
+        );
+    }
+
+    /// The retraction fires once, and the latch re-arms: a peer that flaps is
+    /// reported every time it goes down, not only the first time.
+    #[test]
+    fn recovery_is_reported_once_and_the_latch_re_arms() {
+        let mut latch = FailureLatch::new();
+        assert_eq!(latch.record(false), Report::Opened);
+        assert_eq!(latch.record(true), Report::Recovered);
+        assert_eq!(
+            latch.record(true),
+            Report::Quiet,
+            "a second healthy run re-announced a recovery nobody was waiting for"
+        );
+        assert_eq!(
+            latch.record(false),
+            Report::Opened,
+            "the latch did not re-arm, so the next outage would be silent"
+        );
+    }
+
+    /// A healthy first run says nothing at all — the latch must not open on
+    /// success, which would invert every level at every call site.
+    #[test]
+    fn a_healthy_run_with_nothing_outstanding_is_quiet() {
+        let mut latch = FailureLatch::new();
+        assert_eq!(latch.record(true), Report::Quiet);
+        assert_eq!(latch.record(true), Report::Quiet);
     }
 
     // ── The shipped constants (#665) ─────────────────────────────────────────

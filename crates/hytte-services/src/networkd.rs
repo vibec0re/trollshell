@@ -40,7 +40,7 @@ use anyhow::{Context, Result};
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
 use hytte_bus::{BusKind, call, signals};
-use hytte_reactive::{Service, registry, spawn_supervised_bounded};
+use hytte_reactive::{Service, registry, shared, spawn_supervised_bounded};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
@@ -442,6 +442,12 @@ impl Service for NetworkdService {
         let primary_writer = handles.primary.clone();
         let source_writer = handles.source.clone();
 
+        // The link picture is also read *off* the main thread, by sibling
+        // services' tokio tasks — see [`shared_primary`].
+        shared::insert(NetworkdShared {
+            primary: handles.primary.clone(),
+        });
+
         // Bounded (#1174): this body returns by design on a host with no link
         // backend at all — the `LinkBackend::None` arm below publishes
         // `LinkSource::Unavailable`, says so at `info!`, and falls off the end,
@@ -716,6 +722,28 @@ pub fn primary() -> impl Signal<Item = Option<Link>> {
             .primary
             .signal_cloned()
     })
+}
+
+/// Cross-thread mirror of [`NetworkdHandles::primary`].
+///
+/// [`primary`] reads the thread-local registry, so only the GTK main thread can
+/// call it; this bag is the `hytte_reactive::shared` route a sibling service's
+/// tokio task takes instead — the same shape `upower`, `geoclue` and `places`
+/// already publish. Inserted by [`NetworkdService::start`].
+struct NetworkdShared {
+    primary: Mutable<Option<Link>>,
+}
+
+/// A clone of the primary-link `Mutable`, for tokio tasks in sibling services
+/// that cannot reach the main-thread-only registry. `None` until [`service`]
+/// has started (or forever, in a shell that never registers it).
+///
+/// Its one consumer today is `geoclue`, which watches the `None` → `Some` edge
+/// as "the link came back" and re-resolves the location there (#1170): a fix
+/// that failed because the host was offline should not wait out the retry ramp
+/// once it demonstrably is not.
+pub(crate) fn shared_primary() -> Option<Mutable<Option<Link>>> {
+    shared::get::<NetworkdShared>().map(|s| s.primary.clone())
 }
 
 /// Signal of whether any link manager is answering — see [`LinkSource`].

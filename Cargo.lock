@@ -1423,8 +1423,6 @@ name = "hytte-plugin-timer"
 version = "0.1.0"
 dependencies = [
  "hytte-plugin",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]

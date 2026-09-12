@@ -3,12 +3,15 @@
 //!
 //! # The gate
 //!
-//! [`poll_task`] mirrors the departures board's reference gate (#288): it owns
-//! the fetch interval and drains the command lane fed by
+//! [`poll_task`] is driven by the command lane fed by
 //! [`crate::UsageCmd::SetVisible`]. While the sidebar is hidden it **parks** —
 //! no ticks, no HTTP; on a hidden→visible edge it fires an immediate refresh,
 //! then re-polls every [`POLL_INTERVAL`] until hidden again. HTTP is blocking
 //! `ureq` on a `spawn_blocking` thread — the house idiom.
+//!
+//! It used to mirror the departures board's reference gate (#288) by carrying
+//! a copy of it; since #1168 both call the one helper,
+//! [`hytte_plugin::poll::gated`].
 //!
 //! # The read path (defensive by design)
 //!
@@ -25,6 +28,7 @@
 
 use std::time::Duration;
 
+use hytte_plugin::poll;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -279,13 +283,6 @@ fn fetch_spend(cfg: &Config) -> Result<f64, String> {
 
 // ── The visibility-gated poll task ───────────────────────────────────────────
 
-/// The visibility-gate transition: given the current visible state and a
-/// requested one, return the next state and whether an **immediate** refresh is
-/// owed (a hidden→visible edge). Pure, so the gate is unit-testable.
-fn on_visibility(current: bool, requested: bool) -> (bool, bool) {
-    (requested, requested && !current)
-}
-
 /// Run one blocking fetch and forward the outcome to the reducer.
 async fn fetch_and_send(cfg: &Config, msg_tx: &UnboundedSender<UsageMsg>) {
     let cfg = cfg.clone();
@@ -308,43 +305,32 @@ async fn fetch_and_send(cfg: &Config, msg_tx: &UnboundedSender<UsageMsg>) {
 
 /// The I/O side of the visibility gate (the `sources()` task). Parks while the
 /// sidebar is hidden, refreshes immediately when it opens, then re-polls every
-/// [`POLL_INTERVAL`] until it closes. Exits when the command lane closes (the
-/// session is tearing down).
+/// [`POLL_INTERVAL`] until it closes. Returns when the command lane closes
+/// (the session is tearing down).
+///
+/// The loop is [`hytte_plugin::poll::gated`] since #1168 — this file, the
+/// departures board and `agents` had each written the same dozen lines, down
+/// to the comments; what the `biased;`, the `, if visible` and the reset on
+/// the open edge buy is documented on the helper.
 pub(crate) async fn poll_task(
     cfg: Config,
-    mut cmds: crate::CmdReceiver<UsageCmd>,
+    cmds: crate::CmdReceiver<UsageCmd>,
     msg_tx: UnboundedSender<UsageMsg>,
 ) {
-    let mut visible = false;
-    let mut interval = tokio::time::interval(POLL_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    loop {
-        tokio::select! {
-            // Prefer visibility changes so a close parks the poller promptly.
-            biased;
-            cmd = cmds.recv() => {
-                let Some(UsageCmd::SetVisible(requested)) = cmd else {
-                    return; // lane closed → session teardown
-                };
-                let (next_visible, refresh_now) = on_visibility(visible, requested);
-                visible = next_visible;
-                if refresh_now {
-                    interval.reset();
-                    fetch_and_send(&cfg, &msg_tx).await;
-                }
-            }
-            // Disabled while hidden — the poller parks (no ticks, no HTTP).
-            _ = interval.tick(), if visible => {
-                fetch_and_send(&cfg, &msg_tx).await;
-            }
-        }
-    }
+    // An irrefutable pattern on purpose: a second `UsageCmd` variant would
+    // fail to compile here rather than being read as a visibility flip.
+    poll::gated(
+        cmds,
+        POLL_INTERVAL,
+        |&UsageCmd::SetVisible(visible)| visible,
+        || fetch_and_send(&cfg, &msg_tx),
+    )
+    .await;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Endpoints, derive_endpoints, discover_panel_id, on_visibility, parse_query_value};
+    use super::{Endpoints, derive_endpoints, discover_panel_id, parse_query_value};
 
     const QUERY_FIXTURE: &str = include_str!("../tests/fixtures/grafana-query.json");
     const META_FIXTURE: &str = include_str!("../tests/fixtures/grafana-dashboard.json");
@@ -477,12 +463,10 @@ mod tests {
     }
 
     // ── The visibility gate ───────────────────────────────────────────────────
-
-    #[test]
-    fn on_visibility_refreshes_only_on_the_hidden_to_visible_edge() {
-        assert_eq!(on_visibility(false, true), (true, true));
-        assert_eq!(on_visibility(true, true), (true, false));
-        assert_eq!(on_visibility(true, false), (false, false));
-        assert_eq!(on_visibility(false, false), (false, false));
-    }
+    //
+    // Moved to the SDK with the loop (#1168). The four transitions this
+    // file's `on_visibility_refreshes_only_on_the_hidden_to_visible_edge`
+    // asserted are `hytte_plugin::poll`'s
+    // `only_the_hidden_to_visible_edge_refreshes`, driven through the real
+    // `Gate` on a paused clock rather than through a pure function.
 }

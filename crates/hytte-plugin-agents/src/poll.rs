@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use hytte_plugin::CmdReceiver;
+use hytte_plugin::poll::{Gate, Wake};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::{self, AgentsConfig};
@@ -182,7 +183,7 @@ pub async fn poll_task(cmds: CmdReceiver<Cmd>, msg_tx: UnboundedSender<Msg>) {
 /// at all. The live reload still watches the real XDG layers, so what the
 /// tests do not cover is only *which files* are watched.
 pub async fn poll_task_with(
-    mut cmds: CmdReceiver<Cmd>,
+    cmds: CmdReceiver<Cmd>,
     msg_tx: UnboundedSender<Msg>,
     mut cfg: AgentsConfig,
     mut watch: ConfigSource,
@@ -191,80 +192,64 @@ pub async fn poll_task_with(
         return;
     }
 
-    let mut visible = false;
     let mut urls_done = false;
     // Whether the `Pending` verb is currently refusing — the transition edge
     // that decides `warn!` from `debug!`. Per task, so a plugin restart says it
     // once more rather than staying quiet about a hive that never answered.
     let mut pending_failing = false;
-    let mut interval = tokio::time::interval(cfg.poll_interval());
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // The seed poll — see the module docs on why it ignores `visible`.
+    // The parking, the cadence, the `biased;` lane-before-tick ordering and
+    // the reset on the open edge are the SDK's since #1168 — `departures`,
+    // `usage` and this file had each written the same loop out. This one
+    // drives [`Gate`] rather than [`hytte_plugin::poll::gated`] because its
+    // lane carries a second verb (`Cmd::Send`) and its cadence comes from a
+    // config file that can be edited while the task runs.
+    let mut gate = Gate::new(cmds, cfg.poll_interval(), |cmd: &Cmd| match cmd {
+        Cmd::SetVisible(want) => Some(*want),
+        Cmd::Send(_) => None,
+    });
+
+    // The seed poll — see the module docs on why it ignores visibility.
     poll_once(&cfg, &msg_tx, &mut urls_done, &mut pending_failing).await;
 
-    loop {
-        tokio::select! {
-            // Prefer commands over interval ticks, so a close parks the poller
-            // promptly rather than firing one more round trip first.
-            biased;
-            cmd = cmds.recv() => {
-                let Some(cmd) = cmd else {
-                    return; // lane closed → session teardown
-                };
-                match cmd {
-                    Cmd::SetVisible(want) => {
-                        let opened = want && !visible;
-                        visible = want;
-                        if opened {
-                            // Reset first so the next scheduled tick lands a
-                            // clean interval after this immediate refresh.
-                            interval.reset();
-                            if reload(&mut cfg, &mut watch, &msg_tx) {
-                                interval = fresh_interval(&cfg);
-                            }
-                            poll_once(&cfg, &msg_tx, &mut urls_done, &mut pending_failing).await;
-                        }
-                    }
-                    Cmd::Send(req) => {
-                        match client::request(Path::new(&cfg.socket), &req).await {
-                            Ok(_) => tracing::debug!(?req, "hive accepted"),
-                            Err(e) => {
-                                tracing::warn!(?req, %e, "hive refused");
-                                // One message per refusal — the reducer turns
-                                // it into exactly one toast.
-                                let _ = msg_tx.send(Msg::WriteRefused {
-                                    request: req.clone(),
-                                    reason: e.to_string(),
-                                });
-                            }
-                        }
-                        // Re-poll regardless of the outcome: the roster is the
-                        // truth, and a refused write must un-stick the row's
-                        // optimistic flip just as fast as an accepted one.
-                        interval.reset();
-                        poll_once(&cfg, &msg_tx, &mut urls_done, &mut pending_failing).await;
-                    }
-                }
-            }
-            // Disabled while hidden — the poller parks (no ticks, no sockets).
-            _ = interval.tick(), if visible => {
+    while let Some(wake) = gate.next().await {
+        match wake {
+            // An open edge or a due tick — the gate has already reset the
+            // cadence on the edge, so both run the same body.
+            Wake::Refresh => {
                 if reload(&mut cfg, &mut watch, &msg_tx) {
-                    interval = fresh_interval(&cfg);
+                    gate.set_period(cfg.poll_interval());
                 }
                 poll_once(&cfg, &msg_tx, &mut urls_done, &mut pending_failing).await;
             }
+            Wake::Cmd(Cmd::Send(req)) => {
+                match client::request(Path::new(&cfg.socket), &req).await {
+                    Ok(_) => tracing::debug!(?req, "hive accepted"),
+                    Err(e) => {
+                        tracing::warn!(?req, %e, "hive refused");
+                        // One message per refusal — the reducer turns it into
+                        // exactly one toast.
+                        let _ = msg_tx.send(Msg::WriteRefused {
+                            request: req.clone(),
+                            reason: e.to_string(),
+                        });
+                    }
+                }
+                // Re-poll regardless of the outcome: the roster is the truth,
+                // and a refused write must un-stick the row's optimistic flip
+                // just as fast as an accepted one.
+                gate.reset();
+                poll_once(&cfg, &msg_tx, &mut urls_done, &mut pending_failing).await;
+            }
+            // Absorbed by the gate, which answers an open edge with
+            // `Wake::Refresh`. Spelled out rather than caught by a wildcard so
+            // a third `Cmd` variant fails to compile here.
+            Wake::Cmd(Cmd::SetVisible(_)) => {}
         }
         if msg_tx.is_closed() {
             return;
         }
     }
-}
-
-fn fresh_interval(cfg: &AgentsConfig) -> tokio::time::Interval {
-    let mut interval = tokio::time::interval(cfg.poll_interval());
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    interval
 }
 
 /// Re-read `agents.toml` when a layer moved. `true` when the config changed

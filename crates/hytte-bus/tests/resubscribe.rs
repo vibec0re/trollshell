@@ -18,152 +18,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-// ── An ephemeral broker that can be restarted on the same socket path ────────
-//
-// A near-copy of `tests/common/mod.rs`, plus `restart_on_same_address`. It is
-// duplicated rather than shared because PR #1189 is adding exactly that helper
-// to `common/mod.rs` for `connection_reconnect.rs`; this module collapses onto
-// it the moment #1189 lands. The doc comments there are the canonical ones —
-// in particular the reasoning behind `DBUS_DAEMON_STARTUP_BUDGET`, which is
-// sized for worst-case CI contention rather than typical-case latency
-// (#676/#678).
-mod daemon {
-    use std::path::{Path, PathBuf};
-    use std::process::Stdio;
-    use std::time::Duration;
-    use tempfile::TempDir;
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    use tokio::process::{Child, Command};
-    use zbus::Connection;
-    use zbus::connection::Builder;
-
-    const DBUS_DAEMON_STARTUP_BUDGET: Duration = Duration::from_secs(30);
-
-    pub struct BusGuard {
-        child: Option<Child>,
-        tmp: TempDir,
-        pub address: String,
-    }
-
-    impl Drop for BusGuard {
-        fn drop(&mut self) {
-            if let Some(mut child) = self.child.take() {
-                let _ = child.start_kill();
-                tokio::task::block_in_place(|| {
-                    let handle = tokio::runtime::Handle::current();
-                    let _ = handle.block_on(child.wait());
-                });
-            }
-        }
-    }
-
-    fn write_session_conf(tmp: &TempDir, address: &str) -> PathBuf {
-        let config = tmp.path().join("session.conf");
-        std::fs::write(
-            &config,
-            format!(
-                r#"<?xml version="1.0"?>
-<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
- "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-<busconfig>
-  <type>session</type>
-  <listen>{address}</listen>
-  <auth>EXTERNAL</auth>
-  <policy context="default">
-    <allow send_destination="*" eavesdrop="true"/>
-    <allow eavesdrop="true"/>
-    <allow own="*"/>
-  </policy>
-</busconfig>
-"#
-            ),
-        )
-        .expect("write dbus-daemon config");
-        config
-    }
-
-    async fn spawn_daemon(config: &Path) -> Child {
-        let mut child = Command::new("dbus-daemon")
-            .arg("--config-file")
-            .arg(config)
-            .arg("--print-address=1")
-            .arg("--nofork")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn dbus-daemon — install package `dbus` if missing");
-
-        let stdout = child.stdout.take().expect("dbus-daemon stdout");
-        let mut lines = BufReader::new(stdout).lines();
-        let printed = tokio::time::timeout(DBUS_DAEMON_STARTUP_BUDGET, lines.next_line())
-            .await
-            .expect("dbus-daemon address timeout")
-            .expect("dbus-daemon read address")
-            .expect("dbus-daemon closed stdout");
-        assert!(
-            printed.contains("unix:path="),
-            "unexpected dbus-daemon address: {printed}"
-        );
-
-        child
-    }
-
-    async fn connect(address: &str) -> Connection {
-        Builder::address(address)
-            .expect("parse bus address")
-            .build()
-            .await
-            .expect("connect to ephemeral bus")
-    }
-
-    /// Spawn a fresh `dbus-daemon` and connect to it.
-    pub async fn ephemeral_bus() -> (Connection, BusGuard) {
-        let tmp = TempDir::new().expect("create tempdir for dbus-daemon");
-        let socket: PathBuf = tmp.path().join("bus");
-        let address = format!("unix:path={}", socket.display());
-
-        let config = write_session_conf(&tmp, &address);
-        let child = spawn_daemon(&config).await;
-        let conn = connect(&address).await;
-
-        (
-            conn,
-            BusGuard {
-                child: Some(child),
-                tmp,
-                address,
-            },
-        )
-    }
-
-    /// Kill the daemon behind `guard` and boot a fresh one on the **identical**
-    /// socket path — a real system/session bus restarting under its supervisor
-    /// while every consumer's configured address stays put. Connections opened
-    /// against the old daemon are talking to a dead peer and stay that way;
-    /// the `Connection` returned here is a brand new one. The returned guard
-    /// replaces the caller's, which must not be used again.
-    pub async fn restart_on_same_address(mut guard: BusGuard) -> (Connection, BusGuard) {
-        if let Some(mut child) = guard.child.take() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-
-        // dbus-daemon does not reliably unlink its socket on SIGKILL; remove a
-        // stale one so the fresh daemon can bind the identical path rather than
-        // failing with EADDRINUSE.
-        if let Some(socket_path) = guard.address.strip_prefix("unix:path=") {
-            let _ = std::fs::remove_file(socket_path);
-        }
-
-        let config = guard.tmp.path().join("session.conf");
-        let child = spawn_daemon(&config).await;
-        let conn = connect(&guard.address).await;
-
-        guard.child = Some(child);
-        (conn, guard)
-    }
-}
+mod common;
+use common::{ephemeral_bus, restart_on_same_address};
 
 // ── A trivial peer to subscribe to ───────────────────────────────────────────
 
@@ -254,7 +110,7 @@ where
 /// `Loaded(7)` requires a fresh `Get` on a fresh connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lone_property_subscription_detects_a_dead_daemon_and_recovers() {
-    let (conn_a, guard_a) = daemon::ephemeral_bus().await;
+    let (conn_a, guard_a) = ephemeral_bus().await;
     let address = guard_a.address.clone();
     let _server_a = serve_counter(&address, 42).await;
 
@@ -273,7 +129,7 @@ async fn a_lone_property_subscription_detects_a_dead_daemon_and_recovers() {
 
     // Kill daemon A and boot a fresh one on the identical socket path. The
     // cached connection now points at a dead peer and nothing has said so.
-    let (conn_b, _guard_b) = daemon::restart_on_same_address(guard_a).await;
+    let (conn_b, _guard_b) = restart_on_same_address(guard_a).await;
     let _server_b = serve_counter(&address, 7).await;
 
     // Arm recovery — and only recovery.
@@ -319,7 +175,7 @@ async fn a_failing_resubscribe_marks_stale_exactly_once() {
     /// inside it, and that the ramp has gone round several times.
     const WINDOW: Duration = Duration::from_secs(5);
 
-    let (conn, guard) = daemon::ephemeral_bus().await;
+    let (conn, guard) = ephemeral_bus().await;
     let address = guard.address.clone();
     let _server = serve_counter(&address, 42).await;
 
@@ -383,7 +239,7 @@ async fn a_failing_resubscribe_marks_stale_exactly_once() {
 /// a real peer-back NOC on the still-live stream.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_proxy_rebuild_does_not_announce_live() {
-    let (conn, guard) = daemon::ephemeral_bus().await;
+    let (conn, guard) = ephemeral_bus().await;
     let address = guard.address.clone();
     let server = serve_counter(&address, 42).await;
 
@@ -466,7 +322,7 @@ async fn a_failed_proxy_rebuild_does_not_announce_live() {
 /// opt-in that surfaces them.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_resubscribe_reaches_the_consumer_as_a_marker() {
-    let (conn_a, guard_a) = daemon::ephemeral_bus().await;
+    let (conn_a, guard_a) = ephemeral_bus().await;
     let address = guard_a.address.clone();
     let _server_a = serve_counter(&address, 42).await;
 
@@ -502,7 +358,7 @@ async fn a_resubscribe_reaches_the_consumer_as_a_marker() {
         "the first subscription is not a re-subscription"
     );
 
-    let (conn_b, _guard_b) = daemon::restart_on_same_address(guard_a).await;
+    let (conn_b, _guard_b) = restart_on_same_address(guard_a).await;
     shared.arm_reconnect_for_test(conn_b);
 
     wait_for(

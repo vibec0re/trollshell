@@ -2846,9 +2846,9 @@ pub(in crate::panels) mod tests {
         window.destroy();
     }
 
-    /// An ephemeral card shows the live windows, deduped, carries no Start/Stop
-    /// — it is already running — and offers **Edit** and nothing else
-    /// (#1071 §3.7 / #1109).
+    /// An ephemeral card shows the live windows, one icon per window (#1133),
+    /// carries no Start/Stop — it is already running — and offers **Edit** and
+    /// nothing else (#1071 §3.7 / #1109).
     ///
     /// **#1109's own assertion**: nothing inline. Phase 2 put a `gtk::Entry` and
     /// a Save button on this card; Annika's ruling is that they go entirely, so
@@ -2875,8 +2875,9 @@ pub(in crate::panels) mod tests {
         );
         assert_eq!(
             icons(&card).len(),
-            2,
-            "two windows of one app are one icon — the stack is a set of apps"
+            3,
+            "one icon per window (#1133) — two Term windows are two icons, \
+             not one; the stack is a list of apps, one per window"
         );
         assert!(
             by_class(&card, "ts-ws-action").is_empty(),

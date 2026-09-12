@@ -1946,25 +1946,43 @@ session.
       offscreen passes run at its pre-upscale `cols × rows`, a gauge's run at
       `cols * scale × rows * scale`, so the arc, the ticks and the needle are
       rasterised at the size they are shown at instead of at a logical 144 × 64
-      replicated ×2. Every length is the kit's own, resolved by the kit's own
-      rules (#931's tick budget, centring and counterweight decisions are
-      untouched); the one constant that is deliberately not scaled is the
-      anti-aliasing ramp, which stays **one native pixel** wide. That is the
-      whole of the fix.
+      replicated ×2. Every length is the kit's own — since #1148's review,
+      literally: `hytte-preem` exposes `Gauge::dial` and the shape constants and
+      the GL arm calls them, so #931's tick budget, centring and counterweight
+      decisions cannot drift by transcription. The one constant that is
+      deliberately not scaled is the anti-aliasing ramp, which stays **one
+      native pixel** wide. That is the whole of the fix.
 
       What CI already holds: the mapping (the golden uniform table, the dial
       geometry, the motion-blur fan collapsing exactly at rest, the overtravel
-      stop), the node shape, the kill switch, the lockstep park, the
-      context-failure rebuild, and — under llvmpipe in `checks.system-tests` —
-      twelve gauge parity cases (four skins × rest / mid-sweep / pegged) at
-      `scale = 1`, where the two arms rasterise at the same resolution. Those
-      came out **byte-identical** on Mesa 26.2.2 (max |Δ| 0 of 255 on every
-      channel), the same as the scope's twelve, though the gauge is held only
-      to #893's on-glass ceiling and not to that zero — Annika's word on #865
-      was that it does not have to be pixel-perfect identical.
+      stop, and — since #1148 — every constant `gauge.frag` shares with the kit,
+      parsed back out of the shipped GLSL), the node shape, the kill switch, the
+      lockstep park, the context-failure rebuild, and — under llvmpipe in
+      `checks.system-tests` — **sixteen** gauge parity cases:
 
-      What only glass can answer is the thing the harness cannot see at 1:1:
-      whether the sharper dial is the one you want.
+      - twelve at `scale = 1` (four skins × rest / mid-sweep / pegged), where the
+        two arms rasterise at the same resolution. Measured on Mesa 26.2.2:
+        **max |Δ| 0 of 255 on every channel**, all twelve, the same as the
+        scope's twelve — and since #1148's review `TROLLSHELL_PARITY_EXACT=1`
+        *pins* them there, so a shader drift that clears #893's on-glass ceiling
+        still fails CI;
+      - four at `scale = 2` — `GaugeConfig::default()`, i.e. what every dial on
+        your glass actually uses. The GL frame is rendered at the native
+        288 × 128 and box-averaged back down to the kit's 144 × 64 before
+        comparing, because the two are *supposed* to differ at 1:1 there. The
+        assertion is the split: **every pixel off a rasterisation edge is
+        bit-identical to the kit's** — the flat field, the tick and arc
+        interiors, the lit cores and the CRT comb — with the whole difference in
+        the edge bin. Measured, worst of the four (`gauge.oled.sweep.x2`):
+        `edge[n=2378 mean 9.364 max 76]  field[n=6792 mean 0.000 max 0]
+        lit[n=46 mean 0.000 max 0]`.
+
+      Run it yourself with the headless recipe in the `Scope` entry's item 4
+      above (same four environment variables); the transcript prints those
+      region lines per case.
+
+      What only glass can answer is the thing no harness can see: whether the
+      sharper dial is the one you want.
 
   1. **The needle is crisp.** Start the shell and open
      `hytte-plugin-preem-demo`'s card (or any plugin with a gauge — the timer,
@@ -1974,14 +1992,13 @@ session.
   2. **Side by side with the kit.** Restart with
      `TROLLSHELL_PREEM_RENDERER=cpu` in the **unit's** environment (it is read
      once, at the first widget build, so your shell's environment is not
-     enough) and screenshot the same dial. The GL one should differ **only**
-     in edge softness — the field, the flat tick/arc interiors and the lit
-     core are byte-identical, which is measured: at `scale = 2` the harness
-     reports the whole delta in the `edge` region (`field` mean 0.000, `lit`
-     mean ≤ 0.005) and the GL arm lights ~19 % fewer partial-coverage pixels
-     (4530 against the kit's 5648 on `gauge.vfd.sweep`). If anything but the
-     edges moved — a different colour, a moved tick, a needle at another angle
-     — that is a bug, not the improvement.
+     enough) and screenshot the same dial. The GL one should differ **only** in
+     edge softness — the field, the flat tick/arc interiors and the lit cores
+     must read as identical, which is the `scale = 2` harness case's own
+     assertion (above) rather than a hope. If anything but the edges moved — a
+     different colour, a moved tick, a needle at another angle, a comb at
+     another pitch — that is a bug, not the improvement, and the harness will
+     say so as `FAIL(interior)`.
   3. **The verdict is Annika's.** #1090 is the open report; this entry is what
      closes it, and only she can say the dial now looks right. Both looks are
      one restart apart (item 2), which is the point of keeping the kill switch.
@@ -1995,7 +2012,11 @@ session.
      **same pitch on glass** as the scope's beside it: the mask is the skin's
      screen-space furniture and is deliberately evaluated at the logical
      coordinate, so only the geometry gains resolution. A dial whose comb is
-     twice as fine as its neighbour's means that division was dropped.
+     twice as fine as its neighbour's means that division was dropped — which
+     the `scale = 2` CRT case now catches in CI (measured: pinning the shader's
+     mask divisor to 1 turns `gauge.crt.sweep.x2` into `FAIL(interior)` while
+     every other case stays green), so on glass this is a second pair of eyes
+     rather than the only one.
 
 - [ ] **(#893)** **The shader widget: a plugin's own GLSL on the GPU.** A
       plugin ships a fragment body plus a data buffer; the shell compiles the

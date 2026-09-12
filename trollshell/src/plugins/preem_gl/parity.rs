@@ -288,6 +288,13 @@ impl Kind {
     /// the failure this is meant to prevent. Each pair below is stated with the
     /// llvmpipe measurement it was calibrated from, so the next reader can tell
     /// a budget from a wish.
+    ///
+    /// `match_same_arms` is allowed **deliberately**: two of these three
+    /// currently hold the same pair, and collapsing them would delete exactly
+    /// the property this function exists for — that each kind's budget is its
+    /// own measurement, arrived at separately, and moves without dragging
+    /// another kind's with it.
+    #[allow(clippy::match_same_arms)]
     pub(crate) fn edge_budget(self) -> EdgeBudget {
         match self {
             // Four `scale = 2` cases, one per skin. Measured worst on llvmpipe
@@ -1048,8 +1055,8 @@ fn distribution(deltas: &mut [u8]) -> ChannelStats {
 mod tests {
     use super::{
         CEILING_MAX, CEILING_MEAN, CEILING_P99, ChannelStats, Flatness, Kind, Layout, RegionStats,
-        Regions, Sampling, Stats, Verdict, box_downsample, case_verdict,
-        compare, distribution, peak_row_tolerance, regions,
+        Regions, Sampling, Stats, Verdict, box_downsample, case_verdict, compare, distribution,
+        peak_row_tolerance, regions,
     };
 
     /// A `Stats` whose **worst pixel** is `delta` 255ths off on every channel,
@@ -1231,8 +1238,31 @@ mod tests {
             "…and the numbers llvmpipe actually measures pass, over #893's mean of 2 \
              on the worst-channel statistic and clean everywhere but the edges",
         );
+    }
 
-        // The same three statements for #1144's kind, against **its** budget.
+    /// **The edge budget is per kind, and the dot matrix's is its own**
+    /// (#1150 review, HIGH-2).
+    ///
+    /// The sibling above states the supersampled standard on the gauge, where
+    /// #1148's review set it. This one repeats it for #1144's kind against
+    /// #1144's numbers — worst measured on llvmpipe, edge mean 10.641 (oled)
+    /// and edge max 39 (crt) — and then shows the two budgets are not the same
+    /// number by handing one edge region to both kinds and getting two
+    /// verdicts.
+    ///
+    /// **Falsified** by collapsing [`Kind::edge_budget`]'s arms onto one pair
+    /// (the last assertion goes red), or by widening the dot matrix's `max`
+    /// past the region the second one builds.
+    #[test]
+    fn the_dot_matrix_gets_its_own_edge_budget() {
+        let edgy = Stats {
+            channels: [ChannelStats {
+                mean: 8.0,
+                p99: 40.0,
+                max: 76.0,
+            }; 3],
+            ..inside_by(0.0)
+        };
         let mut dots = clean_regions();
         dots.edge.mean = 10.641;
         dots.edge.max = 39;
@@ -1273,6 +1303,14 @@ mod tests {
              inside the gauge's wider max and outside the dot matrix's, which is the \
              whole reason `Kind::edge_budget` exists rather than one constant",
         );
+    }
+
+    /// The `TROLLSHELL_PARITY_EXACT=1` pin binds the **dot matrix** too
+    /// (#1144): llvmpipe measured `max |Δ| 0` on all twenty of its 1:1 cases.
+    ///
+    /// **Falsified** by flipping `Kind::pinned_exact`'s answer for this kind.
+    #[test]
+    fn the_dot_matrix_is_pinned_bit_exact_at_one_to_one() {
         assert_eq!(
             case_verdict(
                 &inside_by(1.0),
@@ -1313,8 +1351,11 @@ mod tests {
     /// point of it — by adding a variant to [`Kind`], which stops this file
     /// compiling until the new kind's two answers are written down.
     #[test]
+    #[allow(clippy::match_same_arms)]
     fn every_kind_states_its_pin_and_its_beam_check() {
         for kind in Kind::ALL {
+            // One arm per kind even where two currently answer alike: the
+            // point is that each is written down on its own evidence.
             let (pinned, beam) = match kind {
                 // Measured at zero under llvmpipe since #1078, and a trace with
                 // exactly one bright row per column.

@@ -218,6 +218,11 @@ impl Plugin for Infobroker {
                     datasource: prompt.datasource,
                     scope: prompt.scope,
                     detail: prompt.detail,
+                    // #947 P3 added the field; the broker's ask is a standing
+                    // *grant* over a datasource, which is exactly the card this
+                    // names — and it is `skip_serializing_if`-skipped, so these
+                    // bytes are unchanged.
+                    choices: hytte_plugin::proto::ConsentChoices::Grant,
                 }]
             }
             // The broker wants a datasource query routed to the host (#509): turn it

@@ -189,6 +189,7 @@ pub(super) fn broker_effect(
             datasource,
             scope,
             detail,
+            choices,
         } => {
             // #487 phase 1b: raise the interactive consent overlay on the focused
             // output and route the human's decision back to THIS plugin as
@@ -197,13 +198,23 @@ pub(super) fn broker_effect(
             // otherwise), so the `ConsentDecision` reply only ever goes to a
             // connection that can decode it — the #305 opt-in gate, enforced
             // upstream.
-            tracing::info!(plugin = %plugin_id, %agent, %datasource, "plugin effect: RequestConsent");
+            tracing::info!(
+                plugin = %plugin_id,
+                %agent,
+                %datasource,
+                ?choices,
+                "plugin effect: RequestConsent"
+            );
+            // `choices` (#947 P3) selects the card and, with it, what an
+            // unanswered prompt sends — the overlay owns both, so the broker
+            // stays a pass-through and learns no policy.
             crate::overlays::consent::request(
                 *request_id,
                 agent,
                 datasource,
                 scope,
                 detail,
+                *choices,
                 outbound.clone(),
             );
         }

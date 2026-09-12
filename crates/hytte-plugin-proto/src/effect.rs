@@ -174,8 +174,9 @@ pub enum Effect {
     /// to get a human yes/no rather than silently denying.
     ///
     /// The host shows *"⟨agent⟩ wants: ⟨scope⟩ from ⟨datasource⟩"* (with `detail`
-    /// as a secondary line) and four choices — Allow once / this session / always /
-    /// Deny — then routes the answer back to *this* plugin as
+    /// as a secondary line) and the choice set `choices` names — by default four
+    /// (Allow once / this session / always / Deny), or two (Approve / Deny) for
+    /// [`ConsentChoices::Approval`] — then routes the answer back to *this* plugin as
     /// [`HostMsg::ConsentDecision`](crate::msg::HostMsg::ConsentDecision) keyed by
     /// the same `request_id`. **Not** fire-and-forget: it is a request/response
     /// pair, mirroring [`RunCommand`](Effect::RunCommand)→
@@ -184,12 +185,23 @@ pub enum Effect {
     /// leave the requester hanging. `request_id` is the plugin's own correlation
     /// token (a fresh one per prompt); the other fields are the human-facing
     /// strings the plugin computes (the host learns no domain).
+    ///
+    /// `choices` (#947 P3) selects **which** card the host draws, and with it
+    /// what an *unanswered* prompt means — see [`ConsentChoices`]. It is a
+    /// defaulted, skipped-when-default field, so a frame that does not set it
+    /// is byte-identical to a pre-#947 one and no
+    /// [`VOCAB`](crate::VOCAB) generation moves (the crate root's
+    /// "a defaulted *field* is not a variant" rule).
     RequestConsent {
         request_id: u64,
         agent: String,
         datasource: String,
         scope: String,
         detail: String,
+        /// Which choice set the card offers. Defaults to
+        /// [`ConsentChoices::Grant`], the #487 four-button card.
+        #[serde(default, skip_serializing_if = "ConsentChoices::is_grant")]
+        choices: ConsentChoices,
     },
     /// Query a datasource served by **another** plugin (#509), gated on
     /// [`DatasourceQuery`](crate::manifest::Capability::DatasourceQuery). The
@@ -419,7 +431,9 @@ impl Effect {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioAction, Effect, MediaAction, NiriAction, Page};
+    use super::{
+        AudioAction, ConsentChoices, ConsentDecision, Effect, MediaAction, NiriAction, Page,
+    };
     use crate::manifest::Capability;
 
     /// #1058: every [`Effect`] variant maps to exactly the [`Capability`] its
@@ -478,6 +492,22 @@ mod tests {
                 datasource: String::new(),
                 scope: String::new(),
                 detail: String::new(),
+                choices: ConsentChoices::Grant,
+            }
+            .required_capability(),
+            Some(Capability::Consent),
+        );
+        // #947 P3: the choice set changes the card, never the gate — an
+        // approval prompt is still exactly `Consent`, so nothing about
+        // `enforce_capabilities` has to learn about it.
+        assert_eq!(
+            Effect::RequestConsent {
+                request_id: 1,
+                agent: String::new(),
+                datasource: String::new(),
+                scope: String::new(),
+                detail: String::new(),
+                choices: ConsentChoices::Approval,
             }
             .required_capability(),
             Some(Capability::Consent),
@@ -506,6 +536,32 @@ mod tests {
             Effect::open_uri(1, "https://example.invalid/").required_capability(),
             Some(Capability::OpenUri),
         );
+    }
+
+    /// #947 P3. The whole reason [`ConsentChoices`] is a protocol field rather
+    /// than a label: it decides what the *absence* of an answer means.
+    ///
+    /// Falsification: make [`ConsentChoices::unanswered`] return
+    /// `Some(ConsentDecision::Deny)` for both arms — i.e. "a prompt nobody
+    /// answered is a deny, always" — and the second assertion goes red. That is
+    /// the exact regression spec §6.5 forbids: a 60 s silence must not resolve
+    /// a queued item on the requester's far side.
+    #[test]
+    fn only_the_grant_card_denies_on_its_own() {
+        assert_eq!(
+            ConsentChoices::Grant.unanswered(),
+            Some(ConsentDecision::Deny),
+        );
+        assert_eq!(ConsentChoices::Approval.unanswered(), None);
+    }
+
+    /// The default is #487's card, so an effect built without naming a choice
+    /// set behaves exactly as it did before the field existed.
+    #[test]
+    fn the_default_choice_set_is_the_four_button_grant() {
+        assert_eq!(ConsentChoices::default(), ConsentChoices::Grant);
+        assert!(ConsentChoices::Grant.is_grant());
+        assert!(!ConsentChoices::Approval.is_grant());
     }
 }
 
@@ -618,6 +674,90 @@ pub enum DatasourceError {
     Timeout,
     /// The provider answered with a failure of its own (provider-sourced).
     Provider,
+}
+
+/// Which choice set an [`Effect::RequestConsent`] card offers (#947 P3).
+///
+/// #487's prompt was written for exactly one shape — a **standing grant** over a
+/// datasource, where "allow for this session" and "allow always" are real,
+/// persistable answers. They are not answers to every ask: a one-shot decision
+/// on a single queued item (spec §6.5's hive approval is the motivating case)
+/// has nothing to grant standing permission *for*, so an "Always" button on it
+/// would either lie or invent a policy the requester cannot honour.
+///
+/// So the requester says which card it wants, and the host draws it. Two things
+/// change with the variant, and only these two:
+///
+/// 1. **The buttons.** [`Grant`](ConsentChoices::Grant) draws Allow once / This
+///    session / Always / Deny; [`Approval`](ConsentChoices::Approval) draws
+///    **Approve / Deny** and nothing else.
+/// 2. **What an unanswered prompt means** — see
+///    [`ConsentChoices::unanswered`], which is the whole reason this is a
+///    *protocol* field and not a cosmetic one.
+///
+/// # Compatibility
+///
+/// This is an **appended, defaulted field** on an existing variant, not a new
+/// wire variant: the crate root's rule ("a defaulted *field* is not a variant,
+/// and does not move the counter") applies, so [`VOCAB`](crate::VOCAB) is
+/// unchanged. `Grant` is [`skip_serializing_if`]-skipped, so every frame a
+/// pre-#947 plugin could emit is byte-identical on the wire.
+///
+/// A *newer* plugin asking an *older* host for `Approval` degrades in the safe
+/// direction and is worth stating plainly: the host skips the unknown key,
+/// draws the four-button card, and its 60 s timeout resolves to
+/// [`ConsentDecision::Deny`] — so the item is refused rather than silently
+/// approved. That is the wrong *label* and the right *outcome*.
+///
+/// [`skip_serializing_if`]: https://serde.rs/field-attrs.html
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConsentChoices {
+    /// #487's four-button card: Allow once / This session / Always / Deny, and
+    /// a 60 s timeout that resolves to [`ConsentDecision::Deny`]. The default,
+    /// and what every pre-#947 frame decodes to.
+    #[default]
+    Grant,
+    /// A two-button card — **Approve / Deny** — for a one-shot decision that
+    /// has no standing grant to offer.
+    ///
+    /// An unanswered prompt sends **nothing** (see
+    /// [`unanswered`](ConsentChoices::unanswered)).
+    Approval,
+}
+
+impl ConsentChoices {
+    /// Whether this is the default card — the `skip_serializing_if` predicate,
+    /// so the four-button frame stays byte-identical to a pre-#947 one.
+    #[must_use]
+    pub fn is_grant(&self) -> bool {
+        matches!(self, Self::Grant)
+    }
+
+    /// What the host sends when the human answers nothing — the prompt times
+    /// out, or is dismissed with `Esc`.
+    ///
+    /// - [`Grant`](ConsentChoices::Grant) → `Some(Deny)`, #487's rule: a
+    ///   standing-grant ask that nobody answered is refused, and the requester
+    ///   is never left hanging.
+    /// - [`Approval`](ConsentChoices::Approval) → **`None`**, i.e. the host
+    ///   sends no [`ConsentDecision`] at all.
+    ///
+    /// The asymmetry is deliberate and is spec §6.5's rule ("an unanswered
+    /// prompt leaves the approval pending, which is what it already was"). A
+    /// `Deny` on a queued item is a **destructive, durable** answer — it
+    /// resolves the item on the far side — and "nobody was at the screen for
+    /// 60 seconds" is not evidence for it. The requester therefore keeps the
+    /// item exactly as it found it and re-raises on demand; the cost is that a
+    /// requester using this variant **must not** assume an answer always
+    /// arrives, which is why the variant carries the rule rather than a
+    /// convention.
+    #[must_use]
+    pub fn unanswered(self) -> Option<ConsentDecision> {
+        match self {
+            Self::Grant => Some(ConsentDecision::Deny),
+            Self::Approval => None,
+        }
+    }
 }
 
 /// The human's answer to an [`Effect::RequestConsent`] knock (#487 phase 1b),

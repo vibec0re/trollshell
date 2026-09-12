@@ -432,7 +432,7 @@ mod tests {
     /// **#1180 item 1.** `attach_dismiss_catcher` must not pin its popover.
     ///
     /// The shipped bug was one word: the `show` handler captured
-    /// `popover.clone()`, and a GObject owns its signal handlers' data — so
+    /// `popover.clone()`, and a `GObject` owns its signal handlers' data — so
     /// the popover held a closure that held the popover, and every tray menu
     /// and task-edit popover the shell ever built stayed alive for the
     /// session. The fix is to use the parameter GTK hands the handler instead
@@ -458,7 +458,7 @@ mod tests {
         let witness_weak = Rc::downgrade(&witness);
         popover.connect_destroy(move |_| {
             // The body is irrelevant; capturing `witness` is the whole job.
-            let _held = &witness;
+            drop(Rc::clone(&witness));
         });
 
         attach_dismiss_catcher(&popover, &monitor);

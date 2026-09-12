@@ -1754,12 +1754,6 @@ mod imp {
         /// early return in `ensure_resources`: the count goes to 10.
         #[gtk::test]
         fn a_refused_pipeline_is_built_once_not_once_per_frame() {
-            let Some((_window, _area, gl)) =
-                real_gl_or_skip("a_refused_pipeline_is_built_once_not_once_per_frame")
-            else {
-                return;
-            };
-
             // A fragment stage no driver will compile.
             const BROKEN: GlPass = GlPass {
                 vertex: VERTEX,
@@ -1770,6 +1764,12 @@ mod imp {
                 draw: GlDraw::FullScreen,
             };
             const BROKEN_PASS: [GlPass; 1] = [BROKEN];
+
+            let Some((_window, _area, gl)) =
+                real_gl_or_skip("a_refused_pipeline_is_built_once_not_once_per_frame")
+            else {
+                return;
+            };
 
             let pipeline = GlPipeline {
                 aux: 0,

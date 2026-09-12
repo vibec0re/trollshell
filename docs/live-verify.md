@@ -1971,9 +1971,13 @@ session.
         288 × 128 and box-averaged back down to the kit's 144 × 64 before
         comparing, because the two are *supposed* to differ at 1:1 there. The
         assertion is the split: **every pixel off a rasterisation edge is
-        bit-identical to the kit's** — the flat field, the tick and arc
-        interiors, the lit cores and the CRT comb — with the whole difference in
-        the edge bin. Measured, worst of the four (`gauge.oled.sweep.x2`):
+        bit-identical to the kit's** — the flat field, the CRT comb and the
+        small lit-interior bin (46, 47, 46 and 3 pixels of 9216; a
+        1.7-logical-px tick has no interior to speak of) — with the whole
+        difference in the edge bin. What that cannot see: a scale-only drift
+        inside an expression that still carries `* s` moves only edge pixels
+        and clears the budget. Measured, worst of the four
+        (`gauge.oled.sweep.x2`):
         `edge[n=2378 mean 9.364 max 76]  field[n=6792 mean 0.000 max 0]
         lit[n=46 mean 0.000 max 0]`.
 

@@ -179,8 +179,8 @@ pub(crate) const GAUGE_PIPELINE: GlPipeline = GlPipeline {
 /// minor ticks out of the dial — silently, on every skin (#1148 review, LOW-1).
 /// A `const` assertion rather than a test because it is a statement about two
 /// literals and can be decided at compile time; the kit carries the matching
-/// runtime one (`the_major_tick_is_the_widest_mark_on_the_face`), on the side
-/// that owns the numbers.
+/// `const` assertion next to the constants themselves (`hytte-preem`'s
+/// `gauge.rs`), on the side that owns the numbers.
 const _: () = assert!(
     kit::MAJOR_HW >= kit::MINOR_HW,
     "tick_span bounds the tick window with MAJOR_HW; a wider minor tick would be clipped",

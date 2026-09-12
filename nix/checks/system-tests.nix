@@ -193,9 +193,11 @@ craneLib.mkCargoDerivation (
       # which only ever faces the ceiling, while this variable is
       # exported nowhere but the three lines above. Both kinds are
       # pinned at the 1:1 grid, where both have measured `max |Δ| 0`.
-      # What is held to the ceiling alone is the box-averaged
-      # `scale = 2` gauge comparison, which is a render the kit never
-      # made and so cannot be bit-exact by construction.
+      # The box-averaged `scale = 2` gauge comparison is a render the
+      # kit never made and so cannot be bit-exact by construction; it
+      # is held to its own standard instead (every pixel off an edge
+      # bit-identical plus an edge budget, `parity::case_verdict`), not
+      # to #893's ceiling.
       export TROLLSHELL_PARITY_EXACT=1
     '';
     checkPhaseCargoCommand = ''
@@ -287,8 +289,10 @@ craneLib.mkCargoDerivation (
       # (`preem_gl::parity`'s `Kind` and `Sampling`) rather than this
       # file's. Both kinds are pinned bit-exact where the two arms
       # rasterise at the same resolution; the box-averaged `scale = 2`
-      # gauge cases are held to #893's ceiling, which is the only
-      # standard a supersampled comparison can meet.
+      # gauge cases are held to the supersampled standard instead —
+      # every pixel off an edge bit-identical plus an edge budget —
+      # which is the only kind of statement a supersampled comparison
+      # can meet.
       gl_ppm_count="$(find "$out/parity" -maxdepth 1 -name '*.gl.ppm' -type f | wc -l)"
       if [ "$gl_ppm_count" -ne 28 ]; then
         echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected 28 — a case-count regression, not a parity failure." >&2

@@ -265,8 +265,10 @@ impl Kind {
 /// and box-averaging a differently-anti-aliased render is not an operation
 /// that can land on the kit's last bit, nor should it: the whole point of
 /// rendering at `scale = 2` is that the edges are *not* the kit's. So those
-/// cases take the #893 ceiling and stop there, whatever [`Kind::pinned_exact`]
-/// says.
+/// cases are held to their own standard — every pixel off an edge
+/// bit-identical, plus an edge budget — and never to [`Kind::pinned_exact`]
+/// nor to #893's ceiling, which is a statement about two renders of one
+/// picture at one resolution.
 ///
 /// It is a property of the case rather than of the kind for the same reason
 /// `Kind` exists at all: one widget can be measured both ways, and the gauge is
@@ -302,7 +304,13 @@ pub(crate) enum Sampling {
 ///   drew at twice the density and the harness averaged it back down, so the
 ///   edges are *supposed* to differ — that is #1090's fix — while nothing else
 ///   is. Measured on llvmpipe, all four shipping-scale cases come out with the
-///   field and the lit interiors at `max |Δ| 0` and everything in the edge bin.
+///   flat field and the small lit-interior bin at `max |Δ| 0` and everything
+///   else in the edge bin — "small" meaning 46, 47, 46 and 3 pixels of 9216:
+///   a 1.7-logical-px tick has no interior to speak of, so this is mostly a
+///   statement about the field. The residual hole, stated: a scale-only drift
+///   *inside* an expression that still carries `* s` (a tick or an arc 50 %
+///   wider at the shipping scale) moves only edge pixels and clears the
+///   budget; neither the source scan nor the region split sees it.
 ///   #893's ceiling is deliberately **not** applied here: it is a statement
 ///   about rounding between two renders of one picture, and half the frame's
 ///   pixels are edges on a dial.

@@ -186,12 +186,13 @@ const GAUGE_SCALE: u32 = 1;
 /// regression — a sharper edge is *supposed* to differ from a smeared one — so
 /// the harness does not compare them naively. It renders GL at the native grid,
 /// box-averages each `GAUGE_SUPERSAMPLE`² block back down to the kit's logical
-/// frame (`parity::box_downsample`) and holds the result to #893's ceiling. A
-/// supersampled render averaged back down should land inside a single-sample
-/// render of the same picture: that is a genuine invariant rather than a
-/// measurement of the improvement, and it is exactly what a dropped
-/// `(scale - 1) / 2`, an unscaled length, a doubled mask pitch or a mis-scaled
-/// bloom breaks.
+/// frame (`parity::box_downsample`) and holds the result to the supersampled
+/// standard in `parity::case_verdict`: every pixel off a rasterisation edge
+/// bit-identical (`interior_max() == 0`) and the edge bin inside a measured
+/// budget — not #893's ceiling, which a dial's roughly one-quarter edge pixels
+/// would fail by construction. That is what a dropped `(scale - 1) / 2`, an
+/// unscaled length, a doubled mask pitch or a mis-scaled bloom breaks: they
+/// move the field, not only the edges.
 const GAUGE_SUPERSAMPLE: u32 = 2;
 
 /// Whether any case failed, for [`main`]'s exit status.

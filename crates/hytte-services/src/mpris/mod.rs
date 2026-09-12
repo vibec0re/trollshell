@@ -749,7 +749,7 @@ async fn watch_liveness(state: State, bus_name: String, player_proxy: BusProxy) 
 
 /// Watch `PropertiesChanged` for a player. Re-reads all properties on each
 /// emission for the `org.mpris.MediaPlayer2.Player` interface — and on each
-/// [`SignalItem::Resubscribed`] marker.
+/// [`SignalItem::Resubscribed`] or [`SignalItem::Lagged`] marker.
 ///
 /// This state is a **fold** over emissions: `refresh_player` is only ever
 /// called because a `PropertiesChanged` said something moved. Between a
@@ -757,9 +757,9 @@ async fn watch_liveness(state: State, bus_name: String, player_proxy: BusProxy) 
 /// the broker to route through and nothing is replayed, so every change the
 /// player made in that window is lost — and a paused player that never changes
 /// again leaves the drawer showing a track that finished during the outage,
-/// indefinitely. So this is `items()` rather than `events()`: the marker is the
-/// only notice a consumer gets that its history has a hole, and the correct
-/// reaction to it is the same one an emission gets (#1173).
+/// indefinitely. So this is `items()` rather than `events()`: these markers
+/// are the only notice a consumer gets that its history has a hole, and the
+/// correct reaction to either is the same one an emission gets (#1173).
 async fn watch_properties(state: State, bus_name: String, sub: hytte_bus::SignalSubscription) {
     let mut items = sub.items();
     while let Some(item) = items.next().await {
@@ -768,6 +768,14 @@ async fn watch_properties(state: State, bus_name: String, sub: hytte_bus::Signal
                 tracing::debug!(
                     bus_name,
                     "PropertiesChanged re-subscribed; re-reading player properties"
+                );
+            }
+            SignalItem::Lagged { skipped } => {
+                tracing::debug!(
+                    bus_name,
+                    skipped,
+                    "PropertiesChanged consumer lagged behind the broadcast \
+                     channel; re-reading player properties"
                 );
             }
             SignalItem::Event(event) => {

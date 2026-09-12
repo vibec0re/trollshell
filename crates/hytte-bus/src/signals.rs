@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 /// A single signal emission delivered to the consumer.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SignalEvent {
     /// The raw zbus message; consumer calls `.body().deserialize::<T>()`
     /// to decode arguments.
@@ -47,7 +47,17 @@ pub struct SignalEvent {
 /// `SignalEvent` item type and drops markers, so every existing consumer
 /// compiles and behaves exactly as before. [`SignalSubscription::items`] is the
 /// opt-in.
-#[derive(Clone)]
+///
+/// Two variants carry a hole in a consumer's history — [`Self::Resubscribed`]
+/// (the *sender* side: the subscription itself was rebuilt) and
+/// [`Self::Lagged`] (the *receiver* side: this particular consumer fell behind
+/// the broadcast channel and the runtime dropped buffered items to catch it
+/// up). They are kept distinct rather than folded into one variant so a
+/// journal can still tell "the subscription was rebuilt" apart from "this
+/// consumer specifically fell behind" — but every consumer that reacts to
+/// [`Self::Resubscribed`] must react to [`Self::Lagged`] the same way: both
+/// mean re-read whatever state this subscription feeds.
+#[derive(Clone, Debug)]
 pub enum SignalItem {
     /// One signal emission from the peer.
     Event(SignalEvent),
@@ -58,7 +68,28 @@ pub enum SignalItem {
     ///
     /// Emitted only for a *re*-subscription: the first one has no history to
     /// have missed.
+    ///
+    /// This is one of two variants that report a hole in a consumer's
+    /// history — see [`Self::Lagged`] for the other, and react to both the
+    /// same way.
     Resubscribed,
+    /// This receiver fell behind the broadcast channel and the runtime
+    /// dropped `skipped` buffered items before it could see them — same
+    /// underlying condition as [`Self::Resubscribed`] (emissions that will
+    /// never be delivered), just discovered on the receiving end instead of
+    /// the sending end. React to it the same way: re-read whatever state this
+    /// subscription feeds.
+    ///
+    /// Before this variant existed, a lag silently swallowed any
+    /// `Resubscribed` marker it overran (the marker is just another item in
+    /// the same buffer), so a consumer folding emissions into state carried a
+    /// stale fold with no notice at all.
+    Lagged {
+        /// Number of buffered items the broadcast channel dropped before this
+        /// receiver could see them. Mirrors
+        /// `tokio::sync::broadcast::error::RecvError::Lagged`'s count.
+        skipped: u64,
+    },
 }
 
 /// Handle on a live signal subscription. Cloning is cheap and does not cancel;
@@ -98,8 +129,9 @@ impl SignalSubscription {
     /// independent receiver; backpressure is handled by zbus' broadcast
     /// channel (slow consumers may lag).
     ///
-    /// [`SignalItem::Resubscribed`] markers are dropped here — this is the
-    /// ignore-by-default half of #1173. Use [`Self::items`] to see them.
+    /// [`SignalItem::Resubscribed`] and [`SignalItem::Lagged`] markers are
+    /// dropped here — this is the ignore-by-default half of #1173. Use
+    /// [`Self::items`] to see them.
     ///
     /// `+ use<>` for the reason `OwnNameSignal::signal_cloned` carries it
     /// (#750): without it the opaque type captures `&self` under Rust 2024's
@@ -116,9 +148,10 @@ impl SignalSubscription {
         })
     }
 
-    /// Stream of emissions **and** [`SignalItem::Resubscribed`] markers, in the
-    /// order the subscription task produced them. Each call returns an
-    /// independent receiver.
+    /// Stream of emissions **and** [`SignalItem::Resubscribed`] /
+    /// [`SignalItem::Lagged`] markers, in the order the subscription task
+    /// produced them (for `Lagged`, the order this receiver observed them —
+    /// see below). Each call returns an independent receiver.
     ///
     /// Reach for this when the consumer folds emissions into state that goes
     /// stale if any are missed — see [`SignalItem`] for the argument. A
@@ -133,10 +166,19 @@ impl SignalSubscription {
                     Ok(item) => yield (*item).clone(),
                     // A burst overflowed the broadcast channel and this
                     // consumer fell behind. The receiver is still usable — the
-                    // next `recv()` yields the oldest event still buffered — so
-                    // warn and keep going. Treating this as end-of-stream (the
-                    // old `while let Ok`) permanently froze every downstream
-                    // subscriber after an event burst (#428).
+                    // next `recv()` yields the oldest event still buffered —
+                    // so warn and keep going (the old `while let Ok` treated
+                    // this as end-of-stream and permanently froze every
+                    // downstream subscriber after an event burst, #428).
+                    //
+                    // A lag can overrun a buffered `Resubscribed` marker the
+                    // same way it overruns an event — the marker is just
+                    // another item in the same channel — so without a
+                    // `Lagged` item of its own, a fold-over-emissions consumer
+                    // would carry a stale fold with no notice at all. Yield
+                    // one so `events()` can keep filtering by variant
+                    // (unaffected: it only ever extracts `Event`) while
+                    // `items()` reports the hole either way it opened.
                     Err(RecvError::Lagged(n)) => {
                         tracing::warn!(
                             missed = n,
@@ -144,6 +186,7 @@ impl SignalSubscription {
                              channel; dropped buffered events and continuing \
                              (only channel close ends the stream)"
                         );
+                        yield SignalItem::Lagged { skipped: n };
                     }
                     // The sender was dropped — no more events will ever arrive.
                     Err(RecvError::Closed) => break,
@@ -545,5 +588,47 @@ mod tests {
             }
         }
         assert!(saw_100, "stream did not deliver the post-lag event");
+    }
+
+    /// The other end of the #428 arm, read from the opposite direction: a
+    /// `Lagged` must not silently swallow a buffered `Resubscribed` marker.
+    ///
+    /// Capacity 2, one marker then ten events with nothing draining in
+    /// between: the receiver falls behind before it ever polls, so its first
+    /// `recv()` answers `Lagged` having skipped the marker along with most of
+    /// the events. Before the fix, `items()` only warned and kept going —
+    /// `markers` came back 0 here, which is exactly the "the consumer lagged
+    /// past the `Resubscribed` marker and was never told to re-read" hole
+    /// `mpris::watch_properties` depends on `items()` to report.
+    #[tokio::test]
+    async fn lagged_yields_a_re_read_item() {
+        let (tx, _keep) = broadcast::channel::<Arc<SignalItem>>(2);
+        let sub = subscription(tx.clone());
+        let mut items = sub.items();
+
+        let _ = tx.send(Arc::new(SignalItem::Resubscribed));
+        for i in 0..10u32 {
+            let _ = tx.send(event(i));
+        }
+
+        let mut events_seen = 0u32;
+        let mut markers = 0u32;
+        loop {
+            match tokio::time::timeout(Duration::from_millis(50), items.next()).await {
+                Ok(Some(SignalItem::Event(_))) => events_seen += 1,
+                Ok(Some(SignalItem::Resubscribed | SignalItem::Lagged { .. })) => markers += 1,
+                // `Ok(None)`: the sender was dropped. `Err(_)`: nothing more
+                // within the timeout, i.e. the channel is drained. Either way
+                // there is nothing left to read.
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert!(events_seen > 0, "expected at least the buffered survivors");
+        assert_eq!(
+            markers, 1,
+            "the consumer lagged past the Resubscribed marker and was never \
+             told to re-read (#1197 review)"
+        );
     }
 }

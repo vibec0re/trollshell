@@ -119,7 +119,19 @@ async fn poll_loop(writer: Mutable<Option<Brightness>>) {
     // pipewire service's gated-emit pattern.
     let mut last: Option<Brightness> = None;
     loop {
-        let cur = read_state();
+        // `read_state` is synchronous `std::fs` I/O (a sysfs directory walk
+        // plus two file reads per candidate device); run it on tokio's
+        // blocking pool rather than the async worker thread it used to
+        // block (#1171) — the same fix `app_usage`/`sensors` already apply
+        // to their own sysfs/procfs walks (see #434's app_usage fix for the
+        // precedent). Cadence and values are unchanged: still one read per
+        // second, still dedupe-gated on the result.
+        let cur = tokio::task::spawn_blocking(read_state)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "brightness: sysfs read task panicked");
+                None
+            });
         if cur != last {
             writer.set(cur);
             last = cur;

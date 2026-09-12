@@ -231,21 +231,6 @@ impl Facts {
     }
 }
 
-/// How much of an approval's free-text description reaches a row's subtitle.
-///
-/// Same bound `hytte_plugin_agents::plugin`'s `DETAIL_CHARS` uses for the
-/// consent card's detail line, restated here rather than imported: the
-/// constant is private to that crate's reducer, and this window's row is a
-/// second, independent renderer of the same free text over the same 480 px
-/// class of surface.
-const APPROVAL_DETAIL_CHARS: usize = 240;
-
-/// How much of the free-text `requested_at` timestamp reaches a row — the
-/// mirror keeps it an unparsed wire string on purpose (see
-/// [`hytte_plugin_agents::hive::wire::AgentStatusRow::status_set_at`]), so the
-/// cap is what stops an unparseable one from being unbounded.
-const APPROVAL_REQUESTED_AT_CHARS: usize = 40;
-
 /// One row in this window's approval list — spec §6.5's queue, narrowed to
 /// the one agent this window is for.
 ///
@@ -264,18 +249,35 @@ pub struct ApprovalRow {
     /// `Window::update`'s job, not this type's: a row that no longer exists
     /// has nothing to keep showing a reason for.
     pub refused: Option<String>,
+    /// Whether a decision for this row is **in flight** — sent and not yet
+    /// answered, either by a poll that takes the approval out of `Pending` or
+    /// by a refusal (#1146's review, H1).
+    ///
+    /// Renders as two insensitive buttons. `Approve`/`Deny` act immediately on
+    /// the far side and nothing is flipped optimistically here, so without
+    /// this the row sits for a whole cadence with two live buttons: a
+    /// double-click sends the same decision twice, and an impatient operator
+    /// can send `Deny` behind an `Approve` that already succeeded — which
+    /// spec §6.5 spends its whole "silence decides nothing" argument
+    /// preventing.
+    pub in_flight: bool,
 }
 
 impl ApprovalRow {
     /// Derive one row from the hive's `Approval` plus whatever this window
     /// last heard back about a decision on it.
     #[must_use]
-    pub fn of(approval: &Approval, refused: Option<String>) -> Self {
+    pub fn of(approval: &Approval, refused: Option<String>, in_flight: bool) -> Self {
         Self {
             id: approval.id,
             title: approval.kind.human(),
-            detail: detail_line(approval),
+            // The plugin's own renderer, not a copy of it (#1146's review,
+            // M4): the sidebar's consent card and this row show the same
+            // manager-written free text under the same bounds, and a shared
+            // function makes that a compile-time fact.
+            detail: hytte_plugin_agents::plugin::detail_line(approval),
             refused,
+            in_flight,
         }
     }
 
@@ -290,42 +292,6 @@ impl ApprovalRow {
             None => self.detail.clone(),
         }
     }
-}
-
-/// The prompt's secondary line, restated from
-/// `hytte_plugin_agents::plugin::detail_line` — that function is private to
-/// the plugin's reducer, and this window renders the same free text
-/// independently.
-fn detail_line(approval: &Approval) -> String {
-    let stamp = if approval.requested_at.is_empty() {
-        format!("request #{}", approval.id)
-    } else {
-        format!(
-            "request #{}, asked {}",
-            approval.id,
-            clamp(&approval.requested_at, APPROVAL_REQUESTED_AT_CHARS)
-        )
-    };
-    match approval
-        .description
-        .as_deref()
-        .map(str::trim)
-        .filter(|d| !d.is_empty())
-    {
-        Some(description) => format!("{} — {stamp}", clamp(description, APPROVAL_DETAIL_CHARS)),
-        None => stamp,
-    }
-}
-
-/// Truncate on a **char** boundary, appending an ellipsis when it bit — a
-/// description is arbitrary UTF-8 somebody else wrote, and `&s[..n]` would
-/// panic mid-codepoint.
-fn clamp(s: &str, chars: usize) -> String {
-    if s.chars().count() <= chars {
-        return s.to_owned();
-    }
-    let head: String = s.chars().take(chars).collect();
-    format!("{head}…")
 }
 
 /// The `Pending` answer, filtered to this window's one agent.
@@ -428,13 +394,36 @@ mod approvals_tests {
     #[test]
     fn a_refused_write_keeps_the_row_and_shows_why_inline() {
         let approval = approval(11, "stray", ApprovalStatus::Pending);
-        let clean = ApprovalRow::of(&approval, None);
+        let clean = ApprovalRow::of(&approval, None, false);
         assert_eq!(clean.subtitle(), clean.detail);
 
-        let refused = ApprovalRow::of(&approval, Some("agent busy".to_owned()));
+        let refused = ApprovalRow::of(&approval, Some("agent busy".to_owned()), false);
         assert_eq!(refused.id, 11, "the row is still the same approval");
         assert!(refused.subtitle().contains(&refused.detail));
         assert!(refused.subtitle().contains("agent busy"));
+    }
+
+    /// **The row's detail line is the plugin's, not a copy of it** (#1146's
+    /// review, M4). The sidebar's consent card and this window's row render
+    /// the same manager-written free text under the same bounds; the two used
+    /// to be byte-identical bodies in two crates, so a change to one was a
+    /// silent divergence.
+    ///
+    /// Mutation: re-introduce a local `detail_line` with any different bound
+    /// or wording and this reds.
+    #[test]
+    fn the_detail_line_is_the_plugins_own_renderer() {
+        let long = "x".repeat(hytte_plugin_agents::plugin::DETAIL_CHARS + 50);
+        let a = Approval {
+            description: Some(long.clone()),
+            requested_at: "2026-09-12T00:00:00Z".to_owned(),
+            ..approval(11, "stray", ApprovalStatus::Pending)
+        };
+        assert_eq!(
+            ApprovalRow::of(&a, None, false).detail,
+            hytte_plugin_agents::plugin::detail_line(&a),
+            "the window must render the queue's free text through the plugin's own function"
+        );
     }
 }
 

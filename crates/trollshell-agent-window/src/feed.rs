@@ -99,11 +99,17 @@ pub enum Update {
     /// same contract as `hytte_plugin_agents::poll::Msg::Pending`: "which
     /// statuses are still actionable" and "which agent is this window's" are
     /// both model policy (`crate::chrome::pending_for`), not something the
-    /// I/O task decides. A `Pending` refusal (an older daemon, a permissions
-    /// change) also arrives here as an empty `Vec` — the window can no longer
-    /// vouch for the rows, so it clears them rather than freezing on the last
-    /// good answer.
-    Approvals(Vec<Approval>),
+    /// I/O task decides.
+    ///
+    /// A **refusal rides the same update** rather than arriving as an empty
+    /// `Vec` (#1146's review, M1). Both clear the rows — the window can no
+    /// longer vouch for them, so it does not freeze on the last good answer —
+    /// but only one of the two is a hive saying no, and an operator looking
+    /// at a group that hid itself cannot tell "nothing to decide" from "this
+    /// hive will not tell me". The `Err` arm carries the hive's own sentence
+    /// so the group can say which it is. Same shape as the sidebar's
+    /// `Msg::Pending(Result<…>)`, for the same reason.
+    Approvals(Result<Vec<Approval>, String>),
     /// A verb this window sent was refused, with the hive's own words.
     Refused {
         /// The verb, for the sentence the window shows.
@@ -178,21 +184,42 @@ pub async fn run(
     out: UnboundedSender<Update>,
 ) {
     let mut last: Option<AgentState> = None;
-    let mut last_approvals: Option<Vec<Approval>> = None;
+    let mut last_approvals: Option<Result<Vec<Approval>, String>> = None;
+    // Whether the `Pending` verb is currently refusing — the transition edge
+    // that decides `warn!` from `debug!` in `poll_once`. Per task, exactly as
+    // `hytte_plugin_agents::poll::poll_task_with` keeps it.
+    let mut pending_failing = false;
     let mut urls = UrlsFetch::default();
+
+    // **The ticker is created before the seed poll, not after it** (#1146's
+    // review, L3). It used to be built afterwards, which coupled the seed to
+    // an invariant nothing enforced: a seed that yields would let a
+    // `start_paused` test's `tokio::time::advance` land before the interval
+    // existed, so the next tick never came — and the two tests that reddened
+    // when someone added an await to the seed were the *urls* ones, naming
+    // nothing about the cause. Built first, the interval's deadline exists
+    // before anything can await, and the seed may yield as freely as any
+    // later poll.
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // the first tick is immediate; the seed below is it.
+
     if urls.attempt(&socket, &out).await.is_err() {
         return;
     }
-    if poll_once(&socket, &name, &out, &mut last, &mut last_approvals)
-        .await
-        .is_err()
+    if poll_once(
+        &socket,
+        &name,
+        &out,
+        &mut last,
+        &mut last_approvals,
+        &mut pending_failing,
+    )
+    .await
+    .is_err()
     {
         return;
     }
-
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await; // the first tick is immediate; the seed above was it.
 
     loop {
         tokio::select! {
@@ -215,7 +242,14 @@ pub async fn run(
                 if urls.attempt(&socket, &out).await.is_err() {
                     return;
                 }
-                if poll_once(&socket, &name, &out, &mut last, &mut last_approvals)
+                if poll_once(
+                    &socket,
+                    &name,
+                    &out,
+                    &mut last,
+                    &mut last_approvals,
+                    &mut pending_failing,
+                )
                     .await
                     .is_err()
                 {
@@ -226,7 +260,14 @@ pub async fn run(
                 if urls.attempt(&socket, &out).await.is_err() {
                     return;
                 }
-                if poll_once(&socket, &name, &out, &mut last, &mut last_approvals)
+                if poll_once(
+                    &socket,
+                    &name,
+                    &out,
+                    &mut last,
+                    &mut last_approvals,
+                    &mut pending_failing,
+                )
                     .await
                     .is_err()
                 {
@@ -317,7 +358,8 @@ async fn poll_once(
     name: &AgentName,
     out: &UnboundedSender<Update>,
     last: &mut Option<AgentState>,
-    last_approvals: &mut Option<Vec<Approval>>,
+    last_approvals: &mut Option<Result<Vec<Approval>, String>>,
+    pending_failing: &mut bool,
 ) -> Result<(), ()> {
     let answer = client::request(socket, &Request::AgentStatus).await;
     let status_ok = answer.is_ok();
@@ -331,28 +373,52 @@ async fn poll_once(
     // `hytte_plugin_agents::plugin::Agents`'s `Input::App(Msg::Pending(Err))`
     // arm follows for the sidebar's badges.
     let approvals = if status_ok {
-        Some(match client::request(socket, &Request::Pending).await {
-            Ok(resp) => resp.approvals.unwrap_or_default(),
-            Err(e) => {
-                tracing::debug!(
+        let answer = client::request(socket, &Request::Pending)
+            .await
+            .map(|resp| resp.approvals.unwrap_or_default())
+            .map_err(|e| e.to_string());
+        // **Once per transition**, not once per tick (#1146's review, M1) —
+        // the three-arm match `hytte_plugin_agents::poll::poll_once` uses,
+        // ported rather than paraphrased. This used to be a bare `debug!`,
+        // i.e. invisible at the default level *always*, which #1140's LOW-3
+        // is the argument against: a hive refusing this verb every tick would
+        // say nothing, twice a second, forever — and with the group hiding
+        // itself when empty, it rendered identically to a healthy hive with
+        // nothing queued.
+        match (&answer, *pending_failing) {
+            (Err(e), false) => {
+                *pending_failing = true;
+                tracing::warn!(
                     %e,
-                    "the hive refused the approval queue; clearing this window's rows until it answers"
+                    "the hive refuses the approval queue; this window's rows are cleared until it answers"
                 );
-                Vec::new()
             }
-        })
+            (Err(e), true) => tracing::debug!(%e, "the approval queue is still refusing"),
+            (Ok(_), true) => {
+                *pending_failing = false;
+                tracing::info!("the approval queue is answering again");
+            }
+            (Ok(_), false) => {}
+        }
+        Some(answer)
     } else {
         None
     };
 
     // Every send below is **synchronous** (an unbounded channel never
-    // blocks) — deliberately no `.await` between here and `return`. The seed
-    // call relies on that: a test observes `Update::State` the moment it is
-    // sent and then assumes this task has already reached its ticker
-    // (`run`'s next few lines, none of which await either), which held only
-    // because nothing here used to await *after* the send. Fetching the two
-    // answers above **first**, and sending only once both are in hand,
-    // keeps that property true with a second round trip in the mix.
+    // blocks) — deliberately no `.await` between here and `return`, so one
+    // poll's answers reach the window as one batch: the state and the queue
+    // it was observed with land together, and the window never paints a
+    // header from this tick beside rows from the last one.
+    //
+    // Enforced rather than asserted since #1146's review (L3): the invariant
+    // used to be a comment whose only teeth were an accident of where `run`
+    // built its ticker, so breaking it reddened two *urls* tests with a
+    // message naming nothing about the cause. `tests/feed.rs`'s
+    // `the_polls_two_answers_arrive_with_no_await_between_them` now takes the
+    // `State` off the channel and requires the `Approvals` to be sitting
+    // there already, which is exactly false the moment anything awaits
+    // between these two sends.
     if last.as_ref() != Some(&state) {
         *last = Some(state.clone());
         out.send(Update::State(state)).map_err(|_| ())?;

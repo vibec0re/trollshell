@@ -597,32 +597,44 @@ struct Captured {
 ///   out [`RUN_COMMAND_TIMEOUT`] would spend ten seconds to reach the same
 ///   answer.
 async fn capture_bounded(cmd: &mut tokio::process::Command) -> std::io::Result<Captured> {
-    use tokio::io::AsyncReadExt as _;
-
     let mut child = cmd.spawn()?;
     // Both are `Stdio::piped()` at every call site (the caller sets them one
     // statement above), so `take()` always yields the handle.
     let out_pipe = child.stdout.take().expect("RunCommand stdout is piped");
     let err_pipe = child.stderr.take().expect("RunCommand stderr is piped");
-    let budget = RUN_COMMAND_MAX_CAPTURE as u64 + 1;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    // The two `Take`s are bound (rather than built inline in the `join!`)
-    // because a `join!` arm's temporaries die at the end of the statement while
-    // the futures still borrow them.
-    let mut out_capped = out_pipe.take(budget);
-    let mut err_capped = err_pipe.take(budget);
-    let (read_out, read_err) = tokio::join!(
-        out_capped.read_to_end(&mut stdout),
-        err_capped.read_to_end(&mut stderr),
-    );
-    read_out?;
-    read_err?;
-    // Drop the read ends before the kill/wait below, so a still-running child's
-    // next write gets EPIPE on top of it.
-    drop((out_capped, err_capped));
-    let status = if stdout.len() > RUN_COMMAND_MAX_CAPTURE || stderr.len() > RUN_COMMAND_MAX_CAPTURE
-    {
+    // Scoped, so both futures — and with them both read ends — are dropped
+    // before the kill/wait below: a still-running child's next write then gets
+    // EPIPE as well as the signal.
+    let (over, out, err) = {
+        let read_out = read_capped(out_pipe, RUN_COMMAND_MAX_CAPTURE);
+        let read_err = read_capped(err_pipe, RUN_COMMAND_MAX_CAPTURE);
+        tokio::pin!(read_out, read_err);
+        let mut out: Option<Vec<u8>> = None;
+        let mut err: Option<Vec<u8>> = None;
+        let mut over = false;
+        // **Not `join!`.** `join!` waits for *both*, and the pipe that is not
+        // the runaway never EOFs while the child is alive — so a program that
+        // floods stdout and never writes stderr would park here until the
+        // 10 s timeout, which is the exact behaviour this function exists to
+        // remove. Stopping at the first over-budget pipe is what makes the
+        // kill below prompt.
+        while !over && (out.is_none() || err.is_none()) {
+            tokio::select! {
+                read = &mut read_out, if out.is_none() => {
+                    let (bytes, cut) = read?;
+                    over |= cut;
+                    out = Some(bytes);
+                }
+                read = &mut read_err, if err.is_none() => {
+                    let (bytes, cut) = read?;
+                    over |= cut;
+                    err = Some(bytes);
+                }
+            }
+        }
+        (over, out, err)
+    };
+    let status = if over {
         child.kill().await?;
         None
     } else {
@@ -630,9 +642,36 @@ async fn capture_bounded(cmd: &mut tokio::process::Command) -> std::io::Result<C
     };
     Ok(Captured {
         status,
-        stdout,
-        stderr,
+        // `None` only on the over-budget path, where the sibling read was
+        // abandoned mid-stream. Its partial bytes are dropped with it: the
+        // capture of a program the host is about to kill is a diagnostic, and
+        // an honest empty one beats a torn one.
+        stdout: out.unwrap_or_default(),
+        stderr: err.unwrap_or_default(),
     })
+}
+
+/// Read at most `budget` bytes from `src`, returning them and whether the source
+/// had more (#1165).
+///
+/// Owns its reader and its buffer so two of these can be `select!`ed over — a
+/// `read_to_end(&mut buf)` borrows the buffer for the future's whole life, which
+/// leaves nothing to inspect while it is still running.
+///
+/// It reads `budget + 1`: the extra byte is what distinguishes "exactly at the
+/// budget" (fine) from "over it" (kill), with no second syscall to ask.
+async fn read_capped<R>(src: R, budget: usize) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let mut buf = Vec::new();
+    let mut capped = src.take(budget as u64 + 1);
+    capped.read_to_end(&mut buf).await?;
+    let over = buf.len() > budget;
+    buf.truncate(budget);
+    Ok((buf, over))
 }
 
 /// Run one `argv` to completion (bounded by [`RUN_COMMAND_TIMEOUT`], and by

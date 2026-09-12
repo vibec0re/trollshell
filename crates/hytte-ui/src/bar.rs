@@ -209,14 +209,15 @@ impl Drop for BarHandle {
     }
 }
 
-impl BarHandle {
-    /// Forget the handle so the bar lives for the application's lifetime.
-    /// Useful when constructing many bars in the body closure where you
-    /// don't want to track each one individually.
-    pub fn into_long_lived(self) {
-        std::mem::forget(self);
-    }
-}
+// Deliberately absent: an `into_long_lived` that `mem::forget`s the handle so
+// "the bar lives for the application's lifetime" (#1180 item 5). It had no
+// call sites, and the pattern it recommended is the one the multi-monitor
+// contract forbids: `monitors_changed` tears every bar down and rebuilds it on
+// hot-plug, which is exactly the drop a forgotten handle would skip — leaving
+// an orphan layer surface with its exclusive zone still reserved on an output
+// that may no longer exist. `trollshell/src/main.rs` keeps its handles in a
+// per-monitor map for that reason, and a shell that genuinely wants a bar for
+// the whole session keeps the handle alive instead of forgetting it.
 
 // #638: `BarHandle`'s teardown paths (`close()`, `Drop`) call `destroy()`
 // rather than `close()` specifically because `close()` is a *request* that

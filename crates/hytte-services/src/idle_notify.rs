@@ -47,7 +47,9 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
-use hytte_reactive::{Service, registry, runtime, spawn_supervised, spawn_supervised_blocking};
+use hytte_reactive::{
+    Service, registry, runtime, spawn_supervised, spawn_supervised_blocking_bounded,
+};
 use std::collections::BTreeSet;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -613,6 +615,14 @@ fn spawn_observer(state: Mutable<IdleState>) {
 /// [`spawn_observer`] with the name and the loop body injected, so the restart
 /// contract — the same `dimmed` across runs, and the reset on every entry — can
 /// be asserted against a body the test controls.
+///
+/// Supervised via [`spawn_supervised_blocking_bounded`] (#1196), not the plain
+/// `spawn_supervised_blocking`: `run_observer_with_reconnect`'s doc comment
+/// spells out its one designed return (no `ext_idle_notifier_v1` on this
+/// compositor, which retrying cannot fix), and that return is exactly the case
+/// the bounded variant exists for — `debug!` and the health row released,
+/// instead of a `warn!` and a permanent `Returned` row on every host without
+/// the protocol.
 fn supervise_observer<F>(
     name: &'static str,
     state: Mutable<IdleState>,
@@ -621,7 +631,7 @@ fn supervise_observer<F>(
 ) where
     F: Fn(&Mutable<IdleState>, &Arc<AtomicBool>) + Send + Sync + 'static,
 {
-    spawn_supervised_blocking(name, move || {
+    spawn_supervised_blocking_bounded(name, move || {
         reset_after_observer_error(&state, &dimmed);
         body(&state, &dimmed);
     });
@@ -800,8 +810,8 @@ mod tests {
     /// Falsify either half: drop `reset_after_observer_error` from
     /// `supervise_observer` and the second run sees a dimmed, still-`Idle`
     /// world (the screen stays at 10% with nothing left to restore it); swap
-    /// `spawn_supervised_blocking` back to `std::thread::spawn` and there is no
-    /// second run to look at.
+    /// `spawn_supervised_blocking_bounded` back to `std::thread::spawn` and
+    /// there is no second run to look at.
     #[test]
     fn a_panicking_observer_restarts_with_the_dim_flag_reset() {
         const NAME: &str = "test-idle-observer-restart";
@@ -868,6 +878,49 @@ mod tests {
             .find(|h| h.name == NAME)
             .expect("the supervisor publishes a live health row");
         assert_eq!(health.panics, 1, "the restart is not on the health record");
+    }
+
+    /// #1196: the observer's clean return — no `ext_idle_notifier_v1` on this
+    /// compositor — is designed, not a bug that fell out of a loop, so
+    /// `supervise_observer` must go through `spawn_supervised_blocking_bounded`
+    /// rather than the plain `spawn_supervised_blocking`. A body that just
+    /// returns (the shape `run_observer_with_reconnect` takes on such a host)
+    /// must cost a `debug!` and a released health row, not a `warn!` and a
+    /// permanent `Returned` one on every boot without the protocol.
+    ///
+    /// Falsify by swapping `supervise_observer`'s
+    /// `spawn_supervised_blocking_bounded` back to `spawn_supervised_blocking`:
+    /// the row then survives forever in `Returned` and this test times out
+    /// waiting for it to disappear.
+    #[test]
+    fn a_returning_observer_releases_its_row_instead_of_sticking() {
+        const NAME: &str = "test-idle-observer-bounded-return";
+
+        let state = Mutable::new(IdleState::default());
+        let dimmed = Arc::new(AtomicBool::new(false));
+
+        supervise_observer(NAME, state, dimmed, |_state, _dimmed| {
+            // Returns immediately — no `ext_idle_notifier_v1`, nothing to do.
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let released = loop {
+            if !hytte_reactive::health::snapshot()
+                .iter()
+                .any(|h| h.name == NAME)
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            released,
+            "a designed return from the observer must release its health row, not leave it \
+             Returned forever"
+        );
     }
 
     #[test]

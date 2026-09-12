@@ -50,6 +50,63 @@ struct State {
     month_label: gtk::Label,
 }
 
+/// The handle a **day cell's own** click handler gets (#1176).
+///
+/// `State` owns `cells`, and `cells` owns all 42 day buttons — so a handler
+/// on one of those buttons that captures a strong `State` closes
+/// `cells → button → handler → State → cells`. GTK breaks no refcount cycle,
+/// so every day cell survives its grid: 42 buttons plus their labels and dot
+/// rows per calendar surface, leaked once per monitor hot-plug and once per
+/// drawer-page rebuild.
+///
+/// Only the two widget-bearing fields are weakened. The four `Rc` cells hold
+/// plain data, close no cycle, and keeping them strong is what lets
+/// [`Self::upgrade`] hand back a real [`State`] instead of a second set of
+/// accessors — the same split `widgets/tasks.rs`'s `WeakDuePicker` and
+/// `widgets/mpris.rs`'s `Refreeze` make.
+///
+/// The *header* handlers (prev/next month) and the two binds deliberately
+/// keep a strong `State`: neither is reachable from `cells`, so neither
+/// closes a cycle, and between them they are what keeps the `Rc` alive for
+/// the day cells to upgrade through while the block is mounted.
+#[derive(Clone)]
+struct WeakState {
+    viewed: Rc<Cell<(i32, u32)>>,
+    selected: Rc<Cell<Option<NaiveDate>>>,
+    today: Rc<Cell<NaiveDate>>,
+    events: Rc<RefCell<Vec<CalendarEvent>>>,
+    cells: std::rc::Weak<Vec<DayCell>>,
+    month_label: glib::WeakRef<gtk::Label>,
+}
+
+impl State {
+    /// A handle this state's own day buttons may hold — see [`WeakState`].
+    fn downgrade(&self) -> WeakState {
+        WeakState {
+            viewed: Rc::clone(&self.viewed),
+            selected: Rc::clone(&self.selected),
+            today: Rc::clone(&self.today),
+            events: Rc::clone(&self.events),
+            cells: Rc::downgrade(&self.cells),
+            month_label: self.month_label.downgrade(),
+        }
+    }
+}
+
+impl WeakState {
+    /// The state, or `None` once the grid it renders into has been freed.
+    fn upgrade(&self) -> Option<State> {
+        Some(State {
+            viewed: Rc::clone(&self.viewed),
+            selected: Rc::clone(&self.selected),
+            today: Rc::clone(&self.today),
+            events: Rc::clone(&self.events),
+            cells: self.cells.upgrade()?,
+            month_label: self.month_label.upgrade()?,
+        })
+    }
+}
+
 /// One slot in the 6×7 day grid. Built once at widget-build time; the
 /// `date`/text/css-classes/dot row are rewritten on each render.
 struct DayCell {
@@ -247,11 +304,19 @@ fn wire_day_clicks(
     placeholder_track: &Rc<RefCell<Option<adw::ActionRow>>>,
 ) {
     for (idx, cell) in state.cells.iter().enumerate() {
-        let state = state.clone();
+        // Weak, not `state.clone()` (#1176): this handler lives on a button
+        // the state's own `cells` vector holds, so a strong capture is a
+        // cycle GTK never breaks — see [`WeakState`]. `group` and the two
+        // tracks are *not* ancestors of this button (the group is the
+        // upcoming list, a sibling of the grid), so they stay strong.
+        let state = state.downgrade();
         let group = group.clone();
         let rows_track = rows_track.clone();
         let placeholder_track = placeholder_track.clone();
         cell.button.connect_clicked(move |_| {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
             let Some(d) = state.cells[idx].date.get() else {
                 return;
             };
@@ -797,12 +862,31 @@ fn launch_gnome_calendar() {
     }
 }
 
+/// How long a clicked day's matching row stays highlighted.
+const FLASH_DURATION: std::time::Duration = std::time::Duration::from_millis(1500);
+
 fn flash_row_highlight(row: &gtk::Widget) {
+    flash_row_highlight_for(row, FLASH_DURATION);
+}
+
+/// The body of [`flash_row_highlight`], with the timer length as a parameter
+/// so a test can run the timeout to completion instead of waiting 1.5 s.
+///
+/// The timeout holds the row **weakly** (#1176). A strong clone kept it alive
+/// for the whole 1.5 s window regardless of what happened in between — and
+/// `rebuild_upcoming_list` tears the list down on every `calendar::events()`
+/// emission and every minute tick, so a click followed by a refresh left a
+/// retired row alive with a timer pointing at it. Nothing crashed (the row was
+/// already unparented), but the row, its labels and its dot row all sat on the
+/// heap until the timer fired.
+fn flash_row_highlight_for(row: &gtk::Widget, duration: std::time::Duration) {
     use hytte::gtk::prelude::WidgetExt;
     row.add_css_class("ts-cal-day-hit");
-    let row_for_clear = row.clone();
-    glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
-        row_for_clear.remove_css_class("ts-cal-day-hit");
+    let row_for_clear = row.downgrade();
+    glib::timeout_add_local_once(duration, move || {
+        if let Some(row) = row_for_clear.upgrade() {
+            row.remove_css_class("ts-cal-day-hit");
+        }
     });
 }
 
@@ -1471,6 +1555,139 @@ mod reentrancy_tests {
             placeholder_track.borrow().is_some(),
             "the outer call's write-back must still land: re-entry may not leave the cell empty or \
              holding the inner call's placeholder"
+        );
+    }
+}
+
+/// Widget-lifetime coverage for #1176: this block's own widgets must not keep
+/// themselves alive through the handlers hanging off them.
+///
+/// Both shapes here are invisible to `nix/lint-bind-pins.py`'s original
+/// `bind*` rule and to every other check in the tree, because neither is a
+/// `bind` call:
+///
+/// 1. **The day grid.** `State` owns `cells`, `cells` owns all 42 day
+///    buttons, and each button's `connect_clicked` used to capture a strong
+///    `State` — `cells → button → handler → State → cells`, a refcount cycle
+///    GTK never breaks. The whole grid leaked once per monitor hot-plug and
+///    once per drawer-page rebuild.
+/// 2. **The click flash.** `flash_row_highlight`'s 1.5 s timeout held its row
+///    strongly, so a row retired by the refresh that a click itself triggers
+///    stayed on the heap until the timer fired.
+///
+/// Needs a real display server (`gtk::Button`s have to be constructible),
+/// hence the `system-tests` gate, like the re-entrancy module above.
+#[cfg(all(test, feature = "system-tests"))]
+mod lifetime_tests {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use chrono::{Datelike, Local};
+    use hytte::adw::{self, prelude::*};
+    use hytte::gtk::{self, glib};
+
+    use super::wire_day_clicks;
+    use super::{DayCell, State, build_day_cell, build_day_grid, flash_row_highlight_for};
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while glib::MainContext::default().iteration(false) {}
+    }
+
+    /// A `State` shaped exactly as `build_block` builds one.
+    fn fresh_state() -> State {
+        let today = Local::now().date_naive();
+        State {
+            viewed: Rc::new(Cell::new((today.year(), today.month()))),
+            selected: Rc::new(Cell::new(None)),
+            today: Rc::new(Cell::new(today)),
+            events: Rc::new(RefCell::new(Vec::new())),
+            cells: Rc::new((0..42).map(|_| build_day_cell()).collect::<Vec<DayCell>>()),
+            month_label: gtk::Label::new(None),
+        }
+    }
+
+    /// Falsified by restoring `let state = state.clone();` in
+    /// `wire_day_clicks`: all 42 buttons then survive both the grid and the
+    /// state, and the count below reads 42 instead of 0.
+    #[gtk::test]
+    fn day_cell_handlers_do_not_pin_the_grid() {
+        adw::init().expect("libadwaita init");
+        let state = fresh_state();
+        let group = adw::PreferencesGroup::new();
+        let rows_track = Rc::new(RefCell::new(Vec::new()));
+        let placeholder_track = Rc::new(RefCell::new(None));
+
+        let grid = build_day_grid(&state.cells);
+        let cells: Vec<glib::WeakRef<gtk::Button>> =
+            state.cells.iter().map(|c| c.button.downgrade()).collect();
+        wire_day_clicks(&state, &group, &rows_track, &placeholder_track);
+        pump();
+
+        // Everything the shell would drop on a hot-plug: the grid (with the
+        // column above it) and the last strong `State`.
+        drop(grid);
+        drop(state);
+        pump();
+
+        let alive = cells.iter().filter(|c| c.upgrade().is_some()).count();
+        assert_eq!(
+            alive, 0,
+            "all 42 day cells must be freed once the grid and the state are gone; {alive} \
+             survived, which is the `cells → button → handler → State → cells` cycle a strong \
+             `State` capture in `wire_day_clicks` closes (#1176)"
+        );
+    }
+
+    /// Falsified by restoring `let row_for_clear = row.clone();`: the timeout
+    /// then owns the row for the full duration and the upgrade succeeds.
+    #[gtk::test]
+    fn the_flash_timer_does_not_hold_a_retired_row() {
+        adw::init().expect("libadwaita init");
+        let row: gtk::Widget = adw::ActionRow::new().upcast();
+        let weak = row.downgrade();
+
+        flash_row_highlight_for(&row, Duration::from_secs(30));
+        drop(row);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "a row retired between the click and the timer must be freed immediately: a strong \
+             capture keeps it (and its labels and dot row) on the heap for the whole flash \
+             window, and `rebuild_upcoming_list` retires rows on every `events()` emission and \
+             every minute tick (#1176)"
+        );
+    }
+
+    /// The other half of the same contract, and the reason the weak handle is
+    /// an upgrade rather than a no-op: a row that is *still alive* when the
+    /// timer fires must have its highlight cleared.
+    #[gtk::test]
+    fn the_flash_timer_still_clears_a_live_row() {
+        adw::init().expect("libadwaita init");
+        let row: gtk::Widget = adw::ActionRow::new().upcast();
+
+        flash_row_highlight_for(&row, Duration::from_millis(1));
+        assert!(
+            row.has_css_class("ts-cal-day-hit"),
+            "the flash class must go on synchronously"
+        );
+
+        // `iteration(true)` blocks until the pending timeout is ready, so this
+        // needs no sleep and cannot spin.
+        for _ in 0..50 {
+            if !row.has_css_class("ts-cal-day-hit") {
+                break;
+            }
+            glib::MainContext::default().iteration(true);
+        }
+
+        assert!(
+            !row.has_css_class("ts-cal-day-hit"),
+            "the timeout must still clear the class on a live row — if this fails the weak \
+             handle is upgrading to `None` when it should not, and the highlight would stick \
+             forever"
         );
     }
 }

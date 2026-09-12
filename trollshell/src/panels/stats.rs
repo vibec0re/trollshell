@@ -1966,8 +1966,13 @@ fn flapping_subtitle(
         // drops it — but the arm is not dead code either: it is this
         // function's answer if a caller ever renders a `Returned` row (a
         // stopped-tasks history view would), and writing it out costs one line
-        // where a fallback would silently mislabel one.
+        // where the fallback below would silently mislabel one.
         TaskState::Returned => "Returned".to_owned(),
+        // `TaskState` is `#[non_exhaustive]`, so a variant added upstream
+        // reaches this arm instead of breaking the build. Say nothing rather
+        // than guess: the rest of the subtitle — the streak, the total, the run
+        // count — is still true and is what the row is read for.
+        _ => "Supervised".to_owned(),
     });
     let panic_word = if consecutive_panics == 1 {
         "panic"

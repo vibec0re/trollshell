@@ -1003,6 +1003,25 @@ mod imp {
             (true, resized)
         }
 
+        /// Whether the build this surface is *currently* asking for is one
+        /// the driver has already refused — see
+        /// [`GlSurface::build_refused`](super::GlSurface::build_refused).
+        ///
+        /// The key is rebuilt from the live program and the live state's
+        /// grid, deliberately, rather than answered from "the latch holds
+        /// anything at all": a surface repointed at a pipeline that builds
+        /// fine is not refused, even though the key that refused is still
+        /// remembered against the grid it failed at.
+        pub(super) fn build_refused(&self) -> bool {
+            let Some(program) = self.program.get() else {
+                return false;
+            };
+            let Some(grid) = self.state.borrow().as_ref().map(|state| state.grid) else {
+                return false;
+            };
+            self.refused_builds.borrow().refused((grid, program))
+        }
+
         /// The whole render: ensure resources, replay the outstanding steps,
         /// run the frame passes.
         fn draw(&self) {
@@ -1935,6 +1954,11 @@ mod imp {
                 surface.imp().refused_builds.borrow().refused(((4, 4), program)),
                 "…keyed by (grid, program)",
             );
+            assert!(
+                surface.build_refused(),
+                "…and the host can see it: `build_refused` answers for the program and grid \
+                 the surface is currently pointed at (PR #1199 review, LOW 5)",
+            );
 
             // Out of the window: GTK unroots, which unrealizes, which is the
             // only place the per-context state is dropped. The local `surface`
@@ -1948,6 +1972,11 @@ mod imp {
                 surface.imp().refused_builds.borrow().keys.is_empty(),
                 "unrealize must forget refusals measured against a context that is gone \
                  (PR #1199 review, MEDIUM 1)",
+            );
+            assert!(
+                !surface.build_refused(),
+                "…so a host that fell back to its CPU kit on the refusal may offer GL to the \
+                 context that replaces it",
             );
 
             // …and back in, onto a context GTK creates fresh.
@@ -2215,6 +2244,42 @@ impl GlSurface {
     #[must_use]
     pub fn has_error(&self) -> bool {
         self.error().is_some()
+    }
+
+    /// Whether the driver has **refused to build** the pipeline this surface
+    /// is currently pointed at — the program and grid its last
+    /// [`set_state`](Self::set_state) named (PR #1199 review, LOW 5).
+    ///
+    /// This is a third failure, and until now the host had no way to see it.
+    /// [`abandon_gl`] covers a failed *context* and [`GlPipeline`]'s absence
+    /// covers "this kind has no GL arm" — the two cases #893 says the CPU kit
+    /// exists for — but a context that comes up fine and then will not
+    /// *compile* a particular pipeline is neither, so the chip simply stayed
+    /// blank. #1180 item 2 made that permanent rather than a per-frame
+    /// recompile, which is the right answer for the driver and the wrong one
+    /// for the widget: a refusal that is asked once is also a refusal nobody
+    /// is ever going to retract on its own.
+    ///
+    /// Reported per instance and polled rather than pushed, because the only
+    /// consumer is a host that already runs a pump: `trollshell`'s
+    /// `plugins::pump` ticks every render, and reading a `Cell`-shaped answer
+    /// there costs nothing, while a signal would need a `Mutable` in a crate
+    /// that deliberately has none.
+    ///
+    /// **The host half is #1180 part 2**, not this commit:
+    /// `trollshell/src/plugins/preem_render.rs` is where "GL refused this
+    /// instance" becomes a per-instance swap to the CPU kit with one `warn!`,
+    /// alongside the existing `preem_gl::arm() == Arm::Cpu` swap, and that
+    /// file is being rewritten by PR #1193 (dot matrix) at the same time.
+    /// Answering the question here is the half that can land without a
+    /// conflict; nothing in the tree reads it yet.
+    ///
+    /// Goes `false` again when the surface is unrealized — the latch is per
+    /// `GdkGLContext` (see `imp::GlSurface::unrealize`), so a host that
+    /// switched to the CPU kit on a refusal may offer GL to a fresh context.
+    #[must_use]
+    pub fn build_refused(&self) -> bool {
+        self.imp().build_refused()
     }
 }
 

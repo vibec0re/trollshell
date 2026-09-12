@@ -53,7 +53,6 @@
 //! problem — a diagnostics view that never lies beats one that stays small by
 //! forgetting.
 
-
 //!
 //! ```ignore
 //! use hytte::prelude::*;

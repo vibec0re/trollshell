@@ -38,11 +38,15 @@ pub trait Service: Sized + 'static {
 /// at all, and the returned thunk only ever does the trivial insert — no
 /// user code — so it can never re-enter [`with`] or [`install`] either.
 pub trait ServiceErased: 'static {
-    fn start_erased(self: Box<Self>, rt: &tokio::runtime::Handle) -> Box<dyn FnOnce(&mut Registry)>;
+    fn start_erased(self: Box<Self>, rt: &tokio::runtime::Handle)
+    -> Box<dyn FnOnce(&mut Registry)>;
 }
 
 impl<S: Service> ServiceErased for S {
-    fn start_erased(self: Box<Self>, rt: &tokio::runtime::Handle) -> Box<dyn FnOnce(&mut Registry)> {
+    fn start_erased(
+        self: Box<Self>,
+        rt: &tokio::runtime::Handle,
+    ) -> Box<dyn FnOnce(&mut Registry)> {
         let handles = self.start(rt);
         Box::new(move |registry: &mut Registry| registry.insert::<S::Handles>(handles))
     }

@@ -71,6 +71,12 @@ fn build_wired_row(profile: &wifi::WiredProfile) -> adw::ActionRow {
     row
 }
 
+/// Per-profile "⋮" menu. Every button dismisses the popover through a
+/// **weak** handle (#1176): the button is a descendant of the popover it
+/// closes (`popover → popover_box → button`), so a strong `popover.clone()`
+/// closes a refcount cycle GTK never breaks and each rebuilt row leaks its
+/// menu subtree. Same fix and same reasoning as `panels/bluetooth.rs`'s
+/// device menu; `nix/lint-bind-pins.py` now reports the shape.
 fn build_wired_row_menu(profile: &wifi::WiredProfile) -> gtk::MenuButton {
     let menu_btn = gtk::MenuButton::new();
     menu_btn.set_icon_name("view-more-symbolic");
@@ -91,39 +97,45 @@ fn build_wired_row_menu(profile: &wifi::WiredProfile) -> gtk::MenuButton {
     if profile.active {
         // Deactivate needs the device path; only offered when one is resolved.
         if let Some(dev) = device_path.clone() {
-            let pop = popover.clone();
+            let pop = popover.downgrade();
             let deactivate_btn = gtk::Button::with_label("Deactivate");
             deactivate_btn.add_css_class("flat");
             deactivate_btn.add_css_class("destructive-action");
             deactivate_btn.connect_clicked(move |_| {
                 wifi::wired_deactivate(&dev);
-                pop.popdown();
+                if let Some(pop) = pop.upgrade() {
+                    pop.popdown();
+                }
             });
             popover_box.append(&deactivate_btn);
         }
     } else if let Some(dev) = device_path {
         // Activate needs both the connection profile and a target device.
-        let pop = popover.clone();
+        let pop = popover.downgrade();
         let conn = conn_path.clone();
         let activate_btn = gtk::Button::with_label("Activate");
         activate_btn.add_css_class("flat");
         activate_btn.connect_clicked(move |_| {
             wifi::wired_activate(&conn, &dev);
-            pop.popdown();
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
         });
         popover_box.append(&activate_btn);
     }
 
     // Forget is always available — it deletes the saved profile, no device
     // needed.
-    let pop_for_forget = popover.clone();
+    let pop_for_forget = popover.downgrade();
     let forget_conn = conn_path;
     let forget_btn = gtk::Button::with_label("Forget");
     forget_btn.add_css_class("flat");
     forget_btn.add_css_class("destructive-action");
     forget_btn.connect_clicked(move |_| {
         wifi::wired_forget(&forget_conn);
-        pop_for_forget.popdown();
+        if let Some(pop) = pop_for_forget.upgrade() {
+            pop.popdown();
+        }
     });
     popover_box.append(&forget_btn);
 

@@ -17,9 +17,20 @@ use crate::components::mpris_controls::{bind_transport_button, play_pause_icon};
 use crate::scale::scale;
 
 /// Labels + buttons that the bind closure updates on every emission.
+///
+/// The **title label is deliberately not in here** (#1176). It is what
+/// [`wire_player_bind`] binds on, and `bind` holds its widget through a
+/// `glib::WeakRef` precisely so a torn-down page ends the apply-loop
+/// (`crates/hytte-reactive/src/bind.rs:16-22`, #224). A closure that owns a
+/// holder whose *field* is the bind target defeats that just as completely as
+/// cloning the target directly: the weak upgrade always succeeds, the loop
+/// never breaks, and a hot-unplugged Media page keeps running `render_player`
+/// — and therefore `spawn_art_fetch`, a network round trip plus a texture
+/// decode — on every track change, forever, once per dock cycle. The title
+/// now reaches the render functions as the apply closure's **own** widget
+/// argument, which is the same fix #834 made at twelve `bind` sites.
 #[derive(Clone)]
 struct InfoWidgets {
-    title: gtk::Label,
     artist: gtk::Label,
     album: gtk::Label,
     prev_btn: gtk::Button,
@@ -56,7 +67,7 @@ pub fn panel_media() -> gtk::Widget {
 
     let state = Rc::new(PlayerState::default());
     wire_transport_buttons(&info.widgets, &state);
-    wire_player_bind(&info.widgets, &art_image, &state);
+    wire_player_bind(&info.title, &info.widgets, &art_image, &state);
     wire_seek(&info.widgets.seek, &state);
 
     finish_page(&grid)
@@ -287,6 +298,8 @@ fn build_art_panel(grid: &gtk::Grid) -> gtk::Image {
 
 struct InfoPanel {
     section: gtk::Box,
+    /// The bind target, held apart from [`InfoWidgets`] — see that type's doc.
+    title: gtk::Label,
     widgets: InfoWidgets,
 }
 
@@ -329,8 +342,8 @@ fn build_info_panel() -> InfoPanel {
 
     InfoPanel {
         section,
+        title,
         widgets: InfoWidgets {
-            title,
             artist,
             album,
             prev_btn,
@@ -358,26 +371,51 @@ fn wire_transport_buttons(w: &InfoWidgets, state: &Rc<PlayerState>) {
     bind_transport_button(&w.next_btn, &state.bus, mpris::next);
 }
 
-fn wire_player_bind(w: &InfoWidgets, art_image: &gtk::Image, state: &Rc<PlayerState>) {
+fn wire_player_bind(
+    title: &gtk::Label,
+    w: &InfoWidgets,
+    art_image: &gtk::Image,
+    state: &Rc<PlayerState>,
+) {
+    bind_player_info(title, w, art_image, state, mpris::active_player());
+}
+
+/// [`wire_player_bind`] with its signal as a parameter, so the regression test
+/// can drive the apply-loop from a `Mutable` without a registered service.
+///
+/// The apply closure takes the **title label from its own argument** and
+/// captures no handle to it — see [`InfoWidgets`]' doc for why that is the
+/// whole point of this function's shape. `art` and the rest of `w` are
+/// genuinely different widgets than the bind target, so capturing those is the
+/// documented carve-out in `nix/lint-bind-pins.py`, not a pin: they are freed
+/// with the closure the moment the weak title upgrade fails.
+fn bind_player_info<S>(
+    title: &gtk::Label,
+    w: &InfoWidgets,
+    art_image: &gtk::Image,
+    state: &Rc<PlayerState>,
+    signal: S,
+) where
+    S: hytte::futures_signals::signal::Signal<Item = Option<mpris::Player>> + 'static,
+{
     let w = w.clone();
     let state = state.clone();
     let art = art_image.clone();
-    let title = w.title.clone();
     bind(
-        mpris::active_player(),
-        &title,
-        move |_, maybe_player| match maybe_player {
-            None => render_no_player(&w, &art, &state),
-            Some(player) => render_player(&w, &art, &state, &player),
+        signal,
+        title,
+        move |title, maybe_player| match maybe_player {
+            None => render_no_player(title, &w, &art, &state),
+            Some(player) => render_player(title, &w, &art, &state, &player),
         },
     );
 }
 
-fn render_no_player(w: &InfoWidgets, art: &gtk::Image, state: &PlayerState) {
+fn render_no_player(title: &gtk::Label, w: &InfoWidgets, art: &gtk::Image, state: &PlayerState) {
     *state.bus.borrow_mut() = None;
     *state.track_id.borrow_mut() = None;
     state.length_us.set(0);
-    w.title.set_text("No player");
+    title.set_text("No player");
     w.artist.set_text("");
     w.album.set_text("");
     w.pos.set_text("0:00");
@@ -390,12 +428,18 @@ fn render_no_player(w: &InfoWidgets, art: &gtk::Image, state: &PlayerState) {
     w.next_btn.set_sensitive(false);
 }
 
-fn render_player(w: &InfoWidgets, art: &gtk::Image, state: &PlayerState, player: &mpris::Player) {
+fn render_player(
+    title: &gtk::Label,
+    w: &InfoWidgets,
+    art: &gtk::Image,
+    state: &PlayerState,
+    player: &mpris::Player,
+) {
     *state.bus.borrow_mut() = Some(player.bus_name.clone());
     (*state.track_id.borrow_mut()).clone_from(&player.track_id);
     state.length_us.set(player.length_us);
 
-    w.title.set_text(&player.title);
+    title.set_text(&player.title);
     w.artist.set_text(&player.artists);
     w.album.set_text(&player.album);
 
@@ -555,5 +599,200 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+/// #1176 regression coverage for the one thing on this page that outlives the
+/// page: [`wire_player_bind`]'s apply-loop.
+///
+/// `bind` holds its widget weakly so a torn-down surface ends the loop (#224,
+/// `crates/hytte-reactive/src/bind.rs:16-22`). This closure used to own an
+/// `InfoWidgets` whose first field *was* the bind target, so the weak upgrade
+/// could never fail and a hot-unplugged Media page went on calling
+/// `render_player` — and `spawn_art_fetch`, a network round trip plus a
+/// texture decode — on every track change for the rest of the session, one
+/// zombie page per dock cycle.
+///
+/// The assertion is on `PlayerState`, which `render_player` writes before it
+/// does anything else: it is the counter seam that says whether the render
+/// ran at all, and `spawn_art_fetch` is reachable only from inside it.
+///
+/// Needs a real display server (labels and buttons have to be constructible),
+/// hence the `system-tests` gate.
+#[cfg(all(test, feature = "system-tests"))]
+mod gtk_tests {
+    use std::rc::Rc;
+
+    use hytte::adw::{self, prelude::*};
+    use hytte::futures_signals::signal::Mutable;
+    use hytte::gtk::{self, glib};
+    use hytte::services::mpris;
+
+    use super::{InfoPanel, PlayerState, bind_player_info, build_info_panel};
+
+    /// Run the GTK main loop until it has nothing left to dispatch.
+    fn pump() {
+        while glib::MainContext::default().iteration(false) {}
+    }
+
+    /// A player with an **empty** `art_url`, which is also `PlayerState`'s
+    /// initial `last_art_url` — so `render_player` takes its no-change branch
+    /// and no art fetch is spawned. The test is about whether the render ran,
+    /// not about the fetch's own machinery (which would want a live service).
+    /// A player whose every rendered field differs from the next one's, so
+    /// asserting a field actually distinguishes track A from track B. `title`
+    /// seeds the text fields and the track id, `length_us` the numeric ones,
+    /// and `playable` the three button sensitivities plus the play/pause icon.
+    ///
+    /// `art_url` is deliberately left at its empty default. `render_player`
+    /// only calls `spawn_art_fetch` when the url *changes*, and that task holds
+    /// a strong `art` for as long as the fetch runs — which is correct and
+    /// self-limiting, but it would leave the art image alive at the end of this
+    /// test and break the assertion that the apply closure was released. An
+    /// empty url on both players means the comparison never fires, so
+    /// `last_art_url` is not one of the witnesses below.
+    fn player(bus: &str, title: &str, length_us: u64, playable: bool) -> mpris::Player {
+        mpris::Player {
+            bus_name: bus.to_owned(),
+            title: title.to_owned(),
+            artists: format!("{title} Artist"),
+            album: format!("{title} Album"),
+            track_id: Some(format!("/track/{title}")),
+            length_us,
+            position_us: length_us / 2,
+            can_go_previous: playable,
+            can_play_pause: playable,
+            can_go_next: playable,
+            ..mpris::Player::default()
+        }
+    }
+
+    /// Every **widget** field `render_player` writes. Readable only while the
+    /// page is alive, which is the live half of the test below: asserting two
+    /// of about a dozen (#1176 review NIT) would let a partially-stale render
+    /// pass for a fully working one.
+    fn rendered_widgets(info: &InfoPanel) -> Vec<String> {
+        vec![
+            format!("title={}", info.title.text()),
+            format!("artist={}", info.widgets.artist.text()),
+            format!("album={}", info.widgets.album.text()),
+            format!("pos={}", info.widgets.pos.text()),
+            format!("len={}", info.widgets.len.text()),
+            format!("prev={}", info.widgets.prev_btn.is_sensitive()),
+            format!("play={}", info.widgets.play_pause_btn.is_sensitive()),
+            format!("next={}", info.widgets.next_btn.is_sensitive()),
+            format!("icon={:?}", info.widgets.play_pause_btn.icon_name()),
+        ]
+    }
+
+    /// Every **non-widget** field `render_player` writes that this fixture
+    /// varies. These are `Rc`/`Cell` state the test still owns after the page
+    /// is dropped, which is what makes them the witness for the teardown half:
+    /// the widgets are (correctly) freed by then, so they cannot be read back.
+    /// All three are written *before* `render_player` touches a widget, so a
+    /// single changed entry means the closure ran — whatever it then did or
+    /// failed to do with the widget handles.
+    fn rendered_state(state: &PlayerState) -> Vec<String> {
+        vec![
+            format!("bus={:?}", state.bus.borrow()),
+            format!("track_id={:?}", state.track_id.borrow()),
+            format!("len_us={}", state.length_us.get()),
+        ]
+    }
+
+    /// Falsified by putting `title` back into `InfoWidgets` and capturing the
+    /// holder (`let w = w.clone(); let title = w.title.clone();` with a
+    /// discarded closure parameter): the final assertion then reads 99,
+    /// because the dead page rendered the new track.
+    #[gtk::test]
+    fn a_dropped_media_page_stops_rendering_and_fetching() {
+        adw::init().expect("libadwaita init");
+        let info = build_info_panel();
+        let art = gtk::Image::new();
+        let state = Rc::new(PlayerState::default());
+        let players: Mutable<Option<mpris::Player>> = Mutable::new(None);
+
+        bind_player_info(
+            &info.title,
+            &info.widgets,
+            &art,
+            &state,
+            players.signal_cloned(),
+        );
+        pump();
+
+        // Live control: without this the test could pass on a binding that
+        // never worked in the first place. Every field `render_player` writes
+        // is read back, not just the two that happen to be convenient.
+        players.set(Some(player(
+            "org.mpris.MediaPlayer2.a",
+            "Track A",
+            42_000_000,
+            true,
+        )));
+        pump();
+        assert_eq!(
+            rendered_widgets(&info),
+            vec![
+                "title=Track A".to_owned(),
+                "artist=Track A Artist".to_owned(),
+                "album=Track A Album".to_owned(),
+                "pos=0:21".to_owned(),
+                "len=0:42".to_owned(),
+                "prev=true".to_owned(),
+                "play=true".to_owned(),
+                "next=true".to_owned(),
+                "icon=Some(\"media-playback-start-symbolic\")".to_owned(),
+            ],
+            "the apply closure must render every widget field through its own `title`/`w` \
+             arguments before the teardown half of this test means anything"
+        );
+        let state_for_track_a = rendered_state(&state);
+        assert_eq!(
+            state_for_track_a,
+            vec![
+                "bus=Some(\"org.mpris.MediaPlayer2.a\")".to_owned(),
+                "track_id=Some(\"/track/Track A\")".to_owned(),
+                "len_us=42000000".to_owned(),
+            ],
+            "and every non-widget field too — these three are the witness the teardown half reads"
+        );
+
+        let weak_title = info.title.downgrade();
+        let weak_art = art.downgrade();
+        drop(info);
+        drop(art);
+
+        // The page is gone; the service keeps emitting, exactly as it does
+        // when a monitor is unplugged with the Media page open. Track B differs
+        // from track A in every field above.
+        players.set(Some(player(
+            "org.mpris.MediaPlayer2.b",
+            "Track B",
+            99_000_000,
+            false,
+        )));
+        pump();
+
+        assert_eq!(
+            rendered_state(&state),
+            state_for_track_a,
+            "a torn-down Media page must render *nothing* — not merely stop updating the one \
+             field this test used to check. All three of these differ between track A and track \
+             B, and `render_player` writes every one of them before it touches a widget at all, \
+             so a single changed entry means the closure ran again. And if it ran then \
+             `spawn_art_fetch` ran with it: a network fetch and a texture decode per track \
+             change, forever, for a page nobody can see (#1176)"
+        );
+        assert!(
+            weak_title.upgrade().is_none(),
+            "the bind target must be freed with its section: if the apply closure still holds \
+             it, `bind`'s WeakRef can never fail and the loop can never end (#224)"
+        );
+        assert!(
+            weak_art.upgrade().is_none(),
+            "the apply closure must have been released with the page — it is what owns the art \
+             image, and what would fetch into it"
+        );
     }
 }

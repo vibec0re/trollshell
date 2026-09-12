@@ -172,6 +172,12 @@ fn build_vpn_profile_row(profile: &wifi::VpnProfile) -> adw::ActionRow {
     row
 }
 
+/// Per-profile "⋮" menu. Each button dismisses the popover through a **weak**
+/// handle (#1176): the button is a descendant of the popover it closes
+/// (`popover → popover_box → button`), so a strong `popover.clone()` closes a
+/// refcount cycle GTK never breaks and every row the VPN list rebuilds leaks
+/// its menu subtree. Same fix and same reasoning as `panels/bluetooth.rs`'s
+/// device menu; `nix/lint-bind-pins.py` now reports the shape.
 fn build_vpn_row_menu(profile: &wifi::VpnProfile) -> gtk::MenuButton {
     let menu_btn = gtk::MenuButton::new();
     menu_btn.set_icon_name("view-more-symbolic");
@@ -190,25 +196,29 @@ fn build_vpn_row_menu(profile: &wifi::VpnProfile) -> gtk::MenuButton {
         // Deactivate targets the active-connection object path; only offered
         // when the profile is up (and that path was captured).
         if let Some(active) = profile.active_connection_path.clone() {
-            let pop = popover.clone();
+            let pop = popover.downgrade();
             let deactivate_btn = gtk::Button::with_label("Deactivate");
             deactivate_btn.add_css_class("flat");
             deactivate_btn.add_css_class("destructive-action");
             deactivate_btn.connect_clicked(move |_| {
                 wifi::vpn_deactivate(&active);
-                pop.popdown();
+                if let Some(pop) = pop.upgrade() {
+                    pop.popdown();
+                }
             });
             popover_box.append(&deactivate_btn);
         }
     } else {
         // Activate passes the saved-connection path (NM resolves the rest).
-        let pop = popover.clone();
+        let pop = popover.downgrade();
         let conn = profile.connection_path.clone();
         let activate_btn = gtk::Button::with_label("Activate");
         activate_btn.add_css_class("flat");
         activate_btn.connect_clicked(move |_| {
             wifi::vpn_activate(&conn);
-            pop.popdown();
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
         });
         popover_box.append(&activate_btn);
     }

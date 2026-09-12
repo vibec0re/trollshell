@@ -250,12 +250,10 @@ fn read_random_bytes(
 fn random_value() -> String {
     use std::io::Read as _;
 
-    let bytes = read_random_bytes(|buf| {
-        std::fs::File::open("/dev/urandom")?.read_exact(buf)
-    })
-    .unwrap_or_else(|e| {
-        panic!("hytte-infobroker: refusing to mint a session token: /dev/urandom: {e}")
-    });
+    let bytes = read_random_bytes(|buf| std::fs::File::open("/dev/urandom")?.read_exact(buf))
+        .unwrap_or_else(|e| {
+            panic!("hytte-infobroker: refusing to mint a session token: /dev/urandom: {e}")
+        });
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         // Infallible: writing to a String never errors.
@@ -293,8 +291,9 @@ mod tests {
     /// panic is the only other place this shape shows up.
     #[test]
     fn read_random_bytes_refuses_rather_than_falls_back_on_a_failed_read() {
-        let err = read_random_bytes(|_buf| Err(std::io::Error::other("simulated /dev/urandom failure")))
-            .expect_err("a failed read must not synthesize bytes");
+        let err =
+            read_random_bytes(|_buf| Err(std::io::Error::other("simulated /dev/urandom failure")))
+                .expect_err("a failed read must not synthesize bytes");
         assert_eq!(err.to_string(), "simulated /dev/urandom failure");
     }
 

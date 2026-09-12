@@ -925,8 +925,7 @@ mod tests {
         let real = dir.path().join("real-grants.toml");
         let link = dir.path().join("grants.toml");
         std::fs::write(&real, "old\n").expect("seed real file");
-        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640))
-            .expect("chmod 640");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).expect("chmod 640");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
 
         write_atomic(&link, "new\n").expect("writes through the symlink");
@@ -942,7 +941,11 @@ mod tests {
                 .is_symlink(),
             "the symlink must survive the write, not be replaced by a regular file"
         );
-        let mode = std::fs::metadata(&real).expect("stat real file").permissions().mode() & 0o7777;
+        let mode = std::fs::metadata(&real)
+            .expect("stat real file")
+            .permissions()
+            .mode()
+            & 0o7777;
         assert_eq!(mode, 0o640, "the real target's mode must be preserved");
     }
 

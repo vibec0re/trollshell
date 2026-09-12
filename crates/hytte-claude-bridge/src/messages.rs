@@ -1112,10 +1112,7 @@ mod tests {
     fn the_missing_key_refusal_names_neither_retired_mechanism() {
         let msg = super::missing_key_refusal();
         assert!(!msg.contains("8787"), "{msg}");
-        assert!(
-            !msg.contains("trollshell-claude-bridge.service"),
-            "{msg}"
-        );
+        assert!(!msg.contains("trollshell-claude-bridge.service"), "{msg}");
         // And it names what replaced them.
         assert!(
             msg.contains("plugin launcher") || msg.contains("plugins.claude-bridge"),

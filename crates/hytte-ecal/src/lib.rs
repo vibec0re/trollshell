@@ -2761,18 +2761,34 @@ mod tests {
     /// `EXDATE` is applied to a skipped series exactly as to an unskipped one
     /// — the skip moves the iterator, it does not bypass the recurrence-set
     /// modifiers, which are read off the component and matched per occurrence.
+    ///
+    /// `FREQ=HOURLY` (not `DAILY`) from 2014 is deliberate (#1206 NIT-6): a
+    /// 2014 daily rule is only ~4 500 steps from the window, comfortably under
+    /// [`super::MAX_RECUR_ITERATIONS`], so it would still pass with the skip
+    /// stubbed off entirely — this test would then be pinning EXDATE
+    /// filtering alone, not the skip. Hourly from the same DTSTART is ~105
+    /// 000 steps, past the guard, so this genuinely depends on the skip: stub
+    /// `skip_iterator_to_window` to decline unconditionally and this reds
+    /// (0 occurrences) alongside the other 2014-hourly tests.
     #[test]
     fn exdate_still_excludes_occurrences_of_a_skipped_series() {
-        let ical = "BEGIN:VEVENT\r\nUID:daily-2014\r\nDTSTAMP:20140101T090000Z\r\n\
+        let ical = "BEGIN:VEVENT\r\nUID:hourly-2014\r\nDTSTAMP:20140101T090000Z\r\n\
                      DTSTART:20140101T090000Z\r\nDTEND:20140101T093000Z\r\n\
-                     SUMMARY:Old standup\r\nRRULE:FREQ=DAILY\r\n\
+                     SUMMARY:Old standup\r\nRRULE:FREQ=HOURLY\r\n\
                      EXDATE:20260603T090000Z\r\nEXDATE:20260610T090000Z\r\n\
                      END:VEVENT\r\n";
         let inst = super::expand_ical_for_test(ical, JUN_START, JUL_START).unwrap();
 
-        assert_eq!(inst.len(), 28, "30 days of June less the two EXDATEs");
+        assert_eq!(
+            inst.len(),
+            30 * 24 - 2,
+            "30 days of June's hourly grid less the two EXDATEs",
+        );
         let starts: Vec<i64> = inst.iter().map(|e| e.start_unix).collect();
-        assert_eq!(starts[0], ANCHOR_0900, "June 1 survives");
+        // Unlike the DAILY version of this fixture, an hourly grid hits every
+        // hour of every day, so the window's very first hour (midnight, not
+        // DTSTART's 09:00) is the first survivor.
+        assert_eq!(starts[0], JUN_START, "June 1 00:00 survives");
         for excluded in [ANCHOR_0900 + 2 * 86_400, ANCHOR_0900 + 9 * 86_400] {
             assert!(
                 !starts.contains(&excluded),

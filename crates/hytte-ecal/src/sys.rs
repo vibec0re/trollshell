@@ -473,8 +473,10 @@ unsafe extern "C" {
     /// ~100 000.
     ///
     /// Borrows both arguments (the iterator keeps no reference to `start`, so
-    /// the caller may release it straight after). **Returns zero on failure**,
-    /// which libical documents for exactly one case: an RRULE carrying
+    /// the caller may release it straight after). **Returns zero on
+    /// failure.** libical's own doc string is deliberately open-ended here
+    /// ("1 if succeeded, 0 if failed, like when the recurrence type is
+    /// unsupported"); the only case it explicitly names is an RRULE carrying
     /// `COUNT`, where skipping would change which occurrences the count
     /// selects. Callers must treat a zero return as "iterate from `DTSTART`
     /// after all" rather than assume the iterator moved — see

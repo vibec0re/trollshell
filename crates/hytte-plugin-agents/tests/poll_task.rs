@@ -7,7 +7,7 @@
 //!
 //! | mechanism | what it buys | test here |
 //! | --- | --- | --- |
-//! | `, if visible` on the tick arm | §5.4's parking — the entire sidebar-closed power story | [`the_poll_parks_while_the_sidebar_is_closed_and_wakes_on_open`] |
+//! | the `Gate`'s visibility guard | §5.4's parking — the entire sidebar-closed power story | [`the_poll_parks_while_the_sidebar_is_closed_and_wakes_on_open`] |
 //! | the seed poll before the loop | a card that is not "connecting…" until the sidebar is first opened | [`the_seed_poll_runs_before_any_visibility_edge`] |
 //! | `ConfigSource::changed` | `agents.toml` live-reload — the `places` behaviour §9 promises | [`an_agents_toml_edit_is_picked_up_on_the_next_poll`] |
 //! | `*urls_done = true` | one `Urls` round trip per session, not one per poll | [`urls_is_fetched_once_per_session_not_once_per_poll`] |
@@ -96,8 +96,11 @@ async fn recv_status_lane(rx: &mut mpsc::UnboundedReceiver<Msg>, what: &str) -> 
 /// `reducer.rs`'s `the_visibility_edge_reaches_the_poll_task` only proves the
 /// `Cmd` leaves the reducer; it says nothing about the task on the other end.
 ///
-/// Falsification: drop `, if visible` from the `interval.tick()` arm in
-/// `poll.rs` and the "a parked poll makes no round trips" assertion goes red.
+/// Falsification: drop the `, if open` guard from the `interval.tick()` arm
+/// in `hytte_plugin::poll::Gate::next` — the loop has been the SDK's since
+/// #1168 — and the "a parked poll makes no round trips" assertion goes red.
+/// (It reds `hytte_plugin::poll`'s own parking tests too; this one is what
+/// proves *this* plugin is actually wired to that gate.)
 #[tokio::test(start_paused = true)]
 async fn the_poll_parks_while_the_sidebar_is_closed_and_wakes_on_open() {
     let hive = FakeHive::serve(replies(&[(

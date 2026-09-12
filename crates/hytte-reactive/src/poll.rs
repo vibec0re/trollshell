@@ -10,6 +10,14 @@
 //!
 //! [`gated_poll`] captures that scaffolding — including dedup-by-reference — so
 //! each service only supplies its per-tick sampler.
+//!
+//! The inter-sample period is a `FnMut() -> Duration` rather than a fixed
+//! `Duration`, called fresh before every sleep (#1172) — so a poller whose
+//! cadence stretches on battery power (mirroring #1081's config-poll design)
+//! can express that by closing over its own `on_battery()` check, the same
+//! shape `netconn`/`app_usage`'s inlined copies already used before adopting
+//! this. A poller with no such concern just passes a closure returning the
+//! same constant every time.
 
 use futures_signals::signal::{Mutable, SignalExt};
 use std::future::Future;
@@ -27,17 +35,22 @@ use std::time::Duration;
 /// early when `active` goes `false`, so parking is immediate rather than a tick
 /// late.
 ///
+/// `cadence` is called once per sleep, immediately before it — never cached —
+/// so a live source (e.g. a battery-aware `Duration` mapping) is honoured on
+/// every cycle without this loop needing to know anything about batteries.
+///
 /// This is an `async fn` — the loop body itself, not a spawner. Wrap the call
 /// in [`crate::spawn_supervised`] so a panicking sampler restarts with backoff.
-pub async fn gated_poll<T, F, Fut>(
+pub async fn gated_poll<T, F, Fut, C>(
     active: Mutable<bool>,
-    interval: Duration,
+    mut cadence: C,
     writer: Mutable<T>,
     mut sample: F,
 ) where
     T: PartialEq,
     F: FnMut() -> Fut,
     Fut: Future<Output = Option<T>>,
+    C: FnMut() -> Duration,
 {
     loop {
         // Park (forking nothing) while gated inactive.
@@ -58,7 +71,7 @@ pub async fn gated_poll<T, F, Fut>(
         // inactive mid-wait — no point holding the timer when parked. The
         // top-of-loop park then handles the resume edge.
         tokio::select! {
-            () = tokio::time::sleep(interval) => {}
+            () = tokio::time::sleep(cadence()) => {}
             _ = active.signal().wait_for(false) => {}
         }
     }
@@ -88,7 +101,7 @@ mod tests {
             let c = calls.clone();
             let poll = gated_poll(
                 active,
-                Duration::from_millis(1),
+                || Duration::from_millis(1),
                 writer.clone(),
                 move || {
                     c.fetch_add(1, Ordering::SeqCst);
@@ -117,7 +130,7 @@ mod tests {
             let c = calls.clone();
             let poll = gated_poll(
                 active,
-                Duration::from_millis(1),
+                || Duration::from_millis(1),
                 writer.clone(),
                 move || {
                     let n = c.fetch_add(1, Ordering::SeqCst);
@@ -163,7 +176,7 @@ mod tests {
             });
 
             // Always the current value → every tick is deduped, `set` never runs.
-            let poll = gated_poll(active, Duration::from_millis(1), writer.clone(), || async {
+            let poll = gated_poll(active, || Duration::from_millis(1), writer.clone(), || async {
                 Some(7u32)
             });
             let _ = tokio::time::timeout(Duration::from_millis(30), poll).await;
@@ -174,6 +187,58 @@ mod tests {
                 emissions.load(Ordering::SeqCst),
                 1,
                 "identical samples must not re-fire the signal"
+            );
+        });
+    }
+
+    /// `cadence` is called fresh before every sleep — never cached from the
+    /// first call — so a live source (mirroring a battery-aware duration
+    /// mapping, #1081/#1172) is honoured on every cycle. A mutation that reads
+    /// `cadence` once up front and reuses that `Duration` forever would sleep
+    /// the *first* value (10 ms) on every subsequent cycle too, so ticks 2+
+    /// would never observe the flip to 1 ms and the sampler would run far
+    /// fewer than the ~20 times a live 1 ms cadence allows in 25 ms.
+    #[test]
+    fn cadence_is_read_fresh_every_cycle_not_cached() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            tokio::time::pause();
+            let active = Mutable::new(true);
+            let writer = Mutable::new(0u32);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let c = calls.clone();
+
+            // Start slow (10 ms/tick) so a handful of early ticks are cheap to
+            // account for, then drop to 1 ms/tick after the first sample —
+            // a cached-once cadence would never see this flip.
+            let cadence_calls = Arc::new(AtomicUsize::new(0));
+            let cc = cadence_calls.clone();
+            let cadence = move || {
+                cc.fetch_add(1, Ordering::SeqCst);
+                if c.load(Ordering::SeqCst) == 0 {
+                    Duration::from_millis(10)
+                } else {
+                    Duration::from_millis(1)
+                }
+            };
+
+            let sample_calls = calls.clone();
+            let poll = gated_poll(active, cadence, writer, move || {
+                sample_calls.fetch_add(1, Ordering::SeqCst);
+                async { None::<u32> }
+            });
+            let _ = tokio::time::timeout(Duration::from_millis(25), poll).await;
+
+            // 1 (slow first tick) + ~14 fast 1 ms ticks over the remaining
+            // ~15 ms budget; a cached-once cadence would keep sleeping 10 ms
+            // and manage at most ~2-3 ticks in 25 ms.
+            assert!(
+                calls.load(Ordering::SeqCst) > 5,
+                "cadence must be re-read every cycle, not cached from the first call: only {} ticks in 25ms",
+                calls.load(Ordering::SeqCst)
             );
         });
     }

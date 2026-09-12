@@ -9,8 +9,8 @@
 //! Failures (`ss` missing, parse error) log once and the signal stays
 //! at its last known value.
 
-use futures_signals::signal::{Mutable, Signal, SignalExt};
-use hytte_reactive::{Service, registry, spawn_supervised};
+use futures_signals::signal::{Mutable, Signal};
+use hytte_reactive::{Service, gated_poll, registry, spawn_supervised};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -212,33 +212,16 @@ fn on_battery() -> bool {
 }
 
 async fn poll_loop(writer: Mutable<Vec<Connection>>, active: Mutable<bool>) {
-    // Park while gated inactive (mirrors `gated_poll`'s shape — see
-    // `hytte_reactive::gated_poll` — but inlined so the inter-sample sleep
-    // can use a battery-aware duration that `gated_poll`'s fixed `Duration`
-    // parameter can't express). `None` (ss missing / failed) keeps the
+    // The original park/dedup/select-bail scaffolding for this loop now lives
+    // in `hytte_reactive::gated_poll` (#1172) — this was one of the pollers
+    // whose battery-aware duration `gated_poll`'s old fixed `Duration`
+    // parameter couldn't express; it now takes `cadence` as a live source,
+    // called fresh before every sleep. `None` (ss missing / failed) keeps the
     // last-known list. See the `active` field doc on `NetconnHandles`.
-    loop {
-        if !active.get() {
-            let _ = active.signal().wait_for(true).await;
-        }
-
-        if let Some(next) = run_ss().await.map(|out| parse_ss_output(&out)) {
-            // Dedup by reference: only write (and re-fire the signal) when the
-            // sample actually differs from what's currently published.
-            let changed = *writer.lock_ref() != next;
-            if changed {
-                writer.set(next);
-            }
-        }
-
-        // Sleep the battery-aware inter-sample interval, but bail out early if
-        // we get gated inactive mid-wait — no point holding the timer when
-        // parked. The top-of-loop park then handles the resume edge.
-        tokio::select! {
-            () = tokio::time::sleep(cadence(on_battery())) => {}
-            _ = active.signal().wait_for(false) => {}
-        }
-    }
+    gated_poll(active, || cadence(on_battery()), writer, || async {
+        run_ss().await.map(|out| parse_ss_output(&out))
+    })
+    .await;
 }
 
 async fn run_ss() -> Option<String> {

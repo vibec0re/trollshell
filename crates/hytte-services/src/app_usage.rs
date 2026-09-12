@@ -49,8 +49,8 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use futures_signals::signal::{Mutable, Signal, SignalExt};
-use hytte_reactive::{Service, registry, spawn_supervised};
+use futures_signals::signal::{Mutable, Signal};
+use hytte_reactive::{Service, gated_poll, registry, spawn_supervised};
 
 /// Resident page size assumed when converting `/proc/<pid>/statm` pages to
 /// bytes. 4 KiB on every platform trollshell targets; reading the real value
@@ -108,7 +108,10 @@ pub(crate) enum CgroupGroup {
 /// One aggregated process group — all PIDs sharing an app-scope id (v2) or
 /// process name fallback. The `app_id` is `None` for the "System" bucket and
 /// for comm-fallback groups.
-#[derive(Clone, Debug)]
+///
+/// `PartialEq` (#1172) is what lets `gated_poll` dedup a whole sample against
+/// the currently-published one by reference, no clone.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProcSample {
     /// Display name: the app-id parsed from the cgroup scope, or `"System"` for
     /// the aggregate non-app bucket.
@@ -127,8 +130,15 @@ pub struct ProcSample {
 
 #[doc(hidden)]
 pub struct AppUsageHandles {
-    pub(crate) by_cpu: Mutable<Vec<ProcSample>>,
-    pub(crate) by_mem: Mutable<Vec<ProcSample>>,
+    /// Both ranked lists, published together (#1172): they come from the same
+    /// `/proc` walk and `gated_poll` dedups one `T`, so splitting them into two
+    /// independent `Mutable`s would need either two walks (doubling the cost
+    /// this module exists to amortize) or a dedup that only covers one half.
+    /// In practice the jiffy deltas that drive `cpu_frac` move on essentially
+    /// every tick, so this costs no *observable* coalescing over the old
+    /// always-`.set()` pair — see [`top_by_cpu`]/[`top_by_mem`] for how the
+    /// public per-list signals are recovered from it.
+    pub(crate) usage: Mutable<(Vec<ProcSample>, Vec<ProcSample>)>,
     /// Gate for the `/proc` poller. While `false`, the poll loop parks and
     /// walks nothing; flipping it back to `true` resumes sampling immediately
     /// (the loop `select!`s on this so reactivation isn't delayed a full tick).
@@ -147,16 +157,12 @@ impl Service for AppUsageService {
 
     fn start(self, _rt: &tokio::runtime::Handle) -> Self::Handles {
         let handles = AppUsageHandles {
-            by_cpu: Mutable::new(Vec::new()),
-            by_mem: Mutable::new(Vec::new()),
+            usage: Mutable::new((Vec::new(), Vec::new())),
             active: Mutable::new(true),
         };
-        let by_cpu = handles.by_cpu.clone();
-        let by_mem = handles.by_mem.clone();
+        let usage = handles.usage.clone();
         let active = handles.active.clone();
-        spawn_supervised("app_usage", move || {
-            poll_loop(by_cpu.clone(), by_mem.clone(), active.clone())
-        });
+        spawn_supervised("app_usage", move || poll_loop(usage.clone(), active.clone()));
         handles
     }
 }
@@ -171,8 +177,8 @@ pub fn top_by_cpu() -> impl Signal<Item = Vec<ProcSample>> {
     registry::with(|r| {
         r.get::<AppUsageHandles>()
             .expect("app_usage::service() not registered")
-            .by_cpu
-            .signal_cloned()
+            .usage
+            .signal_ref(|(cpu, _mem)| cpu.clone())
     })
 }
 
@@ -181,8 +187,8 @@ pub fn top_by_mem() -> impl Signal<Item = Vec<ProcSample>> {
     registry::with(|r| {
         r.get::<AppUsageHandles>()
             .expect("app_usage::service() not registered")
-            .by_mem
-            .signal_cloned()
+            .usage
+            .signal_ref(|(_cpu, mem)| mem.clone())
     })
 }
 
@@ -217,64 +223,63 @@ struct Agg {
     app_id: Option<String>,
 }
 
-async fn poll_loop(
-    by_cpu: Mutable<Vec<ProcSample>>,
-    by_mem: Mutable<Vec<ProcSample>>,
-    active: Mutable<bool>,
-) {
-    // Per-PID cumulative CPU jiffies from the previous sample, and the previous
-    // aggregate total CPU jiffies — the two halves of the delta ratio.
-    let mut prev_pid: HashMap<u32, u64> = HashMap::new();
-    let mut prev_total: u64 = 0;
+async fn poll_loop(usage: Mutable<(Vec<ProcSample>, Vec<ProcSample>)>, active: Mutable<bool>) {
+    // The park/dedup/select-bail scaffolding this hand-rolled now lives in
+    // `hytte_reactive::gated_poll` (#1172) — this was one of the pollers whose
+    // battery-aware duration the old fixed-`Duration` `gated_poll` couldn't
+    // express; it now takes `cadence` as a live source, called fresh before
+    // every sleep.
+    //
+    // The CPU fractions are jiffy *deltas* over the inter-sample interval, so
+    // a resume sample's delta spans the whole parked gap. That's fine:
+    // `prev_total` grows by the same wall-clock span as the per-PID jiffies,
+    // so the ratio stays a valid "share of total capacity" — a process that
+    // was idle the whole time still reads ~0.
+    //
+    // `gated_poll`'s sampler is a plain `FnMut() -> Fut` (not an `AsyncFnMut`
+    // borrowing its own captures — see `hytte_plugin::poll`'s doc comment on
+    // the identical choice: the sugar's future is higher-ranked over the
+    // call's lifetime, which the compiler can't prove `Send` for a task handed
+    // to `tokio::spawn`). So the per-PID jiffy map and the running total —
+    // state that must survive from one call to the next — live behind a
+    // `std::sync::Mutex` the closure clones an `Arc` handle to on every call,
+    // rather than as captured-by-reference locals: this task is never
+    // actually contended (one loop, calls never overlap), the `Mutex` is only
+    // what lets an owned, `'static` future leave and return through a plain
+    // `FnMut`.
+    let cadence_state = std::sync::Arc::new(std::sync::Mutex::new((HashMap::<u32, u64>::new(), 0u64)));
 
-    loop {
-        // Park (walking nothing) while gated inactive. `wait_for(true)` resolves
-        // as soon as `set_active(true)` lands — `Mutable::signal()` replays the
-        // current value on first poll, so if we've already been reactivated by
-        // the time we get here it returns immediately, with no lost wakeup.
-        // Reactivation is thus instant rather than waiting out a sleep tick.
-        //
-        // The CPU fractions are jiffy *deltas* over the inter-sample interval,
-        // so the resume sample's delta spans the whole parked gap. That's
-        // fine: `prev_total` grows by the same wall-clock span as the per-PID
-        // jiffies, so the ratio stays a valid "share of total capacity" — a
-        // process that was idle the whole time still reads ~0.
-        if !active.get() {
-            let _ = active.signal().wait_for(true).await;
-        }
+    gated_poll(active, || cadence(on_battery()), usage, move || {
+        let cadence_state = cadence_state.clone();
+        async move {
+            // `mem::take` keeps the shared map valid (empty) on the
+            // join-error path below, mirroring the pre-#1172 loop.
+            let (prev_pid, prev_total) = {
+                let mut guard = cadence_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (std::mem::take(&mut guard.0), guard.1)
+            };
 
-        // The whole `/proc` walk is hundreds of synchronous file reads — far too
-        // much blocking I/O for a shared tokio worker (#434). Hand it to a
-        // blocking thread, moving the previous per-PID jiffy map in and getting
-        // the fresh one (plus the ranked lists) back. `mem::take` keeps
-        // `prev_pid` valid (empty) on the join-error path.
-        let prev = std::mem::take(&mut prev_pid);
-        let sample = match tokio::task::spawn_blocking(move || sample_proc(&prev, prev_total)).await
-        {
-            Ok(sample) => sample,
-            Err(e) => {
-                tracing::warn!(error = %e, "app_usage: /proc sample task failed");
-                tokio::select! {
-                    () = tokio::time::sleep(cadence(on_battery())) => {}
-                    _ = active.signal().wait_for(false) => {}
+            // The whole `/proc` walk is hundreds of synchronous file reads —
+            // far too much blocking I/O for a shared tokio worker (#434).
+            match tokio::task::spawn_blocking(move || sample_proc(&prev_pid, prev_total)).await {
+                Ok(sample) => {
+                    let mut guard = cadence_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard.0 = sample.cur_pid;
+                    guard.1 = sample.total_now;
+                    Some((sample.by_cpu, sample.by_mem))
                 }
-                continue;
+                Err(e) => {
+                    tracing::warn!(error = %e, "app_usage: /proc sample task failed");
+                    None
+                }
             }
-        };
-
-        by_cpu.set(sample.by_cpu);
-        by_mem.set(sample.by_mem);
-
-        prev_pid = sample.cur_pid;
-        prev_total = sample.total_now;
-        // Sleep the battery-aware inter-sample interval, but bail out early if
-        // we get gated inactive mid-wait — no point holding the timer when
-        // parked. The top-of-loop park then handles the resume edge.
-        tokio::select! {
-            () = tokio::time::sleep(cadence(on_battery())) => {}
-            _ = active.signal().wait_for(false) => {}
         }
-    }
+    })
+    .await;
 }
 
 /// One full `/proc` sample: the fresh per-PID jiffy map + aggregate total (fed

@@ -5,7 +5,7 @@ use super::parse::{parse_adapter_props, parse_device_props, prop_bool, prop_str,
 use super::types::{Adapter, Device};
 use futures_signals::signal::Mutable;
 use futures_util::StreamExt;
-use hytte_bus::{BusKind, SignalSubscription};
+use hytte_bus::{BusKind, SignalEvent, SignalItem, SignalSubscription};
 use hytte_reactive::runtime;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -168,12 +168,128 @@ pub(super) async fn listen(
     event_loop(&state, &adapter_path, adapter_path_store).await
 }
 
-/// A `PropertiesChanged` event forwarded from a per-device or adapter subscription.
-pub(super) struct PropChangedEvent {
-    /// The object path the signal came from.
-    pub(super) path: String,
-    /// The body of the `PropertiesChanged` signal: (iface, changed, invalidated).
-    pub(super) body: zbus::Message,
+/// A message forwarded from a per-device subscription's forwarder task to
+/// [`event_loop`]: either a `PropertiesChanged` emission, or the notice that
+/// this device's subscription hit a [`SignalItem::Resubscribed`]/
+/// [`SignalItem::Lagged`] marker and needs the shared [`resync`] (#1201) —
+/// the forwarder can't call `resync` itself, since it doesn't own
+/// `device_subs`.
+pub(super) enum PropChangedEvent {
+    /// A `PropertiesChanged` emission. `body` is `(iface, changed,
+    /// invalidated)`.
+    Changed {
+        /// The object path the signal came from.
+        path: String,
+        /// The body of the `PropertiesChanged` signal.
+        body: zbus::Message,
+    },
+    /// This device's subscription needs a re-sync.
+    Resync,
+}
+
+/// Re-sync all bluetooth state from a fresh `GetManagedObjects` snapshot —
+/// the repair for a `Resubscribed`/`Lagged` marker on any of this fold's
+/// four signal subscriptions (the three top-level ones plus one per tracked
+/// device, #1201). Between a subscription dying and its replacement going
+/// up, an `InterfacesAdded`/`InterfacesRemoved`/`PropertiesChanged` emission
+/// for it is gone for good — `GetManagedObjects` is the only source broad
+/// enough to repair whichever one it was. Reconciles the adapter, replaces
+/// the device map wholesale (batteries included), and diffs the per-device
+/// subscription set against it, exactly like the initial [`listen`] snapshot
+/// does. Mirrors [`handle_ifaces_removed`]'s "adapter removed" branch when
+/// the adapter itself is gone: same cleanup, same `Err` to force a full
+/// reconnect.
+async fn resync(
+    state: &State,
+    adapter_path: &str,
+    props_tx: &tokio::sync::mpsc::UnboundedSender<PropChangedEvent>,
+    device_subs: &mut HashMap<String, SignalSubscription>,
+) -> Result<(), anyhow::Error> {
+    let managed = get_managed_objects()
+        .await
+        .map_err(|e| anyhow::anyhow!("GetManagedObjects (resync): {e}"))?;
+
+    let Some(adapter_props) = managed
+        .get(&zbus::zvariant::OwnedObjectPath::try_from(adapter_path)?)
+        .and_then(|ifaces| ifaces.get("org.bluez.Adapter1"))
+    else {
+        tracing::warn!(path = adapter_path, "bluetooth: adapter missing on resync — reconnecting");
+        state.adapter.set(None);
+        state.devices_map.lock().await.clear();
+        state.devices.set(Vec::new());
+        device_subs.clear();
+        return Err(anyhow::anyhow!("adapter removed"));
+    };
+    state.adapter.set(Some(parse_adapter_props(adapter_path, adapter_props)));
+
+    let mut new_map = HashMap::new();
+    for (obj_path, ifaces) in &managed {
+        let p = obj_path.as_str();
+        if p.starts_with(adapter_path)
+            && let Some(dev_props) = ifaces.get("org.bluez.Device1")
+        {
+            let mut dev = parse_device_props(p, dev_props);
+            if let Some(bat_props) = ifaces.get("org.bluez.Battery1") {
+                dev.battery = property::<u8>(bat_props, "Percentage");
+            }
+            new_map.insert(p.to_string(), dev);
+        }
+    }
+
+    // Diff the subscription set: drop a device that's gone (its
+    // SignalSubscription's Drop tears the match rule down), subscribe one
+    // that's new.
+    device_subs.retain(|path, _| new_map.contains_key(path));
+    for path in new_map.keys() {
+        if !device_subs.contains_key(path) {
+            let sub = subscribe_device_props(path, props_tx.clone());
+            device_subs.insert(path.clone(), sub);
+        }
+    }
+
+    *state.devices_map.lock().await = new_map;
+    state.publish_devices().await;
+
+    Ok(())
+}
+
+/// Shared reaction to one item from any of bluetooth's three top-level
+/// signal subscriptions (`InterfacesAdded`, `InterfacesRemoved`, adapter
+/// `PropertiesChanged`): forward an ordinary emission's event to the caller,
+/// and call `do_resync` once on a `Resubscribed`/`Lagged` marker instead of
+/// dropping it (#1201) — the repair [`resync`] performs is the same
+/// regardless of which of the three subscriptions went stale. A `resync`
+/// failure (transient `GetManagedObjects`, or the adapter genuinely gone) is
+/// propagated rather than swallowed, exactly like a `GetManagedObjects`
+/// failure elsewhere in this file — the caller's supervised loop backs off
+/// and restarts [`listen`] from scratch.
+///
+/// `do_resync` is `FnOnce`, not `FnMut`: each call site below constructs a
+/// fresh closure per loop iteration and this function calls it at most once,
+/// so the plain (pre-`AsyncFn*`) "closure returning a future that borrows
+/// its captures" shape is sound here — unlike an `FnMut`/`AsyncFnMut` bound,
+/// which (a discarded earlier draft found) hits a real rustc limitation
+/// once `event_loop` is spawned via `spawn_supervised`
+/// (`Send`-for-a-generic-`AsyncFnMut`-closure "not general enough"). Kept
+/// injectable so a test can stand in for the real `GetManagedObjects` round
+/// trip with a counter.
+async fn bluetooth_marker_or_event<Resync, Fut>(
+    item: SignalItem,
+    source: &'static str,
+    do_resync: Resync,
+) -> Result<Option<SignalEvent>, anyhow::Error>
+where
+    Resync: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), anyhow::Error>>,
+{
+    match item {
+        SignalItem::Event(evt) => Ok(Some(evt)),
+        SignalItem::Resubscribed | SignalItem::Lagged { .. } => {
+            tracing::info!(source, "bluetooth signal resubscribed; re-syncing devices");
+            do_resync().await?;
+            Ok(None)
+        }
+    }
 }
 
 async fn event_loop(
@@ -216,14 +332,18 @@ async fn event_loop(
             .collect()
     };
 
-    let mut ifaces_added_events = ifaces_added_sub.events();
-    let mut ifaces_removed_events = ifaces_removed_sub.events();
-    let mut adapter_props_events = adapter_props_sub.events();
+    let mut ifaces_added_items = ifaces_added_sub.items();
+    let mut ifaces_removed_items = ifaces_removed_sub.items();
+    let mut adapter_props_items = adapter_props_sub.items();
 
     loop {
         tokio::select! {
-            evt = ifaces_added_events.next() => {
-                let Some(evt) = evt else { break; };
+            item = ifaces_added_items.next() => {
+                let Some(item) = item else { break; };
+                let evt = bluetooth_marker_or_event(item, "InterfacesAdded", || {
+                    resync(state, adapter_path, &props_tx, &mut device_subs)
+                }).await?;
+                let Some(evt) = evt else { continue; };
                 let added = handle_ifaces_added(
                     state,
                     adapter_path,
@@ -235,20 +355,39 @@ async fn event_loop(
                 let _ = added; // result used inside handler
             }
 
-            evt = ifaces_removed_events.next() => {
-                let Some(evt) = evt else { break; };
+            item = ifaces_removed_items.next() => {
+                let Some(item) = item else { break; };
+                let evt = bluetooth_marker_or_event(item, "InterfacesRemoved", || {
+                    resync(state, adapter_path, &props_tx, &mut device_subs)
+                }).await?;
+                let Some(evt) = evt else { continue; };
                 if handle_ifaces_removed(state, adapter_path, evt.body, &mut device_subs).await {
                     return Err(anyhow::anyhow!("adapter removed"));
                 }
             }
 
-            evt = adapter_props_events.next() => {
-                let Some(evt) = evt else { break; };
+            item = adapter_props_items.next() => {
+                let Some(item) = item else { break; };
+                let evt = bluetooth_marker_or_event(item, "adapter PropertiesChanged", || {
+                    resync(state, adapter_path, &props_tx, &mut device_subs)
+                }).await?;
+                let Some(evt) = evt else { continue; };
                 handle_adapter_props_changed(state, adapter_path, &evt.body);
             }
 
             Some(dev_evt) = props_rx.recv() => {
-                handle_device_props_changed(state, dev_evt).await;
+                match dev_evt {
+                    PropChangedEvent::Changed { path, body } => {
+                        handle_device_props_changed(state, &path, &body).await;
+                    }
+                    PropChangedEvent::Resync => {
+                        tracing::info!(
+                            source = "device PropertiesChanged",
+                            "bluetooth signal resubscribed; re-syncing devices"
+                        );
+                        resync(state, adapter_path, &props_tx, &mut device_subs).await?;
+                    }
+                }
             }
         }
     }
@@ -257,7 +396,8 @@ async fn event_loop(
 }
 
 /// Subscribe to `PropertiesChanged` on a single device path, forwarding
-/// events to `tx`. Returns the `SignalSubscription` handle; dropping it
+/// events (and Resubscribed/Lagged markers, as [`PropChangedEvent::Resync`],
+/// #1201) to `tx`. Returns the `SignalSubscription` handle; dropping it
 /// cancels the subscription.
 fn subscribe_device_props(
     device_path: &str,
@@ -274,12 +414,20 @@ fn subscribe_device_props(
     // (event stream ends) or the channel is closed.
     let sub_clone = sub.clone();
     runtime::handle().spawn(async move {
-        let mut stream = sub_clone.events();
-        while let Some(evt) = stream.next().await {
-            let _ = tx.send(PropChangedEvent {
-                path: path_str.clone(),
-                body: evt.body,
-            });
+        let mut items = sub_clone.items();
+        while let Some(item) = items.next().await {
+            let sent = match item {
+                SignalItem::Event(evt) => tx.send(PropChangedEvent::Changed {
+                    path: path_str.clone(),
+                    body: evt.body,
+                }),
+                SignalItem::Resubscribed | SignalItem::Lagged { .. } => {
+                    tx.send(PropChangedEvent::Resync)
+                }
+            };
+            if sent.is_err() {
+                break;
+            }
         }
     });
 
@@ -407,21 +555,20 @@ fn handle_adapter_props_changed(state: &State, adapter_path: &str, msg: &zbus::M
     }
 }
 
-async fn handle_device_props_changed(state: &State, evt: PropChangedEvent) {
+async fn handle_device_props_changed(state: &State, path: &str, body: &zbus::Message) {
     let Ok((iface_name, changed, _)) =
-        evt.body
-            .body()
+        body.body()
             .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
     else {
         return;
     };
 
     if iface_name == "org.bluez.Device1" {
-        state.apply_device_props(&evt.path, &changed).await;
+        state.apply_device_props(path, &changed).await;
         state.publish_devices().await;
     } else if iface_name == "org.bluez.Battery1" {
         let mut map = state.devices_map.lock().await;
-        if let Some(dev) = map.get_mut(&evt.path)
+        if let Some(dev) = map.get_mut(path)
             && changed.contains_key("Percentage")
         {
             dev.battery = property::<u8>(&changed, "Percentage");
@@ -434,6 +581,88 @@ async fn handle_device_props_changed(state: &State, evt: PropChangedEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #1201: bluetooth_marker_or_event routes markers to a resync ─────────
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn signal_event() -> SignalEvent {
+        let body = zbus::Message::signal("/t", "t.I", "Ping")
+            .expect("signal builder")
+            .build(&42u32)
+            .expect("build signal message");
+        SignalEvent {
+            body,
+            sender: None,
+            timestamp: std::time::SystemTime::now(),
+        }
+    }
+
+    /// Before #1201 `event_loop` read these three top-level subscriptions
+    /// via `events()`, which cannot represent either marker, so a bus blip
+    /// left device add/remove and adapter-property state stale until
+    /// something else happened to refresh it. Pushing one marker through
+    /// `bluetooth_marker_or_event` must call `do_resync` exactly once — for
+    /// both `Resubscribed` and a broadcast `Lagged`.
+    ///
+    /// Falsifiable: deleting the `Resubscribed | Lagged { .. }` arm (or
+    /// making it a no-op) drops both counts to 0.
+    #[tokio::test(flavor = "current_thread")]
+    async fn marker_triggers_resync_exactly_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = calls.clone();
+            let evt = bluetooth_marker_or_event(SignalItem::Resubscribed, "test", || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .expect("counter never errors");
+            assert!(evt.is_none(), "a marker must not be forwarded as an event");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Resubscribed must resync exactly once"
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let calls = calls.clone();
+            let evt = bluetooth_marker_or_event(
+                SignalItem::Lagged { skipped: 9 },
+                "test",
+                || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .expect("counter never errors");
+            assert!(evt.is_none());
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Lagged must resync exactly once"
+        );
+    }
+
+    /// An ordinary emission is unaffected: it must still reach the caller as
+    /// an event, byte-identical to before #1201, and never touch `do_resync`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_ordinary_event_is_forwarded_and_does_not_resync() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let evt = bluetooth_marker_or_event(SignalItem::Event(signal_event()), "test", || async move {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .expect("no error path here");
+        assert!(evt.is_some(), "an ordinary event must be forwarded");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 
     fn make_owned_value<T: Into<zbus::zvariant::Value<'static>>>(v: T) -> OwnedValue {
         v.into()

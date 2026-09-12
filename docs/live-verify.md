@@ -1132,6 +1132,16 @@ title` in the stderr tail — worth a deliberate look on first run, since
       removes. Deleting the file by hand must also be harmless: the bridge
       starts clean and costs at most that one turn back.
 
+- [ ] **(#1169)** A world-readable `anthropic.key` is refused, same as
+      `openrouter.key`. `chmod 644 ~/.config/trollshell/anthropic.key` with
+      `api` mode configured and no `ANTHROPIC_API_KEY` env set → restart the
+      unit → `journalctl --user -u trollshell-plugin-claude-bridge` names the
+      file and its mode and the bridge refuses to start (`missing_key_refusal`
+      still fires, since the loose file is treated as absent). `chmod 600` the
+      same file → the next restart starts clean. A symlinked key (a
+      home-manager `home.file` entry, `0444` in the Nix store) is refused the
+      same way — `metadata` follows the link.
+
 ## Caw (morning briefing)
 
 - [ ] **(#483)** Poke caw and confirm the taller 8-row briefing bubble renders

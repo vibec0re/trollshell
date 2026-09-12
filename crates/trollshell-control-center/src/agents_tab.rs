@@ -3339,6 +3339,48 @@ mod gtk_tests {
         dismiss(&window);
     }
 
+    /// A hive that answers `Urls` **without a `urls` block** is asked once,
+    /// not once per tick.
+    ///
+    /// The earlier shape cleared the want only inside `Some(urls)`, so
+    /// `ok: true, urls: null` — or any handler that returns an empty block —
+    /// re-dialled for the life of the window, doubling the tab's socket
+    /// traffic with no backoff: the exact thing the gate exists to prevent for
+    /// the down case (#1147 review, LOW 8).
+    ///
+    /// Mutation (run, verified red): put the want back when the answer has no
+    /// block (`if resp.urls.is_none() { state.urls_wanted.set(true) }`) and
+    /// this reds at three requests.
+    #[gtk::test]
+    fn a_hive_with_no_urls_block_is_asked_once() {
+        let hive = scripted(|_, line| {
+            let answer = if line.contains("urls") {
+                "{\"version\":1,\"ok\":true}\n".to_owned()
+            } else {
+                roster_line(&["argus"])
+            };
+            Some((Duration::ZERO, answer))
+        });
+        let (bin, state) = build_tab(hive.cfg());
+        let window = present(&bin, 900);
+
+        let asked = || hive.seen().iter().filter(|l| l.contains("urls")).count();
+        apply(&state, &["argus"]);
+        pump_until(|| asked() >= 1, 10);
+        assert_eq!(asked(), 1, "the first good poll asks once");
+
+        apply(&state, &["argus"]);
+        apply(&state, &["argus"]);
+        pump_until(|| asked() > 1, 1);
+        assert_eq!(asked(), 1, "a hive with no urls block is re-dialled forever");
+
+        assert!(
+            !state.detail.config_repo.is_sensitive(),
+            "an absent forge is still a dead row, not a guess"
+        );
+        dismiss(&window);
+    }
+
     /// **A slow hive must not stack round trips.** With the default 2 s
     /// cadence against a 5 s client timeout, an unguarded poll has two or
     /// three `AgentStatus` requests outstanding at once and they resolve in

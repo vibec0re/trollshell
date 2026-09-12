@@ -738,10 +738,7 @@ async fn unmapping_again_re_parks_the_poll_and_remapping_resumes_it() {
     cmd_tx
         .send(feed::set_paused(&name("stray"), false))
         .expect("the loop is listening");
-    until("the probe's reconciling poll", || {
-        polls(&hive) > after_seed
-    })
-    .await;
+    until("the probe's reconciling poll", || polls(&hive) > after_seed).await;
     let after_probe = polls(&hive);
 
     for _ in 0..5 {
@@ -796,8 +793,9 @@ async fn a_dropped_visibility_sender_does_not_spin_the_poller() {
     cmd_tx
         .send(feed::set_paused(&name("stray"), true))
         .expect("the loop is listening");
-    until("the command lane still drains after the sender drops", || {
-        !hive.writes().is_empty()
-    })
+    until(
+        "the command lane still drains after the sender drops",
+        || !hive.writes().is_empty(),
+    )
     .await;
 }

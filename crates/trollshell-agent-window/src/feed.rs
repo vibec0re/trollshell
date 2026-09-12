@@ -203,7 +203,10 @@ pub fn deny(id: i64) -> Request {
 // event sources plus their shared reconciling-poll call, not branching
 // complexity, so splitting it would scatter one state machine across
 // several functions for no gain.
-#[allow(clippy::too_many_lines, reason = "one poll lifecycle, not nested branching — see the comment above")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one poll lifecycle, not nested branching — see the comment above"
+)]
 pub async fn run(
     socket: PathBuf,
     name: AgentName,

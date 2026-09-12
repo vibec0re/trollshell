@@ -1,6 +1,6 @@
 //! tokio-side: per-connection lifecycle.
 //!
-//! [`handle_conn`] drives one plugin connection — handshake, the four opt-in
+//! [`serve_conn`] drives one plugin connection — handshake, the four opt-in
 //! host→plugin push tasks (clock / visibility / accent / spectrum), the reader
 //! loop feeding renders into the mount mailboxes, and the shared teardown. It
 //! also carries the containment (#435) and registration-hygiene (#436) guards:
@@ -119,7 +119,7 @@ impl Drop for SpectrumDemand {
 /// effects onto the global non-lossy broker channel, park (or clear) its optional
 /// drawer panel in the dedicated `panels` mailbox, and upsert its chip/card
 /// `tree` into the mount's region mailbox (latest-wins per plugin id). Factored
-/// out of [`handle_conn`] so that reader loop stays within the line budget.
+/// out of [`serve_conn`] so that reader loop stays within the line budget.
 fn route_render(ctx: &ListenerCtx, mount: Mount, render: SlotRender, effects: Vec<Effect>) {
     // The mount picks which region mailbox (and thus per-monitor container) the
     // tree lands in: sidebar regions render as cards, bar regions as chips
@@ -875,14 +875,37 @@ pub(super) fn enforce_capabilities(
         .collect()
 }
 
+/// [`serve_conn`] with no unregistered-connection permit — one connection driven
+/// on its own, which is what the per-connection tests do: a socketpair, no
+/// listener, so there is no gate to hold a permit from.
+///
+/// `#[cfg(test)]` because production reaches a connection only through
+/// [`listener::accept_loop`](super::listener::accept_loop), which always has a
+/// permit to hand over. Keeping it as a test-only shim is what let the gate be
+/// added without rewriting twenty-odd call sites that are about something else
+/// entirely.
+#[cfg(test)]
+pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
+    serve_conn(stream, ctx, None).await;
+}
+
 /// Drive one plugin connection: handshake, then read frames until the peer
 /// disconnects, feeding renders into the mount mailbox and pushing state
 /// snapshots + events back out.
+///
+/// `unregistered` is the listener's gate permit (#1165 item 6), released the
+/// moment this connection is registered — see the `drop` after the [`IdGuard`]
+/// claim. It is an `Option` because the gate belongs to the accept loop: a test
+/// driving one socketpair has no listener and passes `None`.
 // One cohesive per-connection lifecycle (handshake → the four opt-in push tasks
 // → reader loop → teardown); splitting it would scatter the paired setup/abort
 // of each task across helpers for no readability gain.
 #[allow(clippy::too_many_lines)]
-pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
+pub(super) async fn serve_conn(
+    stream: UnixStream,
+    ctx: &ListenerCtx,
+    unregistered: Option<tokio::sync::OwnedSemaphorePermit>,
+) {
     let (mut rd, wr) = stream.into_split();
 
     // Handshake: the first frame MUST be `Register`, and its proto must match
@@ -956,6 +979,16 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
         );
         return;
     };
+    // #1165 item 6: **registered**, so the listener's gate permit is released
+    // here rather than at teardown. What the gate bounds is *unregistered*
+    // connections — a peer that dials and says nothing — and a registered
+    // plugin is a long-lived, identified connection that should not count
+    // against the handshake budget. Held to exactly this point: the `IdGuard`
+    // above is the last thing that can reject a registration, so releasing
+    // before it would let a rejected duplicate free a permit it never earned.
+    // A connection that never gets here drops its permit when `REGISTER_TIMEOUT`
+    // (or a decode failure) returns from this function.
+    drop(unregistered);
     // #1165 item 4: the one moment a new plugin id may be about to take a slot
     // in the host's effect-bucket table, and therefore the moment to retire the
     // entries that have refilled. This connection's own bucket is deliberately
@@ -1381,7 +1414,7 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     }
     // Drop this connection from the runtime mirror (#423) — done here, still
     // inside the id's exclusive-ownership window (the `IdGuard` releases only
-    // when `handle_conn` returns), so it can't evict a fast-reconnect successor.
+    // when `serve_conn` returns), so it cannot evict a fast-reconnect successor.
     super::runtime_remove(&ctx.runtime, &plugin_id);
     if let Some(snapshot) = snapshot {
         snapshot.abort();
@@ -1457,7 +1490,7 @@ async fn snapshot_task(
 /// [`snapshot_task`]; spawned **only** for a **sidebar** connection that
 /// subscribes [`StateKey::SlotVisible`] (#305) — an unsubscribed plugin never
 /// receives the frame, and a bar mount gets a constant `true` seed instead (its
-/// chip is always on-screen; see `handle_conn`, #438), never this change loop.
+/// chip is always on-screen; see `serve_conn`, #438), never this change loop.
 ///
 /// #542: when `now_playing_rx` is `Some` (a gated now-playing subscriber), the
 /// unpark rising edge (`false`→`true`) additionally re-seeds the current

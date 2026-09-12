@@ -5,8 +5,15 @@
 //! other code in the workspace should call `zbus::Connection::session()`
 //! or `system()`.
 
-// Production-only accessors (session/system/start) are forward-declared for
-// Task 6; they are wired up in Task 12.
+// The "Task N" cross-references this file carried until #1173 pointed at the
+// numbered steps of the build plan that produced the crate
+// (`docs/superpowers/plans/2026-04-27-hytte-bus-foundation.md`). That plan is
+// part of the April 2026 archive and its numbering is not a live reference: it
+// predates the issue workflow, so there is no issue number to swap in, and
+// every step it deferred has long since landed. The file is still worth
+// reading for the crate's original intent; what it is not is a place to look
+// up what a piece of this file does today, which is what "wired up in Task 12"
+// invited a reader to try.
 
 use crate::BusError;
 use crate::backoff::{FailureStreak, RetryStep};
@@ -45,9 +52,11 @@ struct Inner {
 
 /// Process-wide shared connection to one bus. Cloned freely (cheap, Arc).
 ///
-/// Outside this crate, access is gated through the `test_support` re-export
-/// so test code can construct instances; production code uses the supervisor
-/// accessors added in Task 6.
+/// Outside this crate, access is gated through the `test_support` re-export so
+/// test code can construct instances. Production code never names this type:
+/// it calls one of the [`crate`]-level builders, each of which resolves its
+/// [`BusKind`] argument through `for_kind` to the process-wide singleton the
+/// supervisor keeps alive.
 #[derive(Clone)]
 pub struct SharedConnection {
     kind: BusKind,
@@ -277,8 +286,8 @@ impl SharedConnection {
 
 // ── Test-only constructors and accessors ──────────────────────────────────────
 
-/// Test-only constructors and accessors. Production code uses
-/// `connection::session()` / `connection::system()` (Task 6).
+/// Test-only constructors and accessors. Production code reaches the same
+/// connections through `session()` / `system()`, via `for_kind`.
 #[doc(hidden)]
 pub mod test_support {
     use super::{

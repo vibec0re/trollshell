@@ -240,15 +240,25 @@ pub fn attach_dismiss_catcher(popover: &gtk::Popover, monitor: &Monitor) {
 
     // On show, build + present the catchers *before* the popover's surface
     // finishes mapping so the popover stacks above the home-output one.
+    //
+    // **The handler uses its own `shown` parameter, never a captured clone of
+    // `popover`** (#1180 item 1, the #224/#831 pin shape). A `popover.clone()`
+    // captured here is owned by the closure, the closure is owned by the
+    // popover's own `show` signal, and a GObject holds its handlers' data
+    // strongly: that is a reference cycle through the popover itself, so every
+    // catcher-backed popover — every tray menu, every task-edit popover —
+    // became immortal the moment this function was called on it. Invisible to
+    // `nix/lint-bind-pins.py`, which only walks `bind*` call sites, so the
+    // rule is restated here: the three handlers below take the popover GTK
+    // hands them, and this function captures no strong reference to it at all.
     let catchers_for_show = catchers.clone();
-    let popover_for_show = popover.clone();
-    popover.connect_show(move |_| {
+    popover.connect_show(move |shown| {
         // Tear down any stale catchers from a previous show first.
         close_catchers(&catchers_for_show);
         let wins: Vec<gtk::Window> = all_monitors(&monitor)
             .iter()
             .map(|m| {
-                let win = build_popover_catcher(m, &popover_for_show);
+                let win = build_popover_catcher(m, shown);
                 win.present();
                 win
             })
@@ -342,9 +352,20 @@ fn build_popover_catcher(monitor: &Monitor, popover: &gtk::Popover) -> gtk::Wind
     let gesture = gtk::GestureClick::new();
     // Button 0 → any button dismisses.
     gesture.set_button(0);
-    let popover_for_click = popover.clone();
+    // **Weak, both here and in the scroll handler below** (#1180 item 1). The
+    // popover's own `show` handler owns these windows (through the shared
+    // `catchers` cell), so a strong clone of the popover in a window's
+    // controller is the second half of a cycle: popover → catchers → window →
+    // controller → popover, live for as long as the popover is up. It is
+    // broken by `close_catchers` on the common path, which is why it never
+    // showed up as a leak — but a popover disposed between `show` and either
+    // teardown signal would keep the whole ring alive. Nothing is lost by
+    // going weak: with the popover gone there is nothing left to pop down.
+    let popover_for_click = popover.downgrade();
     gesture.connect_pressed(move |_, _, _, _| {
-        popover_for_click.popdown();
+        if let Some(popover) = popover_for_click.upgrade() {
+            popover.popdown();
+        }
     });
     content.add_controller(gesture);
 
@@ -353,9 +374,11 @@ fn build_popover_catcher(monitor: &Monitor, popover: &gtk::Popover) -> gtk::Wind
     // would be silently eaten; treat it as an outside interaction and dismiss,
     // matching the click behaviour.
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
-    let popover_for_scroll = popover.clone();
+    let popover_for_scroll = popover.downgrade();
     scroll.connect_scroll(move |_, _, _| {
-        popover_for_scroll.popdown();
+        if let Some(popover) = popover_for_scroll.upgrade() {
+            popover.popdown();
+        }
         glib::Propagation::Proceed
     });
     content.add_controller(scroll);
@@ -384,6 +407,83 @@ fn map_position(p: Position) -> gtk::PositionType {
 #[cfg(all(test, feature = "system-tests"))]
 mod tests {
     use super::*;
+
+    /// The display's first monitor, for [`attach_dismiss_catcher`]'s anchor
+    /// argument.
+    ///
+    /// A hard failure rather than a skip when the display reports none: every
+    /// environment these tests run in (a developer's session, CI's
+    /// `xvfb-run`) has at least one output, and a skip here would be
+    /// indistinguishable from a pass in captured output — the same reasoning
+    /// `TROLLSHELL_REQUIRE_GL` encodes for the GL tests next door.
+    fn first_monitor() -> Monitor {
+        let display = gdk::Display::default().expect("a display for a #[gtk::test]");
+        let model = display.monitors();
+        let object = model
+            .item(0)
+            .expect("the display must report at least one monitor");
+        Monitor::new(
+            object
+                .downcast::<gdk::Monitor>()
+                .expect("the monitors model holds GdkMonitors"),
+        )
+    }
+
+    /// **#1180 item 1.** `attach_dismiss_catcher` must not pin its popover.
+    ///
+    /// The shipped bug was one word: the `show` handler captured
+    /// `popover.clone()`, and a GObject owns its signal handlers' data — so
+    /// the popover held a closure that held the popover, and every tray menu
+    /// and task-edit popover the shell ever built stayed alive for the
+    /// session. The fix is to use the parameter GTK hands the handler instead
+    /// (`connect_show(move |shown| …)`), which is the #224/#831 rule that
+    /// `nix/lint-bind-pins.py` enforces for `bind*` and cannot see here.
+    ///
+    /// **Falsified** by restoring the capture (`let popover_for_show =
+    /// popover.clone();` used in place of `shown`): the weak reference still
+    /// upgrades after the last strong one is dropped and the final assertion
+    /// goes red. The same happens for a strong clone in either of
+    /// `build_popover_catcher`'s two controllers *once a catcher exists*,
+    /// which needs a compositor — hence the `Rc` probe below, which pins the
+    /// half of that cycle a headless test can reach: nothing this function
+    /// leaves behind keeps its own data alive either.
+    #[gtk::test]
+    fn attach_dismiss_catcher_does_not_pin_its_popover() {
+        let monitor = first_monitor();
+
+        let popover = gtk::Popover::new();
+        // A refcounted witness moved into nothing but the popover's handlers:
+        // it dies exactly when they do, which is when the popover finalizes.
+        let witness = Rc::new(());
+        let witness_weak = Rc::downgrade(&witness);
+        popover.connect_destroy(move |_| {
+            // The body is irrelevant; capturing `witness` is the whole job.
+            let _held = &witness;
+        });
+
+        attach_dismiss_catcher(&popover, &monitor);
+        let weak = popover.downgrade();
+        assert!(
+            weak.upgrade().is_some(),
+            "the popover is alive while this scope holds it",
+        );
+
+        drop(popover);
+        // Let any deferred finalize settle.
+        while glib::MainContext::default().iteration(false) {}
+
+        assert!(
+            weak.upgrade().is_none(),
+            "attach_dismiss_catcher must not keep the popover alive: dropping the last strong \
+             reference has to finalize it (a strong clone captured in a handler connected to \
+             the popover itself is a cycle — #1180 item 1)",
+        );
+        assert_eq!(
+            witness_weak.strong_count(),
+            0,
+            "the popover's handlers — and everything they captured — must be dropped with it",
+        );
+    }
 
     #[gtk::test]
     fn close_catchers_drains_and_destroys_idempotently() {

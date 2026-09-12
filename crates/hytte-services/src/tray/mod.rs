@@ -33,7 +33,7 @@ use futures_signals::signal::SignalExt;
 use futures_signals::signal::{Mutable, Signal};
 use futures_util::StreamExt;
 use hytte_bus::{BusKind, OwnNameSignal, OwnState, ProxyState, call, proxy, signals};
-use hytte_reactive::{Service, registry, runtime, spawn_supervised};
+use hytte_reactive::{Service, registry, runtime, spawn_supervised, spawn_supervised_bounded};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -484,10 +484,12 @@ impl Watcher {
                 // and bus::signals for property-update signals. Supervised:
                 // `watch_item` re-reads + parses this item's (untrusted) tooltip
                 // / icon-pixmap / menu properties, so it's the real panic
-                // surface; a clean completion (item disconnected) does not
-                // restart.
+                // surface. Bounded (#1174): a clean completion means the item
+                // disconnected, which is this task finishing its job — no
+                // restart, and none of the `warn!`-plus-kept-row that
+                // `spawn_supervised` gives an unexpected return.
                 let state = self.state.clone();
-                spawn_supervised("tray-item", move || {
+                spawn_supervised_bounded("tray-item", move || {
                     let state = state.clone();
                     let bus_name = bus_name.clone();
                     let object_path = object_path.clone();

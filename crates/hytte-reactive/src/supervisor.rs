@@ -11,7 +11,19 @@
 //! [`spawn_supervised`] closes that gap. It spawns a *factory*-produced future
 //! and joins it in a wrapper task. On a panic it logs at `error` level and
 //! re-runs the factory with **capped exponential backoff**. On a clean
-//! completion (`Ok(())`) it does *not* restart — the task finished its job.
+//! completion (`Ok(())`) it does *not* restart, but (#1174) it now `warn!`s
+//! and leaves the task's [`crate::health`] row in a distinct
+//! [`crate::health::TaskState::Returned`] state rather than dropping it
+//! silently — see "Restart policy: why a return is not a panic" below for why
+//! this is *not* a panic-style retry.
+//!
+//! [`spawn_supervised_bounded`] is that same supervisor for the minority of
+//! bodies whose clean return is the **expected** end of their work — one task
+//! per discovered MPRIS player or tray item, a service standing down because
+//! there is nothing for it to do. There the return is reported at `debug!` and
+//! the health row is released, because a browser closing media tabs is not
+//! news. The difference is declared by the caller at the spawn site rather than
+//! inferred here; see [`Intent`].
 //!
 //! [`spawn_supervised_blocking`] is the same supervisor over a
 //! `spawn_blocking` closure, for the services whose client library is
@@ -44,8 +56,44 @@
 //! current backoff — to [`crate::health`], which is where a diagnostics view
 //! reads "the niri connection has panicked four times in the last minute" from.
 //! The bookkeeping lives in [`supervise_runs`], the one loop every spawn
-//! function funnels through, so it covers all three variants and any future
+//! function funnels through, so it covers all four variants and any future
 //! entry point that reuses that loop (#238, #690, #691).
+//!
+//! # Restart policy: why a return is not a panic (#1174)
+//!
+//! A panic and a clean return are treated as opposite ends of "did this run
+//! finish the way its own code expected to", and the supervisor's response to
+//! each is deliberately asymmetric:
+//!
+//! - **A panic restarts**, because [`spawn_supervised_blocking`]'s docs spell
+//!   out an explicit restart-safety precondition every supervised body must
+//!   meet (no durable state, or a `Mutable` write guard held across the point
+//!   that could unwind) — panicking and being restarted from scratch is a
+//!   contract the factory signed up for.
+//! - **A return does not restart**, and this fix does not change that. There
+//!   is no equivalent "return-safety" contract anywhere in this API, and
+//!   several existing supervised bodies actively rely on a clean return meaning
+//!   *stop, permanently*: `mpris-player` and `tray-item` (`hytte-services`)
+//!   each supervise one task per discovered player/item and return on purpose
+//!   once it disappears, `networkd` returns when the host has no link backend
+//!   at all, and the plugin host returns when another shell instance already
+//!   owns its socket. Auto-restarting on `Ok(())` would spin every one of those
+//!   back up forever.
+//!
+//! What *does* change is visibility, and **who decides how loud it is**. Almost
+//! every factory in this tree is written as an infinite loop, so a return from
+//! one of those is a bug that fell out of the loop early; previously it looked
+//! identical to a task that never existed — no log line, no health row. Now a
+//! return from [`spawn_supervised`] logs a `warn!` (not `error!` — a return,
+//! unlike a panic, is not necessarily a failure) naming the task, and keeps its
+//! [`crate::health`] row in [`crate::health::TaskState::Returned`].
+//!
+//! The handful of bodies listed above, whose return is the point rather than a
+//! symptom, say so by spawning through [`spawn_supervised_bounded`] instead:
+//! `debug!`, row released. The supervisor cannot tell the two apart by looking
+//! and does not try — the alternative, a `warn!` on every disconnected tray
+//! item at the shell's default `INFO` level, is how a `warn` level stops being
+//! read, which would defeat #1174 rather than serve it.
 //!
 //! # Extending this API
 //!
@@ -65,7 +113,7 @@
 //! points could one day hand back the same type without a single call site
 //! changing meaning. Do not add either property to it.
 //!
-//! All three funnel through [`supervise_runs`], which is how the cancellable
+//! All four funnel through [`supervise_runs`], which is how the cancellable
 //! variant inherits [`crate::health`] tracking for free — including releasing
 //! its row via [`crate::health::stopped`] when a cancelled supervisor unwinds,
 //! without which every backend switch would leak one.
@@ -112,20 +160,50 @@ impl Default for Backoff {
     }
 }
 
+/// What a clean `Ok(())` return *means* for this supervisor — declared by the
+/// caller at the spawn site, because the supervisor cannot see it from here.
+///
+/// The two shapes in this tree are genuinely different events that happen to
+/// look identical to [`supervise_runs`]: a service loop falling out from under
+/// itself is a bug worth a `warn!` and a visible row, while a per-instance
+/// watcher reaching the end of its instance is the expected end of a task that
+/// did its job. Guessing between them from the task's *name* was the shape
+/// rejected on review; the caller knows, so the caller says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Intent {
+    /// The body is written to run for the life of the process, so a return is
+    /// unexpected: `warn!` and keep a [`health::TaskState::Returned`] row.
+    /// [`spawn_supervised`], [`spawn_supervised_blocking`] and
+    /// [`spawn_supervised_handle`].
+    Perpetual,
+    /// The body is expected to finish — it watches one discovered instance and
+    /// that instance went away, or it stood down on purpose — so a return is
+    /// the end of a task that did its job: `debug!` and release the health row.
+    /// [`spawn_supervised_bounded`].
+    Bounded,
+}
+
 /// Spawn a supervised task on the shared hytte runtime.
 ///
 /// `factory` is called to produce the task future; it is called again — with
 /// capped exponential backoff (1s → 2s → … → 30s cap, reset after a run that
 /// stayed healthy for ≥30s) — every time a run **panics**. A clean
-/// `Ok(())` completion is taken at face value (the task finished its work) and
-/// is *not* restarted; a cancellation (the `JoinHandle` was aborted) likewise
-/// stops the supervisor.
+/// `Ok(())` completion is *not* restarted, but is `warn!`-logged and leaves a
+/// [`crate::health::TaskState::Returned`] row rather than vanishing (#1174;
+/// see "Restart policy" in this module's docs for why); a cancellation (the
+/// `JoinHandle` was aborted) likewise stops the supervisor, but drops its row.
+///
+/// That `warn!` says "this loop was not supposed to end". If the body you are
+/// spawning *is* supposed to end — one task per discovered instance, or a
+/// service that stands down when there is nothing to do — reach for
+/// [`spawn_supervised_bounded`] instead, which is the same supervisor with that
+/// one sentence declared.
 ///
 /// `factory: Fn() -> Fut` (not `FnOnce`) so each restart gets a fresh future;
 /// capture cheap `Mutable`/`Arc` clones inside it and clone them per call.
 ///
 /// `name` is a stable, human-readable label used only for log lines
-/// (`tracing::error!(service = name, …)`).
+/// (`tracing::error!`/`tracing::warn!(service = name, …)`).
 pub fn spawn_supervised<F, Fut>(name: &'static str, factory: F)
 where
     F: Fn() -> Fut + Send + 'static,
@@ -133,7 +211,72 @@ where
 {
     // No `Stop`: this entry point hands back nothing, so nothing can ever ask
     // the supervisor to stop. `spawn_supervised_handle` is the one that can.
-    runtime::handle().spawn(supervise(name, factory, Backoff::default(), None));
+    runtime::handle().spawn(supervise(
+        name,
+        factory,
+        Backoff::default(),
+        None,
+        Intent::Perpetual,
+    ));
+}
+
+/// [`spawn_supervised`] for a task whose clean return is the **expected** end
+/// of its work.
+///
+/// Identical in every other respect — same factory contract, same capped
+/// exponential backoff, same restart-on-panic, same [`crate::health`]
+/// publishing, because it is the same loop. What differs is only what a clean
+/// `Ok(())` *means*:
+///
+/// | | [`spawn_supervised`] | this |
+/// |---|---|---|
+/// | a run panics | restart with backoff | restart with backoff |
+/// | a run returns | `warn!` + a kept [`crate::health::TaskState::Returned`] row | `debug!` + the row released |
+/// | the task is cancelled | row released | row released |
+///
+/// # Why this exists rather than a smarter supervisor
+///
+/// #1174 made a clean return audible, because a service loop falling out from
+/// under itself used to look exactly like a task that never existed. But two
+/// shapes in this tree end by returning **on purpose**: the per-instance
+/// watchers (`mpris-player`, `tray-item` — one supervised task per discovered
+/// player/tray item, which returns when that player or item disappears) and the
+/// services that stand down when there is nothing to do (`networkd` on a host
+/// with no link backend, the plugin host when another shell instance already
+/// holds its socket). A browser closing media tabs walks through the first case
+/// dozens of times a day, and `warn!`-ing each one is how a `warn` level stops
+/// being read — which would defeat #1174 rather than serve it.
+///
+/// The supervisor cannot tell the two apart by looking, and guessing from the
+/// task's *name* would be a table of special cases maintained a long way from
+/// the code it describes. The caller knows, so the caller says it here, at the
+/// spawn site, in one word.
+///
+/// Reach for this **only** when the body's `Ok(())` is genuinely expected. On a
+/// loop that is supposed to run for the life of the process, the plain
+/// [`spawn_supervised`] is what turns a silent fall-out into a log line and a
+/// visible row.
+///
+/// # No blocking twin
+///
+/// There is no `spawn_supervised_bounded_blocking`, for the same reason
+/// [`spawn_supervised_handle`] has no blocking twin: nothing needs one. Every
+/// body that returns by design in this tree is async, and the sole
+/// [`spawn_supervised_blocking`] call site (niri's IPC socket) is an infinite
+/// reconnect loop. Adding the twin is a five-line copy of this function the day
+/// a blocking body earns it.
+pub fn spawn_supervised_bounded<F, Fut>(name: &'static str, factory: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    runtime::handle().spawn(supervise(
+        name,
+        factory,
+        Backoff::default(),
+        None,
+        Intent::Bounded,
+    ));
 }
 
 /// Spawn a supervised **blocking** task on the shared hytte runtime.
@@ -143,10 +286,11 @@ where
 /// on a `spawn_blocking` thread and is re-run — with the same capped
 /// exponential backoff (1s → 2s → … → 30s cap, reset after a run that stayed
 /// healthy for ≥30s) — every time a run **panics**. A run that returns
-/// normally is taken at face value (the task finished its work) and is *not*
-/// re-run; a cancellation likewise stops the supervisor. Same policy, same log
-/// line, same stop conditions as the async variant: there is one supervision
-/// idiom here, not two.
+/// normally is *not* re-run, but is `warn!`-logged and leaves a
+/// [`crate::health::TaskState::Returned`] row rather than vanishing (#1174);
+/// a cancellation likewise stops the supervisor, but drops its row. Same
+/// policy, same log lines, same stop conditions as the async variant: there is
+/// one supervision idiom here, not two.
 ///
 /// # What supervision *means* for a blocking task
 ///
@@ -189,6 +333,8 @@ pub fn spawn_supervised_blocking<F>(name: &'static str, task: F)
 where
     F: Fn() + Send + Sync + 'static,
 {
+    // Always `Intent::Perpetual` (inside `supervise_blocking`) — see
+    // `spawn_supervised_bounded`'s "No blocking twin".
     runtime::handle().spawn(supervise_blocking(name, Arc::new(task), Backoff::default()));
 }
 
@@ -270,13 +416,17 @@ impl SupervisorHandle {
         *self.cancel.borrow()
     }
 
-    /// Resolve once the supervisor has stopped and released its
-    /// [`crate::health`] row.
+    /// Resolve once the supervisor has stopped.
     ///
     /// Not cancellation-specific: it also resolves when the supervised task
-    /// completed cleanly on its own (`Ok(())`, which the supervisor takes at
-    /// face value and does not restart), so it doubles as "await this task's
-    /// completion". Resolves immediately if the supervisor has already stopped.
+    /// returned on its own (which the supervisor does not restart), so it
+    /// doubles as "await this task's completion". Resolves immediately if the
+    /// supervisor has already stopped.
+    ///
+    /// A cancellation releases the task's [`crate::health`] row; a clean
+    /// return does not — it leaves the row behind in
+    /// [`crate::health::TaskState::Returned`] (#1174). Either way this future
+    /// resolves once the loop has returned, whether or not its row is gone.
     ///
     /// After a [`cancel`](Self::cancel) this waits for the aborted run to
     /// unwind, and a run only reaches its abort at an `await`: a run that never
@@ -350,7 +500,10 @@ where
         cancel: cancel_rx,
         _stopped: stopped_tx,
     };
-    runtime::handle().spawn(supervise(name, factory, cfg, Some(stop)));
+    // `Intent::Perpetual`: a cancellable supervisor is the one whose teardown
+    // has a caller, so an *un*asked-for return is exactly as unexpected here as
+    // on `spawn_supervised`.
+    runtime::handle().spawn(supervise(name, factory, cfg, Some(stop), Intent::Perpetual));
     SupervisorHandle {
         cancel: Arc::new(cancel_tx),
         stopped: stopped_rx,
@@ -409,12 +562,24 @@ fn finish_cancelled(name: &'static str, id: health::TaskId) {
 /// The async supervision loop. Split out from [`spawn_supervised`] so the
 /// backoff schedule is injectable for hermetic tests (a zero-delay `Backoff`
 /// keeps the retry-path test fast and non-flaky).
-async fn supervise<F, Fut>(name: &'static str, factory: F, cfg: Backoff, stop: Option<Stop>)
-where
+async fn supervise<F, Fut>(
+    name: &'static str,
+    factory: F,
+    cfg: Backoff,
+    stop: Option<Stop>,
+    intent: Intent,
+) where
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    supervise_runs(name, move || runtime::handle().spawn(factory()), cfg, stop).await;
+    supervise_runs(
+        name,
+        move || runtime::handle().spawn(factory()),
+        cfg,
+        stop,
+        intent,
+    )
+    .await;
 }
 
 /// The blocking supervision loop — [`supervise`]'s twin, likewise split out so
@@ -434,11 +599,14 @@ where
         // thread has picked it up, so there is no cancellable blocking entry
         // point to pass a `Stop` in from. See [`spawn_supervised_handle`].
         None,
+        // Always perpetual: there is no bounded blocking entry point either.
+        // See [`spawn_supervised_bounded`]'s "No blocking twin".
+        Intent::Perpetual,
     )
     .await;
 }
 
-/// The one supervision loop all three entry points run.
+/// The one supervision loop all four entry points run.
 ///
 /// `spawn_run` starts a single run and hands back its `JoinHandle`; everything
 /// above it — restart policy, backoff schedule, log lines, [`crate::health`]
@@ -450,13 +618,24 @@ where
 /// starting a run, while awaiting one, and while sleeping out a backoff — so a
 /// cancel is never left waiting on a 30 s backoff or on a run that has no reason
 /// to end.
-async fn supervise_runs<S>(name: &'static str, spawn_run: S, cfg: Backoff, mut stop: Option<Stop>)
-where
+///
+/// `intent` is what the caller said a clean `Ok(())` means — see [`Intent`] and
+/// [`spawn_supervised_bounded`]. It is consulted at exactly one place, the
+/// `Ok(())` arm below.
+async fn supervise_runs<S>(
+    name: &'static str,
+    spawn_run: S,
+    cfg: Backoff,
+    mut stop: Option<Stop>,
+    intent: Intent,
+) where
     S: Fn() -> JoinHandle<()> + Send + 'static,
 {
-    // The health entry is this supervisor's, and lives exactly as long as this
-    // loop: every `return` below drops it. See `health`'s module docs on why
-    // nothing is retained for a supervisor that has stopped.
+    // The health entry is this supervisor's, and lives as long as this loop:
+    // every `return` below releases it, bar the one that marks it
+    // `TaskState::Returned` instead (an `Intent::Perpetual` task that returned;
+    // see `health`'s module docs on that bounded exception to
+    // entries-are-live).
     let id = health::register(name);
     let mut delay = cfg.initial;
     loop {
@@ -496,11 +675,38 @@ where
         };
 
         match outcome {
-            // The task returned on its own — it finished its job. Do not
-            // restart (restarting a completed task is the caller's bug, not a
-            // failure to recover from).
+            // The task returned on its own. Do not restart either way — see
+            // this module's "Restart policy" docs for why a return is not
+            // treated like a panic. What differs is how loudly it is reported,
+            // and that is the caller's declaration (#1174 + its review), not a
+            // guess made from here.
             Ok(()) => {
-                health::stopped(id);
+                match intent {
+                    // Unexpected: this body was supposed to run forever, so it
+                    // either fell out of its loop or hit a `return` its author
+                    // did not mean as an ending. `warn!` (not `error!`: a
+                    // return is not necessarily a failure) and keep the health
+                    // row so it cannot be mistaken for a task that never ran,
+                    // which is the silence #1174 filed.
+                    Intent::Perpetual => {
+                        tracing::warn!(
+                            service = name,
+                            "supervised task returned; ending supervision without a restart"
+                        );
+                        health::returned(id);
+                    }
+                    // Expected: the caller reached for `spawn_supervised_bounded`
+                    // precisely because this is where the task's work ends. Say
+                    // so at `debug!` — a tray item disconnecting is not news —
+                    // and release the row, exactly as a cancellation would.
+                    Intent::Bounded => {
+                        tracing::debug!(
+                            service = name,
+                            "supervised task finished; ending supervision as declared at its spawn site"
+                        );
+                        health::stopped(id);
+                    }
+                }
                 return;
             }
 
@@ -709,6 +915,14 @@ mod tests {
     /// test uses it — an unlisted tag is never counted, so the mistake shows
     /// up as a test reading 0 rather than as one test silently consuming
     /// another's events.
+    ///
+    /// Shared by both severities [`ErrorCounter`] tags — `ERROR` (into
+    /// [`TAGGED_ERRORS`]) and, since #1174, `WARN` (into [`TAGGED_WARNINGS`])
+    /// — so the uniqueness rule above is really "no two tests may share a tag
+    /// *at the same level*": `"test-blocking-log"` below is one test's
+    /// `service` name and legitimately appears in both an `error!` (the
+    /// panic) and this module's new return `warn!` (the clean run after it),
+    /// landing in the two maps independently.
     const CAPTURE_TAGS: &[&str] = &[
         // The `service` name `a_panicking_blocking_task_is_logged_and_restarted`
         // supervises under.
@@ -716,6 +930,14 @@ mod tests {
         // The payload `the_panic_hook_logs_then_delegates_to_the_previous_hook`
         // panics with.
         "supervisor panic-hook test",
+        // The `service` name `a_returning_task_is_logged_and_keeps_a_visible_row`
+        // supervises under.
+        "test-return-visible",
+        // The `service` name `a_bounded_task_ends_quietly_and_releases_its_row`
+        // supervises under. Listed for the *absence* it asserts: an unlisted
+        // tag is never counted, so a `logged_warnings(…) == 0` on one would
+        // pass whatever the supervisor logged.
+        "test-bounded-quiet",
     ];
 
     /// Per-tag counts of `ERROR` events from this module.
@@ -723,6 +945,11 @@ mod tests {
     /// Never reset: a tag belongs to exactly one test, which runs once per
     /// process, so the cumulative count *is* that test's count.
     static TAGGED_ERRORS: Mutex<BTreeMap<&'static str, usize>> = Mutex::new(BTreeMap::new());
+
+    /// [`TAGGED_ERRORS`]'s twin for `WARN` events (#1174: the supervisor's
+    /// return-visibility log is a `warn!`, not an `error!` — a return is not
+    /// necessarily a failure the way a panic is).
+    static TAGGED_WARNINGS: Mutex<BTreeMap<&'static str, usize>> = Mutex::new(BTreeMap::new());
 
     /// Install the global `ERROR`-counting subscriber, once per process.
     ///
@@ -804,6 +1031,16 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// [`logged_errors`]'s twin for `WARN` events.
+    fn logged_warnings(tag: &'static str) -> usize {
+        TAGGED_WARNINGS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(tag)
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// A factory that panics its first three runs then completes cleanly must
     /// be retried until the clean completion — four calls total — and then
     /// stop (no restart on `Ok(())`).
@@ -826,6 +1063,7 @@ mod tests {
                 },
                 ZERO_BACKOFF,
                 None,
+                Intent::Perpetual,
             )
             .await;
         });
@@ -853,6 +1091,7 @@ mod tests {
                 },
                 Backoff::default(),
                 None,
+                Intent::Perpetual,
             )
             .await;
         });
@@ -926,16 +1165,176 @@ mod tests {
         );
     }
 
+    /// A supervised body that returns must not vanish (#1174): unlike the
+    /// silence that shipped before, the supervisor now `warn!`s exactly once
+    /// — naming the task — and its [`crate::health`] row survives in
+    /// [`crate::health::TaskState::Returned`] rather than being dropped the
+    /// way a cancellation drops it (see this module's "Restart policy" docs
+    /// for why a return is still never restarted).
+    #[test]
+    fn a_returning_task_is_logged_and_keeps_a_visible_row() {
+        const NAME: &str = "test-return-visible";
+
+        install_error_counter();
+
+        runtime::handle().block_on(async move {
+            supervise(NAME, || async {}, ZERO_BACKOFF, None, Intent::Perpetual).await;
+        });
+
+        assert_eq!(
+            logged_warnings(NAME),
+            1,
+            "the return is reported exactly once, at warn (not error) level"
+        );
+        let row = health::snapshot()
+            .into_iter()
+            .find(|task| task.name == NAME)
+            .expect("a returned task's row is kept, not dropped");
+        assert_eq!(
+            row.state,
+            crate::health::TaskState::Returned,
+            "a returned task's row reads Returned rather than just disappearing"
+        );
+    }
+
+    /// The twin of the test above, for the entry point that *declares* a return
+    /// to be the expected end: no `warn!`, and no row left behind.
+    ///
+    /// This is the whole point of [`spawn_supervised_bounded`]. `mpris-player`
+    /// and `tray-item` supervise one task per discovered player/tray item and
+    /// return when it disappears, which a browser closing media tabs does
+    /// dozens of times a day; at the shell's default `INFO` level the generic
+    /// return `warn!` would reach the journal every time, for behaviour both
+    /// modules document as correct.
+    ///
+    /// It still restarts on a **panic** — the half that must not be traded
+    /// away for the quiet — which is why the body here panics once first.
+    #[test]
+    fn a_bounded_task_ends_quietly_and_releases_its_row() {
+        const NAME: &str = "test-bounded-quiet";
+
+        install_error_counter();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_factory = Arc::clone(&calls);
+
+        runtime::handle().block_on(async move {
+            supervise(
+                NAME,
+                move || {
+                    let calls = Arc::clone(&calls_factory);
+                    async move {
+                        let n = calls.fetch_add(1, Ordering::SeqCst);
+                        assert!(n >= 1, "panic on the first run only");
+                    }
+                },
+                ZERO_BACKOFF,
+                None,
+                Intent::Bounded,
+            )
+            .await;
+        });
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a bounded task is still restarted after a panic — only the meaning of a clean \
+             return changes"
+        );
+        assert_eq!(
+            logged_errors(NAME),
+            1,
+            "the panic is still reported at error level"
+        );
+        assert_eq!(
+            logged_warnings(NAME),
+            0,
+            "the declared-expected return must not warn; this is the log line that would \
+             otherwise fire on every closed media tab"
+        );
+        assert!(
+            !health::snapshot().iter().any(|task| task.name == NAME),
+            "a bounded task's row is released on its return, exactly as a cancellation \
+             releases one — which is also what keeps the per-instance supervisors from \
+             accumulating rows"
+        );
+    }
+
+    /// A task that flaps and *then* returns must not stay on the shell's
+    /// "something is wrong right now" surfaces forever.
+    ///
+    /// End to end through the real supervisor, because the seam this pins is a
+    /// cross-crate one: `trollshell`'s Services bar chip and its Flapping card
+    /// both filter on [`crate::health::TaskHealth::consecutive_panics`] alone
+    /// (`panels::stats::is_flapping`), and nothing ever clears a `Returned`
+    /// row. A streak that survived the return would therefore pin a red badge
+    /// on the bar — and a `flapping` pill on a row whose own subtitle reads
+    /// `Returned` — for the rest of the session. `mpris-player` reaching that
+    /// state is an ordinary afternoon: a player emits metadata that panics the
+    /// parser, and the user closes the tab before the 30 s healthy-run
+    /// threshold resets the streak.
+    ///
+    /// [`NEVER_RESET`] rather than [`ZERO_BACKOFF`] so the streak actually
+    /// accumulates: a zero `reset_after` makes every run healthy by definition
+    /// and pins `consecutive_panics` at 1, which would still be non-zero but
+    /// would not show the two-panic history the assertions below read.
+    #[test]
+    fn a_task_that_flapped_before_returning_is_no_longer_flapping() {
+        const NAME: &str = "test-return-clears-streak";
+
+        install_error_counter();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_factory = Arc::clone(&calls);
+
+        runtime::handle().block_on(async move {
+            supervise(
+                NAME,
+                move || {
+                    let calls = Arc::clone(&calls_factory);
+                    async move {
+                        let n = calls.fetch_add(1, Ordering::SeqCst);
+                        assert!(n >= 2, "panic on the first two runs, then return");
+                    }
+                },
+                NEVER_RESET,
+                None,
+                Intent::Perpetual,
+            )
+            .await;
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "two panics then a return");
+
+        let row = health::snapshot()
+            .into_iter()
+            .find(|task| task.name == NAME)
+            .expect("a returned task's row is kept, not dropped");
+        assert_eq!(row.state, health::TaskState::Returned);
+        assert_eq!(
+            row.consecutive_panics, 0,
+            "the streak is what both shell surfaces read as \"flapping now\"; a task that has \
+             stopped running is not flapping, and nothing would ever clear this row"
+        );
+        assert_eq!(
+            row.panics, 2,
+            "the lifetime total is history and stays — it is what makes the row worth keeping"
+        );
+    }
+
     /// The supervisor publishes what it knows to [`crate::health`]: a run
     /// counter that ticks before each run, panic counters that tick after each
-    /// panic, and an entry that is gone once supervision ends.
+    /// panic, and — since the task under test ends by *returning* — an entry
+    /// that survives past the end of supervision in [`TaskState::Returned`]
+    /// (#1174) rather than being dropped.
     ///
-    /// Observed *from inside the supervised closure*, because that is the only
-    /// vantage point where the entry is live — `block_on` returns only after
-    /// the supervisor has stopped and dropped it. Which is itself the last
-    /// assertion here: the table tracks what is being supervised now, not a
-    /// history (`mpris-player`/`tray-item` supervise one task per discovered
-    /// item, so retaining finished entries would leak).
+    /// The per-run snapshots are observed *from inside the supervised
+    /// closure*, because that is the only vantage point where the state is
+    /// still [`TaskState::Running`] — `block_on` returns only after the
+    /// supervisor has stopped, by which point the row (still present) reads
+    /// `Returned`. That is itself the last assertion here.
+    ///
+    /// [`TaskState::Returned`]: crate::health::TaskState::Returned
     #[test]
     fn the_supervisor_publishes_its_task_health() {
         const NAME: &str = "test-health-supervised";
@@ -980,9 +1379,14 @@ mod tests {
                 .all(|task| task.state == crate::health::TaskState::Running),
             "a run in flight always reads Running"
         );
-        assert!(
-            !health::snapshot().iter().any(|task| task.name == NAME),
-            "the entry is dropped when the supervisor stops"
+        let after = health::snapshot()
+            .into_iter()
+            .find(|task| task.name == NAME)
+            .expect("a returned task's row is kept, not dropped (#1174)");
+        assert_eq!(
+            after.state,
+            crate::health::TaskState::Returned,
+            "the clean completion leaves the row in the Returned state"
         );
     }
 
@@ -1209,6 +1613,10 @@ mod tests {
     /// supervisor is gone, including the clean-completion path that has always
     /// ended supervision. Calling it again afterwards must return at once
     /// rather than hang on a channel nobody will ever write to.
+    ///
+    /// Unlike cancellation, a clean completion now (#1174) leaves the health
+    /// row behind in `Returned` rather than releasing it — `stopped()` still
+    /// resolves either way, since it tracks the loop returning, not the row.
     #[test]
     fn stopped_also_resolves_on_a_clean_completion() {
         const NAME: &str = "test-handle-clean";
@@ -1225,7 +1633,10 @@ mod tests {
                 !handle.is_cancelled(),
                 "a task that finished its job was not cancelled"
             );
-            assert!(!health_row_exists(NAME));
+            assert!(
+                health_row_exists(NAME),
+                "a clean completion keeps its row (Returned), unlike a cancellation"
+            );
         });
     }
 
@@ -1277,10 +1688,13 @@ mod tests {
         );
     }
 
-    /// Counts this module's `ERROR` events into [`TAGGED_ERRORS`], keyed by
-    /// whichever [`CAPTURE_TAGS`] entry appears among the event's string
-    /// fields. Hand-rolled so the crate needs no `tracing-subscriber`
-    /// dev-dependency.
+    /// Counts this module's `ERROR` events into [`TAGGED_ERRORS`] and, since
+    /// #1174, its `WARN` events into [`TAGGED_WARNINGS`] — kept as separate
+    /// maps precisely because a return `warn!` and its run's earlier
+    /// panic `error!` can legitimately share one `service` tag (see
+    /// [`CAPTURE_TAGS`]'s doc). Keyed within each map by whichever
+    /// [`CAPTURE_TAGS`] entry appears among the event's string fields.
+    /// Hand-rolled so the crate needs no `tracing-subscriber` dev-dependency.
     ///
     /// Installed process-globally by [`install_error_counter`], which is what
     /// makes it visible from every thread — both as the receiver of the event
@@ -1303,15 +1717,18 @@ mod tests {
 
         fn event(&self, event: &tracing::Event<'_>) {
             let meta = event.metadata();
-            if *meta.level() != tracing::Level::ERROR
-                || meta.target() != "hytte_reactive::supervisor"
-            {
+            if meta.target() != "hytte_reactive::supervisor" {
                 return;
             }
+            let counts = match *meta.level() {
+                tracing::Level::ERROR => &TAGGED_ERRORS,
+                tracing::Level::WARN => &TAGGED_WARNINGS,
+                _ => return,
+            };
             let mut visitor = TagVisitor(None);
             event.record(&mut visitor);
             if let Some(tag) = visitor.0 {
-                *TAGGED_ERRORS
+                *counts
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .entry(tag)

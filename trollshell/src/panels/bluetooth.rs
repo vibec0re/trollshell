@@ -4,7 +4,10 @@
 //! Wraps `hytte::services::bluetooth` (`BlueZ` over D-Bus) plus
 //! `hytte::services::bluetooth_audio` for the auto-switch toggle. Pair
 //! prompts surface inline as a banner above the device list while
-//! `BlueZ`'s `Agent1` callback is awaiting user response.
+//! `BlueZ`'s `Agent1` callback is awaiting user response. A connect / pair /
+//! disconnect failure (#1171) surfaces as a toast via
+//! `notifications::post_local` — the row click itself stays fire-and-forget,
+//! exactly like the equivalent Wi-Fi row in `panels/network/wifi.rs`.
 
 use std::collections::HashSet;
 
@@ -15,6 +18,7 @@ use hytte::gtk::{self};
 use hytte::prelude::*;
 use hytte::services::bluetooth::{self, Device, PairPrompt, PromptKind};
 use hytte::services::bluetooth_audio;
+use hytte::services::notifications;
 
 use crate::components::layout::{finish_page, page_box};
 use crate::components::markup;
@@ -27,6 +31,20 @@ pub fn panel_bluetooth() -> gtk::Widget {
     column.append(&build_pair_prompt_banner());
     column.append(&build_bluetooth_controls());
     column.append(&build_bluetooth_device_groups());
+
+    // Connect/pair/disconnect failures (#1171) — the row's click handler
+    // (`build_device_row`, below) is fire-and-forget, so a failure has no
+    // other way to reach the user than this toast. Ignores the closure's own
+    // widget param: nothing here is rendered, only forwarded.
+    bind(bluetooth::action_error(), &column, |_column, err| {
+        let Some(err) = err else { return };
+        notifications::post_local(
+            "Bluetooth",
+            "Bluetooth",
+            &err.message,
+            notifications::Urgency::Critical,
+        );
+    });
 
     finish_page(&column)
 }

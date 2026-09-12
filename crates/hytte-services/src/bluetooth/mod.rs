@@ -71,6 +71,21 @@ pub(super) struct BluetoothShared {
     pub(super) device_actions: Mutable<HashSet<String>>,
     pub(super) pair_prompt: Mutable<Option<PairPrompt>>,
     pub(super) pending_response: Arc<AsyncMutex<Option<oneshot::Sender<AgentReply>>>>,
+    /// Most recent connect/pair/disconnect failure (#1171), or `None` before
+    /// the first one. `Mutable::set` always notifies subscribers, even on an
+    /// unchanged value (see `mark_busy`'s doc below for the same invariant),
+    /// so a *second* identical failure still reaches the UI — no separate
+    /// "already shown" bookkeeping needed.
+    pub(super) action_error: Mutable<Option<ActionError>>,
+}
+
+/// A user-facing message describing why a connect/pair/disconnect action
+/// failed (#1171) — mirrors wifi's toast-on-failure for the same class of
+/// action. The UI binds [`action_error`] and forwards each emission to
+/// `notifications::post_local`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionError {
+    pub message: String,
 }
 
 /// Cross-thread accessor for the shared handle bag published in
@@ -121,6 +136,10 @@ pub struct BluetoothHandles {
     /// an async mutex so `respond_to_prompt` / `submit_pin` / `submit_passkey`
     /// / `Cancel` can race-lessly take it. `None` when no prompt is in-flight.
     pub(crate) pending_response: Arc<AsyncMutex<Option<oneshot::Sender<AgentReply>>>>,
+    /// Most recent connect/pair/disconnect failure, or `None` before the
+    /// first one (#1171). The UI binds [`action_error`] and forwards each
+    /// emission to a toast.
+    pub(crate) action_error: Mutable<Option<ActionError>>,
     /// Keeps the `own_name` watcher task alive for the process lifetime so the
     /// system bus holds `AGENT_ANCHOR_NAME` and the `PairAgent` interface
     /// remains reachable at `AGENT_PATH`. Stored here for parity with other
@@ -151,6 +170,7 @@ impl Service for BluetoothService {
             device_actions: Mutable::new(HashSet::new()),
             pair_prompt: Mutable::new(None),
             pending_response: Arc::new(AsyncMutex::new(None)),
+            action_error: Mutable::new(None),
             _ownership: ownership.clone(),
         };
         hytte_reactive::shared::insert(BluetoothShared {
@@ -158,6 +178,7 @@ impl Service for BluetoothService {
             device_actions: handles.device_actions.clone(),
             pair_prompt: handles.pair_prompt.clone(),
             pending_response: handles.pending_response.clone(),
+            action_error: handles.action_error.clone(),
         });
 
         let adapter_mutable = handles.adapter.clone();
@@ -284,6 +305,39 @@ pub fn pair_prompts() -> impl Signal<Item = Option<PairPrompt>> {
             .pair_prompt
             .signal_cloned()
     })
+}
+
+/// Signal emitting the most recent connect/pair/disconnect failure message,
+/// or `None` before the first one (#1171). Every `Some` emission — even a
+/// repeat of the same text — is a fresh failure to surface: `Mutable::set`
+/// always notifies (see `mark_busy`'s doc for the same invariant), so the UI
+/// can forward each one straight to a toast with no "already shown"
+/// bookkeeping of its own.
+pub fn action_error() -> impl Signal<Item = Option<ActionError>> {
+    registry::with(|r| {
+        r.get::<BluetoothHandles>()
+            .expect("bluetooth::service() not registered")
+            .action_error
+            .signal_cloned()
+    })
+}
+
+/// Record a connect/pair/disconnect failure for [`action_error`] to surface
+/// (#1171). Callable from any thread — goes through [`shared_state`], not
+/// the GTK-thread-only registry, since every call site here runs on the
+/// tokio runtime. No-op if the service isn't registered (test harness).
+fn report_action_error(message: impl Into<String>) {
+    let Some(shared) = shared_state() else {
+        return;
+    };
+    set_action_error(&shared.action_error, message.into());
+}
+
+/// The actual state transition (#1171), split out of [`report_action_error`]
+/// so it's testable without touching the process-global `shared` map: record
+/// `message` as the latest connect/pair/disconnect failure.
+fn set_action_error(action_error: &Mutable<Option<ActionError>>, message: String) {
+    action_error.set(Some(ActionError { message }));
 }
 
 /// Resolve the active yes/no pairing prompt. `accept = true` returns `Ok`
@@ -418,6 +472,7 @@ pub fn connect_device(device_path: &str) {
     runtime::handle().spawn(async move {
         if let Err(e) = do_device_call(&path, "Connect").await {
             tracing::warn!(error = %e, path, "bluetooth connect_device failed");
+            report_action_error(format!("Couldn't connect: {e}"));
         }
         mark_idle(&path);
     });
@@ -430,6 +485,7 @@ pub fn disconnect_device(device_path: &str) {
     runtime::handle().spawn(async move {
         if let Err(e) = do_device_call(&path, "Disconnect").await {
             tracing::warn!(error = %e, path, "bluetooth disconnect_device failed");
+            report_action_error(format!("Couldn't disconnect: {e}"));
         }
         mark_idle(&path);
     });
@@ -456,6 +512,7 @@ pub fn pair_device(device_path: &str) {
             }
             Err(e) => {
                 tracing::warn!(error = %e, path, "bluetooth pair_device failed");
+                report_action_error(format!("Couldn't pair: {e}"));
             }
         }
         mark_idle(&path);
@@ -574,4 +631,37 @@ async fn do_remove_device(
         .args((dev_op,))
         .send::<()>()
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ActionError, set_action_error};
+    use futures_signals::signal::Mutable;
+
+    /// #1171: a connect/pair/disconnect failure moves `action_error` from
+    /// `None` to `Some`, and a later failure replaces it rather than
+    /// stacking — the UI shows one toast at a time, forwarding whatever the
+    /// latest emission carries.
+    #[test]
+    fn action_error_transitions_from_none_to_the_latest_failure() {
+        let action_error: Mutable<Option<ActionError>> = Mutable::new(None);
+        assert_eq!(action_error.get_cloned(), None, "starts with no failure");
+
+        set_action_error(&action_error, "Couldn't connect: timed out".to_string());
+        assert_eq!(
+            action_error.get_cloned(),
+            Some(ActionError {
+                message: "Couldn't connect: timed out".to_string(),
+            }),
+        );
+
+        set_action_error(&action_error, "Couldn't pair: rejected".to_string());
+        assert_eq!(
+            action_error.get_cloned(),
+            Some(ActionError {
+                message: "Couldn't pair: rejected".to_string(),
+            }),
+            "a later failure replaces the earlier one",
+        );
+    }
 }

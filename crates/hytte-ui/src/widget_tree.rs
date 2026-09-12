@@ -53,7 +53,7 @@
 use gtk::glib;
 use gtk::prelude::*;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -2030,14 +2030,30 @@ fn apply_classes(widget: &impl IsA<gtk::Widget>, classes: &[String]) {
 /// Apply the minimal class delta: remove what dropped, add what's new. Only
 /// classes the reconciler itself added (those in `old`) are ever removed, so
 /// a widget's built-in style classes are untouched.
+///
+/// **Linear in `old.len() + new.len()`, not quadratic.** An earlier version
+/// diffed with `Vec::contains` — O(old × new), run once per node per monitor
+/// per frame on the GTK main thread — on the theory that "a CSS class is not
+/// a layout" made its length nobody's cap to enforce. Measured (#1165 review
+/// round 2): a single `Node::Label` with 20 000 class tokens cost 5.70 s on
+/// its *second* frame (the reconcile, not the build) — over three times the
+/// 8 MiB label the host's display-text caps exist to stop, on a wire payload
+/// two orders of magnitude smaller. The host now also bounds the list itself
+/// (`MAX_NODE_CLASSES`/`MAX_CLASS_BYTES` in `hytte_plugin_proto`), but that is
+/// a policy this crate has no visibility into — a caller that skips it (a
+/// hand-rolled, non-`wire_map` caller; a future one) must not reintroduce the
+/// quadratic cost, so the algorithm itself is fixed here, independent of any
+/// cap upstream.
 fn reconcile_classes(widget: &impl IsA<gtk::Widget>, old: &[String], new: &[String]) {
+    let new_set: HashSet<&str> = new.iter().map(String::as_str).collect();
     for class in old {
-        if !new.contains(class) {
+        if !new_set.contains(class.as_str()) {
             widget.remove_css_class(class);
         }
     }
+    let old_set: HashSet<&str> = old.iter().map(String::as_str).collect();
     for class in new {
-        if !old.contains(class) {
+        if !old_set.contains(class.as_str()) {
             widget.add_css_class(class);
         }
     }
@@ -2732,6 +2748,7 @@ mod gtk_tests {
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     fn root() -> gtk::Box {
         gtk::Box::new(gtk::Orientation::Horizontal, 0)
@@ -2889,6 +2906,52 @@ mod gtk_tests {
         assert_eq!(w1, w2, "reused via positional match");
         assert!(w2.has_css_class("two"));
         assert!(!w2.has_css_class("one"), "dropped class removed");
+    }
+
+    /// `reconcile_classes` must stay linear (#1165 review round 2): reconciling
+    /// a node whose `classes` list is wholly replaced — every old token
+    /// removed, every new one added, the worst case for any diff — must cost
+    /// well under a second even at 20 000 tokens, not the 5.70 s the round-2
+    /// review measured against the old `Vec::contains` scan.
+    ///
+    /// This is deliberately run at a size **larger** than the host's own
+    /// `MAX_NODE_CLASSES` cap (32): this crate has no visibility into that
+    /// cap, so the algorithm itself — not the cap upstream of it — is what
+    /// this test pins. `class_delta_applied_on_update` above is the
+    /// correctness half; this is the complexity half.
+    ///
+    /// **Falsified** by reverting `reconcile_classes` to the `old.contains`/
+    /// `new.contains` scan: this test still passes eventually, but takes
+    /// several seconds instead of milliseconds — turn the bound below down to
+    /// a few hundred ms locally to see it fail, or trust the round-2 review's
+    /// own measurement (5.70 s at this size).
+    #[gtk::test]
+    fn reconciling_a_fully_replaced_class_list_stays_fast_at_20000() {
+        const N: usize = 20_000;
+        let root = root();
+        let mut rec = Reconciler::new(&root, |_, _| {});
+        rec.render(&Node::Label {
+            id: None,
+            text: "t".into(),
+            classes: (0..N).map(|i| format!("a{i}")).collect(),
+            tooltip: None,
+        });
+
+        let start = Instant::now();
+        rec.render(&Node::Label {
+            id: None,
+            text: "t".into(),
+            classes: (0..N).map(|i| format!("b{i}")).collect(),
+            tooltip: None,
+        });
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "reconciling {N} wholly-replaced classes took {elapsed:?} — over the 2 s \
+             regression bound. The round-1 (uncapped) hazard measured 5.70 s at this size; \
+             reconcile_classes may have gone quadratic again",
+        );
     }
 
     #[gtk::test]

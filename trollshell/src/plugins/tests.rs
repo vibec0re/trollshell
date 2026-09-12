@@ -10293,7 +10293,12 @@ mod containment_r2 {
         capped_effect_payload, capped_effect_strings,
     };
     use super::*;
-    use hytte_plugin_proto::{MAX_BODY_TEXT_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_PLUGIN_ID_BYTES};
+    #[cfg(feature = "system-tests")]
+    use hytte::gtk;
+    use hytte_plugin_proto::{
+        MAX_BODY_TEXT_BYTES, MAX_CLASS_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_NODE_CLASSES,
+        MAX_PLUGIN_ID_BYTES,
+    };
 
     /// Every WARN line the capture holds that carries `field`.
     fn warns_with(captured: &hytte_config::test_support::Captured, field: &str) -> usize {
@@ -11154,5 +11159,126 @@ mod containment_r2 {
         .expect("Render");
         let cards = wait_for_region(&bar_center).await;
         assert_eq!(cards[0].plugin_id, id, "an at-cap id registers normally");
+    }
+
+    // ── Adversarial review round 2, HIGH-2: `classes` is bounded too ────────
+
+    /// A [`wire::Node`]'s `classes` list is capped to [`MAX_NODE_CLASSES`]
+    /// tokens, each cut to [`MAX_CLASS_BYTES`]: the mapped node never carries
+    /// more, and a token over the byte cap comes back truncated rather than
+    /// dropped whole.
+    ///
+    /// The hazard this closes is not pango (a class is not a layout) but
+    /// `hytte_ui::widget_tree::reconcile_classes`'s `Vec::contains` diff,
+    /// O(old × new) per node per frame — measured at 5.70 s for 20 000 tokens
+    /// on one label's second frame, over three times the 8 MiB label this PR's
+    /// item 1 exists to stop, on a wire payload two orders of magnitude
+    /// smaller.
+    ///
+    /// **Falsified** by mapping `classes: classes.clone()` (the round-1 code)
+    /// in `wire_map`'s `Label` arm: 33 classes come back as 33 and this reds.
+    #[test]
+    fn an_over_cap_classes_list_is_truncated() {
+        let scope = Scope::detached("r2-classes-count-cap");
+        let classes: Vec<String> = (0..=MAX_NODE_CLASSES).map(|i| format!("c{i}")).collect();
+        let node = wire::Node::Label {
+            id: Some("l".into()),
+            text: "hi".into(),
+            classes,
+            tooltip: None,
+        };
+        match to_ui_node(&scope, Grants::all(), &node) {
+            UiNode::Label { classes, .. } => {
+                assert_eq!(
+                    classes.len(),
+                    MAX_NODE_CLASSES,
+                    "the mapped node carries at most the cap, not the {} the plugin sent",
+                    MAX_NODE_CLASSES + 1,
+                );
+                assert_eq!(
+                    classes, // kept prefix, same posture as the node/depth caps
+                    (0..MAX_NODE_CLASSES)
+                        .map(|i| format!("c{i}"))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            other => panic!("mapped to {other:?}"),
+        }
+    }
+
+    /// A single over-cap class token is truncated on a char boundary, not
+    /// dropped — the [`MAX_DISPLAY_TEXT_BYTES`] posture, not
+    /// [`MAX_PLUGIN_ID_BYTES`]'s: a class is CSS, not a key, so a cut token
+    /// costs a missing style rule rather than a different identity.
+    #[test]
+    fn an_over_cap_class_token_is_truncated_on_a_char_boundary() {
+        let scope = Scope::detached("r2-classes-token-cap");
+        // A multi-byte char straddling the cut point, exactly like
+        // `the_text_cap_cuts_on_a_char_boundary` above.
+        let long_class = format!("{}é", "a".repeat(MAX_CLASS_BYTES - 1));
+        let node = wire::Node::Label {
+            id: Some("l".into()),
+            text: "hi".into(),
+            classes: vec![long_class.clone()],
+            tooltip: None,
+        };
+        match to_ui_node(&scope, Grants::all(), &node) {
+            UiNode::Label { classes, .. } => {
+                assert_eq!(classes.len(), 1, "the token is kept, just shortened");
+                assert!(
+                    classes[0].len() <= MAX_CLASS_BYTES,
+                    "cut to the cap: {} bytes",
+                    classes[0].len(),
+                );
+                assert!(
+                    long_class.as_bytes().starts_with(classes[0].as_bytes()),
+                    "the kept bytes are a genuine prefix, not something else",
+                );
+                assert!(
+                    std::str::from_utf8(classes[0].as_bytes()).is_ok(),
+                    "cut on a char boundary, not mid-codepoint",
+                );
+            }
+            other => panic!("mapped to {other:?}"),
+        }
+    }
+
+    /// `reconcile_classes` (in `hytte_ui::widget_tree`, not this crate — see
+    /// its own `gtk_tests` module for the algorithmic falsification, since the
+    /// function is private to that crate) must stay linear. This is the
+    /// host-side half of the same claim: driving the real `Reconciler` at
+    /// exactly the new cap (32 classes, replaced wholesale so every token is
+    /// both an insertion and a removal — the worst case for a diff) must cost
+    /// well under a millisecond, not the seconds the round-2 review measured
+    /// at 20 000 uncapped tokens.
+    ///
+    /// Needs a display — hermetic under `xvfb-run`, same as the rest of
+    /// `--features system-tests`.
+    #[cfg(feature = "system-tests")]
+    #[gtk::test]
+    fn reconciling_the_max_classes_list_is_fast() {
+        use hytte::ui::{NodeId, Reconciler};
+
+        let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let mut rec = Reconciler::new(&root, |_: NodeId, _: UiEventKind| {});
+        let label = |classes: Vec<String>| UiNode::Label {
+            id: Some("l".into()),
+            text: "hi".into(),
+            classes,
+            tooltip: None,
+        };
+        rec.render(&label(
+            (0..MAX_NODE_CLASSES).map(|i| format!("a{i}")).collect(),
+        ));
+        let start = Instant::now();
+        rec.render(&label(
+            (0..MAX_NODE_CLASSES).map(|i| format!("b{i}")).collect(),
+        ));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "reconciling {MAX_NODE_CLASSES} classes against {MAX_NODE_CLASSES} entirely \
+             different ones took {elapsed:?}, over the 50 ms regression bound",
+        );
     }
 }

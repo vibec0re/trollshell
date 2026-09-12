@@ -1462,6 +1462,47 @@ pub const MAX_PREEM_NODES_PER_TREE: usize = 64;
 /// key can exceed this many bytes.
 pub const MAX_PLUGIN_ID_BYTES: usize = 64;
 
+// ── node `classes` caps (#1165 review round 2) ───────────────────────────────
+//
+// The display-string caps above bound *text* pango shapes; they deliberately
+// left `classes` alone on the theory that a CSS class is not a layout. True,
+// but it answers the wrong hazard: `hytte_ui::widget_tree`'s `reconcile_classes`
+// diffs a node's old and new class lists with `Vec::contains`, i.e.
+// **O(old × new)**, once per node per monitor per frame, on the GTK main
+// thread. Measured: 20 000 class tokens on one `Node::Label` cost 5.70 s on the
+// *second* frame (the reconcile, not the first render) — three and a half
+// times longer than the 8 MiB label the display-text caps exist to stop, on a
+// wire payload two orders of magnitude smaller. Neither the token count nor a
+// token's length was capped anywhere in the proto, `hytte-ui`, or the host.
+
+/// How many CSS classes one [`Node`] may carry.
+///
+/// **32** — comfortably above any real stylesheet's per-widget class list (the
+/// bundled plugins use one to three), and small enough that
+/// `reconcile_classes`'s per-node diff cost is bounded to a constant this
+/// vocabulary is willing to pay every frame regardless of the diff algorithm
+/// used, rather than relying on that algorithm alone to save a pathological
+/// list.
+///
+/// **Past the cap the host keeps the first `MAX_NODE_CLASSES` tokens and drops
+/// the rest**, the same "keep the mapped prefix" posture
+/// [`MAX_NODES_PER_TREE`] takes, with one warning per plugin tree.
+pub const MAX_NODE_CLASSES: usize = 32;
+
+/// The longest single CSS class token the host will map from a [`Node`], in
+/// bytes.
+///
+/// **64** — an order of magnitude past the longest class name anywhere in this
+/// tree's own stylesheets (`hytte-ts-notification-summary-label` and friends
+/// top out in the 30s), and the same number [`MAX_PLUGIN_ID_BYTES`] settles on
+/// for "an identifier, not a sentence": a CSS class is exactly that.
+///
+/// **Truncated on a char boundary**, like [`MAX_DISPLAY_TEXT_BYTES`] — a class
+/// token that GTK never matches because it was cut a few bytes short costs a
+/// missing style rule, not a different plugin's identity, so this one
+/// degrades the same way the text caps do rather than the way the id cap does.
+pub const MAX_CLASS_BYTES: usize = 64;
+
 // ── float sanitisation (#904) ───────────────────────────────────────────────
 
 /// The `min` a [`Node::Slider`] with a **degenerate** stated range falls back

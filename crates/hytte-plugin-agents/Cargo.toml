@@ -56,6 +56,16 @@ tracing-subscriber = { workspace = true, default-features = true, features = [
 ] }
 
 [dev-dependencies]
+# `trollshell-agent-window`'s own `cli::parse` — the P2 argv concern
+# `model.rs` promised a test for (#1167): does the real downstream parser
+# read `window::argv`'s output back to the same agent name? A dev-only edge
+# back to a crate that already depends on this one for `hive`/`model`/
+# `config` (see that crate's own doc comment) — Cargo allows a dev-dependency
+# cycle because it is not part of the normal build graph, and it adds no new
+# resolved package: `trollshell-agent-window` is already a workspace member
+# built by `cargo build --workspace`, so every one of its dependencies is
+# already in `Cargo.lock` at the one version the workspace resolves to.
+trollshell-agent-window = { path = "../trollshell-agent-window" }
 # The fake `host.sock`: a real `UnixListener` in a `TempDir`, speaking the
 # recorded JSON lines under `tests/fixtures/`.
 tempfile.workspace = true

@@ -321,6 +321,44 @@ mod tests {
         assert!(!p.warned);
     }
 
+    /// The `"-leading-hyphen"` fixture (`model.rs`'s `AgentName` test names it
+    /// "a P2 argv concern, not this type's") round-trips through the **real**
+    /// `trollshell-agent-window` parser, not a copy of it — `cli::parse` is
+    /// reached as a dev-dependency so a rename on either side breaks this
+    /// rather than shipping a launcher the window cannot read (the same
+    /// argument as that crate's own `the_plugins_own_argv_parses_on_both_tabs`,
+    /// which asserts the same fact from the window's side).
+    ///
+    /// [`argv`] passes the name as its **own** `Vec` element (`--agent`, then
+    /// `name`, two entries) rather than joining them with `=` into one. That
+    /// matters here because `trollshell-agent-window::cli::parse` is
+    /// hand-rolled, not `clap`: on seeing `"--agent"` it unconditionally takes
+    /// the *next* token as the value — it never re-examines that token for a
+    /// leading `-`, so a name starting with one is never reinterpreted as a
+    /// flag. `--agent=<name>` would in fact **break** this parser, since it
+    /// only ever matches the token `"--agent"` exactly and has no `=`-splitting
+    /// arm; a joined token falls through to its `Unknown` arm instead.
+    ///
+    /// Falsification (verified red, restored after): join the two elements
+    /// into one `format!("{ARG_AGENT}={name}")` entry — the assertion below
+    /// then reds with `Err(Unknown("--agent=-leading-hyphen"))` instead of the
+    /// expected `Ok`, which is exactly the breakage this test exists to catch
+    /// on either side of the argv/parser contract.
+    #[test]
+    fn a_leading_hyphen_name_round_trips_through_the_real_window_parser() {
+        for (tab, want_tab) in [
+            (Tab::Agent, trollshell_agent_window::cli::Tab::Agent),
+            (Tab::Settings, trollshell_agent_window::cli::Tab::Settings),
+        ] {
+            let av = argv("-leading-hyphen", tab);
+            assert_eq!(av[0], BINARY);
+            let parsed = trollshell_agent_window::cli::parse(&av[1..])
+                .expect("the real window parser accepts a leading-hyphen name");
+            assert_eq!(parsed.agent.as_str(), "-leading-hyphen");
+            assert_eq!(parsed.tab, want_tab);
+        }
+    }
+
     /// The real probe resolves **once**: a second call does not re-scan.
     ///
     /// Falsification: drop the `cached` field (or re-run `lookup` every call)

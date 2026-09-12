@@ -196,6 +196,11 @@ which is the `hytte-plugin-infobroker` daemon binary). That CLI reads
 get` then requires it be set (`cli.rs`). This is CLI-side, per-invocation
 state, not a plugin-launch knob.
 
+Argument parsing is `clap` (#1116), with a hidden `completions <shell>`
+subcommand nix's `installShellCompletion` invokes at build time — not a
+runtime knob either, just how `hytte-infobroker`'s bash/zsh/fish completions
+ship.
+
 ### niri-layouts (`hytte-plugin-niri-layouts`)
 
 No runtime knobs — the three layouts and their proportions are compiled in
@@ -207,6 +212,10 @@ The same binary doubles as a CLI — `hytte-plugin-niri-layouts apply <equal |
 golden | split>` applies one layout and exits — which is what a niri `spawn`
 bind invokes. That path takes its layout as an argument, not from the
 environment, so `plugins.niri-layouts.env` has nothing to set either way.
+
+Argument parsing is `clap` (#1116), same as `hytte-infobroker` above, with the
+same hidden `completions <shell>` subcommand backing its nix-installed
+bash/zsh/fish completions.
 
 ### pet (`hytte-plugin-pet`)
 

@@ -15,10 +15,19 @@
 //! The auth line is meant to be `eval`'d:
 //! `eval "$(hytte-infobroker auth --agent claude)"`. Blocking std sockets only —
 //! no async runtime, so the CLI stays a fast, tiny binary.
+//!
+//! Argument parsing is `clap` (#1116, following @kaesaecracker's recommendation
+//! on that thread) rather than hand-rolled, so nix can generate shell
+//! completions from the same `Command` at build time — see the hidden
+//! `completions <shell>` subcommand below, which `nix/plugin.nix`'s
+//! `installShellCompletion` call invokes.
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
+
+use clap::{CommandFactory as _, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell, generate};
 
 use hytte_plugin_infobroker::paths;
 use hytte_plugin_infobroker::wire::{
@@ -29,26 +38,86 @@ use hytte_plugin_infobroker::wire::{
 /// read by `get`.
 const ENV_TOKEN: &str = "HYTTE_INFOBROKER_TOKEN";
 
-const USAGE: &str = "\
-hytte-infobroker — the trollshell data broker CLI (issue #487)
-
-USAGE:
-    hytte-infobroker auth --agent <name>          mint a session token (prints an
-                                                  `export HYTTE_INFOBROKER_TOKEN=…`
-                                                  line to eval)
-    hytte-infobroker get <datasource> [--limit N] fetch scoped data (needs the env
-                                                  token from a prior auth).
-                                                  <datasource>: departures | weather
-                                                  | calendar
-    hytte-infobroker grants list                  list the durable grants
-
-Typical agent flow:
-    eval \"$(hytte-infobroker auth --agent claude)\"
+/// The agent-flow example shown in `--help`.
+const LONG_ABOUT: &str = "hytte-infobroker — the trollshell data broker CLI (issue #487)\n\
+\n\
+Typical agent flow:\n\
+    eval \"$(hytte-infobroker auth --agent claude)\"\n\
     hytte-infobroker get departures --limit 5";
 
+#[derive(Parser, Debug)]
+#[command(name = "hytte-infobroker", version, long_about = LONG_ABOUT)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Mint a session token (prints an `export HYTTE_INFOBROKER_TOKEN=…` line
+    /// meant to be `eval`'d)
+    Auth {
+        /// The agent name the minted token identifies as
+        #[arg(long)]
+        agent: String,
+    },
+    /// Fetch scoped data (needs the env token from a prior `auth`)
+    Get {
+        /// Which datasource to fetch
+        datasource: Datasource,
+        /// Cap the number of rows (ignored by `weather`, a single reading)
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// The durable grants (introspection)
+    Grants {
+        #[command(subcommand)]
+        action: GrantsAction,
+    },
+    /// Print a shell completion script (invoked by nix's
+    /// `installShellCompletion`, not meant for a human to type)
+    #[command(hide = true)]
+    Completions {
+        /// Which shell's script to print
+        shell: Shell,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum GrantsAction {
+    /// List the durable grants
+    List,
+}
+
+/// `get`'s datasource argument — the three the broker serves. Variant names
+/// map to [`wire`]'s `DATASOURCE_*` constants via [`Datasource::as_wire`],
+/// spelled out explicitly rather than leaned on clap's kebab-case renderer
+/// agreeing by coincidence, the same "written out, not derived" call the
+/// golden-layout proportions make elsewhere in this workspace.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Datasource {
+    Departures,
+    Weather,
+    Calendar,
+}
+
+impl Datasource {
+    fn as_wire(self) -> &'static str {
+        match self {
+            Self::Departures => DATASOURCE_DEPARTURES,
+            Self::Weather => DATASOURCE_WEATHER,
+            Self::Calendar => DATASOURCE_CALENDAR,
+        }
+    }
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(&args) {
+    let args: Vec<String> = std::env::args().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(e) => return exit_for_parse_error(&e),
+    };
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("hytte-infobroker: {e}");
@@ -57,27 +126,48 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: &[String]) -> Result<(), String> {
-    match args.first().map(String::as_str) {
-        Some("auth") => cmd_auth(&args[1..]),
-        Some("get") => cmd_get(&args[1..]),
-        Some("grants") => cmd_grants(&args[1..]),
-        None | Some("--help" | "-h" | "help") => {
-            println!("{USAGE}");
+/// clap's own exit code for a usage error is 2; this CLI's contract predates
+/// clap and treats any misuse the same as any other broker error — exit 1 —
+/// so map it down rather than let switching parsers move the number a script
+/// might check. `--help`/`--version` (clap's "display" error kinds) keep
+/// their 0.
+fn exit_for_parse_error(e: &clap::Error) -> ExitCode {
+    let _ = e.print();
+    if e.exit_code() == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn run(cli: Cli) -> Result<(), String> {
+    match cli.command {
+        // No subcommand: print usage and succeed, same as the pre-clap
+        // `None | Some("--help" | "-h" | "help")` arm.
+        None => {
+            Cli::command()
+                .print_help()
+                .map_err(|e| format!("printing help: {e}"))?;
+            println!();
             Ok(())
         }
-        Some(other) => Err(format!("unknown command '{other}'\n\n{USAGE}")),
+        Some(Command::Auth { agent }) => cmd_auth(&agent),
+        Some(Command::Get { datasource, limit }) => cmd_get(datasource, limit),
+        Some(Command::Grants {
+            action: GrantsAction::List,
+        }) => cmd_grants(),
+        Some(Command::Completions { shell }) => {
+            print!("{}", render_completions(shell));
+            Ok(())
+        }
     }
 }
 
 /// `auth --agent <name>` → an eval-able export line on stdout (a human note on
 /// stderr), or the denial (with its how-to-grant hint) as an error.
-fn cmd_auth(args: &[String]) -> Result<(), String> {
-    let agent = flag_value(args, "--agent")
-        .ok_or("auth: missing --agent <name>")?
-        .to_owned();
+fn cmd_auth(agent: &str) -> Result<(), String> {
     let resp = call(&Request::Auth {
-        agent: agent.clone(),
+        agent: agent.to_owned(),
     })?;
     if !resp.ok {
         return Err(deny_message(&resp));
@@ -103,26 +193,7 @@ fn cmd_auth(args: &[String]) -> Result<(), String> {
 /// query protocol) or `calendar` (the host-fed live copy). `--limit` caps the row
 /// datasources (`departures` / `calendar`); `weather` is a single reading and
 /// ignores it.
-fn cmd_get(args: &[String]) -> Result<(), String> {
-    let datasource = args
-        .first()
-        .ok_or("get: missing datasource (try `get departures`)")?;
-    if !matches!(
-        datasource.as_str(),
-        DATASOURCE_DEPARTURES | DATASOURCE_WEATHER | DATASOURCE_CALENDAR
-    ) {
-        return Err(format!(
-            "get: unknown datasource '{datasource}' \
-             (known: '{DATASOURCE_DEPARTURES}', '{DATASOURCE_WEATHER}', '{DATASOURCE_CALENDAR}')"
-        ));
-    }
-    let limit = match flag_value(&args[1..], "--limit") {
-        Some(v) => Some(
-            v.parse::<usize>()
-                .map_err(|_| "get: --limit must be a whole number".to_owned())?,
-        ),
-        None => None,
-    };
+fn cmd_get(datasource: Datasource, limit: Option<usize>) -> Result<(), String> {
     let token = std::env::var(ENV_TOKEN).map_err(|_| {
         format!(
             "get: {ENV_TOKEN} not set — run `eval \"$(hytte-infobroker auth --agent <name>)\"` first"
@@ -130,7 +201,7 @@ fn cmd_get(args: &[String]) -> Result<(), String> {
     })?;
     let resp = call(&Request::Get {
         token,
-        datasource: datasource.clone(),
+        datasource: datasource.as_wire().to_owned(),
         limit,
     })?;
     if !resp.ok {
@@ -139,15 +210,17 @@ fn cmd_get(args: &[String]) -> Result<(), String> {
     // Each `get` populates exactly one payload field (the broker shapes it per
     // datasource); print that one as pretty JSON. A row datasource with no rows
     // prints as `[]`; weather is a single object.
-    let json = match datasource.as_str() {
-        DATASOURCE_WEATHER => {
+    let json = match datasource {
+        Datasource::Weather => {
             let reading = resp
                 .weather
                 .ok_or("get: broker returned ok without a weather reading")?;
             serde_json::to_string_pretty(&reading)
         }
-        DATASOURCE_CALENDAR => serde_json::to_string_pretty(&resp.calendar.unwrap_or_default()),
-        _ => serde_json::to_string_pretty(&resp.departures.unwrap_or_default()),
+        Datasource::Calendar => serde_json::to_string_pretty(&resp.calendar.unwrap_or_default()),
+        Datasource::Departures => {
+            serde_json::to_string_pretty(&resp.departures.unwrap_or_default())
+        }
     }
     .map_err(|e| format!("encoding output: {e}"))?;
     println!("{json}");
@@ -155,7 +228,7 @@ fn cmd_get(args: &[String]) -> Result<(), String> {
 }
 
 /// `grants list` → one grant per line (agent, datasource, scope, decision).
-fn cmd_grants(_args: &[String]) -> Result<(), String> {
+fn cmd_grants() -> Result<(), String> {
     let resp = call(&Request::Grants)?;
     if !resp.ok {
         return Err(deny_message(&resp));
@@ -213,47 +286,141 @@ fn deny_message(resp: &Response) -> String {
     }
 }
 
-/// Find `--flag <value>` or `--flag=value` in `args`. Returns the value slice.
-fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    let eq_prefix = format!("{flag}=");
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == flag {
-            return it.next().map(String::as_str);
-        }
-        if let Some(v) = a.strip_prefix(&eq_prefix) {
-            return Some(v);
-        }
-    }
-    None
+/// Render one shell's completion script for this binary's `Command` tree.
+/// `render_completions`/`print_completions` split lets a test inspect the
+/// bytes without capturing stdout.
+fn render_completions(shell: Shell) -> String {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_owned();
+    let mut buf: Vec<u8> = Vec::new();
+    generate(shell, &mut cmd, name, &mut buf);
+    String::from_utf8(buf).expect("clap_complete's generated script is always valid UTF-8")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::flag_value;
+    use clap::{CommandFactory as _, Parser as _};
+    use clap_complete::Shell;
 
-    fn args(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| (*s).to_owned()).collect()
+    use super::{Cli, Command, GrantsAction, render_completions};
+
+    fn parse(argv: &[&str]) -> Result<Cli, clap::Error> {
+        let mut full = vec!["hytte-infobroker"];
+        full.extend_from_slice(argv);
+        Cli::try_parse_from(full)
     }
 
     #[test]
-    fn flag_value_reads_spaced_and_equals_forms() {
-        let spaced = args(&["--agent", "claude"]);
-        assert_eq!(flag_value(&spaced, "--agent"), Some("claude"));
-        let equals = args(&["--agent=claude"]);
-        assert_eq!(flag_value(&equals, "--agent"), Some("claude"));
+    fn no_arguments_parses_with_no_subcommand() {
+        let cli = parse(&[]).expect("bare invocation parses");
+        assert!(cli.command.is_none());
     }
 
     #[test]
-    fn flag_value_is_none_when_absent_or_dangling() {
-        assert_eq!(flag_value(&args(&["--limit", "5"]), "--agent"), None);
-        // A trailing flag with no value → None (not a panic).
-        assert_eq!(flag_value(&args(&["--agent"]), "--agent"), None);
+    fn auth_requires_the_agent_flag() {
+        assert!(parse(&["auth"]).is_err());
     }
 
     #[test]
-    fn flag_value_finds_the_flag_among_others() {
-        let a = args(&["departures", "--limit", "5"]);
-        assert_eq!(flag_value(&a, "--limit"), Some("5"));
+    fn auth_takes_the_agent_flag_spaced_or_equals() {
+        let spaced = parse(&["auth", "--agent", "claude"]).expect("spaced form parses");
+        assert!(matches!(spaced.command, Some(Command::Auth { agent }) if agent == "claude"));
+
+        let equals = parse(&["auth", "--agent=claude"]).expect("equals form parses");
+        assert!(matches!(equals.command, Some(Command::Auth { agent }) if agent == "claude"));
+    }
+
+    #[test]
+    fn get_parses_each_known_datasource() {
+        for token in ["departures", "weather", "calendar"] {
+            parse(&["get", token]).unwrap_or_else(|e| panic!("{token}: {e}"));
+        }
+    }
+
+    #[test]
+    fn get_rejects_an_unknown_datasource() {
+        let err = parse(&["get", "moonphase"]).expect_err("not a known datasource");
+        let msg = err.to_string();
+        assert!(msg.contains("departures"), "lists the known ones: {msg}");
+    }
+
+    #[test]
+    fn get_parses_the_limit_flag() {
+        let cli = parse(&["get", "departures", "--limit", "5"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Get { limit: Some(5), .. })
+        ));
+    }
+
+    #[test]
+    fn get_limit_must_be_a_whole_number() {
+        assert!(parse(&["get", "departures", "--limit", "nope"]).is_err());
+    }
+
+    #[test]
+    fn grants_list_parses() {
+        let cli = parse(&["grants", "list"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Grants {
+                action: GrantsAction::List
+            })
+        ));
+    }
+
+    #[test]
+    fn grants_without_list_is_an_error() {
+        // The documented surface is `grants list`; requiring the verb (rather
+        // than silently accepting any/no trailing token, as the pre-clap
+        // `cmd_grants` did) matches what `--help` actually promises.
+        assert!(parse(&["grants"]).is_err());
+    }
+
+    #[test]
+    fn an_unknown_subcommand_is_refused() {
+        assert!(parse(&["frobnicate"]).is_err());
+    }
+
+    #[test]
+    fn completions_parses_every_shell_but_stays_hidden() {
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let cli = parse(&["completions", &shell.to_string()]).unwrap_or_else(|e| {
+                panic!("completions {shell}: {e}");
+            });
+            assert!(matches!(cli.command, Some(Command::Completions { .. })));
+        }
+        // Checked against the `Command` tree's own hidden flag, not against
+        // rendered `--help` text: `LONG_ABOUT` is free to *mention* the word
+        // "completions" without that meaning the subcommand itself is listed.
+        let cmd = Cli::command();
+        let completions = cmd
+            .get_subcommands()
+            .find(|s| s.get_name() == "completions")
+            .expect("a completions subcommand exists");
+        assert!(
+            completions.is_hide_set(),
+            "completions subcommand must be hidden from --help"
+        );
+    }
+
+    /// Falsifies a dropped subcommand: removing `auth`/`get`/`grants` from
+    /// [`Command`] would no longer print its name here.
+    #[test]
+    fn bash_completions_name_the_binary_and_every_subcommand() {
+        let script = render_completions(Shell::Bash);
+        assert!(script.contains("hytte-infobroker"), "{script}");
+        for word in ["auth", "get", "grants"] {
+            assert!(
+                script.contains(word),
+                "bash completions missing '{word}':\n{script}"
+            );
+        }
     }
 }

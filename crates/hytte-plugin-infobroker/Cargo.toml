@@ -26,6 +26,13 @@ path = "src/cli.rs"
 # The plugin runtime SDK (used only by the plugin binary — the shared library is
 # SDK-free so the CLI stays lean). Re-exports the proto vocabulary + tokio_stream.
 hytte-plugin = { path = "../hytte-plugin" }
+# `hytte-infobroker` (the CLI binary, `cli.rs`) parses its argv with clap
+# (#1116) rather than by hand, so nix can generate shell completions from the
+# same `Command` tree at build time (`nix/plugin.nix`'s hidden `completions
+# <shell>` invocation). Unused by the `hytte-plugin-infobroker` daemon binary
+# (`plugin.rs`), which never parses arguments.
+clap = { workspace = true, features = ["derive"] }
+clap_complete.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The durable grant store (grants.toml) + the ported places.toml station config.

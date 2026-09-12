@@ -45,6 +45,7 @@
 {
   lib,
   runCommand,
+  installShellFiles,
   # The single whole-workspace compile (nix/package.nix's `passthru.workspace`).
   workspace,
   # The plugin crate = binary = flake-output name, e.g. "hytte-plugin-pet".
@@ -55,9 +56,18 @@
   # tools (hytte-infobroker) pass their own so the description doesn't
   # over-claim plugin-hood.
   description ? "trollshell bundled widget plugin — ${name}",
+  # Whether `${name}` implements a hidden `completions <shell>` subcommand
+  # (clap_complete, #1116) that this derivation can invoke at build time to
+  # generate its bash/zsh/fish completion scripts. A flag rather than a blind
+  # call on every plugin: most bundled widget plugins take no arguments at
+  # all (they're driven entirely by the wire protocol) and have no such
+  # subcommand to call — only the standalone-hat binaries do
+  # (`hytte-infobroker`, `hytte-plugin-niri-layouts`).
+  hasCompletions ? false,
 }:
 runCommand "${name}-0.1.0"
   {
+    nativeBuildInputs = lib.optional hasCompletions installShellFiles;
     meta = {
       inherit description;
       homepage = "https://github.com/vibec0re/trollshell/";
@@ -66,6 +76,14 @@ runCommand "${name}-0.1.0"
       mainProgram = name;
     };
   }
-  ''
-    install -Dm755 ${workspace}/bin/${name} "$out/bin/${name}"
-  ''
+  (
+    ''
+      install -Dm755 ${workspace}/bin/${name} "$out/bin/${name}"
+    ''
+    + lib.optionalString hasCompletions ''
+      installShellCompletion --cmd ${name} \
+        --bash <("$out/bin/${name}" completions bash) \
+        --zsh <("$out/bin/${name}" completions zsh) \
+        --fish <("$out/bin/${name}" completions fish)
+    ''
+  )

@@ -109,6 +109,14 @@ chrono = { version = "0.4.44", default-features = false, features = [
   "clock",
   "std",
 ] }
+# clap + clap_complete (#1116, kaesaecracker's recommendation on that thread):
+# every binary that parses argv (`hytte-infobroker`, `hytte-plugin-niri-layouts`,
+# `trollshell`'s own `--scan-aps`) uses these instead of a hand-rolled parser,
+# so nix can generate shell completions from the same `Command` tree at build
+# time (`installShellCompletion`, `nix/plugin.nix` + `nix/package.nix`). MIT OR
+# Apache-2.0.
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
 futures-channel = "0.3.32"
 futures-executor = "0.3.32"
 futures-signals = "0.3.34"

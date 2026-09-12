@@ -23,6 +23,12 @@ system-tests = []
 # the same error vocabulary hytte-services' systemd helpers already return.
 anyhow.workspace = true
 chrono.workspace = true
+# The binary's own argv (#1116): `--scan-aps` plus a hidden `completions
+# <shell>` subcommand nix's `installShellCompletion` invokes at build time
+# (`nix/package.nix`, against the unwrapped workspace binary). See the `Cli`
+# struct in `main.rs`.
+clap = { workspace = true, features = ["derive"] }
+clap_complete.workspace = true
 hytte = { path = "../crates/hytte" }
 # The config-file layering (#866/#868), for `src/config/` — the XDG search
 # path, the four merge rules and the `Subsystem` reader/validator/writer.

@@ -24,6 +24,8 @@ mod workspace_stacks;
 
 use std::cell::RefCell;
 
+use clap::{CommandFactory as _, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 use hytte::futures_signals::map_ref;
 use hytte::futures_signals::signal::SignalExt;
 use hytte::gtk;
@@ -36,6 +38,58 @@ use hytte::services::{
     power_profiles, recorder, resolved, screensaver, sensors, systemd, tasks, tray, upower, vpn,
     wallpaper, weather, wifi, wifiscan,
 };
+
+/// trollshell's argv, driven by `clap` (#1116): `--scan-aps` (the one-shot
+/// Wi-Fi-AP dump below) plus a hidden `completions <shell>` subcommand nix's
+/// `installShellCompletion` invokes at build time (`nix/package.nix`). Every
+/// other invocation — in particular the bare `trollshell` a niri session
+/// actually runs (`etc/systemd/user/trollshell.service`'s `ExecStart` takes
+/// no arguments) — is unaffected: `Cli::try_parse_from` on an empty argv
+/// produces `scan_aps: false, command: None`.
+#[derive(Parser, Debug)]
+#[command(name = "trollshell", version)]
+struct Cli {
+    /// One-shot dump of visible Wi-Fi networks as a paste-ready
+    /// `ssids = [...]` block for ~/.config/trollshell/places.toml, then exit
+    #[arg(long)]
+    scan_aps: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Print a shell completion script (invoked by nix's
+    /// `installShellCompletion`, not meant for a human to type)
+    #[command(hide = true)]
+    Completions {
+        /// Which shell's script to print
+        shell: Shell,
+    },
+}
+
+/// Render one shell's completion script for [`Cli`]'s `Command` tree. Split
+/// from printing so a test can inspect the bytes without capturing stdout.
+fn render_completions(shell: Shell) -> String {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_owned();
+    let mut buf: Vec<u8> = Vec::new();
+    generate(shell, &mut cmd, name, &mut buf);
+    String::from_utf8(buf).expect("clap_complete's generated script is always valid UTF-8")
+}
+
+/// clap's own exit code for a usage error is 2; there was no prior CLI error
+/// contract for this binary to preserve (any unrecognized flag used to be
+/// silently ignored), but the other two binaries this issue touches
+/// (`hytte-infobroker`, `hytte-plugin-niri-layouts`) both map misuse to exit
+/// 1, so this does too for one consistent convention across the workspace's
+/// three argv-parsing binaries. `--help`/`--version` (clap's "display" error
+/// kinds) keep their 0.
+fn exit_for_parse_error(e: &clap::Error) -> ! {
+    let _ = e.print();
+    std::process::exit(i32::from(e.exit_code() != 0));
+}
 
 /// Default `tracing` level when `RUST_LOG` is unset (#746).
 ///
@@ -96,10 +150,24 @@ fn build_env_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
 // 100-line pedantic limit. Splitting it would only obscure the linear wiring.
 #[allow(clippy::too_many_lines)]
 fn main() -> hytte::ui::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(e) => exit_for_parse_error(&e),
+    };
+
+    // `trollshell completions <shell>`: nix's `installShellCompletion`
+    // (`nix/package.nix`) invokes this against the unwrapped workspace
+    // binary at build time — never a runtime concern for a real session.
+    if let Some(Command::Completions { shell }) = cli.command {
+        print!("{}", render_completions(shell));
+        return Ok(());
+    }
+
     // `trollshell --scan-aps`: one-shot dump of visible Wi-Fi networks as a
     // paste-ready `ssids = [...]` block for ~/.config/trollshell/places.toml,
     // then exit. Runs before the App, so it needs no Wayland session.
-    if std::env::args().any(|a| a == "--scan-aps") {
+    if cli.scan_aps {
         let aps = wifiscan::scan_aps_blocking();
         if aps.is_empty() {
             // Distinguish "scan failed / NM down" from "genuinely nothing" —
@@ -734,9 +802,84 @@ fn group<const N: usize>(widgets: [gtk::Widget; N]) -> gtk::Widget {
 
 #[cfg(test)]
 mod tests {
+    use clap::{CommandFactory as _, Parser as _};
+    use clap_complete::Shell;
     use tracing_subscriber::filter::LevelFilter;
 
-    use super::{DEFAULT_LOG_LEVEL, build_env_filter};
+    use super::{Cli, Command, DEFAULT_LOG_LEVEL, build_env_filter, render_completions};
+
+    fn parse(argv: &[&str]) -> Result<Cli, clap::Error> {
+        let mut full = vec!["trollshell"];
+        full.extend_from_slice(argv);
+        Cli::try_parse_from(full)
+    }
+
+    #[test]
+    fn bare_invocation_sets_no_flag() {
+        let cli = parse(&[]).expect("bare invocation parses");
+        assert!(!cli.scan_aps);
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn scan_aps_sets_the_flag() {
+        let cli = parse(&["--scan-aps"]).expect("--scan-aps parses");
+        assert!(cli.scan_aps);
+    }
+
+    #[test]
+    fn help_and_version_exit_zero() {
+        for flag in ["--help", "-h", "--version"] {
+            let err = parse(&[flag]).expect_err("a display kind is still an Err from try_parse");
+            assert_eq!(err.exit_code(), 0, "{flag} should be a zero-exit display");
+        }
+    }
+
+    #[test]
+    fn an_unknown_flag_is_refused() {
+        assert!(parse(&["--this-is-not-a-flag"]).is_err());
+    }
+
+    #[test]
+    fn completions_parses_every_shell_but_stays_hidden() {
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let cli = parse(&["completions", &shell.to_string()])
+                .unwrap_or_else(|e| panic!("completions {shell}: {e}"));
+            assert!(matches!(cli.command, Some(Command::Completions { .. })));
+        }
+        // Checked against the `Command` tree's own hidden flag, not against
+        // rendered `--help` text: the top-level `about` prose is free to
+        // *mention* the word "completions" (as this file's module doc does)
+        // without that meaning the subcommand itself is listed.
+        let cmd = Cli::command();
+        let completions = cmd
+            .get_subcommands()
+            .find(|s| s.get_name() == "completions")
+            .expect("a completions subcommand exists");
+        assert!(
+            completions.is_hide_set(),
+            "completions subcommand must be hidden from --help"
+        );
+    }
+
+    /// Falsifies a broken `--scan-aps` wiring: if the flag stopped being
+    /// named `scan_aps` (or clap stopped kebab-casing it to `--scan-aps`),
+    /// this would fail to parse.
+    #[test]
+    fn bash_completions_name_the_binary_and_scan_aps() {
+        let script = render_completions(Shell::Bash);
+        assert!(script.contains("trollshell"), "{script}");
+        assert!(
+            script.contains("scan-aps") || script.contains("scan_aps"),
+            "bash completions missing '--scan-aps':\n{script}"
+        );
+    }
 
     // Known gap: both tests below drive `build_env_filter` through its
     // `Some(_)` arm; `build_env_filter(None)` — the arm `main` actually

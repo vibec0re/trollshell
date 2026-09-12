@@ -560,10 +560,11 @@ where
                     // again, so this cannot repeat.
                     //
                     // `eprintln!` rather than `tracing::warn!` for the reason
-                    // documented on `drop_ungranted_effects` — no plugin
-                    // binary installs a subscriber, so a `tracing` line here
-                    // would reach nobody; stderr is what systemd routes to
-                    // the journal. There is no "source index" to name: a
+                    // documented on `drop_ungranted_effects`: most plugin
+                    // binaries install no subscriber (`agents` and the
+                    // claude bridge do, the rest do not), so a `tracing` line
+                    // here would reach only some of them; stderr reaches every
+                    // one, and it is what systemd routes to the journal. There is no "source index" to name: a
                     // plugin returns exactly one stream (it merges its own).
                     eprintln!(
                         "[{plugin_id}] sources() stream ended; no further app messages this session"

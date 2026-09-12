@@ -690,6 +690,7 @@ mod tests {
         let urls = HiveUrls {
             domain: Some("hive.local".to_owned()),
             home: Some("  https://hive.local/  ".to_owned()),
+            forge: None,
         };
         let facts = Facts::hive(&cfg, Some(&urls));
         assert!(

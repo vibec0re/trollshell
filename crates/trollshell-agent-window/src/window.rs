@@ -664,6 +664,7 @@ mod gtk_tests {
         w.update(Update::Urls(Box::new(HiveUrls {
             domain: Some("hive.local".to_owned()),
             home: Some("https://hive.local/".to_owned()),
+            forge: None,
         })));
         assert!(
             w.settings

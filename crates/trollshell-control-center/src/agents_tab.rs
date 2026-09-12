@@ -124,7 +124,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gdk, glib};
 
 use hytte_plugin_agents::config::AgentsConfig;
 use hytte_plugin_agents::hive::client::{self, HiveError};
@@ -510,17 +510,29 @@ pub(crate) fn unassigned_approvals(queue: Vec<Approval>, known: &[String]) -> Ve
         .collect()
 }
 
-/// Where to answer one unassigned approval — the second line of its row.
+/// Where to answer one unassigned approval — the **first** line of its row.
 ///
 /// This tab writes nothing (#1147's contract), so the row's only job once it
 /// has named the request is to say which *other* surface might still be able
-/// to decide it: the agent's own sidebar card, if the name is merely stale
-/// (the agent has since been renamed or removed from `agents.toml`), or the
-/// hive's own dashboard when there is no name to look for at all.
+/// to decide it. Three answers, not two (this round's review, LOW 5):
+///
+/// - No name at all: nothing but the hive's own dashboard can reach it.
+/// - A name this build will not render: [`hive_of`] drops any roster row whose
+///   name fails [`AgentName::parse`], so such an agent has no sidebar card and
+///   never will — telling the operator to wait for one is telling them to wait
+///   forever.
+/// - A legal name that is merely absent (renamed, or removed from
+///   `agents.toml`): its own card is the place, if it comes back.
 #[must_use]
 fn unassigned_destination(agent: &str) -> String {
-    if agent.trim().is_empty() {
+    let agent = agent.trim();
+    if agent.is_empty() {
         "no agent named on this request — answer from the hive's dashboard".to_owned()
+    } else if AgentName::parse(agent).is_none() {
+        format!(
+            "for \"{agent}\", a name this build will not show anywhere — answer from the hive's \
+             dashboard"
+        )
     } else {
         format!(
             "for \"{agent}\", not on this hive's roster — answer from that agent's own sidebar \
@@ -529,14 +541,21 @@ fn unassigned_destination(agent: &str) -> String {
     }
 }
 
-/// One unassigned row's subtitle: the plugin's own detail line (kind,
-/// description, stamp — `hytte_plugin_agents::plugin::detail_line`, not a
-/// copy of it, for the reason `chrome::ApprovalRow::of`'s doc gives: two
-/// renderers of one queue's free text have to agree), plus where to answer
-/// it on its own line.
+/// One unassigned row's subtitle: where to answer it, then the plugin's own
+/// detail line (kind, description, stamp —
+/// `hytte_plugin_agents::plugin::detail_line`, not a copy of it, for the
+/// reason `chrome::ApprovalRow::of`'s doc gives: two renderers of one queue's
+/// free text have to agree).
+///
+/// **The destination comes first** (this round's review, LOW 4). The row is
+/// clamped to three lines and `detail_line` carries up to `DETAIL_CHARS` of
+/// the manager's own prose, which wraps to three lines on its own at this
+/// sidebar's width — so with the order the other way round, the one sentence
+/// this row exists to say was ellipsized away exactly when the description was
+/// long enough to need it.
 #[must_use]
 fn unassigned_subtitle(a: &Approval) -> String {
-    format!("{}\n{}", detail_line(a), unassigned_destination(&a.agent))
+    format!("{}\n{}", unassigned_destination(&a.agent), detail_line(a))
 }
 
 // ── The widget tree ──────────────────────────────────────────────────────────
@@ -643,6 +662,40 @@ struct AgentsState {
     /// and no in-flight latch, so there is no widget state a rebuild could
     /// lose and no click that could land on one mid-replacement.
     unassigned_rows: Rc<RefCell<Vec<adw::ActionRow>>>,
+    /// Whether this tab is on screen, and when it last asked because of that
+    /// — the poll's park gate. See [`Presentation`].
+    presentation: Rc<Presentation>,
+}
+
+/// The Agents tab's park gate (#1149 L4's argument, applied here on this
+/// round's review, MEDIUM 3).
+///
+/// [`start_poll`] used to be an unconditional `glib::timeout_add_local`, so the
+/// tab dialled `host.sock` every `poll_seconds` for the whole life of the
+/// control-center — whichever tab was showing, mapped or not — and #1149 N1
+/// then added a second round trip (`Pending`) to every one of those ticks, in
+/// the same change whose headline is "spend fewer round trips on a surface
+/// nobody is looking at".
+///
+/// The signal is the one the companion window parks on
+/// (`trollshell_agent_window::window::watch_presentation`): the compositor's
+/// `GdkToplevelState::SUSPENDED`, plus map/unmap. Here map/unmap is doing real
+/// work rather than standing in for teardown, and it is the stronger half:
+/// this tab is one child of an `AdwViewStack`, and GTK maps only the visible
+/// child — so "another tab is showing" unmaps this one, which is exactly the
+/// state the review wanted gated and needs no `visible-child-name` watching of
+/// its own.
+///
+/// The flap guard is the window's, for the same reason (a workspace switch is
+/// an edge): a resume less than one poll interval after the last gated refresh
+/// rides the next scheduled tick instead of dialling again.
+#[derive(Default)]
+struct Presentation {
+    /// Whether the tab is being presented — mapped, on an unsuspended window.
+    on: Cell<bool>,
+    /// When the gate last let a tick through, or forced one on a resume.
+    /// Wall-clock, because the timer this guards is a `glib` one.
+    last: Cell<Option<std::time::Instant>>,
 }
 
 /// The single in-flight slot's guard: releases it on drop, wherever that
@@ -696,6 +749,7 @@ struct WeakAgentsState {
     actions: Rc<RefCell<Actions>>,
     unassigned_group: glib::WeakRef<adw::PreferencesGroup>,
     unassigned_rows: Rc<RefCell<Vec<adw::ActionRow>>>,
+    presentation: Rc<Presentation>,
 }
 
 /// [`FlagRow`], weakly — see [`WeakAgentsState`].
@@ -770,6 +824,7 @@ impl AgentsState {
             in_flight: self.in_flight.clone(),
             actions: self.actions.clone(),
             unassigned_group: self.unassigned_group.downgrade(),
+            presentation: self.presentation.clone(),
             unassigned_rows: self.unassigned_rows.clone(),
         }
     }
@@ -822,6 +877,7 @@ impl WeakAgentsState {
             in_flight: self.in_flight.clone(),
             actions: self.actions.clone(),
             unassigned_group: self.unassigned_group.upgrade()?,
+            presentation: self.presentation.clone(),
             unassigned_rows: self.unassigned_rows.clone(),
         })
     }
@@ -850,12 +906,104 @@ pub(crate) fn build_page() -> (adw::BreakpointBin, glib::SourceId) {
 /// testable at all. Before #1147's review, turning it into
 /// [`glib::ControlFlow::Break`] — a tab that polls exactly once and then never
 /// again — passed the whole suite (its MEDIUM 4).
+///
+/// The tick is **gated on [`Presentation`]**: the timer keeps running (a
+/// `SourceId` the window still owns and still drops on close), but a tick that
+/// fires while the tab is not on screen asks the hive for nothing. The resume
+/// itself is what reconciles — [`on_presented`] — so switching back does not
+/// wait out an interval.
 fn start_poll(state: &AgentsState, interval: std::time::Duration) -> glib::SourceId {
     let state = state.clone();
     glib::timeout_add_local(interval, move || {
-        refresh(&state);
+        if state.presentation.on.get() {
+            state.presentation.last.set(Some(std::time::Instant::now()));
+            refresh(&state);
+        } else {
+            tracing::trace!("the Agents tab is not on screen — this tick asks the hive nothing");
+        }
         glib::ControlFlow::Continue
     })
+}
+
+/// Track whether the tab is on screen, so [`start_poll`] can park.
+///
+/// Wired on the tab's own root rather than on the window, which the tab never
+/// sees (`main.rs` builds every page before the window exists): a widget's
+/// `map`/`unmap` already carry both halves — the window being hidden, and
+/// `AdwViewStack` unmapping every child but the visible one — and `realize` is
+/// where the `GdkSurface` behind it first exists, which is the only place the
+/// `GdkToplevel` whose `state` carries `SUSPENDED` can be reached. See
+/// [`Presentation`].
+fn connect_presentation(state: &AgentsState, bin: &adw::BreakpointBin) {
+    let weak = state.downgrade();
+    bin.connect_map(move |w| {
+        if let Some(state) = weak.upgrade() {
+            on_presented(&state, presenting(w));
+        }
+    });
+    let weak = state.downgrade();
+    bin.connect_unmap(move |_| {
+        if let Some(state) = weak.upgrade() {
+            on_presented(&state, false);
+        }
+    });
+    let weak = state.downgrade();
+    bin.connect_realize(move |w| {
+        let Some(toplevel) = w
+            .native()
+            .and_then(|n| n.surface())
+            .and_downcast::<gdk::Toplevel>()
+        else {
+            tracing::debug!("no GdkToplevel over this tab — the poll cannot park on suspension");
+            return;
+        };
+        let weak = weak.clone();
+        let widget = w.downgrade();
+        toplevel.connect_state_notify(move |t| {
+            let Some(state) = weak.upgrade() else { return };
+            let on = widget
+                .upgrade()
+                .is_some_and(|w: adw::BreakpointBin| w.is_mapped())
+                && !t.state().contains(gdk::ToplevelState::SUSPENDED);
+            on_presented(&state, on);
+        });
+    });
+}
+
+/// Whether `widget` is being presented: mapped, on a toplevel the compositor
+/// has not suspended. A widget with no toplevel (nothing realized yet) is
+/// judged on its map state alone.
+fn presenting(widget: &impl IsA<gtk::Widget>) -> bool {
+    let widget = widget.as_ref();
+    widget.is_mapped()
+        && widget
+            .native()
+            .and_then(|n| n.surface())
+            .and_downcast::<gdk::Toplevel>()
+            .is_none_or(|t| !t.state().contains(gdk::ToplevelState::SUSPENDED))
+}
+
+/// Take one presentation edge: park, or resume with a reconciling poll.
+///
+/// The resume's poll is skipped when the gate let one through less than a poll
+/// interval ago — the flap guard `feed::run` carries for the same signal, so
+/// flicking between tabs (or across a workspace) costs the hive nothing beyond
+/// its ordinary cadence.
+fn on_presented(state: &AgentsState, on: bool) {
+    if state.presentation.on.replace(on) || !on {
+        return;
+    }
+    if state
+        .presentation
+        .last
+        .get()
+        .is_some_and(|t| t.elapsed() < state.cfg.poll_interval())
+    {
+        tracing::debug!("the Agents tab came back inside one poll interval — the tick reconciles");
+        return;
+    }
+    state.presentation.last.set(Some(std::time::Instant::now()));
+    refresh(state);
 }
 
 /// The widget tree and its state, with no socket traffic and no timer.
@@ -981,10 +1129,12 @@ fn build_tab(cfg: AgentsConfig) -> (adw::BreakpointBin, AgentsState) {
         actions: Rc::new(RefCell::new(Actions::default())),
         unassigned_group,
         unassigned_rows: Rc::new(RefCell::new(Vec::new())),
+        presentation: Rc::new(Presentation::default()),
     };
 
     connect_selection(&state);
     connect_links(&state);
+    connect_presentation(&state, &bin);
     // Seed the sidebar and the pane from the `Connecting` snapshot, so the tab
     // mounts with a state rather than as a blank pane beside a blank list.
     apply(&state);
@@ -2194,7 +2344,8 @@ mod tests {
     use super::{
         ABSENT, DetailModel, FACT_LABELS, Route, RowModel, agent_page_is_live, detail_of, flags_of,
         flags_of_labels, hive_of, ordered, placeholder, route_for, rows_of, same_agent_set,
-        status_set, systemd_run_argv, unassigned_approvals, user_manager_unreachable,
+        status_set, systemd_run_argv, unassigned_approvals, unassigned_destination, unassigned_subtitle,
+        user_manager_unreachable,
     };
     use hytte_plugin_agents::config::{AgentsConfig, Display};
     use hytte_plugin_agents::hive::client::HiveError;
@@ -2956,6 +3107,52 @@ mod tests {
         let queue = vec![approval(1, "stray", ApprovalStatus::Pending)];
         let here = unassigned_approvals(queue, &["stray".to_owned()]);
         assert!(here.is_empty(), "{here:?}");
+    }
+
+    /// **Each row is sent somewhere that can actually exist** (this round's
+    /// review, LOW 5), and the destination is the row's **first** line (LOW
+    /// 4) so a long description cannot ellipsize away the one sentence the
+    /// row is for.
+    ///
+    /// The middle case is the one the review caught: `hive_of` drops any
+    /// roster row whose name fails `AgentName::parse`, so an approval naming
+    /// `Bad Name` lands here *and* the sidebar will never grow a card for it —
+    /// "answer from that agent's own sidebar card if it returns" was advice
+    /// that could not be taken.
+    ///
+    /// Mutation (verified red): drop the `AgentName::parse` arm and the
+    /// illegal name is told to wait for a card again; put `detail_line` back
+    /// in front and the ordering assertion reds.
+    #[test]
+    fn an_unrenderable_agent_name_is_sent_to_the_dashboard_not_to_a_card() {
+        assert_eq!(
+            unassigned_destination(""),
+            "no agent named on this request — answer from the hive's dashboard"
+        );
+        let illegal = unassigned_destination("Bad Name");
+        assert!(
+            illegal.contains("dashboard") && !illegal.contains("card"),
+            "a name this build will not render has no card to wait for: {illegal}"
+        );
+        let stale = unassigned_destination("ghost");
+        assert!(
+            stale.contains("card") && stale.contains("dashboard"),
+            "a legal name that is merely absent keeps both routes: {stale}"
+        );
+
+        let row = Approval {
+            description: Some("a very long description the manager wrote".to_owned()),
+            ..approval(1, "ghost", ApprovalStatus::Pending)
+        };
+        let subtitle = unassigned_subtitle(&row);
+        let (first, rest) = subtitle
+            .split_once('\n')
+            .expect("the subtitle is two lines");
+        assert_eq!(first, stale, "the destination is the first line");
+        assert!(
+            rest.contains("a very long description the manager wrote"),
+            "the manager's own detail line follows it: {rest}"
+        );
     }
 }
 
@@ -4145,6 +4342,93 @@ mod gtk_tests {
         dismiss(&window);
     }
 
+    /// **A tab nobody is looking at asks the hive nothing**, and coming back
+    /// reconciles at once (this round's review, MEDIUM 3).
+    ///
+    /// `start_poll` used to dial every `poll_seconds` for the whole life of
+    /// the control-center whatever was on screen, and #1149 N1 doubled what
+    /// each of those ticks costs by adding `Pending` to it. The gate is the
+    /// companion window's — `GdkToplevelState::SUSPENDED` plus map/unmap — and
+    /// on a tab the map half is the load-bearing one: `AdwViewStack` maps only
+    /// its visible child, so "another tab is showing" is an unmap. That is the
+    /// state driven here, with a plain `GtkStack` standing in for the view
+    /// stack, because it is the case the review is actually about and it needs
+    /// no compositor. (The `SUSPENDED` half has no setter and no compositor in
+    /// CI — `docs/live-verify.md` carries it.)
+    ///
+    /// The absence is measured **after** letting anything already in flight
+    /// land, then over 25 intervals' worth of main loop, so it is a parked
+    /// timer rather than a slow one.
+    ///
+    /// Mutation (run, verified red): drop the `presentation.on` check in
+    /// [`start_poll`] and the parked assertion reds with a double-digit
+    /// request count.
+    #[gtk::test]
+    fn the_poll_parks_while_another_tab_is_showing() {
+        let hive = scripted(|_, _| Some((Duration::ZERO, roster_line(&["argus"]))));
+        let (bin, state) = build_tab(hive.cfg());
+
+        let stack = gtk::Stack::new();
+        stack.add_named(&bin, Some("agents"));
+        stack.add_named(&gtk::Label::new(Some("another tab")), Some("other"));
+        let window = gtk::Window::new();
+        window.set_child(Some(&stack));
+        window.set_default_size(900, 400);
+        window.present();
+        pump();
+
+        let poll = start_poll(&state, Duration::from_millis(20));
+        pump_until(|| rosters_asked(&hive) >= 2, 10);
+        assert!(
+            state.presentation.on.get(),
+            "the visible child of the stack must read as presented"
+        );
+
+        stack.set_visible_child_name("other");
+        pump();
+        assert!(
+            !state.presentation.on.get(),
+            "another tab showing must park the poll"
+        );
+        // Let a round trip issued just before the switch land, so the count
+        // below is a baseline and not a race.
+        pump_for(Duration::from_millis(100));
+        let parked_at = rosters_asked(&hive);
+        pump_for(Duration::from_millis(500));
+        assert_eq!(
+            rosters_asked(&hive),
+            parked_at,
+            "a parked tab must ask the hive nothing over 25 intervals: {:?}",
+            hive.seen()
+        );
+
+        // …and coming back reconciles immediately rather than waiting out an
+        // interval — the tab's data must not be one cadence stale the moment
+        // it is looked at.
+        stack.set_visible_child_name("agents");
+        pump_until(|| rosters_asked(&hive) > parked_at, 10);
+        assert!(
+            rosters_asked(&hive) > parked_at,
+            "the tab came back and never re-asked: {:?}",
+            hive.seen()
+        );
+        poll.remove();
+        dismiss(&window);
+    }
+
+    /// Drive the main loop for `how_long`, dispatching whatever comes up.
+    ///
+    /// For the absence assertions: `pump_until` stops at its predicate, and
+    /// "nothing happened" needs the opposite — a bounded stretch of real main
+    /// loop with real timer ticks in it.
+    fn pump_for(how_long: Duration) {
+        let deadline = Instant::now() + how_long;
+        while Instant::now() < deadline {
+            pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// A round trip that **fails** still releases the in-flight slot — the
     /// production code drops it unconditionally, but a one-slot guard whose
     /// release is conditional is a permanent freeze, and nothing else in the
@@ -4253,7 +4537,11 @@ mod gtk_tests {
     ///
     /// Mutation (run, verified red): mount `unassigned_group` straight into
     /// `sidebar_box` again, with no `ScrolledWindow` — the containment
-    /// assertion reds with the group's bottom edge ~2.5× the window height.
+    /// assertion reds, and in the sharpest possible way: twelve rows' natural
+    /// height cannot be fitted into the sidebar at all, so GTK leaves the
+    /// group **without a usable allocation in the window**, which is why that
+    /// assertion has to fail loudly on a missing bounds rather than treat it
+    /// as "nothing to check".
     #[gtk::test]
     fn a_full_unassigned_queue_scrolls_instead_of_leaving_the_window() {
         let (bin, state) = build_tab(cfg());
@@ -4287,9 +4575,13 @@ mod gtk_tests {
             .unassigned_group
             .ancestor(gtk::ScrolledWindow::static_type())
             .unwrap_or_else(|| state.unassigned_group.clone().upcast());
-        let bounds = container
-            .compute_bounds(&window)
-            .expect("the group is mounted in the window");
+        let bounds = container.compute_bounds(&window).unwrap_or_else(|| {
+            panic!(
+                "the Unassigned group has no bounds in the window at all — twelve rows could not \
+                 be allocated inside it (the group measures {} px tall)",
+                container.height()
+            )
+        });
         // The allocation is in pixels and fits an f32 exactly at any size a
         // window has; the cast is the only way to compare it with a
         // `graphene::Rect`.

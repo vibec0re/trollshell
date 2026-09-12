@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 
 use hytte::services::pipewire;
 use hytte_plugin_proto::{
-    AudioSpectrum, Capability, ClockState, Effect, HostMsg, LogLevel, Manifest, Mount, NowPlaying,
-    PluginMsg, ProtoError, StateKey, StateSnapshot, UpcomingEvent, VOCAB, read_frame, write_frame,
+    AudioSpectrum, Capability, ClockState, Effect, HostMsg, LogLevel, MAX_BODY_TEXT_BYTES,
+    MAX_DISPLAY_TEXT_BYTES, Manifest, Mount, NowPlaying, PluginMsg, ProtoError, StateKey,
+    StateSnapshot, UpcomingEvent, VOCAB, read_frame, write_frame,
 };
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
@@ -274,6 +275,116 @@ pub(super) fn capped_hidden_on(
         return (Vec::new(), violation);
     }
     (hidden_on, None)
+}
+
+/// Per-connection latch for the effect-level payload caps (#1165), keyed by
+/// effect **kind**.
+///
+/// `std::mem::Discriminant<Effect>` rather than the effect itself: an effect
+/// carries the very strings being capped, so keying on the value would make the
+/// latch a per-payload memo — unbounded, and useless (a plugin that raises a
+/// counter in an over-cap OSD title would get a fresh line every frame). The
+/// kind is what an author fixes, so the kind is what is latched.
+///
+/// Per connection, like [`EffectRateLimiter`]'s own scope and
+/// `capped_hidden_on`'s `violated` set: a reconnect re-arms it, so the same
+/// mistake is named once per connection rather than once per frame or once for
+/// the life of the shell.
+pub(super) type EffectWarnLatch = HashSet<std::mem::Discriminant<Effect>>;
+
+/// Cap the human-facing strings a plugin puts in front of the user through an
+/// effect (#1165) — the non-node half of the display-text cap that
+/// `wire_map::map_node` applies to a render tree.
+///
+/// The three effects here are the ones whose payload becomes a widget on the
+/// **GTK main thread** without passing through `wire_map` at all:
+/// [`Effect::RaiseOsd`] sets a `gtk::Label` in the OSD overlay,
+/// [`Effect::Notify`] goes through the shell's own notification daemon, and
+/// [`Effect::RequestConsent`] renders four fields into the consent card. Each is
+/// bounded only by `MAX_FRAME_LEN` on the wire, so an 8 MiB
+/// `RaiseOsd { title }` is a legal frame that stalls the main loop exactly as an
+/// 8 MiB `Node::Label` does.
+///
+/// Single-line fields (a title, a summary, an icon name, the consent card's
+/// agent/datasource/scope) take
+/// [`MAX_DISPLAY_TEXT_BYTES`](hytte_plugin_proto::MAX_DISPLAY_TEXT_BYTES);
+/// bodies and the consent detail take
+/// [`MAX_BODY_TEXT_BYTES`](hytte_plugin_proto::MAX_BODY_TEXT_BYTES). **Truncate,
+/// never refuse**: an OSD nudge whose title is cut still tells the user
+/// something, and dropping the effect would make a plugin bug look like a dead
+/// click.
+///
+/// Exhaustive over the effect vocabulary, like
+/// [`Effect::required_capability`](hytte_plugin_proto::Effect::required_capability)
+/// and `effects::effect_kind`, so an effect variant that grows a human-facing
+/// string is a compile error here rather than a silent hole. The no-op arms say
+/// why they are no-ops.
+///
+/// Pure, like [`capped_hidden_on`]: it returns the capped effect plus at most
+/// one message for the caller to warn with, and `warned` is the caller's
+/// per-connection latch.
+pub(super) fn capped_effect_strings(
+    mut effect: Effect,
+    warned: &mut EffectWarnLatch,
+) -> (Effect, Option<String>) {
+    let mut longest = 0usize;
+    let mut cut = |s: &mut String, max: usize| {
+        if s.len() > max {
+            longest = longest.max(s.len());
+            *s = super::effects::truncate_on_char_boundary(s, max);
+        }
+    };
+    match &mut effect {
+        Effect::RaiseOsd { title, body, icon } => {
+            cut(title, MAX_DISPLAY_TEXT_BYTES);
+            cut(body, MAX_BODY_TEXT_BYTES);
+            if let Some(icon) = icon.as_mut() {
+                cut(icon, MAX_DISPLAY_TEXT_BYTES);
+            }
+        }
+        Effect::Notify { summary, body } => {
+            cut(summary, MAX_DISPLAY_TEXT_BYTES);
+            cut(body, MAX_BODY_TEXT_BYTES);
+        }
+        Effect::RequestConsent {
+            agent,
+            datasource,
+            scope,
+            detail,
+            ..
+        } => {
+            cut(agent, MAX_DISPLAY_TEXT_BYTES);
+            cut(datasource, MAX_DISPLAY_TEXT_BYTES);
+            cut(scope, MAX_DISPLAY_TEXT_BYTES);
+            cut(detail, MAX_BODY_TEXT_BYTES);
+        }
+        // No human-facing strings at all: these carry enum payloads the host
+        // maps onto its own actions.
+        Effect::OpenPage(_) | Effect::Niri(_) | Effect::Media(_) | Effect::Audio(_) => {}
+        // `argv` is a program invocation, not a display string: nothing renders
+        // it, and `execve`'s own `ARG_MAX` is the bound that actually applies.
+        Effect::RunCommand { .. } => {}
+        // Capped in the broker by `MAX_URI_BYTES` (#1045), which refuses rather
+        // than truncates — a cut URI is a different destination, so truncation
+        // would be the wrong degradation here.
+        Effect::OpenUri { .. } => {}
+        // The datasource legs carry opaque JSON, not display strings; their
+        // payload bound is `MAX_DATASOURCE_PAYLOAD_BYTES` and it refuses
+        // rather than cuts, for the same reason as a URI (#1165 item 7).
+        Effect::DatasourceQuery { .. } | Effect::DatasourceResult { .. } => {}
+    }
+    let message = (longest > 0
+        && warned.insert(std::mem::discriminant(&effect)))
+    .then(|| {
+        format!(
+            "plugin effect carries a display string {longest} B long, over the host's \
+             {MAX_DISPLAY_TEXT_BYTES} B line / {MAX_BODY_TEXT_BYTES} B body cap; the prefix is \
+             shown. Every one of these becomes a pango layout on the GTK main thread, which \
+             shapes the whole run before it can measure it (further occurrences of this effect \
+             kind are silenced for the rest of this connection)"
+        )
+    });
+    (effect, message)
 }
 
 /// Whether a non-blocking outbound push should keep its producer task running.
@@ -805,6 +916,10 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // long-lived misconfiguration is named once per connection, not once per
     // frame.
     let mut hidden_on_warned = HashSet::new();
+    // #1165: the per-connection latch for `capped_effect_strings`, on exactly
+    // the same terms as `hidden_on_warned` above — one line per effect kind per
+    // connection, not one per frame.
+    let mut effect_text_warned = EffectWarnLatch::new();
     let reader = async {
         loop {
             match read_frame::<PluginMsg, _>(&mut rd).await {
@@ -824,6 +939,21 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                         &plugin_id,
                         enforce_capabilities(&capabilities, &plugin_id, effects),
                     );
+                    // #1165: cap the human-facing strings LAST — after the two
+                    // host policies have decided which effects run at all, so a
+                    // dropped effect costs no truncation work, and before the
+                    // broker, which is the GTK main thread.
+                    let kept = kept
+                        .into_iter()
+                        .map(|effect| {
+                            let (effect, message) =
+                                capped_effect_strings(effect, &mut effect_text_warned);
+                            if let Some(message) = message {
+                                tracing::warn!(plugin = %plugin_id, "{message}");
+                            }
+                            effect
+                        })
+                        .collect::<Vec<_>>();
                     // Runtime mirror (#423): this frame proves the plugin is
                     // rendering; the guards' drops feed its violation count.
                     let dropped =

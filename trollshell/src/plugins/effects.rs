@@ -1712,7 +1712,11 @@ fn launch_detached(
 }
 
 /// Truncate `s` to at most `max` bytes without splitting a UTF-8 code point.
-fn truncate_on_char_boundary(s: &str, max: usize) -> String {
+///
+/// `pub(super)` since #1165: `wire_map` truncates plugin display strings with
+/// the same helper, so the node seam and the effect seam cut on one
+/// implementation rather than two that could disagree about what a boundary is.
+pub(super) fn truncate_on_char_boundary(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_owned();
     }

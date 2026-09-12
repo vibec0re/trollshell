@@ -1238,6 +1238,68 @@ pub const MAX_SHADER_DATA_BYTES: usize = 4 * 1024 * 1024;
 /// no [`VOCAB`](crate::VOCAB) or `PROTO_VERSION` bump.
 pub const MAX_SHADER_DATA_EXTENT: u32 = 4096;
 
+// ── display-string caps (#1165) ──────────────────────────────────────────────
+//
+// The tree-shape caps below bound how *many* nodes a frame may carry. These two
+// bound how much **text** one of them may carry, which is a different hazard on
+// a different thread: every string here becomes a `pango` layout on the **GTK
+// main thread**, and pango shapes the whole run before it can measure it. A
+// single 8 MiB `Node::Label` is inside `MAX_FRAME_LEN`, inside every tree-shape
+// cap, and stalls the main loop — the bar, the drawer, the notification daemon
+// and the effect drain with it.
+//
+// Like the tree-shape caps the proto cannot enforce these (it decodes a frame,
+// it never renders one); they are stated here so a plugin author reads them in
+// the same crate as everything else on the wire, and the host enforces them
+// where the string reaches a widget (`trollshell/src/plugins/wire_map.rs`) or an
+// overlay (`trollshell/src/plugins/session.rs`).
+
+/// The longest **single-line** display string the host will render from a
+/// plugin, in bytes — a label, an icon name, a tooltip, an entry's text or
+/// placeholder, and the human-facing strings of
+/// [`Effect::RaiseOsd`](crate::Effect::RaiseOsd) /
+/// [`Effect::Notify`](crate::Effect::Notify) /
+/// [`Effect::RequestConsent`](crate::Effect::RequestConsent).
+///
+/// **4 KiB.** A chip label is a handful of characters and the longest thing in
+/// this class that is still a *line* — a tooltip — is a sentence or two; 4096
+/// bytes is three orders of magnitude above that and still small enough that
+/// shaping it costs nothing measurable. It is deliberately the same number as
+/// the host's `MAX_URI_BYTES`, which bounds the other plugin-supplied string
+/// that ends up in front of a human.
+///
+/// **Past the cap the host truncates on a char boundary and renders the
+/// prefix**, with one warning per plugin tree — the `wire_map` posture that the
+/// node/depth caps and the malformed-`Pixels` seam already take (degrade to
+/// something that still renders and say so, never blank the plugin). Truncation
+/// is not silent data loss the plugin cannot see: the journal line names the
+/// length that arrived and the cap it was cut to.
+///
+/// Enforced **host-side only**, unlike the shader caps: the SDK builds display
+/// strings from a plugin's own formatting, so a cap in the builder would turn a
+/// long line into a construction-time refusal rather than a rendered prefix. The
+/// host is the layer that owns the GTK thread, so the host is the layer that
+/// defends it.
+pub const MAX_DISPLAY_TEXT_BYTES: usize = 4 * 1024;
+
+/// The longest **body** string the host will render from a plugin, in bytes —
+/// [`Node::Text`]'s wrapping paragraph body and the multi-line detail lines of
+/// [`Effect::RaiseOsd`](crate::Effect::RaiseOsd) /
+/// [`Effect::Notify`](crate::Effect::Notify) /
+/// [`Effect::RequestConsent`](crate::Effect::RequestConsent).
+///
+/// **16 KiB**, four times [`MAX_DISPLAY_TEXT_BYTES`], and kept a distinct
+/// constant because the two bound genuinely different things: a label is a line
+/// and a [`Node::Text`] is a paragraph — a log excerpt, a commit message, a
+/// model's answer — which legitimately runs to pages. 16 KiB is ~4000 words,
+/// past anything a sidebar card shows and equal to
+/// [`MAX_SHADER_SOURCE_BYTES`], this vocabulary's other "a large but finite
+/// blob of text" number.
+///
+/// Same degradation as [`MAX_DISPLAY_TEXT_BYTES`]: truncate on a char boundary,
+/// one warning per plugin tree, never a dropped node or a dropped frame.
+pub const MAX_BODY_TEXT_BYTES: usize = 16 * 1024;
+
 // ── tree-shape caps (#901) ───────────────────────────────────────────────────
 //
 // The caps in [`preem`](crate::preem) bound one widget's *geometry*, and the

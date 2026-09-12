@@ -4,12 +4,16 @@
 //! reconciler's `hytte_ui` types (and back for events). Each mapping is written
 //! exhaustively so adding a variant to either side is a compile error here.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use hytte::ui::{Dir as UiDir, EventKind as UiEventKind, Node as UiNode};
-use hytte_plugin_proto::wire::{self, MAX_NODES_PER_TREE, MAX_TREE_DEPTH};
+use hytte_plugin_proto::wire::{
+    self, MAX_BODY_TEXT_BYTES, MAX_DISPLAY_TEXT_BYTES, MAX_NODES_PER_TREE, MAX_TREE_DEPTH,
+};
 
+use super::effects::truncate_on_char_boundary;
 use super::preem_render::{self, Scope, Warned};
 use super::shader_map::{self, Grants, ShaderNode};
 
@@ -37,6 +41,16 @@ struct Walk<'a> {
     /// `over_budget` because they are different mistakes with different fixes,
     /// and a tree can be both.
     over_depth: Cell<bool>,
+    /// Whether any display string was cut to
+    /// [`MAX_DISPLAY_TEXT_BYTES`]/[`MAX_BODY_TEXT_BYTES`] (#1165). A third
+    /// mistake with a third fix — *send less text* — so it gets its own flag
+    /// and its own once-per-tree line, on the `over_budget`/`over_depth`
+    /// pattern. Read once, after the walk; the longest string seen is carried
+    /// with it so the line can name a real length rather than "over the cap".
+    over_text: Cell<bool>,
+    /// The longest over-cap string this pass met, in bytes — what the warning
+    /// reports. `0` while nothing has been cut.
+    longest_text: Cell<usize>,
 }
 
 /// The depth accounting for one live [`map_node`] frame: taken on entry,
@@ -72,6 +86,28 @@ impl Walk<'_> {
         self.budget.set(left - 1);
         self.depth.set(depth + 1);
         Some(Level(&self.depth))
+    }
+
+    /// One plugin-supplied display string, cut to `max` bytes on a char
+    /// boundary (#1165) and marked on the pass if it was actually cut.
+    ///
+    /// The under-cap path is exactly the `text.clone()` every one of these arms
+    /// already did — [`truncate_on_char_boundary`] returns `s.to_owned()`
+    /// unchanged when it fits — so the common case pays nothing new for the
+    /// guard. That matters: this runs once per string per node per mapping
+    /// pass, and a mapping pass runs per monitor per frame.
+    fn text(&self, s: &str, max: usize) -> String {
+        if s.len() > max {
+            self.over_text.set(true);
+            self.longest_text.set(self.longest_text.get().max(s.len()));
+        }
+        truncate_on_char_boundary(s, max)
+    }
+
+    /// [`Walk::text`] over an optional string — the shape every `tooltip` field
+    /// has.
+    fn opt_text(&self, s: Option<&String>, max: usize) -> Option<String> {
+        s.map(|s| self.text(s, max))
     }
 }
 
@@ -120,6 +156,22 @@ impl Walk<'_> {
 /// life of the shell, on the same latch as the preem keying diagnostics
 /// (`preem_render`'s `WARNED`), since a tree over a cap is over it on every
 /// frame.
+///
+/// # The display-string cap (#1165)
+///
+/// The third budget the walk carries, and the only one that is not about the
+/// tree's shape: every `text`/`name`/`placeholder`/`tooltip` a plugin sends is
+/// cut to [`MAX_DISPLAY_TEXT_BYTES`] (or [`MAX_BODY_TEXT_BYTES`] for a
+/// [`wire::Node::Text`] paragraph) on a char boundary, with one warning per
+/// plugin tree ([`WARNED_TEXT_CAP`]). The hazard is not memory, it is the **GTK
+/// main thread**: these strings become pango layouts, pango shapes a run whole
+/// before it measures it, and an 8 MiB label inside the 16 MiB frame cap stalls
+/// the bar, the drawer, the notification daemon and the effect drain together.
+/// Same degradation as the two caps above, for the same reason.
+///
+/// `classes` is deliberately **not** capped here: a CSS class is not a layout,
+/// and bounding that list is the reconciler's diffing to answer for, not this
+/// walk's.
 pub(super) fn to_ui_node(scope: &Scope, grants: Grants, node: &wire::Node) -> UiNode {
     preem_render::begin_pass(scope);
     // The shader arm has its own per-node state cache (#968 review M1) with the
@@ -133,6 +185,8 @@ pub(super) fn to_ui_node(scope: &Scope, grants: Grants, node: &wire::Node) -> Ui
         depth: Cell::new(0),
         over_budget: Cell::new(false),
         over_depth: Cell::new(false),
+        over_text: Cell::new(false),
+        longest_text: Cell::new(0),
     };
     // `None` if the root itself was refused, which takes a chain of *mandatory*
     // single-child containers (`Button`/`Revealer`/`Expander` header) past one
@@ -167,7 +221,51 @@ pub(super) fn to_ui_node(scope: &Scope, grants: Grants, node: &wire::Node) -> Ui
              in this tree are silenced for the rest of this shell run)",
         );
     }
+    if walk.over_text.get() && warn_once_text_cap(scope) {
+        tracing::warn!(
+            plugin = scope.plugin_id(),
+            tree = ?scope.role(),
+            bytes = walk.longest_text.get(),
+            line_cap = MAX_DISPLAY_TEXT_BYTES,
+            body_cap = MAX_BODY_TEXT_BYTES,
+            "plugin render tree carries a display string over the host's text cap; the prefix \
+             is rendered and the rest is dropped. Every one of these becomes a pango layout on \
+             the GTK main thread, which shapes the whole run before it can measure it — an \
+             unbounded one stalls the shell, not just this widget (further occurrences in this \
+             tree are silenced for the rest of this shell run)",
+        );
+    }
     mapped
+}
+
+thread_local! {
+    /// Per-scope latch for the #1165 display-text cap, kept here rather than as
+    /// a ninth [`Warned`] slot because that table is out of bits (#981;
+    /// `shader_map::WARNED_GRID_TOO_LARGE` is the existing precedent for a
+    /// diagnostic that needs its own latch for the same reason).
+    ///
+    /// One shot per scope, **never cleared** — a plugin that renders an
+    /// over-cap string renders it on every frame, at the SDK's ~30 Hz view
+    /// rate, on every monitor, so an unlatched line is a journal flood rather
+    /// than a diagnostic. The same reasoning `preem_render::WARNED` documents
+    /// for the node/depth caps.
+    static WARNED_TEXT_CAP: RefCell<HashSet<Scope>> = RefCell::new(HashSet::new());
+}
+
+/// Claim the display-text-cap latch for `scope`: `true` the first time it is
+/// asked for, `false` for the rest of the shell's run. See [`WARNED_TEXT_CAP`].
+///
+/// Borrow-only on the hot path — `contains` first, and pay for the
+/// `scope.clone()` (a `String` allocation) only on the insert that actually
+/// latches something, exactly as `shader_map::warn_once_grid_too_large` does.
+fn warn_once_text_cap(scope: &Scope) -> bool {
+    WARNED_TEXT_CAP.with_borrow_mut(|warned| {
+        if warned.contains(scope) {
+            return false;
+        }
+        warned.insert(scope.clone());
+        true
+    })
 }
 
 /// Map a wire [`wire::Node`] onto the reconciler's `hytte_ui::Node`. The two
@@ -206,7 +304,7 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
                 .iter()
                 .filter_map(|child| map_node(walk, child))
                 .collect(),
-            tooltip: tooltip.clone(),
+            tooltip: walk.opt_text(tooltip.as_ref(), MAX_DISPLAY_TEXT_BYTES),
         },
         wire::Node::Row {
             id,
@@ -225,7 +323,7 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
                 .iter()
                 .filter_map(|child| map_node(walk, child))
                 .collect(),
-            tooltip: tooltip.clone(),
+            tooltip: walk.opt_text(tooltip.as_ref(), MAX_DISPLAY_TEXT_BYTES),
         },
         wire::Node::ListBox {
             id,
@@ -259,9 +357,13 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             tooltip,
         } => UiNode::Label {
             id: id.clone(),
-            text: text.clone(),
+            // #1165: the crasher seam. `gtk::Label::new(Some(text))` shapes the
+            // whole string on the GTK main thread before it can measure it, so
+            // an 8 MiB label — well inside the 16 MiB frame cap — is a
+            // one-frame freeze of the bar, the drawer and the effect drain.
+            text: walk.text(text, MAX_DISPLAY_TEXT_BYTES),
             classes: classes.clone(),
-            tooltip: tooltip.clone(),
+            tooltip: walk.opt_text(tooltip.as_ref(), MAX_DISPLAY_TEXT_BYTES),
         },
         wire::Node::Text {
             id,
@@ -272,7 +374,12 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             tooltip,
         } => UiNode::Text {
             id: id.clone(),
-            text: text.clone(),
+            // The **body** cap, not the line one (#1165): a `Text` is a
+            // wrapping paragraph — a log excerpt, a model's answer — so it gets
+            // the four-times-larger budget. Wrapping and ellipsizing do not
+            // make the cap redundant: pango still shapes every byte handed to
+            // it before any of that applies.
+            text: walk.text(text, MAX_BODY_TEXT_BYTES),
             max_width_chars: *max_width_chars,
             ellipsize: *ellipsize,
             classes: classes.clone(),
@@ -281,7 +388,7 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             // `hytte_ui`'s `node_tooltip` from the same node it renders. Doing
             // it here would put the derived string in the mapped tree, where
             // the shell's own producers would have to repeat it.
-            tooltip: tooltip.clone(),
+            tooltip: walk.opt_text(tooltip.as_ref(), MAX_DISPLAY_TEXT_BYTES),
         },
         wire::Node::Icon {
             id,
@@ -290,9 +397,13 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             tooltip,
         } => UiNode::Icon {
             id: id.clone(),
-            name: name.clone(),
+            // An icon *name* is a theme lookup key, not a layout — but it is
+            // still an unbounded plugin string that reaches GTK and the
+            // journal on a miss, and there is no icon in any theme whose name
+            // needs four kilobytes (#1165).
+            name: walk.text(name, MAX_DISPLAY_TEXT_BYTES),
             classes: classes.clone(),
-            tooltip: tooltip.clone(),
+            tooltip: walk.opt_text(tooltip.as_ref(), MAX_DISPLAY_TEXT_BYTES),
         },
         wire::Node::Pixels {
             id,
@@ -473,7 +584,7 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
                 .collect(),
             expanded: *expanded,
             classes: classes.clone(),
-            tooltip: tooltip.clone(),
+            tooltip: walk.opt_text(tooltip.as_ref(), MAX_DISPLAY_TEXT_BYTES),
         },
         wire::Node::Entry {
             id,
@@ -482,8 +593,12 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             classes,
         } => UiNode::Entry {
             id: id.clone(),
-            text: text.clone(),
-            placeholder: placeholder.clone(),
+            // A `GtkEntry` is a single-line editable, so both of its strings
+            // take the line cap (#1165). The truncation is visible to the
+            // plugin the moment the user submits: the `Submitted` event carries
+            // what the entry holds, which is the prefix.
+            text: walk.text(text, MAX_DISPLAY_TEXT_BYTES),
+            placeholder: walk.text(placeholder, MAX_DISPLAY_TEXT_BYTES),
             classes: classes.clone(),
         },
         wire::Node::Preem {
@@ -555,6 +670,13 @@ fn map_node(walk: &Walk, node: &wire::Node) -> Option<UiNode> {
             // the field's own doc had no way to learn it did nothing. A shader
             // chip is a picture with nowhere else to say what it is, so it is
             // exactly the kind #957 gave the other three one for.
+            //
+            // Capped here rather than inside `shader_map` (#1165): that module
+            // owns the shader's *own* caps — source bytes, data bytes, grid
+            // extent — and the tooltip is an ordinary display string that
+            // happens to ride this variant, so it is bounded by the same rule
+            // as every other tooltip in this walk.
+            let tooltip = walk.opt_text(tooltip.as_ref(), MAX_DISPLAY_TEXT_BYTES);
             shader_map::map_shader(
                 walk.scope,
                 walk.grants,

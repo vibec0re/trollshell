@@ -88,6 +88,26 @@ range above is a floor, not a ceiling.
       engaged, and disappears the instant it's switched off. Click it → opens
       the Settings drawer on the Keep-awake toggle. Hover → tooltip shows
       "Also awake: …" when another app (mpv/Firefox) also holds an inhibitor.
+- [ ] **(#1171)** Dead-caller `Inhibit` cleanup survives a **bus reconnect**.
+      Everything else about this mechanism is covered by tests — the event
+      path, the startup reconcile, and the periodic reconcile all run against
+      a real `dbus-daemon` or hermetically in
+      `crates/hytte-services/src/screensaver.rs` — but the one thing no test
+      can reach is `hytte_bus::signals`' _internal_ re-subscribe: it is not
+      observable from outside that crate (the epoch lives on
+      `SharedConnection`, which `hytte-bus` does not hand out), so the
+      reconnect path is verified by watching the sweep clean up after one.
+      In a Niri session: `systemd-inhibit --list` / the Power drawer to see
+      the current inhibitors, start `mpv` on a video so it takes an
+      `org.freedesktop.ScreenSaver` `Inhibit` (confirm the row appears), then
+      restart the session bus broker under the shell
+      (`systemctl --user restart dbus-broker.service`, or SIGKILL the
+      `dbus-daemon` if the session runs one) and `pkill -9 mpv` while the
+      shell is reconnecting. Expect the mpv row to disappear from the Power
+      drawer **within a minute** (`RECONCILE_INTERVAL`), with
+      `screensaver: owner absent at reconcile, dropping Inhibit cookie` at
+      `RUST_LOG=hytte_services=debug`. Before this change it stayed until the
+      shell restarted.
 
 ## Plugin host & protocol
 
@@ -2549,6 +2569,18 @@ switch` repoints atomically to a new store path every rebuild; the running
 - [ ] **(#552)** With `TROLLSHELL_WALLPAPER_RELOAD_CMD` set (a custom backend
       like `awww`), the **Clear wallpaper** button should be **disabled** with
       an explanatory tooltip, rather than silently no-op'ing or erroring.
+- [ ] **(#1171)** Dark-mode switch reads the session, not the fallback. On a
+      **light** session (`gsettings get org.gnome.desktop.interface
+color-scheme` → `'prefer-light'`), open the Settings drawer: the "Dark
+      mode" switch is briefly insensitive, then settles **off**. It used to
+      read on, permanently, on any light session — a one-shot read at page
+      build that could only ever see the pre-seed fallback, cached by
+      `modal::ensure_page` for the life of the shell. Toggling it still fans
+      out (GTK apps re-theme; `~/.config/gtk-{3,4}.0/settings.ini` and
+      `qt[56]ct.conf` updated; the `theme-changed` hook runs) and the switch
+      does not bounce back. With `gsettings` removed from `PATH`, a toggle
+      reverts the switch to what the session actually has and logs
+      `theme: color-scheme write failed` exactly once.
 
 ## Notifications
 

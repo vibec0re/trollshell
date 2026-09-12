@@ -60,7 +60,7 @@ use futures_signals::signal::{Mutable, Signal, SignalExt};
 use futures_util::StreamExt;
 use hytte_bus::FdLease;
 use hytte_reactive::{Service, registry, runtime, shared, spawn_supervised};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use zbus::message::Header;
@@ -264,6 +264,33 @@ impl Service for ScreenSaverService {
             owners: owners.clone(),
         };
 
+        // Drop a D-Bus-registered Inhibit cookie the moment its caller's
+        // unique bus name vanishes without an `UnInhibit` (#1171) — reuses
+        // `hytte_bus::signals`, the same `NameOwnerChanged` subscription
+        // primitive `mpris`/`tray` already watch their own peers with,
+        // rather than adding a bespoke second watcher. Cloned here (rather
+        // than moving `state`/`inhibitors`/`owners` themselves) so those
+        // bindings are still available below for `ScreenSaverHandles`.
+        //
+        // **Before `own_name`, deliberately** (#1192 review, MEDIUM-3):
+        // owning the name is what makes `Inhibit` reachable, so a cookie
+        // taken before this watcher exists could be orphaned with nobody
+        // listening for its owner's departure. Both `.start()`s spawn rather
+        // than await, so this ordering narrows the window without closing
+        // it — `run_owner_watch`'s startup + periodic reconcile is what
+        // bounds the remainder.
+        let watch_state = state.clone();
+        let watch_inhibitors = inhibitors.clone();
+        let watch_owners = owners.clone();
+        spawn_supervised("screensaver-owner-watch", move || {
+            let state = watch_state.clone();
+            let inhibitors = watch_inhibitors.clone();
+            let owners = watch_owners.clone();
+            async move {
+                watch_owner_changes(&state, &inhibitors, &owners).await;
+            }
+        });
+
         // Own the well-known name on session bus, mount at both paths.
         let ownership =
             hytte_bus::own_name(hytte_bus::BusKind::Session, "org.freedesktop.ScreenSaver")
@@ -290,25 +317,6 @@ impl Service for ScreenSaverService {
         {
             acquire_manual(shared);
         }
-
-        // Drop a D-Bus-registered Inhibit cookie the moment its caller's
-        // unique bus name vanishes without an `UnInhibit` (#1171) — reuses
-        // `hytte_bus::signals`, the same `NameOwnerChanged` subscription
-        // primitive `mpris`/`tray` already watch their own peers with,
-        // rather than adding a bespoke second watcher. Cloned here (rather
-        // than moving `state`/`inhibitors`/`owners` themselves) so those
-        // bindings are still available below for `ScreenSaverHandles`.
-        let watch_state = state.clone();
-        let watch_inhibitors = inhibitors.clone();
-        let watch_owners = owners.clone();
-        spawn_supervised("screensaver-owner-watch", move || {
-            let state = watch_state.clone();
-            let inhibitors = watch_inhibitors.clone();
-            let owners = watch_owners.clone();
-            async move {
-                watch_owner_changes(&state, &inhibitors, &owners).await;
-            }
-        });
 
         ScreenSaverHandles {
             _state: state,
@@ -595,10 +603,45 @@ async fn watch_owner_changes(
         .signal("NameOwnerChanged")
         .start();
     let messages = subscription.events().map(|event| event.body);
-    run_owner_watch(messages, state, inhibitors, owners).await;
+    run_owner_watch(
+        messages,
+        list_bus_names,
+        RECONCILE_INTERVAL,
+        state,
+        inhibitors,
+        owners,
+    )
+    .await;
     // `subscription` is the live handle — dropping the last one tears the
     // subscription down — so keep it alive across the whole loop, explicitly.
     drop(subscription);
+}
+
+/// How long the watcher waits for a `NameOwnerChanged` before sweeping the
+/// bus for owners that left without one. See [`run_owner_watch`] for the two
+/// windows this covers; a minute is far below the "until the shell restarts"
+/// the bug it closes actually lasted, and the sweep is a single `ListNames`
+/// round trip that does nothing at all when no cookie is registered.
+const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Every name currently owned on the session bus, or `None` if the broker
+/// couldn't be asked. `None` is **not** an empty list: a failed probe must
+/// never be read as "nobody is on the bus", which would drop every live
+/// cookie (see [`reconcile_owners`]).
+async fn list_bus_names() -> Option<Vec<String>> {
+    match hytte_bus::call(hytte_bus::BusKind::Session, "org.freedesktop.DBus")
+        .at_path("/org/freedesktop/DBus")
+        .iface("org.freedesktop.DBus")
+        .method("ListNames")
+        .send::<Vec<String>>()
+        .await
+    {
+        Ok(names) => Some(names),
+        Err(e) => {
+            tracing::debug!(error = %e, "screensaver: ListNames failed, skipping reconcile");
+            None
+        }
+    }
 }
 
 /// The watcher loop, taking its event source as a plain stream of D-Bus
@@ -616,17 +659,119 @@ async fn watch_owner_changes(
 /// [`drop_cookies_for_vanished_owner`], a pure `HashMap` filter: inverting
 /// the departure check below left all three of them green (#1192 review,
 /// MEDIUM-1).
-async fn run_owner_watch<S>(
+///
+/// # Why there is a sweep and not only a stream (#1192 review, MEDIUM-3)
+///
+/// A pure event loop misses a departure in two windows, and a cookie
+/// orphaned in either keeps the screen awake until the shell restarts —
+/// exactly the symptom #1171 exists to remove:
+///
+/// 1. **Startup.** `own_name` makes `Inhibit` reachable as soon as it lands,
+///    while the `NameOwnerChanged` subscription is spawned separately and has
+///    its own connect latency (`SignalsBuilder::start` spawns, it does not
+///    await). `Service::start` now spawns this watcher *before* it owns the
+///    name, which narrows the window, but ordering alone cannot close it.
+/// 2. **Reconnect.** `hytte_bus::signals` re-subscribes internally on a bus
+///    reconnect; anything emitted while it was disconnected is simply gone,
+///    and the re-subscribe is not observable from out here (the epoch signal
+///    lives on `SharedConnection`, which `hytte-bus` does not hand out).
+///
+/// So: sweep once at startup, and again after every `RECONCILE_INTERVAL` of
+/// quiet, asking the broker who is actually on the bus and dropping cookies
+/// whose recorded owner isn't. The sweep is `ListNames` — one round trip for
+/// all owners, rather than a `NameHasOwner` per recorded name — and it uses
+/// the same drop-and-republish path the event does. The startup sweep runs
+/// after `messages` exists but, in production, not necessarily after the
+/// subscription is *live*; the periodic sweep is what makes that
+/// remaining sliver bounded by a minute instead of by a restart.
+///
+/// `tokio::time::timeout` around `messages.next()` rather than a `select!`:
+/// `tokio`'s `macros` feature is a dev-dependency here, and `next()` is
+/// cancel-safe, so a timed-out poll loses nothing.
+///
+/// `reconcile_interval` is a parameter rather than a read of
+/// [`RECONCILE_INTERVAL`] purely so the periodic arm is testable in
+/// milliseconds instead of a minute; production always passes that constant.
+async fn run_owner_watch<S, P, Fut>(
     mut messages: S,
+    live_names: P,
+    reconcile_interval: std::time::Duration,
     state: &Mutex<HashMap<u32, Inhibitor>>,
     inhibitors: &Mutable<Vec<Inhibitor>>,
     owners: &Mutex<HashMap<u32, String>>,
 ) where
     S: futures_util::Stream<Item = zbus::Message> + Unpin,
+    P: Fn() -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<String>>>,
 {
-    while let Some(message) = messages.next().await {
-        handle_name_owner_changed(&message, state, inhibitors, owners);
+    reconcile_owners(&live_names, state, inhibitors, owners).await;
+    loop {
+        match tokio::time::timeout(reconcile_interval, messages.next()).await {
+            Ok(Some(message)) => handle_name_owner_changed(&message, state, inhibitors, owners),
+            // The stream ended: every `SignalSubscription` handle was
+            // dropped. Nothing left to watch.
+            Ok(None) => break,
+            Err(_elapsed) => reconcile_owners(&live_names, state, inhibitors, owners).await,
+        }
     }
+}
+
+/// Ask the broker who is on the bus and drop every cookie whose recorded
+/// owner isn't — the sweep half of [`run_owner_watch`], for departures no
+/// `NameOwnerChanged` reached us for.
+///
+/// A probe that fails returns early and changes nothing: "couldn't ask" must
+/// never be read as "nobody is there", which would drop every live cookie on
+/// a transient bus hiccup.
+async fn reconcile_owners<P, Fut>(
+    live_names: &P,
+    state: &Mutex<HashMap<u32, Inhibitor>>,
+    inhibitors: &Mutable<Vec<Inhibitor>>,
+    owners: &Mutex<HashMap<u32, String>>,
+) where
+    P: Fn() -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<String>>>,
+{
+    if owners.lock().expect("screensaver owners poisoned").is_empty() {
+        return; // nothing recorded — don't even ask the broker
+    }
+    let Some(names) = live_names().await else {
+        return;
+    };
+    let live: HashSet<&str> = names.iter().map(String::as_str).collect();
+    let dead = drop_cookies_with_absent_owners(owners, &live);
+    if dead.is_empty() {
+        return;
+    }
+    for cookie in &dead {
+        tracing::debug!(
+            cookie,
+            "screensaver: owner absent at reconcile, dropping Inhibit cookie",
+        );
+        remove_inhibitor(state, *cookie);
+    }
+    publish_inhibitors(state, inhibitors);
+}
+
+/// Remove every cookie whose recorded owner is **not** in `live`, returning
+/// the removed cookies. The sweep counterpart of
+/// [`drop_cookies_for_vanished_owner`], and split out for the same reason:
+/// the bookkeeping is testable without a bus. Same lock discipline — only
+/// `owners`, never while `state` or `manual` is held.
+fn drop_cookies_with_absent_owners(
+    owners: &Mutex<HashMap<u32, String>>,
+    live: &HashSet<&str>,
+) -> Vec<u32> {
+    let mut map = owners.lock().expect("screensaver owners poisoned");
+    let dead: Vec<u32> = map
+        .iter()
+        .filter(|(_, sender)| !live.contains(sender.as_str()))
+        .map(|(cookie, _)| *cookie)
+        .collect();
+    for cookie in &dead {
+        map.remove(cookie);
+    }
+    dead
 }
 
 /// Apply one `NameOwnerChanged` message: ignore anything that isn't a
@@ -853,6 +998,116 @@ mod tests {
         assert_eq!(owners.lock().unwrap().len(), 1);
     }
 
+    #[test]
+    fn reconcile_drops_exactly_the_owners_not_on_the_bus() {
+        // #1192 review, MEDIUM-3: the sweep half. Two cookies whose owners
+        // are still on the bus, two whose owners are not (a departure that
+        // arrived while nothing was subscribed, or across a reconnect).
+        let owners = Mutex::new(HashMap::from([
+            (1, ":1.10".to_string()),
+            (2, ":1.20".to_string()),
+            (3, ":1.10".to_string()),
+            (4, ":1.30".to_string()),
+        ]));
+        let live: HashSet<&str> =
+            [":1.20", ":1.30", "org.freedesktop.DBus"].into_iter().collect();
+
+        let mut dead = drop_cookies_with_absent_owners(&owners, &live);
+        dead.sort_unstable();
+        assert_eq!(dead, vec![1, 3]);
+
+        let remaining = owners.lock().unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains_key(&2) && remaining.contains_key(&4));
+    }
+
+    /// The **periodic** arm of `run_owner_watch` (#1192 review, MEDIUM-3),
+    /// hermetically: the message stream never yields anything, so only the
+    /// timeout branch can act, and the probe reports the owner as live on the
+    /// startup sweep and gone afterwards — so a passing run means a *second*,
+    /// timer-driven sweep really happened. That is the arm covering a bus
+    /// reconnect, where `hytte_bus::signals` re-subscribes internally and any
+    /// `NameOwnerChanged` emitted while it was disconnected is simply lost.
+    ///
+    /// **Falsification:** drop the `Err(_elapsed) => reconcile_owners(...)`
+    /// arm (or make it a no-op) and this test times out red, while the
+    /// startup-sweep tests stay green.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_periodic_sweep_drops_an_owner_that_left_with_no_signal() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let state: Mutex<HashMap<u32, Inhibitor>> = Mutex::new(HashMap::new());
+        let owners = Mutex::new(HashMap::new());
+        let inhibitors = Mutable::new(Vec::new());
+        insert_inhibitor(
+            &state,
+            Inhibitor {
+                cookie: 1,
+                application: "Firefox".to_string(),
+                reason: "Playing video".to_string(),
+            },
+        );
+        owners.lock().unwrap().insert(1, ":1.42".to_string());
+        publish_inhibitors(&state, &inhibitors);
+
+        // Live on the first probe (the startup sweep must NOT drop it), gone
+        // on every one after.
+        let probes = AtomicUsize::new(0);
+        let live_names = || {
+            let nth = probes.fetch_add(1, Ordering::Relaxed);
+            async move {
+                if nth == 0 {
+                    Some(vec![":1.42".to_string()])
+                } else {
+                    Some(Vec::new())
+                }
+            }
+        };
+
+        let watcher = std::pin::pin!(run_owner_watch(
+            futures_util::stream::pending::<zbus::Message>(),
+            live_names,
+            Duration::from_millis(20),
+            &state,
+            &inhibitors,
+            &owners,
+        ));
+        let until_empty = std::pin::pin!(async {
+            while !inhibitors.get_cloned().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        // The watcher never returns; finishing means `until_empty` won.
+        let raced = tokio::time::timeout(
+            Duration::from_secs(5),
+            futures_util::future::select(watcher, until_empty),
+        )
+        .await;
+
+        assert!(
+            raced.is_ok(),
+            "the periodic sweep never dropped the departed owner's cookie",
+        );
+        assert!(owners.lock().unwrap().is_empty());
+        assert!(state.lock().unwrap().is_empty());
+        assert!(
+            probes.load(Ordering::Relaxed) >= 2,
+            "the startup sweep alone is not evidence of a periodic one",
+        );
+    }
+
+    #[test]
+    fn reconcile_with_every_owner_live_drops_nothing() {
+        let owners = Mutex::new(HashMap::from([
+            (1, ":1.10".to_string()),
+            (2, ":1.20".to_string()),
+        ]));
+        let live: HashSet<&str> = [":1.10", ":1.20"].into_iter().collect();
+        assert!(drop_cookies_with_absent_owners(&owners, &live).is_empty());
+        assert_eq!(owners.lock().unwrap().len(), 2);
+    }
+
     /// End-to-end bookkeeping (#1171), still fully hermetic: register a
     /// cookie the way `Inhibit` does (insert into `state` + remember its
     /// caller in `owners`), then simulate its caller vanishing the way
@@ -918,7 +1173,7 @@ mod tests {
 mod system_tests {
     use super::{
         Arc, AtomicU32, HashMap, Inhibitor, Mutable, Mutex, OwnersMap, PATH_CANONICAL,
-        ScreenSaverIface, StreamExt, run_owner_watch,
+        RECONCILE_INTERVAL, ScreenSaverIface, StreamExt, run_owner_watch,
     };
 
     use std::path::PathBuf;
@@ -1133,6 +1388,67 @@ mod system_tests {
         .expect("Inhibit call failed")
     }
 
+    /// Every name currently owned on `conn`'s bus — the test's stand-in for
+    /// production's `list_bus_names`, which asks the pooled session
+    /// connection instead of this ephemeral one.
+    async fn list_names_on(conn: &Connection) -> Option<Vec<String>> {
+        let proxy = zbus::fdo::DBusProxy::new(conn).await.ok()?;
+        let names = proxy.list_names().await.ok()?;
+        Some(names.into_iter().map(|n| n.to_string()).collect())
+    }
+
+    /// Spawn the production watcher loop over `messages`, with `conn` as the
+    /// broker its reconcile sweep asks. Returns the join handle; every test
+    /// aborts it at the end.
+    fn spawn_watcher(
+        messages: impl futures_util::Stream<Item = zbus::Message> + Unpin + Send + 'static,
+        conn: &Connection,
+        fx: &Fixture,
+    ) -> tokio::task::JoinHandle<()> {
+        let (state, inhibitors, owners) =
+            (fx.state.clone(), fx.inhibitors.clone(), fx.owners.clone());
+        let probe_conn = conn.clone();
+        tokio::spawn(async move {
+            let live_names = move || {
+                let conn = probe_conn.clone();
+                async move { list_names_on(&conn).await }
+            };
+            run_owner_watch(
+                messages,
+                live_names,
+                RECONCILE_INTERVAL,
+                &state,
+                &inhibitors,
+                &owners,
+            )
+            .await;
+        })
+    }
+
+    /// Poll the broker until `name` no longer has an owner, so a test that
+    /// wants "the caller is definitely gone" isn't racing its teardown.
+    async fn wait_until_name_gone(conn: &Connection, name: &str) {
+        let proxy = zbus::fdo::DBusProxy::new(conn)
+            .await
+            .expect("build DBus proxy");
+        let polled = tokio::time::timeout(DBUS_REPLY_BUDGET, async {
+            loop {
+                let owned = proxy
+                    .name_has_owner(
+                        name.try_into().expect("the client's unique name is valid"),
+                    )
+                    .await
+                    .unwrap_or(false);
+                if !owned {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(polled.is_ok(), "{name} never left the bus");
+    }
+
     /// Poll `inhibitors` until it is empty, or fail on the budget.
     async fn wait_until_no_inhibitors(inhibitors: &Mutable<Vec<Inhibitor>>, why: &str) {
         let polled = tokio::time::timeout(DBUS_REPLY_BUDGET, async {
@@ -1164,13 +1480,10 @@ mod system_tests {
         let (server, dest) = mount(&guard, fx.iface.clone()).await;
 
         // Subscribe BEFORE anyone can call Inhibit: `for_match_rule` awaits
-        // AddMatch, so there is no window where a departure could be missed.
-        let messages = name_owner_changed(&server).await;
-        let (watch_state, watch_inhibitors, watch_owners) =
-            (fx.state.clone(), fx.inhibitors.clone(), fx.owners.clone());
-        let watcher = tokio::spawn(async move {
-            run_owner_watch(messages, &watch_state, &watch_inhibitors, &watch_owners).await;
-        });
+        // AddMatch, so there is no window where a departure could be missed,
+        // and the startup reconcile has nothing to find — this test is about
+        // the event path, not the sweep.
+        let watcher = spawn_watcher(name_owner_changed(&server).await, &server, &fx);
 
         let (client_conn, client_name) = client(&guard).await;
         let cookie = inhibit(&client_conn, &dest, "Firefox", "Playing video").await;
@@ -1210,21 +1523,67 @@ mod system_tests {
         watcher.abort();
     }
 
+    /// #1192 review, MEDIUM-3 — the caller died in the window *before* the
+    /// watcher was listening, so no `NameOwnerChanged` will ever arrive for
+    /// it: only the startup reconcile can drop this cookie. That window is
+    /// real in production (owning the name makes `Inhibit` reachable, and
+    /// `SignalsBuilder::start` spawns rather than awaits) and it is the same
+    /// shape a bus reconnect leaves behind.
+    ///
+    /// **Falsification:** delete the `reconcile_owners(...)` call before
+    /// `run_owner_watch`'s loop and this test fails on
+    /// `wait_until_no_inhibitors` — `RECONCILE_INTERVAL` (60 s) is
+    /// deliberately longer than `DBUS_REPLY_BUDGET` (30 s), so the periodic
+    /// sweep cannot quietly stand in for the startup one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cookie_orphaned_before_the_watcher_existed_is_reconciled_away() {
+        let guard = ephemeral_bus().await;
+        let fx = fixture();
+        let (server, dest) = mount(&guard, fx.iface.clone()).await;
+
+        // A caller takes a cookie and dies while nothing is watching.
+        let (client_conn, client_name) = client(&guard).await;
+        let cookie = inhibit(&client_conn, &dest, "Firefox", "Playing video").await;
+        assert_eq!(
+            fx.owners
+                .lock()
+                .expect("owners poisoned")
+                .get(&cookie)
+                .map(String::as_str),
+            Some(client_name.as_str()),
+        );
+        drop(client_conn);
+        wait_until_name_gone(&server, &client_name).await;
+
+        // Only now does the watcher exist. Its `NameOwnerChanged`
+        // subscription can never see a departure that already happened.
+        let watcher = spawn_watcher(name_owner_changed(&server).await, &server, &fx);
+
+        wait_until_no_inhibitors(
+            &fx.inhibitors,
+            "the startup reconcile should have dropped a cookie whose owner \
+             left before the watcher subscribed",
+        )
+        .await;
+        assert!(fx.owners.lock().expect("owners poisoned").is_empty());
+        assert!(fx.state.lock().expect("state poisoned").is_empty());
+
+        watcher.abort();
+    }
+
     /// A live caller's cookies survive an *unrelated* connection's death —
     /// the other half of the departure check, and what would catch a watcher
-    /// that drops everything on any name change.
+    /// that drops everything on any name change. It is also the assertion
+    /// that the reconcile sweep does not mistake a live owner for a departed
+    /// one: the sweep runs at startup here, with the keeper already on the
+    /// bus by the time its cookie is taken.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_unrelated_departure_leaves_a_live_cookie_alone() {
         let guard = ephemeral_bus().await;
         let fx = fixture();
         let (server, dest) = mount(&guard, fx.iface.clone()).await;
 
-        let messages = name_owner_changed(&server).await;
-        let (watch_state, watch_inhibitors, watch_owners) =
-            (fx.state.clone(), fx.inhibitors.clone(), fx.owners.clone());
-        let watcher = tokio::spawn(async move {
-            run_owner_watch(messages, &watch_state, &watch_inhibitors, &watch_owners).await;
-        });
+        let watcher = spawn_watcher(name_owner_changed(&server).await, &server, &fx);
 
         let (keeper, _keeper_name) = client(&guard).await;
         let first = inhibit(&keeper, &dest, "mpv", "Playing video").await;

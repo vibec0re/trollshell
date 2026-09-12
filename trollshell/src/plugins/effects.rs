@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use crate::launch::Launch;
 
 use super::datasource::DatasourceRouter;
+use super::session::TokenBucket;
 
 /// Map one wire [`Effect`] onto a real host command. Handles [`Effect::OpenPage`]
 /// (→ the modal drawer), [`Effect::Niri`] (→ niri's IPC actions), [`Effect::Media`]
@@ -109,6 +110,23 @@ pub(super) fn broker_effect(
     outbound: &mpsc::Sender<HostMsg>,
     datasource: &DatasourceRouter,
 ) {
+    // #1165 item 8: the detached-launch budget, checked FIRST — before the unit
+    // name is allocated and before the audit line is written, so a refused
+    // launch never names a unit nobody started (the #964 M-2 defect, applied to
+    // the new refusal path).
+    if let Some(id) = detached_launch_id(effect)
+        && !launch_budget_allows(plugin_id, std::time::Instant::now())
+    {
+        record_audit(plugin_id, effect, AuditDecision::DroppedRateCap, None);
+        tracing::warn!(
+            plugin = %plugin_id, id,
+            burst = LAUNCH_BURST,
+            per_minute = LAUNCH_PER_MINUTE,
+            "plugin exceeded the host's detached-launch budget; refused",
+        );
+        refuse_detached_launch(plugin_id, id, outbound);
+        return;
+    }
     // #953 M1 / #964 item 2: allocated *here*, before the audit record, and
     // handed to the launcher unchanged — see `detached_launch_unit_for_audit`'s
     // doc for why, and for the rejected-id case.
@@ -1191,6 +1209,119 @@ fn reply_effect_result(
 // It is also the exact groove `plugin_launcher.rs` already runs plugins in, and
 // it gives the program a name in `systemctl --user`, which is what #953 asked
 // for.
+
+// ── Detached-launch budget (#1165 item 8) ────────────────────────────────────
+//
+// A detached launch has a *visibility* bound (`LAUNCH_SLICE`, so every surviving
+// unit lands in one subtree the user can stop with a single command) and had no
+// *count* bound at all. `detached_launch` passes no resource limits either — no
+// `MemoryMax=`, no `TasksMax=` — so each launch is an unbounded program the
+// shell explicitly hands to the user manager and then forgets. Nothing here
+// reclaims them: `--collect` retires a unit that *exits*, and a launch that does
+// not exit is the case that matters.
+//
+// The effect rate cap does not stand in for this. It is 8 back-to-back then one
+// a second, which is right for drawer-opens and toasts and is three orders of
+// magnitude too loose for "start a program that outlives the shell": a plugin
+// inside its effect budget can accumulate a process a second, forever, and each
+// one survives the restart that would otherwise clear them.
+
+/// Detached launches a plugin may fire back-to-back (#1165 item 8).
+///
+/// Four covers every real burst: the motivating consumer is #950's agent
+/// window, where a user clicking through a few agents at once is four launches
+/// in a second and anything beyond that is not a hand on a mouse.
+const LAUNCH_BURST: u32 = 4;
+
+/// The sustained detached-launch budget, per minute (#1165 item 8) — stated in
+/// minutes because that is the unit it is *argued* in, and converted for the
+/// bucket below.
+///
+/// Deliberately far slower than the effect cap's 1/s. A launched program is the
+/// most expensive thing a plugin can ask the host for and the only one the host
+/// cannot take back, so the budget is sized for a human's clicking rather than
+/// for a render loop.
+const LAUNCH_PER_MINUTE: f64 = 4.0;
+
+/// [`LAUNCH_PER_MINUTE`] as the per-second rate [`TokenBucket`] wants.
+const LAUNCH_REFILL_PER_SEC: f64 = LAUNCH_PER_MINUTE / 60.0;
+
+thread_local! {
+    /// Per-plugin detached-launch buckets (#1165 item 8).
+    ///
+    /// A `thread_local` rather than a field on the `ListenerCtx`, because
+    /// unlike the effect buckets this is only ever touched from the **GTK main
+    /// thread**: `broker_effect` is the single place a detached launch can
+    /// start, and it runs there by construction. That also gives the hermetic
+    /// tests isolation for free — a `#[test]` body runs start-to-finish on one
+    /// thread, so no two tests share a table.
+    ///
+    /// Swept on every launch (retiring the buckets that have refilled, exactly
+    /// the ones whose removal changes no decision — see
+    /// [`TokenBucket::is_full`]), so it holds only ids that launched something
+    /// inside the last budget window. No separate size cap is needed the way
+    /// the effect table needs one: a launch *is* an effect, so reaching this at
+    /// all is already inside the effect rate cap.
+    static LAUNCH_BUDGETS: std::cell::RefCell<std::collections::HashMap<String, TokenBucket>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The effect `id` of a **detached** [`Effect::RunCommand`], or `None` for
+/// anything else — including the attached mode, which is bounded by
+/// [`RUN_COMMAND_TIMEOUT`] and dies with the shell and so needs no budget of its
+/// own.
+fn detached_launch_id(effect: &Effect) -> Option<u64> {
+    match effect {
+        Effect::RunCommand {
+            id,
+            detached: true,
+            ..
+        } => Some(*id),
+        _ => None,
+    }
+}
+
+/// Spend one token from `plugin_id`'s detached-launch budget: `true` to go
+/// ahead, `false` to refuse (#1165 item 8).
+fn launch_budget_allows(plugin_id: &str, now: std::time::Instant) -> bool {
+    LAUNCH_BUDGETS.with_borrow_mut(|budgets| {
+        budgets.retain(|_, bucket| !bucket.is_full(now));
+        if !budgets.contains_key(plugin_id) {
+            budgets.insert(
+                plugin_id.to_owned(),
+                TokenBucket::new_at(now, LAUNCH_BURST, LAUNCH_REFILL_PER_SEC),
+            );
+        }
+        budgets
+            .get_mut(plugin_id)
+            .expect("present, or inserted just above")
+            .allow(now)
+    })
+}
+
+/// Tell the plugin its detached launch was refused (#1165 item 8), as the
+/// **same** `ok: false` [`EffectOutcome`] shape a `systemd-run` refusal
+/// produces — `launch_outcome(&Err(…))` — so a plugin needs no new arm to
+/// handle it, and so a refusal can never be mistaken for a launch.
+///
+/// `try_send` rather than the `send().await` the success path uses: this runs on
+/// the GTK main thread, the frame is a few dozen bytes onto a
+/// [`OUTBOUND_CAPACITY`](super::session::OUTBOUND_CAPACITY)-deep queue, and a
+/// queue that full means the plugin has stopped reading — in which case the
+/// liveness ping is already reaping it and a parked task would only be one more
+/// thing waiting on a dead connection.
+fn refuse_detached_launch(plugin_id: &str, id: u64, outbound: &mpsc::Sender<HostMsg>) {
+    let outcome = launch_outcome(&Err(format!(
+        "refused: over the host's detached-launch budget ({LAUNCH_BURST} back-to-back, then \
+         {LAUNCH_PER_MINUTE} a minute)"
+    )));
+    if outbound
+        .try_send(HostMsg::EffectResult { id, outcome })
+        .is_err()
+    {
+        tracing::debug!(plugin = %plugin_id, id, "plugin gone or backed up before the launch refusal; dropped");
+    }
+}
 
 /// Bounds the `systemd-run` **launch call** — the short D-Bus round-trip that
 /// asks the user manager to start the transient unit — and *nothing else*

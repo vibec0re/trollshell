@@ -603,7 +603,7 @@ impl TokenBucket {
     /// full bucket is indistinguishable from a fresh one, so forgetting it
     /// changes no decision, while forgetting a partly-spent one would hand its
     /// owner a free burst.
-    fn is_full(&self, now: Instant) -> bool {
+    pub(super) fn is_full(&self, now: Instant) -> bool {
         self.refilled(now) >= self.burst
     }
 }

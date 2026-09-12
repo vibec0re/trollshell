@@ -314,17 +314,24 @@ pub(crate) fn detail_of(
     now_unix: i64,
 ) -> DetailModel {
     let row = &agent.row;
-    let mut facts: Vec<(&'static str, String)> = Vec::with_capacity(6);
-    facts.push(("Status", agent.status_line().to_owned()));
-    facts.push(("Status set", status_set(row.status_set_at.as_deref(), now_unix)));
-    facts.push(("Model", opt(row.active_model.as_deref())));
-    facts.push(("Parent", opt(row.parent.as_deref())));
-    facts.push(("Deployed", opt(row.deployed_sha.as_deref())));
-    facts.push((
-        "Project",
-        cfg.project_for(agent.name.as_str())
-            .map_or_else(|| ABSENT.to_owned(), str::to_owned),
-    ));
+    // In [`FACT_LABELS`] order — the built rows are zipped against this, so
+    // the two lists are one contract and `the_built_row_labels_match_the_models_order`
+    // is what keeps them honest.
+    let facts: Vec<(&'static str, String)> = vec![
+        ("Status", agent.status_line().to_owned()),
+        (
+            "Status set",
+            status_set(row.status_set_at.as_deref(), now_unix),
+        ),
+        ("Model", opt(row.active_model.as_deref())),
+        ("Parent", opt(row.parent.as_deref())),
+        ("Deployed", opt(row.deployed_sha.as_deref())),
+        (
+            "Project",
+            cfg.project_for(agent.name.as_str())
+                .map_or_else(|| ABSENT.to_owned(), str::to_owned),
+        ),
+    ];
     DetailModel {
         title: cfg.label_for(agent.name.as_str()).to_owned(),
         flags: flags_of(agent),
@@ -572,7 +579,7 @@ impl AgentsState {
                         value: f.value.downgrade(),
                     })
                     .collect(),
-                facts: self.detail.facts.iter().map(|r| r.downgrade()).collect(),
+                facts: self.detail.facts.iter().map(ObjectExt::downgrade).collect(),
                 agent_page: self.detail.agent_page.downgrade(),
                 config_repo: self.detail.config_repo.downgrade(),
             },
@@ -963,8 +970,8 @@ fn open_agent_page(state: &AgentsState) {
 /// zombie parented to a settings app that may outlive it by hours — and
 /// because it does not kill the child when this window goes away.
 fn launch(argv: &[String]) {
-    let args: Vec<&std::ffi::OsStr> = argv.iter().map(|a| a.as_ref()).collect();
-    match gtk::gio::Subprocess::newv(&args, gtk::gio::SubprocessFlags::NONE) {
+    let as_os: Vec<&std::ffi::OsStr> = argv.iter().map(AsRef::as_ref).collect();
+    match gtk::gio::Subprocess::newv(&as_os, gtk::gio::SubprocessFlags::NONE) {
         Ok(_child) => tracing::info!(?argv, "launched the agent companion window"),
         Err(e) => tracing::warn!(?argv, error = %e, "could not launch the agent companion window"),
     }
@@ -1312,16 +1319,8 @@ fn set_flag_row(flag: &FlagRow, set: bool) {
 /// rather than disappearing: "the hive publishes no forge" is an answer, and a
 /// row that vanishes only raises the question again.
 fn set_link_row(row: &adw::ActionRow, uri: Option<&str>) {
-    match uri {
-        Some(uri) => {
-            row.set_subtitle(uri);
-            row.set_sensitive(true);
-        }
-        None => {
-            row.set_subtitle(ABSENT);
-            row.set_sensitive(false);
-        }
-    }
+    row.set_subtitle(uri.unwrap_or(ABSENT));
+    row.set_sensitive(uri.is_some());
 }
 
 /// Build one sidebar row from its model.
@@ -1694,8 +1693,7 @@ mod tests {
             d.facts
                 .iter()
                 .find(|(l, _)| *l == label)
-                .map(|(_, v)| v.clone())
-                .unwrap_or_else(|| panic!("no {label} row"))
+                .map_or_else(|| panic!("no {label} row"), |(_, v)| v.clone())
         };
         assert_eq!(fact("Status"), "reviewing PR #947");
         assert_eq!(fact("Model"), "claude-opus-4-6");

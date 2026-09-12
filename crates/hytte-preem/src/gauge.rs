@@ -475,13 +475,32 @@ pub const VALUE_HW_BONUS: f32 = 0.35;
 ///
 /// Wider than [`MINOR_HW`], which is load-bearing rather than cosmetic: the
 /// widest ink any tick lays down is what bounds the window a renderer has to
-/// search for the ticks that can reach a fragment, and the GL arm computes that
-/// bound from this constant alone. `the_major_tick_is_the_widest_mark_on_the_face`
-/// pins the relation on this side; `preem_gl::gauge`'s `const` assertion pins it
-/// on the other.
+/// search for the ticks that can reach a fragment, and the shell's GL arm
+/// computes that bound from this constant alone. The `const` assertion below
+/// pins the relation here; `preem_gl::gauge`'s carries the matching one there.
 pub const MAJOR_HW: f32 = 0.85;
 /// Minor tick half-width, in logical pixels.
 pub const MINOR_HW: f32 = 0.55;
+
+/// A **major** tick is the widest mark on the face, and a mid tick is drawn at
+/// the same half-width — so [`MAJOR_HW`] alone bounds the ink any tick lays
+/// down either side of its centreline.
+///
+/// Nothing in this file depends on that (each mark is drawn at its own
+/// half-width), so it reads as a tautology here. It is not one for a second
+/// renderer of this dial, which has to decide *per fragment* how many ticks can
+/// reach it and derives that window from `MAJOR_HW` as the upper bound
+/// (`preem_gl::gauge`'s `tick_span`). Inverted, the window would under-estimate
+/// and minor ticks would be clipped out of the dial — silently, on every skin
+/// (#1148 review, LOW-1).
+///
+/// A `const` assertion and not a test: it is a statement about two literals,
+/// and it should fail the compile rather than a run.
+const _: () = assert!(
+    MAJOR_HW > MINOR_HW,
+    "a minor tick must stay narrower than a major one, or a renderer that bounds its \
+     tick search with MAJOR_HW clips them",
+);
 /// Major tick length inward from the scale arc, as a fraction of its radius.
 const MAJOR_LEN_FRAC: f32 = 0.15;
 /// Minor tick length inward from the scale arc, as a fraction of its radius.
@@ -2897,30 +2916,6 @@ mod tests {
     /// The **bloom** stays a fixed fraction of the dial instead of a fixed
     /// pixel count, so a small face's halo does not swallow its needle.
     ///
-    /// A **major** tick is the widest mark on the face, and a mid tick is drawn
-    /// at the same half-width — so `MAJOR_HW` alone bounds the ink any tick
-    /// lays down either side of its centreline.
-    ///
-    /// Nothing in this file depends on that (each mark is drawn at its own
-    /// half-width), so it looks like a tautology here. It is not one for the
-    /// shell's GL arm, which has to decide *in the shader* how many ticks can
-    /// reach a fragment and derives that window from `MAJOR_HW` as the upper
-    /// bound (`preem_gl::gauge`'s `tick_span`, which carries the matching
-    /// `const` assertion). If the two ever inverted, that window would
-    /// under-estimate and minor ticks would be clipped out of the dial — a
-    /// silent, skin-wide loss with nothing else in the tree to notice it
-    /// (#1148 review, LOW-1).
-    ///
-    /// **Falsified** by raising [`MINOR_HW`] past [`MAJOR_HW`].
-    #[test]
-    fn the_major_tick_is_the_widest_mark_on_the_face() {
-        assert!(
-            MAJOR_HW > super::MINOR_HW,
-            "a minor tick must stay narrower than a major one: {MAJOR_HW} vs {}",
-            super::MINOR_HW,
-        );
-    }
-
     /// Both halves matter: the cap arithmetic, and that `render` actually
     /// applies it. The second is measured the way #930 measured the blur — the
     /// lit cross-section straight through the settled blade — because that is

@@ -496,7 +496,10 @@ pub(crate) fn box_downsample(gl: &[u8], alloc: (u32, u32), factor: u32) -> (Vec<
         return (gl.to_vec(), alloc);
     }
     let (out_w, out_h) = (w / n, h / n);
-    let taps = (n * n) as u32;
+    // `factor` came in as a `u32` and `n * n` is at most `u32::MAX²` only for a
+    // factor no allocation could divide by; the guard above has already refused
+    // anything that does not divide `w` and `h`, so this is a small number.
+    let taps = u32::try_from(n * n).unwrap_or(u32::MAX);
     let mut out = Vec::with_capacity(out_w * out_h * 4);
     for by in 0..out_h {
         for bx in 0..out_w {
@@ -1234,7 +1237,9 @@ mod tests {
     /// `(4v + 2) / 4 == v` for every `v` in `0..=255`.
     #[test]
     fn a_replicated_frame_downsamples_back_to_itself() {
-        let logical: Vec<u8> = (0..(3 * 2 * 4)).map(|i| (i * 7 % 256) as u8).collect();
+        let logical: Vec<u8> = (0..(3_u32 * 2 * 4))
+            .map(|i| u8::try_from(i * 7 % 256).unwrap_or(0))
+            .collect();
         let (w, h) = (3_usize, 2_usize);
         let mut native = vec![0_u8; w * 2 * h * 2 * 4];
         for y in 0..h * 2 {

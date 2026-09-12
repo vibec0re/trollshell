@@ -373,9 +373,7 @@ pub(super) fn capped_effect_strings(
         // rather than cuts, for the same reason as a URI (#1165 item 7).
         Effect::DatasourceQuery { .. } | Effect::DatasourceResult { .. } => {}
     }
-    let message = (longest > 0
-        && warned.insert(std::mem::discriminant(&effect)))
-    .then(|| {
+    let message = (longest > 0 && warned.insert(std::mem::discriminant(&effect))).then(|| {
         format!(
             "plugin effect carries a display string {longest} B long, over the host's \
              {MAX_DISPLAY_TEXT_BYTES} B line / {MAX_BODY_TEXT_BYTES} B body cap; the prefix is \
@@ -408,15 +406,61 @@ fn push_state(out: &mpsc::Sender<HostMsg>, msg: HostMsg) -> Push {
     }
 }
 
-/// Per-connection effect rate cap (#435): a token bucket over [`Effect`]
+/// A token bucket: `burst` tokens to spend back-to-back, refilled at
+/// `refill_per_sec`.
+///
+/// Extracted from [`EffectRateLimiter`] in #1165 because the effect cap is no
+/// longer the only thing the host rate-limits — [`LogGate`] bounds
+/// [`PluginMsg::Log`] and the broker bounds detached launches — and three
+/// hand-copied `tokens/last` pairs would be three places for the refill
+/// arithmetic to drift.
+pub(super) struct TokenBucket {
+    tokens: f64,
+    last: Instant,
+    burst: f64,
+    refill_per_sec: f64,
+}
+
+impl TokenBucket {
+    pub(super) fn new_at(now: Instant, burst: u32, refill_per_sec: f64) -> Self {
+        Self {
+            tokens: f64::from(burst),
+            last: now,
+            burst: f64::from(burst),
+            refill_per_sec,
+        }
+    }
+
+    /// What this bucket holds as of `now`, without spending anything.
+    fn refilled(&self, now: Instant) -> f64 {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        (self.tokens + elapsed * self.refill_per_sec).min(self.burst)
+    }
+
+    /// Refill by the time elapsed since the last call (capped at the burst), then
+    /// try to spend one token. `true` = allowed, `false` = over budget (drop).
+    pub(super) fn allow(&mut self, now: Instant) -> bool {
+        self.tokens = self.refilled(now);
+        self.last = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Per-plugin effect rate cap (#435): a token bucket over [`Effect`]
 /// emissions. A plugin may fire up to [`EFFECT_BURST`] effects back-to-back;
 /// beyond that it's limited to [`EFFECT_REFILL_PER_SEC`], so a buggy plugin
 /// emitting an effect per render can't flood the (deliberately non-lossy #277)
 /// effect broker with drawer-opens / OSD nudges / toasts.
-pub(super) struct EffectRateLimiter {
-    tokens: f64,
-    last: Instant,
-}
+///
+/// A thin newtype over [`TokenBucket`] so the two knobs live with the cap they
+/// describe and callers cannot accidentally build an effect limiter with some
+/// other plugin's budget.
+pub(super) struct EffectRateLimiter(TokenBucket);
 
 impl EffectRateLimiter {
     fn new() -> Self {
@@ -424,23 +468,101 @@ impl EffectRateLimiter {
     }
 
     pub(super) fn new_at(now: Instant) -> Self {
-        Self {
-            tokens: f64::from(EFFECT_BURST),
-            last: now,
-        }
+        Self(TokenBucket::new_at(
+            now,
+            EFFECT_BURST,
+            EFFECT_REFILL_PER_SEC,
+        ))
     }
 
     /// Refill by the time elapsed since the last call (capped at the burst), then
     /// try to spend one token. `true` = allowed, `false` = over budget (drop).
     pub(super) fn allow(&mut self, now: Instant) -> bool {
-        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
-        self.last = now;
-        self.tokens = (self.tokens + elapsed * EFFECT_REFILL_PER_SEC).min(f64::from(EFFECT_BURST));
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
-        } else {
-            false
+        self.0.allow(now)
+    }
+}
+
+/// Max [`PluginMsg::Log`] frames a connection may emit back-to-back before the
+/// sustained cap ([`LOG_REFILL_PER_SEC`]) applies (#1165).
+///
+/// 32 is deliberately looser than [`EFFECT_BURST`]: a plugin's startup is
+/// legitimately chatty (a handful of `debug!` lines per subsystem), and a log
+/// line costs the host a journal write, not a drawer-open.
+pub(super) const LOG_BURST: u32 = 32;
+
+/// Sustained [`PluginMsg::Log`] budget refilled per second (#1165). Five lines a
+/// second, forever, is well above what any bundled plugin emits and well below
+/// what fills a journal.
+const LOG_REFILL_PER_SEC: f64 = 5.0;
+
+/// Max bytes in one [`PluginMsg::Log`] message (#1165).
+///
+/// The frame was bounded only by `MAX_FRAME_LEN`, so a plugin could push 16 MiB
+/// into a single `tracing` event — and a journal line is not a widget, so this
+/// costs disk and `journalctl` rather than the GTK thread. 4 KiB matches
+/// [`MAX_DISPLAY_TEXT_BYTES`] and is far past any line worth reading;
+/// `systemd-journald` has its own field limit above it, so the host cuts first
+/// and says so rather than letting the journal silently do it.
+pub(super) const MAX_LOG_MSG_BYTES: usize = 4 * 1024;
+
+/// What the host should do with one inbound [`PluginMsg::Log`] frame (#1165).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LogAdmission {
+    /// Surface this message at the frame's level.
+    Emit {
+        /// The message, cut to [`MAX_LOG_MSG_BYTES`] on a char boundary.
+        msg: String,
+        /// `Some(original_len)` the **first** time this connection sent an
+        /// over-cap message, so the truncation is named once rather than on
+        /// every line.
+        over_cap: Option<usize>,
+    },
+    /// Over the rate cap: drop the line.
+    Drop {
+        /// `true` the **first** time this connection is over budget — the one
+        /// journal line that says logs are being dropped. Latched, because an
+        /// unlatched "dropped" line is itself the flood.
+        warn: bool,
+    },
+}
+
+/// Per-connection [`PluginMsg::Log`] gate (#1165): the rate bucket plus the two
+/// one-shot latches, kept as one value so the policy is unit-testable without a
+/// socket.
+pub(super) struct LogGate {
+    bucket: TokenBucket,
+    rate_warned: bool,
+    len_warned: bool,
+}
+
+impl LogGate {
+    pub(super) fn new_at(now: Instant) -> Self {
+        Self {
+            bucket: TokenBucket::new_at(now, LOG_BURST, LOG_REFILL_PER_SEC),
+            rate_warned: false,
+            len_warned: false,
+        }
+    }
+
+    /// Decide one log frame's fate. The rate cap is checked **first**: an
+    /// over-budget line is dropped whole, so a flood costs no truncation work.
+    pub(super) fn admit(&mut self, msg: &str, now: Instant) -> LogAdmission {
+        if !self.bucket.allow(now) {
+            let warn = !self.rate_warned;
+            self.rate_warned = true;
+            return LogAdmission::Drop { warn };
+        }
+        if msg.len() > MAX_LOG_MSG_BYTES {
+            let over_cap = (!self.len_warned).then_some(msg.len());
+            self.len_warned = true;
+            return LogAdmission::Emit {
+                msg: super::effects::truncate_on_char_boundary(msg, MAX_LOG_MSG_BYTES),
+                over_cap,
+            };
+        }
+        LogAdmission::Emit {
+            msg: msg.to_owned(),
+            over_cap: None,
         }
     }
 }
@@ -920,6 +1042,9 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
     // the same terms as `hidden_on_warned` above — one line per effect kind per
     // connection, not one per frame.
     let mut effect_text_warned = EffectWarnLatch::new();
+    // #1165: the `PluginMsg::Log` length + rate gate, per connection like the
+    // effect limiter beside it.
+    let mut log_gate = LogGate::new_at(Instant::now());
     let reader = async {
         loop {
             match read_frame::<PluginMsg, _>(&mut rd).await {
@@ -997,7 +1122,37 @@ pub(super) async fn handle_conn(stream: UnixStream, ctx: &ListenerCtx) {
                 Ok(PluginMsg::Register { .. }) => {
                     tracing::warn!(plugin = %plugin_id, "duplicate Register ignored");
                 }
-                Ok(PluginMsg::Log { level, msg }) => log_plugin(&plugin_id, level, &msg),
+                // #1165: a `Log` frame was neither length- nor rate-capped —
+                // the one inbound message kind that reaches the journal
+                // directly, bounded only by the 16 MiB frame limit and by how
+                // fast the plugin can write.
+                Ok(PluginMsg::Log { level, msg }) => match log_gate.admit(&msg, Instant::now()) {
+                    LogAdmission::Emit { msg, over_cap } => {
+                        if let Some(bytes) = over_cap {
+                            tracing::warn!(
+                                plugin = %plugin_id,
+                                bytes,
+                                cap = MAX_LOG_MSG_BYTES,
+                                "plugin Log message is over the host's length cap; the \
+                                 prefix is logged (further occurrences on this connection \
+                                 are silenced)",
+                            );
+                        }
+                        log_plugin(&plugin_id, level, &msg);
+                    }
+                    LogAdmission::Drop { warn } => {
+                        if warn {
+                            tracing::warn!(
+                                plugin = %plugin_id,
+                                burst = LOG_BURST,
+                                per_sec = LOG_REFILL_PER_SEC,
+                                "plugin exceeded the host's log rate cap; lines are being \
+                                 dropped (further occurrences on this connection are \
+                                 silenced)",
+                            );
+                        }
+                    }
+                },
                 Ok(PluginMsg::Pong { seq }) => {
                     pong_seen.store(true, Ordering::Relaxed);
                     tracing::trace!(plugin = %plugin_id, seq, "plugin pong");

@@ -19,7 +19,6 @@ use crate::handle::HandleTracker;
 use futures_signals::signal::SignalExt as _;
 use futures_util::StreamExt as _;
 use std::sync::Arc;
-use std::time::Duration;
 use zbus::object_server::Interface;
 
 /// A handle keeping an exported object alive. Dropping the last clone stops the
@@ -87,6 +86,10 @@ impl ExportBuilder {
         hytte_reactive::runtime::handle().spawn(async move {
             let mut epoch_stream = shared.epoch_signal().to_stream();
             let mut last_epoch = u64::MAX;
+            // The crate's retry ramp, owned across the loop's iterations so a
+            // bus that will not answer actually backs off instead of resetting
+            // to 250 ms every time round. Cleared by a successful mount.
+            let mut streak = crate::backoff::FailureStreak::default();
             loop {
                 // Stop once the caller has dropped every ExportHandle clone,
                 // unmounting the interface so a daemon that recorded our unique
@@ -117,10 +120,16 @@ impl ExportBuilder {
                         Ok(()) => {
                             tracing::debug!(path = %path, epoch = current, "exported object mounted");
                             last_epoch = current;
+                            streak.reset();
                         }
                         Err(e) => {
-                            tracing::debug!(path = %path, error = %e, "export mount failed; retrying");
-                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            crate::backoff::back_off_resubscribe(
+                                &mut streak,
+                                "export: object-server mount",
+                                &path,
+                                &e,
+                            )
+                            .await;
                             continue;
                         }
                     }

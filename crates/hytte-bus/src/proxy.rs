@@ -46,6 +46,16 @@ struct ProxyInner {
     /// fast-fails with `BusError::Transient` instead of attempting I/O on a
     /// dead connection.
     cached: RwLock<Option<zbus::Proxy<'static>>>,
+    /// The `NameOwnerChanged` match rule for [`Self::destination`], built once
+    /// by [`ProxyBuilder::build`].
+    ///
+    /// It is a pure function of the destination, so it cannot start working on
+    /// a later attempt — and until #1173 the watcher rebuilt it on every
+    /// iteration and, on failure, retried it at a flat 250 ms forever. That is
+    /// not a retry, it is a spin on a deterministic answer. Failing it in
+    /// `build()` puts the error where the caller can see it, and leaves the
+    /// watcher's loop with only the failures that a retry can actually fix.
+    noc_rule: zbus::OwnedMatchRule,
     liveness: Mutable<ProxyState>,
     /// Per-call timeout applied to every [`BusProxy::call`].
     timeout: Duration,
@@ -212,10 +222,14 @@ impl ProxyBuilder {
     /// subscribed to `NameOwnerChanged` on the bus.
     ///
     /// # Errors
-    /// Returns `BusError` if the initial connection or proxy construction fails.
+    /// Returns `BusError` if the destination cannot be turned into a
+    /// `NameOwnerChanged` match rule, or if the initial connection or proxy
+    /// construction fails.
     pub async fn build(self) -> Result<BusProxy, BusError> {
         let (task_done_tx, task_done_rx) = tokio::sync::oneshot::channel::<()>();
         let tracker = HandleTracker::new();
+
+        let noc_rule = build_noc_match_rule(&self.destination).map_err(BusError::from_zbus)?;
 
         let inner = Arc::new(ProxyInner {
             shared: self.shared,
@@ -223,6 +237,7 @@ impl ProxyBuilder {
             path: self.path,
             iface: self.iface,
             cached: RwLock::new(None),
+            noc_rule,
             liveness: Mutable::new(ProxyState::Reconnecting),
             timeout: self.timeout,
             task_done_rx: tokio::sync::Mutex::new(Some(task_done_rx)),
@@ -317,6 +332,10 @@ async fn run_proxy_watcher(
     let mut first_iteration = true;
     let mut task_done_tx = Some(task_done_tx);
     let dest = inner.destination.clone();
+    // The crate's retry ramp, owned across the loop's iterations so a bus that
+    // will not answer actually backs off instead of resetting to 250 ms every
+    // time round. Cleared once the subscribe and the rebuild have both worked.
+    let mut streak = crate::backoff::FailureStreak::default();
 
     loop {
         if tracker.all_dropped() {
@@ -327,18 +346,23 @@ async fn run_proxy_watcher(
             return;
         }
 
-        let Some(mut stream) = subscribe_noc(&inner, &dest).await else {
+        let Some(mut stream) = subscribe_noc(&inner, &dest, &mut streak).await else {
             continue;
         };
 
         if !first_iteration && let Err(e) = do_rebuild_proxy_cache(&inner).await {
-            tracing::debug!(error = %e, %dest,
-                "proxy watcher: proxy rebuild failed; will retry");
             inner.liveness.set(ProxyState::Reconnecting);
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            crate::backoff::back_off_resubscribe(
+                &mut streak,
+                "proxy: cached-proxy rebuild",
+                &dest,
+                &e,
+            )
+            .await;
             continue;
         }
         first_iteration = false;
+        streak.reset();
 
         let current_epoch = inner.shared.epoch();
         inner.liveness.set(ProxyState::Live);
@@ -360,24 +384,19 @@ async fn run_proxy_watcher(
     }
 }
 
-/// Build the NOC match rule and subscribe before emitting Live, so any NOC
-/// signal fired after subscription (even between proxy-build and subscribe)
-/// is buffered. Returns None on transient failure (caller should retry).
-async fn subscribe_noc(inner: &Arc<ProxyInner>, dest: &str) -> Option<zbus::MessageStream> {
-    let match_rule = match build_noc_match_rule(dest) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, %dest,
-                "proxy watcher: failed to build match rule; retrying");
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            return None;
-        }
-    };
-
+/// Subscribe to the destination's `NameOwnerChanged` before emitting Live, so
+/// any NOC signal fired after subscription (even between proxy-build and
+/// subscribe) is buffered. Returns None on transient failure, having already
+/// backed off — the caller should just go round again.
+async fn subscribe_noc(
+    inner: &Arc<ProxyInner>,
+    dest: &str,
+    streak: &mut crate::backoff::FailureStreak,
+) -> Option<zbus::MessageStream> {
     let subscribe_result = inner
         .shared
         .with_conn(|conn| {
-            let rule = match_rule.clone();
+            let rule = inner.noc_rule.clone();
             async move {
                 let stream = zbus::MessageStream::for_match_rule(rule, &conn, None).await?;
                 Ok(stream)
@@ -388,10 +407,14 @@ async fn subscribe_noc(inner: &Arc<ProxyInner>, dest: &str) -> Option<zbus::Mess
     match subscribe_result {
         Ok(s) => Some(s),
         Err(e) => {
-            tracing::debug!(error = %e, %dest,
-                "proxy watcher: subscribe failed; will retry");
             inner.liveness.set(ProxyState::Reconnecting);
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            crate::backoff::back_off_resubscribe(
+                streak,
+                "proxy: NameOwnerChanged subscribe",
+                dest,
+                &e,
+            )
+            .await;
             None
         }
     }

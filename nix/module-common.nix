@@ -119,6 +119,21 @@ self:
           without the plugin — it is launchable as
           `trollshell-agent-window --agent <name>`.
 
+          A hyperhive gateway is self-signed by default, so the window opens on
+          an error state until its anchor is in the machine's trust store. With
+          the hive on this machine, reference hyperhive's own option rather
+          than a literal path:
+
+              security.pki.certificateFiles = [
+                "''${config.services.hyperhive.deploy.hive-controller.tls.stateDir}/trust-bundle.pem"
+              ];
+
+          (`/var/lib/hive-tls` is only that option's default; spell it out only
+          for a remote hive.) The window's error state names that and the
+          `TROLLSHELL_AGENT_WINDOW_CERT` last resort, which pins one
+          certificate for one host and must be the **leaf** the gateway
+          presents, never the bundle.
+
           It is the one package in this flake that links WebKitGTK; the shell
           and every plugin stay free of a web engine.
         '';

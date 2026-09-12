@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use hytte::services::pipewire;
 use hytte_plugin_proto::{
-    AudioSpectrum, Capability, ClockState, Effect, HostMsg, LogLevel, MAX_BODY_TEXT_BYTES,
-    MAX_DISPLAY_TEXT_BYTES, Manifest, Mount, NowPlaying, PluginMsg, ProtoError, StateKey,
-    StateSnapshot, UpcomingEvent, VOCAB, read_frame, write_frame,
+    AudioSpectrum, Capability, ClockState, DatasourceError, DatasourceOutcome, Effect, HostMsg,
+    LogLevel, MAX_BODY_TEXT_BYTES, MAX_DISPLAY_TEXT_BYTES, Manifest, Mount, NowPlaying, PluginMsg,
+    ProtoError, StateKey, StateSnapshot, UpcomingEvent, VOCAB, read_frame, write_frame,
 };
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
@@ -183,7 +183,35 @@ const MAX_MISSED_PONGS: u32 = 2;
 /// reading its socket backs it up to this cap, at which point new frames are
 /// dropped (see [`push_state`]) rather than buffered without limit. Comfortably
 /// above any real burst, so the happy path never fills it.
+///
+/// **It bounds frames, not bytes**, which is why it is not the whole story
+/// (#1165 item 7). Every other `HostMsg` is a small, host-built value — a clock
+/// tick, an accent colour, a spectrum frame — but the two datasource legs carry
+/// *plugin*-supplied opaque payloads, bounded on the wire only by
+/// `MAX_FRAME_LEN`. 256 × 16 MiB is four gigabytes of queue behind one plugin
+/// that stopped reading, so those payloads carry their own byte cap:
+/// [`MAX_DATASOURCE_PAYLOAD_BYTES`].
 pub(super) const OUTBOUND_CAPACITY: usize = 256;
+
+/// The largest opaque datasource payload the host will forward, in bytes
+/// (#1165 item 7) — [`Effect::DatasourceQuery`]'s `params` and
+/// [`Effect::DatasourceResult`]'s `Ready` body.
+///
+/// These are the only plugin-supplied blobs that ride the host→plugin outbound
+/// queue, and [`OUTBOUND_CAPACITY`] counts frames rather than bytes, so without
+/// this a stalled provider's queue is bounded at 256 × `MAX_FRAME_LEN` = 4 GiB.
+/// With it, 64 MiB — the same order as every other buffer the host holds.
+///
+/// **256 KiB** is generous for a query answer: a departures board, a weather
+/// digest or an agent roster is single-digit kilobytes of JSON, so this is two
+/// orders of magnitude of headroom. A datasource that genuinely needs to move
+/// more than this is asking for a file path or a socket, not a reply frame.
+///
+/// **Refused, not truncated** — the opposite of the display-string caps, and
+/// for a stated reason: these payloads are opaque JSON, and a JSON document cut
+/// at 256 KiB is not a smaller document, it is a parse error at the far end. A
+/// refusal the requester can see beats a corruption it cannot.
+pub(super) const MAX_DATASOURCE_PAYLOAD_BYTES: usize = 256 * 1024;
 
 /// Max effect tokens a **plugin** may hold — the burst of [`Effect`]s it can emit
 /// back-to-back before the sustained cap ([`EFFECT_REFILL_PER_SEC`]) applies.
@@ -374,9 +402,10 @@ pub(super) fn capped_effect_strings(
         // than truncates — a cut URI is a different destination, so truncation
         // would be the wrong degradation here.
         Effect::OpenUri { .. } => {}
-        // The datasource legs carry opaque JSON, not display strings; their
-        // payload bound is `MAX_DATASOURCE_PAYLOAD_BYTES` and it refuses
-        // rather than cuts, for the same reason as a URI (#1165 item 7).
+        // The datasource legs carry opaque JSON and identifiers, not display
+        // strings; their bound is `MAX_DATASOURCE_PAYLOAD_BYTES`, applied by
+        // `capped_effect_payload`, and it refuses rather than cuts — for the
+        // same reason as a URI (#1165 item 7).
         Effect::DatasourceQuery { .. } | Effect::DatasourceResult { .. } => {}
     }
     let message = (longest > 0 && warned.insert(std::mem::discriminant(&effect))).then(|| {
@@ -389,6 +418,117 @@ pub(super) fn capped_effect_strings(
         )
     });
     (effect, message)
+}
+
+/// Enforce [`MAX_DATASOURCE_PAYLOAD_BYTES`] on the two datasource legs (#1165
+/// item 7) — the only plugin-supplied blobs that ride a host→plugin outbound
+/// queue whose bound counts frames rather than bytes.
+///
+/// `None` means the effect is refused outright. The two legs degrade
+/// differently, because the host can answer one of them and not the other:
+///
+/// - **`DatasourceResult`** (a provider's answer to a parked query) is rewritten
+///   to `Failed { error: Provider, … }`. The requester still gets its reply, on
+///   the correlation it is waiting on, saying the provider's answer was
+///   unusable — which is true, and is exactly what `DatasourceError::Provider`
+///   is for.
+/// - **`DatasourceQuery`** is dropped, and the requester gets nothing. Stated
+///   plainly because it is the one asymmetry here: the refusal happens *before*
+///   the router parks anything, so there is no correlation to fail and no
+///   host-sourced "your request was too large" in the wire vocabulary to fail
+///   it with. Adding one is a wire change, which this is deliberately not. A
+///   plugin that hits it has a bug, and the journal line names it — the same
+///   terms on which an ungranted effect is dropped with no reply.
+///
+/// `provider` and `scope` are bounded too: they are identifiers, so an
+/// over-long one is refused rather than cut (a truncated name is a *different*
+/// datasource), and they are formatted into the failure messages the router
+/// sends back, which would otherwise be a second way onto the same queue.
+///
+/// Pure and latched like [`capped_effect_strings`], and a separate function
+/// from it because the two answer different questions: that one bounds what a
+/// human will look at, this one bounds what a queue will hold.
+pub(super) fn capped_effect_payload(
+    mut effect: Effect,
+    warned: &mut EffectWarnLatch,
+) -> (Option<Effect>, Option<String>) {
+    let kind = std::mem::discriminant(&effect);
+    let refuse = |what: &str, bytes: usize, warned: &mut EffectWarnLatch| {
+        let message = warned.insert(kind).then(|| {
+            format!(
+                "plugin {what} is {bytes} B, over the host's {MAX_DATASOURCE_PAYLOAD_BYTES} B \
+                 datasource payload cap; refused. The host→plugin queue bounds frames, not \
+                 bytes, so an unbounded payload is an unbounded queue (further occurrences of \
+                 this effect kind are silenced for the rest of this connection)"
+            )
+        });
+        (None, message)
+    };
+    match &mut effect {
+        Effect::DatasourceQuery {
+            provider,
+            scope,
+            params,
+            ..
+        } => {
+            if params.len() > MAX_DATASOURCE_PAYLOAD_BYTES {
+                return refuse("DatasourceQuery params", params.len(), warned);
+            }
+            if provider.len() > MAX_DISPLAY_TEXT_BYTES {
+                return refuse("DatasourceQuery provider name", provider.len(), warned);
+            }
+            if scope.len() > MAX_DISPLAY_TEXT_BYTES {
+                return refuse("DatasourceQuery scope name", scope.len(), warned);
+            }
+        }
+        Effect::DatasourceResult { outcome, .. } => {
+            let over = match outcome {
+                DatasourceOutcome::Ready(payload) => {
+                    (payload.len() > MAX_DATASOURCE_PAYLOAD_BYTES).then(|| payload.len())
+                }
+                // A failure's `message` is a human line, so it is cut rather
+                // than refused — the requester learning *that* it failed
+                // matters more than the tail of why.
+                DatasourceOutcome::Failed { message, .. } => {
+                    if message.len() > MAX_BODY_TEXT_BYTES {
+                        *message =
+                            super::effects::truncate_on_char_boundary(message, MAX_BODY_TEXT_BYTES);
+                    }
+                    None
+                }
+            };
+            if let Some(bytes) = over {
+                let message = warned.insert(kind).then(|| {
+                    format!(
+                        "plugin DatasourceResult payload is {bytes} B, over the host's \
+                         {MAX_DATASOURCE_PAYLOAD_BYTES} B cap; the requester gets a Failed \
+                         outcome instead of an unbounded frame (further occurrences of this \
+                         effect kind are silenced for the rest of this connection)"
+                    )
+                });
+                *outcome = DatasourceOutcome::Failed {
+                    error: DatasourceError::Provider,
+                    message: format!(
+                        "provider payload is {bytes} B, over the host's \
+                         {MAX_DATASOURCE_PAYLOAD_BYTES} B cap"
+                    ),
+                };
+                return (Some(effect), message);
+            }
+        }
+        // Everything else carries no opaque payload; the display-string caps in
+        // `capped_effect_strings` are what bound their strings.
+        Effect::OpenPage(_)
+        | Effect::Niri(_)
+        | Effect::Media(_)
+        | Effect::Audio(_)
+        | Effect::RunCommand { .. }
+        | Effect::RaiseOsd { .. }
+        | Effect::Notify { .. }
+        | Effect::RequestConsent { .. }
+        | Effect::OpenUri { .. } => {}
+    }
+    (Some(effect), None)
 }
 
 /// Whether a non-blocking outbound push should keep its producer task running.
@@ -1205,6 +1345,9 @@ pub(super) async fn serve_conn(
     // the same terms as `hidden_on_warned` above — one line per effect kind per
     // connection, not one per frame.
     let mut effect_text_warned = EffectWarnLatch::new();
+    // #1165 item 7: the datasource payload cap's own latch, separate from the
+    // display-string one because an effect kind can trip both.
+    let mut effect_payload_warned = EffectWarnLatch::new();
     // #1165 item 5: the two drop-warn latches. Kept apart rather than shared,
     // because an effect kind can be dropped for *both* reasons over one
     // connection's life and the two name different fixes — a manifest edit
@@ -1239,15 +1382,20 @@ pub(super) async fn serve_conn(
                         ),
                         &mut rate_cap_warned,
                     );
-                    // #1165: cap the human-facing strings LAST — after the two
-                    // host policies have decided which effects run at all, so a
-                    // dropped effect costs no truncation work, and before the
+                    // #1165: the payload caps run LAST — after the two host
+                    // policies have decided which effects run at all, so a
+                    // dropped effect costs no capping work, and before the
                     // broker, which is the GTK main thread.
                     let kept = kept
                         .into_iter()
-                        .map(|effect| {
+                        .filter_map(|effect| {
                             let (effect, message) =
                                 capped_effect_strings(effect, &mut effect_text_warned);
+                            if let Some(message) = message {
+                                tracing::warn!(plugin = %plugin_id, "{message}");
+                            }
+                            let (effect, message) =
+                                capped_effect_payload(effect, &mut effect_payload_warned);
                             if let Some(message) = message {
                                 tracing::warn!(plugin = %plugin_id, "{message}");
                             }

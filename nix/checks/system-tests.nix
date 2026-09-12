@@ -158,9 +158,9 @@ craneLib.mkCargoDerivation (
       export TROLLSHELL_REQUIRE_SYSTEMD_RUN=1
       # #1080, on the GL env above: `preem_gl_diff` (the #893 stage B
       # CPU/GL parity harness) runs through the same llvmpipe context
-      # as the three `hytte-ui` GL tests. Under llvmpipe every case
-      # has measured bit-exact since #1078 — `max |Δ| 0` of 255 on
-      # every channel, all twelve cases — so `TROLLSHELL_PARITY_EXACT=1`
+      # as the three `hytte-ui` GL tests. Under llvmpipe every *scope*
+      # case has measured bit-exact since #1078 — `max |Δ| 0` of 255 on
+      # every channel, all twelve of them — so `TROLLSHELL_PARITY_EXACT=1`
       # pins the harness to that zero for *this* run: a case that
       # clears the on-glass ceiling (mean 2 / p99 8 / max 32, #893)
       # but is not bit-exact still fails, named `FAIL(exact)`
@@ -183,6 +183,21 @@ craneLib.mkCargoDerivation (
       # read this check's own `FAIL(exact)` numbers) before
       # suspecting the diff — and the fix is to re-measure, never to
       # raise the ceiling `#893`/`#1078` settled for real hardware.
+      #
+      # Since #1143 the pin is **per case**, and that decision lives in
+      # the harness (`preem_gl::parity`'s `Kind` and `Sampling`), not
+      # here: this variable still means "hold what has been measured at
+      # zero to zero". #1143 read Annika's "does not have to be pixel
+      # perfect identical" (#865) as excusing the gauge from it and
+      # #1148's review corrected that — her word was about the glass,
+      # which only ever faces the ceiling, while this variable is
+      # exported nowhere but the three lines above. Both kinds are
+      # pinned at the 1:1 grid, where both have measured `max |Δ| 0`.
+      # The box-averaged `scale = 2` gauge comparison is a render the
+      # kit never made and so cannot be bit-exact by construction; it
+      # is held to its own standard instead (every pixel off an edge
+      # bit-identical plus an edge budget, `parity::case_verdict`), not
+      # to #893's ceiling.
       export TROLLSHELL_PARITY_EXACT=1
     '';
     checkPhaseCargoCommand = ''
@@ -261,10 +276,26 @@ craneLib.mkCargoDerivation (
       # argv), but a future `--skins` regression that silently
       # empties the list would ship green through the exit code
       # alone. Assert the evidence instead of trusting the exit
-      # code: exactly 12 cases means exactly 12 `.gl.ppm` files.
+      # code: the case list is 4 skins × (3 scope fade depths + 3
+      # gauge needle positions + 1 gauge at the shipping upscale), so
+      # exactly 28 cases means exactly 28 `.gl.ppm` files. It was 12
+      # until #1143 added the gauge arm and 24 until #1148's review
+      # added the `scale = 2` case; bump it with the case list, in
+      # the same commit, for the reason the number is asserted at all.
+      #
+      # Nothing here needs a per-kind knob: `TROLLSHELL_PARITY_EXACT=1`
+      # still means "pin what has been measured at zero", and *which*
+      # cases those are is the harness's own decision
+      # (`preem_gl::parity`'s `Kind` and `Sampling`) rather than this
+      # file's. Both kinds are pinned bit-exact where the two arms
+      # rasterise at the same resolution; the box-averaged `scale = 2`
+      # gauge cases are held to the supersampled standard instead —
+      # every pixel off an edge bit-identical plus an edge budget —
+      # which is the only kind of statement a supersampled comparison
+      # can meet.
       gl_ppm_count="$(find "$out/parity" -maxdepth 1 -name '*.gl.ppm' -type f | wc -l)"
-      if [ "$gl_ppm_count" -ne 12 ]; then
-        echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected 12 — a case-count regression, not a parity failure." >&2
+      if [ "$gl_ppm_count" -ne 28 ]; then
+        echo "ERROR: preem_gl_diff wrote $gl_ppm_count *.gl.ppm file(s) in \$out/parity, expected 28 — a case-count regression, not a parity failure." >&2
         exit 1
       fi
     '';

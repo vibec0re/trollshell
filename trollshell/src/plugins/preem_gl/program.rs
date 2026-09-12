@@ -54,7 +54,7 @@ use hytte_preem as kit;
 /// The registered name of the `Scope` pipeline.
 pub(crate) const SCOPE: GlProgram = GlProgram("preem.scope");
 
-const FULLSCREEN_VERT: &str = include_str!("fullscreen.vert");
+pub(crate) const FULLSCREEN_VERT: &str = include_str!("fullscreen.vert");
 const DECAY_FRAG: &str = include_str!("scope_decay.frag");
 const BEAM_VERT: &str = include_str!("scope_beam.vert");
 const BEAM_FRAG: &str = include_str!("scope_beam.frag");
@@ -68,13 +68,13 @@ const BLIT_FRAG: &str = include_str!("scope_blit.frag");
 /// truncating integer blur is exactly the duplication that drifts. `concat!`
 /// over an `include_str!` is a compile-time splice of one body, so the two
 /// shaders cannot disagree about anything but the axis.
-const BLUR_H_FRAG: &str = concat!(
+pub(crate) const BLUR_H_FRAG: &str = concat!(
     "const ivec2 BLUR_DIR = ivec2(1, 0);\n",
-    include_str!("scope_blur.frag")
+    include_str!("blur.frag")
 );
-const BLUR_V_FRAG: &str = concat!(
+pub(crate) const BLUR_V_FRAG: &str = concat!(
     "const ivec2 BLUR_DIR = ivec2(0, 1);\n",
-    include_str!("scope_blur.frag")
+    include_str!("blur.frag")
 );
 
 /// The `Scope` pipeline. See the module docs for what each pass is.
@@ -138,10 +138,17 @@ pub(crate) const NO_BATCH: i32 = -1;
 /// clamped the same way before the decay shader shifts by it.
 pub(crate) const KIT_MAX_PERSISTENCE: u16 = 256;
 
-/// A `Scope`'s GL node payload: the natural size the reconciler measures with,
-/// and the uniforms one render needs.
+/// One kit widget's GL node payload: the natural size the reconciler measures
+/// with, and the uniforms one render needs.
+///
+/// **Kind-agnostic on purpose** (#1143). It was `ScopeSurface` while the scope
+/// was the only GL arm, and the name was the one thing standing between
+/// `Renderer::gl_surface`'s return type and a second kind: every GL arm hands
+/// the reconciler the same three things, so the type that carries them must not
+/// name one of them. A new kind writes a `*_surface` constructor beside
+/// [`scope_surface`], not a second payload struct.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ScopeSurface {
+pub(crate) struct KitSurface {
     /// Natural width in logical pixels — `cols * scale`, exactly what
     /// `Frame::upscale` would have produced.
     pub(crate) width: u32,
@@ -171,7 +178,7 @@ pub(crate) fn scope_surface(
     batch_step: Option<u64>,
     step_seq: u64,
     palette: &kit::PaletteSnapshot,
-) -> ScopeSurface {
+) -> KitSurface {
     let cols = config.cols.max(1);
     let rows = config.rows.max(1);
     let scale = config.scale.max(1);
@@ -203,7 +210,7 @@ pub(crate) fn scope_surface(
             .map_or(NO_BATCH, |back| i32::try_from(back).unwrap_or(i32::MAX))
     });
 
-    ScopeSurface {
+    KitSurface {
         width: cols.saturating_mul(scale),
         height: rows.saturating_mul(scale),
         uniforms: GlUniforms {
@@ -253,7 +260,7 @@ pub(crate) fn scope_surface(
 /// that arithmetic is written in. Every value is a small integer, exactly
 /// representable in `f32`, so the `ivec4(u_bg + 0.5)` on the far side recovers
 /// it with no rounding question.
-fn channels(rgba: kit::Rgba) -> GlValue {
+pub(crate) fn channels(rgba: kit::Rgba) -> GlValue {
     GlValue::Vec4([
         f32::from(rgba[0]),
         f32::from(rgba[1]),
@@ -540,8 +547,8 @@ mod tests {
             ("scope_beam.vert", BEAM_VERT),
             ("scope_beam.frag", BEAM_FRAG),
             ("scope_decay.frag", DECAY_FRAG),
-            ("scope_blur.frag (H)", BLUR_H_FRAG),
-            ("scope_blur.frag (V)", BLUR_V_FRAG),
+            ("blur.frag (H)", BLUR_H_FRAG),
+            ("blur.frag (V)", BLUR_V_FRAG),
             ("scope_blit.frag", BLIT_FRAG),
         ];
 

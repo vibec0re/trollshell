@@ -40,6 +40,35 @@ pub(crate) const CEILING_MAX: f64 = 32.0;
 /// Channel names, for the transcript.
 pub(crate) const CHANNELS: [&str; 3] = ["R", "G", "B"];
 
+/// Ceiling on the **mean** |Δ| over the edge region of a supersampled case
+/// (#1148 review, HIGH-2), in 255ths.
+///
+/// A separate budget from #893's because it is a different measurement, and
+/// saying so out loud is the point. #893's ceiling bounds two renderers drawing
+/// the same picture at the same resolution, where a disagreement is rounding. A
+/// supersampled case compares a box-average of a **twice-as-dense** render
+/// against a single-sample one: on every pixel the kit anti-aliased, the two
+/// have genuinely different coverage, and that difference *is* the improvement
+/// #1090 asked for. Holding it to mean 2 would be asking the fix not to happen —
+/// measured on llvmpipe, the four shipping-scale cases come out at an edge mean
+/// of 6.1 to 9.4 with the whole rest of the frame bit-identical.
+///
+/// So this bounds the drift rather than the difference: 16 is a little under
+/// twice the worst measured, which leaves a driver room to disagree about a
+/// ramp and leaves none for a face drawn in a different place. The assertion
+/// with the teeth is [`Regions::interior_max`] — see [`case_verdict`].
+pub(crate) const SUPERSAMPLED_EDGE_MEAN: f64 = 16.0;
+
+/// Ceiling on the **single worst** edge pixel of a supersampled case, in
+/// 255ths. Measured worst on llvmpipe: 76.
+///
+/// Half of full contrast. An anti-aliased edge pixel can legitimately be most
+/// of the way from field to ink in one render and most of the way back in the
+/// other — that is what a one-pixel ramp against a half-pixel ramp *is* — but a
+/// pixel that swings further than half the palette's range is not reporting a
+/// ramp any more.
+pub(crate) const SUPERSAMPLED_EDGE_MAX: u8 = 128;
+
 /// How far a column's brightest row may move, in **grid** rows, before it counts
 /// as a structural difference rather than a rounding one.
 ///
@@ -104,7 +133,7 @@ pub(crate) enum Verdict {
     /// no `GLArea::error()` and a live context.
     ///
     /// **This is a split of [`Self::UndrawnFramebuffer`], not new coverage, and
-    /// the distinction matters to anyone editing [`Stats::verdict`].** An
+    /// the distinction matters to anyone editing [`Stats::verdict_for`].** An
     /// all-zero readback is a strict subset of "one flat colour", and `uniform`
     /// was already checked ahead of the ceiling before #1072, so M2's "a case,
     /// not a pass" was satisfied without this variant — measured: deleting the
@@ -124,6 +153,384 @@ pub(crate) enum Verdict {
     /// [`peak_row_tolerance`] — a beam drawn somewhere else, not a rounding
     /// disagreement.
     BeamMoved,
+    /// Inside the ceiling, but not **bit-exact**, under
+    /// `TROLLSHELL_PARITY_EXACT=1` — and for a [`Kind`] that env pins (#1080).
+    ///
+    /// Named separately from [`Self::OverCeiling`] so a transcript can tell
+    /// "outside the ceiling" from "inside the ceiling, but not the zero this
+    /// sandbox is pinned to" at a glance.
+    NotBitExact,
+    /// A **supersampled** case disagrees somewhere that is not a rasterisation
+    /// edge (#1148 review, HIGH-2) — see [`Regions::interior_max`].
+    ///
+    /// The sharp one of the two supersampled checks, and the reason that
+    /// comparison is worth running at all. Everything the two arms are *meant*
+    /// to differ about lives on an edge; a flat fill, the interior of a tick, a
+    /// lit core or the CRT's comb that moved says the face itself was resolved
+    /// differently at this scale, which is what a dropped half-pixel offset, an
+    /// unscaled length, a doubled mask pitch or a mis-scaled bloom does.
+    InteriorMoved,
+    /// A supersampled case's edge region is outside
+    /// [`SUPERSAMPLED_EDGE_MEAN`]/[`SUPERSAMPLED_EDGE_MAX`].
+    EdgeOverBudget,
+}
+
+/// Which kit widget a case is measuring, because the two do **not** take the
+/// same structural checks (#1143).
+///
+/// The ceiling (mean ≤ 2 / p99 ≤ 8 / max ≤ 32 per channel) is #893's, and it
+/// is what Annika agreed to on that thread — it is what every real driver
+/// faces, and nothing here touches it. What `TROLLSHELL_PARITY_EXACT=1` adds
+/// on top is a *measurement*, not a design target: it is exported in exactly
+/// one place, `nix/checks/system-tests.nix`, inside the llvmpipe sandbox, so
+/// it is a regression detector for one pinned software rasteriser and costs
+/// nothing on hardware.
+///
+/// **Both kinds are pinned there** (#1148 review, HIGH-1). The gauge was not,
+/// on the argument that it is a different rasteriser — the kit walks a
+/// bounding box per shape accumulating `u16` coverage, the shader evaluates
+/// the same distance fields per fragment in `highp float` — and that Annika's
+/// "does not have to be pixel perfect identical" on #865 said so. Both halves
+/// were wrong about *this* variable. Annika's word was permission for the GL
+/// arm to look different on glass, which the ceiling already grants; and the
+/// twelve gauge cases have measured `max |Δ| 0` on every channel under
+/// llvmpipe since the day the arm landed, so the sensitivity is there to be
+/// had. Without the pin the review's 9 % widening of every minor tick
+/// (`gauge.frag`'s `MINOR_HW`, 0.55 → 0.60) reported worst-channel mean 0.044
+/// / p99 2 / max 3 and shipped green — ~45× inside a ceiling built for a GPU
+/// nobody has run this on.
+///
+/// A pin is only ever as good as the measurement under it, and the Mesa-bump
+/// risk is real: `nix flake update` can red this on a PR that touched no
+/// shader. That risk was accepted for the scope in #1080 and
+/// `nix/checks/system-tests.nix` already documents the response (re-measure on
+/// the new Mesa; never raise the ceiling).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// `preem.scope` — pinned bit-exact under `TROLLSHELL_PARITY_EXACT=1`, and
+    /// structurally checked with the per-column peak-row test.
+    Scope,
+    /// `preem.gauge` (#1143) — pinned bit-exact too, since #1148's review; no
+    /// peak-row check, which is a beam statistic.
+    Gauge,
+}
+
+impl Kind {
+    /// Whether `TROLLSHELL_PARITY_EXACT=1` holds this kind to a zero delta.
+    ///
+    /// **Only what has been measured at zero** — which, since #1148's review,
+    /// is both of them. See the type docs.
+    ///
+    /// An exhaustive `match` rather than a `matches!`, deliberately: a third
+    /// kind (#1144) must not inherit an answer by falling off the end of a
+    /// pattern. Whoever adds it has to look at their own llvmpipe numbers and
+    /// say which of the two this is, and the compiler makes them.
+    pub(crate) fn pinned_exact(self) -> bool {
+        match self {
+            Self::Scope | Self::Gauge => true,
+        }
+    }
+
+    /// Whether the per-column **peak-row** check applies.
+    ///
+    /// It is a beam test, and it says so in its own name: "a column's
+    /// brightest row moved" is a structural statement about a trace that has
+    /// exactly one bright row per column. A dial's brightest row in a column is
+    /// whichever of the arc, a tick, the needle and the hub happens to win
+    /// there, and two of those can tie at the same intensity — so on a gauge
+    /// the statistic measures which shape `argmax` saw first, not whether the
+    /// picture moved. The ceiling and the blank-framebuffer guards do the work
+    /// for a gauge; inventing a second structural check for it without a
+    /// failure to calibrate against would be inventing a flake.
+    pub(crate) fn checks_peak_rows(self) -> bool {
+        matches!(self, Self::Scope)
+    }
+
+    /// The word the transcript prints.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Scope => "scope",
+            Self::Gauge => "gauge",
+        }
+    }
+}
+
+/// How a case's two buffers were brought to the same grid before comparing
+/// (#1148 review, HIGH-2).
+///
+/// The exact pin is a statement about **one** comparison: the GL arm and the
+/// kit rasterising the same picture at the same resolution, pixel against
+/// pixel. A supersampled case is a different question — the GL arm rendered at
+/// `factor` times the kit's grid and the harness box-averaged it back down —
+/// and box-averaging a differently-anti-aliased render is not an operation
+/// that can land on the kit's last bit, nor should it: the whole point of
+/// rendering at `scale = 2` is that the edges are *not* the kit's. So those
+/// cases are held to their own standard — every pixel off an edge
+/// bit-identical, plus an edge budget — and never to [`Kind::pinned_exact`]
+/// nor to #893's ceiling, which is a statement about two renders of one
+/// picture at one resolution.
+///
+/// It is a property of the case rather than of the kind for the same reason
+/// `Kind` exists at all: one widget can be measured both ways, and the gauge is
+/// — `scale = 1` pinned bit-exact, `scale = 2` held to the split
+/// [`case_verdict`] describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sampling {
+    /// One GL pixel per kit pixel: the comparison the exact pin is about.
+    OneToOne,
+    /// The GL arm rendered `factor`× the kit's grid on each axis and the
+    /// readback was box-averaged back down — see [`box_downsample`].
+    Supersampled(u32),
+}
+
+/// The full verdict for one case: the guards, then whichever standard this
+/// *comparison* is held to.
+///
+/// Split from [`Stats::verdict_for`] rather than folded into it because the two
+/// answer different questions: that one is "do these two buffers agree", a
+/// property of the pixels alone, and this one is "does this *case* pass",
+/// which also depends on which widget it is, how it was sampled, and on an
+/// environment variable. Keeping the pixel statistic free of all three is what
+/// lets the tests below drive it on synthetic buffers.
+///
+/// **Two standards, because there are two comparisons** (#1148 review, HIGH-2):
+///
+/// * [`Sampling::OneToOne`] — #893's per-channel ceiling, the scope's peak-row
+///   check, and the `TROLLSHELL_PARITY_EXACT=1` zero pin on both kinds. Two
+///   renderers drawing the same picture at the same resolution: a disagreement
+///   is rounding, and under llvmpipe there has not been one.
+/// * [`Sampling::Supersampled`] — **every pixel off a rasterisation edge is
+///   bit-identical**, and the edge region is inside its own budget. The GL arm
+///   drew at twice the density and the harness averaged it back down, so the
+///   edges are *supposed* to differ — that is #1090's fix — while nothing else
+///   is. Measured on llvmpipe, all four shipping-scale cases come out with the
+///   flat field and the small lit-interior bin at `max |Δ| 0` and everything
+///   else in the edge bin — "small" meaning 46, 47, 46 and 3 pixels of 9216:
+///   a 1.7-logical-px tick has no interior to speak of, so this is mostly a
+///   statement about the field. The residual hole, stated: a scale-only drift
+///   *inside* an expression that still carries `* s` (a tick or an arc 50 %
+///   wider at the shipping scale) moves only edge pixels and clears the
+///   budget; neither the source scan nor the region split sees it.
+///   #893's ceiling is deliberately **not** applied here: it is a statement
+///   about rounding between two renders of one picture, and half the frame's
+///   pixels are edges on a dial.
+pub(crate) fn case_verdict(
+    stats: &Stats,
+    regions: &Regions,
+    kind: Kind,
+    sampling: Sampling,
+    exact: bool,
+) -> Verdict {
+    // "Drew nothing at all", then "drew one flat colour" — ahead of everything,
+    // on every comparison, for #1070's M2 reason.
+    if stats.all_zero {
+        return Verdict::RendersNothing;
+    }
+    if stats.uniform {
+        return Verdict::UndrawnFramebuffer;
+    }
+    match sampling {
+        Sampling::Supersampled(_) => {
+            if regions.interior_max() > 0 {
+                return Verdict::InteriorMoved;
+            }
+            if regions.edge.mean > SUPERSAMPLED_EDGE_MEAN
+                || regions.edge.max > SUPERSAMPLED_EDGE_MAX
+            {
+                return Verdict::EdgeOverBudget;
+            }
+            Verdict::Pass
+        }
+        Sampling::OneToOne => {
+            let verdict = stats.verdict_for(kind);
+            if !verdict.is_pass() {
+                return verdict;
+            }
+            // `max == 0.0` on every channel is equivalent to "every compared
+            // pixel had `|Δ| == 0`": mean and p99 are drawn from that same
+            // non-negative distribution and cannot exceed its max.
+            let bit_exact = stats.channels.iter().all(|c| c.max == 0.0);
+            if exact && kind.pinned_exact() && !bit_exact {
+                return Verdict::NotBitExact;
+            }
+            Verdict::Pass
+        }
+    }
+}
+
+/// One region's |Δ| distribution — see [`regions`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct RegionStats {
+    /// How many reference pixels fell in this bin.
+    pub(crate) pixels: usize,
+    /// Mean worst-channel |Δ| over them, in 255ths.
+    pub(crate) mean: f64,
+    /// The worst single pixel in the bin.
+    pub(crate) max: u8,
+}
+
+/// The **edge / field / lit** split of one case's deltas.
+///
+/// The classification aid #1072 added, and the reason a transcript from this
+/// harness can be triaged without a driver in front of you. Every compared
+/// pixel goes in exactly one bin, decided by the **CPU reference's own
+/// structure** rather than by the palette — so this needs no knowledge of which
+/// skin is running and cannot drift from one:
+///
+/// * **edge** — the reference disagrees with one of its four neighbours. A
+///   difference that lives only here is rasterisation edge coverage: a boundary
+///   landing one pixel over.
+/// * **field** — not an edge, and the frame's *modal* colour, i.e. the flat
+///   unlit background. A difference here is a tone-curve problem: gamma/sRGB
+///   moves a flat fill uniformly, and nothing else does.
+/// * **lit** — not an edge, not the field: the interior of the trace, the
+///   graticule and the bloom. A difference concentrated here, with the field
+///   clean, is real shader math — or, where it tracks how *dim* the pixel is,
+///   blend/premultiply.
+///
+/// It lived in the example until #1148's review, printed and never read. It is
+/// here now because the supersampled verdict is a *statement about the split*
+/// (everything off an edge must be bit-identical), and because down here it has
+/// tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Regions {
+    /// Pixels the reference itself draws a boundary through.
+    pub(crate) edge: RegionStats,
+    /// The flat modal colour, off any edge.
+    pub(crate) field: RegionStats,
+    /// Everything else off an edge: interiors, bloom, the lit core.
+    pub(crate) lit: RegionStats,
+    /// The modal colour the `field` bin was decided by, for the transcript.
+    pub(crate) field_colour: [u8; 3],
+}
+
+impl Regions {
+    /// The worst |Δ| over every pixel that is **not** on a rasterisation edge.
+    ///
+    /// The supersampled case's whole assertion, in one number. See
+    /// [`Verdict::InteriorMoved`].
+    pub(crate) fn interior_max(self) -> u8 {
+        self.field.max.max(self.lit.max)
+    }
+}
+
+/// Bin one case's per-pixel deltas by the reference's own structure.
+///
+/// `reference` is top-down RGBA8 at `size`; `deltas` is [`delta_map`]'s output,
+/// one worst-channel |Δ| byte per pixel in the same order. A short `reference`
+/// reads as black and a short `deltas` as zero, the same
+/// no-panic-in-the-harness rule the rest of this module follows.
+pub(crate) fn regions(reference: &[u8], size: (usize, usize), deltas: &[u8]) -> Regions {
+    let (w, h) = size;
+    let rgb = |x: usize, y: usize| -> [u8; 3] {
+        let i = (y * w + x) * 4;
+        reference
+            .get(i..i + 3)
+            .map_or([0, 0, 0], |px| [px[0], px[1], px[2]])
+    };
+    let mut counts: std::collections::HashMap<[u8; 3], usize> = std::collections::HashMap::new();
+    for y in 0..h {
+        for x in 0..w {
+            *counts.entry(rgb(x, y)).or_default() += 1;
+        }
+    }
+    let field_colour = counts
+        .into_iter()
+        .max_by_key(|(colour, n)| (*n, *colour))
+        .map_or([0, 0, 0], |(colour, _)| colour);
+
+    // (count, sum, max) per bin, in edge / field / lit order.
+    let mut bins = [(0_usize, 0_u64, 0_u8); 3];
+    for y in 0..h {
+        for x in 0..w {
+            let here = rgb(x, y);
+            let edge = [(-1_isize, 0_isize), (1, 0), (0, -1), (0, 1)]
+                .into_iter()
+                .any(|(dx, dy)| {
+                    let (nx, ny) = (x.wrapping_add_signed(dx), y.wrapping_add_signed(dy));
+                    nx < w && ny < h && rgb(nx, ny) != here
+                });
+            let bin = if edge {
+                0
+            } else if here == field_colour {
+                1
+            } else {
+                2
+            };
+            let delta = deltas.get(y * w + x).copied().unwrap_or(0);
+            bins[bin].0 += 1;
+            bins[bin].1 += u64::from(delta);
+            bins[bin].2 = bins[bin].2.max(delta);
+        }
+    }
+    let stats = |(pixels, sum, max): (usize, u64, u8)| {
+        #[allow(clippy::cast_precision_loss)]
+        let mean = if pixels == 0 {
+            0.0
+        } else {
+            sum as f64 / pixels as f64
+        };
+        RegionStats { pixels, mean, max }
+    };
+    Regions {
+        edge: stats(bins[0]),
+        field: stats(bins[1]),
+        lit: stats(bins[2]),
+        field_colour,
+    }
+}
+
+/// Box-average a bottom-up RGBA8 framebuffer readback down by `factor` on each
+/// axis, for the supersampled comparison [`Sampling::Supersampled`] names.
+///
+/// Returns the averaged buffer and its new `(width, height)`, in the **same**
+/// bottom-up convention, so the result drops straight into a [`Layout`] with no
+/// other change. Row order is a reversal and blocks of `factor` rows stay
+/// blocks under it as long as the height divides, which it does: the GL grid is
+/// the kit's grid times the integer upscale.
+///
+/// Rounding is half-up over the block (`+ n/2` before the divide), which is the
+/// kit's own convention in `mix` — the harness must not introduce a bias of its
+/// own to the thing it is measuring.
+///
+/// A `factor` of `0` or `1`, or an allocation that does not divide by it, hands
+/// the buffer back untouched: this is a harness, and silently reshaping a
+/// framebuffer it did not understand is exactly how #1072 measured nothing for
+/// twelve cases.
+pub(crate) fn box_downsample(gl: &[u8], alloc: (u32, u32), factor: u32) -> (Vec<u8>, (u32, u32)) {
+    let (w, h) = (alloc.0 as usize, alloc.1 as usize);
+    let n = factor as usize;
+    if n <= 1 || w % n != 0 || h % n != 0 || gl.len() < w * h * 4 {
+        return (gl.to_vec(), alloc);
+    }
+    let (out_w, out_h) = (w / n, h / n);
+    // `factor` came in as a `u32` and `n * n` is at most `u32::MAX²` only for a
+    // factor no allocation could divide by; the guard above has already refused
+    // anything that does not divide `w` and `h`, so this is a small number.
+    let taps = u32::try_from(n * n).unwrap_or(u32::MAX);
+    let mut out = Vec::with_capacity(out_w * out_h * 4);
+    for by in 0..out_h {
+        for bx in 0..out_w {
+            for channel in 0..4 {
+                let mut sum = 0_u32;
+                for dy in 0..n {
+                    for dx in 0..n {
+                        let i = (((by * n + dy) * w) + bx * n + dx) * 4 + channel;
+                        sum += u32::from(gl[i]);
+                    }
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                out.push(((sum + taps / 2) / taps).min(255) as u8);
+            }
+        }
+    }
+    (
+        out,
+        (
+            u32::try_from(out_w).unwrap_or(0),
+            u32::try_from(out_h).unwrap_or(0),
+        ),
+    )
 }
 
 impl Verdict {
@@ -135,6 +542,9 @@ impl Verdict {
             Self::UndrawnFramebuffer => "FAIL(blank)",
             Self::OverCeiling => "FAIL(ceiling)",
             Self::BeamMoved => "FAIL(beam)",
+            Self::NotBitExact => "FAIL(exact)",
+            Self::InteriorMoved => "FAIL(interior)",
+            Self::EdgeOverBudget => "FAIL(edges)",
         }
     }
 
@@ -217,10 +627,15 @@ impl Stats {
         self.channels.iter().map(|c| c.max).fold(0.0, f64::max)
     }
 
-    /// The verdict, in the order a reader wants to be told: a blank
-    /// framebuffer first (because it makes every other number meaningless),
-    /// then the ceiling, then the structural check.
-    pub(crate) fn verdict(&self) -> Verdict {
+    /// The pixel verdict for one kind, in the order a reader wants to be told:
+    /// a blank framebuffer first (because it makes every other number
+    /// meaningless), then the ceiling, then the structural check — which is
+    /// the scope's alone (see [`Kind::checks_peak_rows`]).
+    ///
+    /// It takes a [`Kind`] and **not** the `TROLLSHELL_PARITY_EXACT` flag: this
+    /// is a property of the two buffers, which is what lets the tests below
+    /// drive it on synthetic ones. [`case_verdict`] is the whole answer.
+    pub(crate) fn verdict_for(&self, kind: Kind) -> Verdict {
         // "Drew nothing at all" first, then "drew one flat colour": the second
         // is the general case of the first, and the first is the one #1070's
         // M2 says must never be reported as anything else.
@@ -238,7 +653,7 @@ impl Stats {
         {
             return Verdict::OverCeiling;
         }
-        if self.peak_row_mismatches > 0 {
+        if kind.checks_peak_rows() && self.peak_row_mismatches > 0 {
             return Verdict::BeamMoved;
         }
         Verdict::Pass
@@ -466,9 +881,415 @@ fn distribution(deltas: &mut [u8]) -> ChannelStats {
 #[cfg(test)]
 mod tests {
     use super::{
-        CEILING_MAX, CEILING_MEAN, ChannelStats, Layout, Stats, Verdict, compare, distribution,
-        peak_row_tolerance,
+        CEILING_MAX, CEILING_MEAN, CEILING_P99, ChannelStats, Kind, Layout, RegionStats, Regions,
+        SUPERSAMPLED_EDGE_MEAN, Sampling, Stats, Verdict, box_downsample, case_verdict, compare,
+        distribution, peak_row_tolerance, regions,
     };
+
+    /// A `Stats` whose **worst pixel** is `delta` 255ths off on every channel,
+    /// with nothing else wrong — the shape a real near-miss has, where a
+    /// handful of anti-aliased edge pixels disagree and the rest of the frame
+    /// is clean.
+    fn inside_by(delta: f64) -> Stats {
+        let channel = ChannelStats {
+            // A hundredth of the worst pixel: a frame where one pixel in a
+            // hundred is off by `delta`, which is well inside the mean ceiling
+            // for every `delta` this test uses, and exactly `0` at `0`.
+            mean: delta / 100.0,
+            p99: delta.min(CEILING_P99),
+            max: delta,
+        };
+        Stats {
+            channels: [channel, channel, channel],
+            pixels: 1,
+            peak_row_mismatches: 0,
+            uniform: false,
+            all_zero: false,
+            worst: None,
+        }
+    }
+
+    /// A clean [`Regions`] — nothing disagrees anywhere — as the supersampled
+    /// verdict's "no finding" baseline.
+    fn clean_regions() -> Regions {
+        Regions {
+            edge: RegionStats {
+                pixels: 2400,
+                mean: 0.0,
+                max: 0,
+            },
+            field: RegionStats {
+                pixels: 6700,
+                mean: 0.0,
+                max: 0,
+            },
+            lit: RegionStats {
+                pixels: 46,
+                mean: 0.0,
+                max: 0,
+            },
+            field_colour: [4, 10, 14],
+        }
+    }
+
+    /// **`TROLLSHELL_PARITY_EXACT=1` pins both kinds at a 1:1 grid** (#1148
+    /// review, HIGH-1).
+    ///
+    /// The pin used to be the scope's alone, on the reading that Annika's "does
+    /// not have to be pixel perfect identical" (#865) applied to it. It did
+    /// not: that variable is exported in one place, the llvmpipe sandbox
+    /// (`nix/checks/system-tests.nix`), so it never reaches the glass her word
+    /// was about, and the gauge's twelve `scale = 1` cases have measured
+    /// `max |Δ| 0` from the day the arm landed. Unpinned, a 9 % widening of
+    /// every minor tick reported a worst-channel max of 3 against a ceiling of
+    /// 32 and shipped green.
+    ///
+    /// **Falsified** three ways, each moving exactly one assertion: make
+    /// [`Kind::pinned_exact`] answer `false` for either kind (the first two),
+    /// or drop the `exact &&` guard from [`case_verdict`] (the third).
+    #[test]
+    fn the_exact_pin_binds_both_kinds_at_one_to_one() {
+        for kind in [Kind::Scope, Kind::Gauge] {
+            assert_eq!(
+                case_verdict(
+                    &inside_by(1.0),
+                    &clean_regions(),
+                    kind,
+                    Sampling::OneToOne,
+                    true,
+                ),
+                Verdict::NotBitExact,
+                "a {} case one 255th off is inside the ceiling and still fails, \
+                 because llvmpipe has never measured anything but 0",
+                kind.label(),
+            );
+            assert_eq!(
+                case_verdict(
+                    &inside_by(0.0),
+                    &clean_regions(),
+                    kind,
+                    Sampling::OneToOne,
+                    true,
+                ),
+                Verdict::Pass,
+                "a bit-exact {} case passes the pin",
+                kind.label(),
+            );
+        }
+        assert_eq!(
+            case_verdict(
+                &inside_by(1.0),
+                &clean_regions(),
+                Kind::Scope,
+                Sampling::OneToOne,
+                false,
+            ),
+            Verdict::Pass,
+            "…and without the env it is the ceiling alone, on both kinds",
+        );
+    }
+
+    /// **A supersampled case is judged on the region split, not on #893's
+    /// ceiling** (#1148 review, HIGH-2): everything off a rasterisation edge
+    /// must be bit-identical, and the edges get their own budget.
+    ///
+    /// The ceiling is a statement about rounding between two renders of one
+    /// picture at one resolution. A `scale = 2` case is not that — the GL arm
+    /// drew at twice the density and the harness averaged it back down, so on
+    /// every pixel the kit anti-aliased the two have genuinely different
+    /// coverage, which *is* #1090's fix. Measured on llvmpipe, all four
+    /// shipping-scale cases land with the field and the lit interiors at
+    /// `max |Δ| 0` and an edge mean of 6.1 to 9.4 — over #893's mean of 2 on
+    /// two of the four skins, which is why holding them to it would have meant
+    /// holding the improvement to "do not improve".
+    ///
+    /// **Falsified** three ways: drop the `interior_max` check (the first
+    /// assertion passes a moved flat fill), drop the edge budget (the second),
+    /// or apply `verdict_for`'s ceiling to the supersampled arm (the last, and
+    /// it is the one that says why the split exists at all).
+    #[test]
+    fn a_supersampled_case_is_exact_off_the_edges_and_budgeted_on_them() {
+        let edgy = Stats {
+            channels: [ChannelStats {
+                mean: 8.0,
+                p99: 40.0,
+                max: 76.0,
+            }; 3],
+            ..inside_by(0.0)
+        };
+        let mut moved_field = clean_regions();
+        moved_field.field.max = 1;
+        moved_field.field.mean = 0.01;
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &moved_field,
+                Kind::Gauge,
+                Sampling::Supersampled(2),
+                true,
+            ),
+            Verdict::InteriorMoved,
+            "one 255th on a flat fill is the face resolved differently at this scale, \
+             and that is the check with the teeth",
+        );
+
+        let mut wild_edges = clean_regions();
+        wild_edges.edge.mean = SUPERSAMPLED_EDGE_MEAN + 0.5;
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &wild_edges,
+                Kind::Gauge,
+                Sampling::Supersampled(2),
+                true,
+            ),
+            Verdict::EdgeOverBudget,
+            "the edges still have a budget — a face drawn somewhere else is all edge",
+        );
+
+        let mut measured = clean_regions();
+        measured.edge.mean = 9.364;
+        measured.edge.max = 76;
+        assert_eq!(
+            case_verdict(
+                &edgy,
+                &measured,
+                Kind::Gauge,
+                Sampling::Supersampled(2),
+                true,
+            ),
+            Verdict::Pass,
+            "…and the numbers llvmpipe actually measures pass, over #893's mean of 2 \
+             on the worst-channel statistic and clean everywhere but the edges",
+        );
+    }
+
+    /// Every guard fires **ahead** of both standards: a breach is reported as a
+    /// breach, not as "not bit-exact" or as an edge budget, whichever
+    /// comparison it came from.
+    #[test]
+    fn the_ceiling_and_the_blank_guards_come_before_the_pin() {
+        let over = inside_by(CEILING_MAX + 1.0);
+        for kind in [Kind::Scope, Kind::Gauge] {
+            assert_eq!(
+                case_verdict(&over, &clean_regions(), kind, Sampling::OneToOne, true),
+                Verdict::OverCeiling,
+                "{} at 1:1 is still held to #893's ceiling",
+                kind.label(),
+            );
+        }
+        let blank = Stats {
+            uniform: true,
+            all_zero: true,
+            ..inside_by(0.0)
+        };
+        for sampling in [Sampling::OneToOne, Sampling::Supersampled(2)] {
+            assert_eq!(
+                case_verdict(&blank, &clean_regions(), Kind::Gauge, sampling, true),
+                Verdict::RendersNothing,
+                "a gauge that drew nothing is bit-exactly nothing — the guard, not the \
+                 standard behind it",
+            );
+        }
+    }
+
+    /// The **peak-row** check is the scope's alone (#1143): it is a statement
+    /// about a trace with one bright row per column, and a dial's brightest row
+    /// in a column is whichever of the arc, a tick, the needle and the hub wins
+    /// there — two of which can tie, making the statistic a report on which
+    /// shape `argmax` saw first.
+    ///
+    /// **Falsified** by making [`Kind::checks_peak_rows`] answer `true` for the
+    /// gauge: the first assertion reports `FAIL(beam)`.
+    #[test]
+    fn the_peak_row_check_is_the_beams_and_the_gauge_does_not_take_it() {
+        let moved = Stats {
+            peak_row_mismatches: 3,
+            ..inside_by(0.0)
+        };
+        assert_eq!(
+            case_verdict(
+                &moved,
+                &clean_regions(),
+                Kind::Gauge,
+                Sampling::OneToOne,
+                true,
+            ),
+            Verdict::Pass,
+            "a gauge is not a beam",
+        );
+        assert_eq!(
+            case_verdict(
+                &moved,
+                &clean_regions(),
+                Kind::Scope,
+                Sampling::OneToOne,
+                true,
+            ),
+            Verdict::BeamMoved,
+            "…and the scope keeps the check unchanged",
+        );
+    }
+
+    /// [`regions`] bins by the **reference's** structure: a pixel next to a
+    /// different colour is an edge, the modal colour off an edge is the field,
+    /// and everything else off an edge is lit.
+    ///
+    /// The supersampled verdict is a statement about that split, so the split
+    /// has to be right. It lived in the example and was printed but never
+    /// asserted until #1148's review gave it a verdict to feed.
+    ///
+    /// **Falsified** by dropping the neighbour test (every pixel lands in field
+    /// or lit and `interior_max` reports the edge's own delta, which is the one
+    /// way the supersampled check could silently pass everything).
+    #[test]
+    fn the_region_split_bins_by_the_references_own_structure() {
+        // A 4×3 reference: left half field, right half a lit block.
+        let (w, h) = (4_usize, 3_usize);
+        let mut reference = Vec::new();
+        for _ in 0..h {
+            for x in 0..w {
+                let px: [u8; 4] = if x < 2 {
+                    [10, 10, 10, 255]
+                } else {
+                    [90, 90, 90, 255]
+                };
+                reference.extend_from_slice(&px);
+            }
+        }
+        // One delta on the boundary column, one in the middle of the field.
+        let mut deltas = vec![0_u8; w * h];
+        deltas[1] = 7; // (1, 0) — next to the colour change, so an edge
+        deltas[w * 2] = 0; // (0, 2) — field, clean
+        let split = regions(&reference, (w, h), &deltas);
+        assert_eq!(
+            split.field_colour,
+            [90, 90, 90],
+            "half and half: the modal colour is a tie, broken by the larger value",
+        );
+        assert_eq!(
+            split.edge.pixels, 6,
+            "the two columns either side of the colour change, and only those",
+        );
+        assert_eq!(
+            split.edge.max, 7,
+            "the boundary delta lands in the edge bin"
+        );
+        assert_eq!(split.interior_max(), 0, "and nothing off an edge disagrees");
+
+        // Widen the frame so there are interior pixels — and make one colour
+        // clearly modal, so the field is the flat fill rather than a coin toss.
+        let (w, h) = (8_usize, 3_usize);
+        let mut reference = Vec::new();
+        for _ in 0..h {
+            for x in 0..w {
+                let px: [u8; 4] = if x < 6 {
+                    [10, 10, 10, 255]
+                } else {
+                    [90, 90, 90, 255]
+                };
+                reference.extend_from_slice(&px);
+            }
+        }
+        let mut deltas = vec![0_u8; w * h];
+        deltas[w + 1] = 5; // (1, 1) — two columns from the boundary: field
+        let split = regions(&reference, (w, h), &deltas);
+        assert_eq!(
+            split.field.max, 5,
+            "a flat fill that moved is a field finding"
+        );
+        assert_eq!(
+            split.interior_max(),
+            5,
+            "…and that is what the verdict reads"
+        );
+        assert_eq!(split.edge.max, 0, "the edges are clean here");
+    }
+
+    /// [`box_downsample`] averages each `factor`×`factor` block, keeps the
+    /// bottom-up row order, and hands the buffer back untouched when it cannot
+    /// do either.
+    ///
+    /// The three properties the `scale = 2` harness cases rest on. The middle
+    /// one is the one that would fail silently: a downsample that reversed the
+    /// rows would still produce a plausible-looking frame, and every delta
+    /// would then be measured against a vertically mirrored dial — which on a
+    /// gauge, whose face is roughly top-heavy but not symmetric, reads as a
+    /// large-but-not-absurd number rather than as an obvious bug.
+    ///
+    /// **Falsified** by averaging `n` columns but only one row (the gradient
+    /// assertion goes red), by iterating the output rows in reverse (the same
+    /// one), or by dropping the `w % n != 0` guard (the last assertion panics
+    /// on an out-of-range index instead of returning).
+    #[test]
+    fn the_box_downsample_averages_blocks_and_keeps_the_row_order() {
+        // 4×4 RGBA, bottom-up, with a distinct value per row so a flip shows.
+        let mut buf = Vec::new();
+        for y in 0..4_u8 {
+            for _ in 0..4 {
+                buf.extend_from_slice(&[y * 10, y * 10 + 1, y * 10 + 2, 255]);
+            }
+        }
+        let (out, alloc) = box_downsample(&buf, (4, 4), 2);
+        assert_eq!(alloc, (2, 2), "each axis halves");
+        assert_eq!(out.len(), 2 * 2 * 4, "…and so does the buffer");
+        // Rows 0 and 1 average to 5 on R; rows 2 and 3 to 25. Bottom-up order
+        // means the first output row is still the first input block.
+        assert_eq!(
+            out[0], 5,
+            "the first block is the average of input rows 0-1"
+        );
+        assert_eq!(
+            out[2 * 4],
+            25,
+            "and the second output row is input rows 2-3, not 0-1 mirrored",
+        );
+        assert_eq!(out[3], 255, "alpha rides through the same average");
+
+        let (same, alloc) = box_downsample(&buf, (4, 4), 1);
+        assert_eq!(
+            (same.len(), alloc),
+            (buf.len(), (4, 4)),
+            "factor 1 is a copy"
+        );
+        let (odd, alloc) = box_downsample(&buf, (4, 4), 3);
+        assert_eq!(
+            (odd.len(), alloc),
+            (buf.len(), (4, 4)),
+            "a factor the allocation does not divide by is refused, not guessed",
+        );
+    }
+
+    /// Box-averaging a frame that is already the replication of a smaller one
+    /// recovers the smaller one **exactly**.
+    ///
+    /// This is the arithmetic the `scale = 2` cases lean on: the kit renders
+    /// logically and replicates, so its own native frame downsamples back to
+    /// its logical frame with no residue, and every 255th the harness then
+    /// reports is the GL arm's own. Half-up rounding is what makes it exact
+    /// here — every block is four copies of one value, so the sum is `4v` and
+    /// `(4v + 2) / 4 == v` for every `v` in `0..=255`.
+    #[test]
+    fn a_replicated_frame_downsamples_back_to_itself() {
+        let logical: Vec<u8> = (0..(3_u32 * 2 * 4))
+            .map(|i| u8::try_from(i * 7 % 256).unwrap_or(0))
+            .collect();
+        let (w, h) = (3_usize, 2_usize);
+        let mut native = vec![0_u8; w * 2 * h * 2 * 4];
+        for y in 0..h * 2 {
+            for x in 0..w * 2 {
+                let src = ((y / 2) * w + x / 2) * 4;
+                let dst = (y * w * 2 + x) * 4;
+                native[dst..dst + 4].copy_from_slice(&logical[src..src + 4]);
+            }
+        }
+        let (back, alloc) = box_downsample(&native, (6, 4), 2);
+        assert_eq!(alloc, (3, 2));
+        assert_eq!(
+            back, logical,
+            "a 2× replication box-averages back to itself"
+        );
+    }
 
     /// A `w`×`h` top-down RGBA8 frame from a per-pixel colour function.
     fn frame(w: usize, h: usize, colour: impl Fn(usize, usize) -> [u8; 3]) -> Vec<u8> {
@@ -538,7 +1359,7 @@ mod tests {
         assert!((stats.channels[2].mean - 0.0).abs() < 1e-9, "B is exact");
         assert!((stats.worst_mean() - 6.0).abs() < 1e-9, "the worst channel");
         assert_eq!(
-            stats.verdict(),
+            stats.verdict_for(Kind::Scope),
             Verdict::OverCeiling,
             "6 > the ceiling of 2, on one channel"
         );
@@ -555,7 +1376,7 @@ mod tests {
         let cpu = frame(w, h, trace(2));
         let gl = flipped(w, h, trace(2));
         let stats = compare(&gl, &cpu, layout(w, h));
-        assert_eq!(stats.verdict(), Verdict::Pass);
+        assert_eq!(stats.verdict_for(Kind::Scope), Verdict::Pass);
         assert_eq!(stats.peak_row_mismatches, 0);
         assert!(!stats.uniform);
         for (channel, name) in stats.channels.iter().zip(super::CHANNELS) {
@@ -584,7 +1405,7 @@ mod tests {
         let stats = compare(&flat, &cpu, layout(w, h));
         assert!(stats.uniform, "every pixel the same colour");
         assert!(!stats.all_zero, "…but not zero");
-        assert_eq!(stats.verdict(), Verdict::UndrawnFramebuffer);
+        assert_eq!(stats.verdict_for(Kind::Scope), Verdict::UndrawnFramebuffer);
     }
 
     /// **"Renders nothing" is a failure, and it is named** — #1070's review
@@ -617,7 +1438,7 @@ mod tests {
 
         let bright = compare(&black, &frame(w, h, trace(4)), layout(w, h));
         assert!(bright.all_zero, "every compared pixel is 0,0,0");
-        assert_eq!(bright.verdict(), Verdict::RendersNothing);
+        assert_eq!(bright.verdict_for(Kind::Scope), Verdict::RendersNothing);
 
         // The dangerous half: a nearly-black reference, where the *deltas*
         // cannot tell "drew the dark skin correctly" from "drew nothing" —
@@ -633,7 +1454,7 @@ mod tests {
         );
         assert_eq!(dark.peak_row_mismatches, 0, "…and no beam moved");
         assert_eq!(
-            dark.verdict(),
+            dark.verdict_for(Kind::Scope),
             Verdict::RendersNothing,
             "…yet it drew nothing, and that is a failure"
         );
@@ -641,7 +1462,7 @@ mod tests {
         // A readback that never arrived at all reads the same way: the GL arm
         // put no pixels in front of the comparison either way.
         let nothing = compare(&[], &frame(w, h, trace(4)), layout(w, h));
-        assert_eq!(nothing.verdict(), Verdict::RendersNothing);
+        assert_eq!(nothing.verdict_for(Kind::Scope), Verdict::RendersNothing);
     }
 
     /// The worst pixel is reported with its coordinates, its channel and both
@@ -778,7 +1599,7 @@ mod tests {
             "…while every channel stays inside the ceiling: {:?}",
             stats.channels
         );
-        assert_eq!(stats.verdict(), Verdict::BeamMoved);
+        assert_eq!(stats.verdict_for(Kind::Scope), Verdict::BeamMoved);
     }
 
     /// A peak that moved by less than the glow's own height is rounding, not a
@@ -867,7 +1688,7 @@ mod tests {
         // Exactly on the boundary: still rounding.
         let inside = compare(&flipped(w, h, dim(20 + tolerance)), &cpu, layout);
         assert_eq!(inside.peak_row_mismatches, 0);
-        assert_eq!(inside.verdict(), Verdict::Pass);
+        assert_eq!(inside.verdict_for(Kind::Scope), Verdict::Pass);
         // One reference row further: structural.
         let outside = compare(&flipped(w, h, dim(20 + tolerance + 1)), &cpu, layout);
         assert_eq!(
@@ -875,7 +1696,7 @@ mod tests {
             u32::try_from(w).expect("w"),
             "every column"
         );
-        assert_eq!(outside.verdict(), Verdict::BeamMoved);
+        assert_eq!(outside.verdict_for(Kind::Scope), Verdict::BeamMoved);
     }
 
     /// The device scale point-samples the readback back down, so a 2× capture
@@ -897,7 +1718,7 @@ mod tests {
                 peak_row_tolerance: 2,
             },
         );
-        assert_eq!(stats.verdict(), Verdict::Pass);
+        assert_eq!(stats.verdict_for(Kind::Scope), Verdict::Pass);
         assert_eq!(stats.pixels, w * h);
     }
 
@@ -949,7 +1770,7 @@ mod tests {
             uniform: false,
             ..Stats::default()
         };
-        assert_eq!(stats.verdict(), Verdict::Pass);
+        assert_eq!(stats.verdict_for(Kind::Scope), Verdict::Pass);
     }
 
     /// Every verdict prints a distinct word, and only one of them is a pass —
@@ -962,6 +1783,7 @@ mod tests {
             Verdict::UndrawnFramebuffer,
             Verdict::OverCeiling,
             Verdict::BeamMoved,
+            Verdict::NotBitExact,
         ];
         let labels: Vec<&str> = all.iter().map(|v| v.label()).collect();
         let mut unique = labels.clone();

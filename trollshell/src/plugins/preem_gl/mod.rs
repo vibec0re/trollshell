@@ -1,10 +1,14 @@
-//! The GL arm's shell-side glue (#893 stage B): which renderer a `Scope`
-//! takes, and the one-time registration that teaches `hytte-ui` how to draw it.
+//! The GL arm's shell-side glue (#893 stage B): which renderer a kit widget
+//! takes, and the one-time registration that teaches `hytte-ui` how to draw
+//! each pipeline.
 //!
-//! The pipeline itself and the `(config, samples, step_seq, palette) →
-//! GlUniforms` mapping live in [`program`], which references nothing above it
-//! so the parity harness can include the same code the shell runs. Everything
-//! that needs the *shell* — the kill switch, the fallback latch — is here.
+//! The pipelines themselves and their pure `state → GlUniforms` mappings live
+//! one module per kind — [`program`] for the `Scope`, [`gauge`] for the
+//! `Gauge` (#1143) — each referencing nothing above it, so the parity harness
+//! can `#[path]`-include the same code the shell runs. Everything that needs
+//! the *shell* — the kill switch, the fallback latch — is here, and it is
+//! deliberately kind-agnostic: a third kind is a module, a `register` line and
+//! a `preem_render` arm, with nothing in this file to change.
 //!
 //! # The switch: GL is the default, `TROLLSHELL_PREEM_RENDERER=cpu` is the kill switch
 //!
@@ -44,7 +48,8 @@
 //! The CPU arm is used in three cases, and only these:
 //!
 //! 1. the switch names `cpu`;
-//! 2. the widget kind has no GL arm — everything but `Scope` in this PR;
+//! 2. the widget kind has no GL arm — everything but `Scope` and `Gauge`
+//!    today (#1143 added the second; #1144 is the third);
 //! 3. **a GL context could not be created**, which `hytte-ui` latches and
 //!    reports through the hook installed in [`install`]. Falling back is free
 //!    here in a way it is not for #893's shader widget: a kit widget *has* a
@@ -64,8 +69,14 @@
 //! `pending`/`idle`/`fades`/`settle_steps` fields as the CPU arm and answers
 //! `animates()` with the same expression, so #926's frame-clock park and unpark
 //! behave identically and the animation half of the host needed no change at
-//! all. That is a deliberate property of the seam, not a coincidence.
+//! all. That is a deliberate property of the seam, not a coincidence — and
+//! #1143's `Renderer::GaugeGl` takes it further by holding the very same
+//! `kit::Gauge` the CPU arm does: the needle's spring is closed-form and
+//! frame-rate independent, so the two gauge arms share their `update`,
+//! `advance` and `animates` arms outright and differ only in what they hand
+//! the reconciler.
 
+mod gauge;
 mod program;
 
 /// The parity harness's arithmetic — see the module docs there.
@@ -79,17 +90,24 @@ mod program;
 #[cfg(test)]
 mod parity;
 
-pub(super) use program::{SCOPE, SCOPE_PIPELINE, ScopeSurface, scope_surface};
+pub(super) use gauge::{GAUGE, GAUGE_PIPELINE, gauge_surface};
+pub(super) use program::{KitSurface, SCOPE, SCOPE_PIPELINE, scope_surface};
 
 /// The renderer switch. `cpu` forces the kit; unset, `gl`, or anything else
 /// takes the GL arm — see the module docs for the parity numbers behind that
 /// default (#1072).
 pub(super) const RENDERER_ENV: &str = "TROLLSHELL_PREEM_RENDERER";
 
-/// Which renderer a `Scope` takes.
+/// Which renderer a kit widget takes.
+///
+/// **Per kind, not per widget** — one answer for the whole preem renderer, and
+/// `preem_render::build` consults it in each arm that *has* a GL pipeline.
+/// Since #1143 that is the `Scope` and the `Gauge`; every other kind takes
+/// [`Arm::Cpu`] because there is nothing else to take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Arm {
-    /// A `GtkGLArea` running the [`SCOPE`] pipeline — the default.
+    /// A `GtkGLArea` running one of the pipelines [`install`] registers — the
+    /// default.
     Gl,
     /// The `hytte-preem` kit, rasterised in-process into a `PixelSurface` —
     /// the kill switch's arm, the fallback for a failed context, and what
@@ -243,13 +261,15 @@ fn configured_arm() -> Arm {
     TEST_ARM.get()
 }
 
-/// Register the `Scope` pipeline and the context-failure hook.
+/// Register every kit pipeline and the context-failure hook.
 ///
 /// Called once from `plugins::install`, on the GTK main thread, before any
 /// plugin tree is reconciled. Cheap: registering a pipeline stores a `Copy`
-/// struct in a map — no GL is touched until a surface realizes.
+/// struct in a map — no GL is touched until a surface realizes — so a new
+/// kind's cost here is one line and no startup work.
 pub(super) fn install() {
     hytte::ui::gl_surface::register(SCOPE, SCOPE_PIPELINE);
+    hytte::ui::gl_surface::register(GAUGE, GAUGE_PIPELINE);
     hytte::ui::gl_surface::set_context_failure_handler(|_reason| {
         // `hytte-ui` has already logged the reason once. What is left for the
         // host is to make the fallback actually reach the screen, and that is

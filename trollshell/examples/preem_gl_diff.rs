@@ -1,8 +1,31 @@
 //! `preem_gl_diff` — the GL/CPU parity harness for #893 stage B.
 //!
-//! Renders the same `Scope` state through **both** arms and prints the
+//! Renders the same kit-widget state through **both** arms and prints the
 //! per-channel delta, so the ceiling the spec proposes — mean ≤ 2/255,
 //! p99 ≤ 8/255, max ≤ 32/255 — is a measurement rather than a hope.
+//!
+//! Two kinds since #1143: the `Scope` (four skins × three fade depths) and the
+//! `Gauge` (four skins × three needle positions, plus one at the **shipping**
+//! upscale). The three-per-skin gauge cases run at `scale = 1`, where the GL
+//! arm's native grid and the kit's logical one are the same number and the two
+//! can be compared pixel against pixel — that is where
+//! `TROLLSHELL_PARITY_EXACT=1` pins both kinds at zero.
+//!
+//! The fourth gauge case per skin runs at `scale = 2`, which is
+//! `GaugeConfig::default()` and therefore every dial on the glass (#1148
+//! review, HIGH-2). It cannot be compared naively — the GL arm is rasterising
+//! at twice the resolution *on purpose*, which is the whole of #1090's fix — so
+//! the harness box-averages the native readback back down to the kit's logical
+//! grid (`parity::box_downsample`) and then holds it to the split that
+//! difference is supposed to have: **every pixel off a rasterisation edge is
+//! bit-identical to the kit's**, and the edge region has its own budget.
+//! Measured on llvmpipe, all four land exactly there — field and lit interiors
+//! at `max |Δ| 0`, an edge mean of 6.1 to 9.4 — which is a sharper statement
+//! than #893's ceiling could make about them, and one #893's ceiling itself
+//! would fail (a dial is nearly a third edge pixels). A dropped half-pixel
+//! offset, an unscaled length, a doubled mask pitch or a mis-scaled bloom is
+//! what breaks it. See `preem_gl::gauge` and `preem_gl::parity`'s
+//! `Kind`/`Sampling`/`case_verdict`.
 //!
 //! ```sh
 //! nix develop --command cargo run -p trollshell --example preem_gl_diff
@@ -87,12 +110,17 @@
 //! it is deliberately loose enough to survive a different GPU's rounding. It
 //! does **not** protect the bit-exactness this file measured under llvmpipe
 //! (#1078's review, INFO-1): a 1–6/255 regression on every channel still
-//! reports `PASS`. With `TROLLSHELL_PARITY_EXACT=1` set, a case that is inside
-//! the ceiling but not bit-exact (`max |Δ| > 0` on any channel) fails anyway,
-//! named `FAIL(exact)`. This is meant for the sandboxed `system-tests` check
-//! (`flake.nix`), where the driver is pinned to Mesa llvmpipe and 0 is the
-//! only value that has ever been measured — it is **not** set when running
+//! reports `PASS`. With `TROLLSHELL_PARITY_EXACT=1` set, a **1:1** case that is
+//! inside the ceiling but not bit-exact (`max |Δ| > 0` on any channel) fails
+//! anyway, named `FAIL(exact)`. This is meant for the sandboxed `system-tests`
+//! check (`flake.nix`), where the driver is pinned to Mesa llvmpipe and 0 is
+//! the only value that has ever been measured — it is **not** set when running
 //! this by hand against real glass, where the ceiling is the real contract.
+//!
+//! Since #1148's review it pins **both kinds**, not the scope alone. The
+//! supersampled cases are unaffected either way: their verdict is the region
+//! split above, which is already exact where exactness is meaningful and does
+//! not depend on this variable at all.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -113,15 +141,59 @@ mod program;
 // mounted there — where `cargo test -p trollshell --lib` actually runs it.
 #[path = "../src/plugins/preem_gl/parity.rs"]
 mod parity;
+// The gauge's pipeline and mapping (#1143), included the same way and for the
+// same reason. It is a sibling of `program` in the shell too, and reaches it
+// through `super::program::…`, which resolves here as well because both land
+// one module down from a crate root.
+#[path = "../src/plugins/preem_gl/gauge.rs"]
+mod gauge;
 
-/// Logical grid the cases run at. Small enough to keep the whole comparison on
-/// screen at 1× and wide enough that the graticule's 12-column pitch repeats.
-const COLS: u32 = 48;
-const ROWS: u32 = 24;
+/// Logical grid the **scope** cases run at. Small enough to keep the whole
+/// comparison on screen at 1× and wide enough that the graticule's 12-column
+/// pitch repeats.
+const SCOPE_COLS: u32 = 48;
+const SCOPE_ROWS: u32 = 24;
 /// Integer upscale, so the natural size is a clean multiple of the grid.
-const SCALE: u32 = 2;
+const SCOPE_SCALE: u32 = 2;
 /// Phosphor persistence — the kit's default, a ~17-step settle.
 const PERSISTENCE: u16 = 184;
+
+/// Logical grid the **gauge** cases run at — the kit's own default face, the
+/// one #931 tuned and #1090 was reported against.
+const GAUGE_COLS: u32 = 144;
+const GAUGE_ROWS: u32 = 64;
+/// The upscale the **1:1** gauge cases run at.
+///
+/// The GL gauge's offscreen grid is the *native* buffer (`cols * scale`), not
+/// the logical one, because drawing the dial at the size it is shown at is the
+/// point of the arm — see `preem_gl::gauge`. At `scale = 1` the two arms draw
+/// the same picture at the same resolution, which is the one place a *pixel
+/// against pixel* number means something, and it is where
+/// `TROLLSHELL_PARITY_EXACT=1` pins them both at zero.
+const GAUGE_SCALE: u32 = 1;
+
+/// The upscale the **supersampled** gauge cases run at — `GaugeConfig`'s own
+/// default, which is what every dial on the glass actually uses (#1148 review,
+/// HIGH-2).
+///
+/// Without these, nothing in CI ever rendered the gauge in the configuration it
+/// ships in: `Dial::scaled`'s half-pixel offset, the `u_upscale` on every
+/// length, the bloom radius's `* scale` and the CRT mask's logical-pitch
+/// division are all the identity at `scale = 1`, so four separate scale-only
+/// decisions went unrendered by every gate.
+///
+/// Comparing them naively would indeed measure the improvement rather than a
+/// regression — a sharper edge is *supposed* to differ from a smeared one — so
+/// the harness does not compare them naively. It renders GL at the native grid,
+/// box-averages each `GAUGE_SUPERSAMPLE`² block back down to the kit's logical
+/// frame (`parity::box_downsample`) and holds the result to the supersampled
+/// standard in `parity::case_verdict`: every pixel off a rasterisation edge
+/// bit-identical (`interior_max() == 0`) and the edge bin inside a measured
+/// budget — not #893's ceiling, which a dial's roughly one-quarter edge pixels
+/// would fail by construction. That is what a dropped `(scale - 1) / 2`, an
+/// unscaled length, a doubled mask pitch or a mis-scaled bloom breaks: they
+/// move the field, not only the edges.
+const GAUGE_SUPERSAMPLE: u32 = 2;
 
 /// Whether any case failed, for [`main`]'s exit status.
 ///
@@ -143,7 +215,9 @@ fn main() -> glib::ExitCode {
 
     println!("=== preem_gl_diff — #893 stage B parity harness ===");
     println!(
-        "grid {COLS}x{ROWS} scale {SCALE} persistence {PERSISTENCE}; \
+        "scope {SCOPE_COLS}x{SCOPE_ROWS} scale {SCOPE_SCALE} persistence {PERSISTENCE}; \
+         gauge {GAUGE_COLS}x{GAUGE_ROWS} scale {GAUGE_SCALE} and {GAUGE_SUPERSAMPLE} \
+         (box-averaged down); \
          ceiling mean {} / p99 {} / max {} per channel",
         parity::CEILING_MEAN,
         parity::CEILING_P99,
@@ -152,10 +226,20 @@ fn main() -> glib::ExitCode {
     let exact = parity_exact();
     if exact {
         println!(
-            "TROLLSHELL_PARITY_EXACT=1: any case with a non-zero delta on any \
-             channel fails as FAIL(exact), even inside the ceiling above"
+            "TROLLSHELL_PARITY_EXACT=1: a **1:1** case of either kind with a \
+             non-zero delta on any channel fails as FAIL(exact), even inside \
+             the ceiling above."
         );
     }
+    println!(
+        "the .x{GAUGE_SUPERSAMPLE} gauge cases are box-averaged down from the shipping \
+         upscale and take neither the ceiling nor that pin: every pixel off a \
+         rasterisation edge must be bit-identical (FAIL(interior)) and the edge \
+         region has its own budget, mean {SUPERSAMPLED_EDGE_MEAN} / max {SUPERSAMPLED_EDGE_MAX} \
+         (FAIL(edges)). See `preem_gl::parity`'s `case_verdict`.",
+        SUPERSAMPLED_EDGE_MEAN = parity::SUPERSAMPLED_EDGE_MEAN,
+        SUPERSAMPLED_EDGE_MAX = parity::SUPERSAMPLED_EDGE_MAX,
+    );
 
     let app = gtk::Application::builder()
         .application_id("mov.vibec0re.trollshell.preem-gl-diff")
@@ -213,13 +297,114 @@ USAGE:
     Ok(skins)
 }
 
-/// One comparison: a skin plus how many animation steps to run before reading.
-struct Case {
-    style: kit::DisplayStyle,
-    /// Extra idle steps after the debut batch, so the phosphor trail — the one
-    /// thing the GL arm reimplements as a recurrence — is measured mid-fade
-    /// rather than only at full intensity.
-    idle_steps: u32,
+/// One comparison: a kit widget, a skin, and the state to drive it into.
+enum Case {
+    /// A `Scope` after its debut batch plus `idle_steps` idle ones.
+    Scope {
+        style: kit::DisplayStyle,
+        /// Extra idle steps after the debut batch, so the phosphor trail — the
+        /// one thing the GL arm reimplements as a recurrence — is measured
+        /// mid-fade rather than only at full intensity.
+        idle_steps: u32,
+    },
+    /// A `Gauge` with its needle driven into one of three positions (#1143).
+    Gauge {
+        style: kit::DisplayStyle,
+        needle: NeedleAt,
+        /// The integer upscale the GL arm renders at. [`GAUGE_SCALE`] compares
+        /// pixel against pixel; [`GAUGE_SUPERSAMPLE`] compares a box-averaged
+        /// native frame against the kit's logical one.
+        scale: u32,
+    },
+}
+
+/// Where a gauge case's needle is when the frame is taken.
+///
+/// Three positions, chosen to cover what the shader has to get right: the
+/// motion-blur fan **off** and **on** (it is the needle's own geometry
+/// max-combined, so at rest it must vanish exactly rather than fatten the
+/// blade), the lit value arc empty and full, and the overtravel stop.
+#[derive(Clone, Copy)]
+enum NeedleAt {
+    /// Settled at rest, low on the scale: no fan, a short value arc.
+    Rest,
+    /// Mid-sweep toward full scale: the fan is spread, the arc is partly lit.
+    Sweeping,
+    /// Slammed to full scale and overshooting into the mechanical stop.
+    Pegged,
+}
+
+impl NeedleAt {
+    /// The word in the case label and on its evidence files.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Rest => "rest",
+            Self::Sweeping => "sweep",
+            Self::Pegged => "pegged",
+        }
+    }
+
+    /// The target to point the needle at, and how many 60 Hz frames to run
+    /// before the frame is taken. `None` frames means [`kit::Gauge::settle`] —
+    /// parked on the reading with zero velocity, which is what makes the fan
+    /// provably absent rather than merely small.
+    fn drive(self) -> (f32, Option<u32>) {
+        match self {
+            Self::Rest => (0.3, None),
+            // ~120 ms into a 2 Hz spring: past the halfway point and still
+            // moving fast, so every blade of the fan is separated.
+            Self::Sweeping => (0.85, Some(7)),
+            // Full scale from rest overshoots past 1.0 into the overtravel,
+            // which is where the drawn angle is clamped and the physics is not.
+            Self::Pegged => (1.0, Some(16)),
+        }
+    }
+}
+
+impl Case {
+    /// Which per-kind ceiling this case is held to — see `parity::Kind`.
+    fn kind(&self) -> parity::Kind {
+        match self {
+            Self::Scope { .. } => parity::Kind::Scope,
+            Self::Gauge { .. } => parity::Kind::Gauge,
+        }
+    }
+
+    /// How the two buffers are brought to one grid — see `parity::Sampling`.
+    ///
+    /// Every scope case and the `scale = 1` gauge cases compare pixel against
+    /// pixel. The gauge's shipping-scale cases render `factor`× larger and are
+    /// box-averaged down, which is a comparison the exact pin cannot apply to.
+    fn sampling(&self) -> parity::Sampling {
+        match self {
+            Self::Gauge { scale, .. } if *scale > 1 => parity::Sampling::Supersampled(*scale),
+            _ => parity::Sampling::OneToOne,
+        }
+    }
+
+    /// `(logical cols, logical rows, integer upscale)` — the upscale the **GL**
+    /// arm renders at.
+    fn geometry(&self) -> (u32, u32, u32) {
+        match self {
+            Self::Scope { .. } => (SCOPE_COLS, SCOPE_ROWS, SCOPE_SCALE),
+            Self::Gauge { scale, .. } => (GAUGE_COLS, GAUGE_ROWS, *scale),
+        }
+    }
+
+    /// The natural size in logical pixels — what the area is sized to.
+    fn natural(&self) -> (u32, u32) {
+        let (cols, rows, scale) = self.geometry();
+        (cols * scale, rows * scale)
+    }
+
+    /// The size the **CPU reference frame** comes out at, which is the natural
+    /// size for a 1:1 case and the logical grid for a supersampled one.
+    fn reference_scale(&self) -> u32 {
+        match self.sampling() {
+            parity::Sampling::OneToOne => self.geometry().2,
+            parity::Sampling::Supersampled(_) => 1,
+        }
+    }
 }
 
 /// How many renders of the **same** state to issue before reading the
@@ -270,30 +455,55 @@ fn activate(app: &gtk::Application, skins: &[kit::DisplayStyle], exact: bool) {
     // The same registration `plugins::install` does in the shell, with the same
     // pipeline constant — the harness drives the shipping pipeline, not a copy.
     hytte::ui::gl_surface::register(program::SCOPE, program::SCOPE_PIPELINE);
+    hytte::ui::gl_surface::register(gauge::GAUGE, gauge::GAUGE_PIPELINE);
 
     let cases: Vec<Case> = skins
         .iter()
         .flat_map(|style| {
-            [0_u32, 1, 5].into_iter().map(move |idle_steps| Case {
+            let scopes = [0_u32, 1, 5]
+                .into_iter()
+                .map(move |idle_steps| Case::Scope {
+                    style: *style,
+                    idle_steps,
+                });
+            let gauges = [NeedleAt::Rest, NeedleAt::Sweeping, NeedleAt::Pegged]
+                .into_iter()
+                .map(move |needle| Case::Gauge {
+                    style: *style,
+                    needle,
+                    scale: GAUGE_SCALE,
+                });
+            // One supersampled case per skin, at the needle position that puts
+            // the most anti-aliased edge on the face: the blade is at an
+            // arbitrary angle, the fan is spread across four blades, and the
+            // value arc has both of its ends on screen. See
+            // [`GAUGE_SUPERSAMPLE`].
+            let shipping = std::iter::once(Case::Gauge {
                 style: *style,
-                idle_steps,
-            })
+                needle: NeedleAt::Sweeping,
+                scale: GAUGE_SUPERSAMPLE,
+            });
+            scopes.chain(gauges).chain(shipping)
         })
         .collect();
 
     let area = GlSurface::new();
-    let natural = (COLS * SCALE, ROWS * SCALE);
-    let width = i32::try_from(natural.0).unwrap_or(i32::MAX);
-    let height = i32::try_from(natural.1).unwrap_or(i32::MAX);
-    area.set_size_request(width, height);
     area.set_halign(gtk::Align::Center);
     area.set_valign(gtk::Align::Center);
+    // The window has to hold the **largest** case, because the size request
+    // moves per case (the two kinds run at different grids) and an area GTK
+    // could not give its requested size would be compared against a reference
+    // of a different shape. `measure` says so out loud if that ever happens.
+    let widest = cases.iter().map(|case| case.natural().0).max().unwrap_or(1);
+    let tallest = cases.iter().map(|case| case.natural().1).max().unwrap_or(1);
+    let width = i32::try_from(widest).unwrap_or(i32::MAX);
+    let height = i32::try_from(tallest).unwrap_or(i32::MAX);
 
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("preem_gl_diff")
-        .default_width(width + 32)
-        .default_height(height + 32)
+        .default_width(width + 64)
+        .default_height(height + 64)
         .child(&area)
         .build();
     window.present();
@@ -428,7 +638,8 @@ impl Runner {
         println!("-- summary --");
         if self.failures.get() == 0 {
             println!(
-                "PASS all {} case(s) inside the proposed ceiling on every channel",
+                "PASS all {} case(s) — the 1:1 ones inside the proposed ceiling on every \
+                 channel, the box-averaged ones bit-identical off every edge",
                 self.cases.len()
             );
         } else {
@@ -443,8 +654,36 @@ impl Runner {
     }
 }
 
-/// The sample batch every case stamps — a wave with steep segments, so the
-/// polyline join (the part `GL_LINES` would have got wrong) is exercised.
+/// The gauge a case drives, in the state its frame is taken in.
+///
+/// **One builder for both arms.** The needle's spring is deterministic, so
+/// `drive` and `measure` each call this and get the identical state — which is
+/// what makes the comparison a comparison of *renderers* rather than of two
+/// needles that happen to be near each other. It mirrors `preem_render::build`'s
+/// own builder chain, `range` before `set_target` included.
+fn gauge_state(config: vocab::GaugeConfig, needle: NeedleAt) -> kit::Gauge {
+    let mut dial = kit::Gauge::with_size(config.cols as usize, config.rows as usize)
+        .scale(config.scale as usize)
+        .sweep_deg(config.sweep_deg)
+        .ticks(config.divisions as usize, config.subdivisions as usize)
+        .range(config.range.low, config.range.high)
+        .frequency(config.frequency_hz)
+        .damping(config.damping);
+    let (target, frames) = needle.drive();
+    dial.set_target(target);
+    match frames {
+        None => dial.settle(),
+        Some(frames) => {
+            for _ in 0..frames {
+                dial.advance(1.0 / 60.0);
+            }
+        }
+    }
+    dial
+}
+
+/// The sample batch every scope case stamps — a wave with steep segments, so
+/// the polyline join (the part `GL_LINES` would have got wrong) is exercised.
 fn samples() -> Vec<f32> {
     (0..32_u8)
         .map(|i| {
@@ -454,44 +693,103 @@ fn samples() -> Vec<f32> {
         .collect()
 }
 
-fn config(style: kit::DisplayStyle) -> vocab::ScopeConfig {
+/// The wire style reference naming the same skin the kit enum does.
+fn style_ref(style: kit::DisplayStyle) -> vocab::StyleRef {
     let name = vocab::StyleName::ALL
         .into_iter()
         .find(|candidate| candidate.name() == style.name())
         .unwrap_or_default();
+    vocab::StyleRef::new(name)
+}
+
+fn scope_config(style: kit::DisplayStyle) -> vocab::ScopeConfig {
     vocab::ScopeConfig {
-        style: vocab::StyleRef::new(name),
-        cols: COLS,
-        rows: ROWS,
-        scale: SCALE,
+        style: style_ref(style),
+        cols: SCOPE_COLS,
+        rows: SCOPE_ROWS,
+        scale: SCOPE_SCALE,
         persistence: PERSISTENCE,
+    }
+}
+
+fn gauge_config(style: kit::DisplayStyle, scale: u32) -> vocab::GaugeConfig {
+    vocab::GaugeConfig {
+        style: style_ref(style),
+        cols: GAUGE_COLS,
+        rows: GAUGE_ROWS,
+        scale,
+        ..vocab::GaugeConfig::default()
     }
 }
 
 /// One case's name in the transcript and on its evidence files.
 fn label(case: &Case) -> String {
-    format!("{}.idle{}", case.style.name(), case.idle_steps)
+    match case {
+        Case::Scope { style, idle_steps } => format!("scope.{}.idle{idle_steps}", style.name()),
+        // The upscale is in the name only where it is not the 1:1 comparison,
+        // so the twelve pinned cases keep the labels #1143's transcripts carry.
+        Case::Gauge {
+            style,
+            needle,
+            scale,
+        } if *scale == GAUGE_SCALE => format!("gauge.{}.{}", style.name(), needle.name()),
+        Case::Gauge {
+            style,
+            needle,
+            scale,
+        } => format!("gauge.{}.{}.x{scale}", style.name(), needle.name()),
+    }
 }
 
 /// Push a case's state at the surface and ask for a frame.
 fn drive(area: &GlSurface, case: &Case) {
-    let batch: std::sync::Arc<[f32]> = std::sync::Arc::from(&samples()[..]);
-    // The debut batch is step 0; `idle_steps` more steps carry it into the
-    // fade, exactly as `Renderer::ScopeGl::advance` counts them.
-    let step_seq = 1 + u64::from(case.idle_steps);
-    let surface = program::scope_surface(
-        config(case.style),
-        &batch,
-        Some(0),
-        step_seq,
-        &kit::palette_snapshot(case.style),
+    let (program, width, height, uniforms) = match case {
+        Case::Scope { style, idle_steps } => {
+            let batch: std::sync::Arc<[f32]> = std::sync::Arc::from(&samples()[..]);
+            // The debut batch is step 0; `idle_steps` more steps carry it into
+            // the fade, exactly as `Renderer::ScopeGl::advance` counts them.
+            let step_seq = 1 + u64::from(*idle_steps);
+            let surface = program::scope_surface(
+                scope_config(*style),
+                &batch,
+                Some(0),
+                step_seq,
+                &kit::palette_snapshot(*style),
+            );
+            (
+                program::SCOPE,
+                surface.width,
+                surface.height,
+                surface.uniforms,
+            )
+        }
+        Case::Gauge {
+            style,
+            needle,
+            scale,
+        } => {
+            let config = gauge_config(*style, *scale);
+            let dial = gauge_state(config, *needle);
+            let surface = gauge::gauge_surface(
+                config,
+                dial.fraction(),
+                dial.needle().velocity(),
+                &kit::palette_snapshot(*style),
+            );
+            (
+                gauge::GAUGE,
+                surface.width,
+                surface.height,
+                surface.uniforms,
+            )
+        }
+    };
+    // Per case, because the two kinds run at different grids — see `activate`.
+    area.set_size_request(
+        i32::try_from(width).unwrap_or(i32::MAX),
+        i32::try_from(height).unwrap_or(i32::MAX),
     );
-    area.set_state(
-        program::SCOPE,
-        surface.width,
-        surface.height,
-        &std::sync::Arc::new(surface.uniforms),
-    );
+    area.set_state(program, width, height, &std::sync::Arc::new(uniforms));
 }
 
 /// Read the area's framebuffer back. See [`SETTLE_RENDERS`] for *when* this is
@@ -549,18 +847,29 @@ fn capture(area: &GlSurface, label: &str) -> Result<Capture, String> {
 /// — see [`parity::Verdict`] for the five ways it can fail.
 fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool) -> bool {
     let label = label(case);
+    let upscale = case.reference_scale();
 
-    // The CPU reference: the same batches through the kit.
-    let mut oracle = kit::Scope::with_size(COLS as usize, ROWS as usize)
-        .scale(SCALE as usize)
-        .persistence(PERSISTENCE);
-    oracle.advance(&samples());
-    for _ in 0..case.idle_steps {
-        oracle.advance(&[]);
-    }
-    let reference = oracle.render(case.style);
+    // The CPU reference: the same state through the kit, which is the oracle.
+    // A supersampled case takes the kit's **logical** frame — `reference_scale`
+    // is 1 there — because that is what the GL readback is averaged down to.
+    let reference = match case {
+        Case::Scope { style, idle_steps } => {
+            let mut oracle = kit::Scope::with_size(SCOPE_COLS as usize, SCOPE_ROWS as usize)
+                .scale(SCOPE_SCALE as usize)
+                .persistence(PERSISTENCE);
+            oracle.advance(&samples());
+            for _ in 0..*idle_steps {
+                oracle.advance(&[]);
+            }
+            oracle.render(*style)
+        }
+        Case::Gauge { style, needle, .. } => {
+            gauge_state(gauge_config(*style, upscale), *needle).render(*style)
+        }
+    };
 
-    let expected = (COLS * SCALE * shot.scale, ROWS * SCALE * shot.scale);
+    let natural = case.natural();
+    let expected = (natural.0 * shot.scale, natural.1 * shot.scale);
     if shot.alloc != expected {
         println!(
             "INFO {label}: allocation {}x{} is not the natural size {}x{} — \
@@ -570,19 +879,48 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
         );
     }
 
+    // A supersampled case is box-averaged onto the kit's grid **before**
+    // anything is measured, so every statistic below — the ceiling, the region
+    // split, the delta map, the evidence images — is computed on one pair of
+    // buffers of one shape (#1148 review, HIGH-2). The device scale folds into
+    // the same divide: `factor` device pixels per reference pixel on each axis,
+    // averaged in one pass, which leaves the layout at a device scale of 1.
+    let (gl_raw, gl_alloc, device_scale) = match case.sampling() {
+        parity::Sampling::OneToOne => (
+            std::borrow::Cow::Borrowed(&shot.raw[..]),
+            shot.alloc,
+            shot.scale,
+        ),
+        parity::Sampling::Supersampled(factor) => {
+            let (raw, alloc) = parity::box_downsample(&shot.raw, shot.alloc, factor * shot.scale);
+            (std::borrow::Cow::Owned(raw), alloc, 1)
+        }
+    };
+
     // `for_capture` rather than a struct literal: the beam tolerance is
     // `parity::peak_row_tolerance`'s to compute, and it is the number that
     // decides `FAIL(beam)` in a transcript pasted on #893. Written out here it
     // drifted — it carried a stray device-scale factor, which made the verdict
     // depend on the monitor the harness ran on.
     let layout = parity::Layout::for_capture(
-        shot.alloc,
+        gl_alloc,
         (reference.width(), reference.height()),
-        shot.scale,
-        SCALE as usize,
+        device_scale,
+        upscale as usize,
     );
-    let stats = parity::compare(&shot.raw, reference.data(), layout);
-    let verdict = stats.verdict();
+    let stats = parity::compare(&gl_raw, reference.data(), layout);
+    let deltas = parity::delta_map(&gl_raw, reference.data(), layout);
+    let split = parity::regions(
+        reference.data(),
+        (reference.width(), reference.height()),
+        &deltas,
+    );
+    // **The per-case verdict**: the blank-frame guards on every case, then
+    // whichever standard this comparison is held to — #893's ceiling, the
+    // scope's peak-row check and the `TROLLSHELL_PARITY_EXACT=1` zero pin at
+    // 1:1 (#1143/#1148), the region split for a supersampled case. See
+    // `parity::case_verdict`.
+    let verdict = parity::case_verdict(&stats, &split, case.kind(), case.sampling(), exact);
     println!(
         "{} {label}: worst channel mean {:.3} p99 {:.0} max {:.0} of 255 \
          over {} px; peak-row mismatches {}/{}",
@@ -619,103 +957,44 @@ fn measure(case: &Case, shot: &Capture, evidence: &std::path::Path, exact: bool)
         );
     }
 
-    let deltas = parity::delta_map(&shot.raw, reference.data(), layout);
-    print_regions(&deltas, &reference);
-    write_evidence(evidence, &label, shot, layout, &reference, &deltas);
+    print_regions(&split);
+    write_evidence(evidence, &label, &gl_raw, layout, &reference, &deltas);
 
     // #1080's 0-pinned assertion (#1078 review, INFO-1): the ceiling is loose
-    // on purpose, for a driver this harness has never measured. Under
-    // llvmpipe every case has come out bit-exact, so with
-    // `TROLLSHELL_PARITY_EXACT=1` a case that clears the ceiling but is not
-    // bit-exact is *still* a failure — named separately from `verdict`'s own
-    // labels so a transcript can tell "outside the ceiling" from "inside the
-    // ceiling, but not the zero this sandbox is pinned to" at a glance. `max
-    // == 0.0` on every channel is equivalent to "every compared pixel had
-    // `|Δ| == 0`", since mean/p99 are drawn from that same non-negative
-    // distribution and cannot exceed its max.
-    let bit_exact = stats.channels.iter().all(|c| c.max == 0.0);
-    if exact && verdict.is_pass() && !bit_exact {
+    // on purpose, for a driver this harness has never measured. Under llvmpipe
+    // every 1:1 case of both kinds has come out bit-exact, so the pin says so
+    // — and says so only for a comparison that can be, which is what
+    // `case_verdict` decides above.
+    if verdict == parity::Verdict::NotBitExact {
         println!(
-            "FAIL(exact) {label}: TROLLSHELL_PARITY_EXACT=1 — inside the ceiling \
-             but not bit-exact (worst channel mean {:.3} p99 {:.0} max {:.0} of \
-             255), and llvmpipe has never measured anything but 0",
-            stats.worst_mean(),
-            stats.worst_p99(),
-            stats.worst_max(),
+            "      TROLLSHELL_PARITY_EXACT=1 — inside the ceiling but not \
+             bit-exact, and llvmpipe has never measured anything but 0 for a \
+             1:1 {} case",
+            case.kind().label(),
         );
     }
 
-    verdict.is_pass() && (!exact || bit_exact)
+    verdict.is_pass()
 }
 
-/// The classification aid, and the reason a transcript from this harness can be
-/// triaged without a driver in front of you (#1072's four buckets).
+/// Print the **edge / field / lit** split, the classification aid that lets a
+/// transcript from this harness be triaged without a driver in front of you
+/// (#1072's four buckets).
 ///
-/// Every compared pixel goes in exactly one of three bins, decided by the **CPU
-/// reference's own structure** rather than by the palette — so this needs no
-/// knowledge of which skin is running and cannot drift from one:
-///
-/// * **edge** — the reference disagrees with one of its four neighbours. A
-///   difference that lives only here is rasterisation edge coverage (bucket c):
-///   a boundary landing one pixel over.
-/// * **field** — not an edge, and the frame's *modal* colour, i.e. the flat
-///   unlit background. A difference that lives here is a tone-curve problem
-///   (bucket b): gamma/sRGB moves a flat fill uniformly, and nothing else does.
-/// * **lit** — not an edge, not the field: the interior of the trace, the
-///   graticule and the bloom. A difference concentrated here, with the field
-///   clean, is real shader math (bucket d) — or, where it tracks how *dim* the
-///   pixel is, blend/premultiply (bucket a).
-fn print_regions(deltas: &[u8], reference: &kit::Frame) {
-    let (w, h) = (reference.width(), reference.height());
-    let rgb = |x: usize, y: usize| -> [u8; 3] {
-        let i = (y * w + x) * 4;
-        reference.data()[i..i + 3].try_into().unwrap_or([0, 0, 0])
-    };
-    let mut counts: std::collections::HashMap<[u8; 3], usize> = std::collections::HashMap::new();
-    for y in 0..h {
-        for x in 0..w {
-            *counts.entry(rgb(x, y)).or_default() += 1;
-        }
-    }
-    let field = counts
-        .into_iter()
-        .max_by_key(|(colour, n)| (*n, *colour))
-        .map_or([0, 0, 0], |(colour, _)| colour);
-
-    // (count, sum, max) per bin.
-    let mut bins = [(0_usize, 0_u64, 0_u8); 3];
-    for y in 0..h {
-        for x in 0..w {
-            let here = rgb(x, y);
-            let edge = [(-1_isize, 0_isize), (1, 0), (0, -1), (0, 1)]
-                .into_iter()
-                .any(|(dx, dy)| {
-                    let (nx, ny) = (x.wrapping_add_signed(dx), y.wrapping_add_signed(dy));
-                    nx < w && ny < h && rgb(nx, ny) != here
-                });
-            let bin = if edge {
-                0
-            } else if here == field {
-                1
-            } else {
-                2
-            };
-            let delta = deltas[y * w + x];
-            bins[bin].0 += 1;
-            bins[bin].1 += u64::from(delta);
-            bins[bin].2 = bins[bin].2.max(delta);
-        }
-    }
-    let show = |(n, sum, max): (usize, u64, u8)| {
-        #[allow(clippy::cast_precision_loss)]
-        let mean = if n == 0 { 0.0 } else { sum as f64 / n as f64 };
-        format!("n={n} mean {mean:.3} max {max}")
-    };
+/// The binning itself moved into `parity::regions` in #1148's review, because
+/// the supersampled cases' verdict is a statement about it (everything off an
+/// edge must be bit-identical) and because down there it has tests. See that
+/// function for what each bin means and what a difference concentrated in one
+/// of them says.
+fn print_regions(split: &parity::Regions) {
+    let show =
+        |bin: parity::RegionStats| format!("n={} mean {:.3} max {}", bin.pixels, bin.mean, bin.max);
     println!(
-        "      regions: edge[{}]  field{field:?}[{}]  lit[{}]",
-        show(bins[0]),
-        show(bins[1]),
-        show(bins[2]),
+        "      regions: edge[{}]  field{:?}[{}]  lit[{}]",
+        show(split.edge),
+        split.field_colour,
+        show(split.field),
+        show(split.lit),
     );
 }
 
@@ -730,7 +1009,7 @@ fn print_regions(deltas: &[u8], reference: &kit::Frame) {
 fn write_evidence(
     dir: &std::path::Path,
     label: &str,
-    shot: &Capture,
+    gl: &[u8],
     layout: parity::Layout,
     reference: &kit::Frame,
     deltas: &[u8],
@@ -741,7 +1020,7 @@ fn write_evidence(
         cpu.extend_from_slice(&pixel[..3]);
     }
     let files: [(&str, Vec<u8>); 3] = [
-        ("gl.ppm", ppm(w, h, &parity::gl_image(&shot.raw, layout))),
+        ("gl.ppm", ppm(w, h, &parity::gl_image(gl, layout))),
         ("cpu.ppm", ppm(w, h, &cpu)),
         ("delta.pgm", pgm(w, h, deltas)),
     ];

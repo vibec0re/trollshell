@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gdk, glib};
 
 use hytte_plugin_agents::config::AgentsConfig;
 use hytte_plugin_agents::hive::wire::{Approval, HiveUrls, Request};
@@ -29,6 +29,92 @@ use crate::{cli, page, tls, ui, webview};
 /// What the window shows before the hive has a page URL for this agent.
 pub const NO_PAGE: &str = "This hive publishes no page for this agent yet — its domain is unconfigured, or the agent is \
      not on its roster. The header above still follows the agent's live status.";
+
+/// Whether the compositor is **presenting** this window's content — the poll's
+/// visibility signal (#1149 L4, reworked after this round's review).
+///
+/// The first cut read GTK's `map`/`unmap` on the toplevel, and on the target
+/// compositor that parks nothing. No Wayland compositor can unmap a client's
+/// toplevel — only the client can — so `map`/`unmap` report this binary's own
+/// `present()`/teardown and nothing about whether anyone is looking; niri has
+/// no minimise at all, and a window on an inactive workspace stays mapped, it
+/// just stops being handed frame callbacks.
+///
+/// `GdkToplevelState::SUSPENDED` is the state that *does* move there:
+/// xdg-shell v6's "the compositor is not presenting this content", which is
+/// exactly the question the poll wants answered. It landed in GTK 4.12 and the
+/// devShell is 4.22, so reading it costs nothing beyond the `v4_14` feature
+/// this crate already takes.
+///
+/// Deliberately **not** `is-active` (focus): a visible-but-unfocused window
+/// must keep polling, since a live status header while you work in another
+/// window is the entire point of this chrome.
+#[must_use]
+pub(crate) fn presenting(state: gdk::ToplevelState) -> bool {
+    !state.contains(gdk::ToplevelState::SUSPENDED)
+}
+
+/// The poll's visibility source: `true` while `window` is mapped **and** the
+/// compositor says it is presenting it.
+///
+/// Three signals feed one `watch`, because no single one of them covers every
+/// case:
+///
+/// - `realize` is where the `GdkSurface` first exists, so it is the only place
+///   the `GdkToplevel` can be reached and its `state` subscribed to. A window
+///   can be unrealized and realized again (each time on a *new* surface),
+///   which is why the subscription is made here rather than once at build.
+/// - `notify::state` on that toplevel is the live signal — the suspend and
+///   un-suspend edges [`presenting`] exists for.
+/// - `map`/`unmap` stay, for the two edges the toplevel state cannot give: the
+///   window's own first presentation, and its teardown. On niri the unmap edge
+///   is only ever the latter (see [`presenting`]), at which point the poll
+///   ends anyway; on a compositor that *can* hide a client's toplevel it is a
+///   real park.
+///
+/// The state handler holds the window **weakly**: the surface is owned by the
+/// widget, so a strong clone captured in a handler attached to that surface
+/// would be a cycle outliving the window.
+pub(crate) fn watch_presentation(
+    window: &adw::ApplicationWindow,
+) -> tokio::sync::watch::Receiver<bool> {
+    // Not presenting until GTK says otherwise — a window is built and then
+    // explicitly presented (`main.rs`), so `false` is the correct starting
+    // snapshot for `feed::run` to read, not a guess.
+    let (tx, rx) = tokio::sync::watch::channel(false);
+
+    let sender = tx.clone();
+    window.connect_realize(move |w| {
+        let Some(toplevel) = w.surface().and_downcast::<gdk::Toplevel>() else {
+            // Not a toplevel surface. No backend that ships here does this,
+            // but the cast is fallible: the map/unmap edges below still drive
+            // the poll, it simply stops parking on suspension.
+            tracing::debug!("this window has no GdkToplevel — the poll cannot park on suspension");
+            return;
+        };
+        let state_tx = sender.clone();
+        let weak = w.downgrade();
+        toplevel.connect_state_notify(move |t| {
+            let mapped = weak.upgrade().is_some_and(|w: adw::ApplicationWindow| w.is_mapped());
+            let _ = state_tx.send(mapped && presenting(t.state()));
+        });
+        let _ = sender.send(w.is_mapped() && presenting(toplevel.state()));
+    });
+
+    let sender = tx.clone();
+    window.connect_map(move |w| {
+        let _ = sender.send(
+            w.surface()
+                .and_downcast::<gdk::Toplevel>()
+                .is_none_or(|t| presenting(t.state())),
+        );
+    });
+    window.connect_unmap(move |_| {
+        let _ = tx.send(false);
+    });
+
+    rx
+}
 
 /// One agent's window.
 pub struct Window {
@@ -96,27 +182,16 @@ impl Window {
         let cfg = hytte_plugin_agents::config::load();
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
-        // Unmapped until GTK says otherwise (#1149 L4) — a window is built
-        // and then explicitly presented (`main.rs`), so `false` is the
-        // correct starting snapshot for `feed::run` to read, not a guess.
-        let (visible_tx, visible_rx) = tokio::sync::watch::channel(false);
 
         let this = Self::assemble(app, name, cfg, cmd_tx);
 
         // The poll's only visibility source — mirrors
         // `hytte_plugin_agents::poll`'s `SlotVisible` gate, which this window
-        // has no host to push. Both closures hold their own clone of the
-        // sender, so it stays alive for exactly as long as `toplevel` does,
-        // and dropping the window is what ends `feed::run`'s parking loop
-        // (`visible_open` latches `false` once both are gone).
-        let tx = visible_tx.clone();
-        this.toplevel.connect_map(move |_| {
-            let _ = tx.send(true);
-        });
-        let tx = visible_tx.clone();
-        this.toplevel.connect_unmap(move |_| {
-            let _ = tx.send(false);
-        });
+        // has no host to push. Every closure it installs holds its own clone
+        // of the sender, so it stays alive for exactly as long as `toplevel`
+        // does, and dropping the window is what ends `feed::run`'s parking
+        // loop (`visible_open` latches `false` once they are all gone).
+        let visible_rx = watch_presentation(&this.toplevel);
 
         runtime.spawn(feed::run(
             std::path::PathBuf::from(&this.cfg.socket),
@@ -483,6 +558,47 @@ impl Window {
     #[cfg(all(test, feature = "system-tests"))]
     fn header(&self) -> &ui::Header {
         &self.header
+    }
+
+    /// The window itself, for the test that drives the presentation watch.
+    #[cfg(all(test, feature = "system-tests"))]
+    fn toplevel(&self) -> &adw::ApplicationWindow {
+        &self.toplevel
+    }
+}
+
+/// [`presenting`]'s policy, with no display and no compositor: a `ToplevelState`
+/// is a bitflags value, so the decision it drives can be pinned hermetically
+/// even though nothing in CI can make a real compositor set the bit (see
+/// [`gtk_tests::the_presentation_watch_follows_map_and_unmap`] for how far the
+/// wiring itself is pinned, and `docs/live-verify.md` for the rest).
+#[cfg(test)]
+mod tests {
+    use super::presenting;
+    use gtk::gdk::ToplevelState;
+
+    /// **Suspended is the only state that parks the poll.** Focus in
+    /// particular must not: a visible-but-unfocused window keeps its header
+    /// live while you work elsewhere, which is the whole point of this chrome.
+    ///
+    /// Mutation (verified red): swap `SUSPENDED` for `FOCUSED` in
+    /// [`presenting`] and the unfocused cases below red.
+    #[test]
+    fn only_a_suspended_toplevel_parks_the_poll() {
+        assert!(presenting(ToplevelState::empty()), "a plain window polls");
+        assert!(
+            presenting(ToplevelState::TILED | ToplevelState::MAXIMIZED),
+            "geometry states are not presentation states — neither parks the poll"
+        );
+        assert!(presenting(ToplevelState::FOCUSED), "a focused window polls");
+        assert!(
+            !presenting(ToplevelState::SUSPENDED),
+            "a suspended window parks"
+        );
+        assert!(
+            !presenting(ToplevelState::SUSPENDED | ToplevelState::FOCUSED),
+            "suspended wins over every other bit that may ride along"
+        );
     }
 }
 
@@ -1264,5 +1380,59 @@ mod gtk_tests {
         w.update(Update::Approvals(Ok(Vec::new())));
         assert_eq!(page.badge_number(), 0);
         assert!(!page.needs_attention());
+    }
+
+    /// **The presentation watch is wired, and its map/unmap half works** —
+    /// the window realizes, resolves a `GdkToplevel`, seeds the watch from
+    /// its state, and drops to `false` when the window goes away.
+    ///
+    /// What this cannot reach is the **SUSPENDED flip itself**: only a
+    /// compositor sets that bit, `gdk` exposes no setter (the property is
+    /// read-only, fed from the xdg-shell configure), and CI has no compositor
+    /// — xvfb is a bare X server with not even a window manager. So the flip
+    /// is a live-verify line (`docs/live-verify.md`, the #1149 entries), and
+    /// what CI pins instead is split in two: the *policy* hermetically
+    /// ([`super::tests::only_a_suspended_toplevel_parks_the_poll`]), and the
+    /// *wiring up to the toplevel* here. The poll's own reaction to the bool
+    /// is `tests/feed.rs`'s, driven through the same `watch::Receiver` this
+    /// returns.
+    ///
+    /// Mutation (verified red): drop the `connect_unmap` arm in
+    /// [`super::watch_presentation`] and the last assertion reds; drop the
+    /// `connect_realize`/`connect_map` pair and the first two do.
+    #[gtk::test]
+    fn the_presentation_watch_follows_map_and_unmap() {
+        let (w, _rx) = window();
+        let rx = super::watch_presentation(w.toplevel());
+        assert!(
+            !*rx.borrow(),
+            "an unmapped window must not be reported as presenting"
+        );
+
+        w.toplevel().present();
+        while gtk::glib::MainContext::default().iteration(false) {}
+        assert!(
+            w.toplevel().is_mapped(),
+            "the test window never mapped — nothing below would mean anything"
+        );
+        assert!(
+            w.toplevel()
+                .surface()
+                .and_downcast::<gtk::gdk::Toplevel>()
+                .is_some(),
+            "a realized window must resolve a GdkToplevel — without one the poll \
+             cannot park on suspension at all"
+        );
+        assert!(
+            *rx.borrow(),
+            "a mapped, unsuspended window must be reported as presenting"
+        );
+
+        w.toplevel().set_visible(false);
+        while gtk::glib::MainContext::default().iteration(false) {}
+        assert!(
+            !*rx.borrow(),
+            "the unmap edge (teardown, and a hide on a compositor that allows one) must park"
+        );
     }
 }

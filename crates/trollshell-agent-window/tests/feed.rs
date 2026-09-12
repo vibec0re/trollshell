@@ -698,6 +698,97 @@ async fn a_window_that_was_never_mapped_never_polls_and_maps_to_exactly_one() {
     assert_eq!(polls(&hive), after_probe + 2);
 }
 
+/// **A burst of presentation edges inside one cadence costs one poll, not
+/// N** — the flap guard (#1149 L4, this round's review, LOW 1).
+///
+/// This is the cost of moving the park signal onto the compositor's
+/// `SUSPENDED` state: unlike map/unmap, which a Wayland client toggles once at
+/// open and once at teardown, that bit flips on every workspace switch across
+/// the window. Without the guard, flicking across a workspace ten times is
+/// twenty round trips and ten interval resets.
+///
+/// `visible` is driven directly here, as the sibling park tests do: the source
+/// of the bool changed (`window::watch_presentation` now reads the toplevel's
+/// state, not just `map`), the driver reading it did not.
+///
+/// The absence is measured against a **probe command**, not against a bare
+/// pile of yields, for the reason
+/// `unmapping_again_re_parks_the_poll_and_remapping_resumes_it` spells out:
+/// `cmds.recv()` carries no visibility guard, so a command always forces the
+/// loop through, and a stray edge-driven poll would have to land before that
+/// probe's own.
+///
+/// Mutation (verified red): delete the `recent` guard in `feed::run`'s
+/// visibility arm and this reds at six polls instead of two.
+#[tokio::test(start_paused = true)]
+async fn a_burst_of_presentation_edges_inside_one_cadence_costs_one_poll() {
+    let hive = FakeHive::script(&[&roster(r#"{"name":"stray","running":true}"#)]);
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let (visible_tx, visible_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(feed::run(
+        hive.path().to_path_buf(),
+        name("stray"),
+        CADENCE,
+        cmd_rx,
+        visible_rx,
+        out_tx,
+    ));
+
+    // The window is presented once: one immediate poll, as its own test pins.
+    visible_tx.send(true).expect("the loop is listening");
+    until("the first presentation's poll", || polls(&hive) > 0).await;
+    let after_first = polls(&hive);
+
+    // Five suspend/resume pairs, all inside the same cadence — the clock is
+    // never advanced here, so every one of them is provably within one
+    // interval of the poll above. Each send is settled before the next,
+    // because `watch` coalesces: a `false` and a `true` the task never got to
+    // observe in between is not an edge at all, and the burst would be
+    // measuring nothing.
+    for _ in 0..5 {
+        visible_tx.send(false).expect("the loop is listening");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        visible_tx.send(true).expect("the loop is listening");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    cmd_tx
+        .send(feed::set_paused(&name("stray"), false))
+        .expect("the loop is listening");
+    until("the probe's reconciling poll", || polls(&hive) > after_first).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        polls(&hive),
+        after_first + 1,
+        "only the probe's own poll — five resumes inside one cadence must buy no extra round \
+         trips: {:?}",
+        hive.seen()
+    );
+
+    // And the guard expires: once a whole interval has passed, a resume is a
+    // genuine refresh again rather than a flap.
+    tokio::time::advance(CADENCE).await;
+    until("the cadence's own poll", || polls(&hive) > after_first + 1).await;
+    let settled = polls(&hive);
+    visible_tx.send(false).expect("the loop is listening");
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(CADENCE).await;
+    visible_tx.send(true).expect("the loop is listening");
+    until("the resume poll a full interval later", || {
+        polls(&hive) > settled
+    })
+    .await;
+}
+
 /// **Unmapping again re-parks the poll**, and remapping resumes cleanly — not
 /// just the first map/unmap edge the test above covers.
 ///

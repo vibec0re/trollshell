@@ -74,8 +74,10 @@ pub enum Msg {
     /// The hive's `Urls`, fetched once per session after the first successful
     /// poll — it backs the panel's agent-page link and changes about never.
     Urls(Box<HiveUrls>),
-    /// The approval queue, filtered to what is still waiting on a human and
-    /// ordered oldest first (#947 P3).
+    /// The approval queue as the hive returned it (#947 P3), unfiltered — the
+    /// reducer establishes "still waiting, oldest first" in one place,
+    /// [`crate::model::PendingApprovals::new`], rather than trusting this
+    /// task to have done it.
     ///
     /// Sent **only** when the `Pending` round trip succeeded. A failed one is
     /// logged and dropped rather than folded as an empty queue: the badge is
@@ -319,7 +321,10 @@ async fn poll_once(cfg: &AgentsConfig, msg_tx: &UnboundedSender<Msg>, urls_done:
     // for why an empty queue must not stand in for an unanswered one.
     match client::request(socket, &Request::Pending).await {
         Ok(resp) => {
-            if msg_tx.send(Msg::Pending(resp.pending_approvals())).is_err() {
+            if msg_tx
+                .send(Msg::Pending(resp.approvals.unwrap_or_default()))
+                .is_err()
+            {
                 return;
             }
         }

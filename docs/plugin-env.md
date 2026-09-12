@@ -140,6 +140,15 @@ rides `hytte-config`'s layered `Subsystem`, so it merges
 failing, and is re-read on the next poll after an edit — no plugin restart,
 the same live-reload `places.toml` gets.
 
+**Approvals have no knob either (#947 P3).** Pending hive approvals raise the
+shell's consent prompt, and that rides the same `host.sock` and the same
+`poll_seconds` cadence — there is nothing to enable, no key, and no way to
+turn the prompt off short of not running the plugin. `poll_seconds` is the one
+thing that moves it: it bounds how long a freshly-queued approval waits before
+the card appears. Note that the poll **parks while the sidebar is closed**
+(spec §5.4), so a card can be up to one sidebar-open away rather than one
+cadence; the row's badge is what carries it in the meantime.
+
 ### audio-widget (`hytte-plugin-audio-widget`)
 
 No runtime knobs — configuration is entirely via the shell/wire protocol

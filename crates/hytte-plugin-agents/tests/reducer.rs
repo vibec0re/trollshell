@@ -9,12 +9,15 @@
 //! *visible* result is a re-render, but its *consequential* result is the JSON
 //! line that reaches `host.sock`, so these pin the bytes.
 
-use hytte_plugin::proto::{Effect, EffectOutcome, EventKind, Page};
+use hytte_plugin::proto::{
+    ConsentChoices, ConsentDecision, Effect, EffectOutcome, EventKind, Page,
+};
 use hytte_plugin::{CmdReceiver, Input, Plugin, cmd_channel};
 use hytte_plugin_agents::Agents;
 use hytte_plugin_agents::hive::client::HiveError;
 use hytte_plugin_agents::hive::wire::{
-    AgentStatusRow, HiveUrls, Request, Response, Scope, VersionMismatch,
+    AgentStatusRow, Approval, ApprovalKind, ApprovalStatus, HiveUrls, Request, Response, Scope,
+    VersionMismatch,
 };
 use hytte_plugin_agents::model::{Hive, Status};
 use hytte_plugin_agents::poll::{Cmd, Msg};
@@ -1134,4 +1137,431 @@ fn a_refused_open_or_launch_toasts_its_reason_and_a_successful_one_is_silent() {
 
 fn name(s: &str) -> hytte_plugin_agents::model::AgentName {
     hytte_plugin_agents::model::AgentName::parse(s).expect("a legal test name")
+}
+
+// ── #947 P3: approvals — prompt, decide, time out, badge ─────────────────────
+//
+// The whole of spec §6.5's behaviour, driven with no socket, no host and no
+// overlay: `Msg::Pending` in, `Effect::RequestConsent` out,
+// `Input::ConsentDecision` in, a JSON line on the command lane out. Each test
+// below names the mechanism it reds when deleted.
+
+/// One pending approval, `status: Pending`, with the id doubling as a clock —
+/// the queue orders by id, so a lower id is an older request.
+fn approval(id: i64, agent: &str) -> Approval {
+    Approval {
+        id,
+        agent: agent.to_owned(),
+        kind: ApprovalKind::MergeConfigPr,
+        requested_at: format!("2026-09-12T09:{id:02}:00Z"),
+        status: ApprovalStatus::Pending,
+        description: None,
+    }
+}
+
+fn pending(queue: Vec<Approval>) -> Input<Msg> {
+    Input::App(Msg::Pending(queue))
+}
+
+/// Every `RequestConsent` in a batch of effects, as
+/// `(request_id, agent, scope, detail)` — the four strings the card renders.
+fn prompts(fx: &[Effect]) -> Vec<(u64, String, String, String)> {
+    fx.iter()
+        .filter_map(|e| match e {
+            Effect::RequestConsent {
+                request_id,
+                agent,
+                scope,
+                detail,
+                ..
+            } => Some((*request_id, agent.clone(), scope.clone(), detail.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `request_id` of the single prompt in `fx`.
+fn one_prompt(fx: &[Effect]) -> u64 {
+    let raised = prompts(fx);
+    assert_eq!(raised.len(), 1, "expected exactly one prompt, got {fx:?}");
+    raised[0].0
+}
+
+/// A pending approval raises exactly one prompt, and a second poll carrying the
+/// **same** approval raises none — spec §6.5's dedup, and the difference
+/// between a modal and a modal every two seconds.
+///
+/// Falsification: delete the `prompted` insert in `Agents::raise` (or the
+/// `oldest_unprompted` filter) and the second fold raises a second prompt.
+#[test]
+fn a_pending_approval_prompts_once_and_not_again_on_the_next_poll() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+
+    let first = m.update(pending(vec![approval(7, "trollshell-choom")]));
+    let raised = prompts(&first);
+    assert_eq!(raised.len(), 1, "{first:?}");
+    assert_eq!(raised[0].1, "trollshell-choom", "the agent's label");
+    assert_eq!(
+        raised[0].2, "merge a reviewed config PR",
+        "the kind, in English"
+    );
+    assert!(
+        raised[0].3.contains("request #7"),
+        "the detail names the request: {}",
+        raised[0].3
+    );
+
+    let second = m.update(pending(vec![approval(7, "trollshell-choom")]));
+    assert_eq!(prompts(&second), Vec::new(), "{second:?}");
+}
+
+/// The card asks with the **two-button** choice set, because "This session" and
+/// "Always" are not answers to a one-shot config merge — and because that
+/// variant is what makes an unanswered prompt send nothing.
+///
+/// Falsification: pass `ConsentChoices::Grant` and this goes red; the overlay
+/// would then draw four buttons and deny the approval after 60 s of silence.
+#[test]
+fn the_prompt_asks_for_the_approve_deny_card() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    let fx = m.update(pending(vec![approval(7, "trollshell-choom")]));
+    match fx.as_slice() {
+        [
+            Effect::RequestConsent {
+                choices,
+                datasource,
+                ..
+            },
+        ] => {
+            assert_eq!(*choices, ConsentChoices::Approval);
+            assert!(
+                datasource.is_empty(),
+                "an approval names no datasource: {datasource:?}"
+            );
+        }
+        other => panic!("expected one RequestConsent, got {other:?}"),
+    }
+}
+
+/// A second approval gets its own prompt — but only once the first is answered,
+/// because the host has one consent window and a second `RequestConsent` would
+/// replace the first card inside its own 60 s.
+///
+/// Falsification: delete the `if self.prompt.is_some()` gate in `raise_next`
+/// and the second fold raises a prompt while the first is still on screen.
+#[test]
+fn a_second_approval_waits_for_the_first_answer_then_prompts() {
+    let (mut m, mut rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+
+    let queue = vec![approval(7, "trollshell-choom"), approval(8, "nixos-choom")];
+    let first = m.update(pending(queue.clone()));
+    let id = one_prompt(&first);
+
+    // The second approval does not steal the card.
+    let while_open = m.update(pending(queue.clone()));
+    assert_eq!(prompts(&while_open), Vec::new(), "{while_open:?}");
+
+    // Answering the first frees the gate…
+    m.update(Input::ConsentDecision {
+        request_id: id,
+        decision: ConsentDecision::AllowOnce,
+    });
+    assert_eq!(
+        lines(&mut rx),
+        vec![r#"{"cmd":"approve","id":7}"#.to_owned()]
+    );
+
+    // …and the next poll raises the one behind it.
+    let next = m.update(pending(queue));
+    let raised = prompts(&next);
+    assert_eq!(raised.len(), 1, "{next:?}");
+    assert!(
+        raised[0].3.contains("request #8"),
+        "the *next* approval, not the answered one: {}",
+        raised[0].3
+    );
+    assert_ne!(raised[0].0, id, "a fresh correlation token");
+}
+
+/// An approval that is no longer pending raises nothing — whether it left the
+/// queue before the plugin ever saw it, or between two polls.
+#[test]
+fn an_approval_that_is_not_pending_never_prompts() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+
+    let mut resolved = approval(7, "trollshell-choom");
+    resolved.status = ApprovalStatus::Approved;
+    // A caller that hands the model a non-pending row (the poll filters these,
+    // so this is the model refusing to trust that).
+    let fx = m.update(pending(vec![resolved]));
+    assert_eq!(prompts(&fx), Vec::new(), "{fx:?}");
+    assert_eq!(m.pending.all().len(), 0);
+}
+
+/// Spec §6.5's mapping: **every** affirmative becomes exactly one
+/// `Approve { id }` for that one id, and nothing standing is persisted.
+///
+/// The four-button card only reaches this plugin on a host older than #947, so
+/// the `AllowSession` / `AllowAlways` arms are what make that host degrade to
+/// "approved once" rather than to nothing.
+///
+/// Falsification: map any `Allow*` to `Request::Deny` and the line goes red;
+/// send it twice and the `lines` assertion counts two.
+#[test]
+fn every_affirmative_becomes_exactly_one_approve() {
+    for decision in [
+        ConsentDecision::AllowOnce,
+        ConsentDecision::AllowSession,
+        ConsentDecision::AllowAlways,
+    ] {
+        let (mut m, mut rx) = model();
+        m.update(status(roster("agent_status_grouped.json")));
+        let id = one_prompt(&m.update(pending(vec![approval(7, "trollshell-choom")])));
+
+        m.update(Input::ConsentDecision {
+            request_id: id,
+            decision,
+        });
+        assert_eq!(
+            lines(&mut rx),
+            vec![r#"{"cmd":"approve","id":7}"#.to_owned()],
+            "{decision:?}"
+        );
+
+        // The same token again must send nothing: `Approve` runs the action on
+        // the far side, so it is not idempotent the way `SetPaused` is.
+        m.update(Input::ConsentDecision {
+            request_id: id,
+            decision,
+        });
+        assert_eq!(lines(&mut rx), Vec::<String>::new(), "{decision:?} twice");
+    }
+}
+
+/// A deny click becomes exactly one `Deny { id }`.
+#[test]
+fn a_deny_click_becomes_exactly_one_deny() {
+    let (mut m, mut rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    let id = one_prompt(&m.update(pending(vec![approval(7, "trollshell-choom")])));
+
+    m.update(Input::ConsentDecision {
+        request_id: id,
+        decision: ConsentDecision::Deny,
+    });
+    assert_eq!(lines(&mut rx), vec![r#"{"cmd":"deny","id":7}"#.to_owned()]);
+}
+
+/// A decision for a token this model is not waiting on is dropped — a
+/// superseded card's late answer must not be applied to whatever is in flight
+/// now.
+#[test]
+fn a_decision_for_an_unknown_token_writes_nothing() {
+    let (mut m, mut rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    let id = one_prompt(&m.update(pending(vec![approval(7, "trollshell-choom")])));
+
+    m.update(Input::ConsentDecision {
+        request_id: id.wrapping_add(99),
+        decision: ConsentDecision::AllowOnce,
+    });
+    assert_eq!(lines(&mut rx), Vec::<String>::new());
+}
+
+/// §6.5: an approval that disappears from `Pending` between the prompt and the
+/// answer "is dropped with a debug line, not an error" — so the answer writes
+/// nothing, and the gate is free again.
+#[test]
+fn an_approval_resolved_elsewhere_is_dropped_not_re_decided() {
+    let (mut m, mut rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    let id = one_prompt(&m.update(pending(vec![approval(7, "trollshell-choom")])));
+
+    // Somebody answered it on the dashboard.
+    m.update(pending(Vec::new()));
+    m.update(Input::ConsentDecision {
+        request_id: id,
+        decision: ConsentDecision::AllowOnce,
+    });
+    assert_eq!(lines(&mut rx), Vec::<String>::new());
+}
+
+/// **The timeout (default 2 on #947).** The overlay sends nothing at all when
+/// an approval prompt goes unanswered, so the reducer simply never hears from
+/// it: the approval stays pending, the badge stays, and the plugin writes
+/// nothing to the hive.
+///
+/// This test *is* the shape of that silence — there is no input to feed,
+/// because "nothing arrives" is the whole mechanism. What it pins is that the
+/// model does not answer on its own behalf either.
+///
+/// Falsification: make `ConsentChoices::Approval.unanswered()` return
+/// `Some(Deny)` (the overlay would then send a deny on the 60 s timeout) and
+/// `overlays::consent`'s `golden_card_approval_*` goes red; make this reducer
+/// deny on a timer of its own and the `lines` assertion here goes red.
+#[test]
+fn a_prompt_nobody_answers_writes_nothing_and_keeps_its_badge() {
+    let (mut m, mut rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    let queue = vec![approval(7, "trollshell-choom")];
+    m.update(pending(queue.clone()));
+
+    // Sixty seconds of polls go by with no decision.
+    for _ in 0..30 {
+        let fx = m.update(pending(queue.clone()));
+        assert_eq!(prompts(&fx), Vec::new(), "no re-prompt while it is open");
+    }
+    assert_eq!(
+        lines(&mut rx),
+        Vec::<String>::new(),
+        "silence must never become a decision"
+    );
+    assert_eq!(
+        m.pending.count_for("trollshell-choom"),
+        1,
+        "the approval is still waiting, so the badge is still there"
+    );
+}
+
+/// The badge click re-raises the prompt for the **oldest** approval that agent
+/// is waiting on — the recovery path for a timed-out card.
+///
+/// Falsification: make `raise_for` pick `last()` instead of the oldest and the
+/// "request #6" assertion goes red; delete the `self.prompt = None` and the
+/// click raises nothing at all, because the gate is still held by the card that
+/// timed out.
+#[test]
+fn the_badge_click_re_raises_the_oldest_approval() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    let queue = vec![
+        approval(6, "trollshell-choom"),
+        approval(9, "trollshell-choom"),
+    ];
+    let first = m.update(pending(queue.clone()));
+    let id = one_prompt(&first);
+    assert!(prompts(&first)[0].3.contains("request #6"));
+
+    // Nobody answered. The operator clicks the badge.
+    let again = m.update(click("approvals:trollshell-choom"));
+    let raised = prompts(&again);
+    assert_eq!(raised.len(), 1, "{again:?}");
+    assert!(
+        raised[0].3.contains("request #6"),
+        "the oldest, not the newest: {}",
+        raised[0].3
+    );
+    assert_ne!(raised[0].0, id, "a fresh token, so the stale one is inert");
+}
+
+/// A badge click for an agent with nothing queued raises nothing — the click
+/// raced a poll that emptied the queue.
+#[test]
+fn a_badge_click_with_an_empty_queue_raises_nothing() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    let fx = m.update(click("approvals:trollshell-choom"));
+    assert_eq!(prompts(&fx), Vec::new(), "{fx:?}");
+}
+
+/// **The refusal (§6.5's "no silent loss").** The hive rejects the `Approve`;
+/// the operator gets exactly one toast naming what failed, and the approval is
+/// still pending, so the row is still badged.
+///
+/// Falsification: drop the `Approve`/`Deny` arms from `describe` (the toast
+/// then says "the request") or return no effect for a refused write, and the
+/// assertions here go red.
+#[test]
+fn a_refused_approve_toasts_once_and_keeps_the_approval_badged() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    m.update(pending(vec![approval(7, "trollshell-choom")]));
+
+    let fx = m.update(Input::App(Msg::WriteRefused {
+        request: Request::Approve { id: 7 },
+        reason: "approval 7 is not pending".to_owned(),
+    }));
+    match fx.as_slice() {
+        [Effect::Notify { summary, body }] => {
+            assert!(summary.contains("approve"), "{summary}");
+            assert!(summary.contains("#7"), "{summary}");
+            assert!(
+                summary.contains("merge a reviewed config PR"),
+                "the toast names the action, not just a rowid: {summary}"
+            );
+            assert_eq!(body, "approval 7 is not pending");
+        }
+        other => panic!("expected exactly one Notify, got {other:?}"),
+    }
+    assert_eq!(
+        m.pending.count_for("trollshell-choom"),
+        1,
+        "a refused write must not clear the approval"
+    );
+}
+
+/// A refused `Deny` reads as a deny in the toast — the two must not be
+/// indistinguishable, since one of them is destructive on the far side.
+#[test]
+fn a_refused_deny_says_deny() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    m.update(pending(vec![approval(7, "trollshell-choom")]));
+
+    let fx = m.update(Input::App(Msg::WriteRefused {
+        request: Request::Deny { id: 7 },
+        reason: "permission denied".to_owned(),
+    }));
+    match fx.as_slice() {
+        [Effect::Notify { summary, .. }] => {
+            assert!(summary.starts_with("hive refused: deny"), "{summary}");
+        }
+        other => panic!("expected exactly one Notify, got {other:?}"),
+    }
+}
+
+/// The correlation token comes from the **shared** effect counter, not a second
+/// one — `Input::EffectResult`'s allocation contract (#1060), which this plugin
+/// now exercises with three reply-bearing effect kinds at once.
+///
+/// Falsification: give `raise` its own counter starting at 0 and this finds the
+/// same value used twice.
+#[test]
+fn the_prompt_token_shares_the_one_effect_id_space() {
+    let (mut m, _rx) = model();
+    m.set_window_probe(Probe::fixed(false));
+    m.update(status(roster("agent_status_grouped.json")));
+
+    // An `OpenUri` takes a token…
+    let opened = m.update(click("open:trollshell-choom"));
+    let uri_id = match opened.as_slice() {
+        [Effect::OpenUri { id, .. }] => *id,
+        other => panic!("expected one OpenUri, got {other:?}"),
+    };
+    // …and the prompt raised next must not reuse it.
+    let prompt_id = one_prompt(&m.update(pending(vec![approval(7, "trollshell-choom")])));
+    assert_ne!(uri_id, prompt_id);
+}
+
+/// The description is the sentence worth showing, but it is free text another
+/// process wrote, so it is bounded before it reaches a 480 px card — and
+/// bounded on a **char** boundary, so a multi-byte description cannot panic
+/// the plugin.
+#[test]
+fn a_long_description_is_clamped_on_a_char_boundary() {
+    let (mut m, _rx) = model();
+    m.update(status(roster("agent_status_grouped.json")));
+    let mut a = approval(7, "trollshell-choom");
+    a.description = Some("🦀".repeat(400));
+
+    let fx = m.update(pending(vec![a]));
+    let detail = prompts(&fx)[0].3.clone();
+    let crabs = detail.chars().filter(|c| *c == '🦀').count();
+    assert!(crabs <= 240, "clamped to the cap, got {crabs}");
+    assert!(detail.contains('…'), "and says it was cut: {detail}");
+    assert!(detail.contains("request #7"), "{detail}");
 }

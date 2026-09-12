@@ -22,7 +22,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use hytte_plugin_agents::hive::client::{HiveError, REQUEST_TIMEOUT, request};
-use hytte_plugin_agents::hive::wire::{HOST_SOCK_VERSION, Request, Scope, VersionMismatch};
+use hytte_plugin_agents::hive::wire::{
+    ApprovalKind, ApprovalStatus, HOST_SOCK_VERSION, Request, Scope, VersionMismatch,
+};
+use hytte_plugin_agents::model::PendingApprovals;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixListener;
 
@@ -480,4 +483,128 @@ async fn a_reset_connection_parks_too() {
         "a hung-up socket must park, got {err:?}"
     );
     task.abort();
+}
+
+// ── #947 P3: the approval queue, end to end ──────────────────────────────────
+
+/// The `Pending` round trip through the **real** client against a recorded
+/// answer: the queue decodes, the resolved row is filtered out, and the
+/// remaining two come back oldest first.
+///
+/// This is the socket-level half of what `reducer.rs` asserts on the model —
+/// so a fixture that stopped decoding would go red here even if the reducer's
+/// hand-built `Approval`s still compiled.
+#[tokio::test]
+async fn a_recorded_pending_queue_round_trips_through_the_real_client() {
+    let hive = FakeHive::serve(replies(&[("pending", &fixture("pending.json"))]));
+
+    let resp = request(hive.path(), &Request::Pending)
+        .await
+        .expect("the fixture is a good answer");
+    assert_eq!(resp.version, HOST_SOCK_VERSION);
+    // Three rows on the wire…
+    assert_eq!(resp.approvals.as_ref().expect("a queue").len(), 3);
+    // …two of which are still waiting, oldest first once the model applies
+    // its one filter (the wire mirror deliberately does not).
+    let pending = PendingApprovals::new(resp.approvals.clone().unwrap_or_default());
+    let pending = pending.all();
+    assert_eq!(
+        pending.iter().map(|a| a.id).collect::<Vec<_>>(),
+        vec![7, 8],
+        "the `approved` row must not reach a prompt"
+    );
+    assert_eq!(pending[0].agent, "trollshell-choom");
+    assert_eq!(pending[0].kind, ApprovalKind::MergeConfigPr);
+    assert_eq!(
+        pending[0].description.as_deref(),
+        Some("bump the meta flake inputs")
+    );
+    assert_eq!(pending[1].kind, ApprovalKind::Spawn);
+    assert_eq!(pending[1].description, None);
+
+    assert_eq!(hive.seen(), vec![r#"{"cmd":"pending"}"#.to_owned()]);
+}
+
+/// An empty queue is a legitimate answer, distinct from "the verb was not
+/// asked": `approvals: Some(vec![])`, not `None`. The plugin draws no badge
+/// either way, but only one of the two clears a badge that was there.
+#[tokio::test]
+async fn an_empty_queue_is_an_answer_not_an_absence() {
+    let hive = FakeHive::serve(replies(&[("pending", &fixture("pending_empty.json"))]));
+
+    let resp = request(hive.path(), &Request::Pending)
+        .await
+        .expect("an empty queue is a good answer");
+    assert_eq!(resp.approvals, Some(Vec::new()));
+    assert!(
+        PendingApprovals::new(resp.approvals.unwrap_or_default())
+            .all()
+            .is_empty()
+    );
+}
+
+/// Forward drift over a real socket: a kind and a status this build has never
+/// heard of decode rather than failing the queue, and the unknown *status* is
+/// not treated as pending.
+///
+/// Falsification: drop either `#[serde(untagged)] Unknown(String)` arm in
+/// `wire.rs` and this fails at `expect` with a `Protocol` error — i.e. the
+/// whole card would have gone to its error row over one unrecognised word.
+#[tokio::test]
+async fn an_unrecognised_kind_or_status_still_decodes_over_the_socket() {
+    let hive = FakeHive::serve(replies(&[("pending", &fixture("pending_unknown.json"))]));
+
+    let resp = request(hive.path(), &Request::Pending)
+        .await
+        .expect("forward drift must not fail the round trip");
+    let queue = resp.approvals.clone().expect("a queue");
+    assert_eq!(queue.len(), 2);
+    assert_eq!(
+        queue[0].kind,
+        ApprovalKind::Unknown("teleport_agent".to_owned())
+    );
+    assert_eq!(
+        queue[1].status,
+        ApprovalStatus::Unknown("awaiting_quorum".to_owned())
+    );
+    assert_eq!(
+        PendingApprovals::new(resp.approvals.unwrap_or_default())
+            .all()
+            .iter()
+            .map(|a| a.id)
+            .collect::<Vec<_>>(),
+        vec![11],
+        "an unknown status is not waiting on anybody"
+    );
+}
+
+/// The two write verbs reach the socket as the exact lines `hive-c0re` parses
+/// (`hive-host-sock/src/lib.rs:230-233`), and a refusal comes back as
+/// `HiveError::Refused` carrying the daemon's own words — which is what the
+/// reducer turns into its "no silent loss" toast.
+#[tokio::test]
+async fn approve_and_deny_put_their_exact_lines_on_the_socket() {
+    let hive = FakeHive::serve(replies(&[
+        ("approve", r#"{"version":1,"ok":true}"#),
+        ("deny", &fixture("error.json")),
+    ]));
+
+    request(hive.path(), &Request::Approve { id: 7 })
+        .await
+        .expect("the hive accepts");
+    let err = request(hive.path(), &Request::Deny { id: 8 })
+        .await
+        .expect_err("the fixture refuses");
+    assert!(
+        matches!(err, HiveError::Refused { .. }),
+        "expected Refused, got {err:?}"
+    );
+
+    assert_eq!(
+        hive.seen(),
+        vec![
+            r#"{"cmd":"approve","id":7}"#.to_owned(),
+            r#"{"cmd":"deny","id":8}"#.to_owned(),
+        ]
+    );
 }

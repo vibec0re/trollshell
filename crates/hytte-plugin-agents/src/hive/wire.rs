@@ -12,9 +12,9 @@
 //! | [`Response`]      | `HostResponse`, `hive-host-sock/src/lib.rs:546-604`                 |
 //! | [`AgentStatusRow`]| `hive_sh4re::container::AgentStatusRow`, `hive-sh4re/src/container.rs:34-96` |
 //! | [`HiveUrls`]      | `HiveUrls`, `hive-host-sock/src/lib.rs:519-534`                     |
-//! | [`Approval`]      | `hive_sh4re::approvals::Approval`, `hive-sh4re/src/approvals.rs:13-37` |
-//! | [`ApprovalKind`]  | `ApprovalKind`, `hive-sh4re/src/approvals.rs:42-68`                 |
-//! | [`ApprovalStatus`]| `ApprovalStatus`, `hive-sh4re/src/approvals.rs:88-100`              |
+//! | [`Approval`]      | `hive_sh4re::approvals::Approval`, `hive-sh4re/src/approvals.rs:14-38` |
+//! | [`ApprovalKind`]  | `ApprovalKind`, `hive-sh4re/src/approvals.rs:45-69`                 |
+//! | [`ApprovalStatus`]| `ApprovalStatus`, `hive-sh4re/src/approvals.rs:90-100`              |
 //!
 //! # The three rules the mirror follows
 //!
@@ -185,7 +185,9 @@ pub enum Request {
     /// daemon's own store hands back what it hands back, so a reader that
     /// cares about "still waiting for a human" filters on
     /// [`ApprovalStatus::Pending`] itself rather than trusting the verb's
-    /// name. [`Response::pending_approvals`] is that filter, in one place.
+    /// name. [`crate::model::PendingApprovals::new`] is that filter, in one
+    /// place — a model policy, not a wire shape, which is why it does not live
+    /// on [`Response`].
     Pending,
     /// Approve one queued request by id; **the action runs immediately**
     /// (`hive-host-sock/src/lib.rs:230-231`).
@@ -280,42 +282,23 @@ pub struct Response {
     /// `AgentStatus` result — the roster.
     #[serde(default)]
     pub agent_statuses: Option<Vec<AgentStatusRow>>,
-    /// `Pending` result — the approval queue (#947 P3).
+    /// `Pending` result — the approval queue (#947 P3), **verbatim**.
+    ///
+    /// Not filtered here, deliberately: despite the verb's name the daemon
+    /// hands back whatever its store returns, and "which statuses are still
+    /// actionable" is model policy rather than wire shape. That rule lives in
+    /// exactly one place, [`crate::model::PendingApprovals::new`].
+    ///
+    /// `None` means *this response did not answer `Pending`* — distinct from
+    /// `Some(vec![])`, an empty queue, which is what clears a badge.
     #[serde(default)]
     pub approvals: Option<Vec<Approval>>,
-}
-
-impl Response {
-    /// The approvals still waiting on a human, oldest first.
-    ///
-    /// Two decisions live here rather than at each call site:
-    ///
-    /// - **Filter on the status, not on the verb.** `Pending`'s answer is
-    ///   whatever the daemon's store returns; an `Approved` row arriving in it
-    ///   must not raise a prompt for a decision somebody already made.
-    /// - **Order by id.** The hive's ids are monotonic per queue insert, so
-    ///   ascending id *is* oldest-first — and it is a total order over `i64`,
-    ///   where `requested_at` is a free-text timestamp this mirror keeps as a
-    ///   string precisely because it will not fail a whole roster over one
-    ///   unparseable value (the [`AgentStatusRow::status_set_at`] rule).
-    #[must_use]
-    pub fn pending_approvals(&self) -> Vec<Approval> {
-        let mut pending: Vec<Approval> = self
-            .approvals
-            .iter()
-            .flatten()
-            .filter(|a| a.status == ApprovalStatus::Pending)
-            .cloned()
-            .collect();
-        pending.sort_by_key(|a| a.id);
-        pending
-    }
 }
 
 /// One row in the hive's approval queue.
 ///
 /// Mirrors `hive_sh4re::approvals::Approval`
-/// (`hive-sh4re/src/approvals.rs:13-37`). Mirror rule 2 applies: `commit_ref`,
+/// (`hive-sh4re/src/approvals.rs:14-38`). Mirror rule 2 applies: `commit_ref`,
 /// `fetched_sha`, `resolved_at` and `note` are **not** carried. They are the
 /// payload and the audit trail of a decision the desktop does not make — the
 /// prompt says who asked, for what kind of action, and the manager's own
@@ -352,14 +335,14 @@ pub struct Approval {
     #[serde(default)]
     pub status: ApprovalStatus,
     /// The manager's free-text description, attached at submission time
-    /// (`hive-sh4re/src/approvals.rs:33-36`). The prompt's detail line.
+    /// (`hive-sh4re/src/approvals.rs:34-37`). The prompt's detail line.
     #[serde(default)]
     pub description: Option<String>,
 }
 
 /// What an approval, once granted, will trigger.
 ///
-/// Mirrors `ApprovalKind` (`hive-sh4re/src/approvals.rs:42-68`), including its
+/// Mirrors `ApprovalKind` (`hive-sh4re/src/approvals.rs:45-69`), including its
 /// `snake_case` rename — plus the [`Unknown`](ApprovalKind::Unknown) arm, which
 /// hyperhive's own enum does not have and this one needs (see the module docs'
 /// "rule 1, the enum half").
@@ -407,7 +390,7 @@ impl ApprovalKind {
 
 /// Where an approval is in its lifecycle.
 ///
-/// Mirrors `ApprovalStatus` (`hive-sh4re/src/approvals.rs:88-100`), plus the
+/// Mirrors `ApprovalStatus` (`hive-sh4re/src/approvals.rs:90-100`), plus the
 /// same [`Unknown`](ApprovalStatus::Unknown) arm [`ApprovalKind`] carries.
 ///
 /// The default is [`Pending`](ApprovalStatus::Pending) only because
@@ -736,7 +719,6 @@ mod tests {
         assert_eq!(queue[0].description.as_deref(), Some("bump the meta flake"));
         // `commit_ref`/`fetched_sha` are deliberately unmirrored (rule 2) and
         // their presence must not fail the decode.
-        assert_eq!(resp.pending_approvals().len(), 1);
     }
 
     /// Rule 1, the enum half. A hive that grows an `ApprovalKind` or an
@@ -765,31 +747,8 @@ mod tests {
             ApprovalStatus::Unknown("awaiting_quorum".to_owned())
         );
 
-        // …and the unknown *status* is not treated as pending: a build that
-        // cannot name a state must not offer to resolve it.
-        let pending: Vec<i64> = resp.pending_approvals().iter().map(|a| a.id).collect();
-        assert_eq!(pending, vec![1, 3]);
-
         // The unknown kind still says something an operator can act on.
         assert_eq!(queue[0].kind.human(), "perform `teleport_agent`");
-    }
-
-    /// `pending_approvals` is the one place the "still waiting" filter lives,
-    /// and it orders by id — oldest first — because the queue's ids are
-    /// monotonic and `requested_at` is deliberately an unparsed string.
-    ///
-    /// Falsification: drop the `sort_by_key` and the order assertion goes red;
-    /// drop the status filter and the resolved row appears.
-    #[test]
-    fn pending_approvals_filters_on_status_and_orders_oldest_first() {
-        let raw = r#"{"version":1,"ok":true,"approvals":[
-            {"id":9,"agent":"a","kind":"spawn","requested_at":"2026-09-12T09:09:00Z","status":"pending"},
-            {"id":4,"agent":"a","kind":"spawn","requested_at":"2026-09-12T09:04:00Z","status":"approved"},
-            {"id":6,"agent":"a","kind":"spawn","requested_at":"2026-09-12T09:06:00Z","status":"pending"}
-        ]}"#;
-        let resp: Response = serde_json::from_str(raw).expect("decodes");
-        let ids: Vec<i64> = resp.pending_approvals().iter().map(|a| a.id).collect();
-        assert_eq!(ids, vec![6, 9]);
     }
 
     /// The `kind` key is `#[serde(default)]` on the hive's own struct

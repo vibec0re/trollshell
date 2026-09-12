@@ -56,18 +56,37 @@ these files is still a finding, not a formatting nit.
 
 ## The files
 
-| file                             | what it is                                                       |
-| -------------------------------- | ---------------------------------------------------------------- |
-| `agent_status_grouped.json`      | three agents across two projects — the golden roster             |
-| `agent_status_precedence.json`   | one agent per §6.2 precedence row, plus the `needs_update` badge |
-| `agent_status_empty.json`        | a hive with no agents                                            |
-| `agent_status_unknown_keys.json` | forward drift: keys this build has never heard of                |
-| `agent_status_v0.json`           | a pre-version daemon (no `version` key at all)                   |
-| `agent_status_v99.json`          | a daemon newer than this build — must be refused, not read       |
-| `agent_status_bad_name.json`     | a row whose name fails the §11 whitelist                         |
-| `list.json`                      | a `List` answer                                                  |
-| `urls.json`                      | a `Urls` answer                                                  |
-| `error.json`                     | `ok: false` with the daemon's own message                        |
+| file                             | what it is                                                                             |
+| -------------------------------- | -------------------------------------------------------------------------------------- |
+| `agent_status_grouped.json`      | three agents across two projects — the golden roster                                   |
+| `agent_status_precedence.json`   | one agent per §6.2 precedence row, plus the `needs_update` badge                       |
+| `agent_status_empty.json`        | a hive with no agents                                                                  |
+| `agent_status_unknown_keys.json` | forward drift: keys this build has never heard of                                      |
+| `agent_status_v0.json`           | a pre-version daemon (no `version` key at all)                                         |
+| `agent_status_v99.json`          | a daemon newer than this build — must be refused, not read                             |
+| `agent_status_bad_name.json`     | a row whose name fails the §11 whitelist                                               |
+| `list.json`                      | a `List` answer                                                                        |
+| `urls.json`                      | a `Urls` answer                                                                        |
+| `error.json`                     | `ok: false` with the daemon's own message                                              |
+| `pending.json`                   | a `Pending` answer: two queued approvals plus one already resolved                     |
+| `pending_empty.json`             | a hive with an empty approval queue                                                    |
+| `pending_unknown.json`           | forward drift: an `ApprovalKind` and an `ApprovalStatus` this build has never heard of |
+
+### The three `pending_*.json` (#947 P3)
+
+Same provenance and the same caveat, read off
+`hive-sh4re/src/approvals.rs:14-38` (`Approval`, with its field **order** and
+its two `skip_serializing_if`s) and `hive-host-sock/src/lib.rs:228-233`
+(`Pending` / `Approve` / `Deny`). They are **not** part of the verbatim-copy
+round trip described above, which predates them, so re-recording them against a
+live hive is the same open item — and the one field worth watching is
+`commit_ref`, which is overloaded per kind (a sha, a PR number, an inputs
+array, or empty) and which this mirror deliberately does not read.
+
+`pending.json` carries an `approved` row on purpose: `Pending`'s answer is
+whatever the daemon's store returns, so the filter that keeps a resolved
+approval from raising a prompt has to be exercised against a fixture that
+contains one.
 
 `view_*.txt` are render-tree goldens, not wire fixtures — see
 `tests/view_golden.rs` for how to regenerate them.

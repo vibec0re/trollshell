@@ -346,11 +346,7 @@ impl Agents {
         if self.prompt.is_some() {
             return Vec::new();
         }
-        let Some(next) = self
-            .pending
-            .oldest_unprompted(&self.prompted)
-            .map(Approval::clone)
-        else {
+        let Some(next) = self.pending.oldest_unprompted(&self.prompted).cloned() else {
             return Vec::new();
         };
         self.raise(&next)
@@ -398,7 +394,7 @@ impl Agents {
     /// it, so pretending otherwise would leave the model describing a card that
     /// no longer exists.
     fn raise_for(&mut self, name: &AgentName) -> Vec<Effect> {
-        let Some(next) = self.pending.oldest_for(name.as_str()).map(Approval::clone) else {
+        let Some(next) = self.pending.oldest_for(name.as_str()).cloned() else {
             // The badge and the queue disagree — the click raced a poll. The
             // next render simply has no badge.
             return Vec::new();

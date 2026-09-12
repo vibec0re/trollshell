@@ -441,15 +441,28 @@ pub fn request(
     CONSENT_WINDOW.with(|w| *w.borrow_mut() = Some(window));
 }
 
+/// The `Monitor` for niri's focused output, or any mounted one as a fallback
+/// (niri startup / a just-vanished output), or `None` if none are mounted.
+fn focused_monitor() -> Option<Monitor> {
+    let focused = focused_output::current();
+    MONITORS.with(|m| {
+        let m = m.borrow();
+        focused
+            .as_ref()
+            .and_then(|name| m.get(name))
+            .or_else(|| m.values().next())
+            .cloned()
+    })
+}
 /// A card as one line per button, `label|decision|class`, plus the keyboard
 /// default and the silence rule — the artifact the goldens compare.
 ///
-/// A rendering of the *table* rather than of the widgets: `request` builds the
-/// buttons by a straight `map` over [`card`] with no per-variant branch left in
-/// it, so the table is the whole of what "which card" means. (The widget half
-/// wants a display server, a layer-shell compositor and a mounted `Monitor` to
-/// exist at all, which is exactly the wall `tests/overlay_reentrancy.rs`
-/// documents.)
+/// A rendering of the *table* rather than of the widgets: [`request`] builds
+/// the buttons by a straight `map` over [`card`] with no per-variant branch
+/// left in it, so the table is the whole of what "which card" means. (The
+/// widget half wants a display server, a layer-shell compositor and a mounted
+/// `Monitor` to exist at all, which is exactly the wall
+/// `tests/overlay_reentrancy.rs` documents.)
 #[cfg(test)]
 fn render_card(choices: ConsentChoices) -> String {
     use std::fmt::Write as _;
@@ -567,18 +580,4 @@ unanswered=None
             "trollshell-choom wants: merge a reviewed config PR"
         );
     }
-}
-
-/// The `Monitor` for niri's focused output, or any mounted one as a fallback
-/// (niri startup / a just-vanished output), or `None` if none are mounted.
-fn focused_monitor() -> Option<Monitor> {
-    let focused = focused_output::current();
-    MONITORS.with(|m| {
-        let m = m.borrow();
-        focused
-            .as_ref()
-            .and_then(|name| m.get(name))
-            .or_else(|| m.values().next())
-            .cloned()
-    })
 }

@@ -2231,7 +2231,6 @@ mod tests {
         classes: Vec<String>,
     }
 
-    /// Walk every node in `node`, applying `f` to each.
     // ── #947 P3: the approval badge ──────────────────────────────────────────
 
     fn approval(id: i64, agent: &str) -> Approval {
@@ -2329,6 +2328,7 @@ mod tests {
         assert!(find_text(&tree, "3").is_none());
     }
 
+    /// Walk every node in `node`, applying `f` to each.
     fn walk(node: &Node, f: &mut impl FnMut(&Node)) {
         f(node);
         match node {

@@ -133,8 +133,10 @@ const EMPTY_COLUMN_HINT: &str = "No workspaces on this screen";
 /// first moments after a shell start, or a lost IPC socket.
 const NO_OUTPUTS_HINT: &str = "Waiting for niri\u{2026}";
 
-/// The name an unsaved workspace shows in place of one (#1071 §3.7).
-const EPHEMERAL_NAME: &str = "Unsaved workspace";
+/// CSS class on a card's header row (name plus its buttons) — #1134 change
+/// 4's hook for asserting no card repeats the connector its column already
+/// names.
+const CARD_HEADER_CLASS: &str = "ts-ws-card-header";
 
 /// Under an Inactive card, in Annika's own words from the epic.
 const INACTIVE_HINT: &str = "Not on a screen";
@@ -172,6 +174,14 @@ enum Kind {
     /// workspace immediately, so the saved workspace is the Active card"*.
     Ephemeral {
         workspace: u64,
+        /// niri's own position number for the workspace (`Workspace::idx`) —
+        /// what the card's title shows (#1134 change 3: `"Workspace {idx}"`
+        /// rather than a generic placeholder). *Not* a unique id — it is the
+        /// workspace's position on its monitor and can repeat across monitors
+        /// or be reused after the workspace moves — but niri's own bar
+        /// (`widgets::workspaces`) already labels its pills the same way, so a
+        /// card and its pill agree.
+        idx: u8,
         /// The connector the workspace is on — §3.7's *"record the monitor"*.
         /// Taken from the workspace rather than from the column so a Save writes
         /// the screen niri says it is on, not the one the page drew it in.
@@ -461,6 +471,7 @@ fn ephemeral_cards<'w>(workspaces: &'w [Workspace], windows: &[Window]) -> Vec<(
                     name: String::new(),
                     kind: Kind::Ephemeral {
                         workspace: workspace.id,
+                        idx: workspace.idx,
                         output: output.to_owned(),
                         windows: on_workspace
                             .iter()
@@ -1064,12 +1075,19 @@ fn build_card(
     toggle_class(&outer, CARD_INACTIVE_CLASS, !card.is_active());
 
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    // #1134 change 4's hook: a test walks exactly this box for connector text,
+    // rather than the whole card (whose app-icon tooltips legitimately carry
+    // other strings).
+    header.add_css_class(CARD_HEADER_CLASS);
 
-    let name = gtk::Label::new(Some(if card.name.is_empty() {
-        EPHEMERAL_NAME
-    } else {
-        &card.name
-    }));
+    // #1134 change 3: an ephemeral card's title is niri's own workspace number
+    // — the same number `widgets::workspaces`' bar pill shows — rather than a
+    // generic "Unsaved workspace" placeholder. A saved card keeps its name.
+    let title = match &card.kind {
+        Kind::Saved(_) => card.name.clone(),
+        Kind::Ephemeral { idx, .. } => format!("Workspace {idx}"),
+    };
+    let name = gtk::Label::new(Some(&title));
     name.add_css_class("ts-ws-card-name");
     name.set_xalign(0.0);
     name.set_hexpand(true);
@@ -1209,6 +1227,7 @@ fn draft_for(card: &Card) -> Option<workspace_edit::Draft> {
             workspace,
             output,
             windows,
+            ..
         } => Some(ephemeral_draft(
             *workspace,
             output,
@@ -1930,6 +1949,7 @@ mod model_tests {
             workspace,
             output,
             windows,
+            ..
         } = &find(&columns, RIGHT).cards[0].kind
         else {
             panic!("an unnamed workspace with windows is an ephemeral card");
@@ -2390,8 +2410,8 @@ mod model_tests {
 pub(in crate::panels) mod tests {
     use super::fixtures::{LEFT, RIGHT, no_stacks, output_at, saved, stack, win, ws, ws_focused};
     use super::{
-        APP_IDLE_CLASS, APP_RUNNING_CLASS, CARD_INACTIVE_CLASS, DisplayOutput, EMPTY_COLUMN_HINT,
-        EPHEMERAL_NAME, NO_OUTPUTS_HINT, OFFLINE_COLUMN, PageModel, bind_columns, build_panel,
+        APP_IDLE_CLASS, APP_RUNNING_CLASS, CARD_HEADER_CLASS, CARD_INACTIVE_CLASS, DisplayOutput,
+        EMPTY_COLUMN_HINT, NO_OUTPUTS_HINT, OFFLINE_COLUMN, PageModel, bind_columns, build_panel,
     };
     use crate::config::workspaces::Workspaces;
     use hytte::adw;
@@ -2808,8 +2828,8 @@ pub(in crate::panels) mod tests {
         let card = cards(&f.page).first().cloned().expect("an ephemeral card");
         assert_eq!(
             label_text(&card, "ts-ws-card-name"),
-            EPHEMERAL_NAME,
-            "it has no name until it is saved"
+            "Workspace 1",
+            "it has no name until it is saved, so it shows niri's own number instead"
         );
         assert_eq!(
             icons(&card).len(),
@@ -2853,6 +2873,74 @@ pub(in crate::panels) mod tests {
             "#1109: no card may carry an inline text field — found {}",
             inline.len()
         );
+
+        window.destroy();
+    }
+
+    /// #1134 change 3: the number is niri's own — a different `idx` (and a
+    /// different workspace id, so this is not the same fixture as the test
+    /// above with the numbers changed) shows on the card.
+    ///
+    /// **The mutation**: hard-coding `"Workspace 1"` (or any other idx, or the
+    /// retired `"Unsaved workspace"` text) reds this.
+    #[gtk::test]
+    fn an_ephemeral_cards_title_is_niris_own_workspace_number() {
+        let f = fixture();
+        f.workspaces.set(vec![ws(42, 3, LEFT, None)]);
+        f.windows.set(vec![win(1, 42, "com.example.Term", 1)]);
+        pump();
+        let window = present(&f.page);
+
+        let card = cards(&f.page).first().cloned().expect("an ephemeral card");
+        assert_eq!(label_text(&card, "ts-ws-card-name"), "Workspace 3");
+
+        window.destroy();
+    }
+
+    /// #1134 change 4: the column heading (`build_column`'s title) already
+    /// names the connector, so a card's own header must not repeat it —
+    /// neither a saved card's nor an ephemeral one's.
+    ///
+    /// **The mutation**: appending a `gtk::Label::new(Some(&column.connector))`
+    /// (or the card's own `monitor`) into `build_card`'s header reds this.
+    #[gtk::test]
+    fn no_card_header_repeats_its_own_connector() {
+        fn all_label_texts(scope: &gtk::Widget) -> Vec<String> {
+            fn walk(widget: &gtk::Widget, out: &mut Vec<String>) {
+                if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                    out.push(label.text().to_string());
+                }
+                let mut child = widget.first_child();
+                while let Some(c) = child {
+                    walk(&c, out);
+                    child = c.next_sibling();
+                }
+            }
+            let mut out = Vec::new();
+            walk(scope, &mut out);
+            out
+        }
+
+        let f = fixture();
+        f.saved.set(saved(&[("chat", stack(Some(LEFT), &["a"]))]));
+        f.workspaces.set(vec![
+            ws(1, 1, LEFT, Some("chat")),
+            ws(2, 2, RIGHT, None),
+        ]);
+        f.windows.set(vec![win(9, 2, "com.example.Term", 1)]);
+        pump();
+        let window = present(&f.page);
+
+        let headers = by_class(&f.page, CARD_HEADER_CLASS);
+        assert_eq!(headers.len(), 2, "the saved card and the ephemeral one both carry a header");
+        for header in &headers {
+            let texts = all_label_texts(header);
+            assert!(
+                !texts.iter().any(|t| t == LEFT || t == RIGHT),
+                "a card header must not repeat the connector its column already \
+                 names, found {texts:?}"
+            );
+        }
 
         window.destroy();
     }

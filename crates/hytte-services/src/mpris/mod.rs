@@ -591,20 +591,26 @@ impl State {
         self.players.set(list);
     }
 
-    /// Register a new bus name in the tracking order.
-    async fn register(&self, bus_name: &str) {
+    /// Register a new bus name in the tracking order, reporting whether this
+    /// call is the one that inserted it.
+    ///
+    /// That answer is the **only** gate against watching one player twice, so
+    /// every discovery path goes through [`Spawner::spawn_if_new`] rather than
+    /// calling `spawn_player` directly (#1201 review). Until then this was
+    /// silently idempotent and `spawn_player_tasks` registered from *inside*
+    /// the spawned task, so two deliveries of the same name — the `ListNames`
+    /// re-read's reply, and the `NameOwnerChanged` for a player that appeared
+    /// while that round trip was in flight, buffered behind it — each spawned
+    /// a full task set: two proxies, two `PropertiesChanged` subscriptions,
+    /// two position pollers and two liveness watchers for the rest of the
+    /// session, with nothing to notice (`unregister` is idempotent too).
+    async fn register(&self, bus_name: &str) -> bool {
         let mut order = self.order.lock().await;
-        if !order.contains(&bus_name.to_string()) {
-            order.push(bus_name.to_string());
+        if order.iter().any(|n| n == bus_name) {
+            return false;
         }
-    }
-
-    /// Whether `bus_name` already has a per-player watcher — used by the
-    /// `NameOwnerChanged` re-discovery pass (#1201) to skip a name it is
-    /// already tracking rather than spawn a second `spawn_player_tasks` for
-    /// the same player.
-    async fn is_registered(&self, bus_name: &str) -> bool {
-        self.order.lock().await.contains(&bus_name.to_string())
+        order.push(bus_name.to_string());
+        true
     }
 
     /// Remove a bus name from tracking and publish.
@@ -681,8 +687,8 @@ where
 /// `Position`, and a third watches the [`BusProxy`] liveness signal for
 /// `PeerGone`.
 async fn spawn_player_tasks(state: State, bus_name: String) {
-    // Register in discovery order first.
-    state.register(&bus_name).await;
+    // Registration already happened, synchronously, at the call site — see
+    // [`Spawner::spawn_if_new`] for why it cannot happen here.
 
     // Build the long-lived proxy BEFORE the first property read — the reverse
     // of the order this ran in until #1173.
@@ -930,6 +936,51 @@ fn spawn_player(state: &State, bus_name: String) {
     });
 }
 
+/// The "start watching this player" step, as a value.
+///
+/// There are two places a player is discovered — the `ListNames` pass in
+/// [`discover_players`] and the `NameOwnerChanged` "appeared" arm in
+/// [`run_owner_change_loop`] — and a bus blip makes them race each other (see
+/// [`State::register`] for the timeline). Funnelling both through
+/// [`Self::spawn_if_new`] is what makes "one task set per player" a property
+/// of the code rather than of the order two deliveries happen to arrive in,
+/// and holding the spawn behind an `Arc<dyn Fn>` lets a test count spawns
+/// without a session bus — including through `run_owner_change_loop`, so the
+/// gate is exercised where the race actually happens.
+#[derive(Clone)]
+struct Spawner(Arc<dyn Fn(&State, String) + Send + Sync>);
+
+impl Spawner {
+    /// The production spawner: one supervised, bounded [`spawn_player`] task
+    /// set per player.
+    fn player() -> Self {
+        Self(Arc::new(|state: &State, bus_name: String| {
+            spawn_player(state, bus_name);
+        }))
+    }
+
+    /// Register `bus_name` and spawn its task set **only** if this call is the
+    /// one that inserted the name. Returns whether it spawned.
+    ///
+    /// Registering here rather than inside the spawned task is the whole
+    /// point: a duplicate is refused before a proxy, a subscription, a poller
+    /// and a liveness watcher exist, not after.
+    async fn spawn_if_new(&self, state: &State, bus_name: String) -> bool {
+        if !state.register(&bus_name).await {
+            tracing::debug!(
+                bus_name,
+                "mpris player is already watched; not spawning a second task set"
+            );
+            return false;
+        }
+        (self.0)(state, bus_name);
+        true
+    }
+}
+
+/// The session-bus name prefix every MPRIS player owns.
+const PLAYER_NAME_PREFIX: &str = "org.mpris.MediaPlayer2.";
+
 /// List every current session-bus name and spawn a watcher for each MPRIS
 /// player not already tracked. Used both for the startup snapshot and for the
 /// [`SignalItem::Resubscribed`]/[`SignalItem::Lagged`] re-read (#1201): the
@@ -937,10 +988,10 @@ fn spawn_player(state: &State, bus_name: String) {
 /// [`watch_properties`]'s — a hole in its history means a player that
 /// appeared during the gap is never discovered at all, and one that quit
 /// stays in the drawer forever (nothing re-announces a name that already
-/// went away). `is_registered` skips a name already being watched, so a
-/// re-read after a brief gap costs one `ListNames` round trip rather than a
-/// second `spawn_player_tasks` racing the first.
-async fn discover_players(state: &State) -> Result<()> {
+/// went away). [`Spawner::spawn_if_new`] skips a name already being watched,
+/// so a re-read after a brief gap costs one `ListNames` round trip rather
+/// than a second `spawn_player_tasks` racing the first.
+async fn discover_players(state: &State, spawner: &Spawner) -> Result<()> {
     let names: Vec<String> = call(BusKind::Session, "org.freedesktop.DBus")
         .at_path("/org/freedesktop/DBus")
         .iface("org.freedesktop.DBus")
@@ -950,10 +1001,9 @@ async fn discover_players(state: &State) -> Result<()> {
         .await
         .context("ListNames")?;
 
-    for name in names {
-        if name.starts_with("org.mpris.MediaPlayer2.") && !state.is_registered(&name).await {
-            tracing::debug!(name, "found mpris player");
-            spawn_player(state, name);
+    for name in names.iter().filter(|n| n.starts_with(PLAYER_NAME_PREFIX)) {
+        if spawner.spawn_if_new(state, name.clone()).await {
+            tracing::debug!(name = %name, "found mpris player");
         }
     }
 
@@ -976,6 +1026,7 @@ async fn discover_players(state: &State) -> Result<()> {
 async fn run_owner_change_loop<S, Rediscover, Fut>(
     state: &State,
     mut items: S,
+    spawner: &Spawner,
     mut rediscover: Rediscover,
 ) where
     S: futures_util::Stream<Item = SignalItem> + Unpin,
@@ -1001,7 +1052,7 @@ async fn run_owner_change_loop<S, Rediscover, Fut>(
             continue;
         };
 
-        if !name.starts_with("org.mpris.MediaPlayer2.") {
+        if !name.starts_with(PLAYER_NAME_PREFIX) {
             continue;
         }
 
@@ -1013,9 +1064,12 @@ async fn run_owner_change_loop<S, Rediscover, Fut>(
             tracing::debug!(name, "mpris player disappeared (NOC)");
             state.unregister(&name).await;
         } else {
-            // New player appeared.
+            // New player appeared. Through the same gate as the `ListNames`
+            // pass: this arm and that one race whenever a player appears
+            // during a re-read's round trip, and before #1201's review this
+            // one spawned unconditionally.
             tracing::debug!(name, "mpris player appeared");
-            spawn_player(state, name);
+            spawner.spawn_if_new(state, name).await;
         }
     }
 }
@@ -1031,10 +1085,16 @@ async fn listen(players: &Mutable<Vec<Player>>, active: &Mutable<bool>) -> Resul
         .signal("NameOwnerChanged")
         .start();
 
-    // List all current names and register existing MPRIS players.
-    discover_players(&state).await?;
+    // One gate for both discovery paths (see `Spawner`).
+    let spawner = Spawner::player();
 
-    run_owner_change_loop(&state, owner_changes.items(), || discover_players(&state)).await;
+    // List all current names and register existing MPRIS players.
+    discover_players(&state, &spawner).await?;
+
+    run_owner_change_loop(&state, owner_changes.items(), &spawner, || {
+        discover_players(&state, &spawner)
+    })
+    .await;
 
     Ok(())
 }
@@ -1261,11 +1321,42 @@ mod tests {
 
     // ── #1201: NameOwnerChanged re-discovers on Resubscribed/Lagged ─────────
 
-    use super::{State, run_owner_change_loop};
+    use super::{PLAYER_NAME_PREFIX, Spawner, State, run_owner_change_loop};
     use futures_signals::signal::Mutable;
-    use hytte_bus::SignalItem;
+    use hytte_bus::{SignalEvent, SignalItem};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A `Spawner` that counts instead of spawning, so a test can drive the
+    /// real discovery paths without a session bus.
+    fn counting_spawner() -> (Spawner, Arc<AtomicUsize>) {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counter = spawns.clone();
+        (
+            Spawner(Arc::new(move |_state, _bus_name| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })),
+            spawns,
+        )
+    }
+
+    /// One `NameOwnerChanged` emission as it arrives on the wire:
+    /// `(name, old_owner, new_owner)`.
+    fn noc(name: &str, new_owner: &str) -> SignalItem {
+        let body = zbus::Message::signal(
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+        )
+        .expect("signal builder")
+        .build(&(name.to_owned(), String::new(), new_owner.to_owned()))
+        .expect("build NameOwnerChanged message");
+        SignalItem::Event(SignalEvent {
+            body,
+            sender: None,
+            timestamp: std::time::SystemTime::now(),
+        })
+    }
 
     /// Before #1201 this loop was driven by `events()`, which cannot
     /// represent either marker, so a bus blip here left the player list
@@ -1279,12 +1370,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn owner_change_loop_rediscovers_exactly_once_per_marker() {
         let state = State::new(Mutable::new(Vec::new()), Mutable::new(true));
+        let (spawner, _spawns) = counting_spawner();
 
         let calls = Arc::new(AtomicUsize::new(0));
         {
             let calls = calls.clone();
             let items = futures_util::stream::iter(vec![SignalItem::Resubscribed]);
-            run_owner_change_loop(&state, items, move || {
+            run_owner_change_loop(&state, items, &spawner, move || {
                 let calls = calls.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -1303,7 +1395,7 @@ mod tests {
         {
             let calls = calls.clone();
             let items = futures_util::stream::iter(vec![SignalItem::Lagged { skipped: 7 }]);
-            run_owner_change_loop(&state, items, move || {
+            run_owner_change_loop(&state, items, &spawner, move || {
                 let calls = calls.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -1317,5 +1409,80 @@ mod tests {
             1,
             "Lagged must re-discover exactly once"
         );
+    }
+
+    // ── #1201 review: one task set per player, however it is discovered ─────
+
+    /// The M2 race, end to end through the loop: the bus reconnects, the
+    /// marker is read, the re-read's `ListNames` returns player Y, and Y's
+    /// own `NameOwnerChanged` is buffered *behind* the marker so it is read
+    /// straight after. Both deliveries name the same player, and before the
+    /// review's fix each spawned a full task set — `register` ran inside the
+    /// spawned task and only the discovery side checked.
+    ///
+    /// Falsifiable two ways: making `State::register` unconditionally return
+    /// `true`, or having the NOC-appeared arm call `spawn_player` directly
+    /// again, both give 2.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_player_delivered_by_both_paths_spawns_once() {
+        let state = State::new(Mutable::new(Vec::new()), Mutable::new(true));
+        let (spawner, spawns) = counting_spawner();
+        let name = format!("{PLAYER_NAME_PREFIX}y");
+
+        let items = futures_util::stream::iter(vec![
+            SignalItem::Resubscribed,
+            noc(&name, ":1.9"),
+            // A second appearance of the same name (a blip the broker
+            // re-announces) must not add a task set either.
+            noc(&name, ":1.9"),
+        ]);
+        {
+            let spawner2 = spawner.clone();
+            let state2 = state.clone();
+            let name2 = name.clone();
+            run_owner_change_loop(&state, items, &spawner, move || {
+                // Stand in for `discover_players`: the `ListNames` reply
+                // includes Y, which the re-read must start watching.
+                let spawner = spawner2.clone();
+                let state = state2.clone();
+                let name = name2.clone();
+                async move {
+                    spawner.spawn_if_new(&state, name).await;
+                    Ok(())
+                }
+            })
+            .await;
+        }
+
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            1,
+            "one player must cost exactly one task set, however many paths deliver it"
+        );
+        assert_eq!(
+            state.order.lock().await.len(),
+            1,
+            "and exactly one tracking entry"
+        );
+    }
+
+    /// A player that goes away and comes back is a *new* task set: the gate
+    /// must not turn into a one-shot latch that leaves a returning player
+    /// unwatched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_returning_player_spawns_again() {
+        let state = State::new(Mutable::new(Vec::new()), Mutable::new(true));
+        let (spawner, spawns) = counting_spawner();
+        let name = format!("{PLAYER_NAME_PREFIX}y");
+
+        let items = futures_util::stream::iter(vec![
+            noc(&name, ":1.9"),
+            noc(&name, ""), // released
+            noc(&name, ":1.11"),
+        ]);
+        run_owner_change_loop(&state, items, &spawner, || async { Ok(()) }).await;
+
+        assert_eq!(spawns.load(Ordering::SeqCst), 2);
+        assert_eq!(state.order.lock().await.len(), 1);
     }
 }

@@ -124,7 +124,9 @@
           bundledPlugins = pkgs.lib.genAttrs bundledPluginNames (
             name:
             pkgs.callPackage ./nix/plugin.nix (
-              { inherit workspace name; }
+              {
+                inherit workspace name;
+              }
               # `hytte-plugin-niri-layouts` is the one bundled plugin with a
               # standalone-CLI hat (`apply <layout>`, #1019) and so the one
               # with a `completions <shell>` subcommand to build (#1116); every
@@ -242,7 +244,9 @@
           bundledPlugins = pkgs.lib.genAttrs bundledPluginNames (
             name:
             pkgs.callPackage ./nix/plugin.nix (
-              { inherit workspace name; }
+              {
+                inherit workspace name;
+              }
               # `hytte-plugin-niri-layouts` is the one bundled plugin with a
               # standalone-CLI hat (`apply <layout>`, #1019) and so the one
               # with a `completions <shell>` subcommand to build (#1116); every

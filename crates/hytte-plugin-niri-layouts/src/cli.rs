@@ -148,7 +148,11 @@ mod tests {
     fn help_is_recognised_three_ways() {
         for flag in ["--help", "-h", "help"] {
             let err = parse(&[flag]).expect_err("help exits through the Err/DisplayHelp path");
-            assert_eq!(err.exit_code(), 0, "{flag} should be a zero-exit help display");
+            assert_eq!(
+                err.exit_code(),
+                0,
+                "{flag} should be a zero-exit help display"
+            );
         }
     }
 
@@ -242,6 +246,9 @@ mod tests {
     fn bash_completions_name_the_binary_and_every_subcommand() {
         let script = render_completions(Shell::Bash);
         assert!(script.contains("hytte-plugin-niri-layouts"), "{script}");
-        assert!(script.contains("apply"), "bash completions missing 'apply':\n{script}");
+        assert!(
+            script.contains("apply"),
+            "bash completions missing 'apply':\n{script}"
+        );
     }
 }

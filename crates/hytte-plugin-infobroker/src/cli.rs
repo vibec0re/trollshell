@@ -349,10 +349,7 @@ mod tests {
         let cli = parse(&["get", "departures", "--limit", "5"]).expect("parses");
         assert!(matches!(
             cli.command,
-            Some(Command::Get {
-                limit: Some(5),
-                ..
-            })
+            Some(Command::Get { limit: Some(5), .. })
         ));
     }
 
@@ -420,7 +417,10 @@ mod tests {
         let script = render_completions(Shell::Bash);
         assert!(script.contains("hytte-infobroker"), "{script}");
         for word in ["auth", "get", "grants"] {
-            assert!(script.contains(word), "bash completions missing '{word}':\n{script}");
+            assert!(
+                script.contains(word),
+                "bash completions missing '{word}':\n{script}"
+            );
         }
     }
 }

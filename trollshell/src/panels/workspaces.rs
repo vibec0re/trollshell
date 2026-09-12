@@ -138,9 +138,6 @@ const NO_OUTPUTS_HINT: &str = "Waiting for niri\u{2026}";
 /// names.
 const CARD_HEADER_CLASS: &str = "ts-ws-card-header";
 
-/// Under an Inactive card, in Annika's own words from the epic.
-const INACTIVE_HINT: &str = "Not on a screen";
-
 /// Tooltip on the trailing column's heading.
 const OFFLINE_COLUMN_HINT: &str =
     "These stacks name a screen that is not connected. Starting one puts it on the focused screen.";
@@ -1128,12 +1125,6 @@ fn build_card(
     }
     header.append(&edit_button(card));
     outer.append(&header);
-
-    if let Kind::Saved(StackState::Inactive) = card.kind {
-        let note = hint(INACTIVE_HINT);
-        note.add_css_class("ts-ws-card-note");
-        outer.append(&note);
-    }
 
     // #1119: the icons are double-size now (`build_app_icon`), so a busy
     // stack's apps no longer all fit in one row at a column's width. A
@@ -3142,12 +3133,11 @@ pub(in crate::panels) mod tests {
         assert!(stop.is_sensitive());
         assert_inside_and_hittable(&all[0], stop.upcast_ref(), "the Stop button");
 
-        // dev — Inactive: greyed, says so, and offers Start.
+        // dev — Inactive: greyed and offers Start.
         assert!(
             all[1].has_css_class(CARD_INACTIVE_CLASS),
             "an Inactive card is greyed"
         );
-        assert_eq!(label_text(&all[1], "ts-ws-card-note"), "Not on a screen");
         let start = button(&all[1]);
         assert_eq!(
             start.icon_name().as_deref(),
